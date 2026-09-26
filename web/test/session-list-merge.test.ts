@@ -28,6 +28,7 @@ import {
   isWorkerSessionName,
   mergeSessionListEntry,
   parseMainSessionName,
+  resolveSharedSessionProject,
   type IncomingSessionListEntry,
 } from '../src/session-list-merge.js';
 import type { SessionInfo } from '../src/types.js';
@@ -66,6 +67,22 @@ function makeExisting(overrides: Partial<SessionInfo> = {}): SessionInfo {
 }
 
 describe('mergeSessionListEntry — supervision preservation', () => {
+  it('accepts a new authoritative shared mode and preserves it when an older sparse snapshot omits it', () => {
+    const projected = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    }, makeExisting({ supervisionMode: SUPERVISION_MODE.OFF }));
+    expect(projected.supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+
+    const sparse = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      sessionInstanceId: 'instance-new',
+      runtimeEpoch: 'epoch-new',
+    }, projected);
+    expect(sparse.supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+  });
   it('keeps daemon-provided error reason for error session list entries and clears it on recovery', () => {
     const errored = mergeSessionListEntry({
       ...BASE_INCOMING,
@@ -421,6 +438,20 @@ describe('session navigation visibility', () => {
     });
   });
 
+  it('resolves a shared session\'s real project from its name, not the display title, when the owner labeled the session', () => {
+    // A session-share's `title` is the session's own label when one is set —
+    // it must never be mistaken for the project identifier (e.g. used to scope
+    // cron-task visibility), or a labeled session's tasks silently disappear
+    // for participants while the owner (whose UI never derives project this
+    // way) still sees them fine.
+    expect(resolveSharedSessionProject('deck_soft_dev_rules_brain', 'My Custom Label')).toBe('soft_dev_rules');
+  });
+
+  it('falls back to the title only when the session name does not match the deck_{project}_{role} convention', () => {
+    expect(resolveSharedSessionProject('not-a-deck-session', 'Fallback Title')).toBe('Fallback Title');
+    expect(resolveSharedSessionProject('not-a-deck-session', '')).toBe('not-a-deck-session');
+  });
+
   it('identifies sub-sessions and worker main sessions as hidden from top-level navigation', () => {
     expect(isSubSessionName('deck_sub_abc123')).toBe(true);
     expect(isWorkerSessionName('deck_proj_w1')).toBe(true);
@@ -569,5 +600,38 @@ describe('mergeSessionListEntry — structured transport queue sync', () => {
     expect(merged.transportPendingMessages).toEqual(['keep']);
     expect(merged.transportPendingMessageEntries).toEqual([{ clientMessageId: 'keep', text: 'keep' }]);
     expect(merged.transportPendingMessageVersion).toBe(3);
+  });
+});
+
+describe('mergeSessionListEntry — supervision heartbeat projection', () => {
+  it('accepts a valid schedule, preserves it across sparse rows, and applies explicit clear', () => {
+    const armed = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'waiting', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+      },
+    }, undefined);
+    expect(armed.supervisionHeartbeat).toEqual({
+      state: 'armed', kind: 'waiting', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+    });
+
+    expect(mergeSessionListEntry(BASE_INCOMING, armed).supervisionHeartbeat)
+      .toEqual(armed.supervisionHeartbeat);
+    expect(mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: null,
+    }, armed).supervisionHeartbeat).toBeNull();
+  });
+
+  it('fails closed instead of exposing malformed daemon schedule data', () => {
+    const merged = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'waiting', updatedAt: 10_000,
+      },
+    }, makeExisting({
+      supervisionHeartbeat: { state: 'idle', updatedAt: 9_000 },
+    }));
+    expect(merged.supervisionHeartbeat).toBeNull();
   });
 });

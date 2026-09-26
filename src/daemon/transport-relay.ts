@@ -21,20 +21,24 @@ import {
   type ProviderUsageUpdate,
 } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
+import { readDelegationClaim } from '../../shared/delegation-claim.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import {
+  enforceObservedNativeCollaboration,
+  evaluateNativeCollaborationPreExecution,
+  isNativeAgentFenceRequired,
+} from './native-collaboration-guard.js';
+import { readNativeAgentAdmissionMode } from '../../shared/native-collaboration-policy.js';
 import { appendTransportEvent } from './transport-history.js';
 import logger from '../util/logger.js';
 import { TrailingThrottle } from '../util/trailing-throttle.js';
-import { resolveContextWindow } from '../util/model-context.js';
 import { getSession } from '../store/session-store.js';
-import { getCachedPresetContextWindow } from './cc-presets.js';
+import { resolveSessionContextWindow } from './session-context-window.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { ASK_QUESTION_WAIT_MS } from '../../shared/ask-question-timing.js';
 import { normalizeCodexSdkFileChange, normalizeQwenFileChange } from './file-change-normalizer.js';
-import { USAGE_CONTEXT_WINDOW_SOURCES } from '../../shared/usage-context-window.js';
-import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import { SESSION_CONTROL_METADATA_COMMAND_FIELD } from '../../shared/session-control-commands.js';
 import {
   buildSdkSubagentTimelinePayload,
@@ -311,15 +315,11 @@ function normalizeUsageUpdatePayload(
   model: string | undefined,
 ): Record<string, unknown> | null {
   if (!usage && !model) return null;
-  const session = getSession(sessionName);
-  const effectiveModel = resolveEffectiveSessionModel(session, model);
-  // A preset can be edited while an SDK session remains alive. Prefer the
-  // current preset cache over the launch-time copy stored on that session so a
-  // changed 1M window takes effect on the very next usage frame.
-  const cachedPresetCtx = session?.ccPreset
-    ? getCachedPresetContextWindow(session.ccPreset)
-    : undefined;
-  const presetCtx = cachedPresetCtx ?? session?.presetContextWindow;
+  const { contextWindow, effectiveModel, source: contextWindowSource } = resolveSessionContextWindow(
+    sessionName,
+    usage?.model_context_window,
+    model,
+  );
   const inputTokens = typeof usage?.input_tokens === 'number'
     ? usage.input_tokens + (usage.cache_creation_input_tokens ?? 0)
     : undefined;
@@ -334,20 +334,6 @@ function normalizeUsageUpdatePayload(
     ? usage.cache_read_input_tokens
     : typeof usage?.cached_input_tokens === 'number'
       ? usage.cached_input_tokens
-      : undefined;
-  const explicitContextWindow = typeof usage?.model_context_window === 'number' && Number.isFinite(usage.model_context_window) && usage.model_context_window > 0
-    ? usage.model_context_window
-    : undefined;
-  const contextWindow = resolveContextWindow(
-    explicitContextWindow ?? presetCtx,
-    effectiveModel,
-    1_000_000,
-    { preferExplicit: explicitContextWindow !== undefined || presetCtx !== undefined },
-  );
-  const contextWindowSource = explicitContextWindow !== undefined && contextWindow === explicitContextWindow
-    ? USAGE_CONTEXT_WINDOW_SOURCES.PROVIDER
-    : presetCtx !== undefined && contextWindow === presetCtx
-      ? USAGE_CONTEXT_WINDOW_SOURCES.PRESET
       : undefined;
   const payload: Record<string, unknown> = {
     ...(typeof inputTokens === 'number' ? { inputTokens } : {}),
@@ -391,6 +377,20 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
  *  Provider callbacks use providerSessionId; we resolve to IM.codes sessionName
  *  via the routing map before emitting. Unresolved routes are dropped + warned. */
 export function wireProviderToRelay(provider: TransportProvider): void {
+  // Supervision-authority gate for `pre_execution_gate` providers, asked
+  // before a native agent tool runs. Unresolved/ephemeral routes (broker,
+  // compressor) serve no IM.codes session and keep provider defaults.
+  provider.setNativeCollaborationGate?.((providerSid, request) => {
+    const sessionName = resolveSessionName(providerSid);
+    return sessionName ? evaluateNativeCollaborationPreExecution(sessionName, request) : { allow: true };
+  });
+  // Per-session fence resolver for `session_fence` providers, asked on the
+  // path that launches, loads or sends. A provider that launches before the
+  // route is registered passes the IM.codes session name itself.
+  provider.setNativeAgentFenceResolver?.((providerSid, sessionName) => (
+    isNativeAgentFenceRequired(sessionName ?? resolveSessionName(providerSid))
+  ));
+
   provider.onDelta((providerSid: string, delta: MessageDelta) => {
     const sessionName = resolveSessionName(providerSid);
     if (!sessionName) {
@@ -465,9 +465,15 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     // terminal state separately, and a coalesced "Thinking (N tokens)" landing
     // after it would pin the UI to a status the turn already left.
     clearPendingStatusUpdate(sessionName);
+    // Authoritative delegation projection for this turn, forwarded verbatim.
+    // The UI renders assigned/queued/recovered from THIS fact or not at all;
+    // reading it back off metadata keeps the daemon the single source and
+    // leaves the assistant's prose untouched.
+    const delegationClaim = readDelegationClaim(message.metadata);
     timelineEmitter.emit(sessionName, 'assistant.text', {
       text: finalText,
       streaming: false,
+      ...(delegationClaim ? { delegationClaim } : {}),
     }, { source: 'daemon', confidence: 'high', eventId: stableEventId });
 
     const usage = message.metadata?.usage as {
@@ -659,6 +665,18 @@ export function wireProviderToRelay(provider: TransportProvider): void {
     if (sdkDetail.kind === 'malformed-sdk') {
       logger.warn({ toolId: tool.id, reason: sdkDetail.reason }, 'transport-relay: dropping malformed sdk sub-agent detail');
       return;
+    }
+
+    // Post-start EVIDENCE for providers without a pre-execution gate: a
+    // task-bearing native agent in a managed session is recorded and its turn
+    // stopped. It is never the enforcing boundary; the tool event below is
+    // still projected unchanged.
+    try {
+      enforceObservedNativeCollaboration(sessionName, provider.id, tool, {
+        admissionMode: readNativeAgentAdmissionMode(provider.capabilities?.nativeAgentAdmission),
+      });
+    } catch (error) {
+      logger.warn({ error, sessionName, toolId: tool.id }, 'transport-relay: native collaboration enforcement failed');
     }
     if (sdkDetail.kind === 'ok') {
       const sdkPayload = buildSdkSubagentTimelinePayload({
@@ -919,13 +937,41 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   });
 }
 
-/** Emit user.message through timeline when user sends to a transport session. */
-export function emitTransportUserMessage(sessionId: string, text: string): void {
-  timelineEmitter.emit(sessionId, 'user.message', { text, allowDuplicate: true }, { source: 'daemon', confidence: 'high' });
+/**
+ * Emit and persist a transport user.message as one projection.
+ *
+ * `extra` carries the stable client/command identity used by the queue UI. It
+ * must be written to the JSONL fallback as well as the primary timeline;
+ * otherwise a reload can render the already-delivered text from chat.history
+ * while still rendering the same id from a stale queue snapshot.
+ */
+export function emitTransportUserMessage(
+  sessionId: string,
+  text: string,
+  extra: Record<string, unknown> = {},
+  eventId?: string,
+): void {
+  const payload = { text, allowDuplicate: true, ...extra };
+  timelineEmitter.emit(
+    sessionId,
+    'user.message',
+    payload,
+    { source: 'daemon', confidence: 'high', ...(eventId ? { eventId } : {}) },
+  );
+  persistTransportUserMessage(sessionId, text, payload);
+}
+
+/** Persist the fallback copy for a user.message already emitted elsewhere. */
+export function persistTransportUserMessage(
+  sessionId: string,
+  text: string,
+  extra: Record<string, unknown> = {},
+): void {
   void appendTransportEvent(sessionId, {
     type: 'user.message',
     sessionId,
     text,
+    ...extra,
   });
 }
 

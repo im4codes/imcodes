@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { ImageLightbox } from './ImageLightbox.js';
 import {
   CHAT_IMAGE_PATH_ATTR,
@@ -10,6 +11,14 @@ import {
 export interface ChatLocalImagePreviewResult {
   dataUrl: string;
   alt?: string;
+  /**
+   * tsk_5rf R2: streamed previews resolve a download-handle URL with a bounded
+   * server-side TTL. The promise resolves long before the browser discovers the
+   * handle is dead, so the loader supplies this hook and the component calls it
+   * from the <img> error path. Without it a cached URL would be reused forever
+   * and a retry could never mint a fresh handle.
+   */
+  onLoadFailed?: () => void;
 }
 
 export type ChatLocalImagePreviewLoader = (path: string) => Promise<ChatLocalImagePreviewResult | string>;
@@ -21,8 +30,13 @@ interface Props {
   onDownload?: ChatLocalImagePreviewDownloadHandler;
 }
 
+// tsk_5rf R2: a streamed preview resolves a URL, not bytes, so a resolved URL
+// is NOT success. 'pending' means the URL is known and the browser is still
+// fetching it; only the real <img> load event promotes it to 'ok', and an
+// error demotes it to 'error' instead of leaving a broken image on screen.
 type PreviewState =
   | { status: 'loading' }
+  | { status: 'pending'; dataUrl: string; alt: string }
   | { status: 'ok'; dataUrl: string; alt: string }
   | { status: 'error' };
 
@@ -31,6 +45,7 @@ function basename(path: string): string {
 }
 
 export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Props) {
+  const { t } = useTranslation();
   const [preview, setPreview] = useState<PreviewState>({ status: 'loading' });
   const [lightboxOpen, setLightboxOpen] = useState(false);
   const thumbRef = useRef<HTMLImageElement>(null);
@@ -42,6 +57,7 @@ export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Pr
   // moves independently of it as the user pages.
   const [shownPath, setShownPath] = useState(path);
   const [shown, setShown] = useState<PreviewState>({ status: 'loading' });
+  const onLoadFailedRef = useRef<(() => void) | undefined>(undefined);
 
   useEffect(() => {
     let cancelled = false;
@@ -56,8 +72,9 @@ export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Pr
           setPreview({ status: 'error' });
           return;
         }
+        onLoadFailedRef.current = typeof result === 'string' ? undefined : result.onLoadFailed;
         setPreview({
-          status: 'ok',
+          status: 'pending',
           dataUrl,
           alt: typeof result === 'string' ? basename(path) : (result.alt || basename(path)),
         });
@@ -121,14 +138,35 @@ export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Pr
     setShownPath((current) => stepGallery(gallery, current, direction) ?? current);
   }, [gallery]);
 
-  if (preview.status === 'error') return null;
+  if (preview.status === 'error') {
+    // tsk_5rf R3: rendering null made a failed preview indistinguishable from a
+    // message that never had an image, so a dead handle looked like nothing was
+    // ever there. Surface a visible, labelled failure instead.
+    return (
+      <span
+        class="chat-local-image-preview chat-local-image-preview-error"
+        title={path}
+      >
+        {t('file_browser.preview_error')}
+      </span>
+    );
+  }
 
   if (preview.status === 'loading') {
     return <span class="chat-local-image-preview chat-local-image-preview-loading" aria-hidden="true" />;
   }
 
+  const settling = preview.status === 'pending';
+
   return (
     <>
+      {settling && (
+        <span class="chat-local-image-preview chat-local-image-preview-loading" aria-hidden="true" />
+      )}
+      {/* Deliberately NOT display:none while settling. The <img> uses
+          loading="lazy", and a hidden image may never enter the viewport, so
+          hiding it here would stop it ever loading and freeze the placeholder
+          forever. The element stays in flow; an unloaded image paints nothing. */}
       <span class="chat-local-image-preview">
         <img
           ref={thumbRef}
@@ -138,6 +176,18 @@ export function ChatLocalImagePreview({ path, loadImagePreview, onDownload }: Pr
           title={path}
           loading="lazy"
           {...{ [CHAT_IMAGE_PATH_ATTR]: path }}
+          onLoad={() => {
+            setPreview((current) => (current.status === 'pending'
+              ? { status: 'ok', dataUrl: current.dataUrl, alt: current.alt }
+              : current));
+          }}
+          onError={() => {
+            // A dead or expired handle must fail loudly, drop the element, and
+            // evict the cached URL so the next attempt mints a fresh handle.
+            onLoadFailedRef.current?.();
+            setPreview({ status: 'error' });
+            setLightboxOpen(false);
+          }}
           onClick={(e) => {
             e.stopPropagation();
             openLightbox();

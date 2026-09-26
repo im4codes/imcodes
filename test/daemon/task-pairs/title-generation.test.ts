@@ -1,0 +1,357 @@
+/**
+ * Task pair titles: when none was explicitly authored, a short title is
+ * generated in the project Brain's configured UI locale, from the QUEUE
+ * brief, the send_message objective, or (back-fill) a known generic
+ * placeholder -- reusing the `uiLocale` field the retired legacy supervision
+ * prompts used for the same purpose (shared/supervision-config.ts). See
+ * src/daemon/task-pairs/title-generator.ts and the hooks in service.ts /
+ * send-tool.ts.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import type { SessionRecord } from '../../../src/store/session-store.js';
+import { getSession, removeSession, upsertSession } from '../../../src/store/session-store.js';
+import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
+import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../../src/daemon/task-pairs/store.js';
+import { brainUiLocale } from '../../../src/daemon/task-pairs/engine.js';
+import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
+import { TaskPairService, taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { setTaskPairTitleGeneratorForTests } from '../../../src/daemon/task-pairs/title-generator.js';
+import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
+import { handleWebCommand } from '../../../src/daemon/command-handler.js';
+import { hasInvalidSessionSupervisionSnapshot, patchTransportConfigUiLocale, type SupervisionUiLocale } from '../../../shared/supervision-config.js';
+import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
+
+const PROJECT = 'titleproj';
+const BRAIN = 'deck_titleproj_brain';
+const EXEC = 'deck_sub_titleexec';
+const AUD = 'deck_sub_titleaud';
+
+function session(name: string, role: SessionRecord['role'], extra: Partial<SessionRecord> = {}): SessionRecord {
+  return {
+    name, projectName: PROJECT, role, agentType: 'claude-code-sdk', projectDir: `/tmp/${PROJECT}`, state: 'idle',
+    sessionInstanceId: `instance_${name}`, runtimeEpoch: `epoch_${name}`,
+    restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1, ...extra,
+  } as SessionRecord;
+}
+
+function setBrainLocale(locale: string | undefined): void {
+  upsertSession(session(BRAIN, 'brain', {
+    transportConfig: locale ? patchTransportConfigUiLocale(null, locale as SupervisionUiLocale) : undefined,
+  }));
+}
+
+let service: TaskPairService;
+let sent: Array<{ target: string; text: string; id: string }>;
+let turn = 0;
+
+async function say(sessionName: string, text: string, eventId?: string) {
+  turn += 1;
+  timelineEmitter.emit(sessionName, 'assistant.text', { text, streaming: false }, {
+    source: 'daemon', confidence: 'high', eventId: eventId ?? `turn-${turn}`,
+  });
+  await new Promise<void>((resolve) => setImmediate(resolve));
+}
+
+function pair(taskId: string) {
+  return getTaskPairStore().getPair(PROJECT, taskId)?.state;
+}
+
+describe('task-pair title generation', () => {
+  const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+
+  beforeEach(() => {
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    sent = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { sent.push({ target, text, id }); } });
+    for (const record of [session(BRAIN, 'brain'), session(EXEC, 'w2'), session(AUD, 'w3')]) upsertSession(record);
+    service = new TaskPairService();
+    service.init();
+  });
+
+  afterEach(async () => {
+    await service.dispose();
+    setTaskPairTitleGeneratorForTests(undefined);
+    setTaskPairDeliveryDepsForTests(undefined);
+    setTaskPairStoreForTests(undefined);
+    for (const name of [BRAIN, EXEC, AUD]) removeSession(name);
+    if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+    else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('generates a localized title for a titleless QUEUE pair without blocking marker handling', async () => {
+    setBrainLocale('zh-CN');
+    let resolveGen!: (value: string) => void;
+    const generated = new Promise<string>((resolve) => { resolveGen = resolve; });
+    const gen = vi.fn().mockReturnValue(generated);
+    setTaskPairTitleGeneratorForTests(gen);
+    await say(BRAIN, [
+      'Queueing.',
+      '<!-- IMCODES_TASK QUEUE T1 -->',
+      'Fix the login bug for SSO users.',
+      '<!-- IMCODES_TASK_END T1 -->',
+    ].join('\n'));
+    // The marker transition (pair created, queued) completed synchronously;
+    // generation is still in flight and must not have blocked it.
+    expect(pair('T1')?.status).toBe('queued');
+    expect(pair('T1')?.title).toBeUndefined();
+    expect(gen).toHaveBeenCalledWith(expect.stringContaining('Fix the login bug'), 'zh-CN', expect.anything());
+    resolveGen('修复登录问题');
+    await service.waitForIdle();
+    expect(pair('T1')?.title).toBe('修复登录问题');
+  });
+
+  it('persists the browser UI locale from a real session.send, and a later titleless QUEUE pair picks it up (no hand-seeded snapshot)', async () => {
+    // Deliberately no setBrainLocale() call: the locale must come from the
+    // real session.send path (command-handler.ts), not a test shortcut.
+    setTaskPairTitleGeneratorForTests(async (brief, locale) => {
+      expect(locale).toBe('zh-CN');
+      expect(brief).toContain('Fix the login bug');
+      return '修复登录问题';
+    });
+    const serverLink = { send: vi.fn() };
+    // `text` is deliberately omitted: the locale-persist step in handleSend
+    // runs before the sessionName/text validation gate, so this exercises
+    // only that persistence side effect, not a full send pipeline.
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-1', uiLocale: 'zh-CN',
+    }, serverLink as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    await say(BRAIN, [
+      'Queueing.',
+      '<!-- IMCODES_TASK QUEUE T11 -->',
+      'Fix the login bug for SSO users.',
+      '<!-- IMCODES_TASK_END T11 -->',
+    ].join('\n'));
+    await service.waitForIdle();
+    expect(pair('T11')?.title).toBe('修复登录问题');
+  });
+
+  it('persisting uiLocale on a session with no supervision config at all never creates or invalidates one', async () => {
+    // Regression (tsk_cd_pair_title_i18n round 3): storing uiLocale inside
+    // transportConfig.supervision -- even alone -- produced a bare
+    // `{ uiLocale }` object that fails the snapshot's own validation (no
+    // `mode`), turning an unconfigured-but-valid session into one
+    // hasInvalidSessionSupervisionSnapshot reports as invalid/repair-pending,
+    // purely from an ordinary send. 8 of 12 real Brain sessions on this
+    // machine had exactly this shape (no supervision key at all).
+    upsertSession({ ...session(BRAIN, 'brain'), transportConfig: undefined });
+    expect(hasInvalidSessionSupervisionSnapshot(getSession(BRAIN)?.transportConfig ?? null)).toBe(false);
+
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-none', uiLocale: 'zh-CN',
+    }, { send: vi.fn() } as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown> | undefined;
+    expect(hasInvalidSessionSupervisionSnapshot(transportConfig ?? null)).toBe(false);
+    expect(transportConfig?.supervision).toBeUndefined();
+    expect(brainUiLocale(PROJECT)).toBe('zh-CN');
+  });
+
+  it('persisting uiLocale on an invalid stored snapshot never reads, creates, or modifies transportConfig.supervision', async () => {
+    // Reproduces the exact stored shape a repair-pending session can carry
+    // (hasInvalidSessionSupervisionSnapshot): an unrecognized backend. The
+    // codebase deliberately keeps this as-is for the repair UI rather than
+    // silently fixing it -- an ordinary send must not touch it either.
+    const invalidSupervision = {
+      mode: 'supervised_audit', backend: 'bogus-backend', model: 'x',
+      pairEngine: 'pairs', pairMaxConcurrency: 4, customInstructions: 'keep me',
+    };
+    upsertSession({ ...session(BRAIN, 'brain'), transportConfig: { supervision: invalidSupervision, unrelatedKey: 'unrelated' } });
+    expect(hasInvalidSessionSupervisionSnapshot(getSession(BRAIN)?.transportConfig ?? null)).toBe(true);
+
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-invalid', uiLocale: 'zh-CN',
+    }, { send: vi.fn() } as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown>;
+    expect(transportConfig.unrelatedKey).toBe('unrelated');
+    expect(transportConfig.supervision).toEqual(invalidSupervision);
+    expect(transportConfig.uiLocale).toBe('zh-CN');
+    expect(brainUiLocale(PROJECT)).toBe('zh-CN');
+  });
+
+  it('persisting uiLocale on a legacy repair-only snapshot (auditMode requiring repair) never modifies it', async () => {
+    const legacySupervision = {
+      mode: 'supervised_audit', auditMode: '', pairEngine: 'pairs', pairMaxConcurrency: 2,
+    };
+    upsertSession({ ...session(BRAIN, 'brain'), transportConfig: { supervision: legacySupervision } });
+    expect(hasInvalidSessionSupervisionSnapshot(getSession(BRAIN)?.transportConfig ?? null)).toBe(true);
+
+    handleWebCommand({
+      type: 'session.send', session: BRAIN, commandId: 'cmd-locale-legacy', uiLocale: 'ja',
+    }, { send: vi.fn() } as never);
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+
+    const transportConfig = getSession(BRAIN)?.transportConfig as Record<string, unknown>;
+    expect(transportConfig.supervision).toEqual(legacySupervision);
+    expect(transportConfig.uiLocale).toBe('ja');
+  });
+
+  it('never generates over an explicit title', async () => {
+    setBrainLocale('zh-CN');
+    const gen = vi.fn();
+    setTaskPairTitleGeneratorForTests(gen);
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T2 executor=${EXEC} auditor=${AUD} title="Fix login" -->`);
+    await service.waitForIdle();
+    expect(pair('T2')?.title).toBe('Fix login');
+    expect(gen).not.toHaveBeenCalled();
+  });
+
+  it('does not generate when the project has no configured UI locale (headless/legacy caller)', async () => {
+    setBrainLocale(undefined);
+    const gen = vi.fn();
+    setTaskPairTitleGeneratorForTests(gen);
+    await say(BRAIN, [
+      'Queueing.',
+      '<!-- IMCODES_TASK QUEUE T3 -->',
+      'Some brief describing real work.',
+      '<!-- IMCODES_TASK_END T3 -->',
+    ].join('\n'));
+    await service.waitForIdle();
+    expect(gen).not.toHaveBeenCalled();
+    expect(pair('T3')?.title).toBeUndefined();
+    expect(pair('T3')?.brief).toContain('Some brief describing real work');
+  });
+
+  it('keeps the pair titleless when generation fails, falling back to the mechanical (brief) state', async () => {
+    setBrainLocale('en');
+    setTaskPairTitleGeneratorForTests(async () => undefined);
+    await say(BRAIN, [
+      'Queueing.',
+      '<!-- IMCODES_TASK QUEUE T4 -->',
+      'Some brief describing real work.',
+      '<!-- IMCODES_TASK_END T4 -->',
+    ].join('\n'));
+    await service.waitForIdle();
+    expect(pair('T4')?.title).toBeUndefined();
+    expect(pair('T4')?.status).toBe('queued');
+  });
+
+  it('never lets a slow generation call clobber a title a later marker set', async () => {
+    setBrainLocale('zh-CN');
+    let resolveGen!: (value: string) => void;
+    const generated = new Promise<string>((resolve) => { resolveGen = resolve; });
+    setTaskPairTitleGeneratorForTests(() => generated);
+    await say(BRAIN, [
+      'Queueing.',
+      '<!-- IMCODES_TASK QUEUE T5 -->',
+      'Some brief describing real work.',
+      '<!-- IMCODES_TASK_END T5 -->',
+    ].join('\n'));
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T5 executor=${EXEC} title="Explicit override" -->`);
+    expect(pair('T5')?.title).toBe('Explicit override');
+    resolveGen('generated-too-late');
+    await service.waitForIdle();
+    expect(pair('T5')?.title).toBe('Explicit override');
+  });
+
+  it('emits a task-pair timeline event carrying the newly generated title', async () => {
+    setBrainLocale('zh-CN');
+    setTaskPairTitleGeneratorForTests(async () => '修复登录问题');
+    const seen: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT) seen.push(event.payload as Record<string, unknown>);
+    });
+    await say(BRAIN, [
+      'Queueing.',
+      '<!-- IMCODES_TASK QUEUE T6 -->',
+      'Fix the login bug.',
+      '<!-- IMCODES_TASK_END T6 -->',
+    ].join('\n'));
+    await service.waitForIdle();
+    off();
+    expect(seen.some((payload) => payload.taskId === 'T6' && payload.title === '修复登录问题')).toBe(true);
+  });
+
+  it('back-fills a generic legacy-import placeholder title once, from its own text', async () => {
+    setBrainLocale('en');
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'T7', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working',
+      title: TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[0], flags: [], flagSides: {}, round: 0, blocking: [],
+      previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,
+    } as never);
+    const gen = vi.fn(async (brief: string) => {
+      expect(brief).toBe(TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[0]);
+      return 'Delegated task';
+    });
+    setTaskPairTitleGeneratorForTests(gen);
+    await say(BRAIN, 'Just a plain status update, no marker at all.');
+    await service.waitForIdle();
+    expect(pair('T7')?.title).toBe('Delegated task');
+    expect(gen).toHaveBeenCalledTimes(1);
+
+    // A second turn on the same project does not re-run the back-fill sweep.
+    await say(BRAIN, 'Another plain status update.');
+    await service.waitForIdle();
+    expect(gen).toHaveBeenCalledTimes(1);
+  });
+
+  it('retries the back-fill sweep once a locale becomes known, instead of latching on the first locale-less event', async () => {
+    setBrainLocale(undefined);
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'T12', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working',
+      title: TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[0], flags: [], flagSides: {}, round: 0, blocking: [],
+      previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,
+    } as never);
+    const gen = vi.fn(async () => 'Delegated task');
+    setTaskPairTitleGeneratorForTests(gen);
+
+    // A timeline event arrives before the project has any configured locale.
+    await say(BRAIN, 'First status update, before any locale is known.');
+    await service.waitForIdle();
+    expect(gen).not.toHaveBeenCalled();
+    expect(pair('T12')?.title).toBe(TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[0]);
+
+    // The locale becomes known afterwards; the next event must still run the
+    // sweep, not treat the project as already covered.
+    setBrainLocale('en');
+    await say(BRAIN, 'Second status update, after the locale is known.');
+    await service.waitForIdle();
+    expect(gen).toHaveBeenCalledTimes(1);
+    expect(pair('T12')?.title).toBe('Delegated task');
+  });
+
+  it('leaves an untitled pair with no brief alone (nothing to generate from)', async () => {
+    setBrainLocale('en');
+    const gen = vi.fn();
+    setTaskPairTitleGeneratorForTests(gen);
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T8 executor=${EXEC} auditor=${AUD} -->`);
+    await service.waitForIdle();
+    expect(pair('T8')?.title).toBeUndefined();
+    expect(gen).not.toHaveBeenCalled();
+  });
+
+  it('generates a localized title from a send_message wrapper-pair objective, and skips it when an explicit title is given', async () => {
+    setBrainLocale('zh-CN');
+    clearSendIdempotencyCacheForTests();
+    const gen = vi.fn(async (brief: string) => {
+      expect(brief).toBe('fix login');
+      return '修复登录';
+    });
+    setTaskPairTitleGeneratorForTests(gen);
+    const dispatchMessage = vi.fn().mockResolvedValue('sent');
+    const listSessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w2'), session(AUD, 'w3')];
+    const brainCaller = { userId: 'u', sessionName: BRAIN, projectName: PROJECT, projectRoot: `/tmp/${PROJECT}` };
+    const created = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Please fix login.', task: { taskId: 'T9', objective: 'fix login' },
+    } as never, { listSessions, dispatchMessage });
+    expect(created).toMatchObject({ status: 'accepted', taskId: 'T9', taskTitle: 'fix login' });
+    expect(pair('T9')?.title).toBe('fix login');
+    await taskPairService.waitForIdle();
+    expect(pair('T9')?.title).toBe('修复登录');
+
+    const explicitGen = vi.fn();
+    setTaskPairTitleGeneratorForTests(explicitGen);
+    const withExplicitTitle = await dispatchSendMessage(brainCaller, {
+      target: AUD, message: 'Please review.', task: { taskId: 'T10', objective: 'review PR', title: 'Human title' },
+    } as never, { listSessions, dispatchMessage });
+    expect(withExplicitTitle).toMatchObject({ status: 'accepted', taskId: 'T10', taskTitle: 'Human title' });
+    await taskPairService.waitForIdle();
+    expect(pair('T10')?.title).toBe('Human title');
+    expect(explicitGen).not.toHaveBeenCalled();
+  });
+});

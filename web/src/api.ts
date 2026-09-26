@@ -10,6 +10,14 @@ import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
 import { CONTROLLED_NODE_MINT_ERRORS } from '@shared/controlled-node-artifacts.js';
 import { normalizeClientTimezone } from '@shared/client-timezone.js';
 import { PREVIEW_ACCESS_TOKEN_QUERY_PARAM } from '@shared/preview-types.js';
+import {
+  FILE_TRANSFER_RESUMABLE_UPLOAD,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD,
+  FILE_TRANSFER_HTTP_HEADER,
+  FILE_TRANSFER_DOWNLOAD_RESUME,
+  formatFileTransferRangeRequest,
+  parseFileTransferContentRange,
+} from '@shared/transport/file-transfer.js';
 import { getSessionRuntimeType } from '@shared/agent-types.js';
 import type {
   TimelineCursor,
@@ -25,9 +33,16 @@ import {
   normalizeSupervisorDefaultConfig,
   parseSupervisorDefaultConfig,
   type SessionSupervisionSnapshot,
+  type SupervisionMode,
   type SupervisorDefaultConfig,
 } from '@shared/supervision-config.js';
+import { normalizeSupervisionExecutionConfig } from '@shared/supervision-execution-pool.js';
 import type { ShareGrantSummary, ShareRole, ShareTarget } from './tab-sharing-ui.js';
+import {
+  SESSION_IDENTITY_API_PATH,
+  type SessionIdentityProfile,
+  type SessionIdentityScope,
+} from '@shared/session-identity.js';
 
 let _baseUrl = '';
 let _onAuthExpired: ((reason?: string) => void) | null = null;
@@ -205,6 +220,10 @@ function getCsrfToken(): string | null {
 
 // Single-flight lock: at most one refresh in progress at a time (per tab).
 let refreshPromise: Promise<boolean> | null = null;
+// A refresh failure that is not an authentication rejection is transient. Keep
+// it visible to apiFetch so it never turns a healthy session into a logout.
+let _lastRefreshFailure: { status: number; body: string } | null = null;
+let _refreshRetryAt = 0;
 
 // Cross-tab mutex: prevent multiple tabs from refreshing simultaneously.
 // Uses BroadcastChannel to coordinate — only one tab refreshes at a time.
@@ -241,13 +260,32 @@ async function doRefresh(): Promise<boolean> {
   if (res.status >= 500) {
     const body = await res.text().catch(() => '');
     console.warn(`[auth] doRefresh: server error ${res.status}: ${body}`);
+    _lastRefreshFailure = { status: res.status, body };
+    _refreshRetryAt = Date.now() + RETRY_REFRESH_MS;
+    _refreshChannel?.postMessage('refresh-done');
     throw new ApiError(res.status, body);
   }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     console.warn(`[auth] doRefresh FAILED: ${res.status}: ${body}`);
+    if (res.status !== 401 && res.status !== 403) {
+      _lastRefreshFailure = { status: res.status, body };
+      let retryAfterMs = RETRY_REFRESH_MS;
+      try {
+        const parsed = JSON.parse(body) as { retryAfterMs?: unknown };
+        if (typeof parsed.retryAfterMs === 'number' && Number.isFinite(parsed.retryAfterMs)) {
+          retryAfterMs = Math.max(1000, parsed.retryAfterMs);
+        }
+      } catch { /* body is not JSON */ }
+      _refreshRetryAt = Date.now() + retryAfterMs;
+    } else {
+      _lastRefreshFailure = null;
+      _refreshRetryAt = 0;
+    }
     _refreshChannel?.postMessage('refresh-done');
   } else {
+    _lastRefreshFailure = null;
+    _refreshRetryAt = 0;
     _lastRefreshAt = Date.now();
     console.warn(`[auth] doRefresh OK — token refreshed`);
     _refreshChannel?.postMessage('refresh-done');
@@ -300,10 +338,13 @@ export function startProactiveRefresh(): void {
 /** Schedule a quick retry when proactive refresh fails (not from 401 handler). */
 function scheduleRetry(): void {
   if (_retryTimerId !== null) return; // already scheduled
+  const delay = _refreshRetryAt > Date.now()
+    ? Math.max(1000, _refreshRetryAt - Date.now())
+    : RETRY_REFRESH_MS;
   _retryTimerId = setTimeout(() => {
     _retryTimerId = null;
     void refreshSession(); // single retry, no cascade
-  }, RETRY_REFRESH_MS);
+  }, delay);
 }
 
 /** Stop proactive token refresh timer. Call when user logs out. */
@@ -440,6 +481,71 @@ export async function closeLocalWebPreview(serverId: string, previewId: string):
   });
 }
 
+export interface SessionIdentityAccessContext {
+  serverId: string;
+  /** Omitted before the session exists (new-session dialog). */
+  sessionName?: string;
+}
+
+/**
+ * Identity profiles belong to the machine OWNER. Server/session-bound routes
+ * resolve that owner server-side, so a participant edits the profiles the
+ * owner's daemon actually applies; the bare account route is only for the
+ * caller's own profiles.
+ */
+function sessionIdentityApiPath(context?: SessionIdentityAccessContext): string {
+  if (!context) return SESSION_IDENTITY_API_PATH;
+  const server = `/api/server/${encodeURIComponent(context.serverId)}`;
+  return context.sessionName
+    ? `${server}/sessions/${encodeURIComponent(context.sessionName)}/identity`
+    : `${server}/identity`;
+}
+
+function sessionIdentityQuery(
+  scope: SessionIdentityScope,
+  scopeKey: string,
+  context?: SessionIdentityAccessContext,
+): string {
+  return `${sessionIdentityApiPath(context)}?scope=${encodeURIComponent(scope)}&scopeKey=${encodeURIComponent(scopeKey)}`;
+}
+
+export async function fetchSessionIdentityProfile(
+  scope: SessionIdentityScope,
+  scopeKey: string,
+  context?: SessionIdentityAccessContext,
+): Promise<SessionIdentityProfile | null> {
+  const response = await apiFetch<{ profile: SessionIdentityProfile | null }>(
+    sessionIdentityQuery(scope, scopeKey, context),
+    { cache: 'no-store' },
+  );
+  return response.profile;
+}
+
+export async function saveSessionIdentityProfile(input: {
+  scope: SessionIdentityScope;
+  scopeKey: string;
+  content: string;
+  sourceFile?: string;
+}, context?: SessionIdentityAccessContext): Promise<SessionIdentityProfile> {
+  const response = await apiFetch<{ profile: SessionIdentityProfile }>(sessionIdentityApiPath(context), {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input),
+  });
+  return response.profile;
+}
+
+export async function clearSessionIdentityProfile(
+  scope: SessionIdentityScope,
+  scopeKey: string,
+  context?: SessionIdentityAccessContext,
+): Promise<boolean> {
+  const response = await apiFetch<{ deleted: boolean }>(sessionIdentityQuery(scope, scopeKey, context), {
+    method: 'DELETE',
+  });
+  return response.deleted;
+}
+
 export async function apiFetch<T = unknown>(
   path: string,
   opts: RequestInit = {},
@@ -455,6 +561,39 @@ export async function apiFetch<T = unknown>(
   }
 
   if (res.status === 401 && path !== '/api/auth/refresh') {
+    // Native mobile auth is a long-lived Bearer API key, not a refresh-cookie
+    // session. An endpoint-specific 401 (for example, a newly added route that
+    // has not yet accepted API keys) must never erase a still-valid app login.
+    if (_apiKey) {
+      console.warn(`[auth] bearer 401 on ${path} — verifying account before changing login state`);
+      let verifyRes: Response;
+      try {
+        verifyRes = await rawFetch('/api/auth/user/me');
+      } catch {
+        throw new ApiError(503, 'server_unavailable');
+      }
+      if (verifyRes.ok) {
+        if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
+        const retryRes = await rawFetch(path, opts);
+        if (retryRes.status === 409) {
+          const body = await retryRes.text().catch(() => '');
+          if (body.includes(AUTH_IDENTITY_ERRORS.CHANGED)) {
+            _onAuthExpired?.(AUTH_IDENTITY_ERRORS.CHANGED);
+          }
+          throw new ApiError(retryRes.status, body);
+        }
+        if (!retryRes.ok) {
+          throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
+        }
+        return retryRes.json() as Promise<T>;
+      }
+      if (verifyRes.status >= 500) {
+        throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+      }
+      _onAuthExpired?.(`401 on ${path} — bearer account verification failed`);
+      throw new ApiError(401, 'session_expired');
+    }
+
     console.warn(`[auth] 401 on ${path} — attempting refresh`);
     // Try to refresh the token (with one retry on failure).
     // A single failure might be transient (e.g., CSRF mismatch after cookie rotation).
@@ -489,18 +628,32 @@ export async function apiFetch<T = unknown>(
         await new Promise((r) => setTimeout(r, 1000));
       }
     }
+    // 429 and other non-auth refresh failures are transient. Do not verify
+    // /me and call onAuthExpired: the current session may still be valid.
+    if (_lastRefreshFailure && _lastRefreshFailure.status !== 401 && _lastRefreshFailure.status !== 403) {
+      throw new ApiError(_lastRefreshFailure.status, _lastRefreshFailure.body);
+    }
     // Both refresh attempts failed — but verify session is truly expired before logout.
     // Another tab may have refreshed successfully and our cookies are now valid.
+    let verifyRes: Response;
     try {
-      const verifyRes = await rawFetch('/api/auth/user/me');
-      if (verifyRes.ok) {
-        console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
-        _lastRefreshAt = Date.now();
-        const retryRes = await rawFetch(path, opts);
-        if (!retryRes.ok) throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
-        return retryRes.json() as Promise<T>;
+      verifyRes = await rawFetch('/api/auth/user/me');
+    } catch {
+      throw new ApiError(503, 'server_unavailable');
+    }
+    if (verifyRes.ok) {
+      console.warn(`[auth] refresh failed but /me succeeded — session still valid, retrying original request`);
+      _lastRefreshAt = Date.now();
+      if (path === '/api/auth/user/me') return verifyRes.json() as Promise<T>;
+      const retryRes = await rawFetch(path, opts);
+      if (!retryRes.ok) {
+        throw new ApiError(retryRes.status, await retryRes.text().catch(() => ''));
       }
-    } catch { /* /me also failed — truly expired */ }
+      return retryRes.json() as Promise<T>;
+    }
+    if (verifyRes.status >= 500) {
+      throw new ApiError(verifyRes.status, await verifyRes.text().catch(() => 'server_unavailable'));
+    }
     console.warn(`[auth] LOGOUT: refresh failed twice + /me failed for ${path}, triggering onAuthExpired`);
     _onAuthExpired?.(`401 on ${path} — refresh failed twice`);
     throw new ApiError(401, 'session_expired');
@@ -721,6 +874,7 @@ export interface OpenSharedEntryResponse {
     state: string;
     agentType: string;
     activeDispatchId?: string | null;
+    supervisionMode?: SupervisionMode | null;
   }>;
   subSessions: Array<{
     subSessionId: string;
@@ -729,6 +883,7 @@ export interface OpenSharedEntryResponse {
     type: string;
     parentSessionName: string | null;
     activeDispatchId?: string | null;
+    supervisionMode?: SupervisionMode | null;
   }>;
 }
 
@@ -867,11 +1022,15 @@ export interface SubSessionData {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta | null;
+  codexCreditsBalance?: string | null;
+  codexCreditsHasCredits?: boolean | null;
+  codexCreditsUnlimited?: boolean | null;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null;
   serviceTier?: string | null;
   contextNamespace?: import('../../shared/session-context-bootstrap.js').SessionContextBootstrapState['contextNamespace'] | null;
   contextNamespaceDiagnostics?: string[] | null;
   transportConfig?: Record<string, unknown> | null;
+  supervisionMode?: SupervisionMode | null;
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: Array<{ clientMessageId: string; text: string }> | null;
   queueEpoch?: string | null;
@@ -1038,6 +1197,110 @@ export async function patchSessionSupervision(
     },
   );
   return response.transportConfig ?? null;
+}
+
+/**
+ * Load the supervision defaults owned by the machine behind a covered
+ * session. This differs from fetchSupervisorDefaults(): a share participant's
+ * own preference record is not the source consumed by the owner's daemon.
+ */
+export async function fetchSessionSupervisorDefaults(
+  serverId: string,
+  sessionName: string,
+): Promise<SupervisorDefaultConfig | null> {
+  const response = await apiFetch<{ defaults: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(sessionName)}/supervision/defaults`,
+  );
+  return parseSupervisorDefaultConfig(response.defaults);
+}
+
+export interface SessionSupervisorExecutionPoolCatalogSession {
+  sessionName: string;
+  parentSession: string;
+  type: string;
+  runtimeType: 'process' | 'transport';
+  label: string;
+  activeModel: string;
+  providerId: string;
+  ccPresetId: string | null;
+  capabilityId: string;
+  ownerCatalog: true;
+}
+
+function parseSessionSupervisorExecutionPoolCatalogSession(
+  value: unknown,
+): SessionSupervisorExecutionPoolCatalogSession | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const exactText = (input: unknown): string | null => (
+    typeof input === 'string' && input.length > 0 && input.trim() === input ? input : null
+  );
+  const sessionName = exactText(source.sessionName);
+  const parentSession = exactText(source.parentSession);
+  const type = exactText(source.type);
+  const label = exactText(source.label);
+  const activeModel = exactText(source.activeModel);
+  const providerId = exactText(source.providerId);
+  const capabilityId = exactText(source.capabilityId);
+  const runtimeType = source.runtimeType === 'process' || source.runtimeType === 'transport'
+    ? source.runtimeType
+    : null;
+  const ccPresetId = source.ccPresetId === null
+    ? null
+    : exactText(source.ccPresetId);
+  if (!sessionName || !parentSession || !type || !label || !activeModel || !providerId
+    || !capabilityId || !runtimeType || source.ownerCatalog !== true
+    || (source.ccPresetId !== null && !ccPresetId)) return null;
+  const config = normalizeSupervisionExecutionConfig({
+    capabilityId,
+    agentType: type,
+    providerFamily: providerId,
+    runtimeType,
+    model: activeModel,
+    ...(ccPresetId ? { ccPresetId } : {}),
+  });
+  if (!config) return null;
+  return {
+    sessionName,
+    parentSession,
+    type,
+    runtimeType,
+    label,
+    activeModel: config.model,
+    providerId,
+    ccPresetId,
+    capabilityId,
+    ownerCatalog: true,
+  };
+}
+
+export async function fetchSessionSupervisorExecutionPoolCatalog(
+  serverId: string,
+  sessionName: string,
+): Promise<SessionSupervisorExecutionPoolCatalogSession[]> {
+  const response = await apiFetch<{ sessions: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(sessionName)}/supervision/execution-pool-catalog`,
+  );
+  if (!Array.isArray(response.sessions)) return [];
+  return response.sessions
+    .map(parseSessionSupervisorExecutionPoolCatalogSession)
+    .filter((session): session is SessionSupervisorExecutionPoolCatalogSession => session !== null);
+}
+
+export async function saveSessionSupervisorDefaults(
+  serverId: string,
+  sessionName: string,
+  config: Partial<SupervisorDefaultConfig> | null | undefined,
+): Promise<SupervisorDefaultConfig> {
+  const defaults = normalizeSupervisorDefaultConfig(config);
+  const response = await apiFetch<{ ok: boolean; defaults: unknown }>(
+    `/api/server/${encodeURIComponent(serverId)}/sessions/${encodeURIComponent(sessionName)}/supervision/defaults`,
+    {
+      method: 'PUT',
+      body: JSON.stringify({ defaults }),
+    },
+  );
+  return parseSupervisorDefaultConfig(response.defaults) ?? defaults;
 }
 
 export async function reorderSubSessions(serverId: string, ids: string[]): Promise<void> {
@@ -1436,6 +1699,22 @@ export async function deletePasskey(credentialId: string): Promise<void> {
 
 // ── File transfer API ─────────────────────────────────────────────────────
 
+/**
+ * How long `uploadFileRequest`'s XHR may go without any observable activity
+ * (bytes sent, bytes received, or a parsed NDJSON line) before it is treated
+ * as stalled. The node -> server -> browser relay can silently die on a live
+ * connection -- an intermediate proxy holding the socket open without ever
+ * delivering the close it saw from the server -- after the daemon has
+ * already finished and the server has already written and closed its side of
+ * the response (observed live: the daemon logs "File upload complete", but
+ * the browser's XHR never fires `load`, so the composer row sits at 100%
+ * forever with no error and nothing to retry). Aborting on inactivity and
+ * rejecting with the same `ApiError(0, ...)` shape `xhr.onerror` already
+ * produces routes this into the existing resumable-upload retry loop instead
+ * of a silent, permanent hang.
+ */
+const UPLOAD_STALL_TIMEOUT_MS = 20_000;
+
 export interface AttachmentRefResponse {
   id: string;
   source: string;
@@ -1458,17 +1737,106 @@ export async function uploadFile(
   sessionName?: string,
   destinationDirectory?: string,
 ): Promise<{ ok: boolean; attachment: AttachmentRefResponse }> {
+  let highestProgress = 0;
+  const emitProgress = (pct: number) => {
+    highestProgress = Math.max(highestProgress, Math.min(100, Math.round(pct)));
+    onProgress?.(highestProgress);
+  };
+  if (!clientUploadId) {
+    const result = await uploadFileRequest({
+      serverId, file, wholeFile: file, offset: 0, emitProgress, signal, sessionName, destinationDirectory,
+    });
+    if (!('attachment' in result)) throw new ApiError(500, 'upload_incomplete');
+    return result;
+  }
+
+  let offset = 0;
+  let failuresWithoutProgress = 0;
+  while (offset < file.size || (file.size === 0 && offset === 0)) {
+    const end = Math.min(file.size, offset + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
+    const chunk = file.slice(offset, end, file.type);
+    try {
+      const result = await uploadFileRequest({
+        serverId,
+        file: chunk,
+        wholeFile: file,
+        offset,
+        clientUploadId,
+        emitProgress,
+        signal,
+        sessionName,
+        destinationDirectory,
+      });
+      if ('attachment' in result) return result;
+      if (!Number.isSafeInteger(result.committedBytes)
+        || result.committedBytes <= offset
+        || result.committedBytes > file.size) {
+        throw new ApiError(409, 'upload_offset_mismatch');
+      }
+      offset = result.committedBytes;
+      failuresWithoutProgress = 0;
+      if (file.size === 0) throw new ApiError(500, 'upload_incomplete');
+    } catch (error) {
+      if (signal?.aborted || (error instanceof Error && error.name === 'AbortError')) throw error;
+      const receiverOffset = error instanceof ResumableUploadOffsetError ? error.committedBytes : -1;
+      if (Number.isSafeInteger(receiverOffset)
+        && receiverOffset >= 0 && receiverOffset <= file.size && receiverOffset !== offset) {
+        offset = receiverOffset;
+        failuresWithoutProgress = 0;
+        continue;
+      }
+      const retryable = error instanceof ApiError
+        && (error.status === 0 || RESUMABLE_DOWNLOAD_STATUSES.has(error.status)
+          || (error instanceof ResumableUploadOffsetError && error.committedBytes === offset));
+      if (!retryable || ++failuresWithoutProgress > FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) throw error;
+      const backoff = FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS;
+      await waitBeforeResume(backoff[Math.min(failuresWithoutProgress, backoff.length) - 1]!, signal);
+    }
+  }
+  throw new ApiError(500, 'upload_incomplete');
+}
+
+type UploadFileRequestResult =
+  | { ok: boolean; attachment: AttachmentRefResponse }
+  | { ok: true; complete: false; committedBytes: number };
+
+class ResumableUploadOffsetError extends ApiError {
+  constructor(status: number, body: string, readonly committedBytes: number) {
+    super(status, body);
+    this.name = 'ResumableUploadOffsetError';
+  }
+}
+
+async function uploadFileRequest(options: {
+  serverId: string;
+  file: Blob;
+  wholeFile: File;
+  offset: number;
+  clientUploadId?: string;
+  emitProgress: (pct: number) => void;
+  signal?: AbortSignal;
+  sessionName?: string;
+  destinationDirectory?: string;
+}): Promise<UploadFileRequestResult> {
   const form = new FormData();
-  form.append('file', file);
-  if (clientUploadId) form.append('clientUploadId', clientUploadId);
-  if (destinationDirectory) form.append('destinationDirectory', destinationDirectory);
+  form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE, options.file, options.wholeFile.name);
+  if (options.clientUploadId) {
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID, options.clientUploadId);
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.OFFSET, String(options.offset));
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.TOTAL_SIZE, String(options.wholeFile.size));
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME, options.wholeFile.name || 'file');
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED, String(options.wholeFile.lastModified));
+  }
+  if (options.destinationDirectory) {
+    form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.DESTINATION_DIRECTORY, options.destinationDirectory);
+  }
   const browserUploadWeight = 50;
   const daemonDownloadWeight = 50;
 
   // Use XHR for upload progress reporting
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', withSessionName(`${_baseUrl}/api/server/${serverId}/upload`, sessionName));
+    xhr.open('POST', withSessionName(`${_baseUrl}/api/server/${options.serverId}/upload`, options.sessionName));
     xhr.setRequestHeader('Accept', 'application/x-ndjson, application/json');
 
     // Auth headers (same as rawFetch)
@@ -1481,28 +1849,40 @@ export async function uploadFile(
     }
 
     xhr.upload.onprogress = (e) => {
-      if (e.lengthComputable && onProgress) {
-        const transportPct = Math.round((e.loaded / e.total) * 100);
-        onProgress(Math.min(Math.round((transportPct / 100) * browserUploadWeight), browserUploadWeight));
+      armStallTimer();
+      if (e.lengthComputable) {
+        const chunkRatio = e.total > 0 ? Math.min(1, e.loaded / e.total) : 0;
+        const browserLoaded = options.offset + chunkRatio * options.file.size;
+        const wholeRatio = options.wholeFile.size > 0 ? browserLoaded / options.wholeFile.size : 1;
+        options.emitProgress(wholeRatio * browserUploadWeight);
       }
     };
 
     let processedResponseLength = 0;
-    let finalPayload: { ok: boolean; attachment: AttachmentRefResponse } | null = null;
+    let finalPayload: UploadFileRequestResult | null = null;
     let streamError: ApiError | null = null;
-    let highestProgress = 0;
     const abortError = () => {
       const error = new Error('upload_canceled');
       error.name = 'AbortError';
       return error;
     };
     const onSignalAbort = () => xhr.abort();
-    const cleanupAbortListener = () => signal?.removeEventListener('abort', onSignalAbort);
+    const cleanupAbortListener = () => options.signal?.removeEventListener('abort', onSignalAbort);
 
-    const emitProgress = (pct: number) => {
-      const next = Math.max(highestProgress, Math.min(100, Math.round(pct)));
-      highestProgress = next;
-      onProgress?.(next);
+    let stallTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearStallTimer = () => {
+      if (stallTimer) clearTimeout(stallTimer);
+      stallTimer = null;
+    };
+    const armStallTimer = () => {
+      clearStallTimer();
+      stallTimer = setTimeout(() => {
+        // status 0 matches xhr.onerror's shape below, which the resumable
+        // upload loop in uploadFile() already retries from the last
+        // daemon-committed offset.
+        reject(new ApiError(0, 'upload_stalled'));
+        xhr.abort();
+      }, UPLOAD_STALL_TIMEOUT_MS);
     };
 
     const consumeProgressLines = (flush = false) => {
@@ -1527,14 +1907,14 @@ export async function uploadFile(
         }
         if (msg.type === 'file.upload_progress') {
           const loaded = typeof msg.loaded === 'number' ? msg.loaded : 0;
-          const total = typeof msg.total === 'number' && msg.total > 0 ? msg.total : file.size;
+          const total = typeof msg.total === 'number' && msg.total > 0 ? msg.total : options.wholeFile.size;
           const daemonPct = total > 0 ? Math.min(1, loaded / total) : 0;
-          emitProgress(browserUploadWeight + daemonPct * daemonDownloadWeight);
+          options.emitProgress(browserUploadWeight + daemonPct * daemonDownloadWeight);
           continue;
         }
         if (msg.type === 'file.upload_done' && msg.attachment) {
           finalPayload = { ok: true, attachment: msg.attachment as AttachmentRefResponse };
-          emitProgress(100);
+          options.emitProgress(100);
           continue;
         }
         if (msg.type === 'file.upload_error') {
@@ -1548,10 +1928,14 @@ export async function uploadFile(
       }
     };
 
-    xhr.onprogress = () => consumeProgressLines(false);
+    xhr.onprogress = () => {
+      armStallTimer();
+      consumeProgressLines(false);
+    };
 
     xhr.onload = () => {
       cleanupAbortListener();
+      clearStallTimer();
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           consumeProgressLines(true);
@@ -1563,30 +1947,42 @@ export async function uploadFile(
             resolve(finalPayload);
             return;
           }
-          const parsed = JSON.parse(xhr.responseText);
-          onProgress?.(100);
+          const parsed = JSON.parse(xhr.responseText) as UploadFileRequestResult;
+          if ('attachment' in parsed) options.emitProgress(100);
           resolve(parsed);
         }
         catch { reject(new ApiError(xhr.status, 'Invalid JSON response')); }
       } else {
-        reject(new ApiError(xhr.status, xhr.responseText));
+        let committedBytes = -1;
+        try {
+          const parsed = JSON.parse(xhr.responseText) as { committedBytes?: unknown };
+          if (typeof parsed.committedBytes === 'number' && Number.isSafeInteger(parsed.committedBytes)) {
+            committedBytes = parsed.committedBytes;
+          }
+        } catch { /* ApiError retains the raw response below */ }
+        reject(xhr.status === 409 && committedBytes >= 0
+          ? new ResumableUploadOffsetError(xhr.status, xhr.responseText, committedBytes)
+          : new ApiError(xhr.status, xhr.responseText));
       }
     };
 
     xhr.onerror = () => {
       cleanupAbortListener();
+      clearStallTimer();
       reject(new ApiError(0, 'Network error'));
     };
     xhr.onabort = () => {
       cleanupAbortListener();
+      clearStallTimer();
       reject(abortError());
     };
-    if (signal?.aborted) {
+    if (options.signal?.aborted) {
       reject(abortError());
       return;
     }
-    signal?.addEventListener('abort', onSignalAbort, { once: true });
+    options.signal?.addEventListener('abort', onSignalAbort, { once: true });
     xhr.send(form);
+    armStallTimer();
   });
 }
 
@@ -1606,9 +2002,49 @@ export interface AttachmentDownloadProgress {
 }
 
 /**
+ * An interrupted HTTP download resumes from the last byte written instead of
+ * failing the whole file: the node → server → browser relay crosses networks
+ * that drop long-lived streams (seen live: a 165 MB fallback dying at 6.6 MB).
+ */
+export const ATTACHMENT_DOWNLOAD_RESUME = FILE_TRANSFER_DOWNLOAD_RESUME;
+const RESUMABLE_DOWNLOAD_STATUSES = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+/** A failure on the network side of a download: safe to resume. */
+class AttachmentDownloadInterrupted extends Error {
+  constructor(message: string, readonly cause?: unknown) {
+    super(message);
+    this.name = 'AttachmentDownloadInterrupted';
+  }
+}
+
+function throwIfDownloadAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
+}
+
+function isResumableDownloadFailure(error: unknown): boolean {
+  if (error instanceof AttachmentDownloadInterrupted) return true;
+  return error instanceof ApiError && RESUMABLE_DOWNLOAD_STATUSES.has(error.status);
+}
+
+function waitBeforeResume(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException('download_canceled', 'AbortError'));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
  * Stream an attachment response into a caller-owned writable sink.  This is
  * used by File Browser's direct-download HTTP fallback so multi-GiB files
- * never accumulate in a Blob.
+ * never accumulate in a Blob.  The sink is append-only and is never rewound:
+ * a resumed response continues exactly at the bytes already written.
  */
 export async function streamAttachmentDownloadToWritable(
   serverId: string,
@@ -1617,12 +2053,55 @@ export async function streamAttachmentDownloadToWritable(
   sessionName?: string,
   signal?: AbortSignal,
   onProgress?: (progress: AttachmentDownloadProgress) => void,
+  resumeFromBytes = 0,
 ): Promise<void> {
-  if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-  const res = await rawFetch(
-    withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName),
-    { signal },
-  );
+  throwIfDownloadAborted(signal);
+  const path = withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName);
+  if (!Number.isSafeInteger(resumeFromBytes) || resumeFromBytes < 0) {
+    throw new ApiError(400, 'download_resume_offset_invalid');
+  }
+  const state = { loadedBytes: resumeFromBytes, totalBytes: null as number | null };
+  let resumes = 0;
+  let withoutProgress = 0;
+  for (;;) {
+    const before = state.loadedBytes;
+    try {
+      await streamAttachmentDownloadAttempt(path, writable, state, signal, onProgress);
+      return;
+    } catch (error) {
+      throwIfDownloadAborted(signal);
+      if (!isResumableDownloadFailure(error)) throw error;
+      withoutProgress = state.loadedBytes > before ? 1 : withoutProgress + 1;
+      resumes += 1;
+      if (withoutProgress > ATTACHMENT_DOWNLOAD_RESUME.MAX_ATTEMPTS_WITHOUT_PROGRESS
+        || resumes > ATTACHMENT_DOWNLOAD_RESUME.MAX_RESUMES) {
+        throw error instanceof AttachmentDownloadInterrupted && error.cause !== undefined ? error.cause : error;
+      }
+      const backoff = ATTACHMENT_DOWNLOAD_RESUME.BACKOFF_MS;
+      await waitBeforeResume(backoff[Math.min(withoutProgress, backoff.length) - 1]!, signal);
+    }
+  }
+}
+
+async function streamAttachmentDownloadAttempt(
+  path: string,
+  writable: AttachmentDownloadWritable,
+  state: { loadedBytes: number; totalBytes: number | null },
+  signal: AbortSignal | undefined,
+  onProgress: ((progress: AttachmentDownloadProgress) => void) | undefined,
+): Promise<void> {
+  throwIfDownloadAborted(signal);
+  const resumeFrom = state.loadedBytes;
+  let res: Response;
+  try {
+    res = await rawFetch(path, {
+      signal,
+      ...(resumeFrom > 0 ? { headers: { Range: formatFileTransferRangeRequest(resumeFrom) } } : {}),
+    });
+  } catch (error) {
+    throwIfDownloadAborted(signal);
+    throw new AttachmentDownloadInterrupted('download_request_failed', error);
+  }
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);
@@ -1630,26 +2109,52 @@ export async function streamAttachmentDownloadToWritable(
   if (!res.body) throw new ApiError(res.status, 'download_stream_unavailable');
   const contentLength = res.headers.get('content-length');
   const parsedLength = contentLength === null ? Number.NaN : Number(contentLength);
-  const totalBytes = Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null;
-  let loadedBytes = 0;
-  onProgress?.({ loadedBytes, totalBytes });
+  const bodyLength = Number.isSafeInteger(parsedLength) && parsedLength >= 0 ? parsedLength : null;
+
+  if (resumeFrom === 0) {
+    state.totalBytes = bodyLength;
+  } else {
+    // A resumed response must continue exactly where the file on disk ends,
+    // for the same file.
+    const range = res.status === 206 ? parseFileTransferContentRange(res.headers.get(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE)) : null;
+    if (!range || range.start !== resumeFrom
+      || (state.totalBytes !== null && range.total !== state.totalBytes)) {
+      throw new ApiError(res.status, 'download_resume_mismatch');
+    }
+    state.totalBytes = range.total;
+  }
+  onProgress?.({ loadedBytes: state.loadedBytes, totalBytes: state.totalBytes });
+
   const reader = res.body.getReader();
   try {
     for (;;) {
-      if (signal?.aborted) throw new DOMException('download_canceled', 'AbortError');
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (value?.byteLength) {
-        await writable.write(value);
-        loadedBytes += value.byteLength;
-        onProgress?.({ loadedBytes, totalBytes });
+      throwIfDownloadAborted(signal);
+      let chunk: Awaited<ReturnType<typeof reader.read>>;
+      try {
+        chunk = await reader.read();
+      } catch (error) {
+        throwIfDownloadAborted(signal);
+        throw new AttachmentDownloadInterrupted('download_stream_interrupted', error);
       }
+      if (chunk.done) break;
+      const value = chunk.value;
+      if (!value?.byteLength) continue;
+      // Write failures (disk full, revoked handle) are not network failures
+      // and are never resumed.
+      await writable.write(value);
+      state.loadedBytes += value.byteLength;
+      onProgress?.({ loadedBytes: state.loadedBytes, totalBytes: state.totalBytes });
     }
   } catch (error) {
     await reader.cancel(error).catch(() => undefined);
     throw error;
   } finally {
     reader.releaseLock();
+  }
+  if (state.totalBytes !== null) {
+    // A relay that dies can end the response cleanly but short.
+    if (state.loadedBytes < state.totalBytes) throw new AttachmentDownloadInterrupted('download_ended_early');
+    if (state.loadedBytes > state.totalBytes) throw new ApiError(res.status, 'download_size_mismatch');
   }
 }
 
@@ -1725,6 +2230,8 @@ export function controlledNodeDownloadErrorKey(err: unknown): string {
         return 'controlled_nodes.auth_identity_changed';
       case CONTROLLED_NODE_MINT_ERRORS.AUTH_IDENTITY_EXPECTATION_REQUIRED:
         return 'controlled_nodes.auth_identity_expectation_required';
+      case CONTROLLED_NODE_DESK_REQUIRED:
+        return 'controlled_nodes.desk_required';
       default:
         break;
     }
@@ -1739,6 +2246,8 @@ export function controlledNodeDownloadErrorKey(err: unknown): string {
 
 export async function downloadControlledNodeExecutable(
   selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  /** The Desk chosen for THIS action; never read back from shared state. */
+  teamId: string,
   opts: ControlledNodeDownloadOptions = {},
 ): Promise<import('./api/machines.js').ControlledNodeExecutableTicket> {
   const { mintControlledNodeExecutableTicket, buildControlledNodeBootstrapUrl } = await import('./api/machines.js');
@@ -1747,7 +2256,7 @@ export async function downloadControlledNodeExecutable(
   if (!nativeRuntime && !desktopWindow) throw new Error('desktop_window_required');
 
   try {
-    const ticket = await mintControlledNodeExecutableTicket(selection);
+    const ticket = await mintControlledNodeExecutableTicket(selection, teamId);
     const url = buildControlledNodeBootstrapUrl(ticket.ticket);
     if (nativeRuntime) {
       const { Browser } = await import('@capacitor/browser');
@@ -1762,6 +2271,38 @@ export async function downloadControlledNodeExecutable(
   }
 }
 
+/**
+ * Mint a link the operator opens ON the machine being enrolled.
+ *
+ * Deliberately does not navigate anywhere: the whole point is to hand back a
+ * string that survives being pasted into a chat or an email and opened later,
+ * on a different machine. It reuses the same error mapping as the direct
+ * download so a failure reads identically wherever it surfaces.
+ */
+export async function createControlledNodeRemoteInstallLink(
+  selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ url: string; expiresAt: number | null; ticketId: string }> {
+  const { mintControlledNodeRemoteInstallLink } = await import('./api/machines.js');
+  return mintControlledNodeRemoteInstallLink(selection, hostServerId);
+}
+
+export async function revokeControlledNodeRemoteInstallLink(
+  selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<boolean> {
+  const machines = await import('./api/machines.js');
+  return machines.revokeControlledNodeRemoteInstallLink(selection, hostServerId);
+}
+
+export async function createControlledNodeInstallCommand(
+  selection: import('./api/machines.js').ControlledNodeArtifactSelection,
+  hostServerId?: string,
+): Promise<{ command: string; expiresAt: number; ticketId: string }> {
+  const { mintControlledNodeInstallCommand } = await import('./api/machines.js');
+  return mintControlledNodeInstallCommand(selection, hostServerId);
+}
+
 export async function previewAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
   const res = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName));
   if (!res.ok) {
@@ -1773,6 +2314,16 @@ export async function previewAttachment(serverId: string, attachmentId: string, 
   window.open(url, '_blank');
   setTimeout(() => URL.revokeObjectURL(url), 60_000);
 }
+
+/**
+ * Thrown when a mint is attempted without an explicit Desk.
+ *
+ * Declared HERE, not in api/machines.ts, on purpose: machines.ts already
+ * imports from this module, so defining it there and importing it back would
+ * close a static import cycle and leave these exports undefined during module
+ * initialisation -- which took the whole app shell down, not just this feature.
+ */
+export const CONTROLLED_NODE_DESK_REQUIRED = 'controlled_node_desk_required';
 
 export interface TeamSummary {
   id: string;
@@ -1885,6 +2436,18 @@ export interface SharedContextRuntimeConfigView {
   snapshot: SharedContextRuntimeConfigSnapshot;
 }
 
+/**
+ * The Desks this user can enrol a machine into.
+ *
+ * Minting requires a managing role server-side, so a Desk the user merely
+ * belongs to is filtered out here rather than offered and then rejected with a
+ * 403. Returning fewer choices is the fail-closed direction.
+ */
+export async function listMintableDesks(): Promise<TeamSummary[]> {
+  const teams = await listTeams();
+  return teams.filter((team) => team.role === 'owner' || team.role === 'admin');
+}
+
 export async function listTeams(): Promise<TeamSummary[]> {
   const response = await apiFetch<{ teams: TeamSummary[] }>('/api/team', { method: 'GET' });
   return response.teams;
@@ -1901,6 +2464,29 @@ export async function updateSharedContextRuntimeConfig(serverId: string, config:
     method: 'PUT',
     body: JSON.stringify(config),
   });
+}
+
+/** Put a machine in one group, or take it out of that one. */
+export async function setMachineGroupMembership(
+  serverId: string,
+  teamId: string,
+  member: boolean,
+): Promise<void> {
+  const { setMachineGroupMembership: set } = await import('./api/machines.js');
+  return set(serverId, teamId, member);
+}
+
+/** Rename a group. */
+export async function renameTeam(teamId: string, name: string): Promise<void> {
+  await apiFetch(`/api/team/${encodeURIComponent(teamId)}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name }),
+  });
+}
+
+/** Delete a group. Refused by the server while any machine is still in it. */
+export async function deleteTeam(teamId: string): Promise<void> {
+  await apiFetch(`/api/team/${encodeURIComponent(teamId)}`, { method: 'DELETE' });
 }
 
 export async function createTeam(name: string): Promise<{ id: string; name: string; role: string }> {
@@ -1923,6 +2509,18 @@ export async function createTeamInvite(teamId: string, role: 'admin' | 'member',
 
 export async function joinTeamByToken(token: string): Promise<{ ok: true; teamId: string; role: string }> {
   return apiFetch(`/api/team/join/${encodeURIComponent(token)}`, { method: 'POST' });
+}
+
+/** Add someone to a team by username, the way a machine is shared with them. */
+export async function addTeamMember(
+  teamId: string,
+  user: string,
+  role: 'admin' | 'member' = 'member',
+): Promise<{ ok: true; member: TeamMember }> {
+  return apiFetch(`/api/team/${encodeURIComponent(teamId)}/member`, {
+    method: 'POST',
+    body: JSON.stringify({ user, role }),
+  });
 }
 
 export async function updateTeamMemberRole(teamId: string, memberId: string, role: 'admin' | 'member'): Promise<{ ok: true }> {

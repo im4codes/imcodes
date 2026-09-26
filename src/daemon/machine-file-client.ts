@@ -1,12 +1,19 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { openAsBlob } from 'node:fs';
 import { link, lstat, open, realpath, rename, unlink } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
 import {
   FILE_TRANSFER_LIMITS,
+  FILE_TRANSFER_HTTP_HEADER,
   FILE_PATH_HANDLE_ERROR,
+  FILE_TRANSFER_RESUMABLE_UPLOAD,
+  FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD,
+  formatFileTransferRangeRequest,
+  parseFileTransferContentRange,
   validateAttachmentRef,
+  validateFileTransferSourceIdentity,
   type AttachmentRef,
+  type FileTransferSourceIdentity,
 } from '../../shared/transport/file-transfer.js';
 import { isFilePreviewPathAllowed } from './file-preview-path-policy.js';
 import { MachineControlPlaneError } from './machine-exec-client.js';
@@ -19,7 +26,15 @@ import {
   type MachineFileTransferTransport,
   type MachineDirectUploadRequest,
 } from '../../shared/machine-direct-file-transfer.js';
-import { startMachineDirectFetchReceiver, startMachineDirectSender } from './machine-direct-transfer.js';
+import {
+  bindMachineFetchResumeIdentity,
+  discardMachineFetchResume,
+  readMachineFetchResumeIdentity,
+  removeMachineFetchResumeIdentity,
+  startMachineDirectFetchReceiver,
+  startMachineDirectSender,
+} from './machine-direct-transfer.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
 const MAX_CONTROL_RESPONSE_BYTES = 64 * 1024;
 
@@ -28,6 +43,7 @@ interface MachineFileBaseOptions {
   sourceServerId: string;
   sourceToken: string;
   targetServerId: string;
+  sharedMachineAuthority?: string;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
 }
@@ -50,8 +66,12 @@ export interface MachineFileTransferResult {
   destinationPath?: string;
 }
 
-function authHeaders(sourceServerId: string, sourceToken: string): Record<string, string> {
-  return { 'X-Server-Id': sourceServerId, authorization: `Bearer ${sourceToken}` };
+function authHeaders(sourceServerId: string, sourceToken: string, sharedMachineAuthority?: string): Record<string, string> {
+  return {
+    'X-Server-Id': sourceServerId,
+    authorization: `Bearer ${sourceToken}`,
+    ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
+  };
 }
 
 function boundedTransferSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
@@ -86,7 +106,13 @@ async function readBoundedJson(response: Response): Promise<Record<string, unkno
   }
 }
 
-async function resolveReadableRegularFile(sourcePath: string): Promise<{ path: string; size: number }> {
+async function resolveReadableRegularFile(sourcePath: string): Promise<{
+  path: string;
+  size: number;
+  mtimeMs: number;
+  device: number;
+  inode: number;
+}> {
   const requested = resolve(sourcePath);
   let rawStat;
   try {
@@ -101,7 +127,13 @@ async function resolveReadableRegularFile(sourcePath: string): Promise<{ path: s
   if (!canonical || !isFilePreviewPathAllowed(canonical)) {
     throw new MachineControlPlaneError('malformed', 'source path is forbidden');
   }
-  return { path: canonical, size: rawStat.size };
+  return {
+    path: canonical,
+    size: rawStat.size,
+    mtimeMs: rawStat.mtimeMs,
+    device: rawStat.dev,
+    inode: rawStat.ino,
+  };
 }
 
 function parseAttachmentResponse(value: Record<string, unknown>): AttachmentRef {
@@ -113,10 +145,29 @@ function parseAttachmentResponse(value: Record<string, unknown>): AttachmentRef 
   return attachment;
 }
 
+function parseMachineFileSourceIdentity(
+  value: Record<string, unknown>,
+  attachment: AttachmentRef,
+): FileTransferSourceIdentity {
+  const identity = validateFileTransferSourceIdentity(value.sourceIdentity);
+  if (!identity || (attachment.size !== undefined && identity.size !== attachment.size)) {
+    throw new MachineControlPlaneError('malformed', 'missing or invalid machine file source identity');
+  }
+  return identity;
+}
+
 export async function sendFileToMachine(options: SendFileToMachineOptions): Promise<MachineFileTransferResult> {
   const source = await resolveReadableRegularFile(options.sourcePath);
   const doFetch = options.fetchImpl ?? fetch;
-  const clientUploadId = randomBytes(24).toString('base64url');
+  const clientUploadId = createHash('sha256').update(JSON.stringify([
+    options.sourceServerId,
+    options.targetServerId,
+    source.path,
+    source.size,
+    source.mtimeMs,
+    source.device,
+    source.inode,
+  ])).digest('base64url');
   // The MCP process does not own the daemon's long-lived ServerLink, so the
   // direct attempt uses a short authenticated HTTP control request while file
   // bytes stay on the routed-LAN TCP socket.
@@ -132,14 +183,23 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
       size: source.size,
       expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
     };
-    const sender = await startMachineDirectSender({ sourcePath: source.path, request: requestBase }).catch(() => null);
+    const sender = await startMachineDirectSender({
+      sourcePath: source.path,
+      request: requestBase,
+      expectedSourceIdentity: {
+        size: source.size,
+        mtimeMs: source.mtimeMs,
+        device: source.device,
+        inode: source.inode,
+      },
+    }).catch(() => null);
     if (sender) {
       try {
         const response = await doFetch(
           `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/machine-direct-upload`,
           {
             method: 'POST',
-            headers: { ...authHeaders(options.sourceServerId, options.sourceToken), 'content-type': 'application/json' },
+            headers: { ...authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority), 'content-type': 'application/json' },
             body: JSON.stringify({ ...requestBase, candidates: sender.candidates }),
             signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
           },
@@ -170,26 +230,68 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
   if (source.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
     throw new MachineControlPlaneError('malformed', 'source file is too large for Server relay fallback');
   }
-  const form = new FormData();
-  form.append('file', await openAsBlob(source.path), basename(source.path));
-  form.append('clientUploadId', clientUploadId);
-  let response: Response;
-  try {
-    response = await doFetch(
-      `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/upload`,
-      {
-        method: 'POST',
-        headers: authHeaders(options.sourceServerId, options.sourceToken),
-        body: form,
-        signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
-      },
-    );
-  } catch {
-    throw new MachineControlPlaneError('transport', 'file upload transport failed');
+  const sourceBlob = await openAsBlob(source.path);
+  let committedBytes = 0;
+  let attachment: AttachmentRef | null = null;
+  while (!attachment) {
+    const end = Math.min(source.size, committedBytes + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
+    const chunk = sourceBlob.slice(committedBytes, end, sourceBlob.type);
+    let response: Response | null = null;
+    let body: Record<string, unknown> | null = null;
+    for (let attempt = 0; attempt <= FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS; attempt += 1) {
+      const form = new FormData();
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE, chunk, basename(source.path));
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID, clientUploadId);
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.OFFSET, String(committedBytes));
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.TOTAL_SIZE, String(source.size));
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME, basename(source.path));
+      form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED, String(Math.trunc(source.mtimeMs)));
+      try {
+        response = await doFetch(
+          `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/upload`,
+          {
+            method: 'POST',
+            headers: authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority),
+            body: form,
+            signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
+          },
+        );
+        body = await readBoundedJson(response);
+        if (response.ok || response.status === 409) break;
+        if (![408, 425, 429].includes(response.status) && response.status < 500) break;
+      } catch {
+        response = null;
+        body = null;
+      }
+      if (attempt < FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) {
+        await new Promise((resolveDelay) => setTimeout(
+          resolveDelay,
+          FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS[Math.min(attempt, FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS.length - 1)],
+        ));
+      }
+    }
+    if (!response || !body) throw new MachineControlPlaneError('transport', 'file upload transport failed');
+    if (!response.ok) {
+      const receiverOffset = typeof body.committedBytes === 'number' ? body.committedBytes : -1;
+      if (response.status === 409 && Number.isSafeInteger(receiverOffset)
+        && receiverOffset >= 0 && receiverOffset <= source.size && receiverOffset !== committedBytes) {
+        committedBytes = receiverOffset;
+        continue;
+      }
+      throw new MachineControlPlaneError('http_status', typeof body.error === 'string' ? body.error : `http_${response.status}`);
+    }
+    if (body.complete === false) {
+      const receiverOffset = body.committedBytes;
+      if (typeof receiverOffset !== 'number' || !Number.isSafeInteger(receiverOffset)
+        || receiverOffset <= committedBytes || receiverOffset > source.size) {
+        throw new MachineControlPlaneError('malformed', 'invalid resumable upload offset');
+      }
+      committedBytes = receiverOffset;
+      continue;
+    }
+    attachment = parseAttachmentResponse(body);
   }
-  const body = await readBoundedJson(response);
-  if (!response.ok) throw new MachineControlPlaneError('http_status', typeof body.error === 'string' ? body.error : `http_${response.status}`);
-  const attachment = parseAttachmentResponse(body);
+  if (!attachment) throw new MachineControlPlaneError('malformed', 'missing upload attachment');
   return {
     size: attachment.size ?? source.size,
     attachmentId: attachment.id,
@@ -215,7 +317,10 @@ async function prepareDestination(destinationPath: string, overwrite: boolean): 
   }
   return {
     destination,
-    temp: join(parent, `.${basename(destination)}.imcodes-${randomBytes(12).toString('hex')}.part`),
+    // The destination path is already the caller's explicit authority. A
+    // deterministic sibling partial survives process retries without granting
+    // access to any additional path.
+    temp: join(parent, `.${basename(destination)}.imcodes-resume.part`),
   };
 }
 
@@ -235,7 +340,7 @@ async function commitDownloadedFile(temp: string, destination: string, overwrite
 export async function fetchFileFromMachine(options: FetchFileFromMachineOptions): Promise<MachineFileTransferResult> {
   const doFetch = options.fetchImpl ?? fetch;
   const base = options.serverUrl.replace(/\/+$/, '');
-  const headers = authHeaders(options.sourceServerId, options.sourceToken);
+  const headers = authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority);
   const prepared = await prepareDestination(options.destinationPath, options.overwrite === true);
 
   {
@@ -264,6 +369,7 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
           const start = await receiver.completion;
           if (start.size !== terminal.value.size) throw new MachineControlPlaneError('malformed', 'direct fetch size mismatch');
           await commitDownloadedFile(prepared.temp, prepared.destination, options.overwrite === true);
+          await removeMachineFetchResumeIdentity(prepared.temp);
           return {
             size: start.size,
             attachmentId: requestId,
@@ -277,7 +383,6 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
       } finally {
         receiver.close();
       }
-      await unlink(prepared.temp).catch(() => {});
     }
   }
 
@@ -301,38 +406,88 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
     throw new MachineControlPlaneError('http_status', reason);
   }
   const attachment = parseAttachmentResponse(handleBody);
+  const sourceIdentity = parseMachineFileSourceIdentity(handleBody, attachment);
 
   let file;
   try {
-    file = await open(prepared.temp, 'wx', 0o600);
+    const partial = await lstat(prepared.temp).catch(() => null);
+    if (partial && !partial.isFile()) {
+      await discardMachineFetchResume(prepared.temp);
+      throw new MachineControlPlaneError('malformed', 'invalid download partial');
+    }
+    const storedIdentity = partial ? await readMachineFetchResumeIdentity(prepared.temp) : null;
+    let resumeOffset = partial?.size ?? 0;
+    if (!partial || !storedIdentity
+      || storedIdentity.size !== sourceIdentity.size
+      || storedIdentity.mtimeMs !== sourceIdentity.mtimeMs
+      || storedIdentity.device !== sourceIdentity.device
+      || storedIdentity.inode !== sourceIdentity.inode) {
+      await discardMachineFetchResume(prepared.temp);
+      resumeOffset = 0;
+    }
+    if (attachment.size !== undefined && resumeOffset >= attachment.size) {
+      // A newly minted path handle may refer to replacement bytes of the same
+      // length. Without an end-to-end digest, an already-full or oversized
+      // temp cannot be authenticated as this handle's prefix, so restart it
+      // instead of issuing an unsatisfiable Range or committing stale bytes.
+      await discardMachineFetchResume(prepared.temp);
+      resumeOffset = 0;
+    }
+    await bindMachineFetchResumeIdentity(prepared.temp, sourceIdentity);
     const response = await doFetch(
       `${base}/api/server/${encodeURIComponent(options.targetServerId)}/uploads/${encodeURIComponent(attachment.id)}/download`,
-      { headers, signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS) },
+      {
+        headers: {
+          ...headers,
+          ...(resumeOffset > 0 ? { [FILE_TRANSFER_HTTP_HEADER.RANGE]: formatFileTransferRangeRequest(resumeOffset) } : {}),
+        },
+        signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
+      },
     );
     if (!response.ok || !response.body) {
       throw new MachineControlPlaneError('http_status', `file download rejected: http_${response.status}`);
     }
+    if (resumeOffset > 0) {
+      const range = response.status === 206
+        ? parseFileTransferContentRange(response.headers.get(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE))
+        : null;
+      if (!range || range.start !== resumeOffset) {
+        // A rolling Server that ignores Range is safe only when the local
+        // partial is discarded before consuming its whole-body response.
+        resumeOffset = 0;
+      }
+    }
     const contentLength = Number(response.headers.get('content-length'));
-    if (Number.isFinite(contentLength) && contentLength > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+    if (Number.isFinite(contentLength) && resumeOffset + contentLength > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
       throw new MachineControlPlaneError('malformed', 'download is too large');
     }
+    file = await open(prepared.temp, resumeOffset > 0 ? 'r+' : 'w', 0o600);
     const reader = response.body.getReader();
-    let size = 0;
+    let size = resumeOffset;
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (!value) continue;
-      size += value.byteLength;
-      if (size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
+      if (size + value.byteLength > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
         await reader.cancel().catch(() => {});
         throw new MachineControlPlaneError('malformed', 'download is too large');
       }
-      await file.write(value);
+      let written = 0;
+      while (written < value.byteLength) {
+        const result = await file.write(value, written, value.byteLength - written, size + written);
+        if (result.bytesWritten <= 0) throw new Error('write_failed');
+        written += result.bytesWritten;
+      }
+      size += value.byteLength;
+    }
+    if (attachment.size !== undefined && size !== attachment.size) {
+      throw new MachineControlPlaneError('malformed', 'download size mismatch');
     }
     await file.sync();
     await file.close();
     file = undefined;
     await commitDownloadedFile(prepared.temp, prepared.destination, options.overwrite === true);
+    await removeMachineFetchResumeIdentity(prepared.temp);
     return {
       size,
       attachmentId: attachment.id,
@@ -341,7 +496,9 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
     };
   } catch (error) {
     await file?.close().catch(() => {});
-    await unlink(prepared.temp).catch(() => {});
+    if (error instanceof MachineControlPlaneError && error.kind === 'malformed') {
+      await discardMachineFetchResume(prepared.temp);
+    }
     if (error instanceof MachineControlPlaneError) throw error;
     throw new MachineControlPlaneError('transport', 'file download failed');
   }

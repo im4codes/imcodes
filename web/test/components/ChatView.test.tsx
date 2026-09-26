@@ -4,7 +4,14 @@
 import { h } from 'preact';
 import { act, render, waitFor, cleanup, fireEvent, screen } from '@testing-library/preact';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
-import { ChatView, __clearChatLocalImagePreviewCacheForTests, formatChatDateTime } from '../../src/components/ChatView.js';
+import {
+  ChatView,
+  __buildViewItemsForTests,
+  __buildViewItemsTailForTests,
+  __clearChatLocalImagePreviewCacheForTests,
+  formatChatDateTime,
+} from '../../src/components/ChatView.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../../shared/daemon-user-notices.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -20,6 +27,21 @@ import {
   PREVIEW_EVENT_TAIL_LIMIT,
   PREVIEW_RENDER_ITEM_LIMIT,
 } from '../../src/chat-render-limits.js';
+import {
+  PEER_AUDIT_REWORK_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND,
+  SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND,
+  SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND,
+  SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_CONTINUE_AUTOMATION_KIND,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND,
+  SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+} from '../../../shared/supervision-config.js';
 
 const chatMarkdownRenderSpy = vi.hoisted(() => vi.fn());
 const showToolCallsPref = vi.hoisted(() => ({
@@ -61,6 +83,58 @@ function selectText(node: Text, start: number, end: number) {
   selection?.removeAllRanges();
   selection?.addRange(range);
   document.dispatchEvent(new Event('selectionchange'));
+}
+
+function installRenderedLineMeasurement(initialLines: number) {
+  let renderedLines = initialLines;
+  const callbacks = new Set<ResizeObserverCallback>();
+  const originalResizeObserver = globalThis.ResizeObserver;
+  const scrollHeightSpy = vi.spyOn(Element.prototype, 'scrollHeight', 'get').mockImplementation(function () {
+    return this.classList.contains('chat-user-message-fold-content') ? renderedLines * 20 : 0;
+  });
+  const originalGetComputedStyle = window.getComputedStyle.bind(window);
+  const computedStyleSpy = vi.spyOn(window, 'getComputedStyle').mockImplementation((element, pseudoElement) => {
+    const style = originalGetComputedStyle(element, pseudoElement);
+    if (!element.classList.contains('chat-user-message-fold-content')) return style;
+    return new Proxy(style, {
+      get(target, property, receiver) {
+        if (property === 'lineHeight') return '20px';
+        if (property === 'fontSize') return '14px';
+        const value = Reflect.get(target, property, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+  });
+  class ControlledResizeObserver {
+    constructor(callback: ResizeObserverCallback) {
+      callbacks.add(callback);
+    }
+    observe() {}
+    unobserve() {}
+    disconnect() {}
+  }
+  Object.defineProperty(globalThis, 'ResizeObserver', {
+    configurable: true,
+    writable: true,
+    value: ControlledResizeObserver,
+  });
+  return {
+    setRenderedLines(lines: number) {
+      renderedLines = lines;
+      act(() => {
+        for (const callback of callbacks) callback([], {} as ResizeObserver);
+      });
+    },
+    restore() {
+      scrollHeightSpy.mockRestore();
+      computedStyleSpy.mockRestore();
+      Object.defineProperty(globalThis, 'ResizeObserver', {
+        configurable: true,
+        writable: true,
+        value: originalResizeObserver,
+      });
+    },
+  };
 }
 
 describe('formatChatDateTime', () => {
@@ -119,12 +193,398 @@ vi.mock('react-i18next', () => ({
         'share.role.serverMember': 'Server member',
         'share.role.serverManager': 'Server manager',
         'share.role.system': 'System',
+        'chat.execution_status.waiting': 'Waiting',
+        'chat.execution_status.needs_input': 'Needs input',
+        'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
+        'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
+        'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+        'chat.supervision_prompt.continue': 'Supervision continuation',
+        'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
+        'chat.supervision_prompt.audit_delegation': 'Audit delegation',
+        'chat.supervision_prompt.audit_target_recovery': 'Audit target recovery',
+        'chat.supervision_prompt.audit_marker_correction': 'Audit marker correction',
+        'chat.supervision_prompt.peer_audit_rework': 'Peer audit rework',
+        'chat.supervision_prompt.auto_audit_mode_control': 'Auto-audit mode update',
+        'chat.supervision_prompt.generic': 'Supervision automation',
+        'chat.supervision_prompt.show_details': 'Show supervision prompt details',
+        'chat.supervision_prompt.hide_details': 'Hide supervision prompt details',
+        'chat.supervision_status_run.heartbeats_one': '{{count}} heartbeat',
+        'chat.supervision_status_run.heartbeats_other': '{{count}} heartbeats',
+        'chat.supervision_status_run.waiting_one': '{{count}} waiting marker',
+        'chat.supervision_status_run.waiting_other': '{{count}} waiting markers',
+        'chat.supervision_status_run.expand': 'Show repeated supervision status',
+        'chat.supervision_status_run.collapse': 'Hide repeated supervision status',
+        'chat.supervision_status_run.summary': '{{heartbeats}} · {{waiting}} · {{timeRange}}',
+        'chat.daemon_notice.supervision_human_input_blocker': '⚠️ Localized human-input blocker warning.',
       };
-      const template = translations[key] ?? key;
+      const pluralKey = typeof options?.count === 'number'
+        ? `${key}_${options.count === 1 ? 'one' : 'other'}`
+        : key;
+      const template = translations[pluralKey] ?? translations[key] ?? key;
       return template.replace(/\{\{(\w+)\}\}/g, (_, name) => String(options?.[name] ?? ''));
     },
   }),
 }));
+
+describe('assistant execution status chips', () => {
+  const assistant = (
+    text: string,
+    payload: Record<string, unknown> = {},
+    eventId = 'assistant-status',
+  ) => ({
+    eventId,
+    type: 'assistant.text',
+    ts: 1_700_000_000_001,
+    payload: { text, ...payload },
+  }) as any;
+
+  it('renders a trusted structured daemon warning through i18n instead of its English fallback', () => {
+    const event = {
+      ...assistant('⚠️ Automation returned control because the executing session reported a human-input blocker.', {
+        streaming: false,
+        automation: true,
+        automationKind: 'supervision-warning',
+        noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER,
+        noticeParams: {},
+      }),
+      source: 'daemon',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Localized human-input blocker warning');
+    expect(container.textContent).not.toContain('Automation returned control because');
+  });
+
+  it('keeps legacy and unknown notice text as the readable fallback', () => {
+    const legacy = assistant('Legacy daemon warning', { streaming: false }, 'legacy-warning');
+    const unknown = {
+      ...assistant('Future daemon warning', {
+        streaming: false,
+        noticeCode: 'future_notice_code',
+        noticeParams: {},
+      }, 'future-warning'),
+      source: 'daemon',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[legacy, unknown]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Legacy daemon warning');
+    expect(container.textContent).toContain('Future daemon warning');
+  });
+
+  it('does not let an agent-authored payload spoof a trusted daemon notice', () => {
+    const event = {
+      ...assistant('Agent-authored text remains intact', {
+        streaming: false,
+        noticeCode: DAEMON_USER_NOTICE_CODE.SUPERVISION_HUMAN_INPUT_BLOCKER,
+        noticeParams: {},
+      }),
+      source: 'provider',
+      confidence: 'high',
+    };
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(container.textContent).toContain('Agent-authored text remains intact');
+    expect(container.textContent).not.toContain('Localized human-input blocker warning');
+  });
+
+  it.each([
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING, 'Waiting', 'waiting', '⏳'],
+    [SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT, 'Needs input', 'needs-input', '⏸️'],
+  ])('renders a completed %s marker as an accessible chip while hiding the marker', (marker, label, stateClass, glyph) => {
+    const { container } = render(
+      <ChatView
+        events={[assistant(`Visible answer\n${marker}`, { streaming: false })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    const chip = container.querySelector(`.chat-execution-status-chip.${stateClass}`);
+    expect(chip).not.toBeNull();
+    expect(chip?.textContent).toBe(`${glyph}${label}`);
+    expect(chip?.getAttribute('aria-label')).toBe(label);
+    expect(chip?.getAttribute('title')).toBe(label);
+    expect(container.textContent).toContain('Visible answer');
+    expect(container.textContent).not.toContain(marker);
+  });
+
+  it('uses the shared authored-line parser so quoted, inline and fenced examples stay visible without chips', () => {
+    const waiting = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const needsInput = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    const examples = [
+      `> ${waiting}`,
+      `inline ${needsInput}`,
+      ['```md', waiting, '```'].join('\n'),
+    ];
+    const { container } = render(
+      <ChatView
+        events={examples.map((text, index) => assistant(text, { streaming: false }, `example-${index}`))}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-execution-status-chip')).toBeNull();
+    for (const marker of [waiting, needsInput]) expect(container.textContent).toContain(marker);
+  });
+
+  it('does not show a chip for an in-progress streaming marker and shows it after the stable event completes', () => {
+    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const initial = render(
+      <ChatView
+        events={[assistant(`Partial\n${marker}`, { streaming: true })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    expect(initial.container.querySelector('.chat-execution-status-chip')).toBeNull();
+
+    initial.rerender(
+      <ChatView
+        events={[assistant(`Complete\n${marker}`, { streaming: false })]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    expect(initial.container.querySelector('.chat-execution-status-chip.waiting')).not.toBeNull();
+  });
+
+  it('renders a marker-only completed message as only the status chip without an empty rich-text bubble', () => {
+    const marker = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    const { container } = render(
+      <ChatView
+        events={[assistant(marker, { streaming: false })]}
+        loading={false}
+        sessionId="deck_sub_worker"
+      />,
+    );
+
+    expect(container.querySelector('.chat-execution-status-chip.needs-input')).not.toBeNull();
+    expect(container.querySelector('.chat-rich-text')).toBeNull();
+    expect(container.querySelector('.chat-assistant-status-only')).not.toBeNull();
+    expect(container.querySelector('.chat-assistant-status-only .chat-bubble-time')).toBeNull();
+    expect(container.textContent).not.toContain(marker);
+  });
+});
+
+describe('supervision automation prompt labels', () => {
+  const prompt = '[Contract: supervision_waiting_heartbeat_v1] {"contractRefs":["supervision_messaging_v1"]}';
+  const userMessage = (
+    automationKind: string | undefined,
+    automation = true,
+    eventId = 'automation-prompt',
+  ) => ({
+    eventId,
+    type: 'user.message',
+    ts: 1_700_000_000_002,
+    payload: { text: prompt, automation, ...(automationKind ? { automationKind } : {}) },
+  }) as any;
+  const expectedLabelByKey: Record<string, string> = {
+    'chat.supervision_prompt.supervision_heartbeat': 'Supervision heartbeat',
+    'chat.supervision_prompt.audit_heartbeat': 'Audit heartbeat',
+    'chat.supervision_prompt.implementation_heartbeat': 'Implementation heartbeat',
+    'chat.supervision_prompt.continue': 'Supervision continuation',
+    'chat.supervision_prompt.post_audit_finalization': 'Post-audit finalization',
+    'chat.supervision_prompt.audit_delegation': 'Audit delegation',
+    'chat.supervision_prompt.audit_target_recovery': 'Audit target recovery',
+    'chat.supervision_prompt.audit_marker_correction': 'Audit marker correction',
+    'chat.supervision_prompt.peer_audit_rework': 'Peer audit rework',
+    'chat.supervision_prompt.auto_audit_mode_control': 'Auto-audit mode update',
+  };
+  const knownPromptCases = [
+    [SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.supervision_heartbeat'],
+    [SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.audit_heartbeat'],
+    [SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND, 'chat.supervision_prompt.implementation_heartbeat'],
+    [SUPERVISION_CONTINUE_AUTOMATION_KIND, 'chat.supervision_prompt.continue'],
+    [SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND, 'chat.supervision_prompt.post_audit_finalization'],
+    [SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND, 'chat.supervision_prompt.audit_delegation'],
+    [SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND, 'chat.supervision_prompt.audit_target_recovery'],
+    [SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND, 'chat.supervision_prompt.audit_marker_correction'],
+    [PEER_AUDIT_REWORK_AUTOMATION_KIND, 'chat.supervision_prompt.peer_audit_rework'],
+    [SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND, 'chat.supervision_prompt.auto_audit_mode_control'],
+  ] as const;
+
+  it.each(knownPromptCases)(
+    'renders known kind %s as its one-line label without exposing prompt JSON while collapsed',
+    (automationKind, labelKey) => {
+      expect(SUPERVISION_USER_PROMPT_LABEL_KEYS[automationKind]).toBe(labelKey);
+      const { container } = render(
+        <ChatView
+          events={[userMessage(automationKind, true, `known-${automationKind}`)]}
+          loading={false}
+          sessionId={automationKind.includes('audit') ? 'deck_sub_auditor' : 'deck_main_brain'}
+        />,
+      );
+
+      const disclosure = container.querySelector('.chat-supervision-prompt-toggle');
+      const heartbeat = [
+        SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+        SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+        SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+      ].includes(automationKind as never);
+      expect(disclosure?.textContent).toBe(`${heartbeat ? '❤️' : ''}${expectedLabelByKey[labelKey]}`);
+      expect(container.querySelector('.chat-supervision-prompt')?.classList.contains('is-heartbeat')).toBe(heartbeat);
+      expect(disclosure?.getAttribute('aria-expanded')).toBe('false');
+      expect(container.querySelector('.chat-supervision-prompt-details')).toBeNull();
+      expect(container.textContent).not.toContain('contractRefs');
+      expect(container.querySelector('.chat-user-message-fold')).toBeNull();
+    },
+  );
+
+  it('uses a generic label for unknown supervision kinds but leaves other automation and ordinary messages unchanged', () => {
+    const { container } = render(
+      <ChatView
+        events={[
+          userMessage(`${SUPERVISION_AUTOMATION_KIND_PREFIX}future-kind`, true, 'future-supervision'),
+          userMessage('other-automation', true, 'other-automation'),
+          userMessage(SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND, false, 'non-automation-known-kind'),
+          userMessage(undefined, false, 'ordinary-user'),
+        ]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+
+    expect(container.querySelector('.chat-supervision-prompt-toggle')?.textContent).toBe('Supervision automation');
+    expect(container.querySelectorAll('.chat-user-message-fold')).toHaveLength(3);
+    expect(container.textContent?.match(/contractRefs/g)).toHaveLength(3);
+  });
+
+  it('reveals the complete original prompt on demand inside a bounded debug panel', () => {
+    const firstKind = SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND;
+    const { container } = render(
+      <ChatView
+        events={[userMessage(firstKind)]}
+        loading={false}
+        sessionId="deck_sub_worker"
+      />,
+    );
+    const disclosure = container.querySelector('.chat-supervision-prompt-toggle') as HTMLButtonElement;
+    fireEvent.click(disclosure);
+
+    expect(disclosure.getAttribute('aria-expanded')).toBe('true');
+    expect(container.querySelector('.chat-supervision-prompt-details')?.textContent).toBe(prompt);
+    expect(disclosure.getAttribute('title')).toBe('Hide supervision prompt details');
+  });
+});
+
+describe('repeated supervision heartbeat and WAITING presentation', () => {
+  const heartbeat = (eventId: string, ts: number) => ({
+    eventId,
+    type: 'user.message',
+    ts,
+    payload: {
+      text: '[heartbeat contract]',
+      automation: true,
+      automationKind: SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+    },
+  }) as any;
+  const marker = (eventId: string, ts: number, value = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING) => ({
+    eventId,
+    type: 'assistant.text',
+    ts,
+    payload: { text: value, streaming: false },
+  }) as any;
+  const content = (eventId: string, ts: number, text = 'Real assistant content') => ({
+    eventId,
+    type: 'assistant.text',
+    ts,
+    payload: { text, streaming: false },
+  }) as any;
+
+  it('folds only consecutive heartbeat/marker-only WAITING rows and expands to the unchanged original chips', () => {
+    const events = [
+      heartbeat('h1', 1_700_000_000_001),
+      marker('w1', 1_700_000_000_002),
+      heartbeat('h2', 1_700_000_000_003),
+      content('answer', 1_700_000_000_004),
+      marker('needs-input', 1_700_000_000_005, SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT),
+      heartbeat('h3', 1_700_000_000_006),
+      marker('w2', 1_700_000_000_007),
+    ];
+    const { container } = render(
+      <ChatView events={events} loading={false} sessionId="deck_main_brain" />,
+    );
+
+    const summaries = container.querySelectorAll('.chat-supervision-status-run-toggle');
+    expect(summaries).toHaveLength(2);
+    expect(summaries[0]?.getAttribute('aria-expanded')).toBe('false');
+    expect(summaries[0]?.textContent).toContain('2 heartbeats');
+    expect(summaries[0]?.textContent).toContain('1 waiting marker');
+    expect(container.textContent).toContain('Real assistant content');
+    expect(container.querySelector('.chat-execution-status-chip.needs-input')).not.toBeNull();
+    expect(container.querySelectorAll('.chat-supervision-prompt-toggle')).toHaveLength(0);
+    expect(container.querySelectorAll('.chat-execution-status-chip.waiting')).toHaveLength(0);
+
+    (summaries[0] as HTMLButtonElement).focus();
+    fireEvent.click(summaries[0]);
+    expect(summaries[0]?.getAttribute('aria-expanded')).toBe('true');
+    expect(document.activeElement).toBe(summaries[0]);
+    expect(container.querySelectorAll('.chat-supervision-prompt-toggle')).toHaveLength(2);
+    expect(container.querySelectorAll('.chat-execution-status-chip.waiting')).toHaveLength(1);
+  });
+
+  it('forms and extends one run on live append without touching a singleton', () => {
+    const first = heartbeat('live-h1', 1_700_000_001_001);
+    const view = render(
+      <ChatView events={[first]} loading={false} sessionId="deck_main_brain" />,
+    );
+    expect(view.container.querySelector('.chat-supervision-status-run-toggle')).toBeNull();
+    expect(view.container.querySelector('.chat-supervision-prompt-toggle')).not.toBeNull();
+
+    view.rerender(
+      <ChatView
+        events={[first, marker('live-w1', 1_700_000_001_002)]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    const firstSummary = view.container.querySelector('.chat-supervision-status-run-toggle') as HTMLButtonElement;
+    expect(firstSummary).not.toBeNull();
+    fireEvent.click(firstSummary);
+    expect(firstSummary.getAttribute('aria-expanded')).toBe('true');
+
+    view.rerender(
+      <ChatView
+        events={[first, marker('live-w1', 1_700_000_001_002), heartbeat('live-h2', 1_700_000_001_003)]}
+        loading={false}
+        sessionId="deck_main_brain"
+      />,
+    );
+    const summary = view.container.querySelector('.chat-supervision-status-run-toggle');
+    expect(summary).toBe(firstSummary);
+    expect(summary?.getAttribute('aria-expanded')).toBe('true');
+    expect(summary?.textContent).toContain('2 heartbeats');
+    expect(summary?.textContent).toContain('1 waiting marker');
+  });
+
+  it('keeps a 3000-event restored run as one bounded view item with the full count', () => {
+    const events = Array.from({ length: 3_000 }, (_, index) => (
+      index % 2 === 0
+        ? heartbeat(`bulk-h-${index}`, 1_700_001_000_000 + index)
+        : marker(`bulk-w-${index}`, 1_700_001_000_000 + index)
+    ));
+
+    const allItems = __buildViewItemsForTests(events, true);
+    expect(allItems).toHaveLength(1);
+    expect(allItems[0]).toMatchObject({
+      type: 'supervision-status-run',
+      heartbeatCount: 1_500,
+      waitingCount: 1_500,
+    });
+    expect((allItems[0] as any).statusItems).toHaveLength(3_000);
+
+    const tail = __buildViewItemsTailForTests(events, true, 100);
+    expect(tail.windowStartIndex).toBe(0);
+    expect(tail.items).toHaveLength(1);
+    expect(tail.items[0]).toMatchObject({ heartbeatCount: 1_500, waitingCount: 1_500 });
+  });
+});
 
 vi.mock('../../src/components/ChatMarkdown.js', () => ({
   ChatMarkdown: ({ text, onUrlClick }: { text: string; onUrlClick?: (url: string) => void }) => {
@@ -226,6 +686,47 @@ describe('ChatView', () => {
     fireEvent.click(screen.getByText('chat.load_older'));
 
     expect(screen.getByText('message-0')).toBeTruthy();
+  });
+
+  it('keeps cached messages on screen while a background refresh is still loading', () => {
+    const events = [
+      { eventId: 'u1', type: 'user.message', ts: 1_700_000_000_000, payload: { text: 'cached-question' } },
+      { eventId: 'a1', type: 'assistant.text', ts: 1_700_000_000_001, payload: { text: 'cached-answer' } },
+    ];
+
+    render(
+      <ChatView
+        events={events as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cached_refresh_brain"
+      />,
+    );
+
+    // `loading` means "a refresh is in flight", NOT "there is nothing to show".
+    // History restored from the local cache must paint immediately. The list
+    // used to be gated behind `!loading`, so a pane whose events were already
+    // in state was blanked and replaced by the spinner until the network
+    // answered — the reported "open a chat and it's empty for a while".
+    expect(screen.getByText('cached-question')).toBeTruthy();
+    expect(screen.getByText('cached-answer')).toBeTruthy();
+    expect(screen.queryByText('chat.loading')).toBeNull();
+  });
+
+  it('shows the loading placeholder only when nothing is cached yet', () => {
+    render(
+      <ChatView
+        events={[] as any}
+        loading
+        hasOlderHistory={false}
+        sessionId="deck_cold_open_brain"
+      />,
+    );
+
+    // The spinner still has a job: a genuinely cold pane. And it must not be
+    // mistaken for "no messages" — that placeholder is a different claim.
+    expect(screen.getByText('chat.loading')).toBeTruthy();
+    expect(screen.queryByText('chat.no_events')).toBeNull();
   });
 
   it('reveals locally cached older messages at the top while preserving the reading position', async () => {
@@ -350,33 +851,125 @@ describe('ChatView', () => {
     const content = container.querySelector('.chat-user-message-fold-content');
     expect(fold?.classList.contains('is-folded')).toBe(true);
     expect(content?.classList.contains('is-folded')).toBe(true);
+    expect(content?.textContent).toContain('sent-line-11');
+    expect(screen.getByRole('button', { name: 'chat.user_message_expand' }).getAttribute('aria-expanded')).toBe('false');
 
     fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
 
     expect(fold?.classList.contains('is-folded')).toBe(false);
     expect(content?.classList.contains('is-folded')).toBe(false);
-    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' })).toBeTruthy();
+    expect(screen.getByRole('button', { name: 'chat.user_message_collapse' }).getAttribute('aria-expanded')).toBe('true');
+    fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_collapse' }));
+    expect(content?.classList.contains('is-folded')).toBe(true);
+    expect(content?.textContent).toContain('sent-line-11');
   });
 
-  it('does not collapse sent user messages with ten hard lines', () => {
-    const tenLineText = Array.from({ length: 10 }, (_, index) => `sent-line-${index + 1}`).join('\n');
+  it('folds a long soft-wrapped paragraph from rendered overflow rather than newline count', () => {
+    const layout = installRenderedLineMeasurement(12);
+    const paragraph = 'A single paragraph with enough words to soft-wrap across more than ten visual lines. '.repeat(20);
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-soft-wrap',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: paragraph },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_soft_wrapped_user_message"
+        />,
+      );
 
+      expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(true);
+      expect(container.querySelector('.chat-user-message-fold-content')?.classList.contains('is-folded')).toBe(true);
+      expect(screen.getByRole('button', { name: 'chat.user_message_expand' })).toBeTruthy();
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it('keeps unmeasured content capped before layout without dropping its text', () => {
+    const paragraph = 'Content remains capped until the browser can report its rendered height. '.repeat(20);
     const { container } = render(
       <ChatView
         events={[{
-          eventId: 'evt-user-ten-lines',
+          eventId: 'evt-user-awaiting-layout',
           type: 'user.message',
           ts: 1_700_000_000_000,
-          payload: { text: tenLineText },
+          payload: { text: paragraph },
         }] as any}
         loading={false}
         hasOlderHistory={false}
-        sessionId="deck_ten_line_user_message"
+        sessionId="deck_awaiting_layout_user_message"
       />,
     );
+    const content = container.querySelector('.chat-user-message-fold-content');
+    expect(content?.classList.contains('is-measuring')).toBe(true);
+    expect(content?.textContent).toBe(paragraph);
+    expect(screen.queryByRole('button', { name: 'chat.user_message_expand' })).toBeNull();
+  });
 
-    expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
-    expect(screen.queryByText('chat.user_message_expand')).toBeNull();
+  it('does not expose a fold toggle for content that renders to ten lines', () => {
+    const layout = installRenderedLineMeasurement(10);
+    const tenLineText = 'A paragraph measured at exactly ten rendered lines.';
+
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-ten-lines',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: tenLineText },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_ten_line_user_message"
+        />,
+      );
+
+      expect(container.querySelector('.chat-user-message-fold')?.classList.contains('is-foldable')).toBe(false);
+      expect(screen.queryByRole('button', { name: 'chat.user_message_expand' })).toBeNull();
+    } finally {
+      layout.restore();
+    }
+  });
+
+  it('re-measures width changes without losing the user\'s expanded intent', () => {
+    const layout = installRenderedLineMeasurement(12);
+    const paragraph = 'Soft wrapping must track the rendered width without losing expansion state. '.repeat(20);
+    try {
+      const { container } = render(
+        <ChatView
+          events={[{
+            eventId: 'evt-user-responsive-wrap',
+            type: 'user.message',
+            ts: 1_700_000_000_000,
+            payload: { text: paragraph },
+          }] as any}
+          loading={false}
+          hasOlderHistory={false}
+          sessionId="deck_responsive_user_message"
+        />,
+      );
+      const content = container.querySelector('.chat-user-message-fold-content');
+      fireEvent.click(screen.getByRole('button', { name: 'chat.user_message_expand' }));
+      expect(content?.classList.contains('is-folded')).toBe(false);
+
+      layout.setRenderedLines(8);
+      expect(screen.queryByRole('button', { name: 'chat.user_message_collapse' })).toBeNull();
+      expect(content?.classList.contains('is-folded')).toBe(false);
+
+      layout.setRenderedLines(12);
+      const collapse = screen.getByRole('button', { name: 'chat.user_message_collapse' });
+      expect(collapse.getAttribute('aria-expanded')).toBe('true');
+      expect(content?.classList.contains('is-folded')).toBe(false);
+      expect(content?.textContent).toContain('Soft wrapping');
+    } finally {
+      layout.restore();
+    }
   });
 
   it('parses escaped newlines for timeline display while preserving code examples', () => {
@@ -567,7 +1160,7 @@ describe('ChatView', () => {
     const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
     expect(htmlButton).not.toBeNull();
     fireEvent.click(htmlButton!);
-    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/index.HTML');
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/index.HTML', 'deck_main_brain', { chatFileReference: true });
     expect(onPreviewFile).not.toHaveBeenCalled();
     expect(container.querySelector('.html-fullscreen-preview')).toBeNull();
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
@@ -646,7 +1239,7 @@ describe('ChatView', () => {
     const htmlButton = container.querySelector('.chat-html-preview-btn') as HTMLButtonElement | null;
     expect(htmlButton).not.toBeNull();
     expect(() => fireEvent.click(htmlButton!)).not.toThrow();
-    expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./dist/offline.HTML');
+    expect(ws.fsReadFile).toHaveBeenCalledWith('./dist/offline.HTML', 'deck_main_brain', { chatFileReference: true });
     expect(container.textContent).toContain('Open ./dist/offline.HTML');
     expect(document.body.querySelector('.html-fullscreen-preview')).not.toBeNull();
     expect(document.body.textContent).toContain('upload.daemon_offline');
@@ -660,7 +1253,8 @@ describe('ChatView', () => {
     const revokeObjectURL = vi.fn();
     Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: createObjectURL });
     Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, value: revokeObjectURL });
-    const openSpy = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const opened = { opener: window } as unknown as Window;
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(opened);
 
     try {
       const wsListeners = new Set<(msg: any) => void>();
@@ -702,7 +1296,8 @@ describe('ChatView', () => {
       });
 
       expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
-      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank', 'noopener,noreferrer');
+      expect(openSpy).toHaveBeenCalledWith('blob:html-preview', '_blank');
+      expect(opened.opener).toBeNull();
       expect(document.body.querySelector('.html-fullscreen-preview')).toBeNull();
 
       vi.runOnlyPendingTimers();
@@ -744,7 +1339,7 @@ describe('ChatView', () => {
     );
 
     await waitFor(() => {
-      expect(ws.fsReadFile).toHaveBeenCalledWith('/repo/./screenshots/result.png');
+      expect(ws.fsReadFile).toHaveBeenCalledWith('./screenshots/result.png', 'deck_image_preview', { chatFileReference: true });
     });
 
     act(() => {

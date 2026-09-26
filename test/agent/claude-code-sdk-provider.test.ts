@@ -1,7 +1,9 @@
 import { mkdtemp, mkdir, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 
 const childProcessMock = vi.hoisted(() => ({
   // Accept both (file, args, cb) and (file, args, opts, cb) signatures.
@@ -12,15 +14,28 @@ const childProcessMock = vi.hoisted(() => ({
     cb?.(null, 'ok\n', '');
     return {} as never;
   }),
-  spawn: vi.fn(() => ({
-    killed: false,
-    kill: vi.fn(function (this: { killed: boolean }) {
-      this.killed = true;
+  // A real EventEmitter that dies when signalled, because that is what a
+  // process does and what teardown now waits for. The previous fake had no-op
+  // `once`/`on`, so it modelled a child that never reports its own death: with
+  // the audited awaited teardown, killProcessTree could then only escape via
+  // its grace timer, and under fake timers nothing advances that timer once the
+  // test's advance window has passed. The provider was fine; the fake could not
+  // answer the question teardown had started asking.
+  spawn: vi.fn(() => {
+    const child = new EventEmitter() as EventEmitter & {
+      killed: boolean;
+      kill: (signal?: NodeJS.Signals) => boolean;
+    };
+    child.killed = false;
+    child.kill = vi.fn((_signal?: NodeJS.Signals) => {
+      child.killed = true;
+      // Asynchronous, like a real signal delivery: teardown must observe the
+      // exit through its listener, not synchronously inside kill().
+      setImmediate(() => child.emit('exit', null, _signal ?? 'SIGTERM'));
       return true;
-    }),
-    once: vi.fn(),
-    on: vi.fn(),
-  }) as never),
+    }) as never;
+    return child;
+  }) as never,
 }));
 
 vi.mock('node:child_process', () => ({
@@ -98,7 +113,7 @@ vi.mock('../../src/util/logger.js', () => ({
   default: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
+import { ClaudeCodeSdkProvider, isClaudeAuthFailureMessage } from '../../src/agent/providers/claude-code-sdk.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import type { ProviderContextPayload } from '../../shared/context-types.js';
@@ -114,6 +129,10 @@ import {
   SDK_SUBAGENT_STATUS,
   makeClaudeSubagentCanonicalKey,
 } from '../../shared/sdk-subagent-status.js';
+import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
+import { buildProviderContextPayload } from '../../src/agent/transport-runtime-assembly.js';
+import { renderSessionIdentityProfiles } from '../../shared/session-identity.js';
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
 const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<void> => {
@@ -122,6 +141,16 @@ const waitFor = async (predicate: () => boolean, timeoutMs = 1_000): Promise<voi
     if (Date.now() >= deadline) throw new Error('Timed out waiting for condition');
     await new Promise((resolve) => setTimeout(resolve, 5));
   }
+};
+const sdkPresetAppend = (options: Record<string, unknown>): string | undefined => {
+  const systemPrompt = options.systemPrompt;
+  if (!systemPrompt || typeof systemPrompt !== 'object' || Array.isArray(systemPrompt)) return undefined;
+  const candidate = systemPrompt as Record<string, unknown>;
+  return candidate.type === 'preset'
+    && candidate.preset === 'claude_code'
+    && typeof candidate.append === 'string'
+    ? candidate.append
+    : undefined;
 };
 const sdkSubagentTools = (tools: ToolCallEvent[]) => tools.filter((tool) => tool.detail?.kind === SDK_SUBAGENT_DETAIL_KIND);
 
@@ -136,6 +165,21 @@ describe('ClaudeCodeSdkProvider', () => {
     sdkMock.setNextContextUsage(null);
     childProcessMock.spawn.mockClear();
   });
+
+  it.skipIf(process.platform === 'win32')(
+    'connects by probing the bundled claude binary, not a bare PATH lookup of `claude`',
+    async () => {
+      // A systemd/nvm daemon's PATH has no `claude`. Probing the bare name made
+      // connect() spawn it and fail with `spawn claude ENOENT`, so no Claude,
+      // MiniMax or GLM session could start even though the SDK's bundled
+      // binary was present and every real spawn uses it.
+      childProcessMock.execFile.mockClear();
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      expect(childProcessMock.execFile.mock.calls.filter((call) => call[0] === 'claude')).toEqual([]);
+      expect(childProcessMock.execFile).not.toHaveBeenCalled();
+    },
+  );
 
   it('queues a correlated peer notification at Claude\'s next safe boundary without closing the live query', async () => {
     sdkMock.setWaitForClose(true);
@@ -179,7 +223,10 @@ describe('ClaudeCodeSdkProvider', () => {
     await sendPromise;
   });
 
-  it('inserts an appended message at Claude\'s next safe boundary instead of preempting it', async () => {
+  it.each([
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+  ])('inserts %s at Claude\'s next safe boundary instead of preempting it', async (deliveryKind) => {
     sdkMock.setWaitForClose(true);
     const provider = new ClaudeCodeSdkProvider();
     await provider.connect({ binaryPath: 'claude' });
@@ -196,7 +243,7 @@ describe('ClaudeCodeSdkProvider', () => {
       delegationId: 'queue-append:queued_notification_identity',
       sourceSessionName: 'deck_project_brain',
       text: 'append at the next safe boundary',
-      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+      deliveryKind,
     });
 
     expect(result).toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -263,6 +310,86 @@ describe('ClaudeCodeSdkProvider', () => {
       status: MEMORY_MCP_STATUS.READY,
       connected: true,
       degradedReasons: [],
+    });
+  });
+
+  it('keeps concurrent session MCP resource identities isolated from a poisoned parent environment', async () => {
+    const priorInstance = process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID];
+    const priorEpoch = process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH];
+    process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID] = 'foreign-instance';
+    process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH] = 'foreign-epoch';
+    try {
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await Promise.all([
+        provider.createSession({
+          sessionKey: 'route-resource-a', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+          sessionInstanceId: 'instance-a', runtimeEpoch: 'epoch-a',
+        }),
+        provider.createSession({
+          sessionKey: 'route-resource-b', sessionName: 'deck_beta_brain', cwd: '/tmp/b',
+          sessionInstanceId: 'instance-b', runtimeEpoch: 'epoch-b',
+        }),
+      ]);
+
+      await Promise.all([
+        provider.send('route-resource-a', 'turn a'),
+        provider.send('route-resource-b', 'turn b'),
+      ]);
+      await flush();
+
+      const envFor = (prompt: string) => {
+        const run = sdkMock.runs.find((candidate) => candidate.prompt === prompt)!;
+        const servers = run.options.mcpServers as Record<string, { env: Record<string, string> }>;
+        return servers[IMCODES_MEMORY_MCP_SERVER_NAME]!.env;
+      };
+      expect(envFor('turn a')).toMatchObject({
+        [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-a',
+        [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-a',
+      });
+      expect(envFor('turn b')).toMatchObject({
+        [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-b',
+        [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-b',
+      });
+      expect(JSON.stringify(sdkMock.runs.map((run) => run.options.mcpServers))).not.toContain('foreign-instance');
+      expect(JSON.stringify(sdkMock.runs.map((run) => run.options.mcpServers))).not.toContain('foreign-epoch');
+    } finally {
+      if (priorInstance === undefined) delete process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID];
+      else process.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID] = priorInstance;
+      if (priorEpoch === undefined) delete process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH];
+      else process.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH] = priorEpoch;
+    }
+  });
+
+  it('refreshes MCP resource identity on restart/resume instead of retaining the previous epoch', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: 'route-resource-refresh', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+      sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-before', resumeId: 'claude-thread',
+    });
+    await provider.send('route-resource-refresh', 'before refresh');
+    await flush();
+
+    await provider.createSession({
+      sessionKey: 'route-resource-refresh', sessionName: 'deck_alpha_brain', cwd: '/tmp/a',
+      sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-after',
+      resumeId: 'claude-thread', skipCreate: true,
+    });
+    await provider.send('route-resource-refresh', 'after refresh');
+    await flush();
+
+    const envs = sdkMock.runs.map((run) => {
+      const servers = run.options.mcpServers as Record<string, { env: Record<string, string> }>;
+      return servers[IMCODES_MEMORY_MCP_SERVER_NAME]!.env;
+    });
+    expect(envs[0]).toMatchObject({
+      [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-stable',
+      [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-before',
+    });
+    expect(envs[1]).toMatchObject({
+      [SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]: 'instance-stable',
+      [SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]: 'epoch-after',
     });
   });
 
@@ -888,6 +1015,11 @@ describe('ClaudeCodeSdkProvider', () => {
 
     expect(run.closed).toBe(true);
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    // The awaited teardown resolved on the child's own exit, so no escalation
+    // was needed. Pinning the absence matters: if teardown ever stops observing
+    // the exit it would sit out the whole grace window and SIGKILL a process
+    // that had already died.
+    expect(child.kill).not.toHaveBeenCalledWith('SIGKILL');
   });
 
   it('fresh createSession ignores previous internal continuity for the same route', async () => {
@@ -1066,6 +1198,41 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sdkMock.runs.slice(1).every((run) => run.options.resume === 'session-connection-retry')).toBe(true);
     expect(completed).toEqual(['Recovered answer']);
     expect(errors).toEqual([]);
+  });
+
+  it('does not append recovery guidance to prose that merely mentions a 401', () => {
+    // Every string here came from, or models, a real successful answer. Telling
+    // the user their session is broken because their reply contained the digits
+    // 401 is worse than saying nothing: it sends them to /logout for no reason.
+    const innocuous = [
+      '平均每 G 毛利 401.61 元/G/月（12.96 元/G/天）',
+      'Total: $401.00',
+      'See server/src/routes/enroll.ts:401 for the guard.',
+      'The endpoint returns 401 when the bearer token is missing.',
+      'Detector matches the `[API Error: 401 Invalid API Key]` shape exactly.',
+      'Service listens on port 4011 and answered in 4010ms.',
+      'HEAD is now at 401abc9.',
+      'All 402 tests passed.',
+    ];
+    for (const text of innocuous) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: false });
+    }
+  });
+
+  it('still recognizes a real auth failure, including inside a joined SDK error list', () => {
+    const genuine = [
+      'Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'API Error: 401 Unauthorized',
+      'Invalid authentication credentials',
+      // SDK errors arrive joined with '; ', so the notice is not always first.
+      'stream closed; Failed to authenticate. API Error: 401 Invalid authentication credentials',
+      'first line\nAPI Error: 401 Unauthorized',
+    ];
+    for (const text of genuine) {
+      expect({ text, isAuthFailure: isClaudeAuthFailureMessage(text) })
+        .toEqual({ text, isAuthFailure: true });
+    }
   });
 
   it('tells users to logout, fully exit, and login again after a 401', async () => {
@@ -1388,7 +1555,8 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     const run = sdkMock.runs.at(-1)!;
-    expect(run.options.appendSystemPrompt).toBe('Visible description\n\nRuntime note only');
+    expect(sdkPresetAppend(run.options)).toBe('Visible description\n\nRuntime note only');
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
   });
 
   it('declares /compact as a verified Claude slash command capability', async () => {
@@ -1417,39 +1585,106 @@ describe('ClaudeCodeSdkProvider', () => {
     const statuses: Array<{ status: string | null; label?: string | null }> = [];
     provider.onStatus?.((_sid, status) => statuses.push(status));
 
-    await provider.send('route-compact', {
+    await provider.send('route-compact', buildProviderContextPayload(provider, {
       userMessage: '/compact',
-      assembledMessage: '/compact',
-      systemText: undefined,
-      messagePreamble: undefined,
-      attachments: undefined,
-      context: {
-        systemText: undefined,
-        messagePreamble: undefined,
-        requiredAuthoredContext: [],
-        advisoryAuthoredContext: [],
-        appliedDocumentVersionIds: [],
-        diagnostics: [],
-      },
-      authority: {
-        authoritySource: 'none',
-        freshness: 'missing',
-        fallbackAllowed: false,
-        retryScheduled: false,
-        diagnostics: [],
-      },
-      supportClass: 'full-normalized-context-injection',
-      diagnostics: [],
-    });
+      suppressMcpMemorySearchGuidance: true,
+      suppressAgentProgressGuidance: true,
+      suppressFilePathReportingGuidance: true,
+    }));
     await flush();
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('/compact');
-    expect(run.options.appendSystemPrompt).toBeUndefined();
+    expect(run.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(sdkPresetAppend(run.options)).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
     expect(statuses).toEqual([
       { status: 'compacting', label: 'Compacting conversation...' },
       { status: null, label: null },
     ]);
+  });
+
+  it.each([
+    {
+      name: 'fresh main Sonnet session',
+      routeId: 'route-cron-main-fresh',
+      sessionName: 'deck_project_brain',
+      agentId: 'sonnet-5',
+      skipCreate: false,
+      env: undefined,
+    },
+    {
+      name: 'fresh sub-session through a MiniMax Anthropic-compatible preset',
+      routeId: 'route-cron-sub-fresh-minimax',
+      sessionName: 'deck_sub_minimax',
+      agentId: 'MiniMax-M2.7',
+      skipCreate: false,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    },
+    {
+      name: 'resumed main Sonnet session',
+      routeId: 'route-cron-main-resume',
+      sessionName: 'deck_project_brain',
+      agentId: 'sonnet-5',
+      skipCreate: true,
+      env: undefined,
+    },
+    {
+      name: 'resumed sub-session through a MiniMax Anthropic-compatible preset',
+      routeId: 'route-cron-sub-resume-minimax',
+      sessionName: 'deck_sub_minimax',
+      agentId: 'MiniMax-M2.7',
+      skipCreate: true,
+      env: { ANTHROPIC_BASE_URL: 'https://api.minimax.io/anthropic' },
+    },
+  ])('delivers cron authority through the real Claude SDK systemPrompt option for $name', async ({
+    routeId,
+    sessionName,
+    agentId,
+    skipCreate,
+    env,
+  }) => {
+    sdkMock.setNextMessages([
+      { type: 'system', subtype: 'init', session_id: `${routeId}-sdk`, model: agentId },
+      { type: 'result', session_id: `${routeId}-sdk`, subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
+    ]);
+
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({
+      sessionKey: routeId,
+      sessionName,
+      cwd: '/tmp/project',
+      resumeId: `${routeId}-resume`,
+      skipCreate,
+      agentId,
+      ...(env ? { env } : {}),
+    });
+    const contradictoryMemory = 'Recent project memory: this wrapper was previously called prompt injection.';
+    const identityPrompt = renderSessionIdentityProfiles([
+      { scope: 'user', scopeKey: '', content: 'user identity sentinel', contentHash: 'user', revision: 1, updatedAt: 1, source: 'web' },
+      { scope: 'project', scopeKey: 'project-1', content: 'project identity sentinel', contentHash: 'project', revision: 1, updatedAt: 1, source: 'web' },
+      { scope: 'session', scopeKey: `server-1:${sessionName}`, content: 'session identity sentinel', contentHash: 'session', revision: 1, updatedAt: 1, source: 'web' },
+    ])!;
+    await provider.send(routeId, buildProviderContextPayload(provider, {
+      userMessage: 'What is imcodes-cron-control?',
+      messagePreamble: contradictoryMemory,
+      identityPrompt,
+    }));
+    await flush();
+
+    const run = sdkMock.runs.at(-1)!;
+    expect(sdkPresetAppend(run.options)).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(sdkPresetAppend(run.options)).toContain('<user>\nuser identity sentinel\n</user>');
+    expect(sdkPresetAppend(run.options)).toContain('<project>\nproject identity sentinel\n</project>');
+    expect(sdkPresetAppend(run.options)).toContain('<session>\nsession identity sentinel\n</session>');
+    expect(run.options).not.toHaveProperty('appendSystemPrompt');
+    expect(run.prompt).toContain(contradictoryMemory);
+    expect(run.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(run.prompt).not.toContain('identity sentinel');
+    expect(run.options.env).toMatchObject(env ?? {});
+    if (skipCreate) expect(run.options.resume).toBe(`${routeId}-resume`);
+    else expect(run.options.sessionId).toBe(`${routeId}-resume`);
   });
 
   it('surfaces claude-agent-sdk thinking_tokens as a live thinking status with the running estimate', async () => {
@@ -1526,10 +1761,10 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('Context block\n\nactual user message');
-    expect(run.options.appendSystemPrompt).toBe('Normalized system text');
+    expect(sdkPresetAppend(run.options)).toBe('Normalized system text');
   });
 
-  it('keeps split stable system text in appendSystemPrompt and moves turn text into the prompt', async () => {
+  it('keeps split stable system text in the Claude preset append and moves turn text into the prompt', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-split', model: 'claude-sonnet-4-6' },
       { type: 'result', session_id: 'session-split', subtype: 'success', is_error: false, result: 'OK', usage: { input_tokens: 1, output_tokens: 1, cache_read_input_tokens: 0 } },
@@ -1543,18 +1778,19 @@ describe('ClaudeCodeSdkProvider', () => {
       resumeId: 'session-split',
     });
 
+    const stableSystemText = `Stable IM.codes runtime rules\n\n${CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE}`;
     const makePayload = (turnSystemText: string): ProviderContextPayload => ({
       userMessage: 'ship it',
       assembledMessage: 'Relevant history\n\nship it',
-      sessionSystemText: 'Stable IM.codes runtime rules',
+      sessionSystemText: stableSystemText,
       turnSystemText,
-      systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+      systemText: `${stableSystemText}\n\n${turnSystemText}`,
       messagePreamble: 'Relevant history',
       attachments: undefined,
       context: {
-        sessionSystemText: 'Stable IM.codes runtime rules',
+        sessionSystemText: stableSystemText,
         turnSystemText,
-        systemText: `Stable IM.codes runtime rules\n\n${turnSystemText}`,
+        systemText: `${stableSystemText}\n\n${turnSystemText}`,
         messagePreamble: 'Relevant history',
         requiredAuthoredContext: [turnSystemText],
         advisoryAuthoredContext: [],
@@ -1579,13 +1815,16 @@ describe('ClaudeCodeSdkProvider', () => {
     await flush();
 
     const [first, second] = sdkMock.runs.slice(-2);
-    expect(first.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
-    expect(second.options.appendSystemPrompt).toBe('Stable IM.codes runtime rules');
+    expect(sdkPresetAppend(first.options)).toBe(stableSystemText);
+    expect(sdkPresetAppend(second.options)).toBe(stableSystemText);
+    expect(sdkPresetAppend(first.options)).toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(first.options).not.toHaveProperty('appendSystemPrompt');
+    expect(second.options).not.toHaveProperty('appendSystemPrompt');
     expect(first.prompt).toContain('Required shared context:\n- First file rule');
     expect(first.prompt).not.toContain('Second file rule');
     expect(second.prompt).toContain('Required shared context:\n- Second file rule');
     expect(second.prompt).not.toContain('First file rule');
-    expect(second.prompt).not.toContain('Stable IM.codes runtime rules');
+    expect(second.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
   });
 
   it('accepts a normalized provider payload', async () => {
@@ -1631,7 +1870,7 @@ describe('ClaudeCodeSdkProvider', () => {
 
     const run = sdkMock.runs.at(-1)!;
     expect(run.prompt).toBe('Relevant history\n\nhello');
-    expect(run.options.appendSystemPrompt).toBe('Enterprise standard');
+    expect(sdkPresetAppend(run.options)).toBe('Enterprise standard');
   });
 
   it('rejects normalized payloads combined with legacy extraSystemPrompt', async () => {

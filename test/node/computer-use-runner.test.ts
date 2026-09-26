@@ -5,19 +5,98 @@ import {
   browserExecutableCandidatesForTest,
   browserAutomationEndpointForTest,
   browserLaunchArgsForTest,
+  browserCdpExceptionMessageForTest,
+  browserSelectorScriptForTest,
   browserSnapshotPayloadForTest,
+  boundComputerUseStateTextForTest,
   captureBrowserViewportForTest,
+  evaluateBrowserExpressionForTest,
   isFastWindowsCoordinatePointerActionForTest,
   normalizeBrowserUserAgent,
   normalizeComputerUseErrorForTest,
   normalizeOpenComputerUseParsedResult,
   openComputerUseCallArgs,
+  openComputerUseBinaryIdentityForTest,
   openComputerUseCandidateBinariesForTest,
   openComputerUseEnv,
+  resolveOpenComputerUseBinaryForCurrentProcessForTest,
+  resolveOpenComputerUseBinaryForTest,
   selectOpenComputerUseBinaryForTest,
+  verifyOpenComputerUseBinaryForLaunchForTest,
 } from '../../src/node/computer-use-runner.js';
 
 describe('computer use runner open-computer-use CLI', () => {
+  it('bounds accessibility state by default and reports the exact omitted node count', () => {
+    const tree = Array.from({ length: 260 }, (_, index) => `[${index}] button node ${index}`).join('\n');
+    expect(boundComputerUseStateTextForTest(tree, {})).toEqual({
+      text: `${Array.from({ length: 200 }, (_, index) => `[${index}] button node ${index}`).join('\n')}\ntruncated: 60 nodes omitted`,
+      truncated: true,
+      omittedNodes: 60,
+    });
+  });
+
+  it('honors a smaller maxNodes state scope and preserves a complete untruncated tree', () => {
+    expect(boundComputerUseStateTextForTest('one\ntwo\nthree', { maxNodes: 2 })).toEqual({
+      text: 'one\ntwo\ntruncated: 1 nodes omitted',
+      truncated: true,
+      omittedNodes: 1,
+    });
+    expect(boundComputerUseStateTextForTest('one\ntwo', { maxNodes: 2 })).toEqual({
+      text: 'one\ntwo', truncated: false, omittedNodes: 0,
+    });
+    const oversizedNode = boundComputerUseStateTextForTest('x'.repeat(64 * 1024), {});
+    expect(oversizedNode).toMatchObject({ truncated: true, omittedNodes: 1 });
+    expect(Buffer.byteLength(oversizedNode.text, 'utf8')).toBeLessThanOrEqual(48 * 1024);
+    expect(oversizedNode.text).toContain('truncated: 1 nodes omitted');
+  });
+
+  it('applies state bounds to get_app_state and action includeState results', async () => {
+    const tree = Array.from({ length: 205 }, (_, index) => `[${index}] item`).join('\n');
+    const state = await normalizeOpenComputerUseParsedResult('get_app_state', { app: 'chrome' }, {
+      content: [{ type: 'text', text: tree }],
+    });
+    expect(state.truncated).toBe(true);
+    expect(state.content[0]).toMatchObject({ type: 'text', text: expect.stringContaining('truncated: 5 nodes omitted') });
+
+    const click = await normalizeOpenComputerUseParsedResult('click', {
+      app: 'chrome', element_index: '1', includeState: true, maxNodes: 3,
+    }, { content: [{ type: 'text', text: 'one\ntwo\nthree\nfour' }] });
+    expect(click).toMatchObject({
+      truncated: true,
+      content: [{ type: 'text', text: 'one\ntwo\nthree\ntruncated: 1 nodes omitted' }],
+    });
+
+    const splitTree = await normalizeOpenComputerUseParsedResult('get_app_state', { app: 'chrome' }, {
+      content: [
+        { type: 'text', text: Array.from({ length: 150 }, (_, index) => `first-${index}`).join('\n') },
+        { type: 'text', text: Array.from({ length: 100 }, (_, index) => `second-${index}`).join('\n') },
+      ],
+    });
+    expect(splitTree.content).toHaveLength(1);
+    expect(splitTree.content[0]).toMatchObject({
+      type: 'text', text: expect.stringContaining('truncated: 50 nodes omitted'),
+    });
+  });
+
+  it('forwards bounded get_app_state collection controls without leaking wrapper-only keys', () => {
+    expect(openComputerUseCallArgs('get_app_state', '{"app":"chrome"}'))
+      .toEqual(['call', 'get_app_state', '--args', JSON.stringify({
+        app: 'chrome', text_limit: 1_000, max_tree_depth: 64,
+      })]);
+    expect(openComputerUseCallArgs('get_app_state', '{"app":"chrome","maxNodes":25,"maxDepth":4}'))
+      .toEqual(['call', 'get_app_state', '--args', JSON.stringify({
+        app: 'chrome', text_limit: 1_000, max_tree_depth: 4,
+      })]);
+  });
+
+  it('invalidates the long-lived MCP helper when the sidecar bytes are replaced in place', () => {
+    const path = 'C:\\ProgramData\\imcodes-node\\computer-use-helper\\open-computer-use.exe';
+    const before = openComputerUseBinaryIdentityForTest(path, { size: 10, mtimeMs: 100, ino: 1 });
+    const after = openComputerUseBinaryIdentityForTest(path, { size: 11, mtimeMs: 101, ino: 1 });
+    expect(after).not.toBe(before);
+    expect(openComputerUseBinaryIdentityForTest(path, null)).toBe(path);
+  });
+
   it('uses the supported JSON argument form without unsupported timeout flags', () => {
     expect(openComputerUseCallArgs('list_apps', '{}')).toEqual(['call', 'list_apps', '--args', '{}']);
   });
@@ -102,6 +181,108 @@ describe('computer use runner open-computer-use CLI', () => {
     }
   });
 
+  it('resolves the signed packaged macOS app from the module layout when PATH has no helper', async () => {
+    const packaged = resolve('/tmp/imcodes-fixture/dist/computer-use-helper/darwin-arm64/Open Computer Use.app/Contents/MacOS/OpenComputerUse');
+    const verify = vi.fn(async (candidate: string) => candidate === packaged);
+
+    await expect(resolveOpenComputerUseBinaryForTest({
+      platform: 'darwin',
+      arch: 'arm64',
+      moduleFilePath: resolve('/tmp/imcodes-fixture/dist/src/node/computer-use-runner.js'),
+      entryFilePath: resolve('/tmp/unrelated/imcodes'),
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/unrelated',
+      fileExists: async (candidate) => candidate === packaged,
+      verifyTrustedArtifact: verify,
+    })).resolves.toBe(packaged);
+    expect(verify).toHaveBeenCalledWith(packaged);
+  });
+
+  it('wires the running entry location into production resolution instead of relying on cwd or PATH', async () => {
+    const packaged = resolve('dist/computer-use-helper/darwin-arm64/Open Computer Use.app/Contents/MacOS/OpenComputerUse');
+    const exists = vi.fn(async (candidate: string) => candidate === packaged);
+    const verify = vi.fn(async (candidate: string) => exists(candidate));
+
+    const selected = await resolveOpenComputerUseBinaryForCurrentProcessForTest({
+      platform: 'darwin',
+      arch: 'arm64',
+      entryFilePath: resolve('dist/src/index.js'),
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/unrelated',
+      fileExists: exists,
+      verifyTrustedArtifact: verify,
+    });
+    expect(selected).toBe(packaged);
+  });
+
+  it('resolves the signed Windows sidecar in a CJS/SEA build where import.meta.url is unavailable', async () => {
+    const packaged = 'C:\\ProgramData\\imcodes-node\\computer-use-helper\\open-computer-use.exe';
+    const selected = await resolveOpenComputerUseBinaryForCurrentProcessForTest({
+      platform: 'win32',
+      arch: 'x64',
+      entryFilePath: 'C:\\Program Files\\imcodes-node\\imcodes-node.exe',
+      env: { PATH: 'C:\\Windows\\System32' },
+      cwd: 'C:\\Program Files\\imcodes-node',
+      fileExists: async (candidate) => candidate === packaged,
+      verifyTrustedArtifact: async (candidate) => candidate === packaged,
+    });
+    expect(selected).toBe(packaged);
+  });
+
+  it('uses the verified persistent macOS runtime after restart without PATH fallback', async () => {
+    const runtime = '/Library/Application Support/imcodes-node-computer-use/Open Computer Use.app/Contents/MacOS/OpenComputerUse';
+    const verify = vi.fn(async (candidate: string) => candidate === runtime);
+    const options = {
+      platform: 'darwin' as const,
+      arch: 'arm64',
+      moduleFilePath: resolve('/tmp/missing/dist/src/node/computer-use-runner.js'),
+      entryFilePath: resolve('/tmp/missing/imcodes'),
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/missing',
+      fileExists: async (candidate: string) => candidate === runtime,
+      verifyTrustedArtifact: verify,
+    };
+
+    await expect(resolveOpenComputerUseBinaryForTest(options)).resolves.toBe(runtime);
+    await expect(resolveOpenComputerUseBinaryForTest(options)).resolves.toBe(runtime);
+    expect(verify).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails with a typed actionable macOS error when packaged candidates are missing or corrupt', async () => {
+    const app = resolve('/tmp/imcodes-fixture/dist/computer-use-helper/darwin-arm64/Open Computer Use.app/Contents/MacOS/OpenComputerUse');
+    const base = {
+      platform: 'darwin' as const,
+      arch: 'arm64',
+      moduleFilePath: resolve('/tmp/imcodes-fixture/dist/src/node/computer-use-runner.js'),
+      entryFilePath: resolve('/tmp/unrelated/imcodes'),
+      env: { PATH: '/usr/bin:/bin' },
+      cwd: '/tmp/unrelated',
+    };
+    await expect(resolveOpenComputerUseBinaryForTest({
+      ...base,
+      fileExists: async () => false,
+      verifyTrustedArtifact: async () => true,
+    })).rejects.toThrow('signed_macos_open_computer_use_helper_unavailable');
+    await expect(resolveOpenComputerUseBinaryForTest({
+      ...base,
+      fileExists: async (candidate) => candidate === app,
+      verifyTrustedArtifact: async () => false,
+    })).rejects.toThrow('signed_macos_open_computer_use_helper_unavailable');
+  });
+
+  it('re-verifies the selected macOS app at every helper process start', async () => {
+    const binary = '/signed/Open Computer Use.app/Contents/MacOS/OpenComputerUse';
+    const verify = vi.fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error('signature changed'));
+
+    await expect(verifyOpenComputerUseBinaryForLaunchForTest(binary, 'darwin', verify))
+      .resolves.toBeUndefined();
+    await expect(verifyOpenComputerUseBinaryForLaunchForTest(binary, 'darwin', verify))
+      .rejects.toThrow('signature changed');
+    expect(verify).toHaveBeenCalledTimes(2);
+  });
+
   it('production Windows selection rejects PATH and unsigned helpers before choosing the anchored candidate', async () => {
     const exists = vi.fn(async (path: string) => path !== 'C:\\missing.exe');
     const verify = vi.fn(async (path: string) => path === 'C:\\signed.exe');
@@ -135,6 +316,14 @@ describe('computer use runner open-computer-use CLI', () => {
     });
     expect(openComputerUseEnv('click', { PATH: 'x' }, 'win32')).toBeUndefined();
     expect(openComputerUseEnv('type_text', { PATH: 'x' }, 'darwin')).toBeUndefined();
+  });
+
+  it('turns the typed macOS helper failure into an actionable unavailable state', () => {
+    expect(normalizeComputerUseErrorForTest(
+      'list_apps',
+      'signed_macos_open_computer_use_helper_unavailable',
+      'darwin',
+    ).error).toContain('signed Open Computer Use app is unavailable');
   });
 
   it('makes Windows fast coordinate pointer actions per-monitor DPI-aware before geometry calls', () => {
@@ -293,6 +482,103 @@ describe('computer use runner open-computer-use CLI', () => {
 });
 
 describe('computer use runner browser user agent', () => {
+  it('uses the bounded CDP exception description instead of the empty Uncaught label', () => {
+    expect(browserCdpExceptionMessageForTest({
+      text: 'Uncaught',
+      exception: {
+        className: 'ReferenceError',
+        description: 'ReferenceError: missingValue is not defined\n    at <anonymous>:1:1',
+      },
+    })).toBe('page_exception: ReferenceError: missingValue is not defined\n    at <anonymous>:1:1');
+    expect(browserCdpExceptionMessageForTest({
+      text: 'Uncaught',
+      exception: { description: 'Error: element_not_found: #missing\n    at <anonymous>:1:1' },
+    })).toBe('element_not_found: #missing');
+    expect(browserCdpExceptionMessageForTest({
+      text: 'Uncaught',
+      exception: { description: "Error: invalid_selector: Failed to execute 'querySelector': not valid\nstack" },
+    })).toBe("invalid_selector: Failed to execute 'querySelector': not valid");
+    expect(browserCdpExceptionMessageForTest({
+      text: 'Uncaught',
+      exception: { description: "SyntaxError: Failed to execute 'querySelector' on 'Document': 'text=vm' is not a valid selector.\nstack" },
+    })).toBe("invalid_selector: SyntaxError: Failed to execute 'querySelector' on 'Document': 'text=vm' is not a valid selector.");
+    const bounded = browserCdpExceptionMessageForTest({
+      text: 'Uncaught', exception: { description: `Error: ${'x'.repeat(16 * 1024)}` },
+    });
+    expect(bounded).toMatch(/^page_exception: Error: /u);
+    expect(Buffer.byteLength(bounded, 'utf8')).toBeLessThanOrEqual(8 * 1024);
+  });
+
+  it('propagates the real CDP page exception through the production evaluator', async () => {
+    const call = vi.fn(async () => ({
+      exceptionDetails: {
+        text: 'Uncaught',
+        exception: { description: 'TypeError: page exploded\n    at <anonymous>:1:1' },
+      },
+    }));
+    await expect(evaluateBrowserExpressionForTest({ call }, 'explode()', 5_000))
+      .rejects.toThrow('page_exception: TypeError: page exploded');
+    expect(call).toHaveBeenCalledWith('Runtime.evaluate', {
+      expression: 'explode()', awaitPromise: true, returnByValue: true, timeout: 5_000,
+    }, 5_000);
+  });
+
+  it.each(['vm-125 (linux)', 'text=vm-125 (linux)', 'Submit'])(
+    'falls back from selector=%s to visible text',
+    (selector) => {
+      const click = vi.fn();
+      const candidate = {
+        innerText: 'vm-125 (linux) Submit', textContent: '',
+        getAttribute: () => '',
+        getBoundingClientRect: () => ({ width: 20, height: 10 }),
+        scrollIntoView: vi.fn(), focus: vi.fn(), click,
+      };
+      const document = {
+        querySelector: vi.fn((value: string) => {
+          if (value.includes('(') || value.startsWith('text=')) throw new SyntaxError(`invalid selector ${value}`);
+          return null;
+        }),
+        querySelectorAll: vi.fn(() => [candidate]),
+      };
+      const script = browserSelectorScriptForTest({ selector }, 'click');
+      expect(new Function('document', 'Event', `return ${script}`)(document, class {})).toBe(true);
+      expect(click).toHaveBeenCalledOnce();
+    },
+  );
+
+  it('prefers the exact interactive visible-text target over a containing ancestor', () => {
+    const parentClick = vi.fn();
+    const childClick = vi.fn();
+    const element = (innerText: string, click: () => void) => ({
+      innerText, textContent: '', getAttribute: () => '',
+      getBoundingClientRect: () => ({ width: 20, height: 10 }),
+      scrollIntoView: vi.fn(), focus: vi.fn(), click,
+    });
+    const parent = element('Settings Submit Help', parentClick);
+    const child = element('Submit', childClick);
+    const document = {
+      querySelector: () => null,
+      querySelectorAll: () => [parent, child],
+    };
+    const script = browserSelectorScriptForTest({ selector: 'Submit' }, 'click');
+    expect(new Function('document', 'Event', `return ${script}`)(document, class {})).toBe(true);
+    expect(childClick).toHaveBeenCalledOnce();
+    expect(parentClick).not.toHaveBeenCalled();
+  });
+
+  it('keeps invalid-selector and missing-element failures distinct after text fallback', () => {
+    const document = {
+      querySelector: () => { throw new SyntaxError('not a valid selector'); },
+      querySelectorAll: () => [],
+    };
+    expect(() => new Function('document', 'Event', `return ${browserSelectorScriptForTest({ selector: 'bad (' }, 'click')}`)(document, class {}))
+      .toThrow('invalid_selector: not a valid selector');
+
+    const missingDocument = { querySelector: () => null, querySelectorAll: () => [] };
+    expect(() => new Function('document', 'Event', `return ${browserSelectorScriptForTest({ selector: '#missing' }, 'click')}`)(missingDocument, class {}))
+      .toThrow('element_not_found: #missing');
+  });
+
   it('rewrites the HeadlessChrome automation tell while keeping the real version', () => {
     expect(normalizeBrowserUserAgent(
       'Mozilla/5.0 (X11; Ubuntu; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/150.0.0.0 Safari/537.36',

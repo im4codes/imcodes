@@ -1,0 +1,12 @@
+# Android arm64-v8a (NDK r27c, CPU NEON+dotprod+fp16+KleidiAI, 4 threads) on an arm64 Android 15 emulator
+# (Apple M2 Pro host, HVF). Correctness only - emulator timings are NOT device numbers.
+text conformance (tests/text_cases.tsv): 180 passed, 0 failed
+oneshot zh_upstream_test.Chinese: 之前有顾客自己带酒水，也没加收钱或者不让喝。 (upstream onetime_llama: 之前有顾客自己带酒水，也没加收钱或者不让喝。)
+en_tts.English             final=IDENTICAL  steps=32  steps differing from upstream(Metal)=6  mac-cpu differing from upstream(Metal)=5
+zh_upstream_test.Chinese   final=IDENTICAL  steps=42  steps differing from upstream(Metal)=2  mac-cpu differing from upstream(Metal)=5
+Intermediate-step differences are greedy near-ties under different ggml backends (Metal vs Apple CPU vs Arm CPU+KleidiAI);
+the Mac CPU build of the same C++ also differs from Metal. Algorithm conformance is proven same-backend in ../conformance-summary.txt.
+APK UI runs (app-runs.jsonl, pulled from the app's results/runs.jsonl; app default threads):
+  load     n_threads=2 load_ms=6619 mem_peak_mb=3072
+  oneshot  zh_upstream_test latency_ms=2826 mem_peak_mb=3209 text=之前有顾客自己带酒水，也没加收钱或者不让喝。
+  stream   zh_upstream_test chunk_ms=320 steps=21 mem_peak_mb=3215 final=之前有顾客自己带酒水也没加收钱或者不让喝。

@@ -1,4 +1,3 @@
-import { timingSafeEqual } from 'node:crypto';
 import {
   PEER_AUDIT_REPLY_ERRORS,
   PEER_AUDIT_REPLY_VERSION,
@@ -94,11 +93,16 @@ export class PeerAuditReplyRateLimiter {
 
 export type PeerAuditReplyIngressResult =
   | { ok: true }
-  | { ok: false; error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable' };
+  | {
+    ok: false;
+    error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable';
+    /** Bounded operator-facing binding diagnosis; never contains reply text. */
+    message?: string;
+  };
 
 export type PeerAuditReplyInternalReason =
   | 'accepted'
-  | 'capability_rejected'
+  | 'attempt_rejected'
   | 'sender_identity_rejected'
   | 'destination_identity_rejected'
   | 'baseline_rejected'
@@ -108,13 +112,15 @@ export type PeerAuditReplyInternalReason =
   | 'reducer_rejected';
 
 type PeerAuditReplyIngressHandlerResult = PeerAuditReplyIngressResult
-  | { ok: false; error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable'; internalReason: PeerAuditReplyInternalReason };
+  | { ok: false; error: PeerAuditReplyError | 'sender_unavailable' | 'ingress_unavailable'; internalReason: PeerAuditReplyInternalReason; message?: string };
 
 export type PeerAuditReplyIngressHandler = (input: {
   envelope: PeerAuditReplyEnvelope;
   sender: SessionRecord;
   receivedAt: number;
 }) => PeerAuditReplyIngressHandlerResult | Promise<PeerAuditReplyIngressHandlerResult>;
+
+export type DelegatedPeerAuditReplyIngressHandler = PeerAuditReplyIngressHandler;
 
 export interface PeerAuditReplyBoundIdentity {
   sessionName: string;
@@ -132,6 +138,8 @@ export interface PeerAuditReplyAuthority {
   configRevision: string;
   controllerRevision: number;
   deadlineAt: number;
+  /** Daemon-held report authority captured for this exact attempt/baseline. */
+  acceptedImplementerValidation?: boolean;
 }
 
 /** Current daemon-authoritative bindings checked immediately before reduction. */
@@ -167,17 +175,24 @@ export interface PeerAuditReplyAuthorityPipelineInput<T> {
   receivedAt: number;
   authority?: PeerAuditReplyAuthority;
   current: PeerAuditReplyCurrentBindings;
-  capabilityMatches: (providedCapability: string) => boolean;
   onInvalidReply?: (reason: Exclude<PeerAuditReplyInternalReason, 'accepted' | 'deadline_expired' | 'reducer_rejected'>) => void;
   onDeadline: () => void;
   reduce: (reply: PeerAuditAcceptedReply) => PeerAuditReplyReducerDecision<T>;
 }
 
 let activeHandler: PeerAuditReplyIngressHandler | null = null;
+let delegatedAuditHandler: DelegatedPeerAuditReplyIngressHandler | null = null;
 const ingressRateLimiter = new PeerAuditReplyRateLimiter();
 
 export function registerPeerAuditReplyIngressHandler(handler: PeerAuditReplyIngressHandler | null): void {
   activeHandler = handler;
+}
+
+/** Register the durable `send_message` assignment-bound audit bridge. */
+export function registerDelegatedPeerAuditReplyIngressHandler(
+  handler: DelegatedPeerAuditReplyIngressHandler | null,
+): void {
+  delegatedAuditHandler = handler;
 }
 
 export function clearPeerAuditReplyIngressRateLimits(): void {
@@ -197,22 +212,16 @@ export function decodePeerAuditReplyCommandStructure(raw: unknown): PeerAuditPar
   );
 }
 
-/** Constant-time comparison used by controller/reply validation. */
-export function peerAuditCapabilityMatches(expected: string, actual: string): boolean {
-  const expectedBytes = Buffer.from(expected, 'utf8');
-  const actualBytes = Buffer.from(actual, 'utf8');
-  if (expectedBytes.length !== actualBytes.length) return false;
-  return timingSafeEqual(expectedBytes, actualBytes);
-}
-
 export function foldPeerAuditReplyPublicError(reason: Exclude<PeerAuditReplyInternalReason, 'accepted'>): PeerAuditReplyError {
   switch (reason) {
-    case 'capability_rejected':
-      return PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY;
+    case 'attempt_rejected':
+      return PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH;
     case 'sender_identity_rejected':
     case 'destination_identity_rejected':
     case 'baseline_rejected':
+      return PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH;
     case 'revision_rejected':
+      return PEER_AUDIT_REPLY_ERRORS.REVISION_MISMATCH;
     case 'reducer_rejected':
       return PEER_AUDIT_REPLY_ERRORS.IDENTITY_MISMATCH;
     case 'deadline_expired':
@@ -229,7 +238,7 @@ function identityMatches(expected: PeerAuditReplyBoundIdentity, actual: PeerAudi
 }
 
 /**
- * Runs only after raw cap/schema/rate admission. The ordering here is the
+ * Runs only after raw schema/rate admission. The ordering here is the
  * authority boundary: deadline and evidence are invisible until all bindings
  * are valid, and only sanitized data reaches the reducer.
  */
@@ -244,9 +253,8 @@ export function processPeerAuditReplyAuthority<T>(
   };
 
   const authority = input.authority;
-  if (!authority || authority.attemptId !== input.envelope.attemptId
-    || !input.capabilityMatches(input.envelope.replyCapability)) {
-    return reject('capability_rejected');
+  if (!authority || authority.attemptId !== input.envelope.attemptId) {
+    return reject('attempt_rejected');
   }
   if (!identityMatches(authority.sender, input.current.sender)) return reject('sender_identity_rejected');
   if (!identityMatches(authority.destination, input.current.destination)) return reject('destination_identity_rejected');
@@ -266,8 +274,14 @@ export function processPeerAuditReplyAuthority<T>(
       internalReason: 'deadline_expired',
     };
   }
-  const evidence = validatePeerAuditPassEvidence(input.envelope.verdict, input.envelope.validations);
+  const evidence = validatePeerAuditPassEvidence(input.envelope.verdict, input.envelope.validations, {
+    acceptedImplementerValidation: authority.acceptedImplementerValidation === true,
+    // Preserve the pre-existing task-less session-audit behavior. Registry-
+    // backed supervision receipts use a separate ingress and remain strict.
+    allowUnavailableOnly: true,
+  });
   if (!evidence.ok) return reject('evidence_rejected');
+  if (!input.envelope.verdict) return reject('evidence_rejected');
 
   const decision = input.reduce({
     attemptId: input.envelope.attemptId,
@@ -318,8 +332,31 @@ export async function submitPeerAuditReply(input: {
   }, now)) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.RATE_LIMITED };
   }
-  if (!activeHandler) return { ok: false, error: 'ingress_unavailable' };
-  const handled = await activeHandler({ envelope: decoded.value, sender, receivedAt: now });
+  const request = { envelope: decoded.value, sender, receivedAt: now };
+  const handled = activeHandler
+    ? await activeHandler(request)
+    : { ok: false as const, error: 'ingress_unavailable' as const };
+  if (!handled.ok
+    && (handled.error === PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH
+      || handled.error === 'ingress_unavailable')
+    && delegatedAuditHandler) {
+    const delegated = await delegatedAuditHandler(request);
+    if (delegated.ok || delegated.error !== PEER_AUDIT_REPLY_ERRORS.ATTEMPT_MISMATCH) {
+      return delegated.ok
+        ? { ok: true }
+        : {
+            ok: false,
+            error: delegated.error,
+            ...(delegated.message ? { message: delegated.message } : {}),
+          };
+    }
+  }
   // Internal reasons are deliberately not part of the public daemon response.
-  return handled.ok ? { ok: true } : { ok: false, error: handled.error };
+  return handled.ok
+    ? { ok: true }
+    : {
+        ok: false,
+        error: handled.error,
+        ...(handled.message ? { message: handled.message } : {}),
+      };
 }

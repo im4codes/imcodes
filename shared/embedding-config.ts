@@ -10,6 +10,13 @@ export const EMBEDDING_MODEL = 'Xenova/paraphrase-multilingual-MiniLM-L12-v2';
 /** Quantization type — q8 balances memory (~726MB) and quality (0.9945 vs fp32). */
 export const EMBEDDING_DTYPE = 'q8';
 
+/**
+ * Resident-memory budget for the q8 model worker. This is deliberately a
+ * budget rather than the model's approximate 726 MB steady-state footprint:
+ * native ONNX allocations can briefly retain allocator pages around loads.
+ */
+export const EMBEDDING_MODEL_RSS_BUDGET_BYTES = 768 * 1024 * 1024;
+
 /** Output embedding dimension. */
 export const EMBEDDING_DIM = 384;
 

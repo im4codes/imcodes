@@ -2,6 +2,21 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
+import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
+import { isPairsEngineSession } from './task-pairs/engine.js';
+import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
+import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
+import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
+import { handleAgentMcpCommand } from './agent-mcp.js';
+import { handleAgentSkillsCommand } from './agent-skills.js';
+import {
+  SESSION_MODEL_APPLIED,
+  SESSION_MODEL_CONTROL_ERROR,
+  type SessionModelControlError,
+  type SessionModelListResult,
+  type SessionModelSwitchResult,
+  type SessionThinkingSwitchResult,
+} from '../../shared/session-model-control.js';
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
@@ -16,9 +31,18 @@ import { routeMessage, type InboundMessage, type RouterContext } from '../router
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { emitTransportUserMessage as emitTransportUserMessageEvent } from './transport-relay.js';
+import { bindProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import {
+  emitTransportUserMessage as emitTransportUserMessageEvent,
+  persistTransportUserMessage,
+} from './transport-relay.js';
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
 import { hasAssistantFileReadGrant } from './session-file-read-grants.js';
+import {
+  resolveChatFileReference,
+  resolveGitWorktreeRoot,
+  type ChatFileReferenceResolutionResult,
+} from './session-file-reference-resolver.js';
 import {
   recordFsWorkerMetric,
   recordTimelineBudgetShape,
@@ -33,14 +57,17 @@ import { scanFsListSnapshot } from './fs-list-worker.js';
 import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
 import { scanFsGitStatusSnapshot } from './fs-git-status-worker.js';
 import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
+import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
-import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { enqueueResend, getResendEntries, clearResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from './transport-queue-projection.js';
 import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import type { QueueRecipientIdentity } from './transport-queue-store.js';
 import {
   startSubSession,
   stopSubSession,
@@ -98,9 +125,22 @@ import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
+import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import { refreshSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
+import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
+import {
+  normalizeSessionIdentityContent,
+  sessionIdentityContentError,
+} from '../../shared/session-identity.js';
+import {
+  buildSupervisedAuditExecutionPreamble,
+  buildSupervisionExecutionPreamble,
+} from './supervision-prompts.js';
 import {
   getEnabledP2pMemberNames,
   isP2pMemberEligibleSession,
@@ -162,11 +202,19 @@ import {
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '../../shared/codebuddy.js';
 import {
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_TARGET_LATEST,
@@ -244,6 +292,7 @@ import {
   COPILOT_SDK_EFFORT_LEVELS,
   DEFAULT_TRANSPORT_EFFORT,
   OPENCLAW_THINKING_LEVELS,
+  PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
   isTransportEffortLevel,
   type TransportEffortLevel,
@@ -283,8 +332,16 @@ import { detectRepo, parseRemotes } from '../repo/detector.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import {
   SUPERVISION_MODE,
+  canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
+  isAutomaticSupervisionEnabled,
   isSupportedSupervisionTargetSessionType,
+  normalizeSupervisionUiLocale,
+  patchTransportConfigUiLocale,
+  readTransportConfigUiLocale,
+  evaluateAutomaticSupervisionEnablement,
+  type AutomaticSupervisionEnablementGate,
 } from '../../shared/supervision-config.js';
 import {
   PREFERENCE_FEATURE_FLAG,
@@ -355,6 +412,7 @@ import {
 } from '../store/memory-feature-config-store.js';
 import {
   MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import {
@@ -457,6 +515,27 @@ async function waitForSelectedSessionSends(
     if (runtime) {
       const queuedIds = new Set((runtime.pendingEntries ?? []).map((entry) => entry.clientMessageId));
       if (ids.every((id) => queuedIds.has(id))) return;
+    }
+    // After a daemon restart the browser may be rendering an authoritative
+    // SQLite snapshot while the new runtime has not rehydrated that row yet.
+    // Match the exact projected clientMessageId under the persisted recipient
+    // identity; do not burn the full optimistic-send wait budget for a row the
+    // authority already proves exists. The append handler will reconcile the
+    // queue generation and rehydrate it under the session mutex immediately
+    // after this barrier.
+    const recipient = recipientFromSessionRecord(getSession(sessionName));
+    if (recipient) {
+      try {
+        const durableIds = new Set(
+          getTransportQueueStore()
+            .readSnapshotForRecipient(sessionName, recipient, 'append_wait_authority')
+            .pendingMessageEntries
+            .map((entry) => entry.clientMessageId),
+        );
+        if (ids.every((id) => durableIds.has(id))) return;
+      } catch {
+        // The bounded polling path below remains the safe degraded fallback.
+      }
     }
 
     const pending = [...new Set(ids.flatMap((clientMessageId) => {
@@ -876,6 +955,16 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
     return;
   }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    logger.warn({ sessionName }, 'session.update_transport_config: invalid supervision snapshot — ignoring');
+    return;
+  }
+  const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
+  if (isAutomaticSupervisionEnabled(nextSupervision)
+    && !canSessionRoleOwnAutomaticSupervision(record.role)) {
+    logger.warn({ sessionName, role: record.role }, 'session.update_transport_config: automatic supervision requires Brain session — ignoring');
+    return;
+  }
   const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
@@ -886,7 +975,7 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
   // The server persist callback is a no-op when not yet wired; the next `persistSessionToWorker`
   // loop in lifecycle will retry from the local store.
   persistSessionRecord(nextRecord, sessionName);
-  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  supervisionAutomation.applySnapshotUpdate(sessionName, nextSupervision);
   invalidateTransportListModelsCache('session_transport_config_update');
   await handleGetSessions(serverLink);
 }
@@ -907,6 +996,15 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
     return;
   }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: invalid supervision snapshot — ignoring');
+    return;
+  }
+  const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
+  if (isAutomaticSupervisionEnabled(nextSupervision)) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: automatic supervision requires Brain session — ignoring');
+    return;
+  }
   const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
@@ -914,7 +1012,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   };
   upsertSession(nextRecord);
   persistSessionRecord(nextRecord, sessionName);
-  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  supervisionAutomation.applySnapshotUpdate(sessionName, nextSupervision);
   invalidateTransportListModelsCache('subsession_transport_config_update');
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
@@ -933,7 +1031,8 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi' {
+/** Does this transport agent start a fresh conversation for `/clear`? */
+export function supportsTransportClear(agentType: string | undefined): boolean {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
@@ -942,9 +1041,11 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'openclaw'
     || agentType === 'qwen'
     || agentType === 'kimi-sdk'
+    || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === 'grok-sdk'
     || agentType === 'deepseek-harness'
-    || agentType === 'pi';
+    || agentType === 'pi'
+    || isCodeBuddyProviderId(agentType);
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -958,13 +1059,44 @@ function supportsProcessClear(agentType: string | undefined): agentType is 'clau
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
 }
 
+/**
+ * `/clear` for a transport session: a fresh provider conversation. Shared by the
+ * browser send path and daemon-side delivery (agent sends, cron, supervision),
+ * which used to hand "/clear" to the model as ordinary text -- the context was
+ * never cleared (seen live: a Codex session kept its 214k-token context).
+ * `serverLink` only pushes the refreshed session list to browsers now; without
+ * it the change still persists and reaches them through the normal sync.
+ */
+export async function clearTransportConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+  const sessionName = record.name;
+  // Fresh conversation must not replay stale queued messages from the prior
+  // offline window — drop anything we had buffered for resend.
+  clearResend(sessionName);
+  await runExclusiveSessionRelaunch(sessionName, async () => {
+    await relaunchFreshTransportConversation(record);
+  });
+  // Reset per-session memory injection history — fresh conversation should be
+  // allowed to re-inject previously-shown memories again.
+  clearRecentInjectionHistory(sessionName);
+  clearSummarySyncHistory(sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    await syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
   await stopTransportRuntimeSession(record.name);
   await launchTransportSession({
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi',
+    agentType: record.agentType as AgentType,
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -1021,7 +1153,65 @@ function getSupportedEffortLevels(agentType: string | undefined): readonly Trans
           ? QWEN_EFFORT_LEVELS
           : agentType === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
-            : [];
+            : agentType === 'pi'
+              ? PI_EFFORT_LEVELS
+              : [];
+}
+
+async function applyTransportEffortSwitch(
+  record: SessionRecord,
+  transportRuntime: TransportSessionRuntime | undefined,
+  requested: string,
+  serverLink?: ServerLink,
+): Promise<SessionThinkingSwitchResult> {
+  const sessionName = record.name;
+  const agentType = record.agentType ?? '';
+  const allowed = getSupportedEffortLevels(agentType);
+  if (!allowed.length) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${agentType || 'this session'}` };
+  }
+  if (!isTransportEffortLevel(requested) || !allowed.includes(requested)) {
+    const supported = allowed.join(', ');
+    timelineEmitter.emit(sessionName, 'assistant.text', {
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED,
+        `⚠️ Unsupported thinking level: ${requested}. Supported: ${supported}`,
+        { level: requested, supported, detail: `Supported: ${supported}` },
+      ),
+      streaming: false,
+      memoryExcluded: true,
+    }, { source: 'daemon', confidence: 'high' });
+    return {
+      ok: false,
+      sessionName,
+      code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_THINKING_LEVEL,
+      error: `Unsupported thinking level: ${requested}. Supported: ${supported}`,
+      availableThinkingLevels: [...allowed],
+    };
+  }
+  const previousThinking = record.effort;
+  transportRuntime?.setEffort(requested);
+  const nextRecord = { ...record, effort: requested, updatedAt: Date.now() };
+  upsertSession(nextRecord);
+  persistSessionRecord(nextRecord, sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_SWITCHED, `Switched thinking level to ${requested}`, { level: requested }),
+    streaming: false,
+    automation: true,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+  return {
+    ok: true,
+    sessionName,
+    agentType,
+    thinking: requested,
+    ...(previousThinking ? { previousThinking } : {}),
+    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+  };
 }
 
 function getDefaultThinkingLevel(agentType: string | undefined): TransportEffortLevel | undefined {
@@ -1129,8 +1319,9 @@ import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
-import { handleDirectFileTransferCommand } from './direct-file-transfer.js';
+import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
@@ -1140,6 +1331,7 @@ import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
@@ -1154,6 +1346,7 @@ function describeTransportSendError(err: unknown): string {
 }
 
 const pendingSessionRelaunches = new Map<string, Promise<void>>();
+const pendingMcpSessionRestarts = new Map<string, { reset: boolean; result: Promise<boolean> }>();
 const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
 const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
 const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
@@ -1643,6 +1836,20 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG:
       void handleSessionTransportConfigUpdate(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH:
+      void syncSessionIdentitiesForCommand(cmd).then((ack) => {
+        if (!ack) return;
+        if (ack.status === 'error') logger.warn({ error: ack.error }, 'session identity refresh failed');
+        emitCommandAckReliable(serverLink, {
+          commandId: ack.commandId,
+          sessionName: ack.sessionName,
+          status: ack.status,
+          ...(ack.error ? { error: ack.error } : {}),
+        });
+      }).catch((err) => {
+        logger.warn({ err }, 'legacy session identity refresh failed');
+      });
+      break;
     case 'session.send':
       dispatchSessionSend(cmd, serverLink);
       break;
@@ -1689,6 +1896,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case TIMELINE_MESSAGES.PAGE_REQUEST:
       void traceCommandAsync(cmd, 'web_command.timeline_page', () => handleTimelineHistory(cmd, serverLink));
       break;
+    case TIMELINE_MESSAGES.HISTORY_CANCEL:
+      if (typeof cmd.requestId === 'string') serverLink.cancelQueuedDataPlaneRequest(cmd.requestId);
+      break;
     case TIMELINE_MESSAGES.DETAIL_REQUEST:
       traceSync('web_command.timeline_detail', {
         sessionName: typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined,
@@ -1726,6 +1936,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case CODEX_RESET_CREDITS_MSG.CONSUME:
       void handleCodexResetCreditsConsume(cmd, serverLink);
+      break;
+    case CODEX_CREDIT_HISTORY_MSG.REQUEST:
+      void handleCodexCreditHistoryRequest(cmd, serverLink);
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
@@ -1822,6 +2035,14 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SERVER_DELETE:
       void handleServerDelete();
       break;
+    case DAEMON_COMMAND_TYPES.SUPERVISOR_DEFAULTS_CHANGED:
+      // Best-effort, same as the periodic poll this preempts: a fetch
+      // failure here just leaves the existing cache in place until the
+      // next scheduled refresh.
+      void refreshSupervisorDefaultsCache().catch((err) => {
+        logger.debug({ err }, 'supervisor defaults changed push: refresh failed');
+      });
+      break;
     case DAEMON_COMMAND_TYPES.DAEMON_UPGRADE:
       try {
         const normalizedTarget = normalizeDaemonUpgradeTargetVersion(cmd.targetVersion);
@@ -1864,6 +2085,14 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case MEMORY_WS.GET_SOURCES_REQUEST:
       void handleMemoryGetSourcesRequest(cmd, serverLink);
       break;
+    case AGENT_SKILLS_MSG.LIST_REQUEST:
+    case AGENT_SKILLS_MSG.RUN_REQUEST:
+      void handleAgentSkillsCommand(cmd, (message) => serverLink.send(message));
+      break;
+    case AGENT_MCP_MSG.LIST_REQUEST:
+    case AGENT_MCP_MSG.RUN_REQUEST:
+      void handleAgentMcpCommand(cmd, (message) => serverLink.send(message));
+      break;
     case 'fs.ls':
       void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));
       break;
@@ -1901,7 +2130,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void traceCommandAsync(cmd, 'web_command.openspec_auto_deliver', () => handleOpenSpecAutoDeliverCommand(cmd, serverLink));
       break;
     case CC_PRESET_MSG.LIST:
-      void handleCcPresetsList(serverLink);
+      void handleCcPresetsList(cmd, serverLink);
       break;
     case CC_PRESET_MSG.SAVE:
       void handleCcPresetsSave(cmd, serverLink).catch((err) => {
@@ -2020,6 +2249,21 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case TRANSPORT_MSG.LIST_MODELS:
       void traceCommandAsync(cmd, 'web_command.transport_list_models', () => handleTransportListModels(cmd, serverLink));
+      break;
+    case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE:
+    case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE:
+    case SUPERVISION_TASK_CONSOLE_MSG.ACK:
+      // Already handled: createProductionSupervisionConsoleBinding (wired in
+      // lifecycle.ts) registers its OWN serverLink.onMessage handler, and
+      // ServerLink.onMessage is multi-subscriber -- every handler, including
+      // this switch's caller, receives the exact same message. Reproduced
+      // live (test/daemon/supervision-console-dispatch-wiring.test.ts): the
+      // browser genuinely gets its SNAPSHOT/ACK/UNSUBSCRIBE reply through
+      // that path today. The ONLY real gap was this switch having no case for
+      // these 3 types, so every legitimate subscribe/ack/unsubscribe also
+      // fell through to the generic "Unknown web command type" warning below
+      // -- noise indistinguishable from an actually-broken console, which is
+      // what prompted this fix. Nothing to dispatch here; just stop warning.
       break;
     case REPO_MSG.DETECT:
       void traceCommandAsync(cmd, 'web_command.repo_detect', async () => { handleRepoCommand(cmd, serverLink); });
@@ -2143,6 +2387,28 @@ async function handleCodexResetCreditsConsume(cmd: Record<string, unknown>, serv
     : { type: CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE, requestId, ok: false, error: result.error });
 }
 
+/**
+ * Recorded Codex pay-as-you-go credit-balance history (codex_credit_snapshots,
+ * populated by getCodexRuntimeConfig on every real quota refresh). Read via
+ * the async context-store worker client — never the synchronous
+ * context-store.js export directly (see scripts/lint-no-sync-context-store.mjs).
+ */
+async function handleCodexCreditHistoryRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!requestId) return;
+  const limit = typeof cmd.limit === 'number' ? cmd.limit : undefined;
+  try {
+    const snapshots = await getContextStoreClient().run<CodexCreditSnapshot[]>(
+      'listCodexCreditSnapshots',
+      [{ limit }],
+    );
+    serverLink?.send({ type: CODEX_CREDIT_HISTORY_MSG.RESPONSE, requestId, ok: true, snapshots });
+  } catch (err) {
+    logger.warn({ err }, 'codex.credit_history.request failed');
+    serverLink?.send({ type: CODEX_CREDIT_HISTORY_MSG.RESPONSE, requestId, ok: false, error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR });
+  }
+}
+
 async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
   const msg = cmd.msg as InboundMessage | undefined;
   if (!msg) {
@@ -2179,6 +2445,19 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     return;
   }
   const project = sanitizeProjectName(rawProject);
+  const rawIdentityPrompt = cmd.identityPrompt;
+  if (rawIdentityPrompt !== undefined && (
+    typeof rawIdentityPrompt !== 'string'
+    || sessionIdentityContentError(rawIdentityPrompt) !== null
+  )) {
+    const message = 'session.start: invalid Agent identity';
+    logger.warn({ project, agentType }, message);
+    try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
+    return;
+  }
+  const identityPrompt = typeof rawIdentityPrompt === 'string'
+    ? normalizeSessionIdentityContent(rawIdentityPrompt)
+    : undefined;
   const sessionName = `deck_${project}_brain`;
   // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
@@ -2211,8 +2490,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
+      // The fresh session starts under the SAME name, so its predecessor's
+      // durable queue must be cleared and its authority rotated first.
+      clearResend(`deck_${project}_brain`, 'session_removed');
       removeSession(`deck_${project}_brain`);
     }
     const config: ProjectConfig = {
@@ -2221,10 +2503,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || isCodeBuddyProviderId(agentType),
       extraEnv,
       ccPreset: ccPresetName,
       effort,
+      identityPrompt,
     };
     if (agentType === 'claude-code-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
@@ -2241,6 +2524,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'codex-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
@@ -2254,6 +2538,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'copilot-sdk' || agentType === 'cursor-headless') {
       logger.info({ project, agentType }, 'SDK fresh session.start launching new transport main session');
@@ -2267,8 +2552,9 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
-    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi') {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) {
       // Transport providers share the codex-sdk launch shape. DSH/Pi additionally
       // receive ccPreset so their adapters can bind the selected third-party
       // provider and model atomically before the first turn.
@@ -2277,13 +2563,14 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi',
+        agentType: agentType as AgentType,
         projectDir: dir,
         fresh: true,
         ...((agentType === 'deepseek-harness' || agentType === 'pi') && ccPresetName ? { ccPreset: ccPresetName } : {}),
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'qwen') {
       logger.info({ project }, 'SDK fresh session.start launching new Qwen main session');
@@ -2298,6 +2585,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else {
       await startProject(config);
@@ -2404,6 +2692,405 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     emitSessionInlineError(brain.name, message);
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
   }
+}
+
+/**
+ * Daemon-authoritative MCP restart entry point. `reset` maps to the existing
+ * `fresh` relaunch contract; omission/default is an ordinary continuity-
+ * preserving restart. The exact-name lookup guarantees this can never create
+ * a previously unknown main or sub-session.
+ */
+/** Agent types whose model switches in place on a live transport runtime. */
+function isGenericModelSwitchAgent(agentType: string | undefined): boolean {
+  return agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk'
+    || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID
+    || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi'
+    || isCodeBuddyProviderId(agentType);
+}
+
+function isModelSwitchAgent(agentType: string | undefined): boolean {
+  return agentType === 'qwen' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk'
+    || agentType === 'qoder-sdk' || isGenericModelSwitchAgent(agentType);
+}
+
+function emitModelSwitchRefusal(sessionName: string, code: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE], text: string, model: string, detail?: string): void {
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(code, text, { model, ...(detail ? { detail } : {}) }),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+/**
+ * The models `/model` / `session_model` accept for a session whose provider
+ * validates ids -- one source for both the check and the listing, so the list
+ * never offers what the switch refuses. `null` for providers that take any id.
+ */
+async function resolveValidatedModelList(record: SessionRecord): Promise<{ models: string[]; qwenRuntime?: Awaited<ReturnType<typeof getQwenRuntimeConfig>> | null } | null> {
+  switch (record.agentType) {
+    case 'qwen': {
+      const qwenRuntime = await getQwenRuntimeConfig(true).catch(() => null);
+      // Priority: session list (may include preset models) > runtime > built-in.
+      const sessionModels = record.qwenAvailableModels ?? [];
+      const runtimeModels = qwenRuntime?.availableModels ?? [];
+      const models = sessionModels.length ? sessionModels : (runtimeModels.length ? runtimeModels : [...QWEN_MODEL_IDS]);
+      return { models: [...models], qwenRuntime };
+    }
+    case 'claude-code-sdk': {
+      if (!record.ccPreset) return { models: [...CLAUDE_CODE_MODEL_IDS] };
+      const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+      const preset = await getPreset(record.ccPreset);
+      return { models: preset ? getPresetAvailableModelIds(preset) : [] };
+    }
+    case 'codex-sdk': {
+      const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+      const models = sdkRuntime.availableModels?.length
+        ? sdkRuntime.availableModels
+        : record.codexAvailableModels?.length ? record.codexAvailableModels : [...CODEX_MODEL_IDS];
+      return { models: [...models] };
+    }
+    case 'grok-sdk': {
+      const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
+      return { models: grokModels?.models.map((model) => model.id) ?? [] };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Switch a live transport session's model. The single implementation behind
+ * both `/model X` from the browser and the `session_model_set` MCP tool.
+ * Validates against the same per-agent model sources, applies it to the
+ * runtime, persists the record and posts the switched/refused notice into the
+ * session's own timeline. The caller owns the per-session mutex and acks.
+ */
+async function applyTransportModelSwitch(
+  record: SessionRecord,
+  /** Absent for an idle session not loaded yet: the stored model applies at its next start. */
+  transportRuntime: TransportSessionRuntime | undefined,
+  requestedModel: string,
+  serverLink?: ServerLink,
+): Promise<SessionModelSwitchResult> {
+  const sessionName = record.name;
+  const agentType = record.agentType;
+  const previousModel = record.activeModel ?? record.requestedModel;
+  const refuse = (
+    code: SessionModelControlError,
+    error: string,
+    noticeCode: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE],
+    availableModels?: readonly string[],
+    detail?: string,
+  ): SessionModelSwitchResult => {
+    emitModelSwitchRefusal(sessionName, noticeCode, `⚠️ ${error}`, requestedModel, detail);
+    return { ok: false, sessionName, code, error, ...(availableModels?.length ? { availableModels: [...availableModels] } : {}) };
+  };
+  let nextRecord: SessionRecord;
+  let contextWindow: number | undefined;
+
+  const validated = await resolveValidatedModelList(record);
+  if (agentType === 'qwen') {
+    const runtimeConfig = validated?.qwenRuntime ?? null;
+    const sessionModels = record.qwenAvailableModels ?? [];
+    const runtimeModels = runtimeConfig?.availableModels ?? [];
+    const allowedModels = validated?.models ?? [];
+    const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
+    if (!allowedModels.includes(requestedModel)) {
+      const authHint = qwenAuthType === 'qwen-oauth' ? ' (current tier only allows coder-model)' : '';
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Qwen model: ${requestedModel}${authHint}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        allowedModels,
+        authHint ? authHint.trim().replace(/^\(|\)$/g, '') : undefined,
+      );
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    // Merge runtime models INTO the session's list (union) so preset models
+    // survive future switches. Never overwrite with only runtime models.
+    const mergedAvailableModels = [...new Set([...sessionModels, ...runtimeModels])];
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      qwenModel: requestedModel,
+      ...(qwenAuthType ? { qwenAuthType } : {}),
+      ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
+      ...(mergedAvailableModels.length ? { qwenAvailableModels: mergedAvailableModels } : {}),
+      ...getQwenDisplayMetadata({
+        model: requestedModel,
+        authType: qwenAuthType,
+        authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
+        quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
+      }),
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else if (agentType === 'claude-code-sdk') {
+    let presetContextWindow = record.presetContextWindow;
+    let selectedModel: string | undefined;
+    const presetModels = validated?.models ?? [];
+    if (record.ccPreset) {
+      const { getPresetTransportOverrides } = await import('./cc-presets.js');
+      selectedModel = presetModels.find((model) => model === requestedModel);
+      if (selectedModel) {
+        const presetOverrides = await getPresetTransportOverrides(record.ccPreset, selectedModel);
+        presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
+        transportRuntime?.setSystemPrompt(presetOverrides.systemPrompt ?? '');
+      }
+    } else {
+      selectedModel = normalizeClaudeCodeModelId(requestedModel);
+    }
+    if (!selectedModel) {
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Claude model: ${requestedModel}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        presetModels,
+      );
+    }
+    transportRuntime?.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
+    const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
+    nextRecord = {
+      ...record,
+      requestedModel: selectedModel,
+      activeModel: selectedModel,
+      modelDisplay: selectedModel,
+      ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
+      updatedAt: Date.now(),
+    };
+    requestedModel = selectedModel;
+    contextWindow = resolveContextWindow(presetContextWindow, selectedModel);
+  } else if (agentType === 'codex-sdk') {
+    const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+    const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
+    const availableModels = validated?.models ?? [];
+    if (!availableModels.includes(requestedModel)) {
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Codex model: ${requestedModel}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        availableModels,
+      );
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
+      ...sdkDisplay,
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else if (agentType === 'qoder-sdk') {
+    return refuse(
+      SESSION_MODEL_CONTROL_ERROR.PROOF_GATED,
+      `Qoder model switching is proof-gated in IM.codes v1: ${requestedModel}`,
+      DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED,
+    );
+  } else if (isGenericModelSwitchAgent(agentType)) {
+    if (agentType === 'grok-sdk') {
+      const availableModels = validated?.models ?? [];
+      if (!availableModels.includes(requestedModel)) {
+        return refuse(
+          SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+          `Unknown Grok model: ${requestedModel}`,
+          DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+          availableModels,
+        );
+      }
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else {
+    return {
+      ok: false,
+      sessionName,
+      code: SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT,
+      error: `Model switching is not available for ${agentType ?? 'this session'}`,
+    };
+  }
+
+  upsertSession(nextRecord);
+  persistSessionRecord(nextRecord, sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${requestedModel}`, { model: requestedModel }),
+    streaming: false,
+    automation: true,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+  return {
+    ok: true,
+    sessionName,
+    agentType: agentType ?? '',
+    model: requestedModel,
+    ...(previousModel ? { previousModel } : {}),
+    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+  };
+}
+
+function resolveModelControlTarget(sessionName: string):
+  | { ok: true; record: SessionRecord; runtime: TransportSessionRuntime | undefined }
+  | { ok: false; code: SessionModelControlError; error: string } {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const isTransport = record.runtimeType === 'transport'
+    || (typeof record.agentType === 'string' && isTransportAgent(record.agentType));
+  if (!isTransport || !isModelSwitchAgent(record.agentType)) {
+    return {
+      ok: false,
+      code: isTransport ? SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT : SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_RUNTIME,
+      error: `Model switching is not available for ${record.agentType ?? 'this session'}${isTransport ? '' : ' (terminal session: use its own /model)'}`,
+    };
+  }
+  // An idle session is often not loaded (restored lazily on its next message):
+  // the switch then updates the stored model, which that start uses.
+  return { ok: true, record, runtime: getTransportRuntime(sessionName) };
+}
+
+/**
+ * `session_model_set`: switch any session's model by exact name, no text
+ * involved -- session-to-session messages are wrapped, so `/model X` sent by
+ * another session never matched. Deliberately no caller/ownership check: the
+ * exact session name is the only requirement.
+ */
+export async function switchSessionModelNow(sessionName: string, model?: string, thinking?: string): Promise<SessionModelSwitchResult | SessionThinkingSwitchResult> {
+  const requested = model?.trim();
+  const target = resolveModelControlTarget(sessionName);
+  if (requested && !target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
+  if (requested && /\s/.test(requested)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL, error: 'model must be a single model id' };
+  }
+  if (!requested) return switchSessionThinkingNow(sessionName, thinking ?? '');
+  if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const latest = getSession(sessionName) ?? target.record;
+    const switched = await applyTransportModelSwitch(latest, target.runtime, requested);
+    if (!switched.ok || !thinking?.trim()) return switched;
+    const effortRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
+    const effort = await applyTransportEffortSwitch(effortRecord, target.runtime, thinking.trim());
+    if (!effort.ok) return effort;
+    return { ...switched, thinking: effort.thinking, ...(effort.previousThinking ? { previousThinking: effort.previousThinking } : {}), thinkingApplied: effort.applied };
+  } finally {
+    release();
+  }
+}
+
+export async function switchSessionThinkingNow(sessionName: string, thinking: string): Promise<SessionThinkingSwitchResult> {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const isTransport = record.runtimeType === 'transport' || isTransportAgent(record.agentType);
+  if (!isTransport || !supportsEffort(record.agentType)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${record.agentType ?? 'this session'}` };
+  }
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const latest = getSession(sessionName) ?? record;
+    return await applyTransportEffortSwitch(latest, getTransportRuntime(sessionName), thinking.trim());
+  } finally {
+    release();
+  }
+}
+
+/**
+ * `session_model` without a model: the session's current model and what it can
+ * switch to -- the same live, cached list the browser's model picker shows.
+ */
+export async function listSessionModelsNow(sessionName: string): Promise<SessionModelListResult> {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const agentType = record.agentType ?? '';
+  if (!isModelSwitchAgent(agentType)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT, error: `Model switching is not available for ${agentType || 'this session'}` };
+  }
+  const currentModel = record.activeModel ?? record.requestedModel ?? undefined;
+  const validated = await resolveValidatedModelList(record);
+  if (validated) {
+    return {
+      ok: true,
+      sessionName,
+      agentType,
+      ...(currentModel ? { currentModel } : {}),
+      ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
+      models: validated.models,
+      thinkingLevels: [...getSupportedEffortLevels(agentType)],
+      acceptsAnyModel: false,
+      ...(record.ccPreset && agentType === 'claude-code-sdk' ? { note: `preset ${record.ccPreset}` } : {}),
+    };
+  }
+  const listed = await getTransportListModels({
+    agentType,
+    sessionName,
+    ...(record.ccPreset ? { ccPreset: record.ccPreset } : {}),
+  }, agentType, false).catch((err: unknown) => ({
+    models: [] as TransportListModelsResult['models'],
+    error: err instanceof Error ? err.message : String(err),
+  }));
+  const note = agentType === 'qoder-sdk'
+    ? 'Qoder model switching is proof-gated in IM.codes v1'
+    : listed.error;
+  return {
+    ok: true,
+    sessionName,
+    agentType,
+    ...(currentModel ? { currentModel } : {}),
+    ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
+    models: listed.models.map((model) => model.id),
+    thinkingLevels: [...getSupportedEffortLevels(agentType)],
+    // Providers without a validated list take any id; this is their picker list.
+    acceptsAnyModel: isGenericModelSwitchAgent(agentType),
+    ...(note ? { note } : {}),
+  };
+}
+
+export async function restartSessionNow(
+  sessionName: string,
+  options: { reset: boolean } = { reset: false },
+): Promise<boolean> {
+  const currentMcpRestart = pendingMcpSessionRestarts.get(sessionName);
+  if (currentMcpRestart) {
+    if (currentMcpRestart.reset === options.reset) return currentMcpRestart.result;
+    await currentMcpRestart.result;
+    return restartSessionNow(sessionName, options);
+  }
+
+  const result = (async () => {
+    // A browser/settings relaunch may already own the shared per-session lane.
+    // Wait for it rather than letting runExclusive coalesce a semantically
+    // different reset into that restart and then falsely reporting success.
+    await pendingSessionRelaunches.get(sessionName);
+    const existing = getSession(sessionName);
+    if (!existing) return false;
+    await runExclusiveSessionRelaunch(sessionName, async () => {
+      const latest = getSession(sessionName) ?? existing;
+      await relaunchSessionWithSettings(latest, { fresh: options.reset });
+    });
+    logger.info({ sessionName, reset: options.reset }, 'Session relaunched through MCP control');
+    return true;
+  });
+  const tracked = result().finally(() => {
+    if (pendingMcpSessionRestarts.get(sessionName)?.result === tracked) {
+      pendingMcpSessionRestarts.delete(sessionName);
+    }
+  });
+  pendingMcpSessionRestarts.set(sessionName, { reset: options.reset, result: tracked });
+  return tracked;
 }
 
 async function handleStop(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -2519,7 +3206,7 @@ function cancelTransportTurnNow(
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.cancel (transport) failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_STOP_FAILED, `⚠️ Stop failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       markTransportCancelIdle(sessionName, errMsg);
     }
   })();
@@ -3209,6 +3896,40 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
+  const requestedUiLocale = normalizeSupervisionUiLocale(cmd.uiLocale);
+  // The web sends `uiLocale` on every send, not through a separate settings
+  // save. Persist it onto the session record here (best-effort, synchronous,
+  // debounced-write only -- see session-store.ts) so it durably outlives this
+  // one turn: background work unrelated to any live prompt (e.g. task-pair
+  // title generation, src/daemon/task-pairs/engine.ts's `brainUiLocale`) reads
+  // it from the record later, not from the in-request overlay further below
+  // that exists only to steer this turn's own prompts.
+  if (requestedUiLocale && sessionName) {
+    try {
+      const existingRecord = getSession(sessionName);
+      // patchTransportConfigUiLocale stores this under its own sibling
+      // transportConfig key, never inside transportConfig.supervision: that
+      // object is a strictly validated snapshot that may be intentionally
+      // absent, invalid, or legacy-repair-only, and either rebuilding it
+      // through the normalizer or merely adding a field to it here would
+      // silently change what every other reader sees (lost config, or an
+      // unconfigured/repair-pending session on an ordinary send).
+      if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
+        && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
+        upsertSession({
+          ...existingRecord,
+          transportConfig: patchTransportConfigUiLocale(existingRecord.transportConfig ?? null, requestedUiLocale),
+        });
+      }
+    } catch (error) {
+      logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
+    }
+  }
+  // Omission/unknown values are the safe default: ordinary durable FIFO.
+  // Only the exact explicit append value may request a provider-native steer.
+  const requestedDeliveryMode = cmd.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    ? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    : undefined;
   const inboundClientMessageId = typeof cmd.clientMessageId === 'string' && cmd.clientMessageId.trim()
     ? cmd.clientMessageId.trim()
     : undefined;
@@ -3216,6 +3937,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const directTargetMode = ((cmd as any).directTargetMode as string | undefined) ?? 'discuss';
   const sharedActor = cmd.sharedActor && typeof cmd.sharedActor === 'object'
     ? cmd.sharedActor as SharedActorEnvelope
+    : undefined;
+  const sharedMachineAuthority = typeof cmd.sharedMachineAuthority === 'string' && cmd.sharedMachineAuthority.trim()
+    ? cmd.sharedMachineAuthority.trim()
     : undefined;
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
@@ -3335,13 +4059,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       allowDuplicate: true,
       commandId: effectiveId,
       ...(sharedActor ? { sharedActor } : {}),
+      ...(requestedUiLocale ? { uiLocale: requestedUiLocale } : {}),
     };
+    const payload = { ...base, ...(extra ?? {}) };
     timelineEmitter.emit(
       sessionName,
       'user.message',
-      { ...base, ...(extra ?? {}) },
+      payload,
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
+    persistTransportUserMessage(sessionName, payloadText, payload);
   };
 
   const emitDelegationError = (error: AgentDelegationErrorCode | 'delegation_dispatch_failed', detail?: string, targetSession?: string): void => {
@@ -3777,6 +4504,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+  bindProcessSharedMachineAuthority(
+    sessionName,
+    record?.sessionInstanceId && record.runtimeEpoch
+      ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
+      : null,
+    sharedMachineAuthority,
+    sharedActor?.effectiveActorRole === 'participant',
+  );
 
   // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
   //
@@ -3869,7 +4604,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       sessionName,
       'assistant.text',
       {
-        text: `⚠️ Message not delivered: unresolved alias marker${aliasExpansion.unresolved.length === 1 ? '' : 's'} ${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED}). Define the alias or remove the marker, then resend.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.ALIAS_UNRESOLVED,
+          `⚠️ Message not delivered: unresolved alias marker${aliasExpansion.unresolved.length === 1 ? '' : 's'} ${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED}). Define the alias or remove the marker, then resend.`,
+          { count: aliasExpansion.unresolved.length, detail: `${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED})` },
+        ),
         streaming: false,
         memoryExcluded: true,
       },
@@ -3912,9 +4651,45 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     currentRecords: preferenceIngest.records,
   });
   const attachmentRetentionPreamble = buildAttachmentRetentionPreamble(displayText);
+  const persistedSupervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
+    ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
+    : null;
+  const supervisionSnapshot = persistedSupervisionSnapshot && requestedUiLocale
+    ? { ...persistedSupervisionSnapshot, uiLocale: requestedUiLocale }
+    : persistedSupervisionSnapshot;
+  // No legacy Brain-run on a `pairs` project: the pair engine owns supervision
+  // there (see isBrainOwnedAutomaticSupervision in supervision-automation.ts).
+  // The legacy Brain-run supervision path is retired. Pair projects are
+  // marker-driven, while inert projects deliberately receive no supervision
+  // contract or automatic task run even if an old snapshot survives upgrade.
+  const supervisionRunRequested = false;
+  // Fail closed on execution pools at START as well as at save. A session
+  // persisted before the save gate existed can still be carrying
+  // legacy_unconfigured pools, and starting an automatic run on it would be
+  // exactly the silent legacy fallback the gate exists to prevent.
+  const supervisionPoolGate = supervisionRunRequested
+    ? evaluateAutomaticSupervisionEnablement(supervisionSnapshot)
+    : ({ ok: true } as AutomaticSupervisionEnablementGate);
+  if (!supervisionPoolGate.ok) {
+    // Failing closed silently would look identical to supervision quietly not
+    // working. Say why on the operator-visible supervision-warning channel,
+    // reusing the same shared reason and guidance the UI and the authoritative
+    // save use, so all three entry points speak with one voice.
+    supervisionAutomation.warnExecutionPoolUnconfigured(
+      sessionName,
+      supervisionPoolGate.reason,
+      supervisionPoolGate.guidance,
+    );
+  }
+  const shouldTrackSupervisionTaskRun = supervisionRunRequested && supervisionPoolGate.ok;
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,
     attachmentRetentionPreamble,
+    shouldTrackSupervisionTaskRun && supervisionSnapshot
+      ? supervisionSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        ? buildSupervisedAuditExecutionPreamble(supervisionSnapshot.uiLocale)
+        : buildSupervisionExecutionPreamble(supervisionSnapshot.uiLocale)
+      : undefined,
   );
   schedulePreferencePersistence({
     userId: preferenceUserId,
@@ -3922,12 +4697,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     records: preferenceIngest.records,
     sendOrigin: normalizeSendOrigin(cmd.origin),
   });
-  const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
-    ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
-    : null;
-  const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
-    && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
-    && isEligibleSupervisionTaskText(displayText);
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const isTransportSession = record?.runtimeType === 'transport'
@@ -3951,6 +4720,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport session has no runtime — queuing for resend after reconnect',
     );
     const enqueueResult = enqueueResend(sessionName, {
+      ...(recipientFromSessionRecord(record) ? { recipient: recipientFromSessionRecord(record) } : {}),
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       // The anchor travels with the expansion it describes. Without it an
@@ -3959,8 +4729,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
+      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
+      ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
       queuedAt: Date.now(),
     });
     if (!enqueueResult.accepted) {
@@ -3980,14 +4752,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         sessionName,
         'assistant.text',
         {
-          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.QUEUE_OVERFLOW, '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。', { limit: 10 }),
           streaming: false,
           memoryExcluded: true,
         },
         { source: 'daemon', confidence: 'high' },
       );
     }
-    if (shouldTrackSupervisionTaskRun) {
+    if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
@@ -3995,7 +4767,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: infoMsg, streaming: false, memoryExcluded: true },
+      {
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING, infoMsg, { count: queued.length, detail: `Agent ${providerLabel} is restoring` }),
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     timelineEmitter.emit(
@@ -4018,7 +4794,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         timelineEmitter.emit(
           sessionName,
           'assistant.text',
-          { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+          { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_AUTO_RESUME_FAILED, `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, { detail: resumeErr }), streaming: false, memoryExcluded: true },
           { source: 'daemon', confidence: 'high' },
         );
       }
@@ -4042,6 +4818,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
     );
     const enqueueResultMissingSid = enqueueResend(sessionName, {
+      ...(recipientFromSessionRecord(record) ? { recipient: recipientFromSessionRecord(record) } : {}),
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       // Same reason as the no-runtime branch above: the anchor must accompany
@@ -4049,8 +4826,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
+      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
+      ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
       queuedAt: Date.now(),
     });
     if (!enqueueResultMissingSid.accepted) {
@@ -4065,14 +4844,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         sessionName,
         'assistant.text',
         {
-          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.QUEUE_OVERFLOW, '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。', { limit: 10 }),
           streaming: false,
           memoryExcluded: true,
         },
         { source: 'daemon', confidence: 'high' },
       );
     }
-    if (shouldTrackSupervisionTaskRun) {
+    if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
@@ -4080,7 +4859,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: infoMsg, streaming: false, memoryExcluded: true },
+      {
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING, infoMsg, { count: queued.length, detail: `Provider ${providerLabel} runtime is recovering` }),
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     timelineEmitter.emit(
@@ -4104,7 +4887,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           timelineEmitter.emit(
             sessionName,
             'assistant.text',
-            { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+            { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_AUTO_RESUME_FAILED, `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, { detail: resumeErr }), streaming: false, memoryExcluded: true },
             { source: 'daemon', confidence: 'high' },
           );
         }
@@ -4115,31 +4898,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (transportRuntime) {
     if (isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
-      // Fresh conversation must not replay stale queued messages from the prior
-      // offline window — drop anything we had buffered for resend.
-      clearResend(sessionName);
       try {
-        await runExclusiveSessionRelaunch(sessionName, async () => {
-          await relaunchFreshTransportConversation(record);
-        });
-        // Reset per-session memory injection history — fresh conversation
-        // should be allowed to re-inject previously-shown memories again.
-        clearRecentInjectionHistory(sessionName);
-        clearSummarySyncHistory(sessionName);
-        await handleGetSessions(serverLink);
-        await syncSubSessionIfNeeded(sessionName, serverLink);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: 'Started a fresh conversation',
-          streaming: false,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
+        await clearTransportConversation(record!, serverLink);
         const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
       } catch (err) {
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.clear (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
       }
@@ -4164,7 +4931,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           const reason = err instanceof Error ? err.message : 'service_tier_failed';
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `⚠️ Could not change the service tier: ${reason}`,
+            ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SERVICE_TIER_CHANGE_FAILED, `⚠️ Could not change the service tier: ${reason}`, { detail: reason }),
             streaming: false,
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
@@ -4179,9 +4946,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: isCodexFastServiceTier(requestedServiceTier)
-            ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
-            : 'Fast mode is off for this session.',
+          ...attachDaemonUserNotice(
+            isCodexFastServiceTier(requestedServiceTier)
+              ? DAEMON_USER_NOTICE_CODE.FAST_MODE_ON
+              : DAEMON_USER_NOTICE_CODE.FAST_MODE_OFF,
+            isCodexFastServiceTier(requestedServiceTier)
+              ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
+              : 'Fast mode is off for this session.',
+          ),
           streaming: false,
           automation: true,
           memoryExcluded: true,
@@ -4190,219 +4962,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'accepted' });
         return;
       }
-      if (record?.agentType === 'qwen' && modelMatch) {
-        const nextModel = modelMatch[1];
-          const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
-          // Priority: session qwenAvailableModels (may include preset models) >
-          // runtimeConfig.availableModels (from Qwen CLI, may not know about preset
-          // models) > hardcoded QWEN_MODEL_IDS fallback. Session record is
-          // authoritative because it was populated with preset models at launch.
-          const sessionModels = record.qwenAvailableModels ?? [];
-          const runtimeModels = runtimeConfig?.availableModels ?? [];
-          const allowedModels = sessionModels.length
-            ? sessionModels
-            : (runtimeModels.length ? runtimeModels : QWEN_MODEL_IDS);
-          if (!allowedModels.includes(nextModel)) {
-            const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-            const authHint = qwenAuthType === 'qwen-oauth'
-              ? ' (current tier only allows coder-model)'
-              : '';
-            emitTransportUserMessage(text);
-            timelineEmitter.emit(sessionName, 'assistant.text', {
-              text: `⚠️ Unknown Qwen model: ${nextModel}${authHint}`,
-              streaming: false,
-              memoryExcluded: true,
-            }, { source: 'daemon', confidence: 'high' });
-            timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            return;
-          }
-          transportRuntime.setAgentId(nextModel);
-          const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-          // Merge runtime models INTO session's existing list (union) so preset
-          // models survive future switches. Never overwrite with only runtime models.
-          const mergedAvailableModels = [...new Set([...sessionModels, ...runtimeModels])];
-          const nextRecord = {
-            ...record,
-            requestedModel: nextModel,
-            activeModel: nextModel,
-            modelDisplay: nextModel,
-            qwenModel: nextModel,
-            ...(qwenAuthType ? { qwenAuthType } : {}),
-            ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
-            ...(mergedAvailableModels.length ? { qwenAvailableModels: mergedAvailableModels } : {}),
-            ...getQwenDisplayMetadata({
-              model: nextModel,
-              authType: qwenAuthType,
-              authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
-              quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
-            }),
-            updatedAt: Date.now(),
-          };
-          upsertSession(nextRecord);
-          persistSessionRecord(nextRecord, sessionName);
-          await handleGetSessions(serverLink);
-          syncSubSessionIfNeeded(sessionName, serverLink);
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'usage.update', {
-            model: nextModel,
-            contextWindow: resolveContextWindow(undefined, nextModel),
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `Switched model to ${nextModel}`,
-            streaming: false,
-            automation: true,
-            memoryExcluded: true,
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          return;
-      }
-      if (record?.agentType === 'claude-code-sdk' && modelMatch) {
-        const requestedModel = modelMatch[1];
-        let presetContextWindow = record.presetContextWindow;
-        let selectedModel: string | undefined;
-        if (record.ccPreset) {
-          const { getPreset, getPresetAvailableModelIds, getPresetTransportOverrides } = await import('./cc-presets.js');
-          const preset = await getPreset(record.ccPreset);
-          const presetModels = preset ? getPresetAvailableModelIds(preset) : [];
-          selectedModel = presetModels.find((model) => model === requestedModel);
-          if (selectedModel) {
-            const presetOverrides = await getPresetTransportOverrides(record.ccPreset, selectedModel);
-            presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
-            transportRuntime.setSystemPrompt(presetOverrides.systemPrompt ?? '');
-          }
+      if (record && modelMatch && isModelSwitchAgent(record.agentType)) {
+        emitTransportUserMessage(text);
+        const result = await applyTransportModelSwitch(record, transportRuntime, modelMatch[1], serverLink);
+        if (result.ok) {
+          const status = isLegacy ? 'accepted_legacy' : 'accepted';
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
         } else {
-          selectedModel = normalizeClaudeCodeModelId(requestedModel);
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: result.error });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: result.error });
         }
-        if (!selectedModel) {
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          return;
-        }
-        transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
-        const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
-        const nextRecord = {
-          ...record,
-          requestedModel: selectedModel,
-          activeModel: selectedModel,
-          modelDisplay: selectedModel,
-          ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', {
-          model: selectedModel,
-          contextWindow: resolveContextWindow(presetContextWindow, selectedModel),
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${selectedModel}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        return;
-      }
-      if (record?.agentType === 'codex-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
-        const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
-        const availableModels = sdkRuntime.availableModels?.length
-          ? sdkRuntime.availableModels
-          : record.codexAvailableModels?.length
-            ? record.codexAvailableModels
-            : [...CODEX_MODEL_IDS];
-        if (!availableModels.includes(nextModel)) {
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          return;
-        }
-        transportRuntime.setAgentId(nextModel);
-        const nextRecord = {
-          ...record,
-          requestedModel: nextModel,
-          activeModel: nextModel,
-          modelDisplay: nextModel,
-          ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
-          ...sdkDisplay,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${nextModel}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        return;
-      }
-      if (record?.agentType === 'qoder-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const errMsg = `Qoder model switching is proof-gated in IM.codes v1: ${nextModel}`;
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `⚠️ ${errMsg}`,
-          streaming: false,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-        return;
-      }
-      if (record?.agentType === 'grok-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
-        const availableModels = grokModels?.models.map((model) => model.id) ?? [];
-        if (!availableModels.includes(nextModel)) {
-          const error = `Unknown Grok model: ${nextModel}`;
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${error}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error });
-          return;
-        }
-      }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk' || record?.agentType === 'deepseek-harness' || record?.agentType === 'pi') && modelMatch) {
-        const nextModel = modelMatch[1];
-        transportRuntime.setAgentId(nextModel);
-        const nextRecord = {
-          ...record,
-          requestedModel: nextModel,
-          activeModel: nextModel,
-          modelDisplay: nextModel,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${nextModel}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (record?.agentType === 'qoder-sdk' && effortMatch) {
@@ -4410,7 +4980,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const errMsg = `Qoder thinking/effort controls are proof-gated in IM.codes v1: ${nextEffort}`;
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `⚠️ ${errMsg}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, `⚠️ ${errMsg}`, { level: nextEffort }),
           streaming: false,
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
@@ -4420,38 +4990,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (supportsEffort(record?.agentType) && effortMatch) {
         const nextEffort = effortMatch[1];
-        const allowed = getSupportedEffortLevels(record?.agentType);
-        if (!isTransportEffortLevel(nextEffort) || !allowed.includes(nextEffort)) {
-          const supported = allowed.join(', ');
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`,
-            streaming: false,
-            memoryExcluded: true,
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          return;
-        }
-        transportRuntime.setEffort(nextEffort);
-        const nextRecord = {
-          ...record,
-          effort: nextEffort,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched thinking level to ${nextEffort}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        const result = await applyTransportEffortSwitch(record, transportRuntime, nextEffort, serverLink);
+        const status = result.ok ? (isLegacy ? 'accepted_legacy' : 'accepted') : 'error';
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status, ...(!result.ok ? { error: result.error } : {}) });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status, ...(!result.ok ? { error: result.error } : {}) });
         return;
       }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
@@ -4468,11 +5011,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // `aliasAudit` must ride the metadata, not just the immediate emit: a
       // queued/resent message emits its user.message later from session-manager,
       // which can only anchor what the entry carries.
-      const sendMetadata = (sharedActor || aliasProviderText || aliasAudit)
+      const sendMetadata = (sharedActor || sharedMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
+            ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
+            ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
           }
         : undefined;
       const result = agentMessagePreamble
@@ -4497,8 +5042,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             : (sendMetadata
                 ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sendMetadata)
                 : transportRuntime.send(displayText, effectiveId)));
-      if (shouldTrackSupervisionTaskRun) {
-        if (result === 'queued') {
+      if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
+        // A busy-turn Append is an extension of the task already being
+        // supervised, not a queued replacement task. queueTaskIntent() clears
+        // the current run before recording the future one; doing that here
+        // leaves the trailing queueAppended timeline row intentionally unable
+        // to seed either run, so the eventual idle edge never gets audited.
+        // If native append later falls back to an ordinary turn, its normal
+        // user.message projection will seed implicit supervision at dispatch.
+        if (result === 'queued' && requestedDeliveryMode !== MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
           supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
         } else if (result === 'sent') {
           supervisionAutomation.registerTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
@@ -4534,7 +5086,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       const failureLabel = isSessionControlCommandText(displayText, 'compact') ? 'Compact failed' : 'Send failed';
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${failureLabel}: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        ...attachDaemonUserNotice(
+          isSessionControlCommandText(displayText, 'compact')
+            ? DAEMON_USER_NOTICE_CODE.COMPACT_FAILED
+            : DAEMON_USER_NOTICE_CODE.MESSAGE_SEND_FAILED,
+          `⚠️ ${failureLabel}: ${errMsg}`,
+          { detail: errMsg },
+        ),
+        streaming: false,
+        memoryExcluded: true,
+      }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       if (!receiptAcked) {
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
@@ -4575,7 +5137,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       await handleGetSessions(serverLink);
       await syncSubSessionIfNeeded(sessionName, serverLink);
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: 'Started a fresh conversation',
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
@@ -4585,7 +5147,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ sessionName, err }, 'session.clear failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
     }
@@ -4671,6 +5233,8 @@ async function sendProcessSessionMessage(
     aliasAudit?: AliasSendAudit;
     /** Per-turn agent-only context that must never be projected to the timeline. */
     agentMessagePreamble?: string;
+    /** Daemon-owned control turn already represented by its lifecycle event. */
+    suppressTimeline?: boolean;
     /** Trusted daemon-owned metadata for automation surfaces such as P2P.
      * Values are projected only to the local user.message event. */
     userMessageMetadata?: Readonly<{
@@ -4679,6 +5243,9 @@ async function sendProcessSessionMessage(
       p2pRunId?: string;
       p2pDiscussionId?: string;
       p2pPhase?: string;
+      cronRun?: CronRunTimelineProjection;
+      /** Author of a non-human message (shared/chat-message-origin.ts). */
+      messageOrigin?: ChatMessageOrigin;
     }>;
   },
 ): Promise<void> {
@@ -4694,7 +5261,9 @@ async function sendProcessSessionMessage(
   // carries only referenced names + a hash of resolved values, never plaintext.
   if (options?.aliasAudit) payload.aliasAudit = options.aliasAudit;
   if (options?.userMessageMetadata) Object.assign(payload, options.userMessageMetadata);
-  const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+  const userEvent = options?.suppressTimeline
+    ? undefined
+    : timelineEmitter.emit(sessionName, 'user.message', payload);
   if (options?.commandId && !options.ackAlreadySent) {
     const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
     emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
@@ -4783,17 +5352,22 @@ export async function sendProcessSessionMessageForAutomation(
   sessionName: string,
   text: string,
   options?: {
+    suppressTimeline?: boolean;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;
       memoryExcluded?: boolean;
       p2pRunId?: string;
       p2pDiscussionId?: string;
       p2pPhase?: string;
+      cronRun?: CronRunTimelineProjection;
+      /** Author of a non-human message (shared/chat-message-origin.ts). */
+      messageOrigin?: ChatMessageOrigin;
     }>;
   },
 ): Promise<void> {
   await sendProcessSessionMessage(sessionName, text, [], {
     originalText: text,
+    ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
   });
 }
@@ -4835,6 +5409,24 @@ async function resolveProcessRecallQueryContext(
     namespace: { scope: 'personal', projectId },
     repo: projectId,
   };
+}
+
+function discardStaleTransportQueueOwnership(
+  sessionName: string,
+  runtime: {
+    recipientIdentity?: QueueRecipientIdentity;
+    discardDurableQueueStateForRecipientConflict?: () => unknown;
+  },
+  context: string,
+): void {
+  const recipient = runtime.recipientIdentity ?? null;
+  const discarded = typeof runtime.discardDurableQueueStateForRecipientConflict === 'function'
+    ? runtime.discardDurableQueueStateForRecipientConflict()
+    : getTransportQueueStore().discardSessionQueueState(sessionName, recipient);
+  logger.warn(
+    { sessionName, context, discarded },
+    'Transport queue command discarded stale recipient ownership instead of leaving queue unavailable',
+  );
 }
 
 async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -4919,6 +5511,24 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   }
   const release = await getMutex(sessionName).acquire();
   try {
+    // A pre-recipient-identity row may belong to this exact persisted session,
+    // but name equality alone is never authority. Let the runtime prove and
+    // complete its bounded adoption before any status or private-data mutation.
+    if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
+      discardStaleTransportQueueOwnership(sessionName, runtime, 'undo_queued_message_adopt_failed');
+      const queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+        sessionName,
+        runtime.recipientIdentity,
+        'undo_queued_message_stale_discard',
+      );
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...transportQueueSnapshotToPayload(queueSnapshot),
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+      return;
+    }
     const removed = runtime.removePendingMessage(clientMessageId);
     // The SQLite queue authority — not the runtime's in-memory queue — is what
     // keeps the UI queued bubble alive. After a daemon restart the row can still
@@ -4928,26 +5538,73 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     // undeletable ("daemon queue is empty but the frontend can't delete it").
     // Treat the entry as deletable whenever it is a live `queued` row in the
     // store, independent of runtime membership; `drop` itself is idempotent.
+    // Bounded, idempotent recovery at the AUTHORITATIVE entry point.
+    // `restoreExpiredHandoffs` already existed but its only caller was the
+    // automatic-audit path, so a lease that expired while the daemon was down
+    // stayed `handoff_inflight` forever. Because the check below counts only
+    // `queued` rows, such a row was invisible to delete: the ack claimed success
+    // while the row survived and the UI bubble came back. Healing here (rather
+    // than in the UI) also means a daemon restart recovers it on first touch.
+    try {
+      getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
+    } catch (err) {
+      logger.warn({ err, sessionName, clientMessageId }, 'expired handoff recovery failed before undo');
+    }
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'undo_queued_message_before');
-    const queuedInStore = queueSnapshot.pendingMessageEntries.some(
-      (entry) => entry.clientMessageId === clientMessageId && entry.status === 'queued',
+    // Deletability is a property of the ROW EXISTING in the authority, not of one
+    // particular status value. The previous fix here only counted `queued`, so a
+    // row parked in `handoff_inflight` (its lease long expired) plus an empty
+    // runtime made BOTH `removed` and this flag false: the handler took the
+    // "already absent" success path, never called drop, and the next snapshot
+    // resurrected the bubble the user had just deleted. Field case: an entry
+    // whose handoff lease expired two days earlier and had no delivery tombstone.
+    const storeEntry = queueSnapshot.pendingMessageEntries.find(
+      (entry) => entry.clientMessageId === clientMessageId,
     );
-    if (!removed && !queuedInStore) {
-      // Deleting a queued message is IDEMPOTENT: if it is already gone the goal
-      // is met, so ack success. The frontend now always sends the undo — even for
-      // an entry that only ever existed optimistically (never reached the store)
-      // — so an "error: not found" here would spuriously roll the deleted bubble
-      // back into the UI. "Already absent" is a successful delete.
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
-      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+    const queuedInStore = storeEntry !== undefined;
+    // ...but an ACTIVE handoff is genuinely mid-delivery. Dropping it would be
+    // the opposite failure: the provider may already have the text while the UI
+    // reports a successful delete. Only an EXPIRED lease is reclaimable here;
+    // a live one is reported as too_late so the caller sees the truth instead of
+    // a false success or a UI-only tombstone.
+    const handoffStillLive = storeEntry?.status === 'handoff_inflight'
+      && getTransportQueueStore().hasLiveHandoff(sessionName, clientMessageId);
+    if (handoffStillLive) {
+      timelineEmitter.emit(sessionName, 'command.ack', {
+        commandId, status: 'error', error: 'too_late: message is already being delivered',
+      });
+      emitCommandAckReliable(serverLink, {
+        commandId, sessionName, status: 'error', error: 'too_late: message is already being delivered',
+      });
       return;
     }
+    // Even an apparently absent id must pass through atomic cancellation. The
+    // matching send handler can still be awaiting context/runtime work on this
+    // ordered socket; accepting here without a tombstone lets its later enqueue
+    // resurrect a deletion that the user was told succeeded.
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
     peerAuditService.invalidateQueuedEdit(sessionName);
     try {
-      queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
+      // Prove the LIVE runtime identity. The atomic cancellation also leaves a
+      // durable tombstone, so an async send/recovery callback that arrives after
+      // this point cannot resurrect the same logical message.
+      const cancellation = getTransportQueueStore().cancelQueuedMessage(
+        sessionName,
+        clientMessageId,
+        (runtime as { recipientIdentity?: QueueRecipientIdentity }).recipientIdentity ?? null,
+      );
+      if (cancellation.status === 'identity_mismatch') {
+        discardStaleTransportQueueOwnership(sessionName, runtime, 'undo_queued_message_identity_mismatch');
+        queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+          sessionName,
+          runtime.recipientIdentity ?? null,
+          'undo_queued_message_identity_discard',
+        );
+      } else {
+        queueSnapshot = cancellation.snapshot;
+      }
     } catch (err) {
-      // The SQLite row is the queue authority. If the drop threw, the row is
+      // The SQLite row is the queue authority. If cancellation threw, the row is
       // STILL THERE — the delete did NOT happen — so we must NOT ack success
       // (that would leave the message queued on the backend while the UI claims
       // it is deleted). Ack an error so the frontend rolls the bubble back and
@@ -4978,9 +5635,12 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
         typeof value === 'string' && value.trim() ? [value.trim()] : []
       )))]
     : [];
-  const reject = (error: string): void => {
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
-    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
+  // `extras` ride the RELIABLE ack: emitCommandAckReliable persists them in the
+  // ack outbox and replays them verbatim, so a browser that never received the
+  // best-effort timeline broadcast can still reconcile from the ack alone.
+  const reject = (error: string, extras: Record<string, unknown> = {}): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error, ...extras });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error, ...extras });
   };
   if (!sessionName || clientMessageIds.length === 0 || clientMessageIds.length > TRANSPORT_QUEUE_APPEND_MAX_ENTRIES) {
     reject('Invalid queued message selection');
@@ -5001,7 +5661,53 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
 
   const release = await getMutex(sessionName).acquire();
   try {
-    const result = await runtime.appendPendingMessagesToActiveTurn(clientMessageIds, commandId);
+    if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
+      discardStaleTransportQueueOwnership(sessionName, runtime, 'append_queued_messages_adopt_failed');
+      const queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+        sessionName,
+        runtime.recipientIdentity,
+        'append_queued_messages_stale_discard',
+      );
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...transportQueueSnapshotToPayload(queueSnapshot),
+      }, { source: 'daemon', confidence: 'high' });
+      reject('Queued message state was stale and discarded');
+      return;
+    }
+    // Same bounded recovery boundary as the delete path: append reads the
+    // runtime's pending list, so a row stranded in an EXPIRED handoff (or one
+    // that only survives in SQLite after a restart) was unreachable here too.
+    // Recovering first makes it `queued` again and rehydrate brings it into the
+    // runtime; a still-ACTIVE handoff stays out and is correctly not appended.
+    try {
+      getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
+      runtime.rehydratePendingFromStore?.();
+    } catch (err) {
+      logger.warn({ err, sessionName }, 'expired handoff recovery failed before append');
+    }
+    // This is the external, user-initiated append/append-all entry point:
+    // opt into the "no active turn -> dispatch the queue as a fresh turn"
+    // fallback (the internal scheduled active-append-flush loop does not).
+    const result = await runtime.appendPendingMessagesToActiveTurn(
+      clientMessageIds, commandId, undefined, { allowDispatchAsNewTurn: true },
+    );
+    if (result.status === 'dispatched_as_new_turn') {
+      // No turn was active by the time the runtime looked; the pending queue
+      // was dispatched as a fresh turn instead of appended in-place. This is
+      // success from the caller's point of view — the queued messages are on
+      // their way — so ack normally and broadcast the now-accurate state
+      // (the drain already flipped `sending`/`pendingCount`) instead of the
+      // stale "already finished" error this closure used to return.
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...queuePayload,
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+      return;
+    }
     if (result.status !== 'delivered') {
       const error = result.status === 'unsupported'
         ? 'Active-turn append is not supported by this provider'
@@ -5012,28 +5718,85 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
             : result.status === 'stale'
               ? 'The active turn already finished'
               : 'Queued message not found';
-      reject(error);
+      if (result.status === 'not_found') {
+        // A bounded ownership recovery may have retired a pre-session ghost.
+        // The browser must be able to retire the stale card instead of
+        // restoring it from optimistic local state -- and it must be able to do
+        // so from the ONE frame this closure delivers reliably.
+        //
+        // The timeline broadcast below is kept so other subscribers of this
+        // session still converge, but correctness no longer depends on its
+        // delivery or its ordering: the same recipient-gated authority is
+        // attached to the reliable, replayable ack. `queueSnapshot` and
+        // `pendingCount` are deliberately left off the ack -- the former would
+        // duplicate the whole projection into every persisted outbox record,
+        // and the latter is a legacy live-queue field the wire validator
+        // rejects. The browser reduces the flat fields it already knows.
+        const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+          ...queuePayload,
+          queueReconcilesCommandId: commandId,
+        }, { source: 'daemon', confidence: 'high' });
+        reject(error, {
+          queueEpoch: queuePayload.queueEpoch,
+          queueAuthorityId: queuePayload.queueAuthorityId,
+          pendingMessageVersion: queuePayload.pendingMessageVersion,
+          pendingMessageEntries: queuePayload.pendingMessageEntries,
+          failedMessageEntries: queuePayload.failedMessageEntries,
+          queueReconcilesCommandId: commandId,
+          ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
+          ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
+        });
+        return;
+      }
+      // Every other failure here (most concretely 'stale': the turn this
+      // tried to append to already finished by the time the daemon looked)
+      // can ALSO mean the browser's belief about "is a turn still active" is
+      // now wrong. Previously this branch rejected with no state update at
+      // all, so a browser that thought a turn was running had nothing to
+      // ever correct it: it kept showing "working" with a live Stop control,
+      // and kept queueing behind a turn that would never resume -- exactly
+      // the stuck-forever state this closure exists to prevent for
+      // 'not_found'. The queued messages themselves are untouched by any of
+      // these statuses (none of them consume from the pending queue), so
+      // only the state fields are needed here, not a card-retirement ack.
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...queuePayload,
+      }, { source: 'daemon', confidence: 'high' });
+      reject(error, {
+        queueEpoch: queuePayload.queueEpoch,
+        queueAuthorityId: queuePayload.queueAuthorityId,
+        pendingMessageVersion: queuePayload.pendingMessageVersion,
+        ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
+        ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
+      });
       return;
     }
 
     for (const entry of result.entries) {
       supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+      const payload = {
+        text: entry.text,
+        commandId: entry.clientMessageId,
+        clientMessageId: entry.clientMessageId,
+        allowDuplicate: true,
+        // This row records an in-turn queue steer. It extends the currently
+        // supervised task and must not seed a second implicit run at idle.
+        queueAppended: true,
+        pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
+        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+      };
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        {
-          text: entry.text,
-          clientMessageId: entry.clientMessageId,
-          allowDuplicate: true,
-          // This row records an in-turn queue steer. It extends the currently
-          // supervised task and must not seed a second implicit run at idle.
-          queueAppended: true,
-          pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
-          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-        },
+        payload,
         { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
       );
+      persistTransportUserMessage(sessionName, entry.text, payload);
     }
     for (const fact of result.deliveryFacts) {
       timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
@@ -5356,6 +6119,10 @@ function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): ty
   return cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : TIMELINE_MESSAGES.HISTORY;
 }
 
+/** Per-reply ceiling for timeline history/page responses while the server
+ *  link reports uplink congestion (see ServerLink.isUplinkCongested). */
+const CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES = 64 * 1024;
+
 function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
   const requested = optionalFiniteNumber(cmd.budgetBytes);
   const cap = TIMELINE_PAYLOAD_BUDGET_BYTES.EXPLICIT_PAGE_OR_DETAIL;
@@ -5563,6 +6330,9 @@ interface TimelineReplayBuildResult {
 
 const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
 
+const resolveTimelineSupervisionTaskProjection = (taskId: string, assignmentId: string) =>
+  getSupervisionTaskRegistry().getSupervisionTaskProjection(taskId, assignmentId);
+
 function timelineReplayInflightKey(params: TimelineReplayRequestParams): string {
   return JSON.stringify({
     sessionName: params.sessionName,
@@ -5586,7 +6356,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     const events = await timelineStore.readPreferred(params.sessionName, { limit: replayEpochResetLimit });
     const shaped = shapeTimelineEventsForTransport(events, {
       detailSink: getDefaultTimelineDetailStore(),
-    });
+    }, resolveTimelineSupervisionTaskProjection);
     const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
     return {
       events: shaped.events,
@@ -5608,7 +6378,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
   const { events, truncated, source = TIMELINE_RESPONSE_SOURCES.RING_BUFFER } = timelineEmitter.replay(params.sessionName, params.afterSeq);
   const shaped = shapeTimelineEventsForTransport(events, {
     detailSink: getDefaultTimelineDetailStore(),
-  });
+  }, resolveTimelineSupervisionTaskProjection);
   const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
   return {
     events: shaped.events,
@@ -5845,12 +6615,38 @@ interface TimelineHistoryBuildResult {
   status: TimelineResponseStatus;
   errorReason?: TimelineRequestErrorReason | string;
   cursorReset?: boolean;
+  /**
+   * The established wire signal for "momentary, come back" -- read by the web
+   * client in shouldRetryTimelineHistoryResponse. Named `recoverable` because
+   * that is the field the client actually consumes; an invented `retryable`
+   * field would have travelled the wire and been ignored, which is a fix only
+   * in appearance.
+   */
+  recoverable?: boolean;
   detailRefs: TimelinePayloadMetadata['detailRefs'];
 }
 
 const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
 
-function timelineHistoryErrorResult(source: string, errorReason: TimelineRequestErrorReason | string): TimelineHistoryBuildResult {
+/**
+ * Reasons that mean "the projection could not answer right now".
+ *
+ * These must never reach buildTimelineHistoryOnMain. Running the heavy path on
+ * the event loop is the worst available response to saturation, and it is what
+ * turned a worker timeout into a blocked main thread in production.
+ */
+const TIMELINE_HISTORY_TRANSIENT_REASONS = new Set<string>([
+  TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+  TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+  TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
+  TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+]);
+
+function timelineHistoryErrorResult(
+  source: string,
+  errorReason: TimelineRequestErrorReason | string,
+  options?: { recoverable: true },
+): TimelineHistoryBuildResult {
   return {
     events: [],
     eventsRead: 0,
@@ -5864,6 +6660,7 @@ function timelineHistoryErrorResult(source: string, errorReason: TimelineRequest
     source,
     status: TIMELINE_RESPONSE_STATUS.ERROR,
     errorReason,
+    ...(options?.recoverable ? { recoverable: true } : {}),
     detailRefs: [],
   };
 }
@@ -5883,9 +6680,22 @@ function buildTimelineHistory(params: TimelineHistoryRequestParams): Promise<Tim
   if (shouldUseTimelineHistoryWorkerPool() && initialRecord?.agentType !== 'opencode') {
     return buildTimelineHistoryWithWorker(params).catch(async (err) => {
       const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
+      // Genuine, durable absence is the ONLY case that may run on the main
+      // thread: the projection cannot serve this session at all, so there is no
+      // worker path to wait for. Everything transient is refused here.
       if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) {
         logger.debug({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
         return await buildTimelineHistoryOnMain(params);
+      }
+      if (TIMELINE_HISTORY_TRANSIENT_REASONS.has(reason)) {
+        // Saturation: answer determinately and cheaply. Doing the work here
+        // would add main-thread SQLite, synthesize and sanitize to a process
+        // that is already behind, which is exactly how a slow worker became a
+        // blocked event loop.
+        logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history projection saturated; returning retryable response without main-thread work');
+        // No retry-after hint: nothing in the timeline bridge or client carries
+        // or consumes one, so emitting it would be a second unread field.
+        return timelineHistoryErrorResult(`worker_${reason}`, reason, { recoverable: true });
       }
       logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker failed; returning terminal error response');
       return timelineHistoryErrorResult(`worker_${reason}`, reason);
@@ -5999,7 +6809,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   const sanitized = shapeTimelineEventsForTransport(trimmed, {
     maxResponseBytes: params.maxResponseBytes,
     detailSink: getDefaultTimelineDetailStore(),
-  });
+  }, resolveTimelineSupervisionTaskProjection);
   const status = timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
   return {
     events: sanitized.events,
@@ -6032,19 +6842,29 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
   const detailRefs = (result.detailCandidates ?? [])
     .map((candidate) => getDefaultTimelineDetailStore().put(candidate))
     .filter((ref): ref is NonNullable<typeof ref> => ref !== undefined);
+  // The worker intentionally owns no supervision registry connection. Refresh
+  // the small set of returned task cards on the main thread, then re-apply the
+  // response budget because a legacy concise title may gain a bounded 4 KiB
+  // objective here.
+  const refreshed = shapeTimelineEventsForTransport(result.events, {
+    maxResponseBytes: params.maxResponseBytes,
+    detailSink: getDefaultTimelineDetailStore(),
+  }, resolveTimelineSupervisionTaskProjection);
+  const droppedEvents = result.droppedEvents + refreshed.droppedEvents;
+  const truncatedEvents = result.truncatedEvents + refreshed.truncatedEvents;
   return {
-    events: result.events,
+    events: refreshed.events,
     eventsRead: result.eventsRead,
-    payloadBytes: result.payloadBytes,
-    droppedEvents: result.droppedEvents,
-    truncatedEvents: result.truncatedEvents,
-    hasMore: result.hasMore === true || result.droppedEvents > 0,
+    payloadBytes: refreshed.payloadBytes,
+    droppedEvents,
+    truncatedEvents,
+    hasMore: result.hasMore === true || droppedEvents > 0,
     readMs: result.readMs,
     synthesizeMs: 0,
     sanitizeMs: result.sanitizeMs,
     source: result.source ?? TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
-    status: timelineStatusFromPayload(result.droppedEvents, result.truncatedEvents),
-    detailRefs,
+    status: timelineStatusFromPayload(droppedEvents, truncatedEvents),
+    detailRefs: [...detailRefs, ...refreshed.detailRefs],
   };
 }
 
@@ -6058,7 +6878,13 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     : undefined;
   const afterTs = optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
   const beforeTs = optionalFiniteNumber(cmd.beforeTs) ?? optionalFiniteNumber(cursor?.beforeTs);
-  const maxResponseBytes = resolveTimelineHistoryBudgetBytes(cmd);
+  // On a congested uplink one full-budget reply (up to 1 MiB) occupies the
+  // socket for minutes and every heartbeat/ack/session.state queues behind
+  // it. Serve a smaller page instead; the response already reports
+  // hasMore/droppedEvents, so the client pages for the rest.
+  const maxResponseBytes = serverLink.isUplinkCongested?.()
+    ? Math.min(resolveTimelineHistoryBudgetBytes(cmd), CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES)
+    : resolveTimelineHistoryBudgetBytes(cmd);
 
   if (!sessionName) {
     logger.warn({ requestId }, 'timeline.history_request: missing sessionName');
@@ -6101,6 +6927,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       hasMore,
       nextCursor: buildTimelineNextCursor(result.events, timelineEmitter.epoch),
       cursorReset: result.cursorReset,
+      recoverable: result.recoverable,
       droppedEvents: result.droppedEvents,
       truncatedEvents: result.truncatedEvents,
       detailRefs: result.detailRefs && result.detailRefs.length > 0 ? result.detailRefs : undefined,
@@ -6232,7 +7059,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' || type === 'deepseek-harness' || type === 'pi' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -7533,6 +8360,39 @@ async function handleDaemonUpgrade(
     }
   }
 
+  // ── Native transport quiesce (BOTH platforms, before any spawn/install) ───
+  // The detached upgrade replaces the global package — and therefore
+  // node_datachannel.node — IN PLACE while this process still has the addon
+  // mapped. The daemon then restarts and its shutdown finally runs the
+  // direct-transfer cleanup, by which point the pages behind that live mapping
+  // belong to a different file. Both production crashes were SIGBUS at the same
+  // relative offset, addr2line landing in rtc::Description::Media::RtpMap.
+  //
+  // So the addon must be drained and cleaned up while its file is still the
+  // original one, and the acknowledgement must be awaited — not slept on —
+  // before anything is spawned or installed. A refused or timed-out quiesce
+  // means peers may still be live, so nothing is spawned and no package is
+  // touched: the daemon keeps running and direct transfer degrades to relay.
+  //
+  // Deliberately NOT released on abort, unlike the memory freeze below: a
+  // native runtime cannot be un-cleaned, so the safe direction is to stay
+  // degraded until the next restart rather than re-enter a replaced mapping.
+  const nativeQuiesce = await quiesceDirectFileTransferNative();
+  if (!nativeQuiesce.ok) {
+    logger.error({
+      targetVersion,
+      reason: nativeQuiesce.reason,
+    }, 'daemon.upgrade: ABORTING — direct-transfer native runtime did not quiesce, so replacing the package could fault a live mapping. Keeping the current version running; direct transfer is degraded to relay.');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'native_quiesce_failed',
+        detail: nativeQuiesce.reason ?? 'quiesce_refused',
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   let upgradeScriptSpawned = false;
   const releaseUpgradeMemoryFreeze = (() => {
     closeLiveContextMaterializationAdmission('upgrade-pending');
@@ -8378,20 +9238,29 @@ if [ -z "$HEALTH_PID" ]; then
   log "[step 5] WARN: no live new daemon after 14s — service unit may have a stale path or the new binary crashes on startup"
   log "[step 5] WARN: check 'systemctl --user status imcodes' (linux) or 'log show --predicate \"subsystem == \\\"imcodes\\\"\"' (macos)"
   log "[step 5] WARN: if path-stale, manually fix ExecStart in $HOME/.config/systemd/user/imcodes.service then 'systemctl --user daemon-reload && systemctl --user restart imcodes'"
-else
-  # Drop the auto-upgrade cooldown sentinel — handleDaemonUpgrade
-  # consults this on the new daemon's next auto-upgrade attempt to
-  # rate-limit dev-tag-poll-driven restarts. Survives restart by
-  # design (the very transition we are throttling against).
-  # Epoch ms (matches Date.now in JS). MUST stay portable: BSD/macOS \`date\`
-  # has no %N, so \`date +%s%3N\` emits a bogus "<seconds>3N" there and corrupts
-  # the sentinel — which made the cooldown never apply and drove a macOS
-  # auto-upgrade thrash loop (stuck upgrade.sh + endless daemon restarts).
-  # seconds*1000 is ms-granular enough for a multi-minute cooldown and works on
-  # both GNU and BSD date. Best-effort: a missing sentinel means no cooldown.
-  printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
-  log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 fi
+
+# Drop the auto-upgrade cooldown sentinel UNCONDITIONALLY — an upgrade was just
+# attempted, and this rate-limits the NEXT attempt, not successes.
+#
+# It used to be written only on a confirmed-healthy restart within 14s. On a
+# busy node the new daemon writes its pid file later than that (heavy startup,
+# many restored sessions), so the health check timed out, the sentinel was
+# never written, the cooldown never engaged, and every dev-tag poll re-ran the
+# upgrade — an endless "preparing upgrade -> restart" thrash (stuck upgrade.sh,
+# hundreds of restarts) even though the daemon was actually coming up fine. A
+# genuinely dead daemon is still surfaced by the WARN lines above; throttling
+# its retries is correct too. handleDaemonUpgrade consults this on the new
+# daemon's next auto-upgrade attempt; it survives restart by design (the very
+# transition we are throttling against).
+# Epoch ms (matches Date.now in JS). MUST stay portable: BSD/macOS \`date\`
+# has no %N, so \`date +%s%3N\` emits a bogus "<seconds>3N" there and corrupts
+# the sentinel — which made the cooldown never apply and drove a macOS
+# auto-upgrade thrash loop. seconds*1000 is ms-granular enough for a
+# multi-minute cooldown and works on both GNU and BSD date. Best-effort: a
+# missing sentinel means no cooldown.
+printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
+log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
 
 log "=== upgrade script done ==="
 
@@ -8514,28 +9383,41 @@ async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<strin
  * not another root: directory listing/search and every write path continue to
  * use the session project root exclusively.
  */
-async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<string | null> {
+async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<
+  | { granted: false }
+  | { granted: true; resolution: ChatFileReferenceResolutionResult }
+> {
   let granted = false;
   try {
     granted = await hasAssistantFileReadGrant(sessionName, rawPath, async () => (
-      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 500 })
+      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 5_000 })
     ));
   } catch {
     // Projection/history unavailable must fail closed.
-    return null;
+    return { granted: false };
   }
-  if (!granted) return null;
+  if (!granted) return { granted: false };
 
-  const requestedPath = nodePath.resolve(rawPath);
-  try {
-    const linkStats = await fsLstat(requestedPath);
-    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
-    const realTarget = await fsRealpath(requestedPath);
-    if (realTarget !== requestedPath || !isPathAllowed(realTarget)) return null;
-    return realTarget;
-  } catch {
-    return null;
+  const session = getSession(sessionName);
+  if (!session?.projectDir) {
+    return {
+      granted: true,
+      resolution: { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, attemptedLocations: [] },
+    };
   }
+  const projectRoot = listSessions().find((candidate) => (
+    candidate.projectName === session.projectName && candidate.role === 'brain' && !!candidate.projectDir
+  ))?.projectDir ?? session.projectDir;
+  const worktreeRoot = await resolveGitWorktreeRoot(session.projectDir);
+  return {
+    granted: true,
+    resolution: await resolveChatFileReference({
+      reference: rawPath,
+      cwd: session.projectDir,
+      worktreeRoot,
+      projectRoot,
+    }),
+  };
 }
 
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
@@ -9418,19 +10300,89 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;
   }
+  if (cmd.chatFileReference === true) {
+    // A file that already resolves inside the session's own project root has
+    // always been downloadable without any assistant grant -- this predates
+    // chatFileReference and must not regress. ChatView marks EVERY download
+    // and preview click chatFileReference:true now, including clicks on
+    // paths that its own tool.call/tool.result renderer (splitPathsAndUrls)
+    // extracted; those never mint a grant by design (session-file-read-grants
+    // only ingests assistant.text), so without this check an in-project file
+    // mentioned only in tool output, or a plain path a user pasted, would be
+    // wrongly refused with forbidden_path where it used to just work.
+    if (sessionRoot.realRoot) {
+      const inProject = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+      if (inProject.ok) {
+        getDefaultPreviewReadCoordinator().handle(inProject.real, requestId, (message) => serverLink.send({
+          ...message,
+          path: rawPath,
+          resolvedPath: inProject.real,
+          resolutionMatchCount: 1,
+        }));
+        return;
+      }
+    }
+    const sessionName = typeof cmd.sessionName === 'string'
+      ? cmd.sessionName
+      : typeof cmd.session === 'string'
+        ? cmd.session
+        : '';
+    if (!sessionName) {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    const registeredUpload = await resolveRegisteredUploadReadTarget(rawPath);
+    if (registeredUpload) {
+      getDefaultPreviewReadCoordinator().handle(registeredUpload, requestId, (message) => serverLink.send({
+        ...message,
+        path: rawPath,
+        resolvedPath: registeredUpload,
+        resolutionMatchCount: 1,
+      }));
+      return;
+    }
+    const published = await resolveAssistantPublishedReadTarget(sessionName, rawPath);
+    if (!published.granted) {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    if (!published.resolution.ok) {
+      try {
+        serverLink.send({
+          type: 'fs.read_response',
+          requestId,
+          path: rawPath,
+          status: 'error',
+          error: published.resolution.error,
+          attemptedLocations: published.resolution.attemptedLocations,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    const { realPath, attemptedLocations, matchCount } = published.resolution;
+    getDefaultPreviewReadCoordinator().handle(realPath, requestId, (message) => serverLink.send({
+      ...message,
+      path: rawPath,
+      resolvedPath: realPath,
+      attemptedLocations,
+      resolutionMatchCount: matchCount,
+    }));
+    return;
+  }
   if (sessionRoot.realRoot) {
     const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
     if (!target.ok) {
       const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveRegisteredUploadReadTarget(rawPath)
         : null;
-      const assistantPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+      const legacyPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveAssistantPublishedReadTarget(
           typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
           rawPath,
         )
         : null;
-      const exactReadTarget = registeredUpload ?? assistantPublished;
+      const exactReadTarget = registeredUpload
+        ?? (legacyPublished?.granted && legacyPublished.resolution.ok ? legacyPublished.resolution.realPath : null);
       if (exactReadTarget) {
         getDefaultPreviewReadCoordinator().handle(exactReadTarget, requestId, (message) => serverLink.send(message));
         return;
@@ -10756,10 +11708,20 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || isCodeBuddyProviderId(agentType))) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
+      if (agentType === HERMES_AGENT_PROVIDER_ID) {
+        // Provider/spawn errors may contain tokens, command lines, environment
+        // values, or local paths. Hermes failures cross an anonymous model
+        // picker boundary, so persist only a bounded classification in logs.
+        logger.debug({
+          provider: agentType,
+          failureClass: classifyHermesModelDiscoveryFailure(err),
+        }, 'Hermes Agent auto-connect for model listing failed');
+        return hermesModelDiscoveryFailure(err);
+      }
       logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
     }
   }
@@ -10768,6 +11730,57 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
     return await provider.listModels(force);
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
+}
+
+type HermesModelDiscoveryFailureClass =
+  | 'authentication'
+  | 'rate_limited'
+  | 'cli_unavailable_or_incompatible'
+  | 'provider_failure';
+
+function classifyHermesModelDiscoveryFailure(error: unknown): HermesModelDiscoveryFailureClass {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : '';
+  if (code === PROVIDER_ERROR_CODES.AUTH_FAILED) return 'authentication';
+  if (code === PROVIDER_ERROR_CODES.RATE_LIMITED) return 'rate_limited';
+  if (code === PROVIDER_ERROR_CODES.CONFIG_ERROR || code === 'ENOENT') {
+    return 'cli_unavailable_or_incompatible';
+  }
+  return 'provider_failure';
+}
+
+function hermesModelDiscoveryFailure(error: unknown): TransportListModelsResult {
+  const failureClass = classifyHermesModelDiscoveryFailure(error);
+  if (failureClass === 'authentication') {
+    return {
+      models: [],
+      isAuthenticated: false,
+      error: 'Hermes Agent authentication is required. Run `hermes model`, complete an official provider login, then refresh.',
+    };
+  }
+  if (failureClass === 'rate_limited') {
+    return {
+      models: [],
+      isAuthenticated: false,
+      error: 'Hermes Agent model discovery is temporarily rate limited. Retry shortly.',
+    };
+  }
+  if (failureClass === 'cli_unavailable_or_incompatible') {
+    return {
+      models: [],
+      isAuthenticated: false,
+      error: 'Hermes Agent CLI is unavailable or incompatible. Install or upgrade the official Hermes Agent, run `hermes model`, then refresh.',
+    };
+  }
+  // Do not echo arbitrary provider/spawn text here: it can contain command
+  // lines, paths or environment material. Hermes uses this bounded public
+  // message and logs only the bounded failure classification above.
+  return {
+    models: [],
+    isAuthenticated: false,
+    error: 'Hermes Agent model discovery failed. Run `hermes model` to verify provider setup, then refresh.',
+  };
 }
 
 function modelIdsToTransportModels(ids: readonly string[]): TransportListModelsResult['models'] {
@@ -10809,7 +11822,19 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
     };
   }
-  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk'
+  if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) {
+    return {
+      models: modelIdsToTransportModels(CODEBUDDY_CHINA_MODEL_FALLBACK),
+      defaultModel: CODEBUDDY_CHINA_DEFAULT_MODEL,
+    };
+  }
+  if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) {
+    return {
+      models: modelIdsToTransportModels(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK),
+      defaultModel: CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0],
+    };
+  }
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk'
     || agentType === 'deepseek-harness' || agentType === 'pi') {
     // DeepSeek Harness resolves provider routes and model catalogues from its
     // own `~/.dsh` configuration; IM.codes advertises no static list.
@@ -10931,10 +11956,17 @@ export async function listProviderSessions(providerId: string): Promise<Array<{ 
 
 // ── CC env presets ────────────────────────────────────────────────────────
 
-async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
+async function handleCcPresetsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const { loadPresets } = await import('./cc-presets.js');
   const presets = await loadPresets();
-  serverLink.send({ type: CC_PRESET_MSG.LIST_RESPONSE, presets });
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId.trim() : '';
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
+  serverLink.send({
+    type: CC_PRESET_MSG.LIST_RESPONSE,
+    ...(requestId ? { requestId } : {}),
+    ...(sessionName ? { sessionName } : {}),
+    presets,
+  });
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -11093,7 +12125,29 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
   const includeArchived = cmd.includeArchived === true;
-  const baseStats = await getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
+  const pendingArgs = {
+    scope: 'personal' as const,
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    query: query || undefined,
+    limit,
+  };
+  const summaryArgs: ProcessedProjectionQuery = {
+    scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    projectionClass,
+    includeArchived,
+  };
+
+  // These four context-store reads are independent of each other's results —
+  // each only references another's value in its OWN error-fallback response,
+  // never as an input — so fire them concurrently instead of one at a time.
+  // Awaiting them in sequence was turning a request that just fills in two
+  // count badges into up to 4 back-to-back worker RPC round-trips.
+  const statsPromise = getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
     scope: 'personal',
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
@@ -11101,6 +12155,43 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     projectionClass,
     includeArchived,
   }]);
+  const recordsPromise: Promise<unknown> = query
+    ? searchLocalMemorySemanticForManagement({
+      query,
+      scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
+      repo: projectId || undefined,
+      // `projectionClass` is already validated to the 3 classes at its declaration.
+      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
+      limit,
+      includeArchived,
+    })
+    : getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [{
+      scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
+      projectId: projectId || undefined,
+      projectionClass,
+      limit,
+      includeArchived,
+    } satisfies ProcessedProjectionQuery]);
+  const pendingPromise = getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
+  const projectsPromise = getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+  // An early return below (e.g. stats fails) must not leave a sibling
+  // rejection unobserved — that crashes the daemon on Node's default
+  // unhandledRejection policy. This does not affect the real `await`s below;
+  // a promise's rejection is delivered to every handler attached to it.
+  for (const settled of [statsPromise, recordsPromise, pendingPromise, projectsPromise]) settled.catch(() => {});
+
+  let baseStats: ProcessedProjectionStats;
+  try {
+    baseStats = await statsPromise;
+  } catch (error) {
+    logger.warn({ error }, 'personal memory stats unavailable');
+    sendPersonalMemoryUnavailable(serverLink, requestId);
+    return;
+  }
 
   let records: Array<{
     id: string;
@@ -11120,34 +12211,16 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   let matchedRecords: number;
 
   if (query) {
-    const semanticQuery: Parameters<typeof searchLocalMemorySemanticForManagement>[0] = {
-      query,
-      scope: 'personal',
-      userId: ownerUserId,
-      includeLegacyPersonalOwner: true,
-      repo: projectId || undefined,
-      // `projectionClass` is already validated to the 3 classes at its declaration.
-      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
-      limit,
-      includeArchived,
-    };
     // R5 management semantic read goes through the worker (bounded L3 RPC) too,
     // off the daemon main thread. Unlike R1, unavailable/timeout errors are
     // reported explicitly to the management surface instead of becoming a
     // successful empty recall.
     let semantic: Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
     try {
-      semantic = await searchLocalMemorySemanticForManagement(semanticQuery);
+      semantic = await recordsPromise as Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
     } catch (error) {
       logger.warn({ error }, 'personal memory semantic query unavailable');
-      serverLink.send({
-        type: MEMORY_WS.PERSONAL_RESPONSE,
-        requestId,
-        stats: { ...baseStats, matchedRecords: 0, localUnavailable: true },
-        records: [],
-        pendingRecords: [],
-        projects: [],
-      });
+      sendPersonalMemoryUnavailable(serverLink, requestId, { ...baseStats, matchedRecords: 0 });
       return;
     }
     records = semantic.items
@@ -11167,33 +12240,30 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       }));
     matchedRecords = records.length;
   } else {
-    const queryArgs: ProcessedProjectionQuery = {
-      scope: 'personal',
-      userId: ownerUserId,
-      includeLegacyPersonalOwner: true,
-      projectId: projectId || undefined,
-      projectionClass,
-      limit,
-      includeArchived,
-    };
-    records = (await getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [queryArgs])).map((projection) => ({
-      id: projection.id,
-      scope: projection.namespace.scope as 'personal',
-      projectId: projection.namespace.projectId ?? '',
-      ownerUserId: recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
-      createdByUserId: recordCreatedByUserIdFromContent(
-        projection.content,
-        recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
-      ),
-      updatedByUserId: recordUpdatedByUserIdFromContent(projection.content),
-      summary: projection.summary,
-      projectionClass: projection.class,
-      sourceEventCount: projection.sourceEventIds.length,
-      updatedAt: projection.updatedAt,
-      hitCount: projection.hitCount ?? 0,
-      lastUsedAt: projection.lastUsedAt,
-      status: projection.status ?? 'active' as const,
-    }));
+    try {
+      records = (await recordsPromise as ProcessedContextProjection[]).map((projection) => ({
+        id: projection.id,
+        scope: projection.namespace.scope as 'personal',
+        projectId: projection.namespace.projectId ?? '',
+        ownerUserId: recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+        createdByUserId: recordCreatedByUserIdFromContent(
+          projection.content,
+          recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+        ),
+        updatedByUserId: recordUpdatedByUserIdFromContent(projection.content),
+        summary: projection.summary,
+        projectionClass: projection.class,
+        sourceEventCount: projection.sourceEventIds.length,
+        updatedAt: projection.updatedAt,
+        hitCount: projection.hitCount ?? 0,
+        lastUsedAt: projection.lastUsedAt,
+        status: projection.status ?? 'active' as const,
+      }));
+    } catch (error) {
+      logger.warn({ error }, 'personal memory records unavailable');
+      sendPersonalMemoryUnavailable(serverLink, requestId, baseStats);
+      return;
+    }
     matchedRecords = baseStats.matchedRecords;
   }
 
@@ -11201,24 +12271,15 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     ...baseStats,
     matchedRecords,
   };
-  const pendingArgs = {
-    scope: 'personal' as const,
-    userId: ownerUserId,
-    includeLegacyPersonalOwner: true,
-    projectId: projectId || undefined,
-    query: query || undefined,
-    limit,
-  };
-  const pendingRecords = await getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
-  const summaryArgs: ProcessedProjectionQuery = {
-    scope: 'personal',
-    userId: ownerUserId,
-    includeLegacyPersonalOwner: true,
-    projectId: projectId || undefined,
-    projectionClass,
-    includeArchived,
-  };
-  const projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+  let pendingRecords: ContextPendingEventView[];
+  let projects: ContextMemoryProjectView[];
+  try {
+    [pendingRecords, projects] = await Promise.all([pendingPromise, projectsPromise]);
+  } catch (error) {
+    logger.warn({ error }, 'personal memory supplemental views unavailable');
+    sendPersonalMemoryUnavailable(serverLink, requestId, stats);
+    return;
+  }
   // Any caller requesting short refs must consume handles issued by the daemon,
   // never values derived independently in UI code. Keep ordinary management-list
   // reads side-effect free; only an explicit includeShortRefs request registers
@@ -11503,6 +12564,22 @@ function emptyMemoryStatsView(): ContextMemoryStatsView {
     dirtyTargetCount: 0,
     pendingJobCount: 0,
   };
+}
+
+function sendPersonalMemoryUnavailable(
+  serverLink: ServerLink,
+  requestId: string,
+  stats: ContextMemoryStatsView = emptyMemoryStatsView(),
+): void {
+  serverLink.send({
+    type: MEMORY_WS.PERSONAL_RESPONSE,
+    requestId,
+    stats: { ...stats, localUnavailable: true },
+    records: [],
+    pendingRecords: [],
+    projects: [],
+    ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+  });
 }
 
 function memoryManagementError(code: MemoryManagementErrorCode): { errorCode: MemoryManagementErrorCode; error: string } {
@@ -11892,11 +12969,26 @@ async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records: [], featureEnabled: true, ...memoryManagementContextError() });
     return;
   }
-  const records = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
-    scope: PREFERENCE_INGEST_SCOPE,
-    class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  }]))
-    .filter((observation) => observation.state === PREFERENCE_INGEST_OBSERVATION_STATE)
+  let observations: ContextObservationRow[];
+  try {
+    observations = await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
+      scope: PREFERENCE_INGEST_SCOPE,
+      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      state: PREFERENCE_INGEST_OBSERVATION_STATE,
+    }]);
+  } catch (error) {
+    logger.warn({ error }, 'memory preference query unavailable');
+    serverLink.send({
+      type: MEMORY_WS.PREF_RESPONSE,
+      requestId,
+      records: [],
+      featureEnabled: true,
+      localUnavailable: true,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+    });
+    return;
+  }
+  const records = observations
     .map((observation) => {
       const userId = preferenceOwnerFromObservation(observation);
       const createdByUserId = recordCreatedByUserIdFromContent(observation.content, userId);
@@ -12336,19 +13428,34 @@ async function handleMemoryObservationsQuery(cmd: Record<string, unknown>, serve
     return;
   }
   const limit = Math.max(1, Math.min(200, typeof cmd.limit === 'number' ? cmd.limit : 50));
-  const observationsArgs = {
-    scope,
-    class: isObservationClass(observationClass) ? observationClass : undefined,
-  };
   const client = getContextStoreClient();
-  const observations = await client.run<ContextObservationRow[]>('listContextObservations', [observationsArgs]);
   const namespacesById = new Map<string, ContextNamespaceRow>();
-  for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
-    namespacesById.set(namespace.id, namespace);
+  let observations: ContextObservationRow[];
+  try {
+    for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
+      if (managementContextCanAccessNamespace(namespace, ctx)) {
+        namespacesById.set(namespace.id, namespace);
+      }
+    }
+    observations = await client.run<ContextObservationRow[]>('listContextObservations', [{
+      namespaceIds: [...namespacesById.keys()],
+      scope,
+      class: isObservationClass(observationClass) ? observationClass : undefined,
+      limit,
+    }]);
+  } catch (error) {
+    logger.warn({ error }, 'memory observation query unavailable');
+    serverLink.send({
+      type: MEMORY_WS.OBSERVATION_RESPONSE,
+      requestId,
+      records: [],
+      featureEnabled: true,
+      localUnavailable: true,
+      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+    });
+    return;
   }
   const records = observations
-    .filter((observation) => managementContextCanAccessNamespace(namespacesById.get(observation.namespaceId), ctx))
-    .slice(0, limit)
     .map((observation) => {
       const namespace = namespacesById.get(observation.namespaceId);
       const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
@@ -13018,6 +14125,9 @@ async function prependLocalMemory(
   if (!semanticSkipReason && isImperativeCommand(prompt)) semanticSkipReason = 'skipped_control_message';
   try {
     const recallContext = await resolveProcessRecallQueryContext(sessionName);
+    if (recallContext.namespace && !(await isMemoryInjectionEnabled(recallContext.namespace).catch(() => true))) {
+      return { text: prompt };
+    }
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
     // all-strong results). We need enough candidates to survive filtering.
     const recallQuery = {

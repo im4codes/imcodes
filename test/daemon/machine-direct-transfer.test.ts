@@ -1,5 +1,5 @@
 import { randomBytes } from 'node:crypto';
-import { mkdtemp, readFile, readdir, rm, unlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir, networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { connect, createServer, type Server, type Socket } from 'node:net';
@@ -26,9 +26,16 @@ import {
 
 const cleanup: string[] = [];
 const servers: Server[] = [];
+const resumeArtifacts = new Set<string>();
 afterEach(async () => {
   await Promise.all(servers.splice(0).map((server) => new Promise<void>((resolve) => server.close(() => resolve()))));
   await Promise.all(cleanup.splice(0).map((path) => rm(path, { recursive: true, force: true })));
+  const uploadDir = join(homedir(), '.imcodes', 'uploads');
+  await Promise.all([...resumeArtifacts].flatMap((clientUploadId) => [
+    rm(join(uploadDir, `.machine-resume-${clientUploadId}.part`), { force: true }),
+    rm(join(uploadDir, `.machine-resume-${clientUploadId}.json`), { force: true }),
+  ]));
+  resumeArtifacts.clear();
 });
 
 function privateIpv4Host(): string {
@@ -62,7 +69,7 @@ async function readJsonLine(socket: Socket): Promise<unknown> {
 
 async function startProtocolSource(
   request: Omit<MachineDirectUploadRequest, 'candidates'>,
-  sendFrames: (socket: Socket, key: Buffer) => void | Promise<void>,
+  sendFrames: (socket: Socket, key: Buffer, resumeOffset: number) => void | Promise<void>,
 ): Promise<{ host: string; port: number }> {
   const server = createServer((socket) => {
     void (async () => {
@@ -73,10 +80,17 @@ async function startProtocolSource(
         type: MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO,
         requestId: request.requestId,
         nonce: sourceNonce,
-        proof: createMachineDirectProof(request.capability, 'source', request.requestId, targetHello.nonce, sourceNonce),
+        proof: createMachineDirectProof(
+          request.capability,
+          'source',
+          request.requestId,
+          targetHello.nonce,
+          sourceNonce,
+          targetHello.resumeOffset ?? 0,
+        ),
       })}\n`);
       const key = deriveMachineDirectTransferKey(request.capability, targetHello.nonce, sourceNonce, request.requestId);
-      await sendFrames(socket, key);
+      await sendFrames(socket, key, targetHello.resumeOffset ?? 0);
     })().catch(() => socket.destroy());
   });
   servers.push(server);
@@ -96,10 +110,12 @@ async function machinePartFiles(): Promise<Set<string>> {
 }
 
 function requestBase(size: number): Omit<MachineDirectUploadRequest, 'candidates'> {
+  const clientUploadId = randomBytes(24).toString('base64url');
+  resumeArtifacts.add(clientUploadId);
   return {
     type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
     requestId: randomBytes(24).toString('base64url'),
-    clientUploadId: randomBytes(24).toString('base64url'),
+    clientUploadId,
     capability: randomBytes(32).toString('base64url'),
     originalName: 'adversarial.bin',
     size,
@@ -134,9 +150,182 @@ describe('machine direct encrypted TCP transfer', () => {
       requestId: request.requestId,
       size: content.length,
     });
-    expect(start).toEqual({ size: content.length, originalName: 'controlled-source.bin' });
+    expect(start).toMatchObject({
+      size: content.length,
+      originalName: 'controlled-source.bin',
+      sourceIdentity: { size: content.length, device: expect.any(Number), inode: expect.any(Number) },
+    });
     await expect(readFile(tempPath)).resolves.toEqual(content);
     receiver!.close();
+  });
+
+  it('resumes a reverse machine-direct fetch after a connection loss without rewriting its prefix', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-resume-'));
+    cleanup.push(dir);
+    const sourcePath = join(dir, 'controlled-source.bin');
+    const tempPath = join(dir, '.full-destination.part');
+    await writeFile(sourcePath, 'abcdef');
+    const sourceStat = await stat(sourcePath);
+    const sourceIdentity = {
+      size: sourceStat.size,
+      mtimeMs: sourceStat.mtimeMs,
+      device: sourceStat.dev,
+      inode: sourceStat.ino,
+    };
+    const firstRequest = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+    const first = await startMachineDirectFetchReceiver({ tempPath, request: firstRequest, transferTimeoutMs: 1_000 });
+    expect(first).not.toBeNull();
+    const candidate = first!.candidates[0]!;
+    const socket = connect({ host: candidate.host, port: candidate.port });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    const targetHello = validateMachineDirectTargetHello(await readJsonLine(socket));
+    expect(targetHello?.resumeOffset).toBeUndefined();
+    const sourceNonce = randomBytes(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.NONCE_BYTES).toString('base64url');
+    socket.write(`${JSON.stringify({
+      type: MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO,
+      requestId: firstRequest.requestId,
+      nonce: sourceNonce,
+      proof: createMachineDirectProof(firstRequest.capability, 'source', firstRequest.requestId, targetHello!.nonce, sourceNonce),
+    })}\n`);
+    const key = deriveMachineDirectTransferKey(firstRequest.capability, targetHello!.nonce, sourceNonce, firstRequest.requestId);
+    socket.write(encryptMachineDirectFrame(key, firstRequest.requestId, 0n, Buffer.concat([
+      Buffer.from([MACHINE_DIRECT_FRAME_TYPE.START]),
+      Buffer.from(JSON.stringify({ size: 6, originalName: 'controlled-source.bin', sourceIdentity })),
+    ])));
+    socket.end(encryptMachineDirectFrame(
+      key,
+      firstRequest.requestId,
+      1n,
+      Buffer.concat([Buffer.from([MACHINE_DIRECT_FRAME_TYPE.DATA]), Buffer.from('abc')]),
+    ));
+    await expect(first!.completion).rejects.toThrow();
+    await expect(readFile(tempPath, 'utf8')).resolves.toBe('abc');
+
+    const retryRequest = {
+      ...firstRequest,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+    };
+    const retry = await startMachineDirectFetchReceiver({ tempPath, request: retryRequest });
+    expect(retry).not.toBeNull();
+    const response = await sendMachineDirectFetch({
+      ...retryRequest,
+      sourcePath,
+      candidates: retry!.candidates,
+    });
+    await expect(retry!.completion).resolves.toEqual({
+      size: 6,
+      originalName: 'controlled-source.bin',
+      sourceIdentity,
+      resumeOffset: 3,
+    });
+    expect(response).toEqual({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE,
+      requestId: retryRequest.requestId,
+      size: 6,
+    });
+    await expect(readFile(tempPath, 'utf8')).resolves.toBe('abcdef');
+    retry!.close();
+  });
+
+  it('rejects a reverse-direct partial when the source was replaced, then restarts from zero', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-source-replaced-'));
+    cleanup.push(dir);
+    const sourcePath = join(dir, 'controlled-source.bin');
+    const tempPath = join(dir, '.full-destination.part');
+    await writeFile(sourcePath, 'AAAAA');
+    const oldStat = await stat(sourcePath);
+    const oldIdentity = {
+      size: oldStat.size,
+      mtimeMs: oldStat.mtimeMs,
+      device: oldStat.dev,
+      inode: oldStat.ino,
+    };
+    const firstRequest = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+      expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+    const first = await startMachineDirectFetchReceiver({ tempPath, request: firstRequest, transferTimeoutMs: 1_000 });
+    expect(first).not.toBeNull();
+    const socket = connect({ host: first!.candidates[0]!.host, port: first!.candidates[0]!.port });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    const targetHello = validateMachineDirectTargetHello(await readJsonLine(socket));
+    expect(targetHello).not.toBeNull();
+    const sourceNonce = randomBytes(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.NONCE_BYTES).toString('base64url');
+    socket.write(`${JSON.stringify({
+      type: MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO,
+      requestId: firstRequest.requestId,
+      nonce: sourceNonce,
+      proof: createMachineDirectProof(
+        firstRequest.capability,
+        'source',
+        firstRequest.requestId,
+        targetHello!.nonce,
+        sourceNonce,
+      ),
+    })}\n`);
+    const key = deriveMachineDirectTransferKey(firstRequest.capability, targetHello!.nonce, sourceNonce, firstRequest.requestId);
+    socket.write(encryptMachineDirectFrame(key, firstRequest.requestId, 0n, Buffer.concat([
+      Buffer.from([MACHINE_DIRECT_FRAME_TYPE.START]),
+      Buffer.from(JSON.stringify({ size: 5, originalName: 'controlled-source.bin', sourceIdentity: oldIdentity })),
+    ])));
+    socket.end(encryptMachineDirectFrame(
+      key,
+      firstRequest.requestId,
+      1n,
+      Buffer.concat([Buffer.from([MACHINE_DIRECT_FRAME_TYPE.DATA]), Buffer.from('AA')]),
+    ));
+    await expect(first!.completion).rejects.toThrow();
+    await expect(readFile(tempPath, 'utf8')).resolves.toBe('AA');
+
+    await unlink(sourcePath);
+    await writeFile(sourcePath, 'hello');
+    const replacementRequest = {
+      ...firstRequest,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+    };
+    const replacement = await startMachineDirectFetchReceiver({ tempPath, request: replacementRequest });
+    expect(replacement).not.toBeNull();
+    const replacementSend = sendMachineDirectFetch({
+      ...replacementRequest,
+      sourcePath,
+      candidates: replacement!.candidates,
+    });
+    await expect(replacement!.completion).rejects.toThrow('source_identity_mismatch');
+    // The source may finish writing into the kernel before it observes the
+    // receiver close. Receiver identity validation is the commit authority.
+    await expect(replacementSend).resolves.toMatchObject({ requestId: replacementRequest.requestId });
+    await expect(readFile(tempPath)).rejects.toThrow();
+
+    const freshRequest = {
+      ...replacementRequest,
+      requestId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+    };
+    const fresh = await startMachineDirectFetchReceiver({ tempPath, request: freshRequest });
+    expect(fresh).not.toBeNull();
+    await expect(sendMachineDirectFetch({
+      ...freshRequest,
+      sourcePath,
+      candidates: fresh!.candidates,
+    })).resolves.toMatchObject({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE, size: 5 });
+    await expect(fresh!.completion).resolves.toMatchObject({ size: 5 });
+    await expect(readFile(tempPath, 'utf8')).resolves.toBe('hello');
+    fresh!.close();
   });
 
   it('returns a correlated connect failure immediately when every legacy candidate is link-local', async () => {
@@ -209,7 +398,16 @@ describe('machine direct encrypted TCP transfer', () => {
     const key = deriveMachineDirectTransferKey(request.capability, targetHello!.nonce, sourceNonce, request.requestId);
     const start = Buffer.concat([
       Buffer.from([MACHINE_DIRECT_FRAME_TYPE.START]),
-      Buffer.from(JSON.stringify({ size: failure === 'size-mismatch' ? 4 : 3, originalName: 'bad.bin' })),
+      Buffer.from(JSON.stringify({
+        size: failure === 'size-mismatch' ? 4 : 3,
+        originalName: 'bad.bin',
+        sourceIdentity: {
+          size: failure === 'size-mismatch' ? 4 : 3,
+          mtimeMs: 1,
+          device: 1,
+          inode: 1,
+        },
+      })),
     ]);
     socket.write(encryptMachineDirectFrame(key, request.requestId, 0n, start));
     const data = encryptMachineDirectFrame(
@@ -260,6 +458,44 @@ describe('machine direct encrypted TCP transfer', () => {
     sender!.close();
   });
 
+  it('fails closed when the upload source changes after its resume identity was bound', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-direct-source-change-'));
+    cleanup.push(dir);
+    const sourcePath = join(dir, 'source.txt');
+    await writeFile(sourcePath, 'first');
+    const sourceStat = await stat(sourcePath);
+    const base: Omit<MachineDirectUploadRequest, 'candidates'> = {
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+      requestId: randomBytes(24).toString('base64url'),
+      clientUploadId: randomBytes(24).toString('base64url'),
+      capability: randomBytes(32).toString('base64url'),
+      originalName: 'source.txt',
+      size: 5,
+      expiresAt: Date.now() + 15_000,
+    };
+    resumeArtifacts.add(base.clientUploadId);
+    const sender = await startMachineDirectSender({
+      sourcePath,
+      request: base,
+      expectedSourceIdentity: {
+        size: sourceStat.size,
+        mtimeMs: sourceStat.mtimeMs,
+        device: sourceStat.dev,
+        inode: sourceStat.ino,
+      },
+    });
+    expect(sender).not.toBeNull();
+    await unlink(sourcePath);
+    await writeFile(sourcePath, 'other');
+
+    await expect(receiveMachineDirectUpload({ ...base, candidates: sender!.candidates })).resolves.toMatchObject({
+      type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
+      error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.TRANSFER_FAILED,
+    });
+    sender!.close();
+    await expect(sender!.completion).rejects.toThrow('direct_closed');
+  });
+
   it('rejects an expired authority before opening a socket', async () => {
     const response = await receiveMachineDirectUpload({
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
@@ -274,7 +510,7 @@ describe('machine direct encrypted TCP transfer', () => {
     expect(response).toMatchObject({ type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR, error: 'expired' });
   });
 
-  it.each(['tamper', 'replay'] as const)('rejects %s frames and removes partial data', async (failure) => {
+  it.each(['tamper', 'replay'] as const)('rejects %s frames without trusting unauthenticated bytes', async (failure) => {
     const before = await machinePartFiles();
     const base = requestBase(3);
     const candidate = await startProtocolSource(base, (socket, key) => {
@@ -294,10 +530,17 @@ describe('machine direct encrypted TCP transfer', () => {
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
       error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.AUTH_FAILED,
     });
-    expect(await machinePartFiles()).toEqual(before);
+    const after = await machinePartFiles();
+    if (failure === 'tamper') {
+      expect(after).toEqual(before);
+    } else {
+      expect([...after].filter((file) => !before.has(file))).toEqual([
+        `.machine-resume-${base.clientUploadId}.part`,
+      ]);
+    }
   });
 
-  it('times out an authenticated partial stream and removes its temp file', async () => {
+  it('resumes an authenticated machine-direct upload from the receiver-owned durable offset', async () => {
     const before = await machinePartFiles();
     const base = requestBase(6);
     const candidate = await startProtocolSource(base, (socket, key) => {
@@ -318,6 +561,30 @@ describe('machine direct encrypted TCP transfer', () => {
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.ERROR,
       error: MACHINE_DIRECT_FILE_TRANSFER_ERROR.TIMEOUT,
     });
-    expect(await machinePartFiles()).toEqual(before);
+    const afterFailure = await machinePartFiles();
+    expect([...afterFailure].filter((file) => !before.has(file))).toEqual([
+      `.machine-resume-${base.clientUploadId}.part`,
+    ]);
+
+    const retry = { ...base, requestId: randomBytes(24).toString('base64url') };
+    const retryCandidate = await startProtocolSource(retry, (socket, key, resumeOffset) => {
+      expect(resumeOffset).toBe(3);
+      socket.write(encryptMachineDirectFrame(
+        key,
+        retry.requestId,
+        0n,
+        Buffer.concat([Buffer.from([MACHINE_DIRECT_FRAME_TYPE.DATA]), Buffer.from('def')]),
+      ));
+      const finish = Buffer.alloc(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.FINISH_FRAME_PLAINTEXT_BYTES);
+      finish[0] = MACHINE_DIRECT_FRAME_TYPE.FINISH;
+      finish.writeBigUInt64BE(6n, 1);
+      socket.end(encryptMachineDirectFrame(key, retry.requestId, 1n, finish));
+    });
+    const completed = await receiveMachineDirectUpload({ ...retry, candidates: [retryCandidate] });
+    expect(completed.type).toBe(MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE);
+    if (completed.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE) throw new Error(completed.error);
+    await expect(readFile(completed.attachment.daemonPath, 'utf8')).resolves.toBe('abcdef');
+    await unlink(completed.attachment.daemonPath).catch(() => {});
+    await unlink(`${completed.attachment.daemonPath}.meta.json`).catch(() => {});
   });
 });

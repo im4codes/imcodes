@@ -16,6 +16,7 @@
 
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
+#include "api/units/data_rate.h"
 #include "modules/video_coding/include/video_error_codes.h"
 #include "test/gtest.h"
 
@@ -331,6 +332,146 @@ TEST_F(MfH264EncoderTest, ConvertsScalesAndEncodesSyntheticFrame) {
 
 TEST_F(MfH264EncoderTest, UsesApprovedSoftwareMftFallback) {
   RunSyntheticEncode(false);
+}
+
+TEST_F(MfH264EncoderTest,
+       IndependentEncodersKeepPreferencesAndRegistryOwnership) {
+  SetMfH264QualityPreference(QualityPreference{});
+  auto first = std::make_unique<MfH264Encoder>(false, "viewer-a");
+  auto second = std::make_unique<MfH264Encoder>(false, "viewer-b");
+  RecordingCallback first_callback;
+  RecordingCallback second_callback;
+  webrtc::VideoCodec first_codec;
+  first_codec.codecType = webrtc::kVideoCodecH264;
+  first_codec.width = 1920;
+  first_codec.height = 1080;
+  first_codec.startBitrate = 6000;
+  first_codec.minBitrate = 350;
+  first_codec.maxBitrate = 8000;
+  first_codec.maxFramerate = 30;
+  first_codec.numberOfSimulcastStreams = 1;
+  first_codec.mode = webrtc::VideoCodecMode::kScreensharing;
+  first_codec.active = true;
+  const webrtc::VideoEncoder::Settings settings(
+      webrtc::VideoEncoder::Capabilities(false), 2, 1200);
+  ASSERT_EQ(first->RegisterEncodeCompleteCallback(&first_callback),
+            WEBRTC_VIDEO_CODEC_OK);
+  ASSERT_EQ(second->RegisterEncodeCompleteCallback(&second_callback),
+            WEBRTC_VIDEO_CODEC_OK);
+  ASSERT_EQ(first->InitEncode(&first_codec, settings), WEBRTC_VIDEO_CODEC_OK);
+  ASSERT_EQ(second->InitEncode(&first_codec, settings), WEBRTC_VIDEO_CODEC_OK);
+  ASSERT_EQ(GetMfH264ActiveEncoderCount(), 2u);
+  QualityPreference first_preference;
+  first_preference.max_height = 1080;
+  first_preference.max_fps = 30;
+  first_preference.max_bitrate_bps = 7'000'000;
+  QualityPreference second_preference;
+  second_preference.max_height = 1080;
+  second_preference.max_fps = 30;
+  second_preference.max_bitrate_bps = 6'500'000;
+  SetMfH264QualityPreferenceForSession("viewer-a", first_preference);
+  SetMfH264QualityPreferenceForSession("viewer-b", second_preference);
+  webrtc::VideoEncoder::RateControlParameters first_rates;
+  ASSERT_TRUE(first_rates.bitrate.SetBitrate(0, 0, 8'000'000));
+  first->SetRates(first_rates);
+  webrtc::VideoEncoder::RateControlParameters second_rates;
+  ASSERT_TRUE(second_rates.bitrate.SetBitrate(0, 0, 8'000'000));
+  second->SetRates(second_rates);
+  ASSERT_TRUE(GetMfH264RuntimeDiagnosticsForSession("viewer-a"));
+  ASSERT_TRUE(GetMfH264RuntimeDiagnosticsForSession("viewer-b"));
+  const MfH264RuntimeDiagnostics first_quality = first->GetRuntimeDiagnostics();
+  const MfH264RuntimeDiagnostics second_quality = second->GetRuntimeDiagnostics();
+  // Same 1080p30 rung, different BWE targets: matching by preset/size/fps
+  // would return the wrong encoder for one peer. The per-session binding must
+  // preserve each viewer's own cap and actual bitrate.
+  EXPECT_EQ(first_quality.height, 1080);
+  EXPECT_EQ(second_quality.height, 1080);
+  EXPECT_EQ(first_quality.fps, 30);
+  EXPECT_EQ(second_quality.fps, 30);
+  EXPECT_LE(first_quality.bitrate_bps, 7'000'000u);
+  EXPECT_LE(second_quality.bitrate_bps, 6'500'000u);
+  EXPECT_NE(first_quality.bitrate_bps, second_quality.bitrate_bps);
+
+  ASSERT_EQ(first->Release(), WEBRTC_VIDEO_CODEC_OK);
+  ASSERT_EQ(GetMfH264ActiveEncoderCount(), 1u);
+  const MfH264RuntimeDiagnostics surviving = second->GetRuntimeDiagnostics();
+  EXPECT_EQ(surviving.height, second_quality.height);
+  EXPECT_EQ(surviving.bitrate_bps, second_quality.bitrate_bps);
+  EXPECT_EQ(second->Release(), WEBRTC_VIDEO_CODEC_OK);
+  EXPECT_EQ(GetMfH264ActiveEncoderCount(), 0u);
+}
+
+TEST_F(MfH264EncoderTest, SingleViewerPreferenceAndFeedbackRemainBound) {
+  MfH264Encoder encoder(false, "single-viewer");
+  RecordingCallback callback;
+  webrtc::VideoCodec codec;
+  codec.codecType = webrtc::kVideoCodecH264;
+  codec.width = 1920;
+  codec.height = 1080;
+  codec.startBitrate = 6000;
+  codec.minBitrate = 350;
+  codec.maxBitrate = 8000;
+  codec.maxFramerate = 30;
+  codec.numberOfSimulcastStreams = 1;
+  codec.mode = webrtc::VideoCodecMode::kScreensharing;
+  codec.active = true;
+  ASSERT_EQ(encoder.RegisterEncodeCompleteCallback(&callback),
+            WEBRTC_VIDEO_CODEC_OK);
+  ASSERT_EQ(encoder.InitEncode(
+                &codec,
+                webrtc::VideoEncoder::Settings(
+                    webrtc::VideoEncoder::Capabilities(false), 2, 1200)),
+            WEBRTC_VIDEO_CODEC_OK);
+  ASSERT_EQ(GetMfH264ActiveEncoderCount(), 1u);
+  QualityPreference preference;
+  preference.max_height = 360;
+  preference.max_fps = 15;
+  preference.max_bitrate_bps = 700'000;
+  SetMfH264QualityPreferenceForSession("single-viewer", preference);
+  const MfH264RuntimeDiagnostics diagnostics =
+      encoder.GetRuntimeDiagnostics();
+  EXPECT_EQ(diagnostics.height, 360);
+  EXPECT_LE(diagnostics.fps, 15);
+  EXPECT_LE(diagnostics.bitrate_bps, 700'000u);
+  EXPECT_EQ(encoder.Release(), WEBRTC_VIDEO_CODEC_OK);
+  EXPECT_EQ(GetMfH264ActiveEncoderCount(), 0u);
+}
+
+TEST_F(MfH264EncoderTest,
+       LazyPeerDoesNotBorrowTheOnlyOtherEncodersQualityDecision) {
+  MfH264RuntimeDiagnostics other;
+  other.initialized = true;
+  other.preset = "1080p30";
+  other.width = 1920;
+  other.height = 1080;
+  other.fps = 30;
+  other.bitrate_bps = 7'000'000;
+  const imcodes::remote_desktop::common::QualitySelection
+      joining_peer_selection{
+      "720p30", {1280, 720}, 30, 2'000'000, 2'000'000};
+
+  const MfH264QualityDecision decision = EvaluateMfH264QualityDecision(
+      std::nullopt, joining_peer_selection, 1, false);
+  EXPECT_TRUE(decision.accepted);
+  EXPECT_FALSE(decision.has_encoder_bitrate);
+}
+
+TEST_F(MfH264EncoderTest, SinglePeerStillRejectsAnActualQualityMismatch) {
+  MfH264RuntimeDiagnostics own;
+  own.initialized = true;
+  own.preset = "1080p30";
+  own.width = 1920;
+  own.height = 1080;
+  own.fps = 30;
+  own.bitrate_bps = 6'000'000;
+  const imcodes::remote_desktop::common::QualitySelection mismatched{
+      "1080p30", {1920, 1080}, 30, 4'000'000, 6'000'000};
+
+  const MfH264QualityDecision decision = EvaluateMfH264QualityDecision(
+      own, mismatched, 1, false);
+  EXPECT_FALSE(decision.accepted);
+  EXPECT_TRUE(decision.has_encoder_bitrate);
+  EXPECT_EQ(decision.encoder_bitrate_bps, 6'000'000u);
 }
 
 TEST_F(MfH264EncoderTest, SustainsPacedProductionLadder) {

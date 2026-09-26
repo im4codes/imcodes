@@ -45,6 +45,7 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
     // Pinned panel is always visible to the user while mounted; participate
     // in resume broadcast so it catches up even when not the active session.
     isVisible: true,
+    bootstrapWhenVisible: true,
   });
   const liveSub = ctx.subSessions.find(s => s.sessionName === sessionName);
 
@@ -130,6 +131,9 @@ function SubSessionContent({ panel, ctx }: { panel: PinnedPanel; ctx: PanelRende
           activeToolCall={activeToolCall}
           activeTimelineTurn={activeTimelineTurn}
           now={thinkingNow}
+          onRefreshHistory={forceRefresh}
+          historyRefreshing={refreshing}
+          historyStatus={historyStatus}
         />
       )}
       {(compactQuotaText || liveSub.planLabel) && (
@@ -259,6 +263,7 @@ registerPanelType('cronmanager', {
         activeSession={ctx.activeSession}
         sharedSessionName={ctx.sharedAccessRole ? ctx.activeSession ?? undefined : undefined}
         readOnly={ctx.sharedAccessRole === 'viewer'}
+        portalSubPanels
         onBack={() => {}}
         onNavigateSession={(sessionName, quote) => {
           window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: sessionName, quote } }));

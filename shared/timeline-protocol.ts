@@ -1,6 +1,16 @@
 export const TIMELINE_MESSAGES = {
+  /** Browser → server: subscribe one socket to one session's live timeline. */
+  SUBSCRIBE: 'timeline.subscribe',
+  /** Browser → server: stop live timeline delivery for one session/socket. */
+  UNSUBSCRIBE: 'timeline.unsubscribe',
+  /** Server → browser: a bounded live queue/coalescing gap needs history backfill. */
+  SEQ_GAP: 'timeline.seq_gap',
   HISTORY_REQUEST: 'timeline.history_request',
   HISTORY: 'timeline.history',
+  /** Server → daemon: the server abandoned this history/page request (timeout
+   *  or requester gone). The daemon drops its reply if still queued unsent.
+   *  Only sent to daemons advertising TIMELINE_HISTORY_CANCEL_CAPABILITY. */
+  HISTORY_CANCEL: 'timeline.history_cancel',
   REPLAY_REQUEST: 'timeline.replay_request',
   REPLAY: 'timeline.replay',
   PAGE_REQUEST: 'timeline.page_request',
@@ -14,6 +24,45 @@ export const TIMELINE_MESSAGES = {
 } as const;
 
 export type TimelineMessageType = (typeof TIMELINE_MESSAGES)[keyof typeof TIMELINE_MESSAGES];
+
+/** Delivery quality for a browser socket/session pair. */
+export const TIMELINE_SUBSCRIPTION_MODES = {
+  /** Visible/pinned window: all timeline frames, including streaming deltas.
+   * A healthy full subscriber is never coalesced or delayed for load. */
+  FULL: 'full',
+  /** Hidden/minimized window: durable events and latest-value summaries only. */
+  SUMMARY: 'summary',
+} as const;
+
+export type TimelineSubscriptionMode =
+  (typeof TIMELINE_SUBSCRIPTION_MODES)[keyof typeof TIMELINE_SUBSCRIPTION_MODES];
+
+export interface TimelineSubscribeRequest {
+  type: typeof TIMELINE_MESSAGES.SUBSCRIBE;
+  sessionName: string;
+  mode: TimelineSubscriptionMode;
+  /** Optional cursor used when switching mode or reconnecting. */
+  epoch?: number;
+  afterSeq?: number;
+  requestId?: string;
+}
+
+export interface TimelineUnsubscribeRequest {
+  type: typeof TIMELINE_MESSAGES.UNSUBSCRIBE;
+  sessionName: string;
+  requestId?: string;
+}
+
+export interface TimelineSeqGap {
+  type: typeof TIMELINE_MESSAGES.SEQ_GAP;
+  sessionId: string;
+  epoch: number;
+  fromSeq: number;
+  toSeq: number;
+  reason: 'backpressure' | 'coalesced' | 'transport' | string;
+  /** Client should issue HISTORY_REQUEST with cursor.afterSeq = toSeq. */
+  backfill: true;
+}
 
 export const TIMELINE_RESPONSE_STATUS = {
   OK: 'ok',
@@ -59,6 +108,8 @@ export interface TimelineCursor {
 
 export const TIMELINE_PROTOCOL_REVISION = 1 as const;
 export const TIMELINE_PROTOCOL_CAPABILITY = 'timeline.protocol.v1' as const;
+/** Daemon understands TIMELINE_MESSAGES.HISTORY_CANCEL. */
+export const TIMELINE_HISTORY_CANCEL_CAPABILITY = 'timeline.history_cancel.v1' as const;
 
 export interface TimelineProtocolCapability {
   capability: typeof TIMELINE_PROTOCOL_CAPABILITY;
@@ -147,6 +198,8 @@ export interface TimelinePageRequest extends Omit<TimelineHistoryRequest, 'type'
 }
 
 export type TimelineProtocolClientRequest =
+  | TimelineSubscribeRequest
+  | TimelineUnsubscribeRequest
   | TimelineHistoryRequest
   | TimelineReplayRequest
   | TimelinePageRequest

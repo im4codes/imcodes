@@ -16,6 +16,8 @@ import { SessionControls } from './SessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
+import { DaemonRemoteDesktopControl } from './DaemonRemoteDesktopControl.js';
+import type { MachineListItem } from '../api/machines.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { useTerminalRawHold } from '../hooks/useTerminalRawHold.js';
 import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
@@ -39,6 +41,7 @@ import { DESKTOP_WINDOW_IDS } from '../window-stack.js';
 import {
   clampGeometryFullyIntoWorkspace,
   clampGeometryToWorkspace,
+  isWindowChromeDoubleClickTarget,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
   resolveSessionTabsBottom,
@@ -66,8 +69,11 @@ interface Props {
   sub: SubSession;
   ws: WsClient | null;
   connected: boolean;
-  /** When false, timeline and terminal subscriptions are paused to save CPU. */
+  /** Whether this is the focused/topmost visible sub-session window. */
   active: boolean;
+  /** False while its owning main-session tab is hidden; the mounted window and
+   * chat state are retained so returning to the tab never rebuilds a blank pane. */
+  visible?: boolean;
   /** Report the trailing pending ask.question (or null) for dialog re-surface. */
   onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
   idleFlashToken?: number;
@@ -129,6 +135,18 @@ interface Props {
   inP2p?: boolean;
   sharedState?: SharedStateSummary | null;
   accentColor?: string;
+  /**
+   * Whether the daemon behind `serverId` is currently reachable. Gates the
+   * remote-desktop quick-open/install button placed to the left of this
+   * window's own file-browser toggle — same machine `serverId` and the
+   * nested FileBrowser already target, same signal the main-session toolbar
+   * uses for its own DaemonRemoteDesktopControl.
+   */
+  daemonOnline?: boolean;
+  /** Opens the remote-desktop workspace for a machine. Same callback the main-session toolbar passes to its own DaemonRemoteDesktopControl. */
+  onOpenRemoteDesktop?: (machine: MachineListItem) => void;
+  /** This user owns the daemon: its remote-desktop button may offer setup. */
+  remoteDesktopCanSetUp?: boolean;
 }
 
 type ViewMode = 'terminal' | 'chat';
@@ -259,7 +277,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 }
 
 export function SubSessionWindow({
-  sub, ws, connected, active, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR,
+  sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
@@ -283,6 +301,7 @@ export function SubSessionWindow({
     historyStatus: timelineHistoryStatus,
     addOptimisticUserMessage,
     markOptimisticFailed,
+    removeOptimisticMessage,
     retryOptimisticMessage,
     forceRefresh: timelineForceRefresh,
     loadingOlder,
@@ -290,11 +309,12 @@ export function SubSessionWindow({
     loadOlderEvents,
     loadMessageContext,
   } = useTimeline(sub.sessionName, ws, serverId, {
-    // Any mounted sub-session window is user-visible work, even when it is not
-    // the focused/topmost one. Keep its active history/replay/retry path armed
-    // so timeline gaps do not wait for a focus/window switch to backfill.
-    isActiveSession: true,
-    isVisible: true,
+    // Exactly one focused/topmost window owns opportunistic recovery. Other
+    // visible windows stay subscribed and cache-warm, but must not all launch
+    // HTTP/IDB work together when the browser resumes after sleep.
+    isActiveSession: active,
+    isVisible: visible,
+    bootstrapWhenVisible: true,
   });
 
   // Re-surface a still-pending question in the dedicated dialog from history
@@ -459,12 +479,16 @@ export function SubSessionWindow({
     quotaLabel: sub.quotaLabel ?? undefined,
     quotaUsageLabel: sub.quotaUsageLabel ?? undefined,
     quotaMeta: sub.quotaMeta ?? undefined,
+    codexCreditsBalance: sub.codexCreditsBalance ?? undefined,
+    codexCreditsUnlimited: sub.codexCreditsUnlimited ?? undefined,
     effort: sub.effort ?? undefined,
     runtimeType: effectiveRuntimeType,
     sessionInstanceId: sub.sessionInstanceId ?? undefined,
     runtimeEpoch: sub.runtimeEpoch ?? undefined,
     providerId: sub.providerId ?? undefined,
     transportConfig: sub.transportConfig ?? undefined,
+    supervisionMode: sub.supervisionMode ?? undefined,
+    supervisionHeartbeat: sub.supervisionHeartbeat ?? undefined,
     transportPendingMessages: sub.transportPendingMessages ?? undefined,
     transportPendingMessageEntries: sub.transportPendingMessageEntries ?? undefined,
     transportPendingMessageVersion: sub.transportPendingMessageVersion ?? undefined,
@@ -495,32 +519,42 @@ export function SubSessionWindow({
       }
     };
     window.addEventListener('resize', onResize);
-    requestAnimationFrame(onResize);
-    return () => window.removeEventListener('resize', onResize);
+    // Cancel on unmount: a frame firing after the window closed would set
+    // state on an unmounted component and schedule a render nobody owns.
+    const frame = requestAnimationFrame(onResize);
+    return () => {
+      cancelAnimationFrame(frame);
+      window.removeEventListener('resize', onResize);
+    };
   }, [isMobile, isDesktopMaximized]);
 
   // Scroll to bottom whenever switching to chat view;
   // force fit + full terminal refresh when switching to terminal view.
   useEffect(() => {
     if (viewMode === 'chat') {
-      setTimeout(() => chatScrollRef.current?.(), 50);
-    } else if (viewMode === 'terminal') {
-      requestAnimationFrame(() => {
+      const timer = setTimeout(() => chatScrollRef.current?.(), 50);
+      return () => clearTimeout(timer);
+    }
+    if (viewMode === 'terminal') {
+      const frame = requestAnimationFrame(() => {
         termFitFnRef.current?.();
         if (ws && connected && active) {
           try { ws.sendSnapshotRequest(sub.sessionName); } catch { /* ignore */ }
         }
       });
+      return () => cancelAnimationFrame(frame);
     }
+    return undefined;
   }, [viewMode, ws, connected, active, sub.sessionName]);
 
   // Shell/script window: hold the raw PTY stream for the window's ENTIRE
-  // lifetime — NOT just while focused. An open sub-session window is always
-  // on-screen (position:fixed); users often keep one at the side to observe, so
-  // it must keep updating regardless of focus. (Previously this bailed with
+  // visible lifetime — NOT just while focused. Users often keep one at the
+  // side to observe, so it must keep updating regardless of focus. Hidden
+  // retained windows release the stream without discarding their UI state.
+  // (Previously this bailed with
   // `if (isShell && !active) return` and unsubscribed on focus loss, which froze
   // an open-but-unfocused shell window.) Ref-counted hold — see useTerminalRawHold.
-  useTerminalRawHold(ws, connected, isShell && !isTransport, sub.sessionName);
+  useTerminalRawHold(ws, connected, visible && isShell && !isTransport, sub.sessionName);
 
   // These arrive from app.tsx as inline arrows and would otherwise change
   // identity on every timeline event, defeating ChatView's memo boundary.
@@ -530,17 +564,16 @@ export function SubSessionWindow({
 
   // Non-shell window: subscribe raw only while focused (full-fidelity view); when
   // unfocused it falls back to the passive (non-raw) subscription app.tsx keeps.
-  // Re-subscribe on mount so the server sends a fresh snapshot (the window
-  // unmounts on minimize, so a remount would otherwise start empty).
+  // Re-subscribe on mount/restore so the server sends a fresh snapshot.
   useEffect(() => {
-    if (!ws || !connected || isTransport || isShell) return;
+    if (!visible || !ws || !connected || isTransport || isShell) return;
     const raw = active;
     try { ws.subscribeTerminal(sub.sessionName, raw); } catch { /* ignore */ }
     if (!raw) return;
     return () => {
       try { ws.subscribeTerminal(sub.sessionName, false); } catch { /* ignore */ }
     };
-  }, [ws, connected, sub.sessionName, active, isTransport, isShell]);
+  }, [ws, connected, sub.sessionName, active, visible, isTransport, isShell]);
 
   const scrollToBottom = useCallback(() => {
     setTimeout(() => {
@@ -682,6 +715,16 @@ export function SubSessionWindow({
     onFocus();
     onToggleMaximized?.();
   }, [onFocus, onToggleMaximized]);
+
+  // Double-click on the header toggles the same in-window maximize as the
+  // header button (not browser/OS fullscreen). Header controls keep their own
+  // behaviour: only the bare chrome (drag icon, title text, empty space) counts.
+  const handleHeaderDoubleClick = useCallback((event: MouseEvent) => {
+    if (!desktopLayoutCapable || !onToggleMaximized) return;
+    if (!isWindowChromeDoubleClickTarget(event.target)) return;
+    event.preventDefault();
+    handleToggleMaximized();
+  }, [desktopLayoutCapable, handleToggleMaximized, onToggleMaximized]);
 
   const restoreBeforeClosing = useCallback(() => {
     if (maximized) onRestoreBeforeClose?.();
@@ -905,6 +948,7 @@ export function SubSessionWindow({
       <div
         class="subsession-header"
         onMouseDown={onHeaderMouseDown}
+        onDblClick={handleHeaderDoubleClick}
         draggable={!!isPinnable && !isDesktopMaximized}
         onDragStart={handleDragStart}
       >
@@ -914,6 +958,19 @@ export function SubSessionWindow({
         {sub.ccPresetId && <span style={{ fontSize: 11, color: '#f59e0b' }} title={`Custom API: ${sub.ccPresetId}`}>◉</span>}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 10 }}>
           {!isShell && !isTransport && <button class="subsession-mode-btn" onClick={() => { const next = viewMode === 'chat' ? 'terminal' : 'chat'; setViewMode(next); if (next === 'chat') requestAnimationFrame(() => chatScrollRef.current?.()); }} title={viewMode === 'chat' ? 'Switch to terminal' : 'Switch to chat'}>{viewMode === 'chat' ? '⌨' : '💬'}</button>}
+          {/* Left of the file-manager button, on purpose — same convention
+              as the main-session toolbar's DaemonRemoteDesktopControl: it
+              targets the exact same `serverId` (and so the exact same
+              machine) this window's own FileBrowser below is rooted on. */}
+          <DaemonRemoteDesktopControl
+            compact
+            offerLoginScreenSetup={false}
+            ws={ws}
+            serverId={serverId ?? null}
+            daemonOnline={daemonOnline ?? false}
+            onOpen={(machine) => onOpenRemoteDesktop?.(machine)}
+            canSetUp={remoteDesktopCanSetUp}
+          />
           {/* File browser — placed to the LEFT of the pin button in the
               sub-session window header. Each sub-session owns its own
               FileBrowser instance rooted at sub.cwd, so selected paths land
@@ -1014,6 +1071,8 @@ export function SubSessionWindow({
           quotaLabel={sessionInfo?.quotaLabel}
           quotaUsageLabel={(sessionInfo?.agentType === 'codex' || sessionInfo?.agentType === 'codex-sdk') ? undefined : sessionInfo?.quotaUsageLabel}
           quotaMeta={sessionInfo?.quotaMeta}
+          codexCreditsBalance={sessionInfo?.codexCreditsBalance}
+          codexCreditsUnlimited={sessionInfo?.codexCreditsUnlimited}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
@@ -1035,6 +1094,9 @@ export function SubSessionWindow({
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
           runExecutionClonesFeedback={executionCloneLaunchState}
+          onRefreshHistory={timelineForceRefresh}
+          historyRefreshing={refreshing}
+          historyStatus={timelineHistoryStatus}
         />
       )}
 
@@ -1067,12 +1129,14 @@ export function SubSessionWindow({
           addOptimisticUserMessage(text, meta?.commandId, {
             ...(meta?.attachments ? { attachments: meta.attachments } : {}),
             ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+            ...(meta?.queueAppend ? { queueAppend: true } : {}),
           });
           if (meta?.commandId && meta.localFailure) {
             markOptimisticFailed(meta.commandId, meta.localFailure);
           }
           scrollToBottom();
         }}
+        onRemoveOptimisticMessage={removeOptimisticMessage}
         onSubRestart={onRestart}
         onSubNew={onRestart}
         onSubStop={handleClose}

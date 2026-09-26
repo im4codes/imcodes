@@ -180,6 +180,25 @@ export function clampGeometryFullyIntoWorkspace(
   };
 }
 
+/**
+ * Double-clicking a window's title bar toggles the SAME in-window maximize the
+ * title-bar button drives (never browser/OS fullscreen). Anything interactive
+ * inside the chrome -- buttons, links, form controls, contenteditable -- keeps
+ * its own double-click behaviour and must never toggle the window.
+ */
+const WINDOW_CHROME_INTERACTIVE_SELECTOR = [
+  'button', 'a', 'input', 'select', 'textarea', 'label', 'summary',
+  '[role="button"]', '[role="tab"]', '[role="menuitem"]', '[contenteditable]:not([contenteditable="false"])',
+].join(', ');
+
+export function isWindowChromeDoubleClickTarget(target: EventTarget | null): boolean {
+  const element = target && typeof (target as Element).closest === 'function'
+    ? target as Element
+    : null;
+  if (!element) return false;
+  return element.closest(WINDOW_CHROME_INTERACTIVE_SELECTOR) === null;
+}
+
 export function shouldPersistGeometry(isMaximized: boolean): boolean {
   return !isMaximized;
 }

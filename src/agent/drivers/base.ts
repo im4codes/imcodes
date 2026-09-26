@@ -16,6 +16,11 @@ export interface LaunchOptions {
   geminiSessionId?: string;
   /** OpenCode session ID for `opencode -s <ID>`. */
   opencodeSessionId?: string;
+  /**
+   * Launch this agent process with native agent tools withheld (an IM.codes
+   * managed session). Genuinely unmanaged launches omit it and keep defaults.
+   */
+  nativeAgentsFenced?: boolean;
 }
 
 /** Build a cd prefix for shell commands. Uses Windows syntax on win32. */

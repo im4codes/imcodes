@@ -1,5 +1,5 @@
 import type { AttachmentRef } from './transport/file-transfer.js';
-import { validateAttachmentRef } from './transport/file-transfer.js';
+import { FILE_TRANSFER_PATH_MAX_BYTES, validateAttachmentRef } from './transport/file-transfer.js';
 
 /**
  * Full daemons auto-upgrade, so this is a clean v2 protocol.  Do not add v1
@@ -13,7 +13,18 @@ export const DIRECT_FILE_TRANSFER_RESUME_TICKET_TYPE = 'direct_file.v2.resume_ti
 export const DIRECT_FILE_TRANSFER_LEASE_CAPABILITY = 'file.transfer.direct.lease.v2' as const;
 export const DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY = 'file.transfer.direct.upload_recovery.v2' as const;
 export const DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY = 'file.transfer.direct.preview_download.v2' as const;
+/** Optional rolling capability for direct uploads committed into a selected controlled-node directory. */
+export const DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY = 'file.transfer.direct.directory_upload.v1' as const;
 export const DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX = 'imcodes-health-' as const;
+export const DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX = 'direct-file-' as const;
+
+export const DIRECT_FILE_CONNECTION_STATUS = {
+  NONE: 'none',
+  DIRECT: 'direct',
+  RELAY: 'relay',
+} as const;
+
+export type DirectFileConnectionStatus = typeof DIRECT_FILE_CONNECTION_STATUS[keyof typeof DIRECT_FILE_CONNECTION_STATUS];
 
 export const DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES = [
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
@@ -21,7 +32,8 @@ export const DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES = [
   DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
 ] as const;
 
-export type DirectFileTransferCapability = typeof DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES[number];
+export type DirectFileTransferCapability = typeof DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES[number]
+  | typeof DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY;
 
 export const DIRECT_FILE_TRANSFER_DIRECTION = {
   UPLOAD: 'upload',
@@ -34,6 +46,7 @@ export const DIRECT_FILE_TRANSFER_MSG = {
   LEASE_INIT: 'direct_file.v2.lease_init',
   LEASE_READY: 'direct_file.v2.lease_ready',
   LEASE_PREPARED: 'direct_file.v2.lease_prepared',
+  LEASE_LOST: 'direct_file.v2.lease_lost',
   LEASE_REBIND: 'direct_file.v2.lease_rebind',
   LEASE_REBOUND: 'direct_file.v2.lease_rebound',
   OPERATION_INIT: 'direct_file.v2.operation_init',
@@ -144,6 +157,17 @@ export type DirectFileTransferErrorScope = typeof DIRECT_FILE_TRANSFER_ERROR_SCO
  * It deliberately never converts a local/security/integrity failure to HTTP,
  * because a fallback must not mask a denied/changed file or user cancellation.
  */
+const DIRECT_FILE_TRANSFER_LINK_FAILURES = new Set<DirectFileTransferError>([
+  DIRECT_FILE_TRANSFER_ERROR.DAEMON_OFFLINE,
+  DIRECT_FILE_TRANSFER_ERROR.LEASE_REBIND_FAILED,
+  DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION,
+]);
+
+/** Whether a failure points at the node's server link rather than the P2P path. */
+export function isDirectFileTransferLinkFailure(error: DirectFileTransferError): boolean {
+  return DIRECT_FILE_TRANSFER_LINK_FAILURES.has(error);
+}
+
 export function classifyDirectFileTransferFailure(
   error: DirectFileTransferError,
   attemptsUsed: number,
@@ -201,11 +225,26 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   AUTHORITY_TTL_MS: 2 * 60 * 60 * 1000,
   MAX_ATTEMPTS: 3,
   RETRY_BACKOFF_MS: [250, 1_000] as const,
+  /**
+   * Backoff after a failure that means the node's server link is down or was
+   * just replaced (node offline, lease rebind, stale node generation). The
+   * fast schedule burns every attempt inside one reconnect -- a half-dead link
+   * takes seconds to detect -- and drops a working P2P path to HTTP.
+   */
+  LINK_RECOVERY_BACKOFF_MS: [3_000, 8_000] as const,
   RETRY_MAX_POSITIVE_JITTER_RATIO: 0.25,
   NO_PROGRESS_TIMEOUT_MS: 45 * 1000,
   LEASE_IDLE_TTL_MS: 5 * 60 * 1000,
+  /** Renew a retained warm lease before its server-authoritative idle deadline. */
+  LEASE_RENEW_LEAD_MS: 2 * 60 * 1000,
   RESUME_TICKET_TTL_MS: 10 * 60 * 1000,
   STATUS_RECOVERY_DEADLINE_MS: 15 * 1000,
+  /**
+   * A receiver may still be draining its durable write queue after the browser
+   * has handed the last chunk to SCTP.  Poll the authoritative operation
+   * ledger a small, bounded number of times before retrying/falling back.
+   */
+  MAX_STATUS_RECOVERY_QUERIES: 3,
   OPERATION_LEDGER_TTL_MS: 60 * 60 * 1000,
   OPERATION_LEDGER_CAPACITY: 256,
   MAX_ACTIVE_CHANNELS_PER_LEASE: 4,
@@ -214,8 +253,24 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
    * connection phase on a path that is still negotiating. This deadline is
    * measured only until the direct data plane accepts the upload; once bytes
    * start flowing, the normal no-progress watchdog owns the transfer.
+   *
+   * This is the CEILING, for a transfer large enough that winning a direct path
+   * is worth waiting for. See `uploadDirectConnectFallbackMs` — spending the
+   * full budget on a small file is a pure loss, because the HTTP fallback would
+   * have finished many times over inside it.
    */
-  UPLOAD_DIRECT_CONNECT_FALLBACK_MS: 20 * 1000,
+  UPLOAD_DIRECT_CONNECT_FALLBACK_MS: 30 * 1000,
+  /**
+   * Floor: a cross-region path can spend several 200-300 ms round trips on
+   * Server signalling, TURN allocation, ICE checks and DTLS before the first
+   * operation channel opens. The old 2.5 s floor routinely expired while
+   * such a path was still making progress. Eight seconds remains bounded and
+   * well below the large-transfer ceiling, while leaving enough room for a
+   * healthy high-RTT path to prove itself.
+   */
+  UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS: 8 * 1000,
+  /** How much connect time each megabyte of payload is allowed to justify. */
+  UPLOAD_DIRECT_CONNECT_BUDGET_PER_MB_MS: 10_000,
   NEGOTIATION_TIMEOUT_MS: 8 * 1000,
   /**
    * How long a data channel may take to report `open`.
@@ -242,6 +297,30 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   PROBE_CANDIDATE_TYPE_BYTES: 64,
   PROBE_TIMEOUT_MS: 8 * 1000,
 } as const;
+
+/**
+ * How long an upload may sit in the connecting phase before taking HTTP.
+ *
+ * Scaled by payload, because that is what the wait is being spent to save. A
+ * direct path is worth several seconds of negotiation for a large file and
+ * worth almost nothing for a small one: measured on a real device, a 14.7 kB
+ * upload spent the full 20 s ceiling connecting, failed with zero bytes, and
+ * the HTTP fallback then delivered it in about 300 ms.
+ *
+ * The fixed ceiling rested on an assumption the logs disprove — that "a path
+ * that cannot work says so in well under a second, so only a path still making
+ * progress ever reaches the tail of this window". A path can do neither: the
+ * peer never reported `failed` and never moved a byte, so the deadline was
+ * reached by a connection that was simply hung, not by one about to succeed.
+ */
+export function uploadDirectConnectFallbackMs(sizeBytes: number): number {
+  const megabytes = Math.max(0, Number.isFinite(sizeBytes) ? sizeBytes : 0) / (1024 * 1024);
+  const earned = megabytes * DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_BUDGET_PER_MB_MS;
+  return Math.min(
+    DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_FALLBACK_MS,
+    Math.max(DIRECT_FILE_TRANSFER_LIMITS.UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS, earned),
+  );
+}
 
 export const DIRECT_FILE_TRANSFER_ICE_SERVERS = [
   'stun:stun.cloudflare.com:3478',
@@ -349,6 +428,36 @@ export interface DirectFileTransferAttemptBinding extends DirectFileTransferLeas
   operationId: string;
 }
 
+/**
+ * Every data-plane frame must echo the EXACT attempt tuple it belongs to.
+ *
+ * The correlation pair (requestId, attemptId) is not sufficient on its own: a
+ * frame can be well formed and carry the right pair while belonging to another
+ * daemon generation, another lease, another operation, another direction or an
+ * earlier attempt of the same operation. For uploads that is not cosmetic —
+ * the offset such a frame carries becomes the resume boundary a later attempt
+ * starts from, i.e. the value that decides which bytes are never sent again.
+ *
+ * Shared so the two ends cannot drift: the daemon validated the full tuple
+ * while the browser checked only two fields, and that asymmetry WAS the
+ * bypass. One definition, used by both.
+ */
+export function directFileTransferAttemptBindingMatches(
+  expected: DirectFileTransferAttemptBinding,
+  value: Record<string, unknown>,
+): boolean {
+  return value.serverId === expected.serverId
+    && value.browserTabId === expected.browserTabId
+    && value.leaseId === expected.leaseId
+    && value.leaseGeneration === expected.leaseGeneration
+    && value.daemonGeneration === expected.daemonGeneration
+    && value.requestId === expected.requestId
+    && value.attemptId === expected.attemptId
+    && value.attempt === expected.attempt
+    && value.direction === expected.direction
+    && value.operationId === expected.operationId;
+}
+
 export interface DirectFileTransferLeaseInit {
   type: typeof DIRECT_FILE_TRANSFER_MSG.LEASE_INIT;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
@@ -373,6 +482,21 @@ export interface DirectFileTransferLeasePrepared extends DirectFileTransferLease
   type: typeof DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
   requestId: string;
+}
+
+/**
+ * An established lease did not survive the daemon's transfer child.
+ *
+ * Unsolicited by construction. An idle lease has no outstanding request, so
+ * there is no requestId to answer and nothing for the lost-worker sweep to
+ * fail; the lease binding is the only identity that outlives the request that
+ * created it. Without this the browser learns its peer is gone only when its
+ * own ICE consent check finally times out, which is why a recycle that the
+ * daemon completes in milliseconds stalled clients for a median of ~57s.
+ */
+export interface DirectFileTransferLeaseLost extends DirectFileTransferLeaseBinding {
+  type: typeof DIRECT_FILE_TRANSFER_MSG.LEASE_LOST;
+  protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
 }
 
 export interface DirectFileTransferLeaseRebind {
@@ -434,6 +558,7 @@ export interface DirectFileTransferUploadInit extends DirectFileTransferOperatio
   size: number;
   mime?: string;
   sha256?: string;
+  destinationDirectory?: string;
 }
 
 export interface DirectFileTransferDownloadInit extends DirectFileTransferOperationInitBase {
@@ -569,6 +694,21 @@ export interface DirectFileTransferDataStart extends DirectFileTransferAttemptBi
   type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.START;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
   authority: string;
+  /**
+   * Byte offset this attempt wants to continue from.
+   *
+   * A transient DataChannel/ICE replacement used to cost the whole file: the
+   * next attempt started at zero, or the operation gave up and re-sent
+   * everything over the HTTP relay. The sender already learns a durable offset
+   * from the receiver (see `committedBytes` on CREDIT), so it can ask to
+   * continue from exactly that point.
+   *
+   * Advisory, never authority. The receiver accepts it only when the operation,
+   * authorized identity, declared size and the actual length of its own partial
+   * file all agree; anything else fails closed. Absent or 0 means "from the
+   * beginning", which is the only shape older senders can produce.
+   */
+  resumeOffset?: number;
 }
 
 export type DirectFileTransferDataAccepted = DirectFileTransferAttemptBinding & {
@@ -585,6 +725,20 @@ export interface DirectFileTransferDataCredit extends DirectFileTransferAttemptB
   type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT;
   protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
   creditBytes: number;
+  /**
+   * UPLOAD only: bytes the receiver has durably written, monotonic per attempt.
+   *
+   * The upload direction had no receiver-to-sender signal at all — CREDIT was
+   * validated for DOWNLOAD exclusively — so a browser sending a file could only
+   * judge liveness from its own `RTCDataChannel.bufferedAmount`. That cannot
+   * distinguish "the peer is committing steadily but slowly" from "the peer is
+   * gone", and a single drain slower than the no-progress budget killed a
+   * transfer that was in fact advancing the whole time.
+   *
+   * Emitted by the daemon AFTER the write resolves, so it is a commit point and
+   * never a promise. Absent from DOWNLOAD credits, which carry only a window.
+   */
+  committedBytes?: number;
 }
 
 export interface DirectFileTransferDataFinish extends DirectFileTransferAttemptBinding {
@@ -647,6 +801,7 @@ export type DirectFileTransferDaemonCommand =
 
 export type DirectFileTransferDaemonMessage =
   | DirectFileTransferLeasePrepared
+  | DirectFileTransferLeaseLost
   | DirectFileTransferLeaseRebound
   | DirectFileTransferLeaseAnswer
   | DirectFileTransferLeaseIce
@@ -656,6 +811,7 @@ export type DirectFileTransferDaemonMessage =
 
 export type DirectFileTransferServerMessage =
   | DirectFileTransferLeaseReady
+  | DirectFileTransferLeaseLost
   | DirectFileTransferLeaseRebound
   | DirectFileTransferAuthorized
   | DirectFileTransferLeaseAnswer
@@ -872,7 +1028,7 @@ function isResumeTicket(value: unknown): value is string {
 function isUploadInit(value: Record<string, unknown>, type: string): boolean {
   return hasExactKeys(value,
     ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'clientUploadId', 'filename', 'size'],
-    ['sessionName', 'mime', 'sha256'],
+    ['sessionName', 'mime', 'sha256', 'destinationDirectory'],
   )
     && value.type === type
     && value.protocolVersion === DIRECT_FILE_TRANSFER_PROTOCOL_VERSION
@@ -884,7 +1040,9 @@ function isUploadInit(value: Record<string, unknown>, type: string): boolean {
     && isDirectFileTransferSize(value.size)
     && (value.sessionName === undefined || isBoundedString(value.sessionName, DIRECT_FILE_TRANSFER_LIMITS.SESSION_NAME_BYTES))
     && (value.mime === undefined || isBoundedString(value.mime, DIRECT_FILE_TRANSFER_LIMITS.MIME_BYTES))
-    && (value.sha256 === undefined || (typeof value.sha256 === 'string' && SHA256_RE.test(value.sha256)));
+    && (value.sha256 === undefined || (typeof value.sha256 === 'string' && SHA256_RE.test(value.sha256)))
+    && (value.destinationDirectory === undefined
+      || isBoundedString(value.destinationDirectory, FILE_TRANSFER_PATH_MAX_BYTES));
 }
 
 function isDownloadInit(value: Record<string, unknown>, type: string): boolean {
@@ -910,7 +1068,7 @@ function authorityKeysFor(value: Record<string, unknown>, type: string): boolean
   const common = ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority', 'authorityExpiresAt', 'channelLabel', 'iceServers'];
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
     const { authority: _authority, authorityExpiresAt: _authorityExpiresAt, channelLabel: _channelLabel, iceServers: _iceServers, ...operation } = value;
-    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256'])
+    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256', 'destinationDirectory'])
       && isUploadInit(operation, type);
   }
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
@@ -1078,6 +1236,15 @@ export function validateDirectFileTransferDaemonMessage(value: unknown): DirectF
       || !isLeaseBinding(value)) return invalid();
     return { ok: true, value: value as unknown as DirectFileTransferLeasePrepared };
   }
+  if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST) {
+    // No requestId: this message exists precisely because there is no live
+    // request to answer. Keys stay exact so it cannot be confused with a
+    // correlated reply.
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration'])
+      || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION
+      || !isLeaseBinding(value)) return invalid();
+    return { ok: true, value: value as unknown as DirectFileTransferLeaseLost };
+  }
   if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND && validateLeaseReady(value, DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND)) return { ok: true, value: value as unknown as DirectFileTransferLeaseRebound };
   if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER && isLeaseOfferOrAnswer(value, DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER)) return { ok: true, value: value as unknown as DirectFileTransferLeaseAnswer };
   if (value.type === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE && isLeaseIce(value)) return { ok: true, value: value as unknown as DirectFileTransferLeaseIce };
@@ -1197,8 +1364,9 @@ function isDataAttemptBinding(value: Record<string, unknown>): boolean {
 export function validateDirectFileTransferDataMessage(value: unknown): DirectFileTransferValidationResult<DirectFileTransferDataMessage> {
   if (!isRecord(value) || typeof value.type !== 'string') return invalid();
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.START) {
-    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority'])
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority'], ['resumeOffset'])
       || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isDataAttemptBinding(value) || !isAuthority(value.authority)) return invalid();
+    if (value.resumeOffset !== undefined && !isDirectFileTransferSize(value.resumeOffset)) return invalid();
     return { ok: true, value: value as unknown as DirectFileTransferDataStart };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED) {
@@ -1213,10 +1381,20 @@ export function validateDirectFileTransferDataMessage(value: unknown): DirectFil
     return { ok: true, value: value as unknown as DirectFileTransferDataAccepted };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT) {
-    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'creditBytes'])
+    if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'creditBytes'], ['committedBytes'])
       || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isDataAttemptBinding(value)
-      || value.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD
       || !isPositiveSafeInteger(value.creditBytes) || value.creditBytes > DIRECT_FILE_TRANSFER_LIMITS.DATA_CREDIT_BYTES) return invalid();
+    // DOWNLOAD credit is a pure flow-control window and must not claim a commit
+    // point; UPLOAD credit exists only to carry one, so it is required there.
+    // Keeping the two shapes disjoint means a peer cannot smuggle a fabricated
+    // offset in on the direction that has no receiver-side write behind it.
+    if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
+      if (value.committedBytes !== undefined) return invalid();
+    } else if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
+      if (!isDirectFileTransferSize(value.committedBytes)) return invalid();
+    } else {
+      return invalid();
+    }
     return { ok: true, value: value as unknown as DirectFileTransferDataCredit };
   }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH) {
@@ -1263,6 +1441,52 @@ export function validateDirectFileTransferDataMessage(value: unknown): DirectFil
 }
 
 /** True only for v2 message names understood by this protocol. */
+/**
+ * True only for an outcome that DISCHARGES an operation's obligation.
+ *
+ * STATUS is not automatically an answer: STATUS_QUERY deliberately reuses the
+ * active attempt's requestId, so a `streaming`/`attempting` reply carries the
+ * same correlation as the PREPARE it is reporting on. Treating that as a
+ * settlement deletes the pending failure the daemon owes that attempt if its
+ * child later dies -- and the browser keeps active attempts alive across
+ * LEASE_LOST precisely because it expects that correlated error.
+ */
+/**
+ * WIRE SHAPE: exactly the operation outcomes whose STATUS carries
+ * `idleExpiresAt`.
+ *
+ * Defined against the very `TERMINAL_STATES` set the validator uses, so the
+ * two cannot drift. Anything that decides message SHAPE -- appending
+ * idleExpiresAt, propagating a new idle window the browser can only read from
+ * that field -- must ask THIS question, never the discharge one below.
+ */
+export function isDirectFileTransferTerminalShapedOperationMessage(
+  message: { type: string; state?: unknown },
+): boolean {
+  if (message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL) return true;
+  if (message.type !== DIRECT_FILE_TRANSFER_MSG.STATUS) return false;
+  return TERMINAL_STATES.has(message.state as string);
+}
+
+/**
+ * OBLIGATION DISCHARGE: has this attempt ended, so the daemon no longer owes it
+ * a correlated failure if a child generation dies?
+ *
+ * A strictly wider question than the shape above, and the two must stay
+ * separate. `not_found` ends an attempt -- the browser answers it with a
+ * NON-RETRYABLE OPERATION_NOT_FOUND -- but its STATUS is NOT terminal-shaped:
+ * `isServerStatus` forbids `idleExpiresAt` on it. Conflating the two made the
+ * Server append that field to a not_found frame, which then failed validation
+ * and was discarded by the browser before it could reach that very branch.
+ */
+export function isDirectFileTransferOperationDischarged(
+  message: { type: string; state?: unknown },
+): boolean {
+  return isDirectFileTransferTerminalShapedOperationMessage(message)
+    || (message.type === DIRECT_FILE_TRANSFER_MSG.STATUS
+      && message.state === DIRECT_FILE_TRANSFER_OPERATION_STATE.NOT_FOUND);
+}
+
 export function isDirectFileTransferMessageType(value: unknown): value is string {
   return typeof value === 'string' && (Object.values(DIRECT_FILE_TRANSFER_MSG) as string[]).includes(value);
 }
@@ -1276,6 +1500,7 @@ export function isLegacyDirectFileTransferMessageType(value: unknown): boolean {
 
 export function isDirectFileTransferDaemonMessageType(value: unknown): boolean {
   return value === DIRECT_FILE_TRANSFER_MSG.LEASE_PREPARED
+    || value === DIRECT_FILE_TRANSFER_MSG.LEASE_LOST
     || value === DIRECT_FILE_TRANSFER_MSG.LEASE_REBOUND
     || value === DIRECT_FILE_TRANSFER_MSG.LEASE_ANSWER
     || value === DIRECT_FILE_TRANSFER_MSG.LEASE_ICE
@@ -1287,4 +1512,390 @@ export function isDirectFileTransferDaemonMessageType(value: unknown): boolean {
 /** Extracts the stable id after a direction-specific validator has succeeded. */
 export function getDirectFileTransferOperationId(value: Pick<DirectFileTransferOperationInit, 'operationId'>): string {
   return value.operationId;
+}
+
+/* ------------------------------------------------------------------------- *
+ * Worker control protocol.
+ *
+ * The RTC data plane runs in a worker thread so a blocked daemon event loop
+ * cannot starve ICE/DataChannel callbacks, progress timers, hashing or file
+ * I/O. Only CONTROL-plane envelopes cross the thread boundary: file bytes are
+ * read, hashed and written entirely inside the worker and never appear in an
+ * IPC payload.
+ *
+ * Every envelope carries a worker generation. A generation is minted per spawn,
+ * so a reply from a crashed-and-replaced worker is recognisably stale and is
+ * dropped rather than applied to the current worker's state. Validation is
+ * fail-closed in both directions: an envelope that is not exactly well-formed
+ * is rejected, never coerced.
+ * ------------------------------------------------------------------------- */
+
+export const DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION = 1 as const;
+export const DIRECT_FILE_TRANSFER_WORKER_KIND = 'imcodes-direct-file-transfer' as const;
+
+export const DIRECT_FILE_TRANSFER_WORKER_MSG = {
+  /** main -> worker: a validated daemon command plus the sender it replies to. */
+  COMMAND: 'dft.worker.command',
+  /** worker -> main: a control message to hand to that sender's transport. */
+  CONTROL: 'dft.worker.control',
+  /**
+   * worker -> main: this lease is gone, forget it.
+   *
+   * The main thread has to remember every established lease so it can tell the
+   * browser when a child generation dies with it. Only the worker knows when a
+   * lease ends normally (idle TTL, explicit close), so without this the proxy
+   * registry could never shrink and would have to invent a ceiling -- and any
+   * ceiling below the worker's own unbounded `leases` map silently drops the
+   * obligation to notify whichever live lease it displaced.
+   */
+  LEASE_CLOSED: 'dft.worker.lease_closed',
+  /**
+   * worker -> main: the exit about to happen is a PLANNED retirement recycle.
+   *
+   * The child kills itself for a hard recycle, so the parent sees an ordinary
+   * SIGKILL and cannot tell a healthy, deliberate recycle from a crash. It
+   * therefore applied the escalating crash backoff to it: by the sixth recycle
+   * the replacement did not start for 3.2s, which no client retry envelope can
+   * absorb. Declaring intent is what separates the two.
+   */
+  RECYCLING: 'dft.worker.recycling',
+  /** worker -> main: the worker finished booting and declares its generation. */
+  READY: 'dft.worker.ready',
+  /** main -> worker: begin graceful shutdown. */
+  SHUTDOWN: 'dft.worker.shutdown',
+  /** worker -> main: graceful shutdown finished; safe to terminate. */
+  SHUTDOWN_ACK: 'dft.worker.shutdown_ack',
+  /**
+   * main -> worker: prove the native addon is idle before it may be replaced.
+   *
+   * The upgrade path replaces node_datachannel.node in place. Only the isolate
+   * that holds the mapping can drain its peers and call cleanup(), so the main
+   * thread cannot answer this question itself — it has to ask.
+   */
+  QUIESCE: 'dft.worker.quiesce',
+  /** worker -> main: the real outcome of exactly one QUIESCE. */
+  QUIESCE_RESULT: 'dft.worker.quiesce_result',
+  /** main -> worker / worker -> main: runtime availability projection. */
+  STATUS_REQUEST: 'dft.worker.status_request',
+  STATUS_REPLY: 'dft.worker.status_reply',
+  /**
+   * worker -> main: invoke a host-owned authority function.
+   *
+   * Attachment registration and client-upload claims are single-authority state
+   * that the RELAY path also uses, and relay runs on the main thread. Holding a
+   * second copy inside the worker would let a direct and a relay upload claim
+   * the same id independently and would hide worker-registered attachments from
+   * the main thread. So the worker owns no such state: it asks the host.
+   * Only metadata crosses - never file contents.
+   */
+  HOST_CALL: 'dft.worker.host_call',
+  /** main -> worker: the result of exactly one HOST_CALL. */
+  HOST_RESULT: 'dft.worker.host_result',
+} as const;
+
+/**
+ * Host authority methods the worker may invoke. This is an allowlist, not a
+ * suggestion: an envelope naming anything else is refused, so a malformed or
+ * hostile message cannot reach arbitrary main-thread code.
+ */
+/**
+ * Write-ahead record kept beside an upload that is being published.
+ *
+ * Shared because two modules must agree on it without either importing the
+ * other: the worker writes and clears it, and the upload-directory scan on the
+ * host has to recognise it as an internal artifact rather than rehydrate it as
+ * a downloadable attachment.
+ */
+export const DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX = '.commit-intent.json';
+
+export const DIRECT_FILE_TRANSFER_HOST_METHOD = {
+  TRY_CLAIM_CLIENT_UPLOAD: 'tryClaimClientUpload',
+  RELEASE_CLIENT_UPLOAD_CLAIM: 'releaseClientUploadClaim',
+  LOOKUP_ATTACHMENT_BY_CLIENT_UPLOAD_ID: 'lookupAttachmentByClientUploadId',
+  RESOLVE_DIRECT_FILE_DOWNLOAD_SOURCE: 'resolveDirectFileDownloadSource',
+  FINALIZE_DIRECT_UPLOADED_FILE: 'finalizeDirectUploadedFile',
+} as const;
+
+export type DirectFileTransferHostMethod =
+  typeof DIRECT_FILE_TRANSFER_HOST_METHOD[keyof typeof DIRECT_FILE_TRANSFER_HOST_METHOD];
+
+const HOST_METHODS = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_HOST_METHOD));
+
+/**
+ * Structural limits applied BEFORE a value is handed to structured clone.
+ *
+ * structuredClone will happily copy a deeply nested or enormous payload, and
+ * doing so on the main thread is exactly the stall this split removes. These
+ * bounds are therefore a liveness control, not only a hygiene one.
+ */
+export const DIRECT_FILE_TRANSFER_IPC_LIMITS = {
+  MAX_DEPTH: 8,
+  /**
+   * Derived from the protocol, never chosen independently.
+   *
+   * This is a backstop against an unbounded payload, not a second opinion on
+   * what the protocol allows. A hand-picked 8 KB looked reasonable and was
+   * wrong: `SDP_BYTES` is 256 KB, and a real multi-candidate offer passes 8 KB
+   * easily, so every such lease negotiation was dropped at this boundary with
+   * no error anywhere — the transfer simply never started. Any future
+   * tightening must stay at or above the largest single protocol field.
+   */
+  MAX_STRING_LENGTH: DIRECT_FILE_TRANSFER_LIMITS.SDP_BYTES,
+  MAX_ARRAY_LENGTH: 256,
+  MAX_KEYS: 64,
+  /** One maximal SDP plus everything legal that can accompany it. */
+  MAX_TOTAL_STRING_BUDGET: DIRECT_FILE_TRANSFER_LIMITS.SDP_BYTES * 2,
+} as const;
+
+/**
+ * Reject anything that is not a small, plain, JSON-shaped value.
+ *
+ * Binary payloads are refused outright rather than truncated: a Buffer or
+ * TypedArray crossing this boundary would mean file bytes had re-entered the
+ * main thread, which is the property the worker split exists to guarantee.
+ */
+export function isWithinDirectFileTransferIpcLimits(
+  value: unknown,
+  budget: { strings: number } = { strings: 0 },
+  depth = 0,
+): boolean {
+  if (depth > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_DEPTH) return false;
+  if (value === null || value === undefined) return true;
+  const kind = typeof value;
+  if (kind === 'boolean' || kind === 'number') return Number.isFinite(value as number) || kind === 'boolean';
+  if (kind === 'string') {
+    const text = value as string;
+    if (text.length > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_STRING_LENGTH) return false;
+    budget.strings += text.length;
+    return budget.strings <= DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_TOTAL_STRING_BUDGET;
+  }
+  if (kind !== 'object') return false;
+  // Binary never crosses. This is deliberate defence in depth, not the only
+  // thing standing between file bytes and the main thread: the plain-object
+  // check below independently rejects every view and buffer, because none of
+  // them has Object.prototype. Deleting either guard alone still refuses
+  // binary, and that redundancy is the point — the invariant is important
+  // enough to state explicitly rather than to inherit from a prototype test
+  // whose purpose is something else. Kept ahead of the array/record branches so
+  // the refusal is attributable to the rule that means it.
+  if (ArrayBuffer.isView(value) || value instanceof ArrayBuffer) return false;
+  if (Array.isArray(value)) {
+    if (value.length > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_ARRAY_LENGTH) return false;
+    return value.every((entry) => isWithinDirectFileTransferIpcLimits(entry, budget, depth + 1));
+  }
+  if (Object.getPrototypeOf(value) !== Object.prototype && Object.getPrototypeOf(value) !== null) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_KEYS) return false;
+  return entries.every(([key, entry]) => (
+    key.length <= DIRECT_FILE_TRANSFER_IPC_LIMITS.MAX_STRING_LENGTH
+    && isWithinDirectFileTransferIpcLimits(entry, budget, depth + 1)
+  ));
+}
+
+export type DirectFileTransferWorkerMessageType =
+  typeof DIRECT_FILE_TRANSFER_WORKER_MSG[keyof typeof DIRECT_FILE_TRANSFER_WORKER_MSG];
+
+export interface DirectFileTransferWorkerEnvelopeBase {
+  v: typeof DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION;
+  type: DirectFileTransferWorkerMessageType;
+  /** Spawn-scoped worker identity. Mismatches are dropped, never coerced. */
+  generation: number;
+}
+
+export interface DirectFileTransferWorkerCommandEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND;
+  /** Opaque main-thread transport handle id; the worker never sees the socket. */
+  senderId: string;
+  command: unknown;
+}
+
+export interface DirectFileTransferWorkerControlEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL;
+  senderId: string;
+  message: Record<string, unknown>;
+  /**
+   * Worker-clock time at which this was produced.
+   *
+   * The point of the split is that the worker keeps working while the daemon
+   * loop is blocked. That is only observable if the emission time is recorded
+   * on the worker side: a message received after the block could otherwise have
+   * been produced either before or after it.
+   */
+  emittedAt: number;
+}
+
+export interface DirectFileTransferWorkerLeaseClosedEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED;
+  leaseId: string;
+  leaseGeneration: number;
+}
+
+export interface DirectFileTransferWorkerSignalEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type:
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.READY
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN
+    | typeof DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REQUEST;
+}
+
+/**
+ * Shutdown acknowledgement.
+ *
+ * `cleanupOk` is mandatory because an ack is otherwise indistinguishable from a
+ * successful quiesce. A worker whose lease/partial cleanup threw has NOT
+ * reached a safe resting point, and saying so is the difference between an
+ * orderly stop and silently abandoning a half-written upload.
+ */
+export interface DirectFileTransferWorkerQuiesceEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE;
+  timeoutMs: number;
+}
+
+export interface DirectFileTransferWorkerQuiesceResultEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE_RESULT;
+  ok: boolean;
+  closedLeases: number;
+  reason?: string;
+}
+
+export interface DirectFileTransferWorkerShutdownAckEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK;
+  cleanupOk: boolean;
+  detail?: string;
+}
+
+export interface DirectFileTransferWorkerStatusEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY;
+  available: boolean;
+  detail?: string;
+}
+
+export interface DirectFileTransferWorkerHostCallEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL;
+  callId: string;
+  method: DirectFileTransferHostMethod;
+  args: unknown[];
+}
+
+export interface DirectFileTransferWorkerHostResultEnvelope extends DirectFileTransferWorkerEnvelopeBase {
+  type: typeof DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT;
+  callId: string;
+  ok: boolean;
+  value?: unknown;
+  error?: string;
+}
+
+export type DirectFileTransferWorkerEnvelope =
+  | DirectFileTransferWorkerCommandEnvelope
+  | DirectFileTransferWorkerControlEnvelope
+  | DirectFileTransferWorkerLeaseClosedEnvelope
+  | DirectFileTransferWorkerSignalEnvelope
+  | DirectFileTransferWorkerQuiesceEnvelope
+  | DirectFileTransferWorkerQuiesceResultEnvelope
+  | DirectFileTransferWorkerShutdownAckEnvelope
+  | DirectFileTransferWorkerStatusEnvelope
+  | DirectFileTransferWorkerHostCallEnvelope
+  | DirectFileTransferWorkerHostResultEnvelope;
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hasValidEnvelopeHead(value: unknown): value is Record<string, unknown> {
+  if (!isPlainRecord(value)) return false;
+  if (value.v !== DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION) return false;
+  if (typeof value.type !== 'string') return false;
+  return Number.isSafeInteger(value.generation) && (value.generation as number) >= 0;
+}
+
+/**
+ * Fail-closed envelope validation. Returns undefined for anything that is not
+ * exactly a known, well-formed envelope; callers must treat undefined as
+ * "drop", never as "assume default".
+ */
+export function validateDirectFileTransferWorkerEnvelope(
+  value: unknown,
+): DirectFileTransferWorkerEnvelope | undefined {
+  if (!hasValidEnvelopeHead(value)) return undefined;
+  const type = value.type as DirectFileTransferWorkerMessageType;
+  switch (type) {
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.COMMAND:
+      if (typeof value.senderId !== 'string' || !value.senderId) return undefined;
+      if (!('command' in value)) return undefined;
+      // Bounded before it is cloned into the worker.
+      if (!isWithinDirectFileTransferIpcLimits(value.command)) return undefined;
+      return value as unknown as DirectFileTransferWorkerCommandEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.CONTROL:
+      if (typeof value.senderId !== 'string' || !value.senderId) return undefined;
+      if (!isPlainRecord(value.message)) return undefined;
+      if (!Number.isFinite(value.emittedAt)) return undefined;
+      // A control message is forwarded onto the daemon transport, so it is
+      // bounded here rather than trusted because it came from our own worker.
+      if (!isWithinDirectFileTransferIpcLimits(value.message)) return undefined;
+      return value as unknown as DirectFileTransferWorkerControlEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.LEASE_CLOSED:
+      // Fail closed on identity: forgetting the wrong lease would silently
+      // drop its loss notification, which is the exact defect this envelope
+      // exists to prevent.
+      if (!isBoundedString(value.leaseId, DIRECT_FILE_TRANSFER_LIMITS.LEASE_ID_BYTES)
+        || !IDENTIFIER_RE.test(value.leaseId)
+        || !isPositiveSafeInteger(value.leaseGeneration)) return undefined;
+      return value as unknown as DirectFileTransferWorkerLeaseClosedEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.RECYCLING:
+      return value as unknown as DirectFileTransferWorkerSignalEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.READY:
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN:
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REQUEST:
+      return value as unknown as DirectFileTransferWorkerSignalEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE:
+      // A deadline that is not a finite positive number is not a deadline.
+      if (typeof value.timeoutMs !== 'number' || !Number.isFinite(value.timeoutMs) || value.timeoutMs <= 0) return undefined;
+      return value as unknown as DirectFileTransferWorkerQuiesceEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.QUIESCE_RESULT:
+      // Fail closed: a result that cannot state whether the addon is idle must
+      // never be read as permission to replace it.
+      if (typeof value.ok !== 'boolean') return undefined;
+      if (typeof value.closedLeases !== 'number' || !Number.isInteger(value.closedLeases) || value.closedLeases < 0) return undefined;
+      if (value.reason !== undefined && typeof value.reason !== 'string') return undefined;
+      return value as unknown as DirectFileTransferWorkerQuiesceResultEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.SHUTDOWN_ACK:
+      // Fail closed: an ack that does not state its cleanup outcome is refused,
+      // so a missing field can never be read as "cleanup succeeded".
+      if (typeof value.cleanupOk !== 'boolean') return undefined;
+      if (value.detail !== undefined && typeof value.detail !== 'string') return undefined;
+      return value as unknown as DirectFileTransferWorkerShutdownAckEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL:
+      if (typeof value.callId !== 'string' || !value.callId) return undefined;
+      // Allowlisted method only: never dispatch an arbitrary named call.
+      if (typeof value.method !== 'string' || !HOST_METHODS.has(value.method)) return undefined;
+      if (!Array.isArray(value.args)) return undefined;
+      if (!isWithinDirectFileTransferIpcLimits(value.args)) return undefined;
+      return value as unknown as DirectFileTransferWorkerHostCallEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_RESULT:
+      if (typeof value.callId !== 'string' || !value.callId) return undefined;
+      if (typeof value.ok !== 'boolean') return undefined;
+      if (value.error !== undefined && typeof value.error !== 'string') return undefined;
+      if (!isWithinDirectFileTransferIpcLimits(value.value)) return undefined;
+      return value as unknown as DirectFileTransferWorkerHostResultEnvelope;
+    case DIRECT_FILE_TRANSFER_WORKER_MSG.STATUS_REPLY:
+      if (typeof value.available !== 'boolean') return undefined;
+      if (value.detail !== undefined && typeof value.detail !== 'string') return undefined;
+      return value as unknown as DirectFileTransferWorkerStatusEnvelope;
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Accept an envelope only from the generation currently in force.
+ *
+ * A late reply from a worker that has since crashed and been replaced carries
+ * the old generation. Applying it would let a dead worker mutate live lease and
+ * attempt state, so it is dropped.
+ */
+export function isCurrentDirectFileTransferWorkerGeneration(
+  envelope: Pick<DirectFileTransferWorkerEnvelopeBase, 'generation'>,
+  currentGeneration: number,
+): boolean {
+  return envelope.generation === currentGeneration;
 }

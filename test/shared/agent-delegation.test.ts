@@ -1,13 +1,19 @@
 import { describe, expect, it } from 'vitest';
 import {
   AGENT_DELEGATION_ERROR_CODES,
+  AGENT_DELEGATION_BLOCKER_REPORT_FIELDS,
   AGENT_DELEGATION_CONTEXT_HEADER,
   AGENT_DELEGATION_CONTEXT_OMITTED_MARKER,
   AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER,
   AGENT_DELEGATION_REPLY_INSTRUCTION_MARKER,
   AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER,
   AGENT_DELEGATION_REPLY_VERSION,
+  AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+  AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES,
+  projectAgentDelegationSupervisionTaskTitle,
+  readAgentDelegationSupervisionTaskProjection,
   AGENT_DELEGATION_TARGET_FIELD,
+  SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS,
   DELEGATION_REPLY_CAPABLE_AGENT_TYPES,
   DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES,
   DELEGATION_EMPTY_TASK,
@@ -19,12 +25,15 @@ import {
   INVALID_DELEGATION_TARGET,
   MIXED_DELEGATION_P2P_FIELDS,
   buildAgentDelegationOrchestrationPrompt,
+  buildAgentDelegationBlockerReportInstruction,
   buildAgentDelegationReplyInstruction,
   buildQuickAgentDelegationTask,
   decodeAgentDelegationReplyEnvelope,
   extractAgentDelegationReplyAuthorityFromInstruction,
   findForbiddenAgentDelegationCommandFields,
   findMixedAgentDelegationP2pFields,
+  readTrustedAgentDelegationReplyVerdict,
+  readTrustedAgentDelegationPeerAuditCompletionBinding,
   hasAgentDelegationTargetField,
   hasLegacyP2pControlToken,
   isAgentDelegationForwardedPayloadText,
@@ -36,6 +45,54 @@ import {
   stripAgentDelegationControlInstructions,
   type AgentDelegationErrorCode,
 } from '../../shared/agent-delegation.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+
+import { AUDIT_CONVERGENCE_CONTRACT_ID } from '../../shared/audit-convergence.js';
+import { LOAD_VALIDATION_SAFETY_BY_LOCALE } from '../../shared/load-validation-safety.js';
+
+describe('readTrustedAgentDelegationReplyVerdict', () => {
+  it.each(['PASS', 'REWORK'] as const)('accepts the exact top-level %s verdict', (verdict) => {
+    expect(readTrustedAgentDelegationReplyVerdict({
+      status: 'peer_audit_completed',
+      verdict,
+    })).toBe(verdict);
+  });
+
+  it.each([
+    undefined,
+    { status: 'peer_audit_completed' },
+    { status: 'peer_audit_completed', verdict: 'APPROVED' },
+    { status: 'other', verdict: 'PASS' },
+    { status: 'peer_audit_completed', metadata: { verdict: 'PASS' } },
+  ])('rejects missing, unknown, nested, or wrong-shape verdict metadata', (value) => {
+    expect(readTrustedAgentDelegationReplyVerdict(value)).toBeUndefined();
+  });
+});
+
+describe('readTrustedAgentDelegationPeerAuditCompletionBinding audit round', () => {
+  const completion = {
+    status: 'peer_audit_completed',
+    taskId: 'tsk_round',
+    assignmentId: 'asg_round',
+    attemptId: 'attempt-round',
+    revision: 'revision-round',
+    verdict: 'PASS',
+  };
+
+  it('preserves a bounded round and keeps legacy completion bindings unchanged', () => {
+    expect(readTrustedAgentDelegationPeerAuditCompletionBinding({ ...completion, round: 3 }))
+      .toMatchObject({ round: 3, verdict: 'PASS' });
+    expect(readTrustedAgentDelegationPeerAuditCompletionBinding(completion))
+      .toEqual({
+        taskId: 'tsk_round', assignmentId: 'asg_round', attemptId: 'attempt-round',
+        revision: 'revision-round', verdict: 'PASS',
+      });
+  });
+
+  it.each([0, -1, 1.5, 10_000, '2'])('rejects invalid round metadata %j', (round) => {
+    expect(readTrustedAgentDelegationPeerAuditCompletionBinding({ ...completion, round })).toBeUndefined();
+  });
+});
 
 const expectInvalid = (value: unknown) => {
   expect(parseAgentDelegationTargetPayload(value)).toEqual(expect.objectContaining({
@@ -45,6 +102,14 @@ const expectInvalid = (value: unknown) => {
 };
 
 describe('agent delegation shared contract', () => {
+  it('defines one complete structured blocker shape and two exclusive dispositions', () => {
+    expect(AGENT_DELEGATION_BLOCKER_REPORT_FIELDS).toEqual([
+      'taskId', 'assignmentId', 'exactError', 'completedSafeWork', 'options', 'recommendedNextAction',
+    ]);
+    expect(SUPERVISION_BLOCKER_ESCALATION_DISPOSITIONS).toEqual({
+      WAITING_FOR_BRAIN: 'waiting_for_brain', NEEDS_INPUT: 'needs_input',
+    });
+  });
   it('exports the top-level delegate target field name', () => {
     expect(AGENT_DELEGATION_TARGET_FIELD).toBe('delegateTarget');
     expect(hasAgentDelegationTargetField({ delegateTarget: { session: 'deck_repo_w1' } })).toBe(true);
@@ -141,8 +206,11 @@ describe('agent delegation shared contract', () => {
       'qwen',
       'openclaw',
       'kimi-sdk',
+      HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
       'pi',
+      'codebuddy-cn',
+      'codebuddy-international',
     ]);
     expect(DELEGATION_REPLY_CAPABLE_PROCESS_AGENT_TYPES).toBe(DELEGATION_REPLY_CAPABLE_AGENT_TYPES);
     for (const agentType of DELEGATION_REPLY_CAPABLE_AGENT_TYPES) {
@@ -194,48 +262,101 @@ describe('agent delegation shared contract', () => {
     expect(isAgentDelegationControlInstructionText(instruction)).toBe(true);
   });
 
-  it('builds and validates one structured correlated delegation reply', () => {
+  it('omits the supervision contract reference from a pairs-engine reply instruction, except for a legacy audit', () => {
     const delegationId = 'delegation_identity_1234567890';
-    const replyCapability = 'reply_capability_1234567890_ABCDEFG';
+    const pairs = buildAgentDelegationReplyInstruction('deck_repo_brain', { delegationId }, { taskPairEngine: true });
+    expect(pairs).toContain(delegationId);
+    expect(pairs).not.toContain('contractRefs');
+    expect(pairs).not.toContain('supervision_messaging_v1');
+    expect(extractAgentDelegationReplyAuthorityFromInstruction(pairs)).toEqual({ delegationId });
+    expect(buildAgentDelegationReplyInstruction('deck_repo_brain', { delegationId }, { taskPairEngine: false }))
+      .toContain('supervision_messaging_v1');
+  });
+
+  it('builds and validates a reusable tokenless structured delegation reply authority', () => {
+    const delegationId = 'delegation_identity_1234567890';
     const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {
       delegationId,
-      replyCapability,
     });
     expect(instruction).toContain(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER);
     expect(instruction).toContain('delegation_reply');
     expect(instruction).toContain(delegationId);
-    expect(instruction).toContain(replyCapability);
+    expect(instruction).not.toContain('replyCapability');
+    expect(instruction).toContain('supervision_messaging_v1');
     expect(instruction).not.toContain('send your response using: imcodes send');
     expect(stripAgentDelegationControlInstructions(`task\n${instruction}`)).toBe('task');
     expect(extractAgentDelegationReplyAuthorityFromInstruction(instruction)).toEqual({
       delegationId,
-      replyCapability,
     });
+    expect(instruction.length).toBeLessThan(300); // before canonical refs: 405 chars
+    expect(instruction.match(/supervision_messaging_v1/g)).toHaveLength(1);
     expect(extractAgentDelegationReplyAuthorityFromInstruction(
-      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} {"delegationId":"${delegationId}","replyCapability":"${replyCapability}","forged":true}`,
+      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} {"delegationId":"${delegationId}","forged":true}`,
     )).toBeUndefined();
 
     expect(decodeAgentDelegationReplyEnvelope({
       version: AGENT_DELEGATION_REPLY_VERSION,
       delegationId,
-      replyCapability,
       result: 'PASS with evidence',
     })).toEqual({
       ok: true,
       value: {
         version: AGENT_DELEGATION_REPLY_VERSION,
         delegationId,
-        replyCapability,
         result: 'PASS with evidence',
       },
     });
     expect(decodeAgentDelegationReplyEnvelope({
       version: AGENT_DELEGATION_REPLY_VERSION,
       delegationId,
-      replyCapability,
       result: 'ok',
       forged: true,
     })).toEqual({ ok: false, error: 'unknown_field' });
+  });
+
+  it('pins blocker escalation to the durable task and assignment identities', () => {
+    const instruction = buildAgentDelegationBlockerReportInstruction({
+      taskId: 'supervision_task_exact',
+      assignmentId: 'supervision_assignment_exact',
+    });
+    expect(JSON.parse(instruction)).toEqual({
+      contractRefs: ['supervision_messaging_v1'],
+      binding: { taskId: 'supervision_task_exact', assignmentId: 'supervision_assignment_exact' },
+      onBlock: 'reply_immediately',
+    });
+    expect(instruction.length).toBeLessThan(250); // before canonical refs: 1,252 chars
+    expect(buildAgentDelegationBlockerReportInstruction({ taskId: '', assignmentId: 'a' })).toBe('');
+  });
+
+  it('renders supervision-audit reply authorities as peer_audit_reply instructions, not free-text delegation replies', () => {
+    const delegationId = 'delegation_identity_1234567890';
+    const instruction = buildAgentDelegationReplyInstruction('deck_repo_brain', {
+      delegationId,
+      audit: {
+        kind: 'supervision_audit',
+        attemptId: 'attempt-r5',
+        auditedSessionName: 'deck_sub_implementation',
+        taskId: 'supervision_task_exact',
+        assignmentId: 'supervision_assignment_exact',
+        revision: 'revision-r5',
+      },
+    });
+    expect(instruction).toContain(AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER);
+    expect(instruction).toContain('peer_audit_reply');
+    expect(instruction).toContain('"attemptId":"attempt-r5"');
+    expect(instruction).not.toContain('replyCapability');
+    expect(instruction).toContain('"taskId":"supervision_task_exact"');
+    expect(instruction).toContain('"assignmentId":"supervision_assignment_exact"');
+    expect(instruction).toContain('"revision":"revision-r5"');
+    expect(instruction).not.toContain('Use the delegation_reply tool');
+    expect(extractAgentDelegationReplyAuthorityFromInstruction(instruction)).toEqual({
+      delegationId,
+    });
+    expect(instruction.length).toBeLessThan(400); // before canonical refs: 877 chars
+    expect(instruction.match(/supervision_messaging_v1/g)).toHaveLength(1);
+    expect(extractAgentDelegationReplyAuthorityFromInstruction(
+      `${AGENT_DELEGATION_STRUCTURED_REPLY_INSTRUCTION_MARKER} {"delegationId":"${delegationId}","contractRefs":["unknown_v9"]}`,
+    )).toBeUndefined();
   });
 
   it('builds a current-session orchestration prompt for UI-picked single-agent delegation', () => {
@@ -245,24 +366,82 @@ describe('agent delegation shared contract', () => {
       task: 'review the queue sync bug',
     });
     expect(prompt).toContain('current session orchestrator');
-    expect(prompt).toContain('Worker One (deck_repo_w1)');
+    expect(prompt).toContain('Target label: Worker One');
+    expect(prompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_repo_w1');
     expect(prompt).toContain('review the queue sync bug');
-    expect(prompt).toContain('organize the relevant current-session context yourself');
-    expect(prompt).toContain('Do not send the raw user task by itself.');
+    expect(prompt).toContain('Prepare one concise, self-contained brief from the current context');
+    expect(prompt).toContain('Do not forward the raw task alone.');
+    expect(prompt).toContain('send_message(target="deck_repo_w1", reply=true)');
+    expect(prompt).toContain('Do not call send_list_targets.');
     expect(prompt).toContain('imcodes send --reply "deck_repo_w1"');
     expect(prompt).not.toContain('imcodes send --no-reply "deck_repo_w1"');
-    expect(prompt).toContain('do not poll the delegate, session status, logs, or transcripts');
-    expect(prompt).toContain('one-time structured reply capability');
-    expect(prompt).toContain('multiple @ delegates');
-    expect(prompt).toContain('separate per-delegate briefs');
-    expect(prompt).toContain('each delegate result separately');
+    expect(prompt).toContain('do not poll session state, logs, or transcripts');
+    expect(prompt).not.toContain('multiple replies until expiry');
+    expect(prompt).not.toContain('multiple @ delegates');
+    expect(prompt).not.toContain('Quick Audit cycle after each delegated reply:');
+    expect(prompt).not.toContain('<!-- IMCODES_AUTOMATIC_AUDIT:');
+  });
+
+  it('bounds an oversized delegation task instead of flooding the target turn', () => {
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_repo_w1',
+      task: '超'.repeat(10_000),
+    });
+    expect(prompt).toContain('[truncated]');
+    expect(Buffer.byteLength(prompt, 'utf8')).toBeLessThan(6 * 1024);
+    expect(prompt).toContain('Target ID (pass directly to send_message; do not look it up): deck_repo_w1');
+    expect(prompt.match(/imcodes send --reply/g)).toHaveLength(1);
+  });
+
+  it('keeps the Quick Audit marker and repair/re-audit cycle outside task truncation', () => {
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_repo_w1',
+      targetLabel: 'Reviewer',
+      task: '超'.repeat(10_000),
+      auditCycle: true,
+    });
+    expect(prompt).toContain('[truncated]');
+    expect(prompt).toContain('Quick Audit cycle after each delegated reply:');
+    expect(prompt).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: PASS -->');
+    expect(prompt).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: REWORK -->');
+    expect(prompt).toContain('REWORK is not a stopping response');
+    expect(prompt).toContain('do not merely output REWORK and wait');
+    expect(prompt).toContain('apply the complete findings, run the relevant validation');
+    expect(prompt).toContain('prepare the next audit brief itself');
+    expect(prompt).toContain('send one fresh reply-enabled audit to the same Target ID');
+    expect(prompt).toContain('do not wait for another user message or manual kick');
+    expect(prompt).toContain('Repeat repair -> re-audit autonomously until PASS');
+    expect(prompt).toContain('Only when an exact blocker or safety limit prevents another cycle');
+    expect(prompt).toContain('Never finalize the repository or delivery from a REWORK verdict.');
+  });
+
+  it('localizes quick-audit orchestration while preserving exact protocol tokens', () => {
+    const task = buildQuickAgentDelegationTask('audit', '', 'zh-CN');
+    expect(task).toContain('独立审计本会话最近的工作');
+    expect(task).not.toContain('Ask the selected delegate');
+
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_sub_reviewer',
+      targetLabel: '审计员',
+      task,
+      auditCycle: true,
+      uiLocale: 'zh-CN',
+    });
+    expect(prompt).toContain('目标 ID（直接传给 send_message，不要再查询）：deck_sub_reviewer');
+    expect(prompt).toContain('修复→复审');
+    expect(prompt).toContain('send_message(target="deck_sub_reviewer", reply=true)');
+    expect(prompt).toContain('<!-- IMCODES_AUTOMATIC_AUDIT: PASS -->');
+    expect(prompt).not.toContain('You are the current session orchestrator');
   });
 
   it('builds quick presets as ordinary delegation tasks and keeps custom text exact', () => {
     const audit = buildQuickAgentDelegationTask('audit');
     expect(audit).toContain('current session context');
-    expect(audit).toContain('non-destructive tests');
+    expect(audit).toContain('audit from the code plus the submitted test report');
+    expect(audit).toContain('must not rerun tests or other validation');
+    expect(audit).toContain('only a missing report permits the minimal gap-filling check');
     expect(audit).toContain('PASS or REWORK');
+    expect(audit).toContain(LOAD_VALIDATION_SAFETY_BY_LOCALE.en);
     expect(audit).not.toContain('replyCapability');
     expect(audit).not.toContain('baseline');
 
@@ -305,5 +484,68 @@ describe('agent delegation shared contract', () => {
     expect(isAgentDelegationForwardedPayloadText(`${AGENT_DELEGATION_CONTEXT_TRUNCATED_MARKER} truncated`)).toBe(true);
     expect(isAgentDelegationForwardedPayloadText(buildAgentDelegationReplyInstruction('deck_repo_brain'))).toBe(true);
     expect(isAgentDelegationForwardedPayloadText('plain task')).toBe(false);
+  });
+});
+
+describe('Quick Audit orchestration references the audit convergence contract', () => {
+  const ref = `"contractRef":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+  const body = `"contractId":"${AUDIT_CONVERGENCE_CONTRACT_ID}"`;
+  for (const uiLocale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const) {
+    it(`references the contract from the audit cycle without resending it (${uiLocale})`, () => {
+      const prompt = buildAgentDelegationOrchestrationPrompt({
+        targetSession: 'deck_repo_w1',
+        task: 'audit the recent work',
+        auditCycle: true,
+        uiLocale,
+      });
+      expect(prompt).toContain(ref);
+      expect(prompt).toContain('"role":"orchestrator"');
+      expect(prompt).not.toContain(body);
+    });
+
+    it(`carries the localized capped-load rule in the quick-audit task (${uiLocale})`, () => {
+      const task = buildQuickAgentDelegationTask('audit', '', uiLocale);
+      expect(task).toContain(LOAD_VALIDATION_SAFETY_BY_LOCALE[uiLocale]);
+      expect(task).toMatch(/Docker/);
+      expect(task).toMatch(/(?:25%|25％)/);
+    });
+  }
+
+  it('leaves a plain delegation without an audit cycle untouched', () => {
+    const prompt = buildAgentDelegationOrchestrationPrompt({
+      targetSession: 'deck_repo_w1',
+      task: 'discuss the recent work',
+    });
+    expect(prompt).not.toContain(ref);
+  });
+});
+
+describe('delegation card task title', () => {
+  const objective = "Fix automatic audit routing being rejected with 'task execution pool rejected target: unselected_config' for eligible cross-vendor auditors (route and pool check must use the same identity/config matching for the exact target), and make peer_audit_reply / audit-metadata send rejections report an explicit identity_rejected reason with the mismatched fields instead of internal_error: assignment_mismatch.";
+
+  it('projects a concise title while preserving the complete objective separately', () => {
+    expect(objective.length).toBeGreaterThan(256);
+    const title = projectAgentDelegationSupervisionTaskTitle(objective);
+    expect(title).not.toBe(objective);
+    expect(title).toMatch(/…$/u);
+  });
+
+  it('accepts both new concise+objective projections and legacy long-title projections', () => {
+    const base = {
+      version: AGENT_DELEGATION_SUPERVISION_TASK_PROJECTION_VERSION,
+      taskId: 'tsk_title',
+      assignmentId: 'asg_title',
+    };
+    const title = projectAgentDelegationSupervisionTaskTitle(objective)!;
+    expect(readAgentDelegationSupervisionTaskProjection({ ...base, title, objective })).toMatchObject({
+      title,
+      objective,
+    });
+    const legacy = readAgentDelegationSupervisionTaskProjection({ ...base, title: objective });
+    expect(legacy?.title).toBe(title);
+    expect(legacy?.objective).toBe(objective);
+    expect(readAgentDelegationSupervisionTaskProjection({
+      ...base, title, objective: 'x'.repeat(AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES + 1),
+    })?.objective).toBeUndefined();
   });
 });

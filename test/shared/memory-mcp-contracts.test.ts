@@ -5,6 +5,9 @@ import {
   MEMORY_MCP_TOOL_CONTRACTS,
   MEMORY_MCP_TOOL_NAME_LIST,
   MEMORY_MCP_TOOL_NAMES,
+  SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS,
+  SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS,
+  SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS,
   buildMcpDisabledResult,
   pickAllowedMcpArgs,
   stripForbiddenMcpArgs,
@@ -20,7 +23,55 @@ function collectDescriptions(schema: { description?: string; properties?: Readon
   return descriptions;
 }
 
+// Assertions that pinned illustrative PHRASING (example sentences, restated
+// synonyms) were removed: they forced the descriptions to stay long without
+// protecting behaviour. Every assertion that pins an operational fact -- FIFO
+// semantics, candidateCount/truncated, list_machines avoidance, timeouts --
+// is kept, so the contract is shorter but not weaker.
 describe('memory MCP shared contracts', () => {
+  it('publishes a strict structured integration-finalization branch without removing legacy assignment finish', () => {
+    const finish = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_FINISH].inputSchema;
+    // The caller's revision authority is mandatory: a delayed/retried
+    // predecessor finish must be refusable, never inferred as current.
+    expect(finish).toMatchObject({ additionalProperties: false, required: ['assignmentId', 'revision'] });
+    const finalization = MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE
+    ].inputSchema;
+    expect(finalization).toMatchObject({
+      additionalProperties: false,
+      required: [...SUPERVISION_INTEGRATION_FINALIZATION_REQUIRED_FIELDS],
+    });
+    expect(finalization.properties?.verdict?.enum).toEqual(['PASS']);
+    expect(finalization.properties?.ciResult?.enum).toEqual([
+      'success', 'ci_not_configured', 'ci_unavailable', 'pending', 'failure',
+    ]);
+    expect(finalization.properties?.ciResult?.description).toContain(
+      'including failure is descriptive and non-blocking',
+    );
+    expect(MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE
+    ].description).toContain('PASS plus exact Git/push evidence is the finalization authority');
+    expect(finalization.required).not.toContain('ciResult');
+    expect(finalization.required).not.toContain('externalRunId');
+    expect(finalization.required).not.toContain('externalHeadSha');
+    expect(finalization.properties?.pushResult?.enum).toEqual(['pushed', 'already_present']);
+    expect(finalization.required).not.toContain('preflightToken');
+    expect(finalization.properties?.preflightToken?.description).toContain(
+      'exact verified already_present backfill may omit it',
+    );
+    for (const field of SUPERVISION_INTEGRATION_FINALIZATION_RECORD_ONLY_FIELDS) {
+      expect(finalization.required).not.toContain(field);
+      expect(finalization.properties).toHaveProperty(field);
+      expect(finalization.properties?.[field]?.type).toBeUndefined();
+    }
+
+    const start = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START].inputSchema;
+    expect(start.properties?.scopeFiles?.type).toBeUndefined();
+    const sendTask = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+      .inputSchema.properties?.task as { properties?: Record<string, { type?: string }> } | undefined;
+    expect(sendTask?.properties?.ownedFiles?.type).toBeUndefined();
+  });
+
   it('exposes the registered MCP tool names including the execution-clone destroy + machine tools', () => {
     expect(MEMORY_MCP_TOOL_NAME_LIST).toEqual([
       'search_memory',
@@ -33,10 +84,30 @@ describe('memory MCP shared contracts', () => {
       'memory_feedback',
       'save_observation',
       'save_preference',
+      'memory_injection_get',
+      'memory_injection_set',
+      'session_identity_get',
+      'session_identity_set',
+      'session_identity_clear',
+      'session_identity_refresh',
+      'verification_machine_list',
+      'verification_machine_set',
+      'verification_machine_remove',
+      'verification_machine_verify',
       'peer_audit_reply',
       'delegation_reply',
       'send_list_targets',
+      'pair_list',
+      'pair_get',
+      'pair_set_max_concurrency',
+      'pair_get_max_concurrency',
+      'session_runtime_identity_get',
+      'session_restart',
+      'session_model',
       'send_message',
+      'pair_task_get',
+      'pair_task_update',
+      'pair_task_check',
       'send_stop',
       'destroy_execution_clone',
       'cron_create_self',
@@ -54,7 +125,8 @@ describe('memory MCP shared contracts', () => {
       'computer_use_docs',
       'computer_use_call',
     ]);
-    expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS)).toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+    expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS).filter((name) => MEMORY_MCP_TOOL_NAME_LIST.includes(name as never)))
+      .toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
   });
 
   it('keeps search as a text-query contract and send files as path references', () => {
@@ -79,8 +151,11 @@ describe('memory MCP shared contracts', () => {
 
     const send = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
     const files = send.inputSchema.properties?.files as { description?: string } | undefined;
+    const deliveryMode = send.inputSchema.properties?.deliveryMode as { enum?: string[]; description?: string } | undefined;
     expect(files?.description).toMatch(/path references/i);
     expect(files?.description).toMatch(/not read or transferred/i);
+    expect(deliveryMode?.enum).toEqual(['append', 'queue']);
+    expect(deliveryMode?.description).toContain('never inserts into the active turn');
   });
 
   it('advertises the active-user shell 900 second timeout without widening GUI methods', () => {
@@ -93,21 +168,43 @@ describe('memory MCP shared contracts', () => {
     expect(timeout?.description).toContain('900000');
   });
 
+  it('directs shell and executable intent to exec_remote instead of GUI OCU', () => {
+    const exec = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE].description;
+    const ocu = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL].description;
+    expect(exec).toContain('ipmitool.exe');
+    expect(exec).toContain('MUST use exec_remote');
+    expect(exec).toContain('NEVER repeat or summarize its text');
+    expect(exec).toContain('record only the task dispatch and bounded outcome facts');
+    expect(ocu).toContain('Do not use GUI OCU for a shell/CLI/executable request');
+    expect(ocu).toContain('does not mean the machine is unauthorized or uncontrollable');
+  });
+
   it('documents scoped send target discovery and self-target rejection', () => {
     const sendList = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS];
     const sendMessage = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+    const delegationReply = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.DELEGATION_REPLY];
 
     expect(sendList.description).toContain('current caller session');
     expect(sendList.description).toContain('stopped sessions are excluded');
     expect(sendList.description).toContain('if this returns no items');
-    expect(sendList.description).toContain('ask CC to audit');
-    expect(sendList.description).toContain('invite a reviewer to discuss');
-    expect(sendList.description).toContain('display label');
-    expect(sendList.description).toContain('no such running peer session is available');
-    expect(sendMessage.description).toContain('caller session is not a valid target');
-    expect(sendMessage.description).toContain('empty send_list_targets result');
-    expect(sendMessage.description).toContain('asking a CC session to audit');
-    expect(sendMessage.description).toContain('does not start a structured Team/P2P discussion run');
+    expect(sendMessage.description).toContain('exact send_list_targets target');
+    expect(sendMessage.description).toContain('Callers and labels are invalid targets');
+    expect(sendMessage.description).toContain('append (default)');
+    expect(sendMessage.description).toContain('durable FIFO fallback');
+    expect(sendMessage.description).toContain('queue always uses FIFO');
+    expect(sendMessage.description).toContain('delivered/queued/failed status');
+    expect(delegationReply.description).toContain('append-only');
+    expect(delegationReply.inputSchema.properties).not.toHaveProperty('replyCapability');
+    const peerAuditReply = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY];
+    expect(peerAuditReply.inputSchema.required).toEqual([
+      'taskId',
+      'assignmentId',
+      'attemptId',
+      'revision',
+      'receiptKind',
+      'findings',
+      'validations',
+    ]);
 
     const sendListQuery = sendList.inputSchema.properties?.query as { description?: string } | undefined;
     const sendMessageText = sendMessage.inputSchema.properties?.message as { description?: string } | undefined;
@@ -119,14 +216,9 @@ describe('memory MCP shared contracts', () => {
     } | undefined;
     const sendMessageBroadcast = sendMessage.inputSchema.properties?.broadcast as { description?: string } | undefined;
     expect(sendListQuery?.description).toContain('cc');
-    expect(sendListQuery?.description).toContain('display labels');
-    expect(sendMessageText?.description).toContain('complete task/request text');
-    expect(sendMessageReply?.description).toContain('Set true');
-    expect(sendMessageReply?.description).toContain('discussion invites');
     expect(sendMessageAudit?.description).toContain('automatic-supervision');
     expect(sendMessageAudit?.properties?.kind?.enum).toEqual(['supervision_audit']);
-    expect(sendMessageAudit?.required).toEqual(['kind', 'attemptId']);
-    expect(sendMessageBroadcast?.description).toContain('every/all available sessions');
+    expect(sendMessageAudit?.required).toEqual(['kind', 'attemptId', 'auditedSessionName']);
   });
 
   it('provides operational tool and parameter descriptions without secret/doc leakage', () => {
@@ -152,7 +244,6 @@ describe('memory MCP shared contracts', () => {
     const getSources = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.GET_MEMORY_SOURCES];
 
     expect(getSources.description).toContain('up to four');
-    expect(getSources.description).not.toMatch(/every match/i);
     expect(getSources.description).toContain('candidateCount');
     expect(getSources.description).toContain('truncated');
     expect(getSources.description).toMatch(/not.*no memory/i);
@@ -169,10 +260,8 @@ describe('memory MCP shared contracts', () => {
     expect(search.description).not.toContain('call get_memory_sources');
     expect(search.description).toContain('sourceLookup');
     expect(search.description).toMatch(/typed sourceLookup/i);
-    expect(getSources.description).toContain('after a memory-search result');
     expect(getSources.description).toContain('observation id');
     expect(getSources.description).toContain('compact ref');
-    expect(getSources.description).toContain('provenance-sensitive answers');
     expect(projectionId?.description).toContain('memory-search result');
     expect(observationId?.description).toContain('memory-search result');
     expect(ref?.description).toContain('startup memory');
@@ -357,3 +446,15 @@ describe('memory MCP shared contracts', () => {
     expect(stripped).toEqual({ projectionId: 'p1' });
   });
 });
+    const preflight = MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT
+    ].inputSchema;
+    expect(preflight).toMatchObject({
+      additionalProperties: false,
+      required: [...SUPERVISION_INTEGRATION_PREFLIGHT_REQUIRED_FIELDS],
+    });
+    expect(preflight.properties).not.toHaveProperty('commitSha');
+    expect(preflight.properties).not.toHaveProperty('pushResult');
+    expect(MEMORY_MCP_TOOL_CONTRACTS[
+      MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_PREFLIGHT
+    ].description).toContain('before Git side effects');

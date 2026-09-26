@@ -3,8 +3,17 @@ import { marked } from 'marked';
 import { App } from './app.js';
 import { configure, configureExpectedUserId } from './api.js';
 import { RemoteDesktopStandalone } from './components/RemoteDesktopStandalone.js';
+import { RemoteDesktopWallStandalone } from './components/RemoteDesktopWallStandalone.js';
+import { RemoteDesktopGuestAccess } from './components/RemoteDesktopGuestAccess.js';
+import {
+  REMOTE_DESKTOP_NATIVE_STEP_UP_PATH,
+  RemoteDesktopNativeStepUp,
+} from './pages/RemoteDesktopNativeStepUp.js';
 import { applyNativePlatformClasses } from './native-platform.js';
-import { readRemoteDesktopWindowServerId } from './remote-desktop-window.js';
+import {
+  isRemoteDesktopWallWindow,
+  readRemoteDesktopWindowServerId,
+} from './remote-desktop-window.js';
 import './styles.css';
 import './i18n/index.js';
 // Bundled programmer webfonts (OFL 1.1). JetBrains Mono is the default;
@@ -32,7 +41,19 @@ marked.use({
 applyNativePlatformClasses();
 
 const remoteDesktopServerId = readRemoteDesktopWindowServerId();
-if (remoteDesktopServerId) {
+const remoteDesktopWallEntry = isRemoteDesktopWallWindow();
+const remoteDesktopNativeStepUpEntry = window.location.pathname === REMOTE_DESKTOP_NATIVE_STEP_UP_PATH;
+const remoteDesktopGuestEntry = window.__IMCODES_REMOTE_DESKTOP_INVITE_REQUESTED__ === true
+  || window.location.pathname === '/remote-desktop/access';
+if (remoteDesktopNativeStepUpEntry) {
+  render(<RemoteDesktopNativeStepUp />, document.getElementById('app')!);
+} else if (remoteDesktopGuestEntry) {
+  document.documentElement.classList.add('remote-desktop-standalone-root');
+  render(
+    <RemoteDesktopGuestAccess bootstrap={window.__IMCODES_REMOTE_DESKTOP_INVITE_BOOTSTRAP__} />,
+    document.getElementById('app')!,
+  );
+} else if (remoteDesktopServerId || remoteDesktopWallEntry) {
   try {
     const raw = localStorage.getItem('rcc_auth');
     const auth = raw ? JSON.parse(raw) as { userId?: unknown; baseUrl?: unknown } : null;
@@ -40,7 +61,12 @@ if (remoteDesktopServerId) {
     if (typeof auth?.userId === 'string') configureExpectedUserId(auth.userId);
   } catch { /* API falls back to same-origin session authentication. */ }
   document.documentElement.classList.add('remote-desktop-standalone-root');
-  render(<RemoteDesktopStandalone serverId={remoteDesktopServerId} />, document.getElementById('app')!);
+  render(
+    remoteDesktopWallEntry
+      ? <RemoteDesktopWallStandalone />
+      : <RemoteDesktopStandalone serverId={remoteDesktopServerId!} />,
+    document.getElementById('app')!,
+  );
 } else {
   render(<App />, document.getElementById('app')!);
 }

@@ -1,5 +1,8 @@
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
+import { FILE_TRANSFER_DIRECTORY_PATH, FILE_TRANSFER_DIRECTORY_LIST_ERROR } from '@shared/transport/file-transfer.js';
+import { openMacosFullDiskAccessSettings } from '../api/machines.js';
+import { formatByteSize } from '../util/byte-size.js';
 /**
  * FileBrowser — universal reusable file/directory browser.
  *
@@ -28,7 +31,6 @@ import { ImageLightbox } from './ImageLightbox.js';
 import type { ChatLocalImagePreviewLoader } from './ChatLocalImagePreview.js';
 import { buildAttachmentDownloadUrl, downloadAttachment } from '../api.js';
 import {
-  FILE_DOWNLOAD_TRANSPORT_MODE,
   downloadPreviewWithDirectFallback,
   isDirectFileTransferStaleHandleError,
   isFileUploadCanceled,
@@ -36,16 +38,11 @@ import {
   selectPreviewDownloadDestination,
   type DirectPreviewDownloadDestination,
 } from '../direct-file-transfer.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import {
-  DOWNLOAD_TRANSFER_ROUTE,
-  DOWNLOAD_TRANSFER_STATUS,
   beginDownloadTransfer,
-  completeDownloadTransfer,
   failDownloadTransfer,
-  reportDownloadTransferProgress,
-  setDownloadTransferSave,
   setDownloadTransferRetry,
-  updateDownloadTransfer,
 } from '../download-transfer-store.js';
 import {
   getSharedChangesKey,
@@ -64,7 +61,7 @@ import { resizeHandleHoverEvents } from './window-resize.js';
 const PREF_KEY = 'fb_prefer_editor';
 const WINDOWS_DRIVES_ROOT = '__imcodes_windows_drives__';
 /** Sentinel path that asks the daemon to list Windows drive roots. */
-const WINDOWS_DRIVES_PATH = ':drives:';
+const WINDOWS_DRIVES_PATH = FILE_TRANSFER_DIRECTORY_PATH.WINDOWS_DRIVES;
 
 function escapeHtml(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
@@ -155,7 +152,23 @@ export interface FileBrowserProps {
   scopeToSessionRoot?: boolean;
   /** Hide mutation controls while preserving browse, preview, and download. */
   readOnly?: boolean;
-  onConfirm: (paths: string[]) => void;
+  /** Report the current single-selection to an embedded host control. */
+  onSelectedPathChange?: (path: string | null, isDirectory: boolean) => void;
+  /** Report directory navigation so an embedded uploader can target it. */
+  onCurrentPathChange?: (path: string) => void;
+  /** Embedded hosts may provide their own primary action outside the browser. */
+  hideBreadcrumbConfirm?: boolean;
+  /**
+   * Show a one-click row for the user's home / Desktop / Downloads / Documents.
+   *
+   * Opt-in because only a remote-machine browser can honour it: the paths are
+   * sentinels the DAEMON resolves (see FILE_TRANSFER_DIRECTORY_PATH), so a
+   * browser pointed at anything else would navigate to a literal ":desktop:".
+   */
+  quickAccess?: boolean;
+  /** The second argument exposes the already-loaded single-file preview so a
+   * host can consume explicitly selected text without issuing a duplicate read. */
+  onConfirm: (paths: string[], preview?: FileBrowserPreviewState) => void;
   onClose?: () => void;
   /** Called after a new directory is successfully created. */
   onDirectoryCreated?: (path: string) => void;
@@ -186,6 +199,9 @@ type FsNode = {
   hidden?: boolean;
   children?: FsNode[];  // undefined = leaf/file; [] = unloaded dir; [...] = loaded
   isLoading?: boolean;
+  /** Volume capacity, present only on volume roots the daemon could measure. */
+  totalBytes?: number;
+  freeBytes?: number;
 };
 
 interface FileBrowserSnapshot {
@@ -275,8 +291,13 @@ export type FileBrowserPreviewState =
   | { status: 'idle' }
   | { status: 'loading'; path: string }
   | { status: 'ok'; path: string; content: string; diff?: string; diffHtml?: string; downloadId?: string }
-  | { status: 'image'; path: string; dataUrl: string; downloadId?: string }
-  | { status: 'office'; path: string; data: string; mimeType: string; downloadId?: string }
+  /** `dataUrl` holds the chunked HTTP download URL (no inline data: payload). */
+  // tsk_5rf R3: `settling` means the URL is built and the browser is still
+  // fetching it. The pane keeps reporting loading until the real <img> load
+  // event, so a slow or never-loading handle can never look like a rendered
+  // (but empty) image.
+  | { status: 'image'; path: string; dataUrl: string; downloadId?: string; settling?: boolean }
+  | { status: 'office'; path: string; srcUrl: string; mimeType: string; downloadId?: string }
   | { status: 'video'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'audio'; path: string; streamUrl: string; mimeType: string; downloadId?: string }
   | { status: 'error'; path: string; error: string; downloadId?: string };
@@ -495,6 +516,10 @@ export function FileBrowser({
   sessionName,
   scopeToSessionRoot = false,
   readOnly = false,
+  onSelectedPathChange,
+  onCurrentPathChange,
+  hideBreadcrumbConfirm = false,
+  quickAccess = false,
 }: FileBrowserProps) {
   const { t } = useTranslation();
   const includeFiles = mode !== 'dir-only';
@@ -526,9 +551,22 @@ export function FileBrowser({
   const navigateToRef = useRef<(path: string) => void>(() => {});
   const currentLabelRef = useRef(currentLabel);
   useEffect(() => { currentLabelRef.current = currentLabel; }, [currentLabel]);
+  // The last root-level location a fetch actually resolved -- distinct from
+  // currentLabelRef, which by the time a failed fetch's response arrives
+  // already holds the OPTIMISTIC (possibly bogus, e.g. an unresolved
+  // ":downloads:" sentinel) label jumpTo set before the request even went
+  // out. A failed root navigation reverts HERE, not to whatever currentLabel
+  // happens to be at that moment.
+  const lastGoodLabelRef = useRef(initialTreeSnapshot?.currentLabel ?? startPath);
+  useEffect(() => { onCurrentPathChange?.(currentLabel); }, [currentLabel, onCurrentPathChange]);
   const dataRef = useRef(data);
   useEffect(() => { dataRef.current = data; }, [data]);
   const [error, setError] = useState<string | null>(null);
+  // Set only for the specific "this machine's Downloads/Desktop/Documents
+  // are TCC-blocked" signal, never for generic errors -- those keep using
+  // the small ⚠ nav-button indicator. Cleared on the next successful fetch
+  // and whenever the user dismisses or acts on it.
+  const [macosFdaPrompt, setMacosFdaPrompt] = useState<{ requesting: boolean; requestFailed: boolean } | null>(null);
   const [showHidden, setShowHidden] = useState(DEFAULT_SHOW_HIDDEN_FILES);
   const [preview, setPreview] = useState<FileBrowserPreviewState>(() => initialPreview ?? { status: 'idle' });
   const previewRef = useRef<FileBrowserPreviewState>(preview);
@@ -776,6 +814,11 @@ export function FileBrowser({
       if (pendingRef.current.has(requestId)) {
         pendingRef.current.delete(requestId);
         timersRef.current.delete(requestId);
+        // Without this, ws-client's owned-data-request dedup keeps this
+        // path's requestId parked for up to its own TTL: retrying right
+        // after a timeout would silently reuse the dead requestId and send
+        // nothing over the wire, guaranteeing the retry also times out.
+        ws.forgetOwnedDataRequest(requestId);
         setData((prev) => updateNode(prev, nodePath, { isLoading: false }));
         setError(t('file_browser.timeout_detail', { defaultValue: t('file_browser.timeout') }));
       }
@@ -820,6 +863,28 @@ export function FileBrowser({
 
         if (msg.status === 'error') {
           setError(msg.error ?? 'Unknown error');
+          setMacosFdaPrompt(
+            msg.error === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED
+              ? { requesting: false, requestFailed: false }
+              : null,
+          );
+          // A failed fetch for the CURRENT root location (as opposed to one
+          // nested child the user expanded deeper in the tree) must not
+          // leave the browser stuck showing a fake, unresolved location with
+          // no way out -- e.g. a quick-access sentinel like ":downloads:"
+          // that the controlled node refused to resolve (see
+          // well-known-directories.ts's fail-closed behavior for a root
+          // LaunchDaemon with no verifiable console user). Bounce back to
+          // the last place a fetch actually succeeded, the same way a failed
+          // browser navigation does, instead of rendering an empty "folder"
+          // literally named after the sentinel forever. Guarded against
+          // reverting to itself (the very first fetch failing has nowhere
+          // better to go) so this can never loop.
+          const isRootLevelFailure = dataRef.current[0]?.id === nodeId;
+          if (isRootLevelFailure && lastGoodLabelRef.current !== nodeId) {
+            navigateToRef.current(lastGoodLabelRef.current);
+            return;
+          }
           setData((prev) => updateNode(prev, nodeId, { isLoading: false }));
           return;
         }
@@ -836,6 +901,8 @@ export function FileBrowser({
             isDir: e.isDir,
             hidden: e.hidden,
             children: e.isDir ? [] : undefined,
+            ...(typeof e.totalBytes === 'number' ? { totalBytes: e.totalBytes } : {}),
+            ...(typeof e.freeBytes === 'number' ? { freeBytes: e.freeBytes } : {}),
           }));
 
         loadedRef.current.add(nodeId);
@@ -857,8 +924,14 @@ export function FileBrowser({
             return next;
           });
         }
-        setCurrentLabel(resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent);
+        const nextLabel = resolvedParent === WINDOWS_DRIVES_ROOT ? t('file_browser.this_pc') : resolvedParent;
+        setCurrentLabel(nextLabel);
+        // Only a root-level fetch changes "where the browser currently is";
+        // a nested child expanding deeper in the tree must not move the
+        // fallback a failed root navigation would revert to.
+        if (dataRef.current[0]?.id === nodeId) lastGoodLabelRef.current = nextLabel;
         setError(null);
+        setMacosFdaPrompt(null);
 
         // If highlightPath is under this dir, auto-expand
         if (highlightPath && (highlightPath.startsWith(resolvedParent + '/') || highlightPath.startsWith(resolvedParent + '\\'))) {
@@ -961,17 +1034,62 @@ export function FileBrowser({
           return;
         }
 
-        // Office document preview (PDF, DOCX, XLSX) — check before image
+        // Office/image preview — same stream contract as video/audio: the daemon
+        // sends metadata only and the bytes come over the chunked HTTP download
+        // channel, so a large file can never monopolise the WebSocket.
         const officeType = getOfficeType(filePath);
-        if (officeType && msg.encoding === 'base64') {
-          setPreview({ status: 'office', path: filePath, data: msg.content ?? '', mimeType: officeType, downloadId: dlId });
+        if (officeType && (msg as { previewMode?: string }).previewMode === 'stream' && dlId && serverId) {
+          const mimeType = (msg.mimeType as string | undefined) ?? officeType;
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'office', path: filePath, srcUrl: streamUrl, mimeType, downloadId: dlId });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+            });
           return;
         }
 
-        // Image files: render as <img> from base64
-        if (msg.encoding === 'base64' && msg.mimeType) {
-          const dataUrl = `data:${msg.mimeType};base64,${msg.content ?? ''}`;
-          setPreview({ status: 'image', path: filePath, dataUrl, downloadId: dlId });
+        // tsk_5rf: this must verify the mime is actually an image. It previously
+        // accepted ANY streamed mimeType and handed it to <img src=...>, so a
+        // streamed binary rendered as a broken/blank box instead of an error.
+        if (
+          (msg as { previewMode?: string }).previewMode === 'stream'
+          && typeof msg.mimeType === 'string'
+          && msg.mimeType.startsWith('image/')
+          && dlId
+          && serverId
+        ) {
+          void buildAttachmentDownloadUrl(serverId, dlId, sessionName)
+            .then((streamUrl) => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'image', path: filePath, dataUrl: streamUrl, downloadId: dlId, settling: true });
+            })
+            .catch(() => {
+              if (!mountedRef.current) return;
+              const stillActive = getActivePreviewCycle(filePath);
+              if (!stillActive || stillActive.cycleId !== pending.cycleId) return;
+              setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
+            });
+          return;
+        }
+
+        // tsk_5rf: a streamed response carries NO content by design. Before this
+        // guard it fell through to the text path below, where `msg.content ?? ''`
+        // produced an empty 'ok' preview - the silently blank Word pane users
+        // reported. Both stream branches above require serverId (and a mimeType),
+        // so any streamed response that reaches here cannot be rendered and must
+        // say so instead of pretending to be an empty document.
+        if ((msg as { previewMode?: string }).previewMode === 'stream') {
+          setPreview({ status: 'error', path: filePath, error: t('file_browser.preview_error'), downloadId: dlId });
           return;
         }
 
@@ -1330,6 +1448,20 @@ export function FileBrowser({
     }
   }, [currentLabel, navigateTo]);
 
+  // Only ever invoked from the `macosFdaPrompt` banner below, which only
+  // renders after a `file.directory_list_error` carrying
+  // FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED --
+  // meaning `serverId` is guaranteed present (the sentinel came from a
+  // remote machine, not this browser).
+  const requestMacosFullDiskAccess = useCallback(() => {
+    if (!serverId) return;
+    setMacosFdaPrompt({ requesting: true, requestFailed: false });
+    void openMacosFullDiskAccessSettings(serverId).then(
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: false }); },
+      () => { if (mountedRef.current) setMacosFdaPrompt({ requesting: false, requestFailed: true }); },
+    );
+  }, [serverId]);
+
   // Load root on mount and re-load when ws changes (server switch).
   // fetchDir changes when ws changes (useCallback dep), so this also re-runs on server switch.
   const prevWsRef = useRef(ws);
@@ -1578,12 +1710,13 @@ export function FileBrowser({
     } else {
       setSelectedPaths(new Set([nodeId]));
     }
+    onSelectedPathChange?.(nodeId, isDir);
     if (isDir) {
       const path = nodeId.split(/[/\\]/).pop() || nodeId;
       void path;
       setCurrentLabel(nodeId);
     }
-  }, [mode, isMulti]);
+  }, [mode, isMulti, onSelectedPathChange]);
 
   const handlePreview = useCallback((filePath: string) => {
     if (preview.status !== 'loading' || (preview as { path: string }).path !== filePath) {
@@ -1606,7 +1739,12 @@ export function FileBrowser({
       if (mode === 'dir-only') onConfirm([currentLabel]);
       return;
     }
-    onConfirm([...selectedPaths]);
+    const paths = [...selectedPaths];
+    if (mode === 'file-single') {
+      onConfirm(paths, preview);
+      return;
+    }
+    onConfirm(paths);
   };
 
   const copyCurrentPath = useCallback(() => {
@@ -1745,8 +1883,8 @@ export function FileBrowser({
     const transfer = beginDownloadTransfer(selectedPath.split(/[/\\]/).pop() || selectedPath);
     let authorizedHandle = selectedHandle;
     const runTransfer = async (signal: AbortSignal, requireCurrentSelection: boolean): Promise<void> => {
-      let handedOffToBrowser = false;
-      let savePending = false;
+      // One per attempt, so a retry starts from a clean route/save state.
+      const wiring = createDownloadTransferWiring(transfer.id);
       const download = async (handle: string) => downloadPreviewWithDirectFallback({
         ws,
         serverId,
@@ -1758,31 +1896,13 @@ export function FileBrowser({
         // retry classification and calls this at most once when it is eligible.
         httpFallback: () => downloadAttachment(serverId, handle, sessionName, signal),
         signal,
-        onSaveReady: (save) => {
-          savePending = true;
-          setDownloadTransferSave(transfer.id, save);
-        },
-        onProgress: ({ loadedBytes, totalBytes }) => {
-          reportDownloadTransferProgress(transfer.id, loadedBytes, totalBytes);
-        },
-        onMode: (mode) => {
-          if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.CONNECTING) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.PENDING, DOWNLOAD_TRANSFER_STATUS.CONNECTING);
-          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.DIRECT) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
-          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.FALLING_BACK) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.FALLING_BACK);
-          } else if (mode === FILE_DOWNLOAD_TRANSPORT_MODE.HTTP) {
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.HTTP, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING);
-          } else {
-            handedOffToBrowser = true;
-            updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.BROWSER, DOWNLOAD_TRANSFER_STATUS.PREPARING);
-          }
-        },
+        onSaveReady: wiring.onSaveReady,
+        onProgress: wiring.onProgress,
+        onMode: wiring.onMode,
       });
       try {
         await download(authorizedHandle);
-        if (!savePending) completeDownloadTransfer(transfer.id, handedOffToBrowser);
+        wiring.complete(destination);
         return;
       } catch (error) {
         let failure = error;
@@ -1824,7 +1944,7 @@ export function FileBrowser({
               });
             }
             await download(freshId);
-            completeDownloadTransfer(transfer.id, handedOffToBrowser);
+            wiring.complete(destination);
             return;
           } catch (refreshError) {
             if (refreshed) failure = refreshError;
@@ -1853,11 +1973,12 @@ export function FileBrowser({
   const loadMarkdownImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
     loadFsLocalImagePreview(ws, path, {
       sessionName: scopedSessionName,
+      serverId,
       timeoutMs: PREVIEW_REQUEST_TIMEOUT_MS,
       errorMessage: t('file_browser.preview_error'),
       timeoutMessage: t('file_browser.timeout'),
     })
-  ), [scopedSessionName, t, ws]);
+  ), [scopedSessionName, serverId, t, ws]);
 
   const previewPane = hasInlinePreview ? (
     <div class="fb-preview">
@@ -1991,7 +2112,7 @@ export function FileBrowser({
       </div>
       {/* Conflict dialog rendered inside FileEditor */}
       <div class="fb-preview-content" ref={previewContentRef}>
-        {preview.status === 'loading' && (
+        {(preview.status === 'loading' || (preview.status === 'image' && preview.settling)) && (
           <div class="fb-preview-loading">
             <div class="fb-loading-spinner" />
             <div class="fb-loading-text">{t('file_browser.preview_loading')}</div>
@@ -2005,6 +2126,19 @@ export function FileBrowser({
             <img
               src={preview.dataUrl}
               alt={preview.path.split(/[/\\]/).pop() ?? ''}
+              onLoad={() => {
+                setPreview((current) => (current.status === 'image' && current.path === preview.path && current.settling
+                  ? { ...current, settling: false }
+                  : current));
+              }}
+              onError={() => {
+                // tsk_5rf R2: a streamed preview resolves a URL, not bytes. A
+                // dead or expired download handle used to leave a broken image
+                // here while the preview still claimed image state.
+                setPreview((current) => (current.status === 'image' && current.path === preview.path
+                  ? { status: 'error', path: current.path, error: t('file_browser.preview_error'), downloadId: current.downloadId }
+                  : current));
+              }}
               onClick={() => setLightbox({
                 src: preview.dataUrl,
                 fileName: preview.path.split(/[/\\]/).pop() || undefined,
@@ -2016,7 +2150,7 @@ export function FileBrowser({
         )}
         {preview.status === 'office' && (
           <Suspense fallback={<div class="fb-preview-loading"><div class="fb-loading-spinner" /></div>}>
-            <OfficePreview data={preview.data} mimeType={preview.mimeType} path={preview.path} />
+            <OfficePreview srcUrl={preview.srcUrl} mimeType={preview.mimeType} path={preview.path} />
           </Suspense>
         )}
         {preview.status === 'video' && (
@@ -2251,12 +2385,56 @@ export function FileBrowser({
   const looksLikeWindows = /^[A-Za-z]:[\\/]/.test(currentLabel) || currentLabel === thisPcLabel;
   const isAtDrives = currentLabel === thisPcLabel;
 
+  // Sentinels, not paths: the daemon resolves each to wherever it really lives
+  // on the remote machine (a relocated Downloads, a localized XDG directory).
+  const quickAccessTargets = [
+    { path: FILE_TRANSFER_DIRECTORY_PATH.HOME, label: t('file_browser.home'), icon: '🏠' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DESKTOP, label: t('file_browser.desktop'), icon: '🖥️' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS, label: t('file_browser.downloads'), icon: '⬇️' },
+    { path: FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS, label: t('file_browser.documents'), icon: '📄' },
+    // Only meaningful where drive letters exist.
+    ...(looksLikeWindows
+      ? [{ path: WINDOWS_DRIVES_PATH, label: t('file_browser.this_pc'), icon: '💾' }]
+      : []),
+  ];
+
   const breadcrumb = (
     <div class="fb-nav-stack">
+      {quickAccess && (
+        <div class="fb-quick-access" role="group" aria-label={t('file_browser.quick_access')}>
+          {quickAccessTargets.map((target) => (
+            <button
+              key={target.path}
+              type="button"
+              class="fb-quick-access-btn"
+              title={target.label}
+              onClick={() => navigateTo(target.path)}
+            >
+              <span aria-hidden="true">{target.icon}</span>
+              <span class="fb-quick-access-label">{target.label}</span>
+            </button>
+          ))}
+        </div>
+      )}
+      {quickAccess && macosFdaPrompt && (
+        <div class="fb-macos-fda-prompt" role="alert">
+          <span class="fb-macos-fda-prompt-text">
+            {t(macosFdaPrompt.requestFailed ? 'file_browser.macos_fda_prompt_open_failed' : 'file_browser.macos_fda_prompt')}
+          </span>
+          <button
+            type="button"
+            class="fb-macos-fda-prompt-btn"
+            disabled={macosFdaPrompt.requesting}
+            onClick={requestMacosFullDiskAccess}
+          >
+            {t(macosFdaPrompt.requesting ? 'file_browser.macos_fda_prompt_opening' : 'file_browser.macos_fda_prompt_action')}
+          </button>
+        </div>
+      )}
       <div class="fb-nav">
         <button class="fb-nav-btn" disabled={!canGoBack} onClick={goBack}>←</button>
         <button class="fb-nav-btn" onClick={goUp} title="Go up">⬆</button>
-        {looksLikeWindows && (
+        {looksLikeWindows && !quickAccess && (
           <button
             class="fb-nav-btn"
             onClick={() => navigateTo(isAtDrives ? '~' : WINDOWS_DRIVES_PATH)}
@@ -2318,14 +2496,16 @@ export function FileBrowser({
             aria-label={copiedPath === currentLabel ? t('fileBrowser.copied') : t('fileBrowser.copyPath')}
             onClick={copyCurrentPath}
           >{copiedPath === currentLabel ? '✓' : '⧉'}</button>
-          <button
-            type="button"
-            class="fb-breadcrumb-action is-primary"
-            aria-label={confirmLabel}
-            disabled={(mode === 'dir-only' && isAtDrives)
-              || (mode !== 'dir-only' && selectedPaths.size === 0)}
-            onClick={handleConfirm}
-          >✓</button>
+          {!hideBreadcrumbConfirm && (
+            <button
+              type="button"
+              class="fb-breadcrumb-action is-primary"
+              aria-label={confirmLabel}
+              disabled={(mode === 'dir-only' && isAtDrives)
+                || (mode !== 'dir-only' && selectedPaths.size === 0)}
+              onClick={handleConfirm}
+            >✓</button>
+          )}
         </div>
       </div>
     </div>
@@ -2483,6 +2663,7 @@ function FsTreeNode({
   previewPath: string | null;
   depth?: number;
 }) {
+  const { t } = useTranslation();
   const isExpanded = expandedPaths.has(node.id);
   const isSelected = selectedPaths.has(node.id);
   const isAlready = alreadySet.has(node.id);
@@ -2528,6 +2709,27 @@ function FsTreeNode({
             : '📄'}
         </span>
         <span class="fb-node-name">{node.name}</span>
+        {typeof node.freeBytes === 'number' && typeof node.totalBytes === 'number' && (
+          <span
+            class="fb-node-capacity"
+            title={t('file_browser.capacity_detail', {
+              free: formatByteSize(node.freeBytes),
+              total: formatByteSize(node.totalBytes),
+            })}
+          >
+            {t('file_browser.capacity_free', { free: formatByteSize(node.freeBytes) })}
+            <span
+              class="fb-node-capacity-bar"
+              aria-hidden="true"
+              style={{
+                // Used share, so a nearly-full volume reads as a full bar.
+                '--fb-capacity-used': `${Math.round(
+                  Math.max(0, Math.min(1, 1 - node.freeBytes / node.totalBytes)) * 100,
+                )}%`,
+              } as Record<string, string>}
+            />
+          </span>
+        )}
         {gitCode && gitClass && <span class={`fb-node-git-badge git-badge-${gitClass}`} title={`git: ${gitCode}`}>{gitStatusBadge(gitCode)}</span>}
         {isAlready && <span class="fb-node-badge">↑</span>}
       </div>

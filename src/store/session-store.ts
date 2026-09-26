@@ -1,16 +1,28 @@
-import { readFile, writeFile, mkdir } from 'fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
+import {
+  isDelegationLimitActive,
+  observeProviderLimitSignal,
+  type DelegationLimitState,
+  type ProviderLimitSignal,
+} from '../../shared/delegation-availability.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import type { CrossVendorHandoffSessionState } from '../../shared/cross-vendor-handoff.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
+import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
+import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
+import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 
 const DEBOUNCE_MS = 500;
+const SESSION_STORE_DISK_VERSION = 2;
+const IDENTITY_PROMPT_REF_PREFIX = 'p';
 
 function storeDir(): string {
   return join(homedir(), '.imcodes');
@@ -100,6 +112,30 @@ export interface SessionRecord extends SessionContextBootstrapState {
   quotaUsageLabel?: string;
   /** Structured quota metadata for client-side countdown rendering. */
   quotaMeta?: ProviderQuotaMeta;
+  /**
+   * Codex pay-as-you-go usage credit balance (bought once the plan's
+   * included 5h/weekly quota runs out) — decimal string, e.g. "12.50".
+   * DIFFERENT from the rate-limit "reset credits" affordance
+   * (shared/codex-reset-credits.ts), which is never persisted on the
+   * session record. See shared/codex-credit-history.ts.
+   */
+  codexCreditsBalance?: string;
+  codexCreditsHasCredits?: boolean;
+  codexCreditsUnlimited?: boolean;
+  /**
+   * Machine-readable provider limit, from a canonical {@link ProviderLimitSignal}.
+   *
+   * Persisted deliberately. A limit that lived only in memory would be
+   * forgotten on every daemon restart, and an orchestrator would go straight
+   * back to handing work to an account that is still being refused. Distinct
+   * from `quotaMeta`, which is display telemetry and carries no verdict:
+   * `usedPercent` is undefined while Claude is healthy, so it cannot answer
+   * "are we being refused" and must never be thresholded into one.
+   *
+   * Cleared by a healthy structured signal, and treated as expired -- not
+   * cleared -- once `retryAt` or the bounded fallback passes.
+   */
+  providerLimit?: DelegationLimitState;
   /** Generic reasoning/thinking effort for supported providers. */
   effort?: TransportEffortLevel;
   /**
@@ -121,6 +157,10 @@ export interface SessionRecord extends SessionContextBootstrapState {
   providerResumeId?: string;
   /** Session description — used for persona/system prompt injection. */
   description?: string;
+  /** Effective synchronized user/project/session identity contract. */
+  identityPrompt?: string;
+  /** SHA-256 of the explicit startup identity used for deterministic Agent reuse. */
+  provisionedIdentityHash?: string;
   /** CC env preset name — persisted so respawn can re-inject the same env vars. */
   ccPreset?: string;
   /** Context window override carried by a provider preset (for example MiniMax-M3 1M). */
@@ -157,6 +197,8 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  synchronization from repeating after daemon restart. Cleared only for a
    *  genuinely fresh conversation (`/clear` / fresh restart). */
   summarySyncFingerprints?: string[];
+  /** Cross-vendor continuity ledger and at-most-once pending handoff pack. */
+  crossVendorHandoff?: CrossVendorHandoffSessionState;
   /** Execution-clone metadata. Present ONLY for ephemeral execution-clone
    *  sub-sessions (`kind: 'execution_clone'`). First-class field — NEVER stored
    *  inside `transportConfig` (the transport-identity scrubber would strip
@@ -165,10 +207,39 @@ export interface SessionRecord extends SessionContextBootstrapState {
    *  Persisted in the FIRST session-store upsert so a crash between create and
    *  sync still leaves a sweepable record. */
   executionCloneMetadata?: ExecutionCloneMetadata;
+  /**
+   * Durable, instance-bound demand that every runtime serving this session
+   * withholds provider-native agent tools (shared/native-collaboration-policy.ts
+   * SESSION_FENCE). Set when the session takes supervised authority it could not
+   * yet prove; never cleared by an incidental record rebuild, and meaningless
+   * for any other instance that reuses the name.
+   */
+  nativeAgentFenceRequired?: { sessionInstanceId: string; requiredAt: number };
+  /**
+   * The native-agent fence a PROCESS runtime was actually launched with, bound
+   * to the exact instance and runtime epoch it was decided for. A proof from an
+   * older epoch or another instance proves nothing about the live runtime.
+   */
+  nativeAgentLaunchFence?: {
+    fence: 'disabled' | 'provider_default';
+    sessionInstanceId: string;
+    runtimeEpoch: string;
+    decidedAt: number;
+  };
 }
 
 export interface SessionStore {
   sessions: Record<string, SessionRecord>;
+}
+
+interface PersistedSessionRecord extends Omit<SessionRecord, 'identityPrompt'> {
+  identityPromptRef?: string;
+}
+
+interface PersistedSessionStoreV2 {
+  version: typeof SESSION_STORE_DISK_VERSION;
+  sessions: Record<string, PersistedSessionRecord>;
+  identityPrompts: Record<string, string>;
 }
 
 export interface LoadStoreOptions {
@@ -185,6 +256,24 @@ let writeTimerPath: string | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
 let pendingWrite: Promise<void> | null = null;
 let store: SessionStore = { sessions: {} };
+/**
+ * Set once by the daemon after its startup load: from then on this process's
+ * in-memory store is the authority for sessions.json, and a read-only refresh
+ * (`loadStore({ probe: false })`, e.g. the in-daemon send_message target list)
+ * must never replace it with whatever happens to be on disk. Replacing it let a
+ * foreign/partial sessions.json silently wipe the daemon's live main sessions,
+ * which the daemon then persisted.
+ */
+let storeAuthoritative = false;
+
+export function markSessionStoreAuthoritative(): void {
+  storeAuthoritative = true;
+}
+
+/** Test seam: return to the non-authoritative (consumer) default. */
+export function resetSessionStoreAuthorityForTests(): void {
+  storeAuthoritative = false;
+}
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
   return !isKnownTestSessionLike({
@@ -196,10 +285,67 @@ function isPersistableSessionRecord(record: SessionRecord): boolean {
 }
 
 function serializeStore(): string {
-  const persistableSessions = Object.fromEntries(
-    Object.entries(store.sessions).filter(([, record]) => isPersistableSessionRecord(record)),
-  );
-  return JSON.stringify({ sessions: persistableSessions }, null, 2);
+  const identityPrompts: Record<string, string> = {};
+  const promptRefs = new Map<string, string>();
+  const persistableSessions: Record<string, PersistedSessionRecord> = {};
+
+  for (const [name, record] of Object.entries(store.sessions)) {
+    if (!isPersistableSessionRecord(record)) continue;
+    const { identityPrompt, ...persistedRecord } = record;
+    if (typeof identityPrompt === 'string') {
+      let promptRef = promptRefs.get(identityPrompt);
+      if (promptRef === undefined) {
+        promptRef = `${IDENTITY_PROMPT_REF_PREFIX}${promptRefs.size}`;
+        promptRefs.set(identityPrompt, promptRef);
+        identityPrompts[promptRef] = identityPrompt;
+      }
+      persistableSessions[name] = { ...persistedRecord, identityPromptRef: promptRef };
+    } else {
+      persistableSessions[name] = persistedRecord;
+    }
+  }
+
+  const persistedStore: PersistedSessionStoreV2 = {
+    version: SESSION_STORE_DISK_VERSION,
+    sessions: persistableSessions,
+    identityPrompts,
+  };
+  return JSON.stringify(persistedStore, null, 2);
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function hydrateStore(value: unknown): { store: SessionStore; legacy: boolean } | null {
+  if (!isObjectRecord(value) || !isObjectRecord(value.sessions)) return null;
+
+  if (value.version === SESSION_STORE_DISK_VERSION && isObjectRecord(value.identityPrompts)) {
+    const sessions: Record<string, SessionRecord> = {};
+    for (const [name, rawRecord] of Object.entries(value.sessions)) {
+      if (!isObjectRecord(rawRecord)) continue;
+      const { identityPromptRef, identityPrompt: inlineIdentityPrompt, ...record } = rawRecord;
+      const hydratedRecord = { ...record } as unknown as SessionRecord;
+      // Accept an inline value only for a mixed transitional snapshot. A
+      // missing or malformed reference must never become an identity prompt.
+      if (typeof inlineIdentityPrompt === 'string') {
+        hydratedRecord.identityPrompt = inlineIdentityPrompt;
+      } else if (
+        typeof identityPromptRef === 'string'
+        && Object.prototype.hasOwnProperty.call(value.identityPrompts, identityPromptRef)
+        && typeof value.identityPrompts[identityPromptRef] === 'string'
+      ) {
+        hydratedRecord.identityPrompt = value.identityPrompts[identityPromptRef];
+      }
+      sessions[name] = hydratedRecord;
+    }
+    return { store: { sessions }, legacy: false };
+  }
+
+  // Legacy snapshots stored identityPrompt inline on every session. Keep
+  // them readable and rewrite them to the compact schema on the daemon-owned
+  // load path. Read-only consumers (probe:false) remain strictly read-only.
+  return { store: { sessions: value.sessions as Record<string, SessionRecord> }, legacy: true };
 }
 
 function pruneNonPersistableSessions(): boolean {
@@ -211,11 +357,25 @@ function pruneNonPersistableSessions(): boolean {
 }
 
 export async function loadStore(options: LoadStoreOptions = {}): Promise<SessionStore> {
+  // Bind every asynchronous consequence of this load to the same store path.
+  // HOME is stable in production, but test workers deliberately rotate it;
+  // a delayed startup probe must never write an old snapshot into the next
+  // authority's sessions.json after that rotation.
+  const targetPath = storePath();
+  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
+  // The authoritative owner already holds the newest state; a read-only refresh
+  // there is a no-op rather than a disk overwrite of live memory.
+  if (options.probe === false && storeAuthoritative) return store;
   await drainPendingWritesForRead();
-  await mkdir(storeDir(), { recursive: true });
+  await mkdir(dirname(targetPath), { recursive: true });
+  let loadedLegacySnapshot = false;
   try {
-    const raw = await readFile(storePath(), 'utf8');
-    store = JSON.parse(raw) as SessionStore;
+    const raw = await readFile(targetPath, 'utf8');
+    const hydrated = hydrateStore(JSON.parse(raw));
+    if (hydrated) {
+      store = hydrated.store;
+      loadedLegacySnapshot = hydrated.legacy;
+    }
   } catch (err) {
     // Reset to an empty store ONLY when the file genuinely doesn't exist. A
     // transient read/parse failure (a concurrent writer truncating the file
@@ -235,12 +395,13 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   // the daemon's external writes — intermittently dropping a just-added session
   // and failing send_message (flaky CI at the memory-mcp send-refresh path).
   if (options.probe === false) return store;
-  if (pruneNonPersistableSessions()) scheduleWrite();
-  if (reconcilePersistedSessions()) scheduleWrite();
+  if (loadedLegacySnapshot) scheduleWrite(targetPath);
+  if (pruneNonPersistableSessions()) scheduleWrite(targetPath);
+  if (reconcilePersistedSessions()) scheduleWrite(targetPath);
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
-  void probeSessionStates();
+  void probeSessionStates(targetPath);
   return store;
 }
 
@@ -295,10 +456,9 @@ function reconcilePersistedSessions(): boolean {
 }
 
 /** After loadStore, detect actual state of each session from terminal and emit corrections. */
-async function probeSessionStates(): Promise<void> {
+async function probeSessionStates(targetPath: string): Promise<void> {
   try {
     const { detectStatusAsync } = await import('../agent/detect.js');
-    const { timelineEmitter } = await import('../daemon/timeline-emitter.js');
     let mutated = false;
     for (const s of Object.values(store.sessions)) {
       if (s.state !== 'running') continue;
@@ -318,16 +478,16 @@ async function probeSessionStates(): Promise<void> {
         s.state = newState;
         s.updatedAt = Date.now();
         mutated = true;
-        try { timelineEmitter.emit(s.name, 'session.state', { state: newState }); } catch { /* emitter may not be ready */ }
+        emitSessionStateProbeCorrection(s.name, newState);
       }
     }
-    if (mutated) scheduleWrite();
+    if (mutated) scheduleWrite(targetPath);
   } catch { /* probeSessionStates is best-effort — don't crash daemon */ }
 }
 
-function scheduleWrite(): void {
+function scheduleWrite(targetPath = storePath()): void {
   if (writeTimer) clearTimeout(writeTimer);
-  writeTimerPath = storePath();
+  writeTimerPath = targetPath;
   writeTimer = setTimeout(() => {
     const targetPath = writeTimerPath ?? storePath();
     writeTimer = null;
@@ -337,6 +497,9 @@ function scheduleWrite(): void {
 }
 
 async function writeStoreToDisk(bestEffort: boolean, targetPath = storePath()): Promise<void> {
+  // Outside the best-effort catch on purpose: a test reaching the real store
+  // must fail loudly, never be swallowed as a lost write.
+  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
   try {
     await mkdir(dirname(targetPath), { recursive: true });
     await writeFile(targetPath, serializeStore(), 'utf8');
@@ -421,6 +584,8 @@ export function upsertSession(record: SessionRecord): void {
     ?? (existing?.executionCloneMetadata?.kind === EXECUTION_CLONE_KIND
       ? existing.executionCloneMetadata
       : undefined);
+  // The native-agent fence demand is sticky exactly like the clone marker: an
+  // incidental rebuild that omits it must not silently re-open native agents.
   const normalizedError = record.state === 'error' && typeof record.error === 'string' && record.error.trim()
     ? record.error.trim()
     : undefined;
@@ -428,20 +593,34 @@ export function upsertSession(record: SessionRecord): void {
   // Persisted hydration bypasses upsert and keeps its stored id; every truly
   // absent name is therefore a new logical instance even if a stale caller
   // accidentally carries the deleted record's old id.
-  const sessionInstanceId = existing?.sessionInstanceId ?? createSessionInstanceId();
+  const sessionInstanceId = existing?.sessionInstanceId
+    ?? (isMarkedSessionLaunchIdentity(record) && isUsableSessionIdentity(record.sessionInstanceId)
+      ? record.sessionInstanceId
+      : createSessionInstanceId());
   const runtimeAuthorityChanged = existing ? didRuntimeAuthorityChange(existing, record) : false;
   const runtimeEpoch = !existing
-    ? createRuntimeEpoch()
+    ? isMarkedSessionLaunchIdentity(record) && isUsableSessionIdentity(record.runtimeEpoch)
+      ? record.runtimeEpoch
+      : createRuntimeEpoch()
     : isUsableSessionIdentity(record.runtimeEpoch)
     && record.runtimeEpoch !== existing.runtimeEpoch
     ? record.runtimeEpoch
     : !runtimeAuthorityChanged && isUsableSessionIdentity(existing.runtimeEpoch)
       ? existing.runtimeEpoch
       : createRuntimeEpoch();
+  const nativeAgentFenceRequired = [record.nativeAgentFenceRequired, existing?.nativeAgentFenceRequired]
+    .find((marker) => marker?.sessionInstanceId === sessionInstanceId);
+  // A launch-fence proof survives only for the exact instance AND epoch it was
+  // decided for; any other value is dropped rather than carried forward.
+  const nativeAgentLaunchFence = [record.nativeAgentLaunchFence, existing?.nativeAgentLaunchFence]
+    .find((proof) => proof?.sessionInstanceId === sessionInstanceId && proof.runtimeEpoch === runtimeEpoch);
+  const { nativeAgentFenceRequired: _requestedMarker, nativeAgentLaunchFence: _requestedProof, ...incoming } = record;
   store.sessions[record.name] = {
-    ...record,
+    ...incoming,
     sessionInstanceId,
     runtimeEpoch,
+    ...(nativeAgentFenceRequired ? { nativeAgentFenceRequired } : {}),
+    ...(nativeAgentLaunchFence ? { nativeAgentLaunchFence } : {}),
     ...(normalizedError ? { error: normalizedError } : { error: undefined }),
     ...(executionCloneMetadata !== undefined ? { executionCloneMetadata } : {}),
     updatedAt: Date.now(),
@@ -463,6 +642,79 @@ export function listSessions(projectName?: string): SessionRecord[] {
 export function findSessionByProviderSessionId(providerSessionId: string): SessionRecord | undefined {
   return Object.values(store.sessions).find((s) => s.providerSessionId === providerSessionId);
 }
+
+/**
+ * Apply a canonical provider limit signal to one session.
+ *
+ * The ONLY writer of `providerLimit`. Routing every adapter through one
+ * mutator is what makes "a limit can only come from provider-native evidence"
+ * checkable: there is a single place to audit rather than one per provider.
+ *
+ * Returns true when the stored state changed, so a caller can emit a
+ * notification exactly once instead of on every repeated signal -- providers
+ * re-send the same rate-limit event freely, and one notification per event
+ * would be a storm.
+ */
+/**
+ * What a signal does to a record's stored limit. PURE -- no store access.
+ *
+ * Extracted so the store mutator and any caller that must fold the limit into a
+ * WHOLE-RECORD write share one decision. Two implementations would be two
+ * answers, and the one that ran last would win silently.
+ */
+export function resolveProviderLimitUpdate(
+  previous: DelegationLimitState | undefined,
+  signal: ProviderLimitSignal | null | undefined,
+  nowMs: number,
+): { changed: false } | { changed: true; value: DelegationLimitState | undefined } {
+  const observation = observeProviderLimitSignal(signal, nowMs);
+
+  if (observation.kind === 'noEvidence') {
+    // Neither sets nor clears. An unrecognised, low-confidence, or merely
+    // WARNING signal must not un-limit an account that is still being refused.
+    return { changed: false };
+  }
+  if (observation.kind === 'healthy') {
+    return previous === undefined ? { changed: false } : { changed: true, value: undefined };
+  }
+
+  const next = observation.state;
+  // Re-observing an ALREADY ACTIVE limit is not a change. Without this the
+  // limit's own clock would restart on every repeated event and the window
+  // would never expire.
+  if (previous
+    && isDelegationLimitActive(previous, nowMs)
+    && previous.reason === next.reason
+    && previous.retryAt === next.retryAt) {
+    return { changed: false };
+  }
+  return { changed: true, value: next };
+}
+
+/**
+ * Apply a canonical provider limit signal onto a record IN PLACE.
+ *
+ * Used by whole-record writers, which must fold the limit into the SAME object
+ * they are about to persist. Applying it to the store separately and then
+ * upserting a record snapshotted beforehand silently reverted the limit --
+ * `quotaMeta` and `limitSignal` arrive on one `SessionInfoUpdate`, so the very
+ * event that reported a refusal also carried the display field whose write
+ * erased it. The failure was invisible: the store briefly held the right value.
+ *
+ * Returns true when the record changed.
+ */
+export function mergeProviderLimitSignal(
+  record: { providerLimit?: DelegationLimitState },
+  signal: ProviderLimitSignal | null | undefined,
+  nowMs = Date.now(),
+): boolean {
+  const update = resolveProviderLimitUpdate(record.providerLimit, signal, nowMs);
+  if (!update.changed) return false;
+  if (update.value === undefined) delete record.providerLimit;
+  else record.providerLimit = update.value;
+  return true;
+}
+
 
 export function updateSessionState(name: string, state: SessionState, error?: string): void {
   const s = store.sessions[name];

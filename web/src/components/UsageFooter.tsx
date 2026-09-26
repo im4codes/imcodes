@@ -9,19 +9,26 @@ import { bestModelLabel } from '../model-label.js';
 import { getSessionCost, getWeeklyCost, getMonthlyCost, formatCost } from '../cost-tracker.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
-import { formatProviderQuotaLabel, type ProviderQuotaMeta } from '@shared/provider-quota.js';
+import type { ProviderQuotaMeta } from '@shared/provider-quota.js';
 import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
 import { CodexResetCredits } from './CodexResetCredits.js';
+import { CodexCreditBalance } from './CodexCreditBalance.js';
 import { SessionUsagePanel } from './SessionUsagePanel.js';
 import type { WsClient } from '../ws-client.js';
+import type { TimelineHistoryStatus } from '../hooks/useTimeline.js';
 import type { ExecutionCloneLaunchState } from '../hooks/useExecutionCloneLaunch.js';
 import {
   ACK_FAILURE_ACK_TIMEOUT,
   ACK_FAILURE_DAEMON_OFFLINE,
 } from '@shared/ack-protocol.js';
+import {
+  isCompactProviderQuotaAgent,
+  ProviderQuotaLine,
+  useProviderQuotaLabel,
+} from './ProviderQuotaLine.js';
 
 interface Props {
   usage: UsageData;
@@ -33,6 +40,9 @@ interface Props {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: ProviderQuotaMeta | null;
+  /** Codex pay-as-you-go usage credit balance — see shared/codex-credit-history.ts. */
+  codexCreditsBalance?: string | null;
+  codexCreditsUnlimited?: boolean | null;
   /** Show cost tracking (requires costUsd events to have been recorded). */
   showCost?: boolean;
   /** Active thinking timestamp — shows elapsed time spinner. */
@@ -58,17 +68,26 @@ interface Props {
   runExecutionClonesTitle?: string;
   runExecutionClonesCount?: number;
   runExecutionClonesFeedback?: ExecutionCloneLaunchState;
+  /** Reuses the current session timeline's authoritative force-refresh path. */
+  onRefreshHistory?: () => void;
+  historyRefreshing?: boolean;
+  historyStatus?: TimelineHistoryStatus | null;
   /** WS client — enables the Codex reset-credits affordance (codex sessions). */
   wsClient?: WsClient | null;
   connected?: boolean;
 }
+
+// Keep execution-clone plumbing intact while removing only this compact
+// footer entry point. The feature still has its existing handlers/state and
+// can be restored deliberately without competing with history refresh here.
+const SHOW_EXECUTION_CLONE_LAUNCHER = false;
 
 const fmt = (n: number) =>
   n >= 1000000 ? `${(n / 1000000).toFixed(n % 1000000 === 0 ? 0 : 1)}M`
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, wsClient, connected }: Props) {
+export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, onRefreshHistory, historyRefreshing = false, historyStatus, wsClient, connected }: Props) {
   const { t } = useTranslation();
   const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
 
@@ -113,34 +132,11 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     isAgentless,
   });
   const showLiveStatus = !isAgentless;
-  const [quotaNow, setQuotaNow] = useState(() => Date.now());
   const [ctxBurning, setCtxBurning] = useState(false);
   const previousCtxSignatureRef = useRef<string | null>(null);
 
   const displayModel = modelOverride ?? usage.model;
-  // Live-tick the quota label (so "resets in Xm" stays current) for ANY provider
-  // that reports structured quota windows — Codex and claude-code-sdk both feed
-  // `quotaMeta`; the gate is its presence, not the agent family.
-  useEffect(() => {
-    if (!quotaMeta) return;
-    let intervalId: number | undefined;
-    const tick = () => setQuotaNow(Date.now());
-    tick();
-    const delay = Math.max(250, 60_000 - (Date.now() % 60_000));
-    const timeoutId = window.setTimeout(() => {
-      tick();
-      intervalId = window.setInterval(tick, 60_000);
-    }, delay);
-    return () => {
-      window.clearTimeout(timeoutId);
-      if (intervalId !== undefined) window.clearInterval(intervalId);
-    };
-  }, [quotaMeta]);
-
-  const displayQuotaLabel = useMemo(() => {
-    if (!quotaMeta) return quotaLabel;
-    return formatProviderQuotaLabel(quotaMeta, now ?? quotaNow) ?? quotaLabel;
-  }, [now, quotaLabel, quotaMeta, quotaNow]);
+  const displayQuotaLabel = useProviderQuotaLabel({ quotaLabel, quotaMeta, now });
 
   const displayPlanLabel = useMemo(() => {
     const normalized = planLabel?.trim().toLowerCase();
@@ -230,7 +226,14 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
         : t('session.state_stop_requested');
     }
     if (liveStatusMode === 'result') return statusText || t('session.state_idle');
-    if (liveStatusMode === 'waiting') return statusText || t('session.state_idle');
+    if (liveStatusMode === 'waiting') {
+      const match = liveStatus.activityDetail?.match(/^capacity_retry:(\d+):(\d+)$/);
+      if (match) {
+        const seconds = Math.max(0, Math.ceil((Number(match[1]) - (now ?? Date.now())) / 1000));
+        return t('session.capacity_retrying', { seconds, attempt: Number(match[2]), defaultValue: 'Retrying in {{seconds}}s (attempt {{attempt}})' });
+      }
+      return statusText || t('session.state_idle');
+    }
     if (liveStatus.sweep) {
       if (activeToolCall) return statusText || t('session.state_running');
       if (activeThinkingTs) return t('chat.thinking_running', { sec: Math.max(0, Math.round(((now ?? Date.now()) - activeThinkingTs) / 1000)) });
@@ -242,7 +245,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
       return t('session.state_running');
     }
     return t('session.state_idle');
-  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
+  }, [activeThinkingTs, activeToolCall, isAgentless, liveStatus.activityDetail, liveStatus.errorDetail, liveStatus.sweep, liveStatusMode, now, statusText, t]);
   const showInlineStatusText = liveStatusMode === 'running' || liveStatusMode === 'thinking' || liveStatusMode === 'tool' || liveStatusMode === 'waiting' || liveStatusMode === 'stopping' || liveStatusMode === 'cancelled' || liveStatusMode === 'result' || liveStatusMode === 'error';
   // The weekly (7d) line is opt-in: it needs the daemon to read the local
   // Claude token. The 5h line needs no authorization (it comes from the SDK
@@ -251,11 +254,12 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
   const weeklyQuotaPref = usePref<boolean>(CLAUDE_WEEKLY_QUOTA_PREF_KEY, { parse: parseBooleanish });
   const showWeeklyAuthPrompt = agentType === 'claude-code-sdk' && weeklyQuotaPref.value !== true;
   // Providers that report structured quota windows (Codex + claude-code-sdk)
-  // render the SAME prominent multi-line quota block as Codex — not the inline
-  // bottom token span — so the limit display is consistent across providers.
-  const providerQuotaLines = (agentType === 'codex' || agentType === 'codex-sdk' || agentType === 'claude-code-sdk')
-    ? (displayQuotaLabel ?? '').split(' · ').filter(Boolean)
-    : [];
+  // render one compact quota row. Keep the provider's existing separator and
+  // full reset details intact; normal whitespace around ` · ` provides a safe
+  // wrap point on a narrow viewport without turning 5h/7d into two DOM rows.
+  const providerQuotaText = isCompactProviderQuotaAgent(agentType)
+    ? (displayQuotaLabel ?? '').trim()
+    : '';
   // Reset credits are a codex-account feature (accrued via ChatGPT auth).
   const isCodexSession = agentType === 'codex' || agentType === 'codex-sdk';
   const executionCloneFeedbackText = useMemo(() => {
@@ -278,6 +282,15 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     });
   }, [runExecutionClonesFeedback, t]);
   const executionCloneFeedbackPhase = runExecutionClonesFeedback?.phase ?? 'idle';
+  const historyRefreshError = historyStatus?.response?.state === 'error'
+    ? historyStatus.response.localizedMessage
+    : null;
+  const historyRefreshLabel = historyRefreshing
+    ? t('chat.refreshing_history')
+    : t('chat.sync_history');
+  const historyRefreshAccessibleLabel = historyRefreshError
+    ? `${historyRefreshLabel}: ${historyRefreshError}`
+    : historyRefreshLabel;
   return (
     <div class="session-usage-footer" title={tip} data-agent-type={agentType ?? undefined}>
       {sessionUsageOpen && (
@@ -305,16 +318,24 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           )}
         </div>
       )}
-      {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt || isCodexSession) && (
+      {(providerQuotaText || showWeeklyAuthPrompt || isCodexSession) && (
         <div class="session-usage-codex-row">
           {isCodexSession && wsClient && (
             <CodexResetCredits wsClient={wsClient} connected={connected !== false} />
           )}
-          {(providerQuotaLines.length > 0 || showWeeklyAuthPrompt) && (
+          {isCodexSession && wsClient && codexCreditsBalance != null && (
+            <CodexCreditBalance
+              wsClient={wsClient}
+              connected={connected !== false}
+              balance={codexCreditsBalance}
+              unlimited={codexCreditsUnlimited}
+            />
+          )}
+          {(providerQuotaText || showWeeklyAuthPrompt) && (
             <div class="session-usage-codex-quota">
-              {providerQuotaLines.map((line) => (
-                <div class="session-usage-codex-line">{line}</div>
-              ))}
+              {providerQuotaText && (
+                <ProviderQuotaLine text={providerQuotaText} />
+              )}
               {showWeeklyAuthPrompt && (
                 <button
                   type="button"
@@ -358,7 +379,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
         )}
         <span style={{ marginLeft: 'auto', display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-          {onRunExecutionClones && (
+          {SHOW_EXECUTION_CLONE_LAUNCHER && onRunExecutionClones && (
             <span class="shortcut-btn-execution-clones-wrapper">
               <button
                 type="button"
@@ -382,6 +403,29 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
                   {executionCloneFeedbackText}
                 </span>
               )}
+            </span>
+          )}
+          {onRefreshHistory && (
+            <span class="shortcut-btn-history-refresh-wrapper">
+              <button
+                type="button"
+                class={`shortcut-btn shortcut-btn-icon shortcut-btn-history-refresh${historyRefreshing ? ' is-refreshing' : ''}${historyRefreshError ? ' is-error' : ''}`}
+                title={historyRefreshAccessibleLabel}
+                aria-label={historyRefreshAccessibleLabel}
+                disabled={historyRefreshing}
+                onClick={() => {
+                  if (!historyRefreshing) onRefreshHistory();
+                }}
+              >
+                <span class="shortcut-btn-history-refresh-glyph" aria-hidden="true">↻</span>
+                {historyRefreshError && (
+                  <span
+                    class="shortcut-btn-history-refresh-error"
+                    role="alert"
+                    aria-label={historyRefreshError}
+                  >!</span>
+                )}
+              </button>
             </span>
           )}
           <button
@@ -432,7 +476,7 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
           </span>
           {modelLabel && <span class="session-usage-model">{modelLabel}</span>}
           {hasContextInfo && <span class="session-usage-tokens">{fmt(total)} / {fmt(ctx)} ({pctStr}%)</span>}
-          {inlineQuotaText && providerQuotaLines.length === 0 && <span class="session-usage-tokens">{inlineQuotaText}</span>}
+          {inlineQuotaText && !providerQuotaText && <span class="session-usage-tokens">{inlineQuotaText}</span>}
           {sessionCost > 0 && (
             <span class="session-usage-cost">
               {formatCost(sessionCost)} · wk {formatCost(weeklyCost)} · mo {formatCost(monthlyCost)}

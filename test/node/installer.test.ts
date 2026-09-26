@@ -3,11 +3,13 @@ import { createHash } from 'node:crypto';
 import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   CONTROLLED_NODE_SERVICE,
   windowsScheduledTaskArgs,
   windowsHealthWatchdogTaskArgs,
+  windowsStaleUpgradeTaskCleanupArgs,
+  windowsStopControlledNodeGenerationArgs,
   encodeWindowsScheduledTaskXml,
   windowsScheduledTaskXml,
   windowsControlledNodeHealthPaths,
@@ -27,6 +29,8 @@ import {
   LINUX_UNIT_PATH,
   isProcessElevated,
   assertProcessElevated,
+  windowsPowerShellExecutablePath,
+  windowsSchtasksExecutablePath,
   installDefinition,
   inspectDefinition,
   inspectServiceState,
@@ -37,6 +41,7 @@ import {
 const EXE = '/opt/imcodes-node/imcodes-node';
 const WINDOWS_EXE = 'C:\\ProgramData\\imcodes-node\\imcodes-node.exe';
 const WINDOWS_WATCHDOG_NOW = new Date(2026, 6, 14, 11, 36, 7);
+const WINDOWS_SCHTASKS = 'C:\\Windows\\System32\\schtasks.exe';
 
 describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('detects POSIX root without attempting privilege escalation', () => {
@@ -47,7 +52,58 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
   it('detects Windows Administrator membership through a testable probe', () => {
     expect(isProcessElevated({ platform: 'win32', runCommand: () => 'True\r\n' })).toBe(true);
     expect(isProcessElevated({ platform: 'win32', runCommand: () => 'False\r\n' })).toBe(false);
-    expect(isProcessElevated({ platform: 'win32', runCommand: () => { throw new Error('denied'); } })).toBe(false);
+  });
+
+  it('probes the absolute System32 PowerShell before the PATH-resolved name', () => {
+    // A downloaded installer can be started with a PATH that lacks System32,
+    // so the absolute path must be tried first rather than depended upon as a
+    // fallback that only runs after a confusing failure.
+    const seen: string[] = [];
+    expect(isProcessElevated({
+      platform: 'win32',
+      runCommand: (file) => { seen.push(file); return 'True\r\n'; },
+    })).toBe(true);
+    expect(seen).toHaveLength(1);
+    expect(seen[0]).toMatch(/System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/i);
+  });
+
+  it('resolves trusted Windows system executables without consulting PATH', () => {
+    expect(windowsSchtasksExecutablePath({
+      SystemRoot: 'D:\\TrustedWindows',
+      WINDIR: 'E:\\IgnoredWindows',
+    })).toBe('D:\\TrustedWindows\\System32\\schtasks.exe');
+    expect(windowsSchtasksExecutablePath({
+      WINDIR: 'E:\\Windows',
+    })).toBe('E:\\Windows\\System32\\schtasks.exe');
+    expect(windowsSchtasksExecutablePath({})).toBe(WINDOWS_SCHTASKS);
+    expect(windowsPowerShellExecutablePath({
+      SystemRoot: 'D:\\TrustedWindows',
+      WINDIR: 'E:\\IgnoredWindows',
+    })).toBe('D:\\TrustedWindows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe');
+  });
+
+  it('falls back to the PATH name when the absolute probe cannot run', () => {
+    const seen: string[] = [];
+    expect(isProcessElevated({
+      platform: 'win32',
+      runCommand: (file) => {
+        seen.push(file);
+        if (seen.length === 1) throw new Error('ENOENT');
+        return 'True\r\n';
+      },
+    })).toBe(true);
+    expect(seen).toHaveLength(2);
+    expect(seen[1]).toBe('powershell.exe');
+  });
+
+  it('refuses to report an administrator as unprivileged when PowerShell cannot run', () => {
+    // Returning false here would be a lie with a specific, damaging
+    // consequence: a user who DID run as administrator is told to run as
+    // administrator, and has no way to discover the real fault.
+    expect(() => isProcessElevated({
+      platform: 'win32',
+      runCommand: () => { throw new Error('denied'); },
+    })).toThrow(/PowerShell could not be executed/);
   });
 
   it('fails with the existing Administrator/root precondition when not elevated', () => {
@@ -87,6 +143,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     expect(healthPaths).toEqual({
       scriptPath: 'C:\\ProgramData\\imcodes-node\\imcodes-node-health-watchdog.ps1',
       leasePath: 'C:\\ProgramData\\imcodes-node\\health-lease.json',
+      statePath: 'C:\\ProgramData\\imcodes-node\\health-watchdog-state.json',
       logPath: 'C:\\ProgramData\\imcodes-node\\health-watchdog.log',
       upgradeMarkerPath: 'C:\\ProgramData\\imcodes-node\\upgrade-in-progress.json',
     });
@@ -107,14 +164,28 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
     const watchdogScript = windowsControlledNodeHealthWatchdogScript(WINDOWS_EXE);
     expect(watchdogScript).toContain('$lease.updatedAt');
     expect(watchdogScript).toContain('$lease.pid');
-    expect(watchdogScript).toContain('[int]$lease.pid -eq [int]$process.ProcessId');
+    expect(watchdogScript).toContain('[int]$lease.pid -ne [int]$process.ProcessId');
     expect(watchdogScript).toContain('$ageMs -le ($staleSeconds * 1000)');
     expect(watchdogScript).toContain('$process.CreationDate');
     expect(watchdogScript).toContain('$processAgeSeconds -lt $staleSeconds');
+    expect(watchdogScript).toContain("$statePath = 'C:\\ProgramData\\imcodes-node\\health-watchdog-state.json'");
+    expect(watchdogScript).toContain("Write-HealthLog ('grace_begin reason={0}");
+    expect(watchdogScript).toContain("Write-HealthLog ('resume_or_clock_change");
+    expect(watchdogScript).toContain('$sameFailureObservedLongEnough');
+    expect(watchdogScript).toContain('if (-not $sameFailureObservedLongEnough)');
+    expect(watchdogScript).toContain('Move-Item -Force -LiteralPath $stateTempPath -Destination $statePath');
     expect(watchdogScript).toContain('$staleSeconds = 180');
     expect(watchdogScript).toContain("$upgradeMarkerPath = 'C:\\ProgramData\\imcodes-node\\upgrade-in-progress.json'");
     expect(watchdogScript).toContain('$upgradeMarkerMaxAgeMs = 900000');
     expect(watchdogScript).toContain('$upgradeAgeMs -le $upgradeMarkerMaxAgeMs');
+    expect(watchdogScript).toContain("$upgradeMarker.product -ceq 'imcodes-controlled-node-upgrade'");
+    expect(watchdogScript).toContain("$upgradeMarker.taskName -clike 'imcodes-node-upgrade-*'");
+    expect(watchdogScript).toContain('if ($upgradeTask) {');
+    expect(watchdogScript.indexOf('exit 0\r\n      }'))
+      .toBeLessThan(watchdogScript.indexOf('Remove-Item -Force -LiteralPath $upgradeMarkerPath'));
+    expect(watchdogScript).toContain('upgrade_recovery_requested');
+    expect(watchdogScript.indexOf('upgrade_recovery_requested'))
+      .toBeLessThan(watchdogScript.indexOf('Remove-Item -Force -LiteralPath $upgradeMarkerPath'));
     expect(watchdogScript).toContain('Remove-Item -Force -LiteralPath $upgradeMarkerPath');
     expect(watchdogScript).toContain('Start-ScheduledTask -TaskName $nodeTask');
     expect(watchdogScript).toContain("-notmatch '--computer-use-helper'");
@@ -136,7 +207,22 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
         watchdogScript = content;
       },
       runCommand: (file, args) => {
-        expect(file).toBe('schtasks');
+        if (file === windowsPowerShellExecutablePath()) {
+          if (args.join(' ').includes("Get-ScheduledTask -TaskName 'imcodes-node-upgrade-*'")) {
+            expect(args).toEqual(windowsStaleUpgradeTaskCleanupArgs());
+            expect(args.join(' ')).toContain('Unregister-ScheduledTask');
+            expect(args.join(' ')).toContain('[int]$_.State -notin @(2,4)');
+            expect(args.join(' ')).toContain('$info.NextRunTime -le $now');
+            expect(args.join(' ')).not.toContain('Stop-ScheduledTask -InputObject');
+            expect(args.join(' ')).toContain("$preserved -notcontains $_.TaskName");
+            expect(args.join(' ')).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK);
+            expect(args.join(' ')).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK);
+          } else {
+            expect(args).toEqual(windowsStopControlledNodeGenerationArgs(WINDOWS_EXE));
+          }
+          return;
+        }
+        expect(file).toBe(WINDOWS_SCHTASKS);
         if (args[0] === '/Create') {
           const taskName = String(args[2]);
           const expectedArgs = taskName === CONTROLLED_NODE_SERVICE.WINDOWS_TASK
@@ -172,6 +258,20 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       .toEqual(Buffer.from([0xff, 0xfe]));
     expect(artifactPaths).toHaveLength(2);
     expect(artifactPaths.every((path) => !existsSync(path))).toBe(true);
+  });
+
+  it('the stale-upgrade-task sweep never deletes the legacy rescue/restart infrastructure tasks, even though they share its name prefix and sit idle between triggers just like a real stale task', () => {
+    const script = windowsStaleUpgradeTaskCleanupArgs().join(' ');
+    // Both infra tasks are registered under the same imcodes-node-upgrade-
+    // prefix as the one-shot per-attempt upgrader tasks this sweep targets,
+    // and both are legitimately idle (Ready state, no NextRunTime) between
+    // triggers -- exactly the condition this sweep otherwise deletes on.
+    expect(script).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK);
+    expect(script).toContain(CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK);
+    expect(script).toContain('$preserved -notcontains $_.TaskName');
+    // The sweep must still target actual stale one-shot upgrader tasks (UUID-suffixed).
+    expect(script).toContain("Get-ScheduledTask -TaskName 'imcodes-node-upgrade-*'");
+    expect(script).toContain('Unregister-ScheduledTask -InputObject $_');
   });
 
   it('Windows credential dir is ProgramData-scoped (SYSTEM service), honoring %ProgramData% (10.10)', () => {
@@ -231,6 +331,53 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
 
     expect(calls).toEqual(commands.map((args) => ({ file: 'icacls', args })));
     expect(calls).toHaveLength(4);
+  });
+
+  it('Windows reinstall terminates the resident task generation before starting the new bytes', async () => {
+    const calls: Array<{ file: string; args: readonly string[] }> = [];
+    await startService({
+      name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+      platform: 'win32',
+      action: WINDOWS_EXE,
+    }, {
+      platform: 'win32',
+      runCommand: (file, args) => { calls.push({ file, args: [...args] }); },
+    });
+
+    expect(calls).toEqual([
+      { file: windowsPowerShellExecutablePath(), args: windowsStopControlledNodeGenerationArgs(WINDOWS_EXE) },
+      { file: windowsSchtasksExecutablePath(), args: ['/Run', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK] },
+    ]);
+    expect(calls[0]!.args.join(' ')).toContain('previous generation did not stop');
+    expect(calls[0]!.args.join(' ')).toContain("-notmatch '--computer-use-helper'");
+  });
+
+  it('Windows reinstall surfaces generation-stop and start failures instead of claiming success', async () => {
+    const calls: string[][] = [];
+    const runCommand = vi.fn((_file: string, args: readonly string[]) => {
+      calls.push([...args]);
+      if (args[0] === '/Run') throw new Error('service start refused');
+    });
+    await expect(startService({
+      name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+      platform: 'win32',
+      action: WINDOWS_EXE,
+    }, { platform: 'win32', runCommand })).rejects.toThrow('service start refused');
+    expect(calls).toEqual([
+      [...windowsStopControlledNodeGenerationArgs(WINDOWS_EXE)],
+      ['/Run', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK],
+    ]);
+
+    await expect(startService({
+      name: CONTROLLED_NODE_SERVICE.WINDOWS_TASK,
+      platform: 'win32',
+      action: WINDOWS_EXE,
+    }, {
+      platform: 'win32',
+      runCommand: (_file, args) => {
+        if (args.includes('-Command')) throw new Error('previous generation did not stop');
+      },
+    })).rejects.toThrow('previous generation did not stop');
   });
 
   it('macOS artifacts provide boot persistence plus a periodic authenticated-health watchdog (4.2)', () => {
@@ -390,7 +537,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(action),
       runCommand: (file, args) => {
         calls.push({ file, args: [...args] });
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK) ? watchdogXml : xml;
       },
     });
@@ -409,7 +556,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       runState: 'running',
       errors: [],
     });
-    expect(calls.map(({ file }) => file)).toEqual(['schtasks', 'schtasks', 'powershell.exe']);
+    expect(calls.map(({ file }) => file)).toEqual([WINDOWS_SCHTASKS, WINDOWS_SCHTASKS, 'powershell.exe']);
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Create');
     expect(calls.flatMap(({ args }) => args)).not.toContain('/Run');
   });
@@ -435,7 +582,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(action),
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)
           ? normalizedWatchdog
           : normalized;
@@ -480,7 +627,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => watchdogScript,
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         if (args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK)) {
           if (watchdogTaskXml === undefined) throw new Error('watchdog missing');
           return watchdogTaskXml;
@@ -532,7 +679,7 @@ describe('controlled-node installer artifacts (4.1-4.4)', () => {
       platform: 'win32',
       readWindowsWatchdogScript: async () => windowsControlledNodeHealthWatchdogScript(receiptAction),
       runCommand: (file, args) => {
-        if (file !== 'schtasks') return 'Running';
+        if (file !== WINDOWS_SCHTASKS) return 'Running';
         return args.includes(CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK) ? watchdogXml : staleXml;
       },
     });

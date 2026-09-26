@@ -12,6 +12,10 @@ import { join } from 'node:path';
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
 import logger from '../util/logger.js';
 import { isServerFallbackUnavailable, tryServerEmbedding } from './embedding-server-fallback.js';
+import {
+  spawnChildProcessWorker,
+  type ChildProcessWorkerHandle,
+} from '../util/child-process-worker.js';
 
 // Re-export shared constants for backward compatibility with existing imports
 export { EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.js';
@@ -46,7 +50,7 @@ function resolveEmbeddingCacheDir(): string {
 // synchronous native CPU work. Running it on the daemon main thread froze the
 // event loop for tens of seconds on loaded hosts and starved the server link.
 // So the actual load/inference lives behind an EmbeddingEngine:
-//   - WorkerEngine   (production): runs in a worker thread (embedding-worker.ts).
+//   - WorkerEngine   (production): runs in a child process (embedding-worker.ts).
 //   - InProcessEngine (tests / fallback): the original in-process path, so the
 //     existing `vi.mock('@huggingface/transformers')` unit tests keep working.
 // All sticky-failure / server-fallback / status POLICY stays in this module.
@@ -118,24 +122,21 @@ class InProcessEmbeddingEngine implements EmbeddingEngine {
   dispose(): void { this.pipe = null; }
 }
 
-// Worker engine: tiny request/response RPC to embedding-worker.ts. Self-heals a
-// crashed worker by dropping the handle so the next load() respawns it.
+// Worker engine: tiny request/response IPC to embedding-worker.ts. Self-heals a
+// crashed process by dropping the handle so the next load() respawns it.
 class WorkerEmbeddingEngine implements EmbeddingEngine {
-  private worker: import('node:worker_threads').Worker | null = null;
+  private worker: ChildProcessWorkerHandle | null = null;
   private nextId = 1;
   private readonly pending = new Map<number, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
 
-  private async ensureWorker(): Promise<import('node:worker_threads').Worker> {
+  private async ensureWorker(): Promise<ChildProcessWorkerHandle> {
     if (this.worker) return this.worker;
-    const { Worker } = await import('node:worker_threads');
-    // Spawn the plain-ESM bootstrap (NOT the .ts directly): a worker thread
-    // doesn't inherit tsx's loader, so a raw .ts worker can't resolve our
-    // `.js`-suffixed TS imports. The bootstrap registers tsx then imports the
-    // real worker (.ts in dev, compiled .js in prod). Matches the other
-    // *-worker-bootstrap.mjs workers; copy-worker-bootstraps.mjs ships it.
+    // Run ONNX in a dedicated OS process. Native allocation, CPU saturation,
+    // and fatal runtime failures cannot block or terminate the daemon, while
+    // the process-wide engine still gives every daemon caller one shared model.
     const workerUrl = new URL('./embedding-worker-bootstrap.mjs', import.meta.url);
-    const worker = new Worker(workerUrl, {
-      workerData: { cacheDir: resolveEmbeddingCacheDir() },
+    const worker = spawnChildProcessWorker(workerUrl, {
+      env: { IMCODES_EMBEDDING_CACHE_DIR: resolveEmbeddingCacheDir() },
     });
     worker.unref();
     worker.on('message', (msg: { id: number; ok: boolean; result?: unknown; error?: string; code?: string | null }) => {

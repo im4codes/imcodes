@@ -2,13 +2,17 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import {
   controlledNodeDownloadErrorKey,
+  createControlledNodeRemoteInstallLink,
+  createControlledNodeInstallCommand,
   downloadControlledNodeExecutable,
   beginControlledNodeDesktopDownload,
+  revokeControlledNodeRemoteInstallLink,
 } from '../api.js';
 import {
   artifactSelectionKey,
   buildControlledNodeDownloadTargets,
   installMachineRemoteDesktopWorker,
+  requestMachineRemoteDesktopPermissions,
   listAvailableExecutables,
   renameMachine,
   revokeMachine,
@@ -19,15 +23,38 @@ import {
   type ControlledNodeOs,
 } from '../api/machines.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
-import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
-import { normalizeMachineDisplayName } from '@shared/machine-reference.js';
+import {
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT,
+  REMOTE_DESKTOP_LOCAL_WEB_ACTION,
+} from '@shared/remote-desktop-local-management.js';
+import { CONTROLLED_NODE_OS_MAC } from '@shared/controlled-node-artifacts.js';
+import {
+  canInstallRemoteDesktopWorker,
+  machineAccessRole,
+  needsRemoteDesktopPermission,
+} from '../controlled-node-remote-desktop.js';
+import { MACHINE_IDENTITY_UNAVAILABLE, normalizeMachineDisplayName } from '@shared/machine-reference.js';
 import { formatByteSize } from '../util/byte-size.js';
+import { copyToClipboardWhenReady } from '../util/clipboard.js';
 import { useMachines } from '../hooks/useMachines.js';
 import { isNative } from '../native.js';
 import { ShareSessionDialog } from './ShareSessionDialog.js';
 import type { MachineListItem } from '../api/machines.js';
-import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
+import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
+import { RemoteDesktopReadiness } from './RemoteDesktopReadiness.js';
+import { TeamManagementPanel } from './TeamManagementPanel.js';
+import {
+  MACHINE_GROUP_DIRECT,
+  machineGroupTabs,
+  machineGroupsOf,
+  machinesInGroup,
+  resolveMachineGroup,
+  useRememberedMachineGroup,
+} from '../machine-grouping.js';
+
+import { VerificationMachinesSection } from './VerificationMachinesSection.js';
+import { createRemoteDesktopAccessApi, type SavedRemoteDesktopDevice } from '../api/remote-desktop-access.js';
 
 /**
  * Auto unlock exists only where the remote-desktop worker does: it is that
@@ -36,17 +63,7 @@ import { canOpenRemoteDesktop } from './RemoteDesktopPanel.js';
  */
 function canConfigureAutoUnlock(machine: MachineListItem): boolean {
   return (machine.accessRole ?? 'owner') === 'owner'
-    && machine.os === 'win'
     && Boolean(machine.capabilities?.includes(CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY));
-}
-
-function canInstallRemoteDesktopWorker(machine: MachineListItem): boolean {
-  return machineAccessRole(machine) === 'owner'
-    && machine.online
-    && !machine.updateAvailable
-    && machine.os === 'win'
-    && Boolean(machine.capabilities?.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY))
-    && !machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY);
 }
 
 /**
@@ -94,11 +111,6 @@ function findArtifactForTarget(
   return artifacts.find((a) => a.os === target.os && a.arch === target.arch);
 }
 
-function machineAccessRole(machine: MachineListItem): 'owner' | 'viewer' | 'participant' {
-  // The field is optional on the wire so a newly upgraded Web remains usable
-  // with an older Server, whose machine list was owner-only.
-  return machine.accessRole ?? 'owner';
-}
 
 const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: string }> = {
   win: { glyph: '⊞', name: 'Windows' },
@@ -108,13 +120,29 @@ const PLATFORM_PRESENTATION: Record<ControlledNodeOs, { glyph: string; name: str
 
 export interface ControlledNodesPanelProps {
   onOpenRemoteDesktop?(machine: MachineListItem): void;
+  onOpenRemoteDesktopWall?(): void;
+  onConnectById?(): void;
+  projectKey?: string;
+  initialNodeId?: string;
+  initialAction?: typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION[
+    keyof typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION
+  ];
 }
+
+const CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH = 640;
 
 export function ControlledNodesPanel({
   onOpenRemoteDesktop,
+  onOpenRemoteDesktopWall,
+  onConnectById,
+  projectKey,
+  initialNodeId,
+  initialAction = REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE,
 }: ControlledNodesPanelProps) {
   const { t, i18n } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
+  const [savedRemoteDevices, setSavedRemoteDevices] = useState<SavedRemoteDesktopDevice[]>([]);
+  const savedRemoteDesktopApi = useMemo(() => createRemoteDesktopAccessApi(), []);
 
   const [artifacts, setArtifacts] = useState<ControlledNodeArtifactMetadata[]>([]);
   const [downloadTargets, setDownloadTargets] = useState<ControlledNodeArtifactSelection[]>([]);
@@ -123,7 +151,25 @@ export function ControlledNodesPanel({
 
   const [downloadingKey, setDownloadingKey] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
+  // Three things that were stacked on one scrolling page: the machines you can
+  // reach, the groups you share them through, and how to add a new one. Three
+  // separate tasks, so three tabs.
+  const [tab, setTab] = useState<'machines' | 'teams' | 'verification' | 'install'>('machines');
+  // Which slice of the machine list is on screen. Machines shared with you
+  // individually and machines reached through a team are different things, so
+  // they are not poured into one list you then have to read apart.
+  const [rememberedMachineGroup, setMachineGroup] = useRememberedMachineGroup();
+
   const [ticketExpiryByKey, setTicketExpiryByKey] = useState<Partial<Record<string, number>>>({});
+  const [linkingKey, setLinkingKey] = useState<string | null>(null);
+  const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [revokingLinkKey, setRevokingLinkKey] = useState<string | null>(null);
+  const [revokedLinkKey, setRevokedLinkKey] = useState<string | null>(null);
+  const [commandKey, setCommandKey] = useState<string | null>(null);
+  const [copiedCommandKey, setCopiedCommandKey] = useState<string | null>(null);
+  const [linkExpiryByKey, setLinkExpiryByKey] = useState<Partial<Record<string, number>>>({});
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const revokedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [actionError, setActionError] = useState<string | null>(null);
   const [presenceRefreshFailed, setPresenceRefreshFailed] = useState(error != null);
@@ -135,7 +181,36 @@ export function ControlledNodesPanel({
   const [editingServerId, setEditingServerId] = useState<string | null>(null);
   const [renameValue, setRenameValue] = useState('');
   const [sharingMachine, setSharingMachine] = useState<MachineListItem | null>(null);
+  const [sharingMachineSection, setSharingMachineSection] = useState<'account' | 'remote-desktop'>('account');
+  const [mobileActions, setMobileActions] = useState(
+    () => typeof window !== 'undefined' && window.innerWidth <= CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH,
+  );
+
+  useEffect(() => {
+    let active = true;
+    void savedRemoteDesktopApi.listSavedDevices().then((devices) => {
+      if (active) setSavedRemoteDevices(devices);
+    }).catch(() => { if (active) setSavedRemoteDevices([]); });
+    return () => { active = false; };
+  }, [savedRemoteDesktopApi]);
+
+  const openSavedRemoteDevice = (device: SavedRemoteDesktopDevice) => {
+    window.open(`/remote-desktop/access?publicId=${encodeURIComponent(device.publicNodeId)}`, '_blank', 'noopener,noreferrer');
+  };
+  const [mobileActionMenuServerId, setMobileActionMenuServerId] = useState<string | null>(null);
+  const mobileActionMenuTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const mobileActionMenuPanelRef = useRef<HTMLDivElement | null>(null);
   const presenceMountedRef = useRef(true);
+  const consumedInitialActionRef = useRef(false);
+
+  useEffect(() => {
+    if (consumedInitialActionRef.current || !loaded || !initialNodeId) return;
+    consumedInitialActionRef.current = true;
+    setTab('machines');
+    if (initialAction !== REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE) return;
+    const machine = machines.find((candidate) => candidate.nodeId === initialNodeId);
+    if (machine && machineAccessRole(machine) === 'owner') setSharingMachine(machine);
+  }, [initialAction, initialNodeId, loaded, machines]);
 
   const sortedTargets = useMemo(() => downloadTargets, [downloadTargets]);
   const availableOses = useMemo(
@@ -156,6 +231,45 @@ export function ControlledNodesPanel({
   }, [t]);
 
   useEffect(() => { refreshAvailability(); }, [refreshAvailability]);
+
+
+  useEffect(() => {
+    const updateMobileActions = (): void => {
+      const nextMobileActions = window.innerWidth <= CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH;
+      setMobileActions(nextMobileActions);
+      if (!nextMobileActions) setMobileActionMenuServerId(null);
+    };
+    window.addEventListener('resize', updateMobileActions);
+    return () => window.removeEventListener('resize', updateMobileActions);
+  }, []);
+
+  const closeMobileActionMenu = useCallback((restoreFocus = false): void => {
+    setMobileActionMenuServerId(null);
+    if (restoreFocus) mobileActionMenuTriggerRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!mobileActionMenuServerId) return undefined;
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      const target = event.target as Node | null;
+      if (target
+        && !mobileActionMenuPanelRef.current?.contains(target)
+        && !mobileActionMenuTriggerRef.current?.contains(target)) {
+        closeMobileActionMenu();
+      }
+    };
+    const closeOnEscape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return;
+      event.preventDefault();
+      closeMobileActionMenu(true);
+    };
+    document.addEventListener('pointerdown', closeOnOutsidePointer, true);
+    document.addEventListener('keydown', closeOnEscape);
+    return () => {
+      document.removeEventListener('pointerdown', closeOnOutsidePointer, true);
+      document.removeEventListener('keydown', closeOnEscape);
+    };
+  }, [closeMobileActionMenu, mobileActionMenuServerId]);
 
   useEffect(() => {
     presenceMountedRef.current = true;
@@ -206,8 +320,8 @@ export function ControlledNodesPanel({
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
-    setDownloadingKey(key);
     setDownloadError(null);
+    setDownloadingKey(key);
     let desktopWindow: Window | null = null;
     if (!isNative()) {
       try {
@@ -219,12 +333,146 @@ export function ControlledNodesPanel({
       }
     }
     try {
-      const ticket = await downloadControlledNodeExecutable(target, { desktopWindow });
-      setTicketExpiryByKey((prev) => ({ ...prev, [key]: ticket.expiresAt }));
+      const ticket = await downloadControlledNodeExecutable(target, '', { desktopWindow });
+      const expiresAt = ticket.expiresAt;
+      if (expiresAt !== null) {
+        setTicketExpiryByKey((prev) => ({ ...prev, [key]: expiresAt }));
+      }
     } catch (err) {
       setDownloadError(t(controlledNodeDownloadErrorKey(err)));
     } finally {
       setDownloadingKey(null);
+    }
+  };
+
+  // Clearing the "Copied" flash on unmount keeps the timer from calling
+  // setState against a torn-down component when the panel closes quickly.
+  useEffect(() => () => {
+    if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+    if (revokedTimerRef.current) clearTimeout(revokedTimerRef.current);
+  }, []);
+
+  /**
+   * Mint a long-lived link and copy it, without navigating anywhere.
+   *
+   * This is the whole point of the remote-install mode: the operator is not at
+   * the target machine, so the useful artifact is a string they can paste into
+   * a chat and open over there. Downloading here and transferring the binary
+   * would need the very remote tool they are trying to install.
+   */
+  /**
+   * Copy the one-line install command.
+   *
+   * For a machine that has a terminal but no convenient browser: a headless
+   * Linux box, or a Windows host reached over RDP where pasting a line into a
+   * shell beats driving a browser. The command carries a short code rather than
+   * the download ticket, so it can be read off a screen or dictated.
+   */
+  const onCopyInstallCommand = async (target: ControlledNodeArtifactSelection) => {
+    const key = artifactSelectionKey(target);
+    if (commandKey) return;
+    setDownloadError(null);
+    setCommandKey(key);
+    try {
+      // The clipboard is engaged BEFORE the mint is awaited. iOS only lets a
+      // page write to the clipboard while the tap still counts, and awaiting
+      // the network spends that -- which is why this button worked on Android
+      // and told iPhone users to check permissions they never lacked.
+      const pending = createControlledNodeInstallCommand(target).then((minted) => minted.command);
+      const copied = new Promise<boolean>((resolve) => {
+        copyToClipboardWhenReady(pending, () => resolve(true), () => resolve(false));
+      });
+      // Awaited first so that a mint failure is reported as a mint failure.
+      await pending;
+      if (!await copied) {
+        setDownloadError(t('controlled_nodes.copy_install_command_clipboard_error'));
+        return;
+      }
+      setCopiedCommandKey(key);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => {
+        setCopiedCommandKey(null);
+        copiedTimerRef.current = null;
+      }, 4000);
+    } catch (err) {
+      const errorKey = controlledNodeDownloadErrorKey(err);
+      setDownloadError(t(errorKey === 'controlled_nodes.download_error'
+        ? 'controlled_nodes.copy_install_command_error'
+        : errorKey));
+    } finally {
+      setCommandKey(null);
+    }
+  };
+
+  const onCopyInstallLink = async (target: ControlledNodeArtifactSelection) => {
+    const key = artifactSelectionKey(target);
+    if (linkingKey) return;
+    setDownloadError(null);
+    setLinkingKey(key);
+    try {
+      // Same as the command button above: engage the clipboard inside the tap.
+      const minting = createControlledNodeRemoteInstallLink(target);
+      const copyResult = new Promise<boolean>((resolve) => {
+        copyToClipboardWhenReady(minting.then((minted) => minted.url), () => resolve(true), () => resolve(false));
+      });
+      // Awaited first so that a mint failure is reported as a mint failure.
+      const link = await minting;
+      const copied = await copyResult;
+      if (!copied) {
+        setDownloadError(t('controlled_nodes.copy_install_link_clipboard_error'));
+        return;
+      }
+      // Do not retain or render the bearer URL. Stable links have no expiry;
+      // clear any legacy finite-expiry label that this row previously showed.
+      setLinkExpiryByKey((prev) => {
+        const next = { ...prev };
+        if (link.expiresAt === null) delete next[key];
+        else next[key] = link.expiresAt;
+        return next;
+      });
+      setRevokedLinkKey((current) => current === key ? null : current);
+      setCopiedKey(key);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => {
+        setCopiedKey(null);
+        copiedTimerRef.current = null;
+      }, 4000);
+    } catch (err) {
+      const errorKey = controlledNodeDownloadErrorKey(err);
+      setDownloadError(t(errorKey === 'controlled_nodes.download_error'
+        ? 'controlled_nodes.copy_install_link_error'
+        : errorKey));
+    } finally {
+      setLinkingKey(null);
+    }
+  };
+
+  const onRevokeInstallLink = async (target: ControlledNodeArtifactSelection) => {
+    const key = artifactSelectionKey(target);
+    if (revokingLinkKey) return;
+    if (!window.confirm(t('controlled_nodes.revoke_install_link_confirm'))) return;
+    setRevokingLinkKey(key);
+    setDownloadError(null);
+    try {
+      await revokeControlledNodeRemoteInstallLink(target);
+      // Revocation targets the durable binding, never a bearer held in Web
+      // state. Clear only non-secret presentation state for this artifact.
+      setLinkExpiryByKey((prev) => {
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      });
+      setCopiedKey((current) => current === key ? null : current);
+      setRevokedLinkKey(key);
+      if (revokedTimerRef.current) clearTimeout(revokedTimerRef.current);
+      revokedTimerRef.current = setTimeout(() => {
+        setRevokedLinkKey(null);
+        revokedTimerRef.current = null;
+      }, 4000);
+    } catch {
+      setDownloadError(t('controlled_nodes.revoke_install_link_error'));
+    } finally {
+      setRevokingLinkKey(null);
     }
   };
 
@@ -254,6 +502,26 @@ export function ControlledNodesPanel({
     }
     await refreshPresence();
     setBusyServerId(null);
+  };
+
+  /**
+   * Ask the machine to put its permission dialog on screen.
+   *
+   * Presence is not refreshed afterwards on purpose: nothing has changed yet.
+   * The dialog is now waiting for a person at that Mac, and the capability
+   * this button is gated on flips only after they answer -- which the ordinary
+   * presence poll will pick up.
+   */
+  const onRequestRemoteDesktopPermissions = async (serverId: string) => {
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await requestMachineRemoteDesktopPermissions(serverId);
+    } catch {
+      setActionError(t('remote_desktop.request_permission_failed'));
+    } finally {
+      setBusyServerId(null);
+    }
   };
 
   const startAutoUnlock = (serverId: string) => {
@@ -331,15 +599,170 @@ export function ControlledNodesPanel({
     setBusyServerId(null);
   };
 
-  const usageOsKeys: Array<{ os: ControlledNodeOs; key: string }> = [
-    { os: 'win', key: 'controlled_nodes.usage_win_run' },
-    { os: 'mac', key: 'controlled_nodes.usage_mac_run' },
-    { os: 'linux', key: 'controlled_nodes.usage_linux_run' },
+  // Two routes onto a machine, and they fail in different ways: the downloaded
+  // executable needs elevation from the shell that launches it, the copied
+  // command needs a terminal that is ALREADY elevated. Saying only "run with
+  // the required privileges" leaves the most common Windows failure -- pasting
+  // into an ordinary PowerShell window -- undescribed.
+  const usageOsKeys: Array<{ os: ControlledNodeOs; commandKey: string; downloadKey: string }> = [
+    { os: 'win', commandKey: 'controlled_nodes.usage_win_command', downloadKey: 'controlled_nodes.usage_win_run' },
+    { os: 'mac', commandKey: 'controlled_nodes.usage_mac_command', downloadKey: 'controlled_nodes.usage_mac_run' },
+    { os: 'linux', commandKey: 'controlled_nodes.usage_linux_command', downloadKey: 'controlled_nodes.usage_linux_run' },
   ];
+
+  const machineTeams = machineGroupsOf(machines);
+  const machineGroup = resolveMachineGroup(rememberedMachineGroup, machines);
+  const visibleMachines = machinesInGroup(machines, machineGroup);
 
   const showEmptyCatalog = !availLoading && !availError && sortedTargets.length === 0;
   const onlineMachineCount = machines.filter((machine) => machine.online).length;
   const execEnabledMachineCount = machines.filter((machine) => machine.execEnabled).length;
+
+  const renderInstallAction = (machine: MachineListItem, inMobileMenu: boolean) => (
+    canInstallRemoteDesktopWorker(machine) && (
+      <button
+        type="button"
+        class="controlled-nodes-install-worker"
+        disabled={busyServerId === machine.serverId}
+        onClick={() => {
+          if (inMobileMenu) closeMobileActionMenu();
+          void onInstallRemoteDesktopWorker(machine.serverId);
+        }}
+      >
+        {busyServerId === machine.serverId
+          ? t('remote_desktop.installing')
+          : t('remote_desktop.install_worker')}
+      </button>
+    )
+  );
+
+  const renderManagementActions = (machine: MachineListItem, inMobileMenu: boolean) => {
+    const closeAfterAction = (): void => {
+      if (inMobileMenu) closeMobileActionMenu();
+    };
+    return (
+      <>
+        {machineAccessRole(machine) === 'owner' ? (
+          <>
+            <button
+              type="button"
+              class="share-revoke-btn controlled-nodes-share"
+              disabled={busyServerId === machine.serverId}
+              onClick={() => {
+                closeAfterAction();
+                setSharingMachineSection('account');
+                setSharingMachine(machine);
+              }}
+            >
+              {t('share.menu.shareTab')}
+            </button>
+            {machine.remoteDesktopHostId && <button
+              type="button"
+              class="controlled-nodes-share"
+              disabled={busyServerId === machine.serverId}
+              onClick={() => {
+                closeAfterAction();
+                setSharingMachineSection('remote-desktop');
+                setSharingMachine(machine);
+              }}
+            >{t('remote_desktop.access_password')}</button>}
+            <button
+              type="button"
+              class="controlled-nodes-rename"
+              disabled={busyServerId === machine.serverId || editingServerId === machine.serverId}
+              title={t('common.rename')}
+              onClick={() => {
+                closeAfterAction();
+                startRename(machine.serverId, machine.displayName);
+              }}
+            ><span aria-hidden="true">✎</span><span class="controlled-nodes-mobile-action-label">{t('common.rename')}</span></button>
+            <button
+              type="button"
+              class={`controlled-nodes-exec-toggle ${machine.execEnabled ? 'is-enabled' : 'is-disabled'}`}
+              disabled={busyServerId === machine.serverId}
+              aria-pressed={machine.execEnabled}
+              onClick={() => {
+                closeAfterAction();
+                void onToggleExec(machine.serverId, !machine.execEnabled);
+              }}
+            >
+              <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
+              <span>{machine.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
+            </button>
+            {!inMobileMenu && !canConfigureAutoUnlock(machine)
+              && <span class="controlled-nodes-action-slot" aria-hidden="true" />}
+            {canConfigureAutoUnlock(machine) && (autoUnlockServerId === machine.serverId ? (
+              <form
+                class="controlled-nodes-auto-unlock-form"
+                onSubmit={(event) => {
+                  event.preventDefault();
+                  if (autoUnlockValue) void submitAutoUnlock(machine.serverId, autoUnlockValue);
+                }}
+              >
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  value={autoUnlockValue}
+                  // The placeholder names the OS whose sign-in password this
+                  // actually wants -- it defaulted to "Windows ..." even for
+                  // a macOS machine's own account password, which risks the
+                  // operator saving the wrong secret from confusion about
+                  // what is even being asked for here.
+                  placeholder={t(machine.os === CONTROLLED_NODE_OS_MAC
+                    ? 'controlled_nodes.auto_unlock_placeholder_mac'
+                    : 'controlled_nodes.auto_unlock_placeholder')}
+                  aria-label={t(machine.os === CONTROLLED_NODE_OS_MAC
+                    ? 'controlled_nodes.auto_unlock_placeholder_mac'
+                    : 'controlled_nodes.auto_unlock_placeholder')}
+                  onInput={(event) => setAutoUnlockValue((event.target as HTMLInputElement).value)}
+                />
+                <button type="submit" disabled={!autoUnlockValue || busyServerId === machine.serverId}>
+                  {t('common.save')}
+                </button>
+                <button type="button" onClick={cancelAutoUnlock}>{t('common.cancel')}</button>
+              </form>
+            ) : (
+              <button
+                type="button"
+                class="controlled-nodes-auto-unlock"
+                disabled={busyServerId === machine.serverId}
+                title={t('controlled_nodes.auto_unlock_hint')}
+                onClick={() => {
+                  if (machine.autoUnlockConfigured) {
+                    closeAfterAction();
+                    void submitAutoUnlock(machine.serverId, null);
+                  } else {
+                    startAutoUnlock(machine.serverId);
+                  }
+                }}
+              >
+                {machine.autoUnlockConfigured
+                  ? t('controlled_nodes.auto_unlock_clear')
+                  : t('controlled_nodes.auto_unlock_set')}
+              </button>
+            ))}
+            <button
+              type="button"
+              class="controlled-nodes-revoke"
+              disabled={busyServerId === machine.serverId}
+              onClick={() => {
+                closeAfterAction();
+                void onRevoke(machine.serverId);
+              }}
+            >
+              <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
+            </button>
+          </>
+        ) : (
+          <span class="controlled-nodes-muted">
+            {machineAccessRole(machine) === 'participant'
+              ? (machine.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off'))
+              : t('controlled_nodes.share.view_only')}
+          </span>
+        )}
+      </>
+    );
+  };
 
   return (
     <div class="controlled-nodes-panel">
@@ -368,36 +791,94 @@ export function ControlledNodesPanel({
         </div>
       </header>
 
+      <div class="controlled-nodes-tabs" role="tablist" aria-label={t('controlled_nodes.tabs_label')}>
+        {(['machines', 'teams', 'install', 'verification'] as const).map((id) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={tab === id}
+            class={`controlled-nodes-tab${tab === id ? ' is-active' : ''}`}
+            data-testid={`controlled-nodes-tab-${id}`}
+            onClick={() => setTab(id)}
+          >{t(`controlled_nodes.tab_${id}`)}</button>
+        ))}
+      </div>
+
+      {tab === 'machines' && (
       <section class="controlled-nodes-section controlled-nodes-machines-section">
         <div class="controlled-nodes-machines-header">
           <div class="controlled-nodes-section-heading">
-            <span class="controlled-nodes-section-index">01</span>
             <h3>{t('controlled_nodes.machines_title')}</h3>
           </div>
-          <button
-            type="button"
-            class="controlled-nodes-refresh"
-            onClick={() => { void refreshPresenceManually(); }}
-            disabled={manualPresenceRefresh || (!loaded && loading)}
-          >
-            <span class={manualPresenceRefresh || (!loaded && loading) ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
-            {t('controlled_nodes.refresh')}
-          </button>
+          <div class="controlled-nodes-machines-actions">
+            {onConnectById && <button type="button" class="controlled-nodes-wall" onClick={onConnectById}>
+              <span aria-hidden="true">#</span>{t('remote_desktop.connect_by_id')}
+            </button>}
+            {onOpenRemoteDesktopWall && (
+              <button type="button" class="controlled-nodes-wall" onClick={onOpenRemoteDesktopWall}>
+                <span aria-hidden="true">▦</span>{t('remote_desktop.workspace_wall')}
+              </button>
+            )}
+            <button
+              type="button"
+              class="controlled-nodes-refresh"
+              onClick={() => { void refreshPresenceManually(); }}
+              disabled={manualPresenceRefresh || (!loaded && loading)}
+            >
+              <span class={manualPresenceRefresh || (!loaded && loading) ? 'controlled-nodes-refresh-icon is-spinning' : 'controlled-nodes-refresh-icon'} aria-hidden="true">↻</span>
+              {t('controlled_nodes.refresh')}
+            </button>
+          </div>
         </div>
         {actionError && <p class="controlled-nodes-error" role="alert">{actionError}</p>}
+        {savedRemoteDevices.length > 0 && <section class="controlled-nodes-saved-remote" aria-label={t('remote_desktop.guest.saved_device')}>
+          <h4>{t('remote_desktop.guest.saved_device')}</h4>
+          <ul>
+            {savedRemoteDevices.map((device) => <li key={device.id}>
+              <span><strong>{device.displayName}</strong> <small>{device.publicNodeId}</small></span>
+              <button type="button" onClick={() => openSavedRemoteDevice(device)}>{t('remote_desktop.connect_by_id')}</button>
+              <button type="button" onClick={() => void savedRemoteDesktopApi.removeSavedDevice(device.id)
+                .then(() => setSavedRemoteDevices((items) => items.filter((item) => item.id !== device.id)))
+                .catch(() => setActionError(t('controlled_nodes.refresh_error')))}>
+                {t('common.remove')}
+              </button>
+            </li>)}
+          </ul>
+        </section>}
         {(presenceRefreshFailed || error) && (
           <p class="controlled-nodes-error controlled-nodes-presence-error" role="alert">
             {t('controlled_nodes.refresh_error')}
           </p>
         )}
-        {loaded && machines.length === 0 && (
+        {machineTeams.length > 0 && (
+          <div class="controlled-nodes-group-filter" role="tablist" aria-label={t('controlled_nodes.group_filter_label')}>
+            {machineGroupTabs(machines).map(({ id, name, count }) => (
+              <button
+                key={id}
+                type="button"
+                role="tab"
+                aria-selected={machineGroup === id}
+                class={`controlled-nodes-team-chip${machineGroup === id ? ' is-active' : ''}`}
+                data-testid={`controlled-nodes-group-${id}`}
+                onClick={() => setMachineGroup(id)}
+              >
+                {name ?? t(id === MACHINE_GROUP_DIRECT ? 'controlled_nodes.group_direct' : 'controlled_nodes.group_all')}
+                {/* Superscript count: which tabs are worth opening, without
+                    opening them. */}
+                <span class="controlled-nodes-team-chip-count">{count}</span>
+              </button>
+            ))}
+          </div>
+        )}
+        {loaded && visibleMachines.length === 0 && (
           <div class="controlled-nodes-empty">
             <span class="controlled-nodes-empty-radar" aria-hidden="true"><i /></span>
             <p>{t('controlled_nodes.empty')}</p>
           </div>
         )}
         <ul class="controlled-nodes-machine-list">
-          {machines.map((m) => (
+          {visibleMachines.map((m) => (
             <li key={m.serverId} class={`controlled-nodes-machine-row ${m.online ? 'is-online' : 'is-offline'}`}>
               <span class="controlled-nodes-machine-rail" aria-hidden="true" />
               <div class="controlled-nodes-machine-info">
@@ -439,7 +920,7 @@ export function ControlledNodesPanel({
                   </span>
                 </div>
                 <div class="controlled-nodes-machine-meta">
-                  <code>{m.refName}</code>
+                  <code>{m.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</code>
                   {m.os && <span>{m.os.toUpperCase()}</span>}
                   {m.daemonVersion
                     ? (
@@ -454,124 +935,137 @@ export function ControlledNodesPanel({
                     )
                     : <span title={t('controlled_nodes.version_unknown')}>{t('controlled_nodes.version_unknown')}</span>}
                   <span>{t('controlled_nodes.access_role', { role: t(`share.role.${machineAccessRole(m)}`) })}</span>
+                  {/* Which group it is filed under. Changing that lives in the
+                      Teams tab, next to the people it grants -- a dropdown
+                      buried in a metadata row is not where you go looking for
+                      "who else can use this machine". */}
+                  {(m.teamNames ?? []).map((name) => (
+                    <span key={name} class="controlled-nodes-role-tag">{name}</span>
+                  ))}
                   {m.autoUnlockConfigured && (
                     <span
                       class="controlled-nodes-auto-unlock-badge"
                       title={t('controlled_nodes.auto_unlock_badge_hint')}
                     >{t('controlled_nodes.auto_unlock_badge')}</span>
                   )}
+                  {m.capabilities?.includes(REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY) && (
+                    <span
+                      class="controlled-nodes-remote-access-paused"
+                      title={t('controlled_nodes.remote_access_paused_hint')}
+                    >{t('controlled_nodes.remote_access_paused')}</span>
+                  )}
                 </div>
+                <RemoteDesktopReadiness capabilities={m.capabilities} compact />
               </div>
-              <div class="controlled-nodes-machine-actions">
-                {canInstallRemoteDesktopWorker(m) && (
-                  <button
-                    type="button"
-                    class="controlled-nodes-install-worker"
-                    disabled={busyServerId === m.serverId}
-                    onClick={() => { void onInstallRemoteDesktopWorker(m.serverId); }}
-                  >
-                    {busyServerId === m.serverId
-                      ? t('remote_desktop.installing')
-                      : t('remote_desktop.install_worker')}
-                  </button>
-                )}
-                {canOpenRemoteDesktop(m) && (
-                  <button
-                    type="button"
-                    class="controlled-nodes-remote-desktop"
-                    onClick={() => onOpenRemoteDesktop?.(m)}
-                  >
-                    {t('remote_desktop.open')}
-                  </button>
-                )}
-                {machineAccessRole(m) === 'owner' ? (
-                  <>
+              <div class={`controlled-nodes-machine-actions ${mobileActions ? `is-mobile is-${machineAccessRole(m)}` : `is-desktop is-${machineAccessRole(m)}`}`}>
+                {!mobileActions && renderInstallAction(m, false)}
+                {canOpenRemoteDesktopMachine(m) ? (
+                  // Split button: the left two thirds open the remote desktop
+                  // here, the right third opens it in its own browser window.
+                  // A popup is useless on a phone, so mobile keeps one button.
+                  mobileActions ? (
                     <button
                       type="button"
-                      class="share-revoke-btn"
-                      disabled={busyServerId === m.serverId}
-                      onClick={() => setSharingMachine(m)}
+                      class="controlled-nodes-remote-desktop"
+                      onClick={() => onOpenRemoteDesktop?.(m)}
                     >
-                      {t('share.menu.shareTab')}
+                      {t('remote_desktop.open')}
                     </button>
-                    <button
-                      type="button"
-                      class="controlled-nodes-rename"
-                      disabled={busyServerId === m.serverId || editingServerId === m.serverId}
-                      title={t('common.rename')}
-                      onClick={() => startRename(m.serverId, m.displayName)}
-                    >✎</button>
-                    <button
-                      type="button"
-                      class={`controlled-nodes-exec-toggle ${m.execEnabled ? 'is-enabled' : 'is-disabled'}`}
-                      disabled={busyServerId === m.serverId}
-                      aria-pressed={m.execEnabled}
-                      onClick={() => onToggleExec(m.serverId, !m.execEnabled)}
-                    >
-                      <span class="controlled-nodes-toggle-track" aria-hidden="true"><i /></span>
-                      <span>{m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off')}</span>
-                    </button>
-                    {canConfigureAutoUnlock(m) && (autoUnlockServerId === m.serverId ? (
-                      <form
-                        class="controlled-nodes-auto-unlock-form"
-                        onSubmit={(event) => {
-                          event.preventDefault();
-                          if (autoUnlockValue) void submitAutoUnlock(m.serverId, autoUnlockValue);
-                        }}
-                      >
-                        <input
-                          type="password"
-                          autoComplete="new-password"
-                          value={autoUnlockValue}
-                          placeholder={t('controlled_nodes.auto_unlock_placeholder')}
-                          aria-label={t('controlled_nodes.auto_unlock_placeholder')}
-                          onInput={(event) => setAutoUnlockValue((event.target as HTMLInputElement).value)}
-                        />
-                        <button type="submit" disabled={!autoUnlockValue || busyServerId === m.serverId}>
-                          {t('common.save')}
-                        </button>
-                        <button type="button" onClick={cancelAutoUnlock}>{t('common.cancel')}</button>
-                      </form>
-                    ) : (
+                  ) : (
+                    <div class="controlled-nodes-rd-split">
                       <button
                         type="button"
-                        class="controlled-nodes-auto-unlock"
-                        disabled={busyServerId === m.serverId}
-                        title={t('controlled_nodes.auto_unlock_hint')}
-                        onClick={() => (m.autoUnlockConfigured
-                          ? void submitAutoUnlock(m.serverId, null)
-                          : startAutoUnlock(m.serverId))}
+                        class="controlled-nodes-remote-desktop controlled-nodes-rd-main"
+                        onClick={() => onOpenRemoteDesktop?.(m)}
                       >
-                        {m.autoUnlockConfigured
-                          ? t('controlled_nodes.auto_unlock_clear')
-                          : t('controlled_nodes.auto_unlock_set')}
+                        {t('remote_desktop.open')}
                       </button>
-                    ))}
-                    <button
-                      type="button"
-                      class="controlled-nodes-revoke"
-                      disabled={busyServerId === m.serverId}
-                      onClick={() => onRevoke(m.serverId)}
-                    >
-                      <span aria-hidden="true">×</span> {t('controlled_nodes.revoke')}
-                    </button>
-                  </>
-                ) : (
-                  <span class="controlled-nodes-muted">
-                    {machineAccessRole(m) === 'participant'
-                      ? (m.execEnabled ? t('controlled_nodes.exec_on') : t('controlled_nodes.exec_off'))
-                      : t('controlled_nodes.share.view_only')}
-                  </span>
+                      <button
+                        type="button"
+                        class="controlled-nodes-rd-window"
+                        aria-label={t('remote_desktop.open_new_window')}
+                        title={t('remote_desktop.open_new_window')}
+                        onClick={() => { openRemoteDesktopWindow(m.serverId); }}
+                      >↗</button>
+                    </div>
+                  )
+                ) : needsRemoteDesktopPermission(m) && (
+                  // One grant away, not unsupported. Showing nothing here is
+                  // what made a machine that needs a single click look like a
+                  // machine that will never work.
+                  <button
+                    type="button"
+                    class="controlled-nodes-remote-desktop is-permission-required"
+                    disabled={busyServerId === m.serverId}
+                    title={t('remote_desktop.request_permission_hint')}
+                    onClick={() => { void onRequestRemoteDesktopPermissions(m.serverId); }}
+                  >
+                    {busyServerId === m.serverId
+                      ? t('remote_desktop.requesting_permission')
+                      : t('remote_desktop.request_permission')}
+                  </button>
                 )}
+                {!mobileActions && machineAccessRole(m) === 'owner'
+                  && !canInstallRemoteDesktopWorker(m)
+                  && !canOpenRemoteDesktopMachine(m)
+                  && !needsRemoteDesktopPermission(m)
+                  && <span class="controlled-nodes-action-slot" aria-hidden="true" />}
+                {mobileActions && machineAccessRole(m) === 'owner' ? (
+                  <>
+                    <button
+                      ref={mobileActionMenuServerId === m.serverId ? mobileActionMenuTriggerRef : undefined}
+                      type="button"
+                      class="controlled-nodes-mobile-menu-trigger"
+                      aria-haspopup="dialog"
+                      aria-expanded={mobileActionMenuServerId === m.serverId}
+                      aria-controls={`controlled-node-actions-${m.serverId}`}
+                      aria-label={t('controlled_nodes.more_actions')}
+                      title={t('controlled_nodes.more_actions')}
+                      onClick={() => setMobileActionMenuServerId((current) => (
+                        current === m.serverId ? null : m.serverId
+                      ))}
+                    ><span aria-hidden="true">⋯</span></button>
+                    {mobileActionMenuServerId === m.serverId && (
+                      <div
+                        ref={mobileActionMenuPanelRef}
+                        id={`controlled-node-actions-${m.serverId}`}
+                        class="controlled-nodes-mobile-menu-panel"
+                        role="dialog"
+                        aria-label={t('controlled_nodes.more_actions')}
+                      >
+                        {renderInstallAction(m, true)}
+                        {renderManagementActions(m, true)}
+                      </div>
+                    )}
+                  </>
+                ) : renderManagementActions(m, false)}
               </div>
             </li>
           ))}
         </ul>
       </section>
 
+      )}
+
+      {tab === 'verification' && (
+        <VerificationMachinesSection machines={machines} projectKey={projectKey} />
+      )}
+
+      {tab === 'teams' && (
+        <section class="controlled-nodes-section controlled-nodes-team-section">
+          <div class="controlled-nodes-section-heading">
+            <h3>{t('controlled_nodes.team_section_title')}</h3>
+          </div>
+          <TeamManagementPanel machines={machines} onMachinesChanged={async () => { await refetch(); }} />
+        </section>
+      )}
+
+      {/* Download and install-instructions belong together: they are one task
+          read top to bottom, not two places to look. */}
+      {tab === 'install' && (
+      <>
       <section class="controlled-nodes-section controlled-nodes-download-section">
         <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">02</span>
           <h3>{t('controlled_nodes.add_title')}</h3>
         </div>
         {availLoading && <p class="controlled-nodes-muted">{t('controlled_nodes.loading_availability')}</p>}
@@ -585,6 +1079,14 @@ export function ControlledNodesPanel({
             const meta = artifactMetaLine(findArtifactForTarget(artifacts, target), t);
             const expiry = ticketExpiryByKey[key];
             const isDownloading = downloadingKey === key;
+            const isLinking = linkingKey === key;
+            const isCopied = copiedKey === key;
+            const isRevokingLink = revokingLinkKey === key;
+            const isRevokedLink = revokedLinkKey === key;
+            const isCommanding = commandKey === key;
+            const isCommandCopied = copiedCommandKey === key;
+            const linkExpiry = linkExpiryByKey[key];
+            const rowBusy = isDownloading || isLinking || isRevokingLink || isCommanding;
             const platform = PLATFORM_PRESENTATION[target.os];
             return (
               <div key={key} class={`controlled-nodes-download-item is-${target.os}`}>
@@ -595,19 +1097,73 @@ export function ControlledNodesPanel({
                     {meta && <span class="controlled-nodes-artifact-meta">{meta}</span>}
                   </div>
                 </div>
-                <button
-                  type="button"
-                  class="controlled-nodes-download-btn"
-                  disabled={isDownloading}
-                  onClick={() => onDownload(target)}
-                >
-                  <span>{isDownloading ? t('controlled_nodes.loading_download') : downloadLabel(target, t)}</span>
-                  <span class="controlled-nodes-download-arrow" aria-hidden="true">↓</span>
-                </button>
+                <div class="controlled-nodes-download-actions">
+                  <button
+                    type="button"
+                    class="controlled-nodes-download-btn"
+                    disabled={rowBusy}
+                    title={downloadLabel(target, t)}
+                    onClick={() => onDownload(target)}
+                  >
+                    <span>{isDownloading
+                      ? t('controlled_nodes.loading_download')
+                      : t('controlled_nodes.download_action')}</span>
+                    <span class="controlled-nodes-download-arrow" aria-hidden="true">↓</span>
+                  </button>
+                  <button
+                    type="button"
+                    class="controlled-nodes-copy-link-btn"
+                    disabled={rowBusy}
+                    title={t('controlled_nodes.copy_install_link_hint')}
+                    aria-live="polite"
+                    onClick={() => void onCopyInstallLink(target)}
+                  >
+                    {isLinking
+                      ? t('controlled_nodes.copy_install_link_pending')
+                      : isCopied
+                        ? t('controlled_nodes.copy_install_link_copied')
+                        : t('controlled_nodes.copy_install_link')}
+                  </button>
+                  <button
+                    type="button"
+                    class="controlled-nodes-copy-command-btn"
+                    disabled={rowBusy}
+                    title={t('controlled_nodes.copy_install_command_hint')}
+                    aria-live="polite"
+                    onClick={() => void onCopyInstallCommand(target)}
+                  >
+                    {isCommanding
+                      ? t('controlled_nodes.copy_install_command_pending')
+                      : isCommandCopied
+                        ? t('controlled_nodes.copy_install_command_copied')
+                        : t('controlled_nodes.copy_install_command')}
+                  </button>
+                  <button
+                    type="button"
+                    class="controlled-nodes-revoke-link-btn"
+                    disabled={rowBusy}
+                    title={t('controlled_nodes.revoke_install_link_hint')}
+                    aria-live="polite"
+                    onClick={() => void onRevokeInstallLink(target)}
+                  >
+                    {isRevokingLink
+                      ? t('controlled_nodes.revoke_install_link_pending')
+                      : isRevokedLink
+                        ? t('controlled_nodes.revoke_install_link_done')
+                        : t('controlled_nodes.revoke_install_link')}
+                  </button>
+                </div>
                 {expiry != null && (
                   <span class="controlled-nodes-ticket-expiry">
                     {t('controlled_nodes.ticket_expires_at', {
                       time: formatExpiryTime(expiry, i18n.language),
+                    })}
+                  </span>
+                )}
+                {linkExpiry != null && (
+                  <span class="controlled-nodes-ticket-expiry">
+                    {t('controlled_nodes.copy_install_link_expires_at', {
+                      time: formatExpiryTime(linkExpiry, i18n.language),
                     })}
                   </span>
                 )}
@@ -620,7 +1176,6 @@ export function ControlledNodesPanel({
 
       <section class="controlled-nodes-section controlled-nodes-usage-section">
         <div class="controlled-nodes-section-heading">
-          <span class="controlled-nodes-section-index">03</span>
           <h3>{t('controlled_nodes.usage_title')}</h3>
         </div>
         <ol class="controlled-nodes-usage">
@@ -641,15 +1196,35 @@ export function ControlledNodesPanel({
           <ul class="controlled-nodes-usage-os">
             {usageOsKeys
               .filter(({ os }) => availableOses.includes(os))
-              .map(({ os, key }) => (
+              .map(({ os, commandKey, downloadKey }) => (
                 <li key={os}>
-                  <strong>{PLATFORM_PRESENTATION[os].name}</strong>
-                  <span>{t(key)}</span>
+                  <div class="controlled-nodes-usage-os-head">
+                    <span class="controlled-nodes-usage-os-glyph" aria-hidden="true">
+                      {PLATFORM_PRESENTATION[os].glyph}
+                    </span>
+                    <strong>{PLATFORM_PRESENTATION[os].name}</strong>
+                  </div>
+                  {/* Two routes, each a full-width row. They used to be two
+                      spans dropped into a 64px grid column, which squeezed the
+                      text into a ribbon a dozen characters wide. */}
+                  {([
+                    ['command', commandKey],
+                    ['download', downloadKey],
+                  ] as const).map(([route, key]) => (
+                    <div key={route} class={`controlled-nodes-usage-route is-${route}`}>
+                      <span class="controlled-nodes-usage-route-tag">
+                        {t(`controlled_nodes.usage_route_${route}`)}
+                      </span>
+                      <p>{t(key)}</p>
+                    </div>
+                  ))}
                 </li>
               ))}
           </ul>
         )}
       </section>
+      </>
+      )}
 
       {sharingMachine && (
         <ShareSessionDialog
@@ -661,6 +1236,11 @@ export function ControlledNodesPanel({
             sessionName: '',
             tabLabel: sharingMachine.displayName,
           }}
+          remoteDesktopAccess={{
+            hostId: sharingMachine.remoteDesktopHostId ?? null,
+            endpointLabel: sharingMachine.displayName,
+          }}
+          initialMachineSection={sharingMachineSection}
           onClose={() => setSharingMachine(null)}
           onSharesChanged={() => { void refreshPresence(); }}
         />

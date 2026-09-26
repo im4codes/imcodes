@@ -2,10 +2,14 @@ import { describe, expect, it } from 'vitest';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
+  evaluateBrainAuditRoutePolicy,
   resolvePeerAuditCandidate,
   resolvePeerAuditCandidateList,
   revalidatePeerAuditCandidateSelection,
+  validateAutomaticAuditTransportRoute,
 } from '../../src/daemon/peer-audit-candidates.js';
+import { DELEGATION_AVAILABILITY } from '../../shared/delegation-availability.js';
+import { SUPERVISION_DELEGATION_ELIGIBILITY_POLICY } from '../../shared/supervision-config.js';
 
 function session(name: string, patch: Partial<SessionRecord> = {}): SessionRecord {
   const isMain = name.endsWith('_brain');
@@ -41,6 +45,71 @@ function candidate(
 }
 
 describe('peer-audit candidate authority', () => {
+  it('prefers a usable cross-vendor candidate but permits a distinct same-family fallback when none is routable', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name, providerId: 'openai' });
+    const same = session('deck_sub_same', { parentSession: main.name, providerId: 'openai' });
+    const cross = session('deck_sub_cross', { parentSession: main.name, providerId: 'anthropic', agentType: 'claude-code-sdk' });
+    const all = [main, audited, same, cross];
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability: new Map([
+        [same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' }],
+        [cross.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'claude' }],
+      ]),
+    })).toEqual({ ok: true, auditRoutingReason: 'brain_selected_same_family' });
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability: new Map([
+        [same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' }],
+        [cross.name, { availability: DELEGATION_AVAILABILITY.BUSY, limitGroup: 'claude' }],
+      ]),
+      automaticSupervision: true,
+    })).toEqual({
+      ok: true,
+      auditRoutingReason: 'same_family_degraded',
+      degradedReason: 'cross_vendor_unavailable',
+    });
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability: new Map([
+        [same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' }],
+        [cross.name, { availability: DELEGATION_AVAILABILITY.LIMITED, limitGroup: 'claude' }],
+      ]),
+    })).toEqual({ ok: true, auditRoutingReason: 'same_family_degraded', degradedReason: 'cross_vendor_limited' });
+  });
+
+  it('blocks same-family degradation in strict mode and always rejects self-audit', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name, providerId: 'openai' });
+    const same = session('deck_sub_same', { parentSession: main.name, providerId: 'openai' });
+    const all = [main, audited, same];
+    const availability = new Map([[same.name, { availability: DELEGATION_AVAILABILITY.READY, limitGroup: 'codex' as const }]]);
+
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: same.name,
+      allSessions: all,
+      availability,
+      strictCrossVendor: true,
+    })).toMatchObject({ ok: false, degradedReason: 'no_cross_vendor_configured' });
+    expect(evaluateBrainAuditRoutePolicy({
+      auditedSessionName: audited.name,
+      targetName: audited.name,
+      allSessions: all,
+      availability,
+    })).toMatchObject({ ok: false, degradedReason: 'no_independent_session' });
+  });
+
   it('accepts main-to-direct-child and sub-to-sibling relationships', () => {
     const main = session('deck_proj_brain');
     const child = session('deck_sub_child', { parentSession: main.name });
@@ -138,7 +207,103 @@ describe('peer-audit candidate authority', () => {
     });
   });
 
-  it('lists only ordinary direct siblings/children and recommends cross-provider peers first', () => {
+  it('uses a transport-only automatic authority without the legacy reply-capable flag', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    const transport = session('deck_sub_transport', {
+      parentSession: main.name,
+      agentType: 'custom-transport-adapter',
+      runtimeType: 'transport',
+    });
+    const process = session('deck_sub_process', {
+      parentSession: main.name,
+      agentType: 'codex',
+      runtimeType: 'process',
+    });
+    const all = [main, audited, transport, process];
+
+    // Manual candidate compatibility remains unchanged: the unknown adapter
+    // is not in the product reply-capable catalog.
+    expect(candidate(audited.name, transport.name, all)).toMatchObject({
+      eligible: false,
+      reason: 'not_reply_capable',
+    });
+    expect(validateAutomaticAuditTransportRoute({
+      auditedSessionName: audited.name,
+      targetName: transport.name,
+      allSessions: all,
+    })).toEqual({ ok: true });
+    expect(validateAutomaticAuditTransportRoute({
+      auditedSessionName: audited.name,
+      targetName: process.name,
+      allSessions: all,
+    })).toMatchObject({ ok: false, refusal: 'target_ineligible' });
+  });
+
+  it('refuses every runtime type the declared automatic-audit policy forbids', () => {
+    // The contract states `forbidRuntimeTypes` and the router implements its
+    // own filter; nothing tied the two together, so the published policy could
+    // drift away from what automatic audit actually accepts. An agent reading
+    // the contract would then be told a rule the daemon does not enforce.
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    for (const runtimeType of SUPERVISION_DELEGATION_ELIGIBILITY_POLICY.automaticAudit.forbidRuntimeTypes) {
+      const forbidden = session('deck_sub_forbidden', {
+        parentSession: main.name,
+        runtimeType,
+        agentType: 'claude-code',
+      });
+      expect(validateAutomaticAuditTransportRoute({
+        auditedSessionName: audited.name,
+        targetName: forbidden.name,
+        allSessions: [main, audited, forbidden],
+      }), `automatic audit accepted a ${runtimeType} runtime`).toMatchObject({ ok: false });
+    }
+  });
+
+  it('refuses a Brain or an execution clone as an automatic audit target', () => {
+    // Both are session TYPES that must never be routed automatic audit work: a
+    // Brain is the coordinator being audited through, and a clone has no
+    // independent identity to audit with.
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    const clone = session('deck_sub_clone', {
+      parentSession: main.name,
+      executionCloneMetadata: { kind: EXECUTION_CLONE_KIND, parentRunId: 'run-1', parentStage: 'generic_execution' },
+    } as Partial<SessionRecord>);
+    const all = [main, audited, clone];
+    for (const targetName of [main.name, clone.name]) {
+      expect(validateAutomaticAuditTransportRoute({
+        auditedSessionName: audited.name,
+        targetName,
+        allSessions: all,
+      })).toMatchObject({ ok: false });
+    }
+  });
+
+  it('keeps automatic transport authority exact, live, direct-child, and non-self', () => {
+    const main = session('deck_proj_brain');
+    const audited = session('deck_sub_audited', { parentSession: main.name });
+    const missingIdentity = session('deck_sub_missing', {
+      parentSession: main.name,
+      sessionInstanceId: undefined,
+    });
+    const offline = session('deck_sub_offline', { parentSession: main.name, state: 'stopped' });
+    const nested = session('deck_sub_nested', { parentSession: audited.name });
+    const all = [main, audited, missingIdentity, offline, nested];
+    for (const targetName of [audited.name, missingIdentity.name, offline.name, nested.name]) {
+      expect(validateAutomaticAuditTransportRoute({
+        auditedSessionName: audited.name,
+        targetName,
+        allSessions: all,
+      })).toMatchObject({ ok: false });
+    }
+  });
+
+  it('lists only ordinary direct siblings/children and orders them NEUTRALLY', () => {
+    // Enumeration states who is ELIGIBLE. It must not express a vendor
+    // preference: choosing the auditor (and whether to cross vendor) is the
+    // Supervisor Brain's decision, and a ranked list is a recommendation.
     const main = session('deck_proj_brain', { providerId: 'openai' });
     const audited = session('deck_sub_audited', { parentSession: main.name, providerId: 'openai' });
     const sameProvider = session('deck_sub_same', { parentSession: main.name, providerId: 'openai', label: 'A' });
@@ -154,18 +319,30 @@ describe('peer-audit candidate authority', () => {
       parentSession: main.name,
       executionCloneMetadata: { kind: EXECUTION_CLONE_KIND } as SessionRecord['executionCloneMetadata'],
     });
+    const all = [main, audited, sameProvider, crossProvider, legacyProjectName, nested, clone];
 
-    const result = resolvePeerAuditCandidateList({
-      auditedSessionName: audited.name,
-      allSessions: [main, audited, sameProvider, crossProvider, legacyProjectName, nested, clone],
-    });
+    const result = resolvePeerAuditCandidateList({ auditedSessionName: audited.name, allSessions: all });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
+    // Scope: direct ordinary siblings only -- no nested child, no clone, no brain.
+    // Order: purely the deterministic label tiebreak (A, Legacy, Z), NOT provider.
     expect(result.list.candidates.map((item) => item.name)).toEqual([
+      sameProvider.name,
       legacyProjectName.name,
       crossProvider.name,
-      sameProvider.name,
     ]);
+    // The load-bearing part: the audited session's own provider is flipped to
+    // anthropic, which inverts every cross-provider relationship in the set. A
+    // provider-relative ranking MUST reorder here; a neutral one cannot.
+    const flipped = session('deck_sub_audited', { parentSession: main.name, providerId: 'anthropic' });
+    const flippedResult = resolvePeerAuditCandidateList({
+      auditedSessionName: flipped.name,
+      allSessions: [main, flipped, sameProvider, crossProvider, legacyProjectName, nested, clone],
+    });
+    expect(flippedResult.ok).toBe(true);
+    if (!flippedResult.ok) return;
+    expect(flippedResult.list.candidates.map((item) => item.name))
+      .toEqual(result.list.candidates.map((item) => item.name));
   });
 
   it('never exposes an internal deck id as the candidate display label', () => {

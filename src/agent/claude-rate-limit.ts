@@ -1,3 +1,9 @@
+import {
+  PROVIDER_LIMIT_EVIDENCE_KINDS,
+  PROVIDER_LIMIT_STATES,
+  delegationLimitGroup,
+  type ProviderLimitSignal,
+} from '../../shared/delegation-availability.js';
 import type { ProviderQuotaMeta, ProviderQuotaWindow } from '../../shared/provider-quota.js';
 
 /**
@@ -17,6 +23,76 @@ export interface ClaudeRateLimitInfo {
   resetsAt?: number;
   rateLimitType?: string;
   utilization?: number;
+}
+
+/**
+ * Claude's own verdict values on `rate_limit_info.status`.
+ *
+ * These are the ONLY authority for "this account is being refused". The quota
+ * percentages next to them cannot answer it: `utilization` is undefined while
+ * healthy, so a percentage threshold would be a policy we invented rather than
+ * a fact the provider stated.
+ */
+export const CLAUDE_RATE_LIMIT_STATUS = Object.freeze({
+  ALLOWED: 'allowed',
+  ALLOWED_WARNING: 'allowed_warning',
+  REJECTED: 'rejected',
+} as const);
+
+/** Names the provider-native field a limit came from, for auditability. */
+export const CLAUDE_RATE_LIMIT_EVIDENCE_SOURCE = 'claude.rate_limit_event.status' as const;
+
+/**
+ * Map one `rate_limit_event` into the canonical signal.
+ *
+ * THE MAPPING LIVES HERE, IN CLAUDE'S OWN ADAPTER. The orchestration layer
+ * reads only the canonical shape, so no code outside this file needs to know
+ * that Claude spells its verdict `status` or its window `rateLimitType` -- and
+ * there is no global table trying to understand every vendor at once.
+ *
+ * `toWindow()` below deliberately keeps only the display numbers, and for a
+ * long time that was the ONLY thing this module produced. So `status`, the one
+ * field that actually says whether Claude is refusing us, was parsed into the
+ * interface and then dropped; anything downstream asking "are we limited" had
+ * nothing to read.
+ *
+ * Returns `null` for an unrecognised status rather than guessing. An unknown
+ * value must not clear an active limit, and the caller distinguishes "no
+ * evidence" from "healthy" precisely so it cannot.
+ */
+export function claudeRateLimitSignal(
+  info: ClaudeRateLimitInfo | undefined,
+  agentType: string,
+  observedAt: number,
+): ProviderLimitSignal | null {
+  if (!info || typeof info.status !== 'string') return null;
+  const state = info.status === CLAUDE_RATE_LIMIT_STATUS.REJECTED
+    ? PROVIDER_LIMIT_STATES.LIMITED
+    : info.status === CLAUDE_RATE_LIMIT_STATUS.ALLOWED_WARNING
+      ? PROVIDER_LIMIT_STATES.WARNING
+      : info.status === CLAUDE_RATE_LIMIT_STATUS.ALLOWED
+        ? PROVIDER_LIMIT_STATES.RECOVERED
+        : null;
+  if (state === null) return null;
+  // `resetsAt` is epoch SECONDS on this event; the canonical signal carries
+  // epoch milliseconds. Converting at the adapter boundary keeps exactly one
+  // unit above it.
+  const retryAt = typeof info.resetsAt === 'number' && Number.isFinite(info.resetsAt)
+    ? info.resetsAt * 1000
+    : undefined;
+  return {
+    providerId: agentType,
+    limitGroup: delegationLimitGroup(agentType),
+    state,
+    observedAt,
+    ...(retryAt === undefined ? {} : { retryAt }),
+    ...(typeof info.rateLimitType === 'string' && info.rateLimitType
+      ? { scope: info.rateLimitType }
+      : {}),
+    // A field Claude defines, not something we read out of a message.
+    evidenceKind: PROVIDER_LIMIT_EVIDENCE_KINDS.PROVIDER_STRUCTURED,
+    sourceCode: info.status,
+  };
 }
 
 /** Claude's named rate-limit windows. */

@@ -4,12 +4,27 @@
  * ControlledNodesPanel (tasks 12.2/12.3): download buttons gated by server
  * availability + machine list with exec toggle and revoke.
  */
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { act, render, cleanup, fireEvent, waitFor } from '@testing-library/preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ControlledNodeAvailability, MachineListItem } from '../src/api/machines.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
+import { CONTROLLED_NODE_ID_MIN } from '@shared/controlled-node-identity.js';
+import { installClipboardStub, removeClipboardStub } from './support/clipboard-stub.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from '@shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '@shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY } from '@shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_LOCAL_MANAGEMENT,
+  REMOTE_DESKTOP_LOCAL_WEB_ACTION,
+} from '@shared/remote-desktop-local-management.js';
+import {
+  REMOTE_DESKTOP_ENCODER_CAPABILITY,
+  REMOTE_DESKTOP_PLATFORM_CAPABILITY,
+  REMOTE_DESKTOP_SESSION_CAPABILITY,
+} from '@shared/remote-desktop-platform.js';
 
 const translate = (key: string, options?: Record<string, string>) =>
   key === 'controlled_nodes.artifact_meta' && options?.detail ? options.detail : key;
@@ -53,6 +68,21 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
   };
 });
 
+/**
+ * One mintable Desk. The panel auto-selects a single Desk and renders it next
+ * to the actions, so these tests exercise the visible-confirmation path; the
+ * multi-Desk and no-Desk paths get their own cases below.
+ */
+const TEST_DESK = { id: 'desk-1', name: 'Ops Desk', role: 'owner' as const };
+const listMintableDesks = vi.fn(async () => [TEST_DESK]);
+const createTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const }));
+const listTeams = vi.fn(async () => [] as { id: string; name: string; role: 'owner' | 'admin' | 'member' }[]);
+const getTeam = vi.fn(async (..._a: unknown[]) => ({ id: 'team-1', name: 'Ops', myRole: 'owner' as const, members: [] as unknown[] }));
+const addTeamMember = vi.fn(async (..._a: unknown[]) => ({ ok: true as const }));
+const setMachineGroupMembership = vi.fn(async (..._a: unknown[]) => {});
+const renameTeam = vi.fn(async (..._a: unknown[]) => {});
+const deleteTeam = vi.fn(async (..._a: unknown[]) => {});
+
 const downloadControlledNodeExecutable = vi.fn(async () => ({
   version: 2 as const,
   ticket: 'raw-ticket',
@@ -69,6 +99,21 @@ const beginControlledNodeDesktopDownload = vi.fn(() => ({
   closed: false,
   close: vi.fn(),
 }));
+const createControlledNodeRemoteInstallLink = vi.fn(async () => ({
+  url: 'https://im.example.test/api/enroll/v2/bootstrap#ticket=remote-raw-ticket',
+  expiresAt: null,
+  ticketId: 'tid-remote-1',
+}));
+const revokeControlledNodeRemoteInstallLink = vi.fn(async () => true);
+// Platform-faithful: these tests click the Windows row, so the fixture must be
+// the command the server actually mints for Windows. A curl fixture behind a
+// Windows click would assert clipboard behaviour against a string that platform
+// never produces.
+const createControlledNodeInstallCommand = vi.fn(async () => ({
+  command: 'irm -MaximumRedirection 0 https://im.example.test/i/0123456789AB | iex',
+  expiresAt: Date.now() + 10 * 365 * 24 * 60 * 60 * 1000,
+  ticketId: 'tid-cmd-1',
+}));
 const listSharesForTarget = vi.fn(async () => []);
 const createShare = vi.fn(async () => ({
   id: 'share-1', targetUserId: 'user-2', role: 'viewer' as const, status: 'active' as const,
@@ -78,18 +123,72 @@ vi.mock('../src/api.js', async (importOriginal) => {
   return {
     ...actual,
     downloadControlledNodeExecutable: (...a: unknown[]) => downloadControlledNodeExecutable(...a),
+    createControlledNodeRemoteInstallLink: (...a: unknown[]) => createControlledNodeRemoteInstallLink(...a),
+    revokeControlledNodeRemoteInstallLink: (...a: unknown[]) => revokeControlledNodeRemoteInstallLink(...a),
+    createControlledNodeInstallCommand: (...a: unknown[]) => createControlledNodeInstallCommand(...a),
     beginControlledNodeDesktopDownload: () => beginControlledNodeDesktopDownload(),
+    listMintableDesks: () => listMintableDesks(),
+    createTeam: (...a: unknown[]) => createTeam(...a),
+    listTeams: () => listTeams(),
+    getTeam: (...a: unknown[]) => getTeam(...a),
+    addTeamMember: (...a: unknown[]) => addTeamMember(...a),
+    setMachineGroupMembership: (...a: unknown[]) => setMachineGroupMembership(...a),
+    renameTeam: (...a: unknown[]) => renameTeam(...a),
+    deleteTeam: (...a: unknown[]) => deleteTeam(...a),
     listSharesForTarget: (...a: unknown[]) => listSharesForTarget(...a),
     createShare: (...a: unknown[]) => createShare(...a),
   };
 });
 
+vi.mock('../src/components/RemoteDesktopOwnerAccess.js', () => ({
+  RemoteDesktopOwnerAccess: ({ hostId, endpointLabel }: { hostId: string | null; endpointLabel: string }) => (
+    <div data-testid="remote-desktop-owner-access">{hostId ?? 'missing-host'}:{endpointLabel}</div>
+  ),
+}));
+
 import {
   CONTROLLED_NODE_PRESENCE_REFRESH_MS,
   ControlledNodesPanel,
 } from '../src/components/ControlledNodesPanel.js';
+import { MACHINE_GROUP_STORAGE_KEY } from '../src/machine-grouping.js';
+
+/** Set by the clipboard-denied test; `vi.unstubAllGlobals` does not cover
+ *  properties defined directly on `document`. */
+let restoreExecCommand: (() => void) | null = null;
+const originalViewportWidth = window.innerWidth;
+const originalViewportHeight = window.innerHeight;
+
+function setViewportWidth(width: number): void {
+  Object.defineProperty(window, 'innerWidth', { configurable: true, value: width });
+  window.dispatchEvent(new Event('resize'));
+}
+
+function setViewportSize(width: number, height: number): void {
+  Object.defineProperty(window, 'innerHeight', { configurable: true, value: height });
+  setViewportWidth(width);
+}
+
+// The global afterEach clears every mock, which also drops this one's
+// implementation. Re-establish it before each test so the panel can always
+// resolve a Desk; individual tests override it to exercise the other shapes.
+beforeEach(() => {
+  // The chosen machine group is remembered in localStorage; start every test
+  // from the default rather than from whatever the previous test clicked.
+  localStorage.clear();
+  listMintableDesks.mockResolvedValue([TEST_DESK]);
+  createTeam.mockClear();
+  listTeams.mockClear();
+  listTeams.mockResolvedValue([]);
+  getTeam.mockClear();
+  addTeamMember.mockClear();
+  setMachineGroupMembership.mockClear();
+  renameTeam.mockClear();
+  deleteTeam.mockClear();
+  createTeam.mockResolvedValue({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const });
+});
 
 afterEach(() => {
+  restoreExecCommand?.();
   cleanup();
   vi.clearAllMocks();
   vi.unstubAllGlobals();
@@ -97,14 +196,32 @@ afterEach(() => {
   machinesLoaded = true;
   machinesLoading = false;
   refetch.mockResolvedValue(null);
+  Object.defineProperty(window, 'innerHeight', { configurable: true, value: originalViewportHeight });
+  setViewportWidth(originalViewportWidth);
 });
 
-const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
+const machine = (over: Partial<MachineListItem>): MachineListItem => ({ serverId: 's', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'r', displayName: 'D', online: true, execEnabled: false, ...over });
 
 function rejectRefreshAfterInitialLoad(): void {
   refetch
     .mockResolvedValueOnce(null)
     .mockRejectedValueOnce(new TypeError('Failed to fetch'));
+}
+
+/**
+ * Render and switch to the Download & install tab.
+ *
+ * Downloading lives behind a tab now, so a test that renders and immediately
+ * looks for a download button is looking at the machines list. Switching here
+ * rather than defaulting the panel to this tab keeps the tests describing what
+ * a person does.
+ */
+function renderInstallTab() {
+  const result = render(<ControlledNodesPanel />);
+  act(() => {
+    (result.container.querySelector('[data-testid="controlled-nodes-tab-install"]') as HTMLButtonElement | null)?.click();
+  });
+  return result;
 }
 
 describe('ControlledNodesPanel (12.3)', () => {
@@ -201,9 +318,34 @@ describe('ControlledNodesPanel (12.3)', () => {
 
     expect(container.querySelector('.controlled-nodes-hero')).toBeTruthy();
     expect(Array.from(container.querySelectorAll('.controlled-nodes-metric strong')).map((node) => node.textContent)).toEqual(['2', '1', '1']);
-    expect(container.querySelector('.controlled-nodes-machine-row.is-online code')?.textContent).toBe('win-edge');
-    expect(container.querySelector('.controlled-nodes-machine-row.is-offline code')?.textContent).toBe('linux-edge');
+    expect(container.querySelector('.controlled-nodes-machine-row.is-online code')?.textContent).toBe(CONTROLLED_NODE_ID_MIN);
+    expect(container.querySelector('.controlled-nodes-machine-row.is-offline code')?.textContent).toBe(CONTROLLED_NODE_ID_MIN);
     expect(container.querySelector('.controlled-nodes-exec-toggle.is-enabled')?.getAttribute('aria-pressed')).toBe('true');
+  });
+
+  it('renders the durable paused state and opens the exact device share surface from a local-panel deep link', async () => {
+    machines = [machine({
+      serverId: 'paused-node',
+      nodeId: CONTROLLED_NODE_ID_MIN,
+      displayName: 'Paused Mac',
+      remoteDesktopHostId: 'host-00000000000000000001',
+      capabilities: [REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY],
+      accessRole: 'owner',
+    })];
+    const { container } = render(<ControlledNodesPanel
+      initialNodeId={CONTROLLED_NODE_ID_MIN}
+      initialAction={REMOTE_DESKTOP_LOCAL_WEB_ACTION.SHARE}
+    />);
+    await waitFor(() => expect(container.querySelector('.controlled-nodes-remote-access-paused')).toBeTruthy());
+    expect(container.textContent).toContain('controlled_nodes.remote_access_paused');
+    expect(container.querySelector('.controlled-nodes-remote-desktop')).toBeNull();
+    await waitFor(() => expect(listSharesForTarget).toHaveBeenCalledWith(
+      'paused-node',
+      { kind: 'server', serverId: 'paused-node' },
+    ));
+    fireEvent.click(container.querySelectorAll('.share-dialog-tab')[1]!);
+    await waitFor(() => expect(container.querySelector('[data-testid="remote-desktop-owner-access"]')?.textContent)
+      .toBe('host-00000000000000000001:Paused Mac'));
   });
 
   it('labels each node with its reported version and marks only the stale one', async () => {
@@ -230,30 +372,48 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(rows[2]?.textContent).toContain('controlled_nodes.version_unknown');
   });
 
-  it('offers auto unlock only on a node whose worker can hold the secret', async () => {
+  it('offers auto unlock only from explicit capability evidence, never OS metadata', async () => {
     machines = [
       machine({
-        serverId: 'win-capable',
+        serverId: 'capable-contradictory-os',
         refName: 'w1',
-        displayName: 'Windows box',
-        os: 'win',
+        displayName: 'Capability says yes',
+        os: 'linux',
         capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
       }),
-      // Same OS, older build: no advertisement, so no promise of the feature.
-      machine({ serverId: 'win-old', refName: 'w2', displayName: 'Old Windows', os: 'win', capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
-      machine({ serverId: 'linux', refName: 'l1', displayName: 'Linux box', os: 'linux' }),
+      machine({
+        serverId: 'capable-no-os',
+        refName: 'w2',
+        displayName: 'Capability without metadata',
+        os: undefined,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
+      // A Windows label is descriptive and cannot synthesize authority.
+      machine({ serverId: 'win-old', refName: 'w3', displayName: 'Old Windows', os: 'win', capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({
+        serverId: 'shared-capable',
+        refName: 'w4',
+        displayName: 'Shared capable',
+        os: 'win',
+        accessRole: 'participant',
+        capabilities: [CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
     ];
     const { container } = render(<ControlledNodesPanel />);
-    await waitFor(() => expect(container.textContent).toContain('Windows box'));
+    await waitFor(() => expect(container.textContent).toContain('Capability says yes'));
 
     const rows = Array.from(container.querySelectorAll('.controlled-nodes-machine-row'));
     expect(rows.map((row) => Boolean(row.querySelector('.controlled-nodes-auto-unlock'))))
-      .toEqual([true, false, false]);
+      .toEqual([true, true, false, false]);
   });
 
   it('offers one download button per canonical (os, arch) artifact', async () => {
-    const { container } = render(<ControlledNodesPanel />);
-    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_target'));
+    const { container } = renderInstallTab();
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.download_action'));
+    // The os/arch detail moved into the button's title when the row gained a
+    // second action; assert it is still reachable rather than silently dropped.
+    expect(container.querySelector('.controlled-nodes-download-btn')?.getAttribute('title'))
+      .toContain('controlled_nodes.download_target');
     const downloadBtns = Array.from(container.querySelectorAll('.controlled-nodes-download-btn'));
     expect(downloadBtns).toHaveLength(3); // win x64, mac Universal 2, linux x64
     expect(container.textContent).toContain('universal');
@@ -263,7 +423,7 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('shows artifact metadata (arch + size) when present', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('x64'));
     expect(container.textContent).toContain('universal');
     expect(container.textContent).toContain('21.0 MB');
@@ -272,7 +432,7 @@ describe('ControlledNodesPanel (12.3)', () => {
 
   it('clicking a download button uses desktop flow with the Capacitor web shim present', async () => {
     vi.stubGlobal('Capacitor', { isNativePlatform: () => false });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-download-btn');
       if (!b) throw new Error('win x64 download button not found');
@@ -281,14 +441,202 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(btn);
     await waitFor(() => {
       expect(beginControlledNodeDesktopDownload).toHaveBeenCalled();
+      // No team argument. A machine belongs to whoever installs it; sharing
+      // is a separate decision made later about machines that already exist.
       expect(downloadControlledNodeExecutable).toHaveBeenCalledWith(
         { os: 'win', arch: 'x64' },
+        '',
         expect.objectContaining({ desktopWindow: expect.anything() }),
       );
     });
     const preOpenOrder = beginControlledNodeDesktopDownload.mock.invocationCallOrder[0] ?? 0;
     const downloadOrder = downloadControlledNodeExecutable.mock.invocationCallOrder[0] ?? 0;
     expect(preOpenOrder).toBeLessThan(downloadOrder);
+  });
+
+  it('copies a remote install link without navigating anywhere', async () => {
+    // The operator is not at the target machine, so the useful outcome is a
+    // string on the clipboard — explicitly NOT a download in this browser.
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = renderInstallTab();
+    const btn = await waitFor(() => {
+      const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
+      if (!b) throw new Error('win x64 copy-link button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+
+    await waitFor(() => {
+      // The selected Desk must reach the API from the real UI action.
+      expect(createControlledNodeRemoteInstallLink)
+        .toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+      expect(writeText).toHaveBeenCalledWith(
+        'https://im.example.test/api/enroll/v2/bootstrap#ticket=remote-raw-ticket',
+      );
+    });
+    // Minting a link must never start a local download or open a window.
+    expect(downloadControlledNodeExecutable).not.toHaveBeenCalled();
+    expect(beginControlledNodeDesktopDownload).not.toHaveBeenCalled();
+  });
+
+  it('gives the row actions a real side-by-side rule, not just a comment', () => {
+    // jsdom does not compute layout, so this is a static contract check: the
+    // container the component renders must actually have a multi-column rule,
+    // and neither child may keep the full-width/push-to-bottom sizing that
+    // made them stack. It cannot prove pixels — a browser check would — but it
+    // does prove the markup and the stylesheet agree about the intent.
+    // Resolved against this module: these tests run both from the repo root
+    // and from `web/` via the package's own `npm test`, and a cwd-relative
+    // literal is ENOENT under one of them. Not `new URL(..., import.meta.url)`
+    // — Vite rewrites that pattern for asset resolution and yields `undefined`
+    // for an argument it cannot statically resolve.
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+    const read = (relative: string): string => readFileSync(resolve(webRoot, relative), 'utf8');
+    const markup = read('src/components/ControlledNodesPanel.tsx');
+    const css = read('src/styles.css');
+    expect(markup).toContain('class="controlled-nodes-download-actions"');
+
+    // A selector may be declared alone or grouped with a peer that shares its
+    // rules, so match either `sel {` or `sel,`. Matching only the first form
+    // would report a grouped-but-present selector as missing.
+    const rule = (selector: string): string => {
+      const at = [`${selector} {`, `${selector},`]
+        .map((needle) => css.indexOf(needle))
+        .filter((index) => index >= 0)
+        .sort((a, b) => a - b)[0] ?? -1;
+      expect({ selector, defined: at >= 0 }).toEqual({ selector, defined: true });
+      return css.slice(at, css.indexOf('}', at));
+    };
+
+    const container = rule('.controlled-nodes-download-actions');
+    expect(container).toMatch(/display:\s*(grid|flex)/);
+    expect(container).toMatch(/grid-template-columns|flex-direction:\s*row/);
+    // The container now owns bottom alignment for the pair.
+    expect(container).toContain('margin-top: auto');
+
+    for (const selector of [
+      '.controlled-nodes-download-btn',
+      '.controlled-nodes-copy-link-btn',
+      '.controlled-nodes-copy-command-btn',
+      '.controlled-nodes-revoke-link-btn',
+    ]) {
+      const child = rule(selector);
+      expect({ selector, fullWidth: /width:\s*100%/.test(child) })
+        .toEqual({ selector, fullWidth: false });
+      expect({ selector, pushesItself: /margin-top:\s*auto/.test(child) })
+        .toEqual({ selector, pushesItself: false });
+    }
+
+    // Download is the primary action and spans the row; the two copy actions
+    // share the row beneath it. Spanning is the container's job, so the button
+    // itself still must not carry its own full-width sizing (asserted above).
+    expect(css).toContain('.controlled-nodes-download-actions > .controlled-nodes-download-btn');
+    expect(css).toContain('.controlled-nodes-download-actions > .controlled-nodes-revoke-link-btn');
+    expect(markup).toContain('class="controlled-nodes-copy-command-btn"');
+    expect(markup).toContain('class="controlled-nodes-revoke-link-btn"');
+  });
+
+  it('reports a denied clipboard instead of claiming the link was copied', async () => {
+    // The mint succeeded but the operator never received the URL. Showing
+    // "copied" here would send them to the target machine with an empty
+    // clipboard and no way to tell what went wrong.
+    const writeText = vi.fn(async () => { throw new Error('denied'); });
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    // Define rather than spy. `document.execCommand` is not implemented by
+    // jsdom; it exists only when a setup file polyfills it, and the CI unit
+    // project loads a different setup than the workspace project does. Spying
+    // therefore throws "execCommand does not exist" in exactly one of the two
+    // runners. Defining it makes the fallback deterministically fail here no
+    // matter which setup is loaded, which is the behaviour under test.
+    const previousExecCommand = Object.getOwnPropertyDescriptor(document, 'execCommand');
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true, writable: true, value: vi.fn(() => false),
+    });
+    restoreExecCommand = () => {
+      if (previousExecCommand) Object.defineProperty(document, 'execCommand', previousExecCommand);
+      else delete (document as { execCommand?: unknown }).execCommand;
+      restoreExecCommand = null;
+    };
+
+    const { container } = renderInstallTab();
+    const btn = await waitFor(() => {
+      const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
+      if (!b) throw new Error('copy-link button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+
+    await waitFor(() => {
+      const alert = container.querySelector('.controlled-nodes-error');
+      expect(alert?.textContent).toContain('controlled_nodes.copy_install_link_clipboard_error');
+    });
+    expect(createControlledNodeRemoteInstallLink).toHaveBeenCalled();
+    // Neither the success flash nor the expiry may appear for a copy that
+    // never reached the clipboard.
+    expect(btn.textContent).not.toContain('controlled_nodes.copy_install_link_copied');
+    expect(container.textContent).not.toContain('controlled_nodes.copy_install_link_expires_at');
+  });
+
+  it('offers the copy-link action on every platform row, beside the download button', async () => {
+    const { container } = renderInstallTab();
+    await waitFor(() => {
+      if (!container.querySelector('.controlled-nodes-download-item.is-win')) {
+        throw new Error('rows not rendered');
+      }
+    });
+    for (const os of ['win', 'mac', 'linux']) {
+      const row = container.querySelector(`.controlled-nodes-download-item.is-${os}`);
+      expect(row?.querySelector('.controlled-nodes-download-btn')).toBeTruthy();
+      expect(row?.querySelector('.controlled-nodes-copy-link-btn')).toBeTruthy();
+    }
+  });
+
+  it('shows a copied confirmation without inventing an expiry, and surfaces mint failures', async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = renderInstallTab();
+    const btn = await waitFor(() => {
+      const b = container.querySelector('.controlled-nodes-download-item.is-win .controlled-nodes-copy-link-btn');
+      if (!b) throw new Error('copy-link button not found');
+      return b;
+    });
+
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(btn.textContent).toContain('controlled_nodes.copy_install_link_copied');
+    });
+    // The stable link ends only at explicit revocation; a fabricated expiry
+    // label would contradict the authority enforced by the server.
+    expect(container.textContent).not.toContain('controlled_nodes.copy_install_link_expires_at');
+
+    // A mint failure must be visible, not swallowed into a silent no-op.
+    createControlledNodeRemoteInstallLink.mockRejectedValueOnce(new Error('boom'));
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(container.querySelector('.controlled-nodes-error')).toBeTruthy();
+    });
+  });
+
+  it('revokes the stable artifact binding only after explicit confirmation', async () => {
+    const confirm = vi.fn(() => true);
+    vi.stubGlobal('confirm', confirm);
+    const { container } = renderInstallTab();
+    const btn = await waitFor(() => {
+      const found = container.querySelector(
+        '.controlled-nodes-download-item.is-win .controlled-nodes-revoke-link-btn',
+      );
+      if (!found) throw new Error('revoke-link button not found');
+      return found;
+    });
+
+    fireEvent.click(btn);
+    await waitFor(() => {
+      expect(revokeControlledNodeRemoteInstallLink).toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+      expect(btn.textContent).toContain('controlled_nodes.revoke_install_link_done');
+    });
+    expect(confirm).toHaveBeenCalledWith('controlled_nodes.revoke_install_link_confirm');
+    expect(createControlledNodeRemoteInstallLink).not.toHaveBeenCalled();
   });
 
   it('fail-closes when artifacts lack arch metadata', async () => {
@@ -299,7 +647,7 @@ describe('ControlledNodesPanel (12.3)', () => {
         { os: 'mac', filename: 'imcodes-node-macos', sizeBytes: 2000, sha256: null } as never,
       ],
     });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => {
       expect(container.querySelectorAll('.controlled-nodes-download-btn')).toHaveLength(0);
       expect(container.textContent).toContain('controlled_nodes.no_executables');
@@ -308,14 +656,14 @@ describe('ControlledNodesPanel (12.3)', () => {
 
   it('shows availability error distinct from empty catalog', async () => {
     listAvailableExecutables.mockRejectedValueOnce(new Error('network'));
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.availability_error'));
     expect(container.textContent).not.toContain('controlled_nodes.no_executables');
   });
 
   it('shows neutral empty catalog when availability succeeds with no targets', async () => {
     listAvailableExecutables.mockResolvedValueOnce({ available: [], artifacts: [] });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.no_executables'));
     expect(container.textContent).not.toContain('controlled_nodes.availability_error');
   });
@@ -326,13 +674,13 @@ describe('ControlledNodesPanel (12.3)', () => {
       artifacts: [],
       error: 'executable_dir_not_configured',
     } as ControlledNodeAvailability & { error: string });
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.no_executables'));
     expect(container.textContent).not.toContain('controlled_nodes.availability_error');
   });
 
   it('shows ticket expiry hint after a successful download mint', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     const btn = await waitFor(() => {
       const b = container.querySelector('.controlled-nodes-download-btn');
       if (!b) throw new Error('download button not found');
@@ -343,13 +691,13 @@ describe('ControlledNodesPanel (12.3)', () => {
   });
 
   it('shows that the downloaded installer is permanent and reusable', async () => {
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.usage_step4'));
   });
 
   it('maps mint executable_not_built to a specific message', async () => {
     const { ApiError, controlledNodeDownloadErrorKey } = await import('../src/api.js');
-    const { container } = render(<ControlledNodesPanel />);
+    const { container } = renderInstallTab();
     await waitFor(() => expect(container.querySelector('.controlled-nodes-download-btn')).toBeTruthy());
     downloadControlledNodeExecutable.mockRejectedValueOnce(new ApiError(503, '{"error":"executable_not_built"}'));
     fireEvent.click(container.querySelector('.controlled-nodes-download-btn')!);
@@ -372,6 +720,206 @@ describe('ControlledNodesPanel (12.3)', () => {
     fireEvent.click(toggle!);
     await waitFor(() => expect(setMachineExecEnabled).toHaveBeenCalledWith('srv1', true));
     expect(refetch).toHaveBeenCalled();
+  });
+
+  it('keeps only Remote Desktop and one menu trigger visible on a mobile owner card', async () => {
+    setViewportSize(390, 944);
+    machines = [machine({
+      serverId: 'mobile-owner',
+      displayName: 'Pocket Mac',
+      os: 'mac',
+      accessRole: 'owner',
+      execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={vi.fn()} />);
+    const card = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-machine-row');
+      if (!(candidate instanceof HTMLLIElement)) throw new Error('mobile machine card not found');
+      return candidate;
+    });
+
+    expect(card.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(card.querySelector('.controlled-nodes-machine-actions')?.classList.contains('is-owner')).toBe(true);
+    const trigger = card.querySelector('.controlled-nodes-mobile-menu-trigger') as HTMLButtonElement;
+    expect(trigger).not.toBeNull();
+    expect(trigger.getAttribute('aria-label')).toBe('controlled_nodes.more_actions');
+    expect(card.querySelectorAll('.controlled-nodes-machine-actions > button')).toHaveLength(2);
+    expect(card.querySelector('.share-revoke-btn')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-rename')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-exec-toggle')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-auto-unlock')).toBeNull();
+    expect(card.querySelector('.controlled-nodes-revoke')).toBeNull();
+
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute('aria-expanded')).toBe('true');
+    const menu = card.querySelector('.controlled-nodes-mobile-menu-panel');
+    expect(menu?.getAttribute('role')).toBe('dialog');
+    expect(menu?.querySelector('.share-revoke-btn')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-rename')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-exec-toggle')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-auto-unlock')).not.toBeNull();
+    expect(menu?.querySelector('.controlled-nodes-revoke')).not.toBeNull();
+
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).toBeNull();
+    expect(document.activeElement).toBe(trigger);
+
+    fireEvent.click(trigger);
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).not.toBeNull();
+    fireEvent(document.body, new Event('pointerdown', { bubbles: true }));
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel')).toBeNull();
+  });
+
+  it('shows the auto-unlock password field placeholder naming the machine\'s own OS, not a hardcoded "Windows"', async () => {
+    machines = [
+      machine({
+        serverId: 'mac-owner',
+        displayName: 'Mac Owner Node',
+        os: 'mac',
+        accessRole: 'owner',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
+      machine({
+        serverId: 'win-owner',
+        displayName: 'Win Owner Node',
+        os: 'win',
+        accessRole: 'owner',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+      }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    const rows = await waitFor(() => {
+      const candidates = container.querySelectorAll('.controlled-nodes-machine-row');
+      if (candidates.length !== 2) throw new Error('expected both machine rows to be present');
+      return candidates;
+    });
+
+    const setButtonIn = (row: Element): HTMLButtonElement => {
+      const button = Array.from(row.querySelectorAll('button'))
+        .find((b) => b.textContent === 'controlled_nodes.auto_unlock_set');
+      if (!button) throw new Error('missing auto_unlock_set button');
+      return button as HTMLButtonElement;
+    };
+
+    fireEvent.click(setButtonIn(rows[0]!));
+    const macInput = rows[0]!.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(macInput.placeholder).toBe('controlled_nodes.auto_unlock_placeholder_mac');
+    expect(macInput.getAttribute('aria-label')).toBe('controlled_nodes.auto_unlock_placeholder_mac');
+
+    fireEvent.click(setButtonIn(rows[1]!));
+    const winInput = rows[1]!.querySelector('input[type="password"]') as HTMLInputElement;
+    expect(winInput.placeholder).toBe('controlled_nodes.auto_unlock_placeholder');
+    expect(winInput.getAttribute('aria-label')).toBe('controlled_nodes.auto_unlock_placeholder');
+  });
+
+  it('uses a compact role-aware action row for a Participant at a 390x944 CSS-pixel viewport', async () => {
+    setViewportSize(390, 944);
+    machines = [machine({
+      serverId: 'mobile-participant',
+      displayName: 'Shared Windows Node',
+      os: 'win',
+      accessRole: 'participant',
+      execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={vi.fn()} />);
+    const card = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-machine-row');
+      if (!(candidate instanceof HTMLLIElement)) throw new Error('mobile participant card not found');
+      return candidate;
+    });
+
+    expect(window.innerWidth).toBe(390);
+    expect(window.innerHeight).toBe(944);
+    const actions = card.querySelector('.controlled-nodes-machine-actions') as HTMLElement;
+    expect(actions.classList.contains('is-mobile')).toBe(true);
+    expect(actions.classList.contains('is-participant')).toBe(true);
+    expect(actions.classList.contains('is-owner')).toBe(false);
+    expect(actions.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(actions.querySelector('.controlled-nodes-muted')?.textContent).toBe('controlled_nodes.exec_on');
+    expect(actions.querySelector('.controlled-nodes-mobile-menu-trigger')).toBeNull();
+
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+    const css = readFileSync(resolve(webRoot, 'src/styles.css'), 'utf8');
+    const participantRuleStart = css.indexOf('.controlled-nodes-machine-actions.is-mobile.is-participant,');
+    expect(participantRuleStart).toBeGreaterThanOrEqual(0);
+    const participantRule = css.slice(participantRuleStart, css.indexOf('}', participantRuleStart));
+    expect(participantRule).toContain('display: flex');
+    expect(participantRule).toContain('flex-flow: row wrap');
+    expect(participantRule).toContain('align-items: center');
+    expect(css).toContain('.controlled-nodes-machine-actions.is-mobile.is-owner {');
+    expect(css).not.toMatch(/\.controlled-nodes-machine-actions\.is-mobile\s*\{[^}]*grid-template-columns/);
+
+    const remoteRuleStart = css.indexOf('.controlled-nodes-machine-actions.is-mobile.is-participant > .controlled-nodes-remote-desktop {');
+    const remoteRule = css.slice(remoteRuleStart, css.indexOf('}', remoteRuleStart));
+    expect(remoteRule).toContain('width: auto');
+    expect(remoteRule).toContain('flex: 0 0 auto');
+
+    const statusRuleStart = css.indexOf('.controlled-nodes-machine-actions.is-mobile.is-participant > .controlled-nodes-muted,');
+    const statusRule = css.slice(statusRuleStart, css.indexOf('}', statusRuleStart));
+    expect(statusRule).toContain('margin: 0');
+    expect(statusRule).toContain('white-space: nowrap');
+  });
+
+  it('puts worker installation inside the mobile menu instead of adding another card button', async () => {
+    setViewportWidth(390);
+    machines = [machine({
+      serverId: 'mobile-install',
+      displayName: 'Install Worker',
+      os: 'win',
+      accessRole: 'owner',
+      capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel />);
+    const card = await waitFor(() => {
+      const candidate = container.querySelector('.controlled-nodes-machine-row');
+      if (!(candidate instanceof HTMLLIElement)) throw new Error('mobile install card not found');
+      return candidate;
+    });
+
+    expect(card.querySelector('.controlled-nodes-install-worker')).toBeNull();
+    const trigger = card.querySelector('.controlled-nodes-mobile-menu-trigger')!;
+    expect(card.querySelectorAll('.controlled-nodes-machine-actions > button')).toHaveLength(1);
+    fireEvent.click(trigger);
+    expect(card.querySelector('.controlled-nodes-mobile-menu-panel .controlled-nodes-install-worker')).not.toBeNull();
+  });
+
+  it('keeps the full machine action row directly visible on desktop', async () => {
+    setViewportWidth(1024);
+    machines = [machine({
+      serverId: 'desktop-owner',
+      displayName: 'Desktop Owner',
+      os: 'win',
+      accessRole: 'owner',
+      execEnabled: true,
+      capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY],
+    })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Desktop Owner'));
+
+    expect(container.querySelector('.controlled-nodes-mobile-menu-trigger')).toBeNull();
+    expect(container.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(container.querySelector('.share-revoke-btn')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-rename')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-exec-toggle')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-auto-unlock')).not.toBeNull();
+    expect(container.querySelector('.controlled-nodes-revoke')).not.toBeNull();
+  });
+
+  it('removes aiDesk.to branding from the Remote Desktop button in every locale', () => {
+    const webRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+    for (const locale of ['en', 'es', 'ja', 'ko', 'ru', 'zh-CN', 'zh-TW']) {
+      const messages = JSON.parse(readFileSync(
+        resolve(webRoot, `src/i18n/locales/${locale}.json`),
+        'utf8',
+      )) as { remote_desktop?: { open?: string }; controlled_nodes?: { more_actions?: string } };
+      expect(messages.remote_desktop?.open).toBeTruthy();
+      expect(messages.remote_desktop?.open?.toLowerCase()).not.toContain('aidesk.to');
+      expect(messages.controlled_nodes?.more_actions).toBeTruthy();
+    }
   });
 
   it('does not report a successful exec toggle as failed when its refresh fails', async () => {
@@ -438,7 +986,7 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.textContent).toContain('controlled_nodes.exec_on');
   });
 
-  it('shows Remote Desktop only for an operable Windows Owner or Participant with the exact capability', async () => {
+  it('shows Remote Desktop only for an operable Owner or Participant with a resolved profile', async () => {
     machines = [
       machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'participant-ready', displayName: 'Participant Ready', os: 'win', accessRole: 'participant', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
@@ -446,7 +994,7 @@ describe('ControlledNodesPanel (12.3)', () => {
       machine({ serverId: 'disabled', displayName: 'Disabled', os: 'win', accessRole: 'owner', execEnabled: false, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'offline', displayName: 'Offline', os: 'win', accessRole: 'owner', online: false, execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'old-node', displayName: 'Old Node', os: 'win', accessRole: 'owner', execEnabled: true }),
-      machine({ serverId: 'linux', displayName: 'Linux', os: 'linux', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+      machine({ serverId: 'incomplete', displayName: 'Incomplete', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_SESSION_CAPABILITY] }),
     ];
     const { container } = render(<ControlledNodesPanel />);
     await waitFor(() => expect(container.textContent).toContain('Owner Ready'));
@@ -457,12 +1005,63 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(buttons[1]?.closest('li')?.textContent).toContain('Participant Ready');
   });
 
-  it('offers quick worker installation only for an online supported Owner node', async () => {
+  it('splits the Remote Desktop button: the right third opens the machine in its own window, not here', async () => {
+    machines = [
+      machine({ serverId: 'owner-ready', displayName: 'Owner Ready', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+    ];
+    const opened = vi.spyOn(window, 'open').mockReturnValue({} as Window);
+    const onOpenRemoteDesktop = vi.fn();
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={onOpenRemoteDesktop} />);
+    await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-rd-split')).toHaveLength(1));
+
+    const split = container.querySelector('.controlled-nodes-rd-split') as HTMLElement;
+    const main = split.querySelector('.controlled-nodes-rd-main') as HTMLButtonElement;
+    const windowButton = split.querySelector('.controlled-nodes-rd-window') as HTMLButtonElement;
+    expect(main.nextElementSibling).toBe(windowButton);
+    expect(windowButton.getAttribute('aria-label')).toBe('remote_desktop.open_new_window');
+
+    fireEvent.click(windowButton);
+    expect(opened).toHaveBeenCalledTimes(1);
+    expect(String(opened.mock.calls[0]?.[0])).toContain('remoteDesktopServer=owner-ready');
+    expect(onOpenRemoteDesktop).not.toHaveBeenCalled();
+
+    fireEvent.click(main);
+    expect(onOpenRemoteDesktop).toHaveBeenCalledTimes(1);
+    expect(opened).toHaveBeenCalledTimes(1);
+    opened.mockRestore();
+  });
+
+  it('lays an owner\'s actions out as two aligned rows of three, keeping an empty slot for an action a machine lacks', async () => {
+    machines = [
+      // Windows can hold an auto-unlock secret; Linux cannot, and must leave its slot empty rather than shift Revoke.
+      machine({ serverId: 'win-node', displayName: 'Win Node', os: 'win', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY] }),
+      machine({ serverId: 'linux-node', displayName: 'Linux Node', os: 'linux', accessRole: 'owner', execEnabled: true, capabilities: [REMOTE_DESKTOP_CAPABILITY] }),
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner')).toHaveLength(2));
+
+    for (const actions of Array.from(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner'))) {
+      const cells = Array.from(actions.children);
+      expect(cells).toHaveLength(6);
+      expect(cells[0]?.classList.contains('controlled-nodes-rd-split')).toBe(true);
+      expect(cells[1]?.classList.contains('controlled-nodes-share')).toBe(true);
+      expect(cells[2]?.classList.contains('controlled-nodes-rename')).toBe(true);
+      expect(cells[3]?.classList.contains('controlled-nodes-exec-toggle')).toBe(true);
+      expect(cells[5]?.classList.contains('controlled-nodes-revoke')).toBe(true);
+    }
+    const linuxCells = Array.from(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner')[1]?.children ?? []);
+    expect(linuxCells[4]?.classList.contains('controlled-nodes-action-slot')).toBe(true);
+    const winCells = Array.from(container.querySelectorAll('.controlled-nodes-machine-actions.is-desktop.is-owner')[0]?.children ?? []);
+    expect(winCells[4]?.classList.contains('controlled-nodes-auto-unlock')).toBe(true);
+  });
+
+  it('offers worker installation from explicit capability evidence, never OS metadata', async () => {
     machines = [
       machine({ serverId: 'missing', displayName: 'Missing Worker', os: 'win', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'metadata-linux', displayName: 'Metadata Linux', os: 'linux', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
+      machine({ serverId: 'metadata-only', displayName: 'Windows Without Evidence', os: 'win', accessRole: 'owner', online: true, capabilities: [] }),
       machine({ serverId: 'viewer', displayName: 'Shared Viewer', os: 'win', accessRole: 'viewer', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
       machine({ serverId: 'offline', displayName: 'Offline Win', os: 'win', accessRole: 'owner', online: false, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
-      machine({ serverId: 'linux', displayName: 'Linux', os: 'linux', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
       machine({ serverId: 'already-ready', displayName: 'Already Ready', os: 'win', accessRole: 'owner', online: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY] }),
       machine({ serverId: 'updating', displayName: 'Updating', os: 'win', accessRole: 'owner', online: true, updateAvailable: true, capabilities: [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY] }),
     ];
@@ -473,8 +1072,13 @@ describe('ControlledNodesPanel (12.3)', () => {
       return candidate;
     });
 
-    expect(container.querySelectorAll('.controlled-nodes-install-worker')).toHaveLength(1);
+    const installButtons = container.querySelectorAll('.controlled-nodes-install-worker');
+    expect(installButtons).toHaveLength(2);
     expect(button.closest('li')?.textContent).toContain('Missing Worker');
+    expect(installButtons[1]?.closest('li')?.textContent).toContain('Metadata Linux');
+    expect(container.textContent).toContain('Windows Without Evidence');
+    expect(installButtons[0]?.closest('li')?.textContent).not.toContain('Windows Without Evidence');
+    expect(installButtons[1]?.closest('li')?.textContent).not.toContain('Windows Without Evidence');
     expect(button.textContent).toBe('remote_desktop.install_worker');
     fireEvent.click(button);
     await waitFor(() => expect(installMachineRemoteDesktopWorker).toHaveBeenCalledWith('missing'));
@@ -527,6 +1131,100 @@ describe('ControlledNodesPanel (12.3)', () => {
     expect(container.querySelector('.remote-desktop-panel')).toBeNull();
   });
 
+  it('explains macOS Screen Recording readiness from capabilities without trusting OS metadata', async () => {
+    machines = [
+      machine({
+        serverId: 'mac-capture-missing',
+        refName: 'mac-capture-missing',
+        displayName: 'Capture Missing',
+        // Deliberately contradictory descriptive metadata: readiness must come
+        // from the advertised profile, not this field.
+        os: 'win',
+        online: true,
+        execEnabled: true,
+        capabilities: [
+          REMOTE_DESKTOP_SESSION_CAPABILITY,
+          REMOTE_DESKTOP_PLATFORM_CAPABILITY.MACOS,
+          REMOTE_DESKTOP_ENCODER_CAPABILITY.H264,
+          REMOTE_DESKTOP_LOCAL_DISCLOSURE_CAPABILITY,
+        ],
+      }),
+      machine({
+        serverId: 'legacy-on-mac-metadata',
+        refName: 'legacy-on-mac-metadata',
+        displayName: 'Legacy Ready',
+        os: 'mac',
+        online: true,
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }),
+    ];
+    const { container } = render(<ControlledNodesPanel onOpenRemoteDesktop={vi.fn()} />);
+    await waitFor(() => expect(container.textContent).toContain('Capture Missing'));
+
+    const rows = [...container.querySelectorAll('.controlled-nodes-machine-row')];
+    const missing = rows.find((row) => row.textContent?.includes('Capture Missing'))!;
+    const legacy = rows.find((row) => row.textContent?.includes('Legacy Ready'))!;
+    expect(missing.querySelector('[data-readiness="screen_recording_required"]')).not.toBeNull();
+    expect(missing.textContent).toContain('remote_desktop.macos_screen_recording_guidance');
+    // Not openable -- but no longer silent either. The machine is one grant
+    // away, so it offers to ask for it rather than showing nothing, which read
+    // as "this Mac will never do remote desktop".
+    const permission = missing.querySelector('.controlled-nodes-remote-desktop.is-permission-required');
+    expect(permission).not.toBeNull();
+    expect(permission!.textContent).toBe('remote_desktop.request_permission');
+    expect(missing.querySelector(
+      '.controlled-nodes-remote-desktop:not(.is-permission-required)',
+    )).toBeNull();
+    expect(legacy.querySelector('.remote-desktop-readiness')).toBeNull();
+    expect(legacy.querySelector('.controlled-nodes-remote-desktop')).not.toBeNull();
+    expect(legacy.querySelector('.is-permission-required')).toBeNull();
+  });
+
+  it('keeps one Share entry and opens Owner invitations inside that dialog without connecting', async () => {
+    const onOpenRemoteDesktop = vi.fn();
+    machines = [
+      machine({
+        serverId: 'desktop-owner',
+        remoteDesktopHostId: 'canonical-host-owner',
+        displayName: 'Owner Desktop',
+        os: 'win',
+        accessRole: 'owner',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }),
+      machine({
+        serverId: 'desktop-participant',
+        remoteDesktopHostId: 'canonical-host-participant',
+        displayName: 'Participant Desktop',
+        os: 'win',
+        accessRole: 'participant',
+        execEnabled: true,
+        capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }),
+    ];
+    const { container, getByTestId } = render(
+      <ControlledNodesPanel onOpenRemoteDesktop={onOpenRemoteDesktop} />,
+    );
+    await waitFor(() => expect(container.querySelectorAll('.controlled-nodes-remote-desktop')).toHaveLength(2));
+
+    expect(container.querySelector('.controlled-nodes-remote-desktop-access')).toBeNull();
+    const ownerCard = [...container.querySelectorAll('.controlled-nodes-machine-row')]
+      .find((card) => card.textContent?.includes('Owner Desktop'))!;
+    const shareButton = ownerCard.querySelector('.controlled-nodes-machine-actions > .share-revoke-btn');
+    expect(shareButton).not.toBeNull();
+    fireEvent.click(shareButton!);
+
+    const shareTabs = container.querySelectorAll('.share-dialog-tab');
+    expect(shareTabs).toHaveLength(2);
+    fireEvent.click(shareTabs[1]!);
+
+    expect(onOpenRemoteDesktop).not.toHaveBeenCalled();
+    expect(getByTestId('remote-desktop-owner-access').textContent)
+      .toBe('canonical-host-owner:Owner Desktop');
+    expect(container.querySelector('.remote-desktop-panel')).toBeNull();
+  });
+
   it('renames only the mutable display name and refreshes the list', async () => {
     machines = [machine({ serverId: 'srv-rename', refName: 'stable-ref', displayName: 'Old name' })];
     const { container } = render(<ControlledNodesPanel />);
@@ -540,7 +1238,7 @@ describe('ControlledNodesPanel (12.3)', () => {
 
     await waitFor(() => expect(renameMachine).toHaveBeenCalledWith('srv-rename', 'New display name'));
     expect(refetch).toHaveBeenCalled();
-    expect(container.textContent).toContain('stable-ref');
+    expect(container.textContent).toContain(CONTROLLED_NODE_ID_MIN);
   });
 
   it('does not report a successful rename as failed when its refresh fails', async () => {
@@ -599,5 +1297,574 @@ describe('ControlledNodesPanel (12.3)', () => {
     await waitFor(() => expect(container.textContent).toContain('controlled_nodes.refresh_error'));
     expect(container.textContent).not.toContain('controlled_nodes.error_generic');
     confirmSpy.mockRestore();
+  });
+});
+
+/**
+ * The copy-command button had only a static layout assertion, so nothing
+ * verified what actually reaches the clipboard. That matters more here than for
+ * an ordinary copy control: this string is pasted into a root shell, and an
+ * unpinned transport would follow an HTTPS→HTTP redirect into `sudo sh`.
+ */
+describe('ControlledNodesPanel — copy install command', () => {
+  it('copies the minted command verbatim, transport pin included', async () => {
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = renderInstallTab();
+
+    const btn = await waitFor(() => {
+      const b = container.querySelector(
+        '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+      );
+      if (!b) throw new Error('copy-command button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+
+    await waitFor(() => expect(writeText).toHaveBeenCalled());
+    expect(createControlledNodeInstallCommand)
+      .toHaveBeenCalledWith({ os: 'win', arch: 'x64' });
+    const copied = String(writeText.mock.calls[0]?.[0] ?? '');
+    // Verbatim: the UI must not reformat, wrap or truncate a command that will
+    // be executed as root.
+    expect(copied).toBe((await createControlledNodeInstallCommand.mock.results[0]!.value).command);
+    // The redirect pin must survive the copy: this string is executed elevated.
+    expect(copied).toContain('-MaximumRedirection 0');
+    await waitFor(() =>
+      expect(btn.textContent).toContain('controlled_nodes.copy_install_command_copied'));
+  });
+
+  it('reaches the clipboard on an iPhone, where a write after the mint is refused', async () => {
+    // The reported bug: on some iPhones the button answered "无法复制命令,
+    // 请检查剪贴板权限" -- at people whose permissions were fine. iOS only
+    // allows a clipboard write while the tap still counts as a user
+    // activation, and awaiting the mint spends it. Chrome and most Android
+    // browsers allow the late write, which is why it worked on one phone and
+    // not another.
+    //
+    // This clipboard refuses exactly what iOS refuses.
+    const clipboard = installClipboardStub({ activationExpired: true });
+    try {
+      const { container } = renderInstallTab();
+      const btn = await waitFor(() => {
+        const b = container.querySelector(
+          '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+        );
+        if (!b) throw new Error('copy-command button not found');
+        return b;
+      });
+      fireEvent.click(btn);
+      // Everything from here on counts as after the tap.
+      clipboard.endGesture();
+
+      await waitFor(() =>
+        expect(btn.textContent).toContain('controlled_nodes.copy_install_command_copied'));
+      expect(clipboard.written).toEqual([
+        (await createControlledNodeInstallCommand.mock.results[0]!.value).command,
+      ]);
+      expect(container.textContent)
+        .not.toContain('controlled_nodes.copy_install_command_clipboard_error');
+    } finally {
+      removeClipboardStub();
+    }
+  });
+
+  it('still blames the mint, not the clipboard, when minting is what failed', async () => {
+    // Telling someone to check a permission they have, because a server call
+    // failed, is the same bug wearing a different hat.
+    installClipboardStub();
+    createControlledNodeInstallCommand.mockRejectedValueOnce(new Error('nope'));
+    try {
+      const { container } = renderInstallTab();
+      const btn = await waitFor(() => {
+        const b = container.querySelector(
+          '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+        );
+        if (!b) throw new Error('copy-command button not found');
+        return b;
+      });
+      fireEvent.click(btn);
+      await waitFor(() =>
+        expect(container.textContent).toContain('controlled_nodes.copy_install_command_error'));
+      expect(container.textContent)
+        .not.toContain('controlled_nodes.copy_install_command_clipboard_error');
+    } finally {
+      removeClipboardStub();
+    }
+  });
+
+  it('reports a denied clipboard instead of claiming the command was copied', async () => {
+    const writeText = vi.fn(async () => { throw new Error('denied'); });
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const previousExecCommand = Object.getOwnPropertyDescriptor(document, 'execCommand');
+    Object.defineProperty(document, 'execCommand', {
+      configurable: true, writable: true, value: vi.fn(() => false),
+    });
+    try {
+      const { container } = renderInstallTab();
+      const btn = await waitFor(() => {
+        const b = container.querySelector(
+          '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+        );
+        if (!b) throw new Error('copy-command button not found');
+        return b;
+      });
+      fireEvent.click(btn);
+      await waitFor(() => {
+        const alert = container.querySelector('.controlled-nodes-error');
+        expect(alert?.textContent).toContain('controlled_nodes.copy_install_command_clipboard_error');
+      });
+      // No success flash for a copy that never reached the clipboard: the
+      // operator would otherwise walk to the target machine with nothing.
+      expect(btn.textContent).not.toContain('controlled_nodes.copy_install_command_copied');
+    } finally {
+      if (previousExecCommand) Object.defineProperty(document, 'execCommand', previousExecCommand);
+      else delete (document as { execCommand?: unknown }).execCommand;
+    }
+  });
+
+  it('surfaces a mint failure without pretending anything was copied', async () => {
+    createControlledNodeInstallCommand.mockRejectedValueOnce(new Error('boom'));
+    const writeText = vi.fn(async () => {});
+    vi.stubGlobal('navigator', { ...globalThis.navigator, clipboard: { writeText } });
+    const { container } = renderInstallTab();
+    const btn = await waitFor(() => {
+      const b = container.querySelector(
+        '.controlled-nodes-download-item.is-win .controlled-nodes-copy-command-btn',
+      );
+      if (!b) throw new Error('copy-command button not found');
+      return b;
+    });
+    fireEvent.click(btn);
+    await waitFor(() => {
+      const alert = container.querySelector('.controlled-nodes-error');
+      expect(alert?.textContent).toContain('controlled_nodes.copy_install_command_error');
+    });
+    expect(writeText).not.toHaveBeenCalled();
+  });
+});
+
+
+describe('ControlledNodesPanel teams tab', () => {
+  /** These actions change who can reach a machine, so they ask again first. */
+  const confirmClick = async (el: HTMLButtonElement) => {
+    await act(async () => { fireEvent.click(el); });
+    await act(async () => { fireEvent.click(el); });
+  };
+
+  const openTeams = (container: HTMLElement) => act(() => {
+    (container.querySelector('[data-testid="controlled-nodes-tab-teams"]') as HTMLButtonElement).click();
+  });
+
+  it('adds a machine by picking it, and removes the ones already in the group', async () => {
+    // The group panel answers "what is in this group". It used to list every
+    // machine you own with an Add button, so it looked identical whichever
+    // group was selected.
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [
+      {
+        serverId: 'srv-in', nodeId: '1234567890', refName: 'in', displayName: 'Already in',
+        online: true, execEnabled: true, accessRole: 'owner' as const,
+        teamIds: ['team-1'], teamNames: ['Ops'],
+      },
+      {
+        serverId: 'srv-out', nodeId: '1234567891', refName: 'out', displayName: 'Not in',
+        online: true, execEnabled: true, accessRole: 'owner' as const,
+      },
+    ];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const pick = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-machine-pick"]') as HTMLSelectElement | null;
+      if (!el) throw new Error('machine picker not rendered');
+      return el;
+    });
+    // Only machines that are NOT already in the group are offerable.
+    const options = Array.from(pick.querySelectorAll('option')).map((o) => o.value);
+    expect(options).toEqual(['', 'srv-out']);
+    // And the one already in it is listed with a way out, not a way in.
+    expect(container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-in"]')).not.toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-out"]')).toBeNull();
+
+    await act(async () => { fireEvent.input(pick, { target: { value: 'srv-out' } }); });
+    const add = container.querySelector('[data-testid="controlled-nodes-machine-add"]') as HTMLButtonElement;
+    await act(async () => { fireEvent.click(add); });
+    expect(setMachineGroupMembership, 'one click only arms it').not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(add); });
+    expect(setMachineGroupMembership).toHaveBeenCalledWith('srv-out', 'team-1', true);
+
+    // The panel disables its actions while one is in flight, so wait for the
+    // add to finish rather than clicking into a disabled button and calling
+    // that a failure.
+    const removeIn = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-in"]') as HTMLButtonElement | null;
+      if (!el || el.disabled) throw new Error('remove action still busy');
+      return el;
+    });
+    await confirmClick(removeIn);
+    // Names the group it is leaving and says so explicitly. A machine can be in
+    // several, so there is no "the" group to clear, and a body that omitted
+    // either half must not be able to change membership by default.
+    expect(setMachineGroupMembership).toHaveBeenLastCalledWith('srv-in', 'team-1', false);
+  });
+
+  it('says what went wrong instead of showing a status code', async () => {
+    // "Add user" answered 404 and the screen said nothing, which is
+    // indistinguishable from a broken button.
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    const { ApiError } = await import('../src/api.js');
+    addTeamMember.mockRejectedValueOnce(new ApiError(404, JSON.stringify({ error: 'user_not_found' })));
+    machines = [];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const input = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-member-name"]') as HTMLInputElement | null;
+      if (!el) throw new Error('member input not rendered');
+      return el;
+    });
+    await act(async () => { fireEvent.input(input, { target: { value: 'ghost' } }); });
+    await confirmClick(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
+
+    await waitFor(() => {
+      expect(container.textContent).toContain('controlled_nodes.team_error_user_not_found');
+    });
+    expect(container.textContent, 'a raw status code is not an explanation').not.toContain('API 404');
+  });
+
+  it('never offers to file a machine the person does not own', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [{
+      serverId: 'srv-2', nodeId: '1234567891', refName: 'theirs', displayName: 'Theirs',
+      online: true, execEnabled: true, accessRole: 'participant' as const,
+    }];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+    await waitFor(() => expect(container.textContent).toContain('controlled_nodes.team_machines'));
+    // Putting someone else's machine into your group is not filing it, it is
+    // taking it.
+    expect(container.querySelector('[data-testid="controlled-nodes-team-machine-srv-2"]')).toBeNull();
+  });
+
+  it('adds a member by username, the same identifier machine sharing uses', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const input = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-member-name"]') as HTMLInputElement | null;
+      if (!el) throw new Error('member input not rendered');
+      return el;
+    });
+    await act(async () => { fireEvent.input(input, { target: { value: 'alice' } }); });
+    await confirmClick(container.querySelector('[data-testid="controlled-nodes-member-add"]') as HTMLButtonElement);
+    expect(addTeamMember).toHaveBeenCalledWith('team-1', 'alice');
+  });
+
+  it('lets only the owner change roles, and never the owner s own', async () => {
+    // Three roles, and the owner is the only one who appoints admins. A team
+    // where nobody can appoint anyone is a team nobody can run.
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'admin' as const }]);
+    getTeam.mockResolvedValue({
+      id: 'team-1',
+      name: 'Ops',
+      myRole: 'admin',
+      members: [
+        { user_id: 'u-owner', username: 'boss', role: 'owner' as const, joined_at: 1 },
+        { user_id: 'u-mate', username: 'mate', role: 'member' as const, joined_at: 2 },
+      ],
+    });
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    await waitFor(() => expect(container.textContent).toContain('mate'));
+    // An admin may add and remove, but may not promote.
+    expect(container.querySelector('[data-testid="controlled-nodes-member-role-u-mate"]')).toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-member-remove-u-mate"]')).not.toBeNull();
+    // Nobody demotes the owner, including the owner.
+    expect(container.querySelector('[data-testid="controlled-nodes-member-role-u-owner"]')).toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-member-remove-u-owner"]')).toBeNull();
+  });
+
+  it('shows a plain member their team without management controls', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'member' as const }]);
+    getTeam.mockResolvedValue({
+      id: 'team-1',
+      name: 'Ops',
+      myRole: 'member',
+      members: [{ user_id: 'u-mate', username: 'mate', role: 'member' as const, joined_at: 2 }],
+    });
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    await waitFor(() => expect(container.textContent).toContain('mate'));
+    expect(container.querySelector('[data-testid="controlled-nodes-member-name"]')).toBeNull();
+    expect(container.querySelector('[data-testid="controlled-nodes-member-remove-u-mate"]')).toBeNull();
+  });
+});
+
+describe('ControlledNodesPanel machine grouping', () => {
+  const mine = {
+    serverId: 'srv-mine', nodeId: '1234567890', refName: 'mine', displayName: 'Mine',
+    online: true, execEnabled: true, accessRole: 'owner' as const,
+  };
+  const viaTeam = {
+    serverId: 'srv-team', nodeId: '1234567891', refName: 'team', displayName: 'Team box',
+    online: true, execEnabled: true, accessRole: 'participant' as const,
+    teamIds: ['team-1'], teamNames: ['Ops'],
+  };
+
+  it('defaults to what is yours and shared with you, not the team s machines', async () => {
+    // Reached-through-a-team and shared-with-me-directly are different things.
+    // Pouring them into one list means reading it apart every time.
+    machines = [mine, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.textContent).not.toContain('Team box');
+
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    expect(container.textContent).toContain('Team box');
+    expect(container.textContent).not.toContain('Mine');
+
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-all"]') as HTMLButtonElement).click();
+    });
+    // Nothing is unreachable: All still shows both.
+    expect(container.textContent).toContain('Mine');
+    expect(container.textContent).toContain('Team box');
+  });
+
+  it('keeps your own machine on the default view after you file it in a group', async () => {
+    // Filing your own device in a group shares it; it does not put it away.
+    // It used to vanish from the list you land on, which reads as a lost
+    // device rather than a shared one.
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    // Still not the one reachable only through the group.
+    expect(container.textContent).not.toContain('Team box');
+
+    // And it is under its group as well, not instead.
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    expect(container.textContent).toContain('Mine');
+    expect(container.textContent).toContain('Team box');
+  });
+
+  it('remembers the chosen group across closing and reopening the panel', async () => {
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const first = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(first.container.textContent).toContain('Mine'));
+    await act(async () => {
+      (first.container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    first.unmount();
+
+    const reopened = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(reopened.container.textContent).toContain('Team box'));
+    expect(reopened.container.querySelector('[data-testid="controlled-nodes-group-team-1"]')?.getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('falls back to the default view when the remembered group is gone, without forgetting it', async () => {
+    localStorage.setItem(MACHINE_GROUP_STORAGE_KEY, JSON.stringify({ version: 1, group: 'team-gone' }));
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.querySelector('[data-testid="controlled-nodes-group-direct"]')?.getAttribute('aria-selected')).toBe('true');
+    expect(container.textContent).not.toContain('Team box');
+    expect(JSON.parse(localStorage.getItem(MACHINE_GROUP_STORAGE_KEY)!)).toEqual({ version: 1, group: 'team-gone' });
+  });
+
+  it('puts a count on every group tab, matching what the tab opens', async () => {
+    const mineGrouped = { ...mine, teamIds: ['team-1'], teamNames: ['Ops'] };
+    machines = [mineGrouped, viaTeam];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+
+    const countOf = (id: string): string | undefined => container
+      .querySelector(`[data-testid="controlled-nodes-group-${id}"] .controlled-nodes-team-chip-count`)
+      ?.textContent ?? undefined;
+    expect(countOf('direct'), 'your own grouped machine counts here too').toBe('1');
+    expect(countOf('team-1')).toBe('2');
+    expect(countOf('all')).toBe('2');
+
+    // The number has to agree with the list, or it is decoration.
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-group-team-1"]') as HTMLButtonElement).click();
+    });
+    expect(container.querySelectorAll('.controlled-nodes-machine-row')).toHaveLength(2);
+  });
+
+  it('shows no group filter at all when no machine is in a team', async () => {
+    // A chooser with one choice is furniture.
+    machines = [mine];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.querySelector('.controlled-nodes-group-filter')).toBeNull();
+  });
+
+  it('keeps verification devices on their own tab, out of the machine list', async () => {
+    machines = [mine];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(container.textContent).toContain('Mine'));
+    expect(container.textContent).not.toContain('controlled_nodes.verification.title');
+
+    await act(async () => {
+      (container.querySelector('[data-testid="controlled-nodes-tab-verification"]') as HTMLButtonElement).click();
+    });
+    expect(container.textContent).toContain('controlled_nodes.verification.title');
+    expect(container.textContent, 'the machine list is not on this tab').not.toContain('Mine');
+  });
+});
+
+describe('ControlledNodesPanel install instructions', () => {
+  it('gives each OS both routes as full-width rows, not spans in a 64px column', async () => {
+    // They were two <span>s dropped straight into a two-column grid whose first
+    // track is 64px, so the second one wrapped at about a dozen characters and
+    // read as a vertical ribbon. The regression is a layout one, so the shape
+    // is what is asserted: a labelled row per route, inside the OS card.
+    const { container } = renderInstallTab();
+    const card = await waitFor(() => {
+      const el = container.querySelector('.controlled-nodes-usage-os li');
+      if (!el) throw new Error('per-OS install card not rendered');
+      return el;
+    });
+
+    const routes = card.querySelectorAll('.controlled-nodes-usage-route');
+    expect(routes, 'both install routes, every OS').toHaveLength(2);
+    for (const route of Array.from(routes)) {
+      // A tag plus a paragraph. A bare text node would land in whatever grid
+      // cell came next, which is exactly how this broke.
+      expect(route.querySelector('.controlled-nodes-usage-route-tag')).not.toBeNull();
+      expect(route.querySelector('p')).not.toBeNull();
+    }
+    expect(card.textContent).toContain('controlled_nodes.usage_route_command');
+    expect(card.textContent).toContain('controlled_nodes.usage_route_download');
+  });
+
+  it('does not squeeze the instructions into a 64px track', async () => {
+    const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'), 'utf8');
+    const block = css.slice(css.indexOf('.controlled-nodes-usage-os li {'));
+    // The old rule. Reintroducing it puts the text back in the ribbon.
+    expect(block.slice(0, 400)).not.toContain('grid-template-columns: 64px');
+    expect(css).toContain('.controlled-nodes-usage-route {');
+  });
+});
+
+describe('ControlledNodesPanel group rename and delete', () => {
+  const openTeams = (container: HTMLElement) => act(() => {
+    (container.querySelector('[data-testid="controlled-nodes-tab-teams"]') as HTMLButtonElement).click();
+  });
+  const owned = (over: Record<string, unknown> = {}) => ({
+    serverId: 'srv-1', nodeId: '1234567890', refName: 'm', displayName: 'Mine',
+    online: true, execEnabled: true, accessRole: 'owner' as const, ...over,
+  });
+
+  it('renames a group, and will not send a blank name', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const input = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-group-rename"]') as HTMLInputElement | null;
+      if (!el) throw new Error('rename input not rendered');
+      return el;
+    });
+    const save = container.querySelector('[data-testid="controlled-nodes-group-rename-save"]') as HTMLButtonElement;
+    expect(save.disabled, 'an empty name is not a rename').toBe(true);
+
+    await act(async () => { fireEvent.input(input, { target: { value: '  运维组  ' } }); });
+    await act(async () => { fireEvent.click(save); });
+    expect(renameTeam).toHaveBeenCalledWith('team-1', '运维组');
+  });
+
+  it('will not offer delete while machines are still in the group, and says why', async () => {
+    // Disabled with the reason on it rather than clickable and then refused:
+    // the machines have to come out first, and that is something to be told
+    // before trying.
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [owned({ teamIds: ['team-1'], teamNames: ['Ops'] })];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="controlled-nodes-group-delete-blocked"]')).not.toBeNull();
+    });
+    expect(container.querySelector('[data-testid="controlled-nodes-group-delete"]')).toBeNull();
+    expect(deleteTeam).not.toHaveBeenCalled();
+  });
+
+  it('deletes an empty group, and asks once first', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'owner' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [owned()];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    const del = await waitFor(() => {
+      const el = container.querySelector('[data-testid="controlled-nodes-group-delete"]') as HTMLButtonElement | null;
+      if (!el) throw new Error('delete action not rendered');
+      return el;
+    });
+    await act(async () => { fireEvent.click(del); });
+    expect(deleteTeam, 'one click only arms it').not.toHaveBeenCalled();
+    await act(async () => { fireEvent.click(del); });
+    expect(deleteTeam).toHaveBeenCalledWith('team-1');
+  });
+
+  it('shows an admin rename but never delete, and a member neither', async () => {
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'admin' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'admin', members: [] });
+    machines = [];
+    const { container: asAdmin } = render(<ControlledNodesPanel />);
+    openTeams(asAdmin);
+    await waitFor(() => {
+      expect(asAdmin.querySelector('[data-testid="controlled-nodes-group-rename"]')).not.toBeNull();
+    });
+    expect(asAdmin.querySelector('[data-testid="controlled-nodes-group-delete"]')).toBeNull();
+
+    cleanup();
+    listTeams.mockResolvedValue([{ id: 'team-1', name: 'Ops', role: 'member' as const }]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'member', members: [] });
+    const { container: asMember } = render(<ControlledNodesPanel />);
+    openTeams(asMember);
+    await waitFor(() => expect(asMember.textContent).toContain('controlled_nodes.team_machines'));
+    expect(asMember.querySelector('[data-testid="controlled-nodes-group-rename"]')).toBeNull();
+    expect(asMember.querySelector('[data-testid="controlled-nodes-group-delete"]')).toBeNull();
+  });
+
+  it('lists a machine under every group it is in', async () => {
+    listTeams.mockResolvedValue([
+      { id: 'team-1', name: 'Ops', role: 'owner' as const },
+      { id: 'team-2', name: 'Support', role: 'owner' as const },
+    ]);
+    getTeam.mockResolvedValue({ id: 'team-1', name: 'Ops', myRole: 'owner', members: [] });
+    machines = [owned({ teamIds: ['team-1', 'team-2'], teamNames: ['Ops', 'Support'] })];
+    const { container } = render(<ControlledNodesPanel />);
+    openTeams(container);
+
+    // It is offered a way OUT of the selected group, not a way in.
+    await waitFor(() => {
+      expect(container.querySelector('[data-testid="controlled-nodes-team-machine-remove-srv-1"]')).not.toBeNull();
+    });
+    // And both chips carry a count of one for the same machine, because it
+    // really is in both.
+    expect(container.querySelector('[data-testid="controlled-nodes-team-chip-team-1"]')?.textContent).toContain('1');
+    expect(container.querySelector('[data-testid="controlled-nodes-team-chip-team-2"]')?.textContent).toContain('1');
+    expect(container.querySelector('[data-testid="controlled-nodes-machine-pick"]')).toBeNull();
   });
 });

@@ -43,6 +43,7 @@ global.ResizeObserver = vi.fn().mockImplementation(() => ({
 }));
 
 import { TerminalView } from '../../src/components/TerminalView.js';
+import { Terminal as TerminalMock } from 'xterm';
 import type { TerminalDiff } from '../../src/types.js';
 
 describe('TerminalView', () => {
@@ -303,5 +304,83 @@ describe('TerminalView', () => {
     expect(event.defaultPrevented).toBe(true);
     expect(mockFocus).toHaveBeenCalled();
     expect(sendInput).toHaveBeenCalledWith('paste-session', 'echo pasted\n');
+  });
+});
+
+describe('TerminalView — diff scroll backlog while frames are stalled', () => {
+  /** rAF that only ENQUEUES. Reproduces a sleeping display: no frames are
+   *  produced, but WebSocket diffs keep arriving because they are I/O, not
+   *  throttled timers. The shared fake-timer config keeps rAF real for the rest
+   *  of the suite, so the stall is installed locally and restored after. */
+  function installStalledRaf() {
+    const queue: FrameRequestCallback[] = [];
+    const cancelled = new Set<number>();
+    const prevRaf = globalThis.requestAnimationFrame;
+    const prevCancel = globalThis.cancelAnimationFrame;
+    let nextId = 1;
+    Object.defineProperty(globalThis, 'requestAnimationFrame', {
+      value: (cb: FrameRequestCallback) => {
+        const id = nextId++;
+        queue.push(((t: number) => { if (!cancelled.has(id)) cb(t); }) as FrameRequestCallback);
+        return id;
+      },
+      configurable: true, writable: true,
+    });
+    Object.defineProperty(globalThis, 'cancelAnimationFrame', {
+      value: (id: number) => { cancelled.add(id); },
+      configurable: true, writable: true,
+    });
+    return {
+      get queued() { return queue.length; },
+      flush() {
+        const batch = queue.splice(0, queue.length);
+        for (const cb of batch) cb(0);
+      },
+      restore() {
+        Object.defineProperty(globalThis, 'requestAnimationFrame', { value: prevRaf, configurable: true, writable: true });
+        Object.defineProperty(globalThis, 'cancelAnimationFrame', { value: prevCancel, configurable: true, writable: true });
+      },
+    };
+  }
+
+  it('coalesces the scroll frame across a burst of partial diffs', async () => {
+    const raf = installStalledRaf();
+    try {
+      let applyDiff!: (d: unknown) => void;
+      render(
+        h(TerminalView, {
+          sessionName: 'stalled-session',
+          onDiff: (fn: (d: unknown) => void) => { applyDiff = fn; },
+        } as never),
+      );
+      await new Promise((r) => setTimeout(r, 60));
+      const baseline = raf.queued;
+
+      // 200 PTY updates arriving while the display is asleep. A naive
+      // rAF-per-diff queued 200 scroll callbacks, all executed inside the first
+      // frame after unlock.
+      for (let i = 0; i < 200; i++) {
+        applyDiff({
+          sessionName: 'stalled-session',
+          lines: [[0, `line ${i}`]],
+          cols: 80,
+          rows: 24,
+          fullFrame: false,
+        });
+      }
+
+      expect(raf.queued - baseline).toBe(1);
+
+      // And the coalesced frame must still actually scroll once frames resume —
+      // dropping the work instead of merging it would leave the terminal stuck
+      // off-bottom.
+      const term = (TerminalMock as unknown as { mock: { results: Array<{ value: { scrollToBottom: ReturnType<typeof vi.fn> } }> } }).mock;
+      const instance = term.results[term.results.length - 1]?.value;
+      instance?.scrollToBottom?.mockClear?.();
+      raf.flush();
+      expect(instance?.scrollToBottom).toHaveBeenCalledTimes(1);
+    } finally {
+      raf.restore();
+    }
   });
 });

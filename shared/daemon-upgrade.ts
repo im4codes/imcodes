@@ -11,6 +11,7 @@ export interface ControlledNodeUpgradeBlockedMessage {
   [key: string]: unknown;
   type: typeof DAEMON_MSG.UPGRADE_BLOCKED;
   reason: string;
+  targetVersion?: string;
 }
 
 /** CONTROLLED nodes expose only this exact, bounded upgrade-blocker envelope. */
@@ -19,17 +20,17 @@ export function validateControlledNodeUpgradeBlockedMessage(
 ): { ok: true; value: ControlledNodeUpgradeBlockedMessage } | { ok: false } {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return { ok: false };
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).length !== 2) return { ok: false };
   if (record.type !== DAEMON_MSG.UPGRADE_BLOCKED) return { ok: false };
-  if (typeof record.reason !== 'string' || record.reason.length < 1) {
-    return { ok: false };
-  }
+  if (typeof record.reason !== 'string' || record.reason.length < 1) return { ok: false };
+  const keys = Object.keys(record);
+  if (!keys.every((key) => key === 'type' || key === 'reason' || key === 'targetVersion')) return { ok: false };
+  const targetVersion = typeof record.targetVersion === 'string' && DAEMON_UPGRADE_TARGET_VERSION_RE.test(record.targetVersion)
+    ? record.targetVersion
+    : undefined;
+  if (record.targetVersion !== undefined && !targetVersion) return { ok: false };
   return {
     ok: true,
-    // The daemon's exception text is diagnostic only. Bound what crosses the
-    // trust boundary without dropping a recoverable frame merely because an old
-    // runtime included a long URL or platform error in its message.
-    value: { type: DAEMON_MSG.UPGRADE_BLOCKED, reason: record.reason.slice(0, 128) },
+    value: { type: DAEMON_MSG.UPGRADE_BLOCKED, reason: record.reason.slice(0, 128), ...(targetVersion ? { targetVersion } : {}) },
   };
 }
 

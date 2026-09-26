@@ -7,12 +7,16 @@ param(
   [string]$ExpectedSignerSha256 = '',
   [string]$CodeSigningTimestampUrl = 'http://timestamp.digicert.com',
   [switch]$RequireAuthenticodeSignature,
-  [switch]$RunNativeTests
+  [switch]$RunNativeTests,
+  [switch]$CompileAndTestOnly,
+  [string]$FltkRoot = '',
+  [string]$JsoncppRoot = ''
 )
 
 $ErrorActionPreference = 'Stop'
 $SourceDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RepositoryRoot = Split-Path -Parent (Split-Path -Parent $SourceDirectory)
+$CommonSourceDirectory = Join-Path $RepositoryRoot 'native\remote-desktop-common'
 . (Join-Path $SourceDirectory 'invoke-native-logged.ps1')
 $SdkRoot = (Resolve-Path -LiteralPath $SdkRoot).Path
 $ArtifactRoot = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ArtifactRoot)
@@ -132,21 +136,43 @@ $CompileArguments = @(
 ) + $Imsvc + $Defines + $IncludeArguments
 
 $ProductionSources = @(
-  'display_capture.cc', 'display_preferences.cc', 'input_injector.cc', 'ice_candidate_queue.cc', 'json_protocol.cc',
-  'local_indicator.cc', 'mf_h264_encoder.cc', 'peer_session.cc', 'pipe_ipc.cc',
-  'quality_ladder.cc',
-  'unlock_secret.cc', 'worker_policy.cc', 'virtual_display_controller.cc', 'worker_main.cc'
+  'display_capture.cc', 'display_preferences.cc', 'input_injector.cc',
+  'common\data_channel_payload.cc',
+  'common\input_ledger.cc',
+  'common\json_protocol.cc', 'common\value_types.cc',
+  'common\local_management_ipc.cc',
+  'common\transport_session_core.cc',
+  'consent_ipc.cc', 'privacy_ipc.cc', 'consent_prompt.cc', 'local_indicator.cc', 'mf_h264_encoder.cc', 'peer_session.cc', 'pipe_ipc.cc',
+  'common\quality_ladder.cc',
+  'unlock_secret.cc', 'worker_policy.cc', 'windows_platform_adapters.cc', 'virtual_display_controller.cc', 'worker_main.cc'
 )
 $Tests = [ordered]@{
-  display_capture_unittests = @('display_capture.cc', 'display_capture_unittest.cc', 'worker_policy.cc')
-  quality_ladder_unittests = @('quality_ladder.cc', 'quality_ladder_unittest.cc')
-  input_injector_unittests = @('input_injector.cc', 'input_injector_unittest.cc')
-  ice_candidate_queue_unittests = @('ice_candidate_queue.cc', 'ice_candidate_queue_unittest.cc')
-  json_protocol_unittests = @('json_protocol.cc', 'json_protocol_unittest.cc')
+  display_capture_unittests = @(
+    'common\json_protocol.cc', 'common\value_types.cc', 'display_capture.cc',
+    'display_capture_unittest.cc', 'worker_policy.cc'
+  )
+  quality_ladder_unittests = @('common\quality_ladder.cc', 'quality_ladder_unittest.cc')
+  input_injector_unittests = @(
+    'common\input_ledger.cc', 'common\json_protocol.cc', 'common\value_types.cc', 'display_preferences.cc',
+    'display_capture.cc', 'input_injector.cc', 'input_injector_unittest.cc',
+    'windows_platform_adapters.cc', 'worker_policy.cc'
+  )
+  json_protocol_unittests = @('common\json_protocol.cc', 'json_protocol_unittest.cc')
+  local_management_ipc_unittests = @(
+    'common\json_protocol.cc', 'common\local_management_ipc.cc',
+    'local_management_ipc_unittest.cc'
+  )
+  windows_platform_adapters_unittests = @(
+    'common\input_ledger.cc', 'common\json_protocol.cc', 'common\value_types.cc', 'display_preferences.cc',
+    'display_capture.cc', 'input_injector.cc', 'windows_platform_adapters.cc',
+    'windows_platform_adapters_unittest.cc', 'worker_policy.cc'
+  )
+  privacy_ipc_unittests = @('common\json_protocol.cc', 'privacy_ipc.cc', 'privacy_ipc_unittest.cc')
   pipe_ipc_unittests = @('pipe_ipc.cc', 'pipe_ipc_unittest.cc')
-  worker_policy_unittests = @('worker_policy.cc', 'worker_policy_unittest.cc')
+  worker_policy_unittests = @('common\value_types.cc', 'worker_policy.cc', 'worker_policy_unittest.cc')
   mf_h264_encoder_unittests = @(
-    'mf_h264_encoder.cc', 'mf_h264_encoder_unittest.cc', 'quality_ladder.cc', 'worker_policy.cc'
+    'mf_h264_encoder.cc', 'mf_h264_encoder_unittest.cc', 'common\json_protocol.cc', 'common\quality_ladder.cc',
+    'common\value_types.cc', 'worker_policy.cc'
   )
 }
 $SystemLibraries = @(
@@ -173,7 +199,11 @@ function Compile-Sources([string]$Name, [string[]]$Sources, [string[]]$ExtraDefi
   New-Item -ItemType Directory -Force -Path $TargetObjectRoot | Out-Null
   $Objects = @()
   foreach ($SourceName in $Sources) {
-    $Source = Join-Path $SourceDirectory $SourceName
+    if ($SourceName.StartsWith('common\')) {
+      $Source = Join-Path $CommonSourceDirectory $SourceName.Substring('common\'.Length)
+    } else {
+      $Source = Join-Path $SourceDirectory $SourceName
+    }
     $Object = Join-Path $TargetObjectRoot "$([IO.Path]::GetFileNameWithoutExtension($SourceName)).obj"
     $SourceArguments = @($CompileArguments)
     if ($ExtraDefines.Count -ne 0) {
@@ -215,6 +245,10 @@ try {
   New-Item -ItemType Directory -Force -Path $OverlaySource | Out-Null
   Get-ChildItem -LiteralPath $SourceDirectory -File -Filter '*.h' |
     Copy-Item -Destination $OverlaySource
+  $CommonOverlaySource = Join-Path $OverlaySource 'common'
+  New-Item -ItemType Directory -Force -Path $CommonOverlaySource | Out-Null
+  Get-ChildItem -LiteralPath $CommonSourceDirectory -File -Filter '*.h' |
+    Copy-Item -Destination $CommonOverlaySource
   $WorkerObjects = Compile-Sources 'worker' $ProductionSources
   $Worker = Link-Executable 'imcodes-remote-desktop-worker' $WorkerObjects @($ProductionSdk, $LibcxxRuntimeSdk) -Windowed
 
@@ -236,6 +270,15 @@ try {
       Invoke-NativeLogged -Command { & $Executable } `
         -LogRoot $BuildRoot -Name $Test.Key
     }
+  }
+
+  # Developer/qualification machines without the release certificate or WDK
+  # can still compile the production worker and execute every native unit
+  # target. This exits before copying/signing/publishing artifacts, so its
+  # output can never be mistaken for a releasable package.
+  if ($CompileAndTestOnly) {
+    Write-Output "compile-and-test-only worker=$Worker"
+    return
   }
 
   New-Item -ItemType Directory -Force -Path $ArtifactRoot | Out-Null
@@ -315,6 +358,17 @@ try {
     ($Manifest | ConvertTo-Json -Depth 4),
     (New-Object Text.UTF8Encoding($false)))
   Write-Output "worker=$Artifact"
+  if (-not [string]::IsNullOrWhiteSpace($FltkRoot) -or
+      -not [string]::IsNullOrWhiteSpace($JsoncppRoot)) {
+    if ([string]::IsNullOrWhiteSpace($FltkRoot) -or
+        [string]::IsNullOrWhiteSpace($JsoncppRoot)) {
+      throw 'FltkRoot and JsoncppRoot must be supplied together'
+    }
+    & (Join-Path $RepositoryRoot 'native\aidesk-ui\build-ui.ps1') `
+      -FltkRoot $FltkRoot -JsoncppRoot $JsoncppRoot `
+      -ArtifactRoot (Join-Path $ArtifactRoot 'aidesk-ui')
+    if ($LASTEXITCODE -ne 0) { throw 'aiDesk UI build failed' }
+  }
 } finally {
   Remove-Item -Recurse -Force -LiteralPath $BuildRoot -ErrorAction SilentlyContinue
 }

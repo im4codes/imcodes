@@ -9,16 +9,21 @@
  * - All existing chat CSS classes
  */
 import { h } from 'preact';
-import { useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useState } from 'preact/hooks';
 import { marked, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
+import {
+  chatPathHasFileExtension,
+  findChatFileReferencesInText,
+  markdownLocalPath,
+  normalizeChatFileReference,
+  normalizeLocalMarkdownDestinations,
+} from '@shared/chat-local-path.js';
 import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { shouldSkipRichTextEnhancement } from '../chat-render-limits.js';
 import {
   isImagePreviewPath,
-  isLikelyDomainPath,
-  isLocalChatPath,
   renderChatPathActions,
   type ChatPathDownloadHandler,
 } from '../chat-path-actions.js';
@@ -30,6 +35,10 @@ import {
 
 interface Props {
   text: string;
+  /** Stable event id used with the content revision to cache parsed tokens. */
+  cacheKey?: string;
+  /** Streaming blocks are refreshed at most 10Hz; finalized blocks update immediately. */
+  streaming?: boolean;
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
   /** Called to download a file path. Only shown for paths with extensions. */
@@ -199,13 +208,14 @@ function renderToken(
       if (!inLink && splitTextByHttpUrls(t.text).some((chunk) => chunk.type === 'url')) {
         return <code key={key} class="chat-inline-code">{splitPathsAndUrlsInternal(t.text, ctx)}</code>;
       }
-      // Detect file paths inside backtick code spans — agents commonly wrap paths in backticks
-      PATH_REGEX_INLINE.lastIndex = 0;
-      if ((ctx.onPathClick || ctx.onImagePreview) && PATH_REGEX_INLINE.test(t.text)) {
-        PATH_REGEX_INLINE.lastIndex = 0;
+      // Detect complete file references inside backtick code spans — agents
+      // commonly use this old output format, including source `path:line`.
+      const codePath = normalizeChatFileReference(t.text);
+      if ((ctx.onPathClick || ctx.onImagePreview) && codePath && chatPathHasFileExtension(codePath)) {
         return renderChatPathActions({
           key,
-          path: t.text,
+          path: codePath,
+          content: t.text,
           code: true,
           onPathClick: ctx.onPathClick,
           onDownload: ctx.onDownload,
@@ -239,10 +249,11 @@ function renderToken(
 
     case 'link': {
       const t = token as Tokens.Link;
-      if (isLocalChatPath(t.href)) {
+      const path = markdownLocalPath(t.raw, t.href);
+      if (path !== null) {
         return renderChatPathActions({
           key,
-          path: t.href,
+          path,
           content: renderInlineTokens(t.tokens, ctx, true),
           onPathClick: ctx.onPathClick,
           onDownload: ctx.onDownload,
@@ -285,11 +296,12 @@ function renderToken(
 
     case 'image': {
       const t = token as Tokens.Image;
-      if (isLocalChatPath(t.href) && isImagePreviewPath(t.href)) {
+      const path = markdownLocalPath(t.raw, t.href);
+      if (path !== null && isImagePreviewPath(path)) {
         return renderChatPathActions({
           key,
-          path: t.href,
-          content: t.text || t.href,
+          path,
+          content: t.text || path,
           onPathClick: ctx.onPathClick,
           onDownload: ctx.onDownload,
           onHtmlPreview: ctx.onHtmlPreview,
@@ -377,13 +389,43 @@ function renderToken(
 
 // ── URL/Path detection (inline within text tokens) ──────────────────────────
 
-const PATH_REGEX_INLINE = /(\\\\[\w.$ -]+\\[\w.$ \\-]+|[A-Za-z]:\\(?:[\w.$ -]+\\)*[\w.$ -]+|\.{1,2}\/[\w\p{L}.\-~/]+|\/[\w\p{L}.\-~][\w\p{L}.\-~/]*|(?<![:/\w\p{L}])[a-zA-Z_~][\w\p{L}.\-~]*(?:\/[\w\p{L}.\-~]+)+)/gu;
-
 function splitPathsAndUrlsInternal(
   text: string,
   ctx: RenderContext,
 ): h.JSX.Element[] {
   if (!ctx.onPathClick && !ctx.onUrlClick && !ctx.onImagePreview) return [<span>{text}</span>];
+
+  // A complete path occupying the text/code line has an unambiguous boundary,
+  // so preserve spaces and Unicode instead of letting the inline regex stop at
+  // the first space. Prose containing a path still follows the conservative
+  // token scanner below.
+  const standaloneRaw = text.trim();
+  const standaloneMatches = findChatFileReferencesInText(standaloneRaw);
+  const standaloneMatch = standaloneMatches.length === 1
+    && standaloneMatches[0].start === 0
+    && standaloneMatches[0].end === standaloneRaw.length
+    ? standaloneMatches[0]
+    : null;
+  const standalonePath = standaloneMatch?.path ?? null;
+  if (standalonePath) {
+    const leadingLength = text.indexOf(standaloneRaw);
+    const trailingStart = leadingLength + standaloneRaw.length;
+    return [
+      ...(leadingLength > 0 ? [<span key="standalone-leading">{text.slice(0, leadingLength)}</span>] : []),
+      renderChatPathActions({
+        key: 'standalone-path',
+        path: standalonePath,
+        content: standaloneRaw,
+        onPathClick: ctx.onPathClick,
+        onDownload: ctx.onDownload,
+        onHtmlPreview: ctx.onHtmlPreview,
+        onImagePreview: ctx.onImagePreview,
+        downloadLabel: ctx.downloadLabel,
+        htmlPreviewLabel: ctx.htmlPreviewLabel,
+      }),
+      ...(trailingStart < text.length ? [<span key="standalone-trailing">{text.slice(trailingStart)}</span>] : []),
+    ];
+  }
 
   const parts: h.JSX.Element[] = [];
   const chunks = splitTextByHttpUrls(text);
@@ -402,17 +444,14 @@ function splitPathsAndUrlsInternal(
       );
     } else if (ctx.onPathClick || ctx.onImagePreview) {
       let pathLast = 0;
-      PATH_REGEX_INLINE.lastIndex = 0;
-      let pm: RegExpExecArray | null;
-      while ((pm = PATH_REGEX_INLINE.exec(chunk.value)) !== null) {
-        const path = pm[1];
-        if (path.length < 3) continue;
-        if (isLikelyDomainPath(path)) continue;
-        if (pm.index > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, pm.index)}</span>);
+      for (const match of findChatFileReferencesInText(chunk.value)) {
+        const { path } = match;
+        if (match.start > pathLast) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast, match.start)}</span>);
         parts.push(
           renderChatPathActions({
-            key: `p${chunk.start + pm.index}`,
+            key: `p${chunk.start + match.start}`,
             path,
+            content: match.raw,
             onPathClick: ctx.onPathClick,
             onDownload: ctx.onDownload,
             onHtmlPreview: ctx.onHtmlPreview,
@@ -421,7 +460,7 @@ function splitPathsAndUrlsInternal(
             htmlPreviewLabel: ctx.htmlPreviewLabel,
           }),
         );
-        pathLast = pm.index + pm[0].length;
+        pathLast = match.end;
       }
       if (pathLast < chunk.value.length) parts.push(<span key={`t${chunk.start + pathLast}`}>{chunk.value.slice(pathLast)}</span>);
     } else {
@@ -434,12 +473,71 @@ function splitPathsAndUrlsInternal(
 
 // ── Public component ────────────────────────────────────────────────────────
 
-export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
+interface CachedTokens {
+  text: string;
+  tokens: Token[];
+}
+
+const markdownTokenCache = new Map<string, CachedTokens>();
+const MARKDOWN_CACHE_LIMIT = 512;
+
+function markdownRevision(text: string): string {
+  // Fast deterministic content revision; event ids remain the primary key.
+  let hash = 2166136261;
+  for (let i = 0; i < text.length; i += 1) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return `${text.length}:${hash >>> 0}`;
+}
+
+export function __resetChatMarkdownCacheForTests(): void {
+  markdownTokenCache.clear();
+}
+
+export function __getChatMarkdownCacheSizeForTests(): number {
+  return markdownTokenCache.size;
+}
+
+function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
+  const normalized = normalizeLocalMarkdownDestinations(text);
+  const key = cacheKey ? `${cacheKey}:${markdownRevision(normalized)}` : `text:${markdownRevision(normalized)}`;
+  const hit = markdownTokenCache.get(key);
+  if (hit && hit.text === normalized) {
+    markdownTokenCache.delete(key);
+    markdownTokenCache.set(key, hit);
+    return hit.tokens;
+  }
+  const tokens = marked.lexer(normalized);
+  markdownTokenCache.set(key, { text: normalized, tokens });
+  while (markdownTokenCache.size > MARKDOWN_CACHE_LIMIT) {
+    const oldest = markdownTokenCache.keys().next().value;
+    if (oldest === undefined) break;
+    markdownTokenCache.delete(oldest);
+  }
+  return tokens;
+}
+
+export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
   const { t } = useTranslation();
+  // Keep raw streaming text live immediately, while limiting the expensive
+  // markdown lex/AST refresh to 10Hz. Finalized text bypasses the timer.
+  const [parsedText, setParsedText] = useState(text);
+  useEffect(() => {
+    if (!streaming) {
+      setParsedText(text);
+      return undefined;
+    }
+    const timer = window.setTimeout(() => setParsedText(text), 100);
+    return () => window.clearTimeout(timer);
+  }, [text, streaming]);
   const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
+  // Final/non-streaming updates must be visible in the same render. Streaming
+  // blocks may use the throttled snapshot until the next refresh tick.
+  const effectiveParsedText = streaming ? parsedText : text;
   const tokens = useMemo(() => (
-    skipRichTextEnhancement ? [] : marked.lexer(text)
-  ), [skipRichTextEnhancement, text]);
+    skipRichTextEnhancement ? [] : parseMarkdownTokens(effectiveParsedText, cacheKey)
+  ), [skipRichTextEnhancement, effectiveParsedText, cacheKey]);
   const renderContext = useMemo<RenderContext>(() => ({
     onPathClick,
     onUrlClick,
@@ -452,6 +550,14 @@ export function ChatMarkdown({ text, onPathClick, onUrlClick, onDownload, onHtml
   }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
 
   if (skipRichTextEnhancement) {
+    return (
+      <div class="chat-rich-text">
+        <span>{text}</span>
+      </div>
+    );
+  }
+
+  if (streaming && parsedText !== text) {
     return (
       <div class="chat-rich-text">
         <span>{text}</span>

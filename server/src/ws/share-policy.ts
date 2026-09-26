@@ -10,6 +10,7 @@ import { isP2pSavedConfig, sanitizeP2pSavedConfig } from '../../../shared/p2p-mo
 import { collectRoutedSessionNames } from '../../../shared/p2p-routing-fields.js';
 import {
   SHARE_BROWSER_COMMANDS,
+  isSharedServerParticipant,
   rawSubSessionIdFromDisplayName,
   getShareScopedCommandPolicy,
   shareTargetKey,
@@ -28,6 +29,16 @@ import {
 } from '../../../shared/direct-file-transfer.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
+import { CC_PRESET_MSG } from '../../../shared/cc-presets.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
+import { SESSION_GROUP_CLONE_MSG } from '../../../shared/session-group-clone.js';
+import {
+  projectSharedSessionSupervisionMode,
+  SUPERVISION_MODE_PROJECTION_KEY,
+} from '../../../shared/supervision-config.js';
+import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
+import { isDirectConnectivityRuntimeStatus } from '../../../shared/direct-file-transfer.js';
+import type { ProviderQuotaMeta, ProviderQuotaWindow } from '../../../shared/provider-quota.js';
 
 export { shareTargetKey };
 export type { EffectiveCoverage, ShareTarget };
@@ -51,6 +62,8 @@ export type ShareScopedSocketState = {
   actorDisplayName: string;
   ticketId: string;
   target: ShareTarget;
+  /** Original ticket target; target may be widened while a server grant is active. */
+  requestedTarget?: ShareTarget;
   snapshot: ShareAuthorizationSnapshot;
   connectedAt: number;
   coveredSessionNames?: readonly string[];
@@ -72,14 +85,18 @@ export type ShareCommandDecision =
 
 type ShareCommandPolicy =
   | { kind: 'allow-covered-read'; requireTarget: boolean }
+  | { kind: 'allow-main-covered-read' }
   | { kind: 'participant-covered-action' }
   | { kind: 'participant-bound-action' }
   | { kind: 'participant-discussion-start' }
   | { kind: 'participant-send' }
   | { kind: 'participant-model-switch' }
   | { kind: 'participant-model-list' }
+  | { kind: 'participant-preset-list' }
   | { kind: 'participant-p2p-config-save' }
   | { kind: 'participant-cancel' }
+  /** Owner-equivalent only for a whole-server participant, never a tab share. */
+  | { kind: 'server-participant-action' }
   /** An inert lease contains no file authority and is deliberately role-neutral. */
   | { kind: 'direct-file-lease' }
   /** Direction selects FILE_WRITE (upload) or FILE_READ (preview download). */
@@ -120,6 +137,12 @@ const SHARE_MODEL_CATALOG_AGENT_TYPES = new Set([
   'kimi-sdk',
   'deepseek-harness',
   'pi',
+  'qwen',
+]);
+
+const SHARE_PRESET_MODEL_CATALOG_AGENT_TYPES = new Set([
+  'claude-code-sdk',
+  'qwen',
 ]);
 
 function denyFromShared(sharedCommand: string): ShareCommandPolicy {
@@ -147,9 +170,16 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: OPENSPEC_AUTO_DELIVER_MSG.STOP, sharedCommand: SHARE_BROWSER_COMMANDS.OPENSPEC_CONTROL, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'session.send', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_SEND, policy: { kind: 'participant-send' } },
+  { bridgeCommand: SESSION_GROUP_CLONE_MSG.START, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_GROUP_CLONE, policy: { kind: 'server-participant-action' } },
+  { bridgeCommand: SESSION_GROUP_CLONE_MSG.CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_GROUP_CLONE, policy: { kind: 'server-participant-action' } },
   { bridgeCommand: 'subsession.set_model', sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_SWITCH, policy: { kind: 'participant-model-switch' } },
   { bridgeCommand: TRANSPORT_MSG.LIST_MODELS, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_MODEL_LIST, policy: { kind: 'participant-model-list' } },
+  { bridgeCommand: CC_PRESET_MSG.LIST, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_PRESET_LIST, policy: { kind: 'participant-preset-list' } },
+  { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
+  { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.ACK, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
+  { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
   { bridgeCommand: 'fs.read', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_READ, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -210,6 +240,13 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
 ];
 
 function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntry): void {
+  if (entry.policy.kind === 'server-participant-action') {
+    const sharedPolicy = getShareScopedCommandPolicy(entry.sharedCommand);
+    if (sharedPolicy.disposition !== 'deny') {
+      throw new Error(`Whole-server-only command ${entry.sharedCommand} must remain denied to tab shares`);
+    }
+    return;
+  }
   if (entry.policy.kind === 'deny') return;
   const sharedPolicy = getShareScopedCommandPolicy(entry.sharedCommand);
   if (sharedPolicy.disposition !== 'allow') {
@@ -218,6 +255,12 @@ function assertShareCommandInventoryEntry(entry: ShareBridgeCommandInventoryEntr
   if (entry.policy.kind === 'allow-covered-read') {
     if (entry.policy.requireTarget !== (sharedPolicy.scope === 'concrete-tab')) {
       throw new Error(`Share WS command ${entry.bridgeCommand} target requirement does not match shared policy`);
+    }
+    return;
+  }
+  if (entry.policy.kind === 'allow-main-covered-read') {
+    if (sharedPolicy.scope !== 'concrete-tab' || sharedPolicy.minRole !== undefined) {
+      throw new Error(`Task console read ${entry.bridgeCommand} must be a viewer-readable concrete-tab policy`);
     }
     return;
   }
@@ -264,9 +307,19 @@ type DaemonMessagePolicy = {
    * sessions the receiving socket may have no share for at all.
    */
   scopesServerTargetInRedact?: true;
+  /** Task-console authority is visible only through an exact MAIN tab share. */
+  mainShareOnly?: true;
 };
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessagePolicy>([
+  ['daemon.stats', {
+    target: serverFieldTarget,
+    redact: redactDaemonStatsForParticipant,
+    // Stats contain no session transcript and are rebuilt from a strict
+    // allowlist below, so a concrete tab participant may see the same status
+    // bar as the owner without gaining whole-server session visibility.
+    scopesServerTargetInRedact: true,
+  }],
   ['terminal.diff', { target: terminalDiffTarget }],
   ['terminal_update', { target: terminalUpdateTarget }],
   ['terminal.stream_reset', { target: sessionFieldTarget }],
@@ -278,11 +331,15 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['command.ack', { target: sessionFieldTarget, redact: redactActiveDispatchForViewers }],
   ['command.failed', { target: sessionFieldTarget }],
   ['subsession.response', { target: sessionNameFieldTarget }],
-  ['subsession.created', { target: subsessionCreatedTarget }],
+  ['subsession.created', { target: subsessionCreatedTarget, redact: redactSubsessionCreated }],
   ['subsession.removed', { target: subsessionRemovedTarget }],
   ['timeline.event', {
     target: timelineEventTarget,
   }],
+  [SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.DELTA, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
     redact: redactTransportHistory,
@@ -290,6 +347,10 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   [TRANSPORT_MSG.MODELS_RESPONSE, {
     target: sessionNameFieldTarget,
     redact: redactParticipantModelCatalog,
+  }],
+  [CC_PRESET_MSG.LIST_RESPONSE, {
+    target: sessionNameFieldTarget,
+    redact: redactParticipantPresetCatalog,
   }],
   ['chat.delta', { target: sessionIdFieldTarget }],
   ['chat.complete', { target: sessionIdFieldTarget }],
@@ -372,7 +433,11 @@ export function buildSharedActorEnvelope(
     primaryShareId: state.snapshot.primaryShareId,
     effectiveActorRole: state.snapshot.effectiveRole,
     actionId,
-    origin: state.target.kind === 'server' ? 'shared-server' : 'shared-tab',
+    origin: isSharedServerParticipant(
+      state.target,
+      state.snapshot.effectiveRole,
+      state.snapshot.serverParticipantAuthority,
+    ) ? 'shared-server' : 'shared-tab',
     authorizedAt: state.snapshot.authorizedAt,
     queuedAt: now,
   };
@@ -388,16 +453,71 @@ export function evaluateShareCommand(input: {
   const type = typeof input.msg.type === 'string' ? input.msg.type : '';
   const policy = SHARE_SCOPED_COMMAND_POLICY.get(type);
   if (!policy) return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
-  if (policy.kind === 'deny') return { allowed: false, reason: policy.reason };
+  // A whole-server participant is an owner-equivalent delegated operator for
+  // every *registered* daemon command. Unknown commands still fail closed,
+  // while tab-share participants continue through the narrower policy below.
+  // Sharing/grant management is HTTP-only and is intentionally never present
+  // in this bridge inventory.
+  const serverParticipant = isSharedServerParticipant(
+    input.state.target,
+    input.state.snapshot.effectiveRole,
+    input.state.snapshot.serverParticipantAuthority,
+  );
+  if (policy.kind === 'server-participant-action') {
+    if (!serverParticipant) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    const actionId = typeof input.msg.idempotencyKey === 'string' && input.msg.idempotencyKey.trim()
+      ? input.msg.idempotencyKey.trim()
+      : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
+        ? input.msg.commandId.trim()
+        : `share-action-${input.now}`;
+    return {
+      allowed: true,
+      stampedMessage: {
+        ...input.msg,
+        sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
+      },
+    };
+  }
+  if (policy.kind === 'deny') {
+    if (!serverParticipant) return { allowed: false, reason: policy.reason };
+    const actionId = typeof input.msg.actionId === 'string' && input.msg.actionId.trim()
+      ? input.msg.actionId.trim()
+      : typeof input.msg.commandId === 'string' && input.msg.commandId.trim()
+        ? input.msg.commandId.trim()
+        : `share-action-${input.now}`;
+    return {
+      allowed: true,
+      stampedMessage: {
+        ...input.msg,
+        sharedActor: buildSharedActorEnvelope(input.state, actionId, input.now),
+      },
+    };
+  }
 
   const sessionName = commandSessionName(input.msg);
+  // A whole-server participant covers every session on the server, including
+  // ones that do not exist yet. Commands that carry no session at all -- the
+  // new-session dialog's directory picker (fs.ls), its preset and model lists,
+  // creating a folder there -- are therefore covered for them exactly as for
+  // the owner. Tab-share participants and viewers still need a covered target.
+  const targetlessCoveredForServerParticipant = serverParticipant && !sessionName;
   if (policy.kind === 'allow-covered-read') {
     if (!sessionName) {
-      return policy.requireTarget
+      return policy.requireTarget && !targetlessCoveredForServerParticipant
         ? { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED }
         : { allowed: true };
     }
     return shareStateCoversSession(input.state, sessionName)
+      ? { allowed: true }
+      : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+  }
+  if (policy.kind === 'allow-main-covered-read') {
+    if (serverParticipant && sessionName) return { allowed: true };
+    return input.state.target.kind === 'main'
+      && !!sessionName
+      && input.state.target.sessionName === sessionName
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
@@ -420,7 +540,8 @@ export function evaluateShareCommand(input: {
     if (direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
-    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+    if (!targetlessCoveredForServerParticipant
+      && (!sessionName || !shareStateCoversSession(input.state, sessionName))) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
     // Preview download is FILE_READ: viewers with covered scope may use it.
@@ -443,7 +564,7 @@ export function evaluateShareCommand(input: {
   }
 
   if (policy.kind === 'participant-covered-action') {
-    return sessionName && shareStateCoversSession(input.state, sessionName)
+    return targetlessCoveredForServerParticipant || (sessionName && shareStateCoversSession(input.state, sessionName))
       ? { allowed: true }
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
@@ -464,7 +585,8 @@ export function evaluateShareCommand(input: {
   }
 
   if (policy.kind === 'participant-model-list') {
-    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+    if (!targetlessCoveredForServerParticipant
+      && (!sessionName || !shareStateCoversSession(input.state, sessionName))) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
     const agentType = typeof input.msg.agentType === 'string' ? input.msg.agentType.trim() : '';
@@ -472,14 +594,46 @@ export function evaluateShareCommand(input: {
     if (!SHARE_MODEL_CATALOG_AGENT_TYPES.has(agentType) || !requestId || requestId.length > 256) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
+    const ccPreset = typeof input.msg.ccPreset === 'string' ? input.msg.ccPreset.trim() : '';
+    if (ccPreset && (!SHARE_PRESET_MODEL_CATALOG_AGENT_TYPES.has(agentType) || ccPreset.length > 256)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
     return {
       allowed: true,
       stampedMessage: {
         type: TRANSPORT_MSG.LIST_MODELS,
-        sessionName,
+        ...(sessionName ? { sessionName } : {}),
         agentType,
         requestId,
+        ...(ccPreset ? { ccPreset } : {}),
         ...(input.msg.force === true ? { force: true } : {}),
+      },
+    };
+  }
+
+  if (policy.kind === 'participant-preset-list') {
+    const requestId = typeof input.msg.requestId === 'string' ? input.msg.requestId.trim() : '';
+    if (targetlessCoveredForServerParticipant) {
+      // The owner's own sessionless form (new-session dialog): the account's
+      // preset list, optionally correlated by requestId.
+      if (requestId.length > 256) return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+      return {
+        allowed: true,
+        stampedMessage: { type: CC_PRESET_MSG.LIST, ...(requestId ? { requestId } : {}) },
+      };
+    }
+    if (!sessionName || !shareStateCoversSession(input.state, sessionName)) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    if (!requestId || requestId.length > 256) {
+      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    }
+    return {
+      allowed: true,
+      stampedMessage: {
+        type: CC_PRESET_MSG.LIST,
+        sessionName,
+        requestId,
       },
     };
   }
@@ -587,6 +741,13 @@ export function commandSessionName(msg: Record<string, unknown>): string | null 
     const value = msg[key];
     if (typeof value === 'string' && value.trim()) return value.trim();
   }
+  const scope = msg.scope;
+  if (scope && typeof scope === 'object' && !Array.isArray(scope)) {
+    const coordinatorSessionName = (scope as Record<string, unknown>).coordinatorSessionName;
+    if (typeof coordinatorSessionName === 'string' && coordinatorSessionName.trim()) {
+      return coordinatorSessionName.trim();
+    }
+  }
   return null;
 }
 
@@ -631,6 +792,7 @@ export function filterShareDaemonMessage(
   if (!policy) return null;
   const target = policy.target(msg);
   if (!target) return null;
+  if (policy.mainShareOnly && state.target.kind !== 'main') return null;
   if (target.serverId && target.serverId !== state.target.serverId) return null;
   if (target.kind === 'server') {
     // A server-scoped target names no session, so per-session coverage cannot
@@ -696,13 +858,23 @@ function normalizeSnapshot(value: unknown, expectedServerId: string): ShareAutho
     ? record.coveringShareIds.filter((item): item is string => typeof item === 'string')
     : [];
   const primaryShareId = typeof record.primaryShareId === 'string' ? record.primaryShareId : null;
+  const serverParticipantAuthority = record.serverParticipantAuthority === true;
   if (effectiveRole !== 'viewer' && effectiveRole !== 'participant') return null;
   if (typeof historyCutoffAt !== 'number' || !Number.isFinite(historyCutoffAt)) return null;
   if (typeof authorizedAt !== 'number' || !Number.isFinite(authorizedAt)) return null;
   if (nextCoverageRecheckAt !== null && (typeof nextCoverageRecheckAt !== 'number' || !Number.isFinite(nextCoverageRecheckAt))) {
     return null;
   }
-  return { target, effectiveRole, historyCutoffAt, nextCoverageRecheckAt, coveringShareIds, primaryShareId, authorizedAt };
+  return {
+    target,
+    effectiveRole,
+    serverParticipantAuthority,
+    historyCutoffAt,
+    nextCoverageRecheckAt,
+    coveringShareIds,
+    primaryShareId,
+    authorizedAt,
+  };
 }
 
 function parseSubSessionName(sessionName: string): string | null {
@@ -749,6 +921,16 @@ function timelineEventTarget(msg: Record<string, unknown>): ShareTarget | null {
   const event = msg.event && typeof msg.event === 'object' ? msg.event as Record<string, unknown> : null;
   const sessionId = typeof event?.sessionId === 'string' ? event.sessionId : '';
   return sessionId ? sessionNameToShareTarget('', sessionId) : null;
+}
+
+function supervisionTaskConsoleTarget(msg: Record<string, unknown>): ShareTarget | null {
+  const scope = msg.scope && typeof msg.scope === 'object' && !Array.isArray(msg.scope)
+    ? msg.scope as Record<string, unknown>
+    : null;
+  const coordinatorSessionName = typeof scope?.coordinatorSessionName === 'string'
+    ? scope.coordinatorSessionName.trim()
+    : '';
+  return coordinatorSessionName ? sessionNameToShareTarget('', coordinatorSessionName) : null;
 }
 
 function sharedActorTarget(msg: Record<string, unknown>): ShareTarget | null {
@@ -813,6 +995,69 @@ function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | nu
   return subsessionCreatedTarget(msg);
 }
 
+function redactDaemonStatsForParticipant(
+  msg: Record<string, unknown>,
+  state: ShareScopedSocketState,
+): Record<string, unknown> | null {
+  if (state.snapshot.effectiveRole !== 'participant') return null;
+
+  // The status strip needs only operational health. Rebuild the frame instead
+  // of forwarding arbitrary daemon fields so a future token/secret field can
+  // never become visible merely because daemon.stats was expanded upstream.
+  const redacted: Record<string, unknown> = { type: 'daemon.stats' };
+  for (const key of ['daemonVersion', 'cpu', 'memUsed', 'memTotal', 'load1', 'load5', 'load15', 'uptime']) {
+    const value = msg[key];
+    if (typeof value === 'number' || typeof value === 'string' || value === null) {
+      redacted[key] = value;
+    }
+  }
+
+  // A session share gets the status bar without server diagnostics. A server
+  // participant is owner-equivalent for operational status and receives only
+  // an independently rebuilt diagnostic projection. Do not trust the upstream
+  // bridge as the sole validator: this policy is also an authority boundary,
+  // and a future producer must not smuggle new nested fields through it.
+  if (state.target.kind === 'server') {
+    if (isEmbeddingStatus(msg.embedding)) {
+      redacted.embedding = { state: msg.embedding.state, reason: msg.embedding.reason };
+    }
+    if (Array.isArray(msg.disks)) {
+      redacted.disks = msg.disks.flatMap((value) => {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+        const disk = value as Record<string, unknown>;
+        if (typeof disk.mount !== 'string'
+          || typeof disk.totalBytes !== 'number'
+          || typeof disk.usedBytes !== 'number'
+          || typeof disk.usedPercent !== 'number') return [];
+        return [{
+          mount: disk.mount,
+          totalBytes: disk.totalBytes,
+          usedBytes: disk.usedBytes,
+          usedPercent: disk.usedPercent,
+        }];
+      });
+    }
+    if (msg.shortRefHealth && typeof msg.shortRefHealth === 'object' && !Array.isArray(msg.shortRefHealth)) {
+      const health = msg.shortRefHealth as Record<string, unknown>;
+      if (typeof health.stage === 'string'
+        && typeof health.failures === 'number'
+        && typeof health.lastFailureAt === 'number') {
+        // `lastError` is arbitrary host text and is not needed by the status
+        // panel's health indicator, so it stays owner-only.
+        redacted.shortRefHealth = {
+          stage: health.stage,
+          failures: health.failures,
+          lastFailureAt: health.lastFailureAt,
+        };
+      }
+    }
+    if (isDirectConnectivityRuntimeStatus(msg.directConnectivity)) {
+      redacted.directConnectivity = { ...msg.directConnectivity };
+    }
+  }
+  return redacted;
+}
+
 /**
  * The only session-row fields a share recipient sees: enough to identify and
  * follow the conversation, and nothing describing the host machine or the
@@ -826,17 +1071,24 @@ function subsessionRemovedTarget(msg: Record<string, unknown>): ShareTarget | nu
  * field, not to whoever reads this. Adding a field to the session list now
  * keeps it hidden from shares until someone deliberately names it here.
  *
- * Deliberately absent: `projectDir` (absolute host path), `transportConfig`
- * (provider blob that can carry env and endpoints), `providerId` /
+ * `projectDir` is deliberately visible: it identifies the shared project's
+ * working tree and is required for OpenSpec and project-scoped file actions.
+ * Deliberately absent: `transportConfig` (provider blob that can carry env and
+ * endpoints), `providerId` /
  * `providerSessionId`, every `*AuthType` / `*AuthLimit` / `*AvailableModels`,
- * `planLabel`, `permissionLabel`, `quota*`, `contextNamespace*`, `effort`,
+ * `planLabel`, `permissionLabel`, `contextNamespace*`, `effort`,
  * `ccPreset`, `requestedModel`.
+ *
+ * Participant shares receive only the bounded display projection of `quota*`
+ * below. Quota percentages/reset clocks are already user-facing session
+ * telemetry; provider/account configuration and credit balances remain hidden.
  */
 const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'name',
   'sessionInstanceId',
   'runtimeEpoch',
   'project',
+  'projectDir',
   'role',
   'agentType',
   'agentVersion',
@@ -848,15 +1100,107 @@ const SHARE_VISIBLE_SESSION_FIELDS = new Set([
   'error',
   'activeModel',
   'modelDisplay',
+  'supervisionHeartbeat',
 ]);
 
-function redactSessionRow(row: Record<string, unknown>, includeActiveDispatch: boolean): Record<string, unknown> {
+const SHARE_PROVIDER_QUOTA_TEXT_MAX_CHARS = 1_024;
+
+function projectProviderQuotaWindow(value: unknown): ProviderQuotaWindow | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const usedPercent = typeof raw.usedPercent === 'number' && Number.isFinite(raw.usedPercent)
+    ? Math.max(0, Math.min(100, raw.usedPercent))
+    : undefined;
+  const windowDurationMins = typeof raw.windowDurationMins === 'number'
+    && Number.isFinite(raw.windowDurationMins)
+    && raw.windowDurationMins > 0
+    ? raw.windowDurationMins
+    : undefined;
+  const resetsAt = typeof raw.resetsAt === 'number' && Number.isFinite(raw.resetsAt) && raw.resetsAt > 0
+    ? raw.resetsAt
+    : undefined;
+  if (usedPercent === undefined && windowDurationMins === undefined && resetsAt === undefined) return undefined;
+  return {
+    ...(usedPercent !== undefined ? { usedPercent } : {}),
+    ...(windowDurationMins !== undefined ? { windowDurationMins } : {}),
+    ...(resetsAt !== undefined ? { resetsAt } : {}),
+  };
+}
+
+function projectProviderQuotaMeta(value: unknown): ProviderQuotaMeta | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined;
+  const raw = value as Record<string, unknown>;
+  const primary = projectProviderQuotaWindow(raw.primary);
+  const secondary = projectProviderQuotaWindow(raw.secondary);
+  if (!primary && !secondary) return undefined;
+  return {
+    ...(primary ? { primary } : {}),
+    ...(secondary ? { secondary } : {}),
+  };
+}
+
+function projectQuotaText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const normalized = value.trim();
+  return normalized && normalized.length <= SHARE_PROVIDER_QUOTA_TEXT_MAX_CHARS
+    ? normalized
+    : undefined;
+}
+
+function projectParticipantProviderQuota(row: Record<string, unknown>): Record<string, unknown> {
+  const quotaLabel = projectQuotaText(row.quotaLabel);
+  const quotaUsageLabel = projectQuotaText(row.quotaUsageLabel);
+  const quotaMeta = projectProviderQuotaMeta(row.quotaMeta);
+  return {
+    ...(quotaLabel ? { quotaLabel } : {}),
+    ...(quotaUsageLabel ? { quotaUsageLabel } : {}),
+    ...(quotaMeta ? { quotaMeta } : {}),
+  };
+}
+
+function redactSessionRow(row: Record<string, unknown>, includeParticipantFields: boolean): Record<string, unknown> {
   const redacted: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(row)) {
     if (SHARE_VISIBLE_SESSION_FIELDS.has(key)) redacted[key] = value;
   }
-  if (includeActiveDispatch && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
+  if (includeParticipantFields && Object.prototype.hasOwnProperty.call(row, 'activeDispatchId')) {
     redacted.activeDispatchId = row.activeDispatchId;
+  }
+  if (includeParticipantFields) Object.assign(redacted, projectParticipantProviderQuota(row));
+  const supervisionMode = projectSharedSessionSupervisionMode(row.transportConfig);
+  if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
+  return redacted;
+}
+
+const SHARE_VISIBLE_SUBSESSION_FIELDS = new Set([
+  'type',
+  'id',
+  'sessionName',
+  'sessionInstanceId',
+  'runtimeEpoch',
+  'sessionType',
+  'cwd',
+  'label',
+  'parentSession',
+  'runtimeType',
+  'state',
+  'activeModel',
+  'modelDisplay',
+  'supervisionHeartbeat',
+]);
+
+function redactSubsessionCreated(
+  msg: Record<string, unknown>,
+  state: ShareScopedSocketState,
+): Record<string, unknown> {
+  const redacted: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(msg)) {
+    if (SHARE_VISIBLE_SUBSESSION_FIELDS.has(key)) redacted[key] = value;
+  }
+  const supervisionMode = projectSharedSessionSupervisionMode(msg.transportConfig);
+  if (supervisionMode) redacted[SUPERVISION_MODE_PROJECTION_KEY] = supervisionMode;
+  if (state.snapshot.effectiveRole === 'participant') {
+    Object.assign(redacted, projectParticipantProviderQuota(msg));
   }
   return redacted;
 }
@@ -886,7 +1230,76 @@ function redactTransportHistory(msg: Record<string, unknown>, _state: ShareScope
 }
 
 function redactParticipantModelCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
-  return state.snapshot.effectiveRole === 'participant' ? msg : null;
+  if (state.snapshot.effectiveRole !== 'participant') return null;
+  const models = Array.isArray(msg.models) ? msg.models : [];
+  return {
+    type: TRANSPORT_MSG.MODELS_RESPONSE,
+    ...(typeof msg.sessionName === 'string' ? { sessionName: msg.sessionName } : {}),
+    ...(typeof msg.agentType === 'string' ? { agentType: msg.agentType } : {}),
+    ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}),
+    ...(typeof msg.ccPreset === 'string' ? { ccPreset: msg.ccPreset } : {}),
+    models: models.flatMap((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+      const model = value as Record<string, unknown>;
+      const id = typeof model.id === 'string' ? model.id.trim() : '';
+      if (!id || id.length > 256) return [];
+      const name = typeof model.name === 'string' ? model.name.trim() : '';
+      return [{
+        id,
+        ...(name && name.length <= 256 ? { name } : {}),
+        ...(typeof model.supportsReasoningEffort === 'boolean'
+          ? { supportsReasoningEffort: model.supportsReasoningEffort }
+          : {}),
+      }];
+    }),
+    ...(typeof msg.defaultModel === 'string' && msg.defaultModel.trim().length <= 256
+      ? { defaultModel: msg.defaultModel.trim() }
+      : {}),
+    ...(typeof msg.isAuthenticated === 'boolean' ? { isAuthenticated: msg.isAuthenticated } : {}),
+  };
+}
+
+function redactParticipantPresetCatalog(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {
+  if (state.snapshot.effectiveRole !== 'participant') return null;
+  const presets = Array.isArray(msg.presets) ? msg.presets : [];
+  return {
+    type: CC_PRESET_MSG.LIST_RESPONSE,
+    ...(typeof msg.requestId === 'string' ? { requestId: msg.requestId } : {}),
+    ...(typeof msg.sessionName === 'string' ? { sessionName: msg.sessionName } : {}),
+    presets: presets.flatMap((value) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) return [];
+      const preset = value as Record<string, unknown>;
+      const name = typeof preset.name === 'string' ? preset.name.trim() : '';
+      if (!name || name.length > 256) return [];
+      const availableModels = Array.isArray(preset.availableModels)
+        ? preset.availableModels.flatMap((model) => {
+            if (!model || typeof model !== 'object' || Array.isArray(model)) return [];
+            const entry = model as Record<string, unknown>;
+            const id = typeof entry.id === 'string' ? entry.id.trim() : '';
+            if (!id || id.length > 256) return [];
+            const modelName = typeof entry.name === 'string' ? entry.name.trim() : '';
+            return [{ id, ...(modelName && modelName.length <= 256 ? { name: modelName } : {}) }];
+          })
+        : [];
+      const env = preset.env && typeof preset.env === 'object' && !Array.isArray(preset.env)
+        ? preset.env as Record<string, unknown>
+        : {};
+      const defaultModel = (
+        typeof preset.defaultModel === 'string' ? preset.defaultModel
+          : typeof env.ANTHROPIC_MODEL === 'string' ? env.ANTHROPIC_MODEL
+            : typeof env.OPENAI_MODEL === 'string' ? env.OPENAI_MODEL
+              : ''
+      ).trim();
+      return [{
+        name,
+        // Preserve the existing browser contract without exposing any owner
+        // environment values, endpoints, API keys, or other preset metadata.
+        env: {},
+        ...(availableModels.length > 0 ? { availableModels } : {}),
+        ...(defaultModel && defaultModel.length <= 256 ? { defaultModel } : {}),
+      }];
+    }),
+  };
 }
 
 function redactActiveDispatchForViewers(msg: Record<string, unknown>, state: ShareScopedSocketState): Record<string, unknown> | null {

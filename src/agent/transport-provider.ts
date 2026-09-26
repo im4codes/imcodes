@@ -11,8 +11,13 @@
  */
 
 import type { AgentMessage, MessageDelta, ToolCallEvent } from '../../shared/agent-message.js';
+import type { NativeAgentAdmissionMode, NativeAgentFence, NativeCollaborationGate } from '../../shared/native-collaboration-policy.js';
+
+/** Must the IM.codes session behind this provider session run with native agent tools withheld? */
+export type NativeAgentFenceResolver = (providerSessionId: string, sessionName?: string) => boolean;
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
+import type { ProviderLimitSignal } from '../../shared/delegation-availability.js';
 import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
 import type { MemoryMcpProviderStatusView } from '../../shared/memory-ws.js';
@@ -27,6 +32,7 @@ import type {
   ProviderSupportClass,
   SharedScopePolicyOverride,
 } from '../../shared/context-types.js';
+import type { CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
 import {
   SDK_TURN_LOST_RECOVERY_REASON as SHARED_SDK_TURN_LOST_RECOVERY_REASON,
   isSdkTurnLostRecoveryPhase as isSharedSdkTurnLostRecoveryPhase,
@@ -58,19 +64,15 @@ export const SESSION_OWNERSHIP = {
   SHARED:   'shared',
 } as const;
 
-/** Common provider error codes. Import instead of hardcoding. */
-export const PROVIDER_ERROR_CODES = {
-  AUTH_FAILED:      'AUTH_FAILED',
-  CONFIG_ERROR:     'CONFIG_ERROR',
-  CONNECTION_LOST:  'CONNECTION_LOST',
-  SESSION_NOT_FOUND:'SESSION_NOT_FOUND',
-  RATE_LIMITED:     'RATE_LIMITED',
-  PROVIDER_ERROR:   'PROVIDER_ERROR',
-  CANCELLED:        'CANCELLED',
-  PARSE_ERROR:      'PARSE_ERROR',
-  PROVIDER_NOT_FOUND:'PROVIDER_NOT_FOUND',
-  SDK_TURN_LOST:    'SDK_TURN_LOST',
-} as const;
+/**
+ * Common provider error codes. Import instead of hardcoding.
+ *
+ * Defined in `shared/` so shared supervision code can classify provider
+ * failures without depending on the agent layer; re-exported here so every
+ * existing importer keeps working unchanged.
+ */
+import { PROVIDER_ERROR_CODES } from '../../shared/provider-error-codes.js';
+export { PROVIDER_ERROR_CODES, type ProviderErrorCode } from '../../shared/provider-error-codes.js';
 
 /** Why the runtime asked a provider to stop its active turn. */
 export const PROVIDER_CANCEL_ORIGINS = {
@@ -83,6 +85,8 @@ export const PROVIDER_CANCEL_ORIGINS = {
 export const PROVIDER_ACTIVE_TURN_DELIVERY_KINDS = {
   DELEGATION_REPLY: 'delegation_reply',
   QUEUED_MESSAGE: 'queued_message',
+  /** Direct node-to-node MCP append; never entered the ordinary pending FIFO. */
+  MCP_MESSAGE: 'mcp_message',
 } as const;
 
 // ── Derived types ───────────────────────────────────────────────────────────
@@ -94,7 +98,6 @@ export type ConnectionMode = typeof CONNECTION_MODES[keyof typeof CONNECTION_MOD
 export type SessionOwnership = typeof SESSION_OWNERSHIP[keyof typeof SESSION_OWNERSHIP];
 
 /** Error code from a provider operation. */
-export type ProviderErrorCode = typeof PROVIDER_ERROR_CODES[keyof typeof PROVIDER_ERROR_CODES];
 export type ProviderCancelOrigin = typeof PROVIDER_CANCEL_ORIGINS[keyof typeof PROVIDER_CANCEL_ORIGINS];
 export type ProviderActiveTurnDeliveryKind =
   typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS[keyof typeof PROVIDER_ACTIVE_TURN_DELIVERY_KINDS];
@@ -197,6 +200,33 @@ export interface ProviderCompactCapability {
   cancellation: ProviderCompactCancellation;
   /** Human-readable reason for unsupported or unverified behavior. */
   reason?: string;
+  /**
+   * After a compaction the provider re-sends the complete session system text
+   * (merged user/project/session identity, runtime instructions) outside the
+   * compacted history, so no summary can drop or paraphrase it. Required before
+   * the daemon compacts a session on its own (automatic compaction).
+   */
+  reassertsSessionSystemText?: boolean;
+}
+
+/**
+ * Proof-backed provider acceptance for a caller-supplied stable delivery id.
+ *
+ * This is intentionally structured rather than a generic boolean: consumers
+ * may rely on it only when the adapter proves that the same id is accepted at
+ * most once across a daemon/provider-client restart. Runtime type, provider
+ * name, queue support, or the mere presence of a delivery id are not proof.
+ */
+export interface ProviderRestartDurableDeliveryIdCapability {
+  restartDurable: true;
+  replayAfterAcceptance: 'deduplicated';
+}
+
+export function hasRestartDurableDeliveryIdAcceptance(
+  capability: ProviderRestartDurableDeliveryIdCapability | undefined,
+): capability is ProviderRestartDurableDeliveryIdCapability {
+  return capability?.restartDurable === true
+    && capability.replayAfterAcceptance === 'deduplicated';
 }
 
 /**
@@ -233,6 +263,15 @@ export interface ProviderCapabilities {
   backgroundSubagentWake?: BackgroundSubagentWakeMode;
   /** Whether a delegation reply can enter the provider's currently active turn without cancellation or FIFO queueing. */
   activeDelegationNotification?: AgentDelegationActiveNotificationMode;
+  /** Proof-backed restart-stable delivery-id acceptance. Never infer this capability. */
+  restartDurableDeliveryId?: ProviderRestartDurableDeliveryIdCapability;
+  /**
+   * How this provider keeps task-bearing native agent tools out of IM.codes
+   * managed work (shared/native-collaboration-policy.ts). Required: a provider
+   * that cannot state it does not compile, and `unenforceable` providers cannot
+   * host supervised work.
+   */
+  nativeAgentAdmission: NativeAgentAdmissionMode;
 }
 
 export interface ProviderDelegationNotification {
@@ -271,10 +310,16 @@ export interface SessionConfig {
   sessionKey: string;
   /** Exact IM.codes session name whose identity is injected into managed MCP servers. */
   sessionName?: string;
+  /** Stable logical owner id for session-owned child resources. */
+  sessionInstanceId?: string;
+  /** Current runtime authority id for session-owned child resources. */
+  runtimeEpoch?: string;
   /** Runtime-bound project name for project-scoped managed MCP servers. */
   projectName?: string;
   /** Runtime-bound server id for daemon-dependent managed MCP tools. */
   serverId?: string;
+  /** Exact provider identity injected into managed MCP authorization context. */
+  providerId?: string;
   /** Force a brand-new provider conversation; do not reuse provider-side continuity. */
   fresh?: boolean;
   /** Environment variables to pass through for SDK-backed local providers. */
@@ -289,6 +334,8 @@ export interface SessionConfig {
   description?: string;
   /** Runtime/system prompt injection that should not be surfaced as user-facing description. */
   systemPrompt?: string;
+  /** Resolved user/project/session Agent identity contract; stable and prefix-cacheable. */
+  identityPrompt?: string;
   /** Resolved shared-context namespace for the live send path. */
   contextNamespace?: ProviderContextPayload['authority']['namespace'];
   /** Diagnostics describing how the runtime namespace was derived. */
@@ -329,6 +376,8 @@ export interface SessionConfig {
    *  already received startup memory in a prior run). The runtime still emits
    *  the timeline status card so the UI knows it was deliberately skipped. */
   startupMemoryAlreadyInjected?: boolean;
+  /** One-shot cross-vendor context, delivered as message-side preamble. */
+  pendingHandoff?: CrossVendorHandoffPack;
 }
 
 /** Structured error emitted by a provider. */
@@ -430,6 +479,16 @@ export interface SessionInfoUpdate extends SessionContextBootstrapState {
   quotaUsageLabel?: string;
   /** Structured quota metadata for recomputing display labels. */
   quotaMeta?: ProviderQuotaMeta;
+  /**
+   * Canonical provider limit verdict, mapped by the provider's own adapter.
+   *
+   * Separate from `quotaMeta` because they answer different questions.
+   * `quotaMeta` is display telemetry -- percentages and reset clocks -- and
+   * cannot say whether the provider is REFUSING us: Claude leaves
+   * `usedPercent` undefined while healthy, so thresholding it would be a
+   * policy we invented rather than a verdict the vendor stated.
+   */
+  limitSignal?: ProviderLimitSignal;
   /** Current reasoning/thinking effort, if known. */
   effort?: TransportEffortLevel;
   /**
@@ -532,6 +591,13 @@ export interface TransportProvider {
    */
   setServiceTier?(sessionId: string, tier: string): Promise<void>;
 
+  /**
+   * Invalidate the provider's cached stable system text without replacing its
+   * durable conversation. Codex implements this by resuming the same thread
+   * with new baseInstructions before the next turn.
+   */
+  refreshSessionSystemText?(sessionId: string): void;
+
   // ── Core methods — all providers must implement ──────────────────────────
 
   /**
@@ -627,6 +693,33 @@ export interface TransportProvider {
    * Only call when capabilities.toolCalling is true.
    */
   onToolCall?(cb: (sessionId: string, tool: ToolCallEvent) => void): void;
+
+  /**
+   * Install the daemon's native-collaboration gate. Only providers declaring
+   * `capabilities.nativeAgentAdmission === 'pre_execution_gate'` consult it,
+   * before every native agent tool call.
+   */
+  setNativeCollaborationGate?(gate: NativeCollaborationGate): void;
+
+  /**
+   * Install the daemon's fence resolver: does the IM.codes session served by
+   * this provider session currently require native agent tools withheld?
+   * `session_fence` providers consult it on the same authoritative path that
+   * launches, loads or sends, BEFORE any user/task bytes reach the agent, and
+   * pass the IM.codes session name whenever they know it (a launch that runs
+   * before the daemon registers the provider route). A resolver that throws
+   * means fenced.
+   */
+  setNativeAgentFenceResolver?(resolver: NativeAgentFenceResolver): void;
+
+  /**
+   * The native-agent fence of the live runtime serving this provider session
+   * (`session_fence` providers). `decided_at_next_launch` may be returned only
+   * when nothing is loaded or running AND this provider's own send path will
+   * install the fence from the resolver before any bytes are sent; otherwise
+   * report the fence actually live. Anything unknown is `provider_default`.
+   */
+  getNativeAgentFence?(providerSessionId: string): Promise<NativeAgentFence>;
 
   /**
    * Register a callback for provider session metadata changes.

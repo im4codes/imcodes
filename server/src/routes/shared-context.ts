@@ -522,6 +522,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     hit_count: number | null;
     cite_count: number | null;
     origin: MemoryOrigin | null;
+    origin_server_id: string;
   };
   type OwnerPrivateRow = {
     id: string;
@@ -539,6 +540,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     class: string;
     preview: string;
     origin?: MemoryOrigin;
+    originServerId?: string;
     projectId?: string;
     updatedAt: number;
     score: number;
@@ -571,6 +573,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
     const citeCountEnabled = isUserMemoryFeatureEnabled(c, MEMORY_FEATURES.citeCount, featureFlags);
     const rows = await c.env.DB.query<SearchProjectionRow>(
       `SELECT p.id, p.scope, p.project_id, p.projection_class, p.summary, p.updated_at, p.origin,
+              p.server_id AS origin_server_id,
               p.hit_count, COALESCE(cc.cite_count, 0) AS cite_count
        FROM shared_context_projections p
        LEFT JOIN shared_context_projection_cite_counts cc ON cc.projection_id = p.id
@@ -600,6 +603,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
         class: row.projection_class,
         preview: row.summary.slice(0, 240),
         origin: isMemoryOrigin(row.origin) ? row.origin : undefined,
+        originServerId: row.origin_server_id,
         projectId: row.project_id,
         updatedAt: row.updated_at,
         score: row.updated_at + (citeCountEnabled ? Math.min(row.cite_count ?? 0, 100) : 0),
@@ -620,6 +624,7 @@ sharedContextRoutes.post('/memory/search', async (c) => {
       class: result.class,
       preview: result.preview,
       origin: result.origin,
+      originServerId: result.originServerId,
       projectId: result.projectId,
       updatedAt: result.updatedAt,
     })),

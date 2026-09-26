@@ -2,8 +2,13 @@
  * Tests for hook server /send endpoint.
  * Covers: target resolution, queue-when-busy, circuit breakers, Content-Type, body size.
  */
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import http from 'http';
+import { execFileSync } from 'node:child_process';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // ── Mocks ──────────────────────────────────────────────────────────────────
 
@@ -15,6 +20,7 @@ const sendKeysMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const sendProcessSessionMessageForAutomationMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const capturePane = vi.hoisted(() => vi.fn().mockResolvedValue([]));
 const getTransportRuntimeMock = vi.hoisted(() => vi.fn());
+const ensureTransportRuntimeAvailableMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 const refreshSessionWatcherMock = vi.hoisted(() => vi.fn().mockResolvedValue(false));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -46,6 +52,7 @@ vi.mock('../../src/agent/detect.js', () => ({
 
 vi.mock('../../src/agent/session-manager.js', () => ({
   getTransportRuntime: getTransportRuntimeMock,
+  ensureTransportRuntimeAvailable: ensureTransportRuntimeAvailableMock,
 }));
 
 vi.mock('../../src/daemon/watcher-controls.js', () => ({
@@ -61,6 +68,13 @@ import {
   registerPeerAuditReplyIngressHandler,
 } from '../../src/daemon/peer-audit-reply-ingress.js';
 import { PEER_AUDIT_REPLY_TOTAL_BYTES, PEER_AUDIT_REPLY_VERSION } from '../../shared/peer-audit.js';
+import { AGENT_DELEGATION_PURPOSES, buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
+import { getDelegationReplyStore } from '../../src/daemon/delegation-reply-store.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
+import { resolveSupervisionAssignmentWorktree } from '../../src/daemon/supervision-worktree-inspector.js';
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -132,6 +146,7 @@ describe('Hook server /send endpoint', () => {
     clearPeerAuditReplyIngressRateLimits();
     registerPeerAuditReplyIngressHandler(null);
     resetTransportQueueStoreForTests();
+    resetSupervisionTaskRegistryForTests();
     refreshSessionWatcherMock.mockReset();
     refreshSessionWatcherMock.mockResolvedValue(false);
     const result = await startHookServer(hookCallback);
@@ -141,6 +156,7 @@ describe('Hook server /send endpoint', () => {
 
   afterEach(async () => {
     registerPeerAuditReplyIngressHandler(null);
+    resetSupervisionTaskRegistryForTests();
     await new Promise<void>((resolve) => {
       server.close(() => resolve());
     });
@@ -215,7 +231,6 @@ describe('Hook server /send endpoint', () => {
     const validReply = {
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: 'attempt-1',
-      replyCapability: 'A'.repeat(32),
       verdict: 'PASS',
       findings: 'Validated.',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '1 passed' }],
@@ -275,6 +290,100 @@ describe('Hook server /send endpoint', () => {
       expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
     });
 
+    it('accepts a manual send_message audit receipt through the real hook ingress fallback', async () => {
+      const origin = {
+        sessionName: 'deck_proj_brain',
+        sessionInstanceId: 'brain-instance',
+        runtimeEpoch: 'brain-epoch',
+      };
+      const target = {
+        sessionName: 'deck_proj_w1',
+        sessionInstanceId: 'auditor-instance',
+        runtimeEpoch: 'auditor-epoch',
+      };
+      getSessionMock.mockImplementation((name: string) => name === target.sessionName
+        ? makeSession({ name: target.sessionName, sessionInstanceId: target.sessionInstanceId, runtimeEpoch: target.runtimeEpoch })
+        : name === origin.sessionName
+          ? makeSession({ name: origin.sessionName, sessionInstanceId: origin.sessionInstanceId, runtimeEpoch: origin.runtimeEpoch })
+          : undefined);
+      const taskId = 'manual-audit-hook-task';
+      const assignmentId = 'manual-audit-hook-assignment';
+      const revision = 'manual-audit-hook-r1';
+      const registry = getSupervisionTaskRegistry();
+      expect(registry.createOrGet({
+        taskId,
+        projectName: 'proj',
+        classification: 'integration_task',
+        objective: 'exercise the tokenless manual audit hook',
+        currentRevision: revision,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId,
+        taskId,
+        role: 'auditor',
+        identity: {
+          sessionName: target.sessionName,
+          sessionInstanceId: target.sessionInstanceId,
+          runtimeEpoch: target.runtimeEpoch,
+          agentType: 'claude-code',
+          providerFamily: 'anthropic',
+        },
+        auditAttemptId: 'manual-audit-hook-attempt',
+        auditRevision: revision,
+      }).ok).toBe(true);
+      const created = getDelegationReplyStore().create({
+        origin,
+        target,
+        dispatchId: 'manual-audit-dispatch',
+        messageId: 'manual-audit-message',
+        purpose: AGENT_DELEGATION_PURPOSES.SUPERVISION_AUDIT,
+        auditAttemptId: 'manual-audit-hook-attempt',
+        auditRevision: revision,
+        auditedSessionName: origin.sessionName,
+        taskId,
+        assignmentId,
+        now: Date.now(),
+      });
+
+      const res = await postRaw(
+        port,
+        '/audit-reply',
+        JSON.stringify({
+          ...validReply,
+          attemptId: 'manual-audit-hook-attempt',
+          taskId,
+          assignmentId,
+          revision,
+          receiptKind: 'final',
+        }),
+        'application/json',
+        { 'x-imcodes-session': target.sessionName },
+      );
+
+      expect(res.status).toBe(200);
+      expect(JSON.parse(res.body)).toEqual({ ok: true });
+      expect(getDelegationReplyStore().listReceived()).toEqual(expect.arrayContaining([
+        expect.objectContaining({
+          delegationId: created.record.delegationId,
+          result: expect.stringContaining('"verdict":"PASS"'),
+        }),
+      ]));
+      expect(timelineEmitMock).toHaveBeenCalledWith(
+        origin.sessionName,
+        'delegation.reply',
+        expect.objectContaining({
+          result: 'Validated.',
+          verdict: 'PASS',
+          supervisionTask: expect.objectContaining({
+            attemptId: 'manual-audit-hook-attempt',
+          }),
+        }),
+        expect.any(Object),
+      );
+      expect(sendKeysMock).not.toHaveBeenCalled();
+      expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+    });
+
     it('fails closed for missing sender, unknown keys, and oversized Unicode', async () => {
       getSessionMock.mockReturnValue(makeSession({ name: 'deck_proj_w1', state: 'idle' }));
       registerPeerAuditReplyIngressHandler(() => ({ ok: true }));
@@ -307,6 +416,36 @@ describe('Hook server /send endpoint', () => {
     const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });
     const w2 = makeSession({ name: 'deck_proj_w2', role: 'w2', agentType: 'gemini', label: 'Reviewer' });
     const w3 = makeSession({ name: 'deck_proj_w3', role: 'w1', agentType: 'codex', label: 'Coder2' });
+
+    // A sub-session belongs to exactly ONE owning main. Scoping a main's
+    // siblings by shared projectName let a DIFFERENT main in the same project
+    // address and control it -- live shape: project `cd` has 94 unparented
+    // mains and 20 subs, so every main was a sibling of every main's subs.
+    const otherMain = makeSession({ name: 'deck_proj_other', role: 'brain', agentType: 'claude-code', label: 'Other' });
+    const foreignSub = makeSession({
+      name: 'deck_sub_foreign', role: 'w1', agentType: 'codex', label: 'Foreign',
+      parentSession: 'deck_proj_other',
+    });
+
+    it('refuses a main addressing a sub-session owned by a DIFFERENT main', () => {
+      getSessionMock.mockImplementation((n: string) => [brain, otherMain, foreignSub].find((s) => s.name === n));
+      listSessionsMock.mockReturnValue([brain, otherMain, foreignSub]);
+      expect(resolveTarget('deck_proj_brain', 'deck_sub_foreign').ok).toBe(false);
+    });
+
+    it('refuses that foreign sub-session by LABEL too', () => {
+      getSessionMock.mockImplementation((n: string) => [brain, otherMain, foreignSub].find((s) => s.name === n));
+      listSessionsMock.mockReturnValue([brain, otherMain, foreignSub]);
+      expect(resolveTarget('deck_proj_brain', 'Foreign').ok).toBe(false);
+    });
+
+    it('still lets the OWNING main address its own sub-session', () => {
+      getSessionMock.mockImplementation((n: string) => [brain, otherMain, foreignSub].find((s) => s.name === n));
+      listSessionsMock.mockReturnValue([brain, otherMain, foreignSub]);
+      const result = resolveTarget('deck_proj_other', 'deck_sub_foreign');
+      expect(result.ok).toBe(true);
+      if (result.ok) expect(result.targets[0].name).toBe('deck_sub_foreign');
+    });
 
     it('resolves by label (case-insensitive)', () => {
       getSessionMock.mockReturnValue(brain);
@@ -437,6 +576,528 @@ describe('Hook server /send endpoint', () => {
   // ── Successful delivery ──────────────────────────────────────────────────
 
   describe('Successful delivery', () => {
+    /**
+     * Builds the exact-auditor production shape: a task whose revision is owned
+     * by an implementer, an auditor bound to that revision by an exact attempt,
+     * and three sibling implementer assignments on OTHER tasks that share the
+     * same target session and have no worktree on disk. Those siblings are what
+     * made the compatibility scan report an ambiguity for the whole target.
+     */
+    function setupExactAuditorScenario(opts: { role?: string; status?: string } = {}) {
+
+      // DEADLOCK A. An auditor identified by exact task+assignment+attempt+
+      // revision+identity could not be continued once it left `delegated`:
+      // the explicit binding was judged non-matching, the caller fell into the
+      // compatibility scan, and unrelated sibling assignments with missing
+      // worktrees made that scan report
+      // "ambiguous missing assignment worktrees for target (N)".
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-exact-auditor-'));
+      const source = join(temp, 'source');
+      const worktrees = join(temp, 'worktrees');
+      mkdirSync(source, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: source });
+      writeFileSync(join(source, 'fixture.txt'), 'base\n');
+      execFileSync('git', ['add', 'fixture.txt'], { cwd: source });
+      execFileSync('git', ['-c', 'user.name=IM.codes Test', '-c', 'user.email=test@im.codes', 'commit', '-qm', 'base'], { cwd: source });
+      const baseRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
+      const priorRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = worktrees;
+
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code', projectDir: source,
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const auditorSession = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Auditor', agentType: 'codex', projectDir: source,
+        sessionInstanceId: 'auditor-instance', runtimeEpoch: 'auditor-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === auditorSession.name ? auditorSession : null);
+      listSessionsMock.mockReturnValue([brain, auditorSession]);
+
+      const taskId = 'exact-auditor-task';
+      const auditorId = 'exact-auditor-assignment';
+      const revision = 'candidate-cc8-r1-abcdef01';
+      const attemptId = 'attempt-exact-1';
+      const registry = getSupervisionTaskRegistry();
+      const auditorIdentity = {
+        sessionName: auditorSession.name,
+        sessionInstanceId: auditorSession.sessionInstanceId,
+        runtimeEpoch: auditorSession.runtimeEpoch,
+        agentType: auditorSession.agentType,
+        providerFamily: 'openai',
+      };
+      expect(registry.createOrGet({
+        taskId, projectName: 'proj', classification: 'independent_top_level', objective: 'exact auditor continuation', baseRevision,
+      }).ok).toBe(true);
+      // The implementer owns the task revision; the auditor is bound to it.
+      const implId = `${taskId}-impl`;
+      const implIdentity = {
+        sessionName: brain.name,
+        sessionInstanceId: brain.sessionInstanceId,
+        runtimeEpoch: brain.runtimeEpoch,
+        agentType: brain.agentType,
+        providerFamily: 'anthropic',
+      };
+      expect(registry.createAssignment({
+        assignmentId: implId, taskId, role: 'implementer', scopeFiles: [], identity: implIdentity,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId: auditorId, taskId, role: opts.role ?? 'auditor', scopeFiles: [],
+        identity: auditorIdentity, auditAttemptId: attemptId, auditRevision: revision,
+      }).ok).toBe(true);
+      // Sibling assignments on the SAME target session but OTHER tasks, whose
+      // worktrees are absent. This is the production shape: the compatibility
+      // scan lists by project + owner session across tasks, so these made it
+      // report "ambiguous missing assignment worktrees for target (4)".
+      for (const sibling of ['sibling-a', 'sibling-b', 'sibling-c']) {
+        const siblingTask = `${taskId}-${sibling}`;
+        expect(registry.createOrGet({
+          taskId: siblingTask, projectName: 'proj', objective: `sibling ${sibling}`, baseRevision,
+        }).ok).toBe(true);
+        expect(registry.createAssignment({
+          assignmentId: `${siblingTask}-impl`, taskId: siblingTask, role: 'implementer', scopeFiles: [],
+          identity: auditorIdentity,
+        }).ok).toBe(true);
+      }
+      expect(registry.updateTask({ taskId, status: 'delegated' }).ok).toBe(true);
+      expect(registry.updateTask({ taskId, status: 'implementing' }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId: implId, identity: implIdentity, revision, auditRevision: revision,
+      }).ok).toBe(true);
+      expect(registry.updateAssignment({
+        assignmentId: auditorId, identity: auditorIdentity,
+        status: opts.status ?? 'auditing', auditAttemptId: attemptId, auditRevision: revision, revision,
+      }).ok).toBe(true);
+      // The auditor is past `delegated`, and the task revision matches exactly.
+      expect(registry.getAssignment(auditorId)!.status).not.toBe('delegated');
+      expect(registry.getTaskRecord(taskId)!.currentRevision).toBe(revision);
+
+      return {
+        brain, auditorSession, taskId, auditorId, revision, attemptId,
+        restore: () => {
+          if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+          else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
+          rmSync(temp, { recursive: true, force: true });
+        },
+      };
+    }
+
+    it('routes an exact auditor continuation past delegated instead of the ambiguity scan', async () => {
+      // DEADLOCK A1. An auditor identified by exact task+assignment+attempt+
+      // revision+identity could not be continued once it left `delegated`: the
+      // explicit binding was judged non-matching, the caller fell into the
+      // compatibility scan, and unrelated sibling assignments with missing
+      // worktrees made that scan report
+      // "ambiguous missing assignment worktrees for target (N)".
+      const scenario = setupExactAuditorScenario();
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'continue the audit',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true } });
+        // Routed to the exact assignment, never through the ambiguity scan.
+        expect(existsSync(resolveSupervisionAssignmentWorktree({
+          sessionName: scenario.auditorSession.name, assignmentId: scenario.auditorId,
+        }))).toBe(true);
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('routes an exact integration_owner continuation instead of rejecting it as a non-implementer', async () => {
+      // DEFECT 1 (reproduced live): the exact-binding predicate sent only
+      // `implementer` down the reuse path and its fallback hard-required
+      // `role === 'auditor'`. An integration_owner holding a valid
+      // task+assignment+identity+revision+attempt could therefore never be
+      // continued, and the caller fell into the ambiguity scan instead.
+      // `ready_for_integration` is TERMINAL for an auditor but is the WORKING
+      // state for an integration owner, so the two roles cannot share a set.
+      const scenario = setupExactAuditorScenario({ role: 'integration_owner', status: 'ready_for_integration' });
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'finalize the integration',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true } });
+        expect(existsSync(resolveSupervisionAssignmentWorktree({
+          sessionName: scenario.auditorSession.name, assignmentId: scenario.auditorId,
+        }))).toBe(true);
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('still refuses an exact continuation for a terminal integration_owner', async () => {
+      // Fail-closed boundary for DEFECT 1: widening the role set must not
+      // resurrect a terminal owner. `cancelled` is the exact state the stale
+      // integration owner was left in by the live coordination failure.
+      const scenario = setupExactAuditorScenario({ role: 'integration_owner', status: 'cancelled' });
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'finalize again',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res.status).toBe(500);
+        expect(JSON.stringify(res.body)).not.toContain('delivered\":true');
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('continues an exact auditor that already has non-final audit progress (tsk_4d0 shape)', async () => {
+      // tsk_4d0/asg_4dw: the auditor had recorded PROGRESS and had moved past
+      // `delegated`, so exact redelivery was refused, the assignment sat in
+      // `implementing` with an idle session, and Brain had no continue, cancel
+      // or replace path. Progress is precisely why the SAME auditor must stay
+      // reachable -- it owns this attempt. Only a FINAL verdict closes it.
+      const scenario = setupExactAuditorScenario();
+      const registry = getSupervisionTaskRegistry();
+      const progressReceipt = registry.appendMatchingAuditReceipt({
+        taskId: scenario.taskId, auditorAssignmentId: scenario.auditorId,
+        attemptId: scenario.attemptId, revision: scenario.revision,
+        receiptKind: 'progress', findings: 'still reviewing',
+        // Use the assignment's OWN persisted identity rather than
+        // reconstructing it, so the receipt cannot fail on owner_mismatch.
+        auditorIdentity: registry.getAssignment(scenario.auditorId)!.identity,
+        auditorSessionName: scenario.auditorSession.name,
+        validations: [],
+      });
+      // Load-bearing: without this the append can fail silently and the test
+      // would prove nothing about progress at all (a mutant survived exactly
+      // this way before the assertion was added).
+      expect(progressReceipt).toMatchObject({ ok: true });
+      expect(registry.listAuditReceipts(scenario.taskId).some((r) => (
+        r.assignmentId === scenario.auditorId && r.receiptKind === 'progress'
+      ))).toBe(true);
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'continue the audit',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: scenario.revision,
+          },
+        });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true } });
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('rejects a stale audit revision with a safe detail instead of delivering or scanning', async () => {
+      // DEADLOCK A2. A binding whose revision no longer matches the current
+      // attempt must be named as stale immediately. It must not be delivered,
+      // must not create a worktree, and must not fall through to the
+      // compatibility scan, which would blame an unrelated ambiguity.
+      const scenario = setupExactAuditorScenario();
+      try {
+        const res = await postSend(port, {
+          from: scenario.brain.name, to: scenario.auditorSession.name, message: 'continue the audit',
+          supervision: {
+            taskId: scenario.taskId, assignmentId: scenario.auditorId,
+            auditAttemptId: scenario.attemptId, auditRevision: 'candidate-cc8-r2-99887766',
+          },
+        });
+        // 500 is the established status for a fully-failed send gate, the same
+        // one the ambiguity refusal above uses. What must change is the REASON.
+        expect(res.status).toBe(500);
+        const error = JSON.stringify(res.body);
+        expect(error).toContain('stale_audit_revision');
+        // Safe detail: control-plane state only, enough to see which side is stale.
+        expect(error).toContain('taskStatus=implementing');
+        expect(error).toContain('assignmentStatus=auditing');
+        expect(error).toContain(`expectedRevision=${scenario.revision}`);
+        expect(error).toContain('actualRevision=candidate-cc8-r2-99887766');
+        expect(error).toContain(`expectedAttemptId=${scenario.attemptId}`);
+        // Never reported as an ambiguity, and nothing was provisioned or sent.
+        expect(error).not.toContain('ambiguous');
+        expect(existsSync(resolveSupervisionAssignmentWorktree({
+          sessionName: scenario.auditorSession.name, assignmentId: scenario.auditorId,
+        }))).toBe(false);
+        expect(res.body).not.toMatchObject({ delivered: true });
+      } finally {
+        scenario.restore();
+      }
+    });
+
+    it('provisions the unique missing implementer worktree at the live /send boundary before delivery', async () => {
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-worktree-'));
+      const source = join(temp, 'source');
+      const worktrees = join(temp, 'worktrees');
+      mkdirSync(source, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: source });
+      writeFileSync(join(source, 'fixture.txt'), 'base\n');
+      execFileSync('git', ['add', 'fixture.txt'], { cwd: source });
+      execFileSync('git', ['-c', 'user.name=IM.codes Test', '-c', 'user.email=test@im.codes', 'commit', '-qm', 'base'], { cwd: source });
+      const baseRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
+      const priorRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = worktrees;
+
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code', projectDir: source,
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const worker = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Coder', agentType: 'codex', projectDir: source,
+        sessionInstanceId: 'worker-instance', runtimeEpoch: 'worker-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
+      listSessionsMock.mockReturnValue([brain, worker]);
+
+      const taskId = 'live-hook-missing-worktree-task';
+      const assignmentId = 'live-hook-missing-worktree-assignment';
+      const registry = getSupervisionTaskRegistry();
+      expect(registry.createOrGet({
+        taskId, projectName: 'proj', objective: 'production missing-before-manual-recovery regression', baseRevision,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', scopeFiles: [],
+        identity: {
+          sessionName: worker.name,
+          sessionInstanceId: worker.sessionInstanceId,
+          runtimeEpoch: worker.runtimeEpoch,
+          agentType: worker.agentType,
+          providerFamily: 'openai',
+        },
+      }).ok).toBe(true);
+      const expectedRepo = resolveSupervisionAssignmentWorktree({ sessionName: worker.name, assignmentId });
+      expect(existsSync(expectedRepo)).toBe(false);
+      sendProcessSessionMessageForAutomationMock.mockImplementationOnce(async () => {
+        expect(existsSync(expectedRepo)).toBe(true);
+        expect(execFileSync('git', ['rev-parse', 'HEAD'], { cwd: expectedRepo, encoding: 'utf8' }).trim()).toBe(baseRevision);
+      });
+
+      try {
+        // No supervision envelope: this is the production shape from an
+        // already-running MCP bridge that bypassed the newer caller-side helper.
+        const res = await postSend(port, { from: brain.name, to: worker.name, message: 'start assigned work' });
+        expect(res).toMatchObject({ status: 200, body: { ok: true, delivered: true, target: worker.name } });
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+          worker.name,
+          `${buildAgentDelegationSenderLine(brain.name)}\n\nstart assigned work`,
+          // Another session's delivery: incoming, not the human's input.
+          { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
+        );
+      } finally {
+        if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+        else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
+    it('fails closed without delivery when more than one missing assignment could match a stale bridge send', async () => {
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code',
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const worker = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Coder', agentType: 'codex',
+        sessionInstanceId: 'worker-instance', runtimeEpoch: 'worker-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
+      listSessionsMock.mockReturnValue([brain, worker]);
+      const registry = getSupervisionTaskRegistry();
+      for (const suffix of ['one', 'two']) {
+        const taskId = `ambiguous-missing-${suffix}`;
+        expect(registry.createOrGet({ taskId, projectName: 'proj', objective: suffix }).ok).toBe(true);
+        expect(registry.createAssignment({
+          assignmentId: `${taskId}-assignment`, taskId, role: 'implementer', scopeFiles: [],
+          identity: {
+            sessionName: worker.name,
+            sessionInstanceId: worker.sessionInstanceId,
+            runtimeEpoch: worker.runtimeEpoch,
+            agentType: worker.agentType,
+            providerFamily: 'openai',
+          },
+        }).ok).toBe(true);
+      }
+
+      const res = await postSend(port, { from: brain.name, to: worker.name, message: 'must not guess' });
+      expect(res).toEqual({
+        status: 500,
+        body: { ok: false, error: `${worker.name}: ambiguous missing assignment worktrees for target (2)` },
+      });
+      expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+    });
+
+    it('uses an exact pending auditor binding and ignores two unrelated missing implementer worktrees', async () => {
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-audit-worktree-'));
+      const source = join(temp, 'source');
+      const worktrees = join(temp, 'worktrees');
+      mkdirSync(source, { recursive: true });
+      execFileSync('git', ['init', '-q'], { cwd: source });
+      writeFileSync(join(source, 'fixture.txt'), 'base\n');
+      execFileSync('git', ['add', 'fixture.txt'], { cwd: source });
+      execFileSync('git', ['-c', 'user.name=IM.codes Test', '-c', 'user.email=test@im.codes', 'commit', '-qm', 'base'], { cwd: source });
+      const baseRevision = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: source, encoding: 'utf8' }).trim();
+      const priorRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = worktrees;
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'codex-sdk', projectDir: source,
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const auditor = makeSession({
+        name: 'deck_proj_auditor', role: 'w1', agentType: 'claude-code', projectDir: source,
+        sessionInstanceId: 'auditor-instance', runtimeEpoch: 'auditor-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === auditor.name ? auditor : null);
+      listSessionsMock.mockReturnValue([brain, auditor]);
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'tsk_3ft';
+      const assignmentId = 'asg_3gm';
+      const attemptId = 'supervision-auto-audit-live-transport-audit-20260901-cx1-r1-6994afa1';
+      const revision = 'supervision-auto-audit-live-transport-cx3-r1-6994afa1';
+      const messageId = 'send_message_6994afa1-0000-4000-8000-000000000001';
+      expect(registry.createOrGet({
+        taskId, projectName: 'proj', classification: 'integration_task', objective: 'exact auditor worktree',
+        baseRevision, currentRevision: revision,
+      }).ok).toBe(true);
+      expect(registry.createAssignment({
+        taskId, assignmentId, role: 'auditor',
+        identity: {
+          sessionName: auditor.name,
+          sessionInstanceId: auditor.sessionInstanceId,
+          runtimeEpoch: auditor.runtimeEpoch,
+          agentType: auditor.agentType,
+          providerFamily: 'anthropic',
+        },
+        auditAttemptId: attemptId,
+        auditRevision: revision,
+      }).ok).toBe(true);
+      const interfererAssignmentIds: string[] = [];
+      for (const suffix of ['one', 'two']) {
+        const interfererTaskId = `audit-worktree-interferer-${suffix}`;
+        const interfererAssignmentId = `${interfererTaskId}-assignment`;
+        interfererAssignmentIds.push(interfererAssignmentId);
+        expect(registry.createOrGet({
+          taskId: interfererTaskId, projectName: 'proj', objective: suffix, baseRevision,
+        }).ok).toBe(true);
+        expect(registry.createAssignment({
+          taskId: interfererTaskId, assignmentId: interfererAssignmentId, role: 'implementer',
+          identity: {
+            sessionName: auditor.name,
+            sessionInstanceId: auditor.sessionInstanceId,
+            runtimeEpoch: auditor.runtimeEpoch,
+            agentType: auditor.agentType,
+            providerFamily: 'anthropic',
+          },
+        }).ok).toBe(true);
+      }
+      const expectedRepo = resolveSupervisionAssignmentWorktree({ sessionName: auditor.name, assignmentId });
+      expect(existsSync(expectedRepo)).toBe(false);
+
+      try {
+        const missingBinding = await postSend(port, {
+          from: brain.name,
+          to: auditor.name,
+          message: 'must not accept a detached supervised message id',
+          messageId,
+        });
+        expect(missingBinding).toEqual({
+          status: 400,
+          body: { ok: false, error: 'invalid supervised message id' },
+        });
+        expect(sendProcessSessionMessageForAutomationMock).not.toHaveBeenCalled();
+        expect(existsSync(expectedRepo)).toBe(false);
+
+        const res = await postSend(port, {
+          from: brain.name,
+          to: auditor.name,
+          message: 'deliver exact existing audit',
+          supervision: { taskId, assignmentId },
+          messageId,
+        });
+        expect(res).toMatchObject({
+          status: 200,
+          body: { ok: true, delivered: true, target: auditor.name, messageId },
+        });
+        expect(existsSync(expectedRepo)).toBe(true);
+        for (const interfererAssignmentId of interfererAssignmentIds) {
+          expect(existsSync(resolveSupervisionAssignmentWorktree({
+            sessionName: auditor.name,
+            assignmentId: interfererAssignmentId,
+          }))).toBe(false);
+        }
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+          auditor.name,
+          `${buildAgentDelegationSenderLine(brain.name)}\n\ndeliver exact existing audit`,
+          // Another session's delivery: incoming, not the human's input.
+          { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
+        );
+        expect(registry.get(taskId)?.assignments.filter((assignment) => assignment.role === 'auditor'))
+          .toEqual([expect.objectContaining({ assignmentId, auditAttemptId: attemptId, auditRevision: revision })]);
+      } finally {
+        if (priorRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+        else process.env.IMCODES_WORKTREES_ROOT = priorRoot;
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
+    it('uses an explicit binding without reprovisioning an existing dirty assignment worktree', async () => {
+      const temp = mkdtempSync(join(tmpdir(), 'imcodes-hook-explicit-continuation-'));
+      const previousRoot = process.env.IMCODES_WORKTREES_ROOT;
+      process.env.IMCODES_WORKTREES_ROOT = temp;
+      const brain = makeSession({
+        name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code', projectDir: '/unused/project',
+        sessionInstanceId: 'brain-instance', runtimeEpoch: 'brain-epoch',
+      });
+      const worker = makeSession({
+        name: 'deck_proj_w1', role: 'w1', label: 'Coder', agentType: 'codex',
+        sessionInstanceId: 'worker-instance', runtimeEpoch: 'worker-epoch',
+      });
+      getSessionMock.mockImplementation((name: string) => name === brain.name ? brain : name === worker.name ? worker : null);
+      listSessionsMock.mockReturnValue([brain, worker]);
+      const registry = getSupervisionTaskRegistry();
+      const taskId = 'explicit-bypass-one';
+      const assignmentId = `${taskId}-assignment`;
+      expect(registry.createOrGet({ taskId, projectName: 'proj', objective: 'continuation' }).ok).toBe(true);
+      expect(registry.createAssignment({
+        assignmentId, taskId, role: 'implementer', scopeFiles: [],
+        identity: {
+          sessionName: worker.name,
+          sessionInstanceId: worker.sessionInstanceId,
+          runtimeEpoch: worker.runtimeEpoch,
+          agentType: worker.agentType,
+          providerFamily: 'openai',
+        },
+      }).ok).toBe(true);
+      const worktree = resolveSupervisionAssignmentWorktree({ sessionName: worker.name, assignmentId });
+      mkdirSync(worktree, { recursive: true });
+      writeFileSync(join(worktree, 'dirty.ts'), 'implementation bytes\n');
+
+      try {
+        const delivered = await postSend(port, {
+          from: brain.name,
+          to: worker.name,
+          message: 'continue exact assignment',
+          supervision: { taskId, assignmentId },
+        });
+        expect(delivered).toMatchObject({
+          status: 200,
+          body: { ok: true, delivered: true, target: worker.name },
+        });
+        expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+          worker.name,
+          `${buildAgentDelegationSenderLine(brain.name)}\n\ncontinue exact assignment`,
+          // Another session's delivery: incoming, not the human's input.
+          { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
+        );
+      } finally {
+        if (previousRoot === undefined) delete process.env.IMCODES_WORKTREES_ROOT;
+        else process.env.IMCODES_WORKTREES_ROOT = previousRoot;
+        rmSync(temp, { recursive: true, force: true });
+      }
+    });
+
     it('delivers shell-originated callback sends when the target is an exact active session name', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const w1 = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'codex', label: 'Coder' });
@@ -450,7 +1111,8 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.ok).toBe(true);
       expect(res.body.delivered).toBe(true);
       expect(res.body.target).toBe('deck_proj_brain');
-      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_brain', 'Task: UI polish\nResult: done');
+      // A shell/script callback, not typed in the chat.
+      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_brain', 'Task: UI polish\nResult: done', { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM } });
     });
 
     it('REGRESSION GUARD: CLI /send to process sessions must route through session.send recall pipeline and this test must not be deleted', async () => {
@@ -471,11 +1133,15 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.ok).toBe(true);
       expect(res.body.delivered).toBe(true);
       expect(res.body.target).toBe('deck_proj_w1');
-      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_proj_w1', 'hello');
+      expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+        'deck_proj_w1',
+        `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello`,
+        { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
+      );
       expect(sendKeysMock).not.toHaveBeenCalled();
     });
 
-    it('delivers message to transport session via runtime.send()', async () => {
+    it('defaults CLI /send to direct append for a compatible busy transport', async () => {
       const brain = makeSession({ name: 'deck_proj_brain', role: 'brain', agentType: 'claude-code' });
       const transport = makeSession({ name: 'deck_proj_w1', role: 'w1', agentType: 'openclaw', runtimeType: 'transport', label: 'OpenClaw' });
 
@@ -489,6 +1155,7 @@ describe('Hook server /send endpoint', () => {
       const mockRuntime = {
         providerSessionId: 'transport-provider-session',
         send: vi.fn().mockReturnValue('sent'),
+        appendExternalMessageToActiveTurn: vi.fn().mockResolvedValue('appended'),
         getStatus: vi.fn().mockReturnValue('idle'),
       };
       getTransportRuntimeMock.mockReturnValue(mockRuntime);
@@ -500,16 +1167,20 @@ describe('Hook server /send endpoint', () => {
       expect(res.body.delivered).toBe(true);
       const messageId = res.body.messageId;
       expect(typeof messageId).toBe('string');
-      expect(mockRuntime.send).toHaveBeenCalledWith('hello transport', messageId);
-      expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
+      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+        `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello transport`,
+        messageId,
+      );
+      expect(mockRuntime.send).not.toHaveBeenCalled();
       expect(timelineEmitMock).toHaveBeenCalledWith(
         'deck_proj_w1',
         'user.message',
         {
-          text: 'hello transport',
+          text: `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nhello transport`,
           allowDuplicate: true,
           commandId: messageId,
           clientMessageId: messageId,
+          [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT,
         },
         { source: 'daemon', confidence: 'high', eventId: `transport-user:${messageId}` },
       );
@@ -528,6 +1199,7 @@ describe('Hook server /send endpoint', () => {
 
       const mockRuntime = {
         providerSessionId: 'transport-provider-session',
+        appendExternalMessageToActiveTurn: vi.fn().mockResolvedValue('unsupported'),
         send: vi.fn((text: string, clientMessageId: string) => {
           getTransportQueueStore().enqueue({
             sessionName: 'deck_proj_w1',
@@ -547,7 +1219,12 @@ describe('Hook server /send endpoint', () => {
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.queued).toBe(true);
-      expect(mockRuntime.send).toHaveBeenCalledWith('queued transport', res.body.messageId);
+      const expectedQueuedText = `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\nqueued transport`;
+      expect(mockRuntime.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId);
+      // The queued copy carries the agent origin its drained row will render with.
+      expect(mockRuntime.send).toHaveBeenCalledWith(expectedQueuedText, res.body.messageId, undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
+      });
       expect(timelineEmitMock).not.toHaveBeenCalledWith(
         'deck_proj_w1',
         'user.message',
@@ -563,7 +1240,7 @@ describe('Hook server /send endpoint', () => {
             expect.objectContaining({
               clientMessageId: res.body.messageId,
               commandId: res.body.messageId,
-              text: 'queued transport',
+              text: expectedQueuedText,
             }),
           ],
           failedMessageEntries: [],
@@ -572,7 +1249,7 @@ describe('Hook server /send endpoint', () => {
           queueAuthorityId: expect.any(String),
           queueSnapshot: expect.objectContaining({
             type: 'transport.queue.snapshot',
-            source: 'send_tool',
+            source: 'send_tool_append_fallback',
           }),
         }),
         { source: 'daemon', confidence: 'high' },

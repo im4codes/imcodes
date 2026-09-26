@@ -101,6 +101,20 @@ describe('auth nonce exchange API', () => {
     expect(init.credentials).toBe('include');
   });
 
+  it('keeps the session when refresh is rate-limited', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(new Response('', { status: 401 }))
+      .mockResolvedValue(new Response(JSON.stringify({ error: 'too_many_attempts', retryAfterMs: 120000 }), {
+        status: 429,
+        headers: { 'Content-Type': 'application/json' },
+      }));
+    const { configure, apiFetch } = await import('../src/api.js');
+    configure('');
+    await expect(apiFetch('/api/protected')).rejects.toMatchObject({ status: 429 });
+    expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith('/api/auth/user/me'))).toBe(false);
+  });
+
   it('retries transient failures with exponential backoff', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
@@ -348,6 +362,35 @@ describe('auth nonce exchange API', () => {
     await expect(apiFetch('/api/machines')).rejects.toBeInstanceOf(ApiError);
     expect(expired).toHaveBeenCalledOnce();
     expect(expired).toHaveBeenCalledWith('auth_identity_changed');
+  });
+
+  it('does not clear a valid mobile login for an endpoint-specific bearer 401', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse({ error: 'unsupported_account_bearer' }, 401))
+      .mockResolvedValueOnce(jsonResponse({ id: 'mobile-user' }))
+      .mockResolvedValueOnce(jsonResponse({ error: 'unsupported_account_bearer' }, 401));
+    const expired = vi.fn();
+    const {
+      ApiError,
+      apiFetch,
+      configureApiKey,
+      getApiKey,
+      onAuthExpired,
+    } = await import('../src/api.js');
+
+    configureApiKey('deck_mobile_account_key');
+    onAuthExpired(expired);
+
+    await expect(apiFetch('/api/remote-desktop/guest/host?hostId=host-1'))
+      .rejects.toMatchObject({ status: 401 } satisfies Partial<InstanceType<typeof ApiError>>);
+    expect(expired).not.toHaveBeenCalled();
+    expect(getApiKey()).toBe('deck_mobile_account_key');
+    expect(fetchMock.mock.calls.map(([url]) => String(url))).toEqual([
+      '/api/remote-desktop/guest/host?hostId=host-1',
+      '/api/auth/user/me',
+      '/api/remote-desktop/guest/host?hostId=host-1',
+    ]);
   });
 
   it('propagates JSON decode failures from successful API responses', async () => {

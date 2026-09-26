@@ -1,3 +1,9 @@
+import {
+  MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
+  MCP_TOOL_DISCOVERY_NAME,
+  MCP_TOOL_GROUP_QUERY_PREFIX,
+  MCP_TOOL_GROUPS,
+} from '../../shared/mcp-tool-discovery.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -16,6 +22,7 @@ import { MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../sha
 import { MEMORY_MCP_ENV_KEYS, buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { makeMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
+import { resolveMemoryMcpMaxRssBytes } from '../../src/daemon/memory-mcp-server.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import {
   archiveEventsForMaterialization,
@@ -62,13 +69,29 @@ async function withStdioClient(
   }
 }
 
+async function activateToolGroup(client: Client, toolName: string): Promise<Record<string, unknown>> {
+  const group = MCP_TOOL_GROUPS.find((candidate) => candidate.tools.includes(toolName));
+  if (!group) throw new Error(`no MCP tool group contains ${toolName}`);
+  return structured(await client.callTool({
+    name: MCP_TOOL_DISCOVERY_NAME,
+    arguments: { query: `${MCP_TOOL_GROUP_QUERY_PREFIX}${group.id}` },
+  }));
+}
+
 describe('memory MCP interface e2e', () => {
   let tempDbDir: string;
   let projectRoot: string;
   let serverConfigDir: string;
   let serverConfigPath: string;
 
+  let testHome: string;
+  const previousHome = process.env.HOME;
+
   beforeEach(async () => {
+    // The session store and the MCP child resolve ~/.imcodes from HOME; never
+    // let them reach the real one (the store refuses it under vitest).
+    testHome = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-home-'));
+    process.env.HOME = testHome;
     tempDbDir = await createIsolatedSharedContextDb('memory-mcp-interface-e2e');
     projectRoot = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-project-'));
     serverConfigDir = await mkdtemp(join(tmpdir(), 'e2e-memory-mcp-server-'));
@@ -83,6 +106,9 @@ describe('memory MCP interface e2e', () => {
     await cleanupIsolatedSharedContextDb(tempDbDir);
     await rm(projectRoot, { recursive: true, force: true });
     await rm(serverConfigDir, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousHome;
+    await rm(testHome, { recursive: true, force: true });
   });
 
   function childEnv(): Record<string, string> {
@@ -108,6 +134,11 @@ describe('memory MCP interface e2e', () => {
     };
   }
 
+  it('budgets semantic-search RSS growth relative to the stdio process baseline', () => {
+    const mib = 1024 * 1024;
+    expect(resolveMemoryMcpMaxRssBytes({}, 300 * mib)).toBe(1580 * mib);
+  });
+
   it('runs the real stdio server, exposes the registered shared tools, and persists runtime-derived preference provenance', async () => {
     await withStdioClient(childEnv(), async (client) => {
       const listed = await client.listTools();
@@ -115,12 +146,33 @@ describe('memory MCP interface e2e', () => {
       // The MCP process hosts memory plus exact server-backed alias and pin
       // stores; assert each independent surface is present
       // (order-independent). Mirrors test/daemon/memory-mcp-server.test.ts.
-      expect(listedNames).toEqual(expect.arrayContaining([...MEMORY_MCP_TOOL_NAME_LIST]));
+      // Core tools are listed without a discovery round-trip; only the heavy
+      // pins, controlled-machine, file-transfer and computer-use surfaces stay lazy, so
+      // assert both directions rather than the whole catalog.
+      expect(listedNames).toEqual(expect.arrayContaining([...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE]));
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
+      expect(listedNames).not.toContain(MEMORY_MCP_TOOL_NAMES.COMPUTER_USE_CALL);
       expect(listedNames).toEqual(expect.arrayContaining([
         ALIAS_MCP_TOOLS.RESOLVE,
         ALIAS_MCP_TOOLS.LIST,
         ALIAS_MCP_TOOLS.SAVE,
         ALIAS_MCP_TOOLS.DELETE,
+      ]));
+      expect(listedNames).not.toContain(MESSAGE_PIN_MCP_TOOLS.LIST);
+
+      const activated = await activateToolGroup(client, MESSAGE_PIN_MCP_TOOLS.LIST);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([
+          MESSAGE_PIN_MCP_TOOLS.LIST,
+          MESSAGE_PIN_MCP_TOOLS.GET,
+          MESSAGE_PIN_MCP_TOOLS.SAVE,
+          MESSAGE_PIN_MCP_TOOLS.DELETE,
+        ]),
+      });
+      const expandedNames = (await client.listTools()).tools.map((tool) => tool.name);
+      expect(expandedNames).toEqual(expect.arrayContaining([
+        ...MCP_TOOL_DISCOVERY_DEFAULT_ACTIVE,
         MESSAGE_PIN_MCP_TOOLS.LIST,
         MESSAGE_PIN_MCP_TOOLS.GET,
         MESSAGE_PIN_MCP_TOOLS.SAVE,
@@ -357,6 +409,11 @@ describe('memory MCP interface e2e', () => {
         ],
       });
 
+      const activated = await activateToolGroup(client, MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY]),
+      });
       const archived = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.ARCHIVE_MEMORY,
         arguments: { ref: manageableRef },
@@ -382,6 +439,11 @@ describe('memory MCP interface e2e', () => {
     });
 
     await withStdioClient(childEnv(), async (client) => {
+      const activated = await activateToolGroup(client, MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES);
+      expect(activated).toMatchObject({
+        status: 'ok',
+        activated: expect.arrayContaining([MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES]),
+      });
       const listed = structured(await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.LIST_MEMORY_SUMMARIES,
         arguments: {

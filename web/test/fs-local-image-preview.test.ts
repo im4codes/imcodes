@@ -84,6 +84,52 @@ describe('loadFsLocalImagePreview', () => {
     expect(harness.handlers.size).toBe(0);
   });
 
+  // tsk_5rf. 6a169ad3c made the daemon answer image previews with metadata plus a
+  // download handle and no bytes, but this loader still only accepted base64, so
+  // every streamed image fell through to the reject branch and the chat
+  // thumbnail disappeared. The bytes must come over the authenticated chunked
+  // download channel - never back through the WebSocket.
+  it('resolves a streamed image preview through the authenticated download URL (tsk_5rf)', async () => {
+    const harness = createWsHarness();
+    const buildUrl = vi.fn(async (serverId: string, downloadId: string, sessionName?: string) => (
+      `https://host/api/server/${serverId}/uploads/${downloadId}/download?sessionName=${sessionName ?? ''}`
+    ));
+    const promise = loadFsLocalImagePreview(harness.ws, '/repo/docs/image.png', {
+      sessionName: 'deck_alpha_brain',
+      serverId: 'srv-1',
+      buildDownloadUrl: buildUrl,
+    });
+    const requestId = harness.fsReadFile.mock.results[0]?.value as string;
+    harness.emit(imageResponse(requestId, {
+      encoding: undefined,
+      content: undefined,
+      previewMode: 'stream',
+      downloadId: 'dl-42',
+    }));
+
+    await expect(promise).resolves.toEqual({
+      dataUrl: 'https://host/api/server/srv-1/uploads/dl-42/download?sessionName=deck_alpha_brain',
+      alt: 'image.png',
+    });
+    expect(buildUrl).toHaveBeenCalledWith('srv-1', 'dl-42', 'deck_alpha_brain');
+  });
+
+  it('still rejects a streamed image preview that carries no download handle (tsk_5rf)', async () => {
+    const harness = createWsHarness();
+    const promise = loadFsLocalImagePreview(harness.ws, '/repo/docs/image.png', {
+      serverId: 'srv-1',
+      buildDownloadUrl: async () => 'https://host/never',
+    });
+    const requestId = harness.fsReadFile.mock.results[0]?.value as string;
+    harness.emit(imageResponse(requestId, {
+      encoding: undefined,
+      content: undefined,
+      previewMode: 'stream',
+      downloadId: undefined,
+    }));
+    await expect(promise).rejects.toThrow();
+  });
+
   it('cleans up when fsReadFile throws synchronously', async () => {
     const harness = createWsHarness({ throwOnRead: new Error('socket closed') });
     const promise = loadFsLocalImagePreview(harness.ws, '/repo/docs/image.png');

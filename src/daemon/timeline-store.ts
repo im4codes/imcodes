@@ -12,7 +12,8 @@
  * `emit()` synchronous guarantees (handled by timeline-emitter):
  *   - Ring buffer push completes; `replay()` immediately sees it.
  *   - Handler broadcast completes; WS / projection sync listeners see it.
- *   - `recordTurnUsage` (better-sqlite3) writes synchronously.
+ *   - usage telemetry is submitted to the context-store worker asynchronously;
+ *     emit never waits for SQLite.
  *
  * `emit()` does NOT guarantee:
  *   - JSONL file content visible to `read()` / `getLatest()` — those paths
@@ -36,7 +37,7 @@ import { homedir } from 'os';
 import { createInterface } from 'readline';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
-import { timelineProjection, type TimelineProjectionQueryOpts } from './timeline-projection.js';
+import { timelineProjection, TimelineProjectionBusyError, type TimelineProjectionQueryOpts } from './timeline-projection.js';
 import { TIMELINE_HISTORY_ERROR_REASONS, type TimelineHistoryErrorReason } from '../../shared/timeline-history-errors.js';
 import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../shared/agent-delegation.js';
@@ -344,13 +345,23 @@ class TimelineStore {
     types: TimelineEvent['type'][],
     opts?: TimelineProjectionQueryOpts,
   ): Promise<TimelineEvent[]> {
-    const events = await timelineProjection.queryByTypes({
-      sessionId: sessionName,
-      types,
-      afterTs: opts?.afterTs,
-      beforeTs: opts?.beforeTs,
-      limit: opts?.limit,
-    });
+    let events: TimelineEvent[] | null;
+    try {
+      events = await timelineProjection.queryByTypes({
+        sessionId: sessionName,
+        types,
+        afterTs: opts?.afterTs,
+        beforeTs: opts?.beforeTs,
+        limit: opts?.limit,
+      });
+    } catch (err) {
+      // Busy is not absence. Reporting it as absence is what invites the caller
+      // to do this work on the main thread.
+      if (err instanceof TimelineProjectionBusyError) {
+        throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY);
+      }
+      throw err;
+    }
     if (events === null) throw new TimelinePreferredReadError(TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE);
     return events;
   }

@@ -1,15 +1,28 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from '../../shared/memory-mcp-feature-flags.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME, type MemoryFeatureFlag } from '../../shared/feature-flags.js';
-import { MEMORY_MCP_DISABLED_FLAGS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import {
+  MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_TOOL_CONTRACTS,
+  MEMORY_MCP_TOOL_NAMES,
+} from '../../shared/memory-mcp-contracts.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
+import { buildSupervisionExecutionCapabilityId } from '../../shared/supervision-execution-pool.js';
+import { SUPERVISION_TASK_AUDIT_POLICIES } from '../../shared/supervision-config.js';
+import { createMemoryMcpServer } from '../../src/daemon/memory-mcp-server.js';
 import { CRON_COMPLETION_POLICY } from '../../shared/cron-types.js';
 import { MEMORY_MCP_DEGRADED_REASON } from '../../shared/memory-ws.js';
-import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
+import {
+  createMemoryMcpToolHandlers,
+  resolveIntegrationCallerProvenance,
+} from '../../src/daemon/memory-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 vi.mock('../../src/util/rate-limited-warn.js', () => ({ warnOncePerHour: vi.fn() }));
 
@@ -94,22 +107,101 @@ describe('memory MCP tool schema firewall', () => {
     rmSync(shortRefDir, { recursive: true, force: true });
   });
 
+  it('publishes task-start paths as evidence and removes legacy claim admission', () => {
+    const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START];
+    expect(contract.inputSchema.properties?.scopeFiles?.description).toContain('never an implementation ACL');
+    expect(contract.inputSchema.properties).not.toHaveProperty('claimMode');
+  });
+
+  it.each([
+    ['subset', ['src/one.ts']],
+    ['superset', ['src/one.ts', 'src/two.ts', 'src/reported-only.ts']],
+    ['omitted', undefined],
+  ] as const)('keeps %s ownedFiles as record-only provenance while enforcing manifest bytes', (_label, ownedFiles) => {
+    const manifest = [
+      { path: 'src/one.ts', sha256: '1'.repeat(64) },
+      { path: 'src/two.ts', sha256: '2'.repeat(64) },
+    ];
+    expect(resolveIntegrationCallerProvenance({
+      rawInput: { ownedFiles, integrationManifest: manifest },
+      ownedFiles,
+      authoritativeManifest: manifest,
+    })).toEqual({ refusals: [], ownedFiles: ownedFiles ?? [], integrationManifest: manifest });
+
+    expect(resolveIntegrationCallerProvenance({
+      rawInput: {
+        ownedFiles,
+        integrationManifest: [{ path: 'src/one.ts', sha256: 'f'.repeat(64) }],
+      },
+      ownedFiles,
+      authoritativeManifest: manifest,
+    })).toMatchObject({
+      refusals: [expect.objectContaining({ code: 'bundle_mismatch', field: 'integrationManifest' })],
+    });
+  });
+
+  it('rejects partial structured integration finalization instead of falling back to legacy prose finish', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller());
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
+      assignmentId: 'supervision_assignment_owner',
+      revision: 'combined-r1',
+      auditAttemptId: 'overall-audit-r1',
+      evidence: 'must not select the legacy branch',
+    })).resolves.toMatchObject({
+      status: 'error',
+      reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: 'integration_finalize rejected',
+      refusals: expect.arrayContaining([
+        expect.objectContaining({ code: 'missing_field', field: 'auditRevision' }),
+      ]),
+    });
+  });
+
+  it('does not require caller-reported path metadata at the finalization schema boundary', async () => {
+    const handlers = createMemoryMcpToolHandlers(caller());
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SUPERVISION_INTEGRATION_FINALIZE]({
+      assignmentId: 'supervision_assignment_missing',
+      revision: 'combined-r1',
+      auditAttemptId: 'overall-audit-r1',
+      auditRevision: 'combined-r1',
+      verdict: 'PASS',
+      integrationOwner: 'deck_proj_brain',
+      commitSha: '1'.repeat(40),
+      pushResult: 'pushed',
+      pushRemoteRef: 'refs/heads/dev',
+      externalRunId: 'run-1',
+      externalHeadSha: '1'.repeat(40),
+      ciResult: 'success',
+    });
+    expect(result).toMatchObject({ status: 'error' });
+    expect(String(result.message)).not.toContain('invalid structured finalization');
+  });
+
   it('submits peer audit replies only through the strict structured dependency', async () => {
     const peerAuditReply = vi.fn(async () => ({ ok: true }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
     const valid = {
+      taskId: 'supervision_task_12345678',
+      assignmentId: 'supervision_assignment_12345678',
       attemptId: 'attempt_12345678',
-      replyCapability: 'A'.repeat(32),
+      revision: 'revision_12345678',
+      receiptKind: 'final',
       verdict: 'PASS',
       findings: 'Focused tests passed.',
       validations: [{ kind: 'test', label: 'focused', outcome: 'passed', summary: '12 passed' }],
     };
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({
+      ...valid,
+      verdict: undefined,
+    })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+    expect(peerAuditReply).not.toHaveBeenCalled();
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](valid)).resolves.toEqual({ status: 'ok', accepted: true });
     expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
       version: 'peer_audit_reply_v1',
       attemptId: valid.attemptId,
-      replyCapability: valid.replyCapability,
+      receiptKind: 'final',
     }));
+    expect(peerAuditReply.mock.calls[0]?.[0]).not.toHaveProperty('replyCapability');
 
     const forged = await handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY]({ ...valid, injectedTarget: 'other-session' });
     expect(forged).toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
@@ -121,7 +213,6 @@ describe('memory MCP tool schema firewall', () => {
     const handlers = createMemoryMcpToolHandlers(caller(), { delegationReply });
     const valid = {
       delegationId: 'delegation_identity_1234567890',
-      replyCapability: 'reply_capability_1234567890_ABCDEFG',
       result: 'Completed with exact evidence.',
     };
 
@@ -144,11 +235,18 @@ describe('memory MCP tool schema firewall', () => {
   });
 
   it('defers peer-audit PASS evidence policy until the sender-bound ingress', async () => {
-    const peerAuditReply = vi.fn(async () => ({ ok: false, error: 'invalid_capability' }));
+    const peerAuditReply = vi.fn(async () => ({
+      ok: false,
+      error: 'identity_mismatch',
+      message: 'audit sender identity rejected: runtimeEpoch expected="epoch-a" actual="epoch-b"',
+    }));
     const handlers = createMemoryMcpToolHandlers(caller(), { peerAuditReply });
     const structureOnlyPass = {
+      taskId: 'supervision_task_12345678',
+      assignmentId: 'supervision_assignment_12345678',
       attemptId: 'attempt_12345678',
-      replyCapability: 'A'.repeat(32),
+      revision: 'revision_12345678',
+      receiptKind: 'final',
       verdict: 'PASS',
       findings: 'No executable evidence was supplied.',
       validations: [],
@@ -156,7 +254,8 @@ describe('memory MCP tool schema firewall', () => {
 
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY](structureOnlyPass)).resolves.toMatchObject({
       status: 'error',
-      reason: MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE,
+      reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+      message: expect.stringContaining('runtimeEpoch expected="epoch-a" actual="epoch-b"'),
     });
     expect(peerAuditReply).toHaveBeenCalledWith(expect.objectContaining({
       version: 'peer_audit_reply_v1',
@@ -690,6 +789,480 @@ describe('memory MCP tool schema firewall', () => {
     expect(cronList).toHaveBeenCalled();
   });
 
+  it('keeps self out of send_list_targets while returning only the bound caller from session_runtime_identity_get', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', requestedModel: 'gpt-5.6', runtimeType: 'transport', providerId: 'codex',
+    });
+    const peer = sessionRecord({ name: 'deck_proj_w1', role: 'w1', sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch', activeModel: 'opus[1M]', agentType: 'claude-code-sdk', runtimeType: 'transport', providerId: 'claude', userCreated: true });
+    const handlers = createMemoryMcpToolHandlers(caller(), { sendDeps: { listSessions: () => [self, peer] } });
+    const targets = await handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({});
+    expect(targets).toMatchObject({ status: 'ok', items: [expect.objectContaining({ target: 'deck_proj_w1' })] });
+    expect((targets as { items: Array<{ target: string }> }).items.some((item) => item.target === 'deck_proj_brain')).toBe(false);
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({})).resolves.toMatchObject({
+      status: 'ok',
+      identity: {
+        sessionName: 'deck_proj_brain', sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch',
+        agentType: 'codex-sdk', runtimeType: 'transport', providerFamily: 'openai',
+        normalizedModelId: 'gpt-5.6', effectiveModelId: 'gpt-5.6', modelMetadataState: 'known',
+        modelMetadataSource: 'active_model', modelMetadataConfidence: 'daemon_observed',
+      },
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET]({ sessionName: 'deck_proj_w1', model: 'opus' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED });
+  });
+
+  it('threads the optional executionPool contract through MCP ingress without changing default discovery', async () => {
+    const codexConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model: 'gpt-5.6',
+    };
+    const qwenConfig = {
+      agentType: 'qwen', providerFamily: 'alibaba', runtimeType: 'transport' as const, model: 'qwen3-coder-plus',
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', runtimeType: 'transport',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [{ ...codexConfig, capabilityId: buildSupervisionExecutionCapabilityId(codexConfig) }] },
+            economyTaskPool: { configs: [{ ...qwenConfig, capabilityId: buildSupervisionExecutionCapabilityId(qwenConfig) }] },
+          },
+        },
+      },
+    });
+    const primary = sessionRecord({
+      name: 'deck_proj_codex', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'codex-instance', runtimeEpoch: 'codex-epoch',
+      agentType: codexConfig.agentType, activeModel: codexConfig.model, runtimeType: 'transport',
+    });
+    const economy = sessionRecord({
+      name: 'deck_proj_qwen', role: 'w2', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'qwen-instance', runtimeEpoch: 'qwen-epoch',
+      agentType: qwenConfig.agentType, activeModel: qwenConfig.model, runtimeType: 'transport',
+    });
+    const outside = sessionRecord({
+      name: 'deck_proj_cc', role: 'w3', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'cc-instance', runtimeEpoch: 'cc-epoch',
+      agentType: 'claude-code-sdk', activeModel: 'opus[1M]', runtimeType: 'transport',
+    });
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      sendDeps: { listSessions: () => [self, primary, economy, outside] },
+    });
+
+    const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS];
+    expect(contract.inputSchema.properties?.executionPool).toMatchObject({ enum: ['primary', 'economy'] });
+    expect(contract.outputSchema.properties).toHaveProperty('executionPoolsState');
+    expect(contract.outputSchema.properties).toHaveProperty('items');
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok',
+      executionPoolsState: 'configured',
+      items: [
+        expect.objectContaining({ target: primary.name, eligiblePools: ['primary'] }),
+        expect.objectContaining({ target: economy.name, eligiblePools: ['economy'] }),
+        expect.objectContaining({ target: outside.name, eligiblePools: [] }),
+      ],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'primary' })).resolves.toMatchObject({
+      status: 'ok', appliedExecutionPool: 'primary', items: [expect.objectContaining({ target: primary.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'economy' })).resolves.toMatchObject({
+      status: 'ok', appliedExecutionPool: 'economy', items: [expect.objectContaining({ target: economy.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({ executionPool: 'audit' })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+    });
+  });
+
+  it('publishes and preserves optional ccPresetId through the real send_message MCP ingress', async () => {
+    const presetConfig = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: 'opus[1M]',
+      ccPresetId: 'preset-a',
+    };
+    const requestedExecutionType = {
+      ...presetConfig,
+      capabilityId: buildSupervisionExecutionCapabilityId(presetConfig),
+    };
+    const legacyConfig = {
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+      runtimeType: 'transport' as const,
+      model: 'gpt-5.6',
+    };
+    const legacyRequestedExecutionType = {
+      ...legacyConfig,
+      capabilityId: buildSupervisionExecutionCapabilityId(legacyConfig),
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', activeModel: 'gpt-5.6', runtimeType: 'transport',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [requestedExecutionType, legacyRequestedExecutionType] },
+            economyTaskPool: { configs: [] },
+          },
+        },
+      },
+    });
+    const presetPeer = sessionRecord({
+      name: 'deck_proj_cc_preset', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'preset-instance', runtimeEpoch: 'preset-epoch',
+      agentType: presetConfig.agentType, providerId: 'anthropic', activeModel: presetConfig.model,
+      runtimeType: presetConfig.runtimeType, ccPreset: presetConfig.ccPresetId,
+    });
+    const legacyPeer = sessionRecord({
+      name: 'deck_proj_codex_legacy', role: 'w2', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch',
+      agentType: legacyConfig.agentType, providerId: 'openai', activeModel: legacyConfig.model,
+      runtimeType: legacyConfig.runtimeType,
+    });
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller(), {
+      sendDeps: { listSessions: () => [self, presetPeer, legacyPeer], dispatchMessage },
+    });
+    const client = new Client({ name: 'cc-preset-ingress-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contractTask = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+        .inputSchema.properties?.task as { properties?: Record<string, unknown> };
+      const contractRequested = contractTask.properties?.requestedExecutionType as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      expect(contractRequested.properties?.ccPresetId).toMatchObject({ type: 'string', minLength: 1 });
+      expect(contractRequested.required).not.toContain('ccPresetId');
+      expect(contractTask.properties?.auditPolicy).toMatchObject({
+        type: 'string', enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+      });
+
+      const advertised = (await client.listTools()).tools
+        .find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      const advertisedTask = advertised?.inputSchema.properties?.task as {
+        properties?: Record<string, unknown>;
+      };
+      const advertisedRequested = advertisedTask.properties?.requestedExecutionType as {
+        properties?: Record<string, unknown>;
+        required?: string[];
+      };
+      expect(advertisedRequested.properties?.ccPresetId).toMatchObject({ minLength: 1 });
+      expect(advertisedRequested.required).not.toContain('ccPresetId');
+      expect(advertisedTask.properties?.auditPolicy).toMatchObject({
+        enum: [...SUPERVISION_TASK_AUDIT_POLICIES],
+      });
+
+      const exact = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: presetPeer.name,
+          message: 'preset-bound task',
+          task: {
+            taskId: 'supervision_task_missing_preset_ingress',
+            executionPool: 'primary',
+            requestedExecutionType,
+          },
+        },
+      });
+      expect(exact.structuredContent).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: 'task is not visible to this caller',
+      });
+
+      const legacy = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: legacyPeer.name,
+          message: 'legacy task without preset identity',
+          task: {
+            taskId: 'supervision_task_missing_legacy_ingress',
+            executionPool: 'primary',
+            requestedExecutionType: legacyRequestedExecutionType,
+          },
+        },
+      });
+      expect(legacy.structuredContent).toMatchObject({
+        status: 'error',
+        reason: MCP_ERROR_REASONS.IDENTITY_REJECTED,
+        error: 'task is not visible to this caller',
+      });
+
+      const { ccPresetId: _omitted, ...missingPreset } = requestedExecutionType;
+      for (const malformed of [missingPreset, { ...requestedExecutionType, ccPresetId: 'preset-b' }]) {
+        const rejected = await client.callTool({
+          name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+          arguments: {
+            target: presetPeer.name,
+            message: 'malformed preset identity',
+            task: {
+              taskId: 'supervision_task_missing_preset_ingress',
+              executionPool: 'primary',
+              requestedExecutionType: malformed,
+            },
+          },
+        });
+        expect(rejected.structuredContent).toMatchObject({
+          status: 'error',
+          reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        });
+      }
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('resolves an Agent identity file and carries the complete explicit config through MCP auto-provisioning', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-agent-identity-'));
+    const identityFile = 'release-engineer.md';
+    const identityPath = join(root, identityFile);
+    writeFileSync(identityPath, '  You are the release engineer.  \n', 'utf8');
+    const requestedBase = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: 'opus[1M]',
+    };
+    const requestedExecutionType = {
+      ...requestedBase,
+      capabilityId: buildSupervisionExecutionCapabilityId(requestedBase),
+    };
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance',
+      runtimeEpoch: 'self-epoch',
+      projectDir: root,
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      activeModel: 'gpt-5.6-sol',
+    });
+    const target = sessionRecord({
+      name: 'deck_sub_identity_file_target',
+      role: 'w1',
+      parentSession: self.name,
+      userCreated: true,
+      projectDir: root,
+      agentType: 'claude-code-sdk',
+      providerId: 'anthropic',
+      runtimeType: 'transport',
+      activeModel: 'opus[1M]',
+      identityPrompt: 'You are the release engineer.',
+      sessionInstanceId: 'target-instance',
+      runtimeEpoch: 'target-epoch',
+    });
+    let liveSessions = [self];
+    const provisionSupervisionTarget = vi.fn(async () => {
+      liveSessions = [self, target];
+      return {
+        ok: true as const,
+        target,
+        evidence: {
+          selectedPool: 'primary' as const,
+          selectedConfig: requestedExecutionType,
+          origin: 'spawned' as const,
+          createdSessionName: target.name,
+        },
+      };
+    });
+    const profile = {
+      scope: 'session' as const,
+      scopeKey: `srv-1:${target.name}`,
+      content: 'You are the release engineer.',
+      contentHash: 'identity-content-hash',
+      revision: 1,
+      updatedAt: 1,
+      source: 'mcp' as const,
+      sourceFile: identityPath,
+    };
+    const setIdentityProfile = vi.fn(async () => ({ status: 'ok' as const, profile }));
+    const getEffectiveIdentityProfiles = vi.fn(async () => ({ status: 'ok' as const, profiles: [profile] }));
+    const applyEffectiveIdentity = vi.fn(async () => ({ applied: true }));
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { projectRoot: string; assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: join(input.projectRoot, '.imcodes-worktrees', input.assignmentId),
+      baseRevision: 'a'.repeat(40),
+      created: true,
+    }));
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller({ projectRoot: null }), {
+      sendDeps: {
+        listSessions: () => liveSessions,
+        provisionSupervisionTarget,
+        ensureSupervisionAssignmentWorktree,
+        dispatchMessage,
+      },
+      setIdentityProfile,
+      getEffectiveIdentityProfiles,
+      applyEffectiveIdentity,
+    });
+    const client = new Client({ name: 'identity-auto-provision-ingress-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contractIdentity = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]
+        .inputSchema.properties?.identity;
+      expect(contractIdentity).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        anyOf: [{ required: ['content'] }, { required: ['filePath'] }],
+      });
+      const advertised = (await client.listTools()).tools
+        .find((tool) => tool.name === MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE);
+      expect(advertised?.inputSchema.properties?.identity).toMatchObject({
+        type: 'object',
+        additionalProperties: false,
+        properties: { content: { type: 'string' }, filePath: { type: 'string' } },
+      });
+
+      const result = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          message: 'ship the release',
+          idempotencyKey: 'identity-file-auto-provision-1',
+          identity: { filePath: identityFile },
+          task: {
+            objective: 'ship the release',
+            autoProvision: true,
+            requestedExecutionType,
+          },
+        },
+      });
+      expect(result.structuredContent).toMatchObject({
+        status: 'accepted',
+        provisioning: { origin: 'spawned', createdSessionName: target.name },
+      });
+      expect(provisionSupervisionTarget).toHaveBeenCalledWith(expect.objectContaining({
+        requestedCapabilityId: requestedExecutionType.capabilityId,
+        requestedExecutionConfig: requestedExecutionType,
+        identityPrompt: 'You are the release engineer.',
+        provenance: 'manual_explicit',
+      }));
+      expect(setIdentityProfile).toHaveBeenCalledWith(expect.objectContaining({
+        scope: 'session',
+        scopeKey: `srv-1:${target.name}`,
+        content: 'You are the release engineer.',
+        sourceFile: identityFile,
+      }), expect.any(Object));
+      expect(applyEffectiveIdentity).toHaveBeenCalledWith(
+        target.name,
+        expect.stringContaining('You are the release engineer.'),
+        { refresh: true },
+      );
+      expect(ensureSupervisionAssignmentWorktree).toHaveBeenCalledWith(expect.objectContaining({
+        projectRoot: root,
+      }));
+      expect(dispatchMessage).toHaveBeenCalledOnce();
+
+      const invalid = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          message: 'must reject ambiguous identity input',
+          idempotencyKey: 'identity-file-auto-provision-invalid',
+          identity: { content: 'inline', filePath: identityPath },
+          task: { objective: 'reject', autoProvision: true, requestedExecutionType },
+        },
+      });
+      expect(invalid.isError).toBe(true);
+      expect(provisionSupervisionTarget).toHaveBeenCalledTimes(1);
+    } finally {
+      await client.close();
+      await server.close();
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('carries deliveryMode through MCP ingress and refuses queue for an existing task continuation', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', runtimeType: 'transport',
+    });
+    const peer = sessionRecord({
+      name: 'deck_proj_append_peer', role: 'w1', parentSession: self.name, userCreated: true,
+      sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch', runtimeType: 'transport',
+    });
+    const dispatchMessage = vi.fn(async () => undefined);
+    const server = createMemoryMcpServer(caller(), {
+      sendDeps: { listSessions: () => [self, peer], dispatchMessage },
+    });
+    const client = new Client({ name: 'append-contract-test', version: '1' });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+    try {
+      const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+      expect(contract.inputSchema.properties?.deliveryMode).toMatchObject({ enum: ['append', 'queue'] });
+      expect(contract.description).toContain('Existing-task continuations MUST append');
+      const result = await client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
+        arguments: {
+          target: peer.name,
+          message: 'same task continuation',
+          deliveryMode: 'queue',
+          task: { taskId: 'supervision_task_existing', executionPool: 'primary' },
+        },
+      });
+      expect(result.structuredContent).toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        error: expect.stringContaining('must use deliveryMode=append'),
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  });
+
+  it('retains an omitted live target from the authoritative directory but rejects an explicit stopped record', async () => {
+    const self = sessionRecord({
+      sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', runtimeType: 'transport',
+    });
+    const peer = sessionRecord({
+      name: 'deck_proj_w1', role: 'w1', sessionInstanceId: 'peer-instance', runtimeEpoch: 'peer-epoch',
+      agentType: 'claude-code-sdk', runtimeType: 'transport', userCreated: true,
+    });
+    let snapshot = [self, peer];
+    const dispatchMessage = vi.fn(async () => undefined);
+    const authoritative = vi.fn(async (candidate: SessionRecord) => candidate.name === peer.name);
+    const handlers = createMemoryMcpToolHandlers(caller(), {
+      sendDeps: {
+        listSessions: () => snapshot,
+        dispatchMessage,
+        isSessionAuthoritativelyActive: authoritative,
+      },
+    });
+
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [expect.objectContaining({ target: peer.name })],
+    });
+
+    // Deterministic snapshot race: the directory refresh omits only the live
+    // peer. No timer is advanced; authority answers synchronously from the
+    // runtime directory and both list + send retain the same target.
+    snapshot = [self];
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [expect.objectContaining({ target: peer.name })],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+      target: peer.name, message: 'continue after snapshot race',
+    })).resolves.toMatchObject({ status: 'accepted' });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+    expect(authoritative).toHaveBeenCalledWith(expect.objectContaining({ name: peer.name }));
+
+    // An explicit stopped record is newer authority, not an omission. It must
+    // never be resurrected by the previous-good snapshot.
+    snapshot = [self, { ...peer, state: 'stopped' as const }];
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_LIST_TARGETS]({})).resolves.toMatchObject({
+      status: 'ok', items: [],
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+      target: peer.name, message: 'must reject stopped',
+    })).resolves.toMatchObject({ status: 'error' });
+    expect(dispatchMessage).toHaveBeenCalledTimes(1);
+  });
+
   it('does not forward forged cron identity fields to the cron client', async () => {
     const cronCreate = vi.fn(async () => ({ status: 'ok', body: { id: 'job-1' } }));
     const handlers = createMemoryMcpToolHandlers(caller(), {
@@ -1216,5 +1789,68 @@ describe('memory MCP tool schema firewall', () => {
 
     expect(cronCreate.mock.calls[0][0]).toMatchObject({ name: '', cronExpr: '' });
     expect(cronList.mock.calls[0][0]).toEqual({ projectName: 'proj', limit: 5 });
+  });
+});
+
+describe('send_message identity ingress limit', () => {
+  // The MCP ingress rejects an oversized identity before anything is dispatched.
+  // send-tool validates again downstream, so this pins the earlier boundary and
+  // its exact contract rather than merely "rejected somewhere".
+  function handlersFor(root: string) {
+    const self = sessionRecord({ projectDir: root });
+    const dispatchMessage = vi.fn();
+    const handlers = createMemoryMcpToolHandlers(caller({ projectRoot: root }), {
+      sendDeps: { listSessions: () => [self], dispatchMessage },
+    });
+    return { handlers, dispatchMessage };
+  }
+
+  it('rejects an inline identity one code point over the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-'));
+    try {
+      const { handlers, dispatchMessage } = handlersFor(root);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-inline-over', task: { autoProvision: true },
+        identity: { content: 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1) },
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: 'identity is invalid',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects an identity file one code point over the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-file-'));
+    try {
+      // ASCII, so the file stays under the byte pre-read bound and only the
+      // character limit can reject it.
+      writeFileSync(join(root, 'oversized.md'), 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1), 'utf8');
+      const { handlers, dispatchMessage } = handlersFor(root);
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-file-over', task: { autoProvision: true },
+        identity: { filePath: 'oversized.md' },
+      })).resolves.toMatchObject({
+        status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, message: 'identity is invalid',
+      });
+      expect(dispatchMessage).not.toHaveBeenCalled();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('does not reject an identity at exactly the session limit at ingress', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'imc-identity-ingress-limit-'));
+    try {
+      const { handlers } = handlersFor(root);
+      const result = await handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]({
+        message: 'spawn', idempotencyKey: 'ingress-inline-limit', task: { autoProvision: true },
+        identity: { content: 'a'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS) },
+      }) as { message?: string };
+      expect(result.message).not.toBe('identity is invalid');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
   });
 });

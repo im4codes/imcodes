@@ -20,20 +20,66 @@ import type {
   TransportMemoryRecallArtifact,
   TransportMemoryRecallItem,
 } from '../../shared/context-types.js';
-import { buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
-import { buildFilePathReportingPrompt, buildTransportImcodesIdentityPrompt } from '../../shared/transport-runtime-prompts.js';
+import {
+  buildFilePathReportingPrompt,
+  buildTransportImcodesIdentityPrompt,
+  REAL_DEVICE_TESTING_SYSTEM_GUIDANCE,
+} from '../../shared/transport-runtime-prompts.js';
+import { CAPABILITY_AI_SYSTEM_INSTRUCTIONS } from '../../shared/capability-management.js';
+import { MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS } from '../../shared/mcp-tool-discovery.js';
+import {
+  buildBrainSupervisedWorkDelegationContract,
+  buildBrainManualOnlyDelegationContract,
+  buildBrainWorkDelegationContractRef,
+} from '../daemon/supervision-prompts.js';
+import { buildAuditConvergenceContract } from '../../shared/audit-convergence.js';
+import { buildTaskPairMarkerContract, type TaskPairEngineState } from '../../shared/task-pair.js';
+import { CRON_CONTROL_PROTOCOL, CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
+
+/** Stable text: rendered once, registered in every managed session's system prompt. */
+const AUDIT_CONVERGENCE_SYSTEM_CONTRACT = buildAuditConvergenceContract();
+const TASK_PAIR_SYSTEM_CONTRACT = buildTaskPairMarkerContract();
+import type { SessionRecord } from '../store/session-store.js';
+import { identitySpanForSegment, joinSpanned } from './priority-preserving-context-cap.js';
 
 export interface TransportRuntimeAssemblyInput {
   userMessage: string;
   /** Stable logical delivery identity retained across recoverable dispatch retries. */
   deliveryId?: string;
   description?: string;
+  /** Resolved deterministic user/project/session Agent identity contract. */
+  identityPrompt?: string;
   systemPrompt?: string;
   suppressMcpMemorySearchGuidance?: boolean;
   suppressAgentProgressGuidance?: boolean;
   suppressFilePathReportingGuidance?: boolean;
   messagePreamble?: string;
+  /**
+   * True once the full Brain work-delegation contract body has already been
+   * registered for this thread. Later turns then re-assert it by reference
+   * instead of resending the body; the body is registered again after a
+   * thread start/resume or a compaction, which is when the prior text is gone.
+   */
+  brainContractRegistered?: boolean;
+  /**
+   * This turn's answer of `isAutomaticSupervisionEnabled` for the session.
+   * Absent is treated exactly like false: a runtime that cannot establish the
+   * mode must never hand a Brain the automatic supervision duties.
+   * `brainContractRegistered` must refer to THIS variant's registration.
+   */
+  automaticSupervisionEnabled?: boolean;
+  /**
+   * The task-pair engine state governing the session's project: `pairs` (the
+   * default; absent means `pairs`), `legacy`, or `off` (mode `off`, no engine
+   * explicitly configured -- neither engine runs). Selects how
+   * user-requested audited work is kept moving in the manual-only Brain
+   * contract. `brainContractRegistered` must refer to this variant too.
+   */
+  taskPairEngine?: TaskPairEngineState;
+  /** Full dynamic contracts that are not yet registered on this provider thread. */
+  registeredSystemContractText?: string;
   attachments?: TransportAttachment[];
   namespace?: ContextNamespace;
   namespaceDiagnostics?: string[];
@@ -61,7 +107,12 @@ export interface TransportRuntimeAssemblyInput {
    * `MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE` — outside the user-authored
    * 300-char cap. See p2p audit 37bfbb85-430 N-A.
    */
-  sessionIdentity?: { sessionName: string; label?: string | null };
+  /**
+   * Authoritative session identity. `role` comes from the session record, never
+   * from parsing sessionName/label and never from model or client free text: a
+   * session that could impersonate a Brain would inherit delegation authority.
+   */
+  sessionIdentity?: { sessionName: string; label?: string | null; role?: SessionRecord['role'] };
   /** Runtime-minted lifecycle generation for provider active-work attribution. */
   activityGeneration?: ActivityGeneration;
 }
@@ -76,10 +127,15 @@ export const MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE = [
   'Do not call memory for bare control messages like "continue", "go on", "ok", "yes", "commit", "push", "run tests", or other short commands without searchable context.',
 ].join('\n');
 
+// "Sparse, key boundaries only" with no ceiling on silence let long tasks run
+// for many minutes with nothing the user could see. High-signal stays the rule;
+// silence now has an upper bound.
 const AGENT_PROGRESS_SYSTEM_GUIDANCE = [
-  'Keep work updates sparse and high-signal.',
-  'At key boundaries only (long scans, edits, tests, waits, blockers, commit/push), send one short status; skip routine narration and repeated summaries.',
-  'Do not paste logs or diffs unless asked; continue without confirmation unless blocked or the user requested a plan.',
+  'Keep work updates short and high-signal; never paste logs or diffs unless asked.',
+  'Before any step likely to take more than about 2 minutes (builds, test suites, deploys, restarts, waits, polling, multi-step investigation), say in one line what you are doing and why.',
+  'During long work, give a status at least every 5 minutes or every 15 tool calls, in one or two short sentences: what finished, what is running, what is next. Never work longer than that with no user-visible update; never turn a status into a long report.',
+  'Say at once when a hypothesis is disproven, a plan changes, or you are blocked; skip routine narration and repeated summaries.',
+  'Continue without confirmation unless blocked or the user requested a plan.',
 ].join('\n');
 
 export interface DispatchSharedContextSendOptions {
@@ -194,10 +250,12 @@ export function buildProviderContextPayload(
   input: TransportRuntimeAssemblyInput,
 ): ProviderContextPayload {
   const { supportClass, authority } = resolveTransportDispatchAuthority(provider, input);
-  const sanitizedStartupMemory = filterStartupMemoryForAuthority(input.startupMemory, authority);
+  const cronSafeStartupMemory = filterObsoleteCronControlMemory(input.startupMemory);
+  const cronSafeMemoryRecall = filterObsoleteCronControlMemory(input.memoryRecall);
+  const sanitizedStartupMemory = filterStartupMemoryForAuthority(cronSafeStartupMemory, authority);
   const sanitizedRecall = {
     startupMemory: sanitizedStartupMemory,
-    memoryRecall: input.memoryRecall,
+    memoryRecall: cronSafeMemoryRecall,
   };
   const compiledContextInput = composeTransportMemoryInputs({
     ...input,
@@ -217,13 +275,20 @@ export function buildProviderContextPayload(
     if (!diagnostics.includes(entry)) diagnostics.push(entry);
   }
   if (input.startupMemory) {
-    diagnostics.push(sanitizedStartupMemory
-      ? (authority.authoritySource === 'processed_remote' && sanitizedStartupMemory.sourceKind === 'local_processed'
-          ? 'memory:start:local-auxiliary'
-          : 'memory:start')
-      : 'memory:start:suppressed-authority');
+    if (!cronSafeStartupMemory) {
+      diagnostics.push('memory:start:filtered-obsolete-cron-control');
+    } else {
+      diagnostics.push(sanitizedStartupMemory
+        ? (authority.authoritySource === 'processed_remote' && sanitizedStartupMemory.sourceKind === 'local_processed'
+            ? 'memory:start:local-auxiliary'
+            : 'memory:start')
+        : 'memory:start:suppressed-authority');
+    }
   }
-  if (input.memoryRecall) diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
+  if (input.memoryRecall) {
+    if (!cronSafeMemoryRecall) diagnostics.push('memory:message:filtered-obsolete-cron-control');
+    else diagnostics.push(authority.authoritySource === 'processed_local' ? 'memory:message' : 'memory:message:local-auxiliary');
+  }
   const recallInjectionSurface: MemoryRecallInjectionSurface = supportClass === 'degraded-message-side-context-mapping'
     ? 'degraded-message-side'
     : 'normalized-payload';
@@ -240,6 +305,7 @@ export function buildProviderContextPayload(
     ...(input.activityGeneration ? { activityGeneration: input.activityGeneration } : {}),
     sessionSystemText: compiledContext.sessionSystemText,
     turnSystemText: compiledContext.turnSystemText,
+    ...(input.sessionIdentity?.role ? { sessionRole: input.sessionIdentity.role } : {}),
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,
@@ -249,6 +315,39 @@ export function buildProviderContextPayload(
     authority,
     supportClass,
     diagnostics,
+  };
+}
+
+/**
+ * The cron wrapper's authority lives in the permanent provider system prompt.
+ * Historical projections about that wrapper are therefore never valid
+ * authority, even when they record a prior agent refusal or repeat a user's
+ * question.  Injecting those projections message-side created a feedback loop:
+ * a weak model called the wrapper prompt injection, memory summarized that
+ * answer, and the next turn cited the summary as proof.
+ *
+ * Rebuild from structured items whenever the wrapper appears.  An artifact
+ * whose rendered text mentions the wrapper but whose items do not is
+ * incoherent, so fail closed instead of forwarding unbound text.
+ */
+function filterObsoleteCronControlMemory(
+  artifact: TransportMemoryRecallArtifact | undefined,
+): TransportMemoryRecallArtifact | undefined {
+  if (!artifact) return undefined;
+  const marker = CRON_CONTROL_PROTOCOL.TAG_NAME.toLowerCase();
+  const mentionsMarker = (value: string): boolean => value.toLowerCase().includes(marker);
+  const retainedItems = artifact.items.filter((item) => !mentionsMarker(item.summary));
+  const removedItem = retainedItems.length !== artifact.items.length;
+  const renderedMentionsMarker = mentionsMarker(artifact.injectedText);
+  if (!removedItem && !renderedMentionsMarker) return artifact;
+  if (!removedItem || retainedItems.length === 0) return undefined;
+  return {
+    ...artifact,
+    items: retainedItems,
+    injectedText: artifact.reason === 'startup'
+      ? buildStartupProjectMemoryText(attachMemoryShortRefs(retainedItems))
+      : buildRelatedPastWorkText(attachMemoryShortRefs(retainedItems)),
+    sourceKind: resolveRecallSourceKind(retainedItems),
   };
 }
 
@@ -348,8 +447,43 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
   }
   const renderedAuthoredSystemText = renderAuthoredSystemText(authoredContext.required, authoredContext.advisory);
   const memorySearchGuidance = input.suppressMcpMemorySearchGuidance ? undefined : MCP_MEMORY_SEARCH_SYSTEM_GUIDANCE;
+  const capabilityGuidance = input.suppressMcpMemorySearchGuidance ? undefined : CAPABILITY_AI_SYSTEM_INSTRUCTIONS;
+  const mcpToolRefreshGuidance = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : MCP_TOOL_DISCOVERY_REFRESH_INSTRUCTIONS;
   const agentProgressGuidance = input.suppressAgentProgressGuidance ? undefined : AGENT_PROGRESS_SYSTEM_GUIDANCE;
   const filePathReportingGuidance = input.suppressFilePathReportingGuidance ? undefined : buildFilePathReportingPrompt();
+  const realDeviceTestingGuidance = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : REAL_DEVICE_TESTING_SYSTEM_GUIDANCE;
+  // Any session can audit, implement or orchestrate an audit, and audit messages
+  // reference this contract by id only -- so its body belongs to the stable
+  // system prompt of every managed session, never to a message.
+  const auditConvergenceContract = input.suppressMcpMemorySearchGuidance
+    ? undefined
+    : AUDIT_CONVERGENCE_SYSTEM_CONTRACT;
+  // Execution authority is not optional MCP guidance. Keep it in the
+  // provider's system/developer channel even for slash-control turns.
+  const cronControlTrustedSystemClause = CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE;
+  const automaticSupervision = input.automaticSupervisionEnabled === true;
+  const taskPairEngine = input.taskPairEngine ?? 'pairs';
+  // Task-pair markers are the sole active supervision protocol. A stale legacy
+  // engine value is inert just like `off`: it must not receive pair nudges or
+  // the retired supervision contract.
+  const taskPairContract = input.suppressMcpMemorySearchGuidance || taskPairEngine !== 'pairs'
+    ? undefined
+    : TASK_PAIR_SYSTEM_CONTRACT;
+  // Legacy supervision is retired.  Only an explicitly enabled pairs
+  // project receives the marker-driven Brain contract; inert projects must
+  // not inherit the old supervision contract merely because a stale snapshot
+  // still says supervised.
+  const brainDelegationContract = input.sessionIdentity?.role === 'brain' && taskPairEngine === 'pairs'
+    ? (input.brainContractRegistered
+      ? buildBrainWorkDelegationContractRef(automaticSupervision, taskPairEngine)
+      : automaticSupervision
+        ? buildBrainSupervisedWorkDelegationContract(undefined, { taskPairEngine })
+        : buildBrainManualOnlyDelegationContract(undefined, { taskPairEngine }))
+    : undefined;
   // Daemon-injected, session-stable identity block. NOT subject to
   // `USER_SESSION_TEXT_MAX_CHARS` — encodes IM.codes runtime behaviour
   // the model must always follow. p2p audit 37bfbb85-430 N-A: this used
@@ -366,19 +500,54 @@ export function compileAgentContextArtifact(input: TransportRuntimeAssemblyInput
     ? buildTransportImcodesIdentityPrompt(
         input.sessionIdentity.sessionName,
         input.sessionIdentity.label ?? undefined,
+        input.sessionIdentity.role,
       )
     : undefined;
-  const sessionSystemText = [
+  // The identity span is recorded here, from the lengths of the parts being
+  // joined, so providers with a context budget can shrink exactly the identity
+  // body. It must never be recovered later by searching this string: the
+  // description, system prompt and authored turn context are user-authored and may
+  // contain forged identity delimiters.
+  const identitySegment = input.identityPrompt?.trim();
+  const composedSessionSystemText = joinSpanned([
+    capabilityGuidance,
+    mcpToolRefreshGuidance,
+    cronControlTrustedSystemClause,
+    brainDelegationContract,
+    input.registeredSystemContractText,
     input.description?.trim(),
     input.systemPrompt?.trim(),
+    identitySegment ? { text: identitySegment, identity: identitySpanForSegment(identitySegment) } : undefined,
     identityPart,
     filePathReportingGuidance,
+    realDeviceTestingGuidance,
+    auditConvergenceContract,
+    taskPairContract,
     memorySearchGuidance,
     agentProgressGuidance,
-  ].filter(Boolean).join('\n\n') || undefined;
-  const turnSystemText = renderedAuthoredSystemText;
+  ], '\n\n');
+  const sessionSystemText = composedSessionSystemText?.text;
+  const sessionSystemTextIdentity = composedSessionSystemText?.identity;
+  // Baseline delegation and registered IM.codes contracts are hard rules.
+  // They belong to the provider system/developer channel, never in user text.
+  //
+  // It used to be deliberately independent of supervision.mode, on the theory
+  // that with supervision off the Brain would "simply attach no auditPolicy and
+  // run no audit lifecycle". Nothing enforced that: the contract is a set of
+  // duties (delegate instead of implement, mint a task assignment, personally
+  // repair blocked lifecycles), and a supervision-off Brain obeyed them -- on a
+  // daily cron it minted a task, looped on recovery and dispatched its own audit.
+  // Automatic supervision is now decided by the same single authority every
+  // other automatic supervision action already asks. A supervision-off Brain
+  // keeps what the baseline exists for (delegate through IM.codes, never
+  // provider-native) and loses everything automatic; supervised work remains
+  // available when a user explicitly arranges it.
+  //
+  // Authored turn context remains turn-scoped. It is not IM.codes authority.
+  const turnSystemText = renderedAuthoredSystemText || undefined;
   return {
     sessionSystemText,
+    ...(sessionSystemTextIdentity ? { sessionSystemTextIdentity } : {}),
     turnSystemText,
     systemText: [sessionSystemText, turnSystemText].filter(Boolean).join('\n\n') || undefined,
     messagePreamble: input.messagePreamble?.trim() || undefined,

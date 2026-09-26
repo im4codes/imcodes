@@ -23,6 +23,7 @@
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import type { SessionInfo } from './types.js';
 import { resolveRuntimeType } from './runtime-type.js';
+import { parseSupervisionHeartbeatSnapshot } from '@shared/supervision-heartbeat.js';
 import {
   buildTransportPendingSyncPatch,
   hasTransportPendingSyncSnapshot,
@@ -62,11 +63,16 @@ export interface IncomingSessionListEntry {
   quotaLabel?: string | null;
   quotaUsageLabel?: string | null;
   quotaMeta?: SessionInfo['quotaMeta'];
+  codexCreditsBalance?: SessionInfo['codexCreditsBalance'];
+  codexCreditsHasCredits?: SessionInfo['codexCreditsHasCredits'];
+  codexCreditsUnlimited?: SessionInfo['codexCreditsUnlimited'];
   effort?: SessionInfo['effort'];
   serviceTier?: SessionInfo['serviceTier'];
   contextNamespace?: SessionInfo['contextNamespace'];
   contextNamespaceDiagnostics?: string[];
   transportConfig?: Record<string, unknown> | null;
+  supervisionMode?: SessionInfo['supervisionMode'];
+  supervisionHeartbeat?: unknown;
   transportPendingMessages?: unknown;
   transportPendingMessageEntries?: unknown;
   pendingMessageEntries?: unknown;
@@ -96,6 +102,19 @@ export function parseMainSessionName(sessionName: string): { project: string; ro
     project: match[1],
     role: match[2] as SessionInfo['role'],
   };
+}
+
+/**
+ * Resolves a shared-entry session's project identifier. The server's `title`
+ * field is a display label (the session's own label, or its project name if
+ * unlabeled) — it must never be trusted as the project identifier, since a
+ * labeled session's title is the label, not the project. The session name
+ * always encodes the real project per the `deck_{project}_{role}` convention,
+ * so that parse is authoritative; `title` is only a last-resort fallback for
+ * a name that doesn't match the convention.
+ */
+export function resolveSharedSessionProject(sessionName: string, title: string): string {
+  return parseMainSessionName(sessionName)?.project || title || sessionName;
 }
 
 export function isWorkerSessionName(sessionName: string): boolean {
@@ -174,6 +193,9 @@ export function mergeSessionListEntry(
     quotaLabel: incoming.quotaLabel ?? (preservesProviderQuota ? existing?.quotaLabel : undefined),
     quotaUsageLabel: incoming.quotaUsageLabel ?? (preservesProviderQuota ? existing?.quotaUsageLabel : undefined),
     quotaMeta: incoming.quotaMeta ?? (preservesProviderQuota ? existing?.quotaMeta : undefined),
+    codexCreditsBalance: incoming.codexCreditsBalance ?? (preservesProviderQuota ? existing?.codexCreditsBalance : undefined),
+    codexCreditsHasCredits: incoming.codexCreditsHasCredits ?? (preservesProviderQuota ? existing?.codexCreditsHasCredits : undefined),
+    codexCreditsUnlimited: incoming.codexCreditsUnlimited ?? (preservesProviderQuota ? existing?.codexCreditsUnlimited : undefined),
     effort: incoming.effort ?? existing?.effort,
     serviceTier: incoming.serviceTier ?? existing?.serviceTier,
     contextNamespace: incoming.contextNamespace ?? existing?.contextNamespace,
@@ -182,6 +204,12 @@ export function mergeSessionListEntry(
       incoming.transportConfig,
       existing?.transportConfig,
     ),
+    supervisionHeartbeat: incoming.supervisionHeartbeat === undefined
+      ? existing?.supervisionHeartbeat
+      : parseSupervisionHeartbeatSnapshot(incoming.supervisionHeartbeat),
+    supervisionMode: incoming.supervisionMode !== undefined
+      ? incoming.supervisionMode
+      : existing?.supervisionMode,
     transportPendingMessages: nextPendingMessages,
     transportPendingMessageEntries: nextPendingEntries,
     queueEpoch: hasPendingSyncPatch ? (pendingSyncPatch.queueEpoch ?? existing?.queueEpoch) : existing?.queueEpoch,

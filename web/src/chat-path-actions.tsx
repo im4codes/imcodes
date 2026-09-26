@@ -2,11 +2,16 @@ import { h, type ComponentChildren } from 'preact';
 import { useState } from 'preact/hooks';
 import { isHtmlPreviewPath } from '@shared/html-preview.js';
 import {
+  chatPathHasFileExtension,
+  isLikelyDomainPath,
+  isLocalChatPath,
+} from '@shared/chat-local-path.js';
+import {
   ChatLocalImagePreview,
   type ChatLocalImagePreviewLoader,
 } from './components/ChatLocalImagePreview.js';
 
-export type ChatPathDownloadHandler = (path: string) => void | Promise<void>;
+export type ChatPathDownloadHandler = (path: string) => void | string | Promise<void | string>;
 
 export interface ChatPathActionLabels {
   download: string;
@@ -51,28 +56,7 @@ const IMAGE_PREVIEW_EXTENSIONS = new Set([
   'webp',
 ]);
 
-export function chatPathHasFileExtension(path: string): boolean {
-  const basename = path.split(/[/\\]/).pop() ?? '';
-  return /\.\w{1,10}$/.test(basename);
-}
-
-export function isLikelyDomainPath(value: string): boolean {
-  return /^(?:[a-z0-9-]+\.)+[a-z]{2,}(?:\/|$)/i.test(value);
-}
-
-export function isLocalChatPath(path: string): boolean {
-  const value = path.trim().replace(/^`+|`+$/g, '');
-  if (!value) return false;
-  // `//host/path` is a protocol-relative web URL, while `\\host\share` is
-  // a Windows UNC path. Neither may enter the automatic local-file preview
-  // path: doing so could turn rendered Markdown into a zero-click SMB read.
-  if (/^(?:\/\/|\\\\)/.test(value)) return false;
-  if (isLikelyDomainPath(value)) return false;
-  if (/^https?:\/\//i.test(value)) return false;
-  if (/^mailto:/i.test(value)) return false;
-  if (/^[a-z][a-z0-9+.-]*:/i.test(value) && !/^[a-z]:[/\\]/i.test(value)) return false;
-  return true;
-}
+export { chatPathHasFileExtension, isLikelyDomainPath, isLocalChatPath };
 
 export function isImagePreviewPath(path: string): boolean {
   const basename = path.split(/[/\\]/).pop() ?? '';
@@ -105,6 +89,7 @@ function ChatPathActions({
 }: ChatPathActionOptions): h.JSX.Element {
   const [downloadState, setDownloadState] = useState<'idle' | 'busy' | 'error'>('idle');
   const [downloadError, setDownloadError] = useState('');
+  const [downloadResult, setDownloadResult] = useState('');
   const resolvedHandlers = handlers ?? { onPathClick, onDownload, onHtmlPreview, onImagePreview };
   const resolvedLabels = labels ?? {
     download: downloadLabel ?? '',
@@ -125,7 +110,7 @@ function ChatPathActions({
   const showImagePreview = !!resolvedHandlers.onImagePreview && isLocalChatPath(path) && isImagePreviewPath(path);
   const downloadTitle = downloadState === 'error' && downloadError
     ? downloadError
-    : resolvedLabels.download;
+    : downloadResult || resolvedLabels.download;
 
   return (
     <>
@@ -144,8 +129,10 @@ function ChatPathActions({
               if (!resolvedHandlers.onDownload) return;
               setDownloadState('busy');
               setDownloadError('');
+              setDownloadResult('');
               try {
-                await resolvedHandlers.onDownload(path);
+                const result = await resolvedHandlers.onDownload(path);
+                if (typeof result === 'string') setDownloadResult(result);
                 setDownloadState('idle');
               } catch (err) {
                 const message = err instanceof Error ? err.message : String(err);
@@ -176,7 +163,9 @@ function ChatPathActions({
         <ChatLocalImagePreview
           path={path}
           loadImagePreview={resolvedHandlers.onImagePreview}
-          onDownload={resolvedHandlers.onDownload}
+          onDownload={resolvedHandlers.onDownload
+            ? async (downloadPath) => { await resolvedHandlers.onDownload?.(downloadPath); }
+            : undefined}
         />
       )}
     </>

@@ -4,7 +4,7 @@
  * Tests for sub-session metadata propagation via subsession.created and subsession.sync.
  * Verifies that provider display metadata (model, plan, quota) survives the WS → hook → state pipeline.
  */
-import { render, cleanup, waitFor, act } from '@testing-library/preact';
+import { render, cleanup, waitFor, act, screen } from '@testing-library/preact';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   SUPERVISION_MODE,
@@ -12,11 +12,18 @@ import {
 } from '@shared/supervision-config.js';
 import { useSubSessions, type SubSession } from '../src/hooks/useSubSessions.js';
 import { createSubSession, listSubSessions, patchSubSession } from '../src/api.js';
+import { SupervisionHeartbeatBadge } from '../src/components/SupervisionHeartbeatBadge.js';
 
 vi.mock('../src/api.js', () => ({
   listSubSessions: vi.fn().mockResolvedValue([]),
   createSubSession: vi.fn(),
   patchSubSession: vi.fn().mockResolvedValue(undefined),
+}));
+
+vi.mock('react-i18next', () => ({
+  useTranslation: () => ({
+    t: (key: string) => key,
+  }),
 }));
 
 type MsgHandler = (msg: any) => void;
@@ -68,6 +75,14 @@ function Harness({ ws, connected }: { ws: any; connected: boolean }) {
 let closeSubSessionHook: ((id: string) => Promise<void>) | null = null;
 let renameSubSessionHook: ((id: string, label: string) => Promise<void>) | null = null;
 let createSubSessionHook: ((type: string, shellBin?: string, cwd?: string, label?: string, extra?: Record<string, unknown>) => Promise<SubSession | null>) | null = null;
+let hydrateSharedHook: ((serverId: string, items: Array<{
+  subSessionId: string;
+  sessionName: string;
+  title: string;
+  type: string;
+  parentSessionName: string | null;
+  supervisionMode?: SubSession['supervisionMode'];
+}>) => void) | null = null;
 
 function CloseHarness({ ws, connected }: { ws: any; connected: boolean }) {
   const { subSessions, close } = useSubSessions('srv1', ws, connected, null);
@@ -90,8 +105,40 @@ function CreateHarness({ ws, connected }: { ws: any; connected: boolean }) {
   return null;
 }
 
+function SharedHarness({ ws }: { ws: any }) {
+  const { subSessions, hydrateShared } = useSubSessions('srv1', ws, true, null, true);
+  captured = subSessions;
+  hydrateSharedHook = hydrateShared;
+  return null;
+}
+
 describe('sub-session metadata via subsession.created', () => {
-  afterEach(() => { cleanup(); vi.clearAllMocks(); captured = []; sentMessages.length = 0; });
+  afterEach(() => {
+    cleanup();
+    vi.clearAllMocks();
+    captured = [];
+    sentMessages.length = 0;
+    hydrateSharedHook = null;
+  });
+
+  it('hydrates the authoritative shared supervision mode without a transport config', async () => {
+    const { ws } = createMockWs();
+    render(<SharedHarness ws={ws} />);
+    await waitFor(() => expect(hydrateSharedHook).not.toBeNull());
+
+    act(() => hydrateSharedHook?.('srv1', [{
+      subSessionId: 'shared-child',
+      sessionName: 'deck_sub_shared_child',
+      title: 'Shared child',
+      type: 'codex-sdk',
+      parentSessionName: 'deck_project_brain',
+      supervisionMode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+    }]));
+
+    expect(captured).toHaveLength(1);
+    expect(captured[0].supervisionMode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(captured[0].transportConfig).toBeUndefined();
+  });
 
   it('stores Qwen metadata fields from subsession.created', async () => {
     const { ws, send } = createMockWs();
@@ -225,6 +272,33 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].planLabel).toBe('Paid');
     expect(captured[0].quotaUsageLabel).toBe('today 10/5000');
     expect(captured[0].effort).toBe('high');
+  });
+
+  it('applies and preserves a typed heartbeat schedule through subsession sync into the badge, then clears it', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+    act(() => send({
+      type: 'subsession.created', id: 'heartbeat', sessionName: 'deck_sub_heartbeat',
+      sessionType: 'codex-sdk', state: 'idle',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'implementation', nextHeartbeatAt: 20_000, updatedAt: 10_000,
+      },
+    }));
+    expect(captured[0].supervisionHeartbeat).toMatchObject({
+      state: 'armed', kind: 'implementation', nextHeartbeatAt: 20_000,
+    });
+
+    act(() => send({ type: 'subsession.sync', id: 'heartbeat', modelDisplay: 'gpt-5.6-sol' }));
+    expect(captured[0].supervisionHeartbeat?.state).toBe('armed');
+    render(<SupervisionHeartbeatBadge
+      mode={SUPERVISION_MODE.SUPERVISED_AUDIT}
+      heartbeat={captured[0].supervisionHeartbeat}
+    />);
+    expect(screen.getByRole('timer').textContent).toContain('❤️00:10');
+    expect(screen.queryByText('⏸️')).toBeNull();
+    act(() => send({ type: 'subsession.sync', id: 'heartbeat', supervisionHeartbeat: null }));
+    expect(captured[0].supervisionHeartbeat).toBeNull();
   });
 
   it('ignores sync for unknown id', async () => {
@@ -451,6 +525,36 @@ describe('sub-session metadata via subsession.sync', () => {
     expect(captured[0].modelDisplay).toBe('Qwen Max');
     expect(captured[0].planLabel).toBe('Free');
     expect(captured[0].quotaUsageLabel).toBe('today 20/1000');
+  });
+
+  it('updates the original heartbeat badge projection on a subsession.created rebroadcast', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'heartbeat-rebroadcast',
+      sessionName: 'deck_sub_heartbeat-rebroadcast',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'idle', updatedAt: 1_000 },
+    }));
+    act(() => send({
+      type: 'subsession.created',
+      id: 'heartbeat-rebroadcast',
+      sessionName: 'deck_sub_heartbeat-rebroadcast',
+      sessionType: 'codex-sdk',
+      state: 'idle',
+      supervisionHeartbeat: {
+        state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000,
+      },
+    }));
+
+    expect(captured[0].supervisionHeartbeat).toEqual({
+      state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000,
+    });
   });
 
   it('preserves queued transport messages while the drained send is still running and clears on authoritative idle', async () => {

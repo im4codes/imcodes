@@ -1,36 +1,119 @@
 import { describe, expect, it } from 'vitest';
+import {
+  SUPERVISION_CHANGE_PROPORTIONALITY,
+  SUPERVISION_GATE_ENFORCEMENT,
+  SUPERVISION_MODE,
+  supervisionTaskAuditPolicyFromSnapshot,
+} from '../shared/supervision-config.js';
+import { PROVIDER_ERROR_CODES } from '../src/agent/transport-provider.js';
 import { CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import { DEFAULT_PRIMARY_CONTEXT_MODEL } from '../shared/context-model-defaults.js';
 import { PEER_AUDIT_PROMPT_VERSION } from '../shared/peer-audit.js';
+import {
+  buildSupervisionExecutionCapabilityId,
+  type SupervisionExecutionPoolsConfig,
+} from '../shared/supervision-execution-pool.js';
 import {
   DEFAULT_SUPERVISION_BACKEND,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK,
   DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL,
   SUPERVISION_AUDIT_MODES,
   SUPERVISION_CONTRACT_IDS,
+  SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
+  evaluateAutomaticSupervisionEnablement,
   SUPERVISION_DEFAULT_PROMPT_VERSION,
   SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   DEFAULT_SUPERVISION_TIMEOUT_MS,
   SUPERVISION_MIN_TIMEOUT_MS,
   SUPERVISION_MODE,
+  SUPERVISION_EXECUTION_STATUS_MARKERS,
+  RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER,
+  RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER,
   SUPERVISION_TRANSPORT_CONFIG_KEY,
   TASK_RUN_STATUS_MARKERS,
+  buildTransportConfigWithSupervision,
   embedSessionSupervisionSnapshot,
   extractSessionSupervisionSnapshot,
   getSessionSupervisionSnapshotIssues,
   hasInvalidSessionSupervisionSnapshot,
   getSupportedSupervisionAuditModes,
   isSupportedSupervisionAuditMode,
+  isAutomaticSupervisionEnabled,
   mergeSupervisionCustomInstructions,
   mergeTransportConfigPreservingSupervision,
   normalizeSessionSupervisionSnapshot,
+  normalizeSupervisionUiLocale,
+  patchTransportConfigUiLocale,
+  readTransportConfigUiLocale,
+  readSupervisionSnapshotFromTransportConfig,
+  TRANSPORT_CONFIG_UI_LOCALE_KEY,
+  resolveSupervisionAuditBlockingSeverities,
   normalizeSupervisorDefaultConfig,
+  parseSupervisionExecutionStateDetailsFromText,
+  parseSupervisionExecutionStateFromText,
+  stripSupervisionExecutionMarkersForDisplay,
   parseTaskRunTerminalStateFromText,
   patchPeerAuditTargetInTransportConfig,
+  projectSharedSessionSupervisionMode,
   resolveEffectiveCustomInstructions,
+  SUPERVISION_UNAVAILABLE_REASONS,
+  SUPERVISION_PAUSE_CATEGORIES,
+  SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS,
+  classifySupervisionContinuationFailure,
+  classifySupervisionInterruption,
 } from '../shared/supervision-config.js';
 
 describe('supervision config helpers', () => {
+  it('projects only a validated supervision mode across shared-tab boundaries', () => {
+    const privateConfig = {
+      provider: { token: 'must-not-leak' },
+      supervision: {
+        mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+        prompt: 'must-not-leak',
+        customInstructions: 'must-not-leak',
+        identity: { sessionName: 'must-not-leak' },
+      },
+    };
+
+    expect(projectSharedSessionSupervisionMode(privateConfig))
+      .toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(projectSharedSessionSupervisionMode(JSON.stringify(privateConfig)))
+      .toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(projectSharedSessionSupervisionMode({ supervision: { mode: 'forged' } })).toBeNull();
+    expect(projectSharedSessionSupervisionMode('{broken')).toBeNull();
+    expect(projectSharedSessionSupervisionMode(null)).toBeNull();
+  });
+
+  it('registers the canonical Brain work-delegation contract in every standing reference', () => {
+    expect(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION)
+      .toBe('supervision_brain_work_delegation_v1');
+    expect(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE)
+      .toContain(SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION);
+  });
+
+  it('uses one fail-closed authority for automatic supervision mode', () => {
+    expect(isAutomaticSupervisionEnabled(null)).toBe(false);
+    expect(isAutomaticSupervisionEnabled(undefined)).toBe(false);
+    expect(isAutomaticSupervisionEnabled(SUPERVISION_MODE.OFF)).toBe(false);
+    expect(isAutomaticSupervisionEnabled({ mode: SUPERVISION_MODE.OFF })).toBe(false);
+    expect(isAutomaticSupervisionEnabled(SUPERVISION_MODE.SUPERVISED)).toBe(true);
+    expect(isAutomaticSupervisionEnabled({ mode: SUPERVISION_MODE.SUPERVISED_AUDIT })).toBe(true);
+  });
+  it('accepts only the seven supported UI locales for supervision output', () => {
+    expect(normalizeSupervisionUiLocale('zh-CN')).toBe('zh-CN');
+    expect(normalizeSupervisionUiLocale(' ja ')).toBe('ja');
+    expect(normalizeSupervisionUiLocale('en-US')).toBeUndefined();
+
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: SUPERVISION_MODE.SUPERVISED,
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      uiLocale: 'zh-TW',
+    });
+    expect(snapshot.uiLocale).toBe('zh-TW');
+    expect(getSessionSupervisionSnapshotIssues({ ...snapshot, uiLocale: 'fr' })).toContain('invalid_ui_locale');
+  });
+
   it('defaults automatic supervision and audit to Codex 5.3 Spark', () => {
     const config = normalizeSupervisorDefaultConfig(null);
 
@@ -57,10 +140,13 @@ describe('supervision config helpers', () => {
     expect(config.maxAutoContinueTotal).toBe(DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL);
   });
 
-  it('falls back to the backend default model when the model is invalid', () => {
+  it('falls back to the backend default model when the model belongs to a different backend', () => {
+    // 'sonnet' is a recognized Claude Code alias -- configuring it under
+    // `qwen` is a genuine cross-backend mistake, not merely an id the static
+    // list doesn't know about yet, so it is still replaced.
     const config = normalizeSupervisorDefaultConfig({
       backend: 'qwen',
-      model: 'not-a-real-model',
+      model: 'sonnet',
       timeoutMs: 15_000,
       promptVersion: 'custom_prompt_v1',
     });
@@ -69,6 +155,47 @@ describe('supervision config helpers', () => {
     expect(config.model).toBe('qwen3-coder-plus');
     expect(config.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
     expect(config.promptVersion).toBe('custom_prompt_v1');
+  });
+
+  // tsk_cd_model_list_unified: an id that merely isn't in the static list yet
+  // (as opposed to one recognizably belonging to a DIFFERENT backend) must
+  // survive -- silently replacing it with the default discards the user's
+  // real, live model choice.
+  it('keeps a live model unknown to the static list instead of silently replacing it', () => {
+    const config = normalizeSupervisorDefaultConfig({
+      backend: 'qwen',
+      model: 'not-a-real-model',
+      timeoutMs: 15_000,
+      promptVersion: 'custom_prompt_v1',
+    });
+
+    expect(config.backend).toBe('qwen');
+    expect(config.model).toBe('not-a-real-model');
+    expect(config.timeoutMs).toBe(SUPERVISION_MIN_TIMEOUT_MS);
+    expect(config.promptVersion).toBe('custom_prompt_v1');
+  });
+
+  it('normalizes an optional backup runtime with the same preset rules as memory processing', () => {
+    const config = normalizeSupervisorDefaultConfig({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      backupBackend: 'qwen',
+      backupModel: 'MiniMax-M2.7',
+      backupPreset: 'minimax2.7',
+    });
+
+    expect(config).toMatchObject({
+      backupBackend: 'qwen',
+      backupModel: 'MiniMax-M2.7',
+      backupPreset: 'minimax2.7',
+    });
+    expect(normalizeSupervisorDefaultConfig({
+      backend: 'codex-sdk',
+      model: CODEX_MODEL_IDS[0],
+      backupBackend: 'codex-sdk',
+      backupModel: CODEX_MODEL_IDS[0],
+      backupPreset: 'ignored',
+    }).backupPreset).toBeUndefined();
   });
 
   it('upgrades legacy positive timeouts to the 30-second minimum without invalidating the snapshot', () => {
@@ -171,6 +298,50 @@ describe('supervision config helpers', () => {
       timeoutMs: SUPERVISION_MIN_TIMEOUT_MS,
       promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
     } })).toBe(true);
+  });
+
+  it('accepts targetless automatic audit only with a canonical explicit live pool route', () => {
+    const base = {
+      mode: SUPERVISION_MODE.SUPERVISED_AUDIT,
+      backend: 'codex-sdk',
+      model: 'gpt-5.6-sol',
+      timeoutMs: SUPERVISION_MIN_TIMEOUT_MS,
+      promptVersion: SUPERVISION_CONTRACT_IDS.DECISION,
+      maxParseRetries: 1,
+      maxAutoContinueStreak: 2,
+      maxAutoContinueTotal: 0,
+      maxAuditLoops: 2,
+      taskRunPromptVersion: SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
+    } as const;
+    const livePool = {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+          agentType: 'codex-sdk',
+          providerFamily: 'openai',
+          runtimeType: 'transport',
+          model: 'gpt-5.6-sol',
+        }],
+        controls: {},
+      },
+      economyTaskPool: { configs: [], controls: {} },
+    } as const;
+
+    expect(hasInvalidSessionSupervisionSnapshot({ supervision: { ...base, executionPools: livePool } })).toBe(false);
+    expect(getSessionSupervisionSnapshotIssues({ ...base, executionPools: livePool })).not.toContain('missing_audit_target');
+
+    const malformedPool = {
+      ...livePool,
+      primaryDevelopmentPool: { configs: [{}], controls: {} },
+    };
+    expect(hasInvalidSessionSupervisionSnapshot({ supervision: { ...base, executionPools: malformedPool } })).toBe(true);
+    expect(getSessionSupervisionSnapshotIssues({ ...base, executionPools: malformedPool })).toContain('missing_audit_target');
+
+    // Targetless snapshots written before pool routing remain readable for the
+    // legacy repair flow, but they are not valid automatic-audit writes.
+    expect(extractSessionSupervisionSnapshot({ supervision: base })).not.toBeNull();
+    expect(hasInvalidSessionSupervisionSnapshot({ supervision: base })).toBe(true);
   });
 
   it('flags invalid persisted supervision snapshots instead of silently activating normalized automation', () => {
@@ -304,6 +475,145 @@ describe('supervision config helpers', () => {
     expect(parseTaskRunTerminalStateFromText(`${TASK_RUN_STATUS_MARKERS.NEEDS_INPUT}\n${TASK_RUN_STATUS_MARKERS.BLOCKED}`)).toBeNull();
   });
 
+  it('accepts active WAITING/NEEDS_INPUT markers and ignores retired or bare status words', () => {
+    expect(parseSupervisionExecutionStateFromText(
+      `still working\n${RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER}`,
+    )).toBeNull();
+    expect(parseSupervisionExecutionStateFromText(RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER)).toBeNull();
+    expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT)).toBe('needs_input');
+    expect(parseSupervisionExecutionStateFromText(SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING)).toBe('waiting');
+
+    for (const text of ['ADVANCE', 'AUDIT_READY', 'NEEDS_INPUT', 'WAITING', '<!-- IMCODES_TASK_RUN: ADVANCE -->']) {
+      expect(parseSupervisionExecutionStateFromText(text)).toBeNull();
+    }
+  });
+
+  it('uses the last active marker and tolerates trailing prose while retired markers stay inert', () => {
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER}\n${RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER}`,
+    )).toEqual({ state: null, markerCount: 0 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT}\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}`,
+    )).toEqual({ state: 'waiting', markerCount: 2 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}\ntrailing prose`,
+    )).toEqual({ state: 'waiting', markerCount: 1 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `still running\n${SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING}\n\n`,
+    )).toEqual({ state: 'waiting', markerCount: 1 });
+  });
+
+  it('strips only active standalone execution markers from user-visible text', () => {
+    const waiting = SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING;
+    const needsInput = SUPERVISION_EXECUTION_STATUS_MARKERS.NEEDS_INPUT;
+    expect(stripSupervisionExecutionMarkersForDisplay(
+      `等待外部任务完成。\n${waiting}`,
+    )).toBe('等待外部任务完成。');
+    expect(stripSupervisionExecutionMarkersForDisplay(
+      `${needsInput}\n请提供授权。\n${waiting}`,
+    )).toBe('请提供授权。');
+    expect(stripSupervisionExecutionMarkersForDisplay([
+      `> ${waiting}`,
+      '```md',
+      needsInput,
+      '```',
+      `inline ${waiting}`,
+    ].join('\n'))).toBe([
+      `> ${waiting}`,
+      '```md',
+      needsInput,
+      '```',
+      `inline ${waiting}`,
+    ].join('\n'));
+  });
+
+  it('keeps the retired completion marker inert outside quotes and fences', () => {
+    const marker = RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER;
+    expect(parseSupervisionExecutionStateDetailsFromText(`${marker}\nmore text`))
+      .toEqual({ state: null, markerCount: 0 });
+    expect(parseSupervisionExecutionStateDetailsFromText(
+      `${marker}\n已授权派发：1\n执行于: deck_sub_reviewer · claude-opus-5 · primary`,
+    )).toEqual({ state: null, markerCount: 0 });
+    expect(parseSupervisionExecutionStateFromText(`done\n  ${marker}\n`)).toBeNull();
+  });
+
+  it('ignores quoted and fenced marker examples before selecting the last authored marker', () => {
+    const advance = RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER;
+    const ready = RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER;
+    expect(parseSupervisionExecutionStateDetailsFromText([
+      `> ${advance}`,
+      '```md',
+      ready,
+      '```',
+      `The prompt said \`${advance}\`.`,
+      ready,
+      SUPERVISION_EXECUTION_STATUS_MARKERS.WAITING,
+    ].join('\n'))).toEqual({ state: 'waiting', markerCount: 1 });
+    expect(parseSupervisionExecutionStateDetailsFromText(`> ${advance}\n\`\`\`\n${ready}\n\`\`\``))
+      .toEqual({ state: null, markerCount: 0 });
+  });
+
+  describe('buildTransportConfigWithSupervision', () => {
+    const claudePrimaryConfig = {
+      agentType: 'claude-code-sdk',
+      providerFamily: 'anthropic',
+      runtimeType: 'transport' as const,
+      model: DEFAULT_PRIMARY_CONTEXT_MODEL,
+    };
+    const configuredExecutionPools: SupervisionExecutionPoolsConfig = {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          ...claudePrimaryConfig,
+          capabilityId: buildSupervisionExecutionCapabilityId(claudePrimaryConfig),
+        }],
+        controls: { maxConcurrency: 2, maxSpawned: 8, leaseMs: 60_000, changeBudget: 5, auditHeadroomPerProviderFamily: 1 },
+      },
+      economyTaskPool: {
+        configs: [],
+        controls: { maxConcurrency: 2, maxSpawned: 8, leaseMs: 60_000, changeBudget: 5, auditHeadroomPerProviderFamily: 1 },
+      },
+    };
+
+    it('keeps a configured execution pool even while automatic-supervision mode is off', () => {
+      // A Brain that dispatches manually via send_message never turns
+      // automatic mode on, but manual task{objective,acceptance} dispatch
+      // still gates on executionPools.state === 'configured'. Deleting the
+      // whole `supervision` key here silently discarded a just-saved pool
+      // selection -- the save reported success while the daemon's routing
+      // check kept reading legacy_unconfigured from disk.
+      const next = buildTransportConfigWithSupervision(null, {
+        mode: SUPERVISION_MODE.OFF,
+        executionPools: configuredExecutionPools,
+      });
+      expect(next).not.toBeNull();
+      const snapshot = extractSessionSupervisionSnapshot(next);
+      expect(snapshot?.executionPools.state).toBe('configured');
+      expect(snapshot?.executionPools.primaryDevelopmentPool.configs).toHaveLength(1);
+    });
+
+    it('still drops the supervision key when mode is off, there is no audit target, and pools are unconfigured', () => {
+      const next = buildTransportConfigWithSupervision({ other: 'field' }, {
+        mode: SUPERVISION_MODE.OFF,
+      });
+      expect(next).toEqual({ other: 'field' });
+      expect(next && SUPERVISION_TRANSPORT_CONFIG_KEY in next).toBe(false);
+    });
+
+    it('returns null when there is nothing left to persist', () => {
+      expect(buildTransportConfigWithSupervision(null, { mode: SUPERVISION_MODE.OFF })).toBeNull();
+      expect(buildTransportConfigWithSupervision(undefined, { mode: SUPERVISION_MODE.OFF })).toBeNull();
+    });
+
+    it('keeps the supervision key when mode is off but a remembered audit target is set', () => {
+      const next = buildTransportConfigWithSupervision(null, {
+        mode: SUPERVISION_MODE.OFF,
+        auditTargetSessionName: 'deck_sub_reviewer',
+      });
+      expect(extractSessionSupervisionSnapshot(next)?.auditTargetSessionName).toBe('deck_sub_reviewer');
+    });
+  });
+
   describe('mergeTransportConfigPreservingSupervision', () => {
     const snapshot = normalizeSessionSupervisionSnapshot({
       mode: SUPERVISION_MODE.SUPERVISED,
@@ -354,6 +664,92 @@ describe('supervision config helpers', () => {
       const incoming = { someOtherKey: 'value' };
       expect(mergeTransportConfigPreservingSupervision(incoming, null)).toEqual(incoming);
       expect(mergeTransportConfigPreservingSupervision(incoming, {})).toEqual(incoming);
+    });
+  });
+
+  describe('patchTransportConfigUiLocale / readTransportConfigUiLocale', () => {
+    it('creates just a sibling uiLocale key when nothing was stored, never a supervision object', () => {
+      const patched = patchTransportConfigUiLocale(null, 'zh-CN');
+      expect(patched).toEqual({ [TRANSPORT_CONFIG_UI_LOCALE_KEY]: 'zh-CN' });
+      expect(SUPERVISION_TRANSPORT_CONFIG_KEY in patched).toBe(false);
+      expect(readTransportConfigUiLocale(patched)).toBe('zh-CN');
+    });
+
+    it('never creates or invalidates transportConfig.supervision for a session with none stored', () => {
+      // Regression (tsk_cd_pair_title_i18n round 3): storing uiLocale inside
+      // transportConfig.supervision -- even alone, in a config that had none
+      // before -- produced a bare `{ uiLocale }` object that fails the
+      // supervision snapshot's own validation (missing `mode`), turning an
+      // unconfigured, valid session into one hasInvalidSessionSupervisionSnapshot
+      // reports as invalid/repair-pending purely from an ordinary send.
+      const patched = patchTransportConfigUiLocale({}, 'zh-CN');
+      expect(patched).toEqual({ [TRANSPORT_CONFIG_UI_LOCALE_KEY]: 'zh-CN' });
+      expect(SUPERVISION_TRANSPORT_CONFIG_KEY in patched).toBe(false);
+      expect(hasInvalidSessionSupervisionSnapshot(patched)).toBe(false);
+      expect(readTransportConfigUiLocale(patched)).toBe('zh-CN');
+    });
+
+    it('preserves a valid stored supervision snapshot and unrelated keys completely untouched', () => {
+      const snapshot = normalizeSessionSupervisionSnapshot({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'claude-code-sdk',
+        model: DEFAULT_PRIMARY_CONTEXT_MODEL,
+        pairEngine: 'pairs',
+        pairMaxConcurrency: 4,
+      });
+      const transportConfig = { ...embedSessionSupervisionSnapshot(null, snapshot), unrelated: { keep: true } };
+
+      const patched = patchTransportConfigUiLocale(transportConfig, 'ja');
+
+      expect(patched.unrelated).toEqual({ keep: true });
+      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toEqual(snapshot);
+      expect(patched[TRANSPORT_CONFIG_UI_LOCALE_KEY]).toBe('ja');
+      expect(readTransportConfigUiLocale(patched)).toBe('ja');
+    });
+
+    it('preserves an invalid stored snapshot completely untouched (round-2 fixture)', () => {
+      // Round 2: reconstructing the snapshot through
+      // extractSessionSupervisionSnapshot (null for an invalid one) and
+      // normalizeSessionSupervisionSnapshot before re-embedding silently
+      // replaced a repair-pending session's real config -- mode, pairEngine,
+      // custom instructions -- with defaults. This must not read, create, or
+      // modify transportConfig.supervision at all, so it stays exactly as
+      // invalid (and exactly as stored) as it was before this call.
+      const invalidSupervision = {
+        mode: SUPERVISION_MODE.SUPERVISED_AUDIT, backend: 'bogus-backend', model: 'x',
+        pairEngine: 'pairs', pairMaxConcurrency: 4, customInstructions: 'keep me',
+      };
+      const transportConfig = { [SUPERVISION_TRANSPORT_CONFIG_KEY]: invalidSupervision };
+      expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(true);
+      expect(extractSessionSupervisionSnapshot(transportConfig)).toBeNull();
+
+      const patched = patchTransportConfigUiLocale(transportConfig, 'zh-CN');
+
+      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toBe(invalidSupervision);
+      expect(hasInvalidSessionSupervisionSnapshot(patched)).toBe(true);
+      expect(patched[TRANSPORT_CONFIG_UI_LOCALE_KEY]).toBe('zh-CN');
+      expect(readTransportConfigUiLocale(patched)).toBe('zh-CN');
+    });
+
+    it('preserves a legacy repair-only snapshot (auditMode requiring repair) completely untouched', () => {
+      const legacySupervision = {
+        mode: SUPERVISION_MODE.SUPERVISED_AUDIT, auditMode: '', pairEngine: 'pairs', pairMaxConcurrency: 2,
+      };
+      const transportConfig = { [SUPERVISION_TRANSPORT_CONFIG_KEY]: legacySupervision };
+      expect(hasInvalidSessionSupervisionSnapshot(transportConfig)).toBe(true);
+
+      const patched = patchTransportConfigUiLocale(transportConfig, 'ru');
+
+      expect(patched[SUPERVISION_TRANSPORT_CONFIG_KEY]).toBe(legacySupervision);
+      expect(readTransportConfigUiLocale(patched)).toBe('ru');
+    });
+
+    it('readTransportConfigUiLocale returns undefined for missing/malformed input, and never reads transportConfig.supervision', () => {
+      expect(readTransportConfigUiLocale(null)).toBeUndefined();
+      expect(readTransportConfigUiLocale(undefined)).toBeUndefined();
+      expect(readTransportConfigUiLocale({})).toBeUndefined();
+      expect(readTransportConfigUiLocale({ [TRANSPORT_CONFIG_UI_LOCALE_KEY]: 'not-a-real-locale' })).toBeUndefined();
+      expect(readTransportConfigUiLocale({ [SUPERVISION_TRANSPORT_CONFIG_KEY]: { uiLocale: 'zh-CN' } })).toBeUndefined();
     });
   });
 
@@ -519,7 +915,13 @@ describe('supervision config helpers', () => {
       expect(issues).not.toContain('invalid_model');
     });
 
-    it('unknown qwen model without preset still fails validation', () => {
+    // A model name absent from the static per-backend list is no longer
+    // grounds for rejection (tsk_cd_model_list_unified): the daemon's live
+    // SDK/provider probe returns models this file has never heard of, and a
+    // static allowlist here silently dropped/replaced them. Only truly empty
+    // model text is invalid; `isKnownSharedContextModelForBackend` now checks
+    // that and nothing else.
+    it('a live model absent from the static per-backend list still passes validation', () => {
       const issues = getSessionSupervisionSnapshotIssues({
         mode: SUPERVISION_MODE.SUPERVISED,
         backend: 'qwen',
@@ -528,7 +930,31 @@ describe('supervision config helpers', () => {
         promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
         maxParseRetries: 1,
       });
-      expect(issues).toContain('invalid_model');
+      expect(issues).not.toContain('invalid_model');
+    });
+
+    it.each(['gpt-6-luna', 'gpt-6-astra'])('a new live Codex model id (%s) passes validation for codex-sdk', (model) => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'codex-sdk',
+        model,
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+      });
+      expect(issues).not.toContain('invalid_model');
+    });
+
+    it('a new live Claude model id (claude-opus-4-7) passes validation for claude-code-sdk', () => {
+      const issues = getSessionSupervisionSnapshotIssues({
+        mode: SUPERVISION_MODE.SUPERVISED,
+        backend: 'claude-code-sdk',
+        model: 'claude-opus-4-7',
+        timeoutMs: 12_000,
+        promptVersion: SUPERVISION_DEFAULT_PROMPT_VERSION,
+        maxParseRetries: 1,
+      });
+      expect(issues).not.toContain('invalid_model');
     });
 
     it('resolveEffectiveCustomInstructions reads from the snapshot fields', () => {
@@ -549,5 +975,273 @@ describe('supervision config helpers', () => {
       expect(resolveEffectiveCustomInstructions(null)).toBe('');
       expect(resolveEffectiveCustomInstructions({})).toBe('');
     });
+  });
+});
+
+describe('supervision gate scope and change proportionality', () => {
+  it('binds gates only under supervision and treats them as advice when it is off', () => {
+    // A gate that blocks a human working by hand is an obstacle, not quality
+    // control; a gate that stops binding under automation is useless. Both ends
+    // are asserted so neither can drift alone.
+    expect(SUPERVISION_GATE_ENFORCEMENT.bindingModes).toContain(SUPERVISION_MODE.SUPERVISED);
+    expect(SUPERVISION_GATE_ENFORCEMENT.bindingModes).toContain(SUPERVISION_MODE.SUPERVISED_AUDIT);
+    expect(SUPERVISION_GATE_ENFORCEMENT.advisoryModes).toContain(SUPERVISION_MODE.OFF);
+    expect(SUPERVISION_GATE_ENFORCEMENT.bindingModes).not.toContain(SUPERVISION_MODE.OFF);
+    // Advisory still leaves a trace, but the daemon derives it: asking the user
+    // who they are, to waive a gate, would bill them for what the runtime knows.
+    expect(SUPERVISION_GATE_ENFORCEMENT.advisoryBehaviour).toBe('warn_once_then_proceed');
+    expect(SUPERVISION_GATE_ENFORCEMENT.identityFromRuntimeCaller).toBe(true);
+    expect(SUPERVISION_GATE_ENFORCEMENT.neverPromptUserForWaiverDetails).toBe(true);
+  });
+
+  it('lets documentation skip audit while any behaviour change is always audited', () => {
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.docOnlySkipsAuditEvenWhenSupervised).toBe(true);
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.docOnlyShapes).toContain('no_executable_line_changed');
+    // The floor: this must stay true no matter how small the change looks.
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.functionalChangeAlwaysAudited).toBe(true);
+    // ...and the trivial tier can never be reached by a production-byte change.
+    expect(SUPERVISION_CHANGE_PROPORTIONALITY.trivialRequiresAll).toContain('no_production_byte_change');
+  });
+});
+
+describe('automatic supervision enablement gate', () => {
+  function snapshot(mode: string, pools: unknown) {
+    return { mode, executionPools: pools, uiLocale: 'zh-CN' } as never;
+  }
+  const configured = {
+    state: 'configured',
+    primaryDevelopmentPool: {
+      configs: [{
+        agentType: 'codex-sdk',
+        providerFamily: 'openai',
+        runtimeType: 'transport',
+        model: 'gpt-5.6-sol',
+      }],
+      controls: {},
+    },
+    economyTaskPool: { configs: [], controls: {} },
+  };
+
+  it('lets a non-automatic mode through untouched', () => {
+    // Turning supervision OFF must never be blocked by pool configuration.
+    expect(evaluateAutomaticSupervisionEnablement(snapshot('off', {})).ok).toBe(true);
+  });
+
+  it('refuses to enable automatic supervision on unconfigured pools', () => {
+    for (const mode of ['supervised', 'supervised_audit']) {
+      const gate = evaluateAutomaticSupervisionEnablement(snapshot(mode, {}));
+      expect(gate.ok).toBe(false);
+      expect(gate.ok === false && gate.reason).toBeTruthy();
+      // The refusal must carry actionable operator guidance, localized.
+      expect(gate.ok === false && gate.guidance.length).toBeGreaterThan(0);
+    }
+  });
+
+  it('admits automatic supervision once a pool is genuinely selected', () => {
+    for (const mode of ['supervised', 'supervised_audit']) {
+      expect(evaluateAutomaticSupervisionEnablement(snapshot(mode, configured)).ok).toBe(true);
+    }
+  });
+
+  it('localizes the refusal to the snapshot ui locale', () => {
+    const zh = evaluateAutomaticSupervisionEnablement(snapshot('supervised', {}));
+    const en = evaluateAutomaticSupervisionEnablement(
+      { mode: 'supervised', executionPools: {}, uiLocale: 'en' } as never,
+    );
+    expect(zh.ok).toBe(false);
+    expect(en.ok).toBe(false);
+    expect(zh.ok === false && en.ok === false && zh.guidance === en.guidance).toBe(false);
+  });
+});
+
+describe('supervision interruption classification', () => {
+  // The heartbeat is the Brain main session's only way to keep supervising a
+  // task whose work lives in child sessions. A transient supervisor-side
+  // failure must therefore never end the run: only a condition a human must
+  // personally clear may pause it.
+  const resumes: Array<[string, Parameters<typeof classifySupervisionInterruption>[0]]> = [
+    ['an ordinary supervisor decision timeout', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT }],
+    ['a queue/capacity timeout', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT }],
+    ['an unparseable supervisor decision', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT }],
+    ['a disconnected supervisor provider', { unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED }],
+    ['a transient provider error', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+    }],
+    // A rate limit is a throttle with a reset, not exhausted quota. The
+    // requirement pauses only on quota that is *explicitly* exhausted, so this
+    // has to come back through the durable heartbeat rather than stop.
+    ['a rate-limited provider', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.RATE_LIMITED,
+    }],
+  ];
+
+  for (const [label, input] of resumes) {
+    it(`resumes supervision after ${label}`, () => {
+      expect(classifySupervisionInterruption(input)).toEqual({ kind: 'resume' });
+    });
+  }
+
+  const pauses: Array<[string, Parameters<typeof classifySupervisionInterruption>[0], string]> = [
+    ['credentials that must be re-authorized', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.AUTH_FAILED,
+    }, SUPERVISION_PAUSE_CATEGORIES.REAUTHORIZATION_REQUIRED],
+    ['a supervisor config the human must repair', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.CONFIG_ERROR,
+    }, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+    ['a missing supervisor provider', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR,
+      providerFailureCode: PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND,
+    }, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+    ['an invalid supervision snapshot', {
+      unavailableReason: SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT,
+    }, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+    // No machine reason at all means the supervisor itself decided a human is
+    // needed; that is the explicit human-input request.
+    ['a bare ask_human with no machine reason', {}, SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED],
+  ];
+
+  for (const [label, input, category] of pauses) {
+    it(`pauses supervision for ${label}`, () => {
+      expect(classifySupervisionInterruption(input)).toEqual({ kind: 'pause', category });
+    });
+  }
+
+  it('only ever admits the four sanctioned pause categories', () => {
+    // Guards against a future reason quietly inventing a fifth way to stop.
+    expect(Object.values(SUPERVISION_PAUSE_CATEGORIES).sort()).toEqual([
+      'brain_only_authority',
+      'human_input_requested',
+      'quota_exhausted',
+      'reauthorization_required',
+    ]);
+    for (const reason of Object.values(SUPERVISION_UNAVAILABLE_REASONS)) {
+      const outcome = classifySupervisionInterruption({ unavailableReason: reason });
+      if (outcome.kind === 'pause') {
+        expect(Object.values(SUPERVISION_PAUSE_CATEGORIES)).toContain(outcome.category);
+      }
+    }
+  });
+});
+
+describe('supervision continuation repair (repair_then_resume)', () => {
+  // A delegated task whose continuation trips a recoverable control-plane
+  // fault must be REPAIRED and RESUMED, never abandoned. Stopping here is how
+  // a task silently dies while its child sessions are still holding work.
+  const recoverable = Object.values(SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS);
+
+  for (const condition of recoverable) {
+    it(`resumes after the recoverable control-plane condition ${condition}`, () => {
+      expect(classifySupervisionContinuationFailure({ condition }))
+        .toEqual({ kind: 'resume' });
+    });
+  }
+
+  it('names the complete user-specified recoverable control-plane condition set', () => {
+    expect([...recoverable].sort()).toEqual([
+      'ambiguous_assignment_worktree',
+      'blocked_or_recovered_projection',
+      'identity_rejected_after_runtime_change',
+      'invalid_transition',
+      'missing_lease',
+      'old_revision',
+      'old_runtime_identity',
+      'revision_split',
+      'role_continuation_routing_gap',
+      'stale_coordinator_or_auditor_projection',
+      'stale_lease_or_pointer',
+    ]);
+  });
+
+  it('never resumes a cross-project or cross-user takeover, however recoverable it looks', () => {
+    // Repair authority stops at the project boundary. Every recoverable
+    // condition must still refuse when the work belongs to someone else.
+    for (const condition of recoverable) {
+      expect(classifySupervisionContinuationFailure({ condition, crossProject: true }))
+        .toEqual({
+          kind: 'pause',
+          category: SUPERVISION_PAUSE_CATEGORIES.BRAIN_ONLY_AUTHORITY,
+        });
+    }
+  });
+
+  it('pauses conservatively on an unrecognized condition rather than inventing a repair', () => {
+    expect(classifySupervisionContinuationFailure({ condition: 'something_new' }))
+      .toEqual({
+        kind: 'pause',
+        category: SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED,
+      });
+    expect(classifySupervisionContinuationFailure({}))
+      .toEqual({
+        kind: 'pause',
+        category: SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED,
+      });
+  });
+
+  it('reuses the existing pause vocabulary instead of a parallel enum', () => {
+    const outcome = classifySupervisionContinuationFailure({ condition: 'nope', crossProject: true });
+    expect(outcome.kind).toBe('pause');
+    if (outcome.kind === 'pause') {
+      expect(Object.values(SUPERVISION_PAUSE_CATEGORIES)).toContain(outcome.category);
+    }
+  });
+});
+
+describe('automatic audit policy source (tsk_5ny)', () => {
+  // The policy may come ONLY from the authoritative session supervision mode
+  // captured when the task is created. Brain role, contract presence, provider,
+  // model, prior config and defaults are all non-authoritative: inferring a
+  // policy from any of them silently hands an auditor to a task that never
+  // opted in, and "no policy" is a durable fact rather than a gap to repair.
+  it('derives the task audit policy from the authoritative mode and nothing else', () => {
+    expect(supervisionTaskAuditPolicyFromSnapshot({ mode: SUPERVISION_MODE.SUPERVISED_AUDIT }))
+      .toBe('auto_allow_degraded');
+
+    for (const mode of Object.values(SUPERVISION_MODE)) {
+      if (mode === SUPERVISION_MODE.SUPERVISED_AUDIT) continue;
+      expect(
+        supervisionTaskAuditPolicyFromSnapshot({ mode }),
+        `${mode} must not carry an automatic audit policy`,
+      ).toBeUndefined();
+    }
+
+    // Exhaustive over the mode enum, so a mode added later cannot quietly
+    // default into an automatic policy without this test being updated.
+    const enabling = Object.values(SUPERVISION_MODE)
+      .filter((mode) => supervisionTaskAuditPolicyFromSnapshot({ mode }) !== undefined);
+    expect(enabling).toEqual([SUPERVISION_MODE.SUPERVISED_AUDIT]);
+
+    // The mere existence of a snapshot is not evidence of opt-in, and an
+    // absent snapshot fails closed rather than falling back to a default.
+    expect(supervisionTaskAuditPolicyFromSnapshot(null)).toBeUndefined();
+    expect(supervisionTaskAuditPolicyFromSnapshot(undefined)).toBeUndefined();
+  });
+});
+describe('supervision audit blocking severities', () => {
+  it('keeps legacy snapshots byte-stable and resolves them to P0 only', () => {
+    const legacy = normalizeSessionSupervisionSnapshot({ mode: 'supervised_audit', maxAuditLoops: 2 });
+    expect(legacy).not.toHaveProperty('auditBlockingSeverities');
+    expect(resolveSupervisionAuditBlockingSeverities(legacy)).toEqual(['P0']);
+    expect(resolveSupervisionAuditBlockingSeverities(undefined)).toEqual(['P0']);
+  });
+
+  it('round-trips an explicit selection through the transport config and canonicalizes it', () => {
+    const snapshot = normalizeSessionSupervisionSnapshot({
+      mode: 'supervised_audit', auditBlockingSeverities: ['P2', 'P0', 'P2', 'P9'] as never,
+    });
+    expect(snapshot.auditBlockingSeverities).toEqual(['P0', 'P2']);
+    const restored = readSupervisionSnapshotFromTransportConfig({ supervision: snapshot });
+    expect(restored.auditBlockingSeverities).toEqual(['P0', 'P2']);
+    expect(resolveSupervisionAuditBlockingSeverities(restored)).toEqual(['P0', 'P2']);
+  });
+
+  it('never persists an empty or malformed selection as blocking nothing', () => {
+    for (const value of [[], 'P1', [42]]) {
+      const snapshot = normalizeSessionSupervisionSnapshot({ mode: 'supervised_audit', auditBlockingSeverities: value as never });
+      expect(snapshot.auditBlockingSeverities).toEqual(['P0']);
+    }
   });
 });

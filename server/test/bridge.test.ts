@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
+import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import { EventEmitter } from 'node:events';
 import { performance } from 'node:perf_hooks';
 import { readFileSync } from 'node:fs';
@@ -14,6 +16,7 @@ import {
   resetDaemonUpgradePublicationGateForTest,
 } from '../src/ws/daemon-upgrade-publication-gate.js';
 import * as dbQueries from '../src/db/queries.js';
+import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { PUSH_TIMELINE_EVENT_MAX_AGE_MS, TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { P2P_CONFIG_MSG } from '../../shared/p2p-config-events.js';
@@ -26,9 +29,12 @@ import {
   P2P_WORKFLOW_CAPABILITY_V1,
   P2P_WORKFLOW_SCRIPT_ARGV_CAPABILITY_V1,
 } from '../../shared/p2p-workflow-constants.js';
+import { DIRECT_FILE_TRANSFER_LEASE_CAPABILITY } from '../../shared/direct-file-transfer.js';
 import { REPO_MSG } from '../../shared/repo-types.js';
 import { FS_TRANSPORT_MSG } from '../../shared/fs-transport-messages.js';
+import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import {
+  TIMELINE_HISTORY_CANCEL_CAPABILITY,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
@@ -70,6 +76,18 @@ import {
   REMOTE_DESKTOP_INSTALLABLE_CAPABILITY,
   REMOTE_DESKTOP_INSTALL_MSG,
 } from '../../shared/remote-desktop-install.js';
+import {
+  REMOTE_DESKTOP_CONSENT_MSG,
+  REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+  REMOTE_DESKTOP_NODE_CONTEXT_MSG,
+  type RemoteDesktopConsentRequest,
+} from '../../shared/remote-desktop-access.js';
+import {
+  REMOTE_DESKTOP_ACCESS_MODE,
+  REMOTE_DESKTOP_CAPABILITY,
+  REMOTE_DESKTOP_MSG,
+  REMOTE_DESKTOP_PROTOCOL_VERSION,
+} from '../../shared/remote-desktop.js';
 import {
   LEGACY_WINDOWS_UPGRADE_RESCUE_READY_PREFIX,
   LEGACY_WINDOWS_UPGRADE_RESTART_READY_PREFIX,
@@ -113,6 +131,13 @@ class MockWs extends EventEmitter {
   closeCode: number | undefined;
   closeReason: string | undefined;
 
+  /** When true, `send` accepts the frame but NEVER invokes the completion
+   *  callback — the shape of a peer whose receive side has stopped draining, so
+   *  the bridge's in-flight accounting keeps climbing. Off by default. */
+  stallSend = false;
+  /** Pending completion callbacks captured while `stallSend` is on. */
+  stalledCallbacks: Array<(err?: Error) => void> = [];
+
   send(data: string | Buffer, _opts?: unknown, callback?: (err?: Error) => void) {
     if (this.closed) {
       const err = new Error('socket closed');
@@ -120,7 +145,17 @@ class MockWs extends EventEmitter {
       throw err;
     }
     this.sent.push(data);
+    if (this.stallSend) {
+      if (callback) this.stalledCallbacks.push(callback);
+      return;
+    }
     callback?.();
+  }
+
+  /** Release every stalled completion callback (peer started reading again). */
+  drainStalledSends() {
+    const pending = this.stalledCallbacks.splice(0, this.stalledCallbacks.length);
+    for (const cb of pending) cb();
   }
 
   close(code?: number, reason?: string) {
@@ -178,6 +213,7 @@ function makeDb(
   tokenHash: string,
   nodeRole: 'full' | 'controlled' = 'full',
   os: ControlledNodeOs | null = nodeRole === 'controlled' ? CONTROLLED_NODE_OS_LINUX : null,
+  ownerUserId?: string,
 ) {
   const db = {
     queryOne: async () => ({
@@ -185,6 +221,7 @@ function makeDb(
       node_role: nodeRole,
       revoked_at: null,
       os,
+      ...(ownerUserId ? { user_id: ownerUserId } : {}),
     }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
@@ -386,10 +423,201 @@ describe('WsBridge', () => {
 
   afterEach(() => {
     restoreUpgradePublisherSignerResolver();
+    WsBridge.setRemoteDesktopReconnectRevalidator(null);
     WsBridge.getAll().clear();
     resetDaemonUpgradePublicationGateForTest();
     resetMetricsForTests();
     vi.clearAllMocks();
+  });
+
+  it('closes when any second frame arrives before bootstrap redemption', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const redeemGuestBootstrap = vi.fn(async () => true);
+    const handleGuestBrowser = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        redeemGuestBootstrap,
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      ticket: 'A'.repeat(43),
+      browserKeyThumbprint: 'B'.repeat(43),
+      signature: 'C'.repeat(86),
+    })));
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: 'remote_desktop.start',
+      protocolVersion: 'remote-desktop.v1',
+      requestId: 'guest_request_123456',
+    })));
+    await flushAsync();
+    expect(redeemGuestBootstrap).not.toHaveBeenCalled();
+    expect(handleGuestBrowser).not.toHaveBeenCalled();
+    expect(ws.closed).toBe(true);
+    expect(ws.closeCode).toBe(1008);
+  });
+
+  it('acknowledges bootstrap redemption before accepting START', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const handleGuestBrowser = vi.fn(async () => true);
+    const redeemGuestBootstrap = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        redeemGuestBootstrap,
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'), '203.0.113.55');
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      ticket: 'A'.repeat(43),
+      browserKeyThumbprint: 'B'.repeat(43),
+      signature: 'C'.repeat(86),
+    })));
+    await flushAsync();
+    expect(redeemGuestBootstrap).toHaveBeenCalledWith(
+      ws,
+      expect.objectContaining({ ticket: 'A'.repeat(43) }),
+      '203.0.113.55',
+    );
+    expect(ws.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual({
+      type: 'remote_desktop.bootstrap_redeemed',
+    });
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: 'remote_desktop.start',
+      protocolVersion: 'remote-desktop.v1',
+      requestId: 'guest_request_123456',
+    })));
+    await flushAsync();
+    expect(handleGuestBrowser).toHaveBeenCalledOnce();
+    expect(ws.closed).toBe(false);
+  });
+
+  it('admits an exact route resume as the sole first guest frame', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const resumeGuestBrowser = vi.fn(async () => true);
+    const handleGuestBrowser = vi.fn(async () => true);
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        resumeGuestBrowser,
+        redeemGuestBootstrap: vi.fn(),
+        handleGuestBrowser,
+        dropSocket: vi.fn(),
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+    const resume = {
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId: 'guest_request_123456',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    };
+
+    ws.emit('message', Buffer.from(JSON.stringify(resume)));
+    await flushAsync();
+
+    expect(resumeGuestBrowser).toHaveBeenCalledWith(ws, resume);
+    expect(ws.closed).toBe(false);
+    expect(handleGuestBrowser).not.toHaveBeenCalled();
+  });
+
+  it('closes a first-frame guest resume whose exact live authority is absent', async () => {
+    const bridge = WsBridge.get(serverId);
+    const ws = new MockWs();
+    const dropSocket = vi.fn();
+    Object.defineProperty(bridge, 'remoteDesktopRouter', {
+      value: {
+        resumeGuestBrowser: vi.fn(async () => false),
+        redeemGuestBootstrap: vi.fn(),
+        handleGuestBrowser: vi.fn(),
+        dropSocket,
+      },
+    });
+    bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+
+    ws.emit('message', Buffer.from(JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.RESUME,
+      protocolVersion: REMOTE_DESKTOP_PROTOCOL_VERSION,
+      requestId: 'guest_request_123456',
+      sessionId: 'session_12345678',
+      capability: 'a'.repeat(43),
+    })));
+    await flushAsync();
+
+    expect(ws.closed).toBe(true);
+    expect(ws.closeCode).toBe(1008);
+    expect(dropSocket).toHaveBeenCalledWith(ws);
+  });
+
+  it('closes an anonymous socket that never supplies its bounded first proof', async () => {
+    vi.useFakeTimers();
+    try {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleGuestRemoteDesktopConnection(ws as never, makeDb('valid-hash'));
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(ws.closed).toBe(true);
+      expect(ws.closeCode).toBe(1008);
+      expect(ws.closeReason).toBe('unavailable');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('dispatches consent only on the authenticated authority-ready owning generation', () => {
+    const bridge = WsBridge.get(serverId);
+    const daemon = new MockWs();
+    const internals = bridge as unknown as {
+      daemonWs: MockWs;
+      authenticated: boolean;
+      daemonGeneration: number;
+      remoteDesktopAuthorityReadyGeneration: number | null;
+      daemonNodeRole: 'controlled';
+      controlledNodeCapabilities: Set<string>;
+      trySendRemoteDesktopConsent(command: {
+        executionServerId: string;
+        daemonGeneration: number;
+        message: RemoteDesktopConsentRequest;
+      }): boolean;
+    };
+    internals.daemonWs = daemon;
+    internals.authenticated = true;
+    internals.daemonGeneration = 4;
+    internals.daemonNodeRole = 'controlled';
+    internals.controlledNodeCapabilities = new Set([
+      REMOTE_DESKTOP_CAPABILITY,
+      REMOTE_DESKTOP_LOCAL_CONSENT_CAPABILITY,
+    ]);
+    const message: RemoteDesktopConsentRequest = {
+      type: REMOTE_DESKTOP_CONSENT_MSG.REQUEST,
+      approvalId: 'approval-00000000-0000-4000-8000-000000000001',
+      hostId: 'host-00000000-0000-4000-8000-000000000001',
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      requesterLabel: 'Remote guest',
+      createdAt: 1_800_000_000_000,
+      deadlineAt: 1_800_000_030_000,
+      daemonGeneration: 4,
+    };
+    const command = { executionServerId: serverId, daemonGeneration: 4, message };
+
+    internals.remoteDesktopAuthorityReadyGeneration = null;
+    expect(internals.trySendRemoteDesktopConsent(command)).toBe(false);
+    expect(daemon.sent).toEqual([]);
+
+    internals.remoteDesktopAuthorityReadyGeneration = 4;
+    expect(internals.trySendRemoteDesktopConsent(command)).toBe(true);
+    expect(daemon.sentStrings.map((value) => JSON.parse(value))).toEqual([message]);
+    expect(internals.trySendRemoteDesktopConsent({ ...command, daemonGeneration: 3 })).toBe(false);
+    expect(daemon.sent).toHaveLength(1);
   });
 
   describe('daemon auth', () => {
@@ -409,6 +637,45 @@ describe('WsBridge', () => {
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
       await flushAsync();
       expect(bridge.isAuthenticated).toBe(true);
+    });
+
+    it('keeps remote desktop unavailable until each reconnect revalidates durable authority', async () => {
+      const releases: Array<() => void> = [];
+      const revalidate = vi.fn(() => new Promise<void>((resolve) => { releases.push(resolve); }));
+      WsBridge.setRemoteDesktopReconnectRevalidator(revalidate);
+      const bridge = WsBridge.get(serverId);
+
+      const first = new MockWs();
+      bridge.handleDaemonConnection(
+        first as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      first.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }));
+      await flushAsync();
+      expect(revalidate).toHaveBeenCalledWith(serverId);
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(false);
+      releases.shift()?.();
+      await flushAsync();
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(true);
+
+      const replacement = new MockWs();
+      bridge.handleDaemonConnection(
+        replacement as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      replacement.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [REMOTE_DESKTOP_CAPABILITY],
+      }));
+      await flushAsync();
+      expect(revalidate).toHaveBeenCalledTimes(2);
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(false);
+      releases.shift()?.();
+      await flushAsync();
+      expect(WsBridge.remoteDesktopGuestOutboxTarget(serverId)?.isAvailable()).toBe(true);
     });
 
     it('sends an exact generation-bound worker repair request to an installable controlled node', async () => {
@@ -437,6 +704,56 @@ describe('WsBridge', () => {
       expect(bridge.tryInstallControlledNodeRemoteDesktopWorker(
         bridge.daemonConnectionGeneration() - 1,
       )).toBe('generation_changed');
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: bridge.daemonConnectionGeneration(),
+      });
+    });
+
+    it('publishes the canonical host context and actively clears it when the mapping disappears', async () => {
+      let hostId: string | null = 'host-00000000000000000001';
+      const db = {
+        queryOne: async (sql: string) => {
+          if (sql.includes('remote_desktop_host_endpoints')) return hostId ? { host_id: hostId } : null;
+          return {
+            token_hash: 'valid-hash',
+            node_role: 'controlled',
+            revoked_at: null,
+            os: CONTROLLED_NODE_OS_WIN,
+          };
+        },
+        query: async () => [],
+        execute: async () => ({ changes: 1 }),
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => (
+          fn(db as unknown as import('../src/db/client.js').Database)
+        ),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, db, {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        capabilities: [],
+      }));
+      await flushAsync();
+      const generation = bridge.daemonConnectionGeneration();
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.CURRENT,
+        hostId: 'host-00000000000000000001',
+        daemonGeneration: generation,
+      });
+
+      hostId = null;
+      ws.emit('message', JSON.stringify({ type: 'heartbeat' }));
+      await flushAsync();
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
+        daemonGeneration: generation,
+      });
     });
 
     it('closes on auth timeout', async () => {
@@ -487,6 +804,10 @@ describe('WsBridge', () => {
       } as unknown as import('../src/db/client.js').Database;
 
       const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      await flushAsync();
+      browserWs.sent = [];
       const ws = new MockWs();
       bridge.handleDaemonConnection(ws as never, db, {} as never);
 
@@ -517,6 +838,11 @@ describe('WsBridge', () => {
 
       expect(bridge.isAuthenticated).toBe(true);
       expect(ws.closed).toBe(false);
+      const browserTypes = browserWs.sentStrings.map((raw) => JSON.parse(raw).type as string);
+      const reconnectedIndex = browserTypes.indexOf(DAEMON_MSG.RECONNECTED);
+      const helloIndex = browserTypes.indexOf(P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(reconnectedIndex).toBeGreaterThanOrEqual(0);
+      expect(helloIndex).toBeGreaterThan(reconnectedIndex);
     });
 
     it('sends daemon.upgrade when daemon is older than server version', async () => {
@@ -1009,6 +1335,24 @@ describe('WsBridge', () => {
       expect(thirdWs.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(1);
     });
 
+    it('fences an exact rolled-back controlled-node target instead of retrying the destructive upgrade loop', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.9.4544-dev.5197';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
+      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.9.4537-dev.5183', capabilities: [] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+        targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      expect(bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'auto' }))
+        .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF, reason: 'terminal_install_failure' });
+    });
+
     it('retries auto daemon.upgrade after transient daemon upgrade blockers clear without waiting for reconnect', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.4.905-dev.877';
@@ -1118,7 +1462,9 @@ describe('WsBridge', () => {
 
       const bridge = WsBridge.get(serverId);
       const daemonWs = new MockWs();
-      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {
+        JWT_SIGNING_KEY: 'bridge-test-signing-key',
+      } as never);
 
       const target = { kind: 'main', serverId, sessionName: 'deck_slow_auth_brain' } as const;
       const liveCoverage = {
@@ -1441,6 +1787,98 @@ describe('WsBridge', () => {
       expect.soft(nextAuto.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
     });
 
+    it('tells a cancel-capable daemon to drop the reply when an HTTP history request times out', async () => {
+      vi.useFakeTimers();
+      try {
+        const bridge = WsBridge.get(serverId);
+        const daemonWs = new MockWs();
+        bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+        daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+        await vi.advanceTimersByTimeAsync(0);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+          daemonId: serverId,
+          capabilities: [TIMELINE_HISTORY_CANCEL_CAPABILITY],
+          helloEpoch: 1,
+          sentAt: Date.now(),
+        }));
+        await vi.advanceTimersByTimeAsync(0);
+
+        const pending = bridge.requestTimelineHistory({ sessionName: 'deck_slow_uplink', timeoutMs: 1_000 });
+        const rejected = expect(pending).rejects.toThrow('timeout');
+        const outbound = daemonWs.sentStrings.find((raw) => raw.includes(`"type":"${TIMELINE_MESSAGES.HISTORY_REQUEST}"`));
+        const requestId = JSON.parse(outbound!).requestId as string;
+
+        await vi.advanceTimersByTimeAsync(1_001);
+        await rejected;
+        const cancels = daemonWs.sentStrings
+          .map((raw) => { try { return JSON.parse(raw) as Record<string, unknown>; } catch { return null; } })
+          .filter((msg) => msg?.type === TIMELINE_MESSAGES.HISTORY_CANCEL);
+        expect(cancels).toEqual([{ type: TIMELINE_MESSAGES.HISTORY_CANCEL, requestId }]);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('never sends a history cancel to a daemon that does not advertise support', async () => {
+      vi.useFakeTimers();
+      try {
+        const bridge = WsBridge.get(serverId);
+        const daemonWs = new MockWs();
+        bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+        daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+        await vi.advanceTimersByTimeAsync(0);
+        daemonWs.emit('message', JSON.stringify({
+          type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+          daemonId: serverId,
+          capabilities: [],
+          helloEpoch: 1,
+          sentAt: Date.now(),
+        }));
+        await vi.advanceTimersByTimeAsync(0);
+
+        const pending = bridge.requestTimelineHistory({ sessionName: 'deck_old_daemon', timeoutMs: 1_000 });
+        const rejected = expect(pending).rejects.toThrow('timeout');
+        await vi.advanceTimersByTimeAsync(1_001);
+        await rejected;
+        expect(daemonWs.sentStrings.some((raw) => raw.includes(TIMELINE_MESSAGES.HISTORY_CANCEL))).toBe(false);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('tracks each session\'s identity project key exactly as the daemon derives it', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'session_list',
+        sessions: [
+          { name: 'deck_repo_brain', project: 'repo', state: 'idle', contextNamespace: { projectId: 'github-org/repo' } },
+          { name: 'deck_plain_brain', project: 'plain', state: 'idle' },
+        ],
+      }));
+      await flushAsync();
+      expect(bridge.resolveSessionIdentityProjectKey('deck_repo_brain')).toBe('github-org/repo');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_plain_brain')).toBe('plain');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_unknown_brain')).toBeNull();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync', id: 'kid1', parentSession: 'deck_repo_brain', sessionType: 'claude-code', cwd: '/home/k/work/repo',
+      }));
+      daemonWs.emit('message', JSON.stringify({
+        type: 'subsession.sync', id: 'kid2', parentSession: 'deck_repo_brain', sessionType: 'claude-code', cwd: '/home/k/work/other',
+        contextNamespace: { projectId: 'github-org/other' },
+      }));
+      await flushAsync();
+      // Without its own namespace a sub-session shares its parent's project.
+      expect(bridge.resolveSessionIdentityProjectKey('deck_sub_kid1')).toBe('github-org/repo');
+      expect(bridge.resolveSessionIdentityProjectKey('deck_sub_kid2')).toBe('github-org/other');
+    });
+
     it('does not let an error from a replaced socket reject current-generation requests', async () => {
       const bridge = WsBridge.get(serverId);
       const staleWs = new MockWs();
@@ -1599,7 +2037,9 @@ describe('WsBridge', () => {
     it('does not replay an inflight command through a replacement while stale auth revalidation settles', async () => {
       const bridge = WsBridge.get(serverId);
       const firstWs = new MockWs();
-      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {} as never);
+      bridge.handleDaemonConnection(firstWs as never, makeDb('valid-hash'), {
+        JWT_SIGNING_KEY: 'bridge-test-signing-key',
+      } as never);
 
       const target = { kind: 'main', serverId, sessionName: 'deck_stale_auth_replay_brain' } as const;
       const liveCoverage = {
@@ -1714,6 +2154,33 @@ describe('WsBridge', () => {
       daemonWs.emit('message', JSON.stringify({ type: 'terminal_update', diff: { sessionName: 'sess-tu', a: 1 } }));
       await flushAsync();
       expect(JSON.parse(browserWs.sentStrings[0]).type).toBe('terminal.diff');
+    });
+
+    it('routes a daemon terminal.stream_reset only to browsers subscribed to that session', async () => {
+      // A daemon-originated reset (raw_buffer_overflow) previously fell through
+      // to the default-allow broadcast, so every connected tab reset a terminal
+      // it never subscribed to and that never congested.
+      const { bridge, daemonWs, browserWs } = await setupAuthenticatedBridge();
+      const otherWs = new MockWs();
+      bridge.handleBrowserConnection(otherWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-congested' }));
+      otherWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sess-quiet' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+      otherWs.sent.length = 0;
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'terminal.stream_reset', session: 'sess-congested', reason: 'raw_buffer_overflow',
+      }));
+      await flushAsync();
+
+      const resets = (ws: typeof browserWs) => ws.sentStrings
+        .filter((x) => x.includes('"terminal.stream_reset"'));
+      expect(resets(browserWs).length, 'the subscribed tab must receive the reset').toBe(1);
+      expect(
+        resets(otherWs).length,
+        'a tab subscribed to a different session must not be reset',
+      ).toBe(0);
     });
 
     it('relays additive p2p.run_update payload fields without stripping legacy fields', async () => {
@@ -1936,6 +2403,85 @@ describe('WsBridge', () => {
       expect(daemonWs.sentStrings.some((s) => s.includes('terminal.subscribe'))).toBe(true);
     });
 
+    it('forwards installs on the daemon\'s own computer, and only from its owner', async () => {
+      // The remote-desktop router used to answer these `invalid_request`, so the
+      // install buttons never reached the daemon. The controlled-node install
+      // runs as root there; someone the daemon is shared with must not be able
+      // to enrol a node on it to their own account.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const participant = new MockWs();
+      bridge.handleBrowserConnection(participant as never, 'participant-user', db);
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      const requests = [
+        JSON.stringify({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST, installCode: 'ABCDEFGHJKMN' }),
+        JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }),
+      ];
+      const forwarded = () => daemonWs.sentStrings.filter((s) => (
+        s.includes(REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST) || s.includes(REMOTE_DESKTOP_INSTALL_MSG.REQUEST)
+      ));
+
+      for (const request of requests) participant.emit('message', request);
+      await flushAsync();
+      expect(forwarded()).toEqual([]);
+
+      for (const request of requests) owner.emit('message', request);
+      await flushAsync();
+      expect(forwarded()).toEqual(requests);
+      expect(owner.sentStrings.some((s) => s.includes('invalid_request'))).toBe(false);
+    });
+
+    it('relays the daemon\'s install progress to its browsers', async () => {
+      // The router dropped these as malformed signalling, so a browser never
+      // learned how an install it asked for went.
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      const reports = [
+        { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: 'failed', error: 'admin_required' },
+        { type: REMOTE_DESKTOP_INSTALL_MSG.STATE, state: 'downloading' },
+      ];
+      for (const report of reports) daemonWs.emit('message', JSON.stringify(report));
+      daemonWs.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: 'made_up' }));
+      await flushAsync();
+      const relayed = owner.sentStrings
+        .map((frame) => JSON.parse(frame) as { type?: string })
+        .filter((frame) => frame.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE
+          || frame.type === REMOTE_DESKTOP_INSTALL_MSG.STATE);
+      expect(relayed).toEqual(reports);
+    });
+
+    it('never queues an install for a daemon that is not connected', async () => {
+      const bridge = WsBridge.get(serverId);
+      const db = makeDb('valid-hash', 'full', null, 'owner-user');
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, db, {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      const owner = new MockWs();
+      bridge.handleBrowserConnection(owner as never, 'owner-user', db);
+      daemonWs.close();
+      await flushAsync();
+
+      owner.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
+      await flushAsync();
+      const reconnected = new MockWs();
+      bridge.handleDaemonConnection(reconnected as never, db, {} as never);
+      reconnected.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      expect(reconnected.sentStrings.some((s) => s.includes(REMOTE_DESKTOP_INSTALL_MSG.REQUEST))).toBe(false);
+    });
+
     it('forwards any valid message type to daemon (no whitelist)', async () => {
       const { daemonWs, browserWs } = await setupBridge();
       browserWs.emit('message', JSON.stringify({ type: 'admin.shutdown' }));
@@ -2091,6 +2637,18 @@ describe('WsBridge', () => {
 
       expect(daemonWs.sentStrings.some((s) => s.includes('server.delete'))).toBe(false);
       expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r2'))).toBe(true);
+    });
+
+    it('never lets a browser run the skills CLI on the machine directly', async () => {
+      // Only the owner-checked /api/agent-skills route may send these.
+      const { daemonWs, browserWs } = await setupBridge();
+      for (const type of [AGENT_SKILLS_MSG.RUN_REQUEST, AGENT_SKILLS_MSG.LIST_REQUEST, AGENT_MCP_MSG.RUN_REQUEST, AGENT_MCP_MSG.LIST_REQUEST]) {
+        browserWs.emit('message', JSON.stringify({ type, requestId: 'r3', action: 'add', source: 'owner/repo' }));
+      }
+      await flushAsync();
+
+      expect(daemonWs.sentStrings.some((s) => s.includes(AGENT_SKILLS_MESSAGE_PREFIX) || s.includes(AGENT_MCP_MESSAGE_PREFIX))).toBe(false);
+      expect(browserWs.sentStrings.some((s) => s.includes('server_only_command') && s.includes('r3'))).toBe(true);
     });
 
     it('drops oversized payload', async () => {
@@ -2829,6 +3387,97 @@ describe('WsBridge', () => {
       // the normal-sized one MUST flow because subscription is still alive.
       expect(binarySent.length).toBeGreaterThanOrEqual(1);
     });
+
+    it('an oversize single frame does not swallow the stream_reset of a LATER real overflow', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+
+      // A browser that never acknowledges: its ws.send callbacks stay pending,
+      // so in-flight bytes accumulate and a real congestion episode can form.
+      const browserWs = new MockWs();
+      browserWs.stallSend = true;
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessNoticeLatch' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+
+      const resetCount = () => browserWs.sentStrings.filter((x) => x.includes('"terminal.stream_reset"')).length;
+
+      // 1. A single frame bigger than the whole budget, with nothing in flight.
+      //    This is not congestion — there is no backlog — so it must not open
+      //    (or consume) an overflow episode.
+      daemonWs.emit('message', packFrame('sessNoticeLatch', Buffer.alloc(4 * 1024 * 1024 + 100, 0x51)), true);
+      await flushAsync();
+      const afterOversize = resetCount();
+      expect(afterOversize).toBeGreaterThanOrEqual(1);
+
+      // 2. Now build REAL congestion: normal frames the stalled browser never
+      //    acknowledges, until the high-water mark is crossed.
+      for (let i = 0; i < 6; i++) {
+        daemonWs.emit('message', packFrame('sessNoticeLatch', Buffer.alloc(1024 * 1024, 0x52)), true);
+        await flushAsync();
+      }
+
+      // If the oversize drop had consumed the one-shot notice, nothing would
+      // ever clear it again (that path never pauses), and the browser would be
+      // left with a silent gap it is never told about.
+      expect(resetCount()).toBeGreaterThan(afterOversize);
+    });
+
+    it('a late callback from a forgiven generation cannot hand the socket extra budget', async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const browserWs = new MockWs();
+        browserWs.stallSend = true;
+        bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+        browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessEpoch' }));
+        await vi.advanceTimersByTimeAsync(50);
+        browserWs.sent.length = 0;
+
+        const binaryCount = () => browserWs.sent.filter((x) => Buffer.isBuffer(x)).length;
+
+        // Fill the budget with frames the peer never acknowledges.
+        for (let i = 0; i < 5; i++) {
+          daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024 * 1024, 0x61)), true);
+          await vi.advanceTimersByTimeAsync(1);
+        }
+        const acceptedBeforeGrace = binaryCount();
+
+        // Paused now: further frames are dropped, not sent.
+        daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(512 * 1024, 0x62)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(binaryCount()).toBe(acceptedBeforeGrace);
+
+        // Wait past the grace window so the budget is forgiven once, then let
+        // the OLD, still-unacknowledged callbacks land.
+        await vi.advanceTimersByTimeAsync(2_500);
+        daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024, 0x63)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        const afterForgiveness = binaryCount();
+        expect(afterForgiveness).toBeGreaterThan(acceptedBeforeGrace);
+
+        // The forgiven generation's callbacks arrive late. They refer to bytes
+        // already written off; if they decremented the fresh counter it would go
+        // negative and the socket would silently regain multi-MB of credit.
+        browserWs.drainStalledSends();
+        await vi.advanceTimersByTimeAsync(1);
+
+        // Re-fill: the post-forgiveness budget must be the SAME 4MB, not 4MB
+        // plus whatever the stale callbacks refunded.
+        browserWs.stallSend = true;
+        let accepted = 0;
+        for (let i = 0; i < 12; i++) {
+          const before = binaryCount();
+          daemonWs.emit('message', packFrame('sessEpoch', Buffer.alloc(1024 * 1024, 0x64)), true);
+          await vi.advanceTimersByTimeAsync(1);
+          if (binaryCount() > before) accepted += 1;
+        }
+        // 4MB budget / 1MB frames => at most 4 accepted before pausing again.
+        expect(accepted).toBeLessThanOrEqual(4);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
   });
 
   // ── Daemon reconnect subscription replay ──────────────────────────────────
@@ -3196,6 +3845,39 @@ describe('WsBridge', () => {
         session: 'sessStorm',
         raw: true,
       })]);
+    });
+
+    it('bounds legacy browser bulk-read storms without rate-limiting control commands', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      await flushAsync();
+      daemonWs.sent.length = 0;
+      browserWs.sent.length = 0;
+
+      for (let index = 0; index < 65; index += 1) {
+        browserWs.emit('message', JSON.stringify({
+          type: 'fs.ls',
+          requestId: `bulk-${index}`,
+          path: `/tmp/${index}`,
+        }));
+      }
+      browserWs.emit('message', JSON.stringify({
+        type: 'session.send', session: 'sessStorm', text: 'control survives', commandId: 'cmd-survives',
+      }));
+      await flushAsync();
+
+      const forwarded = daemonWs.sentStrings.map((raw) => JSON.parse(raw) as Record<string, unknown>);
+      expect(forwarded.filter((message) => message.type === 'fs.ls')).toHaveLength(64);
+      expect(forwarded).toContainEqual(expect.objectContaining({ type: 'session.send', commandId: 'cmd-survives' }));
+      expect(browserWs.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({
+        type: 'fs.ls_response',
+        requestId: 'bulk-64',
+        status: 'error',
+        error: FS_GENERIC_ERROR_CODES.FS_LIST_WORKER_QUEUE_FULL,
+        recoverable: true,
+      }));
+      expect(getCounter('ws_bridge_browser_data_read_rate_limited', { type: 'fs.ls' })).toBe(1);
     });
 
     it('rapid replace without auth does not crash or leak', async () => {
@@ -4498,6 +5180,138 @@ describe('WsBridge', () => {
         timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
         helloEpoch: 1,
         sentAt: 555,
+      });
+    });
+
+    it('R3 v2 PR-σ — also replays cached daemon.hello to a participant who joins a shared session late', async () => {
+      // Same bug as the owner case above (a browser that opens after the
+      // daemon's hello never receives one), but for a participant share
+      // connection: capabilities carries file.transfer.direct.lease.v2,
+      // which a participant's own upload/download and the client's "WebRTC
+      // runtime" diagnostic both gate on. Excluding every share connection
+      // from the replay (meant to withhold owner-only P2P workflow-launch
+      // state) left a participant permanently without a capability
+      // snapshot, direct transfer never attempted, and the diagnostic
+      // panel stuck on "unavailable" -- reported live: "参与者...卡在100%"
+      // and "WebRTC 运行时不可用 完全不恢复".
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, DIRECT_FILE_TRANSFER_LEASE_CAPABILITY],
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_late_participant_brain' } as const;
+      const coverage = {
+        target,
+        effectiveRole: 'participant',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-late-participant'],
+        primaryShareId: 'share-late-participant',
+        authorizedAt: Date.now(),
+      } as const;
+      const participant = new MockWs();
+      bridge.handleShareBrowserConnection(participant as never, 'participant-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-late-participant',
+        target,
+        snapshot: coverage,
+      });
+      await flushAsync();
+
+      const helloMessages = participant.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === P2P_WORKFLOW_MSG.DAEMON_HELLO);
+      expect(helloMessages).toHaveLength(1);
+      expect(helloMessages[0]).toMatchObject({
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1, DIRECT_FILE_TRANSFER_LEASE_CAPABILITY].sort(),
+      });
+    });
+
+    it('still withholds the replay from a read-only viewer of a shared session', async () => {
+      const bridge = WsBridge.get(serverId);
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb('valid-hash'), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      daemonWs.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: [P2P_WORKFLOW_CAPABILITY_V1],
+        helloEpoch: 1,
+        sentAt: 555,
+      }));
+      await flushAsync();
+
+      const target = { kind: 'main', serverId, sessionName: 'deck_late_viewer_brain' } as const;
+      const coverage = {
+        target,
+        effectiveRole: 'viewer',
+        historyCutoffAt: Date.now() - 1_000,
+        nextCoverageRecheckAt: null,
+        coveringShareIds: ['share-late-viewer'],
+        primaryShareId: 'share-late-viewer',
+        authorizedAt: Date.now(),
+      } as const;
+      const viewer = new MockWs();
+      bridge.handleShareBrowserConnection(viewer as never, 'viewer-user', makeDb('valid-hash'), {
+        ticketId: 'share-ticket-late-viewer',
+        target,
+        snapshot: coverage,
+      });
+      await flushAsync();
+
+      expect(viewer.sentStrings.some((raw) => JSON.parse(raw).type === P2P_WORKFLOW_MSG.DAEMON_HELLO)).toBe(false);
+    });
+
+    it('accepts a replacement daemon process whose hello epoch restarts while the old socket closes asynchronously', async () => {
+      const bridge = WsBridge.get(serverId);
+      const firstDaemon = new MockWs();
+      bridge.handleDaemonConnection(firstDaemon as never, makeDb('valid-hash'), {} as never);
+      firstDaemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      await flushAsync();
+      firstDaemon.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: ['old-capability'],
+        helloEpoch: 9,
+        sentAt: 900,
+      }));
+      await flushAsync();
+      expect(bridge.getDaemonP2pWorkflowCapabilities()?.helloEpoch).toBe(9);
+
+      // Production ws.close() is asynchronous.  Pin the replacement window in
+      // which the old identity-guarded close handler cannot clear bridge state.
+      vi.spyOn(firstDaemon, 'close').mockImplementation(() => {
+        firstDaemon.closed = true;
+        firstDaemon.readyState = 3;
+      });
+      const replacement = new MockWs();
+      bridge.handleDaemonConnection(replacement as never, makeDb('valid-hash'), {} as never);
+      replacement.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+      replacement.emit('message', JSON.stringify({
+        type: P2P_WORKFLOW_MSG.DAEMON_HELLO,
+        daemonId: serverId,
+        capabilities: ['new-capability'],
+        helloEpoch: 1,
+        sentAt: 1_000,
+      }));
+      await flushAsync();
+      await flushAsync();
+
+      expect(bridge.getDaemonP2pWorkflowCapabilities()).toMatchObject({
+        daemonId: serverId,
+        capabilities: ['new-capability'],
+        helloEpoch: 1,
+        sentAt: 1_000,
       });
     });
 

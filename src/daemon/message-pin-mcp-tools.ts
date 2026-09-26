@@ -1,6 +1,6 @@
 import { z } from 'zod';
 import type { CallToolResult } from '@modelcontextprotocol/sdk/types.js';
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { McpServer, RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import {
   MESSAGE_PIN_EVENT_TYPES,
   MESSAGE_PIN_LIMITS,
@@ -184,12 +184,14 @@ export function registerMessagePinMcpTools(
   server: McpServer,
   caller: McpRuntimeCaller,
   deps: MessagePinMcpToolDeps = {},
-): void {
+): ReadonlyMap<string, RegisteredTool> {
   const handlers = createMessagePinMcpToolHandlers(caller, deps);
+  const registered = new Map<string, RegisteredTool>();
   for (const name of MESSAGE_PIN_MCP_TOOL_NAME_LIST) {
-    server.registerTool(name, {
+    registered.set(name, server.registerTool(name, {
       description: descriptions[name],
       inputSchema: schemas[name],
-    }, async (args: unknown) => toolResult(await handlers[name](args)));
+    }, async (args: unknown) => toolResult(await handlers[name](args))));
   }
+  return registered;
 }

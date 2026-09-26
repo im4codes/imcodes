@@ -38,6 +38,7 @@ import { getPaneCwd } from '../agent/tmux.js';
 import { GitRemoteCloneError, cloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { normalizeOptionalGitRemoteUrl } from '../../shared/git-remote-url.js';
 import { cloneTransportConfigWithoutRuntimeIdentity } from '../../shared/transport-identity-scrub.js';
+import { clearResend } from './transport-resend-queue.js';
 
 // Re-export the transport-identity scrub helpers (now living in shared/) so any
 // existing importers of this module continue to resolve them here.
@@ -661,6 +662,7 @@ async function rollbackClone(serverLink: ServerLink, resources: CreatedResources
       logger.warn({ err, sessionName }, 'session-group clone rollback failed for sub-session');
     }
     try {
+      clearResend(sessionName, 'session_removed');
       removeSession(sessionName);
       await persistSessionRecordAwaited(null, sessionName);
     } catch (err) {
@@ -696,6 +698,7 @@ async function rollbackClone(serverLink: ServerLink, resources: CreatedResources
     }
     if (resources.clonedMainSessionName) {
       try {
+        clearResend(resources.clonedMainSessionName, 'session_removed');
         removeSession(resources.clonedMainSessionName);
         await persistSessionRecordAwaited(null, resources.clonedMainSessionName);
       } catch (err) {

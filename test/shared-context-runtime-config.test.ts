@@ -7,6 +7,8 @@ import {
   DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
   defaultSharedContextRuntimeConfig,
   getDefaultSharedContextModelForBackend,
+  inferSharedContextRuntimeBackend,
+  isKnownSharedContextModelForBackend,
   normalizeMemoryScoringWeights,
   normalizeMemoryRecallMinScore,
   normalizeSharedContextRuntimeConfig,
@@ -214,5 +216,45 @@ describe('shared-context-runtime-config', () => {
       primaryContextBackend: 'claude-code-sdk',
     });
     expect(result.enablePersonalMemorySync).toBe(true);
+  });
+
+  // tsk_cd_model_list_unified: a model released after this file's static
+  // lists were last updated must still classify to its real backend by
+  // naming pattern, and must still validate under that backend, instead of
+  // silently falling back to the wrong default and getting rejected there.
+  describe('classifies and validates live models the static lists do not know about', () => {
+    it.each([
+      ['gpt-6-luna', 'codex-sdk'],
+      ['gpt-6-astra', 'codex-sdk'],
+      ['claude-opus-4-7', 'claude-code-sdk'],
+    ] as const)('infers %s as %s', (model, backend) => {
+      expect(inferSharedContextRuntimeBackend(model)).toBe(backend);
+    });
+
+    it.each([
+      ['gpt-6-luna', 'codex-sdk'],
+      ['gpt-6-astra', 'codex-sdk'],
+      ['claude-opus-4-7', 'claude-code-sdk'],
+    ] as const)('accepts %s under %s', (model, backend) => {
+      expect(isKnownSharedContextModelForBackend(backend, model)).toBe(true);
+    });
+
+    it('still rejects a model shaped like a different backend, even though it is unknown to any static list', () => {
+      expect(isKnownSharedContextModelForBackend('qwen', 'gpt-6-luna')).toBe(false);
+      expect(isKnownSharedContextModelForBackend('codex-sdk', 'claude-opus-4-7')).toBe(false);
+      expect(isKnownSharedContextModelForBackend('claude-code-sdk', 'gpt-6-astra')).toBe(false);
+    });
+
+    it('a live Codex model id round-trips through normalizeSharedContextRuntimeConfig without a backend hint', () => {
+      const result = normalizeSharedContextRuntimeConfig({ primaryContextModel: 'gpt-6-luna' });
+      expect(result.primaryContextBackend).toBe('codex-sdk');
+      expect(result.primaryContextModel).toBe('gpt-6-luna');
+    });
+
+    it('a live Claude model id round-trips through normalizeSharedContextRuntimeConfig without a backend hint', () => {
+      const result = normalizeSharedContextRuntimeConfig({ primaryContextModel: 'claude-opus-4-7' });
+      expect(result.primaryContextBackend).toBe('claude-code-sdk');
+      expect(result.primaryContextModel).toBe('claude-opus-4-7');
+    });
   });
 });

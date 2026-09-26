@@ -93,6 +93,15 @@ vi.mock('../../src/daemon/subsession-manager.js', () => ({
   subSessionName: (id: string) => `deck_sub_${id}`,
 }));
 
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionChildResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: vi.fn(() => ({})),
+  initializeSessionResourceLifecycle: vi.fn().mockResolvedValue({ released: 0, preserved: 0, failed: 0 }),
+  measureSessionProcessTreeRssBytes: vi.fn().mockResolvedValue(0),
+}));
+
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({
   startP2pRun: vi.fn(),
   cancelP2pRun: vi.fn(),
@@ -145,12 +154,13 @@ import { handleWebCommand } from '../../src/daemon/command-handler.js';
 import { executeCronJob } from '../../src/daemon/cron-executor.js';
 import { clearQueues, startHookServer } from '../../src/daemon/hook-server.js';
 import { CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
+import { buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 
 function postSend(port: number, body: Record<string, unknown>): Promise<{ status: number; body: Record<string, unknown> }> {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
-      hostname: '127.0.0.1',
+      agent: false, hostname: '127.0.0.1',
       port,
       path: '/send',
       method: 'POST',
@@ -206,7 +216,13 @@ const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
 describe('shared-context send-surface parity integration', () => {
   let server: http.Server;
   let port: number;
-  let runtime: { providerSessionId: string; pendingCount: number; send: ReturnType<typeof vi.fn>; getStatus: ReturnType<typeof vi.fn> };
+  let runtime: {
+    providerSessionId: string;
+    pendingCount: number;
+    send: ReturnType<typeof vi.fn>;
+    appendExternalMessageToActiveTurn: ReturnType<typeof vi.fn>;
+    getStatus: ReturnType<typeof vi.fn>;
+  };
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -215,6 +231,7 @@ describe('shared-context send-surface parity integration', () => {
       providerSessionId: 'provider-session',
       pendingCount: 0,
       send: vi.fn(() => 'sent'),
+      appendExternalMessageToActiveTurn: vi.fn(async () => 'appended'),
       getStatus: vi.fn(() => 'idle'),
     };
     getTransportRuntimeMock.mockReturnValue(runtime);
@@ -269,8 +286,19 @@ describe('shared-context send-surface parity integration', () => {
       daemonVersion: '0.1.0',
     } as never);
 
-    expect(runtime.send).toHaveBeenCalledTimes(3);
-    expect(runtime.send.mock.calls.map((call: unknown[]) => call[0])).toEqual([command, command, command]);
+    expect(runtime.send).toHaveBeenCalledTimes(2);
+    expect(runtime.appendExternalMessageToActiveTurn).toHaveBeenCalledTimes(1);
+    // The interactive session.send (a human's own turn) and the self-scheduled
+    // cron continuation both deliver the raw command untouched — neither is a
+    // cross-session send with a sender to identify. The hook /send IS a
+    // cross-session agent-to-agent send (deck_proj_brain -> deck_proj_w1), so it
+    // alone carries the daemon-trusted sender-identification prefix.
+    expect([
+      runtime.send.mock.calls[0]?.[0],
+      runtime.appendExternalMessageToActiveTurn.mock.calls[0]?.[0],
+      runtime.send.mock.calls[1]?.[0],
+    ]).toEqual([command, `${buildAgentDelegationSenderLine('deck_proj_brain')}\n\n${command}`, command]);
     expect(runtime.send.mock.calls.every((call: unknown[]) => typeof call[0] === 'string')).toBe(true);
+    expect(runtime.appendExternalMessageToActiveTurn.mock.calls.every((call: unknown[]) => typeof call[0] === 'string')).toBe(true);
   });
 });

@@ -12,9 +12,13 @@ import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import {
   CRON_COMPLETION_POLICY,
+  CRON_CONTROL_CONTRACT,
+  LEGACY_CRON_CONTROL_CONTRACT_V1,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
+  registerCronControlAction,
+  type CronAction,
 } from '../../../shared/cron-types.js';
 import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
@@ -41,8 +45,44 @@ const cronParticipantSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('session'), value: z.string().regex(sessionNamePattern) }),
 ]);
 
+const currentCronControlRegistrationSchema = z.object({
+  contractId: z.literal(CRON_CONTROL_CONTRACT.contractId), version: z.literal(CRON_CONTROL_CONTRACT.version), scheduleId: z.string().min(1),
+  constraints: z.object({
+    authorization: z.literal(CRON_CONTROL_CONTRACT.constraints.authorization),
+    executeTaskBody: z.literal(CRON_CONTROL_CONTRACT.constraints.executeTaskBody),
+    scope: z.literal(CRON_CONTROL_CONTRACT.constraints.scope),
+    secrets: z.literal(CRON_CONTROL_CONTRACT.constraints.secrets),
+    updateSelf: z.literal(CRON_CONTROL_CONTRACT.constraints.updateSelf),
+    cancelRecurring: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelRecurring),
+    cancelUntilComplete: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelUntilComplete),
+    silent: z.literal(CRON_CONTROL_CONTRACT.constraints.silent),
+    network: z.literal(CRON_CONTROL_CONTRACT.constraints.network),
+    finalResponse: z.literal(CRON_CONTROL_CONTRACT.constraints.finalResponse),
+  }).strict(),
+}).strict();
+
+const legacyCronControlRegistrationSchema = z.object({
+  contractId: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.contractId), version: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.version), scheduleId: z.string().min(1),
+  constraints: z.object({
+    updateSelf: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.updateSelf),
+    cancelRecurring: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelRecurring),
+    cancelUntilComplete: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelUntilComplete),
+    silent: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.silent),
+    network: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.network),
+    finalResponse: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.finalResponse),
+  }).strict(),
+}).strict();
+
+const cronControlRegistrationSchema = z.union([
+  currentCronControlRegistrationSchema,
+  legacyCronControlRegistrationSchema,
+]);
+
 const cronActionSchemaRaw = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional() }),
+  z.object({
+    type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional(),
+    cronControl: cronControlRegistrationSchema.optional(),
+  }),
   z.object({
     type: z.literal('send'),
     target: z.string().min(1),
@@ -407,6 +447,18 @@ function normalizeCronActionForPersistence<T extends z.infer<typeof cronActionSc
   return stripMemoryMcpSourceProvenance(action) as T;
 }
 
+function registerSelfManagedCronAction(
+  action: z.infer<typeof cronActionSchema>,
+  scheduleId: string,
+  completionPolicy: z.infer<typeof cronJobCreateSchema>['completionPolicy'],
+): { ok: true; action: CronAction } | { ok: false; reason: string } {
+  if (action.type !== 'command' || action.selfManaged !== true) return { ok: true, action };
+  const registered = registerCronControlAction(action, scheduleId, completionPolicy);
+  return registered.ok
+    ? { ok: true, action: registered.action }
+    : { ok: false, reason: registered.reason };
+}
+
 /** Validate cron expression and enforce minimum 5-minute interval. Returns next run time or error string. */
 function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number } | { error: string } {
   try {
@@ -476,7 +528,7 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
     expiresAt,
     completionPolicy,
   } = parsed.data;
-  const persistedAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
+  const unboundAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
 
   const access = await resolveCronScope(c, { serverId, userId, requestedProjectName: projectName, mode: 'write' });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
@@ -491,6 +543,11 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
 
   const id = randomHex(16);
   const now = Date.now();
+  const registeredAction = registerSelfManagedCronAction(unboundAction, id, completionPolicy);
+  if (!registeredAction.ok) {
+    return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
+  }
+  const persistedAction = registeredAction.action;
 
   await c.env.DB.execute(
     `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
@@ -523,6 +580,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
+  if (!jobId) return c.json({ error: 'not_found' }, 404);
   const body = await c.req.json().catch(() => null);
   const parsed = cronJobUpdateSchema.safeParse(await withDefaultCronTimezone(c, userId, body));
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
@@ -590,8 +648,17 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
   if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
   if (updates.action !== undefined) {
+    const unboundAction = normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId));
+    const registeredAction = registerSelfManagedCronAction(
+      unboundAction,
+      jobId,
+      updates.completionPolicy ?? normalizeCronCompletionPolicy(job.completion_policy),
+    );
+    if (!registeredAction.ok) {
+      return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
+    }
     sets.push(`action = $${idx++}`);
-    vals.push(JSON.stringify(normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId))));
+    vals.push(JSON.stringify(registeredAction.action));
   }
   if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }

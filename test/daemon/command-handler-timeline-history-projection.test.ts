@@ -15,6 +15,7 @@ const {
   buildSessionListMock,
   historyWorkerDispatchMock,
   shouldUseHistoryWorkerMock,
+  getSupervisionTaskProjectionMock,
   TimelineHistoryPoolErrorMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
@@ -26,6 +27,7 @@ const {
   buildSessionListMock: vi.fn(async () => []),
   historyWorkerDispatchMock: vi.fn(),
   shouldUseHistoryWorkerMock: vi.fn(() => false),
+  getSupervisionTaskProjectionMock: vi.fn(),
   TimelineHistoryPoolErrorMock: class TimelineHistoryPoolErrorMock extends Error {
     readonly reason: string;
 
@@ -91,6 +93,15 @@ vi.mock('../../src/daemon/timeline-history-pool.js', () => ({
   shouldUseTimelineHistoryWorkerPool: shouldUseHistoryWorkerMock,
   TimelineHistoryPoolError: TimelineHistoryPoolErrorMock,
 }));
+vi.mock('../../src/daemon/supervision-state-store.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/supervision-state-store.js')>();
+  return {
+    ...actual,
+    getSupervisionTaskRegistry: vi.fn(() => ({
+      getSupervisionTaskProjection: getSupervisionTaskProjectionMock,
+    })),
+  };
+});
 vi.mock('../../src/daemon/subsession-manager.js', () => ({ startSubSession: vi.fn(), stopSubSession: vi.fn(), rebuildSubSessions: vi.fn(), detectShells: vi.fn().mockResolvedValue([]), readSubSessionResponse: vi.fn(), subSessionName: (id: string) => `deck_sub_${id}` }));
 vi.mock('../../src/daemon/p2p-orchestrator.js', () => ({ startP2pRun: vi.fn(), cancelP2pRun: vi.fn(), getP2pRun: vi.fn(() => undefined), listP2pRuns: vi.fn(() => []), serializeP2pRun: vi.fn() }));
 vi.mock('../../src/daemon/session-list.js', () => ({ buildSessionList: buildSessionListMock }));
@@ -125,6 +136,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
     readPreferredMock.mockReset();
     readByTypesPreferredMock.mockReset();
     historyWorkerDispatchMock.mockReset();
+    getSupervisionTaskProjectionMock.mockReset();
     shouldUseHistoryWorkerMock.mockReset();
     shouldUseHistoryWorkerMock.mockReturnValue(false);
     getSessionMock.mockReturnValue(undefined);
@@ -184,7 +196,7 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       requestId: 'hist-worker',
       status: TIMELINE_RESPONSE_STATUS.OK,
       source: TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
-      payloadBytes: 120,
+      payloadBytes: expect.any(Number),
       payloadTruncated: false,
       events: [expect.objectContaining({ eventId: 'u-worker' })],
       detailRefs: [expect.objectContaining({
@@ -195,6 +207,39 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
         fieldPath: 'payload.text',
       })],
     }));
+    const response = serverLink.send.mock.calls.at(-1)?.[0] as { payloadBytes: number; events: unknown[] };
+    expect(response.payloadBytes).toBe(Buffer.byteLength(JSON.stringify(response.events), 'utf8'));
+    expect(response.payloadBytes).not.toBe(120);
+  });
+
+  it('serves a small history page while the server link reports uplink congestion', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker', agentType: 'codex' });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: [], detailCandidates: [], eventsRead: 0, payloadBytes: 2,
+      droppedEvents: 0, truncatedEvents: 0, readMs: 1, sanitizeMs: 0,
+    });
+    const congestedLink = { ...serverLink, isUplinkCongested: vi.fn(() => true) };
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_worker',
+      requestId: 'hist-congested',
+      limit: 300,
+      budgetBytes: 1024 * 1024,
+    }, congestedLink as any);
+    await flushAsync();
+
+    expect(historyWorkerDispatchMock).toHaveBeenCalledWith(
+      expect.objectContaining({ maxResponseBytes: 64 * 1024 }),
+      expect.anything(),
+    );
+  });
+
+  it('routes a server history cancel to the link so an unsent reply is dropped', () => {
+    const cancelLink = { ...serverLink, cancelQueuedDataPlaneRequest: vi.fn(() => 1) };
+    handleWebCommand({ type: TIMELINE_MESSAGES.HISTORY_CANCEL, requestId: 'hist-abandoned' }, cancelLink as any);
+    expect(cancelLink.cancelQueuedDataPlaneRequest).toHaveBeenCalledWith('hist-abandoned');
   });
 
   it('uses the full page/detail budget for timeline.history even without an explicit larger budget', async () => {
@@ -290,6 +335,49 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
         expect.objectContaining({ eventId: 's-fallback' }),
       ],
     }));
+  });
+
+  it('never runs the main-thread build when the projection is merely busy', async () => {
+    // The incident in one test. Saturation used to reach the command layer as
+    // projection_unavailable, and the response to that is buildTimelineHistoryOnMain:
+    // two more projection round-trips plus synthesize and sanitize ON the event
+    // loop, while the process is already overloaded. Busy must instead produce a
+    // determinate, retryable answer and touch nothing heavy.
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_busy', agentType: 'codex' });
+    historyWorkerDispatchMock.mockRejectedValue(new TimelineHistoryPoolErrorMock(
+      TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+    ));
+    readByTypesPreferredMock.mockImplementation(async () => {
+      throw new Error('main-thread projection read must not be reached when busy');
+    });
+
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_busy',
+      requestId: 'hist-busy',
+      limit: 5,
+    }, serverLink as any);
+    await flushAsync();
+
+    // The main path is never entered: no second read, no synthesize, no sanitize.
+    expect(readByTypesPreferredMock).not.toHaveBeenCalled();
+    const sent = serverLink.send.mock.calls.map((call: unknown[]) => call[0] as Record<string, unknown>)
+      .filter((msg) => msg.requestId === 'hist-busy');
+    expect(sent).toHaveLength(1);
+    expect(sent[0]!.source).not.toBe(TIMELINE_RESPONSE_SOURCES.MAIN_SQLITE);
+    // Determinate and marked with the field the client actually reads. An
+    // invented `retryable` field would travel the wire and be ignored, leaving
+    // the user with a silently lost history instead of a retry.
+    expect(sent[0]).toMatchObject({
+      status: TIMELINE_RESPONSE_STATUS.ERROR,
+      errorReason: TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+      recoverable: true,
+    });
+    // Nothing in the timeline bridge or client carries a retry-after hint, so
+    // emitting one would be a second unread field. Pin its absence.
+    expect(sent[0]).not.toHaveProperty('retryable');
+    expect(sent[0]).not.toHaveProperty('retryAfterMs');
   });
 
   it('uses type-filtered reads and preserves substantive budgeting plus session.state interleaving', async () => {
@@ -407,9 +495,74 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       requestId: 'page-1',
       status: TIMELINE_RESPONSE_STATUS.OK,
       source: TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
-      payloadBytes: 512,
+      payloadBytes: expect.any(Number),
       events: [expect.objectContaining({ eventId: 'page-older' })],
     }));
+    const response = serverLink.send.mock.calls.at(-1)?.[0] as { payloadBytes: number; events: unknown[] };
+    expect(response.payloadBytes).toBe(Buffer.byteLength(JSON.stringify(response.events), 'utf8'));
+    expect(response.payloadBytes).not.toBe(512);
+  });
+
+  it('re-applies the worker response budget after legacy task objectives are refreshed', async () => {
+    shouldUseHistoryWorkerMock.mockReturnValue(true);
+    getSessionMock.mockReturnValue({ name: 'deck_worker_refresh', agentType: 'codex' });
+    const objective = 'x'.repeat(4_000);
+    getSupervisionTaskProjectionMock.mockReturnValue({
+      version: 1,
+      taskId: 'tsk_refresh',
+      assignmentId: 'asg_refresh',
+      title: 'Refresh the legacy objective.…',
+      objective,
+    });
+    historyWorkerDispatchMock.mockResolvedValue({
+      events: Array.from({ length: 40 }, (_, index) => ({
+        eventId: `legacy-reply-${index}`,
+        sessionId: 'deck_worker_refresh',
+        ts: 1_000 + index,
+        seq: index + 1,
+        epoch: 1,
+        source: 'daemon',
+        confidence: 'high',
+        type: 'delegation.reply',
+        payload: {
+          supervisionTask: {
+            version: 1,
+            taskId: 'tsk_refresh',
+            assignmentId: 'asg_refresh',
+            title: 'Refresh the legacy objective.…',
+          },
+        },
+      })),
+      detailCandidates: [],
+      eventsRead: 40,
+      payloadBytes: 10_000,
+      droppedEvents: 0,
+      truncatedEvents: 0,
+      readMs: 4,
+      sanitizeMs: 1,
+    });
+
+    handleWebCommand({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: 'deck_worker_refresh',
+      requestId: 'hist-worker-refresh',
+      limit: 100,
+      budgetBytes: 64 * 1024,
+    }, serverLink as any);
+    await flushAsync();
+
+    const response = serverLink.send.mock.calls.at(-1)?.[0] as {
+      payloadBytes: number;
+      events: Array<{ payload: { supervisionTask?: { objective?: string } } }>;
+      droppedEvents: number;
+      hasMore: boolean;
+    };
+    expect(getSupervisionTaskProjectionMock).toHaveBeenCalledTimes(1);
+    expect(response.payloadBytes).toBe(Buffer.byteLength(JSON.stringify(response.events), 'utf8'));
+    expect(response.payloadBytes).toBeLessThanOrEqual(64 * 1024);
+    expect(response.droppedEvents).toBeGreaterThan(0);
+    expect(response.hasMore).toBe(true);
+    expect(response.events.every((event) => event.payload.supervisionTask?.objective === objective)).toBe(true);
   });
 
   it('queries content types directly instead of over-reading state storms', async () => {

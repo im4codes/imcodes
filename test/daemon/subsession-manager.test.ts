@@ -52,6 +52,7 @@ vi.mock('../../src/store/session-store.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatchingFile: startWatchingFileMock,
   startWatching: startWatchingMock,
   stopWatching: jsonlStopWatchingMock,
@@ -92,7 +93,15 @@ vi.mock('../../src/agent/tmux.js', () => ({
   sessionExists: sessionExistsMock,
   capturePane: capturePaneMock,
   sendKey: vi.fn().mockResolvedValue(undefined),
+  sendKeys: vi.fn().mockResolvedValue(undefined),
   getPanePids: vi.fn().mockResolvedValue([]),
+  getPaneId: vi.fn().mockResolvedValue('%resource-pane'),
+}));
+
+vi.mock('../../src/daemon/session-resource-service.js', () => ({
+  registerTmuxSessionResource: vi.fn().mockResolvedValue(undefined),
+  releaseSessionResources: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
+  resourceOwnerEnv: vi.fn(() => ({})),
 }));
 
 vi.mock('../../src/agent/session-manager.js', () => ({
@@ -231,6 +240,21 @@ describe('startSubSession — ccSessionId stored in session-store', () => {
     expect(upsertSession).toHaveBeenCalledWith(
       expect.objectContaining({ ccSessionId: 'abc-uuid-123' }),
     );
+  });
+
+  it('persists a process sub-session startup identity for restart reinjection', async () => {
+    await startSubSession({
+      id: 'identity-contract',
+      type: 'claude-code',
+      cwd: '/proj',
+      identityPrompt: 'You are the release engineer.',
+      provisionedIdentityHash: 'identity-sha256',
+    });
+
+    expect(upsertSession).toHaveBeenCalledWith(expect.objectContaining({
+      identityPrompt: 'You are the release engineer.',
+      provisionedIdentityHash: 'identity-sha256',
+    }));
   });
 
   it('calls startWatchingFile (not startWatching) for cc sub-session with ccSessionId', async () => {
@@ -457,6 +481,7 @@ describe('startSubSession — transport SDK agents do not use tmux', () => {
       ccSessionId: 'cc-sdk-session-id',
       parentSession: 'deck_proj_brain',
       description: 'SDK test',
+      identityPrompt: 'You are the release engineer.',
     });
 
     expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
@@ -466,12 +491,49 @@ describe('startSubSession — transport SDK agents do not use tmux', () => {
       projectName: 'proj',
       parentSession: 'deck_proj_brain',
       description: 'SDK test',
+      identityPrompt: 'You are the release engineer.',
       fresh: true,
       userCreated: true,
     }));
     expect(String(launchTransportSessionMock.mock.calls[0][0].ccSessionId)).toMatch(/^[0-9a-f-]{36}$/);
     expect(getDriverMock).not.toHaveBeenCalled();
     expect(newSessionMock).not.toHaveBeenCalled();
+  });
+
+  it('persists the auto-provision identity digest after a transport launch', async () => {
+    let childReads = 0;
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_proj_brain') return { name, projectName: 'proj' };
+      if (name !== 'deck_sub_sdk-identity') return null;
+      childReads += 1;
+      return childReads === 1 ? null : {
+        name,
+        projectName: 'proj',
+        role: 'w1',
+        agentType: 'claude-code-sdk',
+        projectDir: '/proj',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: 1,
+        updatedAt: 1,
+      };
+    });
+
+    await startSubSession({
+      id: 'sdk-identity',
+      type: 'claude-code-sdk',
+      cwd: '/proj',
+      parentSession: 'deck_proj_brain',
+      identityPrompt: 'You are the release engineer.',
+      provisionedIdentityHash: 'identity-sha256',
+      fresh: true,
+    });
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_sdk-identity',
+      provisionedIdentityHash: 'identity-sha256',
+    }));
   });
 });
 
@@ -678,6 +740,160 @@ describe('rebuildSubSessions — transport sessions are lazy', () => {
       state: 'idle',
     }));
   });
+
+  it('a replayed rebuild of unchanged sub-sessions writes nothing', async () => {
+    // Production shape: the server re-sends subsession.rebuild_all on every
+    // reconnect. Measured on a live daemon this replayed 113 sub-sessions every
+    // 40-90s, rewriting every record each time, because `updatedAt: now` made
+    // each one compare as changed. RSS swung 405MB -> 1621MB at 76% CPU and the
+    // resulting GC pauses stalled the loop, which caused the next reconnect.
+    const sub = {
+      id: 'replayed', type: 'codex-sdk', cwd: '/proj', label: 'Cx1',
+      providerSessionId: 'codex-provider-session', requestedModel: 'gpt-5.5',
+      parentSession: 'deck_cd_brain', runtimeType: 'transport',
+    } as Parameters<typeof rebuildSubSessions>[0][number];
+
+    await rebuildSubSessions([sub]);
+    expect(upsertSessionMock, 'the first rebuild persists the record').toHaveBeenCalledTimes(1);
+    const persisted = upsertSessionMock.mock.calls[0]![0] as Record<string, unknown>;
+
+    // The store holds what the rebuild produced, but stamped a MINUTE ago —
+    // the real gap between reconnects. Without this the replay would land in
+    // the same millisecond and `updatedAt` would match by accident, so the test
+    // would pass even if the comparison still counted that field.
+    getSessionMock.mockReturnValue({ ...persisted, updatedAt: (persisted.updatedAt as number) - 60_000 });
+    upsertSessionMock.mockClear();
+
+    await rebuildSubSessions([sub]);
+    await rebuildSubSessions([sub]);
+    expect(
+      upsertSessionMock,
+      'replaying a rebuild over unchanged records must not touch the store',
+    ).not.toHaveBeenCalled();
+  });
+
+  it('still writes when something real changed', async () => {
+    // The skip must be about substance, not about skipping work.
+    const base = {
+      id: 'changed', type: 'codex-sdk', cwd: '/proj', label: 'Cx1',
+      parentSession: 'deck_cd_brain', runtimeType: 'transport',
+    } as Parameters<typeof rebuildSubSessions>[0][number];
+
+    await rebuildSubSessions([base]);
+    const persisted = upsertSessionMock.mock.calls[0]![0] as Record<string, unknown>;
+    getSessionMock.mockReturnValue({ ...persisted, updatedAt: (persisted.updatedAt as number) - 60_000 });
+    upsertSessionMock.mockClear();
+
+    await rebuildSubSessions([{ ...base, label: 'Cx1 renamed' }]);
+    expect(upsertSessionMock, 'a real change is still persisted').toHaveBeenCalledTimes(1);
+    expect(upsertSessionMock.mock.calls[0]![0]).toMatchObject({ label: 'Cx1 renamed' });
+  });
+
+  it('a replayed rebuild does not resurrect a session the restart-loop breaker stopped', async () => {
+    // The breaker marks `error` after MAX_RESTARTS failures and the health
+    // sweep skips that state. Rebuild replays on every reconnect and forced
+    // `idle`, clearing the marker — so the sweep respawned, the session died,
+    // and the breaker re-fired. Measured live: "Restart loop detected" 8 times
+    // in 300s for two sub-sessions, indefinitely.
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_looping', state: 'error',
+      error: 'Restart loop detected: more than 3 restarts within 5 minutes',
+      updatedAt: Date.now() - 60_000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'looping', type: 'codex', cwd: '/proj', parentSession: 'deck_cd_brain',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    const written = upsertSessionMock.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    for (const record of written) {
+      expect(record.state, 'the stop marker must survive a rebuild replay').toBe('error');
+    }
+  });
+
+  it('still brings a healthy stored session back as idle', async () => {
+    // The preservation must be narrow: only the breaker's terminal marker.
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_healthy', state: 'stopped', updatedAt: Date.now() - 60_000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'healthy', type: 'codex', cwd: '/proj', parentSession: 'deck_cd_brain',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    const written = upsertSessionMock.mock.calls.map((c) => c[0] as Record<string, unknown>);
+    expect(written.length).toBeGreaterThan(0);
+    for (const record of written) {
+      expect(record.state, 'a non-terminal state is still re-derived').toBe('idle');
+    }
+  });
+
+  it.each([
+    ['claude-code-sdk', 'CC Preset'],
+    ['qwen', 'Qwen Preset'],
+    ['deepseek-harness', 'DeepSeek Preset'],
+    ['pi', 'Pi Preset'],
+  ])('rehydrates the server-authoritative preset for %s after daemon restart', async (type, ccPresetId) => {
+    await rebuildSubSessions([{
+      id: `preset-${type}`,
+      type,
+      cwd: '/proj',
+      requestedModel: 'MiniMax-M3',
+      // The durable server/web wire calls this field ccPresetId. A daemon
+      // restart must not silently drop it before provider runtime assembly.
+      ccPresetId,
+    } as Parameters<typeof rebuildSubSessions>[0][number] & { ccPresetId: string }]);
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: `deck_sub_preset-${type}`,
+      agentType: type,
+      requestedModel: 'MiniMax-M3',
+      ccPreset: ccPresetId,
+    }));
+  });
+
+  it.each(['claude-code-sdk', 'qwen', 'deepseek-harness', 'pi'])('keeps direct %s rebuilds unbound from presets', async (type) => {
+    await rebuildSubSessions([{
+      id: `direct-${type}`,
+      type,
+      cwd: '/proj',
+      requestedModel: 'provider-owned-model',
+    }]);
+
+    expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: `deck_sub_direct-${type}`,
+      agentType: type,
+      requestedModel: 'provider-owned-model',
+    }));
+    expect(upsertSessionMock.mock.calls.at(-1)?.[0]?.ccPreset).toBeUndefined();
+  });
+
+  it('clears a stale local credential route when the durable rebuild explicitly selects no preset', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_direct-after-preset',
+      agentType: 'pi',
+      projectDir: '/proj',
+      state: 'idle',
+      ccPreset: 'Other User Private Route',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1,
+    });
+
+    await rebuildSubSessions([{
+      id: 'direct-after-preset',
+      type: 'pi',
+      cwd: '/proj',
+      ccPresetId: null,
+      requestedModel: 'provider-owned-model',
+    }]);
+
+    expect(upsertSessionMock.mock.calls.at(-1)?.[0]).toMatchObject({
+      name: 'deck_sub_direct-after-preset',
+      requestedModel: 'provider-owned-model',
+      ccPreset: undefined,
+    });
+  });
 });
 
 // ── rebuildSubSessions: geminiSessionId preserved ────────────────────────────
@@ -814,5 +1030,87 @@ describe('rebuildSubSessions — geminiSessionId preserved', () => {
       sessionInstanceId: 'logical-stable',
       runtimeEpoch: 'runtime-stable',
     }));
+  });
+});
+
+// ── rebuildSubSessions: never restarts a stopped sub-session's watcher ──────
+// Regression: rebuildSubSessions is replayed on every server reconnect and
+// only checked tmux (sessionExists), never the persisted `state`. A
+// sub-session already marked 'stopped' — whose tmux artifact (remain-on-exit)
+// still exists — got its jsonl-watcher restarted on every reconnect, free to
+// adopt another live session's file via directory scan.
+
+describe('rebuildSubSessions — never restarts a stopped sub-session watcher', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    sessionExistsMock.mockResolvedValue(true);
+    isWatchingMock.mockReturnValue(false);
+    codexIsWatchingMock.mockReturnValue(false);
+    geminiIsWatchingMock.mockReturnValue(false);
+  });
+
+  it('does not call startWatchingFile for a claude-code sub-session marked state=stopped', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_5907196l',
+      agentType: 'claude-code',
+      ccSessionId: 'stale-sub-uuid',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: '5907196l',
+      type: 'claude-code',
+      cwd: '/proj',
+      ccSessionId: 'stale-sub-uuid',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    expect(startWatchingFileMock).not.toHaveBeenCalled();
+    // Metadata normalization still runs — this is a watcher-only guard.
+    expect(upsertSessionMock).toHaveBeenCalled();
+  });
+
+  it('does not call codex startWatchingById for a codex sub-session marked state=stopped', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_codexstopped',
+      agentType: 'codex',
+      codexSessionId: 'stale-codex-uuid',
+      state: 'stopped',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: 'codexstopped',
+      type: 'codex',
+      cwd: '/proj',
+      codexSessionId: 'stale-codex-uuid',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    expect(codexStartWatchingByIdMock).not.toHaveBeenCalled();
+  });
+
+  it('still restarts the watcher for a live (non-stopped) claude-code sub-session', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_5907196l',
+      agentType: 'claude-code',
+      ccSessionId: 'live-sub-uuid',
+      state: 'running',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: 1000,
+    });
+
+    await rebuildSubSessions([{
+      id: '5907196l',
+      type: 'claude-code',
+      cwd: '/proj',
+      ccSessionId: 'live-sub-uuid',
+    } as Parameters<typeof rebuildSubSessions>[0][number]]);
+
+    expect(startWatchingFileMock).toHaveBeenCalledWith('deck_sub_5907196l', expect.stringContaining('live-sub-uuid'));
   });
 });

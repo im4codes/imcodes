@@ -22,6 +22,10 @@ import {
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import {
+  parseSupervisionHeartbeatSnapshot,
+  type SupervisionHeartbeatSnapshot,
+} from '@shared/supervision-heartbeat.js';
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/transport-queue-types.js';
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
 
@@ -36,6 +40,7 @@ export interface SubSession extends SubSessionData {
   failedMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
   /** Newest pending-queue version applied. Drops stale snapshots. */
   transportPendingMessageVersion?: number | null;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot | null;
 }
 
 /**
@@ -77,6 +82,9 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
     queueAuthorityId: existing.queueAuthorityId ?? base.queueAuthorityId,
     failedMessageEntries: existing.failedMessageEntries ?? base.failedMessageEntries,
     transportPendingMessageVersion: existing.transportPendingMessageVersion ?? base.transportPendingMessageVersion,
+    supervisionHeartbeat: existing.supervisionHeartbeat !== undefined
+      ? existing.supervisionHeartbeat
+      : base.supervisionHeartbeat,
     ...(preserveCodexDisplay ? {
       codexAvailableModels: base.codexAvailableModels ?? existing.codexAvailableModels ?? null,
       requestedModel: base.requestedModel ?? existing.requestedModel ?? null,
@@ -200,6 +208,7 @@ export function useSubSessions(
     title: string;
     type: string;
     parentSessionName: string | null;
+    supervisionMode?: SubSessionData['supervisionMode'];
   }>) => {
     const now = Date.now();
     setSubSessions((prev) => {
@@ -222,6 +231,7 @@ export function useSubSessions(
         parentSession: item.parentSessionName,
         description: null,
         ccPresetId: null,
+        supervisionMode: item.supervisionMode ?? null,
       }, previousById.get(item.subSessionId)));
     });
     setLoadedServerId(serverIdForShare);
@@ -325,6 +335,10 @@ export function useSubSessions(
                     updated[existingIdx].transportConfig,
                   ),
                 }),
+                ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
+                ...(m.supervisionHeartbeat !== undefined && {
+                  supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+                }),
                 ...transportPendingPatch,
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
                 ...(m.qwenAuthType != null && { qwenAuthType: m.qwenAuthType }),
@@ -371,6 +385,8 @@ export function useSubSessions(
               executionCloneKind: m.executionCloneKind ?? null,
               parentRunId: m.parentRunId ?? null,
               transportConfig: m.transportConfig ?? null,
+              supervisionMode: m.supervisionMode ?? null,
+              supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
               ...transportPendingPatch,
             }];
           });
@@ -421,6 +437,10 @@ export function useSubSessions(
                   m.transportConfig,
                   s.transportConfig,
                 ),
+              } : {}),
+              ...(m.supervisionMode !== undefined ? { supervisionMode: m.supervisionMode } : {}),
+              ...(m.supervisionHeartbeat !== undefined ? {
+                supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
               } : {}),
               ...transportPendingPatch,
             };
@@ -691,7 +711,10 @@ export function useSubSessions(
   }, [serverId]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
-  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'transportConfig'>>) => {
+  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession,
+    'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'transportConfig'
+    | 'requestedModel' | 'activeModel' | 'modelDisplay'
+  >>) => {
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, ...fields } : s,
     ));

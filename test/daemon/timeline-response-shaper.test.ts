@@ -65,6 +65,55 @@ describe('timeline response shaper', () => {
     expect(shaped.events.at(-1)?.eventId).toBe('assistant-219');
   });
 
+  it('replaces a legacy concise reply title with the authoritative registry objective', () => {
+    const legacyTitle = 'Delegation-reply card title is now cut far too short.…';
+    const objective = `Delegation-reply card title is now cut far too short. ${'Preserve authoritative context. '.repeat(14)}`.trim();
+    const legacy = event({
+      eventId: 'delegation-reply:legacy',
+      type: 'delegation.reply',
+      payload: {
+        supervisionTask: {
+          version: 1,
+          taskId: 'tsk_legacy',
+          assignmentId: 'asg_legacy',
+          title: legacyTitle,
+        },
+      },
+    });
+    const resolver = vi.fn(() => ({
+      version: 1 as const,
+      taskId: 'tsk_legacy',
+      assignmentId: 'asg_legacy',
+      title: legacyTitle,
+      objective,
+    }));
+
+    const shaped = shapeTimelineEventsForTransport([legacy], {}, resolver);
+
+    expect(resolver).toHaveBeenCalledWith('tsk_legacy', 'asg_legacy');
+    expect(shaped.events[0]?.payload.supervisionTask).toMatchObject({ objective });
+  });
+
+  it('fails soft to a stored legacy title when registry projection is unavailable', () => {
+    const legacyTitle = 'Legacy objective is the only available title';
+    const legacy = event({
+      eventId: 'delegation-reply:legacy-only',
+      type: 'delegation.reply',
+      payload: {
+        supervisionTask: {
+          version: 1,
+          taskId: 'tsk_legacy_only',
+          assignmentId: 'asg_legacy_only',
+          title: legacyTitle,
+        },
+      },
+    });
+
+    const shaped = shapeTimelineEventsForTransport([legacy], {}, () => undefined);
+
+    expect(shaped.events[0]?.payload.supervisionTask).toMatchObject({ title: legacyTitle });
+  });
+
   it('returns bounded timeline.detail payload metadata and rejects over-cap detail responses', () => {
     const envelope = {
       type: TIMELINE_MESSAGES.DETAIL,

@@ -1,10 +1,101 @@
-import { beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { emitPeerAuditResult, emitPeerAuditStatus, peerAuditResultEventId } from '../../src/daemon/peer-audit-result.js';
 import { resetMetricsForTests, snapshotCounters } from '../../src/util/metrics.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
 
 describe('peer audit result timeline projection', () => {
-  beforeEach(() => resetMetricsForTests());
+  beforeEach(() => {
+    resetMetricsForTests();
+    resetSupervisionTaskRegistryForTests();
+  });
+  afterEach(() => resetSupervisionTaskRegistryForTests());
+
+  it('attaches the authoritative full task objective for a uniquely bound formal audit', () => {
+    const registry = getSupervisionTaskRegistry();
+    const attemptId = 'formal-attempt';
+    const objective = `Repair the peer audit card. ${'Keep the authoritative objective visible. '.repeat(30)}`.trim();
+    expect(registry.createOrGet({
+      taskId: 'tsk_formal', projectName: 'alpha', classification: 'independent_top_level',
+      objective, currentRevision: 'formal-r1',
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId: 'tsk_formal', assignmentId: 'asg_formal_auditor', role: 'auditor', required: true,
+      identity: {
+        sessionName: 'deck_formal_auditor', sessionInstanceId: 'instance-formal',
+        runtimeEpoch: 'epoch-formal', agentType: 'codex-sdk', providerFamily: 'openai',
+      },
+      auditAttemptId: attemptId, auditRevision: 'formal-r1',
+    })).toMatchObject({ ok: true });
+    const events: any[] = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.sessionId === 'deck_formal_brain' && event.type === 'peer_audit.result') events.push(event);
+    });
+    emitPeerAuditResult({
+      auditedSessionName: 'deck_formal_brain', attemptId, trigger: 'automatic', outcome: 'rework',
+      auditorSessionName: 'deck_formal_auditor', elapsedMs: 10,
+    });
+    off();
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.supervisionTask).toMatchObject({
+      version: 1,
+      taskId: 'tsk_formal',
+      assignmentId: 'asg_formal_auditor',
+      revision: 'formal-r1',
+      objective,
+    });
+    expect(registry.getSupervisionTaskProjection('tsk_formal', 'asg_formal_auditor')).toMatchObject({
+      taskId: 'tsk_formal',
+      assignmentId: 'asg_formal_auditor',
+      objective,
+    });
+    expect(registry.getSupervisionTaskProjection('tsk_other', 'asg_formal_auditor')).toBeUndefined();
+    expect(registry.getSupervisionTaskProjection('tsk_formal', 'asg_other')).toBeUndefined();
+    expect(JSON.stringify(events[0])).not.toContain(attemptId);
+  });
+
+  it('attaches the daemon-authoritative audit round after a final receipt', () => {
+    const registry = getSupervisionTaskRegistry();
+    const taskId = 'tsk_round_projection';
+    const assignmentId = 'asg_round_projection';
+    const attemptId = 'round-projection-attempt';
+    const revision = 'round-projection-r1';
+    const auditorIdentity = {
+      sessionName: 'deck_round_projection_auditor',
+      sessionInstanceId: 'instance-round-projection',
+      runtimeEpoch: 'epoch-round-projection',
+      agentType: 'codex-sdk',
+      providerFamily: 'openai',
+    };
+    expect(registry.createOrGet({
+      taskId, projectName: 'alpha', classification: 'independent_top_level',
+      objective: 'Project the audit round', currentRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.createAssignment({
+      taskId, assignmentId, role: 'auditor', required: true, identity: auditorIdentity,
+      auditAttemptId: attemptId, auditRevision: revision,
+    })).toMatchObject({ ok: true });
+    expect(registry.appendMatchingAuditReceipt({
+      taskId, auditorAssignmentId: assignmentId, attemptId, revision,
+      receiptKind: 'final', verdict: 'PASS', auditorSessionName: auditorIdentity.sessionName,
+      auditorIdentity, findings: 'PASS', validations: [], now: 100,
+    })).toMatchObject({ ok: true });
+
+    const events: any[] = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.sessionId === 'deck_round_projection_brain' && event.type === 'peer_audit.result') events.push(event);
+    });
+    emitPeerAuditResult({
+      auditedSessionName: 'deck_round_projection_brain', attemptId, trigger: 'automatic', outcome: 'pass',
+      auditorSessionName: auditorIdentity.sessionName, elapsedMs: 10,
+    });
+    off();
+    expect(events).toHaveLength(1);
+    expect(events[0].payload.round).toBe(1);
+  });
 
   it('emits a stable reconnect-safe id and excludes opaque/capability/provider material', () => {
     const events: unknown[] = [];

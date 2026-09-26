@@ -1,0 +1,5 @@
+=== WITH CHANGES (worktree), isolated x6 ===
+failures=0/6
+=== BASE 48b897534 (git archive), isolated x6 ===
+base_failures=0/6
+=== imports identity/codex/qwen code? 0 ===

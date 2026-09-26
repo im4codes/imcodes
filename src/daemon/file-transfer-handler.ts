@@ -3,7 +3,7 @@
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
 import { constants as fsConstants, createReadStream, createWriteStream, realpathSync } from 'node:fs';
-import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
+import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, statfs, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -14,10 +14,13 @@ import {
   FILE_TRANSFER_LIMITS,
   FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_DIRECTORY_PATH,
+  isFileTransferWellKnownDirectoryPath,
   FILE_TRANSFER_MSG,
   FILE_TRANSFER_DELETE_ERROR,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_PATH_HANDLE_ERROR,
+  FILE_TRANSFER_DIRECTORY_LIST_ERROR,
+  MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
   type AttachmentRef,
   type FileUploadRequest,
   type FileUploadFetchRequest,
@@ -36,13 +39,36 @@ import {
   type FileDirectoryListError,
   type FileDeleteDone,
   type FileDeleteError,
+  type MacosOpenFullDiskAccessDone,
+  type MacosOpenFullDiskAccessError,
   validateFileDeleteRequest,
   validateFileDirectoryListRequest,
+  FILE_TRANSFER_RELAY_HEADER,
+  FILE_TRANSFER_HTTP_HEADER,
+  formatFileTransferRangeRequest,
+  parseFileTransferContentRange,
 } from '../../shared/transport/file-transfer.js';
+import {
+  resolveWellKnownDirectoryDetailed,
+  isPermissionDeniedError,
+  WELL_KNOWN_DIRECTORY,
+  type WellKnownDirectoryKind,
+} from './well-known-directories.js';
+import { resolveMacosUserSession, launchMacosUserSessionCommand } from '../node/user-session-launcher.js';
+import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
+import { MACHINE_DIRECT_RESUME_FILE_PREFIX } from '../../shared/machine-direct-file-transfer.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
+
+/** Sentinel path -> the directory it names. */
+const WELL_KNOWN_DIRECTORY_BY_SENTINEL: Record<string, WellKnownDirectoryKind> = {
+  [FILE_TRANSFER_DIRECTORY_PATH.HOME]: WELL_KNOWN_DIRECTORY.HOME,
+  [FILE_TRANSFER_DIRECTORY_PATH.DESKTOP]: WELL_KNOWN_DIRECTORY.DESKTOP,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOWNLOADS]: WELL_KNOWN_DIRECTORY.DOWNLOADS,
+  [FILE_TRANSFER_DIRECTORY_PATH.DOCUMENTS]: WELL_KNOWN_DIRECTORY.DOCUMENTS,
+};
 
 /** Minimal reusable sender boundary implemented by both ServerLink and the thin node runtime. */
 export interface FileTransferSender {
@@ -78,6 +104,7 @@ interface AttachmentEntry {
   /** Local-handle identity prevents path replacement between mint and read. */
   device?: number;
   inode?: number;
+  mtimeMs?: number;
 }
 
 interface DownloadTarget {
@@ -208,7 +235,8 @@ export async function resolveDirectFileDownloadSource(attachmentId: string): Pro
       // Overlay/container filesystems can immediately reuse an inode when a
       // path is unlinked and recreated. Preserve the minted size as an
       // additional identity component so that replacement still fails closed.
-      || (entry.size !== undefined && current.size !== entry.size)) {
+      || (entry.size !== undefined && current.size !== entry.size)
+      || (entry.mtimeMs !== undefined && current.mtimeMs !== entry.mtimeMs)) {
       throw new Error('download_failed');
     }
   }
@@ -451,7 +479,24 @@ export async function finalizeDirectUploadedFile(params: {
   mime?: string;
   resolved: string;
   size: number;
+  destinationDirectory?: string;
 }): Promise<AttachmentRef> {
+  if (params.destinationDirectory) {
+    const destination = await commitUploadedFileToDirectory(
+      params.resolved,
+      params.destinationDirectory,
+      params.originalName,
+    );
+    const destinationStat = await lstat(destination);
+    return createProjectFileHandleFromValidatedPath(
+      toValidatedRealPath(await fsRealpath(destination)),
+      params.originalName,
+      params.mime,
+      destinationStat.size,
+      { device: destinationStat.dev, inode: destinationStat.ino },
+      params.clientUploadId,
+    );
+  }
   const now = Date.now();
   await writeFile(`${params.resolved}.meta.json`, JSON.stringify({
     originalName: params.originalName,
@@ -513,16 +558,34 @@ async function fetchRelayUpload(
   let lastErr: unknown;
   for (let attempt = 1; attempt <= 3; attempt += 1) {
     try {
+      let loaded = await stat(resolved).then((entry) => entry.size).catch(() => 0);
+      if (loaded > expectedSize) {
+        await unlink(resolved).catch(() => {});
+        loaded = 0;
+      }
       const response = await fetch(downloadUrl, {
+        ...(loaded > 0 ? { headers: { Range: formatFileTransferRangeRequest(loaded) } } : {}),
         signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
       });
+      if (response.status === 416 && loaded === expectedSize) return loaded;
       if (!response.ok) {
         throw new Error(`relay_fetch_${response.status}`);
       }
       if (!response.body) {
         throw new Error('relay_fetch_empty_body');
       }
-      let loaded = 0;
+      if (loaded > 0) {
+        const range = response.status === 206
+          ? parseFileTransferContentRange(response.headers.get(FILE_TRANSFER_HTTP_HEADER.CONTENT_RANGE))
+          : null;
+        if (range) {
+          if (range.start !== loaded || range.total !== expectedSize) throw new Error('relay_resume_mismatch');
+        } else {
+          // Rolling compatibility with an older Server that ignored Range:
+          // restart explicitly rather than appending a second whole file.
+          loaded = 0;
+        }
+      }
       let lastPct = -1;
       let lastSentAt = 0;
       const reportProgress = (force = false) => {
@@ -546,7 +609,7 @@ async function fetchRelayUpload(
       await pipeline(
         Readable.fromWeb(response.body as never),
         progress,
-        createWriteStream(resolved),
+        createWriteStream(resolved, loaded > 0 ? { flags: 'a' } : undefined),
       );
       const fileStat = await stat(resolved);
       if (fileStat.size !== expectedSize) {
@@ -557,7 +620,6 @@ async function fetchRelayUpload(
       return fileStat.size;
     } catch (err) {
       lastErr = err;
-      await unlink(resolved).catch(() => {});
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
@@ -570,10 +632,23 @@ async function fetchRelayUpload(
 
 let initialized = false;
 
+/**
+ * Make the upload directory exist. Nothing more.
+ *
+ * Separated from `initFileTransfer` so a caller that only needs somewhere to
+ * write — the transfer worker, which owns no attachment state — does not also
+ * build a second copy of the attachment registry in its own isolate. A
+ * registry that is written in one isolate and read in another is the exact
+ * split-brain the host-call boundary exists to prevent.
+ */
+export async function ensureUploadDirectory(): Promise<void> {
+  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+}
+
 export async function initFileTransfer(): Promise<void> {
   if (initialized) return;
   initialized = true;
-  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+  await ensureUploadDirectory();
   await cleanupExpiredUploads();
   await recoverRegistry();
 }
@@ -585,6 +660,10 @@ async function recoverRegistry(): Promise<void> {
     const now = Date.now();
     for (const file of files) {
       if (file.endsWith('.meta.json')) continue; // skip sidecar files
+      if (file.startsWith(MACHINE_DIRECT_RESUME_FILE_PREFIX)) continue;
+      // A commit intent describes an upload mid-publish; it is bookkeeping, not
+      // an uploaded file, and must never surface as a downloadable attachment.
+      if (file.endsWith(DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX)) continue;
       if (attachmentRegistry.has(file)) continue;
       try {
         const filePath = path.join(UPLOAD_DIR, file);
@@ -809,13 +888,23 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
     if (!uploadUrl || typeof uploadUrl !== 'string') {
       throw new Error('missing_upload_url');
     }
+    // Resume point for an interrupted HTTP download. The full-daemon path hands
+    // us the raw command, so it is validated here rather than trusted.
+    const offset = msg.offset === undefined ? 0 : msg.offset;
+    if (typeof offset !== 'number' || !Number.isSafeInteger(offset) || offset < 0) {
+      throw new Error('invalid_offset');
+    }
     target = await resolveDownloadTarget(attachmentId, serverLink, downloadId);
     if (!target) return;
+    if (offset > target.size) {
+      throw new Error('range_not_satisfiable');
+    }
 
     // Small files: skip the relay and reply inline in a single round-trip. The
     // relay's PUT + readiness handshake is pure latency for these (and times out
     // entirely if the relay is unhealthy), so only genuinely large files stream.
-    // The server returns the inline bytes immediately on receiving this.
+    // The server returns the inline bytes immediately on receiving this (and
+    // slices them itself for a resumed request).
     if (typeof target.size === 'number' && target.size >= 0
         && target.size <= FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES) {
       await sendInlineDownload(serverLink, downloadId, target);
@@ -828,18 +917,20 @@ export async function handleFileDownloadStream(cmd: Record<string, unknown>, ser
       mime: target.mime,
       filename: target.filename,
       size: target.size,
+      ...(offset > 0 ? { offset } : {}),
     };
     serverLink.send(ready);
 
     const headers: Record<string, string> = {
       'content-type': target.mime || 'application/octet-stream',
-      'content-length': String(target.size),
-      'x-imcodes-filename': encodeURIComponent(target.filename),
+      'content-length': String(target.size - offset),
+      [FILE_TRANSFER_RELAY_HEADER.FILENAME]: encodeURIComponent(target.filename),
+      ...(offset > 0 ? { [FILE_TRANSFER_RELAY_HEADER.OFFSET]: String(offset) } : {}),
     };
     const response = await fetch(uploadUrl, {
       method: 'PUT',
       headers,
-      body: createReadStream(target.readPath) as never,
+      body: createReadStream(target.readPath, offset > 0 ? { start: offset } : undefined) as never,
       duplex: 'half',
       signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
     } as RequestInit & { duplex: 'half' });
@@ -881,7 +972,7 @@ export function createProjectFileHandleFromValidatedPath(
   originalName: string,
   mime?: string,
   size?: number,
-  identity?: { device: number; inode: number },
+  identity?: { device: number; inode: number; mtimeMs?: number },
   clientUploadId?: string,
 ): AttachmentRef {
   const daemonPath = String(validatedRealPath);
@@ -900,7 +991,11 @@ export function createProjectFileHandleFromValidatedPath(
     size,
     createdAt: now,
     expiresAt: now + FILE_TRANSFER_LIMITS.HANDLE_TTL_MS,
-    ...(identity ? { device: identity.device, inode: identity.inode } : {}),
+    ...(identity ? {
+      device: identity.device,
+      inode: identity.inode,
+      ...(identity.mtimeMs !== undefined ? { mtimeMs: identity.mtimeMs } : {}),
+    } : {}),
     ...(clientUploadId ? { clientUploadId } : {}),
   });
 
@@ -976,7 +1071,31 @@ function sendDirectoryListError(sender: FileTransferSender, requestId: string, e
   } satisfies FileDirectoryListError);
 }
 
-/** Controlled-node directory-only browser used by the integrated remote desktop picker. */
+/** Bounded controlled-node browser used by the integrated remote desktop file manager. */
+/**
+ * Free and total bytes for the volume a path sits on, or nothing.
+ *
+ * Reported only for volume ROOTS. Running this per entry would be one syscall
+ * per row for a number identical across all of them, and a 512-entry listing
+ * is on the critical path of a click.
+ *
+ * `statfs` is unavailable on older runtimes and can fail on a drive that is
+ * present but not ready (an empty card reader, a disconnected network drive),
+ * so a failure degrades to "no capacity shown" rather than dropping the drive
+ * from the listing entirely.
+ */
+async function volumeCapacity(target: string): Promise<{ totalBytes?: number; freeBytes?: number }> {
+  try {
+    const info = await statfs(target);
+    const total = Number(info.blocks) * Number(info.bsize);
+    const free = Number(info.bavail) * Number(info.bsize);
+    if (!Number.isFinite(total) || !Number.isFinite(free) || total <= 0) return {};
+    return { totalBytes: total, freeBytes: Math.max(0, Math.min(free, total)) };
+  } catch {
+    return {};
+  }
+}
+
 export async function handleFileDirectoryList(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
   const parsed = validateFileDirectoryListRequest(cmd);
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
@@ -992,7 +1111,7 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
           .map(async (drive): Promise<FileDirectoryEntry | null> => {
             try {
               await readdir(drive);
-              return { name: drive, path: drive, isDir: true, hidden: false };
+              return { name: drive, path: drive, isDir: true, hidden: false, ...(await volumeCapacity(drive)) };
             } catch {
               return null;
             }
@@ -1008,21 +1127,41 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
       return;
     }
 
-    const canonical = await resolveCanonical(parsed.value.path, 'strict');
+    // A well-known sentinel becomes a concrete path HERE, before the gate --
+    // never instead of it. `resolveCanonical` and the sensitive-path denylist
+    // still decide whether the resolved directory may be listed, so a shortcut
+    // can only ever reach somewhere the user could already have typed.
+    let requestedPath = parsed.value.path;
+    if (isFileTransferWellKnownDirectoryPath(parsed.value.path)) {
+      const resolved = await resolveWellKnownDirectoryDetailed(WELL_KNOWN_DIRECTORY_BY_SENTINEL[parsed.value.path]);
+      // Access to the well-known folder itself was denied (the macOS Full
+      // Disk Access signature): report that distinctly rather than silently
+      // listing the fallback home directory mislabeled as the folder the
+      // user actually asked for -- the bug this whole branch exists to fix.
+      if (resolved.permissionDenied) {
+        throw new Error(FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED);
+      }
+      requestedPath = resolved.path;
+    }
+
+    const canonical = await resolveCanonical(requestedPath, 'strict');
     if (!canonical) throw new Error(FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH);
     const directoryStat = await lstat(canonical.realPath);
     if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory()) {
       throw new Error('not_directory');
     }
     const entries = (await readdir(canonical.realPath, { withFileTypes: true }))
-      .filter((entry) => entry.isDirectory())
+      .filter((entry) => entry.isDirectory() || entry.isFile())
       .map((entry): FileDirectoryEntry => ({
         name: entry.name,
         path: path.join(canonical.realPath, entry.name),
-        isDir: true,
+        isDir: entry.isDirectory(),
         hidden: entry.name.startsWith('.'),
       }))
-      .sort((a, b) => a.name === b.name ? 0 : a.name < b.name ? -1 : 1)
+      .sort((a, b) => {
+        if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+        return a.name === b.name ? 0 : a.name < b.name ? -1 : 1;
+      })
       .slice(0, FILE_TRANSFER_DIRECTORY_MAX_ENTRIES);
     sender.send({
       type: FILE_TRANSFER_MSG.DIRECTORY_LIST_DONE,
@@ -1032,12 +1171,62 @@ export async function handleFileDirectoryList(cmd: Record<string, unknown>, send
       entries,
     } satisfies FileDirectoryListDone);
   } catch (error) {
-    const code = isNotFoundError(error)
-      ? 'not_found'
-      : error instanceof Error && /^[a-z0-9_:-]{1,128}$/.test(error.message)
-        ? error.message
-        : 'directory_list_failed';
+    // Covers both the explicit throw above (well-known resolution already
+    // determined FDA is missing) and a later `lstat`/`readdir` failing with
+    // EPERM/EACCES on a well-known sentinel that the resolution step's own
+    // stat happened to let through -- TCC enforces some macOS protections at
+    // `readdir` rather than `stat`.
+    const isMacosFdaDenial = process.platform === 'darwin'
+      && isFileTransferWellKnownDirectoryPath(parsed.value.path)
+      && (
+        (error instanceof Error && error.message === FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED)
+        || isPermissionDeniedError(error)
+      );
+    const code = isMacosFdaDenial
+      ? FILE_TRANSFER_DIRECTORY_LIST_ERROR.MACOS_FULL_DISK_ACCESS_REQUIRED
+      : isNotFoundError(error)
+        ? 'not_found'
+        : error instanceof Error && /^[a-z0-9_:-]{1,128}$/.test(error.message)
+          ? error.message
+          : 'directory_list_failed';
     sendDirectoryListError(sender, parsed.value.requestId, code);
+  }
+}
+
+/**
+ * macOS-only: reveal the native Full Disk Access settings pane in the
+ * signed-in user's own session so they can grant it to this binary
+ * themselves, after a well-known-directory listing failed for exactly that
+ * reason. Fire-and-forget once launched -- there is no callback for "the
+ * user flipped the switch"; the next directory-list retry is the real test.
+ */
+export async function handleMacosOpenFullDiskAccess(cmd: Record<string, unknown>, sender: FileTransferSender): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : '';
+  if (!requestId) return;
+  if (process.platform !== 'darwin') {
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
+      requestId,
+      error: MACOS_OPEN_FULL_DISK_ACCESS_ERROR.UNSUPPORTED_PLATFORM,
+    } satisfies MacosOpenFullDiskAccessError);
+    return;
+  }
+  try {
+    const user = await resolveMacosUserSession();
+    launchMacosUserSessionCommand(user, {
+      executable: '/usr/bin/open',
+      args: ['x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'],
+    });
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_DONE,
+      requestId,
+    } satisfies MacosOpenFullDiskAccessDone);
+  } catch {
+    sender.send({
+      type: FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS_ERROR,
+      requestId,
+      error: MACOS_OPEN_FULL_DISK_ACCESS_ERROR.NO_ACTIVE_GUI_SESSION,
+    } satisfies MacosOpenFullDiskAccessError);
   }
 }
 
@@ -1066,9 +1255,19 @@ export async function handleFilePathHandle(cmd: Record<string, unknown>, sender:
       path.basename(requested),
       undefined,
       requestedStat.size,
-      { device: requestedStat.dev, inode: requestedStat.ino },
+      { device: requestedStat.dev, inode: requestedStat.ino, mtimeMs: requestedStat.mtimeMs },
     );
-    sender.send({ type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE, requestId: parsed.value.requestId, attachment });
+    sender.send({
+      type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
+      requestId: parsed.value.requestId,
+      attachment,
+      sourceIdentity: {
+        size: requestedStat.size,
+        mtimeMs: requestedStat.mtimeMs,
+        device: requestedStat.dev,
+        inode: requestedStat.ino,
+      },
+    });
   } catch (err) {
     sender.send({
       type: FILE_TRANSFER_MSG.PATH_HANDLE_ERROR,

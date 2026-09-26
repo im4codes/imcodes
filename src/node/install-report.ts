@@ -1,0 +1,472 @@
+/**
+ * First-run installer reporting for all three platforms.
+ *
+ * A downloaded controlled node is run once, interactively, by a human. That run
+ * either registers the machine or it does not, and the human has no other way to
+ * find out: there is no UI, and on Windows the console window disappears the
+ * moment the process exits. Reporting the outcome is therefore not a nicety, it
+ * is the only feedback channel the install has.
+ *
+ * Two rules follow:
+ *
+ * 1. Never exit silently. Every terminal outcome of an installer launch prints
+ *    either a success block or a failure block naming the actual cause.
+ * 2. A failure must say what to do next. "requires Administrator/root" is a
+ *    diagnosis; "right-click and Run as administrator" is a fix.
+ *
+ * The background service reuses none of this: it is launched by the OS, has no
+ * console, and reports through the journal instead.
+ */
+
+import { win32, posix } from 'node:path';
+
+/** Machine-readable cause, so the hint and the tests do not match on prose. */
+export const INSTALL_FAILURE_CAUSE = {
+  NOT_ELEVATED: 'not_elevated',
+  ENROLLMENT_MISSING: 'enrollment_missing',
+  ENROLLMENT_REJECTED: 'enrollment_rejected',
+  SERVER_UNREACHABLE: 'server_unreachable',
+  JOURNAL_RECOVERY: 'journal_recovery',
+  PUBLISHER_TRUST: 'publisher_trust',
+  SERVICE_OFFLINE: 'service_offline',
+  UNKNOWN: 'unknown',
+} as const;
+
+export type InstallFailureCause =
+  (typeof INSTALL_FAILURE_CAUSE)[keyof typeof INSTALL_FAILURE_CAUSE];
+
+export interface InstallSuccessFacts {
+  displayName?: string;
+  nodeId?: string;
+  /** Deprecated compatibility alias. */
+  refName?: string;
+  serverUrl: string;
+  /**
+   * Set when the machine registered but the publisher certificate could not be
+   * installed. Registration succeeded, so this is a warning inside a success
+   * block rather than a failure — but it must be visible, because the native
+   * features will refuse to start and the operator would otherwise chase that
+   * as a second, unexplained fault.
+   */
+  publisherTrustError?: string;
+}
+
+function isChinese(locale: string): boolean {
+  return /^zh(?:-|$)/i.test(locale);
+}
+
+/**
+ * True only for the downloaded installer, never the background service.
+ *
+ * The staged executable is the trailer-free copy the service runs from, so a
+ * source path that differs from it is by definition the copy the human just
+ * downloaded and started. Path comparison is case-insensitive on Windows only;
+ * macOS and Linux paths are compared exactly, because they are.
+ */
+export function isInstallerLaunch(
+  platform: NodeJS.Platform,
+  sourceExecutablePath: string,
+  stagedExecutablePath: string,
+): boolean {
+  if (platform === 'win32') {
+    return win32.normalize(sourceExecutablePath).toLowerCase()
+      !== win32.normalize(stagedExecutablePath).toLowerCase();
+  }
+  if (platform !== 'darwin' && platform !== 'linux') return false;
+  return posix.normalize(sourceExecutablePath) !== posix.normalize(stagedExecutablePath);
+}
+
+/** Keep the visible first-run console intentionally terse. */
+export function controlledNodeInstallStatus(locale: string): string {
+  return isChinese(locale)
+    ? 'IM.codes 安装中，请稍候...'
+    : 'Installing IM.codes, please wait...';
+}
+
+/** Seconds the warning stays on screen before the install proceeds. */
+export const CONTROLLED_NODE_INSTALL_WARNING_SECONDS = 30;
+
+/** Matches the enrollment trailer bound; a name is a label, never a paragraph. */
+const OWNER_NAME_MAX_CHARS = 64;
+
+export interface InstallConsentFacts {
+  /** Origin that will control this machine, shown so it can be checked. */
+  serverUrl?: string;
+  /**
+   * Name of the AI Desk this installer binds the machine to, when the installer
+   * carries one. Optional on purpose: the consent screen runs before redemption,
+   * so the name may genuinely be unknown, and the block degrades to the
+   * unnamed-Desk wording rather than inventing or guessing one.
+   */
+  ownerName?: string;
+}
+
+/**
+ * Warning shown before anything is installed, held for a visible countdown.
+ *
+ * Remote-control installers are a standard step in telephone and chat scams:
+ * the victim is walked through pasting a command, and the attacker then owns
+ * the screen, keyboard, files and shell. So this has to arrive BEFORE the first
+ * protected write, name the capability in words a non-technical person already
+ * understands, and name the exact pretexts -- a victim mid-scam does not think
+ * "I am being scammed", they think "I am unfreezing my account", and only the
+ * specific sentence breaks that.
+ *
+ * It states an ACTION, not a caution. "Be careful" leaves someone on a phone
+ * call doing nothing, which is the outcome the caller wants; "close this window
+ * and delete the download" is a thing they can do while being talked at. The
+ * server origin is printed because it is the one fact they can check.
+ */
+export function controlledNodeInstallWarning(
+  locale: string,
+  facts: InstallConsentFacts = {},
+): string {
+  const zh = isChinese(locale);
+  // The destination is an AI Desk, and inside it access follows the permission
+  // granted. Both halves are now what the backend actually enforces.
+  //
+  // A controlled node is bound to exactly one Desk (servers.team_id) at
+  // enrollment, which refuses to create a machine without one. Admission then
+  // requires the caller to be a current member of that Desk before any share
+  // row counts, so a grant to someone outside it -- or one written before the
+  // machine was bound -- is inert, and losing membership revokes access on the
+  // next request. Share creation refuses the same shapes up front rather than
+  // storing a row that could never grant anything.
+  //
+  // Inside the Desk, "authorized" is still not "can control": roles are
+  // owner | viewer | participant, and every control surface gates on
+  // canOperateControlledMachine, true only for owner and participant. A viewer
+  // is authorized and cannot control. Collapsing the two would overstate the
+  // cost of granting view access on the one screen where the reader is deciding
+  // exactly that.
+  //
+  // The Desk name is printed only when the installer carries one. This screen
+  // runs before redemption, so an absent name is normal and must degrade to the
+  // unnamed wording -- naming the wrong Desk here would be worse than naming
+  // none, and the product label alone must never be mistaken for a real binding.
+  // Sanitise even though the trailer decoder already does. This renderer is a
+  // plain function any caller can reach, and the one thing a scam warning can
+  // never afford is an attacker-authored line inside it that reads like the
+  // warning's own voice. Collapse to a single bounded line; control characters
+  // and line separators become spaces rather than new lines.
+  const ownerName = facts.ownerName
+    // eslint-disable-next-line no-control-regex
+    ?.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ')
+    .replace(/\s+/gu, ' ')
+    .trim()
+    .slice(0, OWNER_NAME_MAX_CHARS);
+  // Whose account this machine is being bound to. Installing binds a device to
+  // a person; groups are an association made later, so naming a group here said
+  // the wrong thing about what was about to happen.
+  const desk = zh
+    ? [
+      '',
+      ownerName
+        ? `   ▸ 把这台电脑绑定到 ${ownerName} 的 IM.codes 账号`
+        : '   ▸ 把这台电脑绑定到我的 IM.codes 账号',
+      '     只有这个账号的主人能访问，',
+      '     只有拿到控制权限的人能远程控制它。',
+      '     权限随时可以收回。',
+    ]
+    : [
+      '',
+      ownerName
+        ? `   ▸ Bind this computer to ${ownerName}'s IM.codes account`
+        : '   ▸ Bind this computer to my IM.codes account',
+      '     Only that account holder can access it,',
+      '     and only those granted control can control it.',
+      '     Access can be revoked at any time.',
+    ];
+  const destination = facts.serverUrl
+    ? [
+      ...desk,
+      ...(zh
+        ? [`     服务地址（仅用于连接同步）：${facts.serverUrl}`]
+        : [`     Server address (connection only): ${facts.serverUrl}`]),
+    ]
+    : desk;
+  const lines = zh
+    ? [
+      RULE,
+      '⚠️  警告：装完之后，别人就能远程控制这台电脑。',
+      '',
+      '   对方将可以：看到你的屏幕、操作你的鼠标键盘、',
+      '   读写你的文件、以管理员身份运行任何命令。',
+      '   这包括你的聊天记录、网银、照片和文档。',
+      ...destination,
+      '',
+      '   如果你是被下面这些人或理由带到这里的，这就是诈骗：',
+      '     · 陌生人、“客服”、“技术支持”让你装',
+      '     · 自称公安/检察院/法院，说你涉案、要你“配合调查”',
+      '     · 刷单、贷款、投资、退款、解冻资金、领取补贴',
+      '     · 让你共享屏幕、开视频，或者念出验证码',
+      '',
+      '❗ 立即关闭当前窗口，并删除刚才下载的软件！',
+      '   真正的公检法不会让你装远程控制软件，也不会让你转账。',
+      '   现在关掉，对方什么也拿不到。',
+      RULE,
+    ]
+    : [
+      RULE,
+      '⚠️  WARNING: after this, someone else can control this computer remotely.',
+      '',
+      '   They will be able to: see your screen, move your mouse and keyboard,',
+      '   read and write your files, and run any command as administrator.',
+      '   That includes your messages, your banking, and your photos.',
+      ...destination,
+      '',
+      '   If any of these is why you are here, it is a scam:',
+      '     · a stranger, "support", or "technical service" told you to install',
+      '     · someone claiming to be the police says you are under investigation',
+      '     · refunds, loans, investments, unfreezing money, claiming a subsidy',
+      '     · they asked you to share your screen or read out a verification code',
+      '',
+      '❗ Close this window now and delete the file you just downloaded!',
+      '   Real police never ask you to install remote-control software, and',
+      '   never ask you to move money. Close it now and they get nothing.',
+      RULE,
+    ];
+  return lines.join('\n');
+}
+
+/**
+ * The line that counts down, rewritten in place each second.
+ *
+ * Naming the escape on every tick matters: someone who only looks up halfway
+ * through still learns they can stop it, and pressing a key is something a
+ * person can do while a caller is talking over them.
+ */
+export function controlledNodeInstallCountdown(locale: string, secondsLeft: number): string {
+  return isChinese(locale)
+    ? `   ${secondsLeft} 秒后开始安装 —— 按任意键立即取消。`
+    : `   Installing in ${secondsLeft}s — press any key to cancel.`;
+}
+
+/** Shown when the human declines, so they know nothing happened. */
+export function controlledNodeInstallDeclined(locale: string): string {
+  return isChinese(locale)
+    ? '已取消安装，这台电脑没有任何改动。'
+    : 'Install cancelled. Nothing on this computer was changed.';
+}
+
+/**
+ * Map a thrown error to an actionable cause.
+ *
+ * Matching is on the stable substrings the throwing sites actually produce, not
+ * on localized text. An unrecognized error is reported verbatim rather than
+ * flattened into a generic message: an unknown cause the human can read beats a
+ * known-looking cause that is wrong.
+ */
+export function classifyInstallFailure(error: unknown): InstallFailureCause {
+  const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
+  if (message.includes('requires administrator') || message.includes('elevated privileges')) {
+    return INSTALL_FAILURE_CAUSE.NOT_ELEVATED;
+  }
+  if (message.includes('enrollment blob') || message.includes('enrollment trailer')
+    || message.includes('missing enrollment')) {
+    return INSTALL_FAILURE_CAUSE.ENROLLMENT_MISSING;
+  }
+  if (message.includes('redeem_failed') || message.includes('enrollment redeem')
+    || message.includes('401') || message.includes('409')) {
+    return INSTALL_FAILURE_CAUSE.ENROLLMENT_REJECTED;
+  }
+  if (message.includes('enotfound') || message.includes('econnrefused')
+    || message.includes('etimedout') || message.includes('econnreset')
+    || message.includes('fetch failed') || message.includes('getaddrinfo')) {
+    return INSTALL_FAILURE_CAUSE.SERVER_UNREACHABLE;
+  }
+  if (message.includes('manual recovery required') || message.includes('journal is corrupt')) {
+    return INSTALL_FAILURE_CAUSE.JOURNAL_RECOVERY;
+  }
+  if (message.includes('publisher trust')) return INSTALL_FAILURE_CAUSE.PUBLISHER_TRUST;
+  if (message.includes('did not authenticate after installation')) {
+    return INSTALL_FAILURE_CAUSE.SERVICE_OFFLINE;
+  }
+  return INSTALL_FAILURE_CAUSE.UNKNOWN;
+}
+
+function elevationHint(platform: NodeJS.Platform, zh: boolean): string {
+  if (platform === 'win32') {
+    return zh
+      ? '请右键点击此程序，选择「以管理员身份运行」。'
+      : 'Right-click this program and choose "Run as administrator".';
+  }
+  const command = platform === 'darwin' ? 'sudo ./imcodes-node-macos' : 'sudo ./imcodes-node-linux';
+  return zh
+    ? `请用 root 权限重新运行：${command}`
+    : `Re-run with root privileges: ${command}`;
+}
+
+function hintFor(cause: InstallFailureCause, platform: NodeJS.Platform, zh: boolean): string {
+  if (cause === INSTALL_FAILURE_CAUSE.NOT_ELEVATED) return elevationHint(platform, zh);
+  if (cause === INSTALL_FAILURE_CAUSE.ENROLLMENT_MISSING) {
+    return zh
+      ? '这个文件缺少安装凭据，可能被杀毒软件改动或没有下载完整。请从 IM.codes 重新下载一份，不要复制别人的副本。'
+      : 'This file carries no enrolment credential — antivirus may have altered it, or the download was incomplete. Download a fresh copy from IM.codes rather than copying someone else\'s.';
+  }
+  if (cause === INSTALL_FAILURE_CAUSE.ENROLLMENT_REJECTED) {
+    return zh
+      ? '服务器拒绝了这个安装凭据：它可能已过期、已被撤销，或这份安装包已经用完了次数。请回到 IM.codes 重新生成安装链接。'
+      : 'The server rejected this enrolment credential: it may have expired, been revoked, or exhausted its uses. Generate a fresh install link from IM.codes.';
+  }
+  if (cause === INSTALL_FAILURE_CAUSE.SERVER_UNREACHABLE) {
+    return zh
+      ? '无法连接到 IM.codes 服务器。请检查这台机器的网络、代理和防火墙设置。'
+      : 'Could not reach the IM.codes server. Check this machine\'s network, proxy and firewall settings.';
+  }
+  if (cause === INSTALL_FAILURE_CAUSE.PUBLISHER_TRUST) {
+    // The reason above is PowerShell's, and it is the actionable part. This
+    // only says where to look, because the causes range from a group policy
+    // that locks the certificate stores to antivirus blocking PowerShell.
+    return zh
+      ? '这台机器拒绝安装 IM.codes 的发布者证书。常见原因是组策略锁定了证书存储、杀毒软件拦截了 PowerShell，或这份安装包不是官方签名版本。请把上面这行「原因」连同这台机器的杀毒/组策略情况发给管理员。'
+      : 'This machine refused to install the IM.codes publisher certificate. Common causes are group policy locking the certificate stores, antivirus blocking PowerShell, or an installer that is not an officially signed release. Send the Reason line above, plus this machine\'s antivirus/group-policy situation, to your administrator.';
+  }
+  if (cause === INSTALL_FAILURE_CAUSE.SERVICE_OFFLINE) {
+    return zh
+      ? '安装文件和后台任务已写入，但新节点未能在 45 秒内连接服务器。请运行只读诊断脚本，检查任务退出码、网络和认证日志；安装器不会再把这种情况显示为成功。'
+      : 'The files and background task were installed, but the new node did not connect to the server within 45 seconds. Run the read-only diagnostic script and check the task result, network, and authentication log; the installer no longer reports this state as success.';
+  }
+  if (cause === INSTALL_FAILURE_CAUSE.JOURNAL_RECOVERY) {
+    return zh
+      ? '这台机器上有一次未完成的安装残留，需要先清理。请联系管理员，或删除安装状态目录后重试。'
+      : 'A previous unfinished install is still on this machine and must be cleared first. Contact your administrator, or remove the install state directory and retry.';
+  }
+  return zh
+    ? '请把上面这条错误信息完整发给 IM.codes 管理员。'
+    : 'Send the exact error line above to your IM.codes administrator.';
+}
+
+const RULE = '────────────────────────────────────────────────────────';
+
+/**
+ * Success block. Names the node as it will appear in the web UI, so the human
+ * can confirm the machine they are standing at is the entry they now see.
+ */
+export function formatInstallSuccess(locale: string, facts: InstallSuccessFacts): string {
+  const zh = isChinese(locale);
+  const name = facts.displayName || facts.nodeId || facts.refName || '';
+  const lines = zh
+    ? [
+      RULE,
+      '✅ IM.codes 注册成功',
+      '',
+      ...(name ? [`   设备名称：${name}`] : []),
+      ...(facts.nodeId ? [`   节点 ID： ${facts.nodeId}`] : []),
+      `   服务器：  ${facts.serverUrl}`,
+      '',
+      '   这台机器已经注册，后台服务已安装并会开机自启。',
+      '   现在可以在 IM.codes 网页端看到它了。',
+      ...(facts.publisherTrustError ? [
+        '',
+        '⚠️  发布者证书未能安装，远程桌面等原生功能暂不可用：',
+        `   ${facts.publisherTrustError}`,
+        '   基础功能（终端、命令、文件传输）不受影响，可以先远程连上来再修。',
+      ] : []),
+      RULE,
+    ]
+    : [
+      RULE,
+      '✅ IM.codes registered successfully',
+      '',
+      ...(name ? [`   Device:  ${name}`] : []),
+      ...(facts.nodeId ? [`   Node ID: ${facts.nodeId}`] : []),
+      `   Server:  ${facts.serverUrl}`,
+      '',
+      '   This machine is registered. The background service is installed',
+      '   and will start automatically on boot.',
+      '   You can now see it in the IM.codes web app.',
+      ...(facts.publisherTrustError ? [
+        '',
+        '⚠️  The publisher certificate could not be installed, so native',
+        '   features such as remote desktop stay unavailable:',
+        `   ${facts.publisherTrustError}`,
+        '   Terminal, commands and file transfer still work, so you can',
+        '   connect remotely and fix this from there.',
+      ] : []),
+      RULE,
+    ];
+  return lines.join('\n');
+}
+
+/**
+ * Failure block. The raw error is always shown verbatim above the hint, because
+ * the hint is a guess and the error is evidence.
+ */
+export function formatInstallFailure(
+  locale: string,
+  platform: NodeJS.Platform,
+  error: unknown,
+  cause: InstallFailureCause = classifyInstallFailure(error),
+): string {
+  const zh = isChinese(locale);
+  const raw = error instanceof Error ? error.message : String(error);
+  const lines = zh
+    ? [
+      RULE,
+      '❌ IM.codes 注册失败',
+      '',
+      `   原因：${raw}`,
+      '',
+      `   ${hintFor(cause, platform, zh)}`,
+      RULE,
+    ]
+    : [
+      RULE,
+      '❌ IM.codes registration failed',
+      '',
+      `   Reason: ${raw}`,
+      '',
+      `   ${hintFor(cause, platform, zh)}`,
+      RULE,
+    ];
+  return lines.join('\n');
+}
+
+/** Prompt shown while the installer console is held open so it can be read. */
+export function consoleHoldPrompt(locale: string): string {
+  return isChinese(locale)
+    ? '按回车键关闭此窗口...'
+    : 'Press Enter to close this window...';
+}
+
+/** Countdown prompt for a console we can write to but cannot read a key from. */
+export function consoleHoldCountdown(locale: string, seconds: number): string {
+  return isChinese(locale)
+    ? `此窗口将在 ${seconds} 秒后关闭...`
+    : `This window will close in ${seconds} seconds...`;
+}
+
+export const CONSOLE_HOLD = {
+  /** Waiting on a human keypress; long, because they may have walked away. */
+  KEYPRESS_TIMEOUT_MS: 600_000,
+  /** No readable stdin: hold long enough to read a short block, then release. */
+  COUNTDOWN_MS: 60_000,
+} as const;
+
+export type ConsoleHoldMode = 'keypress' | 'countdown' | 'none';
+
+/**
+ * Decide how to keep an install result on screen.
+ *
+ * The failure this prevents is specific: a double-clicked installer owns its
+ * console window, so exiting destroys the only copy of the result. Waiting for a
+ * keypress is the correct hold, but it requires readable stdin — and stdin is
+ * not readable in every launch path that still owns a console. Where we can
+ * write to a console but cannot read from it, a bounded countdown is the only
+ * remaining way to be readable at all.
+ *
+ * When neither stream is a terminal the output is being captured by something
+ * else (a pipe, a log file, CI), and blocking there would hang a script for no
+ * reader's benefit.
+ */
+export function consoleHoldMode(streams: {
+  installerLaunch: boolean;
+  stdinIsTty: boolean;
+  stdoutIsTty: boolean;
+}): ConsoleHoldMode {
+  if (!streams.installerLaunch) return 'none';
+  if (streams.stdinIsTty) return 'keypress';
+  if (streams.stdoutIsTty) return 'countdown';
+  return 'none';
+}

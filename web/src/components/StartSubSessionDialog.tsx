@@ -30,7 +30,17 @@ import {
 } from '@shared/cc-presets.js';
 import { CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions } from '../../../src/shared/models/options.js';
 import { loadCodexModelPreference } from '../codex-model-preference.js';
+import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
+/** Upper bound on how many identical sub-sessions one launch can request at once. */
+const MAX_SUB_SESSION_LAUNCH_COUNT = 20;
 const CURSOR_HEADLESS_MODEL_SUGGESTIONS = ['gpt-5.2'] as const;
 const COPILOT_SDK_MODEL_SUGGESTIONS = ['gpt-5.4', 'gpt-5.4-mini'] as const;
 const CODEX_SDK_MODEL_SUGGESTIONS = [...CODEX_MODEL_IDS] as const;
@@ -51,6 +61,10 @@ const responsiveDialogStyle = {
 interface Props {
   ws: WsClient | null;
   defaultCwd?: string;
+  /** Optional consumer-owned filter. The ordinary launcher remains unchanged. */
+  allowedAgentTypes?: readonly string[];
+  /** Lets a caller place the reused launcher above another modal. */
+  overlayClassName?: string;
   isProviderConnected: (id: string) => boolean;
   getRemoteSessions: (providerId: string) => RemoteSession[];
   refreshSessions: (providerId: string) => void;
@@ -61,7 +75,7 @@ interface Props {
 
 type OpenClawMode = 'new' | 'bind';
 
-export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
+export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overlayClassName, isProviderConnected: _isProviderConnected, getRemoteSessions, refreshSessions, onStart, onClose, onToast }: Props) {
   const { t } = useTranslation();
   const [type, setType] = useState('claude-code-sdk');
   const [lastUnlockedType, setLastUnlockedType] = useState('claude-code-sdk');
@@ -70,6 +84,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const [shellBin, setShellBin] = useState<string>('/bin/bash');
   const cwd = defaultCwd ?? '';
   const [label, setLabel] = useState('');
+  const [countInput, setCountInput] = useState('1');
   const [scriptCmd, setScriptCmd] = useState('');
   const [scriptInterval, setScriptInterval] = useState('5');
   const [detectingShells, setDetectingShells] = useState(false);
@@ -184,6 +199,16 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
   const ocRemoteSessions = getRemoteSessions('openclaw');
 
   const agentGroups = getSessionAgentGroups('sub-session');
+  const allowedAgentTypeSet = useMemo(
+    () => allowedAgentTypes ? new Set(allowedAgentTypes) : null,
+    [allowedAgentTypes],
+  );
+
+  useEffect(() => {
+    if (!allowedAgentTypeSet || allowedAgentTypeSet.has(type)) return;
+    const fallback = allowedAgentTypes?.[0];
+    if (fallback) setType(fallback);
+  }, [allowedAgentTypeSet, allowedAgentTypes, type]);
 
   // Load saved shell preference from server
   const defaultShellPref = usePref<string>(PREF_KEY_DEFAULT_SHELL, { parse: parseString });
@@ -248,6 +273,14 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (!ccPreset && ccPresets.length > 0) setCcPreset(ccPresets[0].name);
   }, [ccPreset, ccPresets, customProviderSdk, type]);
 
+  // A bind-mode OpenClaw launch connects to one specific EXISTING external
+  // session, so repeating it does not mean "N sessions" -- it always launches
+  // exactly one, regardless of the quantity field.
+  const canLaunchMultiple = !(type === 'openclaw' && ocMode === 'bind');
+  const launchCount = canLaunchMultiple
+    ? Math.min(MAX_SUB_SESSION_LAUNCH_COUNT, Math.max(1, parseInt(countInput, 10) || 1))
+    : 1;
+
   const handleStart = () => {
     const desc = description.trim() || undefined;
     if (customProviderSdk && !ccPreset) {
@@ -260,14 +293,20 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
       const interval = Math.max(1, parseInt(scriptInterval, 10) || 5);
       const escaped = scriptCmd.trim().replace(/'/g, "'\\''");
       const wrapper = `bash -c 'while true; do clear; ${escaped}; sleep ${interval}; done'`;
-      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), desc ? { description: desc } : undefined);
+      onStart('script', wrapper, cwd || undefined, label || scriptCmd.trim().slice(0, 30), {
+        ...(desc ? { description: desc } : {}),
+        ...(launchCount > 1 ? { launchCount } : {}),
+      });
       return;
     }
     if (type === 'openclaw') {
       const extra =
         ocMode === 'bind'
           ? { ocMode: 'bind', ocSessionId: ocSelectedSession, description: desc, thinking }
-          : { ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking };
+          : {
+            ocMode: 'new', ocSessionKey: ocSessionKey.trim(), description: desc, thinking,
+            ...(launchCount > 1 ? { launchCount } : {}),
+          };
       onStart('openclaw', undefined, cwd || undefined, label || undefined, extra);
       return;
     }
@@ -279,8 +318,9 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     if (desc) extra.description = desc;
     if (ccPreset && (type === 'claude-code' || CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type))) extra.ccPreset = ccPreset;
     if (ccInitPrompt.trim() && type === 'claude-code') extra.ccInitPrompt = ccInitPrompt.trim();
-    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
+    if ((type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || type === 'qwen') && requestedModel.trim()) extra.requestedModel = requestedModel.trim();
     if (type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'pi' || type === 'qwen') extra.thinking = thinking;
+    if (launchCount > 1) extra.launchCount = launchCount;
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
@@ -310,7 +350,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     dynamicModelsAgentType,
     CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPreset : undefined,
   );
-  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === 'deepseek-harness' || type === 'pi' || (type === 'qwen' && !!selectedCcPreset);
+  const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && selectedCcPreset
       ? mergeModelSuggestions(
@@ -322,6 +362,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
         ? mergeModelSuggestions(GEMINI_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
         : type === 'codex-sdk'
           ? mergeModelSuggestions(CODEX_SDK_MODEL_SUGGESTIONS, transportModels.models.map((model) => model.id))
+        : type === CODEBUDDY_PROVIDER_IDS.CHINA
+          ? mergeModelSuggestions(CODEBUDDY_CHINA_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
+        : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+          ? mergeModelSuggestions(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK, transportModels.models.map((model) => model.id))
         : transportModels.models.map((model) => model.id))
       : type === 'codex-sdk'
         ? [...CODEX_SDK_MODEL_SUGGESTIONS]
@@ -333,6 +377,10 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             ? selectedPresetModels
             : type === 'gemini-sdk'
               ? [...GEMINI_SDK_MODEL_SUGGESTIONS]
+              : type === CODEBUDDY_PROVIDER_IDS.CHINA
+                ? [...CODEBUDDY_CHINA_MODEL_FALLBACK]
+                : type === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL
+                  ? [...CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK]
               : []
   ), [transportModels.models, type, selectedPresetModels, selectedCcPreset]);
 
@@ -359,8 +407,21 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
     });
   }, [type, modelSuggestions, transportModels.defaultModel]);
 
+  useEffect(() => {
+    if (!isCodeBuddyProviderId(type)) return;
+    setRequestedModel((current) => {
+      const preferred = type === CODEBUDDY_PROVIDER_IDS.CHINA
+        ? CODEBUDDY_CHINA_DEFAULT_MODEL
+        : transportModels.defaultModel ?? CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0];
+      const trimmed = current.trim();
+      if (trimmed && modelSuggestions.includes(trimmed)) return trimmed;
+      if (modelSuggestions.includes(preferred)) return preferred;
+      return modelSuggestions[0] ?? preferred;
+    });
+  }, [type, modelSuggestions, transportModels.defaultModel]);
+
   return (
-    <div class="dialog-overlay">
+    <div class={`dialog-overlay${overlayClassName ? ` ${overlayClassName}` : ''}`}>
       <div class="dialog session-launch-dialog" style={responsiveDialogStyle}>
         <div class="dialog-header">
           <span>{t('subsessionBar.new_sub_session')}</span>
@@ -373,9 +434,12 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
             <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('session.type')}</div>
             <div class="session-agent-groups">
               {agentGroups.map((group) => {
-                const visibleItems = customProviderSdk
-                  ? group.items.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                const allowedItems = allowedAgentTypeSet
+                  ? group.items.filter((choice) => allowedAgentTypeSet.has(choice.id))
                   : group.items;
+                const visibleItems = customProviderSdk
+                  ? allowedItems.filter((choice) => CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id))
+                  : allowedItems;
                 if (visibleItems.length === 0) return null;
                 return (
                   <div key={group.id} class="session-agent-group">
@@ -387,6 +451,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                           type="button"
                           class={`session-agent-card${type === choice.id ? ' active' : ''}`}
                           data-agent-type={choice.id}
+                          // Hidden choices (e.g. qwen) stay real DOM nodes --
+                          // just invisible and out of the tab/accessibility
+                          // order -- rather than being omitted from
+                          // visibleItems, so the underlying data/behavior
+                          // stays fully intact for any test still querying
+                          // it directly. A hidden choice that was explicitly
+                          // allow-listed via allowedAgentTypes (e.g. the
+                          // supervision-pool worker-type picker, which still
+                          // legitimately offers qwen as a backend) is a
+                          // deliberate exception and renders normally.
+                          style={(choice.hidden && !allowedAgentTypeSet?.has(choice.id)) ? { display: 'none' } : undefined}
                           disabled={customProviderSdk && !CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(choice.id)}
                           aria-pressed={type === choice.id}
                           onClick={() => selectType(choice.id)}
@@ -768,6 +843,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
                   {t('new_session.grok_prerequisite_error', { error: transportModels.error })}
                 </div>
               )}
+              {type === HERMES_AGENT_PROVIDER_ID && transportModels.error && (
+                <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>
+                  {t('new_session.hermes_prerequisite_error', { error: transportModels.error })}
+                </div>
+              )}
             </div>
           )}
 
@@ -800,6 +880,28 @@ export function StartSubSessionDialog({ ws, defaultCwd, isProviderConnected: _is
               style={{ width: '100%' }}
             />
           </div>
+
+          {/* Quantity: launch several identical sub-sessions at once */}
+          {canLaunchMultiple && (
+            <div>
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{t('new_session.launch_count')}</div>
+              <input
+                class="input"
+                type="number"
+                min={1}
+                max={MAX_SUB_SESSION_LAUNCH_COUNT}
+                value={countInput}
+                onInput={(e) => setCountInput((e.target as HTMLInputElement).value)}
+                style={{ width: 120 }}
+                aria-label={t('new_session.launch_count')}
+              />
+              {launchCount > 1 && (
+                <div style={{ color: '#94a3b8', fontSize: 12, marginTop: 4, lineHeight: 1.4 }}>
+                  {t('new_session.launch_count_hint', { count: launchCount })}
+                </div>
+              )}
+            </div>
+          )}
 
           {/* Description / persona */}
           <div>

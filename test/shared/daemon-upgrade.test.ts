@@ -66,3 +66,22 @@ describe('controlled-node upgrade blocker validation', () => {
     });
   });
 });
+
+describe('controlled upgrade rollback envelope', () => {
+  it('accepts only a bounded concrete target version with the controlled blocker', () => {
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      targetVersion: '2026.9.4544-dev.5197',
+    })).toEqual({ ok: true, value: {
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      targetVersion: '2026.9.4544-dev.5197',
+    } });
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      targetVersion: 'latest',
+    })).toEqual({ ok: false });
+  });
+});

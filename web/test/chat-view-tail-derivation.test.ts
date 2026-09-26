@@ -21,6 +21,9 @@ vi.mock('../src/api.js', () => ({ downloadAttachment: vi.fn() }));
 import {
   __buildViewItemsForTests,
   __buildViewItemsTailForTests,
+  __computeVirtualChatRangeForTests,
+  __computeVirtualChatRevealScrollTopForTests,
+  __computeRevealRenderItemLimitForTests,
 } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
@@ -119,6 +122,25 @@ describe('windowed view-item derivation', () => {
     expect(tail.items.some((item) => item.type === 'tool-group' || item.type === 'tool-activity')).toBe(true);
   });
 
+  it('still terminates when asked for a non-finite number of items', () => {
+    // Every exit from the widening loop is a numeric comparison, and every
+    // comparison against NaN is false. Before this was guarded, a non-finite
+    // want spun the loop forever on the main thread — which does not merely
+    // make the tab slow, it makes it unrecoverable: a reload cannot run
+    // because the renderer never returns to the event loop.
+    const events = mixedSession(2_000);
+    for (const want of [Number.NaN, Number.POSITIVE_INFINITY, 0, -5]) {
+      const { items, windowStartIndex } = __buildViewItemsTailForTests(events, true, want as number);
+      expect(items.length).toBeGreaterThan(0);
+      // Not merely "it returned": a nonsense want must fall back to the default
+      // and still derive a bounded window. Returning the whole session would
+      // also terminate, which is why asserting termination alone would not
+      // distinguish a guarded input from an unguarded one rescued by the pass
+      // cap.
+      expect(windowStartIndex).toBeGreaterThan(0);
+    }
+  });
+
   it('examines the same number of events no matter how long the conversation is', () => {
     // The property that matters is that derivation reads a bounded window
     // rather than the whole session. Asserting that structurally rather than by
@@ -176,4 +198,44 @@ describe('reaching a message older than the derivation window', () => {
     // reader sees, not a jump.
     expect(rounds).toBeLessThan(40);
   });
+});
+
+
+it('computes measured viewport ranges with overscan and exact spacer conservation', () => {
+  const range = __computeVirtualChatRangeForTests([40, 100, 60, 80, 120, 50, 90, 70], 160, 100, 1);
+  expect(range.start).toBe(1);
+  expect(range.end).toBeGreaterThan(range.start);
+  expect(range.totalHeight).toBe(610);
+  expect(range.topSpacer + range.bottomSpacer).toBeLessThanOrEqual(range.totalHeight);
+});
+
+it('finalizes a merged assistant block when its latest event is terminal', () => {
+  const items = __buildViewItemsForTests([
+    ev(1, 'assistant.text', { text: 'partial', streaming: true }),
+    ev(2, 'assistant.text', { text: 'final answer' }),
+  ], true);
+  expect(items).toHaveLength(1);
+  expect(items[0]?.assistantStreaming).toBe(false);
+  expect(items[0]?.text).toContain('final answer');
+});
+
+it('reveals an offscreen pin target beyond the virtualized viewport', () => {
+  const heights = Array.from({ length: 48 }, () => 72);
+  const targetIndex = 39;
+  const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, targetIndex);
+  const range = __computeVirtualChatRangeForTests(heights, targetTop, 320, 6);
+  expect(targetTop).toBe(2_808);
+  expect(range.start).toBeLessThanOrEqual(targetIndex);
+  expect(range.end).toBeGreaterThan(targetIndex);
+});
+
+it('widens the tail when last-sent navigation targets an item outside 60 rows', () => {
+  const items = Array.from({ length: 140 }, (_, index) => ({ key: `item-${index}` }));
+  const target = __computeRevealRenderItemLimitForTests(items, 'item-12', 60);
+  expect(target).toBe(128);
+  // A target already in the mounted tail does not expand the window.
+  expect(__computeRevealRenderItemLimitForTests(items, 'item-100', 60)).toBe(60);
+  // An unloaded/deep-link target is left for revealEvent's bounded history
+  // load path rather than fabricating an index.
+  expect(__computeRevealRenderItemLimitForTests(items, 'not-loaded', 60)).toBe(60);
 });

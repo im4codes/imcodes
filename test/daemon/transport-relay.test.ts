@@ -267,6 +267,74 @@ describe('transport-relay (timeline-emitter based)', () => {
       vi.useRealTimers();
     });
 
+    it('forwards the delegation-claim projection onto the finalized assistant.text event', () => {
+      // Without this the projection stops at the daemon: the relay reads
+      // metadata only for usage/model, so the UI would have no authority fact
+      // to render and would be left with the prose alone -- the exact gap.
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+
+      const claim = {
+        status: 'substantiated',
+        dispatches: [{
+          dispatchId: 'dsp-1', taskId: 'tsk-1', assignmentId: 'asg-1',
+          deliveries: [{ target: 'deck-worker', status: 'delivered' }],
+        }],
+      };
+      fireComplete('sess-claim', {
+        id: 'msg-claim', sessionId: 'sess-claim', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: claim },
+      } as AgentMessage);
+
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(
+        finalized[0].delegationClaim,
+        'the authority projection must reach the timeline payload',
+      ).toEqual(claim);
+    });
+
+    it('drops a legacy machine-control-only claim before timeline persistence', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-ocu', {
+        id: 'msg-ocu', sessionId: 'sess-ocu', kind: 'text', role: 'assistant',
+        content: 'done', timestamp: Date.now(), status: 'complete',
+        metadata: { delegationClaim: {
+          status: 'substantiated',
+          dispatches: [{
+            dispatchId: 'mcp-ocu', kind: 'machine-control', tool: 'computer_use_call', machine: 'local',
+            deliveries: [{ target: 'local', status: 'delivered' }],
+          }],
+        } },
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .find((payload) => payload.streaming === false);
+      expect(finalized).toBeDefined();
+      expect(Object.keys(finalized)).not.toContain('delegationClaim');
+    });
+
+    it('omits the delegation-claim key entirely when the turn carried no projection', () => {
+      const { provider, fireComplete } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireComplete('sess-noclaim', {
+        id: 'msg-noclaim', sessionId: 'sess-noclaim', kind: 'text', role: 'assistant',
+        content: 'hi', timestamp: Date.now(), status: 'complete',
+      } as AgentMessage);
+      const finalized = emitMock.mock.calls
+        .filter((c) => c[1] === 'assistant.text')
+        .map((c) => c[2])
+        .filter((payload) => payload.streaming === false);
+      expect(finalized).toHaveLength(1);
+      expect(Object.keys(finalized[0])).not.toContain('delegationClaim');
+    });
+
     it('finalizes the previous message (full text, streaming:false) when messageId changes', () => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date('2026-04-08T00:00:00.000Z'));
@@ -1304,7 +1372,12 @@ describe('transport-relay (timeline-emitter based)', () => {
     });
 
     it('caches user.message to JSONL via appendTransportEvent', async () => {
-      emitTransportUserMessage('sess-u', 'cached message');
+      emitTransportUserMessage('sess-u', 'cached message', {
+        commandId: 'queued-1',
+        clientMessageId: 'queued-1',
+        queueAppended: true,
+        pendingMessageVersion: 7,
+      }, 'transport-user:queued-1');
 
       await Promise.resolve();
 
@@ -1314,6 +1387,26 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(event.type).toBe('user.message');
       expect(event.text).toBe('cached message');
       expect(event.sessionId).toBe('sess-u');
+      expect(event.commandId).toBe('queued-1');
+      expect(event.clientMessageId).toBe('queued-1');
+      expect(event.queueAppended).toBe(true);
+      expect(event.pendingMessageVersion).toBe(7);
+
+      expect(emitMock).toHaveBeenCalledWith(
+        'sess-u',
+        'user.message',
+        expect.objectContaining({
+          text: 'cached message',
+          commandId: 'queued-1',
+          clientMessageId: 'queued-1',
+          queueAppended: true,
+        }),
+        expect.objectContaining({
+          source: 'daemon',
+          confidence: 'high',
+          eventId: 'transport-user:queued-1',
+        }),
+      );
     });
 
     it('emits with daemon source and high confidence', () => {

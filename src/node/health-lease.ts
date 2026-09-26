@@ -48,6 +48,54 @@ export async function writeControlledNodeHealthLease(
   }
 }
 
+export async function waitForControlledNodeOnlineLease(
+  path: string,
+  options: {
+    timeoutMs?: number;
+    pollMs?: number;
+    wallNow?: () => number;
+    monotonicNow?: () => number;
+    processExists?: (pid: number) => boolean;
+    sleep?: (ms: number) => Promise<void>;
+    readLease?: () => Promise<unknown>;
+  } = {},
+): Promise<ControlledNodeHealthLease> {
+  const timeoutMs = options.timeoutMs ?? 45_000;
+  const pollMs = options.pollMs ?? 250;
+  const wallNow = options.wallNow ?? Date.now;
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((resolve) => { setTimeout(resolve, ms); }));
+  const readLease = options.readLease ?? (() => readJson(path));
+  const processExists = options.processExists ?? ((pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch (error) {
+      return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+  });
+  // Called after the installer has deliberately cleared the previous
+  // generation's lease. This timestamp additionally rejects a stale file if a
+  // filesystem/antivirus race resurrects it.
+  const notBefore = wallNow();
+  const startedAt = monotonicNow();
+  while (monotonicNow() - startedAt <= timeoutMs) {
+    try {
+      const parsed = await readLease();
+      if (isControlledNodeHealthLease(parsed)) {
+        const futureMs = parsed.updatedAt - wallNow();
+        if (parsed.updatedAt >= notBefore && futureMs <= 60_000 && processExists(parsed.pid)) {
+          return parsed;
+        }
+      }
+    } catch {
+      // The service has not published its first authenticated ack yet.
+    }
+    await sleep(pollMs);
+  }
+  throw new Error('controlled node service did not authenticate after installation');
+}
+
 function isControlledNodeHealthLease(value: unknown): value is ControlledNodeHealthLease {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const lease = value as Record<string, unknown>;
@@ -182,6 +230,7 @@ export function createControlledNodeHealthLeasePublisher(
   path: string,
   options: {
     now?: () => number;
+    monotonicNow?: () => number;
     pid?: number;
     intervalMs?: number;
     writeLease?: (path: string, now: number, pid: number) => Promise<void>;
@@ -189,6 +238,11 @@ export function createControlledNodeHealthLeasePublisher(
   } = {},
 ): ControlledNodeHealthLeasePublisher {
   const now = options.now ?? Date.now;
+  // Keep the persisted timestamp on wall time for external watchdogs, but
+  // throttle on a monotonic clock. NTP, manual clock changes and resume-time
+  // corrections must never defer authenticated lease renewal.
+  const monotonicNow = options.monotonicNow
+    ?? (options.now ? options.now : () => performance.now());
   const pid = options.pid ?? process.pid;
   const intervalMs = options.intervalMs ?? CONTROLLED_NODE_HEALTH_WRITE_INTERVAL_MS;
   const writeLease = options.writeLease ?? writeControlledNodeHealthLease;
@@ -197,8 +251,9 @@ export function createControlledNodeHealthLeasePublisher(
 
   const recordAuthenticatedHeartbeat = (): void => {
     const observedAt = now();
-    if (inFlight || observedAt - lastWriteStartedAt < intervalMs) return;
-    lastWriteStartedAt = observedAt;
+    const throttleAt = monotonicNow();
+    if (inFlight || throttleAt - lastWriteStartedAt < intervalMs) return;
+    lastWriteStartedAt = throttleAt;
     inFlight = writeLease(path, observedAt, pid)
       .catch((error) => { options.onError?.(error); })
       .finally(() => { inFlight = null; });

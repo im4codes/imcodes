@@ -53,6 +53,11 @@ vi.mock('../src/hooks/usePref.js', () => ({
 import { ChatView } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 import { downloadAttachment } from '../src/api.js';
+import {
+  DOWNLOAD_TRANSFER_STATUS,
+  __resetDownloadTransfersForTests,
+  getDownloadTransfers,
+} from '../src/download-transfer-store.js';
 
 function makeEvent(overrides: Partial<TimelineEvent> & { type: string; payload: Record<string, unknown> }): TimelineEvent {
   return {
@@ -600,9 +605,18 @@ describe('ChatView tool payload formatting', () => {
     expect(link?.textContent).toBe('C:\\Users\\admin\\screenshot.png');
     expect(button).not.toBeNull();
 
+    // An image path is also read by the inline preview, so count the reads the
+    // click adds rather than matching an earlier call with the same path.
+    const readsBeforeClick = fsReadFile.mock.calls.length;
     fireEvent.click(button!);
 
-    expect(fsReadFile).toHaveBeenCalledWith('C:\\Users\\admin\\screenshot.png');
+    // The save dialog opens first (it needs the click), so the handle request
+    // follows a tick later rather than synchronously.
+    await waitFor(() => expect(fsReadFile).toHaveBeenCalledTimes(readsBeforeClick + 1));
+    // The daemon now resolves chat-referenced paths itself (candidate roots,
+    // real stat verification), so the client sends the exact bytes the click
+    // target carried instead of pre-resolving them.
+    expect(fsReadFile).toHaveBeenLastCalledWith('C:\\Users\\admin\\screenshot.png', undefined, { chatFileReference: true });
     for (const [handler] of onMessage.mock.calls) {
       handler({
         type: 'fs.read_response',
@@ -611,12 +625,15 @@ describe('ChatView tool payload formatting', () => {
       });
     }
     await waitFor(() => {
-      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-win-path');
+      // No save picker in this browser: the HTTP download is the fallback, now
+      // cancellable from the download center.
+      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-win-path', undefined, expect.any(AbortSignal));
     });
   });
 
   it('downloads relative Chinese file paths from chat text through the current workdir', async () => {
     vi.mocked(downloadAttachment).mockClear();
+    __resetDownloadTransfersForTests();
     const fsReadFile = vi.fn(() => 'req-cn-ppt');
     const onMessage = vi.fn(() => vi.fn());
     const events = [
@@ -646,9 +663,21 @@ describe('ChatView tool payload formatting', () => {
     expect(container.textContent).toContain('!');
     expect(button).not.toBeNull();
 
+    // An image path is also read by the inline preview, so count the reads the
+    // click adds rather than matching an earlier call with the same path.
+    const readsBeforeClick = fsReadFile.mock.calls.length;
     fireEvent.click(button!);
 
-    expect(fsReadFile).toHaveBeenCalledWith('/repo/project/ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx');
+    // The save dialog opens first (it needs the click), so the handle request
+    // follows a tick later rather than synchronously.
+    await waitFor(() => expect(fsReadFile).toHaveBeenCalledTimes(readsBeforeClick + 1));
+    // The daemon now resolves the relative reference itself against the
+    // session's candidate roots (cwd/worktree/project/home) instead of the
+    // client pre-joining it with `workdir`, so the raw relative bytes are
+    // what's sent -- matching acceptance item 3 (relative-path resolution).
+    expect(fsReadFile).toHaveBeenLastCalledWith(
+      'ppt/qisi_antidrug/广西缉毒AI嗅觉方案_政企4K.pptx', undefined, { chatFileReference: true },
+    );
     for (const [handler] of onMessage.mock.calls) {
       handler({
         type: 'fs.read_response',
@@ -657,8 +686,21 @@ describe('ChatView tool payload formatting', () => {
       });
     }
     await waitFor(() => {
-      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-cn-ppt');
+      // No save picker in this browser: the HTTP download is the fallback, now
+      // cancellable from the download center.
+      expect(downloadAttachment).toHaveBeenCalledWith('server-1', 'dl-cn-ppt', undefined, expect.any(AbortSignal));
     });
+    // A chat download now shows up in the download center like the file
+    // browser's, which is where its Show in folder button lives.
+    // Without a save picker this browser hands the file to its own download
+    // manager, so the row settles as handed off.
+    await waitFor(() => {
+      expect(getDownloadTransfers()).toEqual([expect.objectContaining({
+        name: '广西缉毒AI嗅觉方案_政企4K.pptx',
+        status: DOWNLOAD_TRANSFER_STATUS.HANDED_OFF,
+      })]);
+    });
+    __resetDownloadTransfersForTests();
   });
 
   it('keeps adjacent Chinese-punctuated URLs as external links instead of file paths', () => {

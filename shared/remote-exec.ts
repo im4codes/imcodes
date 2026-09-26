@@ -31,6 +31,19 @@ export function isNodeRole(value: unknown): value is NodeRole {
   return value === NODE_ROLE.FULL || value === NODE_ROLE.CONTROLLED;
 }
 
+/**
+ * Refusal reason when a controlled-node credential reaches a surface reserved
+ * for full daemons.
+ *
+ * Named once because the daemon, the browser and every server guard compare it:
+ * a controlled node that starts seeing this is misconfigured, not broken, and
+ * the client needs to tell those two apart.
+ */
+export const NODE_ROLE_REFUSAL = {
+  CONTROLLED_NODE: 'controlled_node',
+} as const;
+export type NodeRoleRefusal = (typeof NODE_ROLE_REFUSAL)[keyof typeof NODE_ROLE_REFUSAL];
+
 /** Shell used to run a one-shot remote command. Default per-OS resolved by node. */
 export const REMOTE_EXEC_SHELLS = ['powershell', 'cmd', 'bash', 'sh'] as const;
 export type RemoteExecShell = (typeof REMOTE_EXEC_SHELLS)[number];
@@ -50,8 +63,62 @@ export const REMOTE_EXEC_MAX_CHUNK_BYTES = 64 * 1024;
  * WsBridge). Kept > the daemon heartbeat interval so a healthy node never flaps.
  */
 export const MACHINE_PRESENCE_STALENESS_MS = 90_000;
+/** Durable server-presence values shared by DB-backed availability readers. */
+export const MACHINE_PRESENCE_STATUS = {
+  ONLINE: 'online',
+  OFFLINE: 'offline',
+} as const;
 /** Explicit maximum returned by list_machines / GET /api/machines. */
 export const MACHINE_LIST_MAX_ITEMS = 200;
+/**
+ * Every key a strict daemon accepts on a machine-list item.
+ *
+ * This lives in shared/ because BOTH ends depend on it and they used to depend
+ * on it separately: the daemon rejects the whole list on any unknown key, and
+ * the Server strips the keys daemons do not know before answering one. Those
+ * two lists were maintained by hand, drifted on `hostServerId`, and the control
+ * plane went down with `malformed` for every account owning a machine with a
+ * canonical host. One list, asserted by test, so the next additive field fails
+ * CI instead of production.
+ */
+/**
+ * The keys the Server actually SENDS to an authenticated daemon.
+ *
+ * `teamIds`/`teamNames` are deliberately NOT here. Group membership is browser
+ * presentation; no daemon reads it (`toSummary` maps nodeId/displayName/os/
+ * online/execEnabled/role and nothing else). Sending it took the control plane
+ * down: the multi-group change started emitting those keys, every daemon built
+ * before the matching allow-list entry rejected the WHOLE list as malformed,
+ * and an account lost control of every machine the moment ONE of them joined a
+ * group. Not sending it fixes every already-deployed daemon without upgrading
+ * any of them.
+ *
+ * Strictly smaller than the tolerated set above: a daemon is told nothing it
+ * does not act on, and every action is re-admitted against the DB anyway. The
+ * response is built by PICKING these, never by omitting known-unwanted ones --
+ * an omit list silently ships each new field to strict daemons the moment
+ * someone forgets to extend it, which is exactly how `hostServerId` took the
+ * control plane down.
+ */
+export const DAEMON_MACHINE_LIST_SENT_KEYS: readonly string[] = [
+  'serverId', 'nodeId', 'name', 'refName', 'displayName',
+  'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs',
+];
+
+/** Build the daemon-facing machine DTO by picking, so new fields cannot leak into it. */
+export function pickDaemonMachineListItem<T extends object>(machine: T): Partial<T> {
+  const source = machine as Record<string, unknown>;
+  const picked: Record<string, unknown> = {};
+  for (const key of DAEMON_MACHINE_LIST_SENT_KEYS) {
+    if (source[key] !== undefined) picked[key] = source[key];
+  }
+  return picked as Partial<T>;
+}
+
+export const DAEMON_MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
+  'serverId', 'nodeId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs',
+  'accessRole', 'daemonVersion', 'updateAvailable', 'autoUnlockConfigured', 'teamIds', 'teamNames', 'hostServerId',
+]);
 /** Envelope input bounds (server is the trust boundary; both ends validate). */
 export const REMOTE_EXEC_MAX_COMMAND_BYTES = 64 * 1024;
 export const REMOTE_EXEC_MAX_CWD_BYTES = 4096;
@@ -115,6 +182,8 @@ export interface RemoteExecResult {
 /** A controllable machine as surfaced to the source agent (list_machines). */
 export interface MachineSummary {
   serverId: string;
+  /** Canonical public identity. Present for every controlled-node projection. */
+  nodeId?: string;
   name: string;
   os?: EnrollmentOs;
   online: boolean;
@@ -160,12 +229,29 @@ export function canonicalMachineOs(value: unknown): EnrollmentOs | undefined {
 // then burns the enrollment token. A leaked installer is therefore only useful
 // within the TTL and only for a single claim.
 
+/** Hard bound on the rendered owner name; also caps the trailer body growth. */
+export const ENROLLMENT_OWNER_NAME_MAX_CHARS = 64;
+
 /** Marker delimiting the appended enrollment blob at the exe tail. */
 export const ENROLLMENT_BLOB_MAGIC = 'IMCODESENROLLv1';
 
 export interface EnrollmentBlob {
   serverUrl: string;
   enrollToken: string;
+  /**
+   * Display name of the person this installer binds the machine to, so the
+   * pre-install consent screen can say whose account it is joining rather than
+   * only the product label. The nickname, never the username: the screen is
+   * read by someone deciding whether to trust an install, and a login handle is
+   * not what they recognise.
+   *
+   * Optional and additive on purpose: the trailer is JSON, so an older daemon
+   * reading a newer installer simply ignores this key, and a newer daemon
+   * reading an older installer degrades to the unnamed wording. It is also
+   * length-bounded where it is written, because the trailer body has a hard
+   * byte ceiling.
+   */
+  ownerName?: string;
 }
 
 /** D-A v2 redeem protocol version — explicit, not inferred from optional fields. */
@@ -204,6 +290,7 @@ export interface EnrollRedeemV2Request {
 /** Server response for D-A v2 — MUST NOT include a recoverable raw token. */
 export interface EnrollRedeemV2Response {
   serverId: string;
+  nodeId: string;
   nodeRole: typeof NODE_ROLE.CONTROLLED;
   refName?: string;
   displayName?: string;
@@ -291,8 +378,21 @@ export function decodeEnrollmentTrailerWithRange(
     const parsed = JSON.parse(tail.toString('utf8', bodyStart, bodyEnd)) as Partial<EnrollmentBlob>;
     if (typeof parsed?.serverUrl === 'string' && typeof parsed?.enrollToken === 'string'
       && /^https?:\/\//.test(parsed.serverUrl) && parsed.enrollToken.length > 0) {
+      // The Desk name is the only human-authored field here, and it is rendered
+      // into the pre-install scam warning. A display name is chosen by a user, so
+      // treat it as hostile input: keep it to a single bounded line with no
+      // control characters, otherwise a name containing newlines could forge
+      // extra lines inside the very block that warns about being scammed.
+      const ownerName = typeof parsed.ownerName === 'string'
+        // eslint-disable-next-line no-control-regex
+        ? parsed.ownerName.replace(/[\u0000-\u001f\u007f\u2028\u2029]/gu, ' ').trim().slice(0, ENROLLMENT_OWNER_NAME_MAX_CHARS)
+        : '';
       return {
-        blob: { serverUrl: parsed.serverUrl.replace(/\/+$/, ''), enrollToken: parsed.enrollToken },
+        blob: {
+          serverUrl: parsed.serverUrl.replace(/\/+$/, ''),
+          enrollToken: parsed.enrollToken,
+          ...(ownerName ? { ownerName } : {}),
+        },
         trailerStart,
         trailerLength,
       };

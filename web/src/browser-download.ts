@@ -42,6 +42,13 @@ async function blobToBase64(blob: Blob): Promise<string> {
  * not add a native dependency; it reuses the plugins already embedded in an
  * installed app and therefore remains safe for a web-only rollout.
  */
+export function canUseNativeFileShare(): boolean {
+  return Capacitor.isNativePlatform()
+    && Capacitor.getPlatform() === 'android'
+    && Capacitor.isPluginAvailable('Filesystem')
+    && Capacitor.isPluginAvailable('Share');
+}
+
 async function tryNativeFileShare(blob: Blob, fileName: string): Promise<boolean> {
   const filesystem = registerPlugin<NativeFilesystemPlugin>('Filesystem');
   const share = registerPlugin<NativeSharePlugin>('Share');
@@ -67,9 +74,7 @@ export async function shareBlobOrDownload(blob: Blob, fileName: string): Promise
   // Check plugin availability synchronously. In the Web Share fallback there
   // must be no await before navigator.share(), otherwise WKWebView consumes the
   // fresh button gesture before the share sheet is requested.
-  if (Capacitor.isNativePlatform()
-    && Capacitor.isPluginAvailable('Filesystem')
-    && Capacitor.isPluginAvailable('Share')) {
+  if (canUseNativeFileShare()) {
     await tryNativeFileShare(blob, fileName);
     return 'shared';
   }

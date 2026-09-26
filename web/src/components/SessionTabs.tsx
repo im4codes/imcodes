@@ -19,8 +19,10 @@ interface Props {
   p2pSessionLabels?: Set<string>;
   onAlertDismiss?: (sessionName: string) => void;
   onSelect: (name: string) => void;
-  onNewSession: () => void;
+  onNewSession?: () => void;
   onStopProject: (project: string) => void;
+  /** Whole-project stop is owner/server-share authority, never tab-share authority. */
+  canStopProject?: boolean;
   onRestartProject: (project: string, fresh?: boolean) => void;
   onCloneSession?: (session: SessionInfo) => void;
   onOpenSessionSettings?: (session: SessionInfo) => void;
@@ -72,7 +74,7 @@ function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -537,7 +539,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         );
       })}
 
-      <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
+      {onNewSession && (
+        <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
+      )}
 
       {ctx && (() => {
         // Pinned tabs can't be stopped — user must unpin first. Check both the
@@ -584,21 +588,25 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
             </button>
           )}
-          <div class="menu-divider" />
-          <button
-            class="menu-item session-action-menu-item menu-item-danger"
-            disabled={projectHasPinned}
-            title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
-            onClick={() => {
-              if (projectHasPinned) return;
-              setStopConfirmProject(ctx.session.project);
-              setStopConfirmLevel(0);
-              setCtx(null);
-            }}
-          >
-            <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
-            <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
-          </button>
+          {canStopProject && (
+            <>
+              <div class="menu-divider" />
+              <button
+                class="menu-item session-action-menu-item menu-item-danger"
+                disabled={projectHasPinned}
+                title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
+                onClick={() => {
+                  if (projectHasPinned) return;
+                  setStopConfirmProject(ctx.session.project);
+                  setStopConfirmLevel(0);
+                  setCtx(null);
+                }}
+              >
+                <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
+                <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
+              </button>
+            </>
+          )}
         </div>
         );
       })()}

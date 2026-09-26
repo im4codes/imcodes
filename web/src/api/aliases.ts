@@ -21,6 +21,8 @@ import { apiFetch, ApiError } from '../api.js';
 
 /** Payload for creating or updating (upsert) an alias. */
 export interface UpsertAliasInput {
+  /** Existing stable row identity. Supplying it performs an in-place rename/update. */
+  id?: string;
   name: string;
   value: string;
   description?: string;
@@ -82,6 +84,7 @@ function normalizeAliasEntry(raw: unknown): AliasEntry | null {
     ? raw.tags.filter((t): t is string => typeof t === 'string')
     : [];
   return {
+    ...(typeof raw.id === 'string' ? { id: raw.id } : {}),
     name,
     value,
     description: typeof raw.description === 'string' ? raw.description : undefined,
@@ -135,6 +138,7 @@ export async function listAliases(q?: string): Promise<AliasEntry[]> {
  */
 export async function upsertAlias(input: UpsertAliasInput): Promise<AliasEntry | null> {
   const body: UpsertAliasInput = {
+    ...(input.id !== undefined ? { id: input.id } : {}),
     name: input.name,
     value: input.value,
     ...(input.description !== undefined ? { description: input.description } : {}),

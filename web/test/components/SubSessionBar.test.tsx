@@ -7,8 +7,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
 import { act, cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
 
-const { probeDirectConnectivityMock } = vi.hoisted(() => ({
+const { probeDirectConnectivityMock, directFileStatusListeners } = vi.hoisted(() => ({
   probeDirectConnectivityMock: vi.fn(),
+  directFileStatusListeners: new Set<(status: 'none' | 'direct' | 'relay') => void>(),
 }));
 
 vi.mock('react-i18next', () => ({
@@ -33,6 +34,9 @@ vi.mock('react-i18next', () => ({
       if (key === 'subsessionBar.daemon_details_memory_handles') return 'Memory handles';
       if (key === 'subsessionBar.daemon_details_memory_handles_ok') return 'Healthy';
       if (key === 'subsessionBar.daemon_details_direct_connectivity') return 'Direct connectivity';
+      if (key === 'subsessionBar.daemon_connection_direct') return 'Direct link';
+      if (key === 'subsessionBar.daemon_connection_relay') return 'Relay';
+      if (key === 'subsessionBar.daemon_connection_none') return 'Not connected';
       if (key === 'subsessionBar.daemon_details_direct_runtime_unavailable') return 'WebRTC runtime unavailable';
       if (key === 'subsessionBar.daemon_details_direct_probing') return 'Testing direct path…';
       if (key === 'subsessionBar.daemon_details_direct_lan') return 'LAN direct';
@@ -103,6 +107,12 @@ vi.mock('../../src/direct-file-transfer.js', () => ({
     constructor(readonly code: string) { super(code); }
   },
   probeDirectConnectivity: probeDirectConnectivityMock,
+  prewarmDirectFileLease: vi.fn(() => () => undefined),
+  subscribeDirectFileConnectionStatus: vi.fn((_ws, _serverId, listener) => {
+    directFileStatusListeners.add(listener);
+    listener('none');
+    return () => directFileStatusListeners.delete(listener);
+  }),
 }));
 
 import { SubSessionBar } from '../../src/components/SubSessionBar.js';
@@ -110,6 +120,11 @@ import { reorderSubSessions } from '../../src/api.js';
 import type { SubSession } from '../../src/hooks/useSubSessions.js';
 import { SUBSESSION_ACCENT_COLORS } from '../../src/subsession-accent-colors.js';
 import { SUPPORTED_LOCALES } from '../../src/i18n/locales/index.js';
+import {
+  SUBSESSION_DESKTOP_DOCK_SIDE,
+  SUBSESSION_DESKTOP_LAYOUT,
+} from '../../src/subsession-desktop-layout-preference.js';
+import { TEAM_DISCUSSION_LAYOUT } from '../../src/team-discussion-layout-preference.js';
 
 const LOCALE_DIR = join(process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web'), 'src/i18n/locales');
 
@@ -168,12 +183,45 @@ describe('SubSessionBar', () => {
   beforeEach(() => {
     localStorage.clear();
     vi.clearAllMocks();
+    directFileStatusListeners.clear();
     probeDirectConnectivityMock.mockResolvedValue({
       route: 'lan_direct',
       rttMs: 1.4,
       localCandidate: { address: '192.168.2.145', port: 49153, type: 'host', transportType: 'udp' },
       remoteCandidate: { address: '192.168.2.59', port: 59074, type: 'prflx', transportType: 'udp' },
     });
+  });
+
+  it('shows gray, green, and yellow daemon-bar connection states from the live broker', async () => {
+    const statsWs = makeStatsWs();
+    const view = render(
+      <SubSessionBar
+        subSessions={[makeSubSession()]}
+        openIds={new Set()}
+        collapsed={false}
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        ws={statsWs.ws as any}
+        serverId="srv-1"
+        connected
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    act(() => statsWs.emit(daemonStatsMessage));
+
+    const dot = await waitFor(() => view.getByTestId('daemon-file-connection-status'));
+    expect(dot.getAttribute('data-status')).toBe('none');
+    expect(dot.getAttribute('title')).toBe('Not connected');
+
+    act(() => directFileStatusListeners.forEach((listener) => listener('direct')));
+    expect(dot.getAttribute('data-status')).toBe('direct');
+    expect(dot.getAttribute('title')).toBe('Direct link');
+
+    act(() => directFileStatusListeners.forEach((listener) => listener('relay')));
+    expect(dot.getAttribute('data-status')).toBe('relay');
+    expect(dot.getAttribute('title')).toBe('Relay');
   });
 
   afterEach(() => {
@@ -561,6 +609,7 @@ describe('SubSessionBar', () => {
     fireEvent.click(idleView.container.querySelector('.subcard-toolbar-btn') as HTMLButtonElement);
     const idleCard = idleView.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(idleCard.className).not.toContain('subcard-running-pulse');
+    expect(idleCard.querySelector('.subcard-running')).toBeNull();
     idleView.unmount();
 
     const runningView = render(
@@ -583,6 +632,10 @@ describe('SubSessionBar', () => {
     }
     const runningCard = runningView.container.querySelector('.subsession-card') as HTMLButtonElement;
     expect(runningCard.className).toContain('subcard-running-pulse');
+    // tsk_5zv: running must not be conveyed by animation alone. Under
+    // prefers-reduced-motion the marquee stops, so the collapsed/rail button
+    // needs a static running mark exactly like the expanded card has.
+    expect(runningCard.querySelector('.subcard-running')).not.toBeNull();
   });
 
   it('assigns ordered accent colors to collapsed buttons and cycles after the palette', () => {
@@ -726,6 +779,90 @@ describe('SubSessionBar', () => {
 
     fireEvent.click(restoreStrip);
 
+    expect(onRestoreQuickClosed).toHaveBeenCalledWith(['sub-a', 'sub-b']);
+  });
+
+  it('persists quick-closed windows per main session so refresh can restore them', () => {
+    const onCloseAllOpen = vi.fn();
+    const subSessions = [
+      makeSubSession({ id: 'sub-a', sessionName: 'deck_sub_sub-a', label: 'a' }),
+      makeSubSession({ id: 'sub-b', sessionName: 'deck_sub_sub-b', label: 'b' }),
+    ];
+
+    const firstView = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set(['sub-a', 'sub-b'])}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        serverId="srv-1"
+        quickClosePersistenceScope="deck_alpha_brain"
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={onCloseAllOpen}
+        onRestoreQuickClosed={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    fireEvent.click(firstView.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement);
+    expect(onCloseAllOpen).toHaveBeenCalledTimes(1);
+    firstView.unmount();
+
+    const otherSession = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        serverId="srv-1"
+        quickClosePersistenceScope="deck_beta_brain"
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={vi.fn()}
+        onRestoreQuickClosed={vi.fn()}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect((otherSession.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement).disabled).toBe(true);
+    otherSession.unmount();
+
+    const onRestoreQuickClosed = vi.fn();
+    const refreshedView = render(
+      <SubSessionBar
+        subSessions={subSessions}
+        openIds={new Set()}
+        collapsed={true}
+        desktopLayoutCapable={true}
+        serverId="srv-1"
+        quickClosePersistenceScope="deck_alpha_brain"
+        onOpen={vi.fn()}
+        onClose={vi.fn()}
+        onCloseAllOpen={vi.fn()}
+        onRestoreQuickClosed={onRestoreQuickClosed}
+        onRestart={vi.fn()}
+        onNew={vi.fn()}
+        ws={null}
+        connected={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    const restoreStrip = refreshedView.container.querySelector('.subsession-close-all-strip') as HTMLButtonElement;
+    expect(restoreStrip.disabled).toBe(false);
+    expect(restoreStrip.getAttribute('aria-label')).toBe('subsessionBar.restore_quick_closed');
+    fireEvent.click(restoreStrip);
     expect(onRestoreQuickClosed).toHaveBeenCalledWith(['sub-a', 'sub-b']);
   });
 
@@ -933,6 +1070,53 @@ describe('SubSessionBar', () => {
     view.unmount();
     const restored = renderBar();
     expect(restored.getByTestId('p2p-progress-card').getAttribute('data-ultra-compact')).toBe('true');
+  });
+
+  it('portals Team discussions into a compact right rail and exposes both layout choices', () => {
+    const host = document.createElement('aside');
+    document.body.append(host);
+    const onTeamDiscussionLayoutChange = vi.fn();
+    const discussion = {
+      id: 'p2p_run_rail',
+      topic: 'Responsive Team audit',
+      state: 'running',
+      currentRound: 1,
+      maxRounds: 2,
+      completedHops: 0,
+      totalHops: 2,
+    };
+
+    try {
+      const view = render(
+        <SubSessionBar
+          subSessions={[makeSubSession()]}
+          openIds={new Set()}
+          desktopLayoutCapable
+          teamDiscussionLayout={TEAM_DISCUSSION_LAYOUT.RIGHT}
+          onTeamDiscussionLayoutChange={onTeamDiscussionLayoutChange}
+          teamDiscussionRailHost={host}
+          discussions={[discussion]}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+
+      expect(view.queryByTestId('team-discussion-bottom')).toBeNull();
+      expect(host.querySelector('[data-testid="team-discussion-rail"]')).toBeTruthy();
+      expect(host.querySelector('[data-testid="team-discussion-rail-scroll"]')).toBeTruthy();
+      expect(host.querySelector('[data-testid="p2p-progress-card"]')?.getAttribute('data-ultra-compact')).toBe('true');
+      expect(host.querySelector('[data-testid="team-discussion-layout-right"]')?.getAttribute('aria-pressed')).toBe('true');
+
+      fireEvent.click(host.querySelector('[data-testid="team-discussion-layout-bottom"]')!);
+      expect(onTeamDiscussionLayoutChange).toHaveBeenCalledWith(TEAM_DISCUSSION_LAYOUT.BOTTOM);
+    } finally {
+      host.remove();
+    }
   });
 
   it('recalculates accent colors and reports visual order after drag reorder', async () => {
@@ -1437,6 +1621,9 @@ describe('SubSessionBar', () => {
       'daemon_details_memory_handles',
       'daemon_details_memory_handles_ok',
       'daemon_details_direct_connectivity',
+      'daemon_connection_direct',
+      'daemon_connection_relay',
+      'daemon_connection_none',
       'daemon_details_direct_runtime_unavailable',
       'daemon_details_direct_probing',
       'daemon_details_direct_lan',
@@ -1453,6 +1640,135 @@ describe('SubSessionBar', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
       for (const key of keys) {
+        expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
+      }
+    }
+  });
+
+  it('renders one ordered compact button set in the desktop vertical rail and keeps its gestures', async () => {
+    const host = document.createElement('aside');
+    document.body.append(host);
+    const onOpen = vi.fn();
+    const onOpenMaximized = vi.fn();
+    const onDesktopLayoutChange = vi.fn();
+    const onDesktopDockSideChange = vi.fn();
+    const sessions = [
+      makeSubSession({ id: 'sub-1', sessionName: 'deck_sub_sub-1', label: 'first' }),
+      makeSubSession({ id: 'sub-2', sessionName: 'deck_sub_sub-2', label: 'second' }),
+    ];
+
+    try {
+      const view = render(
+        <SubSessionBar
+          subSessions={sessions}
+          openIds={new Set()}
+          collapsed={false}
+          desktopLayoutCapable
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          onDesktopLayoutChange={onDesktopLayoutChange}
+          desktopDockSide={SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+          onDesktopDockSideChange={onDesktopDockSideChange}
+          verticalRailHost={host}
+          onOpen={onOpen}
+          onOpenMaximized={onOpenMaximized}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+          serverId="srv-1"
+        />,
+      );
+
+      expect(view.container.querySelector('.subcard-scroll')).toBeNull();
+      expect(view.container.querySelector('.subsession-bar')).toBeNull();
+      expect(view.container.querySelectorAll('[data-sub-id]')).toHaveLength(0);
+      expect(Array.from(host.querySelectorAll<HTMLElement>('[data-sub-id]')).map((node) => node.dataset.subId))
+        .toEqual(['sub-1', 'sub-2']);
+      expect(host.querySelectorAll('.subsession-card-rail')).toHaveLength(2);
+
+      const dockGroup = host.querySelector('[role="group"]');
+      expect(dockGroup?.getAttribute('aria-label')).toBe('subsessionBar.dock_side');
+      const dockLeft = host.querySelector<HTMLButtonElement>('[data-testid="subsession-vertical-rail-dock-left"]')!;
+      const dockRight = host.querySelector<HTMLButtonElement>('[data-testid="subsession-vertical-rail-dock-right"]')!;
+      expect(dockLeft.getAttribute('aria-label')).toBe('subsessionBar.dock_left');
+      expect(dockRight.getAttribute('aria-label')).toBe('subsessionBar.dock_right');
+      expect(dockLeft.getAttribute('aria-pressed')).toBe('true');
+      expect(dockRight.getAttribute('aria-pressed')).toBe('false');
+      fireEvent.click(dockRight);
+      expect(onDesktopDockSideChange).toHaveBeenCalledWith(SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT);
+
+      const toggle = view.getByTestId('subsession-desktop-layout-toggle');
+      expect(toggle.getAttribute('aria-pressed')).toBe('true');
+      expect(toggle.getAttribute('aria-label')).toBe('subsessionBar.switch_to_horizontal');
+      expect(toggle.textContent).toBe('⇆');
+      fireEvent.click(toggle);
+      expect(onDesktopLayoutChange).toHaveBeenCalledWith(SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL);
+
+      fireEvent.dblClick(host.querySelector('[data-sub-id="sub-1"]')!);
+      expect(onOpenMaximized).toHaveBeenCalledWith('sub-1');
+
+      const first = host.querySelector('[data-sub-id="sub-1"]')!;
+      const second = host.querySelector('[data-sub-id="sub-2"]')!;
+      fireEvent.dragStart(first);
+      fireEvent.dragOver(second);
+      fireEvent.dragEnd(first);
+      await waitFor(() => expect(reorderSubSessions).toHaveBeenCalledWith('srv-1', ['sub-2', 'sub-1']));
+    } finally {
+      host.remove();
+    }
+  });
+
+  it('keeps mobile on the existing horizontal compact bar without rendering or toggling a desktop rail', () => {
+    const host = document.createElement('aside');
+    document.body.append(host);
+    try {
+      const view = render(
+        <SubSessionBar
+          subSessions={[makeSubSession()]}
+          openIds={new Set()}
+          collapsed
+          desktopLayoutCapable={false}
+          desktopLayout={SUBSESSION_DESKTOP_LAYOUT.VERTICAL}
+          onDesktopLayoutChange={vi.fn()}
+          desktopDockSide={SUBSESSION_DESKTOP_DOCK_SIDE.LEFT}
+          onDesktopDockSideChange={vi.fn()}
+          verticalRailHost={host}
+          onOpen={vi.fn()}
+          onClose={vi.fn()}
+          onRestart={vi.fn()}
+          ws={null}
+          connected
+          onDiff={vi.fn()}
+          onHistory={vi.fn()}
+        />,
+      );
+
+      expect(view.queryByTestId('subsession-desktop-layout-toggle')).toBeNull();
+      expect(host.querySelector('[data-testid="subsession-vertical-rail"]')).toBeNull();
+      expect(view.queryByTestId('subsession-vertical-rail-dock-left')).toBeNull();
+      expect(view.container.querySelector('.subsession-bar [data-sub-id="sub-1"]')).toBeTruthy();
+    } finally {
+      host.remove();
+    }
+  });
+
+  it('ships desktop layout labels in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const raw = JSON.parse(readFileSync(join(LOCALE_DIR, `${locale}.json`), 'utf8')) as Record<string, Record<string, string>>;
+      for (const key of [
+        'switch_to_vertical',
+        'switch_to_horizontal',
+        'vertical_rail',
+        'dock_side',
+        'dock_left',
+        'dock_right',
+        'team_layout',
+        'team_dock_right',
+        'team_dock_bottom',
+        'team_right_rail',
+      ]) {
         expect(raw.subsessionBar?.[key], `${locale}: subsessionBar.${key}`).toBeTruthy();
       }
     }

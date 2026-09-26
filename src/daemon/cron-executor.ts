@@ -2,12 +2,15 @@
  * Daemon-side cron job executor.
  * Receives dispatched cron jobs and sends commands to target sessions.
  */
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import type { CronCommandResultMessage, CronDispatchMessage, CronParticipant } from '../../shared/cron-types.js';
 import {
-  CRON_COMPLETION_POLICY,
+  buildCompactCronControlRef,
+  buildCronRunTimelineProjection,
   CRON_CONTROL_PROTOCOL,
   CRON_MSG,
   normalizeCronCompletionPolicy,
+  validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
 import { getSession } from '../store/session-store.js';
@@ -23,6 +26,7 @@ import { timelineEmitter } from './timeline-emitter.js';
 import type { TimelineEvent } from './timeline-event.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
+import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 
 /** Default retry budget when daemon admission returns `daemon_busy`. */
 const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
@@ -56,24 +60,28 @@ export interface CronSendDispatchResult {
 type CronSendDispatcher = (input: CronSendDispatchInput) => Promise<CronSendDispatchResult>;
 
 let cronSendDispatcherOverride: CronSendDispatcher | null = null;
-let cronProcessCommandSenderOverride: ((sessionName: string, text: string) => Promise<void>) | null = null;
+type CronProcessCommandSender = (
+  sessionName: string,
+  text: string,
+  options?: Parameters<typeof sendProcessSessionMessageForAutomation>[2],
+) => Promise<void>;
+let cronProcessCommandSenderOverride: CronProcessCommandSender | null = null;
 
 export function __setCronSendDispatcherForTests(dispatcher: CronSendDispatcher | null): void {
   cronSendDispatcherOverride = dispatcher;
 }
 
 export function __setCronProcessCommandSenderForTests(
-  sender: ((sessionName: string, text: string) => Promise<void>) | null,
+  sender: CronProcessCommandSender | null,
 ): void {
   cronProcessCommandSenderOverride = sender;
 }
 
-export function buildSelfManagedCronPrompt(msg: CronDispatchMessage, message: string): string {
+export function buildSelfManagedCronPrompt(msg: CronDispatchMessage): string {
   const completionPolicy = normalizeCronCompletionPolicy(msg.completionPolicy);
-  const lifecycleInstruction = completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
-    ? 'This schedule repeats until its overall goal is complete. Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.'
-    : 'Recurring task: complete this run and keep it scheduled. Cancel only on an explicit user request; force=true is required.';
-  return `${message}\n\n<imcodes-cron-control id=${JSON.stringify(msg.jobId)} completion-policy=${JSON.stringify(completionPolicy)}>\nUse cron_update_self to change this task only when the user explicitly asks.\n${lifecycleInstruction}\nExecute only the operations explicitly requested above. Do not add web fetches, curl requests, or other network checks unless the task explicitly requests them.\nIf an explicitly requested tool returns ${CRON_CONTROL_PROTOCOL.SILENT_RESULT} as its first non-empty line, stop immediately, call no more tools, and finish this occurrence with exactly ${CRON_CONTROL_PROTOCOL.SILENT_RESULT}.\nAlways produce one final response for this occurrence.\n</imcodes-cron-control>`;
+  const binding = buildCompactCronControlRef(msg.jobId, completionPolicy, msg.executionId);
+  const taskBody = msg.action.type === 'command' ? msg.action.command : '';
+  return `${CRON_CONTROL_PROTOCOL.OPEN_TAG}${binding}>\n${taskBody}\n${CRON_CONTROL_PROTOCOL.CLOSE_TAG}`;
 }
 
 async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
@@ -160,10 +168,26 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   if (action.type === 'command') {
+    const managedAgent = action.selfManaged && !isRawCommandSessionAgentType(session.agentType);
+    if (managedAgent) {
+      const control = validateRegisteredCronControlAction(action, jobId);
+      if (!control.ok) {
+        logger.error({ jobId, sessionName: name, reason: control.reason }, 'Cron: invalid registered control state');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: `Cron registered control rejected: ${control.reason}`,
+        });
+        return;
+      }
+    }
     logger.info({ jobId, jobName, sessionName: name, command: action.command.slice(0, 80) }, 'Cron: sending command');
-    const command = action.selfManaged && !isRawCommandSessionAgentType(session.agentType)
-      ? buildSelfManagedCronPrompt(msg, action.command)
+    const command = managedAgent
+      ? buildSelfManagedCronPrompt(msg)
       : action.command;
+    const cronRun = buildCronRunTimelineProjection(msg);
 
     if (session.runtimeType === 'transport') {
       let runtime = getTransportRuntime(name);
@@ -185,14 +209,24 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
       }
       if (runtime) {
         const transportRuntime = runtime;
+        let timelineProjected = false;
         const dispatchAttempt = async (attempt: number): Promise<void> => {
           if (attempt > 1 && transportRuntime.getStatus() !== 'idle') {
             await transportRuntime.cancel();
           }
           const clientMessageId = `cron:${jobId}:${executionId ?? 'dispatch'}:attempt:${attempt}`;
-          const result = await transportRuntime.send(command, clientMessageId);
-          if (result !== 'queued') {
-            timelineEmitter.emit(name, 'user.message', { text: command, allowDuplicate: true });
+          await transportRuntime.send(command, clientMessageId, undefined, undefined, {
+            timelineCommitted: true,
+            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+          });
+          if (!timelineProjected && cronRun) {
+            timelineEmitter.emit(name, 'user.message', {
+              text: command,
+              allowDuplicate: true,
+              cronRun,
+              [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
+            }, { source: 'daemon', confidence: 'high' });
+            timelineProjected = true;
           }
         };
         const collector = collectCommandResult(name, jobId, executionId, serverLink, {
@@ -229,7 +263,15 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
     } else {
       const collector = collectCommandResult(name, jobId, executionId, serverLink);
       try {
-        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command);
+        await (cronProcessCommandSenderOverride ?? sendProcessSessionMessageForAutomation)(name, command, {
+          userMessageMetadata: {
+            allowDuplicate: true,
+            memoryExcluded: true,
+            // A scheduled run, not the human's input, even without a run projection.
+            messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+            ...(cronRun ? { cronRun } : {}),
+          },
+        });
       } catch (error) {
         collector.cancel();
         logger.error({ jobId, sessionName: name, error }, 'Cron: process session send failed');
@@ -275,6 +317,36 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
         }),
       });
     } catch (err) {
+      // A provider-limit refusal is NOT an opaque failure and must not be
+      // flattened by `formatErr`. The scheduler's only useful question is
+      // "when may this run again", and the answer is `retryAt` -- a sentence
+      // saying the same thing forces the control plane to guess, and a guess
+      // here means either hammering a refused account or parking the job
+      // indefinitely. `alternatives` likewise only survives as structure.
+      const limited = asCronTargetLimited(err);
+      if (limited) {
+        logger.warn({
+          jobId,
+          executionId,
+          reason: limited.reason,
+          retryAt: limited.limited?.targets[0]?.retryAt,
+        }, 'Cron: structured send refused by delegation admission');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'error',
+          detail: JSON.stringify({
+            reason: limited.reason,
+            targets: limited.limited?.targets ?? [],
+            alternatives: limited.limited?.alternatives ?? [],
+            // Absolute epoch-ms, so the scheduler can reschedule on it directly
+            // rather than parsing a rendered timestamp back out of prose.
+            retryAt: limited.limited?.targets[0]?.retryAt,
+          }),
+        });
+        return;
+      }
       logger.error({ jobId, executionId, err }, 'Cron: structured send dispatch failed');
       sendCommandResult(serverLink, {
         type: CRON_MSG.COMMAND_RESULT,
@@ -624,6 +696,35 @@ function sendCommandResult(serverLink: ServerLink, msg: CronCommandResultMessage
     const delayMs = Math.min(30_000, 1000 * attempt);
     setTimeout(() => sendCommandResult(serverLink, msg, attempt + 1), delayMs);
   }
+}
+
+/**
+ * Recognise a typed delegation refusal without importing the send tool.
+ *
+ * Structural rather than `instanceof`: the send tool is loaded through a
+ * dynamic import here, so a class identity check would silently fail across
+ * module instances and quietly downgrade every refusal to an opaque error --
+ * the exact flattening this exists to prevent.
+ */
+function asCronTargetLimited(err: unknown): {
+  reason: string;
+  limited?: {
+    targets: Array<{ target: string; retryAt?: number; reason?: string }>;
+    alternatives: Array<{ target: string }>;
+  };
+} | null {
+  if (!err || typeof err !== 'object') return null;
+  const candidate = err as { name?: unknown; reason?: unknown; limited?: unknown };
+  if (typeof candidate.reason !== 'string') return null;
+  if (candidate.reason !== MCP_ERROR_REASONS.TARGET_LIMITED
+    && candidate.reason !== MCP_ERROR_REASONS.TARGET_UNAVAILABLE) return null;
+  return {
+    reason: candidate.reason,
+    ...(candidate.limited ? { limited: candidate.limited as {
+      targets: Array<{ target: string; retryAt?: number; reason?: string }>;
+      alternatives: Array<{ target: string }>;
+    } } : {}),
+  };
 }
 
 function formatErr(err: unknown): string {

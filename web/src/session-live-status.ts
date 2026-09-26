@@ -162,6 +162,8 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
     mode = 'tool';
   } else if (activeThinking) {
     mode = 'thinking';
+  } else if (activityDetail?.startsWith('capacity_retry:')) {
+    mode = 'waiting';
   } else if (running || activeTransportTurn) {
     mode = 'running';
   } else if (statusText) {

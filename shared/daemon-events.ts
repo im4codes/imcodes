@@ -20,6 +20,14 @@ export const DAEMON_MSG = {
    * the boolean only; the secret itself never leaves the node.
    */
   CONTROLLED_NODE_AUTO_UNLOCK_RESULT: 'controlled_node.auto_unlock_result',
+  /**
+   * Controlled node → server: the daemons bound on this same computer (their
+   * serverIds, read from each user's `.imcodes/server.json`; never a token).
+   * The server links the node to one of them when that is unambiguous, so the
+   * daemon's remote-desktop button opens this node. See
+   * shared/controlled-node-host-link.ts.
+   */
+  CONTROLLED_NODE_LOCAL_DAEMONS: 'controlled_node.local_daemons',
 } as const;
 
 export type DaemonMessageType = (typeof DAEMON_MSG)[keyof typeof DAEMON_MSG];

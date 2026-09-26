@@ -137,6 +137,40 @@ describe('SubSessionCard', () => {
     });
   });
 
+  it('passes quota and heartbeat metadata into the compact SessionControls without restoring the removed ChatView status props', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          quotaLabel: '7d 55% 5d05h 9/26 18:39',
+          quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+          supervisionMode: 'supervised_audit',
+          supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+        } as any)}
+        ws={null}
+        connected={true}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+        isOpen={false}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+    });
+    const chatViewProps = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(chatViewProps).toMatchObject({ preview: true });
+    expect(chatViewProps).not.toHaveProperty('quotaLabel');
+    expect(chatViewProps).not.toHaveProperty('quotaMeta');
+    expect(chatViewProps).not.toHaveProperty('supervisionHeartbeat');
+  });
+
   it('attaches the live timeline before closed preview hydration', async () => {
     vi.useFakeTimers();
     render(
@@ -169,7 +203,7 @@ describe('SubSessionCard', () => {
   });
 
 
-  it('treats an open but unfocused card as an active timeline consumer', () => {
+  it('keeps an open but unfocused card passive while remaining visible', () => {
     render(
       <SubSessionCard
         sub={makeSubSession()}
@@ -184,7 +218,43 @@ describe('SubSessionCard', () => {
     );
 
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
+      isVisible: true,
+    });
+  });
+
+  it('lets the focused preview own recovery only when no floating window owns the session', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: true,
+      isVisible: true,
+    });
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={true}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
       isVisible: true,
     });
   });

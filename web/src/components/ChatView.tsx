@@ -1,10 +1,43 @@
+import {
+  isNeverRenderedTimelineEventType,
+  projectAssistantTextForDisplay,
+} from '../../../src/shared/timeline/types.js';
+import {
+  SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_EXECUTION_STATES,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+  type SupervisionExecutionState,
+} from '@shared/supervision-config.js';
+import { SUPERVISION_HEARTBEAT_GLYPH } from '@shared/supervision-heartbeat.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_RUN_TIMELINE,
+  readCronRunTimelineProjection,
+  type CronRunTimelineProjection,
+} from '@shared/cron-types.js';
+import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
+import { localizeChatDownloadError } from '../chat-download-error.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
  * Supports basic Markdown rendering (code blocks, inline code, bold).
  */
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import {
+  downloadPreviewWithDirectFallback,
+  isDirectFileTransferStaleHandleError,
+  isFileUploadCanceled,
+  selectPreviewDownloadDestination,
+  type DirectPreviewDownloadDestination,
+} from '../direct-file-transfer.js';
+import { beginDownloadTransfer, failDownloadTransfer } from '../download-transfer-store.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { memo, createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
@@ -28,6 +61,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
 } from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
@@ -36,6 +70,11 @@ import {
   type ChatLocalWebPreviewOpenHandler,
 } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
+import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
+import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
+import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
+import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
+import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
   CHAT_MOUNT_SETTLE_TICK_MS,
@@ -64,9 +103,19 @@ import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
-import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
-import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
+import {
+  PEER_AUDIT_VERDICTS,
+  isPeerAuditRound,
+  isPeerAuditRuntimeDisposition,
+  isPeerAuditVerdict,
+} from '@shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  readAgentDelegationSupervisionTaskProjection,
+} from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import { TaskPairStatusPanel } from './TaskPairStatusPanel.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -86,6 +135,11 @@ import {
   type SdkSubagentDiagnostic,
   type SdkSubagentStatusRow,
 } from '../timeline/sdk-subagent-aggregator.js';
+import {
+  deriveLiveAssignmentStatuses,
+  liveAssignmentStatusesKey,
+  type LiveAssignmentStatus,
+} from '../timeline/supervision-assignment-status.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
@@ -108,6 +162,8 @@ interface Props {
   onLoadOlder?: () => void;
   sessionState?: string;
   sessionId?: string | null;
+  /** Session labels used by task-pair status rows when the event omits one. */
+  sessions?: readonly { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null }[];
   /** Receives a function that forces the chat list to scroll to the bottom. */
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
@@ -148,17 +204,28 @@ function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {
   key: string;
-  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity';
+  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity' | 'supervision-status-run';
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
   /** Source event ids represented by an assistant block (for old-pin locate). */
   eventIds?: string[];
   assistantAutomation?: boolean;
+  assistantStreaming?: boolean;
+  /** Active final execution marker from a completed source event. */
+  executionState?: SupervisionExecutionState;
+  /** Metadata record of the block's completed assistant message, when it
+   *  carries the structured delegation-claim projection. Passed through by
+   *  reference so the memoized AssistantBlock keeps a stable prop identity. */
+  delegationMetadata?: Record<string, unknown>;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
   linkedEvents?: TimelineEvent[];
+  /** Original presentation items represented by a repeated supervision-status row. */
+  statusItems?: ViewItem[];
+  heartbeatCount?: number;
+  waitingCount?: number;
   ts?: number;
   lastTs?: number;
 }
@@ -170,7 +237,14 @@ type ChatHtmlFullscreenPreviewState =
 interface AssistantBlockProps {
   text: string;
   automation?: boolean;
+  streaming?: boolean;
+  executionState?: SupervisionExecutionState;
   ts: number;
+  /** Completed assistant message metadata carrying the delegation-claim
+   *  projection, when the runtime attached one. */
+  delegationMetadata?: Record<string, unknown>;
+  /** Daemon-announced per-assignment lifecycle status for the dispatch card. */
+  liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
   /** Stable identifier for this merged block. Wired through to a
    *  `data-event-id` attribute so the mobile double-tap detector can pair
    *  taps by event id instead of HTMLElement reference — DOM nodes are
@@ -187,26 +261,43 @@ interface AssistantBlockProps {
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
-const chatLocalImagePreviewCache = new Map<string, Promise<ChatLocalImagePreviewResult>>();
+/**
+ * tsk_5rf R2: a streamed preview caches a download-handle URL, and that handle
+ * expires server-side (4h). An LRU with no TTL therefore served dead URLs
+ * indefinitely. This bound is deliberately well under the handle lifetime so a
+ * cached entry can never outlive the handle it points at.
+ */
+const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS = 30 * 60 * 1000;
+interface ChatLocalImagePreviewCacheEntry {
+  promise: Promise<ChatLocalImagePreviewResult>;
+  createdAt: number;
+}
+const chatLocalImagePreviewCache = new Map<string, ChatLocalImagePreviewCacheEntry>();
+
+function invalidateChatLocalImagePreview(cacheKey: string): void {
+  chatLocalImagePreviewCache.delete(cacheKey);
+}
 
 function getCachedChatLocalImagePreview(
   cacheKey: string,
   load: () => Promise<ChatLocalImagePreviewResult>,
+  now: number = Date.now(),
 ): Promise<ChatLocalImagePreviewResult> {
   const existing = chatLocalImagePreviewCache.get(cacheKey);
-  if (existing) {
+  if (existing && now - existing.createdAt <= CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS) {
     chatLocalImagePreviewCache.delete(cacheKey);
     chatLocalImagePreviewCache.set(cacheKey, existing);
-    return existing;
+    return existing.promise;
   }
+  if (existing) chatLocalImagePreviewCache.delete(cacheKey);
 
   const pending = load().catch((err) => {
-    if (chatLocalImagePreviewCache.get(cacheKey) === pending) {
+    if (chatLocalImagePreviewCache.get(cacheKey)?.promise === pending) {
       chatLocalImagePreviewCache.delete(cacheKey);
     }
     throw err;
   });
-  chatLocalImagePreviewCache.set(cacheKey, pending);
+  chatLocalImagePreviewCache.set(cacheKey, { promise: pending, createdAt: now });
   while (chatLocalImagePreviewCache.size > CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT) {
     const oldestKey = chatLocalImagePreviewCache.keys().next().value;
     if (typeof oldestKey !== 'string') break;
@@ -218,6 +309,13 @@ function getCachedChatLocalImagePreview(
 export function __clearChatLocalImagePreviewCacheForTests() {
   chatLocalImagePreviewCache.clear();
 }
+
+/** Test seam for the streamed-URL cache boundary (tsk_5rf R2). */
+export const __chatLocalImagePreviewCacheInternals = {
+  get: getCachedChatLocalImagePreview,
+  invalidate: invalidateChatLocalImagePreview,
+  ttlMs: CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS,
+};
 
 /** Extract a chat event's visible text while preserving block/list/code
  *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
@@ -300,6 +398,74 @@ export function formatChatDateTime(ts: number, now = Date.now(), locale?: string
     && date.getMonth() === today.getMonth()
     && date.getDate() === today.getDate();
   return chatDateTimeFormatter(locale, !isToday).format(date);
+}
+
+const PINNED_MEMORY_SUMMARY_PREVIEW_MAX = 240;
+const MEMORY_PROBLEM_HEADING_RE = /^#{1,6}\s*(?:user\s+problem|problem|issue|问题|問題)\s*[:：]?\s*$/i;
+const MEMORY_PROBLEM_INLINE_RE = /^(?:user\s+problem|problem|issue|问题|問題)\s*[:：]\s*(.+)$/i;
+const MARKDOWN_HEADING_RE = /^#{1,6}\s+/;
+
+function compactMemorySummaryPreview(text: string): string | null {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, ''))
+    .filter(Boolean)
+    .join(' · ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+  return cleaned.length > PINNED_MEMORY_SUMMARY_PREVIEW_MAX
+    ? `${cleaned.slice(0, PINNED_MEMORY_SUMMARY_PREVIEW_MAX - 1).trimEnd()}…`
+    : cleaned;
+}
+
+function extractMemoryProblemPreview(summary: string): string | null {
+  const normalized = summary.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return null;
+  const lines = normalized.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const inline = MEMORY_PROBLEM_INLINE_RE.exec(line);
+    if (inline?.[1]?.trim()) return compactMemorySummaryPreview(inline[1]);
+    if (!MEMORY_PROBLEM_HEADING_RE.test(line)) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const nextLine = lines[j].trim();
+      if (MARKDOWN_HEADING_RE.test(nextLine)) break;
+      body.push(lines[j]);
+    }
+    const preview = compactMemorySummaryPreview(body.join('\n'));
+    if (preview) return preview;
+  }
+  return compactMemorySummaryPreview(
+    lines.filter((line) => !MARKDOWN_HEADING_RE.test(line.trim())).join('\n'),
+  );
+}
+
+function getLatestRecentMemoryProblemPreview(
+  events: TimelineEvent[],
+  sessionId: string | null | undefined,
+  relatedToEventId: string | null | undefined,
+): string | null {
+  if (!sessionId || !relatedToEventId) return null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== 'memory.context') continue;
+    const payload = event.payload as unknown as Partial<MemoryContextTimelinePayload>;
+    if (payload.relatedToEventId !== relatedToEventId) continue;
+    if (!Array.isArray(payload.items)) continue;
+    for (const item of payload.items) {
+      if (item?.projectionClass !== 'recent_summary') continue;
+      if (item.sourceSessionName !== sessionId) continue;
+      const preview = extractMemoryProblemPreview(String(item.summary ?? ''));
+      if (preview) return preview;
+    }
+  }
+  return null;
 }
 
 type MemoryContextSection =
@@ -732,6 +898,25 @@ const TOOL_LIKE_EVENT_TYPES = new Set<string>([
   'assistant.thinking',
 ]);
 
+/**
+ * Types that reach `ChatEvent` and always come back as `null`:
+ * `assistant.thinking` returns null outright, and the `transport.queue.*`
+ * family has no case at all and falls through to `default`.
+ *
+ * They must not become ViewItems. A ViewItem that draws nothing still counts
+ * towards `viewItems.length`, which gates BOTH the "load earlier messages"
+ * button and the suppression of the empty-state placeholder — so a window made
+ * only of these rendered as a button floating above an empty scroller, with no
+ * spinner and no "no messages" text.
+ *
+ * They are deliberately NOT removed by `isVisibleChatTimelineEvent`: they still
+ * have to flow through `buildViewItems`, where `assistant.thinking` is a
+ * grouping boundary that flushes pending text and tool runs. Filtering them out
+ * earlier would silently merge assistant blocks that are currently separate.
+ * Only the item PUSH is suppressed; every grouping side effect still happens.
+ */
+
+
 function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean): boolean {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
@@ -809,6 +994,41 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
  */
 const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, TimelineEvent>>();
 
+// Stable source identities let the incremental view-model preserve unaffected
+// items across an append/update. The expensive group is rebuilt only when one
+// of its source event objects changes; Preact then skips those unchanged rows.
+const timelineObjectIds = new WeakMap<object, number>();
+let nextTimelineObjectId = 1;
+const incrementalViewItemCache = new Map<string, { signature: string; item: ViewItem }>();
+function timelineObjectId(value: object): number {
+  const hit = timelineObjectIds.get(value);
+  if (hit) return hit;
+  const id = nextTimelineObjectId++;
+  timelineObjectIds.set(value, id);
+  return id;
+}
+function stabilizeViewItems(items: ViewItem[]): ViewItem[] {
+  const next = items.map((item) => {
+    const sources = item.toolEvents ?? (item.event ? [item.event] : []);
+    const sourceIds = sources.map((event) => timelineObjectId(event)).join(',');
+    const signature = [item.type, item.text ?? '', item.lastTs ?? item.ts ?? '', item.executionState ?? '', item.eventIds?.join(',') ?? '', sourceIds, item.heartbeatCount ?? ''].join('|');
+    const cached = incrementalViewItemCache.get(item.key);
+    if (cached?.signature === signature) return cached.item;
+    incrementalViewItemCache.set(item.key, { signature, item });
+    return item;
+  });
+  while (incrementalViewItemCache.size > 4096) {
+    const first = incrementalViewItemCache.keys().next().value;
+    if (first === undefined) break;
+    incrementalViewItemCache.delete(first);
+  }
+  return next;
+}
+
+export function __resetIncrementalViewModelCacheForTests(): void {
+  incrementalViewItemCache.clear();
+}
+
 function cacheMergedToolEvent(
   call: TimelineEvent,
   result: TimelineEvent,
@@ -868,24 +1088,48 @@ const VIEW_TAIL_MARGIN_ITEMS = 24;
 /** First guess at events-per-item. Tool groups collapse many events into one. */
 const VIEW_TAIL_EVENTS_PER_ITEM = 4;
 
+/**
+ * Passes before giving up and deriving everything.
+ *
+ * Each pass quadruples the window, so four billion events are covered in
+ * sixteen. Reaching this cap means the arithmetic below is wrong, and the
+ * correct response is a slow full derivation rather than another pass.
+ */
+const VIEW_TAIL_MAX_WIDENING_PASSES = 16;
+
 function buildViewItemsTail(
   events: TimelineEvent[],
   showToolCalls: boolean,
   wantItems: number,
 ): DerivedViewTail {
-  const target = wantItems + VIEW_TAIL_MARGIN_ITEMS;
+  // Every exit below is a numeric comparison, and every comparison against NaN
+  // is false — a non-finite want would therefore loop forever, on the main
+  // thread, wedging the tab past the point where even a reload can run. The
+  // callers pass finite numbers today; this does not depend on them continuing
+  // to.
+  const want = Number.isFinite(wantItems) && wantItems > 0
+    ? Math.floor(wantItems)
+    : CHAT_INITIAL_RENDER_ITEM_LIMIT;
+  const target = want + VIEW_TAIL_MARGIN_ITEMS;
   let windowSize = Math.min(events.length, Math.max(target * VIEW_TAIL_EVENTS_PER_ITEM, 200));
-  for (;;) {
+  for (let pass = 0; pass < VIEW_TAIL_MAX_WIDENING_PASSES; pass += 1) {
     const startIndex = Math.max(0, events.length - windowSize);
     const items = buildViewItems(startIndex === 0 ? events : events.slice(startIndex), showToolCalls);
+    // A folded run touching the left edge may have started before this window.
+    // Widen until the first visible item is not foldable (or history begins),
+    // otherwise a 700-row restored run would display only the last 200 count.
+    const foldRunTouchesWindowStart = startIndex > 0
+      && items.length > 0
+      && (items[0].type === 'supervision-status-run' || supervisionStatusCandidate(items[0]) !== null);
     // Enough, or there is nothing older to widen into.
-    if (items.length >= target || startIndex === 0) {
+    if ((items.length >= target && !foldRunTouchesWindowStart) || startIndex === 0) {
       return { items, windowStartIndex: startIndex };
     }
     // A tool-heavy stretch can collapse hundreds of events into a handful of
     // items, so widening by a constant factor rather than a constant count.
     windowSize = Math.min(events.length, windowSize * 4);
   }
+  return { items: buildViewItems(events, showToolCalls), windowStartIndex: 0 };
 }
 
 /** Test seam for the windowed derivation; production goes through the memo. */
@@ -1081,23 +1325,32 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingKey = '';
   let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
+  let pendingAssistantStreaming = false;
+  let pendingExecutionState: SupervisionExecutionState | undefined;
+  let pendingDelegationMetadata: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
   const flushPending = () => {
-    if (pendingText.length > 0) {
+    if (pendingEventIds.length > 0) {
       items.push({
         key: pendingKey,
         type: 'assistant-block',
         text: pendingText.join('\n'),
         eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
+        assistantStreaming: pendingAssistantStreaming,
+        ...(pendingExecutionState ? { executionState: pendingExecutionState } : {}),
+        ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
       pendingEventIds = [];
       pendingAssistantAutomation = false;
+      pendingAssistantStreaming = false;
+      pendingExecutionState = undefined;
+      pendingDelegationMetadata = undefined;
     }
   };
 
@@ -1121,7 +1374,10 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     }
     pendingTools = [];
     // Flush any session.state events that were deferred to avoid breaking the group
-    for (const ev of deferredEvents) items.push({ key: ev.eventId, type: 'event', event: ev });
+    for (const ev of deferredEvents) {
+      if (isNeverRenderedTimelineEventType(ev.type)) continue;
+      items.push({ key: ev.eventId, type: 'event', event: ev });
+    }
     deferredEvents = [];
   };
 
@@ -1132,19 +1388,33 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const text = String(event.payload.text ?? '').trim().replace(/\n{3,}/g, '\n\n');
-      if (!text) continue;
+      const projection = projectAssistantTextForDisplay(event.payload.text);
+      const text = projection.text;
+      const executionState = event.payload.streaming === true || event.payload.pending === true
+        ? null
+        : projection.executionState;
+      if (!text && !executionState) continue;
       const assistantAutomation = event.payload.automation === true;
-      if (pendingText.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
+      if (pendingEventIds.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
         flushPending();
       }
-      if (pendingText.length === 0) {
+      if (pendingEventIds.length === 0) {
         pendingKey = event.eventId;
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
       }
+      // The newest event is authoritative: a terminal assistant.text must
+      // clear streaming even when earlier deltas in this merged block were
+      // marked streaming/pending. This lets the markdown renderer finalize
+      // immediately and freeze its parsed AST.
+      pendingAssistantStreaming = event.payload.streaming === true || event.payload.pending === true;
+      // Only the turn's completed message carries the delegation-claim
+      // projection, so the newest event that has one wins for the block.
+      const delegationMetadata = readDelegationClaimMetadata(event.payload);
+      if (delegationMetadata) pendingDelegationMetadata = delegationMetadata;
+      if (executionState) pendingExecutionState = executionState;
       pendingLastTs = event.ts;
-      pendingText.push(text);
+      if (text) pendingText.push(text);
       pendingEventIds.push(event.eventId);
     } else if (event.type === 'tool.call' || event.type === 'tool.result') {
       flushPending();
@@ -1159,6 +1429,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     } else {
       flushPending();
       if (showToolCalls || event.type === 'user.message') flushTools();
+      // Flushing above is the grouping contract and still runs; only the
+      // unrenderable item itself is withheld.
+      if (isNeverRenderedTimelineEventType(event.type)) continue;
       items.push({
         key: event.eventId,
         type: 'event',
@@ -1172,7 +1445,83 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   flushPending();
   flushTools();
 
-  return items;
+  return stabilizeViewItems(foldSupervisionStatusRuns(items));
+}
+
+type SupervisionStatusCandidate = {
+  kind: 'heartbeat' | 'waiting';
+  count: number;
+};
+
+/**
+ * Identify only the two machine-only rows authorized for compact presentation.
+ * Real assistant text, NEEDS_INPUT, audit/implementation heartbeats and every
+ * other visible row deliberately return null and therefore break the run.
+ */
+function supervisionStatusCandidate(item: ViewItem): SupervisionStatusCandidate | null {
+  if (
+    item.type === 'event'
+    && item.event?.type === 'user.message'
+    && (item.linkedEvents?.length ?? 0) === 0
+    && item.event.payload.automation === true
+    && item.event.payload.automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+  ) {
+    return { kind: 'heartbeat', count: 1 };
+  }
+  if (
+    item.type === 'assistant-block'
+    && item.executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    && (item.text ?? '').trim().length === 0
+  ) {
+    return { kind: 'waiting', count: Math.max(1, item.eventIds?.length ?? 0) };
+  }
+  return null;
+}
+
+function foldSupervisionStatusRuns(items: ViewItem[]): ViewItem[] {
+  const folded: ViewItem[] = [];
+  let run: ViewItem[] = [];
+  let heartbeatCount = 0;
+  let waitingCount = 0;
+
+  const flush = () => {
+    const sourceCount = heartbeatCount + waitingCount;
+    if (sourceCount < 2) {
+      folded.push(...run);
+    } else {
+      const first = run[0];
+      const last = run[run.length - 1];
+      folded.push({
+        // The first source event owns the run identity. A live append changes
+        // the summary revision/count but not its key, so Preact preserves the
+        // disclosure node, focus and expanded state without a flicker.
+        key: `supervision-status-run:${first.key}`,
+        type: 'supervision-status-run',
+        statusItems: run,
+        heartbeatCount,
+        waitingCount,
+        ts: first.ts ?? first.event?.ts ?? 0,
+        lastTs: last.lastTs ?? last.ts ?? last.event?.ts ?? 0,
+      });
+    }
+    run = [];
+    heartbeatCount = 0;
+    waitingCount = 0;
+  };
+
+  for (const item of items) {
+    const candidate = supervisionStatusCandidate(item);
+    if (!candidate) {
+      flush();
+      folded.push(item);
+      continue;
+    }
+    run.push(item);
+    if (candidate.kind === 'heartbeat') heartbeatCount += candidate.count;
+    else waitingCount += candidate.count;
+  }
+  flush();
+  return folded;
 }
 
 /** Return the source text represented by a pinnable timeline event.
@@ -1216,6 +1565,10 @@ function eventRevision(event: TimelineEvent): string {
 }
 
 function viewItemRevision(item: ViewItem): string {
+  if (item.type === 'supervision-status-run') {
+    return `${item.key}:supervision-status-run:${item.heartbeatCount ?? 0}:${item.waitingCount ?? 0}:`
+      + (item.statusItems ?? []).map(viewItemRevision).join('|');
+  }
   if (item.type === 'assistant-block') {
     return [
       item.key,
@@ -1223,6 +1576,7 @@ function viewItemRevision(item: ViewItem): string {
       item.ts ?? 0,
       item.lastTs ?? 0,
       item.assistantAutomation === true ? 'automation' : '',
+      item.executionState ?? '',
       textRevision(item.text),
     ].join(':');
   }
@@ -1700,10 +2054,187 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+export function __computeVirtualChatRangeForTests(
+  heights: readonly number[],
+  scrollTop: number,
+  viewportHeight: number,
+  overscan = 6,
+): { start: number; end: number; totalHeight: number; topSpacer: number; bottomSpacer: number } {
+  const offsets = new Array<number>(heights.length + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < heights.length; i += 1) offsets[i + 1] = offsets[i] + Math.max(1, heights[i] || 0);
+  const top = Math.max(0, scrollTop);
+  const bottom = top + Math.max(1, viewportHeight);
+  let start = 0;
+  while (start < heights.length && offsets[start + 1] < top) start += 1;
+  let end = start;
+  while (end < heights.length && offsets[end] < bottom) end += 1;
+  const rangeStart = Math.max(0, start - overscan);
+  const rangeEnd = Math.min(heights.length, end + overscan);
+  return {
+    start: rangeStart,
+    end: rangeEnd,
+    totalHeight: offsets[heights.length],
+    topSpacer: offsets[rangeStart],
+    bottomSpacer: Math.max(0, offsets[heights.length] - offsets[rangeEnd]),
+  };
+}
+
+/** Return the measured/estimated scroll offset needed to reveal an item. */
+export function __computeVirtualChatRevealScrollTopForTests(
+  heights: readonly number[],
+  index: number,
+): number {
+  const end = Math.max(0, Math.min(heights.length, Math.floor(index)));
+  let offset = 0;
+  for (let i = 0; i < end; i += 1) offset += Math.max(1, heights[i] ?? 72);
+  return offset;
+}
+
+/** Tail size required to include an event-backed presentation item. */
+export function __computeRevealRenderItemLimitForTests(
+  items: ReadonlyArray<{ key: string; event?: { eventId: string }; eventIds?: readonly string[] }>,
+  eventId: string,
+  currentLimit: number,
+): number {
+  const index = items.findIndex((item) => (
+    item.key === eventId
+    || item.event?.eventId === eventId
+    || item.eventIds?.includes(eventId)
+  ));
+  return index < 0 ? currentLimit : Math.max(currentLimit, items.length - index);
+}
+
+interface VirtualizedViewItemsProps {
+  items: ViewItem[];
+  scrollRef: { current: HTMLDivElement | null };
+  enabled: boolean;
+  /** A pinned/search target that must be mounted before its caller locates it. */
+  revealKey?: string;
+  renderItem: (item: ViewItem) => h.JSX.Element;
+}
+
+/**
+ * Viewport virtualization for the chat list. Heights are measured after mount
+ * and retained by stable item key; unknown rows use a conservative estimate.
+ * The top/bottom spacers preserve the scroll range, while the parent ChatView
+ * remains the owner of follow/anchor policy and therefore streaming and history
+ * prepend semantics stay unchanged.
+ */
+function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem }: VirtualizedViewItemsProps) {
+  const heightsRef = useRef(new Map<string, number>());
+  const [layoutVersion, setLayoutVersion] = useState(0);
+  const scrollTopRef = useRef(0);
+  const viewportRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+  const estimate = 72;
+  const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimate;
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    scrollTopRef.current = root.scrollTop;
+    viewportRef.current = root.clientHeight;
+    setLayoutVersion((v) => v + 1);
+    const onScroll = () => {
+      scrollTopRef.current = root.scrollTop;
+      viewportRef.current = root.clientHeight;
+      if (rafRef.current !== null) return;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        setLayoutVersion((v) => v + 1);
+      });
+    };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+    };
+  }, [enabled, scrollRef]);
+
+  // Pin/search navigation can target an item outside the mounted overscan
+  // range. Move the real scroll viewport to its measured offset first; the
+  // next render then mounts the target and the existing locator can highlight
+  // it without rendering the entire history.
+  useEffect(() => {
+    if (!enabled || !revealKey) return undefined;
+    const root = scrollRef.current;
+    const index = items.findIndex((item) => (
+      item.key === revealKey || item.event?.eventId === revealKey || item.eventIds?.includes(revealKey)
+    ));
+    if (!root || index < 0) return undefined;
+    const heights = items.map(getHeight);
+    const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, index);
+    if (Math.abs(root.scrollTop - targetTop) > 1) root.scrollTop = targetTop;
+    scrollTopRef.current = targetTop;
+    setLayoutVersion((v) => v + 1);
+    return undefined;
+  }, [enabled, revealKey, items, scrollRef]);
+
+  useEffect(() => {
+    if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    const itemIndex = new Map(items.map((item, index) => [item.key, index]));
+    const offsetBefore = (index: number): number => {
+      let total = 0;
+      for (let i = 0; i < index; i += 1) total += heightsRef.current.get(items[i].key) ?? 72;
+      return total;
+    };
+    const observer = new ResizeObserver((entries) => {
+      let changed = false;
+      let anchorDelta = 0;
+      const atBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
+      for (const entry of entries) {
+        const key = (entry.target as HTMLElement).dataset.virtualKey;
+        if (!key) continue;
+        const height = Math.max(1, Math.ceil(entry.contentRect.height));
+        const previous = heightsRef.current.get(key) ?? 72;
+        if (previous === height) continue;
+        const index = itemIndex.get(key);
+        if (index !== undefined && !atBottom && offsetBefore(index) < root.scrollTop) anchorDelta += height - previous;
+        heightsRef.current.set(key, height);
+        changed = true;
+      }
+      if (anchorDelta !== 0 && !atBottom) {
+        root.scrollTop += anchorDelta;
+        scrollTopRef.current = root.scrollTop;
+      }
+      if (changed) setLayoutVersion((v) => v + 1);
+    });
+    root.querySelectorAll<HTMLElement>('[data-virtual-key]').forEach((node) => observer.observe(node));
+    return () => observer.disconnect();
+  }, [enabled, items, layoutVersion, scrollRef]);
+
+  // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
+  // real viewport exists, preserving deterministic rendering and accessibility.
+  if (!enabled || items.length <= 24 || viewportRef.current <= 0) return <>{items.map(renderItem)}</>;
+  // Keep the arithmetic local and deterministic; no O(n) DOM work occurs.
+  const range = __computeVirtualChatRangeForTests(items.map(getHeight), scrollTopRef.current, viewportRef.current);
+  return <>
+    <div aria-hidden="true" style={{ height: `${range.topSpacer}px`, flexShrink: 0 }} />
+    {items.slice(range.start, range.end).map((item) => (
+      <div class="chat-virtual-item" data-virtual-key={item.key} key={item.key}>
+        {renderItem(item)}
+      </div>
+    ))}
+    <div aria-hidden="true" style={{ height: `${range.bottomSpacer}px`, flexShrink: 0 }} />
+  </>;
+}
+
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
-  const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
+  // Sent on every chatFileReference:true request (path click, preview, download).
+  // The daemon needs the viewed session's identity to find its own in-project
+  // root and its own assistant-published grants (session-file-read-grants.ts);
+  // without it every chat file link is refused as forbidden_path, even ones the
+  // session itself just published. This is unrelated to scopeFilesToSession,
+  // which restricts *unscoped* file-browser access for shared/guest viewers --
+  // that stays wired separately into the embedded FileBrowser panel below.
+  const fileScopeSessionName = sessionId ?? undefined;
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
@@ -1727,6 +2258,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   const [pendingPinnedLocate, setPendingPinnedLocate] = useState<MessagePin | null>(null);
+  // The virtualizer uses this key to mount and scroll an offscreen navigation
+  // target before the locator/highlighter inspects the DOM.
+  const [virtualRevealKey, setVirtualRevealKey] = useState<string | undefined>();
   const pendingPinnedLocateIdRef = useRef<string | null>(null);
   const timelineEventsRef = useRef(events);
   timelineEventsRef.current = events;
@@ -1799,15 +2333,23 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       if (e.type !== 'user.message') continue;
       const p = e.payload as Record<string, unknown>;
       if (p.pending === true || p.failed === true) continue;
+      // The banner pins what the human sent, not an agent delivery or injection.
+      if (classifyUserMessageOrigin(p) !== CHAT_MESSAGE_ORIGINS.USER) continue;
       const text = typeof p.text === 'string' ? p.text : '';
       if (!text.trim()) continue;
       return { eventId: e.eventId, text, ts: e.ts, actorLabel: formatSharedActorLabel(t, p.sharedActor) };
     }
     return null;
   }, [events, t]);
-  // Reset the expand state whenever the pinned target changes so a new
+  const recentMemoryProblemPreview = useMemo(
+    () => getLatestRecentMemoryProblemPreview(events, sessionId, lastSentUserMessage?.eventId),
+    [events, sessionId, lastSentUserMessage?.eventId],
+  );
+  const pinnedPreviewText = recentMemoryProblemPreview ?? lastSentUserMessage?.text ?? '';
+  const pinnedPreviewUsesMemory = !!recentMemoryProblemPreview;
+  // Reset the expand state whenever the pinned target/summary changes so a new
   // message never inherits the expanded state of an older one.
-  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
+  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId, recentMemoryProblemPreview]);
 
   const suppressLoadOlder = useCallback((durationMs = 1200) => {
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
@@ -1932,26 +2474,25 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [t]);
 
   const handleHtmlPreview = useCallback((path: string) => {
-    const resolvedPath = resolvePreviewPath(path, workdir);
     if (!ws || typeof ws.fsReadFile !== 'function') {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: t('file_browser.preview_error'),
       });
       return;
     }
     try {
-      const requestId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
-      setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
+      const requestId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
+      setHtmlFullscreenPreview({ status: 'loading', path, requestId });
     } catch (err) {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: mapPreviewDispatchError(err),
       });
     }
-  }, [fileScopeSessionName, mapPreviewDispatchError, t, workdir, ws]);
+  }, [fileScopeSessionName, mapPreviewDispatchError, t, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1969,7 +2510,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             : t('file_browser.preview_error', 'Preview unavailable');
           return { status: 'error', path: current.path, error };
         }
-        const next = { status: 'ok' as const, path: current.path, content: msg.content ?? '' };
+        const next = { status: 'ok' as const, path: msg.resolvedPath ?? current.path, content: msg.content ?? '' };
         return openHtmlPreviewInNewWindow(next) ? null : next;
       });
     });
@@ -1979,15 +2520,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setPendingUrl(url);
   }, []);
 
-  const mapDownloadError = useCallback((err: unknown): string => {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('daemon_offline') || msg.includes('503')) return t('upload.daemon_offline');
-    if (msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404')) return t('upload.download_expired');
-    if (msg.includes('504') || msg.includes('timeout')) return t('upload.download_timeout');
-    return t('upload.download_failed');
-  }, [t]);
+  const mapDownloadError = useCallback((err: unknown, pathRequest = false): string => (
+    localizeChatDownloadError(err, t, { pathRequest })
+  ), [t]);
 
-  const requestPathDownloadId = useCallback((path: string): Promise<string> => (
+  const requestPathDownloadId = useCallback((path: string): Promise<{
+    downloadId: string;
+    resolvedPath: string;
+    matchCount: number;
+  }> => (
     new Promise((resolve, reject) => {
       if (!ws) {
         reject(new Error(t('upload.daemon_offline')));
@@ -2000,7 +2541,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         unsub?.();
       };
       try {
-        const reqId = fileScopeSessionName ? ws.fsReadFile(path, fileScopeSessionName) : ws.fsReadFile(path);
+        const reqId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
         timer = setTimeout(() => {
           cleanup();
           reject(new Error(t('upload.download_timeout')));
@@ -2009,91 +2550,143 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
           cleanup();
           if (typeof msg.downloadId === 'string' && msg.downloadId.trim()) {
-            resolve(msg.downloadId);
+            resolve({
+              downloadId: msg.downloadId,
+              resolvedPath: typeof msg.resolvedPath === 'string' ? msg.resolvedPath : path,
+              matchCount: typeof msg.resolutionMatchCount === 'number' ? msg.resolutionMatchCount : 1,
+            });
             return;
           }
           if (msg.status === 'error') {
-            reject(new Error(mapDownloadError(new Error(String(msg.error ?? 'download_failed')))));
+            const cause = Object.assign(new Error(String(msg.error ?? 'download_failed')), {
+              attemptedLocations: msg.attemptedLocations,
+            });
+            reject(new Error(mapDownloadError(cause, true)));
             return;
           }
           reject(new Error(t('upload.download_failed')));
         });
       } catch (err) {
         cleanup();
-        reject(new Error(mapDownloadError(err)));
+        reject(new Error(mapDownloadError(err, true)));
       }
     })
   ), [fileScopeSessionName, mapDownloadError, t, ws]);
 
-  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
-    new Promise((resolve, reject) => {
-      if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
-        reject(new Error(t('file_browser.preview_error')));
-        return;
-      }
-
-      let unsub: (() => void) | undefined;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const resolvedPath = resolvePreviewPath(path, workdir);
-      const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
-      const cacheKey = `${cacheScope}\0${resolvedPath}`;
-      const cleanup = () => {
-        if (timer) clearTimeout(timer);
-        unsub?.();
-      };
-
-      getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
-        try {
-          const reqId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
-          timer = setTimeout(() => {
-            cleanup();
-            rejectCached(new Error(t('upload.download_timeout')));
-          }, 30_000);
-          unsub = ws.onMessage((msg) => {
-            if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-            cleanup();
-            if (msg.status === 'error') {
-              rejectCached(new Error(t('file_browser.preview_error')));
-              return;
-            }
-            if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
-              resolveCached({
-                dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
-                alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
-              });
-              return;
-            }
-            rejectCached(new Error(t('file_browser.preview_error')));
-          });
-        } catch (err) {
-          cleanup();
-          rejectCached(err instanceof Error ? err : new Error(String(err)));
-        }
-      })).then(resolve, reject);
-    })
-  ), [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
+  // tsk_5rf: this used to carry its own copy of the fs.read_response loader and
+  // accepted ONLY base64. After 6a169ad3c the daemon answers image previews with
+  // metadata plus a download handle, so that copy rejected every streamed image
+  // and the chat thumbnail vanished while FileBrowser (the other copy) kept
+  // working. There is now one shared loader, so a contract change cannot fix one
+  // surface and silently break the other.
+  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => {
+    if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
+      return Promise.reject(new Error(t('file_browser.preview_error')));
+    }
+    const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
+    const cacheKey = `${cacheScope}\0${path}`;
+    return getCachedChatLocalImagePreview(cacheKey, () => loadFsLocalImagePreview(ws, path, {
+      sessionName: fileScopeSessionName,
+      serverId: serverId ?? undefined,
+      chatFileReference: true,
+      timeoutMs: 30_000,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('upload.download_timeout'),
+    }).then((result) => ({
+      ...result,
+      // Evict on a real <img> failure so the retry calls fsReadFile again for a
+      // fresh handle instead of replaying a dead URL.
+      onLoadFailed: () => invalidateChatLocalImagePreview(cacheKey),
+    })));
+  }, [fileScopeSessionName, serverId, sessionId, t, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
-    if (!serverId) throw new Error(t('upload.daemon_offline'));
-    const resolvedPath = resolvePreviewPath(path, workdir);
-    let downloadId = await requestPathDownloadId(resolvedPath);
-    const { downloadAttachment } = await import('../api.js');
+    if (!serverId || !ws) throw new Error(t('upload.daemon_offline'));
+    const fileName = path.replace(/:\d+(?::\d+)?$/, '').split(/[/\\]/).pop() || undefined;
+    // The save dialog must open first, inside the click that asked for it; any
+    // await in front of it lets the browser refuse the picker. Choosing where
+    // the file goes is also what lets the finished row offer "Show in folder"
+    // — the same path the file browser downloads through.
+    let destination: DirectPreviewDownloadDestination | null;
     try {
-      if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-      else await downloadAttachment(serverId, downloadId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      if (!isStaleHandle) throw new Error(mapDownloadError(err));
-      downloadId = await requestPathDownloadId(resolvedPath);
-      try {
-        if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-        else await downloadAttachment(serverId, downloadId);
-      } catch (retryErr) {
-        throw new Error(mapDownloadError(retryErr));
-      }
+      destination = await selectPreviewDownloadDestination(fileName);
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      throw new Error(t('upload.download_failed'));
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir]);
+    const { downloadAttachment } = await import('../api.js');
+    const transfer = beginDownloadTransfer(fileName ?? path);
+    const attempt = async (downloadId: string) => {
+      const wiring = createDownloadTransferWiring(transfer.id);
+      await downloadPreviewWithDirectFallback({
+        ws,
+        serverId,
+        previewHandle: downloadId,
+        suggestedName: fileName,
+        sessionName: fileScopeSessionName,
+        destination,
+        httpFallback: () => (sessionId
+          ? downloadAttachment(serverId, downloadId, sessionId, transfer.signal)
+          : downloadAttachment(serverId, downloadId, undefined, transfer.signal)),
+        signal: transfer.signal,
+        onSaveReady: wiring.onSaveReady,
+        onProgress: wiring.onProgress,
+        onMode: wiring.onMode,
+      });
+      wiring.complete(destination);
+    };
+    // requestPathDownloadId already rejects with a user-facing message; mapping
+    // it again would turn e.g. a timeout into a generic failure.
+    const alreadyMapped = new WeakSet<object>();
+    const requestDownloadId = async () => {
+      try {
+        return await requestPathDownloadId(path);
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        alreadyMapped.add(error);
+        throw error;
+      }
+    };
+    const isStaleHandle = (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return isDirectFileTransferStaleHandleError(err)
+        || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+    };
+    try {
+      try {
+        const first = await requestDownloadId();
+        await attempt(first.downloadId);
+        if (first.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: first.resolvedPath,
+            count: first.matchCount,
+          });
+        }
+        if (first.resolvedPath !== path) {
+          return t('upload.download_resolved_to', { path: first.resolvedPath });
+        }
+      } catch (err) {
+        // A preview handle can expire between the request and the transfer:
+        // fetch a fresh one once, keeping the same chosen destination.
+        if (!isStaleHandle(err) || transfer.signal.aborted) throw err;
+        const retry = await requestDownloadId();
+        await attempt(retry.downloadId);
+        if (retry.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: retry.resolvedPath,
+            count: retry.matchCount,
+          });
+        }
+        if (retry.resolvedPath !== path) return t('upload.download_resolved_to', { path: retry.resolvedPath });
+      }
+    } catch (err) {
+      const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
+      failDownloadTransfer(transfer.id, canceled);
+      if (canceled) return;
+      if (err instanceof Error && alreadyMapped.has(err)) throw err;
+      throw new Error(mapDownloadError(err));
+    }
+  }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
@@ -2161,6 +2754,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [showToolCallsPref]);
   const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
   const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
+  // Keyed by content so assistant blocks re-render only when a status changes.
+  const liveAssignmentStatusesSignature = useMemo(
+    () => liveAssignmentStatusesKey(deriveLiveAssignmentStatuses(events)),
+    [events],
+  );
+  const liveAssignmentStatuses = useMemo(
+    () => new Map<string, LiveAssignmentStatus>(JSON.parse(liveAssignmentStatusesSignature) as Array<[string, LiveAssignmentStatus]>),
+    [liveAssignmentStatusesSignature],
+  );
   useEffect(() => {
     if (!hasSdkAgentEvents) return;
     setSdkAgentsNow(Date.now());
@@ -2191,11 +2793,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // session pane / sub-session window) keeps the full list so "load older"
   // and infinite scroll-back continue to work — only the rendered slice is
   // capped further down (`renderedViewItems`).
-  const sourceEvents = useMemo(
+  const rawSourceEvents = useMemo(
     () => (preview && events.length > PREVIEW_EVENT_TAIL_LIMIT
       ? events.slice(-PREVIEW_EVENT_TAIL_LIMIT)
       : events),
     [preview, events],
+  );
+  const sourceEvents = useMemo(
+    () => rawSourceEvents.map((event) => localizeDaemonUserNoticeEvent(event, t)),
+    [rawSourceEvents, t, i18n?.resolvedLanguage],
   );
   const effectiveRenderLimit = preview ? PREVIEW_RENDER_ITEM_LIMIT : renderItemLimit;
   // Derived from a window of recent events, not the whole session: the renderer
@@ -2256,13 +2862,73 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     () => getRenderedViewRevision(renderedViewItems),
     [renderedViewItems],
   );
+  const viewItemsRef = useRef(viewItems);
+  viewItemsRef.current = viewItems;
+  const hasOlderOutsideWindowRef = useRef(hasOlderOutsideWindow);
+  hasOlderOutsideWindowRef.current = hasOlderOutsideWindow;
   const resolvePinnedMessageText = useCallback((pin: MessagePin): string => {
     if (pin.sessionName !== sessionId) return pin.text;
     const sourceEvent = events.find((event) => event.eventId === pin.eventId);
     return sourceEvent ? (messagePinSourceText(sourceEvent, viewItems) ?? pin.text) : pin.text;
   }, [events, sessionId, viewItems]);
 
-  const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
+  /**
+   * Reveal an event through the virtualizer and retry DOM lookup until the
+   * measured target is mounted. All message-navigation entry points use this
+   * helper so an offscreen target cannot leave a pending jump stuck.
+   */
+  const revealEvent = useCallback((
+    eventId: string,
+    onFound: (root: HTMLElement, target: HTMLElement) => void,
+    onTimeout?: () => void,
+    eventTs?: number,
+  ): (() => void) => {
+    setVirtualRevealKey(eventId);
+    let cancelled = false;
+    let attempts = 0;
+    let loadingContext = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const attempt = async () => {
+      if (cancelled) return;
+      const currentItems = viewItemsRef.current;
+      const presentationItem = currentItems.find((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ));
+      const presentationKey = presentationItem?.key ?? eventId;
+      setVirtualRevealKey(presentationKey);
+      const root = scrollRef.current;
+      const target = root ? findEventElement(root, presentationKey) : null;
+      if (root && target) {
+        setVirtualRevealKey(undefined);
+        onFound(root, target);
+        return;
+      }
+      const sourceHasEvent = timelineEventsRef.current.some((event) => event.eventId === eventId);
+      if (!sourceHasEvent && eventTs !== undefined && onLoadMessageContext && !loadingContext) {
+        loadingContext = true;
+        await onLoadMessageContext(eventId, eventTs);
+        loadingContext = false;
+      }
+      const requiredLimit = __computeRevealRenderItemLimitForTests(currentItems, eventId, effectiveRenderLimit);
+      if (requiredLimit > effectiveRenderLimit) setRenderItemLimit(requiredLimit);
+      else if (hasOlderOutsideWindowRef.current && !currentItems.some((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ))) setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
+      if (attempts++ >= 30) {
+        setVirtualRevealKey(undefined);
+        onTimeout?.();
+        return;
+      }
+      timer = setTimeout(attempt, 16);
+    };
+    timer = setTimeout(() => { void attempt(); }, 0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [effectiveRenderLimit, onLoadMessageContext]);
+
+  const locatePinnedMessage = useCallback((pin: MessagePin) => {
     if (!sessionId || pin.sessionName !== sessionId) {
       requestMessagePinNavigation(pin, sessionId);
       return;
@@ -2271,14 +2937,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     pendingPinnedLocateIdRef.current = pin.id;
     setPinnedLocateError(false);
     setPendingPinnedLocate(pin);
-    if (timelineEventsRef.current.some((event) => event.eventId === pin.eventId)) return;
-    if (!onLoadMessageContext || !await onLoadMessageContext(pin.eventId, pin.eventTs)) {
-      clearPendingMessagePin(pin.id);
-      pendingPinnedLocateIdRef.current = null;
-      setPendingPinnedLocate(null);
-      setPinnedLocateError(true);
-    }
-  }, [onLoadMessageContext, sessionId]);
+  }, [sessionId]);
 
   useEffect(() => {
     if (!pinsEnabled || !sessionId) return undefined;
@@ -2292,34 +2951,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
   useEffect(() => {
     if (!pendingPinnedLocate) return undefined;
-    if (!events.some((event) => event.eventId === pendingPinnedLocate.eventId)) return undefined;
-    const targetItemIndex = viewItems.findIndex((item) => (
-      item.key === pendingPinnedLocate.eventId
-      || item.event?.eventId === pendingPinnedLocate.eventId
-      || item.eventIds?.includes(pendingPinnedLocate.eventId)
-    ));
-    if (targetItemIndex < 0) {
-      // The event is in the session but older than the derivation window, so it
-      // has no presentation item yet. Widening the render limit widens the
-      // window with it, and this effect re-runs on the rebuilt list — without
-      // this the navigation would silently do nothing for any message older
-      // than the window, which is precisely the ones a pin is used for.
-      if (hasOlderOutsideWindow) {
-        setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
-      }
-      return undefined;
-    }
-    const targetDomEventId = viewItems[targetItemIndex]!.key;
-    // The renderer is tail-limited. Reveal only enough tail items to include
-    // the target instead of mounting a previously expanded 2,000-item history
-    // in one task (which would revive the multi-window freeze this UI avoids).
-    const requiredTailItems = viewItems.length - targetItemIndex;
-    setRenderItemLimit((current) => Math.max(current, requiredTailItems));
-    const frame = requestAnimationFrame(() => {
-      const root = scrollRef.current;
-      if (!root) return;
-      const target = findEventElement(root, targetDomEventId);
-      if (!target) return;
+    return revealEvent(pendingPinnedLocate.eventId, (root, target) => {
       const reducedMotion = typeof window.matchMedia === 'function'
         && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
@@ -2328,9 +2960,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       clearPendingMessagePin(pendingPinnedLocate.id);
       pendingPinnedLocateIdRef.current = null;
       setPendingPinnedLocate(null);
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [events, pendingPinnedLocate, renderedRevision, viewItems.length]);
+    }, () => {
+      clearPendingMessagePin(pendingPinnedLocate.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+      setPinnedLocateError(true);
+    }, pendingPinnedLocate.eventTs);
+  }, [pendingPinnedLocate, revealEvent, renderedRevision]);
 
   useEffect(() => {
     if (revealingOlderTimerRef.current) {
@@ -2400,6 +3036,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // follow/suppress policy stays synchronous so ordering against callers that
   // set state right after is unchanged.
   const pendingScrollFrameRef = useRef<number | null>(null);
+  // Single-flight frame for every "follow the bottom" request in this view.
+  // These fire from timeline updates, scroll handling and ResizeObserver — all
+  // of which keep running while the display is asleep and frames are not
+  // produced. A raw rAF per request therefore builds an unbounded backlog that
+  // the browser executes in one post-unlock frame. See useCoalescedFrame.
+  const scheduleFollowFrame = useCoalescedFrame();
 
   const scrollToBottom = (engageFollow: boolean = true) => {
     const el = scrollRef.current;
@@ -2439,8 +3081,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setShowScrollBtn(false);
     // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
-    requestAnimationFrame(() => scrollToBottom(true));
-  }, [sessionId]);
+    scheduleFollowFrame(() => scrollToBottom(true));
+  }, [sessionId, scheduleFollowFrame]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
   // Save the relative bottom offset on focusin, then restore against the new layout
@@ -2465,7 +3107,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       if (vv.height !== prevHeight) {
         suppressLoadOlder();
         if (savedWasNearBottom || autoScrollRef.current) {
-          requestAnimationFrame(() => scrollToBottom());
+          scheduleFollowFrame(() => scrollToBottom());
         } else if (vv.height < prevHeight) {
           const targetTop = Math.max(0, el.scrollHeight - el.clientHeight - savedBottomOffset);
           el.scrollTop = targetTop;
@@ -2679,13 +3321,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     if (layoutHandledVisibleTsRef.current === lastVisibleTs) return;
-    requestAnimationFrame(() => {
+    scheduleFollowFrame(() => {
       // Re-check inside the rAF callback so a state flip during the frame
       // window (e.g. a user scroll-up that lands between schedule and fire)
       // is honoured. Preview always follows by design.
       if (preview || autoScrollRef.current) scrollToBottom(false);
     });
-  }, [lastVisibleTs, preview]);
+  }, [lastVisibleTs, preview, scheduleFollowFrame]);
 
   const lastScrollActivityRef = useRef(Date.now());
   // (Previously SCROLL_IDLE_RESUME_MS = 60_000 drove a setInterval that
@@ -2784,7 +3426,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       && Date.now() < suppressLoadOlderUntilRef.current;
     if (transientTopJump) {
       setShowScrollBtn(false);
-      requestAnimationFrame(() => scrollToBottom(true));
+      scheduleFollowFrame(() => scrollToBottom(true));
       return;
     }
     // Adaptive + hysteresis thresholds (avoid boundary flicker during streaming
@@ -2846,14 +3488,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       // Re-check follow state INSIDE the rAF: a user scroll-up that disengages
       // during the frame gap must still win, or we'd snap them back against
       // their intent.
-      requestAnimationFrame(() => {
+      scheduleFollowFrame(() => {
         if (autoScrollRef.current) scrollToBottom();
       });
     });
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, [preview]);
+  }, [preview, scheduleFollowFrame]);
 
   // Hold the bottom through the post-mount layout settle.
   //
@@ -3313,38 +3955,39 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
             role="button"
             tabIndex={0}
-            aria-label={t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
+            aria-label={pinnedPreviewUsesMemory
+              ? t('chat.pinned_recent_summary_aria', 'Show recent summary and jump to your last sent message')
+              : t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
             onClick={() => {
               // Tap once → toggle 2-line clamp; tap again (while expanded)
               // behaves like a jump-to-message. Holds the expand state so a
               // long message can be read without hunting for it.
               if (!pinnedExpanded) { setPinnedExpanded(true); return; }
-              const root = scrollRef.current;
-              if (!root) return;
-              const target = findEventElement(root, lastSentUserMessage.eventId);
-              if (target) {
-                // Respect the OS reduced-motion preference — smooth scrolling
-                // is a vestibular-trigger axis for some users.
+              // The last-sent bubble may be outside the virtualizer's mounted
+              // range. Reveal it first, then perform the same centered jump.
+              revealEvent(lastSentUserMessage.eventId, (root, target) => {
                 const reducedMotion = typeof window !== 'undefined'
                   && window.matchMedia
                   && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-                target.scrollIntoView({
-                  behavior: reducedMotion ? 'auto' : 'smooth',
-                  block: 'center',
-                });
-              }
+                scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+              });
             }}
           >
             <span class="chat-pinned-last-sent-meta">
-              <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+              <span class="chat-pinned-last-sent-label">
+                {pinnedPreviewUsesMemory
+                  ? t('chat.pinned_recent_summary_label', 'Recent summary')
+                  : t('chat.pinned_last_sent_label', 'Last sent')}
+              </span>
               {lastSentUserMessage.actorLabel && (
                 <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
               )}
               <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
-            <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
+            <span class="chat-pinned-last-sent-text">{pinnedPreviewText}</span>
           </div>
         )}
+        {!preview && !!sessionId && !sessionId.includes('deck_sub_') && <TaskPairStatusPanel events={events} sessions={sessions} />}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           onWheel={preview ? undefined : handleWheel}
           onTouchStart={preview ? undefined : handleTouchStart}
@@ -3368,7 +4011,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           } : undefined}
         >
           {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
-          {loading ? (
+          {/* The spinner is for an EMPTY pane only. It used to be an exclusive
+           *  branch on `loading` alone, which — together with the `!loading`
+           *  guard on the message list below — blanked a pane whose cached
+           *  events were already in state, purely because a background
+           *  refresh was in flight. Cached history must stay on screen while
+           *  the network catches up. */}
+          {loading && viewItems.length === 0 ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (
             // Suppress the "no events" placeholder while history bootstrap
@@ -3450,7 +4099,16 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               </button>
             </div>
           )}
-          {!loading && renderedViewItems.map((item) => {
+          {/* No `loading` guard: whatever is already restored renders now. */}
+          <VirtualizedViewItems
+            items={renderedViewItems}
+            scrollRef={scrollRef}
+            enabled={!preview}
+            revealKey={virtualRevealKey}
+            renderItem={(item) => {
+            if (item.type === 'supervision-status-run') {
+              return <SupervisionStatusRun key={item.key} item={item} />;
+            }
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock
@@ -3458,6 +4116,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   eventId={item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
+                  streaming={item.assistantStreaming === true}
+                  executionState={item.executionState}
+                  delegationMetadata={item.delegationMetadata}
+                  liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
                   onUrlClick={urlClickHandler}
@@ -3499,7 +4161,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 ))}
               </div>
             );
-          })}
+            }}
+          />
           {!loading && <div ref={bottomRef} />}
         </div>
         {!preview && showScrollBtn && (
@@ -4249,8 +4912,12 @@ function ToolCallGroup({
 const AssistantBlock = memo(function AssistantBlock({
   text,
   automation,
+  streaming,
+  executionState,
   ts,
   eventId,
+  delegationMetadata,
+  liveAssignmentStatuses,
   onPathClick,
   onUrlClick,
   onDownload,
@@ -4258,13 +4925,36 @@ const AssistantBlock = memo(function AssistantBlock({
   onImagePreview,
   onOpenLocalWebPreview,
 }: AssistantBlockProps) {
+  const { t } = useTranslation();
+  const status = executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    ? { className: 'waiting', glyph: SUPERVISION_HEARTBEAT_GLYPH.WAITING, label: t('chat.execution_status.waiting') }
+    : executionState === SUPERVISION_EXECUTION_STATES.NEEDS_INPUT
+      ? { className: 'needs-input', glyph: SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT, label: t('chat.execution_status.needs_input') }
+      : null;
+  const statusOnly = text.length === 0 && status !== null;
   return (
     <div
-      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
+      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
-      <ChatTime ts={ts} />
+      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {status && (
+        <span
+          class={`chat-execution-status-chip ${status.className}`}
+          role="status"
+          aria-label={status.label}
+          title={status.label}
+        >
+          <span class="chat-execution-status-glyph" aria-hidden="true">{status.glyph}</span>
+          {status.label}
+        </span>
+      )}
+      {!statusOnly && (
+        <>
+          <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
+          <ChatTime ts={ts} />
+        </>
+      )}
     </div>
   );
 });
@@ -4353,6 +5043,130 @@ function AttachmentDownloadButton({
   );
 }
 
+function supervisionUserPromptLabelKey(payload: Record<string, unknown>): string | null {
+  if (payload.automation !== true || typeof payload.automationKind !== 'string') return null;
+  const kind = payload.automationKind;
+  const known = (SUPERVISION_USER_PROMPT_LABEL_KEYS as Readonly<Record<string, string>>)[kind];
+  if (known) return known;
+  return kind.startsWith(SUPERVISION_AUTOMATION_KIND_PREFIX)
+    ? 'chat.supervision_prompt.generic'
+    : null;
+}
+
+function SupervisionAutomationPrompt({
+  text,
+  label,
+  automationKind,
+  showDetailsLabel,
+  hideDetailsLabel,
+}: {
+  text: string;
+  label: string;
+  automationKind: string;
+  showDetailsLabel: string;
+  hideDetailsLabel: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const actionLabel = expanded ? hideDetailsLabel : showDetailsLabel;
+  const heartbeat = automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND;
+  return (
+    <div class={`chat-supervision-prompt${heartbeat ? ' is-heartbeat' : ''}`}>
+      <button
+        type="button"
+        class="chat-supervision-prompt-toggle"
+        aria-expanded={expanded}
+        aria-label={`${label}: ${actionLabel}`}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {heartbeat && <span class="chat-supervision-heartbeat-glyph" aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>}
+        {label}
+      </button>
+      {expanded && (
+        <pre class="chat-supervision-prompt-details">{text}</pre>
+      )}
+    </div>
+  );
+}
+
+function CronRunCard({ run, locale }: { run: CronRunTimelineProjection; locale?: string }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = `cron-run-${run.scheduleId}-${run.executionId ?? 'dispatch'}`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+  const formatTime = (value: number | undefined) => value === undefined
+    ? t('cron.run_card.not_available')
+    : new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+  const completionLabel = run.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    ? t('cron.completion_until_complete')
+    : t('cron.completion_recurring');
+  return (
+    <section class="chat-cron-run" aria-label={t('cron.run_card.aria_label', { name: run.name })}>
+      <div class="chat-cron-run-header">
+        <strong class="chat-cron-run-title">{run.name}</strong>
+        <div class="chat-cron-run-chips">
+          {run.cronExpr && <span class="chat-cron-run-chip" title={t('cron.run_card.schedule')}>{run.cronExpr}</span>}
+          <span class="chat-cron-run-chip">{completionLabel}</span>
+          <span class="chat-cron-run-chip is-status">{t('cron.run_card.status_dispatched')}</span>
+        </div>
+      </div>
+      <div class="chat-cron-run-next">
+        <span>{t('cron.run_card.next_run')}</span>
+        <time>{formatTime(run.nextRunAt)}</time>
+        {run.timezone && <span class="chat-cron-run-timezone">{run.timezone}</span>}
+      </div>
+      <button
+        type="button"
+        class="chat-cron-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {expanded ? t('cron.run_card.hide_details') : t('cron.run_card.show_details')}
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-cron-run-details">
+          <div class="chat-cron-run-detail-row">
+            <span>{t('cron.run_card.previous_run')}</span>
+            <time>{formatTime(run.previousRunAt)}</time>
+          </div>
+          <div class="chat-cron-run-contract">
+            {t('cron.run_card.contract_summary', {
+              id: run.contractId,
+              version: run.contractVersion,
+              count: Object.keys(run.constraints).length,
+            })}
+          </div>
+          <div class="chat-cron-run-task-label">{t('cron.run_card.task_body')}</div>
+          <pre class="chat-cron-run-task">{run.taskBody}</pre>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PeerAuditRoundChip({
+  round,
+  outcomeLabel,
+}: {
+  round: unknown;
+  outcomeLabel: string;
+}) {
+  const { t } = useTranslation();
+  if (!isPeerAuditRound(round)) return null;
+  const roundAria = t('peerAuditResult.roundAria', { round, outcome: outcomeLabel });
+  return (
+    <span
+      class="peer-audit-round-chip"
+      aria-label={roundAria}
+      title={roundAria}
+    >
+      {t('peerAuditResult.roundChip', { round })}
+    </span>
+  );
+}
+
 const ChatEvent = memo(function ChatEvent({
   event,
   sessionName,
@@ -4385,6 +5199,35 @@ const ChatEvent = memo(function ChatEvent({
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
+      // Only the human's own input sits on the right; agent deliveries and
+      // daemon injections are incoming messages and sit on the left.
+      const origin = classifyUserMessageOrigin(event.payload);
+      const originClass = ` chat-user-origin-${origin}`;
+      const cronRun = event.source === 'daemon' && event.confidence === 'high'
+        ? readCronRunTimelineProjection(event.payload[CRON_RUN_TIMELINE.PAYLOAD_KEY])
+        : undefined;
+      if (cronRun) {
+        return (
+          <div class={`chat-event chat-user chat-user-cron-run${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+            <CronRunCard run={cronRun} locale={locale} />
+            <ChatTime ts={event.ts} />
+          </div>
+        );
+      }
+      const supervisionPromptLabelKey = supervisionUserPromptLabelKey(event.payload);
+      if (supervisionPromptLabelKey) {
+        return (
+          <div class={`chat-event chat-user chat-user-supervision-prompt${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+            <SupervisionAutomationPrompt
+              text={rawUserText}
+              label={t(supervisionPromptLabelKey)}
+              automationKind={String(event.payload.automationKind)}
+              showDetailsLabel={t('chat.supervision_prompt.show_details')}
+              hideDetailsLabel={t('chat.supervision_prompt.hide_details')}
+            />
+          </div>
+        );
+      }
       let userText = parseTimelineDisplayText(rawUserText);
       const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
       // Strip @path references from text when they're shown as attachment badges
@@ -4403,7 +5246,7 @@ const ChatEvent = memo(function ChatEvent({
         // data-event-id lets the pinned-last-message banner target this bubble
         // with an IntersectionObserver so the banner only shows when the real
         // bubble has scrolled off the top of the viewport.
-        <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
+        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
           {sharedActorLabel && (
             <div class="chat-shared-actor-label" title={sharedActorLabel}>
               {sharedActorLabel}
@@ -4464,6 +5307,7 @@ const ChatEvent = memo(function ChatEvent({
             : outcome === 'cancelled'
               ? 'result_cancelled'
               : 'result_unavailable';
+      const outcomeLabel = t(`peerAuditQuick.${outcomeKey}`);
       const auditor = String(event.payload.auditorLabel ?? event.payload.auditorSessionName ?? '—');
       const elapsedMs = typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0;
       const findingsPreview = typeof event.payload.findingsPreview === 'string'
@@ -4472,12 +5316,35 @@ const ChatEvent = memo(function ChatEvent({
       const disposition = isPeerAuditRuntimeDisposition(event.payload.disposition)
         ? event.payload.disposition
         : null;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
-        <section class="chat-event chat-system peer-audit-result-card" data-event-id={event.eventId}>
-          <strong>{t('peerAuditResult.title')}</strong>
+        <section
+          class="chat-event chat-system peer-audit-result-card"
+          data-event-id={event.eventId}
+          {...(supervisionTask ? {
+            'data-task-id': supervisionTask.taskId,
+            'data-assignment-id': supervisionTask.assignmentId,
+          } : {})}
+        >
+          {supervisionTask?.title ? (
+            <div class="delegation-reply-card-heading peer-audit-result-heading">
+              <span class="delegation-reply-card-kicker">{t('peerAuditResult.title')}</span>
+              <ExpandableTaskObjective
+                text={supervisionTask.objective ?? supervisionTask.title}
+                textClassName="peer-audit-result-objective"
+              />
+            </div>
+          ) : (
+            <strong>{t('peerAuditResult.title')}</strong>
+          )}
           <div>{t('peerAuditResult.attributionAuditor', { auditor })}</div>
           <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
-          <div>{t(`peerAuditQuick.${outcomeKey}`)}</div>
+          <div class="peer-audit-result-verdict-row">
+            <span class={`peer-audit-result-outcome peer-audit-result-outcome--${outcome}`}>{outcomeLabel}</span>
+            <PeerAuditRoundChip round={event.payload.round} outcomeLabel={outcomeLabel} />
+          </div>
           {disposition && (
             <div>{t(`peerAuditQuick.disposition.${disposition}`)}</div>
           )}
@@ -4495,25 +5362,97 @@ const ChatEvent = memo(function ChatEvent({
     case 'peer_audit.status':
       return null;
 
+    case TASK_PAIR_TIMELINE_EVENT:
+      return null;
+
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');
       const result = typeof event.payload.result === 'string' ? event.payload.result : '';
+      const verdict = isPeerAuditVerdict(event.payload.verdict) ? event.payload.verdict : undefined;
+      const verdictClass = verdict ? ` delegation-reply-card--${verdict.toLowerCase()}` : '';
+      const verdictLabel = verdict
+        ? t(verdict === PEER_AUDIT_VERDICTS[0]
+          ? 'peerAuditQuick.result_pass'
+          : 'peerAuditQuick.result_rework')
+        : undefined;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
-        <section class="chat-event chat-system delegation-reply-card" data-event-id={event.eventId}>
+        <section
+          class={`chat-event chat-system delegation-reply-card${verdictClass}`}
+          data-event-id={event.eventId}
+          {...(verdict ? { 'data-verdict': verdict } : {})}
+        >
           <div class="delegation-reply-card-head">
-            <strong>{t('delegation.reply_title')}</strong>
-            <span>{t('delegation.reply_from', { source })}</span>
+            <div class="delegation-reply-card-heading">
+              {supervisionTask?.title ? (
+                <>
+                  <span class="delegation-reply-card-kicker">{t('delegation.reply_title')}</span>
+                  <ExpandableTaskObjective
+                    text={supervisionTask.objective ?? supervisionTask.title}
+                    textClassName="delegation-reply-card-objective"
+                  />
+                </>
+              ) : (
+                <strong>{t('delegation.reply_title')}</strong>
+              )}
+            </div>
+            <div class="delegation-reply-card-meta">
+              {verdict && (
+                <span class="delegation-reply-verdict" aria-label={verdictLabel}>{verdict}</span>
+              )}
+              {verdict && (
+                <PeerAuditRoundChip round={event.payload.round} outcomeLabel={verdictLabel ?? verdict} />
+              )}
+              <span>{t('delegation.reply_from', { source })}</span>
+            </div>
           </div>
+          {supervisionTask && (
+            <div
+              class={`delegation-reply-task${supervisionTask.title ? '' : ' is-fallback'}`}
+              data-testid="delegation-reply-task"
+              data-task-id={supervisionTask.taskId}
+              data-assignment-id={supervisionTask.assignmentId}
+              {...(supervisionTask.attemptId ? { 'data-attempt-id': supervisionTask.attemptId } : {})}
+              {...(supervisionTask.revision ? { 'data-revision': supervisionTask.revision } : {})}
+            >
+              <span class="delegation-reply-task-ids">
+                <span aria-label={`${t('delegation.claim.task_id')}: ${supervisionTask.taskId}`}>{supervisionTask.taskId}</span>
+                <span aria-hidden="true">·</span>
+                <span aria-label={`${t('delegation.claim.assignment_id')}: ${supervisionTask.assignmentId}`}>{supervisionTask.assignmentId}</span>
+              </span>
+            </div>
+          )}
           {result && (
-            <ChatMarkdown
-              text={result}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              onOpenLocalWebPreview={onOpenLocalWebPreview}
-            />
+            verdict ? (
+              <details class="delegation-reply-card-findings">
+                <summary>{t('peerAuditResult.findingsPreview')}</summary>
+                <div class="delegation-reply-card-body">
+                  <ChatMarkdown
+                    text={result}
+                    onPathClick={onPathClick}
+                    onUrlClick={onUrlClick}
+                    onDownload={onDownload}
+                    onHtmlPreview={onHtmlPreview}
+                    onImagePreview={onImagePreview}
+                    onOpenLocalWebPreview={onOpenLocalWebPreview}
+                  />
+                </div>
+              </details>
+            ) : (
+              <div class="delegation-reply-card-body">
+                <ChatMarkdown
+                  text={result}
+                  onPathClick={onPathClick}
+                  onUrlClick={onUrlClick}
+                  onDownload={onDownload}
+                  onHtmlPreview={onHtmlPreview}
+                  onImagePreview={onImagePreview}
+                  onOpenLocalWebPreview={onOpenLocalWebPreview}
+                />
+              </div>
+            )
           )}
           <ChatTime ts={event.ts} />
         </section>
@@ -4698,6 +5637,79 @@ const ChatEvent = memo(function ChatEvent({
       return null;
   }
 });
+
+function SupervisionStatusRun({ item }: { item: ViewItem }) {
+  const { t, i18n } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const heartbeatCount = item.heartbeatCount ?? 0;
+  const waitingCount = item.waitingCount ?? 0;
+  const heartbeatLabel = heartbeatCount > 0
+    ? t('chat.supervision_status_run.heartbeats', { count: heartbeatCount })
+    : '';
+  const waitingLabel = waitingCount > 0
+    ? t('chat.supervision_status_run.waiting', { count: waitingCount })
+    : '';
+  const statusLabel = [heartbeatLabel, waitingLabel].filter(Boolean).join(' · ');
+  const locale = resolveI18nLocale(i18n);
+  const now = Date.now();
+  const firstTime = formatChatDateTime(item.ts ?? 0, now, locale);
+  const lastTime = formatChatDateTime(item.lastTs ?? item.ts ?? 0, now, locale);
+  const timeRange = firstTime === lastTime ? firstTime : `${firstTime}–${lastTime}`;
+  const actionLabel = expanded
+    ? t('chat.supervision_status_run.collapse')
+    : t('chat.supervision_status_run.expand');
+  const detailsId = `${item.key}:details`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+
+  return (
+    <div class={`chat-supervision-status-run${expanded ? ' is-expanded' : ''}`}>
+      <button
+        type="button"
+        class="chat-supervision-status-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        aria-label={t('chat.supervision_status_run.aria', { status: statusLabel, timeRange, action: actionLabel })}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {heartbeatCount > 0 && (
+          <span class="chat-supervision-status-run-part is-heartbeat">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>
+            {heartbeatLabel}
+          </span>
+        )}
+        {heartbeatCount > 0 && waitingCount > 0 && <span aria-hidden="true">·</span>}
+        {waitingCount > 0 && (
+          <span class="chat-supervision-status-run-part is-waiting">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.WAITING}</span>
+            {waitingLabel}
+          </span>
+        )}
+        <span aria-hidden="true">·</span>
+        <span class="chat-supervision-status-run-time">{timeRange}</span>
+        <span class="chat-supervision-status-run-chevron" aria-hidden="true">{expanded ? '▴' : '▾'}</span>
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-supervision-status-run-details">
+          {(item.statusItems ?? []).map((source) => {
+            if (source.type === 'assistant-block') {
+              return (
+                <AssistantBlock
+                  key={source.key}
+                  eventId={source.key}
+                  text={source.text ?? ''}
+                  automation={source.assistantAutomation === true}
+                  executionState={source.executionState}
+                  ts={source.lastTs ?? source.ts ?? 0}
+                />
+              );
+            }
+            return <ChatEvent key={source.key} event={source.event!} />;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function groupFileChangePatches(batch: FileChangeBatch): GroupedFileChange[] {
   const groups = new Map<string, GroupedFileChange>();
@@ -5069,6 +6081,27 @@ function countHardLines(text: string): number {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length;
 }
 
+/**
+ * Measure visual line overflow from the browser's rendered box. `scrollHeight`
+ * includes soft-wrapped content even while the element is capped, so this
+ * catches long paragraphs without guessing from character count.
+ */
+export function renderedUserMessageExceedsLineLimit(
+  element: HTMLElement,
+  lineLimit = USER_MESSAGE_COLLAPSE_LINE_LIMIT,
+): boolean | null {
+  const style = window.getComputedStyle(element);
+  const fontSize = Number.parseFloat(style.fontSize);
+  const rawLineHeight = Number.parseFloat(style.lineHeight);
+  const lineHeight = style.lineHeight.endsWith('px')
+    ? rawLineHeight
+    : Number.isFinite(rawLineHeight) && Number.isFinite(fontSize)
+      ? rawLineHeight * fontSize
+      : Number.NaN;
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0 || element.scrollHeight <= 0) return null;
+  return element.scrollHeight > (lineHeight * lineLimit) + 0.5;
+}
+
 function UserMessageText({
   text,
   onPathClick,
@@ -5087,15 +6120,56 @@ function UserMessageText({
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }) {
   const { t } = useTranslation();
-  const lineCount = countHardLines(text);
-  const shouldFold = lineCount > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const contentRef = useRef<HTMLDivElement>(null);
+  const { prose, leadingSender, trailingReply } = parseDelegationProtocolMessage(text);
+  const hardLineOverflow = countHardLines(prose) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
+    hardLineOverflow ? true : null,
+  );
   const [expanded, setExpanded] = useState(false);
+  const shouldFold = renderedOverflow === true;
+  const measuring = renderedOverflow === null;
   const folded = shouldFold && !expanded;
 
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    let active = true;
+    const measure = () => {
+      const measured = renderedUserMessageExceedsLineLimit(content);
+      const next = hardLineOverflow || measured;
+      if (!active || next === null) return;
+      setRenderedOverflow((current) => current === next ? current : next);
+    };
+
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(content);
+    if (content.parentElement) observer?.observe(content.parentElement);
+    window.addEventListener('resize', measure);
+
+    const fonts = document.fonts;
+    fonts?.addEventListener?.('loadingdone', measure);
+    void fonts?.ready.then(() => {
+      if (active) measure();
+    });
+
+    return () => {
+      active = false;
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+      fonts?.removeEventListener?.('loadingdone', measure);
+    };
+  }, [hardLineOverflow, prose]);
+
   return (
-    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
-      <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
-        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
+    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+      {leadingSender && <DelegationSenderCardView card={leadingSender} />}
+      <div
+        ref={contentRef}
+        class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
+      >
+        {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
       {shouldFold && (
         <button
@@ -5107,6 +6181,7 @@ function UserMessageText({
           {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
         </button>
       )}
+      {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
     </div>
   );
 }
@@ -5184,3 +6259,10 @@ function splitPathsAndUrls(
 
   return parts.length ? parts : [<span>{text}</span>];
 }
+
+/**
+ * Test seam: the renderer itself, so a contract test can measure what a type
+ * ACTUALLY draws instead of trusting the classification it is meant to check.
+ * Same convention as `__buildViewItemsForTests` above.
+ */
+export const __ChatEventForTests = ChatEvent;

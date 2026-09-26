@@ -21,6 +21,7 @@ TEST(JsonProtocolTest, AcceptsOnlyExactBoundedPrepareAuthority) {
   root["expiresAt"] = Json::Int64(kNowMs + 120'000);
   root["leaseExpiresAt"] = Json::Int64(kNowMs + 15'000);
   root["daemonGeneration"] = 7;
+  root["routeGeneration"] = Json::Int64(19);
   root["mode"] = kViewMode;
   root["inputEpoch"] = 0;
   root["reconnectAttempt"] = 3;
@@ -32,6 +33,8 @@ TEST(JsonProtocolTest, AcceptsOnlyExactBoundedPrepareAuthority) {
   ASSERT_TRUE(parsed.has_value());
   EXPECT_EQ(parsed->kind, Signal::Kind::kPrepare);
   EXPECT_EQ(parsed->authority.daemon_generation, 7);
+  ASSERT_TRUE(parsed->authority.route_generation.has_value());
+  EXPECT_EQ(*parsed->authority.route_generation, 19);
   EXPECT_EQ(parsed->authority.reconnect_attempt, 3);
 
   root["reconnectAttempt"] = 4;
@@ -42,11 +45,83 @@ TEST(JsonProtocolTest, AcceptsOnlyExactBoundedPrepareAuthority) {
   EXPECT_FALSE(ParseServiceSignal(root, kNowMs).has_value());
 }
 
+TEST(JsonProtocolTest, LegacyPrepareWithoutRouteGenerationRemainsParseable) {
+  Json::Value root = AuthorityBase(kPrepareType);
+  root["expiresAt"] = Json::Int64(kNowMs + 120'000);
+  root["leaseExpiresAt"] = Json::Int64(kNowMs + 15'000);
+  root["daemonGeneration"] = 7;
+  root["mode"] = kViewMode;
+  root["inputEpoch"] = 0;
+  Json::Value ice(Json::arrayValue);
+  ice.append("stun:stun.example.test:3478");
+  root["iceServers"] = ice;
+
+  const auto parsed = ParseServiceSignal(root, kNowMs);
+  ASSERT_TRUE(parsed.has_value());
+  EXPECT_FALSE(parsed->authority.route_generation.has_value());
+}
+
+TEST(JsonProtocolTest, AcceptsCredentialLessIceObjectsOnlyWhenWhole) {
+  const auto prepare_with = [](const Json::Value& entry) {
+    Json::Value root = AuthorityBase(kPrepareType);
+    root["expiresAt"] = Json::Int64(kNowMs + 60'000);
+    root["leaseExpiresAt"] = Json::Int64(kNowMs + 30'000);
+    root["daemonGeneration"] = 7;
+    root["mode"] = kControlMode;
+    root["inputEpoch"] = 1;
+    Json::Value ice(Json::arrayValue);
+    ice.append(entry);
+    root["iceServers"] = ice;
+    return ParseServiceSignal(root, kNowMs);
+  };
+
+  // A STUN object carries no credentials; the shared contract accepts it.
+  Json::Value stun(Json::objectValue);
+  stun["urls"] = Json::Value(Json::arrayValue);
+  stun["urls"].append("stun:stun.example.test:3478");
+  const auto accepted = prepare_with(stun);
+  ASSERT_TRUE(accepted.has_value());
+  ASSERT_EQ(accepted->authority.ice_servers.size(), 1u);
+  EXPECT_TRUE(accepted->authority.ice_servers[0].username.empty());
+
+  // TURN with both credentials still parses.
+  Json::Value turn = stun;
+  turn["urls"][0] = "turn:turn.example.test:3478";
+  turn["username"] = "user";
+  turn["credential"] = "pass";
+  EXPECT_TRUE(prepare_with(turn).has_value());
+
+  // Half a credential pair is malformed.
+  Json::Value half = stun;
+  half["username"] = "user";
+  EXPECT_FALSE(prepare_with(half).has_value());
+}
+
+TEST(JsonProtocolTest, RejectsMalformedRouteGeneration) {
+  Json::Value root = AuthorityBase(kPrepareType);
+  root["expiresAt"] = Json::Int64(kNowMs + 120'000);
+  root["leaseExpiresAt"] = Json::Int64(kNowMs + 15'000);
+  root["daemonGeneration"] = 7;
+  root["mode"] = kViewMode;
+  root["inputEpoch"] = 0;
+  Json::Value ice(Json::arrayValue);
+  ice.append("stun:stun.example.test:3478");
+  root["iceServers"] = ice;
+
+  root["routeGeneration"] = Json::Int64(-1);
+  EXPECT_FALSE(ParseServiceSignal(root, kNowMs).has_value());
+  root["routeGeneration"] = Json::Int64(9'007'199'254'740'992LL);
+  EXPECT_FALSE(ParseServiceSignal(root, kNowMs).has_value());
+  root["routeGeneration"] = "19";
+  EXPECT_FALSE(ParseServiceSignal(root, kNowMs).has_value());
+}
+
 TEST(JsonProtocolTest, AcceptsDefaultControlPrepareAuthority) {
   Json::Value root = AuthorityBase(kPrepareType);
   root["expiresAt"] = Json::Int64(kNowMs + 120'000);
   root["leaseExpiresAt"] = Json::Int64(kNowMs + 15'000);
   root["daemonGeneration"] = 7;
+  root["routeGeneration"] = Json::Int64(23);
   root["mode"] = kControlMode;
   root["inputEpoch"] = 1;
   Json::Value ice(Json::arrayValue);
@@ -75,12 +150,15 @@ TEST(JsonProtocolTest, AcceptsTheBoundedSixtySecondControllerLease) {
   Json::Value root = AuthorityBase(kLeaseType);
   root["leaseExpiresAt"] = Json::Int64(kNowMs + 60'000);
   root["daemonGeneration"] = 7;
+  root["routeGeneration"] = Json::Int64(23);
   root["mode"] = kViewMode;
   root["inputEpoch"] = 0;
 
   const auto parsed = ParseServiceSignal(root, kNowMs);
   ASSERT_TRUE(parsed.has_value());
   EXPECT_EQ(parsed->authority.lease_expires_at_ms, kNowMs + 60'000);
+  ASSERT_TRUE(parsed->authority.route_generation.has_value());
+  EXPECT_EQ(*parsed->authority.route_generation, 23);
 }
 
 TEST(JsonProtocolTest, RejectsUnknownModeReasonAndMalformedCapability) {

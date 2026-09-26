@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess, type ChildProcessWithoutNullStreams } from 'node:child_process';
-import { access, mkdtemp, rm } from 'node:fs/promises';
+import { access, mkdtemp, rm, stat } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve, win32 as pathWin32 } from 'node:path';
@@ -24,17 +24,43 @@ import {
   WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
   verifyWindowsAuthenticodeSigners,
 } from './windows-artifact-trust.js';
+import {
+  MACOS_AIDESK_APP_NAME,
+  MACOS_COMPUTER_USE_APP_NAME,
+  MACOS_COMPUTER_USE_RUNTIME_ROOT,
+  verifyMacosComputerUseExecutable,
+} from './macos-computer-use.js';
+import {
+  registerBrowserProcessResource,
+  registerMcpProcessResource,
+  releaseSessionResource,
+  sessionResourceOwnerFromEnv,
+  startSessionResourceExpirySweep,
+  touchSessionResource,
+} from '../daemon/session-resource-service.js';
+import type { SessionResourceOwner } from '../daemon/session-resource-registry.js';
 
 export const WINDOWS_DEFAULT_OCU_DIR = 'C:\\ProgramData\\imcodes-node\\computer-use-helper';
 const WINDOWS_DEFAULT_OCU_EXE = `${WINDOWS_DEFAULT_OCU_DIR}\\open-computer-use.exe`;
 const SHELL_SESSION1_OUTPUT_MAX_BYTES = 96 * 1024;
 const OPEN_COMPUTER_USE_STDOUT_MAX_BYTES = 24 * 1024 * 1024;
+const COMPUTER_USE_STATE_DEFAULT_MAX_NODES = 200;
+const COMPUTER_USE_STATE_MAX_NODES = 1_500;
+const COMPUTER_USE_STATE_DEFAULT_MAX_DEPTH = 64;
+const COMPUTER_USE_STATE_MAX_DEPTH = 80;
+const COMPUTER_USE_STATE_MAX_TEXT_BYTES = 48 * 1024;
 const OPEN_COMPUTER_USE_BINARY = process.platform === 'win32' ? 'open-computer-use.exe' : 'open-computer-use';
 const MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE = join(
-  'Open Computer Use.app',
+  MACOS_COMPUTER_USE_APP_NAME,
   'Contents',
   'MacOS',
   'OpenComputerUse',
+);
+const MACOS_AIDESK_APP_EXECUTABLE = join(
+  MACOS_AIDESK_APP_NAME,
+  'Contents',
+  'MacOS',
+  'aidesk-agent',
 );
 
 function platformArchKey(platform: NodeJS.Platform = process.platform, arch: string = process.arch): string {
@@ -61,53 +87,84 @@ async function fileExists(path: string): Promise<boolean> {
   try { await access(path); return true; } catch { return false; }
 }
 
-export function openComputerUseCandidateBinariesForTest(moduleFilePath?: string, entryFilePath?: string): string[] {
-  return openComputerUseCandidateBinaries({ moduleFilePath, entryFilePath });
+export function openComputerUseCandidateBinariesForTest(
+  moduleFilePath?: string,
+  entryFilePath?: string,
+  platform: NodeJS.Platform = process.platform,
+  arch: string = process.arch,
+): string[] {
+  return openComputerUseCandidateBinaries({ moduleFilePath, entryFilePath, platform, arch });
 }
 
-function pushPackagedHelperCandidates(candidates: Array<string | undefined>, baseDir: string, key: string): void {
+function pushPackagedHelperCandidates(
+  candidates: Array<string | undefined>,
+  baseDir: string,
+  key: string,
+  platform: NodeJS.Platform,
+  binary: string,
+): void {
   const helperRoots = [
     resolve(baseDir, '..', 'computer-use-helper', key),
     resolve(baseDir, '..', '..', 'computer-use-helper', key),
     resolve(baseDir, '..', '..', 'dist', 'computer-use-helper', key),
   ];
-  if (process.platform === 'darwin') {
+  if (platform === 'darwin') {
     candidates.push(...helperRoots.map((root) => join(root, MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE)));
   }
   candidates.push(
     // npm package layout: dist/src/index.js -> dist/computer-use-helper/<platform-arch>/...
-    join(helperRoots[0]!, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[0]!, binary),
     // module layout: dist/src/node/computer-use-runner.js -> dist/computer-use-helper/<platform-arch>/...
-    join(helperRoots[1]!, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[1]!, binary),
     // source/dev checkout layout: src/... -> dist/computer-use-helper/<platform-arch>/...
-    join(helperRoots[2]!, OPEN_COMPUTER_USE_BINARY),
+    join(helperRoots[2]!, binary),
   );
 }
 
-function openComputerUseCandidateBinaries(options: { moduleFilePath?: string; entryFilePath?: string } = {}): string[] {
-  const key = platformArchKey();
-  const helperDir = process.env.IMCODES_COMPUTER_USE_HELPER_DIR?.trim();
+interface OpenComputerUseResolutionOptions {
+  moduleFilePath?: string;
+  entryFilePath?: string;
+  platform?: NodeJS.Platform;
+  arch?: string;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+}
+
+function openComputerUseCandidateBinaries(options: OpenComputerUseResolutionOptions = {}): string[] {
+  const platform = options.platform ?? process.platform;
+  const arch = options.arch ?? process.arch;
+  const env = options.env ?? process.env;
+  const cwd = options.cwd ?? process.cwd();
+  const key = platformArchKey(platform, arch);
+  const binary = platform === 'win32' ? 'open-computer-use.exe' : 'open-computer-use';
+  const helperDir = env.IMCODES_COMPUTER_USE_HELPER_DIR?.trim();
   const candidates: Array<string | undefined> = [
-    process.env.IMCODES_COMPUTER_USE_EXE?.trim(),
-    helperDir ? join(helperDir, OPEN_COMPUTER_USE_BINARY) : undefined,
+    env.IMCODES_COMPUTER_USE_EXE?.trim(),
+    platform === 'darwin' && helperDir ? join(helperDir, MACOS_AIDESK_APP_EXECUTABLE) : undefined,
+    platform === 'darwin' && helperDir ? join(helperDir, MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE) : undefined,
+    helperDir ? join(helperDir, binary) : undefined,
   ];
 
   if (options.moduleFilePath) {
-    pushPackagedHelperCandidates(candidates, dirname(resolve(options.moduleFilePath)), key);
+    pushPackagedHelperCandidates(candidates, dirname(resolve(options.moduleFilePath)), key, platform, binary);
   }
-  const entryFilePath = options.entryFilePath ?? process.argv[1];
+  const entryFilePath = options.entryFilePath === undefined ? process.argv[1] : options.entryFilePath;
   if (entryFilePath) {
-    pushPackagedHelperCandidates(candidates, dirname(resolve(entryFilePath)), key);
+    pushPackagedHelperCandidates(candidates, dirname(resolve(entryFilePath)), key, platform, binary);
   }
   candidates.push(
+    ...(platform === 'darwin' ? [
+      join(MACOS_COMPUTER_USE_RUNTIME_ROOT, MACOS_AIDESK_APP_EXECUTABLE),
+      join(MACOS_COMPUTER_USE_RUNTIME_ROOT, MACOS_OPEN_COMPUTER_USE_APP_EXECUTABLE),
+    ] : []),
     // Build-tree fallback for local development and tests.
-    resolve(process.cwd(), 'dist', 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
-    resolve(process.cwd(), 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
+    resolve(cwd, 'dist', 'computer-use-helper', key, binary),
+    resolve(cwd, 'computer-use-helper', key, binary),
     // controlled-node / manually-installed sidecar next to the running executable.
-    join(dirname(process.execPath), 'computer-use-helper', OPEN_COMPUTER_USE_BINARY),
-    join(dirname(process.execPath), 'computer-use-helper', key, OPEN_COMPUTER_USE_BINARY),
-    process.platform === 'win32' ? WINDOWS_DEFAULT_OCU_EXE : undefined,
-    OPEN_COMPUTER_USE_BINARY,
+    join(dirname(process.execPath), 'computer-use-helper', binary),
+    join(dirname(process.execPath), 'computer-use-helper', key, binary),
+    platform === 'win32' ? WINDOWS_DEFAULT_OCU_EXE : undefined,
+    binary,
   );
 
   const unique = new Set<string>();
@@ -118,19 +175,56 @@ function openComputerUseCandidateBinaries(options: { moduleFilePath?: string; en
   });
 }
 
-async function resolveOpenComputerUseBinary(): Promise<string> {
-  const candidates = openComputerUseCandidateBinaries();
-  const signedWindowsRelease = process.platform === 'win32'
+export async function resolveOpenComputerUseBinaryForTest(options: OpenComputerUseResolutionOptions & {
+  fileExists: (path: string) => Promise<boolean>;
+  verifyTrustedArtifact: (path: string) => Promise<boolean>;
+}): Promise<string> {
+  const platform = options.platform ?? process.platform;
+  const candidates = openComputerUseCandidateBinaries(options);
+  const signedWindowsRelease = platform === 'win32'
     && /^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256);
+  const requireTrustedArtifact = signedWindowsRelease || platform === 'darwin';
   return selectOpenComputerUseBinaryForTest(candidates, {
-    requireReleaseSignature: signedWindowsRelease,
-    explicitOverride: process.env.IMCODES_COMPUTER_USE_EXE?.trim(),
-    fileExists,
-    verifySignature: (candidate) => verifyWindowsAuthenticodeSigners(
-      [candidate],
-      WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
-    ),
+    requireReleaseSignature: requireTrustedArtifact,
+    explicitOverride: options.env?.IMCODES_COMPUTER_USE_EXE?.trim(),
+    fileExists: options.fileExists,
+    verifySignature: options.verifyTrustedArtifact,
+    unavailableError: platform === 'darwin'
+      ? 'signed_macos_open_computer_use_helper_unavailable'
+      : 'signed_open_computer_use_helper_unavailable',
   });
+}
+
+async function resolveOpenComputerUseBinary(): Promise<string> {
+  return resolveOpenComputerUseBinaryForCurrentProcessForTest({
+    platform: process.platform,
+    arch: process.arch,
+    env: process.env,
+    cwd: process.cwd(),
+    fileExists,
+    verifyTrustedArtifact: async (candidate) => {
+      if (process.platform === 'darwin') {
+        try {
+          await verifyMacosComputerUseExecutable(candidate);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      return verifyWindowsAuthenticodeSigners([candidate], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256);
+    },
+  });
+}
+
+export async function resolveOpenComputerUseBinaryForCurrentProcessForTest(options: Omit<
+  Parameters<typeof resolveOpenComputerUseBinaryForTest>[0],
+  'moduleFilePath'
+>): Promise<string> {
+  // The controlled-node executable is an esbuild CJS/SEA bundle. In that
+  // format `import.meta.url` is undefined. Resolve from the running entry and
+  // cwd candidates instead; both ESM daemon builds and SEA executables put the
+  // helper beside that entry, and neither route can throw ERR_INVALID_ARG_TYPE.
+  return resolveOpenComputerUseBinaryForTest(options);
 }
 
 export async function selectOpenComputerUseBinaryForTest(
@@ -140,6 +234,7 @@ export async function selectOpenComputerUseBinaryForTest(
     explicitOverride?: string;
     fileExists: (path: string) => Promise<boolean>;
     verifySignature: (path: string) => Promise<boolean>;
+    unavailableError?: string;
   },
 ): Promise<string> {
   for (let index = 0; index < candidates.length; index++) {
@@ -159,16 +254,31 @@ export async function selectOpenComputerUseBinaryForTest(
     if (candidate === OPEN_COMPUTER_USE_BINARY) return candidate;
     if (await options.fileExists(candidate)) return candidate;
   }
-  if (options.requireReleaseSignature) throw new Error('signed_open_computer_use_helper_unavailable');
+  if (options.requireReleaseSignature) {
+    throw new Error(options.unavailableError ?? 'signed_open_computer_use_helper_unavailable');
+  }
   return OPEN_COMPUTER_USE_BINARY;
 }
 
-async function verifyOpenComputerUseBinaryForLaunch(binary: string): Promise<void> {
-  if (process.platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
+export async function verifyOpenComputerUseBinaryForLaunchForTest(
+  binary: string,
+  platform: NodeJS.Platform = process.platform,
+  verifyMacos: (path: string) => Promise<void> = verifyMacosComputerUseExecutable,
+  verifyWindows: (paths: readonly string[], signerSha256: string) => Promise<boolean> = verifyWindowsAuthenticodeSigners,
+): Promise<void> {
+  if (platform === 'darwin') {
+    await verifyMacos(binary);
+    return;
+  }
+  if (platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
   if (!pathWin32.isAbsolute(binary)
-    || !await verifyWindowsAuthenticodeSigners([binary], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) {
+    || !await verifyWindows([binary], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) {
     throw new Error('signed_open_computer_use_helper_authenticity_failed');
   }
+}
+
+async function verifyOpenComputerUseBinaryForLaunch(binary: string): Promise<void> {
+  await verifyOpenComputerUseBinaryForLaunchForTest(binary);
 }
 
 interface ComputerUseReturnOptions {
@@ -186,6 +296,8 @@ const COMPUTER_USE_INTERNAL_ARG_KEYS = new Set([
   'imageQuality',
   'imageMaxWidth',
   'duration_ms',
+  'maxNodes',
+  'maxDepth',
 ]);
 
 function stripInternalArgs(args: Record<string, unknown> | null): Record<string, unknown> | null {
@@ -220,8 +332,20 @@ function parseReturnOptions(tool: string, args: Record<string, unknown> | null):
 }
 
 
-function forwardedComputerUseArgs(args: Record<string, unknown> | null): Record<string, unknown> {
-  return stripInternalArgs(args) ?? {};
+function boundedInteger(value: unknown, fallback: number, maximum: number): number {
+  return typeof value === 'number' && Number.isFinite(value)
+    ? Math.min(Math.max(Math.round(value), 1), maximum)
+    : fallback;
+}
+
+function forwardedComputerUseArgs(tool: string, args: Record<string, unknown> | null): Record<string, unknown> {
+  const forwarded = stripInternalArgs(args) ?? {};
+  if (tool !== 'get_app_state') return forwarded;
+  return {
+    ...forwarded,
+    text_limit: forwarded.text_limit ?? 1_000,
+    max_tree_depth: boundedInteger(args?.maxDepth, COMPUTER_USE_STATE_DEFAULT_MAX_DEPTH, COMPUTER_USE_STATE_MAX_DEPTH),
+  };
 }
 
 function openComputerUseMcpToolArgs(tool: string, args: Record<string, unknown>): Record<string, unknown> {
@@ -262,17 +386,23 @@ class OpenComputerUseMcpClient {
   private nextId = 1;
   private pending = new Map<number, PendingMcp>();
   private starting: Promise<void> | null = null;
+  private resourceId: string | null = null;
 
-  constructor(private readonly binary: string) {}
+  constructor(
+    private readonly binary: string,
+    private readonly resourceOwner: SessionResourceOwner | null,
+  ) {}
 
   async callTool(tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
     await this.ensureStarted();
     return await this.request('tools/call', { name: tool, arguments: openComputerUseMcpToolArgs(tool, args) }, timeoutMs);
   }
 
-  close(): void {
+  async close(): Promise<void> {
     this.rejectAll(new Error('open_computer_use_mcp_closed'));
-    this.child?.kill();
+    const child = this.child;
+    await this.releaseResource();
+    child?.kill();
     this.child = null;
     this.starting = null;
     this.buffer = '';
@@ -286,23 +416,38 @@ class OpenComputerUseMcpClient {
   }
 
   private async start(): Promise<void> {
-    this.close();
+    await this.close();
     await verifyOpenComputerUseBinaryForLaunch(this.binary);
     const env = process.platform === 'win32'
       ? { ...process.env, OPEN_COMPUTER_USE_WINDOWS_ALLOW_UIA_TEXT_FALLBACK: '1' }
       : process.env;
-    const child = spawn(this.binary, ['mcp'], { windowsHide: true, env });
+    const child = spawn(this.binary, ['mcp'], {
+      windowsHide: true,
+      env,
+      detached: process.platform !== 'win32',
+    });
     this.child = child;
+    if (this.resourceOwner && child.pid) {
+      try {
+        this.resourceId = await registerMcpProcessResource(this.resourceOwner, child.pid, true, 'computer-use-mcp');
+      } catch (error) {
+        child.kill();
+        this.child = null;
+        throw error;
+      }
+    }
     child.stdout.setEncoding('utf8');
     child.stderr.setEncoding('utf8');
     child.stdout.on('data', (chunk) => this.onStdout(String(chunk)));
     child.stderr.on('data', () => {});
     child.on('error', (error) => {
       if (this.child === child) this.child = null;
+      void this.releaseResource();
       this.rejectAll(error instanceof Error ? error : new Error(String(error)));
     });
     child.on('exit', (code, signal) => {
       if (this.child === child) this.child = null;
+      void this.releaseResource();
       this.rejectAll(new Error(`open_computer_use_mcp_exited:${code ?? signal ?? 'unknown'}`));
     });
     await this.request('initialize', {
@@ -379,23 +524,69 @@ class OpenComputerUseMcpClient {
       this.pending.delete(id);
     }
   }
+
+  private async releaseResource(): Promise<void> {
+    const resourceId = this.resourceId;
+    this.resourceId = null;
+    if (resourceId && this.resourceOwner) {
+      await releaseSessionResource(resourceId, this.resourceOwner).catch(() => {});
+    }
+  }
 }
 
 let mcpClient: OpenComputerUseMcpClient | null = null;
 let mcpClientBinary = '';
+let mcpClientBinaryIdentity = '';
+let mcpClientOwnerKey = '';
+let stopComputerUseExpirySweep: (() => void) | null = null;
 
-async function openComputerUseMcpClient(): Promise<OpenComputerUseMcpClient> {
+function computerUseOwnerKey(owner: SessionResourceOwner | null | undefined): string {
+  return owner ? JSON.stringify([owner.sessionName, owner.sessionInstanceId, owner.runtimeEpoch]) : 'unowned';
+}
+
+function ensureComputerUseExpirySweep(): void {
+  stopComputerUseExpirySweep ??= startSessionResourceExpirySweep();
+}
+
+export function openComputerUseBinaryIdentityForTest(
+  binary: string,
+  metadata: { size: number; mtimeMs: number; ino: number } | null,
+): string {
+  return metadata
+    ? JSON.stringify([binary, metadata.size, metadata.mtimeMs, metadata.ino])
+    : binary;
+}
+
+async function openComputerUseBinaryIdentity(binary: string): Promise<string> {
+  const metadata = await stat(binary).catch(() => null);
+  return openComputerUseBinaryIdentityForTest(binary, metadata);
+}
+
+async function openComputerUseMcpClient(owner: SessionResourceOwner | null): Promise<OpenComputerUseMcpClient> {
   const bin = await resolveOpenComputerUseBinary();
-  if (!mcpClient || mcpClientBinary !== bin) {
-    mcpClient?.close();
-    mcpClient = new OpenComputerUseMcpClient(bin);
+  const binaryIdentity = await openComputerUseBinaryIdentity(bin);
+  const ownerKey = computerUseOwnerKey(owner);
+  if (!mcpClient
+    || mcpClientBinary !== bin
+    || mcpClientBinaryIdentity !== binaryIdentity
+    || mcpClientOwnerKey !== ownerKey) {
+    await mcpClient?.close();
+    mcpClient = new OpenComputerUseMcpClient(bin, owner);
     mcpClientBinary = bin;
+    mcpClientBinaryIdentity = binaryIdentity;
+    mcpClientOwnerKey = ownerKey;
   }
   return mcpClient;
 }
 
-async function callOpenComputerUseMcpTool(tool: string, args: Record<string, unknown>, timeoutMs: number): Promise<unknown> {
-  const client = await openComputerUseMcpClient();
+async function callOpenComputerUseMcpTool(
+  tool: string,
+  args: Record<string, unknown>,
+  timeoutMs: number,
+  owner: SessionResourceOwner | null,
+): Promise<unknown> {
+  if (owner) ensureComputerUseExpirySweep();
+  const client = await openComputerUseMcpClient(owner);
   const result = await client.callTool(tool, args, timeoutMs);
   if (isActionTool(tool) && typeof args.app === 'string' && args.app.trim() && isNoAppStateError(result)) {
     await client.callTool('get_app_state', { app: args.app, text_limit: 1_000, max_tree_nodes: 1_500, max_tree_depth: 80 }, timeoutMs);
@@ -412,7 +603,7 @@ export function openComputerUseCallArgs(tool: string, argsJson: string): string[
   } catch {
     args = null;
   }
-  const forwardedArgs = forwardedComputerUseArgs(args);
+  const forwardedArgs = forwardedComputerUseArgs(tool, args);
   const forwardedJson = JSON.stringify(forwardedArgs);
   if (isActionTool(tool) && typeof forwardedArgs?.app === 'string' && forwardedArgs.app.trim()) {
     return ['call', '--calls', JSON.stringify([
@@ -812,21 +1003,79 @@ $g.Dispose(); $bmp.Dispose(); $src.Dispose(); $srcStream.Dispose()
   });
 }
 
-async function normalizeContent(raw: unknown, options: ComputerUseReturnOptions): Promise<{ content: ComputerUseContentItem[]; truncated: boolean }> {
+export function boundComputerUseStateTextForTest(
+  text: string,
+  args: Record<string, unknown>,
+): { text: string; truncated: boolean; omittedNodes: number } {
+  const maxNodes = boundedInteger(
+    args.maxNodes,
+    COMPUTER_USE_STATE_DEFAULT_MAX_NODES,
+    COMPUTER_USE_STATE_MAX_NODES,
+  );
+  const lines = text.split(/\r?\n/u);
+  const kept: string[] = [];
+  let keptNodes = 0;
+  let keptBytes = 0;
+  let index = 0;
+  for (; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const isNode = line.trim().length > 0;
+    if (isNode && keptNodes >= maxNodes) break;
+    const nextBytes = utf8Bytes(line) + (kept.length > 0 ? 1 : 0);
+    // Leave enough room for the explicit truncation marker.
+    if (keptBytes + nextBytes > COMPUTER_USE_STATE_MAX_TEXT_BYTES - 64) break;
+    kept.push(line);
+    keptBytes += nextBytes;
+    if (isNode) keptNodes += 1;
+  }
+  const omittedNodes = lines.slice(index).filter((line) => line.trim().length > 0).length;
+  if (index >= lines.length) return { text, truncated: false, omittedNodes: 0 };
+  const bounded = kept.join('\n');
+  const marker = `truncated: ${Math.max(omittedNodes, 1)} nodes omitted`;
+  return {
+    text: bounded ? `${bounded}\n${marker}` : marker,
+    truncated: true,
+    omittedNodes: Math.max(omittedNodes, 1),
+  };
+}
+
+async function normalizeContent(
+  raw: unknown,
+  options: ComputerUseReturnOptions,
+  stateArgs?: Record<string, unknown>,
+): Promise<{ content: ComputerUseContentItem[]; truncated: boolean }> {
   const contentRaw = raw && typeof raw === 'object' && !Array.isArray(raw)
     ? (raw as { content?: unknown }).content
     : undefined;
   const items = Array.isArray(contentRaw) ? contentRaw : [];
   let truncated = false;
   const content: ComputerUseContentItem[] = [];
+  const stateText = stateArgs
+    ? items.flatMap((item) => item
+      && typeof item === 'object'
+      && !Array.isArray(item)
+      && (item as Record<string, unknown>).type === 'text'
+      && typeof (item as Record<string, unknown>).text === 'string'
+      ? [(item as { text: string }).text]
+      : []).join('\n')
+    : null;
+  let emittedStateText = false;
   for (const item of items) {
     if (!item || typeof item !== 'object' || Array.isArray(item)) continue;
     const record = item as Record<string, unknown>;
     if (record.type === 'text' && typeof record.text === 'string') {
       if (!options.includeState) continue;
-      const cut = truncateUtf8(record.text, COMPUTER_USE_MAX_TEXT_BYTES);
-      truncated ||= cut.truncated;
-      content.push({ type: 'text', text: cut.value });
+      if (stateArgs) {
+        if (emittedStateText) continue;
+        emittedStateText = true;
+        const bounded = boundComputerUseStateTextForTest(stateText ?? '', stateArgs);
+        truncated ||= bounded.truncated;
+        content.push({ type: 'text', text: bounded.text });
+      } else {
+        const cut = truncateUtf8(record.text, COMPUTER_USE_MAX_TEXT_BYTES);
+        truncated ||= cut.truncated;
+        content.push({ type: 'text', text: cut.value });
+      }
       continue;
     }
     if (record.type === 'image' && typeof record.data === 'string') {
@@ -846,7 +1095,17 @@ export async function normalizeOpenComputerUseParsedResult(
 ): Promise<{ content: ComputerUseContentItem[]; truncated: boolean; isError: boolean }> {
   const returnOptions = parseReturnOptions(tool, args);
   const isError = Boolean(parsed && typeof parsed === 'object' && !Array.isArray(parsed) && (parsed as { isError?: unknown }).isError);
-  const { content, truncated } = await normalizeContent(parsed, { ...returnOptions, includeState: returnOptions.includeState || isError });
+  const stateArgs = !isError && (
+    tool === 'get_app_state'
+    || (isActionTool(tool) && returnOptions.includeState)
+  )
+    ? (args ?? {})
+    : undefined;
+  const { content, truncated } = await normalizeContent(
+    parsed,
+    { ...returnOptions, includeState: returnOptions.includeState || isError },
+    stateArgs,
+  );
   if (!isError && isActionTool(tool) && !returnOptions.includeState) {
     return { content: [{ type: 'text', text: `${tool} completed` }, ...content], truncated, isError };
   }
@@ -864,6 +1123,12 @@ function actionableComputerUseError(
   }
   if (platform === 'linux' && /Namespace Atspi not available|No module named ['"]pyatspi['"]/.test(text)) {
     return 'Desktop app control is unavailable because this Linux host is missing AT-SPI accessibility support or a graphical desktop session. Browser automation is separate: install Google Chrome, Chromium, or Microsoft Edge and use a browser_* tool.';
+  }
+  if (platform === 'darwin' && text.includes('signed_macos_open_computer_use_helper_unavailable')) {
+    return 'Desktop app control is unavailable because the packaged signed Open Computer Use app is unavailable or failed verification. Reinstall or repair the signed IM.codes package; no PATH helper was executed.';
+  }
+  if (platform === 'darwin' && text.includes('signed_macos_open_computer_use_helper_authenticity_failed')) {
+    return 'Desktop app control is unavailable because the packaged Open Computer Use app failed signature verification. Reinstall or repair the signed IM.codes package; no unverified helper was executed.';
   }
   return text;
 }
@@ -1010,6 +1275,99 @@ function truncateJsonText(value: unknown, maxBytes: number = COMPUTER_USE_MAX_TE
 
 interface CdpResponse { id?: number; result?: unknown; error?: { message?: string; data?: string } }
 interface CdpEvent { method?: string; params?: unknown }
+
+interface BrowserCdpExceptionDetails {
+  text?: string;
+  exception?: { className?: string; description?: string };
+}
+
+function browserCdpExceptionMessage(details: BrowserCdpExceptionDetails): string {
+  const description = details.exception?.description?.trim();
+  const marker = description?.match(/(?:^|\b)(invalid_selector|element_not_found):\s*([^\r\n]*)/u);
+  let message: string;
+  if (marker) {
+    message = `${marker[1]}: ${marker[2]}`.trimEnd();
+  } else if (description
+    && /SyntaxError/u.test(description)
+    && /querySelector|invalid selector|valid selector/iu.test(description)) {
+    message = `invalid_selector: ${description.split(/\r?\n/u, 1)[0]}`;
+  } else {
+    const reason = description
+      || details.exception?.className?.trim()
+      || details.text?.trim()
+      || 'browser_evaluate_failed';
+    message = `page_exception: ${reason}`;
+  }
+  return truncateUtf8(message, COMPUTER_USE_MAX_ERROR_BYTES).value;
+}
+
+export function browserCdpExceptionMessageForTest(details: BrowserCdpExceptionDetails): string {
+  return browserCdpExceptionMessage(details);
+}
+
+type BrowserSelectorAction = 'click' | 'fill' | 'focus';
+
+function browserSelectorScript(args: Record<string, unknown>, action: BrowserSelectorAction): string {
+  const selector = optionalStringArg(args, 'selector');
+  const text = optionalStringArg(args, 'text');
+  const value = typeof args.value === 'string' ? args.value : '';
+  const exact = args.exact === true;
+  const selectorJson = JSON.stringify(selector ?? null);
+  const textJson = JSON.stringify(text ?? null);
+  const valueJson = JSON.stringify(value);
+  return `(() => {
+    const selector = ${selectorJson};
+    const explicitText = ${textJson};
+    const exact = ${JSON.stringify(exact)};
+    const value = ${valueJson};
+    function visible(el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+    function byVisibleText(wanted) {
+      if (!wanted) return null;
+      const interactive = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],label,[tabindex]'));
+      const all = interactive.length > 0 ? interactive : Array.from(document.querySelectorAll('*'));
+      const matches = all.map((candidate) => {
+        const t = (candidate.innerText || candidate.textContent || candidate.getAttribute('aria-label') || candidate.getAttribute('placeholder') || '').trim();
+        return { candidate, t };
+      }).filter(({ candidate, t }) => visible(candidate) && (exact ? t === wanted : t.includes(wanted)));
+      const exactMatch = matches.find(({ t }) => t === wanted);
+      if (exactMatch) return exactMatch.candidate;
+      matches.sort((left, right) => left.t.length - right.t.length);
+      return matches[0]?.candidate || null;
+    }
+    let el = null;
+    let selectorError = null;
+    let selectorText = selector;
+    if (selector) {
+      if (selector.startsWith('text=')) {
+        selectorText = selector.slice('text='.length).trim();
+      } else {
+        try { el = document.querySelector(selector); }
+        catch (error) { selectorError = error instanceof Error ? error.message : String(error); }
+      }
+      if (!el) el = byVisibleText(selectorText);
+    }
+    if (!el) el = byVisibleText(explicitText);
+    if (!el && selectorError) throw new Error('invalid_selector: ' + selectorError);
+    if (!el) throw new Error('element_not_found: ' + (selector || explicitText || 'selector_or_text_required'));
+    el.scrollIntoView({ block: 'center', inline: 'center' });
+    el.focus?.();
+    if (${JSON.stringify(action)} === 'click') { el.click(); return true; }
+    if (${JSON.stringify(action)} === 'fill') {
+      el.value = value;
+      el.dispatchEvent(new Event('input', { bubbles: true }));
+      el.dispatchEvent(new Event('change', { bubbles: true }));
+      return true;
+    }
+    return true;
+  })()`;
+}
+
+export function browserSelectorScriptForTest(
+  args: Record<string, unknown>,
+  action: BrowserSelectorAction,
+): string {
+  return browserSelectorScript(args, action);
+}
 
 type CdpPending = {
   resolve: (value: unknown) => void;
@@ -1244,6 +1602,33 @@ interface BrowserCdpCaller {
   call(method: string, params?: Record<string, unknown>, timeoutMs?: number): Promise<unknown>;
 }
 
+async function evaluateBrowserExpression(
+  client: BrowserCdpCaller,
+  expression: string,
+  timeoutMs: number,
+): Promise<unknown> {
+  const boundedTimeout = Math.min(timeoutMs, 30_000);
+  const result = await client.call('Runtime.evaluate', {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: boundedTimeout,
+  }, boundedTimeout) as {
+    result?: { value?: unknown; description?: string };
+    exceptionDetails?: BrowserCdpExceptionDetails;
+  };
+  if (result.exceptionDetails) throw new Error(browserCdpExceptionMessage(result.exceptionDetails));
+  return result.result?.value ?? result.result?.description ?? null;
+}
+
+export async function evaluateBrowserExpressionForTest(
+  client: BrowserCdpCaller,
+  expression: string,
+  timeoutMs = 30_000,
+): Promise<unknown> {
+  return evaluateBrowserExpression(client, expression, timeoutMs);
+}
+
 interface BrowserViewportScreenshot {
   item?: ComputerUseContentItem;
   truncated: boolean;
@@ -1374,6 +1759,9 @@ class BrowserUseController {
   private client: CdpClient | null = null;
   private starting: Promise<CdpClient> | null = null;
   private cdpHttpEndpoint: string | null = null;
+  private resourceId: string | null = null;
+
+  constructor(private readonly resourceOwner: SessionResourceOwner | null) {}
 
   async run(tool: ComputerUseToolName, args: Record<string, unknown>, timeoutMs: number): Promise<{ content: ComputerUseContentItem[]; truncated?: boolean }> {
     if (tool === 'browser_close') {
@@ -1381,6 +1769,7 @@ class BrowserUseController {
       return { content: [{ type: 'text', text: 'browser closed' }] };
     }
     const client = await this.ensureClient(args, timeoutMs);
+    if (this.resourceId) await touchSessionResource(this.resourceId);
     if (tool === 'browser_open' || tool === 'browser_navigate') {
       const url = optionalStringArg(args, 'url');
       if (tool === 'browser_navigate' && !url) throw new Error('url_required');
@@ -1389,19 +1778,19 @@ class BrowserUseController {
     }
     if (tool === 'browser_snapshot') return this.snapshot(client, args, timeoutMs);
     if (tool === 'browser_click') {
-      await this.evalInPage(client, this.selectorScript(args, 'click'), timeoutMs);
+      await this.evalInPage(client, browserSelectorScript(args, 'click'), timeoutMs);
       return { content: [{ type: 'text', text: 'browser_click completed' }] };
     }
     if (tool === 'browser_fill') {
       if (typeof args.value !== 'string') throw new Error('value_required');
-      await this.evalInPage(client, this.selectorScript(args, 'fill'), timeoutMs);
+      await this.evalInPage(client, browserSelectorScript(args, 'fill'), timeoutMs);
       return { content: [{ type: 'text', text: 'browser_fill completed' }] };
     }
     if (tool === 'browser_press') {
       const key = optionalStringArg(args, 'key');
       if (!key) throw new Error('key_required');
       const selector = optionalStringArg(args, 'selector');
-      if (selector) await this.evalInPage(client, this.selectorScript(args, 'focus'), timeoutMs);
+      if (selector) await this.evalInPage(client, browserSelectorScript(args, 'focus'), timeoutMs);
       await client.call('Input.dispatchKeyEvent', { type: 'keyDown', key }, Math.min(timeoutMs, 30_000));
       await client.call('Input.dispatchKeyEvent', { type: 'keyUp', key }, Math.min(timeoutMs, 30_000));
       return { content: [{ type: 'text', text: 'browser_press completed' }] };
@@ -1435,12 +1824,26 @@ class BrowserUseController {
       // for confined (snap/flatpak/container) browsers.
       const port = await reserveFreePort();
       const launchArgs = browserLaunchArgs(this.userDataDir, args, process.platform, process.env, port);
-      this.child = spawn(browser, launchArgs, { windowsHide: true, stdio: 'ignore' });
+      this.child = spawn(browser, launchArgs, {
+        windowsHide: true,
+        stdio: 'ignore',
+        detached: process.platform !== 'win32',
+      });
+      if (this.resourceOwner && this.child.pid) {
+        try {
+          this.resourceId = await registerBrowserProcessResource(this.resourceOwner, this.child.pid);
+        } catch (error) {
+          this.child.kill();
+          this.child = null;
+          throw error;
+        }
+      }
       this.child.once('exit', () => {
         this.client?.close();
         this.client = null;
         this.cdpHttpEndpoint = null;
         this.child = null;
+        void this.releaseResource();
       });
       const base = `http://127.0.0.1:${port}`;
       const browserUserAgent = await this.waitForCdp(base, Date.now() + Math.min(timeoutMs, 30_000));
@@ -1555,50 +1958,7 @@ class BrowserUseController {
   }
 
   private async evalInPage(client: CdpClient, expression: string, timeoutMs: number): Promise<unknown> {
-    const result = await client.call('Runtime.evaluate', {
-      expression,
-      awaitPromise: true,
-      returnByValue: true,
-      timeout: Math.min(timeoutMs, 30_000),
-    }, Math.min(timeoutMs, 30_000)) as { result?: { value?: unknown; description?: string }; exceptionDetails?: { text?: string } };
-    if (result.exceptionDetails) throw new Error(result.exceptionDetails.text || 'browser_evaluate_failed');
-    return result.result?.value ?? result.result?.description ?? null;
-  }
-
-  private selectorScript(args: Record<string, unknown>, action: 'click' | 'fill' | 'focus'): string {
-    const selector = optionalStringArg(args, 'selector');
-    const text = optionalStringArg(args, 'text');
-    const value = typeof args.value === 'string' ? args.value : '';
-    const exact = args.exact === true;
-    const selectorJson = JSON.stringify(selector ?? null);
-    const textJson = JSON.stringify(text ?? null);
-    const valueJson = JSON.stringify(value);
-    return `(() => {
-      const selector = ${selectorJson};
-      const text = ${textJson};
-      const exact = ${JSON.stringify(exact)};
-      const value = ${valueJson};
-      function visible(el) { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
-      let el = selector ? document.querySelector(selector) : null;
-      if (!el && text) {
-        const all = Array.from(document.querySelectorAll('a,button,input,textarea,select,[role="button"],[role="link"],label,*'));
-        el = all.find((candidate) => {
-          const t = (candidate.innerText || candidate.textContent || candidate.getAttribute('aria-label') || candidate.getAttribute('placeholder') || '').trim();
-          return visible(candidate) && (exact ? t === text : t.includes(text));
-        }) || null;
-      }
-      if (!el) throw new Error('element_not_found');
-      el.scrollIntoView({ block: 'center', inline: 'center' });
-      el.focus?.();
-      if (${JSON.stringify(action)} === 'click') { el.click(); return true; }
-      if (${JSON.stringify(action)} === 'fill') {
-        el.value = value;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-        return true;
-      }
-      return true;
-    })()`;
+    return evaluateBrowserExpression(client, expression, timeoutMs);
   }
 
   private async snapshot(client: CdpClient, args: Record<string, unknown>, timeoutMs: number): Promise<{ content: ComputerUseContentItem[]; truncated?: boolean }> {
@@ -1635,28 +1995,55 @@ class BrowserUseController {
     this.client?.close();
     this.client = null;
     this.cdpHttpEndpoint = null;
-    this.child?.kill();
+    const child = this.child;
     this.child = null;
+    await this.releaseResource();
+    child?.kill();
     const dir = this.userDataDir;
     this.userDataDir = null;
     if (dir) await rm(dir, { recursive: true, force: true }).catch(() => {});
   }
+
+  private async releaseResource(): Promise<void> {
+    const resourceId = this.resourceId;
+    this.resourceId = null;
+    if (resourceId && this.resourceOwner) {
+      await releaseSessionResource(resourceId, this.resourceOwner).catch(() => {});
+    }
+  }
 }
 
-const browserUseController = new BrowserUseController();
+const browserUseControllers = new Map<string, BrowserUseController>();
+
+function browserUseController(owner: SessionResourceOwner | null): BrowserUseController {
+  const key = computerUseOwnerKey(owner);
+  let controller = browserUseControllers.get(key);
+  if (!controller) {
+    controller = new BrowserUseController(owner);
+    browserUseControllers.set(key, controller);
+  }
+  if (owner) ensureComputerUseExpirySweep();
+  return controller;
+}
 
 export async function closeComputerUseRuntimeForProcessExit(): Promise<void> {
-  mcpClient?.close();
+  await mcpClient?.close();
   mcpClient = null;
   mcpClientBinary = '';
+  mcpClientBinaryIdentity = '';
+  mcpClientOwnerKey = '';
   fastPointerClient?.close();
   fastPointerClient = null;
-  await browserUseController.close();
+  await Promise.all([...browserUseControllers.values()].map((controller) => controller.close()));
+  browserUseControllers.clear();
+  stopComputerUseExpirySweep?.();
+  stopComputerUseExpirySweep = null;
 }
 
 async function runBrowserUseTool(request: ComputerUseRequest, timeoutMs: number, started: number): Promise<ComputerUseResult> {
   try {
-    const result = await browserUseController.run(request.tool, request.arguments ?? {}, timeoutMs);
+    const owner = request.resourceOwner ?? sessionResourceOwnerFromEnv();
+    const result = await browserUseController(owner).run(request.tool, request.arguments ?? {}, timeoutMs);
     return {
       correlationId: request.correlationId,
       ok: true,
@@ -1749,8 +2136,20 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
       const returnOptions = parseReturnOptions(request.tool, argsObject);
       if (returnOptions.includeState || returnOptions.includeImage) {
         try {
-          const snapshot = await callOpenComputerUseMcpTool('get_app_state', { app: argsObject.app }, timeoutMs);
-          const normalized = await normalizeContent(snapshot, returnOptions);
+          const snapshotArgs = forwardedComputerUseArgs('get_app_state', {
+            app: argsObject.app,
+            ...(argsObject.maxNodes !== undefined ? { maxNodes: argsObject.maxNodes } : {}),
+            ...(argsObject.maxDepth !== undefined ? { maxDepth: argsObject.maxDepth } : {}),
+          });
+          const snapshot = await callOpenComputerUseMcpTool(
+            'get_app_state', snapshotArgs, timeoutMs,
+            request.resourceOwner ?? sessionResourceOwnerFromEnv(),
+          );
+          const normalized = await normalizeContent(
+            snapshot,
+            returnOptions,
+            returnOptions.includeState ? argsObject : undefined,
+          );
           return {
             correlationId: request.correlationId,
             ok: true,
@@ -1778,7 +2177,12 @@ export async function runComputerUseTool(request: ComputerUseRequest): Promise<C
   try {
     let parsed: unknown;
     try {
-      parsed = await callOpenComputerUseMcpTool(request.tool, forwardedComputerUseArgs(argsObject), timeoutMs);
+      parsed = await callOpenComputerUseMcpTool(
+        request.tool,
+        forwardedComputerUseArgs(request.tool, argsObject),
+        timeoutMs,
+        request.resourceOwner ?? sessionResourceOwnerFromEnv(),
+      );
     } catch {
       const bin = await resolveOpenComputerUseBinary();
       const proc = await execFileBounded(bin, openComputerUseCallArgs(request.tool, argsJson), timeoutMs + 1_000, openComputerUseEnv(request.tool));

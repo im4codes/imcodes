@@ -7,6 +7,8 @@ import { configureSharedContextRuntime } from '../../src/context/shared-context-
 import { makeMemoryShortRef, resetMemoryShortRefsForTests, resolveMemoryShortRef } from '../../src/context/memory-short-ref.js';
 import { ensureContextNamespace, writeContextObservation, writeProcessedProjection } from '../../src/store/context-store.js';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
+import { projectionOwnerCache } from '../../src/daemon/memory-projection-owner-cache.js';
+import { setMemoryInjectionEnabled } from '../../src/context/memory-injection-toggle.js';
 
 const detectRepoMock = vi.hoisted(() => vi.fn());
 
@@ -27,6 +29,7 @@ describe('resolveTransportContextBootstrap', () => {
   beforeEach(() => {
     detectRepoMock.mockReset();
     resetMemoryShortRefsForTests();
+    projectionOwnerCache.clear();
     configureSharedContextRuntime(null);
     vi.unstubAllGlobals();
     vi.unstubAllEnvs();
@@ -412,6 +415,35 @@ describe('resolveTransportContextBootstrap', () => {
     }));
   });
 
+  it('omits durable/recent startup memory once memory_injection_set disables it for the namespace, even when processed memory exists', async () => {
+    const now = Date.now();
+    detectRepoMock.mockResolvedValue({
+      info: {
+        remoteUrl: 'git@github.com:acme/repo.git',
+      },
+    });
+    writeProcessedProjection({
+      namespace: {
+        scope: 'personal',
+        projectId: 'github.com/acme/repo',
+      },
+      class: 'recent_summary',
+      sourceEventIds: ['evt-toggle'],
+      summary: 'Should be hidden once injection is disabled',
+      content: { kind: 'startup' },
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+    await setMemoryInjectionEnabled({ scope: 'personal', projectId: 'github.com/acme/repo' }, false);
+
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: {},
+    });
+
+    expect(result.startupMemory).toBeUndefined();
+  });
+
   it('includes cloud startup memory for the resolved personal project when backend sync is available', async () => {
     detectRepoMock.mockResolvedValue({
       info: {
@@ -515,6 +547,33 @@ describe('resolveTransportContextBootstrap', () => {
     expect(result.startupMemory?.items.map((item) => item.id)).not.toContain('cloud-other-scope');
   });
 
+  it('never surfaces proj:7326uk25z6pnx outside the target consumer namespace', async () => {
+    const projectionId = '455678dc-ab00-4e94-b12c-cac37417a3b8';
+    const remoteItem = {
+      type: 'processed' as const,
+      id: projectionId,
+      projectId: 'github.com/acme/repo',
+      scope: 'personal',
+      userId: 'brain-user',
+      projectionClass: 'recent_summary' as const,
+      summary: 'Brain-only projection must not become a recoverable CC3 action',
+      createdAt: 1,
+      originServerId: 'server-brain',
+    };
+    const brain = await buildTransportStartupMemory({
+      scope: 'personal', projectId: 'github.com/acme/repo', userId: 'brain-user',
+    }, { remoteItems: [remoteItem] });
+    expect(brain?.injectedText).toContain('proj:');
+    expect(brain?.items.map((item) => item.id)).toContain(projectionId);
+    expect(projectionOwnerCache.get(projectionId)).toBe('server-brain');
+
+    const cc3 = await buildTransportStartupMemory({
+      scope: 'personal', projectId: 'github.com/acme/repo', userId: 'cc3-user',
+    }, { remoteItems: [remoteItem] });
+    expect(cc3?.items.map((item) => item.id) ?? []).not.toContain(projectionId);
+    expect(cc3?.injectedText ?? '').not.toContain('proj:7326uk25z6pnx');
+  });
+
   it('buildTransportStartupMemory keeps up to 20 durable plus 30 recent memories', async () => {
     const now = Date.now();
     const namespace = {
@@ -550,6 +609,27 @@ describe('resolveTransportContextBootstrap', () => {
     expect(startup?.items.filter((item) => item.projectionClass === 'durable_memory_candidate')).toHaveLength(20);
     expect(startup?.items.filter((item) => item.projectionClass === 'recent_summary')).toHaveLength(30);
     expect(startup?.items.slice(0, 20).every((item) => item.projectionClass === 'durable_memory_candidate')).toBe(true);
+  });
+
+  it('buildTransportStartupMemory returns no project memory for any caller once the project turned injection off', async () => {
+    const now = Date.now();
+    const namespace = { scope: 'personal' as const, projectId: 'github.com/acme/repo' };
+    writeProcessedProjection({
+      namespace,
+      class: 'durable_memory_candidate',
+      sourceEventIds: ['evt-toggle-off'],
+      summary: 'Memory that must not be injected while the toggle is off',
+      content: {},
+      createdAt: now - 100,
+      updatedAt: now - 50,
+    });
+    expect((await buildTransportStartupMemory(namespace))?.items.length).toBeGreaterThan(0);
+
+    // Written the way memory_injection_set writes it: daemon-local owner filled in.
+    await setMemoryInjectionEnabled({ ...namespace, userId: 'daemon-local' }, false);
+    // The first-dispatch fallback calls the builder directly, without managedSkillsOnly.
+    const startup = await buildTransportStartupMemory(namespace, { projectDir: '/tmp/project' });
+    expect(startup?.items.some((item) => item.summary.includes('must not be injected')) ?? false).toBe(false);
   });
 
   it('buildTransportStartupMemory mixes important and recent startup memories with durable entries first', async () => {

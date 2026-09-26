@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { CRON_COMPLETION_POLICY, CRON_STATUS, CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_CONTROL_CONTRACT,
+  CRON_STATUS,
+  CRON_MSG,
+  buildLegacyCronControlBlock,
+  type CronDispatchMessage,
+} from '../../shared/cron-types.js';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 
@@ -38,6 +45,7 @@ const mockEnv = {
 
 describe('jobDispatchCron', () => {
   let jobDispatchCron: typeof import('../src/cron/job-dispatch.js').jobDispatchCron;
+  let dispatchJobNow: typeof import('../src/cron/job-dispatch.js').dispatchJobNow;
 
   beforeEach(async () => {
     vi.clearAllMocks();
@@ -49,15 +57,17 @@ describe('jobDispatchCron', () => {
 
     const mod = await import('../src/cron/job-dispatch.js');
     jobDispatchCron = mod.jobDispatchCron;
+    dispatchJobNow = mod.dispatchJobNow;
   });
 
   it('dispatches due jobs via WsBridge', async () => {
+    const previousRunAt = Date.now() - 601_000;
     dbRows.push({
       id: 'j1', server_id: 's1', user_id: 'u1', name: 'Test Job',
       cron_expr: '*/10 * * * *', action: '{"type":"command","command":"hello"}',
       project_name: 'myapp', target_role: 'brain', status: 'active',
       timezone: 'Asia/Shanghai',
-      last_run_at: null, next_run_at: Date.now() - 1000, expires_at: null,
+      last_run_at: Date.now(), previous_run_at: previousRunAt, next_run_at: Date.now() - 1000, expires_at: null,
       created_at: Date.now(), updated_at: null,
     });
 
@@ -74,7 +84,95 @@ describe('jobDispatchCron', () => {
     expect(sent.timezone).toBe('Asia/Shanghai');
     expect(sent.expiresAt).toBeNull();
     expect(sent.completionPolicy).toBe(CRON_COMPLETION_POLICY.RECURRING);
+    expect(sent.previousRunAt).toBe(previousRunAt);
+    expect(sent.nextRunAt).toEqual(expect.any(Number));
     expect(sent.action).toEqual({ type: 'command', command: 'hello' });
+  });
+
+  it('durably migrates a legacy self-managed row before dispatching its registered contract', async () => {
+    const legacyCommand = `Inspect progress\n\n${buildLegacyCronControlBlock(
+      'legacy-self',
+      CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+    )}`;
+    dbRows.push({
+      id: 'legacy-self', server_id: 's1', user_id: 'u1', name: 'Legacy Self',
+      cron_expr: '*/10 * * * *',
+      action: JSON.stringify({ type: 'command', command: legacyCommand, selfManaged: true }),
+      project_name: 'myapp', target_role: 'brain', status: 'active',
+      completion_policy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      timezone: 'Asia/Shanghai', last_run_at: null,
+      next_run_at: Date.now() - 1000, expires_at: null,
+      created_at: Date.now(), updated_at: null,
+    });
+
+    await jobDispatchCron(mockEnv);
+
+    const migration = dbExecutes.find((entry) => (
+      entry.sql.includes('UPDATE cron_jobs SET action') && entry.params.includes('legacy-self')
+    ));
+    expect(migration).toBeDefined();
+    const persisted = JSON.parse(String(migration?.params[0])) as Record<string, unknown>;
+    expect(persisted).toMatchObject({
+      type: 'command', command: 'Inspect progress', selfManaged: true,
+      cronControl: {
+        contractId: CRON_CONTROL_CONTRACT.contractId, version: CRON_CONTROL_CONTRACT.version,
+        scheduleId: 'legacy-self',
+      },
+    });
+    const sent = JSON.parse(mockSendToDaemon.mock.calls[0][0]) as CronDispatchMessage;
+    expect(sent.action).toEqual(persisted);
+
+    // A restart hydrates the durable registration without rewriting it.
+    dbRows[0]!.action = String(migration?.params[0]);
+    dbExecutes.length = 0;
+    mockSendToDaemon.mockClear();
+    await jobDispatchCron(mockEnv);
+    expect(mockSendToDaemon).toHaveBeenCalledOnce();
+    expect(dbExecutes.some((entry) => entry.sql.includes('UPDATE cron_jobs SET action'))).toBe(false);
+  });
+
+  it('hydrates and persists the same registered contract on manual dispatch', async () => {
+    const job = {
+      id: 'manual-self', server_id: 's1', user_id: 'u1', name: 'Manual Self',
+      cron_expr: '*/10 * * * *',
+      action: JSON.stringify({ type: 'command', command: 'Inspect manually', selfManaged: true }),
+      project_name: 'myapp', target_role: 'brain', target_session_name: null, status: 'active',
+      completion_policy: CRON_COMPLETION_POLICY.RECURRING,
+      timezone: null, last_run_at: null, next_run_at: Date.now(), expires_at: null,
+      created_at: Date.now(), updated_at: null,
+    } as any;
+
+    await dispatchJobNow(mockEnv, job);
+
+    const migration = dbExecutes.find((entry) => entry.sql.includes('UPDATE cron_jobs SET action'));
+    expect(migration).toBeDefined();
+    expect(JSON.parse(String(migration?.params[0]))).toMatchObject({
+      command: 'Inspect manually',
+      cronControl: { contractId: CRON_CONTROL_CONTRACT.contractId, scheduleId: 'manual-self' },
+    });
+    expect(JSON.parse(mockSendToDaemon.mock.calls[0][0]).action)
+      .toEqual(JSON.parse(String(migration?.params[0])));
+  });
+
+  it.each([
+    ['unknown version', { contractId: 'supervision_cron_control_v1', version: 9, scheduleId: 'bad-control', constraints: {} }],
+    ['task mismatch', { contractId: 'supervision_cron_control_v1', version: 1, scheduleId: 'other', constraints: {} }],
+    ['tampered ref', { contractId: 'unknown_v9', version: 1, scheduleId: 'bad-control', constraints: {} }],
+  ])('fails closed on %s instead of dispatching without constraints', async (_label, cronControl) => {
+    dbRows.push({
+      id: 'bad-control', server_id: 's1', user_id: 'u1', name: 'Bad Control',
+      cron_expr: '*/10 * * * *',
+      action: JSON.stringify({ type: 'command', command: 'Inspect progress', selfManaged: true, cronControl }),
+      project_name: 'myapp', target_role: 'brain', status: 'active',
+      completion_policy: CRON_COMPLETION_POLICY.RECURRING,
+      timezone: null, last_run_at: null, next_run_at: Date.now() - 1000, expires_at: null,
+      created_at: Date.now(), updated_at: null,
+    });
+
+    await jobDispatchCron(mockEnv);
+
+    expect(mockSendToDaemon).not.toHaveBeenCalled();
+    expect(dbExecutes.some((entry) => entry.params.includes(CRON_STATUS.ERROR))).toBe(true);
   });
 
   it('skips when daemon is offline and advances next_run_at', async () => {

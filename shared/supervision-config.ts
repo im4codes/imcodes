@@ -1,5 +1,9 @@
+import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
+import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
+import type { TaskPairEngine } from './task-pair.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
+import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
   DEFAULT_CONTEXT_MODEL_BY_BACKEND,
@@ -9,10 +13,12 @@ import {
   inferSharedContextRuntimeBackend,
   isKnownSharedContextModelForBackend,
   normalizeSharedContextPresetValue,
+  normalizeOptionalSharedContextRuntimeSelection,
   normalizeSharedContextRuntimeBackend,
 } from './shared-context-runtime-config.js';
 import { PROCESS_SESSION_AGENT_TYPES, TRANSPORT_SESSION_AGENT_TYPES } from './agent-types.js';
 import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
+import { FILE_OUTPUT_CONTRACT_ID } from './file-output-contract.js';
 import {
   PEER_AUDIT_PROMPT_VERSION,
   isPeerAuditOpaqueId,
@@ -20,6 +26,18 @@ import {
   type PeerAuditTargetFingerprint,
 } from './peer-audit.js';
 import { isValidImcodesSessionName } from './session-scope.js';
+import {
+  foldLegacyPairAllowlistIntoExecutionPools,
+  migrateLegacySupervisionExecutionPools,
+  type SupervisionEconomyTaskPolicy,
+  type SupervisionExecutionConfig,
+  type SupervisionExecutionPoolKind,
+  buildSupervisionPoolGateGuidance,
+  evaluateSupervisionAutomationPoolGate,
+  normalizeSupervisionExecutionPools,
+  type SupervisionAutomationPoolGateReason,
+  type SupervisionExecutionPoolsConfig,
+} from './supervision-execution-pool.js';
 
 export const SUPERVISION_CONTRACT_IDS = {
   DECISION: 'supervision_decision_v1',
@@ -29,10 +47,212 @@ export const SUPERVISION_CONTRACT_IDS = {
   OPENSPEC_IMPLEMENTATION_AUDIT: 'openspec_implementation_audit_v1',
   CONTEXTUAL_AUDIT: 'contextual_audit_v1',
   REWORK_BRIEF: 'rework_brief_v1',
+  WAITING_HEARTBEAT: 'supervision_waiting_heartbeat_v1',
+  IMPLEMENTATION_HEARTBEAT: 'supervision_implementation_heartbeat_v1',
+  AUDIT_HEARTBEAT: 'supervision_audit_heartbeat_v1',
   AUDIT_TARGET_RECOVERY: 'supervision_audit_target_recovery_v1',
+  AUDIT_MARKER_CORRECTION: 'supervision_audit_marker_correction_v1',
+  AUTO_AUDIT_MODE_CONTROL: 'supervision_auto_audit_mode_control_v1',
+  ORCHESTRATOR_CONTEXT: 'supervision_orchestrator_context_v1',
+  BRAIN_WORK_DELEGATION: 'supervision_brain_work_delegation_v1',
+  CONTINUATION_REPAIR: 'supervision_continuation_repair_v1',
+  TASK_FINALIZATION: 'supervision_task_finalization_v1',
+  DELEGATION_ELIGIBILITY: 'supervision_delegation_eligibility_v1',
+  TASK_REGISTRY: 'supervision_task_registry_v1',
+  MESSAGING: 'supervision_messaging_v1',
+  FILE_OUTPUT: FILE_OUTPUT_CONTRACT_ID,
 } as const;
 
 export const SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND = 'supervision-audit-target-recovery' as const;
+export const SUPERVISION_ORPHANED_AUTOMATIC_AUDITOR_REBIND_SOURCE =
+  'orphaned_automatic_auditor_rebind' as const;
+export const SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND = 'supervision-audit-marker-correction' as const;
+export const SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND = 'supervision-waiting-heartbeat' as const;
+export const SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND = 'supervision-audit-heartbeat' as const;
+export const SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND = 'supervision-auto-audit-mode-control' as const;
+export const SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND = 'supervision-implementation-heartbeat' as const;
+export const SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND = 'supervision-audit-delegation' as const;
+export const PEER_AUDIT_REWORK_AUTOMATION_KIND = 'peer-audit-rework' as const;
+export const SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND = 'supervision-post-audit-finalization' as const;
+export const SUPERVISION_CONTINUE_AUTOMATION_KIND = 'supervision-continue' as const;
+export const SUPERVISION_AUTOMATION_KIND_PREFIX = 'supervision-' as const;
+
+/**
+ * Canonical presentation keys for daemon-authored user-message prompts. The
+ * web renderer consumes this map directly rather than duplicating protocol
+ * kind literals or inferring labels from implementation details.
+ */
+export const SUPERVISION_USER_PROMPT_LABEL_KEYS = {
+  [SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND]: 'chat.supervision_prompt.supervision_heartbeat',
+  [SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_heartbeat',
+  [SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND]: 'chat.supervision_prompt.implementation_heartbeat',
+  [SUPERVISION_CONTINUE_AUTOMATION_KIND]: 'chat.supervision_prompt.continue',
+  [SUPERVISION_POST_AUDIT_FINALIZATION_AUTOMATION_KIND]: 'chat.supervision_prompt.post_audit_finalization',
+  [SUPERVISION_AUDIT_DELEGATION_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_delegation',
+  [SUPERVISION_AUDIT_TARGET_RECOVERY_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_target_recovery',
+  [SUPERVISION_AUDIT_MARKER_CORRECTION_AUTOMATION_KIND]: 'chat.supervision_prompt.audit_marker_correction',
+  [PEER_AUDIT_REWORK_AUTOMATION_KIND]: 'chat.supervision_prompt.peer_audit_rework',
+  [SUPERVISION_AUTO_AUDIT_MODE_CONTROL_AUTOMATION_KIND]: 'chat.supervision_prompt.auto_audit_mode_control',
+} as const;
+export type SupervisionUserPromptAutomationKind = keyof typeof SUPERVISION_USER_PROMPT_LABEL_KEYS;
+
+export const SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS = [
+  SUPERVISION_CONTRACT_IDS.ORCHESTRATOR_CONTEXT,
+  SUPERVISION_CONTRACT_IDS.BRAIN_WORK_DELEGATION,
+  SUPERVISION_CONTRACT_IDS.CONTINUATION_REPAIR,
+  SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+  SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
+  SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
+  SUPERVISION_CONTRACT_IDS.MESSAGING,
+  SUPERVISION_CONTRACT_IDS.FILE_OUTPUT,
+] as const;
+
+/**
+ * Delimit the stable, daemon-authored supervision preamble inside a per-turn
+ * transport message. The runtime uses these markers to inject an unchanged
+ * preamble once per provider conversation instead of spending the same prompt
+ * tokens on every user turn. A fresh runtime/conversation has no remembered
+ * signature and therefore receives the full block again.
+ */
+export const SUPERVISION_CONTRACT_PREAMBLE_START = '<!-- IMCODES_SUPERVISION_CONTRACT_PREAMBLE_START -->' as const;
+export const SUPERVISION_CONTRACT_PREAMBLE_END = '<!-- IMCODES_SUPERVISION_CONTRACT_PREAMBLE_END -->' as const;
+export const SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE =
+  `[Contracts in force (delivered as the supervision preamble; still binding): ${SUPERVISION_TRUSTED_EXECUTION_CONTRACT_IDS.join(', ')}]`;
+
+/**
+ * How the standing supervision contracts reach the model.
+ *
+ * `reinjectEveryEntrypoint` means every entrypoint RE-ASSERTS the contracts in
+ * force -- not that every entrypoint restates them verbatim. Prompts that run
+ * once per task (preambles, decision) carry the full text; the per-turn prompts
+ * (continue, rework brief) re-assert them by id via
+ * buildSupervisionContractsInForceLine(), because ~6.5KB of fixed prose on every
+ * continuation turn crowds out the task context the contracts exist to protect.
+ * SUPERVISION_PROMPT_ENTRYPOINTS records which form each prompt uses, and that
+ * record is enforced by test rather than trusted.
+ */
+export const SUPERVISION_TRUSTED_CONTRACT_DELIVERY = {
+  preferredRoles: ['system', 'developer'],
+  fallback: 'fixed_daemon_prefix',
+  reinjectEveryEntrypoint: true,
+  modelTextIsNonAuthoritative: true,
+  hardGateAuthority: [
+    'delegation_eligibility',
+    'authenticated_audit_receipt',
+    'matching_pass',
+    'actual_git_conflict_free',
+    'explicit_non_broad_git_add',
+    'forbidden_stage_prefixes',
+  ],
+} as const;
+
+/**
+ * User authority over supervision contracts.
+ *
+ * Agent/model text stays non-authoritative (see
+ * SUPERVISION_TRUSTED_CONTRACT_DELIVERY.modelTextIsNonAuthoritative). A directive
+ * from the HUMAN user is different: it is absolute and may override any contract
+ * clause or gate, including the pre-matching-PASS stage/commit/push prohibition.
+ *
+ * The override is deliberately PER-ACTION, not a sticky session mode: contracts
+ * keep driving automated work by default, and the user opts out one action at a
+ * time so a forgotten switch cannot silently disarm every later change.
+ */
+export const SUPERVISION_USER_OVERRIDE = {
+  authority: 'absolute',
+  granularity: 'per_action',
+  /** Must be an explicit user directive; never inferred from ambiguity or silence. */
+  requiresExplicitUserDirective: true,
+  /** Never persists past the single action it authorised. */
+  sticky: false,
+  /** Every gate below may be waived by an explicit user directive. */
+  overridableGates: [
+    'delegation_eligibility',
+    'authenticated_audit_receipt',
+    'matching_pass',
+    'pre_pass_stage_commit_push',
+  ],
+  /** Recorded for attribution; the user owns the outcome of an overridden action. */
+  mustRecord: ['who', 'what', 'when', 'gateWaived', 'userDirectiveText'],
+} as const;
+
+/**
+ * Proportionality: the contract must exercise its own judgement instead of
+ * applying one ceremony to every change. Auditing a comment typo with the same
+ * loop as a native ABI change is waste, not rigour.
+ *
+ * A change qualifies as trivial ONLY if it satisfies EVERY condition in
+ * `trivialRequiresAll` and matches NONE of `neverTrivial`. Anything unmatched or
+ * uncertain falls back to the full gated path — the tier is a narrow, checkable
+ * exemption, not a judgement call an agent may argue itself into.
+ */
+export const SUPERVISION_CHANGE_PROPORTIONALITY = {
+  tiers: ['trivial', 'standard', 'gated'],
+  trivialRequiresAll: [
+    'no_production_byte_change',
+    'single_owner_no_shared_files',
+    'no_manifest_bound_landing_row',
+    'reversible_by_single_revert',
+  ],
+  /** Any match forces the full gated path regardless of size. */
+  neverTrivial: [
+    'native_abi_or_build_graph',
+    'security_auth_permission_or_credential',
+    'cross_owner_or_cross_platform_surface',
+    'public_contract_schema_or_protocol',
+    'release_packaging_or_signing',
+  ],
+  /**
+   * Documentation-shaped work skips the audit loop even under automation. A
+   * comment, README, changelog or translated string cannot change behaviour, so
+   * auditing it spends review budget that a real behaviour change then does not
+   * get. This is the "is it worth auditing" judgement, made explicit rather than
+   * left to whoever is impatient that day.
+   */
+  docOnlySkipsAuditEvenWhenSupervised: true,
+  docOnlyShapes: [
+    'markdown_or_text_only',
+    'code_comment_only',
+    'changelog_or_release_notes',
+    'translation_string_only',
+    'no_executable_line_changed',
+  ],
+  /**
+   * The hard floor: anything that changes what the software DOES is audited, at
+   * any size. A one-line behaviour change is exactly the kind that slips through,
+   * and "it was only one line" is not evidence of safety.
+   */
+  functionalChangeAlwaysAudited: true,
+  /** Trivial tier skips the matching cross-vendor audit loop. */
+  trivialSkipsMatchingAudit: true,
+  /** It never skips these: correctness still has to be demonstrated. */
+  trivialStillRequires: ['typecheck', 'affected_tests', 'attribution_record'],
+} as const;
+
+/**
+ * Where the hard gates actually bind.
+ *
+ * Under supervision (automated multi-agent development) the gates are machine
+ * enforcement: nothing else is watching, so pre-PASS stage/commit/push stays
+ * blocked. With supervision off a human is driving and owns the outcome, so the
+ * same rules are ADVICE: surface the risk once, then do what the user asked.
+ * A gate that blocks an operator working by hand is not quality control, it is
+ * an obstacle wearing its badge.
+ */
+export const SUPERVISION_GATE_ENFORCEMENT = {
+  bindingModes: ['supervised', 'supervised_audit'],
+  advisoryModes: ['off'],
+  /** In advisory mode: warn once, do not refuse, then proceed. */
+  advisoryBehaviour: 'warn_once_then_proceed',
+  /**
+   * Logged automatically. The daemon already knows the caller from the runtime
+   * session, so NEVER ask the user to state who they are or to justify a waiver:
+   * that is friction billed to the user for information the system already has.
+   */
+  recordedAutomatically: ['gate', 'waivedAt'],
+  identityFromRuntimeCaller: true,
+  neverPromptUserForWaiverDetails: true,
+} as const;
 
 export const SUPERVISION_MODE = {
   OFF: 'off',
@@ -40,12 +260,35 @@ export const SUPERVISION_MODE = {
   SUPERVISED_AUDIT: 'supervised_audit',
 } as const;
 
+/** Daemon-authored status emitted after the audit-enabled snapshot is applied. */
+export const SUPERVISION_AUDIT_ENABLED_STATUS = 'supervision_audit_enabled' as const;
+export const SUPERVISION_AUTOMATION_OWNER_ROLE = 'brain' as const;
+
+export function canSessionRoleOwnAutomaticSupervision(role: unknown): boolean {
+  return role === SUPERVISION_AUTOMATION_OWNER_ROLE;
+}
+
 export const SUPERVISION_TRANSPORT_CONFIG_KEY = 'supervision' as const;
+/** The only supervision field safe to project through a shared-tab boundary. */
+export const SUPERVISION_MODE_PROJECTION_KEY = 'supervisionMode' as const;
 export const SUPERVISION_USER_DEFAULT_PREF_KEY = 'supervision.user_default' as const;
 
 export const SUPERVISION_SUPPORTED_BACKENDS = SHARED_CONTEXT_RUNTIME_BACKENDS;
 export const SUPERVISION_SUPPORTED_TARGET_SESSION_TYPES = TRANSPORT_SESSION_AGENT_TYPES;
 export const SUPERVISION_UNSUPPORTED_TARGET_SESSION_TYPES = PROCESS_SESSION_AGENT_TYPES;
+export const SUPERVISION_SUPPORTED_UI_LOCALES = ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko'] as const;
+export type SupervisionUiLocale = typeof SUPERVISION_SUPPORTED_UI_LOCALES[number];
+
+/** Human-readable label for each supported UI locale, for prompts that must name the target language. */
+export const SUPERVISION_OUTPUT_LANGUAGE_LABELS: Record<SupervisionUiLocale, string> = {
+  en: 'English',
+  'zh-CN': 'Simplified Chinese (简体中文)',
+  'zh-TW': 'Traditional Chinese (繁體中文)',
+  es: 'Spanish (Español)',
+  ru: 'Russian (Русский)',
+  ja: 'Japanese (日本語)',
+  ko: 'Korean (한국어)',
+};
 export const DEFAULT_SUPERVISION_BACKEND: SharedContextRuntimeBackend = DEFAULT_PRIMARY_CONTEXT_BACKEND;
 
 const SUPERVISION_AUDIT_MODE_ALLOWLIST = [
@@ -88,6 +331,135 @@ export const SUPERVISION_UNAVAILABLE_REASONS = {
 export type SupervisionUnavailableReason =
   typeof SUPERVISION_UNAVAILABLE_REASONS[keyof typeof SUPERVISION_UNAVAILABLE_REASONS];
 
+/**
+ * The only four conditions that may pause automatic supervision.
+ *
+ * Automatic supervision is the Brain main session's mechanism for driving a
+ * task whose actual work lives in child sessions. If it stops, nothing else
+ * wakes up to check the task registry, so a stop is only legitimate when a
+ * human must personally clear the condition. Everything else — a supervisor
+ * decision timeout, a busy child session, an unparseable decision, no locally
+ * safe main-window work — is a reason to schedule the next heartbeat, not to
+ * end the run.
+ */
+/** Automation note kind for a supervisor call that will be retried by the heartbeat. */
+export const SUPERVISION_SUPERVISOR_RETRY_AUTOMATION_KIND = 'supervision-supervisor-retry';
+
+/**
+ * Automation note kind for a Brain WAITING park refused because no
+ * authoritative IM.codes delegation (non-self participant or pending reply)
+ * exists to wait on.
+ */
+export const SUPERVISION_WAITING_REFUSED_AUTOMATION_KIND = 'supervision-waiting-refused';
+
+export const SUPERVISION_PAUSE_CATEGORIES = {
+  /** Blocked on an action only Brain may perform and cannot delegate. */
+  BRAIN_ONLY_AUTHORITY: 'brain_only_authority',
+  /** Quota is explicitly exhausted (not merely throttled). */
+  QUOTA_EXHAUSTED: 'quota_exhausted',
+  /** Credentials must be renewed before any further supervisor call. */
+  REAUTHORIZATION_REQUIRED: 'reauthorization_required',
+  /** A specific human action has already been requested. */
+  HUMAN_INPUT_REQUESTED: 'human_input_requested',
+} as const;
+export type SupervisionPauseCategory =
+  typeof SUPERVISION_PAUSE_CATEGORIES[keyof typeof SUPERVISION_PAUSE_CATEGORIES];
+
+export type SupervisionInterruptionOutcome =
+  | { kind: 'resume' }
+  | { kind: 'pause'; category: SupervisionPauseCategory };
+
+/**
+ * Decide whether a supervisor-side interruption ends the run or just defers it.
+ *
+ * `RATE_LIMITED` deliberately resumes: a rate limit is a throttle that resets,
+ * which is not the same as quota being exhausted, and the heartbeat is durably
+ * scheduled rather than a poll loop, so waiting it out costs nothing.
+ */
+/**
+ * Control-plane faults a continuation can repair by itself.
+ *
+ * These are the states where the registry and the runtime have drifted apart
+ * but the truth is still recoverable from authoritative same-task state: a
+ * runtime epoch changed under an unchanged assignment, an assignment resolved
+ * to the wrong worktree, a role had no continuation route, or a lease/pointer
+ * went stale. None of them mean the work is gone, so none of them may end a
+ * task. Read authoritative state, rebind or cancel through the supported
+ * same-object path, then resume.
+ */
+export const SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS = {
+  IDENTITY_REJECTED_AFTER_RUNTIME_CHANGE: 'identity_rejected_after_runtime_change',
+  AMBIGUOUS_ASSIGNMENT_WORKTREE: 'ambiguous_assignment_worktree',
+  ROLE_CONTINUATION_ROUTING_GAP: 'role_continuation_routing_gap',
+  STALE_LEASE_OR_POINTER: 'stale_lease_or_pointer',
+  OLD_RUNTIME_IDENTITY: 'old_runtime_identity',
+  REVISION_SPLIT: 'revision_split',
+  INVALID_TRANSITION: 'invalid_transition',
+  OLD_REVISION: 'old_revision',
+  BLOCKED_OR_RECOVERED_PROJECTION: 'blocked_or_recovered_projection',
+  MISSING_LEASE: 'missing_lease',
+  STALE_COORDINATOR_OR_AUDITOR_PROJECTION: 'stale_coordinator_or_auditor_projection',
+} as const;
+export type SupervisionRecoverableContinuationCondition =
+  typeof SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS[
+    keyof typeof SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS];
+
+/**
+ * Decide whether a failed continuation repairs-and-resumes or genuinely stops.
+ *
+ * Deliberately shares SupervisionInterruptionOutcome and the four pause
+ * categories with `classifySupervisionInterruption`: a continuation fault is
+ * the same question asked at a different seam, so it must not grow a second
+ * status vocabulary. Repair authority stops hard at the project boundary -
+ * a recoverable-looking fault on someone else's work is never a licence to
+ * take it over.
+ */
+export function classifySupervisionContinuationFailure(input: {
+  condition?: string | null;
+  crossProject?: boolean;
+}): SupervisionInterruptionOutcome {
+  if (input.crossProject === true) {
+    return { kind: 'pause', category: SUPERVISION_PAUSE_CATEGORIES.BRAIN_ONLY_AUTHORITY };
+  }
+  const recoverable = (Object.values(SUPERVISION_RECOVERABLE_CONTINUATION_CONDITIONS) as string[])
+    .includes(String(input.condition ?? ''));
+  return recoverable
+    ? { kind: 'resume' }
+    : { kind: 'pause', category: SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED };
+}
+
+export function classifySupervisionInterruption(input: {
+  unavailableReason?: SupervisionUnavailableReason | null;
+  providerFailureCode?: string | null;
+}): SupervisionInterruptionOutcome {
+  const pause = (category: SupervisionPauseCategory): SupervisionInterruptionOutcome =>
+    ({ kind: 'pause', category });
+
+  switch (input.unavailableReason) {
+    case SUPERVISION_UNAVAILABLE_REASONS.INVALID_SNAPSHOT:
+      // The stated remedy is "repair the Auto settings", which is a human action.
+      return pause(SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED);
+    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_ERROR:
+      switch (input.providerFailureCode) {
+        case PROVIDER_ERROR_CODES.AUTH_FAILED:
+          return pause(SUPERVISION_PAUSE_CATEGORIES.REAUTHORIZATION_REQUIRED);
+        case PROVIDER_ERROR_CODES.CONFIG_ERROR:
+        case PROVIDER_ERROR_CODES.PROVIDER_NOT_FOUND:
+          return pause(SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED);
+        default:
+          return { kind: 'resume' };
+      }
+    case SUPERVISION_UNAVAILABLE_REASONS.DECISION_TIMEOUT:
+    case SUPERVISION_UNAVAILABLE_REASONS.QUEUE_TIMEOUT:
+    case SUPERVISION_UNAVAILABLE_REASONS.INVALID_OUTPUT:
+    case SUPERVISION_UNAVAILABLE_REASONS.PROVIDER_NOT_CONNECTED:
+      return { kind: 'resume' };
+    default:
+      // No machine-readable reason: the supervisor itself asked for a human.
+      return pause(SUPERVISION_PAUSE_CATEGORIES.HUMAN_INPUT_REQUESTED);
+  }
+}
+
 // Backwards-compatible alias: retained because `web/` still imports this name.
 // Prefer `SUPERVISION_DEFAULT_TIMEOUT_MS` in new code.
 export const DEFAULT_SUPERVISION_TIMEOUT_MS = SUPERVISION_DEFAULT_TIMEOUT_MS;
@@ -98,10 +470,697 @@ export const TASK_RUN_STATUS_MARKERS = {
   BLOCKED: '<!-- IMCODES_TASK_RUN: BLOCKED -->',
 } as const;
 
+export const SUPERVISION_ORCHESTRATOR_STATUS_STATES = [
+  'planned',
+  'delegated',
+  'implementing',
+  'retrying_external_ci',
+  'validated',
+  'auditing',
+  'rework',
+  'passed',
+  'ready_for_integration',
+  'integrating',
+  'final_audit',
+  'committed',
+  'pushed',
+  'recovered',
+  'finalized',
+  'limited',
+  'blocker',
+] as const;
+export type SupervisionOrchestratorStatusState = typeof SUPERVISION_ORCHESTRATOR_STATUS_STATES[number];
+
+/**
+ * The ONE authoritative task lifecycle enum.
+ *
+ * Everything status-shaped derives from this array: registry columns, MCP
+ * schemas, prompts and the transition table. `file_event` and `scope_violation`
+ * are deliberately absent -- they are append-only EVENT types
+ * (see SUPERVISION_TASK_REGISTRY_EVENT_TYPES) and a task may never hold either
+ * as a status. Adding a member (`checkpointed`, `re_audit_required`, ...) is an
+ * explicit contract-version migration, never an ad-hoc text edit.
+ *
+ * The readable string IS the stable, versioned status id. UI labels and
+ * localization are separate mutable display data and must never be persisted
+ * or compared in place of these ids.
+ */
+export const SUPERVISION_TASK_LIFECYCLE_STATUSES = [
+  'planned',
+  'delegated',
+  'implementing',
+  'retrying_external_ci',
+  'validated',
+  'ready_for_audit',
+  'auditing',
+  'rework',
+  'passed',
+  'ready_for_integration',
+  'integrating',
+  'final_audit',
+  'finalizing',
+  'committed',
+  'pushed',
+  'recovered',
+  'finalized',
+  'blocked',
+  'cancelled',
+] as const;
+export type SupervisionTaskLifecycleStatus = typeof SUPERVISION_TASK_LIFECYCLE_STATUSES[number];
+
+/**
+ * PASS plus exact audited Git/push (or already-present ancestor) evidence grants
+ * finalization authority. Every CI value here, including failure, is descriptive
+ * optional smoke and cannot block or grant supervision finalization.
+ */
+export const SUPERVISION_CI_SMOKE_STATUSES = [
+  'success', 'ci_not_configured', 'ci_unavailable', 'pending', 'failure',
+] as const;
+export type SupervisionCiSmokeStatus = typeof SUPERVISION_CI_SMOKE_STATUSES[number];
+
+/**
+ * @deprecated Historical name. Identical to SUPERVISION_TASK_LIFECYCLE_STATUSES
+ * by construction, so the two can no longer drift.
+ */
+export const SUPERVISION_TASK_FINALIZATION_STATES = SUPERVISION_TASK_LIFECYCLE_STATUSES;
+export type SupervisionTaskFinalizationState = SupervisionTaskLifecycleStatus;
+
+/**
+ * Recovery-only states the authoritative project Brain may force when the
+ * ordinary transition machine is wedged. These are deliberately non-success
+ * states: coordination recovery can get work moving again, but cannot invent
+ * validation, audit PASS, a commit, a push, or finalization evidence.
+ */
+export const SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES = [
+  'delegated', 'implementing', 'retrying_external_ci', 'rework',
+  'blocked', 'recovered', 'cancelled',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[];
+export type SupervisionBrainCoordinationRecoveryStatus =
+  typeof SUPERVISION_BRAIN_COORDINATION_RECOVERY_STATUSES[number];
+
+/** Explicit lease handling for Brain/admin same-object recovery. */
+export const SUPERVISION_RECOVERY_LEASE_ACTIONS = [
+  'preserve', 'renew', 'clear',
+] as const;
+export type SupervisionRecoveryLeaseAction =
+  typeof SUPERVISION_RECOVERY_LEASE_ACTIONS[number];
+
+/**
+ * Explicit mode for the project Brain's last-resort mutable-projection repair.
+ * It is deliberately separate from ordinary revision rebind: the latter
+ * proves a narrow predecessor/successor edge, while this action repairs state
+ * that the daemon itself has already made internally inconsistent.
+ */
+export const SUPERVISION_BRAIN_RECOVERY_MODES = ['reset_revision'] as const;
+export type SupervisionBrainRecoveryMode = typeof SUPERVISION_BRAIN_RECOVERY_MODES[number];
+
+/** A reset resumes work but can never project a success/finalization state. */
+export const SUPERVISION_BRAIN_REVISION_RESET_STATUSES = [
+  'implementing', 'rework',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[];
+export type SupervisionBrainRevisionResetStatus =
+  typeof SUPERVISION_BRAIN_REVISION_RESET_STATUSES[number];
+
+/** Active reset owners must retain or receive authority; `clear` cannot resume work. */
+export const SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS = [
+  'preserve', 'renew',
+] as const satisfies readonly SupervisionRecoveryLeaseAction[];
+
+export const SUPERVISION_BRAIN_REVISION_RESET_REFUSALS = {
+  CLOSED_TASK: 'safety_boundary_closed_task',
+} as const;
+
+/**
+ * One canonical description of the Brain's final mutable-state repair action.
+ * Prompts and refusal responses both consume this object so a model can never
+ * be told that the escape hatch exists without also receiving its exact shape.
+ */
+export const SUPERVISION_BRAIN_REVISION_RESET_ACTION = Object.freeze({
+  tool: 'supervision_task_recover',
+  recoveryMode: SUPERVISION_BRAIN_RECOVERY_MODES[0],
+  requiredFields: Object.freeze([
+    'taskId', 'assignmentId', 'toRevision', 'taskStatus',
+    'leaseAction', 'idempotencyKey', 'reason',
+  ] as const),
+  legacyRepairRefusalLimit: 1,
+  defaultTaskStatus: SUPERVISION_BRAIN_REVISION_RESET_STATUSES[1],
+  defaultLeaseAction: SUPERVISION_BRAIN_REVISION_RESET_LEASE_ACTIONS[1],
+  safetyBoundary: SUPERVISION_BRAIN_REVISION_RESET_REFUSALS.CLOSED_TASK,
+});
+
+export const SUPERVISION_BRAIN_REVISION_RESET_FORBID =
+  'mark_control_plane_blocked_and_return_to_user_before_reset_safety_boundary' as const;
+
+export const SUPERVISION_BRAIN_REVISION_RESET_REASON =
+  'repair recoverable daemon-created control-plane divergence' as const;
+
+/** Brain-only refusal guidance. Never attach it before project-Brain authority is proven. */
+export function buildSupervisionBrainRevisionResetGuidance(input?: {
+  taskId?: string;
+  assignmentId?: string;
+  toRevision?: string;
+}): string {
+  const action = SUPERVISION_BRAIN_REVISION_RESET_ACTION;
+  const required = action.requiredFields.join(', ');
+  const prefix = `Use ${action.tool} with recoveryMode=${action.recoveryMode} and required fields: ${required}.`;
+  const taskId = input?.taskId?.trim();
+  const assignmentId = input?.assignmentId?.trim();
+  const toRevision = input?.toRevision?.trim();
+  if (!taskId || !assignmentId || !toRevision) return prefix;
+  const fingerprintSource = `${taskId}\0${assignmentId}\0${toRevision}`;
+  let fingerprint = 0x811c9dc5;
+  for (let index = 0; index < fingerprintSource.length; index += 1) {
+    fingerprint ^= fingerprintSource.charCodeAt(index);
+    fingerprint = Math.imul(fingerprint, 0x01000193);
+  }
+  const idempotencyKey = [
+    'brain-reset', taskId.slice(0, 32), assignmentId.slice(0, 32),
+    toRevision.slice(0, 24), (fingerprint >>> 0).toString(16).padStart(8, '0'),
+  ].join(':');
+  return `${prefix} Exact fallback: ${JSON.stringify({
+    taskId,
+    assignmentId,
+    recoveryMode: action.recoveryMode,
+    toRevision,
+    taskStatus: action.defaultTaskStatus,
+    leaseAction: action.defaultLeaseAction,
+    idempotencyKey,
+    reason: SUPERVISION_BRAIN_REVISION_RESET_REASON,
+  })}`;
+}
+
+/** Explicit Brain decisions for immutable output produced after cancellation. */
+export const SUPERVISION_COMPLETION_EVIDENCE_DECISIONS = ['adopt', 'discard'] as const;
+export type SupervisionCompletionEvidenceDecision =
+  typeof SUPERVISION_COMPLETION_EVIDENCE_DECISIONS[number];
+
+/** Bump only alongside a schema migration that maps every prior status forward. */
+export const SUPERVISION_TASK_STATUS_CONTRACT_VERSION = 1;
+
+export const SUPERVISION_TASK_FINALIZATION_FIELDS = [
+  'taskId', 'topLevelTaskId', 'classification', 'acceptance', 'integrationBoundary', 'sliceId', 'ownerSession',
+  'integrationOwnerSession', 'revision', 'state', 'ownedFiles', 'dependencies', 'sharedFiles',
+  'overlappingFiles', 'integrationTaskId', 'integrationManifest', 'auditAttemptId', 'auditRevision',
+  'verdict', 'overallAuditAttemptId', 'overallAuditRevision', 'commitSha', 'pushResult',
+  'pushRemoteRef', 'stagedPaths', 'conflictedPaths', 'untrackedOtherOwnerPaths',
+] as const;
+export type SupervisionTaskFinalizationField = typeof SUPERVISION_TASK_FINALIZATION_FIELDS[number];
+
+export const SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD = ['git add .', 'git add -A'] as const;
+export const SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES = ['openspec/', 'docs/'] as const;
+
+export const SUPERVISION_TASK_FINALIZATION_CONTRACT = {
+  contractId: SUPERVISION_CONTRACT_IDS.TASK_FINALIZATION,
+  states: SUPERVISION_TASK_FINALIZATION_STATES,
+  fields: SUPERVISION_TASK_FINALIZATION_FIELDS,
+  forbiddenGitAdd: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD,
+  forbiddenStagePrefixes: SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES,
+} as const;
+
+export interface SupervisionTaskFinalizationRecord {
+  taskId?: string | null;
+  topLevelTaskId?: string | null;
+  classification?: SupervisionTaskClassification | null;
+  acceptance?: readonly string[] | null;
+  integrationBoundary?: string | null;
+  sliceId?: string | null;
+  ownerSession?: string | null;
+  integrationOwnerSession?: string | null;
+  revision?: string | number | null;
+  state?: SupervisionTaskFinalizationState | null;
+  ownedFiles?: readonly string[] | null;
+  dependencies?: readonly string[] | null;
+  sharedFiles?: readonly string[] | null;
+  overlappingFiles?: readonly string[] | null;
+  integrationTaskId?: string | null;
+  integrationManifest?: readonly SupervisionTaskFinalizationRecord[] | null;
+  auditAttemptId?: string | null;
+  auditRevision?: string | number | null;
+  verdict?: 'PASS' | 'REWORK' | string | null;
+  overallAuditAttemptId?: string | null;
+  overallAuditRevision?: string | number | null;
+  commitSha?: string | null;
+  pushResult?: string | null;
+  pushRemoteRef?: string | null;
+  stagedPaths?: readonly string[] | null;
+  conflictedPaths?: readonly string[] | null;
+  untrackedOtherOwnerPaths?: readonly string[] | null;
+}
+
+export interface SupervisionTaskFinalizationReleaseInput {
+  attemptId: string;
+  revision: string | number;
+  verdict: 'PASS' | 'REWORK' | string;
+  globalGateBlocked?: boolean;
+  pathspecs?: readonly string[] | null;
+  stagedPaths?: readonly string[] | null;
+  conflictedPaths?: readonly string[] | null;
+  untrackedOtherOwnerPaths?: readonly string[] | null;
+}
+
+export type SupervisionStageManifestIssue =
+  | 'invalid_pathspec';
+
+export interface SupervisionStageManifestValidationInput {
+  pathspecs?: readonly string[] | null;
+  stagedPaths?: readonly string[] | null;
+  integrationManifest?: readonly SupervisionTaskFinalizationRecord[] | null;
+  ownedFiles?: readonly string[] | null;
+  conflictedPaths?: readonly string[] | null;
+  untrackedOtherOwnerPaths?: readonly string[] | null;
+}
+
+export function isValidSupervisionOwnedPathspecs(paths: readonly string[] | null | undefined): boolean {
+  if (!paths || paths.length === 0) return false;
+  return paths.every((pathspec) => {
+    if (typeof pathspec !== 'string') return false;
+    const trimmed = pathspec.trim();
+    if (!trimmed || trimmed === '.' || trimmed === '-A') return false;
+    if ((SUPERVISION_TASK_FINALIZATION_FORBIDDEN_GIT_ADD as readonly string[]).includes(`git add ${trimmed}`)) return false;
+    return !(SUPERVISION_TASK_FINALIZATION_FORBIDDEN_STAGE_PREFIXES as readonly string[])
+      .some((prefix) => trimmed === prefix.slice(0, -1) || trimmed.startsWith(prefix));
+  });
+}
+
+export function validateSupervisionStageManifest(
+  input: SupervisionStageManifestValidationInput,
+): { ok: true } | { ok: false; issue: SupervisionStageManifestIssue; path?: string } {
+  if (!isValidSupervisionOwnedPathspecs(input.pathspecs)) return { ok: false, issue: 'invalid_pathspec' };
+  // All other fields are caller-reported provenance metadata. They cannot
+  // authorize or veto finalization. The integration worktree's Git index and
+  // conflict state are inspected at the authoritative finalization boundary.
+  return { ok: true };
+}
+
+export function canMarkSupervisionSliceReadyForIntegration(
+  slice: SupervisionTaskFinalizationRecord,
+  pass: SupervisionTaskFinalizationReleaseInput,
+): boolean {
+  if (pass.globalGateBlocked) return false;
+  if (pass.verdict !== 'PASS') return false;
+  if (!slice.ownerSession) return false;
+  if (!slice.topLevelTaskId) return false;
+  if (slice.auditAttemptId !== pass.attemptId) return false;
+  if (String(slice.revision ?? '') !== String(pass.revision)) return false;
+  if (String(slice.auditRevision ?? '') !== String(pass.revision)) return false;
+  return true;
+}
+
+/**
+ * New merge-before-audit handoff: a slice freezes validated bytes and hands
+ * them to the integration owner without minting an audit attempt. Historical
+ * rows continue through canMarkSupervisionSliceReadyForIntegration().
+ */
+export function canHandOffValidatedSupervisionManifestRow(
+  row: SupervisionTaskFinalizationRecord,
+): boolean {
+  if (row.classification !== 'integration_slice'
+    && row.classification !== 'independent_top_level') return false;
+  if (row.state !== 'validated' && row.state !== 'ready_for_integration') return false;
+  if (!row.ownerSession || !row.topLevelTaskId || String(row.revision ?? '').trim() === '') return false;
+  return true;
+}
+
+export function canReleaseSupervisionTaskFinalization(
+  task: SupervisionTaskFinalizationRecord,
+  pass: SupervisionTaskFinalizationReleaseInput,
+): boolean {
+  if (pass.globalGateBlocked) return false;
+  if (pass.verdict !== 'PASS') return false;
+  const auditAttemptId = task.overallAuditAttemptId ?? task.auditAttemptId;
+  const auditRevision = task.overallAuditRevision ?? task.auditRevision;
+  if (auditAttemptId !== pass.attemptId) return false;
+  if (String(task.revision ?? '') !== String(pass.revision)) return false;
+  if (String(auditRevision ?? '') !== String(pass.revision)) return false;
+  if (!task.integrationOwnerSession) return false;
+  // Manifest rows, owned files, and caller-reported staged/untracked sets are
+  // record-only. Only explicit safe pathspecs are evaluated here; actual Git
+  // conflicts and staged bytes belong to the integration worktree boundary.
+  return validateSupervisionStageManifest({
+    pathspecs: pass.pathspecs,
+    stagedPaths: pass.stagedPaths,
+    conflictedPaths: pass.conflictedPaths,
+    untrackedOtherOwnerPaths: pass.untrackedOtherOwnerPaths,
+    integrationManifest: task.integrationManifest,
+    ownedFiles: task.ownedFiles,
+  }).ok === true;
+}
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES = ['shell', 'script'] as const;
+export type SupervisionDelegationEligibilityForbiddenAgentType = typeof SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_REQUIRED_TARGET_FIELDS = [
+  'targetSession', 'agentType', 'providerFamily', 'availability', 'limitGroup', 'replyCapable',
+] as const;
+export type SupervisionDelegationEligibilityRequiredTargetField = typeof SUPERVISION_DELEGATION_ELIGIBILITY_REQUIRED_TARGET_FIELDS[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS = [
+  'eligible', 'queue_only', 'limited', 'offline', 'missing_fields', 'forbidden_agent_type',
+  'not_reply_capable', 'same_family_degraded', 'no_cross_vendor_blocker', 'daemon_fixed_target',
+] as const;
+export type SupervisionDelegationEligibilityDecision = typeof SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS = [
+  'targetSession', 'targetAgentType', 'providerFamily', 'availability', 'limitGroup', 'replyCapable',
+  'eligibilityDecision', 'limitedReason', 'degradedReason',
+] as const;
+export type SupervisionDelegationEligibilityTaskListField = typeof SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS[number];
+
+export const SUPERVISION_DELEGATION_ELIGIBILITY_POLICY = {
+  contractId: SUPERVISION_CONTRACT_IDS.DELEGATION_ELIGIBILITY,
+  forbiddenAgentTypes: SUPERVISION_DELEGATION_ELIGIBILITY_FORBIDDEN_AGENT_TYPES,
+  requiredTargetFields: SUPERVISION_DELEGATION_ELIGIBILITY_REQUIRED_TARGET_FIELDS,
+  decisions: SUPERVISION_DELEGATION_ELIGIBILITY_DECISIONS,
+  taskListFields: SUPERVISION_DELEGATION_ELIGIBILITY_TASK_LIST_FIELDS,
+  automaticAudit: {
+    target: 'live_started_authorized_transport',
+    require: ['same_project_pool', 'exact_identity', 'availability'] as const,
+    ignore: ['replyCapable', 'restartDurableDeliveryId'] as const,
+    order: ['ready', 'auto_provision', 'busy_fifo'] as const,
+    forbidRuntimeTypes: ['process'] as const,
+  },
+} as const;
+
+export const SUPERVISION_TASK_REGISTRY_VERSION = 1 as const;
+
+export const SUPERVISION_TASK_CLASSIFICATIONS = [
+  'independent_top_level',
+  'integration_slice',
+  'integration_task',
+] as const;
+export type SupervisionTaskClassification = typeof SUPERVISION_TASK_CLASSIFICATIONS[number];
+
+export const SUPERVISION_TASK_FILE_OPERATIONS = ['create', 'modify', 'delete', 'rename'] as const;
+export type SupervisionTaskFileOperation = typeof SUPERVISION_TASK_FILE_OPERATIONS[number];
+
+export const SUPERVISION_TASK_FILE_TRACKING_MODE = 'caller_reported_only' as const;
+export const SUPERVISION_TASK_SCOPE_RECONCILIATION_MODE = 'caller_supplied_observations_only' as const;
+export const SUPERVISION_TASK_OWNED_FILES_SEMANTICS = 'observed_delivery_evidence_not_acl' as const;
+export const SUPERVISION_TASK_IMPLEMENTATION_ADMISSION_MODE = 'isolated_worktree' as const;
+
+export const SUPERVISION_TASK_REGISTRY_EVENT_TYPES = [
+  'created',
+  'delegated',
+  'implementing',
+  'retrying_external_ci',
+  'validated',
+  'ready_for_audit',
+  'audit_requested',
+  'audit_replied',
+  'rework',
+  'passed',
+  'ready_for_integration',
+  'finalizing',
+  'committed',
+  'pushed',
+  'recovered',
+  'finalized',
+  'blocked',
+  'cancelled',
+  /** Machine signal: implementation bytes are merged, validated, and handed off; never an audit verdict. */
+  'implementation_finished',
+  /** Durable watchdog receipt. It is intentionally excluded from substantive progress clocks. */
+  'implementation_heartbeat',
+  /** Explicit durable progress checkpoint that resets the implementation-idle clock. */
+  'implementation_progress',
+  'file_event',
+  'scope_violation',
+] as const;
+export type SupervisionTaskRegistryEventType = typeof SUPERVISION_TASK_REGISTRY_EVENT_TYPES[number];
+
+export interface SupervisionTaskOwnerIdentity {
+  sessionName: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+  agentType: string;
+  providerFamily: string;
+}
+
+export interface SupervisionTaskScopeReconciliation {
+  trackedPaths?: readonly string[] | null;
+  untrackedPaths?: readonly string[] | null;
+  deletedPaths?: readonly string[] | null;
+  currentRevision?: string | null;
+}
+
+export interface SupervisionTaskMetadata {
+  /** Optional human-readable title shown before the protocol task id. */
+  title?: string | null;
+  topLevelTaskId?: string | null;
+  taskId?: string | null;
+  /** Exact existing assignment for an append-only task continuation. */
+  assignmentId?: string | null;
+  sliceId?: string | null;
+  classification?: SupervisionTaskClassification | null;
+  objective?: string | null;
+  acceptance?: readonly string[] | null;
+  /** Proposed/observed delivery evidence. Never an implementation-write ACL. */
+  ownedFiles?: readonly string[] | null;
+  /** Coordination evidence for later exact-set integration, not admission authority. */
+  sharedFiles?: readonly string[] | null;
+  dependencies?: readonly string[] | null;
+  integrationOwner?: string | null;
+  baseRevision?: string | null;
+  currentRevision?: string | null;
+  auditAttemptId?: string | null;
+  auditRevision?: string | number | null;
+  /**
+   * Explicit Brain-owned automatic-audit intent for this task. When omitted,
+   * new tasks continue to snapshot the caller session's supervision mode.
+   * Existing tasks may only bind a previously-missing policy through the
+   * exact same-project Brain continuation path.
+   */
+  auditPolicy?: SupervisionTaskAuditPolicy | null;
+  executionPool?: SupervisionExecutionPoolKind | null;
+  /** Explicit Brain request to reuse/provision from the configured pool. */
+  autoProvision?: boolean | null;
+  requestedExecutionType?: SupervisionExecutionConfig | null;
+  economyPolicy?: SupervisionEconomyTaskPolicy | null;
+}
+
+export const SUPERVISION_TASK_REGISTRY_CONTRACT = {
+  contractId: SUPERVISION_CONTRACT_IDS.TASK_REGISTRY,
+  version: SUPERVISION_TASK_REGISTRY_VERSION,
+  classifications: SUPERVISION_TASK_CLASSIFICATIONS,
+  statuses: SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  eventTypes: SUPERVISION_TASK_REGISTRY_EVENT_TYPES,
+  fileOperations: SUPERVISION_TASK_FILE_OPERATIONS,
+  fileTracking: {
+    mode: SUPERVISION_TASK_FILE_TRACKING_MODE,
+    ownedFilesSemantics: SUPERVISION_TASK_OWNED_FILES_SEMANTICS,
+    implementationAdmission: SUPERVISION_TASK_IMPLEMENTATION_ADMISSION_MODE,
+    automaticProviderToolHook: false,
+    filesystemOrGitScanner: false,
+    reconciliationMode: SUPERVISION_TASK_SCOPE_RECONCILIATION_MODE,
+    detectsUnreportedWrites: false,
+  },
+} as const;
+
+/**
+ * Compact permanent-preamble rule for free-form task display text.
+ *
+ * The browser-selected locale is already bound to the supervision snapshot.
+ * Filling this one stable template at task start tells the Brain which
+ * language to author in without translating stored history at render time or
+ * adding turn-by-turn prompt churn. Missing locale intentionally emits no rule
+ * so headless/legacy callers keep their raw-text behaviour.
+ */
+export const SUPERVISION_TASK_DISPLAY_LANGUAGE_RULE = 'author:objective|title@{uiLocale}' as const;
+
+export function buildSupervisionTaskDisplayLanguageRule(value: unknown): string | undefined {
+  const locale = normalizeSupervisionUiLocale(value);
+  return locale
+    ? SUPERVISION_TASK_DISPLAY_LANGUAGE_RULE.replace('{uiLocale}', locale)
+    : undefined;
+}
+
+export function isSupervisionTaskClassification(value: unknown): value is SupervisionTaskClassification {
+  return typeof value === 'string' && (SUPERVISION_TASK_CLASSIFICATIONS as readonly string[]).includes(value);
+}
+
+export function isAuditableSupervisionTaskClassification(
+  value: unknown,
+): value is Exclude<SupervisionTaskClassification, 'integration_slice'> {
+  return value === 'independent_top_level' || value === 'integration_task';
+}
+
+export function isSupervisionTaskLifecycleStatus(value: unknown): value is SupervisionTaskLifecycleStatus {
+  return typeof value === 'string' && (SUPERVISION_TASK_LIFECYCLE_STATUSES as readonly string[]).includes(value);
+}
+
+export function isTerminalSupervisionTaskStatus(value: SupervisionTaskLifecycleStatus): boolean {
+  return value === 'pushed' || value === 'finalized' || value === 'blocked' || value === 'cancelled';
+}
+
+/**
+ * Ended for good: nothing addressed to the task can matter again.
+ *
+ * Narrower than {@link isTerminalSupervisionTaskStatus} on purpose: a `blocked`
+ * task can be recovered and a `pushed` one still finalizes, so work addressed
+ * to them may still be read. Deferred deliveries (a reply held across a daemon
+ * restart) are retired only against this predicate.
+ */
+export function isEndedSupervisionTaskStatus(value: SupervisionTaskLifecycleStatus): boolean {
+  return value === 'finalized' || value === 'cancelled';
+}
+
+export const SUPERVISION_TASK_CLEANUP_VERSION = 1 as const;
+export const SUPERVISION_TASK_HOUSEKEEPING_DEFAULT_BATCH_SIZE = 25 as const;
+export const SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE = 100 as const;
+export const SUPERVISION_TASK_ARCHIVE_GRACE_MS = 24 * 60 * 60_000;
+export const SUPERVISION_TASK_ABANDONED_AFTER_MS = 7 * 24 * 60 * 60_000;
+export const SUPERVISION_TASK_RECOVERY_TARGET_STATUSES = [
+  'recovered', 'blocked', 'cancelled',
+] as const satisfies readonly SupervisionTaskLifecycleStatus[];
+export type SupervisionTaskRecoveryTargetStatus = typeof SUPERVISION_TASK_RECOVERY_TARGET_STATUSES[number];
+
+export type SupervisionTaskArchiveReason =
+  | 'terminal_retention'
+  | 'abandoned_planned'
+  | 'superseded';
+
+/** Durable retention metadata. Archiving hides a task; it never deletes evidence. */
+export interface SupervisionTaskRetentionMetadata {
+  archivedAt?: number;
+  archiveReason?: SupervisionTaskArchiveReason;
+  supersededBy?: string;
+  duplicateCandidate?: boolean;
+  duplicateCandidateOf?: string;
+  cleanupVersion?: typeof SUPERVISION_TASK_CLEANUP_VERSION;
+}
+
+/**
+ * One canonical default-list/card predicate shared by SQLite registry and Web
+ * console projection. Terminal exceptions remain visible until the bounded
+ * reconciler has durably archived them after the grace period.
+ */
+export function isSupervisionTaskVisibleByDefault(
+  task: SupervisionTaskRetentionMetadata,
+): boolean {
+  return task.archivedAt === undefined;
+}
+
+const SUPERVISION_TASK_ALLOWED_TRANSITIONS: Readonly<Record<SupervisionTaskLifecycleStatus, readonly SupervisionTaskLifecycleStatus[]>> = {
+  planned: ['delegated', 'implementing', 'blocked', 'cancelled'],
+  delegated: ['implementing', 'retrying_external_ci', 'validated', 'ready_for_audit', 'auditing', 'rework', 'ready_for_integration', 'blocked', 'cancelled'],
+  implementing: ['retrying_external_ci', 'validated', 'ready_for_audit', 'ready_for_integration', 'blocked', 'cancelled'],
+  retrying_external_ci: ['implementing', 'recovered', 'validated', 'ready_for_audit', 'blocked', 'cancelled'],
+  validated: ['ready_for_audit', 'auditing', 'ready_for_integration', 'blocked', 'cancelled'],
+  // ready_for_integration is legal only when the registry has an exact
+  // matching PASS assignment. The generic intent surface cannot manufacture
+  // that evidence; finishAssignment owns this observed-audit edge.
+  ready_for_audit: ['auditing', 'ready_for_integration', 'blocked', 'cancelled'],
+  auditing: ['rework', 'passed', 'ready_for_integration', 'blocked', 'cancelled'],
+  rework: ['implementing', 'validated', 'ready_for_audit', 'auditing', 'ready_for_integration', 'blocked', 'cancelled'],
+  passed: ['ready_for_integration', 'finalizing', 'blocked', 'cancelled'],
+  ready_for_integration: ['integrating', 'finalizing', 'blocked', 'cancelled'],
+  integrating: ['final_audit', 'validated', 'blocked', 'cancelled'],
+  final_audit: ['rework', 'passed', 'finalizing', 'blocked', 'cancelled'],
+  finalizing: ['committed', 'blocked', 'cancelled'],
+  committed: ['pushed', 'blocked'],
+  pushed: ['finalized'],
+  recovered: ['finalized', 'validated', 'ready_for_audit', 'blocked', 'cancelled'],
+  finalized: [],
+  blocked: [],
+  cancelled: [],
+};
+
+export function canTransitionSupervisionTaskStatus(
+  from: SupervisionTaskLifecycleStatus,
+  to: SupervisionTaskLifecycleStatus,
+): boolean {
+  return from === to || (SUPERVISION_TASK_ALLOWED_TRANSITIONS[from] as readonly SupervisionTaskLifecycleStatus[]).includes(to);
+}
+
+export const SUPERVISION_EXECUTION_STATUS_MARKERS = {
+  NEEDS_INPUT: '<!-- IMCODES_EXEC: NEEDS_INPUT -->',
+  WAITING: '<!-- IMCODES_EXEC: WAITING -->',
+} as const;
+
+/**
+ * Historical completion marker retained only so runtime automation can
+ * explicitly quarantine old transcripts. It is not an active protocol token:
+ * prompts must not emit it and parsers must never translate it into lifecycle
+ * authority.
+ */
+export const RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER = '<!-- IMCODES_EXEC: AUDIT_READY -->';
+export const RETIRED_SUPERVISION_EXECUTION_ADVANCE_MARKER = '<!-- IMCODES_EXEC: ADVANCE -->';
+
 export type SupervisionMode = typeof SUPERVISION_MODE[keyof typeof SUPERVISION_MODE];
+export const SUPERVISION_TASK_AUDIT_POLICIES = [
+  'auto_allow_degraded',
+  'auto_strict_cross_vendor',
+] as const;
+export type SupervisionTaskAuditPolicy = typeof SUPERVISION_TASK_AUDIT_POLICIES[number];
+
+export function isSupervisionTaskAuditPolicy(value: unknown): value is SupervisionTaskAuditPolicy {
+  return typeof value === 'string'
+    && (SUPERVISION_TASK_AUDIT_POLICIES as readonly string[]).includes(value);
+}
+
+/** Snapshot the Brain-owned automatic-audit choice for a newly created task. */
+export function supervisionTaskAuditPolicyFromSnapshot(
+  snapshot: Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined,
+): SupervisionTaskAuditPolicy | undefined {
+  return snapshot?.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+    ? 'auto_allow_degraded'
+    : undefined;
+}
+
+/**
+ * Single mode authority for every daemon-owned automatic supervision action.
+ * Unknown, absent, and explicit OFF inputs all fail closed. Manual, explicitly
+ * requested delegation does not call this predicate and never changes mode.
+ */
+export function isAutomaticSupervisionEnabled<T extends Pick<SessionSupervisionSnapshot, 'mode'>>(
+  input: T | null | undefined,
+): input is T;
+export function isAutomaticSupervisionEnabled(input: SupervisionMode | null | undefined): boolean;
+export function isAutomaticSupervisionEnabled(
+  input: SupervisionMode | Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined,
+): boolean {
+  const mode = typeof input === 'string' ? input : input?.mode;
+  return mode === SUPERVISION_MODE.SUPERVISED || mode === SUPERVISION_MODE.SUPERVISED_AUDIT;
+}
+/**
+ * The single decision both the UI and the authoritative save entry must ask
+ * before automatic supervision is enabled.
+ *
+ * Turning supervision OFF is never gated -- only enabling an automatic mode is.
+ * Both call sites share this one function so the button and the server cannot
+ * disagree, and so a refusal always arrives with localized, actionable guidance
+ * rather than a bare error code.
+ */
+export type AutomaticSupervisionEnablementGate =
+  | { ok: true }
+  | { ok: false; reason: SupervisionAutomationPoolGateReason; guidance: string };
+
+export function evaluateAutomaticSupervisionEnablement(
+  snapshot: {
+    mode?: SupervisionMode | null;
+    executionPools?: SupervisionExecutionPoolsConfig | null;
+    uiLocale?: string | null;
+  } | null | undefined,
+): AutomaticSupervisionEnablementGate {
+  if (!isAutomaticSupervisionEnabled(snapshot?.mode ?? null)) return { ok: true };
+  const gate = evaluateSupervisionAutomationPoolGate(snapshot?.executionPools ?? null);
+  if (gate.ok) return { ok: true };
+  return {
+    ok: false,
+    reason: gate.reason,
+    guidance: buildSupervisionPoolGateGuidance(gate.reason, snapshot?.uiLocale ?? undefined),
+  };
+}
+
 export type SupervisionAuditMode = 'audit' | 'review' | 'audit>plan' | 'review>plan' | 'audit>review>plan';
 export type TaskRunStatusMarker = keyof typeof TASK_RUN_STATUS_MARKERS;
 export type TaskRunTerminalState = 'complete' | 'needs_input' | 'blocked';
+export const SUPERVISION_EXECUTION_STATES = {
+  NEEDS_INPUT: 'needs_input',
+  WAITING: 'waiting',
+} as const;
+export type SupervisionExecutionState =
+  (typeof SUPERVISION_EXECUTION_STATES)[keyof typeof SUPERVISION_EXECUTION_STATES];
 export type SessionSupervisionSnapshotIssue =
   | 'invalid_shape'
   | 'invalid_mode'
@@ -114,7 +1173,11 @@ export type SessionSupervisionSnapshotIssue =
   | 'invalid_custom_instructions'
   | 'invalid_custom_instructions_override'
   | 'invalid_global_custom_instructions'
+  | 'invalid_ui_locale'
   | 'invalid_preset'
+  | 'invalid_backup_backend'
+  | 'invalid_backup_model'
+  | 'invalid_backup_preset'
   | 'invalid_max_parse_retries'
   | 'invalid_max_auto_continue_streak'
   | 'invalid_max_auto_continue_total'
@@ -156,10 +1219,18 @@ export interface SupervisorDefaultConfig {
    * env bundle by delegating to `resolveProcessingProviderSessionConfig`.
    */
   preset?: string;
+  /** Optional fallback runtime, normalized with the same rules as memory processing. */
+  backupBackend?: SharedContextRuntimeBackend;
+  backupModel?: string;
+  backupPreset?: string;
+  /** Exactly two user-configured execution pools. Legacy/unconfigured is fail-closed. */
+  executionPools: SupervisionExecutionPoolsConfig;
 }
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   mode: SupervisionMode;
+  /** UI language selected by the human who started this supervised task. */
+  uiLocale?: SupervisionUiLocale;
   /** Session-scoped supervision custom instructions. See merge rule in design §2. */
   customInstructions?: string;
   /**
@@ -190,7 +1261,24 @@ export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   /** Present only with a canonical target + fingerprint. */
   peerAuditPromptVersion?: typeof PEER_AUDIT_PROMPT_VERSION;
   maxAuditLoops: number;
+  /**
+   * Severities whose findings block an audit (REWORK). Missing on legacy
+   * snapshots; readers must resolve it through
+   * resolveSupervisionAuditBlockingSeverities, which defaults to P0 only.
+   */
+  auditBlockingSeverities?: AuditSeverity[];
+  /** Project supervision engine chosen on the Brain (`pairs` default; `legacy` = manual rollback). */
+  pairEngine?: TaskPairEngine;
+  /** Brain's maximum of open pairs. */
+  pairMaxConcurrency?: number;
   taskRunPromptVersion: string;
+}
+
+/** Configured blocking severities for a snapshot; legacy/missing/invalid values mean P0 only. */
+export function resolveSupervisionAuditBlockingSeverities(
+  snapshot: Pick<SessionSupervisionSnapshot, 'auditBlockingSeverities'> | null | undefined,
+): AuditSeverity[] {
+  return normalizeAuditBlockingSeverities(snapshot?.auditBlockingSeverities);
 }
 
 export type SupervisionSessionSnapshot = SessionSupervisionSnapshot;
@@ -201,6 +1289,11 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 
 function trimString(value: unknown): string | undefined {
   return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+}
+
+export function normalizeSupervisionUiLocale(value: unknown): SupervisionUiLocale | undefined {
+  const locale = trimString(value);
+  return SUPERVISION_SUPPORTED_UI_LOCALES.find((candidate) => candidate === locale);
 }
 
 function isCanonicalPeerAuditDimension(value: unknown): value is string {
@@ -278,6 +1371,11 @@ export function normalizeSupervisorDefaultConfig(
     ? rawModel
     : getDefaultSharedContextModelForBackend(normalizedBackend);
   const customInstructions = trimString(merged.customInstructions);
+  const backup = normalizeOptionalSharedContextRuntimeSelection({
+    backend: merged.backupBackend,
+    model: merged.backupModel,
+    preset: merged.backupPreset,
+  });
   return {
     backend: normalizedBackend,
     model,
@@ -289,8 +1387,18 @@ export function normalizeSupervisorDefaultConfig(
     promptVersion: trimString(merged.promptVersion) ?? SUPERVISION_DEFAULT_PROMPT_VERSION,
     maxAutoContinueStreak: normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK),
     maxAutoContinueTotal: normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL),
+    executionPools: migrateLegacySupervisionExecutionPools({
+      backend: normalizedBackend,
+      model,
+      executionPools: merged.executionPools,
+    }),
     ...(customInstructions ? { customInstructions } : {}),
     ...(preset ? { preset } : {}),
+    ...(backup.backend && backup.model ? {
+      backupBackend: backup.backend,
+      backupModel: backup.model,
+      ...(backup.preset ? { backupPreset: backup.preset } : {}),
+    } : {}),
   };
 }
 
@@ -343,6 +1451,26 @@ export function getSessionSupervisionSnapshotIssues(
   if (record.preset != null && typeof record.preset !== 'string') {
     issues.push('invalid_preset');
   }
+  const backupBackend = trimString(record.backupBackend);
+  const backupModel = trimString(record.backupModel);
+  const backupPreset = trimString(record.backupPreset);
+  if (record.backupBackend != null && (!backupBackend || !isSupportedSupervisionBackend(backupBackend))) {
+    issues.push('invalid_backup_backend');
+  }
+  if (record.backupModel != null && !backupModel) issues.push('invalid_backup_model');
+  if (record.backupPreset != null && typeof record.backupPreset !== 'string') issues.push('invalid_backup_preset');
+  if (backupModel && !backupBackend && !issues.includes('invalid_backup_backend')) {
+    issues.push('invalid_backup_backend');
+  }
+  if (
+    backupBackend
+    && isSupportedSupervisionBackend(backupBackend)
+    && backupModel
+    && backupBackend !== 'openclaw'
+    && !isKnownSharedContextModelForBackend(backupBackend, backupModel, backupPreset)
+  ) {
+    issues.push('invalid_backup_model');
+  }
   if (!model) {
     issues.push('missing_model');
   } else if (
@@ -368,6 +1496,9 @@ export function getSessionSupervisionSnapshotIssues(
   }
   if (record.globalCustomInstructions != null && typeof record.globalCustomInstructions !== 'string') {
     issues.push('invalid_global_custom_instructions');
+  }
+  if (record.uiLocale != null && normalizeSupervisionUiLocale(record.uiLocale) === undefined) {
+    issues.push('invalid_ui_locale');
   }
   if (
     record.maxParseRetries != null
@@ -401,7 +1532,17 @@ export function getSessionSupervisionSnapshotIssues(
       if (record.auditMode !== '' && !isSupportedSupervisionAuditMode(String(record.auditMode))) issues.push('invalid_audit_mode');
       else issues.push('legacy_audit_mode_requires_repair');
     }
-    if (!hasTargetName) issues.push('missing_audit_target');
+    // Current automatic audit snapshots deliberately carry no manual target:
+    // the mode snapshots an auditPolicy onto each task and dispatch resolves a
+    // live auditor from the configured execution pool. Accept that targetless
+    // shape only when the payload itself contains a canonical usable pool. A
+    // missing/legacy/malformed pool still needs the historical target repair
+    // path and must remain invalid for a new automatic write.
+    const automaticPoolRoute = record.executionPools != null
+      && evaluateSupervisionAutomationPoolGate(
+        normalizeSupervisionExecutionPools(record.executionPools),
+      ).ok;
+    if (!hasTargetName && !automaticPoolRoute) issues.push('missing_audit_target');
     if (
       record.maxAuditLoops != null
       && (typeof record.maxAuditLoops !== 'number' || !Number.isFinite(record.maxAuditLoops) || Math.floor(record.maxAuditLoops) < 0)
@@ -432,6 +1573,7 @@ export function normalizeSessionSupervisionSnapshot(
     ? merged.customInstructionsOverride
     : false;
   const globalCustomInstructions = trimString(merged.globalCustomInstructions);
+  const uiLocale = normalizeSupervisionUiLocale(merged.uiLocale);
   const maxParseRetries = normalizePositiveInteger(merged.maxParseRetries, SUPERVISION_DEFAULT_MAX_PARSE_RETRIES, 1);
   const maxAutoContinueStreak = normalizeNonNegativeInteger(merged.maxAutoContinueStreak, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK);
   const maxAutoContinueTotal = normalizeNonNegativeInteger(merged.maxAutoContinueTotal, SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL);
@@ -442,14 +1584,26 @@ export function normalizeSessionSupervisionSnapshot(
     : undefined;
   const hasCanonicalAuditTarget = !!auditTargetSessionName
     && isValidImcodesSessionName(auditTargetSessionName);
+  // The task-pair allowlist is removed: pair routing is exactly the pool's
+  // per-entry roles. A legacy stored allowlist (from before this change) is
+  // folded into those roles here, once, so no project silently loses its
+  // routing -- folding is idempotent (an entry with an explicit role already
+  // set is never overwritten), so this never needs a separate "already
+  // migrated" flag or to run anywhere else.
+  const legacyPairAllowlist = (merged as { pairAllowlist?: unknown }).pairAllowlist;
+  const executionPools = legacyPairAllowlist !== undefined
+    ? foldLegacyPairAllowlistIntoExecutionPools(supervisorDefaults.executionPools, legacyPairAllowlist)
+    : supervisorDefaults.executionPools;
   return {
     ...supervisorDefaults,
+    executionPools,
     mode,
     ...(customInstructions ? { customInstructions } : {}),
     // Only emit the override flag when true, to keep payloads minimal for the
     // default (unchecked = concat) case. Normalizer defaults missing to false.
     ...(customInstructionsOverride ? { customInstructionsOverride: true } : {}),
     ...(globalCustomInstructions ? { globalCustomInstructions } : {}),
+    ...(uiLocale ? { uiLocale } : {}),
     maxParseRetries,
     maxAutoContinueStreak,
     maxAutoContinueTotal,
@@ -459,6 +1613,15 @@ export function normalizeSessionSupervisionSnapshot(
       peerAuditPromptVersion: PEER_AUDIT_PROMPT_VERSION,
     } : {}),
     maxAuditLoops,
+    // Persist only an explicit choice so legacy snapshots stay byte-stable and
+    // keep resolving to the P0-only default.
+    ...(merged.auditBlockingSeverities !== undefined
+      ? { auditBlockingSeverities: normalizeAuditBlockingSeverities(merged.auditBlockingSeverities) }
+      : {}),
+    ...(merged.pairEngine === 'pairs' || merged.pairEngine === 'legacy' ? { pairEngine: merged.pairEngine } : {}),
+    ...(typeof merged.pairMaxConcurrency === 'number' && Number.isFinite(merged.pairMaxConcurrency) && merged.pairMaxConcurrency >= 1
+      ? { pairMaxConcurrency: Math.floor(merged.pairMaxConcurrency) }
+      : {}),
     taskRunPromptVersion: trimString(merged.taskRunPromptVersion) ?? SUPERVISION_DEFAULT_TASK_RUN_PROMPT_VERSION,
   };
 }
@@ -497,6 +1660,33 @@ export function extractSessionSupervisionSnapshot(
   return parseSessionSupervisionSnapshot(transportConfig[SUPERVISION_TRANSPORT_CONFIG_KEY]);
 }
 
+/**
+ * Project only the authoritative mode from a daemon/DB transport config.
+ *
+ * Shared-tab recipients need to render the owner's current mode, but must not
+ * receive provider settings, prompts, custom instructions, pool identities,
+ * endpoints, or any other transport configuration.  Both the realtime WS
+ * redactor and the `/shares/open` bootstrap use this single projection helper
+ * so their privacy and validation semantics cannot drift.
+ */
+export function projectSharedSessionSupervisionMode(
+  transportConfig: unknown,
+): SupervisionMode | null {
+  let candidate = transportConfig;
+  if (typeof candidate === 'string') {
+    try {
+      candidate = JSON.parse(candidate) as unknown;
+    } catch {
+      return null;
+    }
+  }
+  if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) return null;
+  const supervision = (candidate as Record<string, unknown>)[SUPERVISION_TRANSPORT_CONFIG_KEY];
+  if (!supervision || typeof supervision !== 'object' || Array.isArray(supervision)) return null;
+  const mode = (supervision as Record<string, unknown>).mode;
+  return SUPERVISION_MODES.includes(mode as SupervisionMode) ? mode as SupervisionMode : null;
+}
+
 export function embedSessionSupervisionSnapshot(
   transportConfig: Record<string, unknown> | null | undefined,
   snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
@@ -506,6 +1696,44 @@ export function embedSessionSupervisionSnapshot(
     ...(transportConfig ?? {}),
     [SUPERVISION_TRANSPORT_CONFIG_KEY]: normalized,
   };
+}
+
+/** A top-level `transportConfig` key, deliberately a sibling of `SUPERVISION_TRANSPORT_CONFIG_KEY`, not a field inside it. */
+export const TRANSPORT_CONFIG_UI_LOCALE_KEY = 'uiLocale' as const;
+
+/**
+ * Sets the browser's UI locale as a sibling top-level `transportConfig` key.
+ * Deliberately NOT a field inside `transportConfig.supervision`
+ * (`SUPERVISION_TRANSPORT_CONFIG_KEY`): that object is a strictly validated
+ * snapshot (`getSessionSupervisionSnapshotIssues` requires `mode`, among
+ * other fields), so even patching only `uiLocale` into it -- when valid,
+ * invalid, or entirely absent -- made an otherwise-unconfigured or
+ * intentionally-invalid/repair-only session look invalid
+ * (`hasInvalidSessionSupervisionSnapshot` true) purely from an ordinary send.
+ * This key is inspected by nothing that validates or normalizes supervision,
+ * so `transportConfig.supervision` (present, absent, valid, or
+ * repair-pending) is never read, created, or modified here. Read back with
+ * {@link readTransportConfigUiLocale}.
+ */
+export function patchTransportConfigUiLocale(
+  transportConfig: Record<string, unknown> | null | undefined,
+  uiLocale: SupervisionUiLocale,
+): Record<string, unknown> {
+  const base = isPlainObject(transportConfig) ? transportConfig : {};
+  return { ...base, [TRANSPORT_CONFIG_UI_LOCALE_KEY]: uiLocale };
+}
+
+/**
+ * Reads `uiLocale` from its sibling top-level `transportConfig` key. Pairs
+ * with {@link patchTransportConfigUiLocale}; never touches
+ * `transportConfig.supervision`, so this is safe to call regardless of
+ * whether that snapshot exists or is valid.
+ */
+export function readTransportConfigUiLocale(
+  transportConfig: Record<string, unknown> | null | undefined,
+): SupervisionUiLocale | undefined {
+  if (!isPlainObject(transportConfig)) return undefined;
+  return normalizeSupervisionUiLocale(transportConfig[TRANSPORT_CONFIG_UI_LOCALE_KEY]);
 }
 
 export function readSupervisionSnapshotFromTransportConfig(
@@ -543,7 +1771,21 @@ export function buildTransportConfigWithSupervision(
   snapshot: Partial<SessionSupervisionSnapshot> | null | undefined,
 ): Record<string, unknown> | null {
   const normalized = normalizeSessionSupervisionSnapshot(snapshot);
-  if (normalized.mode === SUPERVISION_MODE.OFF && !normalized.auditTargetSessionName) {
+  // Execution pools gate manual `task{objective,acceptance}` dispatch
+  // eligibility independently of automatic-supervision `mode`; a Brain that
+  // dispatches by hand and never turns Auto on still needs this persisted.
+  // Deleting the whole `supervision` key whenever mode is off silently threw
+  // away a just-saved pool selection -- the save reported success while the
+  // daemon's routing check kept reading legacy_unconfigured from disk.
+  const hasConfiguredExecutionPools = normalized.executionPools.state === 'configured'
+    && (normalized.executionPools.primaryDevelopmentPool.configs.length > 0
+      || normalized.executionPools.economyTaskPool.configs.length > 0);
+  const hasPairSettings = normalized.pairEngine !== undefined
+    || normalized.pairMaxConcurrency !== undefined;
+  if (normalized.mode === SUPERVISION_MODE.OFF
+    && !normalized.auditTargetSessionName
+    && !hasConfiguredExecutionPools
+    && !hasPairSettings) {
     if (!transportConfig) return null;
     const next = { ...transportConfig };
     delete next[SUPERVISION_TRANSPORT_CONFIG_KEY];
@@ -658,6 +1900,81 @@ export const DEFAULT_SUPERVISION_MAX_AUDIT_LOOPS = SUPERVISION_DEFAULT_MAX_AUDIT
 export const DEFAULT_SUPERVISION_MAX_PARSE_RETRIES = SUPERVISION_DEFAULT_MAX_PARSE_RETRIES;
 export const DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_STREAK = SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_STREAK;
 export const DEFAULT_SUPERVISION_MAX_AUTO_CONTINUE_TOTAL = SUPERVISION_DEFAULT_MAX_AUTO_CONTINUE_TOTAL;
+
+export interface ParsedSupervisionExecutionState {
+  state: SupervisionExecutionState | null;
+  markerCount: number;
+}
+
+const SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(NEEDS_INPUT|WAITING)\s*-->[ \t]*$/;
+const RETIRED_SUPERVISION_EXECUTION_MARKER_LINE_RE = /^[ \t]{0,3}<!--\s*IMCODES_EXEC:\s*(?:ADVANCE|AUDIT_READY)\s*-->[ \t]*$/;
+function scanAssistantAuthoredExecutionLines(text: string): {
+  matches: Array<{ marker: string; lineIndex: number }>;
+  retiredExecutionMarker: boolean;
+} {
+  const matches: Array<{ marker: string; lineIndex: number }> = [];
+  let retiredExecutionMarker = false;
+  let fence: MarkdownFenceState | undefined;
+  const lines = text.split(/\r?\n/u);
+  for (const [lineIndex, line] of lines.entries()) {
+    const advanced = advanceMarkdownFence(line, fence);
+    fence = advanced.fence;
+    if (advanced.fenced) continue;
+    const marker = line.match(SUPERVISION_EXECUTION_MARKER_LINE_RE)?.[1];
+    if (marker) matches.push({ marker, lineIndex });
+    else if (RETIRED_SUPERVISION_EXECUTION_MARKER_LINE_RE.test(line)) retiredExecutionMarker = true;
+  }
+  return { matches, retiredExecutionMarker };
+}
+
+/**
+ * Remove machine-only execution marker lines from user-visible assistant text.
+ *
+ * The parser and renderer intentionally share the exact line scanner. Quoted,
+ * inline, or fenced examples are therefore still visible and can never be
+ * confused with the active protocol boundary; only authoritative standalone
+ * marker lines are omitted from presentation.
+ */
+export function stripSupervisionExecutionMarkersForDisplay(text: string): string {
+  const { matches } = scanAssistantAuthoredExecutionLines(text);
+  if (matches.length === 0) return text;
+  const hiddenLineIndexes = new Set(matches.map((match) => match.lineIndex));
+  return text.split(/\r?\n/u)
+    .filter((_line, lineIndex) => !hiddenLineIndexes.has(lineIndex))
+    .join('\n');
+}
+
+/**
+ * Parse only assistant-authored marker lines. Host dispatch metadata is carried
+ * beside `assistant.text.payload.text`, never concatenated into this input.
+ * Markdown quotations, fenced examples, inline prose and indented code are not
+ * protocol authority. Prompts require one final active marker, but the parser
+ * preserves compatibility and liveness by selecting the last valid authored
+ * WAITING/NEEDS_INPUT marker when a response self-corrects or adds trailing
+ * prose. Historical ADVANCE and AUDIT_READY lines are observed separately and
+ * never become authority.
+ */
+export function parseSupervisionExecutionStateDetailsFromText(text: string): ParsedSupervisionExecutionState {
+  const { matches } = scanAssistantAuthoredExecutionLines(text);
+  const state = matches[matches.length - 1]?.marker;
+  switch (state) {
+    case 'NEEDS_INPUT':
+      return { state: SUPERVISION_EXECUTION_STATES.NEEDS_INPUT, markerCount: matches.length };
+    case 'WAITING':
+      return { state: SUPERVISION_EXECUTION_STATES.WAITING, markerCount: matches.length };
+    default:
+      return { state: null, markerCount: matches.length };
+  }
+}
+
+export function parseSupervisionExecutionStateFromText(text: string): SupervisionExecutionState | null {
+  return parseSupervisionExecutionStateDetailsFromText(text).state;
+}
+
+/** True only for an assistant-authored, non-quoted, non-fenced retired marker. */
+export function hasRetiredSupervisionExecutionMarker(text: string): boolean {
+  return scanAssistantAuthoredExecutionLines(text).retiredExecutionMarker;
+}
 
 export function parseTaskRunTerminalStateDetailsFromText(text: string): ParsedTaskRunTerminalState {
   const matches = [...text.matchAll(/<!--\s*IMCODES_TASK_RUN:\s*(COMPLETE|NEEDS_INPUT|BLOCKED)\s*-->/g)];

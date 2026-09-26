@@ -1,5 +1,5 @@
 import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
-import { chmod, mkdir, mkdtemp, realpath, rm, symlink, writeFile } from 'node:fs/promises';
+import { chmod, mkdir, mkdtemp, realpath, rename, rm, symlink, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { execFile } from 'node:child_process';
@@ -45,6 +45,43 @@ const { getSessionMock, listSessionsMock, getSavedP2pConfigMock, getTransportRun
   }),
 }));
 
+const { truncatedTasksReads, blockedTasksReads } = vi.hoisted(() => ({
+  truncatedTasksReads: { pending: 0 },
+  blockedTasksReads: {
+    pending: 0,
+    started: undefined as (() => void) | undefined,
+    wait: undefined as Promise<void> | undefined,
+    release: undefined as (() => void) | undefined,
+  },
+}));
+
+/**
+ * Default pass-through. Armed only by `truncateNextTasksRead()`, so every other
+ * test in this file sees the real filesystem unchanged.
+ *
+ * This reproduces what a real agent does when it checks a task off: a
+ * non-atomic rewrite is briefly observable as an empty file by the
+ * orchestrator's own 20ms poll.
+ */
+vi.mock('node:fs/promises', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:fs/promises')>();
+  return {
+    ...actual,
+    readFile: async (path: unknown, ...rest: unknown[]) => {
+      if (typeof path === 'string' && path.endsWith('tasks.md') && truncatedTasksReads.pending > 0) {
+        truncatedTasksReads.pending -= 1;
+        return '';
+      }
+      if (typeof path === 'string' && path.endsWith('tasks.md') && blockedTasksReads.pending > 0) {
+        blockedTasksReads.pending -= 1;
+        blockedTasksReads.started?.();
+        await blockedTasksReads.wait;
+      }
+      return (actual.readFile as (...args: unknown[]) => Promise<unknown>)(path, ...rest);
+    },
+  };
+});
+
 vi.mock('../../src/store/session-store.js', () => ({
   getSession: getSessionMock,
   listSessions: listSessionsMock,
@@ -77,6 +114,7 @@ import {
 } from '../../src/daemon/openspec-auto-deliver-orchestrator.js';
 import { clearAllResend, enqueueResend, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS, classifyUserMessageOrigin } from '../../shared/chat-message-origin.js';
 import { getAutoDeliverP2pLock } from '../../src/daemon/p2p-launch-admission.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
@@ -95,15 +133,51 @@ const execFileAsync = promisify(execFile);
 // ~1.5s alone and the complete file passes). Keep the wait bounded, but leave
 // enough headroom for full-suite contention; a genuinely absent send still
 // fails explicitly at the deadline.
-const SEND_WAIT_MS = 30_000;
+//
+// 30s (bumped from the original 15s above) still wasn't enough headroom: a
+// plain (non-coverage) Node 22 CI run timed out on the 'commit&push' wait in
+// the "audit PASS when opted in" case, which chains several of these waits
+// back to back around real git operations. The suite has only grown since
+// the 15s->30s bump, so the contention this constant exists for has grown
+// with it. 45s, still comfortably short of a hung/genuinely-broken send.
+const SEND_WAIT_MS = 45_000;
 const COVERAGE_CONTENDED_SEND_WAIT_MS = 60_000;
+const BLOCKED_TASKS_READ_START_WAIT_MS = 10_000;
+/**
+ * Floor on how many times a wait actually looks, independent of the clock.
+ *
+ * The budget above is wall-clock, but what decides these waits is how many
+ * times the loop gets to observe. On a saturated worker a `setTimeout(10)` can
+ * return hundreds of milliseconds late, so the loop spends its whole 30s on a
+ * handful of observations and reports a timeout for work that was merely
+ * descheduled — the same case finishes in ~1.5s when run alone. Requiring a
+ * minimum number of looks makes the wait mean "I checked enough times", which
+ * is the actual intent. Costs ~2s extra on a genuinely absent send.
+ */
+const SEND_WAIT_MIN_POLLS = 200;
+
+/** True while either the clock or the observation floor still has budget left. */
+function waitBudgetRemains(start: number, maxMs: number, polls: number): boolean {
+  return Date.now() - start < maxMs || polls < SEND_WAIT_MIN_POLLS;
+}
 vi.setConfig({ testTimeout: 120_000, hookTimeout: 60_000 });
 
 async function makeChange(name: string, tasks = '- [ ] first\n- [x] second\n'): Promise<void> {
   const root = join(projectDir, 'openspec', 'changes', name);
   await mkdir(join(root, 'specs', 'demo'), { recursive: true });
   await writeFile(join(root, 'proposal.md'), '# Proposal\n', 'utf8');
-  await writeFile(join(root, 'tasks.md'), tasks, 'utf8');
+  // tasks.md MUST land atomically. `writeFile` truncates before it writes, and
+  // the orchestrator re-reads this file every 20ms in test mode, so a plain
+  // rewrite is observable as an empty file by a poll that lands inside that
+  // window. `readTaskStatsForRun` retries a THROWN read error but not a
+  // successful read of truncated content -- it reports `total: 0`, which
+  // terminalizes the run as needs_human/tasks_missing_checkboxes. The run is
+  // then over, so every later wait times out no matter how long its budget is.
+  // Measured ~8% truncated reads under contention; rename() is atomic, so a
+  // concurrent poll sees either the old content or the new, never neither.
+  const tasksTmp = join(root, `tasks.md.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`);
+  await writeFile(tasksTmp, tasks, 'utf8');
+  await rename(tasksTmp, join(root, 'tasks.md'));
   await writeFile(join(root, 'specs', 'demo', 'spec.md'), '## ADDED Requirements\n\n### Requirement: Demo\n\n#### Scenario: Demo\n- **WHEN** demo\n- **THEN** demo\n', 'utf8');
 }
 
@@ -133,26 +207,30 @@ function describeOrchestratorActivity(): string {
 
 async function waitForSend(predicate: (msg: Record<string, unknown>) => boolean, maxMs = SEND_WAIT_MS): Promise<Record<string, unknown>> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const found = serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
+  const find = (): Record<string, unknown> | undefined =>
+    serverLinkMock.send.mock.calls.map((call) => call[0] as Record<string, unknown>).find(predicate);
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
+    const found = find();
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  const found = find();
+  if (found) return found;
   throw new Error(`Expected websocket send was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForTransportSend(predicate: (text: string) => boolean, maxMs = SEND_WAIT_MS): Promise<string> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
-    const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  const find = (): string | undefined =>
+    transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
+    const found = find();
     if (found) return found;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
-  // Under a saturated CI worker, the final polling timer can resume after the
-  // deadline even though the send was recorded while that timer was delayed.
-  // Check once more before reporting a timeout instead of discarding it solely
-  // because the event loop crossed the wall-clock boundary.
-  const found = transportSendMock.mock.calls.map((call) => String(call[0] ?? '')).find(predicate);
+  // The last timer can also resume after the deadline with the send already
+  // recorded, so look once more rather than discard it for crossing the line.
+  const found = find();
   if (found) return found;
   throw new Error(`Expected transport send was not observed${describeOrchestratorActivity()}`);
 }
@@ -163,19 +241,21 @@ function transportSendCount(predicate: (text: string) => boolean): number {
 
 async function waitForTransportSendCount(predicate: (text: string) => boolean, count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
     if (transportSendCount(predicate) >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  if (transportSendCount(predicate) >= count) return;
   throw new Error(`Expected transport send count was not observed${describeOrchestratorActivity()}`);
 }
 
 async function waitForP2pStartCount(count: number, maxMs = SEND_WAIT_MS): Promise<void> {
   const start = Date.now();
-  while (Date.now() - start < maxMs) {
+  for (let polls = 0; waitBudgetRemains(start, maxMs, polls); polls += 1) {
     if (startP2pRunMock.mock.calls.length >= count) return;
     await new Promise((resolve) => setTimeout(resolve, 10));
   }
+  if (startP2pRunMock.mock.calls.length >= count) return;
   throw new Error(`expected >= ${count} P2P starts, saw ${startP2pRunMock.mock.calls.length}`);
 }
 
@@ -207,6 +287,44 @@ async function writeLatestImplementationMarker(overrides: Record<string, unknown
   await mkdir(dirname(markerPath), { recursive: true });
   await writeFile(markerPath, `${JSON.stringify(marker, null, 2)}\n`, 'utf8');
   return true;
+}
+
+function truncateNextTasksRead(count = 1): void {
+  truncatedTasksReads.pending = count;
+}
+
+function blockNextTasksRead(): { started: Promise<void>; release: () => void } {
+  let markStarted!: () => void;
+  let releaseRead!: () => void;
+  const started = new Promise<void>((resolve) => { markStarted = resolve; });
+  const wait = new Promise<void>((resolve) => { releaseRead = resolve; });
+  blockedTasksReads.pending = 1;
+  blockedTasksReads.started = markStarted;
+  blockedTasksReads.wait = wait;
+  blockedTasksReads.release = releaseRead;
+  return { started, release: releaseRead };
+}
+
+async function waitForBlockedTasksReadStart(started: Promise<void>): Promise<void> {
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    started,
+    new Promise<never>((_resolve, reject) => {
+      timeout = setTimeout(() => reject(new Error(
+        `openspec_auto_deliver_test_tasks_read_gate_not_reached${describeOrchestratorActivity()}`,
+      )), BLOCKED_TASKS_READ_START_WAIT_MS);
+    }),
+  ]).finally(() => {
+    if (timeout) clearTimeout(timeout);
+  });
+}
+
+function resetBlockedTasksRead(): void {
+  blockedTasksReads.release?.();
+  blockedTasksReads.pending = 0;
+  blockedTasksReads.started = undefined;
+  blockedTasksReads.wait = undefined;
+  blockedTasksReads.release = undefined;
 }
 
 async function emitDeckDemoIdle(): Promise<void> {
@@ -477,6 +595,10 @@ async function startFastImplementationAudit(requestId: string): Promise<MockP2pR
 
 describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   beforeEach(async () => {
+    // Disarm the tasks.md read seam. A test that arms more truncations than it
+    // consumes would otherwise leak them into every later test in this file.
+    truncatedTasksReads.pending = 0;
+    resetBlockedTasksRead();
     projectDir = join(tmpdir(), `imcodes-auto-deliver-${Date.now()}-${Math.random().toString(16).slice(2)}`);
     extraTempDirs = [];
     await makeChange('demo-change');
@@ -508,7 +630,7 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
     }));
     ensureTransportRuntimeForPendingResendMock.mockClear();
     clearAllResend();
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     getSessionMock.mockImplementation((name: string) => ({
       name,
       projectName: 'demo',
@@ -535,7 +657,9 @@ describe('OpenSpec Auto Deliver daemon orchestrator', () => {
   });
 
   afterEach(async () => {
-    clearOpenSpecAutoDeliverRunsForTests();
+    truncatedTasksReads.pending = 0;
+    resetBlockedTasksRead();
+    await clearOpenSpecAutoDeliverRunsForTests();
     clearAllResend();
     await rm(projectDir, { recursive: true, force: true });
     await Promise.all(extraTempDirs.map((dir) => rm(dir, { recursive: true, force: true })));
@@ -732,6 +856,9 @@ exec "${realGit}" "$@"
       expect(transportSendMock).toHaveBeenCalledWith(
         expect.stringContaining('OpenSpec Auto Deliver context for @openspec/changes/demo-change'),
         expect.stringContaining(':implementation:'),
+        undefined,
+        undefined,
+        { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM },
       );
     } finally {
       process.env.PATH = oldPath;
@@ -814,6 +941,33 @@ exec "${realGit}" "$@"
     expect(sendAfterSettle).toHaveBeenCalledTimes(1);
     expect(settleBeforeSend.mock.invocationCallOrder[0]).toBeLessThan(sendAfterSettle.mock.invocationCallOrder[0]);
     expect(String(sendAfterSettle.mock.calls[0]?.[0] ?? '')).toContain('OpenSpec Auto Deliver context for @openspec/changes/demo-change');
+  });
+
+  it('stamps a sent Auto Deliver prompt as a system message, not the human input', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    const timelineSpy = vi.spyOn(timelineEmitter, 'emit');
+    try {
+      await handleOpenSpecAutoDeliverCommand({
+        type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+        requestId: 'req-origin-stamp',
+        sessionName: 'deck_demo_brain',
+        changeName: 'demo-change',
+        presetId: 'fast',
+      }, serverLinkMock as never);
+      await waitForSend((msg) =>
+        msg.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION
+        && msg.projection?.stage === 'implementation_task_loop',
+        SEND_WAIT_MS,
+      );
+      const commandId = String(transportSendMock.mock.calls.at(-1)?.[1] ?? '');
+      const promptEvent = timelineSpy.mock.calls.find(([session, type, payload]) =>
+        session === 'deck_demo_brain' && type === 'user.message'
+        && (payload as Record<string, unknown>).commandId === commandId);
+      expect(promptEvent?.[2]).toMatchObject({ [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
+      expect(classifyUserMessageOrigin(promptEvent?.[2] as Record<string, unknown>)).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+    } finally {
+      timelineSpy.mockRestore();
+    }
   });
 
   it('does not preempt a busy transport turn while an active tool is running', async () => {
@@ -961,6 +1115,8 @@ exec "${realGit}" "$@"
       expect(queuedRuntime.send).toHaveBeenCalledTimes(1);
       const commandId = String(queuedRuntime.send.mock.calls[0]?.[1] ?? '');
       expect(commandId).toContain(':implementation:');
+      // The queued copy carries the daemon origin, so its drain row renders left.
+      expect(queuedRuntime.send.mock.calls[0]?.[4]).toMatchObject({ [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM });
       expect(timelineSpy.mock.calls.some(([session, type, payload]) =>
         session === 'deck_demo_brain'
         && type === 'user.message'
@@ -985,7 +1141,7 @@ exec "${realGit}" "$@"
         getTransportQueueStore().readSnapshot('deck_demo_brain').pendingMessageVersion,
       );
       expect(queuedPayload.pendingMessages).toBeUndefined();
-      expect(queuedPayload.pendingCount).toBeUndefined();
+      expect(queuedPayload.pendingCount).toBe(1);
 
       timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
       await new Promise((resolve) => setTimeout(resolve, 60));
@@ -1336,9 +1492,13 @@ exec "${realGit}" "$@"
     expect(acceptancePrompt).toContain('cap implementation and risk at 7 and cap tests at 6');
     await completeAcceptanceAuditFromPrompt(acceptancePrompt);
     await emitDeckDemoIdle();
+    // A hardcoded 8000ms budget here (versus the SEND_WAIT_MS used by every
+    // other wait in this file) is exactly the class of flake CI hit: under
+    // full-suite/coverage load the terminal send can land after 8s even
+    // though it is genuinely on its way. Use the same generous budget.
     const terminal = await waitForSend(
       (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
-      8000,
+      SEND_WAIT_MS,
     );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
@@ -1380,6 +1540,143 @@ exec "${realGit}" "$@"
 
     await waitForP2pStartCount(1);
     expect(startP2pRunMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('survives a single truncated tasks.md read instead of terminalizing a live run', async () => {
+    // An agent checking a task off rewrites tasks.md non-atomically, so the
+    // orchestrator's own 20ms poll can read it empty. `readTaskStatsForRun`
+    // retried a THROWN read error but not a successful read of truncated
+    // content: that returned `total: 0`, which terminalizes the run as
+    // needs_human/tasks_missing_checkboxes and ends it for good.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-truncated-tasks-read',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    // Arm before publishing the marker: the background marker poll can
+    // consume it and read the intact tasks.md before a later arm lands.
+    truncateNextTasksRead();
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForP2pStartCount(1);
+    const terminalized = serverLinkMock.send.mock.calls
+      .map((call) => call[0] as { projection?: { status?: string; lastMessage?: string } })
+      .some((msg) => msg?.projection?.lastMessage === 'tasks_missing_checkboxes');
+    expect(terminalized).toBe(false);
+  });
+
+  it('still terminalizes when tasks.md stays empty past the read retry budget', async () => {
+    // The transient-read allowance must not become a blanket exemption: a
+    // tasks.md that is genuinely emptied still has to stop the run.
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-persistently-empty-tasks',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+
+    // Arm before publishing the marker: the background marker poll can
+    // consume it and read the intact tasks.md before a later arm lands.
+    truncateNextTasksRead(50);
+    expect(await writeLatestImplementationMarker()).toBe(true);
+    timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+
+    await waitForSend((msg) => (
+      (msg as { projection?: { lastMessage?: string } }).projection?.lastMessage === 'tasks_missing_checkboxes'
+    ), SEND_WAIT_MS);
+    expect(startP2pRunMock).not.toHaveBeenCalled();
+  });
+
+  it('quiesces an in-flight implementation advance before resetting test fixtures', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-quiesce-implementation-advance',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):')
+      && text.includes('write this exact JSON marker to:'),
+      SEND_WAIT_MS,
+    );
+    // Arm the read gate before publishing the marker. The background 20ms
+    // marker poll and the explicit idle edge both consume that marker; arming
+    // after the write lets the poll win under CI contention, after which the
+    // idle edge no longer reads tasks.md and `gate.started` can never settle.
+    const gate = blockNextTasksRead();
+    let reset: Promise<void> | undefined;
+    try {
+      expect(await writeLatestImplementationMarker()).toBe(true);
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await waitForBlockedTasksReadStart(gate.started);
+
+      let resetFinished = false;
+      reset = clearOpenSpecAutoDeliverRunsForTests().then(() => {
+        resetFinished = true;
+      });
+      // Give an incorrectly untracked reset a full event-loop turn to resolve.
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      const finishedBeforeAdvance = resetFinished;
+
+      gate.release();
+      await reset;
+      reset = undefined;
+      await waitForP2pStartCount(1);
+
+      expect(finishedBeforeAdvance).toBe(false);
+      expect(describeOpenSpecAutoDeliverRunsForTests()).toEqual([]);
+    } finally {
+      // Never leave a deferred filesystem read parked when an assertion or
+      // diagnostic wait fails; otherwise afterEach would itself deadlock.
+      gate.release();
+      if (reset) await reset;
+    }
+  });
+
+  it('fails a stuck test-reset drain with a bounded, explicit error', async () => {
+    await makeChange('demo-change', '- [x] first\n- [x] second\n');
+    await handleOpenSpecAutoDeliverCommand({
+      type: OPENSPEC_AUTO_DELIVER_MSG.LAUNCH,
+      requestId: 'req-bounded-reset-drain',
+      sessionName: 'deck_demo_brain',
+      changeName: 'demo-change',
+      presetId: 'fast',
+    }, serverLinkMock as never);
+    await waitForTransportSend((text) =>
+      text.includes('Implementation completion marker (required):'), SEND_WAIT_MS);
+    const gate = blockNextTasksRead();
+    try {
+      expect(await writeLatestImplementationMarker()).toBe(true);
+      timelineEmitter.emit('deck_demo_brain', 'session.state', { state: 'idle' });
+      await waitForBlockedTasksReadStart(gate.started);
+      await expect(clearOpenSpecAutoDeliverRunsForTests({ drainTimeoutMs: 25 }))
+        .rejects.toThrow('openspec_auto_deliver_test_reset_drain_timeout');
+    } finally {
+      gate.release();
+    }
+    await clearOpenSpecAutoDeliverRunsForTests();
   });
 
   it('advances implementation from a valid completion marker despite unchecked tasks and without waiting for idle', async () => {
@@ -1736,9 +2033,17 @@ exec "${realGit}" "$@"
     await git(['commit', '-m', commitMessage]);
     await git(['push']);
     await emitDeckDemoIdle();
+    // verifyAutoCommitPushCompleted spawns several sequential real `git`
+    // subprocesses (rev-parse, diff, rev-list, log) before the terminal send.
+    // A hardcoded 8000ms budget (below even the file's normal SEND_WAIT_MS)
+    // raced that under full-suite/coverage CI load: the run had already
+    // reached its own conclusion, but the send observed here simply hadn't
+    // landed inside the tight window yet. Use the same generous budget every
+    // other wait in this file relies on, and give the surrounding test (which
+    // also spawns real git processes) matching headroom below.
     const terminal = await waitForSend(
       (msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed',
-      8000,
+      SEND_WAIT_MS,
     );
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.evidence?.map((entry: { summary?: string }) => entry.summary).join('\n')).toContain('Auto commit/push verified by daemon');
@@ -1751,7 +2056,7 @@ exec "${realGit}" "$@"
       maxBuffer: 1024 * 1024,
     });
     expect(remoteLog.stdout?.toString?.() ?? '').toContain(commitMessage);
-  }, 15_000);
+  }, 60_000);
 
   it('runs the Standard preset from spec audit through implementation audit PASS', async () => {
     await handleOpenSpecAutoDeliverCommand({
@@ -2879,6 +3184,30 @@ exec "${realGit}" "$@"
     expect([...p2pRuns.values()]).toHaveLength(1);
   });
 
+  it('does not let an in-flight idle advance send into the next test after test cleanup', async () => {
+    const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-cleanup-in-flight-idle');
+    await completeAcceptanceAuditFromPrompt(acceptancePrompt, {
+      verdict: 'REWORK',
+      required_changes: ['authorized production release still pending'],
+      repair_completion: repairCompletion({
+        status: 'blocked',
+        previous_items_complete: true,
+        completed_items: ['all in-repo repair items verified'],
+        incomplete_items: [],
+        blocked_items: ['9.3 authorized commit/push/CI/production release'],
+        summary: 'All in-repo repairs are complete; only an authorized external release remains.',
+      }),
+    });
+
+    await emitDeckDemoIdle();
+    await clearOpenSpecAutoDeliverRunsForTests();
+    await rm(projectDir, { recursive: true, force: true });
+    serverLinkMock.send.mockClear();
+
+    await new Promise((resolve) => setTimeout(resolve, 1_000));
+    expect(serverLinkMock.send.mock.calls).toEqual([]);
+  });
+
   it('delivers (passed) when the only unchecked tasks are accepted external/deferred gates', async () => {
     // One in-repo task done + one external release gate deliberately left
     // unchecked and declared skippable. External verification must not block
@@ -2919,8 +3248,10 @@ exec "${realGit}" "$@"
     await completeAcceptanceAuditFromPrompt(acceptancePrompt, { verdict: 'PASS', unchecked_tasks: [], required_changes: [] });
     await emitDeckDemoIdle();
 
+    // Same hardcoded-8000ms-vs-SEND_WAIT_MS class as the other two terminal
+    // waits in this file; align it so this one doesn't flake the same way.
     const terminal = await waitForSend((msg) =>
-      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', 8000);
+      msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL && msg.projection?.status === 'passed', SEND_WAIT_MS);
     expect(terminal?.projection.status).toBe('passed');
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
   });
@@ -3342,7 +3673,7 @@ exec "${realGit}" "$@"
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)).toHaveLength(terminalCountAfterStale);
     expect(serverLinkMock.send.mock.calls.filter((call) => call[0]?.type === OPENSPEC_AUTO_DELIVER_MSG.PROJECTION)).toHaveLength(projectionCountAfterStale);
 
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
@@ -3361,7 +3692,7 @@ exec "${realGit}" "$@"
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
 
-    clearOpenSpecAutoDeliverRunsForTests();
+    await clearOpenSpecAutoDeliverRunsForTests();
     serverLinkMock.send.mockClear();
     transportSendMock.mockClear();
     p2pRuns.clear();
@@ -3380,7 +3711,11 @@ exec "${realGit}" "$@"
     await emitDeckDemoIdle();
     terminal = await waitForSend((msg) => msg.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL, SEND_WAIT_MS);
     expect(terminal?.projection.terminalReason).toBe('final_audit_passed');
-  }, 10_000);
+    // This test chains multiple SEND_WAIT_MS-budgeted waits plus a fixed
+    // settle sleep; a 10_000ms outer test timeout is narrower than a single
+    // one of those internal waits, let alone several in sequence. Match the
+    // generous outer budget used for the other real-verification test below.
+  }, 60_000);
 
   it('rejects authoritative result files that symlink outside .imc/discussions', async () => {
     const acceptancePrompt = await startFinalAcceptanceAuditPrompt('req-result-symlink-escape');

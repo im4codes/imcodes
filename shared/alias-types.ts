@@ -31,6 +31,13 @@ export const ALIAS_NAME_PATTERN = /^[\p{L}\p{N}._-]{1,20}$/u;
 /** Where alias CRUD lives on the server (pod-independent; no serverId). */
 export const ALIAS_API_PATH = '/api/aliases';
 
+/** Stable database identity used by durable references such as verification machines. */
+export const ALIAS_ID_PATTERN = /^[a-f0-9]{32}$/u;
+
+export function isAliasId(value: unknown): value is string {
+  return typeof value === 'string' && ALIAS_ID_PATTERN.test(value);
+}
+
 /**
  * MCP tool names exposed by the daemon for the alias store.
  * - Read: `resolve_alias` (single value), `list_aliases` (metadata-only, optional search query).
@@ -66,8 +73,9 @@ export type AliasReason = typeof ALIAS_REASONS[keyof typeof ALIAS_REASONS];
 /** Origin of a stored alias record. */
 export type AliasSource = 'web' | 'mcp';
 
-/** Canonical alias record. `id`/`user_id` are server-only and not part of this wire shape. */
+/** Canonical alias record. `id` is stable across renames; `user_id` never leaves the server. */
 export interface AliasEntry {
+  id?: string;
   name: string;
   value: string;
   description?: string;

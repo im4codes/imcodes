@@ -13,18 +13,33 @@
  * After startHookServer() resolves, `activeHookPort` holds the actual port.
  * All hook scripts and plugins read this value at write time.
  */
+import { TASK_PAIR_ENGINE_HOOK_PATH, TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
+import { RETIRED_SUPERVISION_MCP_MESSAGE, RETIRED_SUPERVISION_MCP_TOOL_SET } from '../../shared/memory-mcp-contracts.js';
 import http from 'http';
-import { promises as fs } from 'fs';
-import { dirname } from 'path';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { getSession, upsertSession, listSessions } from '../store/session-store.js';
+import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from './memory-mcp-error-codes.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
 import { dispatchHookSend } from './send-tool.js';
-import { DEFAULT_HOOK_PORT, HOOK_PORT_FILE } from './hook-port.js';
+import {
+  DEFAULT_HOOK_PORT,
+  HOOK_BIND_RETRY_SPAN,
+  HOOK_REBIND_RETRY,
+  publishHookAuthority,
+  readSavedHookPort,
+} from './hook-port.js';
+import { boundedExponentialBackoffMs } from '../../shared/context-store-rpc.js';
+import {
+  HOOK_AUTHORITY_ERROR,
+  HOOK_AUTHORITY_RECORD_VERSION,
+  HOOK_IDENTITY_HOOK_PATH,
+  type HookIdentityResponse,
+} from '../../shared/hook-authority.js';
+import { currentDaemonProcessIdentity } from './instance-lock.js';
 import {
   containsLegacyAuditControlMarker,
   PEER_AUDIT_REPLY_ERRORS,
@@ -36,6 +51,31 @@ import {
   AGENT_DELEGATION_REPLY_ERRORS,
   AGENT_DELEGATION_REPLY_TOTAL_BYTES,
 } from '../../shared/agent-delegation.js';
+import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
+import { isMemoryScope, validateMemoryScopeIdentity } from '../../shared/memory-scope.js';
+import type { ContextNamespace } from '../../shared/context-types.js';
+import {
+  MEMORY_MCP_SESSION_RESTART_HOOK_PATH,
+  MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH,
+  MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH,
+  MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from '../../shared/memory-mcp-contracts.js';
+import { isSendMessageId, type SendMessageId } from '../../shared/send-message-id.js';
+import { TASK_ADMISSION_HOOK_PATH, TASK_ADMISSION_OPERATION } from '../../shared/session-resource-lifecycle.js';
+import { getDaemonTaskAdmissionController } from './daemon-task-admission.js';
+import { measureSessionProcessTreeRssBytes } from './session-resource-service.js';
+import {
+  MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES,
+  MEMORY_MCP_DAEMON_RPC_PATH,
+  isMemoryMcpDaemonToolName,
+  type MemoryMcpDaemonToolName,
+} from '../../shared/memory-mcp-daemon-rpc.js';
+import { normalizeDaemonLocalMemoryNamespace, LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
+import type { McpRuntimeCaller } from './memory-mcp-caller.js';
+import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
+import { readProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 
 export { DEFAULT_HOOK_PORT };
 
@@ -51,8 +91,43 @@ const MAX_SEND_DEPTH = 3;
 const RATE_LIMIT_MAX = 10;
 /** Rate limit window: 60 seconds */
 const RATE_LIMIT_WINDOW_MS = 60 * 1000;
+/** Lifecycle controls have a separate, generous burst so batch resets do not
+ * consume ordinary send capacity. Excess work waits in a bounded FIFO. */
+const LIFECYCLE_RATE_LIMIT_MAX = 30;
+const LIFECYCLE_RATE_LIMIT_WINDOW_MS = 60 * 1000;
+const LIFECYCLE_QUEUE_MAX = 100;
+const SESSION_RESTART_BATCH_MAX = 50;
+const LIFECYCLE_IDEMPOTENCY_TTL_MS = 5 * 60 * 1000;
 /** Max broadcast recipients */
 const MAX_BROADCAST_RECIPIENTS = 8;
+
+function validCapabilityNamespace(value: unknown): value is ContextNamespace {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const namespace = value as ContextNamespace;
+  if (!isMemoryScope(namespace.scope)) return false;
+  return validateMemoryScopeIdentity(namespace.scope, {
+    user_id: namespace.userId,
+    project_id: namespace.projectId,
+    workspace_id: namespace.workspaceId,
+    org_id: namespace.enterpriseId,
+    tenant_id: namespace.localTenant,
+  }).ok;
+}
+
+function capabilityNamespaceForSession(session: SessionRecord, ownerId: string): ContextNamespace {
+  const rawNamespace: unknown = session.contextNamespace;
+  if (validCapabilityNamespace(rawNamespace)) {
+    return { ...rawNamespace, userId: ownerId };
+  }
+  const candidateProjectId = rawNamespace && typeof rawNamespace === 'object'
+    ? (rawNamespace as Record<string, unknown>).projectId
+    : undefined;
+  const priorProjectId = typeof candidateProjectId === 'string'
+    && Buffer.byteLength(candidateProjectId, 'utf8') <= 512
+    ? candidateProjectId
+    : undefined;
+  return { scope: 'personal', userId: ownerId, ...(priorProjectId ? { projectId: priorProjectId } : {}) };
+}
 
 /** The port the hook server is currently listening on. Set after startHookServer() resolves. */
 export let activeHookPort: number = DEFAULT_HOOK_PORT;
@@ -83,21 +158,119 @@ const messageQueue = new Map<string, QueuedMessage[]>();
 /** Rate limiter: source session → timestamps of recent sends */
 const rateLimiter = new Map<string, number[]>();
 
+interface LifecycleTask {
+  run: () => void | Promise<void>;
+}
+interface LifecycleBucket {
+  timestamps: number[];
+  queue: LifecycleTask[];
+  timer?: NodeJS.Timeout;
+}
+const lifecycleLimiter = new Map<string, LifecycleBucket>();
+const lifecycleIdempotency = new Map<string, number>();
+
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
-async function loadSavedPort(): Promise<number> {
+/** Preferred bind port: the last published record, else the default. Reading is
+ *  delegated to `hook-port.ts` so there is exactly ONE parser for the record
+ *  (the previous private copy here diverged - it fell back to
+ *  `DEFAULT_HOOK_PORT` where the shared reader returns null, and it accepted
+ *  `parseInt` prefixes like "51915abc"). */
+function loadPreferredPort(home?: string): number {
+  return (home === undefined ? readSavedHookPort() : readSavedHookPort(home)) ?? DEFAULT_HOOK_PORT;
+}
+
+/** Identity of the daemon generation that owns this hook endpoint. Captured
+ *  ONCE so a republish after a rebind keeps the same owner and is therefore not
+ *  fenced against itself. */
+const hookOwnerIdentity = currentDaemonProcessIdentity();
+
+/** Determinate outcome of a publish attempt. */
+export interface PublishAttempt {
+  published: boolean;
+  reason?: string;
+  error?: unknown;
+}
+
+/**
+ * Publish (or republish) the endpoint record, fenced against a different live
+ * owner.
+ *
+ * Returns a DETERMINATE result. It previously swallowed both refusal and write
+ * errors and resolved `void`, so callers could not tell a successful
+ * publication from a refused or failed one - which let the rebind path report
+ * "rebound and republished authority" while clients stayed routed by stale or
+ * never-written authority. A refusal is still not fatal at startup (the server
+ * is already serving), but it MUST be reported, not inferred.
+ */
+async function publishAuthority(port: number, context: string, home?: string): Promise<PublishAttempt> {
   try {
-    const raw = await fs.readFile(HOOK_PORT_FILE, 'utf-8');
-    const p = parseInt(raw.trim(), 10);
-    return Number.isFinite(p) && p > 1024 && p < 65536 ? p : DEFAULT_HOOK_PORT;
-  } catch {
-    return DEFAULT_HOOK_PORT;
+    const result = await publishHookAuthority(port, {
+      owner: hookOwnerIdentity,
+      ...(home === undefined ? {} : { home, allowGlobalWriteInTests: true }),
+    });
+    if (result.published) {
+      logger.info({ port, context, pid: hookOwnerIdentity.pid }, 'Hook server: published endpoint authority');
+      return { published: true };
+    }
+    logger.warn(
+      { port, context, reason: result.reason, heldBy: result.heldBy },
+      'Hook server: endpoint authority publish refused (another live owner holds the record)',
+    );
+    return { published: false, ...(result.reason === undefined ? {} : { reason: result.reason }) };
+  } catch (err) {
+    // A write failure must not take a healthy listener down, but it also must
+    // not be reported as success.
+    logger.warn({ err, port, context }, 'Hook server: endpoint authority publish failed');
+    return { published: false, reason: 'publish_write_failed', error: err };
   }
 }
 
-async function savePort(port: number): Promise<void> {
-  await fs.mkdir(dirname(HOOK_PORT_FILE), { recursive: true });
-  await fs.writeFile(HOOK_PORT_FILE, String(port));
+/** Raised when startup could not converge: a listener was bound but the
+ *  owner-fenced authority could not be published within the bounded retry. The
+ *  listener is closed before this escapes, so no live-but-undiscoverable
+ *  endpoint is ever left behind. */
+export class HookStartupPublishError extends Error {
+  readonly port: number;
+  readonly reason: string;
+  readonly attempts: number;
+  constructor(port: number, reason: string, attempts: number) {
+    super(
+      `hook server could not publish authority for port ${port} after ${attempts} attempt(s): ${reason}`,
+    );
+    this.name = 'HookStartupPublishError';
+    this.port = port;
+    this.reason = reason;
+    this.attempts = attempts;
+  }
+}
+
+/** Raised when a rebind bound a listener but could not publish the authority.
+ *  Carried through the bounded retry so the endpoint is never reported as
+ *  recovered while clients are still routed by the old record. */
+class HookRebindPublishError extends Error {
+  readonly port: number;
+  readonly reason: string;
+  readonly cause?: unknown;
+  constructor(port: number, reason: string, cause?: unknown) {
+    super(`hook authority publish failed after rebinding port ${port}: ${reason}`);
+    this.name = 'HookRebindPublishError';
+    this.port = port;
+    this.reason = reason;
+    if (cause !== undefined) this.cause = cause;
+  }
+}
+
+/** Servers whose close was REQUESTED by the daemon. */
+const intentionallyClosing = new WeakSet<http.Server>();
+
+/** Close the hook server and await it. Daemon shutdown MUST use this so the
+ *  self-healing rebind is not armed in the middle of teardown. */
+export function closeHookServer(server: http.Server): Promise<void> {
+  intentionallyClosing.add(server);
+  return new Promise<void>((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
 }
 
 function tryBind(server: http.Server, port: number): Promise<void> {
@@ -168,6 +341,31 @@ function resolveSenderRecord(from: string, allSessions: SessionRecord[]): Sessio
  *   `imcodes send "deck_proj_brain" ...` without enabling global
  *   label/type/broadcast fan-out.
  */
+/**
+ * THE sibling-scope predicate. Defined once and used by every resolution path.
+ *
+ * A sub-session belongs to exactly ONE owning main. Scoping a main's siblings by
+ * shared `projectName` therefore let a DIFFERENT main in the same project
+ * address and control it -- with 94 unparented mains in one live project, every
+ * main was a sibling of every other main's sub-sessions. A main now sees sibling
+ * MAINS plus its OWN subtree, never another main's children.
+ *
+ * The owner comparison uses `fromRecord.name`, never the raw `from` request
+ * field: `from` may be a label, and a label is not an identity.
+ */
+export function isSiblingSessionOf(candidate: SessionRecord, fromRecord: SessionRecord): boolean {
+  if (candidate.name === fromRecord.name) return false;
+  if (candidate.state === 'stopped') return false;
+  if (fromRecord.parentSession) {
+    // Sub-session: its owning main and that main's other children.
+    return candidate.parentSession === fromRecord.parentSession
+      || candidate.name === fromRecord.parentSession;
+  }
+  // Main session: sibling mains in the same project, plus its own children only.
+  return (candidate.projectName === fromRecord.projectName && !candidate.parentSession)
+    || candidate.parentSession === fromRecord.name;
+}
+
 export function resolveTarget(from: string, to: string): ResolveResult {
   const allSessions = listSessions();
   const fromRecord = resolveSenderRecord(from, allSessions);
@@ -194,16 +392,7 @@ export function resolveTarget(from: string, to: string): ResolveResult {
   }
 
   // Determine siblings: sessions sharing the same parent or project (exclude stopped)
-  const allSiblings = allSessions.filter((s) => {
-    if (s.name === fromRecord.name) return false; // exclude self
-    if (s.state === 'stopped') return false; // exclude stopped sessions
-    // Sub-sessions: match by parentSession
-    if (fromRecord.parentSession) {
-      return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
-    }
-    // Main sessions: match by projectName
-    return s.projectName === fromRecord.projectName || s.parentSession === from;
-  });
+  const allSiblings = allSessions.filter((s) => isSiblingSessionOf(s, fromRecord));
   // Target discovery and every ordinary send mode must mirror what users can
   // identify. Raw legacy workers hidden by the frontend are internal sessions,
   // not user-addressable conversation targets.
@@ -252,10 +441,107 @@ function checkRateLimit(from: string): boolean {
   return recent.length < RATE_LIMIT_MAX;
 }
 
+function ordinaryRateLimitRetryAfterMs(from: string): number {
+  const timestamps = rateLimiter.get(from) ?? [];
+  const oldest = timestamps[0];
+  return oldest === undefined ? RATE_LIMIT_WINDOW_MS : Math.max(1, oldest + RATE_LIMIT_WINDOW_MS - Date.now());
+}
+
 function recordSend(from: string): void {
   const timestamps = rateLimiter.get(from) ?? [];
   timestamps.push(Date.now());
   rateLimiter.set(from, timestamps);
+}
+
+function lifecycleBucketFor(from: string): LifecycleBucket {
+  const bucket = lifecycleLimiter.get(from) ?? { timestamps: [], queue: [] };
+  lifecycleLimiter.set(from, bucket);
+  return bucket;
+}
+
+function pruneLifecycle(bucket: LifecycleBucket, now = Date.now()): void {
+  bucket.timestamps = bucket.timestamps.filter((timestamp) => timestamp > now - LIFECYCLE_RATE_LIMIT_WINDOW_MS);
+  for (const [key, createdAt] of lifecycleIdempotency) {
+    if (createdAt <= now - LIFECYCLE_IDEMPOTENCY_TTL_MS) lifecycleIdempotency.delete(key);
+  }
+}
+
+function lifecycleRetryAfterMs(bucket: LifecycleBucket, now = Date.now()): number {
+  const oldest = bucket.timestamps[0];
+  return oldest === undefined ? 0 : Math.max(1, oldest + LIFECYCLE_RATE_LIMIT_WINDOW_MS - now);
+}
+
+function drainLifecycle(from: string): void {
+  const bucket = lifecycleLimiter.get(from);
+  if (!bucket) return;
+  bucket.timer = undefined;
+  const now = Date.now();
+  pruneLifecycle(bucket, now);
+  while (bucket.queue.length > 0 && bucket.timestamps.length < LIFECYCLE_RATE_LIMIT_MAX) {
+    const task = bucket.queue.shift()!;
+    bucket.timestamps.push(Date.now());
+    setImmediate(() => { void Promise.resolve(task.run()).catch((err: unknown) => logger.warn({ err, from }, 'Lifecycle control task failed')); });
+  }
+  if (bucket.queue.length > 0) {
+    bucket.timer = setTimeout(() => drainLifecycle(from), lifecycleRetryAfterMs(bucket));
+  } else if (bucket.timestamps.length === 0) {
+    lifecycleLimiter.delete(from);
+  }
+}
+
+function scheduleLifecycleTask(
+  from: string,
+  task: LifecycleTask,
+  idempotencyKey?: string,
+): { accepted: boolean; queued: boolean; duplicate: boolean; retryAfterMs?: number } {
+  const bucket = lifecycleBucketFor(from);
+  const idempotency = idempotencyKey?.trim();
+  if (idempotency) {
+    const key = `${from}\u0000${idempotency}`;
+    if (lifecycleIdempotency.has(key)) return { accepted: true, queued: false, duplicate: true };
+  }
+  pruneLifecycle(bucket);
+  if (bucket.timestamps.length < LIFECYCLE_RATE_LIMIT_MAX) {
+    if (idempotency) lifecycleIdempotency.set(`${from}\u0000${idempotency}`, Date.now());
+    bucket.timestamps.push(Date.now());
+    setImmediate(() => { void Promise.resolve(task.run()).catch((err: unknown) => logger.warn({ err, from }, 'Lifecycle control task failed')); });
+    return { accepted: true, queued: false, duplicate: false };
+  }
+  if (bucket.queue.length >= LIFECYCLE_QUEUE_MAX) {
+    return { accepted: false, queued: false, duplicate: false, retryAfterMs: lifecycleRetryAfterMs(bucket) };
+  }
+  if (idempotency) lifecycleIdempotency.set(`${from}\u0000${idempotency}`, Date.now());
+  bucket.queue.push(task);
+  if (!bucket.timer) bucket.timer = setTimeout(() => drainLifecycle(from), lifecycleRetryAfterMs(bucket));
+  return { accepted: true, queued: true, duplicate: false };
+}
+
+/**
+ * Batch lifecycle operations must be admitted atomically. Count only new
+ * idempotency keys against both burst and FIFO capacity before reserving any
+ * task, preventing a 429 after partially accepting a batch.
+ */
+function preflightLifecycleBatch(
+  from: string,
+  idempotencyKeys: Array<string | undefined>,
+): { accepted: boolean; retryAfterMs?: number } {
+  const bucket = lifecycleBucketFor(from);
+  pruneLifecycle(bucket);
+  const seen = new Set<string>();
+  let needed = 0;
+  for (const idempotencyKey of idempotencyKeys) {
+    const idempotency = idempotencyKey?.trim();
+    if (idempotency) {
+      const key = `${from}\u0000${idempotency}`;
+      if (lifecycleIdempotency.has(key) || seen.has(key)) continue;
+      seen.add(key);
+    }
+    needed += 1;
+  }
+  const available = Math.max(0, LIFECYCLE_RATE_LIMIT_MAX - bucket.timestamps.length)
+    + Math.max(0, LIFECYCLE_QUEUE_MAX - bucket.queue.length);
+  if (needed <= available) return { accepted: true };
+  return { accepted: false, retryAfterMs: lifecycleRetryAfterMs(bucket) || LIFECYCLE_RATE_LIMIT_WINDOW_MS };
 }
 
 /**
@@ -302,6 +588,9 @@ export function getQueue(target: string): QueuedMessage[] {
 export function clearQueues(): void {
   messageQueue.clear();
   rateLimiter.clear();
+  for (const bucket of lifecycleLimiter.values()) if (bucket.timer) clearTimeout(bucket.timer);
+  lifecycleLimiter.clear();
+  lifecycleIdempotency.clear();
 }
 
 // ─── /send Handler ───────────────────────────────────────────────────────────
@@ -314,6 +603,27 @@ interface SendRequest {
   context?: string;
   depth?: number;
   reply?: boolean;
+  deliveryMode?: MemoryMcpSendDeliveryMode;
+  supervision?: { taskId: string; assignmentId: string; auditAttemptId?: string; auditRevision?: string };
+  messageId?: SendMessageId;
+}
+
+const SUPERVISION_SEND_BINDING_KEYS = new Set(['taskId', 'assignmentId', 'auditAttemptId', 'auditRevision']);
+
+function validSupervisionSendBinding(value: unknown): value is NonNullable<SendRequest['supervision']> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
+  const record = value as Record<string, unknown>;
+  // Strict allow-list: unknown keys are still rejected outright. `auditAttemptId`
+  // and `auditRevision` are optional and, when present, make the binding an exact
+  // four-tuple that the resolver matches instead of scanning for a candidate.
+  if (Object.keys(record).some((key) => !SUPERVISION_SEND_BINDING_KEYS.has(key))) return false;
+  const validBoundedString = (candidate: unknown): boolean => typeof candidate === 'string'
+    && candidate.trim().length > 0
+    && Buffer.byteLength(candidate, 'utf8') <= 512;
+  return validBoundedString(record.taskId)
+    && validBoundedString(record.assignmentId)
+    && (record.auditAttemptId === undefined || validBoundedString(record.auditAttemptId))
+    && (record.auditRevision === undefined || validBoundedString(record.auditRevision));
 }
 
 async function handleSend(body: SendRequest): Promise<{ status: number; body: Record<string, unknown> }> {
@@ -327,6 +637,16 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
   if (body.context) {
     return { status: 501, body: { ok: false, error: 'context is not yet supported — send plain message only' } };
   }
+  if (body.deliveryMode !== undefined
+      && !Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(body.deliveryMode)) {
+    return { status: 400, body: { ok: false, error: 'invalid delivery mode' } };
+  }
+  if (body.supervision !== undefined && !validSupervisionSendBinding(body.supervision)) {
+    return { status: 400, body: { ok: false, error: 'invalid supervision binding' } };
+  }
+  if (body.messageId !== undefined && (!body.supervision || !isSendMessageId(body.messageId))) {
+    return { status: 400, body: { ok: false, error: 'invalid supervised message id' } };
+  }
 
   if (containsLegacyAuditControlMarker(message)) {
     return { status: 400, body: { ok: false, error: 'peer_audit_control_requires_dedicated_ingress' } };
@@ -337,19 +657,14 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     return { status: 429, body: { ok: false, error: 'depth limit exceeded' } };
   }
 
-  // Circuit breaker: rate limit
-  if (!checkRateLimit(from)) {
-    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
-  }
-
   // Resolve target
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
-
-  // Record send after successful resolution (prevents invalid senders from polluting rate-limit map)
-  recordSend(from);
+  if (body.supervision && result.targets.length !== 1) {
+    return { status: 400, body: { ok: false, error: 'supervision binding requires one exact target' } };
+  }
 
   // Transport command liveness mandate (CLAUDE.md): `/stop` is a CONTROL
   // command and must take the priority stop path from EVERY ingress — never
@@ -382,6 +697,15 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
     };
   }
 
+  // Ordinary messages retain abuse protection. Urgent /stop was handled above
+  // on the priority path and must never consume or wait on this bucket.
+  if (!checkRateLimit(from)) {
+    return { status: 429, body: { ok: false, error: 'rate limit exceeded', retryAfterMs: ordinaryRateLimitRetryAfterMs(from) } };
+  }
+  // Record only after exact target validation; failed requests do not pollute
+  // the ordinary send bucket.
+  recordSend(from);
+
   const sender = resolveSenderRecord(from, listSessions());
   const projectRoot = sender && sender !== 'ambiguous' ? sender.projectDir : null;
   let dispatch;
@@ -393,6 +717,9 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
       files: body.files,
       projectRoot,
       reply: body.reply === true,
+      ...(body.deliveryMode ? { deliveryMode: body.deliveryMode } : {}),
+      ...(body.supervision ? { supervision: body.supervision } : {}),
+      ...(body.messageId ? { messageId: body.messageId } : {}),
     });
   } catch (err) {
     return { status: 400, body: { ok: false, error: (err as Error).message } };
@@ -463,16 +790,10 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
   if (!from || !to) {
     return { status: 400, body: { ok: false, error: 'missing required fields: from, to' } };
   }
-  if (!checkRateLimit(from)) {
-    return { status: 429, body: { ok: false, error: 'rate limit exceeded' } };
-  }
-
   const result = resolveTarget(from, to);
   if (!result.ok) {
     return { status: 404, body: { ok: false, error: result.error, available: result.available } };
   }
-  recordSend(from);
-
   // Lazy import: command-handler pulls in the whole daemon graph, so importing
   // it eagerly here would create a heavy module cycle (and broke hook-server's
   // own tests). Only loaded when /stop is actually called.
@@ -503,7 +824,7 @@ async function handleStop(body: StopRequest): Promise<{ status: number; body: Re
 
 function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<string> {
   return new Promise((resolve, reject) => {
-    let body = '';
+    const chunks: Buffer[] = [];
     let size = 0;
     let rejected = false;
     req.on('data', (chunk: Buffer) => {
@@ -515,10 +836,12 @@ function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<
         req.resume(); // drain remaining data without storing
         return;
       }
-      body += chunk.toString();
+      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
     });
     req.on('end', () => {
-      if (!rejected) resolve(body);
+      // Decode once after framing is complete. Per-chunk toString() corrupts a
+      // valid multi-byte UTF-8 scalar whenever TCP splits inside that scalar.
+      if (!rejected) resolve(Buffer.concat(chunks, size).toString('utf8'));
     });
     req.on('error', (err) => {
       if (!rejected) reject(err);
@@ -528,8 +851,70 @@ function readBody(req: http.IncomingMessage, maxBytes = MAX_BODY_SIZE): Promise<
 
 // ─── Server ──────────────────────────────────────────────────────────────────
 
-export async function startHookServer(onHook: HookCallback): Promise<{ server: http.Server; port: number }> {
-  const preferredPort = await loadSavedPort();
+export interface HookServerOptions {
+  /** State directory for the endpoint authority pair (`hook-port` +
+   *  `hook-authority.json`). Production leaves this unset and uses
+   *  `IMCODES_HOME`/`~/.imcodes`.
+   *
+   *  Tests MUST set it to a temp directory: this is the injection seam whose
+   *  absence let eight suites publish over the machine-global record. Setting it
+   *  also authorises the write, so the publisher's test-runtime guard does not
+   *  suppress a deliberately sandboxed publish. */
+  authorityHome?: string;
+  /** Rebind + republish the endpoint when the listener is lost without a
+   *  `closeHookServer()` request. The daemon sets this; holders that manage the
+   *  server's lifetime themselves (tests, embedders) leave it off so a plain
+   *  `close()` stays a plain close. */
+  rebindOnListenerLoss?: boolean;
+  /** Overrides for the bounded rebind retry (see `HOOK_REBIND_RETRY`). */
+  rebindRetry?: { maxAttempts?: number; baseDelayMs?: number; capDelayMs?: number };
+  /** Test seam performing the owner-fenced authority publication. Injected so a
+   *  transient publish failure can be reproduced deterministically: `fs` is an
+   *  ESM namespace and cannot be spied on, and a chmod race is timing-dependent.
+   *  Production leaves it unset. */
+  publishRecord?: (port: number, context: string, home?: string) => Promise<PublishAttempt>;
+  /** Test seam performing the actual `listen`. Injected so the bounded rebind
+   *  retry can be driven deterministically instead of racing the OS for ports;
+   *  a real `EADDRINUSE` sequence is otherwise impossible to reproduce reliably.
+   *  Tests may bind port `0` to let the OS allocate an isolated endpoint; the
+   *  server always derives the authoritative port from the resulting listener.
+   *  MUST reject with `code: 'EADDRINUSE'` to mean "try the next port". */
+  bindListener?: (server: http.Server, port: number) => Promise<void>;
+  /** Test seam; production lazily binds the daemon-local memory handlers. */
+  invokeMemoryMcpTool?: (
+    caller: McpRuntimeCaller,
+    tool: MemoryMcpDaemonToolName,
+    input?: unknown,
+  ) => Promise<Record<string, unknown>>;
+  /** Exact ServerLink identity injected by the daemon, never by the MCP child. */
+  memoryMcpServerId?: string;
+  /** Test seam; production schedules the command-handler's exclusive relaunch. */
+  restartSession?: (sessionName: string, options: { reset: boolean }) => Promise<boolean> | boolean;
+  /** Test seams for the session model MCP tools. */
+  listSessionModels?: (sessionName: string) => Promise<import('../../shared/session-model-control.js').SessionModelListResult>;
+  switchSessionModel?: (sessionName: string, model?: string, thinking?: string) => Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult>;
+}
+
+async function invokeDaemonMemoryMcpTool(
+  caller: McpRuntimeCaller,
+  tool: MemoryMcpDaemonToolName,
+  input?: unknown,
+): Promise<Record<string, unknown>> {
+  const { createMemoryMcpToolHandlers } = await import('./memory-mcp-tools.js');
+  const { withPairsLegacyTools } = await import('./task-pairs/legacy-tools.js');
+  return withPairsLegacyTools(caller.sessionName, createMemoryMcpToolHandlers(caller))[tool](input) as Promise<Record<string, unknown>>;
+}
+
+export async function startHookServer(
+  onHook: HookCallback,
+  options: HookServerOptions = {},
+): Promise<{ server: http.Server; port: number }> {
+  const preferredPort = loadPreferredPort(options.authorityHome);
+  // `activeHookPort` is the production singleton used by hook writers, but a
+  // test process can own multiple hook servers concurrently. Keep the route's
+  // identity on the instance so one server can never advertise another
+  // server's port when starts overlap.
+  let boundPort = preferredPort;
 
   const server = http.createServer(async (req, res) => {
     if (req.method !== 'POST') {
@@ -539,6 +924,203 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     }
 
     const url = req.url;
+
+    // Owner verification. Unauthenticated on purpose: every local client (the
+    // stdio MCP child, `imcodes send`, the peer-audit CLI) must be able to ask
+    // "who owns this port?" BEFORE it has any session/server credential. The
+    // payload is loopback-only and carries no secret - just the process
+    // identity already written to the on-disk record.
+    if (url === HOOK_IDENTITY_HOOK_PATH) {
+      const identity: HookIdentityResponse = {
+        version: HOOK_AUTHORITY_RECORD_VERSION,
+        port: boundPort,
+        pid: hookOwnerIdentity.pid,
+        startToken: hookOwnerIdentity.startToken,
+      };
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(identity));
+      return;
+    }
+
+    if (url === MEMORY_MCP_DAEMON_RPC_PATH) {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      const session = senderSessionName ? getSession(senderSessionName) : null;
+      if (!session || session.state === 'stopped') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_identity_unavailable' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, MEMORY_MCP_DAEMON_RPC_MAX_BODY_BYTES)) as Record<string, unknown>;
+        if (body.sessionInstanceId !== session.sessionInstanceId
+          || body.runtimeEpoch !== session.runtimeEpoch) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR }));
+          return;
+        }
+        if (!isMemoryMcpDaemonToolName(body.tool)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_tool_forbidden' }));
+          return;
+        }
+        const requestedServerId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
+        const authenticatedOwner = requestedServerId
+          ? getAuthenticatedCapabilityOwner(requestedServerId)
+          : undefined;
+        const daemonServerId = options.memoryMcpServerId?.trim() ?? '';
+        // Normalize the legacy implicit owner before validation. Validating
+        // first rejects persisted personal namespaces that intentionally omit
+        // userId, then silently falls back to a different user_private
+        // namespace and makes every existing project memory row disappear.
+        const normalizedStoredNamespace = session.contextNamespace
+          ? normalizeDaemonLocalMemoryNamespace(session.contextNamespace)
+          : null;
+        const storedNamespace = validCapabilityNamespace(normalizedStoredNamespace)
+          ? normalizedStoredNamespace
+          : { scope: 'user_private' as const, userId: LEGACY_DAEMON_LOCAL_USER_ID };
+        const storedUserId = storedNamespace.userId?.trim() || LEGACY_DAEMON_LOCAL_USER_ID;
+        const isDaemonBoundLegacyNamespace = storedUserId === LEGACY_DAEMON_LOCAL_USER_ID
+          && Boolean(daemonServerId)
+          && requestedServerId === daemonServerId;
+        if (requestedServerId
+          && authenticatedOwner !== storedUserId
+          && !isDaemonBoundLegacyNamespace) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'daemon_memory_worker_server_identity_unavailable' }));
+          return;
+        }
+        const caller: McpRuntimeCaller = Object.freeze({
+          userId: storedUserId,
+          namespace: storedNamespace,
+          sessionName: session.name,
+          projectName: session.projectName,
+          projectRoot: session.projectDir,
+          serverId: requestedServerId || null,
+          providerId: session.providerId ?? session.agentType,
+          transport: 'in_process',
+        });
+        const invoke = options.invokeMemoryMcpTool ?? invokeDaemonMemoryMcpTool;
+        const result = await invoke(caller, body.tool, body.input);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, result }));
+      } catch (error) {
+        const status = (error as Error).message === 'body too large' ? 413 : 500;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: false,
+          error: status === 413 ? 'daemon_memory_worker_request_oversize' : 'daemon_memory_worker_failed',
+        }));
+      }
+      return;
+    }
+
+    if (url === TASK_ADMISSION_HOOK_PATH) {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      const session = senderSessionName ? getSession(senderSessionName) : null;
+      if (!session || session.state === 'stopped') {
+        res.writeHead(403, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'task_admission_identity_unavailable' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        if (body.sessionInstanceId !== session.sessionInstanceId
+          || body.runtimeEpoch !== session.runtimeEpoch) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'task_admission_stale_runtime' }));
+          return;
+        }
+        const controller = getDaemonTaskAdmissionController();
+        if (body.operation === TASK_ADMISSION_OPERATION.ACQUIRE) {
+          const requestedBytes = typeof body.requestedBytes === 'number' ? body.requestedBytes : 0;
+          const sessionRssBytes = await measureSessionProcessTreeRssBytes(session);
+          const result = controller.acquire(session.name, requestedBytes, sessionRssBytes ?? Number.POSITIVE_INFINITY);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, ...result }));
+          return;
+        }
+        if (body.operation === TASK_ADMISSION_OPERATION.RELEASE && typeof body.token === 'string') {
+          const released = controller.release(session.name, body.token);
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, released }));
+          return;
+        }
+        throw new Error('invalid_task_admission_request');
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'malformed' }));
+      }
+      return;
+    }
+
+    if (url === SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const session = senderSessionName ? getSession(senderSessionName) : null;
+        if (!session || session.state === 'stopped'
+          || typeof session.sessionInstanceId !== 'string' || !session.sessionInstanceId
+          || typeof session.runtimeEpoch !== 'string' || !session.runtimeEpoch
+          || body.sessionInstanceId !== session.sessionInstanceId
+          || body.runtimeEpoch !== session.runtimeEpoch) {
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_stale_runtime' }));
+          return;
+        }
+        const { getTransportRuntime } = await import('../agent/session-manager.js');
+        const runtime = getTransportRuntime(session.name);
+        const processContext = readProcessSharedMachineAuthority(session.name, {
+          sessionInstanceId: session.sessionInstanceId,
+          runtimeEpoch: session.runtimeEpoch,
+        });
+        const required = runtime?.requiresSharedMachineAuthority() ?? processContext.required;
+        const authority = runtime?.getActiveSharedMachineAuthority() ?? processContext.authority;
+        if (required && !authority) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_unavailable' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, required, authority }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'malformed' }));
+      }
+      return;
+    }
+
+    if (url === '/capability-identity') {
+      const senderHeader = req.headers['x-imcodes-session'];
+      const senderSessionName = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const providerId = typeof body.providerId === 'string' ? body.providerId.trim() : '';
+        const serverId = typeof body.serverId === 'string' ? body.serverId.trim() : '';
+        const session = senderSessionName ? getSession(senderSessionName) : null;
+        const sessionProviderId = session?.providerId ?? session?.agentType;
+        const ownerId = serverId ? getAuthenticatedCapabilityOwner(serverId) : undefined;
+        const projectDir = session?.projectDir?.trim();
+        if (!session || !providerId || !serverId || sessionProviderId !== providerId || !ownerId
+          || (projectDir && Buffer.byteLength(projectDir, 'utf8') > 4096)) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'capability_identity_unavailable' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({
+          ok: true, ownerId, providerId, serverId, sessionId: session.name,
+          namespace: capabilityNamespaceForSession(session, ownerId),
+          ...(projectDir ? { projectDir } : {}),
+        }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'malformed' }));
+      }
+      return;
+    }
 
     if (url === '/audit-reply') {
       const contentType = req.headers['content-type'] ?? '';
@@ -611,14 +1193,7 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const fromRecord = from ? getSession(from) : null;
         const allSess = listSessions();
         const siblings = (fromRecord
-          ? allSess.filter((s) => {
-              if (s.name === from) return false;
-              if (s.state === 'stopped') return false;
-              if (fromRecord.parentSession) {
-                return s.parentSession === fromRecord.parentSession || s.name === fromRecord.parentSession;
-              }
-              return s.projectName === fromRecord.projectName || s.parentSession === from;
-            })
+          ? allSess.filter((s) => isSiblingSessionOf(s, fromRecord))
           : allSess.filter((s) => s.state !== 'stopped'))
           .filter(isDiscoverableInterAgentSession);
         const sessions = siblings.map((s) => ({
@@ -649,7 +1224,11 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
         const body = await readBody(req);
         const parsed = JSON.parse(body) as SendRequest;
         const result = await handleSend(parsed);
-        res.writeHead(result.status, { 'Content-Type': 'application/json' });
+        const retryAfterMs = result.status === 429 && typeof result.body.retryAfterMs === 'number' ? result.body.retryAfterMs : undefined;
+        res.writeHead(result.status, {
+          'Content-Type': 'application/json',
+          ...(retryAfterMs !== undefined ? { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) } : {}),
+        });
         res.end(JSON.stringify(result.body));
       } catch (err) {
         if ((err as Error).message === 'body too large') {
@@ -659,6 +1238,249 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
           res.writeHead(400);
           res.end(JSON.stringify({ ok: false, error: 'bad request' }));
         }
+      }
+      return;
+    }
+
+    if (url === TASK_PAIR_ENGINE_HOOK_PATH) {
+      // An MCP child process asking, at startup, whether its session is on the
+      // `pairs` engine: there it publishes no legacy supervision tools.
+      try {
+        const body = JSON.parse(await readBody(req, MAX_BODY_SIZE)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        if (!from || authenticatedSender !== from || !getSession(from)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid task-pair engine request' }));
+          return;
+        }
+        const { isPairsEngineSession } = await import('./task-pairs/engine.js');
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: true, pairs: isPairsEngineSession(from) }));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
+      }
+      return;
+    }
+
+    if (url === TASK_PAIR_LEGACY_TOOL_HOOK_PATH) {
+      // A legacy supervision tool called in an MCP child process. The daemon
+      // owns pair state, messages and timeline, so it answers here on the
+      // `pairs` engine and declines otherwise (the child then runs the tool).
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, MAX_BODY_SIZE)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        const tool = typeof body.tool === 'string' ? body.tool : '';
+        if (!from || !tool || authenticatedSender !== from || !getSession(from)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid task-pair legacy tool request' }));
+          return;
+        }
+        if (RETIRED_SUPERVISION_MCP_TOOL_SET.has(tool.trim().toLowerCase())) {
+          res.writeHead(410, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: false,
+            reason: 'retired',
+            error: RETIRED_SUPERVISION_MCP_MESSAGE,
+          }));
+          return;
+        }
+        const { answerLegacyToolInDaemon } = await import('./task-pairs/legacy-tools.js');
+        const answer = await answerLegacyToolInDaemon(tool, from, body.input);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(answer));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
+      }
+      return;
+    }
+
+    if (url === MEMORY_MCP_SESSION_MODEL_LIST_HOOK_PATH || url === MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH) {
+      // Model control by exact session name. By request there is no ownership
+      // or project check: any live session may list or switch any session's
+      // model. The caller must still be an authenticated session (who asked is
+      // logged), and the target must exist on this daemon.
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 4096)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        const to = typeof body.to === 'string' ? body.to.trim() : '';
+        const model = typeof body.model === 'string' ? body.model.trim() : '';
+        const thinking = typeof body.thinking === 'string' ? body.thinking.trim() : '';
+        const isSet = url === MEMORY_MCP_SESSION_MODEL_SET_HOOK_PATH;
+        if (!from || !to || authenticatedSender !== from || (isSet && !model && !thinking)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'invalid session model request' }));
+          return;
+        }
+        const callerRecord = getSession(from);
+        if (!callerRecord || callerRecord.state === 'stopped') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'session model caller identity is unavailable' }));
+          return;
+        }
+        const { listSessionModelsNow, switchSessionModelNow } = await import('./command-handler.js');
+        let result;
+        if (isSet) {
+          let resolveQueued!: (value: import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult) => void;
+          let rejectQueued!: (error: unknown) => void;
+          const completed = new Promise<import('../../shared/session-model-control.js').SessionModelSwitchResult | import('../../shared/session-model-control.js').SessionThinkingSwitchResult>((resolve, reject) => {
+            resolveQueued = resolve;
+            rejectQueued = reject;
+          });
+          const reservation = scheduleLifecycleTask(from, {
+            run: async () => {
+              try {
+                resolveQueued(await (options.switchSessionModel ?? switchSessionModelNow)(to, model || undefined, thinking || undefined));
+              } catch (error) {
+                rejectQueued(error);
+              }
+            },
+          });
+          if (!reservation.accepted) {
+            const retryAfterMs = reservation.retryAfterMs ?? LIFECYCLE_RATE_LIMIT_WINDOW_MS;
+            res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+            res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded', retryAfterMs }));
+            return;
+          }
+          result = await completed;
+        } else {
+          result = await (options.listSessionModels ?? listSessionModelsNow)(to);
+        }
+        if (isSet) logger.info({ caller: from, target: to, model: model || undefined, thinking: thinking || undefined, ok: result.ok }, 'MCP session model/thinking switch');
+        const { ok, ...rest } = result;
+        const payload = ok
+          ? { status: 'ok', ...rest }
+          : { status: 'error', reason: (rest as { code?: string }).code, ...rest };
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(payload));
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
+      }
+      return;
+    }
+
+    if (url === MEMORY_MCP_SESSION_RESTART_HOOK_PATH || url === MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH) {
+      const contentType = req.headers['content-type'] ?? '';
+      if (!contentType.includes('application/json')) {
+        res.writeHead(415, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: 'Content-Type must be application/json' }));
+        return;
+      }
+      try {
+        const body = JSON.parse(await readBody(req, 64 * 1024)) as Record<string, unknown>;
+        const senderHeader = req.headers['x-imcodes-session'];
+        const authenticatedSender = Array.isArray(senderHeader) ? senderHeader[0] : senderHeader;
+        const from = typeof body.from === 'string' ? body.from.trim() : '';
+        const rawBatch = Array.isArray(body.targets) ? body.targets : null;
+        const isBatch = url === MEMORY_MCP_SESSION_RESTART_BATCH_HOOK_PATH || rawBatch !== null;
+        const items = rawBatch
+          ? rawBatch.map((entry) => {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null;
+            const record = entry as Record<string, unknown>;
+            return {
+              target: typeof record.target === 'string' ? record.target.trim() : '',
+              reset: typeof record.reset === 'boolean' ? record.reset : false,
+              idempotencyKey: typeof record.idempotencyKey === 'string' ? record.idempotencyKey.trim() : undefined,
+            };
+          })
+          : [{
+            target: typeof body.to === 'string' ? body.to.trim() : '',
+            // The single-target contract has always defaulted reset to false;
+            // preserve that behavior when older callers omit the field.
+            reset: typeof body.reset === 'boolean' ? body.reset : false,
+            idempotencyKey: typeof body.idempotencyKey === 'string' ? body.idempotencyKey.trim() : undefined,
+          }];
+        if (!from || authenticatedSender !== from || items.length === 0 || items.length > SESSION_RESTART_BATCH_MAX
+          || items.some((item) => !item || !item.target)) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: isBatch ? 'invalid session restart batch request' : 'invalid exact-session restart request' }));
+          return;
+        }
+        const callerRecord = getSession(from);
+        if (!callerRecord || callerRecord.state === 'stopped') {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: 'session restart caller identity is unavailable' }));
+          return;
+        }
+        const targetRecords: SessionRecord[] = [];
+        for (const item of items) {
+          const targetRecord = getSession(item!.target);
+          if (!targetRecord || targetRecord.projectName !== callerRecord.projectName) {
+            res.writeHead(404, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: 'session restart target is unavailable' }));
+            return;
+          }
+          targetRecords.push(targetRecord);
+        }
+        const restart = options.restartSession ?? (async (sessionName: string, restartOptions: { reset: boolean }) => {
+          const { restartSessionNow } = await import('./command-handler.js');
+          return restartSessionNow(sessionName, restartOptions);
+        });
+        if (isBatch) {
+          const preflight = preflightLifecycleBatch(
+            from,
+            targetRecords.map((targetRecord, index) => {
+              const key = items[index]!.idempotencyKey;
+              return key ? `${targetRecord.name}\u0000${key}` : undefined;
+            }),
+          );
+          if (!preflight.accepted) {
+            const retryAfterMs = preflight.retryAfterMs ?? LIFECYCLE_RATE_LIMIT_WINDOW_MS;
+            res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+            res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded', retryAfterMs }));
+            return;
+          }
+        }
+        const reservations = targetRecords.map((targetRecord, index) => {
+          const item = items[index]!;
+          return scheduleLifecycleTask(from, {
+            run: async () => {
+              const accepted = await restart(targetRecord.name, { reset: item.reset as boolean });
+              if (!accepted) logger.warn({ sessionName: targetRecord.name, reset: item.reset }, 'MCP session restart was not accepted');
+            },
+          }, item.idempotencyKey ? `${targetRecord.name}\u0000${item.idempotencyKey}` : undefined);
+        });
+        const rejected = reservations.find((reservation) => !reservation.accepted);
+        if (rejected) {
+          const retryAfterMs = rejected.retryAfterMs ?? LIFECYCLE_RATE_LIMIT_WINDOW_MS;
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) });
+          res.end(JSON.stringify({ ok: false, error: 'rate limit exceeded', retryAfterMs }));
+          return;
+        }
+        const queued = targetRecords.filter((_target, index) => reservations[index]!.queued).map((target) => target.name);
+        res.writeHead(202, { 'Content-Type': 'application/json' });
+        if (isBatch) {
+          res.end(JSON.stringify({ ok: true, accepted: true, targets: targetRecords.map((target) => target.name), ...(queued.length ? { queued } : {}) }));
+        } else {
+          res.end(JSON.stringify({ ok: true, accepted: true, target: targetRecords[0]!.name, reset: items[0]!.reset, ...(queued.length ? { queued: true } : {}) }));
+        }
+      } catch (err) {
+        const status = (err as Error).message === 'body too large' ? 413 : 400;
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ ok: false, error: status === 413 ? 'request body too large' : 'bad request' }));
       }
       return;
     }
@@ -818,24 +1640,199 @@ export async function startHookServer(onHook: HookCallback): Promise<{ server: h
     res.end();
   });
 
-  // Try preferred port first, then increment on conflict
-  for (let attempt = 0; attempt < 20; attempt++) {
-    const port = preferredPort + attempt;
-    try {
-      await tryBind(server, port);
-      activeHookPort = port;
-      await savePort(port);
-      if (port !== preferredPort) {
-        logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port (saved)');
-      } else {
-        logger.info({ port }, 'Hook server listening');
+  const bind = options.bindListener ?? tryBind;
+  /** Single publication entry point for BOTH startup and rebind, so the seam and
+   *  the production path cannot diverge. */
+  const publishVia = (target: number, context: string): Promise<PublishAttempt> => (
+    options.publishRecord
+      ? options.publishRecord(target, context, options.authorityHome)
+      : publishAuthority(target, context, options.authorityHome)
+  );
+  const bindWithin = async (from: number): Promise<number> => {
+    for (let attempt = 0; attempt < HOOK_BIND_RETRY_SPAN; attempt++) {
+      const port = from + attempt;
+      try {
+        await bind(server, port);
+        const address = server.address();
+        const actualPort = typeof address === 'object' && address !== null
+          ? address.port
+          : port;
+        boundPort = actualPort;
+        activeHookPort = actualPort;
+        return actualPort;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
+        logger.debug({ port }, 'Hook server: port in use, trying next');
       }
-      return { server, port };
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EADDRINUSE') throw err;
-      logger.debug({ port }, 'Hook server: port in use, trying next');
     }
+    throw new Error(
+      `Hook server: could not bind to any port in range ${from}-${from + HOOK_BIND_RETRY_SPAN - 1}`,
+    );
+  };
+
+  // A listener that dies after a successful bind used to leave the daemon with
+  // NO hook endpoint and a record pointing at a dead port, recoverable only by
+  // restarting the whole daemon. Rebind + republish in place instead.
+  const rebindRetry = {
+    maxAttempts: options.rebindRetry?.maxAttempts ?? HOOK_REBIND_RETRY.maxAttempts,
+    baseDelayMs: options.rebindRetry?.baseDelayMs ?? HOOK_REBIND_RETRY.baseDelayMs,
+    capDelayMs: options.rebindRetry?.capDelayMs ?? HOOK_REBIND_RETRY.capDelayMs,
+  };
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+
+  /** Close the listener if it is up. Re-entry is already blocked by
+   *  `rebinding`, so the `'close'` this emits is ignored. */
+  const releaseListener = async (): Promise<void> => {
+    if (!server.listening) return;
+    await new Promise<void>((resolve) => {
+      server.close(() => resolve());
+    });
+  };
+
+  const rebindOnce = async (cause: string): Promise<number> => {
+    // An `'error'` event does NOT imply the handle was released, and `listen()`
+    // on a still-listening server throws ERR_SERVER_ALREADY_LISTEN - which is
+    // not EADDRINUSE, so `bindWithin` rethrows and the whole recovery aborts.
+    // Release the handle first.
+    await releaseListener();
+    const port = await bindWithin(loadPreferredPort(options.authorityHome));
+    // Recovery is NOT complete until the authority is actually published:
+    // clients route by the record, so a bound listener with a stale or
+    // unwritten record leaves them pointed at the dead endpoint. Throwing keeps
+    // the bounded retry running over BOTH steps.
+    const attempt = await publishVia(port, `rebind:${cause}`);
+    if (!attempt.published && attempt.reason !== HOOK_AUTHORITY_ERROR.publishSuppressedForTests) {
+      // ROLL BACK THIS ATTEMPT'S LISTENER before failing.
+      //
+      // Previously only the NEXT `rebindOnce` closed it, so intermediate
+      // attempts were cleaned up by accident and the FINAL failure left a live
+      // listener bound to a port no client could discover - the listener /
+      // authority split this work exists to eliminate, needing an unrelated
+      // future close or a daemon restart to heal. An attempt that cannot
+      // publish must leave nothing serving.
+      await releaseListener();
+      throw new HookRebindPublishError(port, attempt.reason ?? 'unknown', attempt.error);
+    }
+    return port;
+  };
+
+  let rebinding = false;
+  const handleUnexpectedLoss = (cause: string, err?: unknown): void => {
+    if (intentionallyClosing.has(server) || rebinding) return;
+    if (!options.rebindOnListenerLoss) return;
+    rebinding = true;
+    logger.warn({ err, cause, port: activeHookPort }, 'Hook server: listener lost, rebinding');
+    void (async () => {
+      try {
+        for (let attempt = 1; attempt <= rebindRetry.maxAttempts; attempt += 1) {
+          try {
+            const port = await rebindOnce(cause);
+            logger.info({ port, cause, attempt }, 'Hook server: rebound and republished authority');
+            return;
+          } catch (rebindError) {
+            if (attempt >= rebindRetry.maxAttempts) {
+              // Belt and braces: `rebindOnce` already rolls back its own
+              // listener, but the invariant asserted by the regression is
+              // "after exhaustion nothing is serving", so enforce it here too
+              // rather than relying on every failure path remembering.
+              await releaseListener();
+              logger.error(
+                { err: rebindError, cause, attempts: attempt, listening: server.listening },
+                'Hook server: rebind failed; hook endpoint is down',
+              );
+              return;
+            }
+            // Every candidate in the bind window can be momentarily occupied,
+            // so back off and try the whole window again rather than declaring
+            // the endpoint permanently dead.
+            const delay = boundedExponentialBackoffMs(
+              rebindRetry.baseDelayMs,
+              attempt,
+              rebindRetry.capDelayMs,
+            );
+            logger.warn(
+              { err: rebindError, cause, attempt, delay },
+              'Hook server: rebind attempt failed, retrying',
+            );
+            await sleep(delay);
+          }
+        }
+      } finally {
+        rebinding = false;
+      }
+    })();
+  };
+  // Attached only AFTER the initial bind resolves, so `tryBind`'s one-shot
+  // error handler still owns EADDRINUSE during discovery.
+  //
+  // The 'close' arm is why this is OPT-IN. A first cut tried to infer intent by
+  // wrapping `server.close()`; that broke callers which close the server
+  // directly (the daemon test suites) - the listener rebound mid-teardown and
+  // in-flight requests died with ECONNRESET. Rather than guess, the daemon
+  // declares that it wants self-healing and anyone holding the handle for their
+  // own lifecycle (tests, embedders) keeps plain close() semantics.
+  const armLossHandlers = (): void => {
+    server.on('error', (err) => handleUnexpectedLoss('error', err));
+    server.on('close', () => handleUnexpectedLoss('close'));
+  };
+
+  const port = await bindWithin(preferredPort);
+  if (port !== preferredPort) {
+    logger.info({ port, preferredPort }, 'Hook server: port conflict, using new port');
+  } else {
+    logger.info({ port }, 'Hook server listening');
   }
 
-  throw new Error(`Hook server: could not bind to any port in range ${preferredPort}–${preferredPort + 19}`);
+  // ── Startup is ONE bounded convergence transaction: bind AND owner-fenced
+  // publish, or nothing.
+  //
+  // This result used to be discarded, and the rebind handler only fires on a
+  // later `error`/`close`. So a single startup write failure or fence refusal
+  // left a LIVE listener paired with a stale or missing authority record -
+  // permanently, until an unrelated listener loss or a daemon restart. That is
+  // exactly the reported live-51941 / stale-51915 split, reached without any
+  // subsequent failure. A started hook server must never be undiscoverable.
+  let published: PublishAttempt = { published: false, reason: 'not_attempted' };
+  for (let attempt = 1; attempt <= rebindRetry.maxAttempts; attempt += 1) {
+    published = await publishVia(port, 'start');
+    if (published.published) break;
+    // `publishSuppressedForTests` means publication was DELIBERATELY skipped by
+    // the containment guard, not that it failed: the caller is an in-process
+    // test runner that must never write the machine-global record. Retrying or
+    // failing the start would be wrong - there is nothing to converge on.
+    if (published.reason === HOOK_AUTHORITY_ERROR.publishSuppressedForTests) {
+      logger.debug({ port }, 'Hook server: authority publication suppressed for a test runtime');
+      break;
+    }
+    if (attempt >= rebindRetry.maxAttempts) break;
+    const delay = boundedExponentialBackoffMs(
+      rebindRetry.baseDelayMs,
+      attempt,
+      rebindRetry.capDelayMs,
+    );
+    logger.warn(
+      { port, attempt, delay, reason: published.reason },
+      'Hook server: startup authority publish failed, retrying',
+    );
+    await sleep(delay);
+  }
+
+  if (!published.published
+    && published.reason !== HOOK_AUTHORITY_ERROR.publishSuppressedForTests) {
+    // Fail closed: tear the listener down so nothing is serving an endpoint no
+    // client can discover, then fail the start.
+    logger.error(
+      { port, reason: published.reason, attempts: rebindRetry.maxAttempts },
+      'Hook server: startup authority publish exhausted; closing listener and failing start',
+    );
+    await closeHookServer(server).catch(() => {});
+    throw new HookStartupPublishError(port, published.reason ?? 'unknown', rebindRetry.maxAttempts);
+  }
+
+  armLossHandlers();
+  return { server, port };
 }

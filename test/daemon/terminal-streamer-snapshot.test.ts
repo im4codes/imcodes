@@ -438,6 +438,185 @@ describe('TerminalStreamer — snapshot behavior', () => {
     expect(stalled).toHaveBeenCalledWith('snapshot_failed');
   });
 
+  it('signals bootstrap stall when the snapshot capture never settles (hung tmux, not a rejection)', async () => {
+    // Field failure after R1: Sh1 renders completely blank, reopening the window
+    // does not help, and only a daemon restart cures it.
+    //
+    // R1 covers a capture that THROWS and a capture that returns BLANK. It does
+    // not cover a capture that never settles. `tmuxRun` calls execFile with no
+    // timeout (src/agent/tmux.ts), so a wedged `capture-pane` returns neither
+    // value nor error. bootstrapSubscriber awaits it at the top, and BOTH the
+    // `snapshotPending = false` release and the stall-watch arming sit AFTER
+    // that await -- so nothing is ever armed and the subscriber buffers raw
+    // silently forever.
+    //
+    // Reopening the window does not help because the pipe still exists, so the
+    // new subscriber starts snapshotPending=true and wedges identically. Only a
+    // daemon restart drops the pipe map. A bounded bootstrap must refuse to wait
+    // forever, whatever shape the failure takes.
+    const stalled = vi.fn();
+    mockCapture.mockReturnValue(new Promise(() => { /* never settles */ }));
+
+    streamer.subscribe({
+      sessionName: 'hung-capture-session',
+      send: () => {},
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(30_000);
+
+    expect(
+      stalled,
+      'a capture that never settles must not leave the subscriber wedged with no bounded signal',
+    ).toHaveBeenCalled();
+  });
+
+  it('a fast successful first paint is not abandoned by an orphan deadline timer', async () => {
+    // Negative control for the bound. The deadline timer must be cleared when
+    // the capture wins the race; otherwise it fires 1.5s later and flips
+    // firstPaintAbandoned on a HEALTHY subscriber, poisoning good state exactly
+    // the way the original wedge did.
+    const stalled = vi.fn();
+    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    mockCapture.mockResolvedValue('alive0\nalive1\nalive2\nalive3');
+
+    streamer.subscribe({
+      sessionName: 'fast-success-session',
+      send: (d) => received.push(d),
+      onBootstrapStalled: stalled,
+    });
+
+    await flush();
+    const afterPaint = received.length;
+    expect(afterPaint, 'the healthy first paint must publish').toBeGreaterThan(0);
+
+    // Advance well past the deadline the race armed.
+    await vi.advanceTimersByTimeAsync(10_000);
+
+    expect(stalled, 'a healthy fast paint must never signal a stall').not.toHaveBeenCalled();
+    expect(
+      received.length,
+      'no extra frame may appear from an orphan deadline firing after success',
+    ).toBe(afterPaint);
+  });
+
+  it('clears the first-paint deadline timer once the capture settles', async () => {
+    // Directly observes the orphan: the flag it would set has no consumer after
+    // bootstrap, so the only faithful assertion is that the timer is not left
+    // armed. An armed deadline after a successful paint is the defect.
+    mockCapture.mockResolvedValue('alive0\nalive1\nalive2\nalive3');
+
+    // Measure only the timers THIS subscribe introduces. vi.getTimerCount() is
+    // a global: unrelated legitimate timers (graced pipe stop, idle watch, or a
+    // leftover from an earlier test in the file) make an absolute
+    // `toBe(0)` pass or fail on ordering and ambient state rather than on the
+    // defect. A delta isolates the first-paint deadline and stays load-bearing:
+    // an orphan left armed shows up as +1.
+    const before = vi.getTimerCount();
+
+    const sent: unknown[] = [];
+    streamer.subscribe({
+      sessionName: 'timer-hygiene-session',
+      send: (frame) => { sent.push(frame); },
+      onBootstrapStalled: vi.fn(),
+    });
+
+    // Wait for the paint itself, not for a fixed slice of time. The deadline is
+    // cleared when the capture settles, so advancing a fixed 200ms and
+    // asserting asks the question before the thing it is about has necessarily
+    // happened -- invisible on an idle machine, and a real failure on a loaded
+    // CI runner where the mocked promise chain needs more turns.
+    for (let attempt = 0; attempt < 50 && sent.length === 0; attempt += 1) {
+      await flush();
+    }
+    expect(sent.length, 'the capture must have won the race for this to mean anything').toBeGreaterThan(0);
+
+    // `sent.length > 0` is not the same instant as the deadline actually
+    // clearing: `subscriber.send(diff)` runs synchronously inside
+    // `captureAndSendSnapshot`, but `clearTimeout` runs in that call's
+    // `.finally()`, which is a LATER microtask than the `send()` that set
+    // `sent.length`. Draining that continuation is purely a matter of
+    // microtask-queue turns -- it needs NO more fake time to elapse, so drain
+    // it with `advanceTimersByTimeAsync(0)` rather than by widening the loop
+    // above to keep advancing time. Advancing time here would be wrong in the
+    // other direction: BLANK_BOOTSTRAP_STALL_MS is only 1500ms away, and a
+    // genuinely LEAKED deadline (the defect this test exists to catch) would
+    // itself fire and clear out of vi.getTimerCount() by then, making the
+    // assertion below pass on a real leak. Zero-time turns can only observe
+    // the winner's own `.finally()`; they can never let the loser's timer
+    // fire, so a real leak still fails below no matter how many turns this
+    // takes.
+    for (let turn = 0; turn < 20 && vi.getTimerCount() - before !== 0; turn += 1) {
+      await vi.advanceTimersByTimeAsync(0);
+    }
+
+    expect(
+      vi.getTimerCount() - before,
+      'the first-paint deadline must be cleared when the capture wins the race',
+    ).toBe(0);
+  });
+
+  it('bounds capture spawning: a wedged capture is not retried in a loop', async () => {
+    // The bound is on the consumer, not the child: a hung `tmux capture-pane`
+    // is not killed. What must hold is that the daemon does not keep spawning
+    // captures because of it. Bootstrap issues at most the first paint plus one
+    // deadline re-probe, then reports through the existing stall path.
+    mockCapture.mockReturnValue(new Promise(() => { /* never settles */ }));
+
+    streamer.subscribe({
+      sessionName: 'no-spawn-loop-session',
+      send: () => {},
+      onBootstrapStalled: vi.fn(),
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(
+      mockCapture.mock.calls.length,
+      'a wedged capture must not cause repeated unbounded capture spawning',
+    ).toBeLessThanOrEqual(2);
+  });
+
+  it('does not publish a first-paint capture that settles after its deadline', async () => {
+    // Bounding the first paint creates a new hazard: the abandoned capture can
+    // still settle later. By then the deadline re-probe has repainted with
+    // NEWER content, so publishing the old full frame would rewrite the pane
+    // from cursor home and regress the screen -- the same staleness the
+    // re-probe's rawGuardSince barrier already prevents.
+    const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    let releaseStale: ((v: string) => void) | undefined;
+    mockCapture
+      .mockReturnValueOnce(new Promise<string>((resolve) => { releaseStale = resolve; }))
+      .mockResolvedValue('fresh0\nfresh1\nfresh2\nfresh3');
+
+    streamer.subscribe({
+      sessionName: 'late-capture-session',
+      send: (d) => received.push(d),
+      onBootstrapStalled: vi.fn(),
+    });
+
+    await flush();
+    await vi.advanceTimersByTimeAsync(5_000);
+
+    const beforeLate = received.length;
+    expect(
+      received.some((d) => d.lines.some(([, text]) => text.startsWith('fresh'))),
+      'the re-probe must have repainted with fresh content',
+    ).toBe(true);
+
+    // The abandoned capture finally returns, carrying the OLD screen.
+    releaseStale?.('stale0\nstale1\nstale2\nstale3');
+    await flush();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(
+      received.slice(beforeLate).some((d) => d.lines.some(([, text]) => text.startsWith('stale'))),
+      'a capture that settled after its deadline must never be published',
+    ).toBe(false);
+  });
+
   it('repaints and does NOT restart when a failed snapshot recovers by the deadline (transient error, healthy shell)', async () => {
     const stalled = vi.fn();
     const received: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
@@ -626,4 +805,216 @@ describe('TerminalStreamer — snapshot behavior', () => {
 
     expect(stalled).not.toHaveBeenCalled();
   });
+});
+
+describe('TerminalStreamer — snapshot coalescing (subscription storm)', () => {
+  let streamer: TerminalStreamer;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    mockSize.mockResolvedValue({ cols: 80, rows: 4 });
+    mockCapture.mockResolvedValue('line0\nline1\nline2\nline3');
+    mockHistory.mockResolvedValue('');
+    mockGetPaneId.mockResolvedValue('%1');
+    mockSessionExists.mockResolvedValue(true);
+    mockGetSession.mockReturnValue({ paneId: '%1' });
+    jsonlWatcherMock.isWatching.mockReturnValue(false);
+    const noopStream = { on: vi.fn(), destroy: vi.fn() };
+    mockStartPipe.mockResolvedValue({ stream: noopStream, cleanup: vi.fn().mockResolvedValue(undefined) });
+    streamer = new TerminalStreamer();
+  });
+
+  afterEach(() => {
+    streamer.destroy();
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
+  });
+
+  /** Attach a subscriber and let the bootstrap capture settle, then reset the
+   *  capture spy so assertions only count on-demand snapshots. */
+  async function attachAndSettle(sessionName: string) {
+    const frames: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    streamer.subscribe({ sessionName, send: (d) => { frames.push(d); } });
+    await vi.advanceTimersByTimeAsync(200);
+    mockCapture.mockClear();
+    frames.length = 0;
+    return frames;
+  }
+
+  it('collapses a burst of concurrent snapshot requests into ONE capture and ONE broadcast', async () => {
+    const frames = await attachAndSettle('sess-burst');
+
+    // Every open browser tab asks on reconnect, and SessionPane /
+    // SubSessionWindow each render a TerminalView that asks again.
+    for (let i = 0; i < 8; i++) streamer.requestSnapshot('sess-burst');
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+    expect(frames.filter((f) => f.snapshotRequested)).toHaveLength(1);
+  });
+
+  it('reuses a just-taken snapshot even when requests are spaced out (in-flight alone is not enough)', async () => {
+    await attachAndSettle('sess-spaced');
+
+    // The client staggers its requests, and a local capture-pane finishes far
+    // faster than the stagger — so an implementation that only checks
+    // "is a capture in flight" would re-capture every single time.
+    streamer.requestSnapshot('sess-spaced');
+    await vi.advanceTimersByTimeAsync(20);
+    streamer.requestSnapshot('sess-spaced');
+    await vi.advanceTimersByTimeAsync(20);
+    streamer.requestSnapshot('sess-spaced');
+    await vi.advanceTimersByTimeAsync(20);
+
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a new snapshot through once the freshness window expires', async () => {
+    await attachAndSettle('sess-expiry');
+
+    streamer.requestSnapshot('sess-expiry');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+
+    await vi.advanceTimersByTimeAsync(400);
+    streamer.requestSnapshot('sess-expiry');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it('a resize invalidates freshness so the next request is not swallowed', async () => {
+    await attachAndSettle('sess-resize');
+
+    streamer.requestSnapshot('sess-resize');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+
+    // Geometry changed — serving the cached frame would show the old size.
+    streamer.invalidateSize('sess-resize');
+    streamer.requestSnapshot('sess-resize');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it('a failed capture does not wedge the session into permanent in-flight', async () => {
+    await attachAndSettle('sess-fail');
+
+    mockCapture.mockRejectedValueOnce(new Error('capture-pane exploded'));
+    streamer.requestSnapshot('sess-fail');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(1);
+
+    // A rejected capture must NOT earn a freshness window and must release the
+    // in-flight flag, or one failure would freeze the terminal forever.
+    streamer.requestSnapshot('sess-fail');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(mockCapture).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a slow requestSnapshot overwrite raw bytes that arrived while it was capturing', async () => {
+    // requestSnapshot awaits getSize + capturePaneVisible and then broadcasts
+    // fullFrame unconditionally. Raw bytes forwarded during that await are
+    // NEWER than the captured screen, so publishing the capture afterwards
+    // regresses the terminal. The bootstrap re-probe path already guards this
+    // exact hazard via rawGuardSince (terminal-streamer.ts:385-399, whose
+    // comment says emitting a stale fullFrame "would overwrite them and
+    // regress the screen"); requestSnapshot has no such guard.
+    const session = 'snapshot-vs-raw';
+    const frames: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    const rawSeen: string[] = [];
+    const stream = { on: vi.fn(), destroy: vi.fn() };
+    mockStartPipe.mockResolvedValueOnce({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+
+    streamer.subscribe({
+      sessionName: session,
+      send: (diff) => frames.push(diff),
+      sendRaw: (data: Buffer) => rawSeen.push(data.toString()),
+    });
+    await flush();
+    frames.length = 0;
+
+    // Hold the capture open so raw can overtake it.
+    let releaseCapture: (v: string) => void = () => {};
+    mockCapture.mockReturnValueOnce(new Promise<string>((res) => { releaseCapture = res; }));
+    streamer.requestSnapshot(session);
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Newer bytes arrive and are forwarded to the subscriber right now.
+    const onData = stream.on.mock.calls.find((c) => c[0] === 'data')?.[1] as (b: Buffer) => void;
+    expect(onData, 'pipe data handler must be registered').toBeTypeOf('function');
+    onData(Buffer.from('NEWER-OUTPUT'));
+    expect(rawSeen.join('')).toContain('NEWER-OUTPUT');
+
+    // The capture finally resolves with the pre-raw screen.
+    releaseCapture('stale0\nstale1\nstale2\nstale3');
+    await flush();
+
+    const stale = frames.filter((d) => d.snapshotRequested && d.fullFrame);
+    expect(
+      stale.length,
+      'a capture older than already-forwarded raw must not be published as a full frame',
+    ).toBe(0);
+  });
+
+  it('keeps a session recoverable after a raw_buffer_overflow reset', async () => {
+    // failSubscriber() removes the subscriber AND sends stream_reset. The
+    // browser never reads msg.reason and its only reaction is to request a
+    // snapshot -- but requestSnapshot returns early when the session has no
+    // subscribers, so the reset is unrecoverable and the pane stays dead until
+    // a full reconnect.
+    //
+    // Reaching the overflow path requires the production shape: raw is only
+    // buffered (snapshotPending) when a pipe is ALREADY running, which is the
+    // resubscribe case -- the first subscriber starts the pipe only after its
+    // snapshot, so its raw is forwarded, never buffered.
+    const session = 'overflow-recovery';
+    const frames: import('../../src/daemon/terminal-streamer.js').TerminalDiff[] = [];
+    const control: Array<Record<string, unknown>> = [];
+    const stream = { on: vi.fn(), destroy: vi.fn() };
+    mockStartPipe.mockResolvedValue({ stream, cleanup: vi.fn().mockResolvedValue(undefined) });
+
+    // First subscriber establishes the pipe, then leaves; the pipe lingers.
+    const unsub = streamer.subscribe({ sessionName: session, send: () => {}, sendRaw: () => {} });
+    await flush();
+    const onData = stream.on.mock.calls.find((c) => c[0] === 'data')?.[1] as (b: Buffer) => void;
+    expect(onData, 'pipe data handler must be registered').toBeTypeOf('function');
+    unsub();
+
+    // Resubscribe against the live pipe: this subscriber buffers raw while its
+    // snapshot is pending. Hold that capture open.
+    let releaseSecond: (v: string) => void = () => {};
+    mockCapture.mockReturnValueOnce(new Promise<string>((res) => { releaseSecond = res; }));
+    streamer.subscribe({
+      sessionName: session,
+      send: (diff) => frames.push(diff),
+      sendRaw: () => {},
+      sendControl: (msg: Record<string, unknown>) => control.push(msg),
+    });
+    await vi.advanceTimersByTimeAsync(1);
+
+    // Exceed MAX_RAW_BUFFER (256 KiB) while that snapshot is still pending.
+    onData(Buffer.alloc(300 * 1024, 0x61));
+
+    expect(
+      control.some((m) => m.type === 'terminal.stream_reset'),
+      'overflow must notify the client',
+    ).toBe(true);
+
+    // The client's only recovery move is a snapshot request. It must produce a
+    // frame; otherwise the stream is permanently dead.
+    releaseSecond('a0\na1\na2\na3');
+    await flush();
+    frames.length = 0;
+    mockCapture.mockResolvedValue('r0\nr1\nr2\nr3');
+    streamer.requestSnapshot(session);
+    await flush();
+
+    expect(
+      frames.length,
+      'a snapshot request after stream_reset must re-deliver the screen',
+    ).toBeGreaterThan(0);
+  });
+
+
 });

@@ -10,6 +10,7 @@ import { randomBytes, createHash } from 'node:crypto';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
 import { createUser, createServer } from '../src/db/queries.js';
+import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 import { createMachineExecRoutes, machineExecAuditIntentStore, type ExecDispatcher, type ExecIntentStore } from '../src/routes/machine-exec.js';
 import {
   decodeMachineExecHttpStreamFrame,
@@ -49,9 +50,9 @@ async function fullCredential(userId: string): Promise<{ serverId: string; token
 async function controlledServer(userId: string, opts: { execEnabled?: boolean; revoked?: boolean } = {}): Promise<{ serverId: string; token: string }> {
   const token = hex(16); const serverId = hex(8);
   await db.execute(
-    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name)
-     VALUES ($1,$2,'ctl',$3,'offline',$4,$5,$6,$7,$8)`,
-    [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, opts.execEnabled ?? true, opts.revoked ? Date.now() : null, `ref-${serverId}`],
+    `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, revoked_at, ref_name, node_id)
+     VALUES ($1,$2,'ctl',$3,'offline',$4,$5,$6,$7,$8,$9)`,
+    [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, opts.execEnabled ?? true, opts.revoked ? Date.now() : null, `ref-${serverId}`, generateControlledNodeId()],
   );
   return { serverId, token };
 }

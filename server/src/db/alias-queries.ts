@@ -22,6 +22,7 @@ import {
 export const ALIAS_LIST_LIMIT = 500;
 
 interface DbAliasRow {
+  id: string;
   name: string;
   value: string;
   description: string | null;
@@ -54,6 +55,7 @@ function coerceSource(raw: string): AliasSource {
 /** Project a raw DB row into the canonical {@link AliasEntry} wire shape. */
 function projectAliasRow(row: DbAliasRow): AliasEntry {
   const entry: AliasEntry = {
+    id: row.id,
     name: row.name,
     value: row.value,
     tags: coerceTags(row.tags),
@@ -65,7 +67,7 @@ function projectAliasRow(row: DbAliasRow): AliasEntry {
   return entry;
 }
 
-const SELECT_COLUMNS = 'name, value, description, tags, source, created_at, updated_at';
+const SELECT_COLUMNS = 'id, name, value, description, tags, source, created_at, updated_at';
 
 /**
  * Escape LIKE/ILIKE metacharacters so a stored literal `%`, `_`, or `\` in the
@@ -87,6 +89,8 @@ export interface UpsertAliasParams {
   description?: string | null;
   tags?: string[];
   source: AliasSource;
+  /** When present, update this owned row in place so durable references survive a rename. */
+  existingId?: string;
 }
 
 /**
@@ -99,6 +103,19 @@ export async function upsertAlias(db: Database, params: UpsertAliasParams): Prom
   const storedValue = normalizeAliasValueForStorage(params.value);
   const storedDescription = params.description != null ? nfc(params.description) : null;
   const tags = params.tags ?? [];
+  if (params.existingId) {
+    const row = await db.queryOne<DbAliasRow>(
+      `UPDATE user_aliases
+          SET name = $3, value = $4, description = $5, tags = $6::jsonb,
+              source = $7, updated_at = $8
+        WHERE user_id = $1 AND id = $2
+        RETURNING ${SELECT_COLUMNS}`,
+      [params.userId, params.existingId, params.name, storedValue, storedDescription,
+        JSON.stringify(tags), params.source, now],
+    );
+    if (!row) throw new Error('alias_not_found');
+    return projectAliasRow(row);
+  }
   await db.execute(
     `INSERT INTO user_aliases (id, user_id, name, value, description, tags, source, created_at, updated_at)
      VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, $9)
@@ -126,6 +143,15 @@ export async function upsertAlias(db: Database, params: UpsertAliasParams): Prom
   );
   if (!row) throw new Error('alias_upsert_failed');
   return projectAliasRow(row);
+}
+
+/** Fetch a single alias by its stable owner-scoped row identity. */
+export async function getAliasById(db: Database, userId: string, id: string): Promise<AliasEntry | null> {
+  const row = await db.queryOne<DbAliasRow>(
+    `SELECT ${SELECT_COLUMNS} FROM user_aliases WHERE user_id = $1 AND id = $2`,
+    [userId, id],
+  );
+  return row ? projectAliasRow(row) : null;
 }
 
 /** Fetch a single alias by exact (NFC) name for the given owner, or null. */

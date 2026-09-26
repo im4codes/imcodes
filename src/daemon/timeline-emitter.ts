@@ -12,11 +12,14 @@ import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfiden
 import { timelineStore } from './timeline-store.js';
 import { preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
-import { recordTurnUsage } from '../store/context-store.js';
+import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { getSession } from '../store/session-store.js';
+import { registerSessionStateProbeObserver } from '../store/session-state-probe-events.js';
 import logger from '../util/logger.js';
+import { incrementCounter } from '../util/metrics.js';
 import { recordTimelineEmit } from './latency-tracer.js';
 import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
+import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 import { recordAssistantFileReadGrants } from './session-file-read-grants.js';
 
@@ -61,6 +64,34 @@ export class TimelineEmitter {
   private recentUserMsg = new Map<string, { text: string; ts: number }>();
   /** Daemon startup timestamp — changes on restart, used for epoch-based seq continuity */
   readonly epoch = Date.now();
+  /**
+   * In-flight `recordTurnUsage` worker RPCs, fired-and-forgotten from `emit`
+   * (nothing on the heartbeat/ack/send path may await this). Tracked only so
+   * a graceful shutdown can wait for them with a bounded budget instead of
+   * exiting mid-write and losing the row -- the exact race a synchronous
+   * write used to avoid before this became fire-and-forget.
+   */
+  private pendingUsageWrites = new Set<Promise<unknown>>();
+
+  /**
+   * Wait up to `budgetMs` for every currently in-flight usage-record write to
+   * settle. Never blocks longer than the budget: whatever is still pending
+   * at the deadline is abandoned (counted, not awaited further) so shutdown
+   * itself is never at the mercy of a stalled worker.
+   */
+  async drainUsageWrites(budgetMs: number): Promise<{ pendingAtStart: number; abandoned: number }> {
+    const pendingAtStart = this.pendingUsageWrites.size;
+    if (pendingAtStart === 0) return { pendingAtStart: 0, abandoned: 0 };
+    let timedOut = false;
+    await Promise.race([
+      Promise.allSettled([...this.pendingUsageWrites]),
+      new Promise<void>((resolve) => {
+        const timer = setTimeout(() => { timedOut = true; resolve(); }, budgetMs);
+        timer.unref?.();
+      }),
+    ]);
+    return { pendingAtStart, abandoned: timedOut ? this.pendingUsageWrites.size : 0 };
+  }
 
   emit(
     sessionId: string,
@@ -96,24 +127,26 @@ export class TimelineEmitter {
     // Deduplicate session.state — skip repeated same-state events to avoid UI flicker,
     // but still return a synthetic event so callers (store updates, idle callbacks) proceed.
     //
-    // Structured queue authority fields bypass state-only dedupe. Legacy
-    // diagnostic fields such as pendingCount/pendingMessages must not trigger
-    // queue mutation delivery.
+    // Only a complete structured queue authority can bypass state-only dedupe.
+    // Individual queue-looking fields are not authoritative: accepting an
+    // entries array, epoch, authority id, or version by itself lets a partial
+    // legacy/stale payload masquerade as a live queue mutation. Legacy
+    // diagnostic fields such as pendingCount/pendingMessages are likewise not
+    // queue authority. Session errors remain independently deliverable.
     if (type === 'session.state') {
       const state = String(payload.state ?? '');
-      const hasQueueMutation = Array.isArray(payload.pendingMessageEntries)
-        || Array.isArray(payload.transportPendingMessageEntries)
-        || Array.isArray(payload.failedMessageEntries)
-        || typeof payload.queueEpoch === 'string'
-        || typeof payload.queueAuthorityId === 'string'
-        || typeof payload.pendingMessageVersion === 'number'
-        || typeof payload.transportPendingMessageVersion === 'number'
-        || typeof payload.resetReason === 'string'
-        || typeof payload.dropReason === 'string'
-        || typeof payload.degradedReason === 'string'
-        || typeof payload.queueError === 'string'
-        || 'error' in payload;
-      if (!hasQueueMutation && this.lastSessionState.get(sessionId) === state) {
+      const pendingMessageVersion = typeof payload.pendingMessageVersion === 'number'
+        ? payload.pendingMessageVersion
+        : payload.transportPendingMessageVersion;
+      const hasStructuredQueueMutation = typeof payload.queueEpoch === 'string'
+        && payload.queueEpoch.trim().length > 0
+        && typeof payload.queueAuthorityId === 'string'
+        && payload.queueAuthorityId.trim().length > 0
+        && typeof pendingMessageVersion === 'number'
+        && Number.isFinite(pendingMessageVersion);
+      const hasErrorMutation = 'error' in payload;
+      if (!hasStructuredQueueMutation && !hasErrorMutation
+        && this.lastSessionState.get(sessionId) === state) {
         // State unchanged AND no queue/error snapshot — don't emit to
         // handlers/UI, but still return synthetic event for caller.
         finishTrace('synthetic');
@@ -292,22 +325,21 @@ export class TimelineEmitter {
       timelineStore.append(event);
       traceAppendScheduleMs += performance.now() - appendStart;
       // Mirror per-turn `usage.update` into SQLite so operators can query
-      // historical token spend without parsing JSONL. Best-effort — failures
-      // never escape (recordTurnUsage swallows internally + extra try/catch).
+      // historical token spend without parsing JSONL. This MUST stay off the
+      // daemon event loop: the context-store worker owns SQLite and a large
+      // database/page cache or a stalled write must never starve ServerLink.
+      // Best-effort — failures degrade usage telemetry only.
       // Final-only: streaming deltas don't reach here.
       //
-      // Round-2 audit (0699ea64-3e6 finding A1): synchronous call + eventId
-      // idempotency key. Replaced the previous `void import(...).then(...)`
-      // pattern — there is no real cyclic dependency on context-store, and
-      // the .then deferred path lost rows under SIGTERM races. Passing
-      // `eventId` lets the partial UNIQUE index swallow replay duplicates
-      // (e.g. gemini-watcher's deterministic stableId on daemon restart).
+      // Preserve the eventId idempotency key from the earlier path. The
+      // worker-side partial UNIQUE index swallows replay duplicates (e.g.
+      // gemini-watcher's deterministic stableId on daemon restart).
       if (type === 'usage.update') {
         const usageStart = performance.now();
         try {
           const sessionRecord = getSession(sessionId);
           const parentSessionName = sessionRecord?.parentSession ?? null;
-          recordTurnUsage({
+          const usageRecord = {
             createdAt: ts,
             sessionName: sessionId,
             agentType: typeof payload.agentType === 'string' ? payload.agentType : null,
@@ -322,12 +354,34 @@ export class TimelineEmitter {
             contextWindow: typeof payload.contextWindow === 'number' ? payload.contextWindow : null,
             costUsd: typeof payload.costUsd === 'number' ? payload.costUsd : null,
             eventId,
-          });
+          };
+          // Keep this fire-and-forget from the emitter's synchronous API, but
+          // route it through the bounded worker RPC. `run()` enforces the
+          // awaited cap/timeout; a slow store rejects after its budget instead
+          // of accumulating unbounded work on the main thread. Tracked in
+          // pendingUsageWrites purely so shutdown can drain it -- nothing on
+          // this call path (or the heartbeat/ack/send paths) ever awaits it.
+          const usageWrite = getContextStoreClient()
+            .run('recordTurnUsage', [usageRecord])
+            .catch(() => {
+              incrementCounter('mem.turn_usage.record_failed', {});
+            });
+          this.pendingUsageWrites.add(usageWrite);
+          void usageWrite.finally(() => this.pendingUsageWrites.delete(usageWrite));
         } catch { /* swallow — telemetry must never escape */ }
         finally {
           traceUsageMs += performance.now() - usageStart;
         }
       }
+    }
+
+    // Low-overhead per-session emit accounting. It is opt-in because labels
+    // include session ids and should not add cardinality on installations that
+    // do not collect delivery telemetry. It remains outside the handler loop so
+    // instrumentation cannot delay liveness-critical consumers or server-link
+    // delivery.
+    if (process.env.IMCODES_TIMELINE_DELIVERY_METRICS === '1') {
+      incrementCounter(TIMELINE_DELIVERY_METRICS.DAEMON_SESSION_EMIT, { sessionId, type });
     }
 
     // Notify handlers
@@ -417,3 +471,7 @@ export class TimelineEmitter {
 }
 
 export const timelineEmitter = new TimelineEmitter();
+
+registerSessionStateProbeObserver((sessionName, state) => {
+  timelineEmitter.emit(sessionName, 'session.state', { state });
+});

@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useRef } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { startRegistration, startAuthentication } from '@simplewebauthn/browser';
 import {
@@ -10,16 +10,39 @@ import {
   passwordLogin,
   passwordChange,
   passwordRegister,
+  ApiError,
 } from '../api.js';
 import { isNative } from '../native.js';
 import { validatePasswordComplexity } from '@shared/password-rules.js';
+import { AUTH_ERROR_CODES } from '@shared/auth-error-codes.js';
+import { LOGIN_SESSION_NOT_STUCK_KEY } from '../login-session-not-stuck.js';
+
+export interface LoginAuthAttempt {
+  isCurrent: () => boolean;
+  finish: () => void;
+}
 
 interface Props {
   onLogin?: () => void;
   serverUrl?: string | null;
   onLoginSuccess?: (userId: string, serverUrl: string) => void;
-  onChangeServer?: () => void;
+  onChangeServer?: () => void | Promise<void>;
+  beginAuthAttempt?: () => LoginAuthAttempt;
+  /** Initial surface for a trusted same-origin flow such as invite resumption. */
+  initialMode?: LoginMode;
+  /** Disable external OAuth when a caller must resume exact in-tab state. */
+  showGithub?: boolean;
+  /**
+   * True only once the app's own mount-verification has confirmed a just-
+   * completed login did not keep its session (a 401 after the flag a login
+   * sets right before its own reload). Never true for an ordinary logged-out
+   * visit, and never true before verification settles -- so a session that
+   * DID stick never flashes this message.
+   */
+  sessionNotStuck?: boolean;
 }
+
+type LoginMode = 'buttons' | 'register' | 'password' | 'password_register' | 'change_password';
 
 // localStorage keys for the optional "remember password" feature on the
 // password login form. Cleartext storage is opt-in via the checkbox; the
@@ -59,9 +82,18 @@ function persistRememberedCredentials(remember: boolean, username: string, passw
   } catch { /* ignore quota / disabled storage */ }
 }
 
-export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }: Props) {
+export function LoginPage({
+  onLogin,
+  serverUrl,
+  onLoginSuccess,
+  onChangeServer,
+  beginAuthAttempt,
+  initialMode = 'buttons',
+  showGithub = true,
+  sessionNotStuck = false,
+}: Props) {
   const { t } = useTranslation();
-  const [mode, setMode] = useState<'buttons' | 'register' | 'password' | 'password_register' | 'change_password'>('buttons');
+  const [mode, setMode] = useState<LoginMode>(initialMode);
   const [displayName, setDisplayName] = useState('');
   const [deviceName, setDeviceName] = useState('');
   // Hydrate username + password from localStorage when the user previously
@@ -77,8 +109,79 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
   const [confirmPassword, setConfirmPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Only show this once the app confirms mount verification actually failed
+  // for a login that had just completed (see the `sessionNotStuck` prop doc);
+  // never derived eagerly at mount, or a session that DID stick would flash
+  // it for the instant this component renders ahead of /me resolving.
+  useEffect(() => {
+    if (sessionNotStuck) setError(t('login.session_not_stuck'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionNotStuck]);
   const [passkeySupported, setPasskeySupported] = useState(false);
   const [rememberPassword, setRememberPassword] = useState(readRememberPreference);
+  const authErrorMessage = (err: unknown): string => {
+    const apiError = err instanceof ApiError ? err : null;
+    const body = apiError?.body ?? '';
+    let code = apiError?.code ?? null;
+    let retryAfterMs: number | null = null;
+    try {
+      const parsed = JSON.parse(body) as { error?: unknown; retryAfterMs?: unknown };
+      if (!code && typeof parsed.error === 'string') code = parsed.error;
+      if (typeof parsed.retryAfterMs === 'number') retryAfterMs = parsed.retryAfterMs;
+    } catch { /* non-JSON error body */ }
+    if (code === AUTH_ERROR_CODES.TOO_MANY_ATTEMPTS) {
+      const minutes = Math.max(1, Math.ceil((retryAfterMs ?? 60_000) / 60_000));
+      return t('login.too_many_attempts', { minutes });
+    }
+    if (code === AUTH_ERROR_CODES.INVALID_CREDENTIALS) return t('login.invalid_credentials');
+    if (code === AUTH_ERROR_CODES.ACCOUNT_PENDING) return t('login.account_pending');
+    if (code === AUTH_ERROR_CODES.ACCOUNT_DISABLED) return t('login.account_disabled');
+    // A real ApiError with no ok status (5xx, or 0 for a fetch()-level
+    // failure) is network/server-shaped by construction. A non-ApiError throw
+    // (a JS error unrelated to the request) only counts as network/server-shaped
+    // when it actually says so -- otherwise `apiError` being null would make
+    // every unrelated error default to status 0 and always match here,
+    // permanently hiding the plain "login failed" fallback below.
+    const isNetworkLike = apiError
+      ? (apiError.status >= 500 || apiError.status === 0)
+      : /network|fetch/i.test(String(err));
+    if (isNetworkLike) return t('login.network_error');
+    if (code) return t('login.login_failed_code', { code });
+    return t('login.login_failed');
+  };
+  // `loading` only becomes visible after a render. Enter and click events can
+  // otherwise admit a second auth flow in the same render, invalidating a
+  // native attempt after it has begun writing Secure Storage/Preferences.
+  // Serialize every auth ceremony with a synchronous ref so an older attempt
+  // is never superseded while it may own a credential write.
+  const authAttemptInFlightRef = useRef(false);
+  const startAuthAttempt = (): LoginAuthAttempt | null => {
+    if (authAttemptInFlightRef.current) return null;
+    authAttemptInFlightRef.current = true;
+    let parentAttempt: LoginAuthAttempt;
+    try {
+      parentAttempt = beginAuthAttempt?.() ?? {
+        isCurrent: () => true,
+        finish: () => {},
+      };
+    } catch (error) {
+      authAttemptInFlightRef.current = false;
+      throw error;
+    }
+    let finished = false;
+    return {
+      isCurrent: parentAttempt.isCurrent,
+      finish: () => {
+        if (finished) return;
+        finished = true;
+        try {
+          parentAttempt.finish();
+        } finally {
+          authAttemptInFlightRef.current = false;
+        }
+      },
+    };
+  };
 
   useEffect(() => {
     // Native apps always support passkey (WebAuthn runs in Custom Tab / ASWebAuthSession, not WebView).
@@ -87,8 +190,32 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
   }, []);
 
   const handleGithub = () => {
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
     const params = new URLSearchParams({ reauth: '1', origin: window.location.origin });
-    window.location.href = `/api/auth/github?${params}`;
+    try {
+      window.location.href = `/api/auth/github?${params}`;
+    } finally {
+      // Navigation owns the server-side ceremony. Releasing the local lock is
+      // safe, while the generation claimed above still fences stale /me work.
+      attempt.finish();
+    }
+  };
+
+  const handleChangeServerClick = async () => {
+    // Server switching is not an authentication attempt (the App callback
+    // performs the authority cleanup), but it shares the same local admission
+    // boundary. This closes the same-render window where a native credential
+    // write and Change Server could otherwise start concurrently.
+    if (authAttemptInFlightRef.current || !onChangeServer) return;
+    authAttemptInFlightRef.current = true;
+    setLoading(true);
+    try {
+      await onChangeServer();
+    } finally {
+      authAttemptInFlightRef.current = false;
+      setLoading(false);
+    }
   };
 
   // Native: open ASWebAuthenticationSession → server page auto-triggers passkey →
@@ -96,6 +223,8 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
   // Works with ANY server domain — no hardcoding.
   const handleNativeAuth = async (action?: string) => {
     if (!serverUrl) return;
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
     setLoading(true);
     setError(null);
     try {
@@ -103,6 +232,7 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       let url = `${serverUrl}/api/auth/passkey/native?callback=${encodeURIComponent('imcodes://auth')}&_t=${Date.now()}`;
       if (action) url += `&action=${action}`;
       const result = await AuthSession.start({ url, callbackScheme: 'imcodes' });
+      if (!attempt.isCurrent()) return;
       const parsed = new URL(result.url);
       const nonce = parsed.searchParams.get('nonce');
       const key = parsed.searchParams.get('key');
@@ -113,12 +243,14 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       if (nonce) {
         try {
           const exchanged = await exchangeNonceWithRetry(serverUrl, nonce);
+          if (!attempt.isCurrent()) return;
           const { configureApiKey } = await import('../api.js');
-          const { storeAuthKey } = await import('../biometric-auth.js');
-          const { Preferences } = await import('@capacitor/preferences');
-          await storeAuthKey(exchanged.apiKey);
+          const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+          await storeAuthKey(exchanged.apiKey, serverUrl);
+          if (!attempt.isCurrent()) return;
           configureApiKey(exchanged.apiKey);
-          await Preferences.set({ key: 'deck_api_key_id', value: exchanged.keyId });
+          await storeAuthKeyId(exchanged.keyId, serverUrl);
+          if (!attempt.isCurrent()) return;
           onLoginSuccess?.(exchanged.userId, serverUrl);
           resolved = true;
         } catch {
@@ -126,28 +258,34 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
         }
       }
       if (!resolved && key && userId && keyId) {
+        if (!attempt.isCurrent()) return;
         const { configureApiKey } = await import('../api.js');
-        const { storeAuthKey } = await import('../biometric-auth.js');
-        const { Preferences } = await import('@capacitor/preferences');
-        await storeAuthKey(key);
+        const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+        await storeAuthKey(key, serverUrl);
+        if (!attempt.isCurrent()) return;
         configureApiKey(key);
-        await Preferences.set({ key: 'deck_api_key_id', value: keyId });
+        await storeAuthKeyId(keyId, serverUrl);
+        if (!attempt.isCurrent()) return;
         onLoginSuccess?.(userId, serverUrl);
         resolved = true;
       }
       if (!resolved) setError(t('login.nonce_exchange_failed'));
     } catch (err: unknown) {
+      if (!attempt.isCurrent()) return;
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('cancel')) {
         setError(t('login.nonce_exchange_failed'));
       }
     } finally {
-      setLoading(false);
+      attempt.finish();
+      if (attempt.isCurrent()) setLoading(false);
     }
   };
 
   const handlePasskeyLogin = async () => {
     if (isNative()) return handleNativeAuth();
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
     setLoading(true);
     setError(null);
     try {
@@ -155,9 +293,11 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       const { challengeId, ...options } = beginRes;
       const authResponse = await startAuthentication(options as never);
       await passkeyLoginComplete(challengeId, authResponse);
+      if (!attempt.isCurrent()) return;
       onLogin?.();
       window.location.reload();
     } catch (err: unknown) {
+      if (!attempt.isCurrent()) return;
       const msg = err instanceof Error ? err.message : String(err);
       if (msg.includes('NotAllowedError') || msg.toLowerCase().includes('not allowed')) {
         setError(t('login.passkey_not_found'));
@@ -165,13 +305,16 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
         setError(t('login.passkey_error'));
       }
     } finally {
-      setLoading(false);
+      attempt.finish();
+      if (attempt.isCurrent()) setLoading(false);
     }
   };
 
   const handlePasskeyRegister = async () => {
     if (isNative()) return handleNativeAuth('register');
     if (!displayName.trim()) return;
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
     setLoading(true);
     setError(null);
     try {
@@ -179,38 +322,45 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       const { challengeId, ...options } = beginRes;
       const regResponse = await startRegistration(options as never);
       await passkeyRegisterComplete(challengeId, regResponse, deviceName.trim() || undefined);
+      if (!attempt.isCurrent()) return;
       onLogin?.();
       window.location.reload();
     } catch (err: unknown) {
+      if (!attempt.isCurrent()) return;
       const msg = err instanceof Error ? err.message : String(err);
       if (!msg.toLowerCase().includes('cancel')) {
         setError(t('login.passkey_error'));
       }
     } finally {
-      setLoading(false);
+      attempt.finish();
+      if (attempt.isCurrent()) setLoading(false);
     }
   };
 
   const handlePasswordLogin = async () => {
     if (!username.trim() || !password) return;
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
     setLoading(true);
     setError(null);
     try {
       const native = isNative();
       const res = await passwordLogin(username.trim(), password, native);
+      if (!attempt.isCurrent()) return;
       // On any success path (including forced password change) we persist the
       // remember preference so flipping it OFF clears the storage even if the
       // user never re-types their password. Always pass the credentials that
       // just succeeded — `password` is still the original (pre-change) value
       // when `passwordMustChange` is true; the change flow re-saves below.
       persistRememberedCredentials(rememberPassword, username.trim(), password);
-      if (native && res.apiKey && res.userId && res.keyId) {
+      if (native && serverUrl && res.apiKey && res.userId && res.keyId) {
         const { configureApiKey } = await import('../api.js');
-        const { storeAuthKey } = await import('../biometric-auth.js');
-        const { Preferences } = await import('@capacitor/preferences');
-        await storeAuthKey(res.apiKey);
+        const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+        await storeAuthKey(res.apiKey, serverUrl);
+        if (!attempt.isCurrent()) return;
         configureApiKey(res.apiKey);
-        await Preferences.set({ key: 'deck_api_key_id', value: res.keyId });
+        await storeAuthKeyId(res.keyId, serverUrl);
+        if (!attempt.isCurrent()) return;
         if (res.passwordMustChange) {
           setMode('change_password');
         } else {
@@ -220,21 +370,15 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
         setMode('change_password');
       } else {
         onLogin?.();
+        try { sessionStorage.setItem(LOGIN_SESSION_NOT_STUCK_KEY, '1'); } catch { /* ignore */ }
         window.location.reload();
       }
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('account_pending')) {
-        setError(t('login.account_pending'));
-      } else if (msg.includes('account_disabled')) {
-        setError(t('login.account_disabled'));
-      } else if (msg.includes('invalid_credentials')) {
-        setError(t('login.invalid_credentials'));
-      } else {
-        setError(msg);
-      }
+      if (!attempt.isCurrent()) return;
+      setError(authErrorMessage(err));
     } finally {
-      setLoading(false);
+      attempt.finish();
+      if (attempt.isCurrent()) setLoading(false);
     }
   };
 
@@ -249,44 +393,51 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       setError(t(`login.${complexity.errorKey}`));
       return;
     }
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
     setLoading(true);
     setError(null);
     try {
       const native = isNative();
       const res = await passwordRegister(username.trim(), password, displayName.trim() || undefined, native);
+      if (!attempt.isCurrent()) return;
       if (res.pending) {
         setMode('buttons');
         setError(t('login.account_pending'));
         return;
       }
-      if (native && res.apiKey && res.userId && res.keyId) {
+      if (native && serverUrl && res.apiKey && res.userId && res.keyId) {
         const { configureApiKey } = await import('../api.js');
-        const { storeAuthKey } = await import('../biometric-auth.js');
-        const { Preferences } = await import('@capacitor/preferences');
-        await storeAuthKey(res.apiKey);
+        const { storeAuthKey, storeAuthKeyId } = await import('../biometric-auth.js');
+        await storeAuthKey(res.apiKey, serverUrl);
+        if (!attempt.isCurrent()) return;
         configureApiKey(res.apiKey);
-        await Preferences.set({ key: 'deck_api_key_id', value: res.keyId });
+        await storeAuthKeyId(res.keyId, serverUrl);
+        if (!attempt.isCurrent()) return;
         onLoginSuccess?.(res.userId, serverUrl!);
       } else {
         onLogin?.();
+        try { sessionStorage.setItem(LOGIN_SESSION_NOT_STUCK_KEY, '1'); } catch { /* ignore */ }
         window.location.reload();
       }
     } catch (err: unknown) {
+      if (!attempt.isCurrent()) return;
       const msg = err instanceof Error ? err.message : String(err);
-      if (msg.includes('username_taken')) {
+      if (msg.includes(AUTH_ERROR_CODES.USERNAME_TAKEN)) {
         setError(t('login.username_taken'));
-      } else if (msg.includes('registration_disabled')) {
+      } else if (msg.includes(AUTH_ERROR_CODES.REGISTRATION_DISABLED)) {
         setError(t('login.registration_disabled'));
-      } else if (msg.includes('invalid_username_format')) {
+      } else if (msg.includes(AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT)) {
         setError(t('login.invalid_username_format'));
       } else if (msg.includes('password_missing_')) {
         const key = msg.match(/password_missing_\w+/)?.[0];
         setError(key ? t(`login.${key}`) : msg);
       } else {
-        setError(msg);
+        setError(authErrorMessage(err));
       }
     } finally {
-      setLoading(false);
+      attempt.finish();
+      if (attempt.isCurrent()) setLoading(false);
     }
   };
 
@@ -300,24 +451,25 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       setError(t(`login.${complexity.errorKey}`));
       return;
     }
+    const attempt = startAuthAttempt();
+    if (!attempt) return;
     setLoading(true);
     setError(null);
     try {
       await passwordChange(password, newPassword);
+      if (!attempt.isCurrent()) return;
       // The persisted password is now stale — refresh storage with the new
       // value (or wipe it if the user has unticked remember in the meantime).
       persistRememberedCredentials(rememberPassword, username.trim(), newPassword);
       if (isNative() && serverUrl) {
         // API key was already stored during login — just proceed
         const { getAuthKey } = await import('../biometric-auth.js');
-        const key = await getAuthKey();
+        const key = await getAuthKey(serverUrl);
         if (key) {
-          // userId already known from login, but we can read from Preferences
-          const { Preferences } = await import('@capacitor/preferences');
-          await Preferences.get({ key: 'deck_api_key_id' });
           // Re-resolve userId from /me endpoint
           const { apiFetch } = await import('../api.js');
           const me = await apiFetch<{ id: string }>('/api/auth/user/me');
+          if (!attempt.isCurrent()) return;
           onLoginSuccess?.(me.id, serverUrl);
           return;
         }
@@ -325,9 +477,11 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
       onLogin?.();
       window.location.reload();
     } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : String(err));
+      if (!attempt.isCurrent()) return;
+      setError(authErrorMessage(err));
     } finally {
-      setLoading(false);
+      attempt.finish();
+      if (attempt.isCurrent()) setLoading(false);
     }
   };
 
@@ -379,11 +533,12 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
               </>
             )}
 
-            {!isNative() && (
+            {!isNative() && showGithub && (
               <button
                 class="btn btn-ghost"
                 style={{ width: '100%', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, marginBottom: 10 }}
                 onClick={handleGithub}
+                disabled={loading}
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor">
                   <path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/>
@@ -618,7 +773,8 @@ export function LoginPage({ onLogin, serverUrl, onLoginSuccess, onChangeServer }
           </span>
           <button
             style={{ background: 'none', border: 'none', color: '#64748b', fontSize: 12, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}
-            onClick={onChangeServer}
+            onClick={handleChangeServerClick}
+            disabled={loading}
           >
             {t('serverSetup.changeServer')}
           </button>

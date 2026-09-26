@@ -36,6 +36,7 @@
  */
 
 import { describe, expect, it, beforeEach } from 'vitest';
+import { readFileSync } from 'node:fs';
 import {
   clearAllResend,
   drainResend,
@@ -48,6 +49,137 @@ beforeEach(() => {
 });
 
 describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
+  it('reuses the supervision authority gate at both resend and runtime FIFO drain edges', () => {
+    const manager = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
+    // Both edges share ONE admission: the supervision heartbeat gate for every
+    // entry, plus the ended-task gate for queued delegation replies.
+    const resendGate = manager.indexOf('const admission = resolveTransportQueueEntryAdmission(sessionName, entry);');
+    const resendDispatch = manager.indexOf('deliverTransportResendEntry(runtime, entry, ownership)');
+    const runtimeGate = manager.indexOf('runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);');
+
+    expect(resendGate).toBeGreaterThanOrEqual(0);
+    expect(resendGate).toBeLessThan(resendDispatch);
+    expect(runtimeGate).toBeGreaterThan(resendDispatch);
+  });
+
+  it('kills either-edge regression to the stale boolean-authorizer literal', () => {
+    const manager = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
+    const admission = readFileSync(new URL('../../src/daemon/delegation-reply-task-liveness.ts', import.meta.url), 'utf8');
+    const resendResolver = 'const admission = resolveTransportQueueEntryAdmission(sessionName, entry);';
+    const runtimeResolver = 'runtime.pendingDrainAdmission = (entry) => resolveTransportQueueEntryAdmission(sessionName, entry);';
+    const staleBooleanLiteral = 'authorizeQueuedSupervisionHeartbeatDelivery({';
+    const triStateHeartbeat = 'const supervision = resolveQueuedSupervisionHeartbeatDelivery({';
+
+    const preservesBothTriStateEdges = (source: string, shared = admission): boolean => (
+      source.includes(resendResolver)
+      && source.includes(runtimeResolver)
+      && !source.includes(staleBooleanLiteral)
+      && shared.includes(triStateHeartbeat)
+      && !shared.includes(staleBooleanLiteral)
+    );
+
+    expect(preservesBothTriStateEdges(manager)).toBe(true);
+    expect(preservesBothTriStateEdges(manager.replace(
+      resendResolver,
+      `const admission = ${staleBooleanLiteral}`,
+    )), 'resend edge mutant collapses stale/retry into boolean').toBe(false);
+    expect(preservesBothTriStateEdges(manager.replace(
+      runtimeResolver,
+      `runtime.pendingDrainAdmission = (entry) => ${staleBooleanLiteral}`,
+    )), 'runtime FIFO edge mutant collapses stale/retry into boolean').toBe(false);
+    expect(preservesBothTriStateEdges(manager, admission.replace(
+      triStateHeartbeat,
+      `const supervision = ${staleBooleanLiteral}`,
+    )), 'shared admission mutant collapses stale/retry into boolean').toBe(false);
+  });
+
+  it('pins the single resend-to-runtime handoff transfer and kills release/reinsert mutants', () => {
+    const resend = readFileSync(new URL('../../src/daemon/transport-resend-queue.ts', import.meta.url), 'utf8');
+    const manager = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
+    const delivery = readFileSync(new URL('../../src/agent/transport-resend-delivery.ts', import.meta.url), 'utf8');
+    const runtime = readFileSync(new URL('../../src/agent/transport-session-runtime.ts', import.meta.url), 'utf8');
+    const dispatchTransfer = 'dispatch(entry, { clientMessageId, handoffId })';
+    const release = 'releaseHandoff(sessionName, handoffId, [clientMessageId])';
+
+    const preservesExactlyOnceTransfer = (sources: {
+      resend: string; manager: string; delivery: string; runtime: string;
+    }): boolean => {
+      const drainStart = sources.resend.indexOf('export async function drainResend(');
+      const dispatchIndex = sources.resend.indexOf(dispatchTransfer, drainStart);
+      const firstReleaseIndex = sources.resend.indexOf(release, drainStart);
+      return drainStart >= 0
+        && dispatchIndex > drainStart
+        && firstReleaseIndex > dispatchIndex
+        && sources.manager.includes('deliverTransportResendEntry(runtime, entry, ownership)')
+        && sources.delivery.includes('queueHandoff: ownership')
+        && sources.delivery.includes('entry.clientMessageId ?? entry.commandId')
+        && sources.runtime.includes('if (entry.queueHandoff) {')
+        && sources.runtime.includes('if (!entry.queueHandoff) this._pendingVersion++')
+        && sources.runtime.includes('if (entry.queueHandoff) addReservation(entry.queueHandoff.handoffId, entry.clientMessageId)');
+    };
+    const sources = { resend, manager, delivery, runtime };
+    expect(preservesExactlyOnceTransfer(sources)).toBe(true);
+    expect(preservesExactlyOnceTransfer({
+      ...sources,
+      resend: resend.replace(
+        `const dispatchResult = await ${dispatchTransfer};`,
+        `getTransportQueueStore().${release};\n      const dispatchResult = await dispatch(entry, { clientMessageId, handoffId });`,
+      ),
+    }), 'pre-dispatch release mutant').toBe(false);
+    expect(preservesExactlyOnceTransfer({
+      ...sources,
+      manager: manager.replace(
+        'deliverTransportResendEntry(runtime, entry, ownership)',
+        'deliverTransportResendEntry(runtime, entry)',
+      ),
+    }), 'manager ownership-drop mutant').toBe(false);
+    expect(preservesExactlyOnceTransfer({
+      ...sources,
+      delivery: delivery.replace('queueHandoff: ownership', 'queueHandoff: undefined'),
+    }), 'delivery ownership-drop mutant').toBe(false);
+    expect(preservesExactlyOnceTransfer({
+      ...sources,
+      delivery: delivery.replaceAll('entry.clientMessageId ?? entry.commandId', 'entry.commandId'),
+    }), 'commandId substitution mutant').toBe(false);
+    expect(preservesExactlyOnceTransfer({
+      ...sources,
+      runtime: runtime.replace('if (entry.queueHandoff) {', 'if (false) {'),
+    }), 'runtime reinsert mutant').toBe(false);
+    expect(preservesExactlyOnceTransfer({
+      ...sources,
+      runtime: runtime.replace(
+        'if (entry.queueHandoff) addReservation(entry.queueHandoff.handoffId, entry.clientMessageId)',
+        'void entry.queueHandoff',
+      ),
+    }), 'APPEND reacquire mutant').toBe(false);
+  });
+
+  it('wires same-instance epoch rebinding and dead-runtime lease recovery before resend drain', () => {
+    const source = readFileSync(new URL('../../src/agent/session-manager.ts', import.meta.url), 'utf8');
+    const launch = source.slice(source.indexOf('async function launchTransportSessionInner'));
+    const canonicalize = launch.indexOf('runtime.adoptOrRebindQueueRecipient()');
+    const upsert = launch.indexOf('upsertSession(record);');
+    const rebind = launch.indexOf('runtime.rebindQueueRecipient(runtimeRecipient, persistedRecipient)');
+    const publish = launch.indexOf('emitSessionPersist(persistedRecord ?? record, name);');
+    const recover = launch.indexOf("await recoverPersistedTransportQueue(runtime, name, 'launch')");
+    const helper = source.slice(
+      source.indexOf('async function recoverPersistedTransportQueue'),
+      source.indexOf('/** Drain control traffic', source.indexOf('async function recoverPersistedTransportQueue')),
+    );
+    const prove = helper.indexOf('runtime.adoptOrRebindQueueRecipient()');
+    const reclaim = helper.indexOf('restoreExpiredHandoffs(sessionName, Date.now(), { includeUnexpired: true })');
+    const drain = helper.indexOf('await drainTransportResendQueueIntoRuntime(runtime, sessionName, context)');
+
+    expect(canonicalize).toBeGreaterThanOrEqual(0);
+    expect(upsert).toBeGreaterThan(canonicalize);
+    expect(rebind).toBeGreaterThan(upsert);
+    expect(publish).toBeGreaterThan(rebind);
+    expect(recover).toBeGreaterThan(publish);
+    expect(prove).toBeGreaterThanOrEqual(0);
+    expect(reclaim).toBeGreaterThan(prove);
+    expect(drain).toBeGreaterThan(reclaim);
+  });
+
   it('synchronous dispatcher executes runtime.send before the first await yields', async () => {
     // Mirrors the shape of the dispatcher used in session-manager.ts:
     //   (entry) => { const result = runtime.send(...); ... return result; }

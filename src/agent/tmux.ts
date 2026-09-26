@@ -7,6 +7,7 @@ import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import type { Readable } from 'stream';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 
 import {
   weztermNewSession,
@@ -640,6 +641,71 @@ export async function getPaneId(session: string): Promise<string> {
   }
   if (BACKEND === 'wezterm') return weztermGetPaneId(session);
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_id}');
+}
+
+/**
+ * Pane id plus the owning session's creation time -- tmux's own `%N` pane-id
+ * counter is scoped to the server and gets REUSED once every other session
+ * is gone (a lone kill-session + new-session with the same name routinely
+ * reallocates the exact same `%0`). A staleness check that compares only
+ * `pane_id` can therefore silently pass for a pane that was actually
+ * destroyed and replaced -- session_created (a tmux-native, always-available
+ * unix timestamp, no daemon-side env-var injection required) changes on
+ * every fresh session even when the pane id coincidentally repeats, so
+ * comparing the pair reliably detects "this session was replaced".
+ * tmux-only: conpty/wezterm sessions are not recreated under the same
+ * session name in the way this guards against.
+ */
+export async function getPaneIdentity(session: string): Promise<{ paneId: string; sessionCreated: string } | undefined> {
+  if (BACKEND !== 'tmux') return undefined;
+  try {
+    // Two separate queries, not one joined by a literal tab/delimiter:
+    // tmux's `display-message -p` format engine is a status-line renderer and
+    // mangles embedded control characters (an inline tab silently became a
+    // stray `_` in testing), so a single combined-format call cannot be
+    // parsed back apart reliably.
+    const [paneId, sessionCreated] = await Promise.all([
+      tmuxRun('display-message', '-p', '-t', session, '#{pane_id}'),
+      tmuxRun('display-message', '-p', '-t', session, '#{session_created}'),
+    ]);
+    const trimmedPaneId = paneId.trim();
+    const trimmedSessionCreated = sessionCreated.trim();
+    return trimmedPaneId && trimmedSessionCreated ? { paneId: trimmedPaneId, sessionCreated: trimmedSessionCreated } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface TmuxSessionResourceIdentity {
+  paneId: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+}
+
+/**
+ * Read the live tmux pane and the owner tuple injected when that session was
+ * launched. This deliberately bypasses tmuxRun's startup retries: conflict
+ * recovery must be a bounded observation and must never hold the resource
+ * registry lock while an unhealthy tmux server retries indefinitely.
+ */
+export async function getTmuxSessionResourceIdentity(
+  session: string,
+  timeoutMs: number,
+): Promise<TmuxSessionResourceIdentity | undefined> {
+  if (BACKEND !== 'tmux') return undefined;
+  try {
+    const format = `#{pane_id}\t#{${SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID}}\t#{${SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH}}`;
+    const { stdout } = await execFile('tmux', ['display-message', '-p', '-t', session, format], {
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024,
+    });
+    const [paneId, sessionInstanceId, runtimeEpoch, ...extra] = stdout.trimEnd().split('\t');
+    return paneId && sessionInstanceId && runtimeEpoch && extra.length === 0
+      ? { paneId, sessionInstanceId, runtimeEpoch }
+      : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 /** Get the current working directory of the first pane of a session. */

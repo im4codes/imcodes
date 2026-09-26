@@ -34,6 +34,7 @@ const {
   listSessionsMock,
   recallClientControl,
   collectRecentSummarySyncCandidatesMock,
+  memoryInjectionEnabledMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
   getTransportRuntimeMock: vi.fn(),
@@ -64,6 +65,11 @@ const {
   // bounded-empty path (no in-process recall).
   recallClientControl: { isProductionOwner: false },
   collectRecentSummarySyncCandidatesMock: vi.fn(),
+  memoryInjectionEnabledMock: vi.fn(async () => true),
+}));
+
+vi.mock('../../src/context/memory-injection-toggle.js', () => ({
+  isMemoryInjectionEnabled: memoryInjectionEnabledMock,
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -1377,8 +1383,149 @@ describe('handleWebCommand memory context timeline', () => {
         localUnavailable: true,
       }),
     }));
-    expect(queryPendingContextEventsMock).not.toHaveBeenCalled();
-    expect(listMemoryProjectSummariesMock).not.toHaveBeenCalled();
+    // The four context-store reads fire concurrently rather than one at a
+    // time (sequential round trips made every load of this "just show two
+    // count badges" panel noticeably slow), so a failure in one no longer
+    // holds the others back -- their results are simply discarded once the
+    // response is already going to report unavailable.
+    expect(queryPendingContextEventsMock).toHaveBeenCalled();
+    expect(listMemoryProjectSummariesMock).toHaveBeenCalled();
+  });
+
+  it('returns a structured response instead of rejecting when personal memory stats are unavailable', async () => {
+    getProcessedProjectionStatsMock.mockRejectedValueOnce(new Error('context-store worker unavailable'));
+
+    handleWebCommand({
+      type: MEMORY_WS.PERSONAL_QUERY,
+      requestId: 'personal-stats-degraded',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'personal-stats-degraded',
+        boundProjects: [],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PERSONAL_RESPONSE,
+      requestId: 'personal-stats-degraded',
+      records: [],
+      pendingRecords: [],
+      projects: [],
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+      stats: expect.objectContaining({ localUnavailable: true }),
+    }));
+    // Fired concurrently with the (failing) stats read rather than gated
+    // behind it; its result is simply discarded once stats fails.
+    expect(queryProcessedProjectionsMock).toHaveBeenCalled();
+  });
+
+  it('bounds observation reads to authorized namespaces inside the context-store worker', async () => {
+    listContextNamespacesMock.mockReturnValue([
+      {
+        id: 'ns-bob',
+        scope: 'personal',
+        userId: 'user-bob',
+        projectId: 'github.com/acme/repo',
+        key: 'personal::user-bob::github.com/acme/repo',
+        visibility: 'private',
+        createdAt: 1,
+        updatedAt: 2,
+      },
+      {
+        id: 'ns-alice',
+        scope: 'personal',
+        userId: 'user-alice',
+        projectId: 'github.com/acme/repo',
+        key: 'personal::user-alice::github.com/acme/repo',
+        visibility: 'private',
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    ]);
+    listContextObservationsMock.mockReturnValue([]);
+
+    handleWebCommand({
+      type: MEMORY_WS.OBSERVATION_QUERY,
+      requestId: 'observations-bounded',
+      scope: 'personal',
+      class: 'note',
+      limit: 17,
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'observations-bounded',
+        boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+      },
+    }, serverLink as any);
+
+    await flushAsync();
+
+    expect(listContextObservationsMock).toHaveBeenCalledWith(expect.objectContaining({
+      namespaceIds: ['ns-bob'],
+      scope: 'personal',
+      class: 'note',
+      limit: 17,
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.OBSERVATION_RESPONSE,
+      requestId: 'observations-bounded',
+      records: [],
+    }));
+  });
+
+  it('degrades observation and preference worker failures without unhandled rejections', async () => {
+    listContextNamespacesMock.mockRejectedValueOnce(new Error('context-store worker unavailable'));
+    handleWebCommand({
+      type: MEMORY_WS.OBSERVATION_QUERY,
+      requestId: 'observations-degraded',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'observations-degraded',
+        boundProjects: [],
+      },
+    }, serverLink as any);
+    await flushAsync();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.OBSERVATION_RESPONSE,
+      requestId: 'observations-degraded',
+      localUnavailable: true,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+    }));
+
+    serverLink.send.mockClear();
+    listContextObservationsMock.mockRejectedValueOnce(new Error('context-store worker unavailable'));
+    handleWebCommand({
+      type: MEMORY_WS.PREF_QUERY,
+      requestId: 'preferences-degraded',
+      [MEMORY_MANAGEMENT_CONTEXT_FIELD]: {
+        actorId: 'user-bob',
+        userId: 'user-bob',
+        role: 'user',
+        source: 'server_bridge',
+        requestId: 'preferences-degraded',
+        boundProjects: [],
+      },
+    }, serverLink as any);
+    await flushAsync();
+    expect(listContextObservationsMock).toHaveBeenCalledWith(expect.objectContaining({
+      state: 'active',
+    }));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: MEMORY_WS.PREF_RESPONSE,
+      requestId: 'preferences-degraded',
+      localUnavailable: true,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+    }));
   });
 
   it('emits a linked memory.context event for injected related history', async () => {
@@ -1419,6 +1566,30 @@ describe('handleWebCommand memory context timeline', () => {
     );
     expect(recordMemoryHitsMock).toHaveBeenCalledWith(['mem-1']);
     expect(recordMemoryHitsMock.mock.invocationCallOrder[0]).toBeGreaterThan(sendKeysDelayedEnterMock.mock.invocationCallOrder[0]);
+  });
+
+  it('injects no related history into a process send when the project turned memory injection off', async () => {
+    memoryInjectionEnabledMock.mockImplementation(async () => false);
+    try {
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_process_brain',
+        text: 'Fix reconnect issues in websocket client',
+        commandId: 'cmd-memory-off',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(memoryInjectionEnabledMock).toHaveBeenCalled();
+      expect(sendKeysDelayedEnterMock).toHaveBeenCalledWith(
+        'deck_process_brain',
+        'Fix reconnect issues in websocket client',
+        undefined,
+      );
+      expect(emitMock).not.toHaveBeenCalledWith('deck_process_brain', 'memory.context', expect.anything(), expect.anything());
+      expect(recordMemoryHitsMock).not.toHaveBeenCalled();
+    } finally {
+      memoryInjectionEnabledMock.mockImplementation(async () => true);
+    }
   });
 
   it('synchronizes a new recent summary once across subsequent process sends', async () => {

@@ -1,9 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
-import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_MSG } from '../../shared/transport/file-transfer.js';
+import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_MSG, FILE_TRANSFER_RELAY_HEADER } from '../../shared/transport/file-transfer.js';
 
 async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
   vi.resetModules();
@@ -317,6 +317,83 @@ describe('file-transfer local handle hardening', () => {
     );
   });
 
+  it('resumes a relay download from the requested offset', async () => {
+    const filePath = path.join(rootDir, 'project', 'resume.bin');
+    const content = Buffer.alloc(FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES + 4096);
+    for (let i = 0; i < content.length; i += 1) content[i] = i % 251;
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, content);
+
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'resume.bin', 'application/octet-stream', content.length);
+    let putBody: Buffer | undefined;
+    const fetchMock = vi.fn(async (_url: string, init: RequestInit) => {
+      const chunks: Buffer[] = [];
+      for await (const chunk of init.body as AsyncIterable<Buffer>) chunks.push(Buffer.from(chunk));
+      putBody = Buffer.concat(chunks);
+      return new Response('', { status: 200 });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const streamed = createServerLinkMock();
+    const offset = 1_000_003;
+
+    await transfer.handleFileDownloadStream(
+      {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId: 'download-resume',
+        attachmentId: handle.id,
+        uploadUrl: 'https://relay.example/download-staged/download-resume?token=secret',
+        offset,
+      },
+      streamed.serverLink as never,
+    );
+
+    // READY still describes the whole file, and says where this body starts.
+    expect(streamed.sent).toEqual([
+      expect.objectContaining({
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM_READY,
+        size: content.length,
+        offset,
+      }),
+    ]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://relay.example/download-staged/download-resume?token=secret',
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'content-length': String(content.length - offset),
+          [FILE_TRANSFER_RELAY_HEADER.OFFSET]: String(offset),
+        }),
+      }),
+    );
+    expect(putBody?.equals(content.subarray(offset))).toBe(true);
+  });
+
+  it('refuses an offset past the end of the file', async () => {
+    const filePath = path.join(rootDir, 'project', 'short.bin');
+    const content = Buffer.alloc(FILE_TRANSFER_LIMITS.DOWNLOAD_INLINE_MAX_BYTES + 10, 1);
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await writeFile(filePath, content);
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const handle = transfer.createProjectFileHandle(filePath, 'short.bin', 'application/octet-stream', content.length);
+    const fetchMock = vi.fn();
+    vi.stubGlobal('fetch', fetchMock);
+    const failed = createServerLinkMock();
+
+    await transfer.handleFileDownloadStream(
+      {
+        type: FILE_TRANSFER_MSG.DOWNLOAD_STREAM,
+        downloadId: 'download-past-end',
+        attachmentId: handle.id,
+        uploadUrl: 'https://relay.example/download-staged/download-past-end?token=secret',
+        offset: content.length + 1,
+      },
+      failed.serverLink as never,
+    );
+
+    expect(failed.sent).toEqual([expect.objectContaining({ type: 'file.download_error', downloadId: 'download-past-end' })]);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
   it('rejects legacy uploads over the active single-frame cap', async () => {
     const transfer = await loadFileTransferHandler(fakeHome, { maxFileSize: 4 });
     const failed = createServerLinkMock();
@@ -403,11 +480,45 @@ describe('file-transfer local handle hardening', () => {
     }));
   });
 
-  it('lists only child directories through the bounded directory picker', async () => {
+  it('resumes a broken relay upload fetch from the bytes already written', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const broken = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('he'));
+        setTimeout(() => controller.error(new TypeError('link_lost')), 20);
+      },
+    });
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(broken, { status: 200 }))
+      .mockResolvedValueOnce(new Response('llo', {
+        status: 206,
+        headers: { 'Content-Range': 'bytes 2-4/5' },
+      }));
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+
+    await transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch',
+      uploadId: 'upload-fetch-resume',
+      filename: 'resume.txt',
+      originalName: 'resume.txt',
+      mime: 'text/plain',
+      size: 5,
+      downloadUrl: 'https://relay.example/upload-staged/upload-fetch-resume?token=reusable',
+    }, done.serverLink as never);
+
+    expect(fetchMock).toHaveBeenNthCalledWith(2, expect.any(String), expect.objectContaining({
+      headers: { Range: 'bytes=2-' },
+    }));
+    await expect(readFile(path.join(fakeHome, '.imcodes', 'uploads', 'resume.txt'), 'utf8')).resolves.toBe('hello');
+    expect(done.sent).toContainEqual(expect.objectContaining({ type: 'file.upload_done', uploadId: 'upload-fetch-resume' }));
+  });
+
+  it('lists child directories and regular files through the bounded remote file browser', async () => {
     const parent = path.join(rootDir, 'directory-picker');
     await mkdir(path.join(parent, 'visible'), { recursive: true });
     await mkdir(path.join(parent, '.hidden'), { recursive: true });
-    await writeFile(path.join(parent, 'ignored.txt'), 'not a directory');
+    await writeFile(path.join(parent, 'report.txt'), 'downloadable file');
     const transfer = await loadFileTransferHandler(fakeHome);
     const result = createServerLinkMock();
 
@@ -425,6 +536,7 @@ describe('file-transfer local handle hardening', () => {
       entries: [
         { name: '.hidden', path: path.join(await realpath(parent), '.hidden'), isDir: true, hidden: true },
         { name: 'visible', path: path.join(await realpath(parent), 'visible'), isDir: true, hidden: false },
+        { name: 'report.txt', path: path.join(await realpath(parent), 'report.txt'), isDir: false, hidden: false },
       ],
     }]);
   });
@@ -475,6 +587,38 @@ describe('file-transfer local handle hardening', () => {
       uploadId: 'upload-existing-destination',
     }));
     await expect(stat(path.join(destinationDirectory, 'report.txt'))).resolves.toMatchObject({ size: 5 });
+  });
+
+  it('commits a direct upload into the same validated destination seam', async () => {
+    const destinationDirectory = path.join(rootDir, 'direct-destination');
+    const stagedPath = path.join(rootDir, 'direct-upload.part');
+    await mkdir(destinationDirectory, { recursive: true });
+    await writeFile(stagedPath, 'hello');
+    const transfer = await loadFileTransferHandler(fakeHome);
+
+    const attachment = await transfer.finalizeDirectUploadedFile({
+      clientUploadId: 'client-direct-directory',
+      filename: 'direct-staged.txt',
+      originalName: 'report.txt',
+      mime: 'text/plain',
+      resolved: stagedPath,
+      size: 5,
+      destinationDirectory,
+    });
+
+    const destination = path.join(destinationDirectory, 'report.txt');
+    await expect(stat(destination)).resolves.toMatchObject({ size: 5 });
+    await expect(stat(stagedPath)).rejects.toMatchObject({ code: 'ENOENT' });
+    expect(attachment).toMatchObject({
+      source: 'local',
+      daemonPath: await realpath(destination),
+      originalName: 'report.txt',
+      size: 5,
+    });
+    expect(transfer.lookupAttachmentByClientUploadId('client-direct-directory')).toMatchObject({
+      id: attachment.id,
+      daemonPath: await realpath(destination),
+    });
   });
 
   it('deletes a completed upload and its metadata while refusing local project handles', async () => {
@@ -670,6 +814,7 @@ describe('file-transfer local handle hardening', () => {
       type: FILE_TRANSFER_MSG.PATH_HANDLE_DONE,
       requestId: 'path-handle-1',
       attachment: expect.objectContaining({ daemonPath: await realpath(filePath), size: 5, downloadable: true }),
+      sourceIdentity: expect.objectContaining({ size: 5, device: expect.any(Number), inode: expect.any(Number) }),
     })]);
   });
 

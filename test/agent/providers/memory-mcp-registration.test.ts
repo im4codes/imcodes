@@ -10,9 +10,11 @@ import {
   IMCODES_DAEMON_NAMESPACE_ENV,
   IMCODES_DAEMON_PROJECT_NAME_ENV,
   IMCODES_DAEMON_PROJECT_ROOT_ENV,
+  IMCODES_DAEMON_PROVIDER_ID_ENV,
   IMCODES_DAEMON_SERVER_ID_ENV,
   IMCODES_DAEMON_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
+  IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
   isMemoryMcpAllowedEnvKey,
 } from '../../../shared/memory-mcp-env.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
@@ -20,17 +22,27 @@ import {
   MEMORY_MCP_PROVIDER_ID,
   MEMORY_MCP_PROVIDER_IDS,
 } from '../../../shared/memory-ws.js';
-import { getDefaultCodexMcpArgs } from '../../../src/agent/providers/getDefaultCodexMcpArgs.js';
+import { getDefaultCodexMcpArgs, getCodexAppServerArgs } from '../../../src/agent/providers/getDefaultCodexMcpArgs.js';
 import {
   getDefaultAcpMcpServers,
   getDefaultMcpServers,
+  IMCODES_MEMORY_MCP_ARGS,
+  IMCODES_MEMORY_MCP_COMMAND,
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../../src/agent/providers/getDefaultMcpServers.js';
+import { IMCODES_MCP_PARENT_PID_ENV } from '../../../src/daemon/mcp-stdio-lifecycle.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../../shared/session-resource-lifecycle.js';
 
 const sessionConfig = {
   sessionKey: 'route-1',
   sessionName: 'deck_alpha_worker',
+  sessionInstanceId: 'instance-bound',
+  runtimeEpoch: 'epoch-bound',
   projectName: 'alpha',
   serverId: 'srv-bound',
+  providerId: 'codex-sdk',
   cwd: '/tmp/project',
   env: {
     [IMCODES_SESSION_ENV]: 'deck_alpha_worker',
@@ -45,12 +57,13 @@ const sessionConfig = {
 };
 
 describe('managed provider MCP registration helpers', () => {
-  it('pins the exact twelve managed provider matrix and excludes process/OpenClaw providers', () => {
+  it('pins the exact fifteen managed provider matrix and excludes process/OpenClaw providers', () => {
     expect(MEMORY_MCP_PROVIDER_IDS).toEqual([
       MEMORY_MCP_PROVIDER_ID.CLAUDE_CODE_SDK,
       MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
       MEMORY_MCP_PROVIDER_ID.GROK_SDK,
       MEMORY_MCP_PROVIDER_ID.KIMI_SDK,
+      MEMORY_MCP_PROVIDER_ID.HERMES_AGENT,
       MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
       MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
       MEMORY_MCP_PROVIDER_ID.QODER_SDK,
@@ -59,6 +72,8 @@ describe('managed provider MCP registration helpers', () => {
       MEMORY_MCP_PROVIDER_ID.QWEN,
       MEMORY_MCP_PROVIDER_ID.DEEPSEEK_HARNESS,
       MEMORY_MCP_PROVIDER_ID.PI,
+      MEMORY_MCP_PROVIDER_ID.CODEBUDDY_CHINA,
+      MEMORY_MCP_PROVIDER_ID.CODEBUDDY_INTERNATIONAL,
     ]);
 
     expect(TRANSPORT_SESSION_AGENT_TYPES.filter((agentType) => (
@@ -75,8 +90,8 @@ describe('managed provider MCP registration helpers', () => {
 
     expect(server).toMatchObject({
       type: 'stdio',
-      command: 'imcodes',
-      args: ['memory', 'mcp'],
+      command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+      args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
     });
     expect(server.env[IMCODES_DAEMON_USER_ID_ENV]).toBe('user-secret-ish');
     expect(JSON.parse(server.env[IMCODES_DAEMON_NAMESPACE_ENV])).toEqual({
@@ -88,9 +103,21 @@ describe('managed provider MCP registration helpers', () => {
     expect(server.env[IMCODES_DAEMON_PROJECT_NAME_ENV]).toBe('alpha');
     expect(server.env[IMCODES_DAEMON_PROJECT_ROOT_ENV]).toBe('/tmp/project');
     expect(server.env[IMCODES_DAEMON_SERVER_ID_ENV]).toBe('srv-bound');
+    expect(server.env[IMCODES_DAEMON_PROVIDER_ID_ENV]).toBe('codex-sdk');
+    expect(server.env[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID]).toBe('instance-bound');
+    expect(server.env[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH]).toBe('epoch-bound');
+    expect(server.env[IMCODES_MCP_TOOL_CATALOG_MODE_ENV]).toBe(MCP_TOOL_CATALOG_MODES.STATIC_FULL);
     expect(server.env.IMCODES_SERVER_TOKEN).toBeUndefined();
     expect(server.env.OAUTH_TOKEN).toBeUndefined();
     expect(Object.keys(server.env).every(isMemoryMcpAllowedEnvKey)).toBe(true);
+  });
+
+  it('requires an explicit proven client opt-in before using dynamic publication', () => {
+    const server = getDefaultMcpServers(sessionConfig, {
+      toolCatalogMode: MCP_TOOL_CATALOG_MODES.DYNAMIC,
+    })[IMCODES_MEMORY_MCP_SERVER_NAME];
+
+    expect(server.env[IMCODES_MCP_TOOL_CATALOG_MODE_ENV]).toBe(MCP_TOOL_CATALOG_MODES.DYNAMIC);
   });
 
   it('fills daemon-local identity for local personal namespaces without user ids', () => {
@@ -137,9 +164,13 @@ describe('managed provider MCP registration helpers', () => {
     const [server] = getDefaultAcpMcpServers(sessionConfig);
 
     expect(server.name).toBe(IMCODES_MEMORY_MCP_SERVER_NAME);
-    expect(server.command).toBe('imcodes');
-    expect(server.args).toEqual(['memory', 'mcp']);
+    expect(server.command).toBe(IMCODES_MEMORY_MCP_LAUNCH_COMMAND);
+    expect(server.args).toEqual([...IMCODES_MEMORY_MCP_LAUNCH_ARGS]);
     expect(server.env).toContainEqual({ name: IMCODES_DAEMON_USER_ID_ENV, value: 'user-secret-ish' });
+    expect(server.env).toContainEqual({
+      name: IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
+      value: MCP_TOOL_CATALOG_MODES.STATIC_FULL,
+    });
     expect(server.env.some((entry) => entry.name === 'IMCODES_SERVER_TOKEN')).toBe(false);
   });
 
@@ -170,10 +201,61 @@ describe('managed provider MCP registration helpers', () => {
     expect(serialized).not.toContain(IMCODES_DAEMON_NAMESPACE_ENV);
     expect(serialized).not.toContain('user-secret-ish');
     expect(serialized).not.toContain('github.com/acme/project');
+    expect(serialized).toContain('IMCODES_MCP_TOOL_CATALOG_MODE');
+    expect(serialized).toContain('static_full');
+  });
+
+  it('keeps native multi-agent collaboration available at app-server process start', () => {
+    // The app-server is shared by every session. Disabling a feature here would
+    // hide native collaboration from analysis and non-Brain sessions too; Brain
+    // task participation is enforced by the daemon relay instead.
+    const args = getCodexAppServerArgs();
+    expect(args, 'no process-wide feature may be disabled').not.toContain('--disable');
+    expect(JSON.stringify(args)).not.toContain('multi_agent');
+    expect(args.at(-1)).toBe('app-server');
+    // The IM MCP catalog must stay intact so send_message/supervision still work.
+    const serialized = JSON.stringify(args);
+    expect(serialized).toContain('IMCODES_MCP_TOOL_CATALOG_MODE');
+    expect(serialized).toContain('static_full');
   });
 
   it('pins Gemini model-list probe as MCP-free', async () => {
     const source = await readFile(new URL('../../../src/agent/providers/gemini-sdk.ts', import.meta.url), 'utf8');
     expect(source).toMatch(/listModels[\s\S]*newSession\(\{\s*cwd:[\s\S]*mcpServers:\s*\[\]/);
+  });
+});
+
+describe('production parent-identity injection', () => {
+  it('declares the host parent pid on every real POSIX launch, exec-preserving', () => {
+    // R2 shipped the `expectedParentPid` check with NO producer: the only
+    // setter anywhere in the repository was a test, so the mechanism protected
+    // nothing real. This pins the declaration to the launch shape MCP clients
+    // actually run, rather than to a helper or a test-supplied env.
+    if (process.platform === 'win32') {
+      // Windows has no `exec`: a wrapper would leave an intermediate process
+      // between client and server and break signal/exit-code fidelity, so this
+      // platform keeps the direct launch and is deliberately not narrowed.
+      expect(IMCODES_MEMORY_MCP_LAUNCH_COMMAND).toBe(IMCODES_MEMORY_MCP_COMMAND);
+      expect([...IMCODES_MEMORY_MCP_LAUNCH_ARGS]).toEqual([...IMCODES_MEMORY_MCP_ARGS]);
+      return;
+    }
+    expect(IMCODES_MEMORY_MCP_LAUNCH_COMMAND).toBe('sh');
+    const script = IMCODES_MEMORY_MCP_LAUNCH_ARGS[1] ?? '';
+    expect(script, 'the wrapper must declare its own parent').toContain(`${IMCODES_MCP_PARENT_PID_ENV}=$PPID`);
+    expect(script, 'exec: no shell survives, so stdio/exit/signals are unchanged').toContain('exec "$0" "$@"');
+    expect(
+      [...IMCODES_MEMORY_MCP_LAUNCH_ARGS].slice(2),
+      'the wrapped command is the real server, unchanged',
+    ).toEqual([IMCODES_MEMORY_MCP_COMMAND, ...IMCODES_MEMORY_MCP_ARGS]);
+  });
+
+  it('routes the stdio and Codex consumers through that same shape', () => {
+    // One source of truth. A consumer left on the bare command would spawn a
+    // server with no declared parent and silently lose the protection.
+    const server = getDefaultMcpServers(sessionConfig)[IMCODES_MEMORY_MCP_SERVER_NAME];
+    expect(server.command).toBe(IMCODES_MEMORY_MCP_LAUNCH_COMMAND);
+    expect(server.args).toEqual([...IMCODES_MEMORY_MCP_LAUNCH_ARGS]);
+    const codex = getDefaultCodexMcpArgs(sessionConfig).join(' ');
+    expect(codex).toContain(`command=${JSON.stringify(IMCODES_MEMORY_MCP_LAUNCH_COMMAND)}`);
   });
 });

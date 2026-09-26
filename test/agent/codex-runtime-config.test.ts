@@ -37,7 +37,11 @@ const childProcessMock = vi.hoisted(() => {
               result: {
                 rateLimits: {
                   planType: 'pro',
+                  // windowDurationMins: 300 === 5h — verified against the real
+                  // app-server response shape (findWindowLeftPercent matches by
+                  // duration, not by primary/secondary position).
                   primary: { usedPercent: 12, windowDurationMins: 300, resetsAt: 1_750_000_000_000 },
+                  credits: { hasCredits: true, unlimited: false, balance: '4.25' },
                 },
               },
             });
@@ -109,6 +113,10 @@ const providerRegistryMock = vi.hoisted(() => ({
   getProvider: vi.fn(() => undefined),
 }));
 
+const contextStoreClientMock = vi.hoisted(() => ({
+  run: vi.fn().mockResolvedValue(undefined),
+}));
+
 const fsMock = vi.hoisted(() => ({
   readFile: vi.fn(async (_path: string, _enc?: string) => {
     throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
@@ -131,6 +139,16 @@ vi.mock('../../src/agent/provider-registry.js', () => ({
   getProvider: providerRegistryMock.getProvider,
 }));
 
+// codex-runtime-config.ts records a local SQLite snapshot on every real
+// refresh, dispatched through the async context-store worker client (never
+// the synchronous context-store.js export directly — see
+// scripts/lint-no-sync-context-store.mjs). Mocked so this unit test never
+// spawns the real worker / touches the real ~/.imcodes SQLite file as a side
+// effect of importing it.
+vi.mock('../../src/store/context-store-worker-client.js', () => ({
+  getContextStoreClient: () => contextStoreClientMock,
+}));
+
 import { getCodexRuntimeConfig, getCodexBaseInstructions } from '../../src/agent/codex-runtime-config.js';
 
 describe('getCodexRuntimeConfig', () => {
@@ -139,6 +157,8 @@ describe('getCodexRuntimeConfig', () => {
     childProcessMock.children.length = 0;
     providerRegistryMock.getProvider.mockReset();
     providerRegistryMock.getProvider.mockReturnValue(undefined);
+    contextStoreClientMock.run.mockReset();
+    contextStoreClientMock.run.mockResolvedValue(undefined);
     fsMock.readFile.mockReset();
     fsMock.readFile.mockImplementation(async () => {
       throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' });
@@ -156,6 +176,25 @@ describe('getCodexRuntimeConfig', () => {
     expect(config.planLabel).toBe('Pro');
     expect(config.isAuthenticated).toBe(true);
     expect(childProcessMock.spawn).toHaveBeenCalledTimes(2);
+  });
+
+  it('captures the pay-as-you-go credit balance from account/rateLimits/read and records a local snapshot', async () => {
+    const config = await getCodexRuntimeConfig(true);
+    expect(config.creditsBalance).toBe('4.25');
+    expect(config.creditsHasCredits).toBe(true);
+    expect(config.creditsUnlimited).toBe(false);
+    expect(contextStoreClientMock.run).toHaveBeenCalledTimes(1);
+    expect(contextStoreClientMock.run).toHaveBeenCalledWith('recordCodexCreditSnapshot', [{
+      planType: 'pro',
+      balance: '4.25',
+      hasCredits: true,
+      unlimited: false,
+      // 100 - usedPercent(12), matched to the 5h bucket by windowDurationMins
+      // (300), not by primary/secondary position.
+      fiveHourLeftPercent: 88,
+      // No secondary window in the fixture — never guessed from position.
+      weeklyLeftPercent: undefined,
+    }]);
   });
 
   it('returns codex-cached base_instructions on exact slug match', async () => {
@@ -216,6 +255,26 @@ describe('getCodexRuntimeConfig', () => {
     }
   });
 
+  it('never lets a passive (probe:false) read replace the live catalog a non-forced read returns', async () => {
+    // Fresh module: the catalog cache is module state shared across this file.
+    vi.resetModules();
+    const fresh = await import('../../src/agent/codex-runtime-config.js');
+    const { CODEX_MODEL_IDS } = await import('../../src/shared/models/options.js');
+
+    const passive = await fresh.getCodexRuntimeConfig({ probe: false });
+    expect(passive.availableModels).toEqual([...CODEX_MODEL_IDS]);
+    expect(childProcessMock.spawn).not.toHaveBeenCalled();
+
+    // Session-list/sub-session hydration runs passively all the time; the model
+    // picker's non-forced read right after must still reach the live catalog.
+    const live = await fresh.getCodexRuntimeConfig(false);
+    expect(live.availableModels).toEqual(['gpt-5.5', 'gpt-5.4-mini']);
+
+    // Once a live catalog exists, passive readers see it instead of the fallback.
+    expect((await fresh.getCodexRuntimeConfig({ probe: false })).availableModels)
+      .toEqual(['gpt-5.5', 'gpt-5.4-mini']);
+  });
+
   it('reuses the connected singleton provider when available', async () => {
     providerRegistryMock.getProvider.mockReturnValue({
       readModelList: vi.fn().mockResolvedValue([
@@ -224,6 +283,7 @@ describe('getCodexRuntimeConfig', () => {
       ]),
       readRateLimits: vi.fn().mockResolvedValue({
         planType: 'enterprise',
+        credits: { hasCredits: false, unlimited: true, balance: '0' },
       }),
     });
 
@@ -232,5 +292,41 @@ describe('getCodexRuntimeConfig', () => {
     expect(config.defaultModel).toBe('gpt-5.5');
     expect(config.planLabel).toBe('Enterprise');
     expect(childProcessMock.spawn).not.toHaveBeenCalled();
+    // The singleton path (provider.readRateLimits()) forwards the raw
+    // rateLimits payload verbatim — credits flows through it exactly like
+    // the one-shot app-server spawn path.
+    expect(config.creditsBalance).toBe('0');
+    expect(config.creditsUnlimited).toBe(true);
+    expect(contextStoreClientMock.run).toHaveBeenCalledWith(
+      'recordCodexCreditSnapshot',
+      [expect.objectContaining({ balance: '0', hasCredits: false, unlimited: true })],
+    );
+  });
+
+  it('matches the 5h/weekly window by windowDurationMins, not by primary/secondary position', async () => {
+    // Verified against the real account/rateLimits/read response on a live
+    // account: once an account is deep into its weekly limit, the top-level
+    // `codex` limitId can report the WEEKLY window as `primary` with
+    // `secondary: null` — there is no fixed (primary=5h, secondary=weekly)
+    // convention. A positional read would mislabel this as the 5h window.
+    providerRegistryMock.getProvider.mockReturnValue({
+      readRateLimits: vi.fn().mockResolvedValue({
+        planType: 'pro',
+        primary: { usedPercent: 99, windowDurationMins: 10_080, resetsAt: 1_750_000_000 },
+        secondary: null,
+        credits: { hasCredits: false, unlimited: false, balance: '0' },
+      }),
+    });
+
+    await getCodexRuntimeConfig(true);
+    expect(contextStoreClientMock.run).toHaveBeenCalledWith(
+      'recordCodexCreditSnapshot',
+      [expect.objectContaining({
+        // 100 - 99, correctly attributed to the weekly bucket by duration.
+        weeklyLeftPercent: 1,
+        // No window matched the 5h duration — never guessed from position.
+        fiveHourLeftPercent: undefined,
+      })],
+    );
   });
 });

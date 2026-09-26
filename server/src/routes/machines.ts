@@ -13,12 +13,18 @@ import {
   canonicalMachineOs,
   type MachineAccessRole,
   type MachineSummary,
+  pickDaemonMachineListItem,
 } from '../../../shared/remote-exec.js';
 import {
+  MACHINE_HOST_LINK_ERROR,
+  MACHINE_HOST_LINK_ROUTE,
   MACHINE_REASONS,
   normalizeMachineDisplayName,
 } from '../../../shared/machine-reference.js';
-import { listAccessibleControlledMachines } from '../share/machine-access.js';
+import {
+  listAccessibleControlledMachines,
+  resolveControlledMachineManagementAccess,
+} from '../share/machine-access.js';
 import { validateControlledNodeCapabilities } from '../../../shared/controlled-node-capabilities.js';
 import {
   isImcodesVersionOutdated,
@@ -40,7 +46,17 @@ import {
   cancelPendingAutoUnlock,
   registerPendingAutoUnlock,
 } from '../ws/auto-unlock-registry.js';
-import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
+import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY } from '../../../shared/remote-desktop-install.js';
+import { backfillCanonicalHosts } from '../services/remote-desktop-host-identity.js';
+import {
+  MACHINE_HOST_LINK_AUDIT,
+  hostIdentitiesConflict,
+  isOwnedHostDaemon,
+  setControlledNodeHost,
+} from '../services/controlled-node-host-link.js';
+import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -52,6 +68,9 @@ export const machinesRoutes = new Hono<{
 
 interface ControlledRow {
   id: string;
+  node_id: string | null;
+  team_ids: string[] | null;
+  team_names: string[] | null;
   ref_name: string | null;
   display_name: string | null;
   status: string | null;
@@ -61,6 +80,7 @@ interface ControlledRow {
   daemon_version: string | null;
   auto_unlock_configured: boolean;
   host_server_id: string | null;
+  remote_desktop_host_id: string | null;
   access_role: MachineAccessRole;
   controlled_capabilities: unknown;
 }
@@ -74,7 +94,18 @@ export async function listControlledMachines(
   db: Database,
   userId: string,
   nowMs: number,
-): Promise<{ machines: (MachineSummary & { refName: string; displayName: string; execEnabled: boolean; accessRole: MachineAccessRole })[]; overLimit: boolean }> {
+): Promise<{ machines: (MachineSummary & {
+  nodeId: string;
+  refName: string;
+  displayName: string;
+  execEnabled: boolean;
+  accessRole: MachineAccessRole;
+  remoteDesktopHostId?: string;
+  // Declared because it is emitted. It was not, so the daemon-strip list below
+  // could omit it without a type error -- and every strict daemon then rejected
+  // the whole machine list as malformed.
+  hostServerId?: string;
+})[]; overLimit: boolean }> {
   const rows: ControlledRow[] = await listAccessibleControlledMachines(
     db,
     userId,
@@ -83,6 +114,9 @@ export async function listControlledMachines(
   );
   const overLimit = rows.length > MACHINE_LIST_MAX_ITEMS;
   const machines = rows.slice(0, MACHINE_LIST_MAX_ITEMS).map((r) => {
+    if (!isControlledNodeId(r.node_id)) {
+      throw new Error(`controlled_node_missing_canonical_node_id:${r.id}`);
+    }
     const online = r.status === 'online'
       && typeof r.last_heartbeat_at === 'number'
       && nowMs - r.last_heartbeat_at < MACHINE_PRESENCE_STALENESS_MS;
@@ -95,15 +129,30 @@ export async function listControlledMachines(
       : null;
     return {
       serverId: r.id,
-      name: r.display_name ?? r.ref_name ?? r.id,
-      refName: r.ref_name ?? r.id,
-      displayName: r.display_name ?? r.ref_name ?? r.id,
+      nodeId: r.node_id,
+      name: r.display_name ?? r.node_id,
+      refName: r.ref_name ?? '',
+      displayName: r.display_name ?? r.node_id,
       online,
       nodeRole: NODE_ROLE.CONTROLLED,
       // Viewers may inspect bounded metadata only. Projecting false here also
       // keeps old MCP resolution logic from presenting a non-operable target.
       execEnabled: r.exec_enabled === true && r.access_role !== 'viewer',
       accessRole: r.access_role,
+      ...(typeof r.remote_desktop_host_id === 'string' && r.remote_desktop_host_id
+        ? { remoteDesktopHostId: r.remote_desktop_host_id }
+        : {}),
+      // Every group this machine is in, so the owner can see and change them
+      // without a round trip per machine. Omitted when it is in none, so "no
+      // groups" and "an empty group list" stay the same absent value.
+      ...(Array.isArray(r.team_ids) && r.team_ids.length > 0
+        ? {
+          teamIds: r.team_ids,
+          ...(Array.isArray(r.team_names) && r.team_names.length === r.team_ids.length
+            ? { teamNames: r.team_names }
+            : {}),
+        }
+        : {}),
       ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
       ...(canonicalMachineOs(r.os) ? { os: canonicalMachineOs(r.os) } : {}),
       ...(typeof r.last_heartbeat_at === 'number' ? { lastSeenMs: r.last_heartbeat_at } : {}),
@@ -127,31 +176,49 @@ export async function listControlledMachines(
 
 // GET /api/machines — owned + actively shared controlled machines with DB-backed presence.
 machinesRoutes.get('/', requireAuth(), async (c) => {
-  const userId = c.get('userId' as never) as string;
-  const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, Date.now());
+  let userId = c.get('userId' as never) as string;
+  const now = Date.now();
+  // Browser discovery is also the bounded, resumable provisioning seam for an
+  // Owner whose remote-desktop node predates canonical host identity. This is
+  // idempotent and owner-scoped; strict daemon clients neither need nor receive
+  // the additive identity field.
+  const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
+    && typeof c.get('authServerId') === 'string';
+  if (authenticatedDaemon) {
+    const sourceServerId = c.get('authServerId') as string;
+    const operational = await resolveMachineOperationalUser(c.env.DB, {
+      token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+      signingKey: c.env.JWT_SIGNING_KEY,
+      authenticatedSourceServerId: sourceServerId,
+      sourceOwnerUserId: userId,
+      now,
+    });
+    if (!operational) return c.json({ error: 'forbidden' }, 403);
+    userId = operational.userId;
+  }
+  if (!authenticatedDaemon) {
+    await backfillCanonicalHosts({
+      db: c.env.DB,
+      ownerUserId: userId,
+      limit: MACHINE_LIST_MAX_ITEMS,
+      now,
+    });
+  }
+  const { machines, overLimit } = await listControlledMachines(c.env.DB, userId, now);
   if (overLimit) {
     return c.json({ error: 'machine_list_over_limit', maxItems: MACHINE_LIST_MAX_ITEMS }, 413);
   }
   // Older daemons strictly reject unknown machine-list keys. Server-authenticated
   // callers do not need the display-only role because every action is admitted
   // again against the DB; preserve their legacy DTO during rolling upgrades.
-  const authenticatedDaemon = c.get('nodeRole') === NODE_ROLE.FULL
-    && typeof c.get('authServerId') === 'string';
   const responseMachines = authenticatedDaemon
-    ? machines.map(({
-      accessRole: _accessRole,
-      capabilities: _capabilities,
-      daemonVersion: _daemonVersion,
-      updateAvailable: _updateAvailable,
-      autoUnlockConfigured: _autoUnlockConfigured,
-      ...machine
-    }) => machine)
+    ? machines.map((machine) => pickDaemonMachineListItem(machine))
     : machines;
   return c.json({ machines: responseMachines });
 });
 
-// POST /api/machines/:serverId/display-name — owner-controlled render name.
-// `ref_name` remains immutable so existing ^^(refName) markers stay valid.
+// POST /api/machines/:serverId/display-name — operator-controlled render name.
+// A deprecated legacy `ref_name` remains immutable so historical markers stay valid.
 machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
@@ -161,13 +228,15 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
   const displayName = normalizeMachineDisplayName(parsed.data.displayName);
   if (!displayName) return c.json({ error: MACHINE_REASONS.INVALID_DISPLAY_NAME }, 400);
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+  if (!access) return c.json({ error: 'not_found' }, 404);
 
   const row = await c.env.DB.queryOne<{ previous_name: string | null }>(
-    `UPDATE servers SET display_name = $3
+    `UPDATE servers SET display_name = $2
        FROM (SELECT display_name AS previous_name FROM servers WHERE id = $1) prev
-      WHERE servers.id = $1 AND servers.user_id = $2 AND servers.node_role = $4 AND servers.revoked_at IS NULL
+      WHERE servers.id = $1 AND servers.node_role = $3 AND servers.revoked_at IS NULL
       RETURNING prev.previous_name`,
-    [serverId, userId, displayName, NODE_ROLE.CONTROLLED],
+    [serverId, displayName, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
@@ -180,17 +249,147 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   return c.json({ ok: true, displayName });
 });
 
-// POST /api/machines/:serverId/revoke — owner kill-switch (10.3).
+// POST /api/machines/desk-binding?serverId=... — owner binds this machine to
+// one Desk.
+//
+// Deliberately NOT under the `/:serverId/` device-action namespace. Upstream's
+// authority contract defines every route there as a device capability that must
+// admit through resolveControlledMachineOperatorAccess with no owner predicate,
+// and that is right for acting ON a device. Binding is not such an action: it
+// chooses the authorization domain that decides who counts as a Participant at
+// all, so delegating it to a Participant would let a grantee re-point the
+// machine at a Desk they control. Keeping it outside that namespace states the
+// distinction instead of carving an exception into the contract, and matches
+// the repository convention of `?serverId=` for new routes.
+//
+// This is the only way a machine joins or leaves a group, and it is deliberately
+// explicit. Nothing infers a group from the owner's memberships: a "obvious
+// default" would silently decide who can reach the machine. Every ambiguous or
+// unauthorized shape below fails closed and changes no membership.
+machinesRoutes.post('/desk-binding', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.query('serverId')?.trim();
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const body = await c.req.json().catch(() => null);
+  // One group at a time, joined or left explicitly. A machine can be in several
+  // groups, so there is no "the" group to set: `{ teamId, member: false }` takes
+  // it out of that one and leaves the rest alone. Both keys are required --
+  // changing who can reach a machine is not something a malformed body should
+  // be able to do by omission.
+  const parsed = z.object({
+    teamId: z.string().trim().min(1),
+    member: z.boolean(),
+  }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body', reason: 'desk_required' }, 400);
+  const { teamId, member } = parsed.data;
+
+  // Only the machine's own owner may file it, and only while it is live.
+  const machine = await c.env.DB.queryOne<{ id: string }>(
+    `SELECT id FROM servers
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
+    [serverId, userId, NODE_ROLE.CONTROLLED],
+  );
+  if (!machine) return c.json({ error: 'not_found' }, 404);
+
+  // Putting a machine INTO a group requires managing that group. Taking it out
+  // requires nothing beyond owning the machine, which is checked above --
+  // otherwise an owner removed from the group could never get their own machine
+  // back out of it.
+  if (member) {
+    const membership = await c.env.DB.queryOne<{ role: string }>(
+      `SELECT tm.role FROM team_members tm
+         JOIN teams t ON t.id = tm.team_id
+        WHERE tm.team_id = $1 AND tm.user_id = $2 AND tm.role IN ('owner', 'admin')`,
+      [teamId, userId],
+    );
+    if (!membership) return c.json({ error: 'forbidden', reason: 'desk_membership_required' }, 403);
+    await c.env.DB.execute(
+      `INSERT INTO machine_groups (server_id, team_id, added_at) VALUES ($1, $2, $3)
+       ON CONFLICT (server_id, team_id) DO NOTHING`,
+      [serverId, teamId, Date.now()],
+    );
+  } else {
+    await c.env.DB.execute(
+      'DELETE FROM machine_groups WHERE server_id = $1 AND team_id = $2',
+      [serverId, teamId],
+    );
+  }
+
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: member ? 'machine.group_add' : 'machine.group_remove',
+    ip,
+    details: { serverId, teamId },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true, teamId, member });
+});
+
+// POST /api/machines/host-link?serverId=... — owner declares which daemon this
+// controlled node shares a computer with (`{ hostServerId }`), or clears it
+// (`{ hostServerId: null }`).
+//
+// The same link enrollment records when a node is installed from a daemon's own
+// remote-desktop button, for nodes that were installed some other way: that
+// daemon's button then opens this node instead of offering an install. Like
+// desk-binding, it chooses a relationship rather than acting on the device, so
+// it lives outside the `/:serverId/` operator namespace and admits only the
+// owner of both rows.
+machinesRoutes.post(MACHINE_HOST_LINK_ROUTE, requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.query('serverId')?.trim();
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const body = await c.req.json().catch(() => null);
+  // Required, not optional: clearing a link is `null`, never an omitted key.
+  const parsed = z.object({
+    hostServerId: z.string().trim().min(1).max(128).nullable(),
+  }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const { hostServerId } = parsed.data;
+
+  const node = await c.env.DB.queryOne<{ id: string; host_server_id: string | null }>(
+    `SELECT id, host_server_id FROM servers
+      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
+    [serverId, userId, NODE_ROLE.CONTROLLED],
+  );
+  if (!node) return c.json({ error: 'not_found' }, 404);
+
+  if (hostServerId !== null) {
+    // Same rule enrollment applies to its hostServerId: a live daemon of this
+    // same user, never a controlled node and never someone else's machine.
+    if (!await isOwnedHostDaemon(c.env.DB, userId, hostServerId)) {
+      return c.json({ error: MACHINE_HOST_LINK_ERROR.INVALID_HOST_SERVER }, 403);
+    }
+    if (await hostIdentitiesConflict(c.env.DB, serverId, hostServerId)) {
+      return c.json({ error: MACHINE_HOST_LINK_ERROR.HOST_CONFLICT }, 409);
+    }
+  }
+
+  await setControlledNodeHost(c.env.DB, { userId, nodeServerId: serverId, hostServerId });
+
+  const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
+  logAudit({
+    userId,
+    action: hostServerId !== null ? MACHINE_HOST_LINK_AUDIT.LINK : MACHINE_HOST_LINK_AUDIT.UNLINK,
+    ip,
+    details: { serverId, hostServerId, previousHostServerId: node.host_server_id },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true, hostServerId });
+});
+
+// POST /api/machines/:serverId/revoke — operator kill-switch (10.3).
 machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const now = Date.now();
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, now);
+  if (!access) return c.json({ error: 'not_found' }, 404);
   const row = await c.env.DB.queryOne<{ id: string }>(
-    `UPDATE servers SET revoked_at = $3
-      WHERE id = $1 AND user_id = $2 AND node_role = $4 AND revoked_at IS NULL
+    `UPDATE servers SET revoked_at = $2
+      WHERE id = $1 AND node_role = $3 AND revoked_at IS NULL
       RETURNING id`,
-    [serverId, userId, now, NODE_ROLE.CONTROLLED],
+    [serverId, now, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
   // Drop the live connection immediately (the `:serverId` path is ingress
@@ -209,7 +408,7 @@ machinesRoutes.post('/:serverId/revoke', requireAuth(), async (c) => {
   return c.json({ ok: true });
 });
 
-// POST /api/machines/:serverId/exec-enabled — owner toggles D-E exec gate.
+// POST /api/machines/:serverId/exec-enabled — operator toggles D-E exec gate.
 machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
@@ -217,14 +416,16 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ enabled: z.boolean() }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+  if (!access) return c.json({ error: 'not_found' }, 404);
   // Capture the prior value so the audit records from → to (enabling exec is a
   // high-privilege action that gates SYSTEM/root RCE and MUST be attributable).
   const row = await c.env.DB.queryOne<{ was: boolean }>(
-    `UPDATE servers SET exec_enabled = $3
+    `UPDATE servers SET exec_enabled = $2
        FROM (SELECT exec_enabled AS was FROM servers WHERE id = $1) prev
-      WHERE servers.id = $1 AND servers.user_id = $2 AND servers.node_role = $4 AND servers.revoked_at IS NULL
+      WHERE servers.id = $1 AND servers.node_role = $3 AND servers.revoked_at IS NULL
       RETURNING prev.was`,
-    [serverId, userId, parsed.data.enabled, NODE_ROLE.CONTROLLED],
+    [serverId, parsed.data.enabled, NODE_ROLE.CONTROLLED],
   );
   if (!row) return c.json({ error: 'not_found' }, 404);
   if (!parsed.data.enabled) {
@@ -249,7 +450,8 @@ machinesRoutes.post('/:serverId/exec-enabled', requireAuth(), async (c) => {
  * The secret is relayed and never retained: it is not written to the database,
  * not placed in an audit detail, not logged, and not readable back through any
  * route. Only the boolean outcome the node reports is persisted, so the list
- * page can mark the node. Owner-only, like every other node mutation here.
+ * page can mark the node. Owner and active Participant use the same
+ * centralized device-operation authority.
  */
 machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
@@ -264,11 +466,7 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'invalid_body' }, 400);
 
-  const owned = await c.env.DB.queryOne<{ id: string; controlled_capabilities: unknown }>(
-    `SELECT id, controlled_capabilities FROM servers
-      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
-    [serverId, userId, NODE_ROLE.CONTROLLED],
-  );
+  const owned = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   // A node that never advertised auto unlock cannot answer this command; it
   // would simply not reply, and the caller would wait out the whole timeout
@@ -304,9 +502,9 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   if (!result) return c.json({ error: 'node_timeout' }, 504);
 
   await c.env.DB.execute(
-    `UPDATE servers SET auto_unlock_configured = $3
-      WHERE id = $1 AND user_id = $2`,
-    [serverId, userId, result.configured],
+    `UPDATE servers SET auto_unlock_configured = $2
+      WHERE id = $1`,
+    [serverId, result.configured],
   );
   const ip = (c.get('clientIp' as never) as string) ?? 'unknown';
   logAudit({
@@ -322,29 +520,58 @@ machinesRoutes.post('/:serverId/auto-unlock', requireAuth(), async (c) => {
   return c.json({ ok: true, autoUnlockConfigured: result.configured });
 });
 
-// POST /api/machines/:serverId/remote-desktop-worker — owner-only quick repair.
+// POST /api/machines/:serverId/remote-desktop-permissions — ask the machine to
+// raise its own screen-recording prompt.
+//
+// The grant itself is never made here and cannot be: macOS shows that dialog
+// only to a responsible signed application running in the console user's
+// session, and only a human can answer it. All this endpoint does is ask the
+// node to put it on screen.
+machinesRoutes.post('/:serverId/remote-desktop-permissions', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const owned = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+  if (!owned) return c.json({ error: 'not_found' }, 404);
+  const now = Date.now();
+  // Presence is load-bearing rather than cosmetic: the dialog appears on the
+  // machine, so asking an offline one produces nothing an operator can see.
+  if (owned.status !== 'online'
+    || typeof owned.last_heartbeat_at !== 'number'
+    || now - owned.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  const bridge = WsBridge.get(serverId);
+  if (bridge.tryRequestControlledNodeRemoteDesktopPermissions(
+    bridge.daemonConnectionGeneration(),
+  ) !== 'sent') {
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  logAudit({
+    userId,
+    action: 'machine.remote_desktop_permission_request',
+    ip: (c.get('clientIp' as never) as string) ?? 'unknown',
+    details: { serverId },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true }, 202);
+});
+
+// POST /api/machines/:serverId/remote-desktop-worker — operator quick repair.
 machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('serverId');
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
-  const owned = await c.env.DB.queryOne<{
-    id: string;
-    os: string | null;
-    status: string | null;
-    last_heartbeat_at: number | null;
-    daemon_version: string | null;
-    controlled_capabilities: unknown;
-  }>(
-    `SELECT id, os, status, last_heartbeat_at, daemon_version, controlled_capabilities FROM servers
-      WHERE id = $1 AND user_id = $2 AND node_role = $3 AND revoked_at IS NULL`,
-    [serverId, userId, NODE_ROLE.CONTROLLED],
-  );
+  const owned = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
   if (!owned) return c.json({ error: 'not_found' }, 404);
   const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
-  if (canonicalMachineOs(owned.os) !== 'win'
-    || !capabilities.ok
-    || !capabilities.value.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
-    || capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
+  // Whichever platform advertised that it can install. The OS was checked
+  // here as well as the capability, which made the capability redundant on
+  // Windows and made every other platform unreachable -- a macOS node that
+  // advertised it could install was refused by the layer above it.
+  const installable = capabilities.ok
+    && (capabilities.value.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
+      || capabilities.value.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY));
+  if (!installable || capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
     return c.json({ error: 'remote_desktop_worker_not_installable' }, 409);
   }
   if (isImcodesVersionOutdated(owned.daemon_version, process.env.APP_VERSION)) {

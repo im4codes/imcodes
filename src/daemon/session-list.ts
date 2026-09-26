@@ -18,6 +18,8 @@ import { buildTransportQueueSnapshotPayload } from './transport-queue-projection
 import { expireResendEntries } from './transport-resend-queue.js';
 import { validateExecutionTemplateCandidate } from './execution-clone.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import type { SupervisionHeartbeatSnapshot } from '../../shared/supervision-heartbeat.js';
+import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 
 export interface SessionListItem extends SessionContextBootstrapState {
   name: string;
@@ -49,6 +51,9 @@ export interface SessionListItem extends SessionContextBootstrapState {
   quotaLabel?: string;
   quotaUsageLabel?: string;
   quotaMeta?: import('../../shared/provider-quota.js').ProviderQuotaMeta;
+  codexCreditsBalance?: string;
+  codexCreditsHasCredits?: boolean;
+  codexCreditsUnlimited?: boolean;
   effort?: import('../../shared/effort-levels.js').TransportEffortLevel;
   /** Provider service tier, so a viewer can be warned about Codex's Fast tier. */
   serviceTier?: string;
@@ -72,6 +77,7 @@ export interface SessionListItem extends SessionContextBootstrapState {
   /** Ineligibility reason code (an `EXECUTION_CLONE_ERROR_CODES` value) set ONLY
    *  when `executionTemplateEligible` is false. Absent when eligible. */
   executionTemplateIneligibleReason?: string;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot;
 }
 
 /**
@@ -116,21 +122,29 @@ function resolveTransportSessionListState(
   return record.state;
 }
 
+/**
+ * The one daemon-side session activity projection used by both session.list and
+ * the supervision console. It observes the live transport runtime and its
+ * structured queue; it never guesses from elapsed heartbeat time.
+ */
+export function resolveAuthoritativeSessionListState(record: SessionRecord): SessionListItem['state'] {
+  const runtime = record.runtimeType === 'transport' ? getTransportRuntime(record.name) : undefined;
+  const runtimeState = resolveTransportSessionListState(record, runtime);
+  if (record.runtimeType === 'transport') expireResendEntries(record.name);
+  const queuePayload = record.runtimeType === 'transport'
+    ? buildTransportQueueSnapshotPayload(record.name, 'session_list')
+    : null;
+  const hasPendingQueue = (queuePayload?.pendingMessageEntries.length ?? 0) > 0;
+  return hasPendingQueue
+    ? (runtime ? (runtimeState === 'idle' ? 'queued' : runtimeState) : 'queued')
+    : runtimeState;
+}
+
 function baseItem(s: SessionRecord): SessionListItem {
-  const runtime = s.runtimeType === 'transport' ? getTransportRuntime(s.name) : undefined;
-  const runtimeState = resolveTransportSessionListState(s, runtime);
-  if (s.runtimeType === 'transport') {
-    expireResendEntries(s.name);
-  }
+  const state = resolveAuthoritativeSessionListState(s);
   const queuePayload = s.runtimeType === 'transport'
     ? buildTransportQueueSnapshotPayload(s.name, 'session_list')
     : null;
-  const hasPendingQueue = (queuePayload?.pendingMessageEntries.length ?? 0) > 0;
-  const state = hasPendingQueue
-    ? runtime
-      ? (runtimeState === 'idle' ? 'queued' : runtimeState)
-      : 'queued'
-    : runtimeState;
   // DAEMON-AUTHORITATIVE template eligibility. Computed from the persisted
   // record (not the resolved transport `state` above) so it stays deterministic
   // and matches the clone-create gate's view of the session.
@@ -165,6 +179,9 @@ function baseItem(s: SessionRecord): SessionListItem {
     quotaLabel: s.quotaLabel,
     quotaUsageLabel: s.quotaUsageLabel,
     quotaMeta: s.quotaMeta,
+    codexCreditsBalance: s.codexCreditsBalance,
+    codexCreditsHasCredits: s.codexCreditsHasCredits,
+    codexCreditsUnlimited: s.codexCreditsUnlimited,
     effort: s.effort,
     serviceTier: s.serviceTier,
     contextNamespace: s.contextNamespace,
@@ -177,6 +194,7 @@ function baseItem(s: SessionRecord): SessionListItem {
     label: s.label,
     userCreated: s.userCreated,
     transportConfig: s.transportConfig,
+    supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(s.name),
     ...(queuePayload ?? {}),
     executionTemplateEligible: eligibility.eligible,
     ...(eligibility.eligible

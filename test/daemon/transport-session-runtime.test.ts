@@ -1,10 +1,20 @@
+import { CHAT_MESSAGE_ORIGINS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { TransportSessionRuntime, type PendingTransportMessage } from '../../src/agent/transport-session-runtime.js';
 import { RUNTIME_TYPES } from '../../src/agent/session-runtime.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_STATUS, type TransportProvider, type ProviderError, type SessionConfig, type ProviderStatusUpdate, type ProviderUsageUpdate, type ToolCallEvent } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import { CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE } from '../../shared/cron-types.js';
 import type { MemorySearchResult, MemorySearchResultItem } from '../../src/context/memory-search.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import {
+  SUPERVISION_CONTRACT_PREAMBLE_END,
+  SUPERVISION_CONTRACT_PREAMBLE_START,
+  SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
+} from '../../shared/supervision-config.js';
+import { buildSupervisionExecutionPreamble } from '../../src/daemon/supervision-prompts.js';
 import {
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
@@ -36,11 +46,24 @@ import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
 } from '../../shared/agent-delegation.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
+import { clearAllResend, drainResend, enqueueResend } from '../../src/daemon/transport-resend-queue.js';
+import { deliverTransportResendEntry } from '../../src/agent/transport-resend-delivery.js';
+import { preserveTransportRuntimeQueuesToResend } from '../../src/daemon/transport-resend-preservation.js';
+import { resolveQueuedSupervisionHeartbeatDelivery } from '../../src/daemon/supervision-participant-delivery.js';
+import {
+  getSupervisionTaskRegistry,
+  resetSupervisionTaskRegistryForTests,
+} from '../../src/daemon/supervision-state-store.js';
+import { getSession, removeSession, upsertSession, type SessionRecord } from '../../src/store/session-store.js';
+import { deterministicSendMessageId } from '../../shared/send-message-id.js';
+import { SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR } from '../../shared/agent-delegation.js';
 
 const timelineEmitterEmitMock = vi.hoisted(() => vi.fn());
 const searchLocalMemoryMock = vi.hoisted(() => vi.fn());
 const searchLocalMemorySemanticMock = vi.hoisted(() => vi.fn());
 const collectRecentSummarySyncCandidatesMock = vi.hoisted(() => vi.fn());
+const memoryInjectionEnabledMock = vi.hoisted(() => vi.fn(async () => true));
 
 const sharedActorFixture: SharedActorEnvelope = {
   actorUserId: 'user-shared',
@@ -72,6 +95,10 @@ vi.mock('../../src/daemon/timeline-emitter.js', () => ({
 vi.mock('../../src/context/memory-search.js', () => ({
   searchLocalMemory: searchLocalMemoryMock,
   searchLocalMemorySemantic: searchLocalMemorySemanticMock,
+}));
+
+vi.mock('../../src/context/memory-injection-toggle.js', () => ({
+  isMemoryInjectionEnabled: memoryInjectionEnabledMock,
 }));
 
 vi.mock('../../src/context/summary-sync.js', async (importOriginal) => {
@@ -227,6 +254,23 @@ const flushDispatch = async () => {
   await new Promise((resolve) => setTimeout(resolve, 0));
 };
 
+describe('transport restore snapshot propagation', () => {
+  it('notifies automation only after the restored record and authority are committed', () => {
+    const source = readFileSync(resolve(process.cwd(), 'src/agent/session-manager.ts'), 'utf8');
+    const upsert = source.indexOf('upsertSession(restoredRecord);');
+    const authority = source.indexOf('refreshRestoreAuthority(persistedRestoredRecord);', upsert);
+    const committed = source.indexOf('restoreCommitted = true;', authority);
+    const snapshotNotification = source.indexOf('emitTransportSessionRestored(s.name);', committed);
+    const persistence = source.indexOf('emitSessionPersist(persistedRestoredRecord, s.name);', snapshotNotification);
+
+    expect(upsert).toBeGreaterThan(-1);
+    expect(authority).toBeGreaterThan(upsert);
+    expect(committed).toBeGreaterThan(authority);
+    expect(snapshotNotification).toBeGreaterThan(committed);
+    expect(persistence).toBeGreaterThan(snapshotNotification);
+  });
+});
+
 const waitForProviderSendCount = async (provider: ReturnType<typeof makeMockProvider>['provider'], count: number) => {
   const send = provider.send as ReturnType<typeof vi.fn>;
   const deadline = Date.now() + 5_000;
@@ -284,6 +328,25 @@ describe('TransportSessionRuntime', () => {
   it('initialize() calls provider.createSession', async () => {
     expect(runtime.providerSessionId).toBe('sess-1');
     expect(mock.provider.createSession).toHaveBeenCalledWith(defaultConfig);
+  });
+
+  it('passes registered-node identity without minting a second capability credential', async () => {
+    const restored = makeMockProvider('codex-sdk');
+    const restoredRuntime = new TransportSessionRuntime(restored.provider, 'deck_restore_brain');
+    await restoredRuntime.initialize({
+      sessionKey: 'restore-route',
+      sessionName: 'deck_restore_brain',
+      providerId: 'codex-sdk',
+      serverId: 'server-1',
+    });
+
+    expect(restored.provider.createSession).toHaveBeenCalledWith({
+      sessionKey: 'restore-route',
+      sessionName: 'deck_restore_brain',
+      providerId: 'codex-sdk',
+      serverId: 'server-1',
+    });
+    await restoredRuntime.kill();
   });
 
   it('send() throws if not initialized', () => {
@@ -386,6 +449,36 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
   });
 
+  it('does not start a delegation notify until provider.send has admitted the original prompt', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('A', 'foreground-delegation-starting');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    const notification = {
+      notificationId: 'notify-before-admission',
+      delegationId: 'delegation-before-admission',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'B',
+    };
+    await expect(runtime.deliverDelegationNotification(notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+
+    confirmProviderAdmission();
+    await flushDispatch();
+    await expect(runtime.deliverDelegationNotification(notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
   it('fails closed instead of queueing when a busy provider has no native delegation notification', async () => {
     const mock = makeMockProvider();
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
@@ -433,6 +526,152 @@ describe('TransportSessionRuntime', () => {
     expect(runtime.pendingEntries).toEqual([]);
   });
 
+  it('does not start an idle retry while a timed-out provider admission can still succeed', async () => {
+    const mock = makeMockProvider();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    let finishAdmission!: (result: typeof AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) => void;
+    mock.provider.notifyActiveDelegation = vi.fn(() => new Promise((resolve) => {
+      finishAdmission = resolve;
+    }));
+    const runtime = new TransportSessionRuntime(mock.provider, 'deck_test_brain');
+    await runtime.initialize(defaultConfig);
+    runtime.send('foreground work', 'foreground-late-admission');
+    await flushDispatch();
+    vi.useFakeTimers();
+    const notification = {
+      notificationId: 'notify-late-admission',
+      delegationId: 'delegation-late-admission',
+      sourceSessionName: 'deck_sub_auditor',
+      text: 'audit complete',
+    };
+
+    const first = runtime.deliverDelegationNotification(notification);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(first).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+
+    // A settles while the provider's B write remains unresolved. The durable
+    // retry must rejoin the same admission instead of starting an idle turn.
+    mock.fireComplete('sess-1');
+    await Promise.resolve();
+    const retryWhilePending = runtime.deliverDelegationNotification(notification);
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(retryWhilePending).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+
+    finishAdmission(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await Promise.resolve();
+    await expect(runtime.deliverDelegationNotification(notification))
+      .resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
+  it('retains all pending delegation authorities at capacity and rejects conflicting or distinct admissions', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-admission-capacity');
+    await flushDispatch();
+
+    const admissions = (runtime as any)._activeDelegationNotificationAdmissions as Map<string, {
+      notification: {
+        notificationId: string;
+        delegationId: string;
+        sourceSessionName: string;
+        text: string;
+      };
+      promise: Promise<string>;
+      status: 'pending' | 'delivered';
+    }>;
+    const unresolved = new Promise<string>(() => {});
+    for (let index = 0; index < 512; index += 1) {
+      const notificationId = `pending-capacity-${index}`;
+      admissions.set(notificationId, {
+        notification: {
+          notificationId,
+          delegationId: `delegation-capacity-${index}`,
+          sourceSessionName: 'deck_sub_capacity',
+          text: `pending ${index}`,
+        },
+        promise: unresolved,
+        status: 'pending',
+      });
+    }
+    vi.useFakeTimers();
+
+    const samePending = runtime.deliverDelegationNotification({
+      notificationId: 'pending-capacity-0',
+      delegationId: 'delegation-capacity-0',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'pending 0',
+    });
+    await vi.advanceTimersByTimeAsync(10_000);
+    await expect(samePending).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+
+    await expect(runtime.deliverDelegationNotification({
+      notificationId: 'pending-capacity-0',
+      delegationId: 'delegation-capacity-0',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'changed immutable content',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    await expect(runtime.deliverDelegationNotification({
+      notificationId: 'pending-capacity-512',
+      delegationId: 'delegation-capacity-512',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'distinct admission beyond capacity',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+
+    expect(admissions.size).toBe(512);
+    expect(admissions.get('pending-capacity-0')?.notification.text).toBe('pending 0');
+    expect(admissions.has('pending-capacity-512')).toBe(false);
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+  });
+
+  it('prunes only delivered delegation tombstones before admitting new work at capacity', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-tombstone-capacity');
+    await flushDispatch();
+
+    const admissions = (runtime as any)._activeDelegationNotificationAdmissions as Map<string, {
+      notification: {
+        notificationId: string;
+        delegationId: string;
+        sourceSessionName: string;
+        text: string;
+      };
+      promise: Promise<string>;
+      status: 'pending' | 'delivered';
+    }>;
+    for (let index = 0; index < 512; index += 1) {
+      const notificationId = `delivered-capacity-${index}`;
+      admissions.set(notificationId, {
+        notification: {
+          notificationId,
+          delegationId: `delegation-delivered-${index}`,
+          sourceSessionName: 'deck_sub_capacity',
+          text: `delivered ${index}`,
+        },
+        promise: Promise.resolve(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED),
+        status: 'delivered',
+      });
+    }
+
+    await expect(runtime.deliverDelegationNotification({
+      notificationId: 'new-after-delivered-capacity',
+      delegationId: 'delegation-new-after-capacity',
+      sourceSessionName: 'deck_sub_capacity',
+      text: 'new work after delivered tombstones',
+    })).resolves.toBe(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    await Promise.resolve();
+
+    expect(admissions.size).toBe(512);
+    expect(admissions.has('delivered-capacity-0')).toBe(false);
+    expect(admissions.get('new-after-delivered-capacity')?.status).toBe('delivered');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
   it('appends selected queued messages into the active turn without cancelling or draining the rest', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -462,6 +701,1020 @@ describe('TransportSessionRuntime', () => {
         expect.objectContaining({ clientMessageId: 'queued-append-1', deliveryFrameId: 'append-command-1' }),
       ]);
     }
+  });
+
+  it('revalidates a staged APPEND before provider admission and removes a stale control row', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-stale-append');
+    await flushDispatch();
+    let admit = true;
+    runtime.pendingDrainAdmission = (entry) => (
+      !entry.clientMessageId.startsWith('supervision-implementation-heartbeat:') || admit
+    );
+    expect(runtime.send(
+      'continue exact assignment',
+      'supervision-implementation-heartbeat:asg_stale:queued',
+    )).toBe('queued');
+    admit = false;
+
+    await expect(runtime.appendPendingMessagesToActiveTurn(
+      ['supervision-implementation-heartbeat:asg_stale:queued'],
+      'stale-append-admission',
+    )).resolves.toEqual({ status: 'rejected' });
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    expect(getTransportQueueStore().hasDeliveryTombstone(
+      'deck_test_brain', 'supervision-implementation-heartbeat:asg_stale:queued',
+    )).toBe(false);
+  });
+
+  it('retains a temporarily unauthorized APPEND for retry without delivery evidence', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    runtime.send('foreground work', 'foreground-retry-append');
+    await waitForProviderSendCount(mock.provider, 1);
+    let admission: 'authorized' | 'retry' = 'authorized';
+    runtime.pendingDrainAdmission = () => admission;
+    expect(runtime.send('retry later', 'supervision-retry-control', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    admission = 'retry';
+    confirmProviderAdmission();
+    await flushDispatch();
+
+    await expect(runtime.appendPendingMessagesToActiveTurn(
+      ['supervision-retry-control'], 'retry-append-admission',
+    )).resolves.toEqual({ status: 'retry' });
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'supervision-retry-control', text: 'retry later' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries)
+      .toEqual([expect.objectContaining({ clientMessageId: 'supervision-retry-control' })]);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'supervision-retry-control'))
+      .toBe(false);
+  });
+
+  it('append dispatches the pending queue as a fresh turn instead of erroring "stale" once no turn is active (owner report: append/append-all kept failing "The active turn already finished" against a queue the runtime never drained)', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-crash-turn');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.send('queued behind crash', 'queued-after-crash-append')).toBe('queued');
+
+    // A drain attempt during settlement can be transiently deferred (e.g. a
+    // stale provider activity snapshot, or a supervision admission that is
+    // not ready yet) -- force every drain admission to 'retry' while the
+    // crash settles, so the queue is left populated with no active turn,
+    // matching the exact shape append/append-all hit in production.
+    runtime.pendingDrainAdmission = () => 'retry';
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'provider crashed', recoverable: false });
+    await flushDispatch();
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.getStatus()).not.toBe('running');
+
+    // Once admission is normal again, append must not report a stale
+    // "already finished" error -- it must dispatch the queue as a new turn.
+    runtime.pendingDrainAdmission = () => 'authorized';
+    const result = await runtime.appendPendingMessagesToActiveTurn(
+      ['queued-after-crash-append'], 'append-after-crash', undefined, { allowDispatchAsNewTurn: true },
+    );
+    await flushDispatch();
+
+    expect(result.status).toBe('dispatched_as_new_turn');
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a retry supervision row durable without blocking a trailing ordinary message, repeated ticks, or recovery', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    runtime.send('foreground work', 'foreground-retry-hol');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    let authority: 'authorized' | 'retry' = 'authorized';
+    runtime.pendingDrainAdmission = (entry) => (
+      entry.clientMessageId === 'supervision-retry-hol' ? authority : 'authorized'
+    );
+    expect(runtime.send('transient supervision wake', 'supervision-retry-hol', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    authority = 'retry';
+    expect(runtime.send('ordinary user message', 'ordinary-after-retry')).toBe('queued');
+
+    confirmProviderAdmission();
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls[1]?.[1]).toMatchObject({
+      userMessage: 'ordinary user message',
+    });
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'supervision-retry-hol', text: 'transient supervision wake' },
+    ]);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'supervision-retry-hol'))
+      .toBe(false);
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.drainPendingIfIdle('retry-authority-tick-1')).toBe(false);
+    expect(runtime.drainPendingIfIdle('retry-authority-tick-2')).toBe(false);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'supervision-retry-hol'))
+      .toBe(false);
+
+    authority = 'authorized';
+    expect(runtime.drainPendingIfIdle('retry-authority-recovered')).toBe(true);
+    await waitForProviderSendCount(mock.provider, 3);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls[2]?.[1]).toMatchObject({
+      userMessage: 'transient supervision wake',
+    });
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('bounds automatic authority retry ticks with capped backoff and permits a later authoritative recovery', async () => {
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    expect(runtime.send('foreground', 'authority-budget-foreground')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    vi.useFakeTimers();
+
+    let authority: 'authorized' | 'retry' = 'authorized';
+    const admission = vi.fn((entry: { clientMessageId: string }) => (
+      entry.clientMessageId === 'authority-budget-control' ? authority : 'authorized'
+    ));
+    runtime.pendingDrainAdmission = admission;
+    expect(runtime.send('retry with backoff', 'authority-budget-control')).toBe('queued');
+    authority = 'retry';
+    confirmProviderAdmission();
+    await Promise.resolve();
+    await Promise.resolve();
+    mock.fireComplete('sess-1');
+    await Promise.resolve();
+
+    await vi.runAllTimersAsync();
+    const internal = runtime as unknown as {
+      _pendingAuthorityRetryAttempts: Map<string, number>;
+      _pendingAuthorityRetryTimer: ReturnType<typeof setTimeout> | null;
+    };
+    expect(internal._pendingAuthorityRetryAttempts.get('authority-budget-control')).toBe(6);
+    expect(internal._pendingAuthorityRetryTimer).toBeNull();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'authority-budget-control', text: 'retry with backoff' },
+    ]);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'authority-budget-control'))
+      .toBe(false);
+
+    authority = 'authorized';
+    expect(runtime.drainPendingIfIdle('authority-budget-recovered')).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    await Promise.resolve();
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it('rejects a stale direct heartbeat at the final runtime edge without touching provider or queue', () => {
+    runtime.pendingDrainAdmission = (entry) => (
+      !entry.clientMessageId.startsWith('supervision-implementation-heartbeat:')
+    );
+    expect(() => runtime.send(
+      'stale direct continuation',
+      'supervision-implementation-heartbeat:asg_stale:direct',
+    )).toThrow('transport message authority rejected before dispatch');
+    expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
+  it('directly appends an external MCP message without creating a pending queue row', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-mcp-append');
+    await flushDispatch();
+
+    const result = await runtime.appendExternalMessageToActiveTurn('peer update', 'send_message_peer_1');
+
+    expect(result).toBe('appended');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', {
+      notificationId: 'send_message_peer_1',
+      delegationId: 'mcp-append:send_message_peer_1',
+      sourceSessionName: 'deck_test_brain',
+      text: 'peer update',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+    });
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
+  it.each([
+    ['delegation completion', 'delegation-reply-real-queue', 'delegation completed'],
+    ['automatic-audit wake', 'automatic-audit-wake-real-queue', 'automatic audit needs attention'],
+  ] as const)('production-shaped real runtime + real queue appends %s exactly once across duplicate/replay', async (
+    _kind, messageId, text,
+  ) => {
+    clearAllResend();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground parked turn', `foreground-${messageId}`);
+    await waitForProviderSendCount(mock.provider, 1);
+    const row = {
+      text, commandId: messageId, clientMessageId: messageId,
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      timelineCommitted: true, queuedAt: Date.now(),
+    } as const;
+    expect(enqueueResend('deck_test_brain', row).accepted).toBe(true);
+    // A producer replay before drain binds to the same durable row.
+    expect(enqueueResend('deck_test_brain', row).accepted).toBe(true);
+
+    await expect(drainResend('deck_test_brain', (entry, ownership) => (
+      deliverTransportResendEntry(runtime, entry, ownership)
+    ))).resolves.toBe(1);
+    await vi.waitFor(() => expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce());
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: messageId,
+      text,
+    }));
+    await expect(drainResend('deck_test_brain', (entry, ownership) => (
+      deliverTransportResendEntry(runtime, entry, ownership)
+    ))).resolves.toBe(0);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
+  it('transfers a multi-row ordinary resend batch into the runtime exactly once without SQLite restaging', async () => {
+    clearAllResend();
+    let confirmForegroundAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmForegroundAdmission = resolve;
+    }));
+    expect(runtime.send('foreground ordinary transfer', 'foreground-ordinary-transfer')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    const rows = [
+      { id: 'ordinary-transfer-1', text: 'ordinary transfer one' },
+      { id: 'ordinary-transfer-2', text: 'ordinary transfer two' },
+      { id: 'ordinary-transfer-3', text: 'ordinary transfer three' },
+    ];
+    for (const row of rows) {
+      expect(enqueueResend('deck_test_brain', {
+        text: row.text, commandId: `command-${row.id}`, clientMessageId: row.id, queuedAt: Date.now(),
+      }).accepted).toBe(true);
+    }
+    const ownerships: Array<{ clientMessageId: string; handoffId: string }> = [];
+    await expect(drainResend('deck_test_brain', (entry, ownership) => {
+      ownerships.push(ownership);
+      return deliverTransportResendEntry(runtime, entry, ownership);
+    })).resolves.toBe(3);
+
+    expect(ownerships.map((ownership) => ownership.clientMessageId)).toEqual(rows.map((row) => row.id));
+    expect(new Set(ownerships.map((ownership) => ownership.handoffId))).toHaveLength(1);
+    expect(runtime.pendingEntries).toEqual(rows.map((row) => ({
+      clientMessageId: row.id, text: row.text,
+    })));
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries)
+      .toEqual(rows.map((row) => expect.objectContaining({
+        clientMessageId: row.id, status: 'handoff_inflight',
+      })));
+    // This was R8's duplicate edge: a queued durable row was rehydrated even
+    // though the dispatcher had already staged it in the live runtime.
+    expect(runtime.rehydratePendingFromStore()).toBe(0);
+    expect(runtime.pendingEntries).toHaveLength(3);
+
+    confirmForegroundAdmission();
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls[1]?.[1]).toMatchObject({
+      userMessage: rows.map((row) => row.text).join('\n\n'),
+    });
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    for (const row of rows) {
+      expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', row.id)).toBe(true);
+    }
+  });
+
+  it('transfers a multi-row APPEND resend batch exactly once across producer replay and repeated drain', async () => {
+    clearAllResend();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    expect(runtime.send('foreground append transfer', 'foreground-append-transfer')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    const rows = [
+      { id: 'append-transfer-1', text: 'append transfer one' },
+      { id: 'append-transfer-2', text: 'append transfer two' },
+      { id: 'append-transfer-3', text: 'append transfer three' },
+    ];
+    for (const row of rows) {
+      const entry = {
+        text: row.text, commandId: `command-${row.id}`, clientMessageId: row.id,
+        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+        timelineCommitted: true, queuedAt: Date.now(),
+      } as const;
+      expect(enqueueResend('deck_test_brain', entry).accepted).toBe(true);
+      expect(enqueueResend('deck_test_brain', entry).accepted).toBe(true);
+    }
+    const ownerships: Array<{ clientMessageId: string; handoffId: string }> = [];
+    await expect(drainResend('deck_test_brain', (entry, ownership) => {
+      ownerships.push(ownership);
+      return deliverTransportResendEntry(runtime, entry, ownership);
+    })).resolves.toBe(3);
+
+    await vi.waitFor(() => expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledTimes(3));
+    expect(ownerships.map((ownership) => ownership.clientMessageId)).toEqual(rows.map((row) => row.id));
+    expect(new Set(ownerships.map((ownership) => ownership.handoffId))).toHaveLength(1);
+    expect((mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map(
+      ([, notification]) => (notification as { notificationId: string }).notificationId,
+    )).toEqual(rows.map((row) => row.id));
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    for (const row of rows) {
+      expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', row.id)).toBe(true);
+    }
+
+    expect(runtime.rehydratePendingFromStore()).toBe(0);
+    await expect(drainResend('deck_test_brain', (entry, ownership) => (
+      deliverTransportResendEntry(runtime, entry, ownership)
+    ))).resolves.toBe(0);
+    await flushDispatch();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledTimes(3);
+  });
+
+  it('fails closed when a resend handoff capability is applied to a different clientMessageId', () => {
+    expect(() => runtime.send('mismatched ownership', 'message-owned-by-runtime', undefined, undefined, {
+      queueHandoff: { clientMessageId: 'different-message', handoffId: 'handoff-mismatch' },
+    })).toThrow('Transport queue handoff does not match clientMessageId');
+    expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([]);
+  });
+
+  it.each([
+    ['delegation completion', 'base-delegation-reply', 'delegation completed'],
+    ['automatic-audit wake', 'base-automatic-audit-wake', 'automatic audit needs attention'],
+  ] as const)('legacy non-APPEND delivery policy for %s stays parked after the fixed handoff release', async (
+    _kind, messageId, text,
+  ) => {
+    clearAllResend();
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground parked turn', `foreground-${messageId}`);
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(enqueueResend('deck_test_brain', {
+      text, commandId: messageId, clientMessageId: messageId,
+      timelineCommitted: true, queuedAt: Date.now(),
+    }).accepted).toBe(true);
+
+    await expect(drainResend('deck_test_brain', (entry, ownership) => (
+      deliverTransportResendEntry(runtime, entry, ownership)
+    ))).resolves.toBe(1);
+    await flushDispatch();
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries).toEqual([{ clientMessageId: messageId, text }]);
+
+    // This characterizes only the missing APPEND policy after R5's lease fix.
+    // On the actual 8a4f8d98 base the outer resend lease is still held, so the
+    // manual append attempt is `not_found`; the real RED is the paired test
+    // above where notifyActiveDelegation remains at zero on base bytes.
+    await expect(runtime.appendPendingMessagesToActiveTurn([messageId], `manual-${messageId}`))
+      .resolves.toMatchObject({ status: 'delivered' });
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+  });
+
+  it('buffers immediate B/C appends until provider.send confirms A admission, then injects next in order', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let releaseDispatchBootstrap!: () => void;
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    runtime.setContextBootstrapResolver(() => new Promise((resolve) => {
+      releaseDispatchBootstrap = () => resolve({
+        namespace: { scope: 'personal', projectId: 'test' },
+        diagnostics: [],
+      });
+    }));
+
+    expect(runtime.send('A', 'msg-A')).toBe('sent');
+    await expect(runtime.appendExternalMessageToActiveTurn('B', 'msg-B')).resolves.toBe('appended');
+    await expect(runtime.appendExternalMessageToActiveTurn('C', 'msg-C')).resolves.toBe('appended');
+
+    // Context assembly is deliberately blocked: provider.send/query has not
+    // started, yet receipt is immediate and neither append was demoted into a
+    // second provider turn.
+    expect(mock.provider.send).not.toHaveBeenCalled();
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['msg-B', 'msg-C']);
+
+    releaseDispatchBootstrap();
+    await waitForProviderSendCount(mock.provider, 1);
+    // Crossing into provider.send is not admission.  SDKs such as Codex,
+    // DSH/Pi, OpenCode and CodeBuddy still perform asynchronous bootstrap or
+    // request setup here.  B/C must remain staged and must never race ahead of
+    // A while that send-start Promise is unresolved.
+    await flushDispatch();
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['msg-B', 'msg-C']);
+
+    confirmProviderAdmission();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline && (mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.length < 2) {
+      await flushDispatch();
+    }
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect((mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.map((call) => call[1]))
+      .toEqual([
+        expect.objectContaining({
+          notificationId: 'msg-B',
+          text: 'B',
+          deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+        }),
+        expect.objectContaining({
+          notificationId: 'msg-C',
+          text: 'C',
+          deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+        }),
+      ]);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    expect(runtime.getHistory().filter((entry) => entry.role === 'user').map((entry) => entry.content))
+      .toEqual(['A', 'B', 'C']);
+  });
+
+  it('continues the accepted APPEND flush after removing a stale head', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let releaseDispatchBootstrap!: () => void;
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    runtime.setContextBootstrapResolver(() => new Promise((resolve) => {
+      releaseDispatchBootstrap = () => resolve({
+        namespace: { scope: 'personal', projectId: 'test' }, diagnostics: [],
+      });
+    }));
+    let staleStillAuthorized = true;
+    runtime.pendingDrainAdmission = (entry) => (
+      entry.clientMessageId !== 'supervision-implementation-heartbeat:asg_stale:head'
+      || staleStillAuthorized
+    );
+
+    expect(runtime.send('A', 'append-flush-A')).toBe('sent');
+    expect(runtime.send(
+      'stale head', 'supervision-implementation-heartbeat:asg_stale:head', undefined, undefined,
+      { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
+    )).toBe('queued');
+    expect(runtime.send(
+      'valid tail', 'supervision-implementation-heartbeat:asg_valid:tail', undefined, undefined,
+      { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
+    )).toBe('queued');
+    staleStillAuthorized = false;
+    releaseDispatchBootstrap();
+    await waitForProviderSendCount(mock.provider, 1);
+    confirmProviderAdmission();
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline
+      && (mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.length < 1) {
+      await flushDispatch();
+    }
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'supervision-implementation-heartbeat:asg_valid:tail',
+      text: 'valid tail',
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
+  it('continues the accepted APPEND flush past a retry head without tombstoning it', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    let confirmProviderAdmission!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise<void>((resolve) => {
+      confirmProviderAdmission = resolve;
+    }));
+    let retryHead = false;
+    runtime.pendingDrainAdmission = (entry) => (
+      entry.clientMessageId === 'supervision-retry-append-head' && retryHead
+        ? 'retry'
+        : 'authorized'
+    );
+    expect(runtime.send('foreground', 'retry-append-foreground')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.send('retry head', 'supervision-retry-append-head', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    retryHead = true;
+    expect(runtime.send('valid tail', 'valid-append-tail', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    confirmProviderAdmission();
+
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline
+      && (mock.provider.notifyActiveDelegation as ReturnType<typeof vi.fn>).mock.calls.length < 1) {
+      await flushDispatch();
+    }
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'valid-append-tail',
+      text: 'valid tail',
+    }));
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'supervision-retry-append-head', text: 'retry head' },
+    ]);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'supervision-retry-append-head'))
+      .toBe(false);
+  });
+
+  it('auto-appends through provider-native active work after the tracked dispatch has settled', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const appended = vi.fn();
+    runtime.onActiveAppend = appended;
+
+    runtime.send('foreground work', 'foreground-provider-owned');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.sending).toBe(false);
+    expect((runtime as unknown as { _activeDispatchId: number | null })._activeDispatchId).toBeNull();
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: {
+        scope: 'session',
+        sessionName: 'deck_test_brain',
+        generation: 1,
+      },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append automatically', 'auto-append-provider-owned', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'auto-append-provider-owned',
+      text: 'append automatically',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+    expect(appended).toHaveBeenCalledWith(
+      [expect.objectContaining({ clientMessageId: 'auto-append-provider-owned' })],
+      expect.objectContaining({ pendingMessageEntries: [] }),
+    );
+  });
+
+  it('does not auto-append ahead of an entry waiting on a recoverable retry', async () => {
+    // The null-dispatch auto-append path fires while `_activeDispatchId` is
+    // null, and a pending recoverable retry is exactly that state: A already
+    // left send() and is scheduled to go again, so it owns the head of the
+    // queue. Native-appending B there would deliver it to the provider before
+    // A's retry, which is an ordering violation the durable queue cannot undo.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: PROVIDER_ERROR_CODES.CONNECTION_LOST,
+      message: 'fetch failed',
+      recoverable: true,
+    });
+
+    expect(runtime.send('first message', 'retry-head-A')).toBe('sent');
+    await flushDispatch();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'retry-head-A', text: 'first message' },
+    ]);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append behind the retry', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation, 'B must not jump the retrying head').not.toHaveBeenCalled();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['retry-head-A', 'append-B']);
+  });
+
+  it('does not auto-append while an sdk_turn_lost recovery owns the queue head', async () => {
+    // FIFO integrity for the turn-lost mode: B must stay durably queued and
+    // must not be natively delivered while A is being replayed.
+    //
+    // Honest scope: this is a regression guard, NOT proof that the
+    // `_sdkTurnLostRecoveryAttempt === null` clause is load-bearing. A probe
+    // showed this scenario never reaches the null-dispatch append branch at all
+    // (the replay keeps a tracked dispatch id), so removing that clause leaves
+    // this test green. It still catches a future change that made the branch
+    // reachable here and fired it.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockRejectedValueOnce(sdkTurnLostError())
+      .mockImplementationOnce(() => new Promise(() => {}));
+
+    expect(runtime.send('lost turn head', 'turn-lost-A')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append behind the lost turn', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['append-B']);
+  });
+
+  it('does not auto-append while a dispatch is still in flight without an id', async () => {
+    // FIFO integrity while A's provider send is unsettled: B must stay queued.
+    //
+    // Honest scope: also a regression guard rather than proof. The probe showed
+    // an unsettled send keeps a tracked dispatch id, so the null-dispatch branch
+    // is not entered and the `hasInFlightDispatchWork()` clause is never the
+    // sole blocker in any scenario I could construct.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockImplementationOnce(() => new Promise(() => {}));
+
+    expect(runtime.send('unsettled head', 'inflight-A')).toBe('sent');
+    await waitForProviderSendCount(mock.provider, 1);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('append behind the unsettled head', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['append-B']);
+  });
+
+  it('reschedules the owner transition when a deferred admission outlives its dispatch', async () => {
+    // P1. The exact audited sequence:
+    //   1. dispatch A is provider-accepted;
+    //   2. append B starts the flush owned by A's non-null dispatchId and its
+    //      native admission has not resolved;
+    //   3. A completes while the provider snapshot still reports foreground work;
+    //   4. append C queues and asks for a null-dispatch flush, which used to
+    //      return for the sole reason that `_activeAppendFlush` was non-null;
+    //   5. B's admission resolves, the old flush sees it no longer owns A, exits
+    //      and clears the handle;
+    //   6. nothing rescheduled, so C stayed in the runtime AND the durable queue
+    //      forever even though the provider was still working.
+    // A dropped request is not a retry that lost a race -- it is silence.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    const admissions: string[] = [];
+    let releaseB: (() => void) | null = null;
+    mock.provider.notifyActiveDelegation = vi.fn(async (_sid: string, payload: { notificationId: string }) => {
+      admissions.push(payload.notificationId);
+      if (payload.notificationId === 'append-B') {
+        await new Promise<void>((resolve) => { releaseB = resolve; });
+      }
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    }) as never;
+
+    const providerForeground = () => ({
+      status: 'current' as const,
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    });
+
+    // (1) A is dispatched and provider-accepted.
+    runtime.send('dispatch A', 'dispatch-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(providerForeground);
+
+    // (2) B queues and owns the flush under A's dispatch id; its admission hangs.
+    expect(runtime.send('append B', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+    expect(admissions, 'B must be in flight before A settles').toEqual(['append-B']);
+    expect(releaseB).not.toBeNull();
+
+    // (3) A completes; the provider is still working, so the runtime keeps queueing.
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect((runtime as unknown as { _activeDispatchId: number | null })._activeDispatchId).toBeNull();
+
+    // (4) C arrives and requests the null-dispatch flush while B still holds it.
+    expect(runtime.send('append C', 'append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    // (5) B resolves; the old flush exits and must hand the turn to C.
+    releaseB?.();
+    await flushDispatch();
+    await flushDispatch();
+
+    expect(admissions, 'B then C, each admitted exactly once, in order')
+      .toEqual(['append-B', 'append-C']);
+    expect(runtime.pendingEntries, 'C must not be stranded in the runtime').toEqual([]);
+    expect(
+      getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries,
+      'C must not be stranded in the durable queue',
+    ).toEqual([]);
+  });
+
+  it('discards a pending transition whose owner lost authority before the handoff', async () => {
+    // Reverse edge of the same mechanism. The retained request must be a
+    // request, not a promise: if the provider stops reporting foreground work
+    // before the old flush hands over, C must not be admitted.
+    //
+    // Honest scope: this pins the BEHAVIOUR, not the authority gate. Authority
+    // is enforced three times over -- the `ownsActiveAppendFlush` guard at the
+    // top of `scheduleActiveAppendFlush`, the same check at the head of the
+    // flush loop, and the append operation's own refusal once foreground work
+    // is gone -- and a mutant that deletes the first two together still leaves
+    // this test green. It is a regression guard for the outcome, and it is the
+    // reason the redundant re-check that once sat in the flush's `finally` was
+    // removed rather than kept as an untested safeguard.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    const admissions: string[] = [];
+    let releaseB: (() => void) | null = null;
+    mock.provider.notifyActiveDelegation = vi.fn(async (_sid: string, payload: { notificationId: string }) => {
+      admissions.push(payload.notificationId);
+      if (payload.notificationId === 'append-B') {
+        await new Promise<void>((resolve) => { releaseB = resolve; });
+      }
+      return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+    }) as never;
+    const foreground = vi.fn(() => ({
+      status: 'current' as const,
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    runtime.send('dispatch A', 'dispatch-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = foreground;
+    expect(runtime.send('append B', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.send('append C', 'append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    // Provider foreground work ends before B hands over, so C's owner is gone.
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current' as const,
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    releaseB?.();
+    await flushDispatch();
+    await flushDispatch();
+
+    expect(admissions, 'C must not be admitted once its owner stopped being authoritative')
+      .toEqual(['append-B']);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['append-C']);
+  });
+
+  it.each([
+    ['unsupported', AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED],
+    ['stale', AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE],
+  ])('does not spin a pending transition when the handed-over admission is %s', async (_label, admission) => {
+    // The pending transition must fire at most once per blocked request. If a
+    // non-delivered admission could re-arm it, every rejection would schedule
+    // the next attempt and the runtime would spin against the provider.
+    //
+    // Honest scope: also behavioural. Nothing re-arms the request -- only an
+    // explicit `scheduleActiveAppendFlush` call does -- so moving the clear
+    // after the dispatch still cannot spin, and that mutant leaves this green.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    const admissions: string[] = [];
+    let releaseB: (() => void) | null = null;
+    mock.provider.notifyActiveDelegation = vi.fn(async (_sid: string, payload: { notificationId: string }) => {
+      admissions.push(payload.notificationId);
+      if (payload.notificationId === 'append-B') {
+        await new Promise<void>((resolve) => { releaseB = resolve; });
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+      }
+      return admission;
+    }) as never;
+    const foreground = () => ({
+      status: 'current' as const,
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session' as const, sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    });
+
+    runtime.send('dispatch A', 'dispatch-A');
+    await waitForProviderSendCount(mock.provider, 1);
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(foreground);
+    runtime.send('append B', 'append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    });
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    runtime.send('append C', 'append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    });
+    await flushDispatch();
+    releaseB?.();
+    for (let i = 0; i < 5; i++) await flushDispatch();
+
+    expect(admissions.filter((id) => id === 'append-C'), 'C is attempted once, never retried in a loop')
+      .toHaveLength(1);
+    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['append-C']);
+  });
+
+  it('leaves a handoff-leased entry out of the auto-append flush without losing it', async () => {
+    // The sixth failure mode. A row under a handoff lease may already be
+    // executing at the provider, so auto-append must neither deliver it again
+    // nor drop it: the durable row stays exactly once, still leased.
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+
+    runtime.send('foreground work', 'foreground-handoff');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    // Provider-native work must already be visible, otherwise send() dispatches
+    // directly and there is no queued row to lease.
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    expect(runtime.send('leased append', 'handoff-append', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+    getTransportQueueStore().markHandoffInFlight('deck_test_brain', ['handoff-append']);
+
+    expect(runtime.send('second leased append', 'handoff-append-2', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    const rows = getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries
+      .map((entry) => entry.clientMessageId);
+    expect(rows, 'no duplication and no loss under a handoff lease')
+      .toEqual([...new Set(rows)]);
+    expect(rows).toContain('handoff-append');
+  });
+
+  it.each([
+    ['stale', AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE],
+    ['unsupported', AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED],
+  ])('retains exact durable FIFO when a provider-owned auto-append returns %s', async (_label, admission) => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(admission);
+    runtime.send('foreground work', 'foreground-provider-rejection');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('B', 'auto-append-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    expect(runtime.send('C', 'auto-append-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'auto-append-B', text: 'B' },
+      { clientMessageId: 'auto-append-C', text: 'C' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['auto-append-B', 'auto-append-C']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-B')).toBe(false);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-C')).toBe(false);
+    expect(mock.provider.send).toHaveBeenCalledOnce();
+  });
+
+  it('retains exact durable FIFO when a provider-owned auto-append throws', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockRejectedValue(new Error('provider write failed'));
+    runtime.send('foreground work', 'foreground-provider-failure');
+    await waitForProviderSendCount(mock.provider, 1);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      activityGeneration: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+
+    expect(runtime.send('B', 'auto-append-throw-B', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    expect(runtime.send('C', 'auto-append-throw-C', undefined, undefined, {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    })).toBe('queued');
+    await flushDispatch();
+
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'auto-append-throw-B', text: 'B' },
+      { clientMessageId: 'auto-append-throw-C', text: 'C' },
+    ]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries.map(
+      (entry) => entry.clientMessageId,
+    )).toEqual(['auto-append-throw-B', 'auto-append-throw-C']);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-throw-B')).toBe(false);
+    expect(getTransportQueueStore().hasDeliveryTombstone('deck_test_brain', 'auto-append-throw-C')).toBe(false);
+  });
+
+  it('fails an unsupported external MCP append without falling back to the FIFO', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.UNSUPPORTED;
+    runtime.send('foreground work', 'foreground-mcp-unsupported');
+    await flushDispatch();
+
+    await expect(runtime.appendExternalMessageToActiveTurn('peer update', 'send_message_peer_2'))
+      .resolves.toBe('unsupported');
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
   it('keeps queued messages intact when active-turn append is unsupported', async () => {
@@ -519,6 +1772,24 @@ describe('TransportSessionRuntime', () => {
     expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([
       expect.objectContaining({ clientMessageId: 'queued-control', status: 'queued' }),
     ]);
+  });
+
+  it('appends ordinary queued text that starts with an absolute path', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-path');
+    await flushDispatch();
+    expect(runtime.send('/home/ai/zhilan 就是这个目录复制过去啊!', 'queued-path')).toBe('queued');
+
+    const result = await runtime.appendPendingMessagesToActiveTurn(['queued-path'], 'append-path');
+
+    expect(result.status).toBe('delivered');
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+      notificationId: 'append-path',
+      text: '/home/ai/zhilan 就是这个目录复制过去啊!',
+      deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    }));
+    expect(runtime.pendingEntries).toEqual([]);
   });
 
   it('keeps an accepted append delivered when SQLite finalization fails', async () => {
@@ -615,6 +1886,375 @@ describe('TransportSessionRuntime', () => {
       return { restartMock, restarted };
     };
 
+    it('rehydrates a retry supervision row after restart without blocking a durable ordinary tail', async () => {
+      const sessionName = 'deck_restart_authority_retry';
+      const supervisionId = 'restart-supervision-retry';
+      const ordinaryId = 'restart-ordinary-tail';
+      const supervisionReference = {
+        kind: 'implementation_blocker' as const,
+        taskId: 'restart-task',
+        assignmentId: 'restart-assignment',
+        revision: 'restart-r1',
+        exactError: 'transient registry outage',
+      };
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: supervisionId,
+        commandId: supervisionId,
+        text: 'retry after restart',
+        supervisionReference,
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: supervisionId,
+          text: 'retry after restart',
+          supervisionReference,
+        }),
+      });
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: ordinaryId,
+        commandId: ordinaryId,
+        text: 'ordinary after restart',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: ordinaryId,
+          text: 'ordinary after restart',
+        }),
+      });
+
+      const { restartMock, restarted } = await simulateRestart(sessionName);
+      let authority: 'retry' | 'authorized' = 'retry';
+      restarted.pendingDrainAdmission = (entry) => (
+        entry.clientMessageId === supervisionId ? authority : 'authorized'
+      );
+      expect(restarted.rehydratePendingFromStore()).toBe(2);
+      expect(restarted.drainPendingIfIdle('restart-authority-retry')).toBe(true);
+      await waitForProviderSendCount(restartMock.provider, 1);
+      expect((restartMock.provider.send as ReturnType<typeof vi.fn>).mock.calls[0]?.[1]).toMatchObject({
+        userMessage: 'ordinary after restart',
+      });
+      expect(restarted.pendingEntries).toEqual([
+        { clientMessageId: supervisionId, text: 'retry after restart' },
+      ]);
+      expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, supervisionId)).toBe(false);
+      expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, ordinaryId)).toBe(true);
+
+      restartMock.fireComplete('sess-1');
+      await flushDispatch();
+      authority = 'authorized';
+      expect(restarted.drainPendingIfIdle('restart-authority-recovered')).toBe(true);
+      await waitForProviderSendCount(restartMock.provider, 2);
+      expect(restarted.pendingEntries).toEqual([]);
+    });
+
+    it('keeps the same durable message across a same-instance runtime epoch rotation', async () => {
+      const before = { sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-before' };
+      const after = { sessionInstanceId: 'instance-stable', runtimeEpoch: 'epoch-after' };
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_rotated_brain',
+        recipient: before,
+        clientMessageId: 'msg-stable-across-rotation',
+        commandId: 'msg-stable-across-rotation',
+        text: 'survive provider relaunch',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'msg-stable-across-rotation',
+          text: 'survive provider relaunch',
+        }),
+      });
+      const replacementProvider = makeMockProvider();
+      const replacement = new TransportSessionRuntime(
+        replacementProvider.provider,
+        'deck_rotated_brain',
+        before,
+      );
+      await replacement.initialize({ sessionKey: 'deck_rotated_brain' });
+
+      expect(replacement.rebindQueueRecipient(before, after)).toBe(true);
+      expect(replacement.recipientIdentity).toEqual(after);
+      expect(replacement.rehydratePendingFromStore()).toBe(1);
+      expect(replacement.pendingEntries).toEqual([
+        { clientMessageId: 'msg-stable-across-rotation', text: 'survive provider relaunch' },
+      ]);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(
+        'deck_rotated_brain',
+        'msg-stable-across-rotation',
+        after,
+      )).toBeTypeOf('string');
+    });
+
+    it.each([
+      { authority: 'valid' as const, expectedSends: 1, expectedTombstone: true },
+      { authority: 'stale' as const, expectedSends: 0, expectedTombstone: false },
+    ])('preserves private supervision authority across a real runtime relaunch/epoch rotation ($authority)', async ({
+      authority, expectedSends, expectedTombstone,
+    }) => {
+      resetSupervisionTaskRegistryForTests();
+      const registry = getSupervisionTaskRegistry();
+      const taskId = `preserved-authority-${authority}-task`;
+      const assignmentId = `preserved-authority-${authority}-worker`;
+      const sessionName = `deck_preserved_authority_${authority}_brain`;
+      const revision = 'preserved-authority-r1';
+      const blockerFingerprint = `preserved-authority-${authority}-fingerprint`;
+      const clientMessageId = deterministicSendMessageId(`implementation-blocker:${blockerFingerprint}`);
+      const before = { sessionInstanceId: `instance-${authority}`, runtimeEpoch: 'epoch-before' };
+      const brain = {
+        name: sessionName,
+        label: 'Brain',
+        projectName: 'preserved-authority',
+        projectDir: '/work/preserved-authority',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        providerId: 'codex-sdk',
+        state: 'idle',
+        restarts: 0,
+        restartTimestamps: [],
+        createdAt: 1,
+        updatedAt: 2,
+        ...before,
+      } as SessionRecord;
+      const workerIdentity = {
+        sessionName: `deck_preserved_authority_${authority}_worker`,
+        sessionInstanceId: `worker-instance-${authority}`,
+        runtimeEpoch: `worker-epoch-${authority}`,
+        agentType: 'codex-sdk',
+        providerFamily: 'openai' as const,
+      };
+      const supervisionReference = {
+        kind: 'implementation_blocker' as const,
+        taskId,
+        assignmentId,
+        revision,
+        exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+      };
+
+      upsertSession(brain);
+      const persistedBrain = getSession(sessionName)!;
+      const persistedBefore = {
+        sessionInstanceId: persistedBrain.sessionInstanceId!,
+        runtimeEpoch: persistedBrain.runtimeEpoch!,
+      };
+      const after = { ...persistedBefore, runtimeEpoch: 'epoch-after' };
+      try {
+        expect(registry.createOrGet({
+          taskId,
+          projectName: 'preserved-authority',
+          classification: 'independent_top_level',
+          objective: 'preserve private authority through runtime replacement',
+          currentRevision: revision,
+        })).toMatchObject({ ok: true });
+        const coordinator = registry.createAssignment({
+          taskId,
+          role: 'coordinator',
+          required: false,
+          identity: {
+            sessionName,
+            sessionInstanceId: persistedBefore.sessionInstanceId,
+            runtimeEpoch: persistedBefore.runtimeEpoch,
+            agentType: 'codex-sdk',
+            providerFamily: 'openai',
+          },
+          auditRevision: revision,
+        });
+        expect(coordinator).toMatchObject({ ok: true });
+        expect(registry.createAssignment({
+          taskId,
+          assignmentId,
+          role: 'implementer',
+          identity: workerIdentity,
+          auditRevision: revision,
+        })).toMatchObject({ ok: true });
+        expect(registry.updateTask({ taskId, status: 'implementing', currentRevision: revision }))
+          .toMatchObject({ ok: true });
+        expect(registry.updateAssignment({
+          assignmentId,
+          identity: workerIdentity,
+          status: 'implementing',
+          blocker: JSON.stringify({
+            kind: 'implementation_no_progress',
+            taskId,
+            assignmentId,
+            exactError: SUPERVISION_IMPLEMENTATION_NO_PROGRESS_ERROR,
+            blockerFingerprint,
+          }),
+        })).toMatchObject({ ok: true });
+
+        const predecessorProvider = makeMockProvider();
+        // Model a provider-owned active turn without creating a second runtime
+        // queue row. The supervision wake is therefore the only row that must
+        // cross preservation and epoch rebind.
+        predecessorProvider.provider.getActiveWorkSnapshot = vi.fn(() => ({
+          status: 'current',
+          activeWorkCount: 1,
+          activeToolCount: 1,
+          busyReasons: ['provider_tool_item'],
+          activityGeneration: {
+            scope: 'session',
+            sessionName,
+            generation: 1,
+          },
+          updatedAt: Date.now(),
+        }));
+        const predecessor = new TransportSessionRuntime(
+          predecessorProvider.provider,
+          sessionName,
+          persistedBefore,
+        );
+        await predecessor.initialize({ sessionKey: sessionName });
+        expect(predecessor.send(
+          'durable supervision continuation',
+          clientMessageId,
+          undefined,
+          undefined,
+          {
+            supervisionReference,
+          },
+        )).toBe('queued');
+
+        // The session-store projection may rotate before shutdown preservation
+        // runs. Preservation must retain the predecessor runtime's captured
+        // recipient and let the successor perform the one legal epoch rebind.
+        upsertSession({ ...brain, ...after, updatedAt: 3 });
+
+        // Session-manager preservation is the failure edge from R9: the runtime
+        // disappears while its queued entry remains the sole owner of private
+        // supervision authority. The exact durable replay must merge, never
+        // replace the strong row with a metadata-less copy.
+        expect(preserveTransportRuntimeQueuesToResend(sessionName, predecessor))
+          .toMatchObject({ rejectedCount: 0 });
+        expect(JSON.parse(getTransportQueueStore().readPrivateDispatchMaterial(
+          sessionName,
+          clientMessageId,
+          persistedBefore,
+        ) ?? '{}')).toMatchObject({
+          supervisionReference,
+        });
+
+        if (authority === 'stale') {
+          expect(registry.updateAssignment({
+            assignmentId,
+            identity: workerIdentity,
+            blocker: 'superseded by a different durable blocker',
+          })).toMatchObject({ ok: true });
+        }
+
+        const successorProvider = makeMockProvider();
+        const successor = new TransportSessionRuntime(successorProvider.provider, sessionName, after);
+        await successor.initialize({ sessionKey: sessionName });
+        successor.pendingDrainAdmission = (entry) => resolveQueuedSupervisionHeartbeatDelivery({
+          targetSessionName: sessionName,
+          clientMessageId: entry.clientMessageId,
+          text: entry.text,
+          supervisionReference: entry.supervisionReference,
+        });
+        expect(successor.rehydratePendingFromStore()).toBe(1);
+        expect(successor.pendingEntriesForResend[0]).toMatchObject({
+          clientMessageId,
+          supervisionReference,
+        });
+        expect(successor.drainPendingIfIdle(`preserved-authority-${authority}`)).toBe(
+          authority === 'valid',
+        );
+        if (expectedSends > 0) await waitForProviderSendCount(successorProvider.provider, expectedSends);
+        await flushDispatch();
+        expect(successorProvider.provider.send).toHaveBeenCalledTimes(expectedSends);
+        expect(successor.rehydratePendingFromStore()).toBe(0);
+        expect(successor.drainPendingIfIdle(`preserved-authority-${authority}-duplicate`)).toBe(false);
+        expect(successorProvider.provider.send).toHaveBeenCalledTimes(expectedSends);
+        expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, clientMessageId))
+          .toBe(expectedTombstone);
+      } finally {
+        removeSession(sessionName);
+        resetSupervisionTaskRegistryForTests();
+      }
+    });
+
+    it('recovers a queue left one epoch behind when a restored runtime starts on the rotated epoch', async () => {
+      // The daemon restart path rebuilds a runtime straight from the PERSISTED
+      // record, which already carries the rotated epoch. Nothing calls
+      // rebindQueueRecipient() there, so the durable queue is still bound to the
+      // pre-rotation epoch of the SAME instance. That split is repairable --
+      // rebindRecipientRuntimeEpoch exists for exactly it -- but ownership
+      // recovery only knew "adopt legacy NULL rows" or "destroy", so the user's
+      // queued message was silently discarded on restart.
+      const stale = { sessionInstanceId: 'instance-split', runtimeEpoch: 'epoch-stale' };
+      const current = { sessionInstanceId: 'instance-split', runtimeEpoch: 'epoch-current' };
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_split_brain',
+        recipient: stale,
+        clientMessageId: 'msg-survives-restart',
+        commandId: 'msg-survives-restart',
+        text: 'queued before the epoch rotated',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'msg-survives-restart',
+          text: 'queued before the epoch rotated',
+        }),
+      });
+      const restoredProvider = makeMockProvider();
+      const restored = new TransportSessionRuntime(
+        restoredProvider.provider,
+        'deck_split_brain',
+        current,
+      );
+      await restored.initialize({ sessionKey: 'deck_split_brain' });
+
+      expect(restored.rehydratePendingFromStore()).toBe(1);
+      expect(restored.pendingEntries).toEqual([
+        { clientMessageId: 'msg-survives-restart', text: 'queued before the epoch rotated' },
+      ]);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(
+        'deck_split_brain',
+        'msg-survives-restart',
+        current,
+      )).toBeTypeOf('string');
+    });
+
+    it('still destroys a queue belonging to a DIFFERENT session instance', async () => {
+      const predecessor = { sessionInstanceId: 'instance-predecessor', runtimeEpoch: 'epoch-1' };
+      // A real replacement instance also gets a fresh epoch. Keeping the epoch
+      // equal would short-circuit ownership recovery before the instance
+      // boundary is ever consulted, so the case must differ in BOTH fields.
+      const successor = { sessionInstanceId: 'instance-successor', runtimeEpoch: 'epoch-2' };
+      getTransportQueueStore().enqueue({
+        sessionName: 'deck_foreign_brain',
+        recipient: predecessor,
+        clientMessageId: 'msg-of-previous-instance',
+        commandId: 'msg-of-previous-instance',
+        text: 'must never reach the replacement runtime',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'msg-of-previous-instance',
+          text: 'must never reach the replacement runtime',
+        }),
+      });
+      const successorProvider = makeMockProvider();
+      const successorRuntime = new TransportSessionRuntime(
+        successorProvider.provider,
+        'deck_foreign_brain',
+        successor,
+      );
+      await successorRuntime.initialize({ sessionKey: 'deck_foreign_brain' });
+
+      expect(successorRuntime.rehydratePendingFromStore()).toBe(0);
+      expect(successorRuntime.pendingEntries).toEqual([]);
+    });
+
+    it('does not retain a runtime-local copy when a durable cancellation beats late enqueue', async () => {
+      const recipient = { sessionInstanceId: 'instance-cancelled', runtimeEpoch: 'epoch-cancelled' };
+      const lateMock = makeMockProvider();
+      const lateRuntime = new TransportSessionRuntime(lateMock.provider, 'deck_cancelled_brain', recipient);
+      await lateRuntime.initialize({ sessionKey: 'deck_cancelled_brain' });
+      lateRuntime.send('active turn', 'msg-active');
+      await waitForProviderSendCount(lateMock.provider, 1);
+      expect(getTransportQueueStore().cancelQueuedMessage(
+        'deck_cancelled_brain',
+        'msg-cancel-won',
+        recipient,
+      ).status).toBe('accepted');
+
+      expect(lateRuntime.send('late callback', 'msg-cancel-won')).toBe('queued');
+
+      expect(lateRuntime.pendingEntries).toEqual([]);
+      expect(getTransportQueueStore().readSnapshot('deck_cancelled_brain').pendingMessageEntries).toEqual([]);
+    });
+
     it('recovers a queued message that only survives in SQLite after a restart', async () => {
       runtime.send('first');
       await waitForProviderSendCount(mock.provider, 1);
@@ -628,6 +2268,153 @@ describe('TransportSessionRuntime', () => {
       expect(restarted.pendingEntries).toEqual([
         { clientMessageId: 'msg-stuck', text: 'create pr and merge to master' },
       ]);
+    });
+
+    it('adopts an original persisted session legacy queue, drains it once, and survives epoch rotation', async () => {
+      const sessionName = 'deck_legacy_restart_brain';
+      const createdAt = Date.now() - 10_000;
+      const before = { sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch-1' };
+      const after = { sessionInstanceId: 'legacy-instance', runtimeEpoch: 'legacy-epoch-2' };
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: 'legacy-stuck',
+        commandId: 'legacy-stuck',
+        text: 'resume this exact message',
+        now: createdAt + 1,
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'legacy-stuck',
+          text: 'resume this exact message',
+        }),
+      });
+
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(
+        restartMock.provider,
+        sessionName,
+        before,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.drainPendingIfIdle('legacy-adoption')).toBe(true);
+      await waitForProviderSendCount(restartMock.provider, 1);
+      expect(restartMock.provider.send).toHaveBeenCalledOnce();
+      expect(restartMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        userMessage: 'resume this exact message',
+      }));
+
+      expect(restarted.rebindQueueRecipient(before, after)).toBe(true);
+      expect(getTransportQueueStore().queueBelongsTo(sessionName, after)).toBe(true);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(sessionName, 'legacy-stuck', before))
+        .toBeUndefined();
+    });
+
+    it('purges a prior same-name session ghost on restart without dispatch, then permits epoch rotation', async () => {
+      const sessionName = 'deck_legacy_stale_restart_brain';
+      const createdAt = Date.now();
+      const before = { sessionInstanceId: 'current-instance', runtimeEpoch: 'current-epoch-1' };
+      const after = { sessionInstanceId: 'current-instance', runtimeEpoch: 'current-epoch-2' };
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: 'old-private-message',
+        commandId: 'old-private-message',
+        text: 'must never reach the replacement session',
+        now: createdAt - 1,
+        privateMaterialJson: JSON.stringify({ text: 'must never reach the replacement session' }),
+      });
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(
+        restartMock.provider,
+        sessionName,
+        before,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(restarted.pendingEntries).toEqual([]);
+      expect(restartMock.provider.send).not.toHaveBeenCalled();
+      expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+      expect(getTransportQueueStore().readPrivateDispatchMaterial(sessionName, 'old-private-message', before))
+        .toBeUndefined();
+      expect(restarted.rebindQueueRecipient(before, after)).toBe(true);
+      expect(getTransportQueueStore().queueBelongsTo(sessionName, after)).toBe(true);
+      await restarted.kill();
+    });
+
+    it('continues a stale-ghost purge across the runtime bounded batch cursor', async () => {
+      const sessionName = 'deck_legacy_stale_batched_brain';
+      const createdAt = Date.now();
+      const recipient = { sessionInstanceId: 'batched-instance', runtimeEpoch: 'batched-epoch' };
+      for (let index = 0; index < 65; index++) {
+        const id = `old-${String(index).padStart(3, '0')}`;
+        getTransportQueueStore().enqueue({
+          sessionName,
+          clientMessageId: id,
+          commandId: id,
+          text: `old private ${index}`,
+          now: createdAt - 1,
+          privateMaterialJson: JSON.stringify({ text: `old private ${index}` }),
+        });
+      }
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(
+        restartMock.provider,
+        sessionName,
+        recipient,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+      expect(getTransportQueueStore().queueBelongsTo(sessionName, recipient)).toBe(true);
+      expect(restartMock.provider.send).not.toHaveBeenCalled();
+      await restarted.kill();
+    });
+
+    it('adopts a legacy row before an active-turn append and records one delivery tombstone', async () => {
+      const sessionName = 'deck_legacy_append_brain';
+      const createdAt = Date.now() - 10_000;
+      const recipient = { sessionInstanceId: 'legacy-append-instance', runtimeEpoch: 'legacy-append-epoch' };
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId: 'legacy-append',
+        commandId: 'legacy-append',
+        text: 'append the stranded row',
+        now: createdAt + 1,
+        privateMaterialJson: JSON.stringify({
+          clientMessageId: 'legacy-append',
+          text: 'append the stranded row',
+        }),
+      });
+      const appendMock = makeMockProvider();
+      appendMock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+      appendMock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+      const restarted = new TransportSessionRuntime(
+        appendMock.provider,
+        sessionName,
+        recipient,
+        { sessionCreatedAt: createdAt },
+      );
+      await restarted.initialize({ sessionKey: sessionName });
+      restarted.send('active foreground', 'active-foreground');
+      await waitForProviderSendCount(appendMock.provider, 1);
+
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      await expect(restarted.appendPendingMessagesToActiveTurn(
+        ['legacy-append'],
+        'legacy-append-frame',
+      )).resolves.toEqual(expect.objectContaining({ status: 'delivered' }));
+      expect(appendMock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+      expect(appendMock.provider.notifyActiveDelegation).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        text: 'append the stranded row',
+      }));
+      expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, 'legacy-append')).toBe(true);
+      expect(restarted.rehydratePendingFromStore()).toBe(0);
+      await restarted.kill();
     });
 
     it('drains the rehydrated message to the provider once idle', async () => {
@@ -677,6 +2464,35 @@ describe('TransportSessionRuntime', () => {
       expect(JSON.stringify(restartMock.provider.send.mock.calls)).not.toContain('private audit brief');
     });
 
+    it('rehydrates preserved delegation reply routing instead of demoting it to ordinary FIFO metadata', async () => {
+      const sessionName = 'deck_delegation_private_restart';
+      const clientMessageId = 'delegation-private-restart';
+      getTransportQueueStore().enqueue({
+        sessionName,
+        clientMessageId,
+        commandId: clientMessageId,
+        text: 'delegation completed while runtime relaunched',
+        privateMaterialJson: JSON.stringify({
+          clientMessageId,
+          text: 'delegation completed while runtime relaunched',
+          deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+          activeTurnDeliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
+          delegationReply: { delegationId: 'delegation-restart-1' },
+        }),
+      });
+
+      const { restarted } = await simulateRestart(sessionName);
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.pendingEntriesForResend).toEqual([
+        expect.objectContaining({
+          clientMessageId,
+          deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+          activeTurnDeliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
+          delegationReply: { delegationId: 'delegation-restart-1' },
+        }),
+      ]);
+    });
+
     it('does NOT recover a handoff_inflight entry (may already have executed at the provider)', async () => {
       runtime.send('first');
       await waitForProviderSendCount(mock.provider, 1);
@@ -688,6 +2504,25 @@ describe('TransportSessionRuntime', () => {
       const { restarted } = await simulateRestart();
       expect(restarted.rehydratePendingFromStore()).toBe(0);
       expect(restarted.pendingCount).toBe(0);
+    });
+
+    it('restores an expired handoff under the same id before rehydrating after restart', async () => {
+      runtime.send('first');
+      await waitForProviderSendCount(mock.provider, 1);
+      runtime.send('expired handoff', 'msg-expired-handoff');
+      const expiredAt = Date.now() - 10_000;
+      expect(getTransportQueueStore().markHandoffInFlight(
+        'deck_test_brain',
+        ['msg-expired-handoff'],
+        1,
+        expiredAt,
+      )).toHaveLength(1);
+
+      const { restarted } = await simulateRestart();
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.pendingEntries).toEqual([
+        { clientMessageId: 'msg-expired-handoff', text: 'expired handoff' },
+      ]);
     });
 
     it('does NOT recover an already-delivered entry', async () => {
@@ -1367,6 +3202,109 @@ describe('TransportSessionRuntime', () => {
     expect(secondPayload.assembledMessage).toBe('second preference-aware turn');
   });
 
+  it('injects unchanged supervision contracts once and then sends only their stable reference', async () => {
+    const supervisionPreamble = buildSupervisionExecutionPreamble('en');
+
+    runtime.send('first supervised turn', 'supervision-once-1', undefined, supervisionPreamble);
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('second supervised turn', 'supervision-once-2', undefined, supervisionPreamble);
+    await flushDispatch();
+
+    const firstPayload = mock.provider.send.mock.calls[0]?.[1] as Record<string, unknown>;
+    const secondPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
+    expect(firstPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
+    expect(firstPayload.messagePreamble).toContain('"contractId":"supervision_orchestrator_context_v1"');
+    expect(firstPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_END);
+    expect(secondPayload.messagePreamble).toBe(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
+    expect(String(secondPayload.assembledMessage)).toContain(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
+    expect(String(secondPayload.assembledMessage)).not.toContain('"contractId":"supervision_orchestrator_context_v1"');
+  });
+
+  it('re-injects a changed supervision contract block and resets it after compaction', async () => {
+    const englishPreamble = buildSupervisionExecutionPreamble('en');
+    const changedPreamble = buildSupervisionExecutionPreamble('zh-CN').replace('"v":1', '"v":2');
+
+    runtime.send('seed contracts', 'supervision-change-1', undefined, englishPreamble);
+    await flushDispatch();
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('contract changed', 'supervision-change-2', undefined, changedPreamble);
+    await flushDispatch();
+    const changedPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
+    expect(changedPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
+    expect(changedPayload.messagePreamble).toContain('"v":2');
+    expect(changedPayload.messagePreamble).not.toBe(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    runtime.send('/compact', 'supervision-compact-control', undefined, changedPreamble);
+    await flushDispatch();
+    expect((mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>).messagePreamble).toBeUndefined();
+    mock.fireComplete('sess-1', {
+      kind: 'system',
+      role: 'system',
+      content: 'Codex context compacted.',
+      metadata: { provider: 'codex-sdk', [SESSION_CONTROL_METADATA_COMMAND_FIELD]: 'compact' },
+    });
+    await flushDispatch();
+
+    runtime.send('after compact', 'supervision-change-3', undefined, changedPreamble);
+    await flushDispatch();
+    const afterCompactPayload = mock.provider.send.mock.calls[3]?.[1] as Record<string, unknown>;
+    expect(afterCompactPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
+    expect(afterCompactPayload.messagePreamble).toContain('"v":2');
+  });
+
+  it('chooses only the last supervision contract block across one queued batch', async () => {
+    const englishPreamble = buildSupervisionExecutionPreamble('en');
+    const changedPreamble = buildSupervisionExecutionPreamble('zh-CN').replace('"v":1', '"v":2');
+
+    runtime.send('active unsupervised turn', 'supervision-batch-seed');
+    await flushDispatch();
+    expect(runtime.send('queued old contracts', 'supervision-batch-old', undefined, englishPreamble)).toBe('queued');
+    expect(runtime.send('queued new contracts', 'supervision-batch-new', undefined, changedPreamble)).toBe('queued');
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    const batchPayload = mock.provider.send.mock.calls[1]?.[1] as Record<string, unknown>;
+    const preamble = String(batchPayload.messagePreamble);
+    expect(preamble.match(new RegExp(SUPERVISION_CONTRACT_PREAMBLE_START, 'g'))).toHaveLength(1);
+    expect(preamble.match(/"contractId":"supervision_orchestrator_context_v1"/g)).toHaveLength(1);
+    expect(preamble).toContain('"v":2');
+    expect(preamble).not.toContain('"v":1,"role":"orchestrator"');
+  });
+
+  it('rolls back a rejected queued-batch contract reservation', async () => {
+    const englishPreamble = buildSupervisionExecutionPreamble('en');
+    const changedPreamble = buildSupervisionExecutionPreamble('zh-CN').replace('"v":1', '"v":2');
+
+    runtime.send('active unsupervised turn', 'supervision-rollback-seed');
+    await flushDispatch();
+    runtime.send('queued old contracts', 'supervision-rollback-old', undefined, englishPreamble);
+    runtime.send('queued new contracts', 'supervision-rollback-new', undefined, changedPreamble);
+    (mock.provider.send as ReturnType<typeof vi.fn>).mockRejectedValueOnce({
+      code: 'TRANSPORT_TURN_TIMEOUT',
+      message: 'provider did not accept the contract batch',
+      recoverable: false,
+    });
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+    expect(runtime.getStatus()).toBe('error');
+
+    runtime.send('retry after rejection', 'supervision-rollback-retry', undefined, changedPreamble);
+    await flushDispatch();
+    const retryPayload = mock.provider.send.mock.calls[2]?.[1] as Record<string, unknown>;
+    expect(retryPayload.messagePreamble).toContain(SUPERVISION_CONTRACT_PREAMBLE_START);
+    expect(retryPayload.messagePreamble).toContain('"v":2');
+    expect(retryPayload.messagePreamble).not.toBe(SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE);
+  });
+
   it('does not attach preference context to control messages and re-injects it after compaction', async () => {
     const preferencePreamble = `${PREFERENCE_CONTEXT_START}\n- Use pnpm\n${PREFERENCE_CONTEXT_END}`;
 
@@ -1434,7 +3372,40 @@ describe('TransportSessionRuntime', () => {
     );
   });
 
-  it('keeps slash controls raw for every transport by suppressing startup, recall, authored, and preference context', async () => {
+  it('drops first-turn startup memory built before the project turned injection off, without a restart', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_startup_toggle_brain');
+    r.setContextBootstrapResolver(async () => ({
+      namespace: { scope: 'personal', projectId: 'repo-1' },
+      diagnostics: ['namespace:explicit'],
+      localProcessedFreshness: 'fresh',
+      // Assembled at bootstrap while injection was still on.
+      startupMemory: {
+        reason: 'startup',
+        runtimeFamily: 'transport',
+        authoritySource: 'processed_local',
+        sourceKind: 'local_processed',
+        injectionSurface: 'normalized-payload',
+        items: [makeSearchItem({ id: 'startup-before-off', summary: 'Startup memory captured before the toggle went off' })],
+        injectedText: '# Recent project memory (reference only)\nStartup memory captured before the toggle went off',
+      } as any,
+    }));
+    await r.initialize({ ...defaultConfig, sessionKey: 'deck_startup_toggle_brain' });
+
+    memoryInjectionEnabledMock.mockImplementation(async () => false);
+    try {
+      r.send('Continue the assigned implementation work now', 'startup-toggle-turn');
+      await waitForProviderSendCount(localMock.provider, 1);
+      const payload = localMock.provider.send.mock.calls[0]![1] as Record<string, unknown>;
+      const rendered = JSON.stringify(payload);
+      expect(rendered).not.toContain('Startup memory captured before the toggle went off');
+      expect(rendered).not.toContain('# Recent project memory');
+    } finally {
+      memoryInjectionEnabledMock.mockImplementation(async () => true);
+    }
+  });
+
+  it('keeps slash-control user bytes raw while retaining only permanent system authority', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
     r.setContextBootstrapResolver(async () => ({
@@ -1467,13 +3438,27 @@ describe('TransportSessionRuntime', () => {
 
     expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
     const compactPayload = localMock.provider.send.mock.calls[0]?.[1] as Record<string, any>;
+    // `/compact` remains an ordinary, byte-exact provider message. The one
+    // surviving context value is permanent system authority, not turn/session
+    // authored context injected into the user message.
     expect(compactPayload.userMessage).toBe('/compact');
     expect(compactPayload.assembledMessage).toBe('/compact');
-    expect(compactPayload.systemText).toBeUndefined();
+    expect(localMock.provider.send).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        userMessage: '/compact',
+        assembledMessage: '/compact',
+      }),
+    );
+    expect(compactPayload.systemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.sessionSystemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.turnSystemText).toBeUndefined();
     expect(compactPayload.messagePreamble).toBeUndefined();
     expect(compactPayload.startupMemory).toBeUndefined();
     expect(compactPayload.memoryRecall).toBeUndefined();
-    expect(compactPayload.context?.systemText).toBeUndefined();
+    expect(compactPayload.context?.systemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.context?.sessionSystemText).toBe(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
+    expect(compactPayload.context?.turnSystemText).toBeUndefined();
     expect(compactPayload.context?.messagePreamble).toBeUndefined();
     expect(compactPayload.context?.requiredAuthoredContext).toEqual([]);
     expect(compactPayload.context?.advisoryAuthoredContext).toEqual([]);
@@ -1587,6 +3572,84 @@ describe('TransportSessionRuntime', () => {
       message: 'temporary provider refusal',
       recoverable: true,
     });
+  });
+
+  it('retries a provider capacity refusal on the same session with bounded backoff', async () => {
+    runtime.send('capacity retry', 'msg-capacity');
+    await flushDispatch();
+    vi.useFakeTimers();
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity',
+      recoverable: false,
+    });
+    expect(runtime.getStatus()).toBe('thinking');
+    expect(runtime.pendingMessages).toEqual(['capacity retry']);
+    expect(runtime.getDiagnosticSnapshot().capacityRetry?.attempt).toBe(1);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    await vi.runAllTicks();
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'capacity retry',
+      deliveryId: 'msg-capacity',
+    }));
+  });
+
+  it('does not let a late completion bypass a pending capacity retry', async () => {
+    runtime.send('late completion', 'msg-capacity-late');
+    await flushDispatch();
+    vi.useFakeTimers();
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity',
+      recoverable: false,
+    });
+    // Simulate the provider callback for the failed turn arriving after the
+    // runtime has already preserved the entry and armed its retry timer.
+    mock.fireComplete('sess-1');
+    expect(runtime.getDiagnosticSnapshot().capacityRetry?.attempt).toBe(1);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
+  it('stop drops a timer-fired capacity retry whose drain is deferred by blocking work', async () => {
+    runtime.send('stop deferred capacity retry', 'msg-capacity-stop');
+    await flushDispatch();
+    vi.useFakeTimers();
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity',
+      recoverable: false,
+    });
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(runtime.pendingMessages).toEqual(['stop deferred capacity retry']);
+    expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+
+    await runtime.cancel();
+    expect(runtime.pendingMessages).toEqual([]);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    expect(runtime.drainPendingIfIdle('after-stop')).toBe(false);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
   it('auto-retry redelivers a recoverable-failed message once the provider frees up', async () => {
@@ -2723,6 +4786,40 @@ ${PREFERENCE_CONTEXT_END}`;
     );
   });
 
+  it('injects neither recent project memory nor related past work when the project turned memory injection off', async () => {
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([
+      makeSummarySyncCandidate('summary-off', 'A recent summary that must stay out'),
+    ]);
+    searchLocalMemorySemanticMock.mockResolvedValue(makeSearchResult([makeSearchItem({
+      projectId: 'repo-1',
+      summary: 'A related past-work item that must stay out',
+      relevanceScore: 0.92,
+    })]));
+    memoryInjectionEnabledMock.mockImplementation(async () => false);
+    try {
+      const localMock = makeMockProvider();
+      const r = new TransportSessionRuntime(localMock.provider, 'deck_injection_off_brain');
+      r.setContextBootstrapResolver(async () => ({
+        namespace: { scope: 'personal', projectId: 'repo-1' },
+        diagnostics: ['namespace:explicit'],
+        localProcessedFreshness: 'fresh',
+      }));
+      await r.initialize({ ...defaultConfig, sessionKey: 'deck_injection_off_brain' });
+
+      r.send('Please recall recent transport memory around recall runtime', 'injection-off-turn');
+      await waitForProviderSendCount(localMock.provider, 1);
+
+      expect(memoryInjectionEnabledMock).toHaveBeenCalledWith({ scope: 'personal', projectId: 'repo-1' });
+      const payload = localMock.provider.send.mock.calls[0]![1] as Record<string, unknown>;
+      expect(payload.memoryRecall).toBeUndefined();
+      expect(String(payload.assembledMessage ?? '')).not.toContain('[Related past work]');
+      expect(String(payload.assembledMessage ?? '')).not.toContain('# Recent project memory');
+      expect(searchLocalMemorySemanticMock).not.toHaveBeenCalled();
+    } finally {
+      memoryInjectionEnabledMock.mockImplementation(async () => true);
+    }
+  });
+
   it('injects each newly materialized recent summary once across subsequent transport turns', async () => {
     const summary = makeSummarySyncCandidate('summary-new', 'Added the latest unsynchronized project summary');
     collectRecentSummarySyncCandidatesMock.mockResolvedValue([summary]);
@@ -3270,6 +5367,56 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(r.getStatus()).toBe('error');
     expect(r.sending).toBe(false);
     expect(r.activeDispatchEntries).toEqual([]);
+  });
+
+  it('drains a message queued behind a provider send-start timeout instead of leaving the session queue stuck forever (owner report: queued message never sent, UI stuck "working")', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '50');
+    const localMock = makeMockProvider();
+    (localMock.provider.send as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise(() => {}));
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+
+    r.send('/status', 'client-timeout-turn');
+    // Queued behind the first send, which never accepts.
+    r.send('queued after timeout', 'client-queued-after-timeout');
+    expect(r.pendingCount).toBe(1);
+
+    await sleep(80);
+    await flushDispatch();
+
+    // The timed-out turn settles (to 'error'), but the session-level queue is
+    // not bound to it: the queued message must be dispatched as the next
+    // turn automatically, with no user action (Stop/append) required.
+    expect(r.pendingCount).toBe(0);
+    expect(r.getStatus()).not.toBe('error');
+    expect(localMock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('drains a message queued behind an unrecoverable provider error (crash) instead of leaving the session queue stuck forever', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+
+    r.send('/status', 'client-crash-turn');
+    await waitForProviderSendCount(localMock.provider, 1);
+    // Queued while the first turn is genuinely in flight.
+    r.send('queued after crash', 'client-queued-after-crash');
+    expect(r.pendingCount).toBe(1);
+
+    localMock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'provider crashed', recoverable: false });
+    await flushDispatch();
+
+    expect(r.pendingCount).toBe(0);
+    expect(r.getStatus()).not.toBe('error');
+    expect(localMock.provider.send).toHaveBeenCalledTimes(2);
   });
 
   it('emits a template-prompt skip status before transport recall lookup', async () => {
@@ -3984,7 +6131,10 @@ ${PREFERENCE_CONTEXT_END}`;
   it('preserves shared actor metadata on queued entries and drain callbacks without injecting it into provider text', async () => {
     runtime.send('first', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
-    runtime.send('shared queued', 'cmd-shared', undefined, undefined, { sharedActor: sharedActorFixture });
+    runtime.send('shared queued', 'cmd-shared', undefined, undefined, {
+      sharedActor: sharedActorFixture,
+      sharedMachineAuthority: 'SIGNED_PRIVATE_AUTHORITY',
+    });
     expect(runtime.pendingEntries).toEqual([
       expect.objectContaining({
         clientMessageId: 'cmd-shared',
@@ -3992,6 +6142,7 @@ ${PREFERENCE_CONTEXT_END}`;
         sharedActor: sharedActorFixture,
       }),
     ]);
+    expect(runtime.pendingEntries[0]).not.toHaveProperty('sharedMachineAuthority');
 
     let received: PendingTransportMessage[] = [];
     runtime.onDrain = (messages) => {
@@ -4008,6 +6159,9 @@ ${PREFERENCE_CONTEXT_END}`;
         sharedActor: sharedActorFixture,
       }),
     ]);
+    expect(received[0]).not.toHaveProperty('sharedMachineAuthority');
+    expect(runtime.getActiveSharedMachineAuthority()).toBe('SIGNED_PRIVATE_AUTHORITY');
+    expect(runtime.requiresSharedMachineAuthority()).toBe(true);
     const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
     expect(resentPayload.userMessage).toBe('shared queued');
     expect(resentPayload).not.toHaveProperty('sharedActor');
@@ -4087,6 +6241,28 @@ ${PREFERENCE_CONTEXT_END}`;
     expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before + 1);
     const resentPayload = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
     expect(resentPayload.userMessage).toBe('queued-after-idle');
+  });
+
+  it('revalidates queued control-message authority at drain and drops a stale heartbeat exactly once', async () => {
+    runtime.send('active turn', 'cmd-active');
+    await waitForProviderSendCount(mock.provider, 1);
+    const staleHeartbeat = JSON.stringify({
+      contractRefs: ['supervision_implementation_heartbeat_v1'],
+      binding: { mode: 'continue_existing', taskId: 'tsk_stale', assignmentId: 'asg_stale' },
+      action: 'advance_safe_unfinished',
+    });
+    expect(runtime.send(
+      staleHeartbeat,
+      'supervision-implementation-heartbeat:asg_stale:1',
+    )).toBe('queued');
+    runtime.pendingDrainAdmission = (entry) => !entry.clientMessageId.startsWith('supervision-implementation-heartbeat:');
+
+    mock.fireComplete('sess-1');
+    await flushDispatch();
+
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
   it('cancels a stale active turn once so queued messages drain without waiting for the cancel callback', async () => {
@@ -4407,7 +6583,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(drained.userMessage).toBe('queued follow-up');
   });
 
-  it('preserves queued work on unrecoverable provider error when active-turn state was cleared', async () => {
+  it('drains queued work on an unrecoverable provider error too, instead of leaving it stuck behind a turn that will never resume', async () => {
     runtime.send('first turn', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued follow-up', 'cmd-queued');
@@ -4424,12 +6600,15 @@ ${PREFERENCE_CONTEXT_END}`;
     internal._activeDispatchEntries = [];
 
     mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'fatal late error', recoverable: false });
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, sendCountBefore + 1);
 
-    expect(runtime.getStatus()).toBe('error');
-    expect(runtime.pendingCount).toBe(1);
-    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['cmd-queued']);
-    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore);
+    // The failed turn's own message is not retried (still no `cmd-first`
+    // resend), but the queue is session-level: `cmd-queued` must dispatch as
+    // a fresh turn instead of waiting forever on a turn that already died.
+    expect(runtime.getStatus()).not.toBe('error');
+    expect(runtime.pendingCount).toBe(0);
+    const drained = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(drained.userMessage).toBe('queued follow-up');
   });
 
   it('does not cancel a recently active turn with queued work', async () => {
@@ -4493,7 +6672,11 @@ ${PREFERENCE_CONTEXT_END}`;
     // identity block at the assembly layer, but now lives in Codex SDK's
     // `appendImcodesBaseInstructions` — Codex-only, once per thread.
     // It must NOT appear in the per-turn payload here.
-    const oversized = 'Y'.repeat(2000);
+    // Use a private-use marker that cannot occur in daemon-authored guidance.
+    // Counting a common ASCII letter made this regression depend on unrelated
+    // system-prompt wording (for example, "PRIORITY" contains "Y").
+    const authoredMarker = '\uE000';
+    const oversized = authoredMarker.repeat(2000);
     const freshProvider = makeMockProvider();
     const fresh = new TransportSessionRuntime(freshProvider.provider, 'deck_identity_brain');
     await fresh.initialize({
@@ -4509,21 +6692,22 @@ ${PREFERENCE_CONTEXT_END}`;
     const sent = freshProvider.provider.send.mock.calls.at(-1)?.[1] as Record<string, unknown>;
     const systemText = String(sent.systemText ?? '');
 
-    // User-authored cap still enforced: total Y count is 2 * 300 = 600.
-    const yCount = (systemText.match(/Y/g) ?? []).length;
-    expect(yCount).toBe(600);
-    expect(systemText).not.toMatch(/Y{301}/);
+    // User-authored cap still enforced: both fields contribute exactly 300
+    // private-use markers, independent of daemon-authored prompt wording.
+    const authoredMarkerCount = systemText.split(authoredMarker).length - 1;
+    expect(authoredMarkerCount).toBe(600);
+    expect(systemText).not.toContain(authoredMarker.repeat(301));
 
     // Identity block present in full, including the exact session name
     // and the display label. None of these strings exist in the user
-    // text (Y's only), so any match must come from the daemon-injected
+    // text (private-use markers only), so any match must come from the daemon-injected
     // block — proving it survived the user cap.
     expect(systemText).toMatch(/IM\.codes session identity:/);
     expect(systemText).toMatch(/Exact session name: deck_identity_brain/);
     expect(systemText).toMatch(/Display label: Identity Brain/);
     expect(systemText).toMatch(/imcodes send/);
-    expect(systemText).toMatch(/full absolute filesystem path/);
-    expect(systemText).toMatch(/not a bare filename or relative path/);
+    expect(systemText).toContain('"contractId":"file_output_v1"');
+    expect(systemText).toContain('[display name](/absolute/full/path)');
 
     // Generated Image Reporting must NOT be in the per-turn assembly
     // payload — it now lives in Codex SDK baseInstructions tail.
@@ -4653,6 +6837,35 @@ ${PREFERENCE_CONTEXT_END}`;
       expect(rehydrated?.aliasAudit).toEqual(AUDIT);
       // Still delivered privately, never on the public projection.
       expect(rehydrated?.providerText).toBe(EXPANDED);
+    });
+
+    it('a queued daemon message carries its origin to onDrain and across a restart', async () => {
+      runtime.send('first turn');
+      await waitForProviderSendCount(mock.provider, 1);
+      const onDrainEntries: PendingTransportMessage[][] = [];
+      runtime.onDrain = (entries) => { onDrainEntries.push(entries); };
+      expect(runtime.send('Auto Deliver: implement task 2', 'origin-queued-1', undefined, undefined, {
+        messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      })).toBe('queued');
+      expect(runtime.send('human follow-up', 'origin-queued-human')).toBe('queued');
+      // The origin is not secret: it survives the public projection onDrain reads.
+      expect(runtime.pendingEntries.find((e) => e.clientMessageId === 'origin-queued-1')?.messageOrigin)
+        .toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+
+      const restartMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartMock.provider, 'deck_test_brain');
+      await restarted.initialize(defaultConfig);
+      expect(restarted.rehydratePendingFromStore()).toBe(2);
+      expect(restarted.pendingEntriesForResend.find((e) => e.clientMessageId === 'origin-queued-1')?.messageOrigin)
+        .toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+      expect(restarted.pendingEntriesForResend.find((e) => e.clientMessageId === 'origin-queued-human')?.messageOrigin)
+        .toBeUndefined();
+
+      mock.fireComplete('sess-1');
+      await waitForProviderSendCount(mock.provider, 2);
+      const drained = onDrainEntries.flat();
+      expect(drained.find((e) => e.clientMessageId === 'origin-queued-1')?.messageOrigin).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
+      expect(drained.find((e) => e.clientMessageId === 'origin-queued-human')?.messageOrigin).toBeUndefined();
     });
 
     it('editing a queued message drops the anchor along with the stale expansion', async () => {

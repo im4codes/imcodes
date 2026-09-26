@@ -41,14 +41,8 @@ export const PERMANENT_IMPORTERS = [
   'context/memory-recall-core.ts', // worker-side recall leaf (collect/rank/redact)
   'context/memory-recall-bounded.ts', // worker-side L3 bounded recall RPC impl
   'context/memory-search.ts', // main-thread recall fallback (runs only when worker cold)
-  // ── Documented single-owner exception ──
-  // `recordTurnUsage` stays SYNCHRONOUS by design (audit finding A1: the deferred
-  // path lost rows under SIGTERM races). Routing it through the worker would need
-  // a guaranteed shutdown drain to preserve A1; until then it is a documented
-  // limited exception (design Decision 5).
-  'daemon/timeline-emitter.ts',
   // ── Non-daemon CLI ──
-  'index.ts', // short-lived memory commands; worker spawn not warranted
+  'cli.ts', // short-lived memory commands; worker spawn not warranted
 ];
 
 // STRICT END STATE REACHED: every daemon CALLER module now reaches the store
@@ -60,7 +54,7 @@ const ALLOWED = new Set([...PERMANENT_IMPORTERS, ...TRANSITION_IMPORTERS]);
 
 export const MEMORY_SEARCH_IMPORTERS = [
   'context/memory-recall-client.ts', // centralized R1/R5 facade owns the cold fallback
-  'index.ts', // short-lived CLI memory commands
+  'cli.ts', // short-lived CLI memory commands
 ];
 const MEMORY_SEARCH_ALLOWED = new Set(MEMORY_SEARCH_IMPORTERS);
 

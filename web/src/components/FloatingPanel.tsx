@@ -10,6 +10,7 @@ import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';
 import {
   clampGeometryFullyIntoWorkspace,
   geometryFromWorkspace,
+  isWindowChromeDoubleClickTarget,
   normalizeWindowGeometry,
   reserveWorkspaceBottom,
   shouldPersistGeometry,
@@ -236,6 +237,24 @@ export function FloatingPanel({
     onToggleMaximized?.();
   }, [onFocus, onToggleMaximized]);
 
+  // Double-click on the window chrome (the visible title bar, or the declared
+  // drag handle when the title bar is hidden) toggles the same in-window
+  // maximize as the button. It is not browser/OS fullscreen.
+  const onChromeDoubleClick = useCallback((event: MouseEvent) => {
+    if (!canUseDesktopMaximize || !onToggleMaximized) return;
+    if (!isWindowChromeDoubleClickTarget(event.target)) return;
+    event.preventDefault();
+    onFocus?.();
+    onToggleMaximized();
+  }, [canUseDesktopMaximize, onFocus, onToggleMaximized]);
+
+  const onPanelDoubleClick = useCallback((event: MouseEvent) => {
+    if (!dragHandleSelector) return;
+    const target = event.target as Element | null;
+    if (!target?.closest?.(dragHandleSelector)) return;
+    onChromeDoubleClick(event);
+  }, [dragHandleSelector, onChromeDoubleClick]);
+
   const onPanelMouseDown = useCallback((event: MouseEvent) => {
     const target = event.target as HTMLElement;
     if (target.closest('button, a, input, select, textarea, [role="button"]')) {
@@ -310,11 +329,13 @@ export function FloatingPanel({
       // propagation cannot make this window unraisable.
       onPointerDownCapture={() => onFocus?.()}
       onMouseDown={onPanelMouseDown}
+      onDblClick={hideTitleBar ? onPanelDoubleClick : undefined}
     >
       {/* Title bar — draggable */}
       {!hideTitleBar && <div
         className="floating-panel-titlebar"
         onMouseDown={startDrag}
+        onDblClick={onChromeDoubleClick}
         style={{
           display: 'flex', alignItems: 'center', gap: 8,
           padding: '6px 12px', background: '#1e293b', cursor: isDesktopMaximized ? 'default' : 'grab',

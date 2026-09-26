@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   enqueueResend,
+  enqueueDurableResend,
   getFreshResendEntries,
   getResendEntries,
   getResendCount,
@@ -11,6 +12,7 @@ import {
   drainResend,
   RESEND_EXPIRY_MS,
   MAX_RESEND_ENTRIES,
+  RESEND_DISPATCH_CONTROL,
 } from '../../src/daemon/transport-resend-queue.js';
 import { getTransportQueueStore } from '../../src/daemon/transport-queue-store.js';
 
@@ -19,11 +21,137 @@ beforeEach(() => {
 });
 
 describe('transport-resend-queue', () => {
+  it.each([
+    ['stale', RESEND_DISPATCH_CONTROL.STALE, 0, 0],
+    ['temporary', RESEND_DISPATCH_CONTROL.RETRY, 1, 1],
+  ] as const)('keeps %s authority rejection distinct from delivery evidence', async (
+    _label, decision, expectedMemory, expectedDurable,
+  ) => {
+    const sessionName = `authority-${decision}`;
+    const messageId = `message-${decision}`;
+    expect(enqueueResend(sessionName, {
+      text: 'daemon control', commandId: messageId, clientMessageId: messageId, queuedAt: Date.now(),
+    }).accepted).toBe(true);
+
+    await expect(drainResend(sessionName, () => decision)).resolves.toBe(0);
+
+    expect(getResendCount(sessionName)).toBe(expectedMemory);
+    expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries)
+      .toHaveLength(expectedDurable);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, messageId)).toBe(false);
+  });
+
+  it('retries a transient supervision row without blocking its ordinary FIFO tail', async () => {
+    const sessionName = 'authority-retry-no-hol';
+    const supervisionId = 'supervision-retry-head';
+    const ordinaryId = 'ordinary-tail';
+    expect(enqueueResend(sessionName, {
+      text: 'transient supervision', commandId: supervisionId,
+      clientMessageId: supervisionId, queuedAt: Date.now(),
+    }).accepted).toBe(true);
+    expect(enqueueResend(sessionName, {
+      text: 'ordinary user message', commandId: ordinaryId,
+      clientMessageId: ordinaryId, queuedAt: Date.now(),
+    }).accepted).toBe(true);
+
+    const firstDispatch = vi.fn((entry: { clientMessageId?: string }) => (
+      entry.clientMessageId === supervisionId ? RESEND_DISPATCH_CONTROL.RETRY : 'sent'
+    ));
+    await expect(drainResend(sessionName, firstDispatch)).resolves.toBe(1);
+    expect(firstDispatch.mock.calls.map(([entry]) => entry.clientMessageId))
+      .toEqual([supervisionId, ordinaryId]);
+    expect(getResendEntries(sessionName).map((entry) => entry.clientMessageId)).toEqual([supervisionId]);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, supervisionId)).toBe(false);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, ordinaryId)).toBe(true);
+
+    await expect(drainResend(sessionName, () => RESEND_DISPATCH_CONTROL.RETRY)).resolves.toBe(0);
+    expect(getResendEntries(sessionName).map((entry) => entry.clientMessageId)).toEqual([supervisionId]);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, supervisionId)).toBe(false);
+
+    await expect(drainResend(sessionName, () => 'sent')).resolves.toBe(1);
+    expect(getResendCount(sessionName)).toBe(0);
+    expect(getTransportQueueStore().hasDeliveryTombstone(sessionName, supervisionId)).toBe(true);
+  });
+
   it('stores appended entries in FIFO order', () => {
     enqueueResend('s1', { text: 'a', commandId: 'c1', queuedAt: 10 });
     enqueueResend('s1', { text: 'b', commandId: 'c2', queuedAt: 20 });
     expect(getResendEntries('s1').map((e) => e.commandId)).toEqual(['c1', 'c2']);
     expect(getResendCount('s1')).toBe(2);
+  });
+
+  it('preserves append delivery intent in memory and durable private material', () => {
+    enqueueResend('s-append', {
+      text: 'append after restore',
+      commandId: 'cmd-append',
+      clientMessageId: 'msg-append',
+      deliveryMode: 'append',
+      queuedAt: Date.now(),
+    });
+
+    expect(getResendEntries('s-append')).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'msg-append',
+        deliveryMode: 'append',
+      }),
+    ]);
+    expect(JSON.parse(
+      getTransportQueueStore().readPrivateDispatchMaterial('s-append', 'msg-append') ?? '{}',
+    )).toMatchObject({ deliveryMode: 'append' });
+  });
+
+  it('rejects a weaker metadata-less replay of an existing private-authority row', () => {
+    const supervisionReference = {
+      kind: 'implementation_blocker' as const,
+      taskId: 'tsk-strong-replay',
+      assignmentId: 'asg-strong-replay',
+      exactError: 'automatic audit routing blocked',
+      revision: 'strong-replay-r1',
+    };
+    const strong = {
+      text: 'authorized control wake',
+      commandId: 'cmd-strong-replay',
+      clientMessageId: 'msg-strong-replay',
+      deliveryMode: 'append' as const,
+      activeTurnDeliveryKind: 'mcp_message' as const,
+      delegationReply: { delegationId: 'delegation-strong-replay' },
+      supervisionReference,
+      queuedAt: Date.now(),
+    };
+    // Seed SQLite only so the durable idempotency gate—not a coincidental
+    // in-memory copy—must reject the weaker replay.
+    expect(enqueueDurableResend('s-strong-replay', strong)).toMatchObject({ accepted: true });
+
+    const weaker = enqueueResend('s-strong-replay', {
+      text: strong.text,
+      commandId: strong.commandId,
+      clientMessageId: strong.clientMessageId,
+      queuedAt: strong.queuedAt + 2,
+    });
+    expect(weaker).toMatchObject({ accepted: false, reason: 'idempotency_conflict' });
+    expect(enqueueResend('s-strong-replay', { ...strong, queuedAt: strong.queuedAt + 1 }))
+      .toMatchObject({ accepted: true });
+    expect(getResendEntries('s-strong-replay')).toEqual([
+      expect.objectContaining({
+        clientMessageId: strong.clientMessageId,
+        activeTurnDeliveryKind: 'mcp_message',
+        delegationReply: strong.delegationReply,
+        supervisionReference,
+      }),
+    ]);
+  });
+
+  it('persists typed supervision authority separately from display text', () => {
+    const supervisionReference = {
+      kind: 'exact_integration' as const, taskId: 'tsk_exact', assignmentId: 'asg_owner', revision: 'rev-1',
+    };
+    enqueueResend('s-supervision', {
+      text: 'arbitrary localized display wording', commandId: 'cmd-supervision',
+      clientMessageId: 'msg-supervision', supervisionReference, queuedAt: Date.now(),
+    });
+
+    expect(getTransportQueueStore().readSnapshot('s-supervision').pendingMessageEntries[0]?.supervisionReference)
+      .toEqual(supervisionReference);
   });
 
   it('fails closed when SQLite enqueue fails', () => {
@@ -61,6 +189,27 @@ describe('transport-resend-queue', () => {
         text: 'already stored',
       }),
     ]);
+  });
+
+  it('does not recreate resend memory after the same logical message was durably cancelled', () => {
+    const recipient = { sessionInstanceId: 'instance-cancelled', runtimeEpoch: 'epoch-cancelled' };
+    expect(getTransportQueueStore().cancelQueuedMessage(
+      's-cancelled',
+      'msg-cancelled',
+      recipient,
+    ).status).toBe('accepted');
+
+    const result = enqueueResend('s-cancelled', {
+      recipient,
+      text: 'late recovery callback',
+      commandId: 'cmd-cancelled',
+      clientMessageId: 'msg-cancelled',
+      queuedAt: Date.now(),
+    });
+
+    expect(result).toEqual(expect.objectContaining({ accepted: false, reason: 'cancelled' }));
+    expect(getResendEntries('s-cancelled')).toEqual([]);
+    expect(getTransportQueueStore().readSnapshot('s-cancelled').pendingMessageEntries).toEqual([]);
   });
 
   it('isolates queues per session', () => {
@@ -174,6 +323,8 @@ describe('transport-resend-queue', () => {
       expect.objectContaining({
         clientMessageId: 'msg-runtime-queued',
         commandId: 'cmd-runtime-queued',
+        // The live runtime owns the exact outer reconnect lease. Keeping the row
+        // handoff_inflight prevents a restore rehydrate from staging it twice.
         status: 'handoff_inflight',
       }),
     ]);
@@ -202,7 +353,10 @@ describe('transport-resend-queue', () => {
 
     expect(count).toBe(1);
     expect(dispatch).toHaveBeenCalledTimes(1);
-    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ commandId: 'c-fresh' }));
+    expect(dispatch).toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'c-fresh' }),
+      expect.objectContaining({ clientMessageId: expect.any(String), handoffId: expect.any(String) }),
+    );
     expect(getResendCount('s1')).toBe(0);
   });
 
@@ -242,5 +396,109 @@ describe('transport-resend-queue', () => {
     const count = await drainResend('nonexistent', dispatch);
     expect(count).toBe(0);
     expect(dispatch).not.toHaveBeenCalled();
+  });
+});
+
+// `clearResend` wrote to SQLite ONLY when the in-memory map still held the
+// session. Rows written by the runtime path, rows left after a drain, and every
+// row after a daemon restart are therefore invisible to it -- so "clear" left
+// durable work that a later same-named session could drain. `clearAllResend`
+// had the same hole outside VITEST.
+describe('clear is atomic across memory AND the durable store', () => {
+  it('clears SQLite even when the in-memory queue is empty', () => {
+    const store = getTransportQueueStore();
+    // Durable row with no memory mirror: exactly what the runtime path and a
+    // daemon restart leave behind.
+    store.enqueue({
+      sessionName: 'sqlite-only', clientMessageId: 'm1', text: 'orphan', queuedAt: 10,
+    } as never);
+    expect(store.readSnapshot('sqlite-only').pendingMessageEntries).toHaveLength(1);
+    expect(getResendCount('sqlite-only')).toBe(0); // memory genuinely empty
+
+    clearResend('sqlite-only', 'session_removed');
+
+    expect(
+      store.readSnapshot('sqlite-only').pendingMessageEntries,
+      'a removed session must not leave durable work behind',
+    ).toEqual([]);
+  });
+
+  it('session_removed does not let a new same-named session inherit the old authority', () => {
+    const store = getTransportQueueStore();
+    enqueueResend('reused-name', { text: 'old work', commandId: 'c-old', clientMessageId: 'm-old', queuedAt: 10 });
+    const before = store.readSnapshot('reused-name').queueEpoch;
+
+    clearResend('reused-name', 'session_removed');
+
+    const after = store.readSnapshot('reused-name');
+    expect(after.pendingMessageEntries).toEqual([]);
+    expect(
+      after.queueEpoch,
+      'a new same-named session must not inherit the removed session queue epoch',
+    ).not.toBe(before);
+  });
+
+  it('clearAllResend clears the durable store too', () => {
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'all-clear', clientMessageId: 'm2', text: 'orphan', queuedAt: 10,
+    } as never);
+    clearAllResend();
+    // Re-fetch: under VITEST clearAllResend also recycles the store singleton.
+    expect(getTransportQueueStore().readSnapshot('all-clear').pendingMessageEntries).toEqual([]);
+  });
+});
+
+// R2 P1 (found by the cross-vendor auditor): drainResend proved the recipient by
+// reading it OFF THE QUEUED ROW -- `freshEntries.find(e => e.recipient)?.recipient`.
+// That is circular: the row authorises itself, so a same-named successor
+// presented the previous instance's identity simply by draining its rows. The
+// authorising identity must come from the LIVE runtime and be compared against
+// the row, never derived from it.
+describe('drain authority comes from the live runtime, not the queued row', () => {
+  const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+  const B = { sessionInstanceId: 'instance-B', runtimeEpoch: 'epoch-B' };
+  const NAME = 'drain-authority-session';
+
+  function queueForA() {
+    enqueueResend(NAME, {
+      recipient: A, text: 'for A', commandId: 'c-a', clientMessageId: 'm-a', queuedAt: Date.now(),
+    });
+  }
+
+  it('a same-name NEW instance drains nothing and dispatches nothing', async () => {
+    queueForA();
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); }, undefined, undefined, undefined, B);
+    expect(dispatched, 'B must never receive work queued for A').toEqual([]);
+    expect(count).toBe(0);
+    // A's work is preserved, not consumed or destroyed.
+    expect(getTransportQueueStore().readSnapshot(NAME).pendingMessageEntries).toHaveLength(1);
+  });
+
+  it('a caller that proves NO identity cannot drain identity-bound work', async () => {
+    queueForA();
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); });
+    expect(dispatched).toEqual([]);
+    expect(count).toBe(0);
+    expect(getTransportQueueStore().readSnapshot(NAME).pendingMessageEntries).toHaveLength(1);
+  });
+
+  it('the exact live owner A drains its own work', async () => {
+    queueForA();
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); }, undefined, undefined, undefined, A);
+    expect(dispatched).toEqual(['for A']);
+    expect(count).toBe(1);
+  });
+
+  it('is idempotent: a second drain by A delivers nothing further', async () => {
+    queueForA();
+    await drainResend(NAME, () => {}, undefined, undefined, undefined, A);
+    const dispatched: string[] = [];
+    const count = await drainResend(NAME, (entry) => { dispatched.push(entry.text); }, undefined, undefined, undefined, A);
+    expect(dispatched).toEqual([]);
+    expect(count).toBe(0);
   });
 });

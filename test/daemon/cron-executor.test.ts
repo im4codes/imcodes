@@ -1,3 +1,4 @@
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 // ── Hoisted mocks ─────────────────────────────────────────────────────────────
@@ -57,7 +58,14 @@ import {
 import { detectStatusAsync } from '../../src/agent/detect.js';
 import { sendKeys } from '../../src/agent/tmux.js';
 import { startP2pRun } from '../../src/daemon/p2p-orchestrator.js';
-import { CRON_COMPLETION_POLICY, CRON_MSG, type CronDispatchMessage } from '../../shared/cron-types.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_CONTROL_CONTRACT,
+  CRON_MSG,
+  registerCronControlAction,
+  type CronCommandAction,
+  type CronDispatchMessage,
+} from '../../shared/cron-types.js';
 import logger from '../../src/util/logger.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -92,6 +100,20 @@ function makeSession(overrides: Record<string, unknown> = {}) {
   };
 }
 
+function selfManagedAction(
+  scheduleId: string,
+  command: string,
+  completionPolicy = CRON_COMPLETION_POLICY.RECURRING,
+): CronCommandAction {
+  const registered = registerCronControlAction(
+    { type: 'command', command, selfManaged: true },
+    scheduleId,
+    completionPolicy,
+  );
+  if (!registered.ok) throw new Error(registered.reason);
+  return registered.action;
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 describe('executeCronJob', () => {
@@ -116,6 +138,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
     expect(sendKeys).not.toHaveBeenCalled();
   });
@@ -142,24 +165,55 @@ describe('executeCronJob', () => {
     );
   });
 
-  it('injects only the self-management id and lifecycle rule into agent wake-up prompts', async () => {
+  it('keeps hard rules in the static system contract and sends tagged task data each occurrence', async () => {
     (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
     (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
 
-    await executeCronJob(makeMsg({
+    const occurrence = makeMsg({
       jobId: 'job-progress-1',
       jobName: 'Check implementation progress',
       cronExpr: '*/10 * * * *',
       timezone: 'Asia/Shanghai',
       expiresAt: Date.parse('2026-07-12T00:00:00Z'),
-      action: { type: 'command', command: 'Inspect the current progress.', selfManaged: true },
-    }), mockServerLink);
+      action: selfManagedAction('job-progress-1', 'Inspect the current progress.'),
+    });
+    await executeCronJob({ ...occurrence, executionId: 'run-1' }, mockServerLink);
+    await executeCronJob({ ...occurrence, executionId: 'run-2' }, mockServerLink);
 
-    const prompt = cronProcessSendMock.mock.calls[0][1] as string;
-    expect(prompt).toContain('Inspect the current progress.\n\n<imcodes-cron-control id="job-progress-1" completion-policy="recurring">');
-    expect(prompt).toContain('Do not add web fetches, curl requests, or other network checks unless the task explicitly requests them.');
-    expect(prompt).toContain('If an explicitly requested tool returns SILENT as its first non-empty line, stop immediately, call no more tools, and finish this occurrence with exactly SILENT.');
-    expect(prompt).toContain('Always produce one final response for this occurrence.');
+    const prompts = cronProcessSendMock.mock.calls.map((call) => call[1] as string);
+    expect(prompts).toHaveLength(2);
+    for (const [index, prompt] of prompts.entries()) {
+      expect(prompt).toMatch(/^<imcodes-cron-control /);
+      expect(prompt).toContain('\nInspect the current progress.\n</imcodes-cron-control>');
+      expect(prompt).toContain('"contractRef":"supervision_cron_control_v2"');
+      expect(prompt).toContain('"scheduleId":"job-progress-1"');
+      expect(prompt).toContain('"completionPolicy":"recurring"');
+      expect(prompt).toContain(`"executionId":"run-${index + 1}"`);
+      expect(prompt).not.toContain('Do not add web fetches, curl requests, or other network checks');
+      expect(prompt).not.toContain('first non-empty line, stop immediately');
+      expect(prompt).not.toContain('Always produce one final response');
+      expect(prompt).not.toContain('This wrapped run is a user-authorized scheduled execution.');
+    }
+    expect(prompts[1]).not.toContain('"contractId"');
+    expect(prompts.join('\n').match(/supervision_cron_control_v2/g)).toHaveLength(2);
+    for (const call of cronProcessSendMock.mock.calls) {
+      expect(call[2]).toEqual({
+        userMessageMetadata: {
+          allowDuplicate: true,
+          memoryExcluded: true,
+          // A scheduled run renders as a system message, not the human's input.
+          [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.SYSTEM,
+          cronRun: expect.objectContaining({
+            scheduleId: 'job-progress-1',
+            name: 'Check implementation progress',
+            cronExpr: '*/10 * * * *',
+            timezone: 'Asia/Shanghai',
+            taskBody: 'Inspect the current progress.',
+            status: 'dispatched',
+          }),
+        },
+      });
+    }
   });
 
   it('allows an until-complete schedule to self-cancel only after its overall goal completes', async () => {
@@ -169,13 +223,49 @@ describe('executeCronJob', () => {
     await executeCronJob(makeMsg({
       jobId: 'job-bounded-1',
       completionPolicy: CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
-      action: { type: 'command', command: 'Keep working toward the release.', selfManaged: true },
+      action: selfManagedAction(
+        'job-bounded-1',
+        'Keep working toward the release.',
+        CRON_COMPLETION_POLICY.UNTIL_COMPLETE,
+      ),
     }), mockServerLink);
 
-    expect(cronProcessSendMock.mock.calls[0][1]).toContain(
-      'Call cron_cancel_self with this id only when the overall goal—not merely this occurrence—is complete.',
-    );
+    expect(cronProcessSendMock.mock.calls[0][1]).toContain('"completionPolicy":"until_complete"');
+    expect(cronProcessSendMock.mock.calls[0][1]).not.toContain('Call cron_cancel_self');
     expect(cronProcessSendMock.mock.calls[0][1]).not.toContain('force=true');
+  });
+
+  it.each([
+    ['missing authoritative body', { type: 'command', command: '', selfManaged: true }, 'missing_authoritative_body'],
+    ['missing authoritative contract', { type: 'command', command: 'task', selfManaged: true }, 'missing_authoritative_contract'],
+    ['unknown version', {
+      type: 'command', command: 'task', selfManaged: true,
+      cronControl: { ...CRON_CONTROL_CONTRACT, scheduleId: 'job-invalid', version: 9 },
+    }, 'unknown_contract_version'],
+    ['task id mismatch', {
+      type: 'command', command: 'task', selfManaged: true,
+      cronControl: { ...CRON_CONTROL_CONTRACT, scheduleId: 'other-job' },
+    }, 'task_id_mismatch'],
+    ['tampered ref', {
+      type: 'command', command: 'task', selfManaged: true,
+      cronControl: { ...CRON_CONTROL_CONTRACT, scheduleId: 'job-invalid', contractId: 'unknown_v9' },
+    }, 'tampered_contract_ref'],
+  ] as const)('fails closed for %s', async (_label, action, reason) => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+
+    await executeCronJob(makeMsg({
+      jobId: 'job-invalid',
+      action: action as CronCommandAction,
+    }), mockServerLink);
+
+    expect(cronProcessSendMock).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId: 'job-invalid',
+      status: 'error',
+      detail: `Cron registered control rejected: ${reason}`,
+    }));
   });
 
   it.each(['shell', 'script'] as const)('does not inject MCP controls into %s commands', async (agentType) => {
@@ -184,12 +274,13 @@ describe('executeCronJob', () => {
 
     await executeCronJob(makeMsg({
       jobId: 'job-raw-1',
-      action: { type: 'command', command: 'printf ready', selfManaged: true },
+      action: selfManagedAction('job-raw-1', 'printf ready'),
     }), mockServerLink);
 
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'printf ready',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 
@@ -251,6 +342,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 
@@ -264,6 +356,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 
@@ -293,6 +386,31 @@ describe('executeCronJob', () => {
   });
 
   // 10. Transport session — skips busy check, calls runtime.send()
+  it('sends the authoritative task body as tagged user data without per-turn system metadata', async () => {
+    const mockRuntime = {
+      providerSessionId: 'connected-provider-session',
+      send: vi.fn().mockReturnValue('sent'),
+    };
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(
+      makeSession({ runtimeType: 'transport', agentType: 'codex-sdk' }),
+    );
+    (getTransportRuntime as ReturnType<typeof vi.fn>).mockReturnValue(mockRuntime);
+
+    await executeCronJob(makeMsg({
+      jobId: 'job-registered-transport',
+      executionId: 'run-transport-1',
+      action: selfManagedAction('job-registered-transport', 'Inspect transport progress.'),
+    }), mockServerLink);
+
+    const [prompt, clientMessageId, attachments, preamble, metadata] = mockRuntime.send.mock.calls[0];
+    expect(prompt).toContain('"contractRef":"supervision_cron_control_v2"');
+    expect(prompt).toContain('\nInspect transport progress.\n</imcodes-cron-control>');
+    expect(clientMessageId).toBe('cron:job-registered-transport:run-transport-1:attempt:1');
+    expect(attachments).toBeUndefined();
+    expect(preamble).toBeUndefined();
+    expect(metadata).toEqual({ timelineCommitted: true, messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM });
+  });
+
   it('sends command to transport session via runtime.send(), skipping busy check', async () => {
     const mockRuntime = {
       providerSessionId: 'connected-provider-session',
@@ -306,17 +424,25 @@ describe('executeCronJob', () => {
     await executeCronJob(makeMsg(), mockServerLink);
 
     expect(detectStatusAsync).not.toHaveBeenCalled();
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
+    expect(mockRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
     expect(typeof mockRuntime.send.mock.calls[0][0]).toBe('string');
     expect(sendKeys).not.toHaveBeenCalled();
     expect(timelineEmit).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'user.message',
-      { text: 'review the codebase', allowDuplicate: true },
+      expect.objectContaining({
+        text: 'review the codebase',
+        allowDuplicate: true,
+        cronRun: expect.objectContaining({ scheduleId: 'job-1', taskBody: 'review the codebase' }),
+      }),
+      { source: 'daemon', confidence: 'high' },
     );
   });
 
-  it('does not emit a user.message when a transport cron command is only queued', async () => {
+  it('emits one durable cron card when a transport cron command is queued', async () => {
     const mockRuntime = {
       providerSessionId: 'connected-provider-session',
       send: vi.fn().mockReturnValue('queued'),
@@ -328,11 +454,15 @@ describe('executeCronJob', () => {
 
     await executeCronJob(makeMsg(), mockServerLink);
 
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
-    expect(timelineEmit).not.toHaveBeenCalledWith(
+    expect(mockRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
+    expect(timelineEmit).toHaveBeenCalledWith(
       'deck_myapp_brain',
       'user.message',
-      expect.anything(),
+      expect.objectContaining({ cronRun: expect.objectContaining({ scheduleId: 'job-1' }) }),
+      { source: 'daemon', confidence: 'high' },
     );
   });
 
@@ -374,7 +504,11 @@ describe('executeCronJob', () => {
       2,
       'review the codebase',
       'cron:job-1:exec-retry-safe:attempt:2',
+      undefined,
+      undefined,
+      expect.objectContaining({ timelineCommitted: true }),
     );
+    expect(timelineEmit).toHaveBeenCalledTimes(1);
     expect(mockRuntime.cancel).not.toHaveBeenCalled();
 
     handler?.({ sessionId: 'deck_myapp_brain', type: 'assistant.text', payload: { text: 'done after retry' } });
@@ -511,7 +645,10 @@ describe('executeCronJob', () => {
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledOnce();
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
     expect(mockRuntime.send).toHaveBeenCalledOnce();
-    expect(mockRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
+    expect(mockRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
     expect(sendKeys).not.toHaveBeenCalled();
     expect(mockServerLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
       type: CRON_MSG.COMMAND_RESULT,
@@ -536,7 +673,10 @@ describe('executeCronJob', () => {
     expect(ensureTransportRuntimeAvailable).toHaveBeenCalledWith('deck_myapp_brain');
     expect(unboundRuntime.send).not.toHaveBeenCalled();
     expect(restoredRuntime.send).toHaveBeenCalledOnce();
-    expect(restoredRuntime.send).toHaveBeenCalledWith('review the codebase', 'cron:job-1:dispatch:attempt:1');
+    expect(restoredRuntime.send).toHaveBeenCalledWith(
+      'review the codebase', 'cron:job-1:dispatch:attempt:1', undefined, undefined,
+      expect.objectContaining({ timelineCommitted: true }),
+    );
   });
 
   it('reports an error only after on-demand transport recovery fails', async () => {
@@ -737,6 +877,7 @@ describe('executeCronJob', () => {
     expect(cronProcessSendMock).toHaveBeenCalledWith(
       'deck_sub_abc123',
       'review the codebase',
+      expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
   });
 

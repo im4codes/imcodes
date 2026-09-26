@@ -1,0 +1,683 @@
+import { createHash } from 'node:crypto';
+import {
+  DELEGATION_AVAILABILITY,
+  resolveDelegationTargets,
+} from '../../shared/delegation-availability.js';
+import { isTransportSessionAgentType } from '../../shared/agent-types.js';
+import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
+import {
+  DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS,
+  normalizeSupervisionExecutionPools,
+  normalizeSupervisionExecutionConfig,
+  normalizeSupervisionExecutionModel,
+  type SupervisionAuditDegradedReason,
+  type SupervisionExecutionConfig,
+  type SupervisionProvisionFailureReason,
+  type SupervisionProvisionPool,
+  type SupervisionProvisioningEvidence,
+} from '../../shared/supervision-execution-pool.js';
+import { resolvePeerAuditProviderFamily as resolveSharedPeerAuditProviderFamily } from '../../shared/peer-audit.js';
+import {
+  SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE,
+  SUPERVISION_TRANSPORT_CONFIG_KEY,
+  extractSessionSupervisionSnapshot,
+  isAutomaticSupervisionEnabled,
+  isTerminalSupervisionTaskStatus,
+} from '../../shared/supervision-config.js';
+import type { SessionRecord } from '../store/session-store.js';
+import { getSession, listSessions } from '../store/session-store.js';
+import { resolvePeerAuditProviderFamily } from './peer-audit-candidates.js';
+import { delegationTargetInputs } from './delegation-admission.js';
+import { startSubSession, stopSubSession, type SubSessionRecord } from './subsession-manager.js';
+import { overlayCachedExecutionPools } from './supervisor-defaults-cache.js';
+import logger from '../util/logger.js';
+import {
+  SESSION_IDENTITY_SCOPES,
+  renderSessionIdentityProfileSection,
+} from '../../shared/session-identity.js';
+import type { SupervisionTaskRegistry } from './supervision-state-store.js';
+
+const AUTO_SESSION_ID_PREFIX = 'sup_auto_';
+export const SUPERVISION_AUTO_PROVISION_COOLDOWN_MS = 30_000;
+export const SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS = 15_000;
+export const SUPERVISION_AUTO_PROVISION_IDLE_REAP_MS = 30 * 60_000;
+export const SUPERVISION_AUTO_PROVISION_MAX_REAPS_PER_ATTEMPT = 1;
+const SUPERVISION_AUTO_PROVISION_POLL_MS = 50;
+const SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE = SUPERVISION_TASK_HOUSEKEEPING_MAX_BATCH_SIZE + 1;
+
+export interface SupervisionAutoProvisionRequest {
+  parentSessionName: string;
+  pool: 'primary' | 'economy';
+  requestedCapabilityId?: string;
+  /**
+   * A complete execution identity explicitly selected by a human/MCP caller.
+   * Manual explicit provisioning may use this without a configured automatic
+   * execution pool. Daemon-owned automatic supervision never may.
+   */
+  requestedExecutionConfig?: SupervisionExecutionConfig;
+  /** Exact session-scoped identity contract for the provisioned Agent. */
+  identityPrompt?: string;
+  idempotencyKey: string;
+  auditedSessionName?: string;
+  strictCrossVendor?: boolean;
+  /** Explicit tool calls are manual; daemon-owned callers must opt into this provenance. */
+  provenance?: 'manual_explicit' | 'automatic_supervision';
+}
+
+export type SupervisionAutoProvisionResult =
+  | {
+      ok: true;
+      target: SessionRecord;
+      evidence: SupervisionProvisioningEvidence;
+      auditRoutingReason?: 'cross_vendor_preferred' | 'same_family_degraded';
+      auditDegradedReason?: SupervisionAuditDegradedReason;
+    }
+  | {
+      ok: false;
+      reason: SupervisionProvisionFailureReason;
+      evidence: SupervisionProvisioningEvidence;
+      auditDegradedReason?: SupervisionAuditDegradedReason;
+    };
+
+export interface SupervisionAutoProvisionDeps {
+  now?: () => number;
+  listSessions?: () => SessionRecord[];
+  getSession?: (name: string) => SessionRecord | undefined;
+  startSubSession?: (sub: SubSessionRecord) => Promise<void>;
+  stopSubSession?: (sessionName: string) => Promise<boolean>;
+  hasActiveSupervisionLease?: (sessionName: string) => boolean | Promise<boolean>;
+  countActiveSupervisionAssignments?: (
+    parent: SessionRecord,
+    pool: SupervisionAutoProvisionRequest['pool'],
+  ) => number | Promise<number>;
+  wait?: (ms: number) => Promise<void>;
+  readyTimeoutMs?: number;
+  cooldownMs?: number;
+  idleReapMs?: number;
+}
+
+const inFlight = new Map<string, Promise<SupervisionAutoProvisionResult>>();
+const cooldownUntil = new Map<string, number>();
+
+export function clearSupervisionAutoProvisionStateForTests(): void {
+  inFlight.clear();
+  cooldownUntil.clear();
+}
+
+export function configuredPools(parent: SessionRecord) {
+  // Execution pools are account-level policy. The session snapshot remains a
+  // compatibility mirror, but the daemon's supervisor-defaults cache is the
+  // authoritative source after Settings saves (and survives daemon restart).
+  // Task-pair selection and auto-provisioning must use the same overlay as
+  // send_message; otherwise the UI can show a checked pool while the pair
+  // engine still reads an old sessions.json mirror.
+  //
+  // Read the raw field directly rather than through the strict snapshot
+  // parser/extractor: a session's transportConfig can carry a perfectly
+  // usable executionPools value while failing snapshot validation for an
+  // unrelated reason (e.g. no `mode` set at all on an older/partial mirror).
+  // Routing through the strict extractor here would silently discard a real
+  // pool whenever that happens.
+  const raw = parent.transportConfig?.[SUPERVISION_TRANSPORT_CONFIG_KEY];
+  const rawExecutionPools = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).executionPools
+    : undefined;
+  const local = normalizeSupervisionExecutionPools(rawExecutionPools);
+  const executionPools = overlayCachedExecutionPools({ executionPools: local }).executionPools;
+  const normalized = normalizeSupervisionExecutionPools(executionPools);
+  return normalized.state === 'configured' ? normalized : undefined;
+}
+
+export function poolDefinition(parent: SessionRecord, pool: SupervisionAutoProvisionRequest['pool']) {
+  const pools = configuredPools(parent);
+  if (!pools) return undefined;
+  return pool === 'primary' ? pools.primaryDevelopmentPool : pools.economyTaskPool;
+}
+
+function supportedConfigs(
+  parent: SessionRecord,
+  request: SupervisionAutoProvisionRequest,
+): SupervisionExecutionConfig[] {
+  if (request.provenance === 'manual_explicit' && request.requestedExecutionConfig) {
+    const explicit = normalizeSupervisionExecutionConfig(request.requestedExecutionConfig);
+    if (!explicit || (request.requestedCapabilityId && explicit.capabilityId !== request.requestedCapabilityId)) {
+      return [];
+    }
+    return explicit.runtimeType === 'transport'
+      && isTransportSessionAgentType(explicit.agentType)
+      && resolveSharedPeerAuditProviderFamily({ providerId: explicit.agentType }) === explicit.providerFamily
+      ? [explicit]
+      : [];
+  }
+  const definition = poolDefinition(parent, request.pool);
+  if (!definition) return [];
+  const supported = definition.configs.filter((config) => (
+    config.runtimeType === 'transport'
+    && isTransportSessionAgentType(config.agentType)
+    // The visible transport launcher selects its provider adapter by agentType.
+    // Reject a mismatched claimed family up front instead of spawning a child
+    // that can never satisfy the requested execution identity.
+    && resolveSharedPeerAuditProviderFamily({ providerId: config.agentType }) === config.providerFamily
+  ));
+  return request.requestedCapabilityId
+    ? supported.filter((config) => config.capabilityId === request.requestedCapabilityId)
+    : supported;
+}
+
+function hasManualExplicitConfig(request: SupervisionAutoProvisionRequest): boolean {
+  return request.provenance === 'manual_explicit'
+    && Boolean(normalizeSupervisionExecutionConfig(request.requestedExecutionConfig));
+}
+
+function provisionedIdentityHash(identityPrompt?: string): string | undefined {
+  return identityPrompt ? createHash('sha256').update(identityPrompt).digest('hex') : undefined;
+}
+
+function sessionMatchesProvisionedIdentity(session: SessionRecord, identityPrompt?: string): boolean {
+  if (identityPrompt === undefined) return true;
+  if (session.provisionedIdentityHash === provisionedIdentityHash(identityPrompt)) return true;
+  if (session.identityPrompt === identityPrompt) return true;
+  const persistedSection = renderSessionIdentityProfileSection(
+    SESSION_IDENTITY_SCOPES.SESSION,
+    identityPrompt,
+  );
+  return Boolean(persistedSection && session.identityPrompt?.includes(persistedSection));
+}
+
+export function configMatchesSession(
+  config: SupervisionExecutionConfig,
+  session: SessionRecord,
+  identityPrompt?: string,
+): boolean {
+  const model = resolveEffectiveSessionModel(session);
+  return session.agentType === config.agentType
+    && (session.runtimeType ?? 'process') === config.runtimeType
+    && resolvePeerAuditProviderFamily(session) === config.providerFamily
+    && typeof model === 'string'
+    && normalizeSupervisionExecutionModel(session.agentType, model) === config.model
+    && session.ccPreset === config.ccPresetId
+    && sessionMatchesProvisionedIdentity(session, identityPrompt);
+}
+
+function matchingChildren(
+  sessions: readonly SessionRecord[],
+  parent: SessionRecord,
+  config: SupervisionExecutionConfig,
+  identityPrompt?: string,
+): SessionRecord[] {
+  return sessions.filter((session) => (
+    session.parentSession === parent.name
+    && session.role !== 'brain'
+    && !session.executionCloneMetadata
+    && configMatchesSession(config, session, identityPrompt)
+  ));
+}
+
+function readyChildren(
+  sessions: readonly SessionRecord[],
+  parent: SessionRecord,
+  config: SupervisionExecutionConfig,
+  now: number,
+  identityPrompt?: string,
+): SessionRecord[] {
+  const availability = resolveDelegationTargets(delegationTargetInputs(sessions), now);
+  return matchingChildren(sessions, parent, config, identityPrompt)
+    .filter((session) => session.state === 'idle'
+      && Boolean(session.sessionInstanceId)
+      && Boolean(session.runtimeEpoch)
+      && availability.get(session.name)?.availability === DELEGATION_AVAILABILITY.READY)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+function configurationAvailability(
+  sessions: readonly SessionRecord[],
+  parent: SessionRecord,
+  config: SupervisionExecutionConfig,
+  now: number,
+  identityPrompt?: string,
+): 'available' | 'limited' | 'offline' {
+  const matches = matchingChildren(sessions, parent, config, identityPrompt);
+  if (matches.length > 0 && matches.every((session) => session.state === 'stopped' || session.state === 'error')) {
+    return 'offline';
+  }
+  const syntheticKey = `__supervision_config_${config.capabilityId}`;
+  const availability = resolveDelegationTargets([
+    ...delegationTargetInputs(sessions),
+    { key: syntheticKey, agentType: config.agentType, sessionState: 'unknown' as const },
+  ], now).get(syntheticKey);
+  return availability?.availability === DELEGATION_AVAILABILITY.LIMITED ? 'limited' : 'available';
+}
+
+function attemptIdentity(request: SupervisionAutoProvisionRequest, config: SupervisionExecutionConfig): {
+  attemptId: string;
+  sessionName: string;
+  subId: string;
+} {
+  const digest = createHash('sha256').update(JSON.stringify({
+    parent: request.parentSessionName,
+    pool: request.pool,
+    capabilityId: config.capabilityId,
+    idempotencyKey: request.idempotencyKey,
+    identityHash: provisionedIdentityHash(request.identityPrompt) ?? null,
+  })).digest('hex');
+  const suffix = digest.slice(0, 16);
+  const subId = `${AUTO_SESSION_ID_PREFIX}${suffix}`;
+  return {
+    attemptId: `supervision_provision_${digest.slice(0, 32)}`,
+    sessionName: `deck_sub_${subId}`,
+    subId,
+  };
+}
+
+function failureEvidence(
+  pool: SupervisionProvisionPool,
+  reason: SupervisionProvisionFailureReason,
+  config?: SupervisionExecutionConfig,
+  extra: Partial<SupervisionProvisioningEvidence> = {},
+): SupervisionProvisioningEvidence {
+  return { selectedPool: pool, ...(config ? { selectedConfig: config } : {}), failureReason: reason, ...extra };
+}
+
+function isAutomaticChildOf(parent: SessionRecord, session: SessionRecord): boolean {
+  return session.parentSession === parent.name
+    && session.name.startsWith(`deck_sub_${AUTO_SESSION_ID_PREFIX}`);
+}
+
+/** Audit workers consume the primary development pool even though their label
+ * is `Auto audit`. Labels are presentation, never capacity authority. */
+function childConsumesPool(
+  parent: SessionRecord,
+  session: SessionRecord,
+  pool: SupervisionAutoProvisionRequest['pool'],
+): boolean {
+  if (!isAutomaticChildOf(parent, session)) return false;
+  return pool === 'economy' ? session.label === 'Auto economy' : session.label !== 'Auto economy';
+}
+
+export async function defaultHasActiveSupervisionLease(
+  sessionName: string,
+  registryOverride?: Pick<SupervisionTaskRegistry, 'list'>,
+): Promise<boolean> {
+  // On the `pairs` engine a session is leased while it is the executor or
+  // auditor of an open pair, so pool controls keep bounding provisioning.
+  const pairs = await import('./task-pairs/engine.js');
+  if (!registryOverride && pairs.isPairsEngineSession(sessionName)) {
+    const { getTaskPairStore } = await import('./task-pairs/store.js');
+    return getTaskPairStore().isParticipantOfOpenPair(sessionName);
+  }
+  const registry = registryOverride
+    ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
+  let cursor: string | undefined;
+  do {
+    const page = registry.list({
+      ownerSessionName: sessionName,
+      includeArchived: true,
+      cursor,
+      limit: SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE,
+    });
+    for (const task of page) {
+      if (task.assignments.some((assignment) => (
+        assignment.identity.sessionName === sessionName
+        && Boolean(assignment.leaseId)
+        && !isTerminalSupervisionTaskStatus(assignment.status)
+      ))) return true;
+    }
+    cursor = page.length === SUPERVISION_AUTO_PROVISION_REGISTRY_PAGE_SIZE
+      ? page[page.length - 1]?.taskId
+      : undefined;
+  } while (cursor);
+  return false;
+}
+
+export async function defaultCountActiveSupervisionAssignments(
+  parent: SessionRecord,
+  pool: SupervisionAutoProvisionRequest['pool'],
+  registryOverride?: Pick<SupervisionTaskRegistry, 'countActiveLeasedAssignmentsByPool'>,
+): Promise<number> {
+  const pairs = await import('./task-pairs/engine.js');
+  if (!registryOverride && pairs.isPairsEngineProject(parent.projectName)) {
+    const { getTaskPairStore } = await import('./task-pairs/store.js');
+    const { TASK_PAIR_OPEN_STATUSES } = await import('../../shared/task-pair.js');
+    return getTaskPairStore().listActivePairs(parent.projectName).filter((pair) => (
+      TASK_PAIR_OPEN_STATUSES.includes(pair.state.status)
+      && (pair.state.executorPool ?? 'primary') === pool
+    )).length;
+  }
+  const registry = registryOverride
+    ?? (await import('./supervision-state-store.js')).getSupervisionTaskRegistry();
+  return registry.countActiveLeasedAssignmentsByPool({
+    projectName: parent.projectName,
+    pool,
+  });
+}
+
+async function reapOneIdleAutomaticChild(
+  parent: SessionRecord,
+  request: SupervisionAutoProvisionRequest,
+  deps: Required<Pick<SupervisionAutoProvisionDeps,
+    'now' | 'listSessions' | 'stopSubSession' | 'hasActiveSupervisionLease' | 'idleReapMs'>>,
+): Promise<void> {
+  const cutoff = deps.now() - deps.idleReapMs;
+  const candidates = deps.listSessions()
+    .filter((session) => childConsumesPool(parent, session, request.pool)
+      && session.state === 'idle'
+      && session.updatedAt <= cutoff)
+    .sort((a, b) => a.updatedAt - b.updatedAt || a.name.localeCompare(b.name));
+  let reaped = 0;
+  for (const candidate of candidates) {
+    if (await deps.hasActiveSupervisionLease(candidate.name)) continue;
+    if (await deps.stopSubSession(candidate.name)) reaped += 1;
+    if (reaped >= SUPERVISION_AUTO_PROVISION_MAX_REAPS_PER_ATTEMPT) break;
+  }
+}
+
+async function provisionConfig(
+  parent: SessionRecord,
+  request: SupervisionAutoProvisionRequest,
+  config: SupervisionExecutionConfig,
+  deps: Required<Pick<SupervisionAutoProvisionDeps, 'now' | 'listSessions' | 'getSession' | 'startSubSession'
+    | 'stopSubSession' | 'hasActiveSupervisionLease' | 'countActiveSupervisionAssignments'
+    | 'wait' | 'readyTimeoutMs' | 'cooldownMs' | 'idleReapMs'>>,
+  selectedPool: SupervisionProvisionPool,
+): Promise<SupervisionAutoProvisionResult> {
+  const requestedIdentityHash = provisionedIdentityHash(request.identityPrompt) ?? '';
+  const reservationKey = `${parent.name}\0${request.pool}\0${config.capabilityId}\0${requestedIdentityHash}`;
+  const existingReservation = inFlight.get(reservationKey);
+  if (existingReservation) return existingReservation;
+
+  const operation = (async (): Promise<SupervisionAutoProvisionResult> => {
+    const now = deps.now();
+    const existingReady = readyChildren(deps.listSessions(), parent, config, now, request.identityPrompt)[0];
+    if (existingReady) {
+      return {
+        ok: true,
+        target: existingReady,
+        evidence: { selectedPool, selectedConfig: config, origin: 'reused' },
+      };
+    }
+
+    const until = cooldownUntil.get(`${parent.name}\0${request.pool}`) ?? 0;
+    if (until > now) {
+      return { ok: false, reason: 'cooldown', evidence: failureEvidence(selectedPool, 'cooldown', config) };
+    }
+    const definition = poolDefinition(parent, request.pool);
+    if (!definition && !hasManualExplicitConfig(request)) {
+      return { ok: false, reason: 'pool_unconfigured', evidence: failureEvidence(selectedPool, 'pool_unconfigured', config) };
+    }
+    const identity = attemptIdentity(request, config);
+    const existing = deps.getSession(identity.sessionName);
+    if (existing && (!configMatchesSession(config, existing, request.identityPrompt)
+      || existing.parentSession !== parent.name || existing.role === 'brain')) {
+      return {
+        ok: false,
+        reason: 'identity_collision',
+        evidence: failureEvidence(selectedPool, 'identity_collision', config, {
+          provisionAttemptId: identity.attemptId,
+          createdSessionName: identity.sessionName,
+        }),
+      };
+    }
+
+    let spawnedCount = deps.listSessions().filter((session) => (
+      childConsumesPool(parent, session, request.pool)
+    )).length;
+    const controls = definition?.controls ?? DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[request.pool];
+    if (await deps.countActiveSupervisionAssignments(parent, request.pool) >= controls.maxConcurrency) {
+      return { ok: false, reason: 'max_concurrency', evidence: failureEvidence(selectedPool, 'max_concurrency', config) };
+    }
+    if (!existing && spawnedCount >= controls.maxSpawned) {
+      await reapOneIdleAutomaticChild(parent, request, deps);
+      spawnedCount = deps.listSessions().filter((session) => (
+        childConsumesPool(parent, session, request.pool)
+      )).length;
+    }
+    if (!existing && spawnedCount >= controls.maxSpawned) {
+      return { ok: false, reason: 'max_spawned', evidence: failureEvidence(selectedPool, 'max_spawned', config) };
+    }
+
+    if (!existing) {
+      try {
+        await deps.startSubSession({
+          id: identity.subId,
+          type: config.agentType,
+          cwd: parent.projectDir,
+          runtimeType: config.runtimeType,
+          providerId: config.agentType,
+          requestedModel: config.model,
+          ...(config.ccPresetId ? { ccPreset: config.ccPresetId } : {}),
+          ...(request.identityPrompt ? { identityPrompt: request.identityPrompt } : {}),
+          ...(requestedIdentityHash ? { provisionedIdentityHash: requestedIdentityHash } : {}),
+          parentSession: parent.name,
+          fresh: true,
+          label: `Auto ${selectedPool}`,
+        });
+      } catch (error) {
+        logger.warn({
+          err: error,
+          parentSessionName: parent.name,
+          createdSessionName: identity.sessionName,
+          agentType: config.agentType,
+          providerFamily: config.providerFamily,
+          runtimeType: config.runtimeType,
+          model: config.model,
+        }, 'Supervision target auto-provision launch failed');
+        cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+        return {
+          ok: false,
+          reason: 'launch_failed',
+          evidence: failureEvidence(selectedPool, 'launch_failed', config, {
+            provisionAttemptId: identity.attemptId,
+            createdSessionName: identity.sessionName,
+          }),
+        };
+      }
+    }
+
+    const deadline = deps.now() + deps.readyTimeoutMs;
+    while (deps.now() <= deadline) {
+      const current = readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt)
+        .find((candidate) => candidate.name === identity.sessionName);
+      if (current) {
+        cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+        return {
+          ok: true,
+          target: current,
+          evidence: {
+            selectedPool,
+            selectedConfig: config,
+            origin: 'spawned',
+            provisionAttemptId: identity.attemptId,
+            createdSessionName: identity.sessionName,
+          },
+        };
+      }
+      await deps.wait(SUPERVISION_AUTO_PROVISION_POLL_MS);
+    }
+    cooldownUntil.set(`${parent.name}\0${request.pool}`, deps.now() + deps.cooldownMs);
+    return {
+      ok: false,
+      reason: 'readiness_timeout',
+      evidence: failureEvidence(selectedPool, 'readiness_timeout', config, {
+        provisionAttemptId: identity.attemptId,
+        createdSessionName: identity.sessionName,
+      }),
+    };
+  })();
+
+  inFlight.set(reservationKey, operation);
+  try {
+    return await operation;
+  } finally {
+    if (inFlight.get(reservationKey) === operation) inFlight.delete(reservationKey);
+  }
+}
+
+function degradationFor(
+  crossConfigs: readonly SupervisionExecutionConfig[],
+  statuses: readonly ('available' | 'limited' | 'offline')[],
+  provisionFailure?: SupervisionProvisionFailureReason,
+): SupervisionAuditDegradedReason {
+  if (provisionFailure === 'readiness_timeout') return 'cross_vendor_provision_timeout';
+  if (provisionFailure) return 'cross_vendor_provision_failed';
+  if (crossConfigs.length === 0) return 'no_cross_vendor_configured';
+  if (statuses.length > 0 && statuses.every((status) => status === 'limited')) return 'cross_vendor_limited';
+  if (statuses.length > 0 && statuses.every((status) => status === 'offline')) return 'cross_vendor_offline';
+  return 'cross_vendor_unavailable';
+}
+
+export async function provisionSupervisionTarget(
+  request: SupervisionAutoProvisionRequest,
+  injected: SupervisionAutoProvisionDeps = {},
+): Promise<SupervisionAutoProvisionResult> {
+  const deps = {
+    now: injected.now ?? Date.now,
+    listSessions: injected.listSessions ?? (() => listSessions()),
+    getSession: injected.getSession ?? getSession,
+    startSubSession: injected.startSubSession ?? startSubSession,
+    stopSubSession: injected.stopSubSession ?? (async (sessionName: string) => (
+      await stopSubSession(sessionName)
+    ).ok),
+    hasActiveSupervisionLease: injected.hasActiveSupervisionLease ?? defaultHasActiveSupervisionLease,
+    countActiveSupervisionAssignments: injected.countActiveSupervisionAssignments
+      ?? defaultCountActiveSupervisionAssignments,
+    wait: injected.wait ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+    readyTimeoutMs: injected.readyTimeoutMs ?? SUPERVISION_AUTO_PROVISION_READY_TIMEOUT_MS,
+    cooldownMs: injected.cooldownMs ?? SUPERVISION_AUTO_PROVISION_COOLDOWN_MS,
+    idleReapMs: injected.idleReapMs ?? SUPERVISION_AUTO_PROVISION_IDLE_REAP_MS,
+  };
+  const parent = deps.getSession(request.parentSessionName);
+  const selectedPool: SupervisionProvisionPool = request.auditedSessionName ? 'audit' : request.pool;
+  if (!parent || parent.role !== 'brain') {
+    return { ok: false, reason: 'parent_unavailable', evidence: failureEvidence(selectedPool, 'parent_unavailable') };
+  }
+  if (request.provenance === 'automatic_supervision'
+    && !isAutomaticSupervisionEnabled(extractSessionSupervisionSnapshot(parent.transportConfig ?? null))) {
+    return { ok: false, reason: 'no_selected_config', evidence: failureEvidence(selectedPool, 'no_selected_config') };
+  }
+  const definition = poolDefinition(parent, request.pool);
+  if (!definition && !hasManualExplicitConfig(request)) {
+    return { ok: false, reason: 'pool_unconfigured', evidence: failureEvidence(selectedPool, 'pool_unconfigured') };
+  }
+  const configs = supportedConfigs(parent, request);
+  if (configs.length === 0) {
+    const reason: SupervisionProvisionFailureReason = definition && definition.configs.length === 0
+      ? 'no_selected_config' : 'unsupported_config';
+    return { ok: false, reason, evidence: failureEvidence(selectedPool, reason) };
+  }
+
+  const sessions = deps.listSessions();
+  const audited = request.auditedSessionName ? deps.getSession(request.auditedSessionName) : undefined;
+  if (request.auditedSessionName && !audited) {
+    return {
+      ok: false,
+      reason: 'audited_unavailable',
+      evidence: failureEvidence(selectedPool, 'audited_unavailable'),
+      auditDegradedReason: 'no_independent_session',
+    };
+  }
+  if (!audited) {
+    const ready = configs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
+    if (ready) {
+      const config = configs.find((candidate) => configMatchesSession(candidate, ready, request.identityPrompt))!;
+      return {
+        ok: true,
+        target: ready,
+        evidence: { selectedPool, selectedConfig: config, origin: 'reused' },
+      };
+    }
+    const config = configs[0]!;
+    const status = configurationAvailability(sessions, parent, config, deps.now(), request.identityPrompt);
+    if (status === 'limited' || status === 'offline') {
+      const reason = status === 'limited' ? 'provider_limited' : 'provider_offline';
+      return { ok: false, reason, evidence: failureEvidence(selectedPool, reason, config) };
+    }
+    return provisionConfig(parent, request, config, deps, selectedPool);
+  }
+
+  const auditedFamily = resolvePeerAuditProviderFamily(audited);
+  const crossConfigs = configs.filter((config) => config.providerFamily !== auditedFamily);
+  const sameConfigs = configs.filter((config) => config.providerFamily === auditedFamily);
+  const crossReady = crossConfigs.flatMap((config) => readyChildren(sessions, parent, config, deps.now(), request.identityPrompt))[0];
+  if (crossReady) {
+    const config = crossConfigs.find((candidate) => configMatchesSession(candidate, crossReady, request.identityPrompt))!;
+    return {
+      ok: true,
+      target: crossReady,
+      evidence: { selectedPool, selectedConfig: config, origin: 'reused' },
+      auditRoutingReason: 'cross_vendor_preferred',
+    };
+  }
+
+  const crossStatuses = crossConfigs.map((config) => configurationAvailability(
+    sessions,
+    parent,
+    config,
+    deps.now(),
+    request.identityPrompt,
+  ));
+  const provisionableCross = crossConfigs.find((_config, index) => crossStatuses[index] === 'available');
+  let crossFailure: SupervisionProvisionFailureReason | undefined;
+  let crossEvidence: SupervisionProvisioningEvidence | undefined;
+  if (provisionableCross) {
+    const provisioned = await provisionConfig(parent, request, provisionableCross, deps, selectedPool);
+    if (provisioned.ok) return { ...provisioned, auditRoutingReason: 'cross_vendor_preferred' };
+    crossFailure = provisioned.reason;
+    crossEvidence = provisioned.evidence;
+  }
+
+  const degradedReason = degradationFor(crossConfigs, crossStatuses, crossFailure);
+  if (request.strictCrossVendor) {
+    return {
+      ok: false,
+      reason: crossFailure ?? (crossStatuses.includes('limited') ? 'provider_limited'
+        : crossStatuses.includes('offline') ? 'provider_offline' : 'no_selected_config'),
+      evidence: { ...(crossEvidence ?? failureEvidence(selectedPool, 'no_selected_config')), degradedReason },
+      auditDegradedReason: degradedReason,
+    };
+  }
+
+  const sameReady = sameConfigs.flatMap((config) => readyChildren(deps.listSessions(), parent, config, deps.now(), request.identityPrompt))
+    .filter((session) => session.name !== audited.name)[0];
+  if (sameReady) {
+    const config = sameConfigs.find((candidate) => configMatchesSession(candidate, sameReady, request.identityPrompt))!;
+    return {
+      ok: true,
+      target: sameReady,
+      evidence: {
+        ...(crossEvidence ?? { selectedPool, selectedConfig: config }),
+        selectedConfig: config,
+        origin: 'reused',
+        createdSessionName: undefined,
+        degradedReason,
+      },
+      auditRoutingReason: 'same_family_degraded',
+      auditDegradedReason: degradedReason,
+    };
+  }
+
+  const sameConfig = sameConfigs[0];
+  if (sameConfig) {
+    const status = configurationAvailability(deps.listSessions(), parent, sameConfig, deps.now());
+    if (status === 'available') {
+      const provisioned = await provisionConfig(parent, request, sameConfig, deps, selectedPool);
+      if (provisioned.ok && provisioned.target.name !== audited.name) {
+        return {
+          ...provisioned,
+          evidence: { ...provisioned.evidence, degradedReason },
+          auditRoutingReason: 'same_family_degraded',
+          auditDegradedReason: degradedReason,
+        };
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    reason: crossFailure ?? 'no_selected_config',
+    evidence: {
+      ...(crossEvidence ?? failureEvidence(selectedPool, 'no_selected_config')),
+      degradedReason: 'no_independent_session',
+    },
+    auditDegradedReason: 'no_independent_session',
+  };
+}

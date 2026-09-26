@@ -35,6 +35,7 @@ import {
 import type { AgentMessage, MessageDelta } from '../../../shared/agent-message.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 // TODO: Replace 'your-provider' with the unique stable id for your provider.
 const PROVIDER_ID = 'your-provider';
@@ -77,6 +78,9 @@ export class YourProvider implements TransportProvider {
     // authored context still reaches the model. payload.systemText is a legacy
     // combined compatibility view and should not be used directly by new providers.
     contextSupport: 'full-normalized-context-injection',
+    // Declare how native agent tools are kept out of managed work; a new
+    // provider starts unenforceable until it proves a gate or a fence.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   };
 
   // ── Private state ──────────────────────────────────────────────────────────

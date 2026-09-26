@@ -19,6 +19,13 @@ describe('test session guard', () => {
     expect(isKnownTestSessionName('deck_perflat_abc123_w2')).toBe(true);
     expect(isKnownTestSessionName('deck_storm_abc123_probe')).toBe(true);
     expect(isKnownTestSessionName('imc_perf_test_abc123')).toBe(true);
+    expect(isKnownTestSessionName('deck_wtproj_brain')).toBe(true);
+    expect(isKnownTestSessionName('deck_sub_wtexec')).toBe(true);
+    expect(isKnownTestSessionName('deck_sub_wtaud')).toBe(true);
+    expect(isKnownTestProjectName('wtproj')).toBe(true);
+    // Real production names stay untouched.
+    expect(isKnownTestSessionName('deck_sub_wtexecx')).toBe(false);
+    expect(isKnownTestSessionName('deck_wtproject_brain')).toBe(false);
     expect(isKnownTestSessionName('deck_test_preview_abc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_test_p2p_workflow_abc123_brain')).toBe(true);
     expect(isKnownTestSessionName('imcodes-test-p2p-workflow-abc123')).toBe(true);

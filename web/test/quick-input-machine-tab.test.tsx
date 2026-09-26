@@ -23,6 +23,7 @@ import { QuickInputPanel } from '../src/components/QuickInputPanel.js';
 
 const machine = (over: Partial<MachineListItem>): MachineListItem => ({
   serverId: 'machine-1',
+  nodeId: '1000000001',
   refName: 'stable-ref',
   displayName: 'Office PC',
   online: true,
@@ -61,8 +62,8 @@ describe('QuickInputPanel controlled-node tab', () => {
       onInsertMachine,
       onClose,
       machines: [
-        machine({ serverId: 'online', refName: 'office-pc', displayName: 'Renamed Office PC' }),
-        machine({ serverId: 'offline', refName: 'lab-pc', displayName: 'Lab PC', online: false }),
+        machine({ serverId: 'online', nodeId: '1000000001', refName: 'office-pc', displayName: 'Renamed Office PC' }),
+        machine({ serverId: 'offline', nodeId: '1000000002', refName: 'lab-pc', displayName: 'Lab PC', online: false }),
       ],
     })} />);
 
@@ -70,15 +71,16 @@ describe('QuickInputPanel controlled-node tab', () => {
       .find((button) => button.textContent?.includes('quick_input.tab_machines'))!;
     fireEvent.click(tab);
     expect(document.body.textContent).toContain('Renamed Office PC');
-    expect(document.body.textContent).toContain('^^(office-pc)');
+    expect(document.body.textContent).toContain('^^(1000000001)');
+    expect(document.body.textContent).not.toContain('^^(office-pc)');
 
     const nodeButtons = Array.from(document.body.querySelectorAll<HTMLButtonElement>('.qp-machine-item'));
     expect(nodeButtons[1].disabled).toBe(false);
     expect(nodeButtons[1].classList.contains('is-offline')).toBe(true);
     fireEvent.click(nodeButtons[1]);
-    expect(onInsertMachine).toHaveBeenCalledWith('lab-pc', 'Lab PC');
+    expect(onInsertMachine).toHaveBeenCalledWith('1000000002', 'Lab PC');
     fireEvent.click(nodeButtons[0]);
-    expect(onInsertMachine).toHaveBeenCalledWith('office-pc', 'Renamed Office PC');
+    expect(onInsertMachine).toHaveBeenCalledWith('1000000001', 'Renamed Office PC');
     expect(onClose).toHaveBeenCalledTimes(2);
   });
 });

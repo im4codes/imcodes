@@ -2,6 +2,8 @@ import { formatLabel } from './format-label.js';
 import { getApiKey } from './api.js';
 import { pushDurableEventToWatch, syncSnapshotToWatch } from './watch-bridge.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 import { isRunningTimelineEvent, isSdkSubagentTimelineEvent } from './timeline-running.js';
 import {
   createTransportQueueReducerState,
@@ -58,6 +60,8 @@ export interface WatchSessionRow {
   isSubSession: boolean;
   parentTitle?: string;
   parentSessionName?: string;
+  activeModel?: string | null;
+  requestedModel?: string | null;
   isPinned?: boolean;
   previewText?: string;
   previewUpdatedAt?: number;
@@ -102,6 +106,8 @@ export interface WatchSessionInput {
   state: string;
   label?: string | null;
   parentSession?: string | null;
+  activeModel?: string | null;
+  requestedModel?: string | null;
   queueEpoch?: string | null;
   queueAuthorityId?: string | null;
   transportPendingMessageVersion?: number | null;
@@ -116,6 +122,8 @@ export interface WatchSubSessionInput {
   state?: string;
   label?: string | null;
   parentSession?: string | null;
+  activeModel?: string | null;
+  requestedModel?: string | null;
   queueEpoch?: string | null;
   queueAuthorityId?: string | null;
   transportPendingMessageVersion?: number | null;
@@ -173,8 +181,11 @@ const BADGE_MAP: Record<string, string> = {
   'gemini-sdk': 'gm',
   'grok-sdk': 'gr',
   'kimi-sdk': 'km',
+  [HERMES_AGENT_PROVIDER_ID]: 'he',
   'deepseek-harness': 'ds',
   pi: 'pi',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'cb',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'cb',
   'shell': 'sh',
   'script': 'sc',
 };
@@ -772,6 +783,8 @@ export class WatchProjectionStore {
       state: this.effectiveStateForSession(raw.name, baseState),
       agentBadge: badgeForType(raw.agentType ?? raw.sessionType),
       isSubSession: isSubSessionName(raw.name, raw.parentSession),
+      activeModel: raw.activeModel,
+      requestedModel: raw.requestedModel,
     };
     const preview = this.previewBySession.get(row.sessionName);
     if (preview) {
@@ -791,6 +804,8 @@ export class WatchProjectionStore {
       state: this.effectiveStateForSession(session.sessionName, baseState),
       agentBadge: badgeForType(session.sessionType),
       isSubSession: true,
+      activeModel: session.activeModel,
+      requestedModel: session.requestedModel,
     };
     const preview = this.previewBySession.get(row.sessionName);
     if (preview) {

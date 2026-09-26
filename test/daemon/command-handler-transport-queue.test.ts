@@ -1,8 +1,10 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import {
@@ -26,6 +28,7 @@ import { MEMORY_MANAGEMENT_ERROR_CODES } from '../../shared/memory-management.js
 import { MEMORY_FEATURE_CONFIG_MSG, MEMORY_FEATURE_FLAGS_BY_NAME, memoryFeatureFlagEnvKey } from '../../shared/feature-flags.js';
 import {
   MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_TOOL_NAMES,
 } from '../../shared/memory-mcp-contracts.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS } from '../../shared/timeline-history-errors.js';
@@ -41,12 +44,19 @@ import {
 } from '../../shared/preference-ingest.js';
 import { TIMELINE_CURSOR_DIRECTIONS, TIMELINE_MESSAGES, TIMELINE_RESPONSE_STATUS, TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { RETIRED_SUPERVISION_EXECUTION_AUDIT_READY_MARKER } from '../../shared/supervision-config.js';
+import {
+  AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
+  AGENT_DELEGATION_NOTIFICATION_RESULTS,
+} from '../../shared/agent-delegation.js';
 import { ALIAS_LEGEND_DIRECTIVE, buildAliasLegendLine } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from '../../src/daemon/alias-audit.js';
 import { TransportSessionRuntime } from '../../src/agent/transport-session-runtime.js';
 import type { TransportProvider } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
 import { resetMemoryFeatureConfigStoreForTests } from '../../src/store/memory-feature-config-store.js';
+import logger from '../../src/util/logger.js';
 
 const {
   getSessionMock,
@@ -61,6 +71,7 @@ const {
   terminalRequestSnapshotMock,
   supervisionDecideMock,
   queueTaskIntentMock,
+  warnExecutionPoolUnconfiguredMock,
   cancelForUserStopMock,
   registerTaskIntentMock,
   applySnapshotUpdateMock,
@@ -84,6 +95,7 @@ const {
   getProviderMock,
   ensureProviderConnectedMock,
   getPresetModelCatalogMock,
+  loadPresetsMock,
   lookupAttachmentMock,
 } = vi.hoisted(() => ({
   getSessionMock: vi.fn(),
@@ -98,6 +110,7 @@ const {
   terminalRequestSnapshotMock: vi.fn(),
   supervisionDecideMock: vi.fn(async () => ({ decision: 'complete', reason: 'ok', confidence: 0.9 })),
   queueTaskIntentMock: vi.fn(),
+  warnExecutionPoolUnconfiguredMock: vi.fn(),
   cancelForUserStopMock: vi.fn(),
   registerTaskIntentMock: vi.fn(),
   applySnapshotUpdateMock: vi.fn(),
@@ -137,6 +150,7 @@ const {
   getProviderMock: vi.fn(),
   ensureProviderConnectedMock: vi.fn(),
   getPresetModelCatalogMock: vi.fn(),
+  loadPresetsMock: vi.fn().mockResolvedValue([]),
   lookupAttachmentMock: vi.fn(() => undefined),
 }));
 
@@ -268,6 +282,7 @@ vi.mock('../../src/agent/provider-registry.js', () => ({
 vi.mock('../../src/daemon/cc-presets.js', async (importOriginal) => ({
   ...await importOriginal<typeof import('../../src/daemon/cc-presets.js')>(),
   getPresetModelCatalog: getPresetModelCatalogMock,
+  loadPresets: loadPresetsMock,
 }));
 
 vi.mock('../../src/context/memory-search.js', () => ({
@@ -347,6 +362,7 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
     cancelSession: vi.fn(),
     cancelForUserStop: cancelForUserStopMock,
     queueTaskIntent: queueTaskIntentMock,
+    warnExecutionPoolUnconfigured: warnExecutionPoolUnconfiguredMock,
     registerTaskIntent: registerTaskIntentMock,
     applySnapshotUpdate: applySnapshotUpdateMock,
     updateQueuedTaskIntent: updateQueuedTaskIntentMock,
@@ -356,10 +372,18 @@ vi.mock('../../src/daemon/supervision-automation.js', () => ({
 
 import {
   handleWebCommand,
+  listSessionModelsNow,
+  switchSessionModelNow,
+  switchSessionThinkingNow,
+  restartSessionNow,
   __invalidateTransportListModelsCacheForTests,
   __resetTransportListModelsCacheForTests,
   __resolveTransportListModelsCacheTtlMsForTests,
 } from '../../src/daemon/command-handler.js';
+import {
+  SUPERVISION_AUTOMATION_POOL_GATE_REASONS,
+  buildSupervisionPoolGateGuidance,
+} from '../../shared/supervision-execution-pool.js';
 import { getDefaultTimelineDetailStore } from '../../src/daemon/timeline-detail-store.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
@@ -738,7 +762,7 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.any(Object),
     );
     const stateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
-    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).toHaveProperty('pendingCount', 2);
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
     expect(emitMock).not.toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -1010,7 +1034,7 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.any(Object),
     );
     const answerStateCall = emitMock.mock.calls.find((call) => call[0] === 'deck_transport_brain' && call[1] === 'session.state');
-    expect(answerStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(answerStateCall?.[2]).toHaveProperty('pendingCount', 3);
     expect(answerStateCall?.[2]).not.toHaveProperty('pendingMessages');
     // Front placement alone only beats other QUEUED messages — it still waits
     // for the active turn, which is the very turn paused on this question. The
@@ -1121,6 +1145,386 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(stillPresent).toBe(false);
   });
 
+  it('undo_queued_message safely adopts and deletes a legacy NULL-recipient row for its original session', async () => {
+    const createdAt = Date.now() - 10_000;
+    const recipient = { sessionInstanceId: 'legacy-original', runtimeEpoch: 'legacy-runtime' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-delete',
+      commandId: 'legacy-delete',
+      text: 'legacy private text',
+      now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'legacy-delete', text: 'legacy private text' }),
+    });
+    const runtime = new TransportSessionRuntime(
+      makeRuntimeProvider(vi.fn().mockResolvedValue(undefined)),
+      'deck_transport_brain',
+      recipient,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch, createdAt,
+    });
+
+    try {
+      handleWebCommand({
+        type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+        clientMessageId: 'legacy-delete', commandId: 'cmd-legacy-delete',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'command.ack', commandId: 'cmd-legacy-delete', status: 'accepted',
+      }));
+      expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'legacy-delete', recipient)).toBeUndefined();
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('undo_queued_message purges an older same-name legacy ghost and stays idempotent', async () => {
+    const createdAt = Date.now();
+    const recipient = { sessionInstanceId: 'replacement-instance', runtimeEpoch: 'replacement-runtime' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-old-delete',
+      commandId: 'legacy-old-delete',
+      text: 'old private text must not cross sessions',
+      now: createdAt - 1,
+      privateMaterialJson: JSON.stringify({ text: 'old private text must not cross sessions' }),
+    });
+    const runtime = new TransportSessionRuntime(
+      makeRuntimeProvider(vi.fn().mockResolvedValue(undefined)),
+      'deck_transport_brain',
+      recipient,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch, createdAt,
+    });
+
+    try {
+      for (const commandId of ['cmd-old-delete-1', 'cmd-old-delete-2']) {
+        handleWebCommand({
+          type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+          clientMessageId: 'legacy-old-delete', commandId,
+        }, serverLink as any);
+        await flushAsync();
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'command.ack', commandId, status: 'accepted',
+        }));
+      }
+      expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'legacy-old-delete', recipient)).toBeUndefined();
+      expect(store.queueBelongsTo('deck_transport_brain', recipient)).toBe(true);
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('deletes a displayed canonical row when queue_meta is stranded on an older runtime epoch', async () => {
+    const createdAt = Date.now() - 10_000;
+    const canonical = { sessionInstanceId: 'stable-live-instance', runtimeEpoch: 'epoch-current' };
+    const staleEpoch = { sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: 'epoch-before-restart' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: staleEpoch,
+      clientMessageId: 'earlier-same-instance', text: 'survives the restart', now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({ text: 'survives the restart' }),
+    });
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: canonical,
+      clientMessageId: 'displayed-canonical-id', commandId: 'legacy-command-id',
+      text: 'visible card selected by its canonical id', now: createdAt + 2,
+      privateMaterialJson: JSON.stringify({ text: 'visible card selected by its canonical id' }),
+    });
+    expect(store.queueBelongsTo('deck_transport_brain', canonical)).toBe(false);
+    expect(store.readSnapshotForRecipient('deck_transport_brain', canonical).pendingMessageEntries)
+      .toEqual([expect.objectContaining({
+        clientMessageId: 'displayed-canonical-id', commandId: 'legacy-command-id',
+      })]);
+
+    const runtime = new TransportSessionRuntime(
+      makeRuntimeProvider(vi.fn().mockResolvedValue(undefined)),
+      'deck_transport_brain',
+      canonical,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', createdAt,
+      sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: canonical.runtimeEpoch,
+    });
+
+    try {
+      for (const commandId of ['delete-canonical-1', 'delete-canonical-2']) {
+        handleWebCommand({
+          type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+          clientMessageId: 'displayed-canonical-id', commandId,
+        }, serverLink as any);
+        await flushAsync();
+        expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+          type: 'command.ack', commandId, status: 'accepted',
+        }));
+      }
+      expect(store.queueBelongsTo('deck_transport_brain', canonical)).toBe(true);
+      expect(store.readSnapshotForRecipient('deck_transport_brain', canonical).pendingMessageEntries)
+        .toEqual([expect.objectContaining({ clientMessageId: 'earlier-same-instance' })]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'displayed-canonical-id', canonical))
+        .toBeUndefined();
+      expect(emitMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'session.state',
+        expect.objectContaining({
+          pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'earlier-same-instance' })],
+        }),
+        expect.any(Object),
+      );
+    } finally {
+      await runtime.kill();
+    }
+  });
+
+  it('undo_queued_message discards stale queue state when legacy ownership cannot be proven', async () => {
+    const cancelSpy = vi.spyOn(getTransportQueueStore(), 'cancelQueuedMessage');
+    const discardDurableQueueStateForRecipientConflict = vi.fn();
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      recipientIdentity: { sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch' },
+      adoptLegacyQueueRecipient: vi.fn(() => false),
+      discardDurableQueueStateForRecipientConflict,
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand({
+      type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-ambiguous', commandId: 'cmd-legacy-ambiguous-delete',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(cancelSpy).not.toHaveBeenCalled();
+    expect(discardDurableQueueStateForRecipientConflict).toHaveBeenCalledTimes(1);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-legacy-ambiguous-delete', status: 'accepted',
+    }));
+    cancelSpy.mockRestore();
+  });
+
+  it('durably prevents an immediate delete/send race from resurrecting the message', async () => {
+    const recipient = { sessionInstanceId: 'instance-race', runtimeEpoch: 'epoch-race' };
+    let pending = false;
+    let enqueueResult: ReturnType<ReturnType<typeof getTransportQueueStore>['enqueueWithCapacityEviction']> | undefined;
+    const send = vi.fn((text: string, clientMessageId: string) => {
+      pending = true;
+      enqueueResult = getTransportQueueStore().enqueueWithCapacityEviction({
+        sessionName: 'deck_transport_brain', recipient, clientMessageId, commandId: clientMessageId,
+        text, privateMaterialJson: JSON.stringify({ clientMessageId, text }),
+      });
+      return 'queued';
+    });
+    const removePendingMessage = vi.fn((clientMessageId: string) => {
+      if (!pending) return null;
+      pending = false;
+      return { clientMessageId, text: 'race message' };
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport', recipientIdentity: recipient,
+      send, removePendingMessage, pendingCount: 1, sending: true,
+      pendingEntries: [], pendingMessages: [], pendingVersion: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send', sessionName: 'deck_transport_brain', text: 'race message',
+      commandId: 'msg-race', clientMessageId: 'msg-race',
+    }, serverLink as any);
+    handleWebCommand({
+      type: 'session.undo_queued_message', sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-race', commandId: 'undo-race',
+    }, serverLink as any);
+    await flushAsync();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    expect(send).toHaveBeenCalledTimes(1);
+    expect(send.mock.results[0]?.type).toBe('return');
+    expect(enqueueResult?.cancelled).toBe(true);
+    expect(removePendingMessage).toHaveBeenCalledWith('msg-race');
+    expect(getTransportQueueStore().readSnapshot('deck_transport_brain').pendingMessageEntries)
+      .not.toEqual(expect.arrayContaining([expect.objectContaining({ clientMessageId: 'msg-race' })]));
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'command.ack', commandId: 'undo-race', status: 'accepted',
+    }));
+  });
+
+  it('undo_queued_message deletes an EXPIRED handoff_inflight row that the runtime no longer knows', async () => {
+    // Field defect (172.16.253.217): client_message_id 535f388c-…, status
+    // handoff_inflight, handoff_started_at 1788246218272, expires_at
+    // 1788246278272 — expired two days earlier — still sitting in queue_entries
+    // with no delivery tombstone. The handler only counted `status === 'queued'`
+    // as present in the store, so with an empty runtime BOTH removed and
+    // queuedInStore were false. It took the "already absent" success path, never
+    // called store.drop, and the authoritative row survived — so the next
+    // snapshot resurrected the bubble the user had just deleted.
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-expired-handoff',
+      commandId: 'msg-expired-handoff',
+      text: '要时刻关注服务器CPU和内存变化',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-expired-handoff', secret: 'private-material' }),
+    });
+    // Claim it, then let the lease expire (started two days ago, 60s lease).
+    const startedAt = 1788246218272;
+    store.markHandoffInFlight('deck_transport_brain', ['msg-expired-handoff'], 60_000, startedAt);
+    const claimed = store.readSnapshot('deck_transport_brain').pendingMessageEntries
+      .find((e) => e.clientMessageId === 'msg-expired-handoff');
+    expect(claimed?.status, 'fixture must reproduce the field status').toBe('handoff_inflight');
+
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null), // restarted daemon: nothing in memory
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-expired-handoff', commandId: 'cmd-undo-expired' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-expired', status: 'accepted' }),
+    );
+    const survivors = store.readSnapshot('deck_transport_brain').pendingMessageEntries
+      .filter((e) => e.clientMessageId === 'msg-expired-handoff');
+    expect(
+      survivors.length,
+      'the authoritative row must be gone, or the next snapshot resurrects it',
+    ).toBe(0);
+  });
+
+  it('undo_queued_message refuses too_late for a LIVE handoff instead of faking a delete', async () => {
+    // The opposite failure from the stale case: an entry inside a live handoff
+    // lease may already be at the provider. Dropping it would ack a successful
+    // delete for a message that still gets delivered. The race must be explicit.
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'msg-live-handoff',
+      commandId: 'msg-live-handoff',
+      text: 'in flight right now',
+      placement: 'normal',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'msg-live-handoff' }),
+    });
+    store.markHandoffInFlight('deck_transport_brain', ['msg-live-handoff'], 60_000, Date.now());
+
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-live-handoff', commandId: 'cmd-undo-live' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'cmd-undo-live', status: 'error' }),
+    );
+    expect(serverLink.send).not.toHaveBeenCalledWith(
+      expect.objectContaining({ commandId: 'cmd-undo-live', status: 'accepted' }),
+    );
+    // The authoritative row survives: it is genuinely being delivered.
+    const survivors = store.readSnapshot('deck_transport_brain').pendingMessageEntries
+      .filter((e) => e.clientMessageId === 'msg-live-handoff');
+    expect(survivors.length, 'a live handoff must not be silently dropped').toBe(1);
+  });
+
+  // If the live runtime proves a different canonical identity, the daemon must
+  // still avoid mis-delivery: B never drains A's private row. It may discard the
+  // stale aggregate so the reusable session name can recover instead of leaving
+  // the transport queue permanently unavailable.
+  it('undo_queued_message lets a same-name NEW instance self-heal by discarding the stale aggregate', async () => {
+    const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+    const B = { sessionInstanceId: 'instance-B', runtimeEpoch: 'epoch-B' };
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      recipient: A,
+      clientMessageId: 'msg-owned-by-a',
+      commandId: 'msg-owned-by-a',
+      text: 'queued for A',
+      placement: 'normal',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      recipientIdentity: B, // a replacement runtime under the same name
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-owned-by-a', commandId: 'cmd-undo-foreign' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(
+      getTransportQueueStore().readSnapshot('deck_transport_brain')
+        .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-owned-by-a'),
+      "B must not drain A's queued work; the stale aggregate is discarded instead",
+    ).toBe(false);
+    expect(getTransportQueueStore().queueBelongsTo('deck_transport_brain', B)).toBe(true);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-undo-foreign',
+      status: 'accepted',
+    }));
+  });
+
+  it('undo_queued_message still lets the exact live owner drop its own row', async () => {
+    const A = { sessionInstanceId: 'instance-A', runtimeEpoch: 'epoch-A' };
+    getTransportQueueStore().enqueue({
+      sessionName: 'deck_transport_brain',
+      recipient: A,
+      clientMessageId: 'msg-owned-by-a2',
+      commandId: 'msg-owned-by-a2',
+      text: 'queued for A',
+      placement: 'normal',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      removePendingMessage: vi.fn(() => null),
+      recipientIdentity: A,
+      pendingCount: 0,
+      sending: false,
+    });
+
+    handleWebCommand(
+      { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-owned-by-a2', commandId: 'cmd-undo-own' },
+      serverLink as any,
+    );
+    await flushAsync();
+
+    expect(serverLink.send).toHaveBeenCalledWith(
+      expect.objectContaining({ type: 'command.ack', commandId: 'cmd-undo-own', status: 'accepted' }),
+    );
+    expect(
+      getTransportQueueStore().readSnapshot('deck_transport_brain')
+        .pendingMessageEntries.some((entry) => entry.clientMessageId === 'msg-owned-by-a2'),
+    ).toBe(false);
+  });
+
   it('undo_queued_message acks accepted (idempotent) when neither the runtime nor the store has the id', async () => {
     // Deleting a queued message is idempotent: if it is already absent, the goal
     // is met. The frontend now ALWAYS sends the undo (even for an entry that only
@@ -1163,7 +1567,7 @@ describe('handleWebCommand transport queue behavior', () => {
       pendingCount: 0,
       sending: false,
     });
-    const dropSpy = vi.spyOn(getTransportQueueStore(), 'drop').mockImplementation(() => { throw new Error('sqlite busy'); });
+    const dropSpy = vi.spyOn(getTransportQueueStore(), 'cancelQueuedMessage').mockImplementation(() => { throw new Error('sqlite busy'); });
     try {
       handleWebCommand(
         { type: 'session.undo_queued_message', sessionName: 'deck_transport_brain', clientMessageId: 'msg-drop-throw', commandId: 'cmd-undo-drop-throw' },
@@ -1231,6 +1635,8 @@ describe('handleWebCommand transport queue behavior', () => {
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
       text: 'Started a fresh conversation',
+      noticeCode: DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED,
+      noticeParams: {},
       streaming: false,
       memoryExcluded: true,
     }, expect.objectContaining({ source: 'daemon' }));
@@ -1260,6 +1666,43 @@ describe('handleWebCommand transport queue behavior', () => {
       projectDir: '/proj',
       requestedModel: 'gpt-5.4-mini',
       effort: 'high',
+    }));
+  });
+
+  it('passes a validated selected-file identity into the initial SDK launch', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'identity startup',
+      dir: '/proj',
+      agentType: 'codex-sdk',
+      identityPrompt: 'Identity loaded from a selected file.',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_identity_startup_brain',
+      agentType: 'codex-sdk',
+      identityPrompt: 'Identity loaded from a selected file.',
+    }));
+  });
+
+  it('rejects an invalid startup identity before creating an SDK runtime', async () => {
+    handleWebCommand({
+      type: 'session.start',
+      project: 'invalid identity startup',
+      dir: '/proj',
+      agentType: 'codex-sdk',
+      // One past the session cap, from the constant: a literal here silently
+      // becomes an in-budget value the moment the cap is raised, and the test
+      // then asserts that a VALID identity is rejected.
+      identityPrompt: 'x'.repeat(SESSION_IDENTITY_SESSION_MAX_CHARS + 1),
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).not.toHaveBeenCalled();
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'session.error',
+      project: 'invalid_identity_startup',
     }));
   });
 
@@ -1354,6 +1797,42 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('providerResumeId');
     expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-grok', status: 'accepted' });
+  });
+
+  it('dispatches /clear as a fresh CodeBuddy relaunch without the old resume id', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'codebuddy-cn',
+      runtimeType: 'transport',
+      state: 'running',
+      projectDir: '/proj',
+      providerSessionId: 'route-codebuddy-old',
+      providerResumeId: 'resume-codebuddy-old',
+      requestedModel: 'hy3',
+    });
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-codebuddy-old',
+      send: vi.fn(() => 'queued'),
+      pendingCount: 1,
+      pendingMessages: ['a'],
+    });
+
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: '/clear', commandId: 'cmd-clear-codebuddy' }, serverLink as any);
+    await flushAsync();
+
+    expect(stopTransportRuntimeSessionMock).toHaveBeenCalledWith('deck_transport_brain');
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_transport_brain',
+      agentType: 'codebuddy-cn',
+      projectDir: '/proj',
+      requestedModel: 'hy3',
+      fresh: true,
+    }));
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('providerResumeId');
+    expect(launchTransportSessionMock.mock.calls.at(-1)?.[0]).not.toHaveProperty('bindExistingKey');
+    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', { commandId: 'cmd-clear-codebuddy', status: 'accepted' });
   });
 
   it('dispatches /clear as a fresh openclaw relaunch that preserves the provider key', async () => {
@@ -1527,8 +2006,16 @@ describe('handleWebCommand transport queue behavior', () => {
       'session.state',
       expect.objectContaining({
         state: 'idle',
-        pendingMessageEntries: [expect.objectContaining({ clientMessageId: 'sqlite-queued', text: 'sqlite queued' })],
-        pendingMessageVersion: committed.pendingMessageVersion,
+        // RETIRED (R2): this previously expected the SQLite-only entry to SURVIVE
+        // cancel. It did so only because clearResend skipped the durable store
+        // whenever the in-memory mirror was empty. Cancel routes through the
+        // transport stop path, whose whole purpose is dropping queued work (the
+        // `user_stopped` drop reason exists for exactly this), so the durable row
+        // is now dropped consistently with the in-memory one. The epoch and
+        // authority id are still preserved -- only a session REMOVAL rotates
+        // those -- and the version bumps because the queue really did change.
+        pendingMessageEntries: [],
+        pendingMessageVersion: expect.any(Number),
         queueEpoch: committed.queueEpoch,
         queueAuthorityId: committed.queueAuthorityId,
         queueSnapshot: expect.objectContaining({
@@ -1543,7 +2030,9 @@ describe('handleWebCommand transport queue behavior', () => {
       && call[1] === 'session.state'
       && (call[2] as Record<string, unknown>)?.state === 'idle'
     ));
-    expect(idleStateCall?.[2]).not.toHaveProperty('pendingCount');
+    // Retired with the block above: the durable row is dropped by stop, so the
+    // idle snapshot reports an empty queue rather than the orphaned entry.
+    expect(idleStateCall?.[2]).toHaveProperty('pendingCount', 0);
     expect(idleStateCall?.[2]).not.toHaveProperty('pendingMessages');
     const stopFeedbackOrder = firstInvocationOrder((call) =>
       call[0] === 'deck_transport_brain'
@@ -1762,6 +2251,42 @@ describe('handleWebCommand transport queue behavior', () => {
       expect.objectContaining({ state: 'queued' }),
       expect.anything(),
     );
+  });
+
+  it('forwards only the exact composer append delivery mode into runtime metadata', async () => {
+    const send = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send,
+      pendingCount: 0,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'append now',
+      commandId: 'cmd-composer-append',
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+    }, serverLink as any);
+    await flushAsync();
+    expect(send).toHaveBeenCalledWith(
+      'append now',
+      'cmd-composer-append',
+      undefined,
+      undefined,
+      { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND },
+    );
+
+    send.mockClear();
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'safe default',
+      commandId: 'cmd-composer-unknown',
+      deliveryMode: 'unexpected-mode',
+    }, serverLink as any);
+    await flushAsync();
+    expect(send).toHaveBeenCalledWith('safe default', 'cmd-composer-unknown');
   });
 
   it('injects a numbered temporary-upload reminder for the agent without changing the transport timeline', async () => {
@@ -2098,7 +2623,14 @@ describe('handleWebCommand transport queue behavior', () => {
 
   it('acks ordinary transport sends before provider send-start settles', async () => {
     vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '30');
-    const providerSend = vi.fn(() => new Promise(() => {}));
+    let settleProviderSend!: () => void;
+    let providerSendSettled = false;
+    const providerSend = vi.fn(() => new Promise<void>((resolve) => {
+      settleProviderSend = () => {
+        providerSendSettled = true;
+        resolve();
+      };
+    }));
     const runtime = new TransportSessionRuntime(makeRuntimeProvider(providerSend), 'deck_transport_brain');
     await runtime.initialize({
       sessionKey: 'deck_transport_brain',
@@ -2113,22 +2645,38 @@ describe('handleWebCommand transport queue behavior', () => {
       text: 'ordinary provider send-start should not hold ack',
       commandId: 'cmd-provider-start-hang',
     }, serverLink as any);
-    await flushAsync();
-    await flushAsync();
+    try {
+      await waitForAsync(() => providerSend.mock.calls.length === 1);
 
-    expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
-      commandId: 'cmd-provider-start-hang',
-      status: 'accepted',
-    });
-    expect(providerSend).toHaveBeenCalledWith('sess-1', expect.objectContaining({
-      userMessage: 'ordinary provider send-start should not hold ack',
-    }));
-    const ackOrder = firstInvocationOrder((call) =>
-      call[0] === 'deck_transport_brain'
-      && call[1] === 'command.ack'
-      && (call[2] as Record<string, unknown>)?.commandId === 'cmd-provider-start-hang',
-    );
-    expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
+      expect(providerSendSettled).toBe(false);
+      expect(runtime.sending).toBe(true);
+      expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'command.ack', {
+        commandId: 'cmd-provider-start-hang',
+        status: 'accepted',
+      });
+      expect(providerSend).toHaveBeenCalledWith('sess-1', expect.objectContaining({
+        userMessage: 'ordinary provider send-start should not hold ack',
+      }));
+      const ackOrder = firstInvocationOrder((call) =>
+        call[0] === 'deck_transport_brain'
+        && call[1] === 'command.ack'
+        && (call[2] as Record<string, unknown>)?.commandId === 'cmd-provider-start-hang',
+      );
+      expect(ackOrder).toBeLessThan(providerSend.mock.invocationCallOrder[0]);
+    } finally {
+      // Do not leave a deliberately unresolved provider send, its watchdog,
+      // and an active runtime turn alive after this test. Under a loaded test
+      // worker that leaked work can be starved far beyond the 50ms bounded
+      // timeout and make an unrelated file-level run look deterministically
+      // hung. The deferred still proves the receipt ACK while send-start is
+      // unsettled; explicit settlement makes the test lifecycle bounded.
+      settleProviderSend?.();
+      await flushAsync();
+      await runtime.kill();
+    }
+
+    expect(providerSendSettled).toBe(true);
+    expect(runtime.sending).toBe(false);
   });
 
   it('acks before bootstrap/recall finish and still sends the SDK turn without recall after failures', async () => {
@@ -2770,6 +3318,34 @@ describe('handleWebCommand transport queue behavior', () => {
     });
   });
 
+  it('echoes request and session scope when listing owner CC presets', async () => {
+    loadPresetsMock.mockResolvedValueOnce([{
+      name: 'MiniMax Owner Preset',
+      env: { ANTHROPIC_API_KEY: 'owner-secret' },
+      defaultModel: 'MiniMax-M2.7',
+    }]);
+
+    handleWebCommand({
+      type: 'cc.presets.list',
+      requestId: 'presets-participant',
+      sessionName: 'deck_transport_brain',
+    }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'presets-participant'
+    )));
+
+    expect(serverLink.send).toHaveBeenCalledWith({
+      type: 'cc.presets.list_response',
+      requestId: 'presets-participant',
+      sessionName: 'deck_transport_brain',
+      presets: [{
+        name: 'MiniMax Owner Preset',
+        env: { ANTHROPIC_API_KEY: 'owner-secret' },
+        defaultModel: 'MiniMax-M2.7',
+      }],
+    });
+  });
+
   it('allows forced transport.list_models to connect a missing local provider', async () => {
     const listModels = vi.fn().mockResolvedValue({ models: [{ id: 'live-model' }] });
     getProviderMock.mockReturnValue(undefined);
@@ -2811,6 +3387,52 @@ describe('handleWebCommand transport queue behavior', () => {
       models: [{ id: 'grok-build' }],
       defaultModel: 'grok-build',
     }));
+  });
+
+  it.each([
+    [Object.assign(new Error('ENOENT /secret/install/path'), { code: 'ENOENT' }), 'unavailable or incompatible', 'cli_unavailable_or_incompatible'],
+    [{ code: 'AUTH_FAILED', message: 'token=super-secret', recoverable: false }, 'authentication is required', 'authentication'],
+    [{ code: 'CONFIG_ERROR', message: 'api_key=super-secret', recoverable: false }, 'unavailable or incompatible', 'cli_unavailable_or_incompatible'],
+    [{ code: 'RATE_LIMITED', message: 'bearer=super-secret', recoverable: true }, 'temporarily rate limited', 'rate_limited'],
+    [new Error('generic failure /secret/install/path token=super-secret'), 'model discovery failed', 'provider_failure'],
+  ])('surfaces and logs a bounded Hermes model-discovery failure without echoing provider secrets', async (failure, expected, failureClass) => {
+    getProviderMock.mockReturnValue(undefined);
+    ensureProviderConnectedMock.mockRejectedValue(failure);
+
+    handleWebCommand({
+      type: 'transport.list_models',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestId: 'hermes-model-failure',
+      force: true,
+    }, serverLink as any);
+    await waitForAsync(() => serverLink.send.mock.calls.some((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'hermes-model-failure'
+    )));
+
+    expect(ensureProviderConnectedMock).toHaveBeenCalledWith(HERMES_AGENT_PROVIDER_ID, {});
+    const response = serverLink.send.mock.calls.find((call) => (
+      (call[0] as Record<string, unknown>).requestId === 'hermes-model-failure'
+    ))?.[0] as Record<string, unknown>;
+    expect(response).toMatchObject({
+      type: 'transport.models_response',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestId: 'hermes-model-failure',
+      models: [],
+      isAuthenticated: false,
+      error: expect.stringContaining(expected),
+    });
+    expect(JSON.stringify(response)).not.toContain('super-secret');
+    expect(JSON.stringify(response)).not.toContain('/secret/install/path');
+    expect(JSON.stringify(response)).not.toContain('Unsupported agentType');
+    expect(logger.debug).toHaveBeenCalledWith({
+      provider: HERMES_AGENT_PROVIDER_ID,
+      failureClass,
+    }, 'Hermes Agent auto-connect for model listing failed');
+    const serializedHermesLogs = JSON.stringify((logger.debug as ReturnType<typeof vi.fn>).mock.calls.filter((call) => (
+      call[1] === 'Hermes Agent auto-connect for model listing failed'
+    )));
+    expect(serializedHermesLogs).not.toContain('super-secret');
+    expect(serializedHermesLogs).not.toContain('/secret/install/path');
   });
 
   it('does not auto-connect qoder-sdk for forced transport.list_models', async () => {
@@ -3063,7 +3685,13 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'assistant.text',
-      { text: '⚠️ Compact failed: provider does not support compact', streaming: false, memoryExcluded: true },
+      {
+        text: '⚠️ Compact failed: provider does not support compact',
+        noticeCode: DAEMON_USER_NOTICE_CODE.COMPACT_FAILED,
+        noticeParams: { detail: 'provider does not support compact' },
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     const compactUserMessages = emitMock.mock.calls.filter((call) =>
@@ -3373,7 +4001,7 @@ describe('handleWebCommand transport queue behavior', () => {
       .find((entry) => entry.commandId === 'cmd-offline-1');
     expect(offlineEntry?.clientMessageId).toEqual(expect.any(String));
     expect(offlineEntry?.clientMessageId).not.toBe('cmd-offline-1');
-    expect(offlineStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(offlineStateCall?.[2]).toHaveProperty('pendingCount', 1);
     expect(offlineStateCall?.[2]).not.toHaveProperty('pendingMessages');
 
     // 5. The entry is actually sitting in the resend queue for later drain.
@@ -3498,51 +4126,46 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('tracks supervision task intents while offline so Auto still follows the resent turn', async () => {
+  it('starts no legacy supervision run for a Brain on a pairs-engine project', async () => {
     const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
     clearAllResend();
-
-    getSessionMock.mockReturnValue({
-      name: 'deck_transport_brain',
-      projectName: 'transport',
-      role: 'brain',
-      agentType: 'claude-code-sdk',
-      runtimeType: 'transport',
-      providerId: 'claude-code-sdk',
-      state: 'idle',
-      transportConfig: {
-        supervision: {
-          mode: 'supervised',
-          backend: 'codex-sdk',
-          model: 'gpt-5.4',
-          timeoutMs: 12_000,
-          promptVersion: 'supervision_decision_v1',
-          maxParseRetries: 1,
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    try {
+      getSessionMock.mockReturnValue({
+        name: 'deck_transport_brain',
+        projectName: 'transport',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        providerId: 'claude-code-sdk',
+        state: 'idle',
+        transportConfig: {
+          supervision: {
+            mode: 'supervised_audit',
+            backend: 'codex-sdk',
+            model: 'gpt-5.4',
+            timeoutMs: 12_000,
+            promptVersion: 'supervision_decision_v1',
+            maxParseRetries: 1,
+          },
         },
-      },
-    });
-    getTransportRuntimeMock.mockReturnValue(undefined);
-
-    handleWebCommand({
-      type: 'session.send',
-      session: 'deck_transport_brain',
-      text: 'offline supervised task',
-      commandId: 'cmd-offline-supervised',
-    }, serverLink as any);
-    await flushAsync();
-
-    expect(queueTaskIntentMock).toHaveBeenCalledWith(
-      'deck_transport_brain',
-      'cmd-offline-supervised',
-      'offline supervised task',
-      expect.objectContaining({
-        mode: 'supervised',
-        backend: 'codex-sdk',
-        model: 'gpt-5.4',
-      }),
-    );
-
-    clearAllResend();
+      });
+      getTransportRuntimeMock.mockReturnValue(undefined);
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_transport_brain',
+        text: 'implement the export feature',
+        commandId: 'cmd-pairs-brain',
+      }, serverLink as any);
+      await flushAsync();
+      expect(queueTaskIntentMock).not.toHaveBeenCalledWith('deck_transport_brain', 'cmd-pairs-brain', expect.anything(), expect.anything());
+      expect(registerTaskIntentMock).not.toHaveBeenCalledWith('deck_transport_brain', 'cmd-pairs-brain', expect.anything(), expect.anything());
+    } finally {
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+      clearAllResend();
+    }
   });
 
   it('treats transport runtimes without a provider session id as unavailable', async () => {
@@ -3616,7 +4239,7 @@ describe('handleWebCommand transport queue behavior', () => {
       .find((entry) => entry.commandId === 'cmd-stale-runtime');
     expect(staleRuntimeEntry?.clientMessageId).toEqual(expect.any(String));
     expect(staleRuntimeEntry?.clientMessageId).not.toBe('cmd-stale-runtime');
-    expect(staleRuntimeStateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(staleRuntimeStateCall?.[2]).toHaveProperty('pendingCount', 1);
     expect(staleRuntimeStateCall?.[2]).not.toHaveProperty('pendingMessages');
     expect(serverLink.send).toHaveBeenCalledWith({
       type: 'command.ack',
@@ -3628,60 +4251,6 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(getResendEntries('deck_transport_brain')).toEqual([
       expect.objectContaining({ text: 'hello after restart', commandId: 'cmd-stale-runtime' }),
     ]);
-    clearAllResend();
-  });
-
-  it('tracks supervision task intents when the runtime is queued for auto-resume', async () => {
-    const { clearAllResend } = await import('../../src/daemon/transport-resend-queue.js');
-    clearAllResend();
-
-    getSessionMock.mockReturnValue({
-      name: 'deck_transport_brain',
-      projectName: 'transport',
-      role: 'brain',
-      agentType: 'claude-code-sdk',
-      runtimeType: 'transport',
-      providerId: 'claude-code-sdk',
-      state: 'idle',
-      transportConfig: {
-        supervision: {
-          mode: 'supervised',
-          backend: 'codex-sdk',
-          model: 'gpt-5.4',
-          timeoutMs: 12_000,
-          promptVersion: 'supervision_decision_v1',
-          maxParseRetries: 1,
-        },
-      },
-    });
-    getTransportRuntimeMock.mockReturnValue({
-      providerSessionId: null,
-      send: vi.fn(() => {
-        throw new Error('TransportSessionRuntime not initialized — call initialize() first');
-      }),
-      pendingCount: 0,
-      pendingMessages: [],
-    });
-
-    handleWebCommand({
-      type: 'session.send',
-      session: 'deck_transport_brain',
-      text: 'resume supervised task',
-      commandId: 'cmd-resume-supervised',
-    }, serverLink as any);
-    await flushAsync();
-
-    expect(queueTaskIntentMock).toHaveBeenCalledWith(
-      'deck_transport_brain',
-      'cmd-resume-supervised',
-      'resume supervised task',
-      expect.objectContaining({
-        mode: 'supervised',
-        backend: 'codex-sdk',
-        model: 'gpt-5.4',
-      }),
-    );
-
     clearAllResend();
   });
 
@@ -3774,7 +4343,7 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
-  it('registers eligible supervised task messages immediately when the transport send dispatches now', async () => {
+  it('keeps ordinary Brain execution free of automatic supervision contracts while mode is off', async () => {
     const transportSend = vi.fn(() => 'sent');
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -3783,19 +4352,7 @@ describe('handleWebCommand transport queue behavior', () => {
       agentType: 'claude-code-sdk',
       runtimeType: 'transport',
       state: 'running',
-      transportConfig: {
-        supervision: {
-          mode: 'supervised_audit',
-          backend: 'codex-sdk',
-          model: 'gpt-5.3-codex-spark',
-          timeoutMs: 12_000,
-          promptVersion: 'supervision_decision_v1',
-          maxParseRetries: 1,
-          auditMode: 'audit',
-          maxAuditLoops: 2,
-          taskRunPromptVersion: 'task_run_status_v1',
-        },
-      },
+      transportConfig: { supervision: { mode: 'off' } },
     });
     getTransportRuntimeMock.mockReturnValue({
       providerSessionId: 'route-transport',
@@ -3806,18 +4363,16 @@ describe('handleWebCommand transport queue behavior', () => {
     handleWebCommand({
       type: 'session.send',
       session: 'deck_transport_brain',
-      text: 'implement the feature',
-      commandId: 'cmd-heavy',
+      text: 'implement this directly',
+      commandId: 'cmd-supervision-off',
     }, serverLink as any);
     await flushAsync();
 
-    expect(transportSend).toHaveBeenCalledWith('implement the feature', 'cmd-heavy');
-    expect(registerTaskIntentMock).toHaveBeenCalledWith(
-      'deck_transport_brain',
-      'cmd-heavy',
-      'implement the feature',
-      expect.objectContaining({ mode: 'supervised_audit' }),
-    );
+    expect(transportSend).toHaveBeenCalled();
+    const args = transportSend.mock.calls[0] ?? [];
+    expect(args.map(String).join('\n')).not.toContain('supervision_orchestrator_context_v1');
+    expect(args.map(String).join('\n')).not.toContain('IMCODES_EXEC');
+    expect(registerTaskIntentMock).not.toHaveBeenCalled();
     expect(queueTaskIntentMock).not.toHaveBeenCalled();
   });
 
@@ -3859,6 +4414,103 @@ describe('handleWebCommand transport queue behavior', () => {
     );
   });
 
+  describe('session_model control (MCP, by exact session name)', () => {
+    it('switches another session\'s model directly, with no message involved', async () => {
+      const setAgentId = vi.fn();
+      const record = {
+        name: 'deck_sub_cc1',
+        projectName: 'other_project',
+        role: 'w1',
+        agentType: 'cursor-headless',
+        runtimeType: 'transport',
+        state: 'running',
+        activeModel: 'auto',
+      };
+      getSessionMock.mockReturnValue(record);
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-cc1', setAgentId, pendingCount: 0 });
+
+      const result = await switchSessionModelNow('deck_sub_cc1', ' gpt-6-sol ');
+
+      expect(result).toEqual({ ok: true, sessionName: 'deck_sub_cc1', agentType: 'cursor-headless', model: 'gpt-6-sol', previousModel: 'auto', applied: 'live' });
+      expect(setAgentId).toHaveBeenCalledWith('gpt-6-sol');
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_sub_cc1', requestedModel: 'gpt-6-sol', activeModel: 'gpt-6-sol' }));
+      expect(emitMock).toHaveBeenCalledWith('deck_sub_cc1', 'assistant.text', expect.objectContaining({ text: 'Switched model to gpt-6-sol' }), expect.any(Object));
+    });
+
+    it('switches an idle session that is not loaded: its next start uses the new model', async () => {
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_idle', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'idle', activeModel: 'opus',
+      });
+      getTransportRuntimeMock.mockReturnValue(undefined);
+
+      const result = await switchSessionModelNow('deck_sub_idle', 'sonnet');
+
+      expect(result).toMatchObject({ ok: true, model: 'sonnet', previousModel: 'opus', applied: 'next_start' });
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ name: 'deck_sub_idle', requestedModel: 'sonnet' }));
+    });
+
+    it('refuses an unknown model for a validated provider and returns the valid list', async () => {
+      const setAgentId = vi.fn();
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running',
+      });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-cc1', setAgentId, pendingCount: 0 });
+
+      const result = await switchSessionModelNow('deck_sub_cc1', 'gpt-6-sol');
+
+      expect(result).toMatchObject({ ok: false, code: 'unknown_model', error: 'Unknown Claude model: gpt-6-sol' });
+      expect((result as { availableModels?: string[] }).availableModels).toEqual(expect.arrayContaining(['sonnet']));
+      expect(setAgentId).not.toHaveBeenCalled();
+    });
+
+    it('reports a missing session or a terminal session clearly', async () => {
+      getSessionMock.mockReturnValue(undefined);
+      await expect(switchSessionModelNow('deck_sub_nope', 'x')).resolves.toMatchObject({ ok: false, code: 'session_not_found' });
+      getSessionMock.mockReturnValue({ name: 'deck_p_w1', projectName: 'p', role: 'w1', agentType: 'claude-code', runtimeType: 'process', state: 'running' });
+      await expect(switchSessionModelNow('deck_p_w1', 'sonnet')).resolves.toMatchObject({ ok: false, code: 'unsupported_runtime' });
+    });
+
+    it('lists what a Claude session accepts, with its current model', async () => {
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_cc1', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'sonnet', effort: 'medium',
+      });
+      await expect(listSessionModelsNow('deck_sub_cc1')).resolves.toMatchObject({
+        ok: true, agentType: 'claude-code-sdk', currentModel: 'sonnet', currentThinking: 'medium', thinkingLevels: ['low', 'medium', 'high', 'max'], acceptsAnyModel: false, models: expect.arrayContaining(['sonnet', 'haiku']),
+      });
+    });
+
+    it('switches thinking only, live when the transport runtime is loaded', async () => {
+      const setEffort = vi.fn();
+      getSessionMock.mockReturnValue({ name: 'deck_sub_effort', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', effort: 'low' });
+      getTransportRuntimeMock.mockReturnValue({ setEffort, pendingCount: 0 });
+      await expect(switchSessionModelNow('deck_sub_effort', undefined, 'high')).resolves.toMatchObject({ ok: true, thinking: 'high', previousThinking: 'low', applied: 'live' });
+      expect(setEffort).toHaveBeenCalledWith('high');
+    });
+
+    it('switches both in model-then-thinking order', async () => {
+      const setAgentId = vi.fn();
+      const setEffort = vi.fn();
+      getSessionMock.mockReturnValue({ name: 'deck_sub_both', projectName: 'p', role: 'w1', agentType: 'claude-code-sdk', runtimeType: 'transport', state: 'running', activeModel: 'opus', effort: 'low' });
+      getTransportRuntimeMock.mockReturnValue({ setAgentId, setEffort, pendingCount: 0 });
+      await expect(switchSessionModelNow('deck_sub_both', 'sonnet', 'max')).resolves.toMatchObject({ ok: true, model: 'sonnet', thinking: 'max', thinkingApplied: 'live' });
+      expect(setAgentId).toHaveBeenCalledWith('sonnet');
+      expect(setEffort).toHaveBeenCalledWith('max');
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ requestedModel: 'sonnet' }));
+      expect(upsertSessionMock).toHaveBeenCalledWith(expect.objectContaining({ effort: 'max' }));
+    });
+
+    it('returns the agent-supported levels for an invalid thinking request', async () => {
+      getSessionMock.mockReturnValue({ name: 'deck_sub_bad_effort', projectName: 'p', role: 'w1', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' });
+      getTransportRuntimeMock.mockReturnValue(undefined);
+      await expect(switchSessionThinkingNow('deck_sub_bad_effort', 'adaptive')).resolves.toMatchObject({ ok: false, code: 'unknown_thinking_level', availableThinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh'] });
+    });
+
+    it('rejects thinking control for agents without effort support', async () => {
+      getSessionMock.mockReturnValue({ name: 'deck_sub_unsupported_effort', projectName: 'p', role: 'w1', agentType: 'cursor-headless', runtimeType: 'transport', state: 'idle' });
+      await expect(switchSessionThinkingNow('deck_sub_unsupported_effort', 'high')).resolves.toMatchObject({ ok: false, code: 'thinking_unsupported' });
+    });
+  });
+
   it('updates live supervision state when the browser patches transportConfig', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_transport_brain',
@@ -3893,6 +4545,74 @@ describe('handleWebCommand transport queue behavior', () => {
         backend: 'codex-sdk',
       }),
     );
+  });
+
+  it('ignores automatic-supervision enablement for a non-Brain main session', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_worker',
+      projectName: 'transport',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: null,
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_transport_worker',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+        },
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSessionMock).not.toHaveBeenCalled();
+    expect(applySnapshotUpdateMock).not.toHaveBeenCalled();
+  });
+
+  it('ignores automatic-supervision enablement for a sub-session', async () => {
+    getSessionMock.mockReturnValue({
+      name: 'deck_sub_worker',
+      projectName: 'transport',
+      parentSession: 'deck_transport_brain',
+      role: 'w1',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: null,
+    });
+
+    handleWebCommand({
+      type: DAEMON_COMMAND_TYPES.SUBSESSION_UPDATE_TRANSPORT_CONFIG,
+      sessionName: 'deck_sub_worker',
+      transportConfig: {
+        supervision: {
+          mode: 'supervised_audit',
+          backend: 'codex-sdk',
+          model: 'gpt-5.6-sol',
+          timeoutMs: 30_000,
+          promptVersion: 'supervision_decision_v1',
+          maxParseRetries: 1,
+          maxAutoContinueStreak: 2,
+          maxAutoContinueTotal: 0,
+          auditTargetSessionName: 'deck_transport_auditor',
+        },
+      },
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(upsertSessionMock).not.toHaveBeenCalled();
+    expect(applySnapshotUpdateMock).not.toHaveBeenCalled();
   });
 
   it('does not create a heavy-mode task run for slash commands', async () => {
@@ -4108,7 +4828,7 @@ describe('handleWebCommand transport queue behavior', () => {
       }),
       expect.any(Object),
     );
-    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).toHaveProperty('pendingCount', 1);
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
@@ -4164,7 +4884,7 @@ describe('handleWebCommand transport queue behavior', () => {
       }),
       expect.any(Object),
     );
-    expect(stateCall?.[2]).not.toHaveProperty('pendingCount');
+    expect(stateCall?.[2]).toHaveProperty('pendingCount', 0);
     expect(stateCall?.[2]).not.toHaveProperty('pendingMessages');
   });
 
@@ -4211,7 +4931,9 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(['cmd-append-1'], 'cmd-append-action');
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(
+      ['cmd-append-1'], 'cmd-append-action', undefined, { allowDispatchAsNewTurn: true },
+    );
     expect(removeQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-append-1');
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -4244,6 +4966,347 @@ describe('handleWebCommand transport queue behavior', () => {
       commandId: 'cmd-append-action',
       status: 'accepted',
     }));
+  });
+
+  it('does not append and clears stale queue state when ownership adoption is ambiguous', async () => {
+    const appendPendingMessagesToActiveTurn = vi.fn();
+    const discardDurableQueueStateForRecipientConflict = vi.fn();
+    getTransportRuntimeMock.mockReturnValue({
+      recipientIdentity: { sessionInstanceId: 'new-instance', runtimeEpoch: 'new-epoch' },
+      adoptLegacyQueueRecipient: vi.fn(() => false),
+      discardDurableQueueStateForRecipientConflict,
+      rehydratePendingFromStore: vi.fn(),
+      appendPendingMessagesToActiveTurn,
+      sending: true,
+      pendingCount: 1,
+      pendingMessages: ['quarantined'],
+      pendingEntries: [{ clientMessageId: 'legacy-ambiguous', text: 'quarantined' }],
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['legacy-ambiguous'],
+      commandId: 'cmd-legacy-ambiguous-append',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(appendPendingMessagesToActiveTurn).not.toHaveBeenCalled();
+    expect(discardDurableQueueStateForRecipientConflict).toHaveBeenCalledTimes(1);
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-legacy-ambiguous-append', status: 'error', error: 'Queued message state was stale and discarded',
+    }));
+  });
+
+  it('append retires an older same-name ghost without dispatching its private text or re-projecting the card', async () => {
+    const createdAt = Date.now();
+    const recipient = { sessionInstanceId: 'append-replacement', runtimeEpoch: 'append-replacement-epoch' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'legacy-old-append',
+      commandId: 'legacy-old-append',
+      text: 'old append private text',
+      now: createdAt - 1,
+      privateMaterialJson: JSON.stringify({ text: 'old append private text' }),
+    });
+    const provider = makeRuntimeProvider(vi.fn().mockResolvedValue(undefined));
+    provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const runtime = new TransportSessionRuntime(
+      provider,
+      'deck_transport_brain',
+      recipient,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    runtime.send('current foreground turn', 'foreground-current');
+    await flushAsync();
+    // Simulate the card the browser selected only for the synchronizer's first
+    // observation. The real runtime queue remains empty, so the production
+    // append path must reconcile SQLite rather than dispatching stale text.
+    const pendingSpy = vi.spyOn(runtime, 'pendingEntries', 'get').mockReturnValueOnce([
+      { clientMessageId: 'legacy-old-append', text: 'public stale card' },
+    ]);
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', sessionInstanceId: recipient.sessionInstanceId,
+      runtimeEpoch: recipient.runtimeEpoch, createdAt,
+    });
+
+    try {
+      handleWebCommand({
+        type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+        sessionName: 'deck_transport_brain',
+        clientMessageIds: ['legacy-old-append'],
+        commandId: 'cmd-old-append',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(provider.notifyActiveDelegation).not.toHaveBeenCalled();
+      expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'legacy-old-append', recipient)).toBeUndefined();
+      expect(emitMock).toHaveBeenCalledWith(
+        'deck_transport_brain',
+        'session.state',
+        expect.objectContaining({
+          pendingMessageEntries: [],
+          pendingCount: 0,
+          queueReconcilesCommandId: 'cmd-old-append',
+        }),
+        expect.any(Object),
+      );
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        commandId: 'cmd-old-append', status: 'error', error: 'Queued message not found',
+      }));
+    } finally {
+      pendingSpy.mockRestore();
+      await runtime.kill();
+    }
+  });
+
+  it('keeps a live handoff visible when append reports not_found instead of treating it as an absent card', async () => {
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'append-live-handoff',
+      commandId: 'append-live-handoff',
+      text: 'already crossing the provider boundary',
+      privateMaterialJson: JSON.stringify({ text: 'already crossing the provider boundary' }),
+    });
+    store.markHandoffInFlight('deck_transport_brain', ['append-live-handoff'], 60_000, Date.now());
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'not_found' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      pendingEntries: [{
+        clientMessageId: 'append-live-handoff',
+        text: 'already crossing the provider boundary',
+      }],
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['append-live-handoff'],
+      commandId: 'cmd-append-live-handoff',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(store.readSnapshot('deck_transport_brain').pendingMessageEntries).toEqual([
+      expect.objectContaining({
+        clientMessageId: 'append-live-handoff',
+        status: 'handoff_inflight',
+      }),
+    ]);
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({
+        queueReconcilesCommandId: 'cmd-append-live-handoff',
+        pendingMessageEntries: [expect.objectContaining({
+          clientMessageId: 'append-live-handoff',
+          status: 'handoff_inflight',
+        })],
+      }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-append-live-handoff', status: 'error', error: 'Queued message not found',
+    }));
+  });
+
+  it('corrects the browser\'s active-turn belief when append reports stale, instead of leaving it stuck', async () => {
+    // The turn this tried to append to already finished by the time the
+    // daemon looked (appendPendingMessagesToActiveTurn's very first check),
+    // AND the runtime's own drain-fallback could not dispatch it either
+    // (e.g. still transiently blocked) -- so the message the browser tried
+    // to append to a live turn is genuinely still sitting in the queue.
+    // This used to reject with no session.state update at all: a browser
+    // that believed a turn was still running never learned otherwise, so it
+    // kept showing "working" with a live Stop control and kept queueing new
+    // messages behind a turn that would never resume -- stuck forever, with
+    // nothing to ever correct it short of a manual reload.
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain',
+      clientMessageId: 'append-stale-turn',
+      commandId: 'append-stale-turn',
+      text: 'this turn already finished',
+      privateMaterialJson: JSON.stringify({ text: 'this turn already finished' }),
+    });
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'stale' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      pendingEntries: [{
+        clientMessageId: 'append-stale-turn',
+        text: 'this turn already finished',
+      }],
+      // Realistic, not 0: none of the append failure statuses (including
+      // 'stale') consume the pending queue, so the message that failed to
+      // append is still sitting right there.
+      pendingCount: 1,
+      sending: false,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['append-stale-turn'],
+      commandId: 'cmd-append-stale-turn',
+    }, serverLink as any);
+    await flushAsync();
+
+    // The fix: the daemon now tells the browser the TRUE current state —
+    // still queued (not sending) — instead of leaving it to guess or
+    // falsely claiming idle while a message actually still awaits delivery.
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'queued' }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-append-stale-turn', status: 'error', error: 'The active turn already finished',
+    }));
+  });
+
+  it('acks an append as accepted and reports the true running state when no turn was active and the runtime dispatched the queue as a fresh turn instead', async () => {
+    // appendPendingMessagesToActiveTurn's new fallback: no turn was active,
+    // so the runtime drained the pending queue as a new turn rather than
+    // erroring "stale". This must ack success, not the old opaque error, and
+    // the broadcast state must reflect the turn now actually running.
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'dispatched_as_new_turn' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      pendingEntries: [{
+        clientMessageId: 'append-dispatched-as-new-turn',
+        text: 'this turn already finished, so send it as a new one',
+      }],
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['append-dispatched-as-new-turn'],
+      commandId: 'cmd-append-dispatched-as-new-turn',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'running' }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-append-dispatched-as-new-turn', status: 'accepted',
+    }));
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+  });
+
+  it('carries the whole recipient-gated queue authority on the not-found ack itself', async () => {
+    // The snapshot used to travel ONLY on a best-effort timeline session.state.
+    // command.ack is the reliable, replayable frame, so a browser that loses the
+    // timeline event must still be able to retire the ghost card from the ack
+    // alone. Assert the authority is on the ack, not merely broadcast beside it.
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'not_found' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      // The ghost shape: the runtime still lists the row, the canonical SQLite
+      // queue does not. Listing it also keeps waitForSelectedSessionSends from
+      // polling its bounded window, so the assertion stays deterministic.
+      pendingEntries: [{ clientMessageId: 'ghost-only-in-browser', text: 'ghost card' }],
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['ghost-only-in-browser'],
+      commandId: 'cmd-ack-carries-authority',
+    }, serverLink as any);
+    await flushAsync();
+
+    const snapshot = getTransportQueueStore().readSnapshot('deck_transport_brain');
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-ack-carries-authority',
+      status: 'error',
+      error: 'Queued message not found',
+      queueEpoch: snapshot.queueEpoch,
+      queueAuthorityId: snapshot.queueAuthorityId,
+      pendingMessageVersion: snapshot.pendingMessageVersion,
+      pendingMessageEntries: [],
+      failedMessageEntries: [],
+      queueReconcilesCommandId: 'cmd-ack-carries-authority',
+    }));
+  });
+
+  it('appends a displayed canonical row immediately across a stranded same-instance queue epoch', async () => {
+    const createdAt = Date.now() - 10_000;
+    const canonical = { sessionInstanceId: 'append-stable-instance', runtimeEpoch: 'append-current-epoch' };
+    const staleEpoch = { sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: 'append-stale-epoch' };
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: staleEpoch,
+      clientMessageId: 'same-instance-earlier', text: 'leave this queued', now: createdAt + 1,
+      privateMaterialJson: JSON.stringify({ text: 'leave this queued' }),
+    });
+    store.enqueue({
+      sessionName: 'deck_transport_brain', recipient: canonical,
+      clientMessageId: 'canonical-append-id', commandId: 'legacy-append-command',
+      text: 'append the displayed card', now: createdAt + 2,
+      privateMaterialJson: JSON.stringify({ text: 'append the displayed card' }),
+    });
+    const provider = makeRuntimeProvider(vi.fn().mockResolvedValue(undefined));
+    provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    const runtime = new TransportSessionRuntime(
+      provider,
+      'deck_transport_brain',
+      canonical,
+      { sessionCreatedAt: createdAt },
+    );
+    await runtime.initialize({ sessionKey: 'deck_transport_brain' });
+    runtime.send('current foreground turn', 'foreground-current');
+    getTransportRuntimeMock.mockReturnValue(runtime);
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain', runtimeType: 'transport', createdAt,
+      sessionInstanceId: canonical.sessionInstanceId, runtimeEpoch: canonical.runtimeEpoch,
+    });
+
+    try {
+      handleWebCommand({
+        type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+        sessionName: 'deck_transport_brain',
+        clientMessageIds: ['canonical-append-id'],
+        commandId: 'append-canonical-action',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(provider.notifyActiveDelegation).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ text: 'append the displayed card' }),
+      );
+      expect(store.queueBelongsTo('deck_transport_brain', canonical)).toBe(true);
+      expect(store.readSnapshotForRecipient('deck_transport_brain', canonical).pendingMessageEntries)
+        .toEqual([expect.objectContaining({ clientMessageId: 'same-instance-earlier' })]);
+      expect(store.readPrivateDispatchMaterial('deck_transport_brain', 'canonical-append-id', canonical))
+        .toBeUndefined();
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'command.ack', commandId: 'append-canonical-action', status: 'accepted',
+      }));
+    } finally {
+      await runtime.kill();
+    }
   });
 
   it('waits for an optimistic queue row even when append arrives before its matching send', async () => {
@@ -4324,6 +5387,8 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(
       ['cmd-sync-race'],
       'cmd-sync-race-append',
+      undefined,
+      { allowDispatchAsNewTurn: true },
     );
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
       commandId: 'cmd-sync-race-append',
@@ -4391,6 +5456,46 @@ describe('handleWebCommand transport queue behavior', () => {
     resolveRestart?.();
     await flushAsync();
     await flushAsync();
+  });
+
+  it('maps MCP restart to resume by default and reset to fresh without creating an unknown session', async () => {
+    relaunchSessionWithSettingsMock.mockResolvedValue(undefined);
+
+    await expect(restartSessionNow('deck_transport_brain')).resolves.toBe(true);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'deck_transport_brain' }),
+      { fresh: false },
+    );
+
+    await expect(restartSessionNow('deck_transport_brain', { reset: true })).resolves.toBe(true);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ name: 'deck_transport_brain' }),
+      { fresh: true },
+    );
+
+    getSessionMock.mockReturnValueOnce(undefined);
+    await expect(restartSessionNow('deck_missing_brain')).resolves.toBe(false);
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('deduplicates equal MCP restarts but serializes a reset so start-over is never swallowed', async () => {
+    let releaseFirst: (() => void) | undefined;
+    relaunchSessionWithSettingsMock
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { releaseFirst = resolve; }))
+      .mockResolvedValueOnce(undefined);
+
+    const first = restartSessionNow('deck_transport_brain');
+    const duplicate = restartSessionNow('deck_transport_brain');
+    const reset = restartSessionNow('deck_transport_brain', { reset: true });
+    await flushAsync();
+    expect(relaunchSessionWithSettingsMock).toHaveBeenCalledTimes(1);
+
+    releaseFirst?.();
+    await expect(Promise.all([first, duplicate, reset])).resolves.toEqual([true, true, true]);
+    expect(relaunchSessionWithSettingsMock.mock.calls.map(([, options]) => options)).toEqual([
+      { fresh: false },
+      { fresh: true },
+    ]);
   });
 
   it('skips terminal subscribe and snapshot requests for transport sessions', async () => {
@@ -5218,6 +6323,7 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(listContextObservationsMock).toHaveBeenCalledWith({
       scope: PREFERENCE_INGEST_SCOPE,
       class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      state: PREFERENCE_INGEST_OBSERVATION_STATE,
     });
     expect(serverLink.send).toHaveBeenCalledWith({
       type: MEMORY_WS.PREF_RESPONSE,
@@ -5330,4 +6436,79 @@ describe('handleWebCommand transport queue behavior', () => {
       error: MEMORY_MANAGEMENT_ERROR_CODES.MISSING_PROJECT_IDENTITY,
     });
   });
+
+  describe('automatic supervision execution-pool START gate', () => {
+    // Selecting an execution pool is a precondition for running supervision,
+    // so the daemon START path has to refuse the same cases the UI and the
+    // authoritative save refuse. A session persisted before the gate existed
+    // still carries legacy pools, so the refusal cannot live at save time only.
+    function seed(supervision: Record<string, unknown>) {
+      const transportSend = vi.fn(() => 'sent');
+      getSessionMock.mockReturnValue({
+        name: 'deck_transport_brain',
+        projectName: 'transport',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        state: 'running',
+        transportConfig: { supervision },
+      });
+      getTransportRuntimeMock.mockReturnValue({
+        providerSessionId: 'route-transport',
+        send: transportSend,
+        pendingCount: 0,
+      });
+      return transportSend;
+    }
+
+    const SUPERVISED = {
+      mode: 'supervised',
+      backend: 'codex-sdk',
+      model: 'gpt-5.3-codex-spark',
+      timeoutMs: 12_000,
+      promptVersion: 'supervision_decision_v1',
+      maxParseRetries: 1,
+      taskRunPromptVersion: 'task_run_status_v1',
+    };
+
+    const CONFIGURED_POOLS = {
+      state: 'configured',
+      primaryDevelopmentPool: {
+        configs: [{
+          agentType: 'codex-sdk',
+          providerFamily: 'openai',
+          runtimeType: 'transport',
+          model: 'gpt-5.6-sol',
+          capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6-sol',
+        }],
+        controls: {},
+      },
+      economyTaskPool: { configs: [], controls: {} },
+    };
+
+    async function send(text: string, commandId: string) {
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_transport_brain',
+        text,
+        commandId,
+        uiLocale: 'zh-CN',
+      }, serverLink as any);
+      await flushAsync();
+    }
+
+    it('never gates a session with supervision turned off', async () => {
+      // Turning supervision OFF is not an automatic run, so an unconfigured
+      // pool must neither block the send nor warn about pools.
+      const transportSend = seed({ mode: 'off' });
+
+      await send('implement the feature', 'cmd-gate-off');
+
+      expect(warnExecutionPoolUnconfiguredMock).not.toHaveBeenCalled();
+      expect(queueTaskIntentMock).not.toHaveBeenCalled();
+      expect(registerTaskIntentMock).not.toHaveBeenCalled();
+      expect(transportSend).toHaveBeenCalled();
+    });
+  });
+
 });

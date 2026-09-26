@@ -27,21 +27,19 @@ export function shortModelLabel(model?: string | null): string | null {
   }
   if (lower.includes('flash')) return 'flash';
 
-  if (/^gpt-5\.4(?:$|[-_.])/.test(lower)) {
-    if (lower.includes('mini')) return 'gpt-5.4-mini';
-    if (lower.includes('nano')) return 'gpt-5.4-nano';
-    if (lower.includes('pro')) return 'gpt-5.4-pro';
-    if (lower.includes('codex')) return 'gpt-5.4-codex';
-    return 'gpt-5.4';
-  }
-
-  const gpt5x = lower.match(/\b(gpt-5(?:\.\d+)?(?:-(?:codex|max|mini|nano|pro))?)\b/);
-  if (gpt5x) return gpt5x[1];
-
   if (lower.includes('gpt-4o')) return 'gpt-4o';
   if (lower.includes('gpt-4.1')) return 'gpt-4.1';
   if (lower.includes('o4-mini') || lower.includes('o4mini')) return 'o4-mini';
   if (/\bo3(?:$|[-_.])/.test(lower)) return 'o3';
+
+  // Any GPT/Codex id of any generation (gpt-5.4-mini, gpt-5.6-sol,
+  // gpt-6-luna, ...): show its last two dash-separated parts so both the
+  // version and the variant survive; a bare `gpt-5.6` stays `gpt-5.6`.
+  const gpt = lower.match(/\bgpt-\d[\w.-]*/);
+  if (gpt) {
+    const id = gpt[0].replace(/-\d{4}-\d{2}-\d{2}$/, '').replace(/[-_]\d{6,8}$/, '');
+    return id.split('-').filter(Boolean).slice(-2).join('-');
+  }
 
   const gem = lower.match(/\b(gemini[- ]\d[\w.-]*)\b/);
   if (gem) return gem[1];
