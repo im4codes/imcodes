@@ -3597,6 +3597,24 @@ describe('TransportSessionRuntime', () => {
     }));
   });
 
+  it('does not let a late completion bypass a pending capacity retry', async () => {
+    runtime.send('late completion', 'msg-capacity-late');
+    await flushDispatch();
+    vi.useFakeTimers();
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity',
+      recoverable: false,
+    });
+    // Simulate the provider callback for the failed turn arriving after the
+    // runtime has already preserved the entry and armed its retry timer.
+    mock.fireComplete('sess-1');
+    expect(runtime.getDiagnosticSnapshot().capacityRetry?.attempt).toBe(1);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(29_999);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
   it('auto-retry redelivers a recoverable-failed message once the provider frees up', async () => {
     // The first provider.send rejects with a recoverable "busy" error; the
     // runtime must re-queue and auto-retry, and the next attempt (provider now

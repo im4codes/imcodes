@@ -804,10 +804,23 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         this._lastProviderOutputAt = this._lastActivityAt;
+        const hadLocalActiveTurn = this.hasLocalActiveTurnWork();
+        // Provider callbacks are not dispatch-scoped. A completion belonging
+        // to the turn that just failed with capacity must not clear the
+        // pending retry owned by this runtime, or it would bypass backoff (and
+        // could strand the preserved entry when no active turn remains).
+        if (!hadLocalActiveTurn
+          && (this._capacityRetryTimer !== null || this._capacityRetryEntryIds.length > 0)) {
+          logger.warn(
+            { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+            'transport runtime ignored late completion while capacity retry is pending',
+          );
+          return;
+        }
         // A completed turn means the provider is responsive and queued work is
         // about to drain — clear any recoverable-retry streak.
         this._recoverableDispatchRetries = 0;
-        this.cancelCapacityRetry(false);
+        if (hadLocalActiveTurn) this.cancelCapacityRetry(false);
         if (this._externalCompletionSettlementsToIgnore > 0) {
           this._externalCompletionSettlementsToIgnore--;
           logger.warn(
