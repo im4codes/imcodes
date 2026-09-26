@@ -1171,11 +1171,21 @@ async function applyTransportEffortSwitch(
     return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${agentType || 'this session'}` };
   }
   if (!isTransportEffortLevel(requested) || !allowed.includes(requested)) {
+    const supported = allowed.join(', ');
+    timelineEmitter.emit(sessionName, 'assistant.text', {
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED,
+        `⚠️ Unsupported thinking level: ${requested}. Supported: ${supported}`,
+        { level: requested, supported, detail: `Supported: ${supported}` },
+      ),
+      streaming: false,
+      memoryExcluded: true,
+    }, { source: 'daemon', confidence: 'high' });
     return {
       ok: false,
       sessionName,
       code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_THINKING_LEVEL,
-      error: `Unsupported thinking level: ${requested}. Supported: ${allowed.join(', ')}`,
+      error: `Unsupported thinking level: ${requested}. Supported: ${supported}`,
       availableThinkingLevels: [...allowed],
     };
   }
