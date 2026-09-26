@@ -4391,6 +4391,7 @@
     "panel_group_recent": "Completadas",
     "panel_queued": "En cola hace {{duration}}",
     "panel_unassigned": "Sin asignar",
+    "panel_no_audit": "No requiere auditoría",
     "panel_started": "Inicio {{time}}",
     "panel_duration_day": "d",
     "panel_executor": "Ejecutor",

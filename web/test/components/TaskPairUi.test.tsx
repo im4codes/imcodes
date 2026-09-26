@@ -199,6 +199,88 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getByText('taskPair.panel_executor')).toBeTruthy();
     expect(screen.queryByText('deck_sub_exec')).toBeNull();
   });
+
+  it('fills its parent height with the rows list owning the scroll, not a fixed height on the panel', () => {
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+    const rule = (selector: string) => new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+    const panelRule = rule('.task-pair-status-panel');
+    expect(panelRule).toMatch(/top:\s*0/);
+    expect(panelRule).toMatch(/bottom:\s*0/);
+    expect(panelRule).toMatch(/display:\s*flex/);
+    expect(panelRule).toMatch(/flex-direction:\s*column/);
+    const rowsRule = rule('.task-pair-status-rows');
+    expect(rowsRule).toMatch(/flex:\s*1/);
+    expect(rowsRule).toMatch(/min-height:\s*0/);
+    expect(rowsRule).toMatch(/overflow-y:\s*auto/);
+    expect(rowsRule).not.toMatch(/max-height/);
+  });
+
+  it('keeps the toggle header clear of the sidebar toolbar cluster at every width', () => {
+    const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const css = readFileSync(join(WEB_ROOT, 'src/styles.css'), 'utf8');
+    const rule = (selector: string) => new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+    // .chat-top-actions floats at top:6px, its tallest button is 24px, and the
+    // count badge extends 4px above that -- roughly y=2..30. The toggle must
+    // clear that band regardless of the panel's own (responsive) width.
+    const toggleRule = rule('.task-pair-status-toggle');
+    const topPadding = /padding-top:\s*(\d+)px/.exec(toggleRule)?.[1];
+    expect(Number(topPadding)).toBeGreaterThanOrEqual(34);
+    expect(toggleRule).toMatch(/flex-wrap:\s*wrap/);
+  });
+
+  it('renders every group -- including a tall rework group -- so the list can scroll to reach it, never dropping rows from the DOM', () => {
+    const events = [
+      { eventId: 'w1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'W1', title: 'Working one', toStatus: 'working', executor: 'deck_sub_w1' } },
+      { eventId: 'w2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'W2', title: 'Working two', toStatus: 'working', executor: 'deck_sub_w2' } },
+      { eventId: 'w3', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'W3', title: 'Working three', toStatus: 'working', executor: 'deck_sub_w3' } },
+      { eventId: 'r1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'R1', title: 'Needs rework', toStatus: 'rework', executor: 'deck_sub_r1', round: 2 } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} />);
+    // Not clipped away by MAX_ROWS or any render-time truncation -- only CSS
+    // (overflow-y: auto on .task-pair-status-rows, asserted above) is
+    // responsible for keeping this reachable by scrolling instead of visible.
+    expect(container.querySelector('.task-pair-status-group-working')).toBeTruthy();
+    expect(container.querySelector('.task-pair-status-group-rework')).toBeTruthy();
+    expect(screen.getByText('Needs rework')).toBeTruthy();
+  });
+
+  it('keeps the header total in sync with the sum of every rendered group -- including rework', () => {
+    const events = [
+      { eventId: 'c1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C1', title: 'A', toStatus: 'working' } },
+      { eventId: 'c2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C2', title: 'B', toStatus: 'working' } },
+      { eventId: 'c3', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C3', title: 'C', toStatus: 'rework' } },
+      { eventId: 'c4', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C4', title: 'D', toStatus: 'in_audit' } },
+      { eventId: 'c5', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'C5', title: 'E', toStatus: 'queued', queuePosition: 1 } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} />);
+    // 'working' + 'rework' both count toward the header's "working" bucket.
+    expect(screen.getByText(/taskPair.panel_counts:.*"working":3/)).toBeTruthy();
+    const groupCount = (key: string) => Number(container.querySelector(`.task-pair-status-group-${key} small`)?.textContent?.replace(/[()]/g, '') ?? 0);
+    expect(groupCount('working') + groupCount('rework')).toBe(3);
+    expect(groupCount('audit')).toBe(1);
+    expect(groupCount('queued')).toBe(1);
+  });
+
+  it('shows a non-clickable "no audit needed" label for auditor=none instead of a dangling session button', () => {
+    const navigate = vi.fn();
+    const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
+    window.addEventListener('deck:navigate', listener);
+    try {
+      const { container } = render(<TaskPairStatusPanel events={[{
+        eventId: 'no-audit', type: 'task_pair.event', ts: Date.now(),
+        payload: { taskId: 'NA1', title: 'Solo task', toStatus: 'working', executor: 'deck_sub_solo', auditor: 'none' },
+      }] as never} />);
+      expect(screen.getByText('taskPair.panel_no_audit')).toBeTruthy();
+      const buttons = [...container.querySelectorAll('.task-pair-status-session')];
+      expect(buttons).toHaveLength(1);
+      expect(buttons[0].getAttribute('data-session-name')).toBe('deck_sub_solo');
+      fireEvent.click(screen.getByText('taskPair.panel_no_audit'));
+      expect(navigate).not.toHaveBeenCalledWith('none');
+    } finally {
+      window.removeEventListener('deck:navigate', listener);
+    }
+  });
 });
 
 describe('formatElapsedDuration', () => {

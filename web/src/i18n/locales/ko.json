@@ -4390,6 +4390,7 @@
     "panel_group_recent": "최근 완료",
     "panel_queued": "대기 {{duration}}",
     "panel_unassigned": "미할당",
+    "panel_no_audit": "감사 불필요",
     "panel_started": "시작 {{time}}",
     "panel_duration_day": "일",
     "panel_executor": "실행자",

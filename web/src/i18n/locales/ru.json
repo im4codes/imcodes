@@ -4390,6 +4390,7 @@
     "panel_group_recent": "Недавно завершённые",
     "panel_queued": "В очереди {{duration}}",
     "panel_unassigned": "Не назначено",
+    "panel_no_audit": "Аудит не требуется",
     "panel_started": "Начало {{time}}",
     "panel_duration_day": "д",
     "panel_executor": "Исполнитель",

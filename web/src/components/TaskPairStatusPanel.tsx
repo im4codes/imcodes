@@ -105,7 +105,9 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
   const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch {} return next; });
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
   const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
-    if (typeof id !== 'string' || !id) return null;
+    // 'none' is a real, deliberate value (auditor=none): there is no session
+    // to open, so it must not render as a dangling clickable placeholder.
+    if (typeof id !== 'string' || !id || id === 'none') return null;
     const text = resolveSessionLabel(id, label, sessions, projectionSessions) || t(`taskPair.panel_${role}`);
     const resolvedModel = resolveSessionModel(id, model, sessions, projectionSessions);
     return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>{resolvedModel ? `${text}${t('taskPair.panel_model_separator')}${resolvedModel}` : text}</button>;
@@ -130,7 +132,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
           {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           <small>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
           {!queued && <span>{payload.toStatus === 'rework' ? t('taskPair.status.rework_round', { round: payload.round ?? 1 }) : t(`taskPair.status.${payload.toStatus}`)} · {t('taskPair.panel_round', { round: payload.round ?? 0 })}</span>}
-          <div><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? <small>{t('taskPair.panel_unassigned')}</small>}<span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</div>
+          <div><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? <small>{t('taskPair.panel_unassigned')}</small>}{payload.auditor !== 'none' && <span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />}{payload.auditor === 'none' ? <small>{t('taskPair.panel_no_audit')}</small> : session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? <small>{t('taskPair.panel_unassigned')}</small>}</div>
         </div>; });
         return group.key === 'recent'
           ? <details class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}><summary>{heading}</summary>{content}</details>

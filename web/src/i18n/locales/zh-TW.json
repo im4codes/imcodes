@@ -4391,6 +4391,7 @@
     "panel_group_recent": "最近完成",
     "panel_queued": "已排隊 {{duration}}",
     "panel_unassigned": "待分配",
+    "panel_no_audit": "無需審計",
     "panel_started": "開始於 {{time}}",
     "panel_duration_day": "天",
     "panel_executor": "執行者",

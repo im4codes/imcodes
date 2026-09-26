@@ -14461,14 +14461,30 @@ button.quick-agent-delegation-preset.active {
   border-left: 1px solid var(--status-info-border, var(--chrome-accent));
   box-shadow: -4px 0 18px color-mix(in srgb, var(--chrome-accent) 12%, transparent);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* Fill the sidebar top-to-bottom (top/right/bottom above) and let the rows
+     list -- not this box -- own the scrolling, so nothing is ever clipped by
+     a fixed height on the panel itself. */
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
 }
 .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: min(312px, calc(30vw + 12px)); }
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; max-height: 42vh; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
 }
-.task-pair-status-toggle { width: 100%; display: flex; justify-content: space-between; gap: 8px; padding: 8px; color: inherit; background: transparent; border: 0; text-align: left; }
-.task-pair-status-rows { max-height: 360px; overflow: auto; padding: 0 8px 8px; }
+.task-pair-status-toggle {
+  width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 8px;
+  padding: 8px; color: inherit; background: transparent; border: 0; text-align: left; flex-shrink: 0;
+  /* .chat-top-actions floats at top:6px/right:8px with z-index:10 over this
+     same corner (its tallest button + badge span roughly y=2..30). This panel
+     is z-index:12, so without this offset its own header text renders behind
+     those icons instead of below them. */
+  padding-top: 38px;
+}
+.task-pair-status-toggle strong,
+.task-pair-status-toggle span { min-width: 0; overflow-wrap: anywhere; }
+.task-pair-status-rows { flex: 1; min-height: 0; overflow-y: auto; padding: 0 8px 8px; }
 .task-pair-status-group { margin: 0 0 4px; }
 .task-pair-status-group h4 { margin: 5px 0 0; padding-top: 3px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
 .task-pair-status-group h4 small { font-family: ui-monospace, SFMono-Regular, monospace; opacity: .7; }
