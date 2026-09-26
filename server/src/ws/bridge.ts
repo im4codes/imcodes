@@ -1188,6 +1188,7 @@ const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
 // and a more generous ceiling, we recover automatically instead of
 // forcing a manual page refresh.
 const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 4096;
+const TIMELINE_DATA_PLANE_MAX_IN_FLIGHT = 4;
 const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMELINE_DATA_PLANE_SOCKET_MAX_BYTES = 8 * 1024 * 1024;
 const DEFAULT_TIMELINE_DATA_PLANE_USER_MAX_BYTES = 32 * 1024 * 1024;
@@ -2229,12 +2230,11 @@ export class WsBridge {
 
   private timelineDataPlaneQueue: TimelineDataPlaneJob[] = [];
   private timelineDataPlaneScheduled = false;
-  private timelineDataPlaneActive = false;
+  private timelineDataPlaneActiveJobs = new Set<TimelineDataPlaneJob>();
   /** Bytes retained by queued and active timeline data-plane jobs. */
   private timelineDataPlaneQueueBytes = 0;
   private timelineDataPlaneBytesBySocket = new Map<WebSocket, number>();
   private timelineDataPlaneBytesByUser = new Map<string, number>();
-  private timelineDataPlaneActiveJob: TimelineDataPlaneJob | null = null;
   /** Canonical request id for each identical in-flight history/page request. */
   private timelineInFlightByKey = new Map<string, string>();
   private timelineRequestKeys = new Map<string, string>();
@@ -3863,7 +3863,7 @@ export class WsBridge {
   }
 
   private scheduleTimelineDataPlaneDrain(): void {
-    if (this.timelineDataPlaneScheduled || this.timelineDataPlaneActive) return;
+    if (this.timelineDataPlaneScheduled || this.timelineDataPlaneActiveJobs.size >= TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) return;
     this.timelineDataPlaneScheduled = true;
     setImmediate(() => this.drainTimelineDataPlaneQueue());
   }
@@ -3964,8 +3964,7 @@ export class WsBridge {
         }
       }
     }
-    const active = this.timelineDataPlaneActiveJob;
-    if (active) {
+    for (const active of this.timelineDataPlaneActiveJobs) {
       for (const attachment of active.attachments) {
         if (attachment.origin === 'browser_request' && attachment.socket === ws) {
           incrementCounter('ws_bridge_timeline_data_plane_canceled', {
@@ -4030,14 +4029,13 @@ export class WsBridge {
     return true;
   }
 
-  private finishTimelineDataPlaneJob(): void {
-    const active = this.timelineDataPlaneActiveJob;
-    if (active) {
-      for (const attachment of active.attachments) this.releaseTimelineDataPlaneAttachment(attachment);
+  private finishTimelineDataPlaneJob(job: TimelineDataPlaneJob): void {
+    if (this.timelineDataPlaneActiveJobs.delete(job)) {
+      for (const attachment of job.attachments) this.releaseTimelineDataPlaneAttachment(attachment);
     }
-    this.timelineDataPlaneActiveJob = null;
-    this.timelineDataPlaneActive = false;
-    if (this.timelineDataPlaneQueue.length > 0) this.scheduleTimelineDataPlaneDrain();
+    if (this.timelineDataPlaneQueue.length > 0 && this.timelineDataPlaneActiveJobs.size < TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) {
+      this.scheduleTimelineDataPlaneDrain();
+    }
   }
 
   private enqueueTimelineDataPlaneJob(
@@ -4267,49 +4265,49 @@ export class WsBridge {
 
   private drainTimelineDataPlaneQueue(): void {
     this.timelineDataPlaneScheduled = false;
-    if (this.timelineDataPlaneActive) return;
     this.pruneCanceledTimelineDataPlaneJobs();
-    const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
-    const job = this.timelineDataPlaneQueue.shift();
-    if (!job) return;
-    this.timelineDataPlaneActive = true;
-    this.timelineDataPlaneActiveJob = job;
-    const queueMetrics: TimelineDataPlaneQueueMetrics = {
-      backlogAgeMs: performance.now() - job.enqueuedAt,
-      queueDepthAtEnqueue: job.queueDepthAtEnqueue,
-      queueDepthBeforeDrain,
-      queuedBehindCount: job.queuedBehindCount,
-    };
-    if (this.isTimelineDataPlaneJobCanceled(job)) {
-      incrementCounter('ws_bridge_timeline_data_plane_canceled', {
-        type: job.meta.type,
-        route: job.meta.route,
-      });
-      this.finishTimelineDataPlaneJob();
-      return;
+    while (this.timelineDataPlaneActiveJobs.size < TIMELINE_DATA_PLANE_MAX_IN_FLIGHT) {
+      const queueDepthBeforeDrain = this.timelineDataPlaneQueue.length;
+      const job = this.timelineDataPlaneQueue.shift();
+      if (!job) break;
+      this.timelineDataPlaneActiveJobs.add(job);
+      const queueMetrics: TimelineDataPlaneQueueMetrics = {
+        backlogAgeMs: performance.now() - job.enqueuedAt,
+        queueDepthAtEnqueue: job.queueDepthAtEnqueue,
+        queueDepthBeforeDrain,
+        queuedBehindCount: job.queuedBehindCount,
+      };
+      if (this.isTimelineDataPlaneJobCanceled(job)) {
+        incrementCounter('ws_bridge_timeline_data_plane_canceled', {
+          type: job.meta.type,
+          route: job.meta.route,
+        });
+        this.finishTimelineDataPlaneJob(job);
+        continue;
+      }
+      if (performance.now() > job.deadlineAt) {
+        incrementCounter('ws_bridge_timeline_data_plane_deadline_exceeded', {
+          type: job.meta.type,
+          route: job.meta.route,
+        });
+        logger.warn({
+          serverId: this.serverId,
+          type: job.meta.type,
+          route: job.meta.route,
+          backlogAgeMs: queueMetrics.backlogAgeMs,
+          deadlineMs: Math.max(0, job.deadlineAt - job.enqueuedAt),
+        }, 'WsBridge timeline data-plane deadline exceeded');
+        this.handleTimelineDataPlaneJobDeadline(job);
+        this.finishTimelineDataPlaneJob(job);
+        continue;
+      }
+      void Promise.resolve()
+        .then(() => this.runTimelineDataPlaneJob(job, queueMetrics))
+        .catch((err) => {
+          logger.warn({ serverId: this.serverId, err, type: job.meta.type, route: job.meta.route }, 'WsBridge timeline data-plane delivery failed');
+        })
+        .finally(() => this.finishTimelineDataPlaneJob(job));
     }
-    if (performance.now() > job.deadlineAt) {
-      incrementCounter('ws_bridge_timeline_data_plane_deadline_exceeded', {
-        type: job.meta.type,
-        route: job.meta.route,
-      });
-      logger.warn({
-        serverId: this.serverId,
-        type: job.meta.type,
-        route: job.meta.route,
-        backlogAgeMs: queueMetrics.backlogAgeMs,
-        deadlineMs: Math.max(0, job.deadlineAt - job.enqueuedAt),
-      }, 'WsBridge timeline data-plane deadline exceeded');
-      this.handleTimelineDataPlaneJobDeadline(job);
-      this.finishTimelineDataPlaneJob();
-      return;
-    }
-    void Promise.resolve()
-      .then(() => this.runTimelineDataPlaneJob(job, queueMetrics))
-      .catch((err) => {
-        logger.warn({ serverId: this.serverId, err, type: job.meta.type, route: job.meta.route }, 'WsBridge timeline data-plane delivery failed');
-      })
-      .finally(() => this.finishTimelineDataPlaneJob());
   }
 
   private stringifyTimelineDataPlaneResponse(
