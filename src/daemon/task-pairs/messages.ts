@@ -137,6 +137,25 @@ export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrain
   ].join('\n');
 }
 
+/**
+ * One combined, rate-limited notice for queued pairs that have been unable
+ * to start for a long time (owner correction: an ordinary, self-resolving
+ * queue miss gets no per-pair notice at all; see scheduler.ts#checkQueueStalls).
+ */
+export function buildQueueStallNoticeMessage(pairs: readonly Pick<TaskPairState, 'taskId' | 'title' | 'executor' | 'auditor' | 'updatedAt'>[], now: number): string {
+  const lines = pairs.map((pair) => {
+    const minutes = Math.max(1, Math.round((now - pair.updatedAt) / 60_000));
+    const waitingFor = !pair.executor ? 'an executor' : (!pair.auditor || pair.auditor === TASK_PAIR_NO_AUDITOR) ? 'an auditor' : 'a session';
+    return `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: waiting ~${minutes}m for ${waitingFor} from the pool.`;
+  });
+  return [
+    `[IM.codes task pairs] ${pairs.length} queued pair(s) have been unable to start for a while:`,
+    ...lines,
+    'Check Settings → execution pool (pool roles, capacity) if this persists, or name a session/model on the pair directly with REASSIGN.',
+    `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
+  ].join('\n');
+}
+
 /** To the executor of a pair that was imported as passed without any audit. */
 export function buildLegacyImportCorrectionMessage(pair: TaskPairState): string {
   const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `auditor ${pair.auditor}` : 'the auditor being assigned';

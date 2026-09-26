@@ -21,7 +21,6 @@ import {
   TASK_PAIR_DEFAULT_ENGINE,
   TASK_PAIR_ENGINE_ENV,
   TASK_PAIR_ENGINES,
-  type TaskPairAllowlistEntry,
   type TaskPairEngine,
   type TaskPairEngineState,
 } from '../../../shared/task-pair.js';
@@ -75,15 +74,10 @@ export function resolveTaskPairEngine(project: string | undefined, env: NodeJS.P
 }
 
 /** The pair settings the owner saved on the project Brain's supervision settings, if any. */
-export function brainSupervisionSettings(project: string): Pick<SessionSupervisionSnapshot, 'mode' | 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'> | undefined {
+export function brainSupervisionSettings(project: string): Pick<SessionSupervisionSnapshot, 'mode' | 'pairEngine' | 'pairMaxConcurrency'> | undefined {
   const brain = listSessions().find((session: SessionRecord) => session.projectName === project && session.role === 'brain');
   const snapshot = brain ? extractSessionSupervisionSnapshot(brain.transportConfig ?? null) : null;
   return snapshot ?? undefined;
-}
-
-/** Allowlist for daemon picks: Brain settings, else the stored project value, else the default. */
-export function resolveTaskPairAllowlist(project: string): TaskPairAllowlistEntry[] {
-  return brainSupervisionSettings(project)?.pairAllowlist ?? getTaskPairStore().getProjectSettings(project).allowlist;
 }
 
 /** Brain's open-pair limit: the value fixed in settings wins over `QUEUE - max=`. */

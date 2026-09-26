@@ -17,7 +17,12 @@ import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
 import { describeLimitedProviderFamilies, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { DELEGATION_LIMIT_REASONS, PROVIDER_LIMIT_EVIDENCE_KINDS } from '../../../shared/delegation-availability.js';
-import { TASK_PAIR_SILENCE_LIMIT, type TaskPairAllowlistEntry } from '../../../shared/task-pair.js';
+import { TASK_PAIR_SILENCE_LIMIT } from '../../../shared/task-pair.js';
+import {
+  buildSupervisionExecutionCapabilityId,
+  normalizeSupervisionExecutionModel,
+  type SupervisionExecutionConfig,
+} from '../../../shared/supervision-execution-pool.js';
 import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 import { resetTaskPairProviderErrorsForTests } from '../../../src/daemon/task-pairs/provider-errors.js';
 
@@ -25,45 +30,71 @@ const PROJECT = 'limitproj';
 const BRAIN = 'deck_limitproj_brain';
 const NOW = 1_000_000;
 
+// Model names matched between each test session and its cross-family pool
+// config below: codex-sdk/EXEC_MODEL is executor-only, both codex-sdk/
+// OPENAI_AUDITOR_MODEL and claude-code-sdk/anthropic auditor models carry
+// the auditor role, so an auditor replacement can land on either family.
+const EXEC_MODEL = 'gpt-6-luna';
+const ANTHROPIC_AUDITOR_MODEL = 'opus';
+const OPENAI_AUDITOR_MODEL = 'gpt-5.6-sol';
+
+function poolConfig(agentType: string, providerFamily: string, model: string, role: SupervisionExecutionConfig['role']): SupervisionExecutionConfig {
+  const canonical = normalizeSupervisionExecutionModel(agentType, model);
+  // Test sessions here never set an explicit runtimeType, so they default to
+  // 'process' (see configMatchesSession) -- match that, not 'transport'.
+  const config = { agentType, providerFamily, runtimeType: 'process' as const, model: canonical, role };
+  return { ...config, capabilityId: buildSupervisionExecutionCapabilityId(config) };
+}
+
+function crossFamilyPools() {
+  return {
+    state: 'configured' as const,
+    economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+    primaryDevelopmentPool: {
+      configs: [
+        poolConfig('codex-sdk', 'openai', EXEC_MODEL, 'executor'),
+        poolConfig('codex-sdk', 'openai', OPENAI_AUDITOR_MODEL, 'auditor'),
+        poolConfig('claude-code-sdk', 'anthropic', ANTHROPIC_AUDITOR_MODEL, 'auditor'),
+      ],
+      controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
+    },
+  };
+}
+
 function session(name: string, role: SessionRecord['role'], extra: Partial<SessionRecord> = {}): SessionRecord {
   return {
     name, projectName: PROJECT, role, agentType: 'claude-code-sdk', providerId: 'anthropic',
-    ...(role === 'brain' ? {} : { parentSession: BRAIN }),
+    ...(role === 'brain' ? { transportConfig: { supervision: { executionPools: crossFamilyPools() } } } : { parentSession: BRAIN }),
     projectDir: `/tmp/${PROJECT}`, state: 'idle', sessionInstanceId: `instance_${name}`, runtimeEpoch: `epoch_${name}`,
     restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1, ...extra,
   } as SessionRecord;
 }
 
-const CROSS_FAMILY_ALLOWLIST: TaskPairAllowlistEntry[] = [
-  { role: 'auditor', agentType: 'claude-code-sdk', modelPattern: '' },
-  { role: 'auditor', agentType: 'codex-sdk', modelPattern: '' },
-];
-
 describe('pool: provider-family preference and limited-family reporting', () => {
   it('prefers a different provider family once one is named to avoid, but still returns the same family last rather than nothing', () => {
-    const anthropic = session('deck_sub_anthropic', 'w1', { agentType: 'claude-code-sdk', providerId: 'anthropic', updatedAt: 1 });
-    const openai = session('deck_sub_openai', 'w2', { agentType: 'codex-sdk', providerId: 'openai', updatedAt: 2 });
+    const anthropic = session('deck_sub_anthropic', 'w1', { agentType: 'claude-code-sdk', providerId: 'anthropic', activeModel: ANTHROPIC_AUDITOR_MODEL, updatedAt: 1 });
+    const openai = session('deck_sub_openai', 'w2', { agentType: 'codex-sdk', providerId: 'openai', activeModel: OPENAI_AUDITOR_MODEL, updatedAt: 2 });
     const deps = { listSessions: () => [session(BRAIN, 'brain'), anthropic, openai], hasPendingMessages: () => false };
 
-    const plain = listTaskPairCandidates({ brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: CROSS_FAMILY_ALLOWLIST, exclude: new Set() }, deps);
+    const plain = listTaskPairCandidates({ brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set() }, deps);
     expect(plain.map((s) => s.name)).toEqual(['deck_sub_anthropic', 'deck_sub_openai']);
 
     const preferred = listTaskPairCandidates({
-      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: CROSS_FAMILY_ALLOWLIST, exclude: new Set(), avoidProviderFamily: 'anthropic',
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(), avoidProviderFamily: 'anthropic',
     }, deps);
     expect(preferred.map((s) => s.name)).toEqual(['deck_sub_openai', 'deck_sub_anthropic']);
   });
 
   it('reports the real, structured-limited families and their retry time, not sessions merely busy or off-allowlist', () => {
     const limitedAnthropic = session('deck_sub_anthropic', 'w1', {
-      agentType: 'claude-code-sdk', providerId: 'anthropic',
+      agentType: 'claude-code-sdk', providerId: 'anthropic', activeModel: ANTHROPIC_AUDITOR_MODEL,
       providerLimit: { limitedAt: NOW, retryAt: NOW + 60_000, reason: DELEGATION_LIMIT_REASONS.PROVIDER_RATE_LIMITED, evidenceKind: PROVIDER_LIMIT_EVIDENCE_KINDS.PROVIDER_STRUCTURED, agentType: 'claude-code-sdk' },
     } as Partial<SessionRecord>);
-    const busyOpenai = session('deck_sub_openai', 'w2', { agentType: 'codex-sdk', providerId: 'openai', state: 'running' });
+    const busyOpenai = session('deck_sub_openai', 'w2', { agentType: 'codex-sdk', providerId: 'openai', activeModel: OPENAI_AUDITOR_MODEL, state: 'running' });
     const deps = { listSessions: () => [session(BRAIN, 'brain'), limitedAnthropic, busyOpenai], now: () => NOW };
 
     const result = describeLimitedProviderFamilies({
-      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: CROSS_FAMILY_ALLOWLIST, exclude: new Set(),
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, deps);
     // The reported deadline is a FLOOR (limitedAt + a minimum backoff), never
     // shorter than the provider's own retryAt -- see delegationLimitDeadline.
@@ -76,7 +107,7 @@ describe('pool: provider-family preference and limited-family reporting', () => 
   it('finds nothing when the pick failed for a different reason (no eligible session at all)', () => {
     const deps = { listSessions: () => [session(BRAIN, 'brain')], now: () => NOW };
     const result = describeLimitedProviderFamilies({
-      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: CROSS_FAMILY_ALLOWLIST, exclude: new Set(),
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, deps);
     expect(result).toBeUndefined();
   });
@@ -107,13 +138,12 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
   beforeEach(() => {
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
-    getTaskPairStore().setProjectAllowlist(PROJECT, CROSS_FAMILY_ALLOWLIST);
     sent = [];
     setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { sent.push({ target, text, id }); } });
     for (const record of [
       session(BRAIN, 'brain'),
-      session(EXEC, 'w1', { agentType: 'codex-sdk', providerId: 'openai' }),
-      session(AUD, 'w2', { agentType: 'claude-code-sdk', providerId: 'anthropic' }),
+      session(EXEC, 'w1', { agentType: 'codex-sdk', providerId: 'openai', activeModel: EXEC_MODEL }),
+      session(AUD, 'w2', { agentType: 'claude-code-sdk', providerId: 'anthropic', activeModel: ANTHROPIC_AUDITOR_MODEL }),
     ]) upsertSession(record);
     taskPairService.init();
   });
@@ -130,7 +160,7 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
   });
 
   it('reassigns a rate-limited auditor to the different-family candidate, not the same-family one that is also idle', async () => {
-    upsertSession(session(OPENAI_AUD, 'w3', { agentType: 'codex-sdk', providerId: 'openai', updatedAt: 2 }));
+    upsertSession(session(OPENAI_AUD, 'w3', { agentType: 'codex-sdk', providerId: 'openai', activeModel: OPENAI_AUDITOR_MODEL, updatedAt: 2 }));
     automation = new TaskPairAutomation({ now: () => now, importLegacy: () => undefined });
     taskPairService.setScheduler(automation);
 
@@ -139,7 +169,7 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
     await flush();
     sent = [];
     upsertSession(session(AUD, 'w2', {
-      agentType: 'claude-code-sdk', providerId: 'anthropic',
+      agentType: 'claude-code-sdk', providerId: 'anthropic', activeModel: ANTHROPIC_AUDITOR_MODEL,
       // isSessionProviderLimited (unlike the scheduler's own fake `now`)
       // resolves availability against real wall-clock time, since scheduler.ts
       // never threads a `now` override into the pool.ts availability check.
@@ -164,7 +194,7 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
     sent = [];
     // AUD is the only eligible auditor in the whole pool, and it is limited.
     upsertSession(session(AUD, 'w2', {
-      agentType: 'claude-code-sdk', providerId: 'anthropic',
+      agentType: 'claude-code-sdk', providerId: 'anthropic', activeModel: ANTHROPIC_AUDITOR_MODEL,
       providerLimit: { limitedAt: Date.now(), reason: DELEGATION_LIMIT_REASONS.PROVIDER_RATE_LIMITED, evidenceKind: PROVIDER_LIMIT_EVIDENCE_KINDS.PROVIDER_STRUCTURED, agentType: 'claude-code-sdk' },
     } as Partial<SessionRecord>));
 
@@ -255,7 +285,7 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
 
   it('keeps replacing an ordinarily silent auditor (no capacity/rate-limit signal) at the silence limit', async () => {
     automation = new TaskPairAutomation({ now: () => now, importLegacy: () => undefined });
-    upsertSession(session(OPENAI_AUD, 'w3', { agentType: 'codex-sdk', providerId: 'openai' }));
+    upsertSession(session(OPENAI_AUD, 'w3', { agentType: 'codex-sdk', providerId: 'openai', activeModel: OPENAI_AUDITOR_MODEL }));
     taskPairService.setScheduler(automation);
 
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T6 executor=${EXEC} auditor=${AUD} -->`);
@@ -265,7 +295,7 @@ describe('scheduler: limit-triggered failover, needs_auditor invariant, and real
     // Keep the executor busy throughout: this isolates the auditor's silence
     // (asymmetric quiet) from the upstream "both sides quiet" nudge-executor
     // path, which takes over only when NEITHER side has done anything.
-    upsertSession(session(EXEC, 'w1', { agentType: 'codex-sdk', providerId: 'openai', state: 'running' }));
+    upsertSession(session(EXEC, 'w1', { agentType: 'codex-sdk', providerId: 'openai', activeModel: EXEC_MODEL, state: 'running' }));
 
     for (let i = 0; i < TASK_PAIR_SILENCE_LIMIT; i += 1) {
       now += 6 * 60_000;

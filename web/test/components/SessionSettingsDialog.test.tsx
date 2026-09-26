@@ -1077,6 +1077,59 @@ describe('SessionSettingsDialog supervision', () => {
     expect(economyWorker.checked).toBe(false);
   });
 
+  it('defaults a primary pool entry to the both role, offers executor/auditor/both, and persists the choice', async () => {
+    render(
+      <SessionSettingsDialog
+        surface="supervision"
+        canControlAutomaticSupervision
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description="desc"
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        peerAuditSessions={[makePeerAuditSession({
+          sessionName: 'deck_sub_worker',
+          label: 'Integration worker',
+          activeModel: 'gpt-5.6',
+          requestedModel: 'gpt-5.6',
+        })]}
+        transportConfig={null}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    const primary = screen.getByTestId('supervision-execution-pool-primary');
+    const economy = screen.getByTestId('supervision-execution-pool-economy');
+    const primaryWorker = within(primary).getByLabelText('primary:deck_sub_worker') as HTMLInputElement;
+    fireEvent.click(primaryWorker);
+
+    const capabilityId = 'supervision-exec-v1:transport:codex-sdk:openai:gpt-5.6';
+    const roleSelect = within(primary).getByTestId(`supervision-execution-pool-role-${capabilityId}`) as HTMLSelectElement;
+    expect(roleSelect.value).toBe('both');
+    // The economy pool never shows a role selector: auditors always come from primary.
+    expect(within(economy).queryByTestId(`supervision-execution-pool-role-${capabilityId}`)).toBeNull();
+
+    // A native 'change' dispatch (not the fireEvent.change/changeSelect
+    // helper, whose synthetic event this nested-in-label <select> did not
+    // react to in this environment), wrapped in act() so the resulting
+    // state update is flushed before the very next interaction reads it.
+    act(() => {
+      roleSelect.value = 'executor';
+      roleSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    });
+    fireEvent.click(screen.getByRole('button', { name: /save/i }));
+
+    await waitFor(() => expect(saveSupervisorDefaultsMock).toHaveBeenCalled());
+    const saved = saveSupervisorDefaultsMock.mock.calls.at(-1)?.[0] as {
+      executionPools?: { primaryDevelopmentPool?: { configs?: Array<Record<string, unknown>> } };
+    };
+    const config = saved.executionPools?.primaryDevelopmentPool?.configs?.find((entry) => entry.capabilityId === capabilityId);
+    expect(config).toMatchObject({ role: 'executor' });
+  });
+
   it('persists a CC preset constraint without binding it to a live session', async () => {
     render(
       <SessionSettingsDialog

@@ -9,6 +9,10 @@ import {
 export const SUPERVISION_EXECUTION_POOL_KINDS = ['primary', 'economy'] as const;
 export type SupervisionExecutionPoolKind = typeof SUPERVISION_EXECUTION_POOL_KINDS[number];
 
+/** Which pair role(s) a pool entry may serve. Missing means 'both' (the default for existing/new entries). */
+export const SUPERVISION_EXECUTION_POOL_ROLES = ['executor', 'auditor', 'both'] as const;
+export type SupervisionExecutionPoolRole = typeof SUPERVISION_EXECUTION_POOL_ROLES[number];
+
 export const SUPERVISION_EXECUTION_POOL_CONFIG_STATES = ['configured', 'legacy_unconfigured'] as const;
 export type SupervisionExecutionPoolConfigState = typeof SUPERVISION_EXECUTION_POOL_CONFIG_STATES[number];
 
@@ -105,6 +109,22 @@ export interface SupervisionExecutionConfig {
   runtimeType: 'process' | 'transport';
   model: string;
   ccPresetId?: string;
+  /** Pair role(s) this entry may serve. Absent means 'both' -- never part of capabilityId. */
+  role?: SupervisionExecutionPoolRole;
+}
+
+/** Effective role of a pool entry: absent/invalid normalizes to 'both'. */
+export function supervisionExecutionConfigRole(config: SupervisionExecutionConfig): SupervisionExecutionPoolRole {
+  return config.role === 'executor' || config.role === 'auditor' ? config.role : 'both';
+}
+
+/** True when a pool entry may serve the given pair role. */
+export function supervisionExecutionConfigAllowsRole(
+  config: SupervisionExecutionConfig,
+  role: 'executor' | 'auditor',
+): boolean {
+  const configured = supervisionExecutionConfigRole(config);
+  return configured === 'both' || configured === role;
 }
 
 export interface SupervisionExecutionPoolControls {
@@ -261,7 +281,14 @@ export function normalizeSupervisionExecutionConfig(value: unknown): Supervision
   const canonical = normalizeSupervisionExecutionModel(agentType, model);
   const expected = buildSupervisionExecutionCapabilityId({ agentType, providerFamily, runtimeType, model: canonical, ccPresetId });
   if (source.capabilityId !== expected) return undefined;
-  return { capabilityId: expected, agentType, providerFamily, runtimeType, model: canonical, ...(ccPresetId ? { ccPresetId } : {}) };
+  // 'both' and absent/invalid both mean the default; omitting them from the
+  // normalized output keeps existing entries (and round-trip equality tests)
+  // byte-stable, since role never feeds into capabilityId identity.
+  const role = source.role === 'executor' || source.role === 'auditor' ? source.role : undefined;
+  return {
+    capabilityId: expected, agentType, providerFamily, runtimeType, model: canonical,
+    ...(ccPresetId ? { ccPresetId } : {}), ...(role ? { role } : {}),
+  };
 }
 
 function positive(value: unknown, fallback: number): number {
@@ -401,6 +428,50 @@ export function migrateLegacySupervisionExecutionPools(input: {
   if (!migration) return normalized;
   const config = { ...migration, capabilityId: buildSupervisionExecutionCapabilityId(migration) };
   return { ...normalized, state: 'configured', primaryDevelopmentPool: { ...normalized.primaryDevelopmentPool, configs: [config] } };
+}
+
+interface LegacyPairAllowlistEntryLike {
+  role?: unknown;
+  agentType?: unknown;
+  modelPattern?: unknown;
+}
+
+function legacyPairAllowlistEntryMatches(entry: LegacyPairAllowlistEntryLike, config: SupervisionExecutionConfig): boolean {
+  const agentType = typeof entry.agentType === 'string' ? entry.agentType : '';
+  if (!agentType || agentType !== config.agentType) return false;
+  const modelPattern = typeof entry.modelPattern === 'string' ? entry.modelPattern.trim().toLowerCase() : '';
+  return !modelPattern || config.model.toLowerCase().includes(modelPattern);
+}
+
+/**
+ * One-time, idempotent migration: the removed task-pair allowlist is folded
+ * into per-entry pool roles instead of being read directly. A config that
+ * already carries an explicit role (including one this same fold set on a
+ * prior call) is never overwritten, so calling this repeatedly on the same
+ * pools is harmless -- there is no separate "already migrated" flag to track.
+ * A config the legacy allowlist says nothing about is left at the 'both'
+ * default: the allowlist adds nothing for it, so there is nothing to fold.
+ */
+export function foldLegacyPairAllowlistIntoExecutionPools(
+  pools: SupervisionExecutionPoolsConfig,
+  legacyAllowlist: unknown,
+): SupervisionExecutionPoolsConfig {
+  if (!Array.isArray(legacyAllowlist) || legacyAllowlist.length === 0) return pools;
+  const entries = legacyAllowlist.filter((item): item is LegacyPairAllowlistEntryLike => !!item && typeof item === 'object');
+  if (entries.length === 0) return pools;
+  const foldConfig = (config: SupervisionExecutionConfig): SupervisionExecutionConfig => {
+    if (config.role !== undefined) return config;
+    const matches = entries.filter((entry) => legacyPairAllowlistEntryMatches(entry, config));
+    if (matches.length === 0) return config;
+    const roles = new Set(matches.map((entry) => (entry.role === 'executor' || entry.role === 'auditor' ? entry.role : 'both')));
+    const role = roles.size === 1 ? [...roles][0]! : 'both';
+    return role === 'both' ? config : { ...config, role };
+  };
+  return {
+    ...pools,
+    primaryDevelopmentPool: { ...pools.primaryDevelopmentPool, configs: pools.primaryDevelopmentPool.configs.map(foldConfig) },
+    economyTaskPool: { ...pools.economyTaskPool, configs: pools.economyTaskPool.configs.map(foldConfig) },
+  };
 }
 
 export type SupervisionExecutionEligibilityReason = 'eligible' | 'pool_unconfigured' | 'unselected_config' | 'excluded_session' | 'excluded_model' | 'unknown_model' | 'identity_mismatch' | 'economy_policy_required';

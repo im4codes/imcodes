@@ -13,8 +13,6 @@ import {
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
   TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_TERMINAL_STATUSES,
-  normalizeTaskPairAllowlist,
-  type TaskPairAllowlistEntry,
   type TaskPairEngine,
   type TaskPairEventSource,
   type TaskPairRole,
@@ -76,7 +74,6 @@ export interface TaskPairEventRecord {
 
 export interface TaskPairProjectSettings {
   engine?: TaskPairEngine;
-  allowlist: TaskPairAllowlistEntry[];
 }
 
 function emptyLiveness(now: number): TaskPairLiveness {
@@ -319,12 +316,10 @@ export class TaskPairStore {
   }
 
   getProjectSettings(project: string): TaskPairProjectSettings {
-    const row = this.#db.prepare('SELECT engine, allowlist_json FROM task_pair_project_settings WHERE project = ?').get(project) as
-      { engine: string | null; allowlist_json: string | null } | undefined;
+    const row = this.#db.prepare('SELECT engine FROM task_pair_project_settings WHERE project = ?').get(project) as
+      { engine: string | null } | undefined;
     const engine = row?.engine === 'pairs' || row?.engine === 'legacy' ? row.engine : undefined;
-    let allowlistRaw: unknown;
-    try { allowlistRaw = row?.allowlist_json ? JSON.parse(row.allowlist_json) : undefined; } catch { allowlistRaw = undefined; }
-    return { ...(engine ? { engine } : {}), allowlist: normalizeTaskPairAllowlist(allowlistRaw) };
+    return { ...(engine ? { engine } : {}) };
   }
 
   setProjectEngine(project: string, engine: TaskPairEngine, now = Date.now()): void {
@@ -332,13 +327,6 @@ export class TaskPairStore {
       INSERT INTO task_pair_project_settings (project, engine, allowlist_json, updated_at) VALUES (?, ?, NULL, ?)
       ON CONFLICT (project) DO UPDATE SET engine = excluded.engine, updated_at = excluded.updated_at
     `).run(project, engine, now);
-  }
-
-  setProjectAllowlist(project: string, allowlist: readonly TaskPairAllowlistEntry[], now = Date.now()): void {
-    this.#db.prepare(`
-      INSERT INTO task_pair_project_settings (project, engine, allowlist_json, updated_at) VALUES (?, NULL, ?, ?)
-      ON CONFLICT (project) DO UPDATE SET allowlist_json = excluded.allowlist_json, updated_at = excluded.updated_at
-    `).run(project, JSON.stringify(normalizeTaskPairAllowlist(allowlist)), now);
   }
 
   getMeta(key: string): string | undefined {
