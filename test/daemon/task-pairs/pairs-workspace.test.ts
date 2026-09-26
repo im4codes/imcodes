@@ -24,7 +24,7 @@ import { removeSession, upsertSession } from '../../../src/store/session-store.j
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { setTaskPairMaterialDepsForTests } from '../../../src/daemon/task-pairs/material.js';
-import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from '../../../src/daemon/task-pairs/service.js';
 import {
   releaseTaskPairWorkspace,
   provisionTaskPairWorkspace,
@@ -76,6 +76,28 @@ function marker(writer: string, line: string) {
   turn += 1;
   return taskPairService.ingestText(PROJECT, writer, line, `wt-turn-${turn}`);
 }
+/**
+ * A DISPATCH marker now queues before it starts (owner rule, tsk_cd_dispatch_default:
+ * DISPATCH is capacity-gated exactly like QUEUE). This suite always names both
+ * roles explicitly, so no pool/pick/capacity logic is exercised here -- this
+ * stand-in just starts a pair the moment its slot frees, same as the real
+ * queue drain does once roles are already resolved.
+ */
+const testScheduler: TaskPairScheduler = {
+  async onIntent(project, pairState, intent) {
+    if (intent.kind !== 'slot_changed') return;
+    if (pairState.status !== 'queued' || !pairState.executor || pairState.auditor === undefined) return;
+    taskPairService.applyMarker({
+      project,
+      writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: pairState.taskId, attrs: { executor: pairState.executor, auditor: pairState.auditor } },
+      source: 'queue',
+      now: Date.now(),
+      eventId: `test-queue-drain:${pairState.taskId}:${Date.now()}:${Math.random()}`,
+    });
+    await taskPairService.briefParticipants(project, pairState.taskId);
+  },
+};
 function pair(taskId: string): TaskPairState {
   return getTaskPairStore().getPair(PROJECT, taskId)!.state;
 }
@@ -131,6 +153,7 @@ describe('pair workspaces', () => {
     git(project, 'fetch', '-q', 'origin');
     setTaskPairWorkspaceDepsForTests({ env: { ...process.env, IMCODES_WORKTREES_ROOT: worktreesRoot, IMCODES_WORKS_ROOT: worksRoot } });
     useProject(project);
+    taskPairService.setScheduler(testScheduler);
   });
 
   afterEach(async () => {
@@ -141,6 +164,7 @@ describe('pair workspaces', () => {
     // store underneath it closes, or a late write throws against an
     // already-closed database (the original tsk_cd_pairs_bg_drain report).
     await taskPairService.waitForIdle();
+    taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairWorkspaceDepsForTests(undefined);
     setTaskPairMaterialDepsForTests(undefined);

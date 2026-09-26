@@ -359,12 +359,94 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'brain-queue-stall')).toHaveLength(1);
   });
 
-  it('does not auto-dispatch a queued task without a brief, telling Brain once', async () => {
+  it('a queued task with no brief and no available candidate stays queued silently -- an ordinary capacity miss, not a brief-specific stall', async () => {
+    candidates = [];
     marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q4 -->');
     await flush();
     await tick(2);
     expect(pair('Q4').status).toBe('queued');
-    expect(sentTo(BRAIN, 'brain-no_brief')).toHaveLength(1);
+    expect(pair('Q4').flags).toContain('waiting_for_capacity');
+    expect(sentTo(BRAIN)).toHaveLength(0);
+  });
+
+  it('auto-dispatches a queued task with no brief once candidates are available, briefing the executor instead of stalling forever', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH Q4b executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('Q4b').status).toBe('working');
+    const brief = sentTo(EXEC, 'pair-brief')[0];
+    expect(brief).toBeDefined();
+    expect(brief!.text).not.toContain('undefined');
+    expect(brief!.text).toContain('executor of this task pair');
+  });
+
+  it('DISPATCH with a brief under the limit starts right away and delivers the brief, same as QUEUE', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DB1 title="Dispatch with a brief" executor=${EXEC} auditor=${AUD} -->\nfix the thing\n<!-- IMCODES_TASK_END DB1 -->`);
+    await flush();
+    expect(pair('DB1')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD, brief: 'fix the thing' });
+    const dispatch = sentTo(EXEC, 'dispatch')[0]!;
+    expect(dispatch.text.startsWith('fix the thing')).toBe(true);
+    // Owner rule (tsk_cd_dispatch_default): ask, don't just reply -- in the auditor brief too.
+    expect(sentTo(AUD, 'auditor-assigned')[0]?.text).toContain('Ask, don\'t just reply');
+  });
+
+  it('tells Brain immediately when the executor writes BLOCKED, instead of waiting for it to go silent', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DBL executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED DBL note="need a decision on scope" -->');
+    await flush();
+    const notice = sentTo(BRAIN, 'brain-blocked');
+    expect(notice).toHaveLength(1);
+    expect(notice[0]!.text).toContain('need a decision on scope');
+    // A second BLOCKED from the same side, still blocked, is not re-notified.
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED DBL note="still need a decision on scope" -->');
+    await flush();
+    expect(sentTo(BRAIN, 'brain-blocked')).toHaveLength(1);
+  });
+
+  it('DISPATCH over the concurrency limit auto-queues instead of starting, then auto-starts once a slot frees', async () => {
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH D1 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('D1').status).toBe('working');
+
+    // Brain still just writes DISPATCH -- no need to pick QUEUE to defer it.
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH D2 title="Second" executor=${SPARE} auditor=${SPARE2} -->\nsecond brief\n<!-- IMCODES_TASK_END D2 -->`);
+    await flush();
+    expect(pair('D2')).toMatchObject({ status: 'queued', executor: SPARE, auditor: SPARE2 });
+    expect(sentTo(SPARE)).toHaveLength(0);
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE D1 force=true -->');
+    await flush();
+    expect(pair('D2').status).toBe('working');
+    expect(sentTo(SPARE, 'dispatch')[0]?.text.startsWith('second brief')).toBe(true);
+  });
+
+  it('a DISPATCH naming a busy session queues and starts once that session frees, never silently substituting another', async () => {
+    busy.add(EXEC);
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH D3 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('D3')).toMatchObject({ status: 'queued', executor: EXEC });
+    expect(pair('D3').flags).toContain('waiting_for_capacity');
+
+    busy.delete(EXEC);
+    await tick(1);
+    expect(pair('D3').status).toBe('working');
+  });
+
+  it('urgent=true on DISPATCH jumps a queued pair ahead of earlier-queued normal work, same as QUEUE', async () => {
+    candidates = [SPARE, SPARE2, AUD, EXEC];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DU1 title="First" executor=${EXEC} auditor=${AUD} -->`);
+    marker(BRAIN, '<!-- IMCODES_TASK DISPATCH DU2 title="Second (normal)" -->');
+    marker(BRAIN, '<!-- IMCODES_TASK DISPATCH DU3 title="Third (urgent)" urgent=true -->');
+    await flush();
+    expect(pair('DU1').status).toBe('working');
+    expect(pair('DU2').status).toBe('queued');
+    expect(pair('DU3')).toMatchObject({ status: 'queued', urgent: true });
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE DU1 force=true -->');
+    await flush();
+    expect(pair('DU3').status).toBe('working');
+    expect(pair('DU2').status).toBe('queued');
   });
 
   it('batches several brief-less queued pairs found in one heartbeat into one digest naming them all, with one example marker (not one per pair)', async () => {

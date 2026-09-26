@@ -892,7 +892,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
     for (const stored of queued) {
       if (open >= max) return;
       const pair = stored.state;
-      if (pair.brief === undefined) {
+      // A brief-less pair imported from legacy supervision has no real work to
+      // start: park it (one batched Brain notice) until Brain adds a brief.
+      // A bare DISPATCH that was auto-queued (no brief, no legacy id) is
+      // legitimate and starts below, briefed like an immediate DISPATCH.
+      if (pair.brief === undefined && stored.legacyTaskId) {
         this.#flagOnceWithKey(stored, 'no_brief', buildNoBriefLine(pair.taskId));
         continue;
       }
@@ -948,10 +952,18 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'no_pool_configured') };
       store.savePair(project, cleaned);
       open += 1;
-      // The executor's worktree exists before the brief that names it is sent.
-      const withWorkspace = await taskPairService.ensureWorkspace(project, pair.taskId) ?? cleaned;
-      await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(withWorkspace)}`);
-      if (auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(cleaned));
+      if (pair.brief !== undefined) {
+        // The executor's worktree exists before the brief that names it is sent.
+        const withWorkspace = await taskPairService.ensureWorkspace(project, pair.taskId) ?? cleaned;
+        await sendTaskPairMessage(executor, pair.taskId, 'dispatch', `${pair.brief}${buildDispatchTrailer(withWorkspace)}`);
+        if (auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(cleaned));
+      } else {
+        // DISPATCH never required a brief (unlike QUEUE); a queued pair that
+        // reached here without one -- a bare DISPATCH the queue could not
+        // start right away -- is briefed the same way an immediate DISPATCH
+        // always was, instead of stalling for a brief it was never going to get.
+        await taskPairService.briefParticipants(project, pair.taskId);
+      }
       await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.`));
     }
   }

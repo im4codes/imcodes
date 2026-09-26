@@ -3,7 +3,7 @@ import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
-import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { taskPairService, type TaskPairScheduler } from '../../../src/daemon/task-pairs/service.js';
 import {
   answerLegacyToolInDaemon,
   handleLegacyToolOnPairs,
@@ -39,18 +39,44 @@ function pair(taskId: string) {
   return getTaskPairStore().getPair(PROJECT, taskId)?.state;
 }
 
+/**
+ * A DISPATCH marker now queues before it starts (owner rule, tsk_cd_dispatch_default:
+ * DISPATCH is capacity-gated exactly like QUEUE). This suite always names
+ * both roles explicitly and is not testing pool/pick/capacity logic at all,
+ * so this stand-in just starts a pair the moment its slot frees.
+ */
+const testScheduler: TaskPairScheduler = {
+  async onIntent(project, pairState, intent) {
+    if (intent.kind !== 'slot_changed') return;
+    if (pairState.status !== 'queued' || !pairState.executor || pairState.auditor === undefined) return;
+    taskPairService.applyMarker({
+      project,
+      writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: pairState.taskId, attrs: { executor: pairState.executor, auditor: pairState.auditor } },
+      source: 'queue',
+      now: Date.now(),
+      eventId: `test-queue-drain:${pairState.taskId}:${Date.now()}:${Math.random()}`,
+    });
+    await taskPairService.briefParticipants(project, pairState.taskId);
+  },
+};
+
 describe('legacy supervision tools and migration on the pairs engine', () => {
   const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
 
-  beforeEach(() => {
+  beforeEach(async () => {
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     setTaskPairDeliveryDepsForTests({ send: async () => undefined });
     for (const record of [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')]) upsertSession(record);
+    taskPairService.setScheduler(testScheduler);
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L1 executor=${EXEC} auditor=${AUD} -->`);
+    await taskPairService.waitForIdle();
   });
 
-  afterEach(() => {
+  afterEach(async () => {
+    await taskPairService.waitForIdle();
+    taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
     for (const name of [BRAIN, EXEC, AUD]) removeSession(name);
