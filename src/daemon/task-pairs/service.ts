@@ -111,23 +111,31 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
 }
 
 export async function refreshTaskPairWorkspaceHead(project: string, taskId: string): Promise<void> {
-  const store = getTaskPairStore();
-  const stored = store.getPair(project, taskId);
-  const workspace = stored?.state.workspace;
-  if (!stored || !workspace || workspace.kind !== 'worktree' || workspace.status === 'removed') return;
-  const material = await resolveTaskPairMaterial(stored.state);
-  if (!material.head) return;
-  const now = Date.now();
-  if (workspace.lastHead === material.head && workspace.lastHeadAt) return;
-  // Re-read: resolveTaskPairMaterial was an async gap, and something else
-  // (endWorkspace ending the pair, a self-heal rebuild) may have mutated the
-  // workspace while it ran. Merge lastHead onto FRESH state, never onto the
-  // snapshot captured before the gap -- writing that back would silently
-  // clobber whatever changed (e.g. reopen an 'ended' workspace to 'active').
-  const latest = store.getPair(project, taskId);
-  const latestWorkspace = latest?.state.workspace;
-  if (!latest || !latestWorkspace || latestWorkspace.status === 'removed') return;
-  store.savePair(project, { ...latest.state, workspace: { ...latestWorkspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(latest.state.updatedAt, now) });
+  try {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    const workspace = stored?.state.workspace;
+    if (!stored || !workspace || workspace.kind !== 'worktree' || workspace.status === 'removed') return;
+    const material = await resolveTaskPairMaterial(stored.state);
+    if (!material.head) return;
+    const now = Date.now();
+    if (workspace.lastHead === material.head && workspace.lastHeadAt) return;
+    // Re-read: resolveTaskPairMaterial was an async gap, and something else
+    // (endWorkspace ending the pair, a self-heal rebuild) may have mutated the
+    // workspace while it ran. Merge lastHead onto FRESH state, never onto the
+    // snapshot captured before the gap -- writing that back would silently
+    // clobber whatever changed (e.g. reopen an 'ended' workspace to 'active').
+    const latest = store.getPair(project, taskId);
+    const latestWorkspace = latest?.state.workspace;
+    if (!latest || !latestWorkspace || latestWorkspace.status === 'removed') return;
+    store.savePair(project, { ...latest.state, workspace: { ...latestWorkspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(latest.state.updatedAt, now) });
+  } catch (error) {
+    // Best-effort cache refresh: the async gap above can outlive the pair's
+    // store (test teardown, daemon shutdown). Losing lastHead is harmless --
+    // it is re-derived on the next marker -- but an unhandled rejection here
+    // is not.
+    logger.warn({ err: error, taskId }, 'task-pair: workspace head refresh failed');
+  }
 }
 
 export class TaskPairService {

@@ -23,7 +23,7 @@ import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
-import { ensureTaskPairWorkspaceAvailable, taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import {
   releaseTaskPairWorkspace,
   provisionTaskPairWorkspace,
@@ -513,6 +513,17 @@ describe('pair workspaces', () => {
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-workspace-unrecoverable')).toHaveLength(1));
       expect(pair('R7').workspaceRecoveryEscalatedAt).toBeTruthy();
     });
+  });
+
+  it('refreshTaskPairWorkspaceHead never rejects when the store closes mid-flight (a fire-and-forget call, not awaited by its caller)', async () => {
+    await opened('R8');
+    const refresh = refreshTaskPairWorkspaceHead(PROJECT, 'R8');
+    // Race the real `git rev-parse HEAD` subprocess this kicks off: swap in a
+    // fresh store (which closes the old one) before it can resolve, exactly
+    // like afterEach does while a background refresh from a prior test is
+    // still in flight.
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    await expect(refresh).resolves.toBeUndefined();
   });
 
   describe('deliverables', () => {
