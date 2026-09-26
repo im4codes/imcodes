@@ -9347,6 +9347,36 @@ afterEach(() => {
     });
   });
 
+  it('does not send text-only when a completed transfer has no daemon path', async () => {
+    // A malformed completion must fail closed just like a transport failure.
+    // This covers recovery/fallback adapters returning an incomplete
+    // attachment object: the visible failure keeps the composer text intact
+    // instead of allowing Send to serialize an empty attachment list.
+    uploadFileMock.mockResolvedValue({ attachment: {} });
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'missing-path-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    const input = screen.getByRole('textbox') as HTMLDivElement;
+    input.textContent = 'keep this text';
+    fireEvent.input(input);
+    fireEvent.paste(input, {
+      clipboardData: { files: [new File(['x'], 'missing-path.txt', { type: 'text/plain' })], getData: () => '' },
+    });
+
+    const failedRow = await screen.findByTestId('composer-upload-row');
+    expect(within(failedRow).getByRole('button', { name: 'retry: missing-path.txt' })).toBeTruthy();
+    expect(input.textContent).toBe('keep this text');
+    expect(screen.getAllByText('upload_failed').length).toBeGreaterThan(0);
+    expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
   it('deletes the daemon upload when the existing attachment x is clicked without confirmation', async () => {
     uploadFileMock.mockResolvedValue({
       attachment: {

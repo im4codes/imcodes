@@ -723,6 +723,9 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachmentR
   }
 }
 
+// Keep the persisted-draft append primitive for single-completion callers and
+// compatibility with older composer integrations.  Batched uploads call it
+// first, then immediately rewrite the draft in selection order below.
 function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachmentRecord): ComposerAttachmentRecord[] {
   const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
   const next = renumberAttachments([...current, attachment]);
@@ -747,6 +750,8 @@ type ComposerUploadItem = {
   lastSampleBytes: number;
   speedBps: number;
   updatedAt: number;
+  /** The daemon path is recorded before the transient row can become done. */
+  attachmentPath?: string;
 };
 
 type ComposerUploadEntry = {
@@ -1689,7 +1694,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [uploadSnapshot, setUploadSnapshot] = useState(() => getComposerUploadSnapshot(composerUploadKey));
   const uploadRows = uploadSnapshot.uploads;
-  const uploading = uploadRows.some((item) => item.status === 'uploading');
+  // A row is pending until its resolved daemon path is attached to the
+  // composer.  The path check closes the small render window between a
+  // transfer settling and the attachment list update (and also fails closed
+  // for any stale row restored from an older build).
+  const uploading = uploadRows.some((item) => (
+    item.status === 'uploading' || (item.status === 'done' && !item.attachmentPath)
+  ));
   const uploadNow = useNowTicker(uploading);
   const uploadError = uploadSnapshot.error;
   const [sendWarning, setSendWarning] = useState<string | null>(null);
@@ -4953,6 +4964,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     addComposerUploadItems(uploadKey, uploadItems);
 
     const settledUploadIds: string[] = [];
+    // Uploads run concurrently, but composer sequence numbers follow the
+    // user's selection order rather than whichever transfer happens to finish
+    // first.  Keep each completed path immediately, then project the completed
+    // subset in `uploadItems` order before the transient row becomes `done`.
+    const completedAttachments = new Map<string, ComposerAttachmentRecord>();
     const uploadedAttachments = await Promise.all(files.map(async (file, index): Promise<ComposerAttachmentRecord | null> => {
       const uploadItem = uploadItems[index];
       const abortController = new AbortController();
@@ -4971,20 +4987,52 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           },
           signal: abortController.signal,
         });
-        updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
-        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done' });
-        settledUploadIds.push(uploadItem.id);
-        if (result.attachment?.daemonPath) {
-          rememberAttachmentPreview(result.attachment.daemonPath, file);
-          return {
-            path: result.attachment.daemonPath,
-            name: file.name,
-            seq: 0,
-            ...(result.attachment.id ? { id: result.attachment.id } : {}),
-            ...(result.attachment.serverId ? { serverId: result.attachment.serverId } : { serverId }),
-          };
+        const daemonPath = typeof result.attachment?.daemonPath === 'string'
+          ? result.attachment.daemonPath.trim()
+          : '';
+        // A transfer is not composer-complete until the daemon path has been
+        // committed to the attachment list.  In particular, status recovery,
+        // relay fallback, retry, and reconnect all resolve through this same
+        // branch; marking the progress row done first briefly enabled Send
+        // while `attachments` was still empty, which produced text-only sends.
+        if (!daemonPath) throw new Error('attachment_path_missing');
+        const attachment: ComposerAttachmentRecord = {
+          path: daemonPath,
+          name: file.name,
+          seq: 0,
+          ...(result.attachment.id ? { id: result.attachment.id } : {}),
+          ...(result.attachment.serverId ? { serverId: result.attachment.serverId } : { serverId }),
+        };
+        rememberAttachmentPreview(daemonPath, file);
+        completedAttachments.set(uploadItem.id, attachment);
+        const orderedCompleted = uploadItems
+          .map((item) => completedAttachments.get(item.id))
+          .filter((entry): entry is ComposerAttachmentRecord => !!entry);
+        const completedPaths = new Set(orderedCompleted.map((entry) => entry.path));
+        if (uploadAttachmentDraftKey) {
+          appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
+          const stored = parseStoredComposerAttachments(window.sessionStorage.getItem(uploadAttachmentDraftKey));
+          const next = renumberAttachments([
+            ...stored.filter((entry) => !completedPaths.has(entry.path)),
+            ...orderedCompleted,
+          ]);
+          window.sessionStorage.setItem(uploadAttachmentDraftKey, JSON.stringify(next));
+          if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
+            setAttachments(next);
+          }
+        } else {
+          setAttachments((prev) => renumberAttachments([
+            ...prev.filter((entry) => !completedPaths.has(entry.path)),
+            ...orderedCompleted,
+          ]));
         }
-        return null;
+        // Keep the path on the transient row as a second invariant: a render
+        // that observes `done` can never be mistaken for a sendable upload
+        // without a resolved daemon path.
+        updateComposerUploadProgress(uploadKey, uploadItem.id, 100);
+        updateComposerUploadItem(uploadKey, uploadItem.id, { status: 'done', attachmentPath: daemonPath });
+        settledUploadIds.push(uploadItem.id);
+        return attachment;
       } catch (err) {
         if (isFileUploadCanceled(err)) {
           removeComposerUploadItems(uploadKey, [uploadItem.id]);
@@ -5015,19 +5063,6 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }));
 
     const successfulAttachments = uploadedAttachments.filter((entry): entry is ComposerAttachmentRecord => !!entry);
-    if (successfulAttachments.length > 0) {
-      if (uploadAttachmentDraftKey) {
-        let next: ComposerAttachmentRecord[] = [];
-        for (const attachment of successfulAttachments) {
-          next = appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
-        }
-        if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
-          setAttachments(next);
-        }
-      } else {
-        setAttachments((prev) => renumberAttachments([...prev, ...successfulAttachments]));
-      }
-    }
     // Successful/canceled rows are transient.  Failed rows deliberately stay
     // visible with a retry action: removing every row here made a 99%-phase
     // failure disappear immediately and look like a silent success/failure.
