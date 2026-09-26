@@ -2,6 +2,7 @@ import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/c
 import { taskPairService } from './task-pairs/service.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import { isSessionWorking } from './session-working.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, type SessionRecord } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
@@ -1465,10 +1466,11 @@ export async function startup(): Promise<DaemonContext> {
           };
         }
         const observed = resolveAuthoritativeSessionListState(record);
+        const working = isSessionWorking(sessionName);
         return {
           label: record.label,
           model: record.activeModel?.trim() || record.requestedModel?.trim(),
-          state: observed === 'running' || observed === 'queued'
+          state: working || observed === 'running' || observed === 'queued'
             ? 'running'
             : observed === 'idle'
               ? 'idle'
@@ -1487,15 +1489,26 @@ export async function startup(): Promise<DaemonContext> {
     // Pair changes refresh the task console (resync) and the session badges,
     // coalesced per project so a burst of markers costs one refresh.
     const pendingPairRefresh = new Map<string, NodeJS.Timeout>();
-    getTaskPairStore().onPairSaved((project) => {
+    const schedulePairRefresh = (project: string, reason: 'task_pair_changed' | 'session_activity_changed') => {
       if (pendingPairRefresh.has(project)) return;
       const timer = setTimeout(() => {
         pendingPairRefresh.delete(project);
-        supervisionConsole?.sessions.resyncProject(project, 'task_pair_changed');
+        supervisionConsole?.sessions.resyncProject(project, reason);
         taskPairAutomation.publishBadges();
       }, 250);
       timer.unref?.();
       pendingPairRefresh.set(project, timer);
+    };
+    getTaskPairStore().onPairSaved((project) => schedulePairRefresh(project, 'task_pair_changed'));
+    // State/tool events change live executorState/auditorState in the status
+    // payload even when no pair row was saved. Resolve by participant so main
+    // sessions and sub-sessions follow the same refresh path.
+    timelineEmitter.on((event) => {
+      if (event.type !== 'session.state' && event.type !== 'assistant.text'
+        && event.type !== 'tool.call' && event.type !== 'tool.result') return;
+      for (const pair of getTaskPairStore().pairsForSession(event.sessionId)) {
+        schedulePairRefresh(pair.project, 'session_activity_changed');
+      }
     });
   } catch (err) {
     supervisionConsole = undefined;

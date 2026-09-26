@@ -39,6 +39,7 @@ import { delegationTargetInputs } from '../delegation-admission.js';
 import { configMatchesSession, configuredPools, poolDefinition } from '../supervision-auto-provision.js';
 import { describeSupervisorDefaultsSyncGap } from '../supervisor-defaults-cache.js';
 import { getTransportRuntime } from '../../agent/session-manager.js';
+import { isSessionWorking } from '../session-working.js';
 import { getTaskPairStore } from './store.js';
 
 export type TaskPairPickRole = 'executor' | 'auditor';
@@ -327,6 +328,7 @@ export function describeLimitedProviderFamilies(input: {
 export function isSessionBusy(sessionName: string, deps: TaskPairPoolDeps = {}): boolean {
   const session = (deps.getSession ?? getSession)(sessionName);
   if (!session) return false;
+  if (!deps.getSession && isSessionWorking(sessionName)) return true;
   if (session.state === 'running') return true;
   return (deps.hasPendingMessages ?? defaultHasPendingMessages)(sessionName);
 }

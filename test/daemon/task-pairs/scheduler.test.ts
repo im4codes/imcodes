@@ -5,6 +5,7 @@ import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../..
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
+import { isSessionWorking } from '../../../src/daemon/session-working.js';
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { getSupervisionTaskRegistry } from '../../../src/daemon/supervision-state-store.js';
 import {
@@ -74,6 +75,16 @@ async function tick(times = 1) {
   for (let i = 0; i < times; i += 1) {
     now += 6 * 60_000;
     await automation.tick();
+  }
+}
+
+// The lightweight both-idle check runs independently of, and much more
+// frequently than, the 6-minute heartbeat tick (30s by default in
+// production); tests drive it directly rather than waiting on that timer.
+async function bothIdleCheck(times = 1, stepMs = 30_000) {
+  for (let i = 0; i < times; i += 1) {
+    now += stepMs;
+    await automation.checkBothIdlePairs();
   }
 }
 
@@ -178,21 +189,136 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(EXEC, 'nudge-executor')[0]?.text).toContain('DONE without a PASS is not complete');
   });
 
-  it('nudges the executor when both sides are idle, but stands down when either side has activity', async () => {
+  it('nudges whoever holds the ball when both sides are idle (in_audit with a real auditor: the auditor), but stands down when either side has activity', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH BOTH_IDLE executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT BOTH_IDLE -->');
     await flush();
     sent = [];
     await tick(1);
     expect(pair('BOTH_IDLE').status).toBe('in_audit');
-    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
-    expect(sentTo(AUD, 'nudge-auditor')).toHaveLength(0);
+    expect(sentTo(AUD, 'nudge-auditor')).toHaveLength(1);
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
 
     sent = [];
     now += 1;
     taskPairService.recordActivity(AUD, now);
     await tick(1);
     expect(sent).toHaveLength(0);
+  });
+
+  describe('lightweight both-idle check (checkBothIdlePairs, independent of the 6-minute heartbeat)', () => {
+    it('nudges the executor once both sides have been idle for the threshold, and not again for the same idle spell', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST1 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(3); // 90s: under the 2-minute threshold
+      expect(sent).toHaveLength(0);
+      await bothIdleCheck(1); // 120s: threshold reached
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      await bothIdleCheck(3); // still the same idle spell: no repeat within the threshold window
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it("nudges the auditor when it is clearly the auditor's turn (in_audit, material delivered)", async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST2 executor=${EXEC} auditor=${AUD} -->`);
+      marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT FAST2 -->');
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(AUD, 'nudge-auditor')).toHaveLength(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
+    });
+
+    it('never nudges while one side is busy', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST3 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      busy.add(EXEC);
+      await bothIdleCheck(4);
+      expect(sent).toHaveLength(0);
+    });
+
+    it('never nudges a rate-limited (provider usage limit) session', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST4 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      limited.add(EXEC);
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
+    });
+
+    it('resets the idle timer on activity, so the threshold has to elapse again', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST5 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      now += 1;
+      taskPairService.recordActivity(EXEC, now);
+      sent = [];
+      await bothIdleCheck(3); // 90s since the fresh activity: still under threshold
+      expect(sent).toHaveLength(0);
+      await bothIdleCheck(1); // 120s since the fresh activity: threshold reached again
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it('counts the fast nudge toward the existing silence escalation and continues the 6-minute heartbeat cadence', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST6 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      // The 2-minute check is the first nudge. The normal heartbeat resumes
+      // after its 6-minute interval, rather than being replaced by the fast
+      // trigger. Silence still escalates after the same number of ticks.
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      now += 1;
+      await automation.tick();
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1); // fast nudge is too recent
+      await tick(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+      await tick(1);
+      expect(pair('FAST6').flags).toContain('executor_silent');
+      expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+      await tick(1);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
+      expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+    });
+
+    it('for an auditor=none pair, "both idle" collapses to the executor alone', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST7 executor=${EXEC} auditor=none -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+
+    it('does not send a double nudge when both the fast check and the ordinary heartbeat tick fire for the same idle spell', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST8 executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4); // 2 minutes: the fast check nudges first
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      // The ordinary heartbeat tick reaches the same still-idle pair moments
+      // later: it must see the fast check's own nudge and stand down.
+      now += 1;
+      await automation.tick();
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+    });
+  });
+
+  it('treats unfinished provider background work (such as an SDK subagent) as working', () => {
+    const snapshot = {
+      status: 'idle', sending: false, pendingCount: 0, pendingVersion: 0,
+      activeDispatchCount: 0, stalePendingRecoveryActive: false, providerSessionBound: true,
+      lastActivityAt: 1, lastActivityAgeMs: 0, lastProviderOutputAt: 1, lastProviderOutputAgeMs: 0,
+      activityGeneration: { scope: 'session', sessionName: EXEC, generation: 1 },
+      blockingWorkCount: 0, backgroundWorkCount: 1, activeToolCount: 0, busyReasons: ['provider_background'],
+    } as const;
+    expect(isSessionWorking(EXEC, {
+      getSession: () => session(EXEC, 'worker'),
+      getDiagnosticSnapshot: () => snapshot as never,
+    })).toBe(true);
   });
 
   it('escalates a repeatedly quiet pair once after the configured silence limit', async () => {

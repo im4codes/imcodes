@@ -43,6 +43,8 @@ export interface TaskPairLiveness {
   /** Any visible participant activity (messages, tool calls, or markers). */
   activityExecutorAt?: number;
   activityAuditorAt?: number;
+  /** Last time the fast both-idle check (scheduler.ts) sent a nudge; dedupes against the ordinary heartbeat tick's own check of the same idle spell. */
+  bothIdleNudgedAt?: number;
   lastTickAt: number;
   /** Escalations already sent, so each is sent once. */
   notified: string[];
@@ -358,6 +360,7 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     progressAuditorAt,
     activityExecutorAt: Number(raw.activityExecutorAt ?? progressExecutorAt),
     activityAuditorAt: Number(raw.activityAuditorAt ?? progressAuditorAt),
+    ...(Number.isFinite(Number(raw.bothIdleNudgedAt)) ? { bothIdleNudgedAt: Number(raw.bothIdleNudgedAt) } : {}),
     lastTickAt: Number(raw.lastTickAt ?? 0),
     notified: Array.isArray(raw.notified) ? raw.notified.map(String) : [],
   };

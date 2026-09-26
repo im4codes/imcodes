@@ -19,6 +19,7 @@ import {
 } from '../supervision-heartbeat-projection.js';
 import logger from '../../util/logger.js';
 import {
+  TASK_PAIR_BOTH_IDLE_NUDGE_MS,
   TASK_PAIR_HEARTBEAT_MS,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
@@ -74,6 +75,10 @@ const TASK_PAIR_AGGREGATE_NOTICE_ID = '__aggregate__' as const;
 
 /** Heartbeat interval override, e.g. for real-device testing. */
 export const TASK_PAIR_HEARTBEAT_ENV = 'IMCODES_TASK_PAIR_HEARTBEAT_MS' as const;
+/** Both-idle nudge threshold override, e.g. for real-device testing. */
+export const TASK_PAIR_BOTH_IDLE_NUDGE_ENV = 'IMCODES_TASK_PAIR_BOTH_IDLE_NUDGE_MS' as const;
+/** How often the lightweight both-idle check runs; independent of, and much cheaper than, a full heartbeat tick. */
+const TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS = 30_000;
 
 export interface TaskPairSchedulerDeps {
   now?: () => number;
@@ -91,6 +96,11 @@ export function resolveTaskPairHeartbeatMs(env: NodeJS.ProcessEnv = process.env)
   return Number.isFinite(raw) && raw >= 1_000 ? raw : TASK_PAIR_HEARTBEAT_MS;
 }
 
+export function resolveTaskPairBothIdleNudgeMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env[TASK_PAIR_BOTH_IDLE_NUDGE_ENV]);
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : TASK_PAIR_BOTH_IDLE_NUDGE_MS;
+}
+
 async function defaultImportLegacy(now: number): Promise<void> {
   const [{ importLegacyTasks }, { getSupervisionTaskRegistry }] = await Promise.all([
     import('./legacy-import.js'),
@@ -101,6 +111,7 @@ async function defaultImportLegacy(now: number): Promise<void> {
 
 export class TaskPairAutomation implements TaskPairScheduler {
   #timer?: NodeJS.Timeout;
+  #bothIdleTimer?: NodeJS.Timeout;
   #deps: TaskPairSchedulerDeps;
   #queueRuns = new Map<string, Promise<void>>();
 
@@ -109,6 +120,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   #intervalMs = TASK_PAIR_HEARTBEAT_MS;
+  #bothIdleNudgeMs = resolveTaskPairBothIdleNudgeMs();
   #nextTickAt = 0;
   #badgeSessions = new Set<string>();
 
@@ -121,11 +133,20 @@ export class TaskPairAutomation implements TaskPairScheduler {
       void this.tick().catch((error) => logger.warn({ err: error }, 'task-pair: heartbeat tick failed'));
     }, intervalMs);
     this.#timer.unref?.();
+    // Independent, much cheaper than a full tick: skips legacy import, queue
+    // running, and workspace refresh, so an idle pair does not have to wait
+    // for the next full heartbeat to be nudged.
+    this.#bothIdleTimer = setInterval(() => {
+      void this.checkBothIdlePairs().catch((error) => logger.warn({ err: error }, 'task-pair: both-idle check failed'));
+    }, TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS);
+    this.#bothIdleTimer.unref?.();
   }
 
   stop(): void {
     if (this.#timer) clearInterval(this.#timer);
     this.#timer = undefined;
+    if (this.#bothIdleTimer) clearInterval(this.#bothIdleTimer);
+    this.#bothIdleTimer = undefined;
   }
 
   #now(): number { return (this.#deps.now ?? Date.now)(); }
@@ -403,42 +424,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const capacityLimited = this.#capacityLimited(session);
 
     // A pair is stuck only when *both* participants have been quiet since the
-    // previous heartbeat. In that case the executor is the single owner of
-    // forward progress, regardless of the nominal side-to-act derived from
-    // the pair status (including an audit that has gone quiet before its
-    // materials arrived). One nudge per heartbeat escalates exactly once.
-    const executor = pair.executor;
-    const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
-    // Neither side counts as "quiet" (needing a nudge) while it is rate- or
-    // capacity-limited: tsk_cd_limit_failover's whole point is that a limited
-    // session is never nudged (it cannot answer) and is held/failed-over by
-    // its own dedicated path below, not treated as plain silence here.
-    const executorQuiet = Boolean(executor)
-      && !this.#busy(executor!)
-      && !this.#rateLimited(executor!)
-      && !this.#capacityLimited(executor!)
-      && (liveness.activityExecutorAt ?? liveness.progressExecutorAt) <= previousTick;
-    const auditorQuiet = Boolean(auditor)
-      && !this.#busy(auditor!)
-      && !this.#rateLimited(auditor!)
-      && !this.#capacityLimited(auditor!)
-      && (liveness.activityAuditorAt ?? liveness.progressAuditorAt) <= previousTick;
-    const executorFlagged = pair.flagSides.blocked === 'executor' || pair.flagSides.needs_input === 'executor';
-    const auditorFlagged = pair.flagSides.blocked === 'auditor' || pair.flagSides.needs_input === 'auditor';
-    if (executorQuiet && auditorQuiet && !executorFlagged && !auditorFlagged && !pair.flags.includes('executor_silent')) {
-      const silence = liveness.silenceExecutor + 1;
-      liveness.silenceExecutor = silence;
-      store.saveLiveness(stored.project, pair.taskId, liveness);
-      if (silence < TASK_PAIR_SILENCE_LIMIT) {
-        const repeat = silence > 1
-          ? `This is repeated quiet heartbeat ${silence}; take ownership now.`
-          : 'Both sides are idle; take ownership of the next action now.';
-        await sendTaskPairMessage(executor!, pair.taskId, 'nudge-executor', buildNudgeMessage(pair, 'executor', repeat));
-      } else if (silence === TASK_PAIR_SILENCE_LIMIT) {
-        this.#escalateExecutor(stored.project, pair.taskId, `both executor and auditor were silent for ${TASK_PAIR_SILENCE_LIMIT} heartbeats`);
-      }
-      return;
-    }
+    // previous heartbeat -- a tick-boundary comparison, correct at this 6-
+    // minute granularity (unlike an absolute duration: a check this
+    // infrequent cannot otherwise tell "idle the whole window" from "just
+    // became active moments before this tick runs"). The faster, absolute-
+    // duration-based #maybeNudgeBothIdle (checkBothIdlePairs, every 30s)
+    // normally already handles this sooner; reached here too so `.tick()`
+    // alone (as tests drive it) still covers it without that faster timer
+    // running, deduped via liveness.bothIdleNudgedAt so the two never both
+    // fire for the same idle spell.
+    if (await this.#maybeNudgeBothQuietSinceTick(stored, pair, liveness, previousTick, now)) return;
 
     const progressAt = side === 'executor' ? liveness.progressExecutorAt : liveness.progressAuditorAt;
     const activityAt = side === 'executor'
@@ -494,6 +489,129 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
     }
     // Past the limit: no more nudges until that side makes progress or is reassigned.
+  }
+
+  /**
+   * Lightweight, frequent (default every 30s, see start()) check independent
+   * of the 6-minute heartbeat tick: every open pair whose side(s) to act have
+   * ALL been idle for at least TASK_PAIR_BOTH_IDLE_NUDGE_MS gets nudged at
+   * once, instead of waiting for the next full heartbeat.
+   */
+  async checkBothIdlePairs(): Promise<void> {
+    const now = this.#now();
+    for (const stored of getTaskPairStore().listActivePairs()) {
+      if (!isPairsEngineProject(stored.project)) continue;
+      try {
+        await this.#maybeNudgeBothIdle(stored.project, stored.state.taskId, now);
+      } catch (error) {
+        logger.warn({ err: error, taskId: stored.state.taskId }, 'task-pair: both-idle check failed');
+      }
+    }
+  }
+
+  /**
+   * Absolute-duration version, meaningful at this method's fine (30s) polling
+   * granularity: the side(s) whose turn it is (in_audit with a real auditor:
+   * the auditor; otherwise the executor -- with no real auditor at all,
+   * "both idle" collapses to the executor alone) have ALL been continuously
+   * idle for at least the both-idle threshold. See #maybeNudgeBothQuietSinceTick
+   * for the coarser, tick-boundary version #tickPair uses instead (a check
+   * this infrequent cannot reliably measure a sub-interval duration).
+   */
+  async #maybeNudgeBothIdle(project: string, taskId: string, now: number): Promise<boolean> {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored) return false;
+    const pair = stored.state;
+    if (!TASK_PAIR_OPEN_STATUSES.includes(pair.status)) return false;
+    const executor = pair.executor;
+    if (!executor) return false;
+    const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
+    const isHeld = (sessionName: string) => this.#busy(sessionName) || this.#rateLimited(sessionName) || this.#capacityLimited(sessionName);
+    if (isHeld(executor) || (auditor && isHeld(auditor))) return false;
+
+    const liveness = stored.liveness;
+    const executorIdleSince = liveness.activityExecutorAt ?? liveness.progressExecutorAt;
+    // The shared idle spell begins when the LAST participant became idle.
+    const idleSince = auditor
+      ? Math.max(executorIdleSince, liveness.activityAuditorAt ?? liveness.progressAuditorAt)
+      : executorIdleSince;
+    if (now - idleSince < this.#bothIdleNudgeMs) return false;
+    // The fast trigger fires once per uninterrupted idle spell. A later
+    // ordinary heartbeat remains responsible for its normal silence cadence.
+    if (liveness.bothIdleNudgedAt !== undefined && liveness.bothIdleNudgedAt >= idleSince) return false;
+    return this.#nudgeBothIdleTarget(stored.project, pair, liveness, now);
+  }
+
+  /**
+   * Coarse, tick-boundary version: "quiet since the previous heartbeat"
+   * (compared against the tick BOUNDARY, not an absolute duration -- correct
+   * at the 6-minute granularity #tickPair runs at; an absolute-duration check
+   * this infrequent cannot otherwise tell "idle the whole window" from "just
+   * became active moments before this tick runs", which the fast, 30s
+   * #maybeNudgeBothIdle instead measures directly). Skips entirely once the
+   * fast check already covered the same idle spell (liveness.bothIdleNudgedAt
+   * recent), so the two never both send a nudge for it.
+   */
+  async #maybeNudgeBothQuietSinceTick(
+    stored: StoredTaskPair, pair: TaskPairState, liveness: TaskPairLiveness, previousTick: number, now: number,
+  ): Promise<boolean> {
+    const executor = pair.executor;
+    if (!executor) return false;
+    const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
+    const isHeld = (sessionName: string) => this.#busy(sessionName) || this.#rateLimited(sessionName) || this.#capacityLimited(sessionName);
+    const executorQuiet = !isHeld(executor) && (liveness.activityExecutorAt ?? liveness.progressExecutorAt) <= previousTick;
+    // With no real auditor, "both idle" collapses to the executor alone.
+    const auditorQuiet = auditor
+      ? !isHeld(auditor) && (liveness.activityAuditorAt ?? liveness.progressAuditorAt) <= previousTick
+      : true;
+    if (!executorQuiet || !auditorQuiet) return false;
+    // The fast nudge counts as one silence tick. Do not also send the normal
+    // heartbeat nudge when it happened within the last heartbeat interval.
+    // It is still handled so #tickPair does not fall through and double-count.
+    if (liveness.bothIdleNudgedAt !== undefined && now - liveness.bothIdleNudgedAt < this.#intervalMs) return true;
+    return this.#nudgeBothIdleTarget(stored.project, pair, liveness, now);
+  }
+
+  /**
+   * Shared send/escalate step once a caller has determined the relevant
+   * side(s) are both idle: nudges whoever holds the ball (in_audit with a
+   * real auditor: the auditor; otherwise the executor), reusing the same
+   * liveness counters and TASK_PAIR_SILENCE_LIMIT escalation as the ordinary
+   * single-side quiet check. Never acts on a side already flagged
+   * blocked/needs_input (its own dedicated path escalates that), or once the
+   * executor is already flagged `executor_silent` (no more nudges until it
+   * makes progress or is reassigned -- mirrors the single-side check below).
+   * Returns true when it sent a nudge or escalated.
+   */
+  async #nudgeBothIdleTarget(project: string, pair: TaskPairState, liveness: TaskPairLiveness, now: number): Promise<boolean> {
+    const executor = pair.executor;
+    if (!executor) return false;
+    const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
+    if (pair.flagSides.blocked || pair.flagSides.needs_input) return false;
+    if (pair.flags.includes('executor_silent')) return false;
+
+    const target = taskPairSideToAct(pair) === 'auditor' && auditor ? 'auditor' : 'executor';
+    const targetSession = target === 'auditor' ? auditor! : executor;
+    const silence = (target === 'executor' ? liveness.silenceExecutor : liveness.silenceAuditor) + 1;
+    const nextLiveness: TaskPairLiveness = {
+      ...liveness,
+      notified: [...liveness.notified],
+      bothIdleNudgedAt: now,
+      ...(target === 'executor' ? { silenceExecutor: silence } : { silenceAuditor: silence }),
+    };
+    getTaskPairStore().saveLiveness(project, pair.taskId, nextLiveness);
+
+    if (silence < TASK_PAIR_SILENCE_LIMIT) {
+      const repeat = silence > 1
+        ? `This is repeated quiet heartbeat ${silence}; take ownership now.`
+        : 'Both sides are idle; take ownership of the next action now.';
+      await sendTaskPairMessage(targetSession, pair.taskId, `nudge-${target}`, buildNudgeMessage(pair, target, repeat));
+    } else if (silence === TASK_PAIR_SILENCE_LIMIT) {
+      if (target === 'auditor') await this.replaceAuditor(project, pair.taskId, `auditor silent for ${TASK_PAIR_SILENCE_LIMIT} both-idle checks`);
+      else this.#escalateExecutor(project, pair.taskId, `both executor and auditor idle for ${TASK_PAIR_SILENCE_LIMIT} both-idle checks`);
+    }
+    return true;
   }
 
   /**

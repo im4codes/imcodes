@@ -177,6 +177,14 @@ export const TASK_PAIR_INERT_AUTHORIZATION_RULE: string =
 
 export const TASK_PAIR_DEFAULT_MAX_CONCURRENCY = 5;
 export const TASK_PAIR_HEARTBEAT_MS = 6 * 60_000;
+/**
+ * How long the side(s) whose turn it is (or, with no real auditor, the
+ * executor alone) must have been continuously idle before an out-of-band
+ * nudge fires -- independent of, and faster than, the TASK_PAIR_HEARTBEAT_MS
+ * heartbeat tick. Shares the same nudge/silence/escalation machinery as the
+ * heartbeat's own quiet-side check (see scheduler.ts).
+ */
+export const TASK_PAIR_BOTH_IDLE_NUDGE_MS = 2 * 60_000;
 /** Silent ticks before a side stops being nudged and escalates. */
 export const TASK_PAIR_SILENCE_LIMIT = 3;
 /** Marker-triggered daemon messages per pair, per reason, per audit round. */

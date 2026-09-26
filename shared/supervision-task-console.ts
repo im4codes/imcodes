@@ -82,6 +82,8 @@ export const SUPERVISION_CONSOLE_RESYNC_REASONS = [
   'stale_subscription',
   /** A marker-driven task pair changed (`pairs` engine rows are rebuilt from the pair store). */
   'task_pair_changed',
+  /** A participant's live turn/tool state changed without changing its pair. */
+  'session_activity_changed',
 ] as const;
 export type SupervisionConsoleResyncReason = typeof SUPERVISION_CONSOLE_RESYNC_REASONS[number];
 
