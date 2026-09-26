@@ -8,12 +8,10 @@ import {
   applyTaskPairMarker,
   buildTaskPairMarkerContract,
   judgeTaskPairVerdict,
-  matchesTaskPairAllowlist,
-  normalizeTaskPairAllowlist,
+  matchesTaskPairBuiltinDefaultRouting,
   scanTaskPairMarkers,
   stripTaskPairMarkersForDisplay,
   taskPairSideToAct,
-  TASK_PAIR_DEFAULT_ALLOWLIST,
   TASK_PAIR_NO_AUDITOR,
   parseTaskPairBindingId,
   taskPairBindingId,
@@ -116,6 +114,13 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('[Contract: task_pair_markers_v1]');
     expect(body).toContain('audit_convergence_v1');
     expect(body).toContain('IMCODES_TASK_END');
+  });
+
+  it('warns that a marker written before a mid-turn tool call is lost, since only the final reply is scanned', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain('FINAL reply of the turn');
+    expect(body).toContain('silently lost');
+    expect(body).toContain('QUEUE <taskId> ... and its');
   });
 
   it('ships a contract stating a project\'s own workflow takes precedence, and that Brain hears only final/terminal states', () => {
@@ -386,21 +391,13 @@ describe('task-pair state machine', () => {
   });
 });
 
-describe('task-pair allowlist', () => {
-  it('defaults to Codex gpt-6-luna executors and Claude Opus auditors', () => {
-    const allowlist = normalizeTaskPairAllowlist(undefined);
-    expect(allowlist).toEqual(TASK_PAIR_DEFAULT_ALLOWLIST);
-    expect(matchesTaskPairAllowlist(allowlist, 'executor', 'codex-sdk', 'gpt-6-luna')).toBe(true);
-    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(true);
-    expect(matchesTaskPairAllowlist(allowlist, 'executor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(false);
-    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'claude-code-sdk', 'claude-sonnet-5')).toBe(false);
-    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'codex-sdk', 'gpt-6-luna')).toBe(false);
-  });
-
-  it('honours a configured entry and role', () => {
-    const allowlist = normalizeTaskPairAllowlist([{ role: 'auditor', agentType: 'codex-sdk', modelPattern: 'gpt-5' }]);
-    expect(matchesTaskPairAllowlist(allowlist, 'auditor', 'codex-sdk', 'gpt-5.5')).toBe(true);
-    expect(matchesTaskPairAllowlist(allowlist, 'executor', 'codex-sdk', 'gpt-5.5')).toBe(false);
+describe('task-pair built-in default routing', () => {
+  it('defaults to Codex gpt-6-luna executors and Claude Opus auditors when no pool is configured', () => {
+    expect(matchesTaskPairBuiltinDefaultRouting('executor', 'codex-sdk', 'gpt-6-luna')).toBe(true);
+    expect(matchesTaskPairBuiltinDefaultRouting('auditor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(true);
+    expect(matchesTaskPairBuiltinDefaultRouting('executor', 'claude-code-sdk', 'claude-opus-5-5')).toBe(false);
+    expect(matchesTaskPairBuiltinDefaultRouting('auditor', 'claude-code-sdk', 'claude-sonnet-5')).toBe(false);
+    expect(matchesTaskPairBuiltinDefaultRouting('auditor', 'codex-sdk', 'gpt-6-luna')).toBe(false);
   });
 });
 

@@ -682,7 +682,10 @@ html.native-ios-mac .chat-dl-btn {
   flex-shrink: 0;
 }
 @keyframes scan-sweep { 0% { left: -60%; } 100% { left: 130%; } }
-.controls-wrapper { position: relative; }
+/* Stack the composer above the task-pair status panel (z-index 12 in
+   .chat-view-wrap): its upward-opening menus (model, audit, OpenSpec…) live
+   inside .shortcuts-row's own z-index:1 context and were drawn under the panel. */
+.controls-wrapper { position: relative; z-index: 13; }
 .controls-wrapper::before { content: ''; position: absolute; top: -1px; left: -60%; width: 60%; height: 2px; background: linear-gradient(90deg, transparent, #00e5ff, #818cf8, #00e5ff, transparent); z-index: 2; opacity: 0; transition: opacity 0.3s ease-out; }
 .controls-wrapper::after { content: ''; position: absolute; inset: 0; background: repeating-linear-gradient(90deg, transparent 0 22px, rgba(125,211,252,0.025) 22px 23px); opacity: 0.55; pointer-events: none; }
 .controls-wrapper-running::before { animation: scan-sweep 3s linear infinite; opacity: 1; }

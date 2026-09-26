@@ -205,6 +205,13 @@ export type AppendQueuedMessagesResult =
       queueSnapshot: QueueSnapshot;
       deliveryFacts: QueueDeliveryFact[];
     }
+  // No turn was actually active (it already settled — completed, failed, hit
+  // the send-start timeout, was stopped, or the provider crashed/restarted)
+  // by the time this append was processed. The session-level queue is not
+  // bound to any one turn: rather than fail with a stale "already finished"
+  // error and leave the queue stuck, the pending queue was dispatched as a
+  // fresh turn instead.
+  | { status: 'dispatched_as_new_turn' }
   | { status: 'stale' | 'rejected' | 'retry' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
 
 type SdkTurnLostRecoveryAttemptStatus =
@@ -1004,6 +1011,13 @@ export class TransportSessionRuntime implements SessionRuntime {
           // so non-relaunch errors cannot wedge future sends behind a phantom
           // dispatch.
           this._activeDispatchEntries = [];
+          // The session-level queue is not tied to this one turn: a genuinely
+          // unrecoverable provider error (crash, auth failure, restart) must
+          // not leave anything queued behind it waiting forever for a turn
+          // that will never resume. Drain it as a fresh turn; if the provider
+          // really is down, the next attempt fails fast the same way instead
+          // of the session sitting stuck in a permanent "working" state.
+          this._drainPending();
         }
       }),
       ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
@@ -2692,10 +2706,28 @@ export class TransportSessionRuntime implements SessionRuntime {
     clientMessageIds: string[],
     notificationId: string,
     deliveryKind: ProviderActiveTurnDeliveryKind = PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    options: { allowDispatchAsNewTurn?: boolean } = {},
   ): Promise<AppendQueuedMessagesResult> {
     const ids = [...new Set(clientMessageIds.map((id) => id.trim()).filter(Boolean))];
     if (ids.length === 0 || !this._providerSessionId) return { status: 'not_found' };
-    if (!this.hasActiveTurnWork()) return { status: 'stale' };
+    if (!this.hasActiveTurnWork()) {
+      // No turn is actually running — it already settled (completion, error,
+      // send-start timeout, stop, provider crash/restart) by the time this
+      // append reached the runtime. `allowDispatchAsNewTurn` is opt-in and set
+      // only by the EXTERNAL command-handler entry point: per the
+      // session-level queue contract, an explicit user append/append-all must
+      // never error out and leave the queue stuck, so dispatch the pending
+      // queue as a fresh turn instead of reporting a stale "already finished"
+      // failure. The INTERNAL scheduled active-append-flush loop
+      // (flushAcceptedProviderActiveAppends) calls this same method with its
+      // own careful authority/ownership checks and must keep its existing
+      // "stale means defer to the normal idle-drain path" behavior unchanged
+      // — it must not force an immediate out-of-turn dispatch.
+      if (options.allowDispatchAsNewTurn && this._drainPending()) {
+        return { status: 'dispatched_as_new_turn' };
+      }
+      return { status: 'stale' };
+    }
     if (this.provider.capabilities.activeDelegationNotification
         !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
       || !this.provider.notifyActiveDelegation) {
@@ -4041,7 +4073,14 @@ export class TransportSessionRuntime implements SessionRuntime {
         // resend queue, then clear runtime-local active state. Ordinary
         // dispatch failures must not leave `hasActiveTurnWork()` true forever.
         this._activeDispatchEntries = [];
-        // Don't drain on async send failure — the provider is likely broken.
+        // The failed message itself is not retried here — the provider is
+        // likely broken for this specific turn — but the queue is
+        // SESSION-level, not bound to this one turn: anything queued behind
+        // it must still get a chance to run instead of waiting forever on a
+        // turn that will never complete. A genuinely down provider fails the
+        // next attempt fast (settling the same way), instead of the session
+        // sitting stuck in "working" with the queue never draining.
+        this._drainPending();
       });
   }
 

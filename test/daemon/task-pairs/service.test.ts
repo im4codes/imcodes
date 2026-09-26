@@ -5,7 +5,7 @@ import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
-import { resolveTaskPairAllowlist, resolveTaskPairEngine, resolveTaskPairEngineState, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
+import { resolveTaskPairEngine, resolveTaskPairEngineState, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
 import { TASK_PAIR_TIMELINE_EVENT, taskPairBindingId } from '../../../shared/task-pair.js';
@@ -346,20 +346,23 @@ describe('task-pair marker ingestion', () => {
     expect(resolveTaskPairEngine('rolledback', {})).toBe('legacy');
   });
 
-  it('reads engine, allowlist and limit from the Brain supervision settings first', () => {
+  it('reads engine and limit from the Brain supervision settings first', () => {
+    // Pair routing (executor/auditor picks) is exactly the execution pool's
+    // per-entry role now -- see shared/supervision-execution-pool.test.ts
+    // for foldLegacyPairAllowlistIntoExecutionPools and pool.test.ts /
+    // owner-rule.test.ts for role-based picking. This test covers only the
+    // remaining pair settings (engine, max concurrency).
     delete process.env.IMCODES_SUPERVISION_ENGINE;
     upsertSession({
       ...session(BRAIN, 'brain'),
       transportConfig: {
         supervision: normalizeSessionSupervisionSnapshot({
           pairEngine: 'legacy',
-          pairAllowlist: [{ role: 'auditor', agentType: 'codex-sdk', modelPattern: 'gpt-5' }],
           pairMaxConcurrency: 3,
         }),
       },
     } as SessionRecord);
     expect(resolveTaskPairEngine(PROJECT)).toBe('legacy');
-    expect(resolveTaskPairAllowlist(PROJECT)).toEqual([{ role: 'auditor', agentType: 'codex-sdk', modelPattern: 'gpt-5' }]);
     getTaskPairStore().setMaxConcurrency(BRAIN, 8);
     expect(resolveTaskPairMaxConcurrency(BRAIN)).toBe(3);
   });

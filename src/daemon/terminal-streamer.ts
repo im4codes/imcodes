@@ -16,7 +16,7 @@
  */
 
 import type { Readable } from 'stream';
-import { BACKEND, capturePaneVisible, capturePaneHistory, getPaneId, getPaneSize, paneExists, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
+import { BACKEND, capturePaneVisible, capturePaneHistory, getPaneId, getPaneIdentity, getPaneSize, paneExists, sessionExists, startPipePaneStream, stopPipePaneStream } from '../agent/tmux.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { getSession, upsertSession } from '../store/session-store.js';
 import { processRawPtyData, resetParser } from './terminal-parser.js';
@@ -77,6 +77,20 @@ function isBlankTerminalSnapshot(value: string): boolean {
   return stripAnsiForBlankCheck(value).trim().length === 0;
 }
 
+/**
+ * `getPaneIdentity` is a best-effort, additive staleness signal (see
+ * PipeState.sessionCreated) -- never let a rejection, or the function being
+ * absent entirely (a test double that mocks only the pre-existing tmux
+ * exports), interrupt the bootstrap/pipe-start flow it is called from.
+ */
+async function safeGetPaneIdentity(sessionName: string): Promise<{ paneId: string; sessionCreated: string } | undefined> {
+  try {
+    return await getPaneIdentity(sessionName);
+  } catch {
+    return undefined;
+  }
+}
+
 export type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 
 /** How long a just-broadcast snapshot is treated as current, so a burst of
@@ -124,6 +138,13 @@ interface PipeState {
    *  EOF. In both cases the recorded paneId is stale; reusing the pipe
    *  reads from a dead pipe-pane and bytes silently never arrive. */
   paneId?: string;
+  /** The owning tmux session's creation time when this pipe was started.
+   *  tmux's `%N` pane-id counter is server-scoped and gets REUSED once every
+   *  other session is gone — a lone kill+recreate under the same session name
+   *  routinely reallocates the exact same paneId, so `paneId` equality alone
+   *  cannot detect that staleness. `session_created` changes on every fresh
+   *  session even when the paneId coincidentally repeats. */
+  sessionCreated?: string;
 }
 
 // ── TerminalStreamer ───────────────────────────────────────────────────────────
@@ -269,15 +290,21 @@ export class TerminalStreamer {
     if (hasPipe && BACKEND !== 'conpty' && BACKEND !== 'wezterm') {
       const existingPipe = this.pipes.get(sessionName);
       const recordedPaneId = existingPipe?.paneId;
-      // Use sync getSession first (fast, no tmux call) and fall back to
-      // async tmux probe only when session-store doesn't know.
-      let currentPaneId = getSession(sessionName)?.paneId;
-      if (!currentPaneId) {
-        const fetched = getPaneId(sessionName);
-        currentPaneId = fetched != null ? await fetched.catch(() => undefined) : undefined;
-      }
-      if (recordedPaneId && currentPaneId && recordedPaneId !== currentPaneId) {
-        logger.info({ sessionName, recordedPaneId, currentPaneId }, 'subscribe: pane changed under us, restarting pipe');
+      const recordedSessionCreated = existingPipe?.sessionCreated;
+      // A live probe of BOTH signals together, rather than the sync
+      // session-store paneId alone: tmux's `%N` pane-id counter is
+      // server-scoped and gets REUSED once every other session is gone, so a
+      // lone kill+recreate under the same session name routinely reallocates
+      // the exact same paneId. `session_created` changes on every fresh
+      // session even when the paneId coincidentally repeats, so comparing
+      // the pair (when both sides have it) catches that case too.
+      const currentIdentity = await safeGetPaneIdentity(sessionName);
+      const currentPaneId = currentIdentity?.paneId ?? getSession(sessionName)?.paneId;
+      const paneIdChanged = !!(recordedPaneId && currentPaneId && recordedPaneId !== currentPaneId);
+      const sessionReplaced = !!(recordedSessionCreated && currentIdentity?.sessionCreated
+        && recordedSessionCreated !== currentIdentity.sessionCreated);
+      if (paneIdChanged || sessionReplaced) {
+        logger.info({ sessionName, recordedPaneId, currentPaneId, sessionReplaced }, 'subscribe: pane changed under us, restarting pipe');
         if (existingPipe) {
           this.pipes.delete(sessionName);
           try { existingPipe.stream.destroy(); } catch { /* ignore */ }
@@ -795,7 +822,13 @@ export class TerminalStreamer {
     try {
       const { stream, cleanup } = await startPipePaneStream(sessionName, paneId ?? '');
 
-      const pipeState: PipeState = { stream, cleanup, retryCount, paneId };
+      // Best-effort: lets the staleness check below catch a same-paneId
+      // session replacement (see PipeState.sessionCreated). A failure here
+      // (conpty/wezterm, or a transient tmux hiccup) just falls back to the
+      // paneId-only comparison that already existed.
+      const identity = BACKEND === 'tmux' ? await safeGetPaneIdentity(sessionName) : undefined;
+
+      const pipeState: PipeState = { stream, cleanup, retryCount, paneId, sessionCreated: identity?.sessionCreated };
       this.pipes.set(sessionName, pipeState);
 
       stream.on('data', (chunk: unknown) => {

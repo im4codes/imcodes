@@ -761,6 +761,37 @@ describe('TransportSessionRuntime', () => {
       .toBe(false);
   });
 
+  it('append dispatches the pending queue as a fresh turn instead of erroring "stale" once no turn is active (owner report: append/append-all kept failing "The active turn already finished" against a queue the runtime never drained)', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-crash-turn');
+    await waitForProviderSendCount(mock.provider, 1);
+    expect(runtime.send('queued behind crash', 'queued-after-crash-append')).toBe('queued');
+
+    // A drain attempt during settlement can be transiently deferred (e.g. a
+    // stale provider activity snapshot, or a supervision admission that is
+    // not ready yet) -- force every drain admission to 'retry' while the
+    // crash settles, so the queue is left populated with no active turn,
+    // matching the exact shape append/append-all hit in production.
+    runtime.pendingDrainAdmission = () => 'retry';
+    mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'provider crashed', recoverable: false });
+    await flushDispatch();
+    expect(runtime.pendingCount).toBe(1);
+    expect(runtime.getStatus()).not.toBe('running');
+
+    // Once admission is normal again, append must not report a stale
+    // "already finished" error -- it must dispatch the queue as a new turn.
+    runtime.pendingDrainAdmission = () => 'authorized';
+    const result = await runtime.appendPendingMessagesToActiveTurn(
+      ['queued-after-crash-append'], 'append-after-crash', undefined, { allowDispatchAsNewTurn: true },
+    );
+    await flushDispatch();
+
+    expect(result.status).toBe('dispatched_as_new_turn');
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
   it('keeps a retry supervision row durable without blocking a trailing ordinary message, repeated ticks, or recovery', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
@@ -5260,6 +5291,56 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(r.activeDispatchEntries).toEqual([]);
   });
 
+  it('drains a message queued behind a provider send-start timeout instead of leaving the session queue stuck forever (owner report: queued message never sent, UI stuck "working")', async () => {
+    vi.stubEnv('IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS', '50');
+    const localMock = makeMockProvider();
+    (localMock.provider.send as ReturnType<typeof vi.fn>).mockReturnValueOnce(new Promise(() => {}));
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+
+    r.send('/status', 'client-timeout-turn');
+    // Queued behind the first send, which never accepts.
+    r.send('queued after timeout', 'client-queued-after-timeout');
+    expect(r.pendingCount).toBe(1);
+
+    await sleep(80);
+    await flushDispatch();
+
+    // The timed-out turn settles (to 'error'), but the session-level queue is
+    // not bound to it: the queued message must be dispatched as the next
+    // turn automatically, with no user action (Stop/append) required.
+    expect(r.pendingCount).toBe(0);
+    expect(r.getStatus()).not.toBe('error');
+    expect(localMock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
+  it('drains a message queued behind an unrecoverable provider error (crash) instead of leaving the session queue stuck forever', async () => {
+    const localMock = makeMockProvider();
+    const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
+    await r.initialize({
+      ...defaultConfig,
+      contextNamespace: { scope: 'personal', projectId: 'repo-1' },
+      contextLocalProcessedFreshness: 'fresh',
+    });
+
+    r.send('/status', 'client-crash-turn');
+    await waitForProviderSendCount(localMock.provider, 1);
+    // Queued while the first turn is genuinely in flight.
+    r.send('queued after crash', 'client-queued-after-crash');
+    expect(r.pendingCount).toBe(1);
+
+    localMock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'provider crashed', recoverable: false });
+    await flushDispatch();
+
+    expect(r.pendingCount).toBe(0);
+    expect(r.getStatus()).not.toBe('error');
+    expect(localMock.provider.send).toHaveBeenCalledTimes(2);
+  });
+
   it('emits a template-prompt skip status before transport recall lookup', async () => {
     const localMock = makeMockProvider();
     const r = new TransportSessionRuntime(localMock.provider, 'deck_test_brain');
@@ -6424,7 +6505,7 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(drained.userMessage).toBe('queued follow-up');
   });
 
-  it('preserves queued work on unrecoverable provider error when active-turn state was cleared', async () => {
+  it('drains queued work on an unrecoverable provider error too, instead of leaving it stuck behind a turn that will never resume', async () => {
     runtime.send('first turn', 'cmd-first');
     await waitForProviderSendCount(mock.provider, 1);
     runtime.send('queued follow-up', 'cmd-queued');
@@ -6441,12 +6522,15 @@ ${PREFERENCE_CONTEXT_END}`;
     internal._activeDispatchEntries = [];
 
     mock.fireError('sess-1', { code: 'PROVIDER_ERROR', message: 'fatal late error', recoverable: false });
-    await flushDispatch();
+    await waitForProviderSendCount(mock.provider, sendCountBefore + 1);
 
-    expect(runtime.getStatus()).toBe('error');
-    expect(runtime.pendingCount).toBe(1);
-    expect(runtime.pendingEntries.map((entry) => entry.clientMessageId)).toEqual(['cmd-queued']);
-    expect((mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.length).toBe(sendCountBefore);
+    // The failed turn's own message is not retried (still no `cmd-first`
+    // resend), but the queue is session-level: `cmd-queued` must dispatch as
+    // a fresh turn instead of waiting forever on a turn that already died.
+    expect(runtime.getStatus()).not.toBe('error');
+    expect(runtime.pendingCount).toBe(0);
+    const drained = (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect(drained.userMessage).toBe('queued follow-up');
   });
 
   it('does not cancel a recently active turn with queued work', async () => {

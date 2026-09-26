@@ -1321,6 +1321,10 @@ function bindAcceptedDispatchToTaskPair(
   // Preserve both the requested executor model and an explicit human title.
   executorModel?: string,
   explicitTitle?: string | null,
+  // True only when this taskId is being minted from real task metadata
+  // (task.objective), not merely a plain send reinterpreted as one -- see
+  // TaskPairService.implicitDispatch's suppressAutoPickAuditor.
+  hasObjective?: boolean,
 ): SendMessageResult {
   const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
   const title = deriveSupervisionTaskTitleFromBrief(objective, explicitTitle) ?? deriveSupervisionTaskTitle(objective);
@@ -1332,6 +1336,7 @@ function bindAcceptedDispatchToTaskPair(
       taskId,
       ...(title ? { title } : {}),
       ...(executorModel ? { executorModel } : {}),
+      ...(hasObjective ? { hasObjective } : {}),
       eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
     });
   }
@@ -1396,9 +1401,43 @@ export async function dispatchSendMessage(
     // A new objective opens one pair for its one recipient (an explicit target
     // or an auto-provisioned worker), never for a broadcast or a clone.
     const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
-    const opensNewTask = !input.task?.taskId?.trim() && !!objective
-      && !input.broadcast && !input.clone && result.deliveries.length === 1 && reached.length === 1;
-    const taskId = input.task?.taskId?.trim() || (opensNewTask
+    const singleTarget = !input.broadcast && !input.clone && result.deliveries.length === 1 && reached.length === 1
+      ? reached[0]!.target
+      : undefined;
+    const explicitTaskId = input.task?.taskId?.trim();
+    // Before minting: a DISPATCH marker for this exact taskId that landed in
+    // the same turn (#recentBrainDispatch), or the message naming an existing
+    // open pair, continues that pair instead of opening a second one for a
+    // follow-up, relay, or handover message. The target merely already
+    // holding a role in one open pair does NOT apply here: this branch only
+    // runs with real task metadata (hasLegacyTaskMetadata), and an EXPLICIT
+    // objective is clearly new work even for an already-busy target -- it
+    // still gets its own pair (bullet 2; also how existing callers expect a
+    // fresh idempotency key on the same target to open a second pair).
+    if (!explicitTaskId && singleTarget) {
+      const focused = taskPairService.recentBrainDispatch(callerProjectName, caller.sessionName!, singleTarget);
+      if (focused && getTaskPairStore().getPair(callerProjectName, focused)?.state.executor === singleTarget) {
+        return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, focused, objective, input.task?.requestedExecutionType?.model, input.task?.title);
+      }
+      const mentioned = taskPairService.resolveMentionedOpenPair(callerProjectName, caller.sessionName!, input.message ?? '');
+      if (mentioned) {
+        return bindAcceptedDispatchToTaskPair(
+          caller, callerProjectName, result, mentioned, objective,
+          input.task?.requestedExecutionType?.model, input.task?.title,
+        );
+      }
+      if (!objective) {
+        const existingTaskId = taskPairService.resolveSingleParticipantOpenPair(caller.sessionName!, singleTarget);
+        if (existingTaskId) {
+          return bindAcceptedDispatchToTaskPair(
+            caller, callerProjectName, result, existingTaskId, objective,
+            input.task?.requestedExecutionType?.model, input.task?.title,
+          );
+        }
+      }
+    }
+    const opensNewTask = !explicitTaskId && !!objective && !!singleTarget;
+    const taskId = explicitTaskId || (opensNewTask
       ? mintDispatchTaskPairId(caller, callerProjectName, input)
       : undefined);
     if (!taskId) return result;
@@ -1410,6 +1449,7 @@ export async function dispatchSendMessage(
       objective,
       input.task?.requestedExecutionType?.model,
       input.task?.title,
+      !!objective,
     );
   }
   // A Brain that dispatches work with a plain send_message (no task metadata,
@@ -1425,10 +1465,24 @@ export async function dispatchSendMessage(
     const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
     const target = result.deliveries.length === 1 && reached.length === 1 ? reached[0]!.target : undefined;
     const focused = target ? taskPairService.recentBrainDispatch(callerProjectName, caller.sessionName, target) : undefined;
-    // A DISPATCH marker already opened this pair in the same turn.  Keep the
-    // ordinary send receipt unadorned and, crucially, do not mint/bind a
-    // second implicit pair for the follow-up message.
-    if (focused && target && getTaskPairStore().getPair(callerProjectName, focused)?.state.executor === target) return result;
+    // A DISPATCH marker already opened this pair in the same turn: bind the
+    // receipt to it and, crucially, do not mint/bind a second implicit pair
+    // for the follow-up message.
+    if (focused && target && getTaskPairStore().getPair(callerProjectName, focused)?.state.executor === target) {
+      return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, focused, projectSupervisionTaskObjective(input.message));
+    }
+    // The message names an open pair, or the target already holds a role in
+    // exactly one open pair of this Brain: continue that pair, never a
+    // second one, for a follow-up, relay, or notice. A plain send like this
+    // never carries an objective, so both checks always apply (unlike the
+    // task-metadata branch above).
+    const existingTaskId = target
+      ? taskPairService.resolveMentionedOpenPair(callerProjectName, caller.sessionName, input.message ?? '')
+        ?? taskPairService.resolveSingleParticipantOpenPair(caller.sessionName, target)
+      : undefined;
+    if (existingTaskId) {
+      return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, existingTaskId, projectSupervisionTaskObjective(input.message));
+    }
     const taskId = mintDispatchTaskPairId(caller, callerProjectName, input);
     if (!implicitWorkPairTarget(callerProjectName, taskId, result, d.listSessions())) return result;
     return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, projectSupervisionTaskObjective(input.message));

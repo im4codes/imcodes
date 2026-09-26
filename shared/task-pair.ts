@@ -201,55 +201,31 @@ export type TaskPairVerdictJudgement = typeof TASK_PAIR_VERDICT_JUDGEMENTS[numbe
 export type TaskPairSeverityCounts = Record<AuditSeverity, number>;
 
 // ---------------------------------------------------------------------------
-// Allowlist (daemon picks only)
+// Built-in default routing (daemon picks only, no execution pool configured)
 // ---------------------------------------------------------------------------
 
-export const TASK_PAIR_ALLOWLIST_ROLES = ['executor', 'auditor', 'both'] as const;
-export type TaskPairAllowlistRole = typeof TASK_PAIR_ALLOWLIST_ROLES[number];
+/**
+ * Pair routing is exactly the Brain's execution pool (each entry carries an
+ * `executor` / `auditor` / `both` role): there is no separate allowlist. This
+ * is the one exception -- a project that has never configured any execution
+ * pool at all keeps this built-in default rather than picking nothing.
+ */
+export const TASK_PAIR_BUILTIN_DEFAULT_ROUTING: Readonly<Record<'executor' | 'auditor', { agentType: string; modelPattern: string }>> = {
+  executor: { agentType: 'codex-sdk', modelPattern: 'gpt-6-luna' },
+  auditor: { agentType: 'claude-code-sdk', modelPattern: 'opus' },
+};
 
-export interface TaskPairAllowlistEntry {
-  role: TaskPairAllowlistRole;
-  agentType: string;
-  /** Case-insensitive substring of the normalized model id. Empty matches any model. */
-  modelPattern: string;
-}
-
-/** Owner routing policy: executors on Codex gpt-6-luna, auditors on Claude Opus. */
-export const TASK_PAIR_DEFAULT_ALLOWLIST: readonly TaskPairAllowlistEntry[] = [
-  { role: 'executor', agentType: 'codex-sdk', modelPattern: 'gpt-6-luna' },
-  { role: 'auditor', agentType: 'claude-code-sdk', modelPattern: 'opus' },
-];
-
-export function normalizeTaskPairAllowlist(value: unknown): TaskPairAllowlistEntry[] {
-  if (!Array.isArray(value)) return TASK_PAIR_DEFAULT_ALLOWLIST.map((entry) => ({ ...entry }));
-  const entries: TaskPairAllowlistEntry[] = [];
-  for (const raw of value) {
-    if (!raw || typeof raw !== 'object') continue;
-    const record = raw as Record<string, unknown>;
-    const role = (TASK_PAIR_ALLOWLIST_ROLES as readonly string[]).includes(String(record.role))
-      ? record.role as TaskPairAllowlistRole
-      : 'both';
-    const agentType = typeof record.agentType === 'string' ? record.agentType.trim() : '';
-    const modelPattern = typeof record.modelPattern === 'string' ? record.modelPattern.trim() : '';
-    if (!agentType) continue;
-    entries.push({ role, agentType, modelPattern });
-  }
-  return entries;
-}
-
-export function matchesTaskPairAllowlist(
-  allowlist: readonly TaskPairAllowlistEntry[],
+export function matchesTaskPairBuiltinDefaultRouting(
   role: 'executor' | 'auditor',
   agentType: string,
   model: string | undefined,
 ): boolean {
-  const normalizedModel = (model ?? '').toLowerCase();
-  return allowlist.some((entry) => (
-    (entry.role === 'both' || entry.role === role)
-    && entry.agentType === agentType
-    && (!entry.modelPattern || normalizedModel.includes(entry.modelPattern.toLowerCase()))
-  ));
+  const entry = TASK_PAIR_BUILTIN_DEFAULT_ROUTING[role];
+  return agentType === entry.agentType && (model ?? '').toLowerCase().includes(entry.modelPattern.toLowerCase());
 }
+
+/** How long a queued pair may sit unable to start before Brain hears about it (once, combined per project). */
+export const TASK_PAIR_QUEUE_STALL_NOTICE_MS = 30 * 60_000;
 
 // ---------------------------------------------------------------------------
 // Marker grammar and parsing
@@ -450,10 +426,10 @@ export interface TaskPairState {
    * `send_message task.requestedExecutionType.model` captured at implicit
    * dispatch bind time. Owner rule (design D-pool-sync): once set, the
    * pairs engine picks or auto-provisions that role by model match alone,
-   * bypassing the project's audit allowlist -- for both the initial pick
-   * and any later automatic replacement (executor_silent, auditor
-   * replacement). The allowlist governs only a role with neither an
-   * explicit session nor an explicit model.
+   * bypassing the execution pool's per-entry role -- for both the initial
+   * pick and any later automatic replacement (executor_silent, auditor
+   * replacement). The pool's role config governs only a role with neither
+   * an explicit session nor an explicit model.
    */
   executorModel?: string;
   auditorModel?: string;
@@ -1119,12 +1095,13 @@ export function buildTaskPairMarkerContract(): string {
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
+    `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
     'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL. taskId "-" means your single open task.',
     'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming the material; the daemon relays it to the auditor. After PASS commit/push code yourself and write DONE (with output= when the result must be kept). DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck.',
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
     `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
-    `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the project's pair allowlist. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring the allowlist) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>".`,
+    `Brain: DISPATCH <taskId> executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project]; queue with QUEUE <taskId> title="..." then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true completes without audit; CANCEL <taskId>. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>".`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

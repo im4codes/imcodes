@@ -22,6 +22,7 @@ import {
   TASK_PAIR_HEARTBEAT_MS,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
+  TASK_PAIR_QUEUE_STALL_NOTICE_MS,
   TASK_PAIR_SILENCE_LIMIT,
   compareQueuedTaskPairs,
   isTerminalTaskPairStatus,
@@ -31,13 +32,13 @@ import {
   type TaskPairState,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
-import { isPairsEngineProject, resolveTaskPairAllowlist, resolveTaskPairMaxConcurrency } from './engine.js';
+import { isPairsEngineProject, resolveTaskPairMaxConcurrency } from './engine.js';
 import { sendTaskPairMessage } from './delivery.js';
 import { hasRecentTaskPairProviderError } from './provider-errors.js';
 import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from './service.js';
 import {
-  allowlistedProvisionConfig,
-  describeAuditorAllowlistGap,
+  roleEligibleProvisionConfig,
+  describeAuditorPoolGap,
   describeLimitedProviderFamilies,
   describePoolSyncGap,
   describeRequestedModelMiss,
@@ -58,6 +59,7 @@ import {
   buildExecutorHandoffMessage,
   buildExecutorResendMessage,
   buildNudgeMessage,
+  buildQueueStallNoticeMessage,
   type PendingBrainNotice,
 } from './messages.js';
 
@@ -156,20 +158,24 @@ export class TaskPairAutomation implements TaskPairScheduler {
 
   #pick(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string; avoidProviderFamily?: string }): string | undefined {
     if (this.#deps.pickCandidate) return this.#deps.pickCandidate(input);
-    const allowlist = resolveTaskPairAllowlist(input.project);
-    return listTaskPairCandidates({ ...input, allowlist })[0]?.name;
+    return listTaskPairCandidates(input)[0]?.name;
   }
 
   async #provision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }): Promise<string | undefined> {
     if (this.#deps.provision) return this.#deps.provision(input);
-    const allowlist = resolveTaskPairAllowlist(input.project);
-    const config = allowlistedProvisionConfig({ ...input, allowlist });
+    const config = roleEligibleProvisionConfig(input);
     if (!config) return undefined;
     const { provisionSupervisionTarget } = await import('../supervision-auto-provision.js');
     const result = await provisionSupervisionTarget({
       parentSessionName: input.brain,
       pool: input.role === 'auditor' ? 'primary' : input.pool,
-      requestedCapabilityId: config.capabilityId,
+      // Owner rule: a named model is provisioned as-is even when it is not a
+      // pool member -- manual_explicit is the only provenance that bypasses
+      // the "pool must be configured" gate, so it must carry the full config
+      // rather than just a capabilityId the pool may not actually contain.
+      ...(input.requestedModel
+        ? { provenance: 'manual_explicit' as const, requestedExecutionConfig: config }
+        : { requestedCapabilityId: config.capabilityId }),
       idempotencyKey: `task-pair:${input.project}:${input.taskId}:${input.role}:${this.#now()}`,
     });
     return result.ok ? result.target.name : undefined;
@@ -228,7 +234,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
           logger.warn({ err: error, taskId: stored.state.taskId }, 'task-pair: pair tick failed');
         }
       }
-      for (const [brain, project] of brains) await this.runQueue(project, brain);
+      for (const [brain, project] of brains) {
+        await this.runQueue(project, brain);
+        await this.#checkQueueStalls(project, brain, now);
+      }
     } finally {
       this.#tickBusy = undefined;
       await this.#flushPendingNotices();
@@ -534,7 +543,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         // the very session we are replacing because it is limited is never
         // counted as a limited family.
         const limitedScanExclude = new Set<string>([pair.brain, ...pair.previousAuditors]);
-        const limited = describeLimitedProviderFamilies({ brain: pair.brain, role: 'auditor', pool: 'primary', allowlist: resolveTaskPairAllowlist(project), exclude: limitedScanExclude });
+        const limited = describeLimitedProviderFamilies({ brain: pair.brain, role: 'auditor', pool: 'primary', exclude: limitedScanExclude });
         if (limited) {
           const key = `all_providers_limited:${pair.round}`;
           if (stored.liveness.notified.includes(key)) return false;
@@ -549,11 +558,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const state = pair.flags.includes('needs_auditor') ? pair : { ...pair, flags: [...pair.flags, 'needs_auditor' as TaskPairFlag], updatedAt: this.#now() };
       store.savePair(project, state, { liveness: { ...stored.liveness, notified: [...stored.liveness.notified, key] } });
       // Owner rule (design D-pool-sync): an explicitly named auditor model
-      // bypasses the allowlist entirely, so a miss here is a pool-config gap,
-      // not an allowlist gap -- name the requested model instead of guessing.
+      // bypasses pool roles entirely, so a miss here is a pool-config gap,
+      // not a role gap -- name the requested model instead of guessing.
       const gap = requestedModel
         ? describeRequestedModelMiss(requestedModel)
-        : describeAuditorAllowlistGap({ brain: pair.brain, allowlist: resolveTaskPairAllowlist(project) });
+        : describeAuditorPoolGap({ brain: pair.brain });
       this.#queueNotice(state, 'needs_auditor', gap);
       return false;
     }
@@ -604,7 +613,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
         // See replaceAuditor: the limited executor itself must stay IN this
         // scan even though it is excluded from the pick.
         const limitedScanExclude = new Set<string>([pair.brain, ...(pair.auditor ? [pair.auditor] : [])]);
-        const limited = describeLimitedProviderFamilies({ brain: pair.brain, role: 'executor', pool, allowlist: resolveTaskPairAllowlist(project), exclude: limitedScanExclude });
+        const limited = describeLimitedProviderFamilies({ brain: pair.brain, role: 'executor', pool, exclude: limitedScanExclude });
         if (limited) {
           const key = `all_providers_limited:${pair.round}`;
           if (stored.liveness.notified.includes(key)) return false;
@@ -690,6 +699,50 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#queueNotice(state, flag, detail);
   }
 
+  /**
+   * Like {@link #flagOnce} but never notifies Brain: a queued pair unable to
+   * start yet is common and usually self-resolving, so per-pair noise here
+   * would spam Brain for an ordinary transient gap. {@link #checkQueueStalls}
+   * is the only path that tells Brain about this, and only once it has
+   * actually persisted.
+   */
+  #flagQuiet(project: string, taskId: string, flag: TaskPairFlag): void {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored || stored.state.flags.includes(flag)) return;
+    store.savePair(project, { ...stored.state, flags: [...stored.state.flags, flag], updatedAt: this.#now() });
+  }
+
+  /**
+   * One combined, rate-limited notice per Brain for queued pairs that have
+   * been unable to start for a long time (owner correction: a queue miss is
+   * ordinary and self-resolving; only a persistent one is worth Brain's
+   * attention, and never one message per pair).
+   */
+  async #checkQueueStalls(project: string, brain: string, now: number): Promise<void> {
+    const store = getTaskPairStore();
+    const queued = store.listActivePairs(project).filter((stored) => (
+      stored.state.brain === brain && stored.state.status === 'queued'
+    ));
+    // The run-queue loop is strict FIFO and stops at the first pair it can't
+    // start, so only the HEAD of the queue ever gets flagged/timestamped by
+    // #flagQuiet -- everything behind it is equally stuck (it cannot start
+    // until the head does), so once the head has been stuck long enough the
+    // whole queued set is reported together.
+    const stalledHead = queued.some((stored) => (
+      stored.state.flags.includes('waiting_for_capacity') && now - stored.state.updatedAt >= TASK_PAIR_QUEUE_STALL_NOTICE_MS
+    ));
+    if (!stalledHead) return;
+    const key = `queue_stall_notice:${project}:${brain}`;
+    const lastSent = Number(store.getMeta(key) ?? 0);
+    if (now - lastSent < TASK_PAIR_QUEUE_STALL_NOTICE_MS) return;
+    store.setMeta(key, String(now));
+    await sendTaskPairMessage(
+      brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-queue-stall',
+      buildQueueStallNoticeMessage(queued.map((stored) => stored.state), now),
+    );
+  }
+
   /** Pool bookkeeping after role changes: record pools, flag off-pool and unreviewed economy work. */
   #checkPools(project: string, taskId: string): void {
     const store = getTaskPairStore();
@@ -743,6 +796,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#flagOnceWithKey(stored, 'no_brief', `queued without a brief: write QUEUE ${pair.taskId} … <!-- IMCODES_TASK_END ${pair.taskId} --> or DISPATCH it yourself.`);
         continue;
       }
+      // A session named explicitly on QUEUE (executor=/auditor=) is a
+      // reservation, but it is only BOUND at start: while queued it never
+      // occupies a window (TASK_PAIR_OPEN_STATUSES excludes 'queued'), so
+      // another pair may freely pick it in the meantime. If it is busy right
+      // now, this pair waits for it rather than silently substituting an
+      // auto-pick -- the owner named that session on purpose.
+      if ((pair.executor && this.#busy(pair.executor)) || (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && this.#busy(pair.auditor))) {
+        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
+        return;
+      }
       const pool = pair.executorPool === 'economy' ? 'economy' : 'primary';
       const executor = pair.executor
         ?? this.#pick({ brain, role: 'executor', pool, exclude: new Set([brain, ...(pair.auditor ? [pair.auditor] : [])]), project, requestedModel: pair.executorModel })
@@ -753,11 +816,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
             ?? await this.#provision({ brain, role: 'auditor', pool: 'primary', project, taskId: pair.taskId, requestedModel: pair.auditorModel })
           : undefined);
       if (!executor || !auditor || executor === auditor) {
-        const requestedModel = !executor ? pair.executorModel : !auditor ? pair.auditorModel : undefined;
-        this.#flagOnce(
-          project, pair.taskId, 'waiting_for_capacity',
-          requestedModel ? describeRequestedModelMiss(requestedModel) : describePoolSyncGap(brain),
-        );
+        // No per-pair notice here (owner correction): a queue miss is common
+        // and self-resolving as soon as a matching session frees up or is
+        // provisioned. Brain hears about it only via the combined, rate-
+        // limited stall notice (see #checkQueueStalls) once it has actually
+        // persisted a long time.
+        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
         return;
       }
       const result = taskPairService.applyMarker({

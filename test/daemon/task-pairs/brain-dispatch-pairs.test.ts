@@ -18,7 +18,7 @@ import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
 import { isSessionCoveredByPairHeartbeat } from '../../../src/daemon/task-pairs/engine.js';
-import { describeAuditorAllowlistGap, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
+import { describeAuditorPoolGap, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { handleLegacyToolOnPairs } from '../../../src/daemon/task-pairs/legacy-tools.js';
 import {
   clearSendIdempotencyCacheForTests,
@@ -34,7 +34,6 @@ import {
 } from '../../../src/daemon/supervision-prompts.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MODE, normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
-import { TASK_PAIR_DEFAULT_ALLOWLIST } from '../../../shared/task-pair.js';
 import { buildSupervisionExecutionCapabilityId, normalizeSupervisionExecutionModel } from '../../../shared/supervision-execution-pool.js';
 
 const PROJECT = 'dispproj';
@@ -91,6 +90,10 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   beforeEach(() => {
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    // The auditor grace window (suppressAutoPickAuditor) defaults to 5s in
+    // production; make it instant here so `flush()` alone still observes the
+    // pick, matching every pre-existing assertion in this file.
+    process.env.IMCODES_IMPLICIT_AUDITOR_GRACE_MS = '0';
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     resetTaskPairFocusForTests();
     clearSendIdempotencyCacheForTests();
@@ -115,6 +118,7 @@ describe('Brain work dispatch opens driven pairs', () => {
     setTaskPairStoreForTests(undefined);
     resetTaskPairFocusForTests();
     for (const name of [BRAIN, EXEC, EXEC2, AUD]) removeSession(name);
+    delete process.env.IMCODES_IMPLICIT_AUDITOR_GRACE_MS;
     if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
   });
@@ -136,12 +140,16 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(result.assignmentId).toBe(`pair:${result.taskId}:executor`);
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
 
-    // Follow-ups to a session already working on a pair continue that pair.
+    // Follow-ups to a session already working on a pair continue that pair
+    // (bound to it, not a second one).
     const followUp = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Report progress.' } as never, deps());
-    expect(followUp).toMatchObject({ status: 'accepted' });
-    expect((followUp as { taskId?: string }).taskId).toBeUndefined();
+    expect(followUp).toMatchObject({ status: 'accepted', taskId: result.taskId });
+    // The auditor is a role slot of the SAME open pair (not freshly-dispatch-
+    // flagged like the executor above, so this exercises resolveSingleParticipantOpenPair's
+    // own participant match rather than the recentBrainDispatch short-circuit):
+    // record onto it, never mint a second pair.
     const toAuditor = await dispatchSendMessage(brainCaller, { target: AUD, message: 'Keep auditing.' } as never, deps());
-    expect((toAuditor as { taskId?: string }).taskId).toBeUndefined();
+    expect((toAuditor as { taskId?: string }).taskId).toBe(result.taskId);
     expect(pairs()).toHaveLength(1);
 
     // A replay of the same send names the same pair.
@@ -169,6 +177,77 @@ describe('Brain work dispatch opens driven pairs', () => {
 
     await dispatchCronSend({ fromSessionName: BRAIN, target: EXEC2, message: 'Hourly: report status.' }, deps());
     expect(pairs()).toHaveLength(1);
+  });
+
+  // ---- 215/jdzj: implicit_dispatch minting duplicate wrapper pairs -----------
+
+  it('a notice whose text names an existing open pair binds to it, never opening a second pair for the relay', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    const opened = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-existing', objective: 'Fix the login bug' },
+    } as never, deps());
+    if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
+    await flush();
+    expect(pairs()).toHaveLength(1);
+
+    // A relay to a completely different, otherwise-idle worker: the message
+    // is only about the existing pair, not new work of its own.
+    const notice = await dispatchSendMessage(brainCaller, {
+      target: EXEC2, message: 'T-existing has been requeued; the audit window is pre-assigned.',
+    } as never, deps());
+    expect(notice).toMatchObject({ status: 'accepted', taskId: 'T-existing' });
+    await flush();
+    expect(pairs()).toHaveLength(1);
+  });
+
+  it('a handover message to the reassigned executor of an existing pair binds to it, never opening a second pair', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    const opened = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-handover', objective: 'Fix the login bug' },
+    } as never, deps());
+    if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
+    await flush();
+    await taskPairService.ingestText(PROJECT, BRAIN, `<!-- IMCODES_TASK DISPATCH T-handover executor=${EXEC2} -->`, 'handover-marker', now);
+    await flush();
+    expect(pairs()[0]).toMatchObject({ taskId: 'T-handover', executor: EXEC2 });
+
+    // A plain handover message to the NEW executor -- already a role slot of
+    // the one open pair -- continues it instead of minting a second one.
+    const handover = await dispatchSendMessage(brainCaller, {
+      target: EXEC2, message: 'Please continue from where the previous executor left off.',
+    } as never, deps());
+    expect(handover).toMatchObject({ status: 'accepted', taskId: 'T-handover' });
+    await flush();
+    expect(pairs()).toHaveLength(1);
+  });
+
+  it('holds the auditor auto-pick for a bare implicit dispatch so a race-arriving Brain marker still names the intended auditor', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    process.env.IMCODES_IMPLICIT_AUDITOR_GRACE_MS = '80'; // real grace for this one test, not instant
+    const taskId = 'T-race';
+    // Brain's send_message names the taskId explicitly (its own tool call),
+    // but its own DISPATCH marker (naming the intended auditor) hasn't landed
+    // yet -- exactly the 215/jdzj live case (13:33:18: DISPATCH source=
+    // implicit_dispatch with no auditor, then an immediate heartbeat REASSIGN).
+    const dispatched = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Starting work.', task: { taskId },
+    } as never, deps());
+    if (dispatched.status !== 'accepted') throw new Error(JSON.stringify(dispatched));
+    await flush();
+    expect(pairs()[0]).toMatchObject({ taskId, executor: EXEC });
+    expect(pairs()[0].auditor).toBeFalsy();
+    expect(pairs()[0].flags).toContain('needs_auditor');
+
+    // The Brain's own marker for the SAME taskId lands a moment later, naming AUD.
+    await taskPairService.ingestText(PROJECT, BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=${AUD} -->`, 'race-marker', now);
+    await flush();
+    expect(pairs()[0]).toMatchObject({ taskId, executor: EXEC, auditor: AUD });
+
+    // The grace window elapses; the auto-pick that would otherwise have
+    // fired does not overwrite the auditor Brain actually named.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    await flush();
+    expect(pairs()[0]).toMatchObject({ taskId, executor: EXEC, auditor: AUD });
   });
 
   it('auto-audit off: a plain Brain send opens no pair (the project chose no automatic audit)', async () => {
@@ -278,18 +357,20 @@ describe('Brain work dispatch opens driven pairs', () => {
   });
 });
 
-describe('an auditor allowlist that no pool config can satisfy (jdzj)', () => {
+describe('a pool with no auditor-role entry (jdzj)', () => {
   const jdzjPools = {
     state: 'configured',
     economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
     primaryDevelopmentPool: {
-      configs: [{ model: 'sonnet', agentType: 'claude-code-sdk', runtimeType: 'transport', capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet', providerFamily: 'anthropic' }],
+      // Explicit executor-only role: the owner marked this entry executor-only,
+      // so it can never satisfy the auditor role, no matter how idle it is.
+      configs: [{ model: 'sonnet', agentType: 'claude-code-sdk', runtimeType: 'transport', capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet', providerFamily: 'anthropic', role: 'executor' as const }],
       controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
     },
   };
   const opusConfig = () => {
     const model = normalizeSupervisionExecutionModel('claude-code-sdk', 'opus');
-    const config = { agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model };
+    const config = { agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model, role: 'auditor' as const };
     return { ...config, capabilityId: buildSupervisionExecutionCapabilityId(config) };
   };
   const opusPools = {
@@ -308,29 +389,37 @@ describe('an auditor allowlist that no pool config can satisfy (jdzj)', () => {
 
   beforeEach(() => {
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    // The auditor grace window (suppressAutoPickAuditor) defaults to 5s in
+    // production; make it instant here so `flush()` alone still observes the
+    // pick, matching every pre-existing assertion in this file.
+    process.env.IMCODES_IMPLICIT_AUDITOR_GRACE_MS = '0';
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
   });
   afterEach(() => {
     setTaskPairStoreForTests(undefined);
     delete process.env.IMCODES_SUPERVISION_ENGINE;
+    delete process.env.IMCODES_IMPLICIT_AUDITOR_GRACE_MS;
   });
 
-  it('can never pick the idle Opus session outside a Sonnet-only pool, and says exactly what to add', () => {
+  it('can never pick the idle Opus session outside an executor-only pool, and says exactly what to add', () => {
     const records = [brain(jdzjPools), opusWorker];
     const lookup = (name: string) => records.find((entry) => entry.name === name);
     expect(listTaskPairCandidates({
-      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST, exclude: new Set(),
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, { listSessions: () => records, getSession: lookup, hasPendingMessages: () => false })).toEqual([]);
-    const gap = describeAuditorAllowlistGap({ brain: BRAIN, allowlist: TASK_PAIR_DEFAULT_ALLOWLIST }, { getSession: lookup });
-    expect(gap).toContain('claude-code-sdk/opus');
+    const gap = describeAuditorPoolGap({ brain: BRAIN }, { getSession: lookup });
     expect(gap).toContain('claude-code-sdk/sonnet');
-    expect(gap).toContain('Add an allowlisted auditor config to the primary pool');
+    expect(gap).toContain('no pool entry has the auditor role');
+    expect(gap).toContain('Settings → execution pool');
 
-    // With an Opus config in the pool the gap is gone.
+    // With an Opus (auditor-role) config in the pool, a miss is now a
+    // transient capacity issue, not a structural config gap.
     const fixed = [brain(opusPools), opusWorker];
-    expect(describeAuditorAllowlistGap({ brain: BRAIN, allowlist: TASK_PAIR_DEFAULT_ALLOWLIST }, {
+    const fixedGap = describeAuditorPoolGap({ brain: BRAIN }, {
       getSession: (name) => fixed.find((entry) => entry.name === name),
-    })).toBeUndefined();
+    });
+    expect(fixedGap).toContain('every auditor-role session in the primary pool is busy');
+    expect(fixedGap).not.toContain('no pool entry has the auditor role');
   });
 
   it('puts the gap into the needs_auditor notice Brain receives', async () => {
@@ -347,7 +436,7 @@ describe('an auditor allowlist that no pool config can satisfy (jdzj)', () => {
       taskPairService.ingestText(PROJECT, BRAIN, `<!-- IMCODES_TASK DISPATCH G1 executor=${EXEC} -->`, 'gap-1', now);
       await flush();
       expect(notices).toHaveLength(1);
-      expect(notices[0]).toContain('Why: the auditor allowlist (claude-code-sdk/opus) matches none of the primary pool');
+      expect(notices[0]).toContain('Why: no pool entry has the auditor role');
     } finally {
       taskPairService.setScheduler(undefined);
       setTaskPairDeliveryDepsForTests(undefined);

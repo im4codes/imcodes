@@ -2,10 +2,17 @@
  * Execution-pool membership and daemon picks for task pairs (design D12).
  *
  * The execution pool is kept exactly as configured on the Brain (primary /
- * economy pools, eligibility, capacity, auto-provisioning); the pairs engine
- * only reads it. The daemon picks a participant itself only for automatic
- * dispatch and automatic auditor replacement, and then also applies the
- * project allowlist. What Brain names explicitly is never refused.
+ * economy pools, eligibility, capacity, auto-provisioning, and a per-entry
+ * role -- executor, auditor, or both); the pairs engine only reads it. The
+ * daemon picks a participant itself only for an AUTOMATIC dispatch or
+ * auditor replacement (no named session/model), filtered by pool membership
+ * and the matching entry's role. A project with no configured pool at all
+ * falls back to the built-in default routing.
+ *
+ * Owner rule: what the user or Brain names explicitly (an exact session, or
+ * `executormodel=`/`auditormodel=`) is used as-is and provisioned if it does
+ * not exist yet, even outside the pool and regardless of any entry's role --
+ * the pool governs only automatic picks, never a named one.
  */
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
 import { resolveEffectiveSessionModel } from '../../../shared/session-model.js';
@@ -14,13 +21,18 @@ import {
   resolveDelegationTargets,
 } from '../../../shared/delegation-availability.js';
 import { resolvePeerAuditProviderFamily } from '../../../shared/peer-audit.js';
+import { getSessionRuntimeType } from '../../../shared/agent-types.js';
+import { inferSharedContextRuntimeBackend } from '../../../shared/shared-context-runtime-config.js';
 import {
   SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS,
+  buildSupervisionExecutionCapabilityId,
   isExcludedDevelopmentModel,
+  normalizeSupervisionExecutionModel,
+  supervisionExecutionConfigAllowsRole,
   type SupervisionExecutionConfig,
   type SupervisionExecutionPoolKind,
 } from '../../../shared/supervision-execution-pool.js';
-import { matchesTaskPairAllowlist, type TaskPairAllowlistEntry } from '../../../shared/task-pair.js';
+import { matchesTaskPairBuiltinDefaultRouting } from '../../../shared/task-pair.js';
 import { delegationTargetInputs } from '../delegation-admission.js';
 import { configMatchesSession, configuredPools, poolDefinition } from '../supervision-auto-provision.js';
 import { describeSupervisorDefaultsSyncGap } from '../supervisor-defaults-cache.js';
@@ -81,8 +93,8 @@ export function describeRequestedModelMiss(requestedModel: string): string {
   return `no session/config for requested model ${requestedModel}${gap ? ` (${gap})` : ''}`;
 }
 
-function allowlisted(session: SessionRecord, role: TaskPairPickRole, allowlist: readonly TaskPairAllowlistEntry[]): boolean {
-  return matchesTaskPairAllowlist(allowlist, role, session.agentType, resolveEffectiveSessionModel(session) ?? undefined);
+function builtinDefaultRouted(session: SessionRecord, role: TaskPairPickRole): boolean {
+  return matchesTaskPairBuiltinDefaultRouting(role, session.agentType, resolveEffectiveSessionModel(session) ?? undefined);
 }
 
 /** A named model (`executormodel=`/`auditormodel=`) matches by exact id, case-insensitively. */
@@ -99,14 +111,14 @@ export function listTaskPairCandidates(input: {
   brain: string;
   role: TaskPairPickRole;
   pool: SupervisionExecutionPoolKind;
-  allowlist: readonly TaskPairAllowlistEntry[];
   exclude: ReadonlySet<string>;
   /**
    * Owner rule (design D-pool-sync): the human or Brain explicitly named
    * this model for the role (`executormodel=`/`auditormodel=`, or a bound
    * `send_message task.requestedExecutionType.model`). A candidate matches
-   * by model alone; the allowlist -- which governs only an automatic pick --
-   * is not consulted.
+   * by model alone, regardless of pool membership or role -- the pool
+   * governs only an automatic pick, when neither a session nor a model was
+   * named.
    */
   requestedModel?: string;
   /**
@@ -127,11 +139,18 @@ export function listTaskPairCandidates(input: {
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
   const hasPending = deps.hasPendingMessages ?? defaultHasPendingMessages;
   const store = getTaskPairStore();
-  const eligibleForRole = (session: SessionRecord): boolean => (
-    input.requestedModel
-      ? sameModelId(resolveEffectiveSessionModel(session), input.requestedModel)
-      : allowlisted(session, input.role, input.allowlist)
+  const poolConfigOf = (session: SessionRecord): SupervisionExecutionConfig | undefined => (
+    definition?.configs.find((config: SupervisionExecutionConfig) => configMatchesSession(config, session))
   );
+  // Owner rule: a named model is never confined to the pool at all -- not
+  // just its role. Only an AUTOMATIC pick (no requestedModel) is filtered by
+  // pool membership and role.
+  const eligibleForRole = (session: SessionRecord): boolean => {
+    if (input.requestedModel) return sameModelId(resolveEffectiveSessionModel(session), input.requestedModel);
+    if (!pools) return builtinDefaultRouted(session, input.role);
+    const config = poolConfigOf(session);
+    return !!config && supervisionExecutionConfigAllowsRole(config, input.role);
+  };
   const candidates = sessions
     .filter((session) => (
       // Only the Brain's own sub-sessions: the daemon never commandeers an
@@ -142,7 +161,7 @@ export function listTaskPairCandidates(input: {
       && !input.exclude.has(session.name)
       && !SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS.includes(session.name)
       && !isExcludedDevelopmentModel(resolveEffectiveSessionModel(session) ?? '')
-      && (!pools || !!definition?.configs.some((config: SupervisionExecutionConfig) => configMatchesSession(config, session)))
+      && (!!input.requestedModel || !pools || !!poolConfigOf(session))
       && eligibleForRole(session)
       && session.state === 'idle'
       && availability.get(session.name)?.availability === DELEGATION_AVAILABILITY.READY
@@ -167,49 +186,72 @@ export function providerFamilyOfSession(sessionName: string, deps: TaskPairPoolD
 }
 
 /**
- * Why the pool can never yield an auditor: the Brain's primary pool is
- * configured, but none of its configs is on the auditor allowlist, so no pool
- * member qualifies and nothing can be provisioned. Undefined when some config
- * qualifies (a shortage is then temporary) or no pools are configured.
+ * Why the pool can never yield an auditor right now, once pick+provision have
+ * already both failed. Distinguishes a structural config gap (no entry
+ * carries the auditor role at all -- nothing can ever be provisioned) from a
+ * transient one (some entry qualifies, so the gap is every qualifying session
+ * being busy, limited, or absent right now). Undefined only when no pools are
+ * configured at all (the built-in default routing applies instead, and a miss
+ * there is described by {@link describePoolSyncGap}).
  */
-export function describeAuditorAllowlistGap(input: {
+export function describeAuditorPoolGap(input: {
   brain: string;
-  allowlist: readonly TaskPairAllowlistEntry[];
 }, deps: TaskPairPoolDeps = {}): string | undefined {
   const parent = (deps.getSession ?? getSession)(input.brain);
   const definition = parent ? poolDefinition(parent, 'primary') : undefined;
   if (!definition) return undefined;
-  if (definition.configs.some((config) => matchesTaskPairAllowlist(input.allowlist, 'auditor', config.agentType, config.model))) {
-    return undefined;
+  const syncGap = describeSupervisorDefaultsSyncGap();
+  const suffix = syncGap ? ` (${syncGap})` : '';
+  if (definition.configs.some((config) => supervisionExecutionConfigAllowsRole(config, 'auditor'))) {
+    return `every auditor-role session in the primary pool is busy, limited, or otherwise unavailable right now. Check Settings → execution pool if this persists${suffix}`;
   }
   const pool = definition.configs.map((config) => `${config.agentType}/${config.model}`).join(', ') || 'none';
-  const wanted = input.allowlist
-    .filter((entry) => entry.role === 'auditor' || entry.role === 'both')
-    .map((entry) => `${entry.agentType}/${entry.modelPattern || '*'}`)
-    .join(', ') || 'none';
-  const syncGap = describeSupervisorDefaultsSyncGap();
-  return `the auditor allowlist (${wanted}) matches none of the primary pool's configs (${pool}). Add an allowlisted auditor config to the primary pool, or widen the project's pair allowlist${syncGap ? ` (${syncGap})` : ''}`;
+  return `no pool entry has the auditor role (primary pool configs: ${pool}). Give an entry the auditor role in Settings → execution pool${suffix}`;
 }
 
-/** First allowlisted pool config for auto-provisioning a role, if any. */
-export function allowlistedProvisionConfig(input: {
+/**
+ * A provisionable config for a named model (owner rule) that no pool entry
+ * matches -- the pool never confines a named session/model, only an
+ * automatic pick. Undefined only when the model cannot be resolved to a
+ * known backend at all (an unsupported/unrecognized model id).
+ */
+export function resolveRequestedModelProvisionConfig(requestedModel: string): SupervisionExecutionConfig | undefined {
+  const agentType = inferSharedContextRuntimeBackend(requestedModel);
+  if (!agentType) return undefined;
+  const providerFamily = resolvePeerAuditProviderFamily({ agentType });
+  const runtimeType = getSessionRuntimeType(agentType);
+  const model = normalizeSupervisionExecutionModel(agentType, requestedModel);
+  const config = { agentType, providerFamily, runtimeType, model };
+  return { ...config, capabilityId: buildSupervisionExecutionCapabilityId(config) };
+}
+
+/**
+ * First role-eligible pool config for auto-provisioning a role, if any. A
+ * requested model that matches nothing in the pool still resolves via
+ * {@link resolveRequestedModelProvisionConfig} (owner rule) rather than
+ * confining it to the pool -- only an automatic pick (no requestedModel) is
+ * pool-scoped.
+ */
+export function roleEligibleProvisionConfig(input: {
   brain: string;
   role: TaskPairPickRole;
   pool: SupervisionExecutionPoolKind;
-  allowlist: readonly TaskPairAllowlistEntry[];
   /** Owner rule: see {@link listTaskPairCandidates}. */
   requestedModel?: string;
   /** See {@link listTaskPairCandidates}. */
   avoidProviderFamily?: string;
 }, deps: TaskPairPoolDeps = {}): SupervisionExecutionConfig | undefined {
   const parent = (deps.getSession ?? getSession)(input.brain);
-  if (!parent) return undefined;
+  if (!parent) return input.requestedModel ? resolveRequestedModelProvisionConfig(input.requestedModel) : undefined;
   const definition = poolDefinition(parent, input.role === 'auditor' ? 'primary' : input.pool);
   const matches = definition?.configs.filter((config) => (
     input.requestedModel
       ? sameModelId(config.model, input.requestedModel)
-      : matchesTaskPairAllowlist(input.allowlist, input.role, config.agentType, config.model)
+      : supervisionExecutionConfigAllowsRole(config, input.role)
   )) ?? [];
+  if (matches.length === 0) {
+    return input.requestedModel ? resolveRequestedModelProvisionConfig(input.requestedModel) : undefined;
+  }
   if (!input.avoidProviderFamily) return matches[0];
   return matches.find((config) => config.providerFamily !== input.avoidProviderFamily) ?? matches[0];
 }
@@ -238,7 +280,6 @@ export function describeLimitedProviderFamilies(input: {
   brain: string;
   role: TaskPairPickRole;
   pool: SupervisionExecutionPoolKind;
-  allowlist: readonly TaskPairAllowlistEntry[];
   exclude: ReadonlySet<string>;
   requestedModel?: string;
 }, deps: TaskPairPoolDeps = {}): { text: string; families: TaskPairLimitedFamily[] } | undefined {
@@ -248,11 +289,12 @@ export function describeLimitedProviderFamilies(input: {
   const pools = configuredPools(parent);
   const definition = pools ? poolDefinition(parent, input.role === 'auditor' ? 'primary' : input.pool) : undefined;
   const availability = resolveDelegationTargets(delegationTargetInputs(sessions), (deps.now ?? Date.now)());
-  const eligibleForRole = (session: SessionRecord): boolean => (
-    input.requestedModel
-      ? sameModelId(resolveEffectiveSessionModel(session), input.requestedModel)
-      : allowlisted(session, input.role, input.allowlist)
-  );
+  const eligibleForRole = (session: SessionRecord): boolean => {
+    if (input.requestedModel) return sameModelId(resolveEffectiveSessionModel(session), input.requestedModel);
+    if (!pools) return builtinDefaultRouted(session, input.role);
+    const config = definition?.configs.find((candidate: SupervisionExecutionConfig) => configMatchesSession(candidate, session));
+    return !!config && supervisionExecutionConfigAllowsRole(config, input.role);
+  };
   const eligible = sessions.filter((session) => (
     session.parentSession === parent.name
     && session.role !== 'brain'
@@ -260,7 +302,8 @@ export function describeLimitedProviderFamilies(input: {
     && !input.exclude.has(session.name)
     && !SUPERVISION_DEFAULT_EXCLUDED_DEVELOPMENT_SESSIONS.includes(session.name)
     && !isExcludedDevelopmentModel(resolveEffectiveSessionModel(session) ?? '')
-    && (!pools || !!definition?.configs.some((config: SupervisionExecutionConfig) => configMatchesSession(config, session)))
+    // Owner rule: see listTaskPairCandidates -- a named model is never pool-scoped.
+    && (!!input.requestedModel || !pools || !!definition?.configs.some((config: SupervisionExecutionConfig) => configMatchesSession(config, session)))
     && eligibleForRole(session)
   ));
   const byFamily = new Map<string, TaskPairLimitedFamily>();

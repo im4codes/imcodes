@@ -4899,7 +4899,9 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
-    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(['cmd-append-1'], 'cmd-append-action');
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(
+      ['cmd-append-1'], 'cmd-append-action', undefined, { allowDispatchAsNewTurn: true },
+    );
     expect(removeQueuedTaskIntentMock).toHaveBeenCalledWith('deck_transport_brain', 'cmd-append-1');
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
@@ -5086,7 +5088,10 @@ describe('handleWebCommand transport queue behavior', () => {
 
   it('corrects the browser\'s active-turn belief when append reports stale, instead of leaving it stuck', async () => {
     // The turn this tried to append to already finished by the time the
-    // daemon looked (appendPendingMessagesToActiveTurn's very first check).
+    // daemon looked (appendPendingMessagesToActiveTurn's very first check),
+    // AND the runtime's own drain-fallback could not dispatch it either
+    // (e.g. still transiently blocked) -- so the message the browser tried
+    // to append to a live turn is genuinely still sitting in the queue.
     // This used to reject with no session.state update at all: a browser
     // that believed a turn was still running never learned otherwise, so it
     // kept showing "working" with a live Stop control and kept queueing new
@@ -5108,7 +5113,10 @@ describe('handleWebCommand transport queue behavior', () => {
         clientMessageId: 'append-stale-turn',
         text: 'this turn already finished',
       }],
-      pendingCount: 0,
+      // Realistic, not 0: none of the append failure statuses (including
+      // 'stale') consume the pending queue, so the message that failed to
+      // append is still sitting right there.
+      pendingCount: 1,
       sending: false,
     });
 
@@ -5120,17 +5128,55 @@ describe('handleWebCommand transport queue behavior', () => {
     }, serverLink as any);
     await flushAsync();
 
-    // The fix: the daemon now tells the browser the TRUE current state
-    // (idle, nothing pending/sending) instead of leaving it to guess.
+    // The fix: the daemon now tells the browser the TRUE current state —
+    // still queued (not sending) — instead of leaving it to guess or
+    // falsely claiming idle while a message actually still awaits delivery.
     expect(emitMock).toHaveBeenCalledWith(
       'deck_transport_brain',
       'session.state',
-      expect.objectContaining({ state: 'idle' }),
+      expect.objectContaining({ state: 'queued' }),
       expect.any(Object),
     );
     expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
       commandId: 'cmd-append-stale-turn', status: 'error', error: 'The active turn already finished',
     }));
+  });
+
+  it('acks an append as accepted and reports the true running state when no turn was active and the runtime dispatched the queue as a fresh turn instead', async () => {
+    // appendPendingMessagesToActiveTurn's new fallback: no turn was active,
+    // so the runtime drained the pending queue as a new turn rather than
+    // erroring "stale". This must ack success, not the old opaque error, and
+    // the broadcast state must reflect the turn now actually running.
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'dispatched_as_new_turn' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      pendingEntries: [{
+        clientMessageId: 'append-dispatched-as-new-turn',
+        text: 'this turn already finished, so send it as a new one',
+      }],
+      pendingCount: 0,
+      sending: true,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['append-dispatched-as-new-turn'],
+      commandId: 'cmd-append-dispatched-as-new-turn',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'running' }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-append-dispatched-as-new-turn', status: 'accepted',
+    }));
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
   });
 
   it('carries the whole recipient-gated queue authority on the not-found ack itself', async () => {
@@ -5309,6 +5355,8 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(
       ['cmd-sync-race'],
       'cmd-sync-race-append',
+      undefined,
+      { allowDispatchAsNewTurn: true },
     );
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
       commandId: 'cmd-sync-race-append',
