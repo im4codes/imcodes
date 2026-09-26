@@ -22,12 +22,17 @@ import {
 import type { ResolvedTaskPairMaterial } from './material.js';
 
 /**
- * Backtick-wrapped so a marker example renders as literal inline code in the
- * web chat instead of the daemon's `<!--`/`-->` comment syntax being eaten by
- * markdown font ligatures (owner report: shows as "←!—— … ——→").
+ * Bare, never backtick-wrapped: this is copied verbatim onto its own line by
+ * the agent it's shown to (executor/auditor instructions, and Brain copying
+ * a QUEUE/DISPATCH example), and `MARKER_LINE_RE` only accepts a bare
+ * `<!-- ... -->` line (shared/task-pair.ts) -- a wrapped copy silently fails
+ * to parse and the pair hangs (r1 audit regression). The web's font-ligature
+ * rendering of `<!--`/`-->` ("←!——…——→") is fixed at the CSS level instead
+ * (body { font-variant-ligatures: none }), which covers plain text exactly
+ * as well as a code span.
  */
 function marker(verb: string, taskId: string, attrs = ''): string {
-  return `\`<!-- ${TASK_PAIR_MARKER_TAG} ${verb} ${taskId}${attrs ? ` ${attrs}` : ''} -->\``;
+  return `<!-- ${TASK_PAIR_MARKER_TAG} ${verb} ${taskId}${attrs ? ` ${attrs}` : ''} -->`;
 }
 
 function contracts(blocking: readonly AuditSeverity[]): string {
@@ -239,8 +244,9 @@ export function buildLegacyImportCorrectionBrainLine(taskIds: readonly string[])
   return `[IM.codes task pairs] ${taskIds.length} imported legacy task(s) were marked passed without any audit PASS and are now back in audit: ${taskIds.join(', ')}. Each gets an auditor from the pool within your concurrency limit; no action needed.`;
 }
 
+/** Bare, never backtick-wrapped: see {@link marker}. */
 export function buildBriefEndHint(taskId: string): string {
-  return `\`<!-- ${TASK_PAIR_BRIEF_END_TAG} ${taskId} -->\``;
+  return `<!-- ${TASK_PAIR_BRIEF_END_TAG} ${taskId} -->`;
 }
 
 export { marker as formatTaskPairMarker };

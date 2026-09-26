@@ -198,7 +198,7 @@ describe('pair workspaces', () => {
     const brief = sentTo(EXEC, 'pair-brief')[0]!.text;
     expect(brief).toContain(`Work in the task directory the daemon created for this pair: ${dir}`);
     // Its own READY instruction names a path, never a head.
-    expect(brief).toContain('write `<!-- IMCODES_TASK READY_FOR_AUDIT D1 path=<the task directory or the result files> -->`');
+    expect(brief).toContain('write <!-- IMCODES_TASK READY_FOR_AUDIT D1 path=<the task directory or the result files> -->');
     expect(brief).not.toContain('READY_FOR_AUDIT D1 worktree=');
 
     // READY_FOR_AUDIT without a path: the daemon names the directory, no HEAD.
