@@ -53,8 +53,17 @@ async function tick(times = 1) {
   }
 }
 
+// A fixed number of event-loop turns raced the service's tracked background
+// work (intents → queue run → dispatch send) on slower CI runners (Node 22),
+// so a dispatch could land after the assertion. Drain until the service is
+// idle and stays idle across a turn.
 async function flush() {
-  for (let i = 0; i < 5; i += 1) await new Promise<void>((resolve) => setImmediate(resolve));
+  for (let i = 0; i < 50; i += 1) {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await taskPairService.waitForIdle();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    if (taskPairService.pendingCount === 0) return;
+  }
 }
 
 function sentTo(target: string, reasonPart?: string) {
