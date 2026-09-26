@@ -773,7 +773,7 @@ interface TimelineQueueEvent {
  * command acknowledgements, stop and approval frames continue through the
  * direct control path above and therefore cannot wait behind this queue.
  */
-class TimelineOutboundQueue {
+export class TimelineOutboundQueue {
   private pending: TimelineQueueEvent[] = [];
   private bytes = 0;
   private sending = false;
