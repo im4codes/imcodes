@@ -243,11 +243,16 @@ bool TestTextBoundsAndUtf8() {
       !Check(copied.empty(), "oversized copied text must not escape") ||
       !Check(fixture.adapter.LastError().code ==
                  clipboard::ClipboardErrorCode::kTextTooLarge,
-             "copy byte bound must be reported") ||
-      !Check(!fixture.adapter.PasteText(std::string(33, 'p')),
+             "copy byte bound must be reported")) {
+    return false;
+  }
+  const int readiness_before_oversized_paste = fixture.fake->readiness_calls;
+  if (!Check(!fixture.adapter.PasteText(std::string(33, 'p')),
              "oversized paste must fail before backend access") ||
       !Check(fixture.fake->write_calls == 0 && fixture.paste_actions == 0,
-             "invalid paste must not mutate the pasteboard or inject input")) {
+             "invalid paste must not mutate the pasteboard or inject input") ||
+      !Check(fixture.fake->readiness_calls == readiness_before_oversized_paste,
+             "invalid paste must not probe the pasteboard backend")) {
     return false;
   }
 

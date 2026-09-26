@@ -759,9 +759,9 @@ bool X11ClipboardAdapter::EnsureWindow() {
 }
 
 bool X11ClipboardAdapter::PasteText(std::string_view text) {
+  if (text.empty() || text.size() > imcodes::rd::kMaxPasteTextBytes) return false;
   Display* display = Dpy(connection_);
-  if (display == nullptr || !connection_->has_xtest() || !EnsureWindow() ||
-      text.empty() || text.size() > imcodes::rd::kMaxPasteTextBytes) return false;
+  if (display == nullptr || !connection_->has_xtest() || !EnsureWindow()) return false;
   owned_text_.assign(text);
   const Atom clipboard = XInternAtom(display, "CLIPBOARD", False);
   XSetSelectionOwner(display, clipboard, static_cast<Window>(window_), CurrentTime);

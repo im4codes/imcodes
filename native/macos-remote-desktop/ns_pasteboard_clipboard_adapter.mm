@@ -298,17 +298,20 @@ public:
                 "another explicit clipboard operation is active"});
       return false;
     }
-    const std::uint64_t generation = BeginOperation();
-    if (generation == 0) {
-      return false;
-    }
     ClipboardErrorCode validation_error = ClipboardErrorCode::kNone;
-    if (!IsValidBoundedUtf8(text, imcodes::rd::kMaxPasteTextBytes,
+    if (!IsValidBoundedUtf8(text, options_.max_text_bytes,
                             &validation_error)) {
       SetError({validation_error,
                 validation_error == ClipboardErrorCode::kTextTooLarge
                     ? "clipboard text exceeds the byte bound"
                     : "clipboard text is not valid UTF-8"});
+      return false;
+    }
+    // Reject invalid input before probing or otherwise touching the native
+    // pasteboard backend. This keeps the protocol bound a hard admission
+    // gate even when the graphical session is unavailable.
+    const std::uint64_t generation = BeginOperation();
+    if (generation == 0) {
       return false;
     }
     const std::uint64_t deadline =

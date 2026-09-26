@@ -8,6 +8,7 @@
 #include <string>
 #include <string_view>
 
+#include "../remote-desktop-common/data_channel_constants.h"
 #include "../remote-desktop-common/platform_interfaces.h"
 
 namespace imcodes::remote_desktop::macos {
@@ -40,7 +41,12 @@ struct ClipboardError {
   std::string message;
 };
 
-inline constexpr std::size_t kNSPasteboardClipboardMaxTextBytes = 12 * 1024;
+// The native adapter and chunked control protocol must share the same
+// aggregate bound.  Keep the adapter's configurable limit at or below this
+// protocol limit, never at a private smaller value that rejects valid
+// assembled transfers.
+inline constexpr std::size_t kNSPasteboardClipboardMaxTextBytes =
+    imcodes::rd::kMaxPasteTextBytes;
 inline constexpr std::uint32_t kNSPasteboardClipboardMaxDeadlineMs = 5'000;
 
 struct NSPasteboardClipboardOptions {

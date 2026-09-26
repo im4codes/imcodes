@@ -2535,7 +2535,7 @@ export function RemoteDesktopPanel({
 
   const sendPastedText = (text: string): boolean => {
     if (!snapshot.inputEnabled || !text) return false;
-    const sent = clientRef.current?.pasteText(text) ?? false;
+    const sent = clientRef.current?.pasteText?.(text) ?? false;
     if (sent) stageRef.current?.focus({ preventScroll: true });
     return sent;
   };
