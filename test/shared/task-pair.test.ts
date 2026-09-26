@@ -130,6 +130,16 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('Report to Brain only at the end');
     expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
   });
+
+  it('ships a contract stating auditor=none is a real choice with its own self-validation/report rules, not a lesser one', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain('auditor=<session>|none');
+    expect(body).toContain('auditor=none is a real choice, not a lesser one');
+    expect(body).toContain('no audit window is assigned');
+    expect(body).toContain('nothing auto-picks one for you');
+    expect(body).toContain('write DONE straight to Brain with no PASS required');
+    expect(body).toContain('what changed, the worktree/branch/HEAD or file paths, and your validation result');
+  });
 });
 
 describe('task-pair severity judgement', () => {
@@ -362,6 +372,16 @@ describe('task-pair state machine', () => {
     const withAuditor = apply(undefined, BRAIN, `<!-- IMCODES_TASK DISPATCH T55 executor=${EXEC} auditor=${AUD} -->`).pair!;
     const result = apply(withAuditor, BRAIN, '<!-- IMCODES_TASK REASSIGN T55 auditormodel=claude-sonnet-5 -->');
     expect(result.pair).toMatchObject({ auditor: AUD, auditorModel: 'claude-sonnet-5' });
+    expect(result.intents).not.toContainEqual({ kind: 'pick_auditor' });
+  });
+
+  it('a REASSIGN without an explicit auditor= never re-enables audit on a pair that is auditor=none', () => {
+    const none = apply(undefined, BRAIN, `<!-- IMCODES_TASK DISPATCH T56 executor=${EXEC} auditor=none -->`).pair!;
+    // auditormodel= alone is a hint for the daemon's next automatic pick; it
+    // must not itself flip a deliberately-none pair back into audited mode.
+    const result = apply(none, BRAIN, '<!-- IMCODES_TASK REASSIGN T56 auditormodel=claude-sonnet-5 -->');
+    expect(result.pair).toMatchObject({ auditor: TASK_PAIR_NO_AUDITOR, auditorModel: 'claude-sonnet-5' });
+    expect(result.pair?.flags).not.toContain('needs_auditor');
     expect(result.intents).not.toContainEqual({ kind: 'pick_auditor' });
   });
 

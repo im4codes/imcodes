@@ -124,6 +124,41 @@ describe('task-pair marker ingestion', () => {
     expect(getTaskPairStore().listEvents(PROJECT, 'T3')).toHaveLength(3);
   });
 
+  it('relays the executor\'s own closing summary to Brain when a no-auditor pair reaches DONE, so Brain never has to poll', async () => {
+    await say(BRAIN, `Dispatching.\n<!-- IMCODES_TASK DISPATCH T60 executor=${EXEC} auditor=none title="Bump a config value" -->`);
+    sent.length = 0; // clear the DISPATCH brief so only the DONE relay is asserted below
+    await say(
+      EXEC,
+      'Changed the timeout to 30s in config.yaml and pushed.\nRan the full suite locally: all green.\n'
+      + '<!-- IMCODES_TASK DONE T60 -->',
+    );
+    expect(pair('T60')?.status).toBe('done');
+    const notice = sent.find((entry) => entry.target === BRAIN);
+    expect(notice).toBeDefined();
+    expect(notice!.text).toContain('DONE from executor');
+    expect(notice!.text).toContain(EXEC);
+    expect(notice!.text).toContain('no auditor for this pair');
+    expect(notice!.text).toContain('Changed the timeout to 30s in config.yaml and pushed.');
+    expect(notice!.text).toContain('Ran the full suite locally: all green.');
+    expect(notice!.text).not.toContain('IMCODES_TASK DONE');
+  });
+
+  it('does not send the no-auditor DONE relay for an audited pair, or for a Brain-forced DONE', async () => {
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T61 executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, 'Done.\n<!-- IMCODES_TASK READY_FOR_AUDIT T61 worktree=/w head=1234567 -->');
+    await say(AUD, '<!-- IMCODES_TASK PASS T61 blocking=P0 -->');
+    sent.length = 0;
+    await say(EXEC, 'Merged.\n<!-- IMCODES_TASK DONE T61 -->');
+    expect(pair('T61')?.status).toBe('done');
+    expect(sent.some((entry) => entry.target === BRAIN)).toBe(false);
+
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T62 executor=${EXEC} auditor=none -->`);
+    sent.length = 0;
+    await say(BRAIN, '<!-- IMCODES_TASK DONE T62 force=true -->');
+    expect(pair('T62')?.status).toBe('done');
+    expect(sent.some((entry) => entry.target === BRAIN)).toBe(false);
+  });
+
   it('ignores streaming, automation and memory-excluded payloads and legacy-engine projects', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T4 executor=${EXEC} auditor=${AUD} -->`, { streaming: true });
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T4 executor=${EXEC} auditor=${AUD} -->`, { automation: true });

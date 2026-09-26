@@ -24,6 +24,7 @@ import {
   isTerminalTaskPairStatus,
   mayContainTaskPairMarker,
   scanTaskPairMarkers,
+  stripTaskPairMarkersForDisplay,
   taskPairRoleOf,
   type TaskPairEventPayload,
   type TaskPairEventSource,
@@ -48,6 +49,7 @@ import {
   buildBrainNoticeMessage,
   buildCorrectionMessage,
   buildDoneReminderMessage,
+  buildNoAuditorDoneNotice,
   buildReworkNoticeMessage,
 } from './messages.js';
 
@@ -66,6 +68,14 @@ export interface ApplyMarkerInput {
   /** Stable id for this marker occurrence: replaying it is a no-op. */
   eventId: string;
   now?: number;
+  /**
+   * The full assistant turn text this marker was scanned from, markers not
+   * stripped. Only a real user-authored turn (`ingestText`) has one; a
+   * synthetic marker minted by the daemon itself (dispatch, reassign, queue
+   * drain) has no prose to relay and omits it. Used to relay the executor's
+   * own closing summary to Brain when a no-auditor pair reaches DONE.
+   */
+  turnText?: string;
   /**
    * A DISPATCH this creates with no auditor named gets one held for a short
    * grace window instead of an immediate auto-pick, in case the Brain's own
@@ -294,7 +304,7 @@ export class TaskPairService {
     const results: TaskPairTransition[] = [];
     for (const marker of markers) {
       results.push(this.applyMarker({
-        project, writer, marker, source: 'marker', eventId: `${turnId}:${marker.markerIndex}`, now,
+        project, writer, marker, source: 'marker', eventId: `${turnId}:${marker.markerIndex}`, now, turnText: text,
       }));
     }
     return results;
@@ -386,6 +396,19 @@ export class TaskPairService {
     }
     if (stored && transition.toStatus === 'passed' && transition.fromStatus !== 'passed') {
       this.#scheduler?.flagEconomyUnreviewed?.(input.project, stored.state.taskId);
+    }
+    // A no-auditor pair has no PASS for Brain to learn about instead: relay
+    // the executor's own closing-reply prose (the marker line stripped out)
+    // as the completion notice, so Brain never has to poll a pair it can't
+    // watch an auditor finish for it.
+    if (stored && input.marker.knownVerb === 'DONE' && transition.toStatus === 'done'
+      && transition.fromStatus !== 'done' && stored.state.auditor === TASK_PAIR_NO_AUDITOR
+      && input.writer !== stored.state.brain) {
+      const summary = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText) : '';
+      this.#track(sendTaskPairMessage(
+        stored.state.brain, stored.state.taskId, 'brain-line-done-no-auditor',
+        buildNoAuditorDoneNotice(stored.state, summary),
+      ));
     }
     if (input.marker.knownVerb === 'DISPATCH' && transition.pair?.executor
       && input.writer === transition.pair.brain) {
