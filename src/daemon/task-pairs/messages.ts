@@ -442,7 +442,7 @@ export function buildBrainLine(pair: TaskPairState, text: string): string {
  */
 export function buildNoAuditorDoneNotice(pair: TaskPairState, executorSummary: string): string {
   const summary = executorSummary.trim();
-  return `${header(pair)} DONE from executor ${pair.executor ?? '(unknown)'}, no auditor for this pair.${
+  return `${header(pair)} Executor ${pair.executor ?? '(unknown)'} reported DONE; no auditor was assigned. The pair is open and awaiting your decision. Accept with DONE ${pair.taskId} force=true, cancel with CANCEL ${pair.taskId}, or dispatch/brief/message more work to return it to working.${
     summary ? `\n\n${summary}` : ' (no summary text in the closing reply)'
   }`;
 }

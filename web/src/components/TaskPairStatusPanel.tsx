@@ -94,13 +94,14 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
     if (key === 'queued') rows.sort((a, b) => Number(a.payload.queuePosition ?? Number.MAX_SAFE_INTEGER) - Number(b.payload.queuePosition ?? Number.MAX_SAFE_INTEGER));
     return { key, rows: key === 'recent' ? rows.slice(-MAX_ROWS) : rows };
   }).filter((group) => group.rows.length > 0);
-  const counts = allRows.reduce<{ working: number; audit: number; queued: number }>((result, row) => {
+  const counts = allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number }>((result, row) => {
     const value = row.payload.toStatus;
     if (value === 'working' || value === 'rework') result.working += 1;
     else if (value === 'in_audit' || value === 'awaiting_audit') result.audit += 1;
+    else if (value === 'awaiting_brain_decision') result.awaitingBrain += 1;
     else if (value === 'queued') result.queued += 1;
     return result;
-  }, { working: 0, audit: 0, queued: 0 });
+  }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
   if (latest.size === 0) return null;
   const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch {} return next; });
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
@@ -127,6 +128,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
         <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--working">{t('taskPair.panel_count_working', { count: counts.working })}</span>
         <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--in_audit">{t('taskPair.panel_count_audit', { count: counts.audit })}</span>
         <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
+        <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
       </span>
     </button>
     {!collapsed && <div class="task-pair-status-rows">

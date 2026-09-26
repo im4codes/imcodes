@@ -4339,7 +4339,8 @@
       "passed": "合格",
       "done": "完了",
       "cancelled": "キャンセル",
-      "rework_round": "再作業 第{{round}}ラウンド"
+      "rework_round": "再作業 第{{round}}ラウンド",
+      "awaiting_brain_decision": "Brain の判断待ち"
     },
     "flag": {
       "blocked": "ブロック",
@@ -4357,7 +4358,8 @@
       "markers_unresolved": "未解決のマーカー",
       "all_providers_limited": "全プロバイダー制限中",
       "auditor_capacity_hold": "監査者待機中(容量)",
-      "no_pool_configured": "実行プール未設定"
+      "no_pool_configured": "実行プール未設定",
+      "policy_violation": "ポリシー違反"
     },
     "settings": {
       "title": "タスクペア（マーカー駆動の監督）",

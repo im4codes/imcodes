@@ -14448,6 +14448,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-chip--working { --task-pair-status-text: var(--status-active-text); --task-pair-status-border: var(--status-active-border); --task-pair-status-bg: var(--status-active-bg); }
 .task-pair-chip--in_audit { --task-pair-status-text: var(--status-audit-text); --task-pair-status-border: var(--status-audit-border); --task-pair-status-bg: var(--status-audit-bg); }
 .task-pair-chip--awaiting_audit { --task-pair-status-text: var(--supervision-waiting-text); --task-pair-status-border: var(--supervision-waiting-border); --task-pair-status-bg: var(--supervision-waiting-bg); }
+.task-pair-chip--awaiting_brain_decision { --task-pair-status-text: #8a5b18; --task-pair-status-border: #c99845; --task-pair-status-bg: color-mix(in srgb, #e9b85f 16%, transparent); }
 .task-pair-chip--rework { --task-pair-status-text: var(--status-rework-text); --task-pair-status-border: var(--status-rework-border); }
 .task-pair-chip--passed { --task-pair-status-text: var(--status-pass-text); --task-pair-status-border: var(--status-pass-border); }
 .task-pair-chip--done { --task-pair-status-text: var(--status-done-text); --task-pair-status-border: var(--status-done-border); --task-pair-status-bg: var(--status-done-bg); }

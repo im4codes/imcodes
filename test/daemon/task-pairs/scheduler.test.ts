@@ -184,9 +184,32 @@ describe('task-pair heartbeat, replacement and queue', () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T4 executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK DONE T4 -->');
     await flush();
+    expect(sentTo(EXEC, 'policy-rejection')[0]?.text).toContain('material-backed audit round');
     sent = [];
     await tick(1);
-    expect(sentTo(EXEC, 'nudge-executor')[0]?.text).toContain('DONE without a PASS is not complete');
+    expect(pair('T4').status).toBe('working');
+  });
+
+  it('holds a no-auditor completion in the concurrency slot, reminds Brain once, and releases only on Brain decision', async () => {
+    candidates = [SPARE, SPARE2];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH NO_AUD executor=${EXEC} auditor=none -->`);
+    marker(EXEC, '<!-- IMCODES_TASK DONE NO_AUD -->');
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE NEXT title="Next" -->\nDo next\n<!-- IMCODES_TASK_END NEXT -->');
+    await flush();
+    expect(pair('NO_AUD').status).toBe('awaiting_brain_decision');
+    expect(pair('NEXT').status).toBe('queued');
+    expect(sentTo(BRAIN, 'brain-line-done-no-auditor')[0]?.text).toContain('awaiting your decision');
+
+    sent = [];
+    await tick(4);
+    expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'brain-decision-reminder')[0]?.text).toContain('CANCEL <taskId>');
+
+    marker(BRAIN, '<!-- IMCODES_TASK DONE NO_AUD force=true -->');
+    await flush();
+    expect(pair('NO_AUD').status).toBe('done');
+    expect(pair('NEXT').status).toBe('working');
   });
 
   it('nudges whoever holds the ball when both sides are idle (in_audit with a real auditor: the auditor), but stands down when either side has activity', async () => {

@@ -4339,7 +4339,8 @@
       "passed": "Принята",
       "done": "Готово",
       "cancelled": "Отменена",
-      "rework_round": "Доработка, раунд {{round}}"
+      "rework_round": "Доработка, раунд {{round}}",
+      "awaiting_brain_decision": "Ожидает решения Brain"
     },
     "flag": {
       "blocked": "Заблокирована",
@@ -4357,7 +4358,8 @@
       "markers_unresolved": "Неразрешённые маркеры",
       "all_providers_limited": "Все провайдеры лимитированы",
       "auditor_capacity_hold": "Аудитор ждёт (перегрузка)",
-      "no_pool_configured": "Пул выполнения не настроен"
+      "no_pool_configured": "Пул выполнения не настроен",
+      "policy_violation": "Нарушение политики"
     },
     "settings": {
       "title": "Пары задач (надзор по маркерам)",

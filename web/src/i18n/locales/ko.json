@@ -4339,7 +4339,8 @@
       "passed": "통과",
       "done": "완료",
       "cancelled": "취소됨",
-      "rework_round": "재작업 {{round}}차"
+      "rework_round": "재작업 {{round}}차",
+      "awaiting_brain_decision": "Brain 결정 대기"
     },
     "flag": {
       "blocked": "막힘",
@@ -4357,7 +4358,8 @@
       "markers_unresolved": "해결되지 않은 마커",
       "all_providers_limited": "모든 공급자 제한됨",
       "auditor_capacity_hold": "감사자 대기(용량)",
-      "no_pool_configured": "실행 풀 미구성"
+      "no_pool_configured": "실행 풀 미구성",
+      "policy_violation": "정책 위반"
     },
     "settings": {
       "title": "작업 페어(마커 기반 감독)",
