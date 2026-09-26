@@ -11,7 +11,6 @@ import {
   defaultCountActiveSupervisionAssignments,
   defaultHasActiveSupervisionLease,
 } from '../../../src/daemon/supervision-auto-provision.js';
-import { TASK_PAIR_DEFAULT_ALLOWLIST } from '../../../shared/task-pair.js';
 import { getSupervisionHeartbeatProjection } from '../../../src/daemon/supervision-heartbeat-projection.js';
 
 const PROJECT = 'schedproj';
@@ -281,17 +280,39 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(pair('Q5').status).toBe('working');
   });
 
-  it('keeps a queued task waiting for capacity, tells Brain once, and retries on the heartbeat', async () => {
+  it('keeps a queued task waiting for capacity quietly and retries on the heartbeat', async () => {
     candidates = [];
     marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3 -->\nbrief\n<!-- IMCODES_TASK_END Q3 -->');
     await flush();
     await tick(2);
     expect(pair('Q3')).toMatchObject({ status: 'queued', flags: ['waiting_for_capacity'] });
-    expect(sentTo(BRAIN, 'brain-waiting_for_capacity')).toHaveLength(1);
+    // Owner correction: an ordinary, self-resolving queue miss gets no
+    // per-pair Brain notice at all -- only the combined stall notice, and
+    // only once it has actually persisted (see the test below).
+    expect(sentTo(BRAIN, 'brain-waiting_for_capacity')).toHaveLength(0);
     candidates = [SPARE, SPARE2];
     await tick(1);
     expect(pair('Q3')).toMatchObject({ status: 'working', executor: SPARE, auditor: SPARE2 });
     expect(pair('Q3').flags).not.toContain('waiting_for_capacity');
+  });
+
+  it('sends one combined notice for queued tasks stalled a long time, not one per pair or per tick', async () => {
+    candidates = [];
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3a -->\nbrief a\n<!-- IMCODES_TASK_END Q3a -->');
+    marker(BRAIN, '<!-- IMCODES_TASK QUEUE Q3b -->\nbrief b\n<!-- IMCODES_TASK_END Q3b -->');
+    await flush();
+    // Under 30 minutes: still quiet.
+    await tick(4);
+    expect(sentTo(BRAIN, 'brain-queue-stall')).toHaveLength(0);
+    // Past 30 minutes: one combined notice naming both pairs.
+    await tick(2);
+    const stallNotices = sentTo(BRAIN, 'brain-queue-stall');
+    expect(stallNotices).toHaveLength(1);
+    expect(stallNotices[0]!.text).toContain('Q3a');
+    expect(stallNotices[0]!.text).toContain('Q3b');
+    // Rate-limited: further ticks while still stalled do not repeat it.
+    await tick(3);
+    expect(sentTo(BRAIN, 'brain-queue-stall')).toHaveLength(1);
   });
 
   it('does not auto-dispatch a queued task without a brief, telling Brain once', async () => {
@@ -352,7 +373,7 @@ describe('task-pair pool candidates', () => {
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
   });
 
-  it('picks only idle allowlisted sub-sessions of the Brain, longest idle first (default: Opus auditors)', () => {
+  it('picks only idle sub-sessions of the Brain, longest idle first (no pool configured: built-in default Opus auditors)', () => {
     const sessions = [
       session(BRAIN, 'brain'),
       session('deck_sub_codex', 'w1', { parentSession: BRAIN, agentType: 'codex-sdk', activeModel: 'gpt-5.5', updatedAt: 1 }),
@@ -366,9 +387,9 @@ describe('task-pair pool candidates', () => {
       session('deck_sub_nomodel', 'w8', { parentSession: BRAIN, updatedAt: 0 }),
     ];
     const picked = listTaskPairCandidates({
-      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST, exclude: new Set(),
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, { listSessions: () => sessions, hasPendingMessages: () => false });
-    // Project main sessions are never commandeered; an unknown model is not allowlisted.
+    // Project main sessions are never commandeered; an unknown model does not match the built-in default.
     expect(picked.map((entry) => entry.name)).toEqual(['deck_sub_opus_old', 'deck_sub_opus_new']);
   });
 });

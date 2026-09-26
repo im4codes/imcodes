@@ -48,15 +48,18 @@ import {
   TASK_RUN_PROMPT_VERSION,
   type SupervisionMode,
 } from '@shared/supervision-config.js';
-import type { TaskPairAllowlistEntry, TaskPairEngine } from '@shared/task-pair.js';
+import type { TaskPairEngine } from '@shared/task-pair.js';
 import { TaskPairSettingsSection } from './TaskPairSettingsSection.js';
 import {
   buildSupervisionExecutionCapabilityId,
   isExcludedDevelopmentModel,
   normalizeSupervisionExecutionModel,
   normalizeSupervisionExecutionPools,
+  supervisionExecutionConfigRole,
+  SUPERVISION_EXECUTION_POOL_ROLES,
   type SupervisionExecutionConfig,
   type SupervisionExecutionPoolKind,
+  type SupervisionExecutionPoolRole,
   type SupervisionExecutionPoolsConfig,
 } from '@shared/supervision-execution-pool.js';
 import {
@@ -173,7 +176,6 @@ type SupervisionDraft = {
   auditBlockingSeverities?: AuditSeverity[];
   taskRunPromptVersion?: string;
   pairEngine?: TaskPairEngine;
-  pairAllowlist?: TaskPairAllowlistEntry[];
   pairMaxConcurrency?: number;
 };
 
@@ -623,6 +625,18 @@ function updateExecutionPoolSelection(
   };
 }
 
+/** Which pair role a primary-pool entry may serve. Auditors always come from the primary pool. */
+function updateExecutionPoolRole(
+  pools: SupervisionExecutionPoolsConfig,
+  capabilityId: string,
+  role: SupervisionExecutionPoolRole,
+): SupervisionExecutionPoolsConfig {
+  const applyRole = (config: SupervisionExecutionConfig): SupervisionExecutionConfig => (
+    config.capabilityId === capabilityId ? { ...config, role } : config
+  );
+  return { ...pools, primaryDevelopmentPool: { ...pools.primaryDevelopmentPool, configs: pools.primaryDevelopmentPool.configs.map(applyRole) } };
+}
+
 function SupervisionExecutionPoolsEditor({
   t,
   saving,
@@ -645,6 +659,22 @@ function SupervisionExecutionPoolsEditor({
   const toggle = (pool: SupervisionExecutionPoolKind, config: SupervisionExecutionConfig): void => {
     onChange(updateExecutionPoolSelection(pools, pool, config));
   };
+  const setRole = (capabilityId: string, role: SupervisionExecutionPoolRole): void => {
+    onChange(updateExecutionPoolRole(pools, capabilityId, role));
+  };
+  const renderRoleSelect = (config: SupervisionExecutionConfig) => (
+    <select
+      aria-label={t('session.supervision.poolEntryRole', { model: config.model })}
+      data-testid={`supervision-execution-pool-role-${config.capabilityId}`}
+      value={supervisionExecutionConfigRole(config)}
+      disabled={saving}
+      onChange={(e) => setRole(config.capabilityId, (e.target as HTMLSelectElement).value as SupervisionExecutionPoolRole)}
+    >
+      {SUPERVISION_EXECUTION_POOL_ROLES.map((role) => (
+        <option key={role} value={role}>{t(`session.supervision.poolEntryRole_${role}`)}</option>
+      ))}
+    </select>
+  );
   const renderPool = (pool: SupervisionExecutionPoolKind) => {
     const primary = pool === 'primary';
     const eligibleCandidates = primary
@@ -692,6 +722,7 @@ function SupervisionExecutionPoolsEditor({
                 <span>{candidate.sessionNames.join(', ')} · ×{candidate.matchingSessionCount}</span>
                 <span>{labelForPoolAgentType(t, candidate.config.agentType)} · {candidate.config.model}</span>
               </span>
+              {primary && renderRoleSelect(candidate.config)}
             </label>
           ))}
           {configuredOnly.map((config) => (
@@ -708,6 +739,7 @@ function SupervisionExecutionPoolsEditor({
                 <span>{labelForPoolAgentType(t, config.agentType)} · {config.model}</span>
                 <span>{t('session.supervision.configuredPoolModelUnavailable')}</span>
               </span>
+              {primary && renderRoleSelect(config)}
             </label>
           ))}
         </div>
@@ -718,10 +750,9 @@ function SupervisionExecutionPoolsEditor({
 }
 
 /** Pair settings carried unchanged through every supervision draft rebuild. */
-function pairSettingsOf(draft: Pick<SupervisionDraft, 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'>): Pick<SupervisionDraft, 'pairEngine' | 'pairAllowlist' | 'pairMaxConcurrency'> {
+function pairSettingsOf(draft: Pick<SupervisionDraft, 'pairEngine' | 'pairMaxConcurrency'>): Pick<SupervisionDraft, 'pairEngine' | 'pairMaxConcurrency'> {
   return {
     ...(draft.pairEngine ? { pairEngine: draft.pairEngine } : {}),
-    ...(draft.pairAllowlist ? { pairAllowlist: draft.pairAllowlist } : {}),
     ...(draft.pairMaxConcurrency ? { pairMaxConcurrency: draft.pairMaxConcurrency } : {}),
   };
 }
@@ -1217,7 +1248,6 @@ export function SessionSettingsDialog({
     isMainSession,
     supervision.pairEngine,
     supervision.pairMaxConcurrency,
-    JSON.stringify(supervision.pairAllowlist ?? null),
     supervisionAuditLoops,
     supervisionAutoContinueStreak,
     supervisionAutoContinueTotal,
@@ -1827,7 +1857,6 @@ export function SessionSettingsDialog({
                 onChange={(next) => setSupervision((prev) => ({
                   ...prev,
                   pairEngine: next.pairEngine,
-                  pairAllowlist: next.pairAllowlist,
                   pairMaxConcurrency: next.pairMaxConcurrency,
                 }))}
               />

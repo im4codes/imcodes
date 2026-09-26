@@ -1,6 +1,6 @@
 import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
 import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
-import { normalizeTaskPairAllowlist, type TaskPairAllowlistEntry, type TaskPairEngine } from './task-pair.js';
+import type { TaskPairEngine } from './task-pair.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
 import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
@@ -27,6 +27,7 @@ import {
 } from './peer-audit.js';
 import { isValidImcodesSessionName } from './session-scope.js';
 import {
+  foldLegacyPairAllowlistIntoExecutionPools,
   migrateLegacySupervisionExecutionPools,
   type SupervisionEconomyTaskPolicy,
   type SupervisionExecutionConfig,
@@ -1257,8 +1258,6 @@ export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
   auditBlockingSeverities?: AuditSeverity[];
   /** Project supervision engine chosen on the Brain (`pairs` default; `legacy` = manual rollback). */
   pairEngine?: TaskPairEngine;
-  /** Allowlist for daemon picks of pair executors/auditors. */
-  pairAllowlist?: TaskPairAllowlistEntry[];
   /** Brain's maximum of open pairs. */
   pairMaxConcurrency?: number;
   taskRunPromptVersion: string;
@@ -1574,8 +1573,19 @@ export function normalizeSessionSupervisionSnapshot(
     : undefined;
   const hasCanonicalAuditTarget = !!auditTargetSessionName
     && isValidImcodesSessionName(auditTargetSessionName);
+  // The task-pair allowlist is removed: pair routing is exactly the pool's
+  // per-entry roles. A legacy stored allowlist (from before this change) is
+  // folded into those roles here, once, so no project silently loses its
+  // routing -- folding is idempotent (an entry with an explicit role already
+  // set is never overwritten), so this never needs a separate "already
+  // migrated" flag or to run anywhere else.
+  const legacyPairAllowlist = (merged as { pairAllowlist?: unknown }).pairAllowlist;
+  const executionPools = legacyPairAllowlist !== undefined
+    ? foldLegacyPairAllowlistIntoExecutionPools(supervisorDefaults.executionPools, legacyPairAllowlist)
+    : supervisorDefaults.executionPools;
   return {
     ...supervisorDefaults,
+    executionPools,
     mode,
     ...(customInstructions ? { customInstructions } : {}),
     // Only emit the override flag when true, to keep payloads minimal for the
@@ -1598,7 +1608,6 @@ export function normalizeSessionSupervisionSnapshot(
       ? { auditBlockingSeverities: normalizeAuditBlockingSeverities(merged.auditBlockingSeverities) }
       : {}),
     ...(merged.pairEngine === 'pairs' || merged.pairEngine === 'legacy' ? { pairEngine: merged.pairEngine } : {}),
-    ...(merged.pairAllowlist !== undefined ? { pairAllowlist: normalizeTaskPairAllowlist(merged.pairAllowlist) } : {}),
     ...(typeof merged.pairMaxConcurrency === 'number' && Number.isFinite(merged.pairMaxConcurrency) && merged.pairMaxConcurrency >= 1
       ? { pairMaxConcurrency: Math.floor(merged.pairMaxConcurrency) }
       : {}),
@@ -1723,7 +1732,6 @@ export function buildTransportConfigWithSupervision(
     && (normalized.executionPools.primaryDevelopmentPool.configs.length > 0
       || normalized.executionPools.economyTaskPool.configs.length > 0);
   const hasPairSettings = normalized.pairEngine !== undefined
-    || normalized.pairAllowlist !== undefined
     || normalized.pairMaxConcurrency !== undefined;
   if (normalized.mode === SUPERVISION_MODE.OFF
     && !normalized.auditTargetSessionName

@@ -19,7 +19,6 @@ import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
 import {
-  TASK_PAIR_DEFAULT_ALLOWLIST,
   TASK_PAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
@@ -363,26 +362,23 @@ describe('TaskPairEventChip status colours', () => {
 describe('TaskPairSettingsSection', () => {
   afterEach(() => cleanup());
 
-  it('edits engine, limit and allowlist starting from the defaults', () => {
+  it('edits engine and limit starting from the defaults', () => {
     let value: TaskPairSettingsValue = {};
     const onChange = vi.fn((next: TaskPairSettingsValue) => { value = next; });
-    const view = render(<TaskPairSettingsSection value={value} onChange={onChange} />);
+    render(<TaskPairSettingsSection value={value} onChange={onChange} />);
     // An unconfigured project is inert (owner decision, 2026-09-26), not
     // 'pairs' -- the select must show that truthfully, or choosing 'pairs'
     // fires no input event because it already matches the shown value.
     expect((screen.getByTestId('task-pair-engine') as HTMLSelectElement).value).toBe('');
     expect((screen.getByTestId('task-pair-max-concurrency') as HTMLInputElement).value).toBe('5');
-    expect(screen.getAllByTestId(/task-pair-allowlist-row-/)).toHaveLength(TASK_PAIR_DEFAULT_ALLOWLIST.length);
+    // Who does executor/auditor work is not configured here -- it is the
+    // execution pool's per-entry role, in SessionSettingsDialog's pool editor.
+    expect(screen.queryByTestId(/task-pair-allowlist-row-/)).toBeNull();
 
     const engine = screen.getByTestId('task-pair-engine') as HTMLSelectElement;
     expect([...engine.options].map((option) => option.value)).not.toContain('legacy');
     fireEvent.input(screen.getByTestId('task-pair-max-concurrency'), { target: { value: '8' } });
     expect(value.pairMaxConcurrency).toBe(8);
-
-    view.rerender(<TaskPairSettingsSection value={value} onChange={onChange} />);
-    fireEvent.click(screen.getByTestId('task-pair-allowlist-add'));
-    expect(value.pairAllowlist).toHaveLength(TASK_PAIR_DEFAULT_ALLOWLIST.length + 1);
-    expect(value.pairAllowlist?.at(-1)).toEqual({ role: 'both', agentType: '', modelPattern: '' });
   });
 
   it('renders a stored legacy value as inert unset without offering it again', () => {

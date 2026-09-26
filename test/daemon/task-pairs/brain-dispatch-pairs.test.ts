@@ -18,7 +18,7 @@ import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
 import { isSessionCoveredByPairHeartbeat } from '../../../src/daemon/task-pairs/engine.js';
-import { describeAuditorAllowlistGap, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
+import { describeAuditorPoolGap, listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { handleLegacyToolOnPairs } from '../../../src/daemon/task-pairs/legacy-tools.js';
 import {
   clearSendIdempotencyCacheForTests,
@@ -34,7 +34,6 @@ import {
 } from '../../../src/daemon/supervision-prompts.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MODE, normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
-import { TASK_PAIR_DEFAULT_ALLOWLIST } from '../../../shared/task-pair.js';
 import { buildSupervisionExecutionCapabilityId, normalizeSupervisionExecutionModel } from '../../../shared/supervision-execution-pool.js';
 
 const PROJECT = 'dispproj';
@@ -278,18 +277,20 @@ describe('Brain work dispatch opens driven pairs', () => {
   });
 });
 
-describe('an auditor allowlist that no pool config can satisfy (jdzj)', () => {
+describe('a pool with no auditor-role entry (jdzj)', () => {
   const jdzjPools = {
     state: 'configured',
     economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
     primaryDevelopmentPool: {
-      configs: [{ model: 'sonnet', agentType: 'claude-code-sdk', runtimeType: 'transport', capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet', providerFamily: 'anthropic' }],
+      // Explicit executor-only role: the owner marked this entry executor-only,
+      // so it can never satisfy the auditor role, no matter how idle it is.
+      configs: [{ model: 'sonnet', agentType: 'claude-code-sdk', runtimeType: 'transport', capabilityId: 'supervision-exec-v1:transport:claude-code-sdk:anthropic:sonnet', providerFamily: 'anthropic', role: 'executor' as const }],
       controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
     },
   };
   const opusConfig = () => {
     const model = normalizeSupervisionExecutionModel('claude-code-sdk', 'opus');
-    const config = { agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model };
+    const config = { agentType: 'claude-code-sdk', providerFamily: 'anthropic', runtimeType: 'transport' as const, model, role: 'auditor' as const };
     return { ...config, capabilityId: buildSupervisionExecutionCapabilityId(config) };
   };
   const opusPools = {
@@ -315,22 +316,25 @@ describe('an auditor allowlist that no pool config can satisfy (jdzj)', () => {
     delete process.env.IMCODES_SUPERVISION_ENGINE;
   });
 
-  it('can never pick the idle Opus session outside a Sonnet-only pool, and says exactly what to add', () => {
+  it('can never pick the idle Opus session outside an executor-only pool, and says exactly what to add', () => {
     const records = [brain(jdzjPools), opusWorker];
     const lookup = (name: string) => records.find((entry) => entry.name === name);
     expect(listTaskPairCandidates({
-      brain: BRAIN, role: 'auditor', pool: 'primary', allowlist: TASK_PAIR_DEFAULT_ALLOWLIST, exclude: new Set(),
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
     }, { listSessions: () => records, getSession: lookup, hasPendingMessages: () => false })).toEqual([]);
-    const gap = describeAuditorAllowlistGap({ brain: BRAIN, allowlist: TASK_PAIR_DEFAULT_ALLOWLIST }, { getSession: lookup });
-    expect(gap).toContain('claude-code-sdk/opus');
+    const gap = describeAuditorPoolGap({ brain: BRAIN }, { getSession: lookup });
     expect(gap).toContain('claude-code-sdk/sonnet');
-    expect(gap).toContain('Add an allowlisted auditor config to the primary pool');
+    expect(gap).toContain('no pool entry has the auditor role');
+    expect(gap).toContain('Settings → execution pool');
 
-    // With an Opus config in the pool the gap is gone.
+    // With an Opus (auditor-role) config in the pool, a miss is now a
+    // transient capacity issue, not a structural config gap.
     const fixed = [brain(opusPools), opusWorker];
-    expect(describeAuditorAllowlistGap({ brain: BRAIN, allowlist: TASK_PAIR_DEFAULT_ALLOWLIST }, {
+    const fixedGap = describeAuditorPoolGap({ brain: BRAIN }, {
       getSession: (name) => fixed.find((entry) => entry.name === name),
-    })).toBeUndefined();
+    });
+    expect(fixedGap).toContain('every auditor-role session in the primary pool is busy');
+    expect(fixedGap).not.toContain('no pool entry has the auditor role');
   });
 
   it('puts the gap into the needs_auditor notice Brain receives', async () => {
@@ -347,7 +351,7 @@ describe('an auditor allowlist that no pool config can satisfy (jdzj)', () => {
       taskPairService.ingestText(PROJECT, BRAIN, `<!-- IMCODES_TASK DISPATCH G1 executor=${EXEC} -->`, 'gap-1', now);
       await flush();
       expect(notices).toHaveLength(1);
-      expect(notices[0]).toContain('Why: the auditor allowlist (claude-code-sdk/opus) matches none of the primary pool');
+      expect(notices[0]).toContain('Why: no pool entry has the auditor role');
     } finally {
       taskPairService.setScheduler(undefined);
       setTaskPairDeliveryDepsForTests(undefined);

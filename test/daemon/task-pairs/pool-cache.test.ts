@@ -28,7 +28,10 @@ function brainWithPool(pool: Record<string, unknown>): SessionRecord {
 }
 
 function configuredPool(model: string) {
-  const config = { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model };
+  // Explicit executor-only role: under role-based routing any pool entry can
+  // serve either role by default ('both'), so these tests -- which need a
+  // pool that genuinely cannot satisfy the auditor role -- must say so.
+  const config = { agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport' as const, model, role: 'executor' as const };
   return {
     state: 'configured' as const,
     primaryDevelopmentPool: {
@@ -97,7 +100,7 @@ describe('task-pair pool authority: unsynced-cache visibility', () => {
     taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK DISPATCH T80 -->', 'pool-sync-turn-1', now);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
-    const notice = sent.find((entry) => entry.target === BRAIN && entry.text.includes('auditor allowlist'));
+    const notice = sent.find((entry) => entry.target === BRAIN);
     expect(notice?.text).toContain("account pool not synced from server (last successful fetch: never); using this session's local copy");
   });
 
@@ -107,7 +110,7 @@ describe('task-pair pool authority: unsynced-cache visibility', () => {
     taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK DISPATCH T81 -->', 'pool-sync-turn-2', now);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
-    const notice = sent.find((entry) => entry.target === BRAIN && entry.text.includes('auditor allowlist'));
+    const notice = sent.find((entry) => entry.target === BRAIN);
     expect(notice?.text).toBeTruthy();
     expect(notice?.text).not.toContain('account pool not synced');
   });
@@ -123,7 +126,7 @@ describe('task-pair pool authority: unsynced-cache visibility', () => {
     taskPairService.ingestText(PROJECT, BRAIN, '<!-- IMCODES_TASK DISPATCH T82 -->', 'pool-sync-turn-3', now);
     await new Promise<void>((resolve) => setImmediate(resolve));
 
-    const notice = sent.find((entry) => entry.target === BRAIN && entry.text.includes('auditor allowlist'));
+    const notice = sent.find((entry) => entry.target === BRAIN);
     expect(notice?.text).toContain("no account-level pool configured; using this session's local copy");
     expect(notice?.text).not.toContain('not synced from server');
   });
