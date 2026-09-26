@@ -169,7 +169,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const result = await provisionSupervisionTarget({
       parentSessionName: input.brain,
       pool: input.role === 'auditor' ? 'primary' : input.pool,
-      requestedCapabilityId: config.capabilityId,
+      // Owner rule: a named model is provisioned as-is even when it is not a
+      // pool member -- manual_explicit is the only provenance that bypasses
+      // the "pool must be configured" gate, so it must carry the full config
+      // rather than just a capabilityId the pool may not actually contain.
+      ...(input.requestedModel
+        ? { provenance: 'manual_explicit' as const, requestedExecutionConfig: config }
+        : { requestedCapabilityId: config.capabilityId }),
       idempotencyKey: `task-pair:${input.project}:${input.taskId}:${input.role}:${this.#now()}`,
     });
     return result.ok ? result.target.name : undefined;

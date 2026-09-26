@@ -80,6 +80,61 @@ describe('owner rule: pool-role bypass by requested model', () => {
   });
 });
 
+describe('owner rule: a named model is never confined to the pool, only an automatic pick is', () => {
+  const poolWithUnrelatedModel = {
+    state: 'configured' as const,
+    economyTaskPool: { configs: [], controls: { leaseMs: 900000, maxSpawned: 2, changeBudget: 40, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 } },
+    primaryDevelopmentPool: {
+      configs: [{ model: 'gpt-6-luna', agentType: 'codex-sdk', runtimeType: 'transport' as const, capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6-luna', providerFamily: 'openai', role: 'executor' as const }],
+      controls: { leaseMs: 1800000, maxSpawned: 2, changeBudget: 200, maxConcurrency: 4, auditHeadroomPerProviderFamily: 1 },
+    },
+  };
+
+  it('(a) picks an idle out-of-pool session once its exact model is requested, even with a pool configured', () => {
+    const parent = session(BRAIN, 'brain', {
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools: poolWithUnrelatedModel }) },
+    } as Partial<SessionRecord>);
+    // Not a member of any pool entry (agentType and model both differ).
+    const outOfPool = session('deck_sub_outofpool', 'w1', { parentSession: BRAIN, agentType: 'claude-code-sdk', activeModel: 'gpt-5.6', updatedAt: 1 });
+    const deps = { listSessions: () => [parent, outOfPool], getSession: (name: string) => [parent, outOfPool].find((s) => s.name === name), hasPendingMessages: () => false };
+
+    const picked = listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(), requestedModel: 'gpt-5.6',
+    }, deps);
+    expect(picked.map((entry) => entry.name)).toEqual(['deck_sub_outofpool']);
+  });
+
+  it('(c) an unnamed (automatic) pick still ignores the same out-of-pool session', () => {
+    const parent = session(BRAIN, 'brain', {
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools: poolWithUnrelatedModel }) },
+    } as Partial<SessionRecord>);
+    const outOfPool = session('deck_sub_outofpool', 'w1', { parentSession: BRAIN, agentType: 'claude-code-sdk', activeModel: 'gpt-5.6', updatedAt: 1 });
+    const deps = { listSessions: () => [parent, outOfPool], getSession: (name: string) => [parent, outOfPool].find((s) => s.name === name), hasPendingMessages: () => false };
+
+    const picked = listTaskPairCandidates({
+      brain: BRAIN, role: 'auditor', pool: 'primary', exclude: new Set(),
+    }, deps);
+    expect(picked).toEqual([]);
+  });
+
+  it('(b) provisions the named model outside the pool when no session runs it yet', () => {
+    const parent = session(BRAIN, 'brain', {
+      transportConfig: { supervision: normalizeSessionSupervisionSnapshot({ mode: SUPERVISION_MODE.OFF, executionPools: poolWithUnrelatedModel }) },
+    } as Partial<SessionRecord>);
+    const deps = { getSession: (name: string) => (name === BRAIN ? parent : undefined) };
+
+    const config = roleEligibleProvisionConfig({
+      brain: BRAIN, role: 'auditor', pool: 'primary', requestedModel: 'gpt-5.6',
+    }, deps);
+    expect(config).toMatchObject({ agentType: 'codex-sdk', providerFamily: 'openai', model: 'gpt-5.6' });
+
+    // An unrecognized model still reports "no session/config", not a crash.
+    expect(roleEligibleProvisionConfig({
+      brain: BRAIN, role: 'auditor', pool: 'primary', requestedModel: 'nonexistent-fictional-model',
+    }, deps)).toBeUndefined();
+  });
+});
+
 describe('owner rule: scheduler wires an explicit executormodel=/auditormodel= through to the pick, ignoring the allowlist', () => {
   const EXEC = 'deck_sub_ownerexec';
   const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
