@@ -27,7 +27,8 @@ export type TimelineMessageType = (typeof TIMELINE_MESSAGES)[keyof typeof TIMELI
 
 /** Delivery quality for a browser socket/session pair. */
 export const TIMELINE_SUBSCRIPTION_MODES = {
-  /** Visible/pinned window: all timeline frames, including streaming deltas. */
+  /** Visible/pinned window: all timeline frames, including streaming deltas.
+   * A healthy full subscriber is never coalesced or delayed for load. */
   FULL: 'full',
   /** Hidden/minimized window: durable events and latest-value summaries only. */
   SUMMARY: 'summary',

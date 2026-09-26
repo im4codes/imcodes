@@ -1424,7 +1424,7 @@ export class ServerLink {
   /** Send a timeline event to connected browsers via the server relay. */
   sendTimelineEvent(event: TimelineEvent): void {
     try {
-      this.send({ type: 'timeline.event', event });
+      this.send({ type: TIMELINE_MESSAGES.EVENT, event });
     } catch {
       // Not connected — timeline events are best-effort
     }

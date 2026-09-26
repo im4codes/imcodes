@@ -24,12 +24,20 @@ import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from './agent-delegation.js';
 
 /** Counter names. Kept in one place so daemon/server/tests cannot drift. */
 export const TIMELINE_DELIVERY_METRICS = {
+  /** Daemon-side event emission rate, labelled by session/type. */
+  DAEMON_SESSION_EMIT: 'timeline.delivery.daemon_session_emit',
   /** Daemon-side: a control-plane timeline event hit a non-OPEN socket. */
   DAEMON_LINK_DOWN_DROPPED: 'timeline.delivery.daemon_link_down_dropped',
   /** Server-side: relayed to a session with zero subscribed viewers. */
   SERVER_NO_SUBSCRIBER_DROPPED: 'timeline.delivery.server_no_subscriber_dropped',
   /** Server-side: relayed and delivered to at least one viewer. */
   SERVER_DELIVERED: 'timeline.delivery.server_delivered',
+  /** Per-socket low-overhead delivery counters. */
+  SERVER_SOCKET_RECIPIENT: 'timeline.delivery.server_socket_recipient',
+  SERVER_SOCKET_BYTES: 'timeline.delivery.server_socket_bytes',
+  SERVER_SOCKET_BUFFERED: 'timeline.delivery.server_socket_buffered',
+  SERVER_SOCKET_COALESCED: 'timeline.delivery.server_socket_coalesced',
+  SERVER_SOCKET_GAP: 'timeline.delivery.server_socket_gap',
 } as const;
 
 export type TimelineDeliveryMetric =

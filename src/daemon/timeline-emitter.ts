@@ -19,6 +19,7 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { recordTimelineEmit } from './latency-tracer.js';
 import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
+import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 import { recordAssistantFileReadGrants } from './session-file-read-grants.js';
 
@@ -372,6 +373,15 @@ export class TimelineEmitter {
           traceUsageMs += performance.now() - usageStart;
         }
       }
+    }
+
+    // Low-overhead per-session emit accounting. It is opt-in because labels
+    // include session ids and should not add cardinality on installations that
+    // do not collect delivery telemetry. It remains outside the handler loop so
+    // instrumentation cannot delay liveness-critical consumers or server-link
+    // delivery.
+    if (process.env.IMCODES_TIMELINE_DELIVERY_METRICS === '1') {
+      incrementCounter(TIMELINE_DELIVERY_METRICS.DAEMON_SESSION_EMIT, { sessionId, type });
     }
 
     // Notify handlers

@@ -22,6 +22,7 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import type { TimelineEvent } from './timeline-event.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
@@ -1270,6 +1271,39 @@ export async function startup(): Promise<DaemonContext> {
   if (serverLink) {
     const sentEventIds = new Set<string>();
     const DEDUP_MAX = 2000;
+    const latestValues = new Map<string, TimelineEvent>();
+    let latestFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    const latestFlushMs = Number.parseInt(process.env.IMCODES_TIMELINE_LATEST_COALESCE_MS ?? '40', 10);
+
+    const sendTimelineNow = (event: TimelineEvent): void => {
+      // For session.state idle, attach lastText so push notifications have context.
+      // Skip shell/script — they are always idle, no useful notification.
+      if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
+        const rec = listSessions().find((s) => s.name === event.sessionId);
+        if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
+        void getLastAssistantText(event.sessionId).then((lastText) => {
+          serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
+        }).catch(() => {
+          serverLink!.send({ type: 'timeline.event', event });
+        });
+        return;
+      }
+      serverLink.sendTimelineEvent(event);
+    };
+
+    const flushLatestValues = (): void => {
+      latestFlushTimer = null;
+      const values = [...latestValues.values()];
+      latestValues.clear();
+      for (const event of values) sendTimelineNow(event);
+    };
+
+    const scheduleLatestValue = (event: TimelineEvent): void => {
+      latestValues.set(`${event.sessionId}\0${event.type}`, event);
+      if (latestFlushTimer) return;
+      latestFlushTimer = setTimeout(flushLatestValues, Number.isFinite(latestFlushMs) ? Math.max(0, latestFlushMs) : 40);
+      latestFlushTimer.unref?.();
+    };
 
     timelineEmitter.on((event) => {
       // Transport streaming events reuse the same eventId for in-place replacement
@@ -1289,18 +1323,13 @@ export async function startup(): Promise<DaemonContext> {
           for (const v of keep) sentEventIds.add(v);
         }
       }
-      // For session.state idle, attach lastText so push notifications have context
-      // Skip shell/script — they are always idle, no useful notification
-      if (event.type === 'session.state' && (event.payload as Record<string, unknown>).state === 'idle') {
-        const rec = listSessions().find((s) => s.name === event.sessionId);
-        if (rec?.agentType === 'shell' || rec?.agentType === 'script') return;
-        void getLastAssistantText(event.sessionId).then((lastText) => {
-          serverLink!.send({ type: 'timeline.event', event, ...(lastText ? { lastText } : {}) });
-        }).catch(() => {
-          serverLink!.send({ type: 'timeline.event', event });
-        });
+      // Latest-value signals are trailing-coalesced per session. Durable
+      // conversation/tool/final events stay ordered and are sent immediately;
+      // the final state is always the value flushed for its session.
+      if (event.type === 'agent.status' || event.type === 'usage.update' || event.type === 'session.state') {
+        scheduleLatestValue(event);
       } else {
-        serverLink!.sendTimelineEvent(event);
+        sendTimelineNow(event);
       }
     });
   }

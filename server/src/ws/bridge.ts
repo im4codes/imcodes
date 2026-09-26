@@ -326,7 +326,7 @@ import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
 } from '../../../shared/timeline-delivery-telemetry.js';
-import { incrementCounter } from '../util/metrics.js';
+import { addCounter, incrementCounter } from '../util/metrics.js';
 import { logAudit } from '../security/audit.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -408,10 +408,13 @@ import { isP2pSavedConfig, type P2pSavedConfig } from '../../../shared/p2p-modes
 import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
   TIMELINE_HISTORY_CANCEL_CAPABILITY,
+  TIMELINE_CURSOR_DIRECTIONS,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
+  TIMELINE_SUBSCRIPTION_MODES,
+  type TimelineSubscriptionMode,
 } from '../../../shared/timeline-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
 import type { DaemonBuildInfo } from '../../../shared/build-manifest-types.js';
@@ -583,6 +586,12 @@ const QUEUE_LOW_WATER_BYTES = QUEUE_MAX_BYTES / 4;
  *  budget the way the old queue-replacement did. */
 const QUEUE_PAUSE_GRACE_MS = 2_000;
 const SUBSESSION_OWNERSHIP_RETRY_DELAYS_MS = [50, 150, 350] as const;
+/** Timeline JSON is bounded separately from raw PTY so a slow hidden tab cannot
+ * consume an unbounded amount of server memory. Control/ack frames remain on
+ * their direct liveness path and never enter this queue. */
+const TIMELINE_SOCKET_QUEUE_MAX_BYTES = 2 * 1024 * 1024;
+const TIMELINE_SOCKET_QUEUE_MAX_ITEMS = 512;
+const TIMELINE_SOCKET_BUFFERED_HIGH_WATER = 1 * 1024 * 1024;
 
 /**
  * Safe ws.send: checks readyState, wraps in try/catch.
@@ -728,6 +737,85 @@ class TerminalForwardQueue {
     if (this.overflowNotified) return false;
     this.overflowNotified = true;
     return true;
+  }
+}
+
+type TimelineQueuePriority = 'final' | 'durable' | 'coalescible';
+
+interface TimelineQueueEvent {
+  data: string;
+  sessionId: string;
+  epoch: number;
+  seq: number;
+  priority: TimelineQueuePriority;
+  coalesceKey?: string;
+}
+
+/**
+ * Per-browser timeline queue. It deliberately owns only timeline events;
+ * command acknowledgements, stop and approval frames continue through the
+ * direct control path above and therefore cannot wait behind this queue.
+ */
+class TimelineOutboundQueue {
+  private pending: TimelineQueueEvent[] = [];
+  private bytes = 0;
+  private sending = false;
+
+  enqueue(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
+    const existingIndex = item.coalesceKey
+      ? this.pending.findIndex((entry) => entry.coalesceKey === item.coalesceKey)
+      : -1;
+    if (existingIndex >= 0) {
+      onCoalesced?.();
+      const previous = this.pending[existingIndex]!;
+      this.bytes -= Buffer.byteLength(previous.data, 'utf8');
+      this.pending[existingIndex] = item;
+      this.bytes += Buffer.byteLength(item.data, 'utf8');
+    } else {
+      this.pending.push(item);
+      this.bytes += Buffer.byteLength(item.data, 'utf8');
+    }
+
+    const bufferedAmount = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
+    const pressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER
+      || this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES
+      || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS;
+    if (pressured) {
+      this.trim(onGap);
+    }
+    this.pump(ws, onGap);
+  }
+
+  private trim(onGap: (event: TimelineQueueEvent) => void): void {
+    while (this.bytes > TIMELINE_SOCKET_QUEUE_MAX_BYTES || this.pending.length > TIMELINE_SOCKET_QUEUE_MAX_ITEMS) {
+      // Preserve final and durable events for as long as possible. Under a
+      // completely wedged socket even those may be discarded, but every such
+      // discard emits a seq gap so the browser can converge via history.
+      let index = this.pending.findIndex((entry) => entry.priority === 'coalescible');
+      if (index < 0) index = this.pending.findIndex((entry) => entry.priority === 'durable');
+      if (index < 0) index = 0;
+      const [removed] = this.pending.splice(index, 1);
+      if (!removed) break;
+      this.bytes -= Buffer.byteLength(removed.data, 'utf8');
+      onGap(removed);
+    }
+  }
+
+  private pump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
+    if (this.sending || this.pending.length === 0) return;
+    this.pending.sort((a, b) => {
+      const rank = (value: TimelineQueuePriority): number => value === 'final' ? 0 : value === 'durable' ? 1 : 2;
+      return rank(a.priority) - rank(b.priority);
+    });
+    const item = this.pending.shift();
+    if (!item) return;
+    this.bytes -= Buffer.byteLength(item.data, 'utf8');
+    this.sending = true;
+    safeSend(ws, item.data, (error) => {
+      this.sending = false;
+      if (error) onGap(item);
+      this.pump(ws, onGap);
+    });
   }
 }
 
@@ -1703,6 +1791,12 @@ export class WsBridge {
   /** browser socket → set of subscribed transport session IDs */
   private transportSubscriptions = new Map<WebSocket, Set<string>>();
   private transportSubscriptionRevisions = new Map<WebSocket, Map<string, number>>();
+  /** browser socket → explicit timeline mode per session. */
+  private timelineSubscriptions = new Map<WebSocket, Map<string, TimelineSubscriptionMode>>();
+  /** Sockets that have spoken the v2 timeline protocol, including after unsubscribe. */
+  private timelineProtocolSockets = new Set<WebSocket>();
+  /** Bounded live timeline queues; control frames never use these queues. */
+  private timelineQueues = new Map<WebSocket, TimelineOutboundQueue>();
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
@@ -3434,6 +3528,50 @@ export class WsBridge {
       return false;
     }
     return true;
+  }
+
+  private async handleTimelineSubscription(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const sessionName = optionalString(msg.sessionName);
+    if (!sessionName) return;
+    const mode = msg.mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+      ? TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+      : msg.mode === TIMELINE_SUBSCRIPTION_MODES.FULL
+        ? TIMELINE_SUBSCRIPTION_MODES.FULL
+        : undefined;
+    if (!mode || !(await this.verifySessionOwnership(sessionName))) {
+      logger.warn({ serverId: this.serverId, sessionName }, 'timeline.subscribe: rejected or malformed subscription');
+      return;
+    }
+    this.timelineProtocolSockets.add(ws);
+    let subscriptions = this.timelineSubscriptions.get(ws);
+    if (!subscriptions) {
+      subscriptions = new Map();
+      this.timelineSubscriptions.set(ws, subscriptions);
+    }
+    subscriptions.set(sessionName, mode);
+
+    // A mode switch can carry the last cursor in one round trip. Reuse the
+    // existing history API so the browser receives authoritative durable rows,
+    // including a completed assistant message that was produced while hidden.
+    const afterSeq = typeof msg.afterSeq === 'number' && Number.isFinite(msg.afterSeq)
+      ? Math.max(0, Math.trunc(msg.afterSeq))
+      : undefined;
+    const epoch = typeof msg.epoch === 'number' && Number.isFinite(msg.epoch)
+      ? Math.trunc(msg.epoch)
+      : undefined;
+    if (afterSeq !== undefined && epoch !== undefined) {
+      const requestId = typeof msg.requestId === 'string' && msg.requestId.length > 0
+        ? msg.requestId
+        : `timeline-sub-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const history: Record<string, unknown> = {
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName,
+        requestId,
+        cursor: { epoch, afterSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER },
+      };
+      this.registerPendingTimelineRequest(ws, history);
+      this.sendToDaemon(JSON.stringify(history));
+    }
   }
 
   private settlePendingHttpTimelineRequest(
@@ -5366,6 +5504,7 @@ export class WsBridge {
     if (isMobile) this.mobileSockets.add(ws);
     this.browserSubscriptions.set(ws, new Map());
     this.transportSubscriptions.set(ws, new Set());
+    this.timelineSubscriptions.set(ws, new Map());
     this.browserUserIds.set(ws, userId);
     if (controlledTarget) this.controlledTargetBrowserSockets.add(ws);
     const shareState = this.browserShareStates.get(ws);
@@ -5742,6 +5881,19 @@ export class WsBridge {
         if (typeof msg.requestId === 'string') {
           this.registerPendingTimelineRequest(ws, msg);
         }
+      }
+
+      // Explicit per-socket timeline quality. This is intentionally separate
+      // from terminal/chat subscriptions: a companion tab can subscribe to a
+      // session in summary mode without inheriting another socket's stream.
+      if (msg.type === TIMELINE_MESSAGES.SUBSCRIBE && typeof msg.sessionName === 'string') {
+        await this.handleTimelineSubscription(ws, msg);
+        return;
+      }
+      if (msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE && typeof msg.sessionName === 'string') {
+        this.timelineProtocolSockets.add(ws);
+        this.timelineSubscriptions.get(ws)?.delete(msg.sessionName);
+        return;
       }
 
       // Track terminal subscriptions for binary routing + ref-counted daemon forwarding
@@ -7122,26 +7274,11 @@ export class WsBridge {
         void upsertSessionTextTailCacheEvent(this.db, this.serverId, rawEvent)
           .catch((err) => logger.warn({ err, serverId: this.serverId, sessionId }, 'Failed to update session_text_tail_cache'));
       }
-      // Bypass TerminalForwardQueue: timeline events are control-plane and
-      // must never queue behind PTY data. Critical for cancel/stop UX —
-      // session.state(idle) used to arrive seconds after the push notification.
-      // Timeline is the shared chat state for every browser viewing this
-      // server, not an exclusive transport stream. The web client normally
-      // keeps passive subscriptions for every known session, but those
-      // subscriptions are intentionally asynchronous (ownership checks,
-      // reconnect replay, runtime-type correction). Tying live timeline
-      // delivery to that transient map creates a multi-device split-brain:
-      // one device can receive every streaming assistant.text update while a
-      // second connected device misses them and only catches the persisted
-      // final event through history/backfill.
-      //
-      // Fan out to the subscribed viewer plus that same user's companion
-      // devices. Different users remain isolated by the session subscription
-      // boundary, and share-scoped sockets still pass through
-      // filterShareOutgoingJson(). PTY/raw frames, transport deltas, and
-      // request/response data remain on their existing subscription/unicast
-      // paths.
-      const timelineRecipients = this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
+      // New clients have per-socket explicit mode subscriptions. Legacy
+      // clients retain the old path until they speak timeline.subscribe.
+      const timelineRecipients = this.timelineProtocolSockets.size > 0
+        ? this.deliverTimelineEventToSubscribers(sessionId, rawEvent, msg)
+        : this.sendJsonToSessionUserDevices(sessionId, JSON.stringify(msg));
       this.recordTimelineFanout(sessionId, rawEvent, timelineRecipients);
       return;
     }
@@ -7907,6 +8044,130 @@ export class WsBridge {
     return sent.size;
   }
 
+  private isTimelineSummaryEvent(event: Record<string, unknown>): boolean {
+    const type = typeof event.type === 'string' ? event.type : '';
+    const payload = event.payload && typeof event.payload === 'object'
+      ? event.payload as Record<string, unknown>
+      : {};
+    if (type === 'assistant.text') return payload.streaming !== true;
+    if (type === 'user.message' || type === 'ask.question' || type === 'task_pair.event'
+      || type === 'memory.context' || type === 'memory.compression' || type.startsWith('peer_audit.')
+      || type.startsWith('delegation.') || type.startsWith('execution_clone.')) return true;
+    return type === 'session.state' || type === 'agent.status' || type === 'usage.update'
+      || type === 'tool.call' || type === 'tool.result';
+  }
+
+  private summarizeTimelineEvent(event: Record<string, unknown>): Record<string, unknown> {
+    const type = typeof event.type === 'string' ? event.type : '';
+    if (type !== 'tool.call' && type !== 'tool.result') return event;
+    const payload = event.payload && typeof event.payload === 'object'
+      ? event.payload as Record<string, unknown>
+      : {};
+    const previewFields = ['command', 'description', 'input', 'output', 'text', 'error', 'status'];
+    const preview: Record<string, unknown> = {};
+    for (const key of previewFields) {
+      const value = payload[key];
+      if (typeof value === 'string') preview[key] = value.length > 256 ? `${value.slice(0, 256)}…` : value;
+      else if (typeof value === 'number' || typeof value === 'boolean') preview[key] = value;
+    }
+    return {
+      ...event,
+      summary: true,
+      payload: { name: payload.name ?? payload.toolName ?? 'tool', status: payload.status ?? type, preview },
+      detailAvailable: true,
+    };
+  }
+
+  private deliverTimelineEventToSubscribers(
+    sessionName: string,
+    rawEvent: Record<string, unknown>,
+    envelope: Record<string, unknown>,
+  ): number {
+    const eventType = typeof rawEvent.type === 'string' ? rawEvent.type : '';
+    const payload = rawEvent.payload && typeof rawEvent.payload === 'object'
+      ? rawEvent.payload as Record<string, unknown>
+      : {};
+    const sessionId = typeof rawEvent.sessionId === 'string' ? rawEvent.sessionId : sessionName;
+    const epoch = typeof rawEvent.epoch === 'number' ? rawEvent.epoch : 0;
+    const seq = typeof rawEvent.seq === 'number' ? rawEvent.seq : 0;
+    let recipients = 0;
+    const sockets = new Set<WebSocket>();
+    for (const [ws, subscriptions] of this.timelineSubscriptions) {
+      if (!subscriptions.has(sessionName)) continue;
+      sockets.add(ws);
+    }
+    for (const [ws, subscriptions] of this.browserSubscriptions) {
+      if (this.timelineProtocolSockets.has(ws) || !subscriptions.has(sessionName)) continue;
+      sockets.add(ws);
+    }
+    for (const [ws, subscriptions] of this.transportSubscriptions) {
+      if (this.timelineProtocolSockets.has(ws) || !subscriptions.has(sessionName)) continue;
+      sockets.add(ws);
+    }
+
+    for (const ws of sockets) {
+      const mode = this.timelineSubscriptions.get(ws)?.get(sessionName);
+      if (this.timelineProtocolSockets.has(ws) && !mode) continue;
+      if (mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY && !this.isTimelineSummaryEvent(rawEvent)) continue;
+      const outgoingEvent = mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+        ? this.summarizeTimelineEvent(rawEvent)
+        : rawEvent;
+      const outgoingEnvelope = { ...envelope, event: outgoingEvent };
+      const msg = this.tryParseJsonRecord(JSON.stringify(outgoingEnvelope));
+      const outgoing = this.filterShareOutgoingJson(ws, msg, JSON.stringify(outgoingEnvelope));
+      if (!outgoing) continue;
+      const coalescible = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update';
+      const priority = eventType === 'assistant.text' && payload.streaming !== true
+        ? 'final'
+        : coalescible ? 'coalescible' : 'durable';
+      const item: TimelineQueueEvent = {
+        data: outgoing,
+        sessionId,
+        epoch,
+        seq,
+        priority,
+        ...(coalescible ? { coalesceKey: `${sessionId}\0${eventType}` } : {}),
+      };
+      // Active/visible windows are latency-sensitive. A healthy full-mode
+      // socket takes the direct path: no coalescing, no queue scheduling, and
+      // every streaming delta remains ordered. Only a real bufferedAmount
+      // overflow falls back to the bounded queue/gap path.
+      if (mode === TIMELINE_SUBSCRIPTION_MODES.FULL
+        && (typeof ws.bufferedAmount !== 'number' || ws.bufferedAmount <= TIMELINE_SOCKET_BUFFERED_HIGH_WATER)) {
+        incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
+        addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
+        if (safeSend(ws, outgoing)) recipients += 1;
+        continue;
+      }
+      let queue = this.timelineQueues.get(ws);
+      if (!queue) {
+        queue = new TimelineOutboundQueue();
+        this.timelineQueues.set(ws, queue);
+      }
+      incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
+      addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
+      addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BUFFERED, typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0, { mode: mode ?? 'legacy' });
+      queue.enqueue(ws, item, (dropped) => {
+        incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_GAP, { mode: mode ?? 'legacy', eventType });
+        incrementCounter('ws_bridge_timeline_socket_gap', { reason: dropped.priority });
+        const gap = {
+          type: TIMELINE_MESSAGES.SEQ_GAP,
+          sessionId: dropped.sessionId,
+          epoch: dropped.epoch,
+          fromSeq: dropped.seq,
+          toSeq: dropped.seq,
+          reason: 'backpressure',
+          backfill: true,
+        };
+        safeSend(ws, JSON.stringify(gap));
+      }, () => {
+        incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, { mode: mode ?? 'legacy', eventType });
+      });
+      recipients += 1;
+    }
+    return recipients;
+  }
+
   /**
    * Observe the fan-out result for a live timeline event.
    *
@@ -7950,6 +8211,8 @@ export class WsBridge {
   private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (sessions.get(sessionName) !== true) continue;
+      if (this.timelineProtocolSockets.has(ws)
+        && this.timelineSubscriptions.get(ws)?.get(sessionName) !== TIMELINE_SUBSCRIPTION_MODES.FULL) continue;
       if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
       queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
@@ -8175,6 +8438,9 @@ export class WsBridge {
     this.terminalSubscriptionRevisions.delete(ws);
     this.transportSubscriptionRevisions.delete(ws);
     this.transportSubscriptions.delete(ws);
+    this.timelineSubscriptions.delete(ws);
+    this.timelineProtocolSockets.delete(ws);
+    this.timelineQueues.delete(ws);
     this.clearPendingFsRoutesForSocket(ws);
     for (const [requestId, pending] of this.pendingRepoRequests) {
       if (pending.socket !== ws) continue;
