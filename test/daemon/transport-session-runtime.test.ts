@@ -3615,6 +3615,43 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(1);
   });
 
+  it('stop drops a timer-fired capacity retry whose drain is deferred by blocking work', async () => {
+    runtime.send('stop deferred capacity retry', 'msg-capacity-stop');
+    await flushDispatch();
+    vi.useFakeTimers();
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity',
+      recoverable: false,
+    });
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 1,
+      busyReasons: ['provider_tool_item'],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(runtime.pendingMessages).toEqual(['stop deferred capacity retry']);
+    expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+
+    await runtime.cancel();
+    expect(runtime.pendingMessages).toEqual([]);
+
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+      updatedAt: Date.now(),
+    }));
+    expect(runtime.drainPendingIfIdle('after-stop')).toBe(false);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+  });
+
   it('auto-retry redelivers a recoverable-failed message once the provider frees up', async () => {
     // The first provider.send rejects with a recoverable "busy" error; the
     // runtime must re-queue and auto-retry, and the next attempt (provider now

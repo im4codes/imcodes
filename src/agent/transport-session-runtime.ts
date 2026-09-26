@@ -3072,7 +3072,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
-    if (this._capacityRetryTimer && !this._activeTurn && !this._sending) {
+    if ((this._capacityRetryTimer || this._capacityRetryEntryIds.length > 0)
+      && !this._activeTurn && !this._sending) {
       this.cancelCapacityRetry();
       this.markCurrentActivityGenerationLocallyCancelled();
       if (!this._drainPending()) this.setStatus('idle');
