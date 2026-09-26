@@ -568,6 +568,17 @@ describe('Watch routes', () => {
     }));
   });
 
+  it('GET /api/server/:id/timeline/history/full clamps oversized pages to 200 events', async () => {
+    mockRequestTimelineHistory.mockResolvedValue({ epoch: 1, events: [] });
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/timeline/history/full?sessionName=deck_proj_brain&limit=999');
+    expect(res.status).toBe(200);
+    expect(mockRequestTimelineHistory).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_proj_brain',
+      limit: 200,
+    }));
+  });
+
   it('GET /api/server/:id/timeline/history/full preserves share-scoped full history and detail refs before invite time', async () => {
     mockResolveServerRole.mockResolvedValue('none');
     mockResolveHttpShareAccess.mockResolvedValue({

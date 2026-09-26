@@ -17,6 +17,7 @@ import { WsBridge } from '../ws/bridge.js';
 import { IMCODES_POD_HEADER } from '../../../shared/http-header-names.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
 import { TIMELINE_RESPONSE_STATUS } from '../../../shared/timeline-protocol.js';
+import { clampTimelineHistoryLimit } from '../../../shared/timeline-history-limits.js';
 import { getPodIdentity } from '../util/pod-identity.js';
 import logger from '../util/logger.js';
 // Shared so the daemon (command-handler.ts) and server emit the SAME log
@@ -539,7 +540,9 @@ watchRoutes.get('/server/:id/timeline/history/full', requireAuth(), async (c) =>
   if (!authorization.ok) return c.json({ error: 'forbidden', ...(authorization.reason ? { reason: authorization.reason } : {}) }, 403);
 
   const rawLimit = Number(c.req.query('limit') ?? '50');
-  const limit = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(Math.trunc(rawLimit), 500) : 50;
+  const limit = Number.isFinite(rawLimit) && rawLimit > 0
+    ? clampTimelineHistoryLimit(rawLimit, 50)
+    : 50;
   const rawBeforeTs = c.req.query('beforeTs');
   const beforeTs = rawBeforeTs !== undefined ? Number(rawBeforeTs) : undefined;
   const rawAfterTs = c.req.query('afterTs');

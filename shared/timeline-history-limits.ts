@@ -11,7 +11,7 @@ export const TIMELINE_HISTORY_LIMITS = {
   MAX_BYTES: 1024 * 1024,
 } as const;
 
-export function clampTimelineHistoryLimit(value: unknown, fallback = TIMELINE_HISTORY_LIMITS.MAX_EVENTS): number {
+export function clampTimelineHistoryLimit(value: unknown, fallback: number = TIMELINE_HISTORY_LIMITS.MAX_EVENTS): number {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) return fallback;
   return Math.min(Math.max(1, Math.trunc(value)), TIMELINE_HISTORY_LIMITS.MAX_EVENTS);
 }
