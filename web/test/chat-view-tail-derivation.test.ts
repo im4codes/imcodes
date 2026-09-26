@@ -23,6 +23,7 @@ import {
   __buildViewItemsTailForTests,
   __computeVirtualChatRangeForTests,
   __computeVirtualChatRevealScrollTopForTests,
+  __computeRevealRenderItemLimitForTests,
 } from '../src/components/ChatView.js';
 import type { TimelineEvent } from '../src/ws-client.js';
 
@@ -226,4 +227,15 @@ it('reveals an offscreen pin target beyond the virtualized viewport', () => {
   expect(targetTop).toBe(2_808);
   expect(range.start).toBeLessThanOrEqual(targetIndex);
   expect(range.end).toBeGreaterThan(targetIndex);
+});
+
+it('widens the tail when last-sent navigation targets an item outside 60 rows', () => {
+  const items = Array.from({ length: 140 }, (_, index) => ({ key: `item-${index}` }));
+  const target = __computeRevealRenderItemLimitForTests(items, 'item-12', 60);
+  expect(target).toBe(128);
+  // A target already in the mounted tail does not expand the window.
+  expect(__computeRevealRenderItemLimitForTests(items, 'item-100', 60)).toBe(60);
+  // An unloaded/deep-link target is left for revealEvent's bounded history
+  // load path rather than fabricating an index.
+  expect(__computeRevealRenderItemLimitForTests(items, 'not-loaded', 60)).toBe(60);
 });

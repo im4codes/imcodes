@@ -2091,6 +2091,20 @@ export function __computeVirtualChatRevealScrollTopForTests(
   return offset;
 }
 
+/** Tail size required to include an event-backed presentation item. */
+export function __computeRevealRenderItemLimitForTests(
+  items: ReadonlyArray<{ key: string; event?: { eventId: string }; eventIds?: readonly string[] }>,
+  eventId: string,
+  currentLimit: number,
+): number {
+  const index = items.findIndex((item) => (
+    item.key === eventId
+    || item.event?.eventId === eventId
+    || item.eventIds?.includes(eventId)
+  ));
+  return index < 0 ? currentLimit : Math.max(currentLimit, items.length - index);
+}
+
 interface VirtualizedViewItemsProps {
   items: ViewItem[];
   scrollRef: { current: HTMLDivElement | null };
@@ -2846,6 +2860,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     () => getRenderedViewRevision(renderedViewItems),
     [renderedViewItems],
   );
+  const viewItemsRef = useRef(viewItems);
+  viewItemsRef.current = viewItems;
+  const hasOlderOutsideWindowRef = useRef(hasOlderOutsideWindow);
+  hasOlderOutsideWindowRef.current = hasOlderOutsideWindow;
   const resolvePinnedMessageText = useCallback((pin: MessagePin): string => {
     if (pin.sessionName !== sessionId) return pin.text;
     const sourceEvent = events.find((event) => event.eventId === pin.eventId);
@@ -2857,16 +2875,18 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
    * measured target is mounted. All message-navigation entry points use this
    * helper so an offscreen target cannot leave a pending jump stuck.
    */
-  const revealEventWithRetry = useCallback((
+  const revealEvent = useCallback((
     eventId: string,
     onFound: (root: HTMLElement, target: HTMLElement) => void,
     onTimeout?: () => void,
+    eventTs?: number,
   ): (() => void) => {
     setVirtualRevealKey(eventId);
     let cancelled = false;
     let attempts = 0;
+    let loadingContext = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    const attempt = () => {
+    const attempt = async () => {
       if (cancelled) return;
       const root = scrollRef.current;
       const target = root ? findEventElement(root, eventId) : null;
@@ -2875,6 +2895,18 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         onFound(root, target);
         return;
       }
+      const sourceHasEvent = timelineEventsRef.current.some((event) => event.eventId === eventId);
+      if (!sourceHasEvent && eventTs !== undefined && onLoadMessageContext && !loadingContext) {
+        loadingContext = true;
+        await onLoadMessageContext(eventId, eventTs);
+        loadingContext = false;
+      }
+      const currentItems = viewItemsRef.current;
+      const requiredLimit = __computeRevealRenderItemLimitForTests(currentItems, eventId, effectiveRenderLimit);
+      if (requiredLimit > effectiveRenderLimit) setRenderItemLimit(requiredLimit);
+      else if (hasOlderOutsideWindowRef.current && !currentItems.some((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ))) setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
       if (attempts++ >= 30) {
         setVirtualRevealKey(undefined);
         onTimeout?.();
@@ -2882,14 +2914,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       }
       timer = setTimeout(attempt, 16);
     };
-    timer = setTimeout(attempt, 0);
+    timer = setTimeout(() => { void attempt(); }, 0);
     return () => {
       cancelled = true;
       if (timer) clearTimeout(timer);
     };
-  }, []);
+  }, [effectiveRenderLimit, onLoadMessageContext]);
 
-  const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
+  const locatePinnedMessage = useCallback((pin: MessagePin) => {
     if (!sessionId || pin.sessionName !== sessionId) {
       requestMessagePinNavigation(pin, sessionId);
       return;
@@ -2898,14 +2930,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     pendingPinnedLocateIdRef.current = pin.id;
     setPinnedLocateError(false);
     setPendingPinnedLocate(pin);
-    if (timelineEventsRef.current.some((event) => event.eventId === pin.eventId)) return;
-    if (!onLoadMessageContext || !await onLoadMessageContext(pin.eventId, pin.eventTs)) {
-      clearPendingMessagePin(pin.id);
-      pendingPinnedLocateIdRef.current = null;
-      setPendingPinnedLocate(null);
-      setPinnedLocateError(true);
-    }
-  }, [onLoadMessageContext, sessionId]);
+  }, [sessionId]);
 
   useEffect(() => {
     if (!pinsEnabled || !sessionId) return undefined;
@@ -2919,30 +2944,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
   useEffect(() => {
     if (!pendingPinnedLocate) return undefined;
-    if (!events.some((event) => event.eventId === pendingPinnedLocate.eventId)) return undefined;
-    const targetItemIndex = viewItems.findIndex((item) => (
-      item.key === pendingPinnedLocate.eventId
-      || item.event?.eventId === pendingPinnedLocate.eventId
-      || item.eventIds?.includes(pendingPinnedLocate.eventId)
-    ));
-    if (targetItemIndex < 0) {
-      // The event is in the session but older than the derivation window, so it
-      // has no presentation item yet. Widening the render limit widens the
-      // window with it, and this effect re-runs on the rebuilt list — without
-      // this the navigation would silently do nothing for any message older
-      // than the window, which is precisely the ones a pin is used for.
-      if (hasOlderOutsideWindow) {
-        setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
-      }
-      return undefined;
-    }
-    const targetDomEventId = viewItems[targetItemIndex]!.key;
-    // The renderer is tail-limited. Reveal only enough tail items to include
-    // the target instead of mounting a previously expanded 2,000-item history
-    // in one task (which would revive the multi-window freeze this UI avoids).
-    const requiredTailItems = viewItems.length - targetItemIndex;
-    setRenderItemLimit((current) => Math.max(current, requiredTailItems));
-    return revealEventWithRetry(targetDomEventId, (root, target) => {
+    return revealEvent(pendingPinnedLocate.eventId, (root, target) => {
       const reducedMotion = typeof window.matchMedia === 'function'
         && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
@@ -2956,8 +2958,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       pendingPinnedLocateIdRef.current = null;
       setPendingPinnedLocate(null);
       setPinnedLocateError(true);
-    });
-  }, [events, pendingPinnedLocate, renderedRevision, revealEventWithRetry, viewItems.length]);
+    }, pendingPinnedLocate.eventTs);
+  }, [pendingPinnedLocate, revealEvent, renderedRevision]);
 
   useEffect(() => {
     if (revealingOlderTimerRef.current) {
@@ -3956,7 +3958,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               if (!pinnedExpanded) { setPinnedExpanded(true); return; }
               // The last-sent bubble may be outside the virtualizer's mounted
               // range. Reveal it first, then perform the same centered jump.
-              revealEventWithRetry(lastSentUserMessage.eventId, (root, target) => {
+              revealEvent(lastSentUserMessage.eventId, (root, target) => {
                 const reducedMotion = typeof window !== 'undefined'
                   && window.matchMedia
                   && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
