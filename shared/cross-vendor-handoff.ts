@@ -52,6 +52,22 @@ export interface CrossVendorHandoffSessionState {
   pending?: CrossVendorHandoffPack;
 }
 
+export function beginCrossVendorHandoffState(
+  existing: CrossVendorHandoffSessionState | undefined,
+  config: CrossVendorHandoffConfig,
+  sourceAgentType: string,
+  cutoff: CrossVendorHandoffCutoff,
+): CrossVendorHandoffSessionState {
+  return {
+    ...(existing ?? {}),
+    config,
+    // A new switch supersedes any pack built for the previous target. Keeping
+    // it would let a timeout on B leak stale context into C after restart.
+    pending: undefined,
+    cutoffs: { ...(existing?.cutoffs ?? {}), [sourceAgentType]: cutoff },
+  };
+}
+
 export function isCrossVendorHandoffLaunchCurrent(input: {
   expectedGeneration: number;
   currentGeneration: number | undefined;

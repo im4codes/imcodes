@@ -108,8 +108,8 @@ import { getAuthenticatedCapabilityOwner } from '../capability/capability-author
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
-import { isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
-import { buildCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
+import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
+import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -1176,11 +1176,12 @@ export async function relaunchSessionWithSettings(
     const cutoff = handoffCutoff ?? { epoch: timelineEmitter.epoch, seq: 0, ts: Date.now() };
     const providerKey = targetAgentType;
     const priorCutoff = record.crossVendorHandoff?.cutoffs?.[providerKey];
-    const persistedState = {
-      ...(record.crossVendorHandoff ?? {}),
-      config: handoffConfig,
-      cutoffs: { ...(record.crossVendorHandoff?.cutoffs ?? {}), [record.agentType]: cutoff },
-    };
+    const persistedState = beginCrossVendorHandoffState(
+      record.crossVendorHandoff,
+      handoffConfig,
+      record.agentType,
+      cutoff,
+    );
     upsertSession({ ...record, crossVendorHandoff: persistedState, updatedAt: Date.now() });
     const build = buildCrossVendorHandoffPack(record, cutoff, targetAgentType, targetRuntimeType, {
       ...handoffConfig,
@@ -1188,17 +1189,7 @@ export async function relaunchSessionWithSettings(
       // uses the authoritative timeline and the target runtime receives it once.
       ...(priorCutoff ? { recentTurns: handoffConfig.recentTurns } : {}),
     }, priorCutoff);
-    handoffPromise = Promise.race([
-      build,
-      new Promise<undefined>((resolve) => setTimeout(() => {
-        incrementCounter('handoff.build_timeout', {});
-        resolve(undefined);
-      }, handoffConfig.timeoutMs)),
-    ]).catch((err) => {
-      incrementCounter('handoff.build_failed', {});
-      logger.debug({ err, session: record.name }, 'cross-vendor handoff build failed');
-      return undefined;
-    });
+    handoffPromise = resolveCrossVendorHandoffPack(build, handoffConfig.timeoutMs);
   }
   const preserveTransportBinding = record.runtimeType === RUNTIME_TYPES.TRANSPORT
     && record.agentType === targetAgentType
@@ -3503,6 +3494,20 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   // conversation already has its history preamble. `opts.fresh` is the
   // authoritative "force fresh" signal from /clear or explicit user action.
 
+  const restoredHandoff = existing?.crossVendorHandoff?.pending;
+  if (restoredHandoff && !opts.fresh) {
+    // Install before initialize: initialize notifies readiness and may drain a
+    // queued send immediately, so acceptance must already have a durable clear.
+    runtime.setPendingHandoffConsumedHandler(() => {
+      const current = getSession(name);
+      const pending = current?.crossVendorHandoff?.pending;
+      if (!pending || pending.cutoff.epoch !== restoredHandoff.cutoff.epoch || pending.cutoff.seq !== restoredHandoff.cutoff.seq) return;
+      const state = current.crossVendorHandoff ?? {};
+      upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: restoredHandoff.cutoff } }, updatedAt: Date.now() });
+      incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.TRANSPORT, source: 'restart' });
+    });
+  }
+
   // Create session on provider
   await runtime.initialize({
     sessionKey: effectiveSessionKey,
@@ -3537,9 +3542,12 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
-        effort: opts.effort,
+    effort: opts.effort,
+    ...(existing?.crossVendorHandoff?.pending && !opts.fresh
+      ? { pendingHandoff: existing.crossVendorHandoff.pending }
+      : {}),
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
-      });
+  });
   const latestSessionInfo = getLatestSessionInfo();
   // Atomic: store runtime + register provider route + persist — rollback all on failure
   const providerSid = runtime.providerSessionId;
@@ -3792,6 +3800,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
 
   const exists = await sessionExists(name);
   const storedBeforeLaunch = getSession(name);
+  const pendingHandoffOnRestart = !fresh ? storedBeforeLaunch?.crossVendorHandoff?.pending : undefined;
   const resourceSessionInstanceId = storedBeforeLaunch?.sessionInstanceId ?? randomUUID();
   const resourceRuntimeEpoch = !exists ? randomUUID() : storedBeforeLaunch?.runtimeEpoch ?? randomUUID();
   // Inject both the display identity and the exact logical/runtime owner tuple.
@@ -3982,6 +3991,33 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
         () => capturePane(name),
         (key) => sendKey(name, key),
       ).catch((e) => logger.warn({ err: e, session: name }, 'postLaunch failed'));
+    }
+    if (pendingHandoffOnRestart) {
+      try {
+        const { prepareProcessSessionPrivateWriter, runWithProcessSessionSendLock } = await import('../daemon/command-handler.js');
+        let injected = false;
+        await runWithProcessSessionSendLock(name, async () => {
+          const current = getSession(name);
+          if (!current?.crossVendorHandoff?.pending
+            || current.crossVendorHandoff.pending.cutoff.epoch !== pendingHandoffOnRestart.cutoff.epoch
+            || current.crossVendorHandoff.pending.cutoff.seq !== pendingHandoffOnRestart.cutoff.seq) return;
+          const writePrivate = await prepareProcessSessionPrivateWriter(name);
+          writePrivate(pendingHandoffOnRestart.text);
+          injected = true;
+        });
+        if (injected) {
+          const current = getSession(name);
+          if (current?.crossVendorHandoff?.pending?.cutoff.epoch === pendingHandoffOnRestart.cutoff.epoch
+            && current.crossVendorHandoff.pending.cutoff.seq === pendingHandoffOnRestart.cutoff.seq) {
+            const state = current.crossVendorHandoff;
+            upsertSession({ ...current, crossVendorHandoff: { ...state, pending: undefined, cutoffs: { ...(state.cutoffs ?? {}), [agentType]: pendingHandoffOnRestart.cutoff } }, updatedAt: Date.now() });
+          }
+          incrementCounter('handoff.injected', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+        }
+      } catch (error) {
+        logger.warn({ err: error, session: name }, 'Persisted cross-vendor handoff restore failed');
+        incrementCounter('handoff.injection_failed', { runtime: RUNTIME_TYPES.PROCESS, source: 'restart' });
+      }
     }
     const initialContext = [opts.description, opts.identityPrompt].filter(Boolean).join('\n\n');
     if (!initialContext || agentType === 'shell' || agentType === 'script') return;

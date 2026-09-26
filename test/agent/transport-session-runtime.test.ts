@@ -572,3 +572,45 @@ it('returns session.send acknowledgement before a slow handoff build and proceed
   await waitForProviderSend(provider);
   await runtime.kill();
 });
+
+it('startup-restored pending handoff invokes the persistence callback exactly once on acceptance', async () => {
+  const provider = makeProvider();
+  const runtime = new TransportSessionRuntime(provider, 'handoff-restore');
+  await runtime.initialize({
+    sessionKey: 'handoff-restore',
+    pendingHandoff: {
+      text: 'restored pending context', sourceAgentType: 'claude-code-sdk', sourceRuntimeType: 'transport',
+      cutoff: { epoch: 9, seq: 4, ts: 5 }, createdAt: Date.now(), tokenCount: 3,
+    },
+  });
+  let consumed = 0;
+  runtime.setPendingHandoffConsumedHandler(() => { consumed += 1; });
+  runtime.send('first after restart', 'restore-first');
+  await waitForProviderSend(provider);
+  expect(consumed).toBe(1);
+  await runtime.kill();
+});
+
+it('restart-accept-restart does not inject a restored pack twice', async () => {
+  const pack = {
+    text: 'restored once', sourceAgentType: 'claude-code-sdk', sourceRuntimeType: 'transport' as const,
+    cutoff: { epoch: 4, seq: 8, ts: 9 }, createdAt: Date.now(), tokenCount: 2,
+  };
+  let persisted: typeof pack | undefined = pack;
+  const firstProvider = makeProvider();
+  const first = new TransportSessionRuntime(firstProvider, 'handoff-restart-once');
+  await first.initialize({ sessionKey: 'handoff-restart-once', pendingHandoff: persisted });
+  first.setPendingHandoffConsumedHandler(() => { persisted = undefined; });
+  first.send('accept restored', 'restart-accept');
+  await waitForProviderSend(firstProvider);
+  expect(firstProvider.send.mock.calls[0]?.[1]?.messagePreamble).toContain('restored once');
+  await first.kill();
+
+  const secondProvider = makeProvider();
+  const second = new TransportSessionRuntime(secondProvider, 'handoff-restart-once');
+  await second.initialize({ sessionKey: 'handoff-restart-once', ...(persisted ? { pendingHandoff: persisted } : {}) });
+  second.send('after second restart', 'restart-second');
+  await waitForProviderSend(secondProvider);
+  expect(secondProvider.send.mock.calls[0]?.[1]?.messagePreamble ?? '').not.toContain('restored once');
+  await second.kill();
+});

@@ -3,8 +3,9 @@ import {
   CROSS_VENDOR_HANDOFF_DEFAULTS,
   normalizeCrossVendorHandoffConfig,
   isCrossVendorHandoffLaunchCurrent,
+  beginCrossVendorHandoffState,
 } from '../../shared/cross-vendor-handoff.js';
-import { buildCrossVendorHandoffPack, shouldCreateCrossVendorHandoff, sourceConversationKey } from '../../src/daemon/cross-vendor-handoff.js';
+import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff, sourceConversationKey } from '../../src/daemon/cross-vendor-handoff.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
 import type { TimelineEvent } from '../../src/daemon/timeline-event.js';
 
@@ -106,6 +107,23 @@ describe('cross-vendor handoff contract', () => {
     expect(isCrossVendorHandoffLaunchCurrent({ expectedGeneration: 1, currentGeneration: 2, currentAgentType: 'claude-code-sdk', targetAgentType: 'claude-code-sdk' })).toBe(false);
     expect(isCrossVendorHandoffLaunchCurrent({ expectedGeneration: 2, currentGeneration: 2, currentAgentType: 'claude-code-sdk', targetAgentType: 'claude-code-sdk' })).toBe(true);
     expect(isCrossVendorHandoffLaunchCurrent({ expectedGeneration: 2, currentGeneration: 2, currentAgentType: 'codex-sdk', targetAgentType: 'claude-code-sdk' })).toBe(false);
+  });
+
+  it('replaces a pending pack when a consecutive switch starts', () => {
+    const prior = {
+      pending: { text: 'pack-A', sourceAgentType: 'claude-code-sdk', sourceRuntimeType: 'transport' as const, cutoff: { epoch: 1, seq: 2, ts: 2 }, createdAt: 1, tokenCount: 1 },
+      cutoffs: { 'codex-sdk': { epoch: 1, seq: 2, ts: 2 } },
+    };
+    const next = beginCrossVendorHandoffState(prior, normalizeCrossVendorHandoffConfig(), 'codex-sdk', { epoch: 1, seq: 3, ts: 3 });
+    expect(next.pending).toBeUndefined();
+    expect(next.cutoffs?.['codex-sdk']).toEqual({ epoch: 1, seq: 3, ts: 3 });
+  });
+
+  it('times out a stuck projection without delaying the caller', async () => {
+    const started = Date.now();
+    const result = await resolveCrossVendorHandoffPack(new Promise(() => undefined), 5);
+    expect(result).toBeUndefined();
+    expect(Date.now() - started).toBeLessThan(250);
   });
 
 });

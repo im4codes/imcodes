@@ -67,6 +67,22 @@ export function sourceConversationKey(record: Pick<SessionRecord, 'agentType' | 
   return record.providerResumeId ?? record.providerSessionId ?? record.ccSessionId ?? record.codexSessionId;
 }
 
+export function resolveCrossVendorHandoffPack(
+  build: Promise<CrossVendorHandoffPack | undefined>,
+  timeoutMs: number,
+): Promise<CrossVendorHandoffPack | undefined> {
+  return Promise.race([
+    build,
+    new Promise<undefined>((resolve) => setTimeout(() => {
+      incrementCounter('handoff.build_timeout', {});
+      resolve(undefined);
+    }, Math.max(1, timeoutMs))),
+  ]).catch((err) => {
+    incrementCounter('handoff.build_failed', {});
+    return undefined;
+  });
+}
+
 export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff: CrossVendorHandoffCutoff, targetAgentType: string, targetRuntimeType: 'process' | 'transport', inputConfig?: Partial<CrossVendorHandoffConfig>, afterCutoff?: CrossVendorHandoffCutoff): Promise<CrossVendorHandoffPack | undefined> {
   const config = normalizeCrossVendorHandoffConfig(inputConfig);
   if (!config.enabled) return undefined;
