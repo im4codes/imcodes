@@ -2161,7 +2161,9 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
   useEffect(() => {
     if (!enabled || !revealKey) return undefined;
     const root = scrollRef.current;
-    const index = items.findIndex((item) => item.key === revealKey);
+    const index = items.findIndex((item) => (
+      item.key === revealKey || item.event?.eventId === revealKey || item.eventIds?.includes(revealKey)
+    ));
     if (!root || index < 0) return undefined;
     const heights = items.map(getHeight);
     const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, index);
@@ -2888,8 +2890,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     let timer: ReturnType<typeof setTimeout> | null = null;
     const attempt = async () => {
       if (cancelled) return;
+      const currentItems = viewItemsRef.current;
+      const presentationItem = currentItems.find((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ));
+      const presentationKey = presentationItem?.key ?? eventId;
+      setVirtualRevealKey(presentationKey);
       const root = scrollRef.current;
-      const target = root ? findEventElement(root, eventId) : null;
+      const target = root ? findEventElement(root, presentationKey) : null;
       if (root && target) {
         setVirtualRevealKey(undefined);
         onFound(root, target);
@@ -2901,7 +2909,6 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         await onLoadMessageContext(eventId, eventTs);
         loadingContext = false;
       }
-      const currentItems = viewItemsRef.current;
       const requiredLimit = __computeRevealRenderItemLimitForTests(currentItems, eventId, effectiveRenderLimit);
       if (requiredLimit > effectiveRenderLimit) setRenderItemLimit(requiredLimit);
       else if (hasOlderOutsideWindowRef.current && !currentItems.some((item) => (
