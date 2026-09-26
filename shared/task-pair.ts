@@ -145,6 +145,19 @@ export const TASK_PAIR_ASK_DONT_JUST_REPLY_RULE: string =
   + 'partner (executor/auditor) go to them by message the same way.';
 
 /**
+ * Stated in the pairs contract and the executor brief. Owner report: two
+ * PASSed pairs sat unintegrated for hours because Brain relied on the
+ * executor remembering to say so -- the daemon now tells Brain itself on
+ * PASS/DONE (see buildPassDoneNoticeMessage), but the executor still owns
+ * its own branch: never merge/push to dev or main itself, only Brain
+ * integrates.
+ */
+export const TASK_PAIR_INTEGRATION_RULE: string =
+  'After PASS: commit/push your own branch, then report the branch and HEAD '
+  + 'to Brain in your reply (the daemon also tells Brain, but say it '
+  + 'yourself too). Never push to dev/main yourself -- only Brain integrates.';
+
+/**
  * Stated in the Brain contract for a project not enabled for pairs (owner
  * decision, 2026-09-26, tsk_cd_pairs_optin: pairs is no longer a zero-config
  * default). Kept as one shared string so the daemon's own auto-start gates
@@ -1192,6 +1205,7 @@ export function buildTaskPairMarkerContract(): string {
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
     'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL. taskId "-" means your single open task.',
     'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming the material; the daemon relays it to the auditor. After PASS commit/push code yourself and write DONE (with output= when the result must be kept). DONE without a PASS is not complete. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit/push code yourself, then write DONE straight to Brain with no PASS required -- your closing reply is what Brain reads as the completion notice, so it must state what changed, the worktree/branch/HEAD or file paths, and your validation result before the DONE marker.',
+    TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
     `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,

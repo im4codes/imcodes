@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
+  TASK_PAIR_INTEGRATION_RULE,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   TASK_PAIR_STATUSES,
@@ -156,6 +157,13 @@ describe('task-pair marker grammar', () => {
     const body = buildTaskPairMarkerContract();
     expect(body).toContain(TASK_PAIR_ASK_DONT_JUST_REPLY_RULE);
     expect(body).toContain('never leave the question only in your own reply');
+  });
+
+  it('ships a contract telling the executor to report its branch/HEAD to Brain after PASS and never push to dev/main itself', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain(TASK_PAIR_INTEGRATION_RULE);
+    expect(body).toContain('report the branch and HEAD to Brain');
+    expect(body).toContain('Never push to dev/main yourself -- only Brain integrates.');
   });
 });
 

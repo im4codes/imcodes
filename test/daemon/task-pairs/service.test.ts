@@ -166,6 +166,26 @@ describe('task-pair marker ingestion', () => {
     expect(getTaskPairStore().listEvents(PROJECT, 'T3')).toHaveLength(4);
   });
 
+  it('tells Brain once when an audited pair PASSes, with the verdict and material, and does not repeat it on DONE', async () => {
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T63 executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, 'Ready.\n<!-- IMCODES_TASK READY_FOR_AUDIT T63 worktree=/tmp/wt63 head=abc1234 base=def5678 -->');
+    sent.length = 0;
+    await say(AUD, '<!-- IMCODES_TASK PASS T63 blocking=P0 -->');
+    const passNotices = sent.filter((entry) => entry.id.includes(':brain-line-pass-done:'));
+    expect(passNotices).toHaveLength(1);
+    expect(passNotices[0]!.target).toBe(BRAIN);
+    expect(passNotices[0]!.text).toContain('T63');
+    expect(passNotices[0]!.text).toContain(`Auditor ${AUD} verdict: PASS`);
+    expect(passNotices[0]!.text).toContain('worktree /tmp/wt63');
+    expect(passNotices[0]!.text).toContain('head abc1234');
+    expect(passNotices[0]!.text).toContain('base def5678');
+
+    // DONE is a backstop for the same notice, not a second one -- the PASS
+    // notice already caught it this round.
+    await say(EXEC, 'Committed and pushed.\n<!-- IMCODES_TASK DONE T63 -->');
+    expect(sent.filter((entry) => entry.id.includes(':brain-line-pass-done:'))).toHaveLength(1);
+  });
+
   it('relays the executor\'s own closing summary to Brain when a no-auditor pair reaches DONE, so Brain never has to poll', async () => {
     await say(BRAIN, `Dispatching.\n<!-- IMCODES_TASK DISPATCH T60 executor=${EXEC} auditor=none title="Bump a config value" -->`);
     sent.length = 0; // clear the DISPATCH brief so only the DONE relay is asserted below
