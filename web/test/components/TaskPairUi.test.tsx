@@ -244,7 +244,7 @@ describe('TaskPairStatusPanel', () => {
     const brief = '# Paged brief\n\nThe complete older brief';
     const firstPage = Array.from({ length: 500 }, (_, index) => ({ type: 'assistant.text', ts: 2000 - index, payload: { text: `event-${index}` } }));
     const fetchMock = vi.fn()
-      .mockResolvedValueOnce(new Response(JSON.stringify({ events: firstPage, epoch: null, hasMore: true, earliestTs: 1501 }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ events: firstPage, epoch: 7, hasMore: true, nextCursor: { epoch: 7, beforeTs: 1501, direction: 'older' } }), { status: 200, headers: { 'Content-Type': 'application/json' } }))
       .mockResolvedValueOnce(new Response(JSON.stringify({ events: [{ type: 'task_pair.event', ts: 100, payload: { taskId: 'paged-task', brief } }], epoch: null, hasMore: false }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
     vi.stubGlobal('fetch', fetchMock);
     try {

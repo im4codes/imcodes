@@ -1383,6 +1383,8 @@ export async function fetchTimelineHistoryHttp(
         ? result.nextCursor
         : typeof result.legacyBeforeTs === 'number'
           ? result.legacyBeforeTs
+          : result.nextCursor && typeof result.nextCursor === 'object' && typeof result.nextCursor.beforeTs === 'number'
+            ? result.nextCursor.beforeTs
           : typeof result.earliestTs === 'number'
             ? result.earliestTs
             : undefined,
