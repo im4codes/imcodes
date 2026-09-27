@@ -221,6 +221,20 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       disableStdin: isMobile && !mobileInput,
     });
 
+    // The isolated real-browser shell harness uses the xterm API to select and
+    // checksum wrapped output deterministically. This hook is opt-in and only
+    // exposed when the harness sets the test flag before app startup.
+    const testWindow = globalThis as typeof globalThis & {
+      __IMC_SHELL_BROWSER_TEST__?: boolean;
+      __imcShellTerminal?: Terminal;
+      __imcShellTerminals?: Record<string, Terminal>;
+    };
+    if (testWindow.__IMC_SHELL_BROWSER_TEST__) {
+      testWindow.__imcShellTerminals ??= {};
+      testWindow.__imcShellTerminals[sessionName] = term;
+      if (!testWindow.__imcShellTerminal) testWindow.__imcShellTerminal = term;
+    }
+
     // Copy selected text to clipboard on Ctrl+C / Cmd+C when selection exists
     term.attachCustomKeyEventHandler((ev) => {
       if ((ev.ctrlKey || ev.metaKey) && ev.key === 'c' && term.hasSelection()) {
@@ -419,6 +433,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     }
 
     return () => {
+      if (testWindow.__imcShellTerminal === term) delete testWindow.__imcShellTerminal;
+      if (testWindow.__imcShellTerminals?.[sessionName] === term) delete testWindow.__imcShellTerminals[sessionName];
       if (fitTimer) clearTimeout(fitTimer);
       cancelPendingFit();
       discardPendingRaw();

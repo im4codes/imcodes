@@ -41,7 +41,7 @@ async function typeCommand(page, command, marker, timeout = 15_000) {
 
 async function pasteCommand(page, command, marker, timeout = 15_000) {
   const usedClipboardApi = await page.evaluate(async (value) => {
-    if (navigator.clipboard?.writeText) {
+    if (navigator.clipboard?.writeText && !window.__shellClipboardStub) {
       await navigator.clipboard.writeText(value);
       return true;
     }
@@ -62,6 +62,73 @@ async function pasteCommand(page, command, marker, timeout = 15_000) {
   const result = await waitForTerminalText(page, marker, timeout);
   await page.waitForTimeout(100);
   return result;
+}
+
+async function measureKeystrokeEcho(page, samples = 24) {
+  await page.locator('.terminal-container').first().click();
+  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
+  const latencies = [];
+  for (let index = 0; index < samples; index += 1) {
+    const marker = `LATENCY_ECHO_${index}_${Date.now()}`;
+    const started = await page.evaluate(() => performance.now());
+    await page.keyboard.type(`printf '%s\\n' '${marker}'`);
+    await page.keyboard.press('Enter');
+    await waitForTerminalText(page, marker, 5_000);
+    latencies.push(await page.evaluate((startedAt) => performance.now() - startedAt, started));
+  }
+  latencies.sort((a, b) => a - b);
+  const p95 = latencies[Math.min(latencies.length - 1, Math.ceil(latencies.length * 0.95) - 1)] ?? 0;
+  return { p95Ms: Number(p95.toFixed(2)), samples: latencies.length };
+}
+
+async function fitViewportToColumns(page, targetCols) {
+  let low = 390;
+  let high = Math.max(2400, targetCols * 14);
+  let best = { width: high, cols: 0, distance: Number.POSITIVE_INFINITY };
+  for (let attempt = 0; attempt < 9; attempt += 1) {
+    const width = Math.round((low + high) / 2);
+    await page.setViewportSize({ width, height: 800 });
+    await page.waitForTimeout(120);
+    const cols = await page.evaluate((session) => window.__imcShellTerminals?.[session]?.cols ?? window.__imcShellTerminal?.cols ?? 0, SESSION);
+    const distance = Math.abs(cols - targetCols);
+    if (distance < best.distance) best = { width, cols, distance };
+    if (cols < targetCols) low = width + 1;
+    else high = width - 1;
+  }
+  await page.setViewportSize({ width: best.width, height: 800 });
+  await page.waitForTimeout(150);
+  return best;
+}
+
+async function copyUrlAtColumns(page, targetCols, url) {
+  const fitted = await fitViewportToColumns(page, targetCols);
+  await page.locator('.terminal-container').first().click();
+  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
+  await page.keyboard.press('Control+C');
+  const encoded = Buffer.from(url).toString('base64');
+  await pasteCommand(page, `printf '%s' '${encoded}' | base64 -d > /tmp/url.txt; cat /tmp/url.txt; printf 'Z9\\n'`, 'Z9');
+  const selection = await page.evaluate(({ value, session }) => {
+    const candidates = Object.values(window.__imcShellTerminals ?? {});
+    const fallback = window.__imcShellTerminals?.[session] ?? window.__imcShellTerminal;
+    const term = candidates.find((candidate) => {
+      for (let row = 0; row < candidate.buffer.active.length; row += 1) {
+        if ((candidate.buffer.active.getLine(row)?.translateToString(true) ?? '').includes(value.slice(0, 16))) return true;
+      }
+      return false;
+    }) ?? fallback;
+    if (!term) throw new Error('xterm test handle missing');
+    term.selectAll();
+    const selected = term.getSelection();
+    if (!selected.includes(value)) throw new Error('xterm selection did not contain the printed URL');
+    return { selected, cols: term.cols };
+  }, { value: url, session: SESSION });
+  await page.keyboard.press('Control+C');
+  const copied = await page.evaluate(() => navigator.clipboard?.readText?.() ?? '');
+  const normalized = copied.replace(/\r?\n/g, '');
+  const selectedNormalized = selection.selected.replace(/\r?\n/g, '');
+  const selectedOccurrences = selectedNormalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
+  const copiedOccurrences = normalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
+  return { requestedCols: targetCols, actualCols: fitted.cols, viewportWidth: fitted.width, copiedLength: copied.length, exact: selectedOccurrences.length === 1 && selectedOccurrences[0] === url, clipboardExact: copiedOccurrences.length === 1 && copiedOccurrences[0] === url, selectedLength: selection.selected.length, rows: [] };
 }
 
 function sha256(value) {
@@ -87,6 +154,18 @@ export async function runShellBrowserScenario() {
   const context = await browser.newContext({ permissions: ['clipboard-read', 'clipboard-write'], viewport: { width: 1280, height: 800 } });
   await context.addCookies([{ name: 'rcc_session', value: jwt(), url: BASE_URL }, { name: 'rcc_csrf', value: 'imc-shell-perf-csrf-token', url: BASE_URL }]);
   await context.addInitScript(({ apiKey, serverId }) => {
+    window.__IMC_SHELL_BROWSER_TEST__ = true;
+    if (!navigator.clipboard) {
+      window.__shellClipboardStub = true;
+      window.__shellClipboardText = '';
+      Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: {
+          writeText: async (value) => { window.__shellClipboardText = value; },
+          readText: async () => window.__shellClipboardText,
+        },
+      });
+    }
     if (typeof crypto.randomUUID !== 'function') {
       crypto.randomUUID = () => {
         const bytes = new Uint8Array(16);
@@ -126,6 +205,8 @@ export async function runShellBrowserScenario() {
     const text = document.querySelector('.terminal-container .xterm-rows')?.innerText ?? '';
     return /#\s*$/.test(text.trim());
   }, undefined, { timeout: 30_000 });
+
+  const inputLatency = await measureKeystrokeEcho(page);
 
   // Input path: fast text, editing keys, history, interrupts and controls.
   const typed = 'typed-once-in-order';
@@ -213,6 +294,14 @@ export async function runShellBrowserScenario() {
   const keyBarCount = await keyBarButtons.count();
   for (let index = 0; index < keyBarCount; index += 1) await keyBarButtons.nth(index).click().catch(() => {});
 
+  const copyUrl = `https://example.test/remote-desktop/${'x'.repeat(260)}`;
+  const urlCopies = [];
+  for (const columns of [80, 120, 200]) urlCopies.push(await copyUrlAtColumns(page, columns, copyUrl));
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(200);
+  urlCopies.push(await copyUrlAtColumns(page, 0, copyUrl));
+  for (const result of urlCopies) assert.equal(result.exact, true, `wrapped URL copy must be exact at ${result.requestedCols || 'mobile'} columns`);
+
   const desktopScreenshot = process.env.IMC_PERF_SHELL_SCREENSHOT ?? '/tmp/shell-desktop.png';
   await page.screenshot({ path: desktopScreenshot });
   await page.setViewportSize({ width: 390, height: 844 });
@@ -227,7 +316,7 @@ export async function runShellBrowserScenario() {
   assert.equal(metrics.longTasks, 0, 'shell output must not create long tasks');
   assert.ok(metrics.fps >= 50, `shell render FPS ${metrics.fps.toFixed(1)} is below 50`);
   await browser.close();
-  return { firstPaintMs, recovery: 1, metrics, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash } };
+  return { firstPaintMs, recovery: 1, metrics, inputLatency, urlCopies, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash } };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
