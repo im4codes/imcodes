@@ -132,7 +132,7 @@ describe('TaskPairStatusPanel', () => {
       taskId: `authoritative-${index}`,
       title: `Authoritative task ${index}`,
       pair: {
-        status: index < 3 ? 'working' : index === 3 ? 'in_audit' : index < 6 ? 'awaiting_brain_decision' : 'working',
+        status: index < 3 ? 'working' : index === 3 ? 'in_audit' : index < 6 ? 'awaiting_brain_decision' : 'queued',
         flags: index < 3 ? [] : index < 6 ? ['blocked'] : [],
         startedAt: 1_790_476_778_973 + index,
         updatedAt: 1_790_476_778_973 + index,
@@ -144,6 +144,7 @@ describe('TaskPairStatusPanel', () => {
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks, assignments: [], authoritative: true } }));
     await waitFor(() => expect(screen.getAllByText(/Authoritative task/)).toHaveLength(7));
     expect(screen.getByText(/taskPair.status.awaiting_brain_decision \(2\)/)).toBeTruthy();
+    expect(screen.getByText(/taskPair.panel_group_queued/).textContent).toContain('(1)');
     expect(screen.queryByText('History only')).toBeNull();
     expect(screen.getByText(/Authoritative task 0/).parentElement?.textContent).toContain('taskPair.panel_started');
   });
@@ -170,6 +171,15 @@ describe('TaskPairStatusPanel', () => {
     expect(snapshot.tasks).toHaveLength(1);
     expect(snapshot.tasks[0].pair.status).toBe('awaiting_brain_decision');
     expect(snapshot.tasks[0].pair.startedAt).toBe(123);
+  });
+  it('clears the prior scope snapshot before the next authoritative sync', async () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { tasks: [{ taskId: 'old-scope', title: 'Old scope', pair: { status: 'working' } }] };
+    render(<TaskPairStatusPanelHost events={[]} serverId="scope-a" />);
+    expect(screen.getByText('Old scope')).toBeTruthy();
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true, scopeKey: 'scope-b' } }));
+    await waitFor(() => expect(screen.queryByText('Old scope')).toBeNull());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks: [{ taskId: 'new-scope', title: 'New scope', pair: { status: 'working' } }], assignments: [], authoritative: true } }));
+    expect(await waitFor(() => screen.getByText('New scope'))).toBeTruthy();
   });
   it('defaults collapsed on mobile but expanded on desktop, with independent layout keys', () => {
     const events = [{ eventId: 'layout-default', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-default', title: 'Layout default', toStatus: 'working' } }] as never;

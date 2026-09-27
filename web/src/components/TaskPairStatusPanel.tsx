@@ -169,8 +169,12 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   });
   useEffect(() => {
     const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; op?: string; task?: Record<string, unknown>; removedId?: string } | undefined;
+      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean; op?: string; task?: Record<string, unknown>; removedId?: string } | undefined;
       if (!detail) return;
+      if (detail.scopeReset) {
+        setSnapshotRows(null);
+        return;
+      }
       if (Array.isArray(detail.tasks)) {
         const normalized = normalizeSnapshot(detail);
         if (normalized) setSnapshotRows((current) => mergeSnapshotRows(current, normalized));
@@ -307,7 +311,11 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   useEffect(() => { if (!active && hasPairActivity(props.events)) setActive(true); }, [active, props.events]);
   useEffect(() => {
     const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined;
+      const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined;
+      if (detail?.scopeReset) {
+        setAuthorityUnavailable(false);
+        return;
+      }
       if ((Array.isArray(detail?.tasks) && detail.tasks.length > 0) || detail?.op === 'task_upsert' || detail?.task) setActive(true);
       if (detail && 'authorityUnavailable' in detail) setAuthorityUnavailable(Boolean(detail.authorityUnavailable));
       else if (detail && Array.isArray(detail.tasks)) setAuthorityUnavailable(false);

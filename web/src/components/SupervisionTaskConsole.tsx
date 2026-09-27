@@ -48,6 +48,10 @@ const FOCUSABLE_SELECTOR = [
 ].join(',');
 
 const BRAIN_DECISION_FLAGS = new Set(['blocked', 'needs_input', 'waiting_for_capacity']);
+const TASK_PAIR_PANEL_VISIBLE_STATUSES: readonly TaskPairStatus[] = [
+  ...TASK_PAIR_OPEN_STATUSES,
+  'queued',
+];
 
 function legacyPairStatus(task: SupervisionTaskConsoleTaskRow): TaskPairStatus {
   if (task.phase === 'audit') return 'in_audit';
@@ -78,7 +82,7 @@ export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleRedu
     };
     // The supervision projection can retain completed history.  The compact
     // panel is an open-pair indicator, so do not reintroduce terminal rows.
-    if (!TASK_PAIR_OPEN_STATUSES.includes(normalizedPair.status)) return [];
+    if (!TASK_PAIR_PANEL_VISIBLE_STATUSES.includes(normalizedPair.status)) return [];
     return [{
       taskId: task.taskId,
       title: task.title,
@@ -102,6 +106,7 @@ export function SupervisionTaskPairSnapshotBridge(props: {
   projectName: string;
   coordinatorSessionName: string;
 }) {
+  const scopeKey = `${props.serverId}\u0000${props.projectName}\u0000${props.coordinatorSessionName}`;
   const { state } = useSupervisionTaskConsole({
     ws: props.ws,
     connected: props.connected,
@@ -111,6 +116,15 @@ export function SupervisionTaskPairSnapshotBridge(props: {
   });
   useEffect(() => {
     if (typeof window === 'undefined') return;
+    // Invalidate rows from the previous server/project/session immediately;
+    // the new subscription will publish its authoritative snapshot separately.
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true, scopeKey } }));
+  }, [scopeKey]);
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (state.scope.projectName !== props.projectName
+      || state.scope.coordinatorSessionName !== props.coordinatorSessionName) return;
     // Cached projections are marked STALE and must not silently replace the
     // daemon's authoritative list.  Publish only a live, fully synced snapshot.
     if (state.hasAuthoritativeSnapshot && state.syncState === SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED) {
@@ -124,7 +138,7 @@ export function SupervisionTaskPairSnapshotBridge(props: {
       (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
       window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
     }
-  }, [state]);
+  }, [state, props.projectName, props.coordinatorSessionName]);
   return null;
 }
 
