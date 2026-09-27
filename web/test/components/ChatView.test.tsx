@@ -735,12 +735,22 @@ describe('ChatView', () => {
     Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 320 });
     await waitFor(() => expect(scrollTopValue).toBe(2_880));
 
-    // A fast foreground replay can temporarily publish a shorter cache tail
-    // while the old scrollTop is still retained by WebKit.
-    scrollHeightValue = 1_800;
-    rerender(<ChatView events={makeEvents(25) as any} loading={false} sessionId="deck_resume_bottom" />);
-    await waitFor(() => expect(scrollTopValue).toBe(1_800));
-    expect(screen.getByText('resume-message-24')).toBeTruthy();
+    const originalVisibility = document.visibilityState;
+    try {
+      // A fast foreground replay can temporarily publish a shorter cache tail
+      // while the old scrollTop is still retained by WebKit. Exercise the
+      // actual hide/show path that captures and restores the logical anchor.
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      scrollHeightValue = 1_800;
+      rerender(<ChatView events={makeEvents(25) as any} loading={false} sessionId="deck_resume_bottom" />);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await waitFor(() => expect(scrollTopValue).toBe(1_800));
+      expect(screen.getByText('resume-message-24')).toBeTruthy();
+    } finally {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: originalVisibility });
+    }
   });
 
   it('preserves a reader anchor while a foreground history delta arrives', async () => {
@@ -767,10 +777,19 @@ describe('ChatView', () => {
     scrollTopValue = 900;
     fireEvent.wheel(scrollEl, { deltaY: -20 });
     fireEvent.scroll(scrollEl);
-    scrollHeightValue = 3_000;
-    rerender(<ChatView events={makeEvents('after') as any} loading={false} sessionId="deck_resume_reader" />);
-    await waitFor(() => expect(screen.getByText('anchor-after-6')).toBeTruthy());
-    expect(scrollTopValue).toBe(900);
+    const originalVisibility = document.visibilityState;
+    try {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
+      document.dispatchEvent(new Event('visibilitychange'));
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
+      scrollHeightValue = 3_000;
+      rerender(<ChatView events={makeEvents('after') as any} loading={false} sessionId="deck_resume_reader" />);
+      document.dispatchEvent(new Event('visibilitychange'));
+      await waitFor(() => expect(screen.getByText('anchor-after-6')).toBeTruthy());
+      expect(scrollTopValue).toBe(900);
+    } finally {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, value: originalVisibility });
+    }
   });
 
   it('shows the loading placeholder only when nothing is cached yet', () => {
