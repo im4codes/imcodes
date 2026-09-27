@@ -169,6 +169,53 @@ describe('crash boundary matrix', () => {
   });
 });
 
+describe('bounded projection cost on a large backlog', () => {
+  it('projects assignments once per replay/snapshot pass, not once per event', () => {
+    seedTask('implementing');
+    const ASSIGNMENTS = 40;
+    const EVENTS = 200;
+    for (let i = 1; i < ASSIGNMENTS; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_assignments
+        (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch,
+         agent_type, provider_family, lease_id, generation, payload_json, created_at, updated_at)
+        VALUES (?, 'tsk_console', 'implementer', 'implementing', ?, 'i', 'e', 'codex', 'openai', 'l', 1, '{}', 1, 1)`)
+        .run(`asg_bulk_${i}`, `deck_sub_bulk_${i % 7}`);
+    }
+    let calls = 0;
+    const p = producer({
+      broadcast: false,
+      resolveSessionPresentation: (_sessionName, observedAt) => {
+        calls += 1;
+        return { state: 'idle', source: 'runtime', observedAt };
+      },
+    });
+    // Baseline first so the raw events below are an unprojected backlog, as on
+    // a daemon whose projection cursor fell behind the registry.
+    p.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < EVENTS; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_console', ?, 'implementing', 'implementing', '{}', ?)`)
+        .run(i % 2 === 0 ? 'asg_console' : `asg_bulk_${1 + (i % (ASSIGNMENTS - 1))}`, 10 + i);
+    }
+    expect(p.synchronizeDurableEvents(SCOPE, { deliver: false })).toBe(EVENTS);
+    // One projection of every assignment for the whole replay. Per event it was
+    // EVENTS × 2 × ASSIGNMENTS (row lookup + pools) = 16,000 live-state reads.
+    expect(calls).toBe(ASSIGNMENTS);
+    const frames = db.prepare('SELECT frame_json FROM supervision_outbox ORDER BY id').all() as Array<{ frame_json: string }>;
+    expect(frames).toHaveLength(EVENTS);
+    expect(frames.every((row) => (JSON.parse(row.frame_json) as SupervisionTaskConsoleDelta).op === 'assignment_upsert')).toBe(true);
+
+    calls = 0;
+    const snap = p.buildSnapshot(SCOPE, 'sub-1');
+    expect(snap.assignments).toHaveLength(ASSIGNMENTS);
+    expect(calls).toBe(ASSIGNMENTS);
+    // The memo lives only for one pass: a later pass sees fresh live state.
+    calls = 0;
+    p.buildSnapshot(SCOPE, 'sub-2');
+    expect(calls).toBe(ASSIGNMENTS);
+  });
+});
+
 describe('restart reconstruction from SQLite alone', () => {
   it('restores the projection cursor, not a reset one', () => {
     seedTask('implementing');

@@ -131,6 +131,14 @@ export class SupervisionConsoleProducer {
   readonly #onBoundary: (boundary: SupervisionCrashBoundary) => void;
   readonly #broadcast?: (frame: SupervisionTaskConsoleDelta) => void;
   readonly #resolveSessionPresentation?: SupervisionProducerOptions['resolveSessionPresentation'];
+  /**
+   * Assignment rows memoized for one synchronous projection pass. A replay of
+   * N durable events used to re-project every assignment (and each owner's
+   * live transport queue) N×2 times on the main thread, which pegged the
+   * daemon for minutes on large registries and starved the server heartbeat.
+   * Nothing writes assignments inside a pass, so one read per pass is exact.
+   */
+  #passAssignmentRows: Map<string, SupervisionTaskConsoleAssignmentRow[]> | null = null;
 
   constructor(db: SupervisionMigrationDb, options: SupervisionProducerOptions) {
     this.#db = db;
@@ -307,7 +315,7 @@ export class SupervisionConsoleProducer {
     const cursor = this.restoreCursor(scope);
     const events = this.#readDurableRegistryEvents(scope, cursor.lastDurableEventId);
     if (events.length === 0) return 0;
-    const committed = this.#transaction(() => events.map((event) => {
+    const committed = this.#withAssignmentPass(() => this.#transaction(() => events.map((event) => {
       const projectionVersion = this.#nextProjectionVersion(scope, event.id);
       const frame = this.#buildDurableDelta(scope, event, projectionVersion);
       this.#db.prepare(
@@ -318,7 +326,7 @@ export class SupervisionConsoleProducer {
       ).run(scope.projectName, scope.coordinatorSessionName, event.id, projectionVersion,
         this.#epoch, JSON.stringify(frame), this.#now(), this.#now());
       return { frame, projectionVersion };
-    }));
+    })));
     if (options.deliver !== false) {
       for (const item of committed) this.#deliver(item.frame, item.projectionVersion, scope);
     }
@@ -430,8 +438,26 @@ export class SupervisionConsoleProducer {
     };
   }
 
+  #withAssignmentPass<T>(fn: () => T): T {
+    if (this.#passAssignmentRows) return fn();
+    this.#passAssignmentRows = new Map();
+    try {
+      return fn();
+    } finally {
+      this.#passAssignmentRows = null;
+    }
+  }
+
   /** Project every assignment into its browser-safe row. */
   readAssignmentRows(projectName: string): SupervisionTaskConsoleAssignmentRow[] {
+    const cached = this.#passAssignmentRows?.get(projectName);
+    if (cached) return cached;
+    const rows = this.#projectAssignmentRows(projectName);
+    this.#passAssignmentRows?.set(projectName, rows);
+    return rows;
+  }
+
+  #projectAssignmentRows(projectName: string): SupervisionTaskConsoleAssignmentRow[] {
     const visibleTaskIds = this.#visibleTaskIds(projectName);
     const rows = this.#db.prepare(
       `SELECT a.assignment_id, a.task_id, a.role, a.status, a.session_name, a.agent_type, a.provider_family,
@@ -673,6 +699,10 @@ export class SupervisionConsoleProducer {
   }
 
   buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
+    return this.#withAssignmentPass(() => this.#buildSnapshot(scope, subscriptionId));
+  }
+
+  #buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
     const cursor = this.restoreCursor(scope);
     const pairRows = isPairsEngineProject(scope.projectName) ? this.readPairRows(scope.projectName) : undefined;
     const tasks = pairRows?.tasks ?? [...this.#visibleTaskIds(scope.projectName)]

@@ -1486,6 +1486,16 @@ export async function startup(): Promise<DaemonContext> {
   // take the daemon down, so it is logged and the rest of startup continues.
   try {
     if (!serverLink) throw new Error('no server link');
+    // Live session state read at most once per session per second. A console
+    // snapshot/replay projects every assignment, and each read builds that
+    // session's full transport-queue snapshot; hundreds of assignments share
+    // far fewer sessions, and re-reading per row pegged the main thread (215).
+    const liveStateCache = new Map<string, {
+      at: number;
+      observed: ReturnType<typeof resolveAuthoritativeSessionListState>;
+      working: boolean;
+    }>();
+    const SUPERVISION_LIVE_STATE_CACHE_MS = 1_000;
     supervisionConsole = createProductionSupervisionConsoleBinding({
       serverLink,
       registry: getSupervisionTaskRegistry(),
@@ -1505,8 +1515,18 @@ export async function startup(): Promise<DaemonContext> {
             observedAt: record.updatedAt,
           };
         }
-        const observed = resolveAuthoritativeSessionListState(record);
-        const working = isSessionWorking(sessionName);
+        const now = Date.now();
+        let live = liveStateCache.get(sessionName);
+        if (!live || now - live.at >= SUPERVISION_LIVE_STATE_CACHE_MS) {
+          live = {
+            at: now,
+            observed: resolveAuthoritativeSessionListState(record),
+            working: isSessionWorking(sessionName),
+          };
+          if (liveStateCache.size >= 4_096) liveStateCache.clear();
+          liveStateCache.set(sessionName, live);
+        }
+        const { observed, working } = live;
         return {
           label: record.label,
           model: record.activeModel?.trim() || record.requestedModel?.trim(),
