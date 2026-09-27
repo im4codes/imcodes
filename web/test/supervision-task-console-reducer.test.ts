@@ -252,25 +252,71 @@ describe('supervision task console reducer', () => {
     }
   });
 
-  it('fails closed on an unknown future status and requests resync', () => {
-    const payload = snapshot() as unknown as Record<string, unknown>;
-    payload.tasks = [{
-      taskId: 'task-unknown',
-      title: 'Unknown',
-      status: 'future_status',
-      phase: 'active',
-      validationState: 'unknown',
-      updatedAt: 1,
-      lastEventId: 3,
-    }];
-    payload.assignments = [];
+  it('drops only the unknown-status rows of a snapshot instead of rejecting it and resyncing', () => {
+    const base = snapshot();
+    const payload = {
+      ...base,
+      tasks: [...base.tasks, {
+        taskId: 'task-unknown',
+        title: 'Unknown',
+        status: 'future_status',
+        phase: 'active',
+        validationState: 'unknown',
+        updatedAt: 1,
+        lastEventId: 3,
+      }],
+      assignments: [...base.assignments, {
+        assignmentId: 'assignment-of-unknown-task',
+        taskId: 'task-unknown',
+        status: 'implementing', phase: 'active', validationState: 'pending',
+        updatedAt: 1,
+        lastEventId: 3,
+      }, {
+        assignmentId: 'assignment-unknown',
+        taskId: 'task-1',
+        status: 'future_status', phase: 'active', validationState: 'pending',
+        updatedAt: 1,
+        lastEventId: 3,
+      }],
+    } as unknown as SupervisionTaskConsoleSnapshot;
     const next = supervisionTaskConsoleReducer(subscribingState(), {
       type: 'snapshot_received',
       payload,
     });
-    expect(next.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING);
-    expect(next.syncState).toBe('connecting');
-    expect(next.resyncReason).toBe('status_contract_mismatch');
+    expect(next.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(next.syncing).toBe(false);
+    expect(next.resyncReason).toBeNull();
+    expect(next.resyncGeneration).toBe(subscribingState().resyncGeneration);
+    expect(Object.keys(next.tasks)).toEqual(['task-1']);
+    expect(Object.keys(next.assignments)).toEqual(['assignment-1']);
+  });
+
+  it('turns a delta carrying an unknown status into a removal of just that row', () => {
+    const ready = readyState();
+    const unknownTask = supervisionTaskConsoleReducer(ready, {
+      type: 'delta_received',
+      payload: delta({ task: { ...delta().task!, status: 'future_status' as never } }),
+    });
+    expect(unknownTask.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(unknownTask.resyncGeneration).toBe(ready.resyncGeneration);
+    expect(unknownTask.tasks['task-1']).toBeUndefined();
+    expect(unknownTask.lastDurableEventId).toBe(4);
+
+    const unknownAssignment = supervisionTaskConsoleReducer(ready, {
+      type: 'delta_received',
+      payload: delta({
+        op: 'assignment_upsert',
+        task: undefined,
+        assignment: {
+          assignmentId: 'assignment-1', taskId: 'task-1', status: 'future_status' as never,
+          phase: 'active', validationState: 'pending', updatedAt: 40, lastEventId: 4,
+        },
+      }),
+    });
+    expect(unknownAssignment.resyncGeneration).toBe(ready.resyncGeneration);
+    expect(unknownAssignment.tasks['task-1']).toBeDefined();
+    expect(unknownAssignment.assignments['assignment-1']).toBeUndefined();
+    expect(unknownAssignment.lastDurableEventId).toBe(4);
   });
 
   it('drops malformed delayed frames before validating a replaced subscription', () => {

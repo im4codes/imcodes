@@ -10,6 +10,9 @@ import {
 } from '../../shared/supervision-task-console.js';
 import { SUPERVISION_TASK_STATUS_CONTRACT_VERSION } from '../../shared/supervision-config.js';
 import {
+  SUPERVISION_TASK_CONSOLE_MAX_AUTOMATIC_RESYNCS,
+  SUPERVISION_TASK_CONSOLE_RESYNC_LIMIT_ERROR,
+  SUPERVISION_TASK_CONSOLE_RESYNC_MAX_DELAY_MS,
   SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS,
   SupervisionTaskConsoleController,
   type SupervisionTaskConsoleSocket,
@@ -360,6 +363,42 @@ describe('SupervisionTaskConsoleController', () => {
     socket.emit(snapshot(first.subscriptionId));
     expect(controller.getState().projectionVersion).toBe(7);
     expect(controller.getState().subscriptionId).toBe(resync.subscriptionId);
+  });
+
+  it('spaces out and caps automatic resyncs when every snapshot is rejected', () => {
+    vi.useFakeTimers();
+    const socket = new FakeSocket();
+    const controller = new SupervisionTaskConsoleController(socket, SCOPE);
+    controller.start();
+    controller.setConnected(true);
+    const subscribes = () => socket.sent.filter((message) =>
+      (message as { type?: unknown }).type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+    // A projection this client always rejects (wrong schema version) used to
+    // resubscribe instantly forever, each costing the daemon a full snapshot.
+    const rejectLatest = () => {
+      const current = latest<{ type: string; subscriptionId: string }>(socket, SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE);
+      socket.emit({ ...snapshot(current.subscriptionId), schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION + 1 });
+    };
+    rejectLatest();
+    // First automatic resync is immediate.
+    expect(subscribes()).toHaveLength(2);
+    rejectLatest();
+    // The next one waits instead of firing in the same tick.
+    expect(subscribes()).toHaveLength(2);
+    vi.advanceTimersByTime(1_999);
+    expect(subscribes()).toHaveLength(2);
+    vi.advanceTimersByTime(1);
+    expect(subscribes()).toHaveLength(3);
+    for (let i = 0; i < 20; i += 1) {
+      rejectLatest();
+      vi.advanceTimersByTime(SUPERVISION_TASK_CONSOLE_RESYNC_MAX_DELAY_MS);
+    }
+    expect(subscribes()).toHaveLength(1 + SUPERVISION_TASK_CONSOLE_MAX_AUTOMATIC_RESYNCS);
+    expect(controller.getState().error).toBe(SUPERVISION_TASK_CONSOLE_RESYNC_LIMIT_ERROR);
+    expect(controller.getState().syncing).toBe(false);
+    // Explicit Retry restores a fresh budget.
+    controller.retry();
+    expect(subscribes()).toHaveLength(2 + SUPERVISION_TASK_CONSOLE_MAX_AUTOMATIC_RESYNCS);
   });
 
   it('unsubscribes without polling when the console closes', () => {

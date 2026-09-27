@@ -36,6 +36,20 @@ type StateListener = (state: SupervisionTaskConsoleReducerState) => void;
 /** Bound an unanswered subscribe so the console always exposes its Retry control. */
 export const SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS = 15_000;
 
+/**
+ * Automatic full resyncs are spaced out and capped. Every resync makes the
+ * daemon rebuild a full snapshot, so an immediate retry loop on a projection
+ * the client keeps rejecting turns into a request storm that can peg the
+ * daemon. The first resync in a window is immediate (a real gap should heal
+ * fast); later ones back off exponentially; past the cap the console stops
+ * for good and shows its stale/error state with the explicit Retry control.
+ */
+export const SUPERVISION_TASK_CONSOLE_RESYNC_BASE_DELAY_MS = 2_000;
+export const SUPERVISION_TASK_CONSOLE_RESYNC_MAX_DELAY_MS = 60_000;
+export const SUPERVISION_TASK_CONSOLE_RESYNC_WINDOW_MS = 5 * 60_000;
+export const SUPERVISION_TASK_CONSOLE_MAX_AUTOMATIC_RESYNCS = 6;
+export const SUPERVISION_TASK_CONSOLE_RESYNC_LIMIT_ERROR = 'resync_limit';
+
 function sameScope(left: SupervisionTaskConsoleScope, right: SupervisionTaskConsoleScope): boolean {
   return left.projectName === right.projectName
     && left.coordinatorSessionName === right.coordinatorSessionName;
@@ -96,6 +110,11 @@ export class SupervisionTaskConsoleController {
   private unsubscribeMessage: (() => void) | null = null;
   private connected = false;
   private subscribeTimeout: ReturnType<typeof setTimeout> | null = null;
+  private resyncTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Scheduled start times of recent automatic resyncs, pruned to the window. */
+  private automaticResyncs: number[] = [];
+  /** Set at the cap; only an explicit Retry re-enables automatic resyncs. */
+  private automaticResyncExhausted = false;
 
   constructor(
     private readonly socket: SupervisionTaskConsoleSocket,
@@ -134,6 +153,7 @@ export class SupervisionTaskConsoleController {
     }
     this.connected = false;
     this.clearSubscribeTimeout();
+    this.clearResyncTimer();
     this.unsubscribeMessage?.();
     this.unsubscribeMessage = null;
   }
@@ -151,6 +171,7 @@ export class SupervisionTaskConsoleController {
     this.connected = connected;
     if (!connected) {
       this.clearSubscribeTimeout();
+      this.clearResyncTimer();
       this.apply({ type: 'transport_disconnected' });
       return;
     }
@@ -163,6 +184,10 @@ export class SupervisionTaskConsoleController {
       this.apply({ type: 'transport_disconnected' });
       return;
     }
+    // An explicit user retry starts a fresh automatic-resync budget.
+    this.clearResyncTimer();
+    this.automaticResyncs = [];
+    this.automaticResyncExhausted = false;
     this.requestSubscription('initial', true);
   }
 
@@ -174,6 +199,48 @@ export class SupervisionTaskConsoleController {
     if (!this.subscribeTimeout) return;
     clearTimeout(this.subscribeTimeout);
     this.subscribeTimeout = null;
+  }
+
+  private clearResyncTimer(): void {
+    if (!this.resyncTimer) return;
+    clearTimeout(this.resyncTimer);
+    this.resyncTimer = null;
+  }
+
+  private scheduleAutomaticResync(reason: SupervisionConsoleResyncReason): void {
+    // One pending resync covers every further request until it fires.
+    if (this.resyncTimer) return;
+    if (this.automaticResyncExhausted) {
+      // Never claim "resyncing" when nothing will be requested.
+      this.apply({ type: 'transport_error', error: SUPERVISION_TASK_CONSOLE_RESYNC_LIMIT_ERROR });
+      return;
+    }
+    const now = Date.now();
+    this.automaticResyncs = this.automaticResyncs
+      .filter((at) => now - at < SUPERVISION_TASK_CONSOLE_RESYNC_WINDOW_MS);
+    const attempt = this.automaticResyncs.length;
+    if (attempt >= SUPERVISION_TASK_CONSOLE_MAX_AUTOMATIC_RESYNCS) {
+      this.automaticResyncExhausted = true;
+      this.clearSubscribeTimeout();
+      this.apply({ type: 'transport_error', error: SUPERVISION_TASK_CONSOLE_RESYNC_LIMIT_ERROR });
+      return;
+    }
+    const delayMs = attempt === 0
+      ? 0
+      : Math.min(
+        SUPERVISION_TASK_CONSOLE_RESYNC_BASE_DELAY_MS * 2 ** (attempt - 1),
+        SUPERVISION_TASK_CONSOLE_RESYNC_MAX_DELAY_MS,
+      );
+    this.automaticResyncs.push(now + delayMs);
+    if (delayMs === 0) {
+      this.requestSubscription(reason, true);
+      return;
+    }
+    this.resyncTimer = setTimeout(() => {
+      this.resyncTimer = null;
+      if (!this.connected) return;
+      this.requestSubscription(this.state.resyncReason ?? reason, true);
+    }, delayMs);
   }
 
   private armSubscribeTimeout(subscriptionId: string): void {
@@ -199,7 +266,7 @@ export class SupervisionTaskConsoleController {
     this.emit();
 
     if (next.resyncGeneration > previous.resyncGeneration && this.connected && next.resyncReason) {
-      this.requestSubscription(next.resyncReason, true);
+      this.scheduleAutomaticResync(next.resyncReason);
       return;
     }
     if (
