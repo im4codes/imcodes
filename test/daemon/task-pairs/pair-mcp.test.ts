@@ -79,4 +79,13 @@ describe('pair MCP projections', () => {
     const listed = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_LIST]({});
     expect((listed.pairs as Array<Record<string, unknown>>)[0]).toMatchObject({ executorModel: 'gpt-6-luna', auditorModel: 'none' });
   });
+
+  it('lets the project Brain set a title without replacing the brief', async () => {
+    getTaskPairStore().savePair(PROJECT, { ...pair('title-1', 'queued'), title: '(untitled task)', brief: 'Fix the retry path.' });
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]({ taskId: 'title-1', title: 'Fix retry backoff' })).resolves.toMatchObject({
+      taskId: 'title-1', title: 'Fix retry backoff', markdown: 'Fix the retry path.',
+    });
+    expect(getTaskPairStore().getPair(PROJECT, 'title-1')?.state.brief).toBe('Fix the retry path.');
+  });
 });

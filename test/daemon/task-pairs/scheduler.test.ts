@@ -606,7 +606,9 @@ describe('task-pair heartbeat, replacement and queue', () => {
     await tick(2);
     expect(pair('Q4').status).toBe('queued');
     expect(pair('Q4').flags).toContain('waiting_for_capacity');
-    expect(sentTo(BRAIN)).toHaveLength(0);
+    // No project UI locale is available in this headless fixture, so the
+    // title request waits for the later locale/backfill pass.
+    expect(sentTo(BRAIN, 'title-request')).toHaveLength(0);
   });
 
   it('auto-dispatches a queued task with no brief once candidates are available, briefing the executor instead of stalling forever', async () => {
@@ -825,7 +827,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(getTaskPairStore().getPairByLegacyTaskId('tsk_flip')).toBeUndefined();
     getTaskPairStore().setProjectEngine(PROJECT, 'pairs');
     await live.tick();
-    expect(getTaskPairStore().getPairByLegacyTaskId('tsk_flip')?.state).toMatchObject({ taskId: 'tsk_flip', title: 'created during rollback' });
+    expect(getTaskPairStore().getPairByLegacyTaskId('tsk_flip')?.state).toMatchObject({ taskId: 'tsk_flip', title: '(untitled task)' });
   });
 
   it('answers pool leases and counts from open pairs on the pairs engine', async () => {

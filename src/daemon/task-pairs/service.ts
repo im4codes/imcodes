@@ -20,7 +20,6 @@ import {
   TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_TITLE_EVENT_VERB,
-  TASK_PAIR_TITLE_GENERATED_EFFECT,
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_RETENTION_MS,
@@ -43,7 +42,7 @@ import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './deliv
 import { resolveTaskPairMaterial } from './material.js';
 import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
-import { generateTaskPairTitle } from './title-generator.js';
+import { isUsableTaskPairTitle, taskPairTitlePlaceholder } from './title-generator.js';
 import { getSession, listSessions } from '../../store/session-store.js';
 import { resolveProjectAuthoritativeSupervisionSnapshot } from '../supervision-snapshot.js';
 import { resolveSupervisionAuditBlockingSeverities } from '../../../shared/supervision-config.js';
@@ -59,6 +58,7 @@ import {
   buildNoAuditorDoneNotice,
   buildPassDoneNoticeMessage,
   buildReworkNoticeMessage,
+  buildUntitledTaskTitleRequest,
 } from './messages.js';
 
 /** Intents that need the pool, the heartbeat or the queue (see scheduler.ts). */
@@ -177,6 +177,8 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
 }
 
 export class TaskPairService {
+  static readonly TITLE_REQUEST_RETRY_MS = 5 * 60_000;
+  #titleRequestFlushes = new Map<string, Promise<void>>();
   #unsubscribe?: () => void;
   #scheduler?: TaskPairScheduler;
   /** Bounded notices for unknown task ids, which have no pair state for persisted caps. */
@@ -396,6 +398,20 @@ export class TaskPairService {
       });
       this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
     }
+    if (stored && input.marker.attrs.title && stored.state.brain === input.writer
+      && isUsableTaskPairTitle(input.marker.attrs.title, stored.state.taskId)) {
+      this.#clearTitleRequest(stored.state.brain, stored.state.taskId);
+    }
+    if (stored && (input.marker.knownVerb === 'QUEUE' || input.marker.knownVerb === 'DISPATCH')
+      && (transition.effect === 'created' || transition.effect === 'dispatched' || transition.effect === 'reopened')) {
+      this.ensureTaskPairTitle(
+        input.project,
+        stored.state.taskId,
+        stored.state.brief ?? (input.turnText ? stripTaskPairMarkersForDisplay(input.turnText) : undefined),
+        input.writer,
+        { emitEvent: false },
+      );
+    }
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
     const holdsAutoPickAuditor = input.suppressAutoPickAuditor
       && transition.intents.some((intent) => intent.kind === 'pick_auditor');
@@ -417,18 +433,6 @@ export class TaskPairService {
         || (input.marker.knownVerb === 'REASSIGN' && !!input.marker.attrs.executor
           && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')))) {
       this.#track(this.briefParticipants(input.project, stored.state.taskId));
-    }
-    // A QUEUE/DISPATCH marker's `title=` is always deliberately authored
-    // (there is no other source for it), so only a brand new queued pair
-    // that named no title is a candidate: generate one from its brief,
-    // best-effort. A DISPATCH/QUEUE from `implicitDispatch` (source
-    // `implicit_dispatch`) already conflated an explicit title with a
-    // mechanically derived one by the time it reaches here -- that
-    // distinction, and the matching generation call, is handled by the
-    // caller (send-tool.ts) instead.
-    if (stored && input.source === 'marker' && (input.marker.knownVerb === 'QUEUE' || input.marker.knownVerb === 'DISPATCH')
-      && transition.effect === 'created' && !input.marker.attrs.title && stored.state.brief) {
-      this.maybeGenerateTitle(input.project, stored.state.taskId, stored.state.brief);
     }
     // A pair that just ended (DONE, CANCEL, DONE force=true): its workspace
     // starts its retention and a deliverable named on DONE is kept.
@@ -496,7 +500,7 @@ export class TaskPairService {
 
   /** send_message with task metadata: creates a missing pair, otherwise record only. */
   implicitDispatch(input: {
-    project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; eventId: string;
+    project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; titleExplicit?: boolean; eventId: string;
     /** Owner rule (design D-pool-sync): a bound `task.requestedExecutionType.model` on the initial send_message dispatch, kept so a later automatic executor replacement still honors it instead of falling back to the allowlist. */
     executorModel?: string;
     /** True only for a send carrying real task metadata (task.objective).
@@ -517,6 +521,7 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const existing = store.getPair(project, input.taskId);
     if (existing) {
+      this.ensureTaskPairTitle(project, input.taskId, input.brief ?? existing.state.brief ?? existing.state.title, input.sender, { mechanicalTitle: input.titleExplicit !== true });
       // A task-bound send is itself evidence that the named participant has
       // begun work.  This is especially important for a queued pair whose
       // executor is already busy: waiting for the queue drain would otherwise
@@ -563,7 +568,7 @@ export class TaskPairService {
       noteTaskPairFocus(input.target, input.taskId);
       return { effect: 'recorded', unusual, intents: [] };
     }
-    return this.applyMarker({
+    const transition = this.applyMarker({
       project,
       writer: input.sender,
       marker: {
@@ -584,6 +589,8 @@ export class TaskPairService {
       // reason to wait).
       ...(!input.auditor && !input.hasObjective ? { suppressAutoPickAuditor: true } : {}),
     });
+    this.ensureTaskPairTitle(project, input.taskId, input.brief, input.sender, { mechanicalTitle: input.titleExplicit !== true });
+    return transition;
   }
 
   /**
@@ -948,83 +955,142 @@ export class TaskPairService {
   }
 
   /**
-   * Best-effort: kicks off background generation of a short, localized title
-   * for a pair that has no deliberately-authored one, from `sourceText` (the
-   * QUEUE brief, the send_message objective, or a generic placeholder title
-   * worth replacing). Never blocks the caller and never throws; a no-op when
-   * `sourceText` is empty, the project's Brain has no configured UI locale
-   * (headless/legacy callers keep the mechanical fallback untouched, exactly
-   * as the retired legacy supervision prompts did), or generation fails.
+   * Enforce the title invariant at every pair entry point. The placeholder is
+   * saved synchronously so the task panel never falls back to a raw id. The
+   * daemon asks the project's Brain for the title; it never calls a provider
+   * itself and never delays dispatch.
    */
-  maybeGenerateTitle(project: string, taskId: string, sourceText: string | undefined): void {
-    if (!sourceText?.trim()) return;
-    this.#track(this.#generateAndApplyTitle(project, taskId, sourceText));
+  ensureTaskPairTitle(
+    project: string,
+    taskId: string,
+    sourceText: string | undefined,
+    _creator?: string,
+    options: { mechanicalTitle?: boolean; emitEvent?: boolean } = {},
+  ): void {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored) return;
+    const source = sourceText?.trim() || `Supervised task ${taskId}`;
+    if (isUsableTaskPairTitle(stored.state.title, taskId, source, options.mechanicalTitle === true)) return;
+    const locale = brainUiLocale(project);
+    const placeholder = locale
+      ? taskPairTitlePlaceholder(locale)
+      : TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[1];
+    let pair = stored.state;
+    if (pair.title !== placeholder) {
+      pair = { ...pair, title: placeholder, updatedAt: Date.now() };
+      store.savePair(project, pair);
+      if (options.emitEvent !== false) this.#recordTitleEvent(project, pair, 'title_placeholder');
+    }
+    // A Brain request must be authored in the owner's UI language.  When the
+    // locale has not arrived yet, persist the pending id but wait for the
+    // later backfill pass rather than sending an English/unknown-language
+    // request.
+    if (locale) this.#queueTitleRequest(project, pair.brain, pair.taskId, locale);
   }
 
-  async #generateAndApplyTitle(project: string, taskId: string, sourceText: string): Promise<void> {
+  #titleMetaKey(brain: string): string {
+    return `task_pair_title_request:${brain}`;
+  }
+
+  #readTitleRequest(brain: string): { pending: string[]; lastAttemptAt?: number } {
+    const raw = getTaskPairStore().getMeta(this.#titleMetaKey(brain));
+    if (!raw) return { pending: [] };
     try {
-      const locale = brainUiLocale(project);
-      if (!locale) return;
-      const before = getTaskPairStore().getPair(project, taskId)?.state;
-      if (!before || isTerminalTaskPairStatus(before.status)) return;
-      const titleAtStart = before.title;
-      const generated = await generateTaskPairTitle(sourceText, locale);
-      if (!generated) return;
-      // Re-read: generation is a long-lived await. Never clobber a title a
-      // marker (an explicit title=, a reassignment, a reopen) set meanwhile,
-      // and never resurrect a pair that ended in the meantime.
-      const latest = getTaskPairStore().getPair(project, taskId)?.state;
-      if (!latest || isTerminalTaskPairStatus(latest.status) || latest.title !== titleAtStart) return;
-      const next: TaskPairState = { ...latest, title: generated, updatedAt: Date.now() };
-      getTaskPairStore().savePair(project, next);
-      this.#recordTitleGeneratedEvent(project, next);
-    } catch (error) {
-      logger.warn({ err: error, taskId }, 'task-pair: title generation failed');
+      const parsed = JSON.parse(raw) as { pending?: unknown; lastAttemptAt?: unknown };
+      return {
+        pending: Array.isArray(parsed.pending) ? parsed.pending.map(String).filter(Boolean) : [],
+        ...(Number.isFinite(Number(parsed.lastAttemptAt)) ? { lastAttemptAt: Number(parsed.lastAttemptAt) } : {}),
+      };
+    } catch {
+      return { pending: [] };
     }
   }
 
-  #recordTitleGeneratedEvent(project: string, pair: TaskPairState): void {
+  #writeTitleRequest(brain: string, state: { pending: string[]; lastAttemptAt?: number }): void {
+    getTaskPairStore().setMeta(this.#titleMetaKey(brain), JSON.stringify(state));
+  }
+
+  #clearTitleRequest(brain: string, taskId: string): void {
+    const state = this.#readTitleRequest(brain);
+    if (!state.pending.includes(taskId)) return;
+    state.pending = state.pending.filter((id) => id !== taskId);
+    this.#writeTitleRequest(brain, state);
+  }
+
+  #queueTitleRequest(project: string, brain: string, taskId: string, locale?: string): void {
+    const state = this.#readTitleRequest(brain);
+    if (!state.pending.includes(taskId)) state.pending.push(taskId);
+    this.#writeTitleRequest(brain, state);
+    const key = `${project}\0${brain}`;
+    if (this.#titleRequestFlushes.has(key)) return;
+    // Defer one microtask so several markers in the same assistant turn are
+    // coalesced into one Brain request instead of racing separate sends.
+    const promise = Promise.resolve()
+      .then(() => this.#flushTitleRequest(brain, locale))
+      .finally(() => this.#titleRequestFlushes.delete(key));
+    this.#titleRequestFlushes.set(key, promise);
+    this.#track(promise);
+  }
+
+  async #flushTitleRequest(brain: string, locale?: string): Promise<void> {
+    const record = getSession(brain);
+    if (!record || record.state === 'stopped' || record.state === 'error') return;
+    const state = this.#readTitleRequest(brain);
+    if (state.pending.length === 0) return;
+    const now = Date.now();
+    if (state.lastAttemptAt !== undefined && now - state.lastAttemptAt < TaskPairService.TITLE_REQUEST_RETRY_MS) return;
+    state.lastAttemptAt = now;
+    this.#writeTitleRequest(brain, state);
+    const ids = state.pending.slice(0, 100);
+    await sendTaskPairMessage(
+      brain,
+      'title-request',
+      'title-request',
+      buildUntitledTaskTitleRequest(ids, locale),
+    );
+  }
+
+  /** Brain-only title setter used by pair_task_update and title markers. */
+  setTaskPairTitle(project: string, taskId: string, title: string, writer: string): StoredTaskPair | undefined {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored || stored.state.brain !== writer || !isUsableTaskPairTitle(title, taskId)) return undefined;
+    const next = { ...stored.state, title: title.trim(), updatedAt: Date.now() };
+    store.savePair(project, next);
+    this.#recordTitleEvent(project, next, 'title_generated');
+    this.#clearTitleRequest(next.brain, taskId);
+    return store.getPair(project, taskId);
+  }
+
+  #recordTitleEvent(project: string, pair: TaskPairState, effect: 'title_placeholder' | 'title_generated'): void {
     const at = Date.now();
-    const eventId = `title:${pair.taskId}:${at}`;
+    const eventId = `title:${pair.taskId}:${effect}:${at}`;
     getTaskPairStore().recordEvent({
       id: eventId, project, taskId: pair.taskId, writer: 'daemon', role: 'daemon', verb: TASK_PAIR_TITLE_EVENT_VERB,
-      attrs: { title: pair.title ?? '' }, effect: TASK_PAIR_TITLE_GENERATED_EFFECT, unusual: false,
+      attrs: { title: pair.title ?? '' }, effect, unusual: false,
       source: 'heartbeat', fromStatus: pair.status, toStatus: pair.status, at,
     });
     emitTaskPairDaemonEvent(pair, {
-      eventId, verb: TASK_PAIR_TITLE_EVENT_VERB, effect: TASK_PAIR_TITLE_GENERATED_EFFECT,
+      eventId, verb: TASK_PAIR_TITLE_EVENT_VERB, effect,
       source: 'heartbeat', fromStatus: pair.status, toStatus: pair.status, unusual: false,
     });
   }
 
   #backfilledTitleProjects = new Set<string>();
 
-  /**
-   * Once per project per daemon run *after* the project has a configured UI
-   * locale: every open pair with no title, or with a known non-informative
-   * placeholder title (shared/task-pair.ts), gets a background generation
-   * pass from whatever source text it has (its QUEUE brief, or -- for an
-   * imported placeholder with nothing richer recorded -- its own generic
-   * title, which is still worth showing translated). A pair with neither a
-   * brief nor a title is left alone: there is no text to generate from.
-   *
-   * Not latched until a locale is actually known: the daemon can see a
-   * project's very first timeline event before the browser has sent one
-   * (`uiLocale` arrives on `session.send`, see command-handler.ts), and a
-   * project that latched "done" on that first, locale-less call would never
-   * get a real backfill pass for the rest of the run.
-   */
+  /** Back-fill missing/mechanical titles once per project per daemon run. */
   backfillTitlesOnce(project: string): void {
     if (this.#backfilledTitleProjects.has(project)) return;
+    // Wait for the browser to persist the owner's UI locale; otherwise the
+    // neutral placeholder would be latched forever and could not be localized
+    // when the first session.send arrives.
     if (!brainUiLocale(project)) return;
     this.#backfilledTitleProjects.add(project);
     for (const stored of getTaskPairStore().listActivePairs(project)) {
       const pair = stored.state;
-      const isGenericTitle = pair.title !== undefined
-        && (TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS as readonly string[]).includes(pair.title);
-      if (pair.title !== undefined && !isGenericTitle) continue;
-      const sourceText = pair.brief ?? (isGenericTitle ? pair.title : undefined);
-      this.maybeGenerateTitle(project, pair.taskId, sourceText);
+      if (isUsableTaskPairTitle(pair.title, pair.taskId, pair.brief, true)) continue;
+      this.ensureTaskPairTitle(project, pair.taskId, pair.brief ?? pair.title, pair.brain, { mechanicalTitle: true });
     }
   }
 

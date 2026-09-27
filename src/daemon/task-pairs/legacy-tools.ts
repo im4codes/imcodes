@@ -17,6 +17,7 @@ import {
   TASK_PAIR_CONTRACT_ID,
   TASK_PAIR_INFER_TASK_ID,
   TASK_PAIR_MARKER_TAG,
+  TASK_PAIR_TITLE_RULE,
   parseTaskPairBindingId,
   taskPairRoleOf,
   type TaskPairRole,
@@ -57,13 +58,13 @@ function hint(taskId?: string, role?: TaskPairRole): string {
   const example = role === 'auditor'
     ? `<!-- ${TASK_PAIR_MARKER_TAG} PASS ${id} blocking=P0 --> or <!-- ${TASK_PAIR_MARKER_TAG} REWORK ${id} blocking=P0 p0=<n> -->`
     : role === 'brain'
-      ? `<!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${id} executor=<session> -->`
+      ? `<!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${id} title="..." executor=<session> -->`
       : `<!-- ${TASK_PAIR_MARKER_TAG} READY_FOR_AUDIT ${id} worktree=<absolute path> head=<commit> base=<commit> -->`;
-  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). Instead of this tool, write a marker line such as ${example} in your reply. ${NO_LEGACY_ARTIFACTS}`;
+  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). ${TASK_PAIR_TITLE_RULE} Instead of this tool, write a marker line such as ${example} in your reply. ${NO_LEGACY_ARTIFACTS}`;
 }
 
 function coordinatorStartHint(taskId: string): string {
-  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). Send the brief to the executor with send_message and task: { taskId: "${taskId}" }; that opens the pair and the daemon assigns an auditor unless you name one. Or write <!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${taskId} executor=<session> auditor=<session> --> in your reply.`;
+  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). ${TASK_PAIR_TITLE_RULE} Send the brief to the executor with send_message and task: { taskId: "${taskId}" }; that opens the pair and the daemon assigns an auditor unless you name one. Or write <!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${taskId} title="..." executor=<session> auditor=<session> --> in your reply.`;
 }
 
 function str(record: Record<string, unknown>, key: string): string | undefined {

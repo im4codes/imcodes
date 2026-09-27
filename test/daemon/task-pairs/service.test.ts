@@ -391,9 +391,9 @@ describe('task-pair marker ingestion', () => {
       target: EXEC, message: 'Please fix login.', task: { taskId: 'T11', objective: 'fix login' },
     } as never, { listSessions, dispatchMessage });
     expect(created, JSON.stringify(created)).toMatchObject({
-      status: 'accepted', taskId: 'T11', taskTitle: 'fix login', taskObjective: 'fix login',
+      status: 'accepted', taskId: 'T11', taskTitle: '(untitled task)',
     });
-    expect(pair('T11')).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: 'fix login' });
+    expect(pair('T11')).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: '(untitled task)' });
 
     // The executor sends its materials to the auditor with task and audit metadata.
     await say(BRAIN, `<!-- IMCODES_TASK REASSIGN T11 auditor=${AUD} -->`);
@@ -420,11 +420,11 @@ describe('task-pair marker ingestion', () => {
     const created = await dispatchSendMessage(brainCaller, input as never, { listSessions, dispatchMessage });
     if (created.status !== 'accepted' || !created.taskId) throw new Error(JSON.stringify(created));
     expect(created.taskId).toMatch(/^tsk_[0-9a-f]{10}$/);
-    expect(created).toMatchObject({ taskTitle: 'Add one README sentence', taskObjective: 'Add one README sentence' });
+    expect(created).toMatchObject({ taskTitle: '(untitled task)' });
     // The executor slot's pair binding id is the receipt's assignmentId.
     expect(created.assignmentId).toBe(taskPairBindingId(created.taskId, 'executor'));
     expect(created.deliveries).toEqual([expect.objectContaining({
-      target: EXEC, taskId: created.taskId, assignmentId: created.assignmentId, taskTitle: 'Add one README sentence',
+      target: EXEC, taskId: created.taskId, assignmentId: created.assignmentId, taskTitle: '(untitled task)',
     })]);
     // So the Brain turn's delegation claim is substantiated, live and after reload.
     const fact = readDelegationDispatchFact(DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', input, created);
@@ -432,7 +432,7 @@ describe('task-pair marker ingestion', () => {
     const claim = projectDelegationClaim([fact!]);
     expect(claim).toMatchObject({ status: 'substantiated', dispatches: [{ taskId: created.taskId, assignmentId: created.assignmentId }] });
     expect(readDelegationClaim({ [DELEGATION_CLAIM_METADATA_FIELD]: JSON.parse(JSON.stringify(claim)) })?.status).toBe('substantiated');
-    expect(pair(created.taskId)).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: 'Add one README sentence' });
+    expect(pair(created.taskId)).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: '(untitled task)' });
     // The send's own objective is stored as the pair's brief -- not left
     // empty -- so pair_task_get and a later REASSIGN/re-dispatch still have
     // the actual brief, not just the title (tsk_cd_pair_implicit_duplicates).

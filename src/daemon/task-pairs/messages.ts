@@ -12,6 +12,7 @@ import {
   TASK_PAIR_MARKER_TAG,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
+  TASK_PAIR_TITLE_RULE,
   TASK_PAIR_WORKS_DIR,
   TASK_PAIR_WORKSPACE_RULES,
   formatTaskPairSeverityCounts,
@@ -38,6 +39,19 @@ function marker(verb: string, taskId: string, attrs = ''): string {
 
 function contracts(blocking: readonly AuditSeverity[]): string {
   return `[Contracts: ${TASK_PAIR_CONTRACT_ID}, ${AUDIT_CONVERGENCE_CONTRACT_ID} blocking=${blocking.join(',')}]`;
+}
+
+export function buildUntitledTaskTitleRequest(
+  taskIds: readonly string[],
+  locale?: string,
+): string {
+  const language = locale ? ` in the owner's UI language (${locale})` : ' in the owner\'s UI language';
+  return [
+    `[IM.codes task titles] Please assign short, specific titles${language} for: ${taskIds.join(', ')}.`,
+    'Reply with one marker per task, for example <!-- IMCODES_TASK DISPATCH tsk_demo title="Fix login retry" -->; title= updates the existing pair without changing its brief.',
+    TASK_PAIR_TITLE_RULE,
+    'This is one batched reminder; do not retry immediately. Use pair_task_update with {taskId, title} if preferred.',
+  ].join('\n');
 }
 
 /** Plain-English statement of the pair's effective blocking set, for briefs and assignment messages. */
@@ -190,6 +204,7 @@ export function buildQueueStallNoticeMessage(pairs: readonly Pick<TaskPairState,
 export function buildNoBriefDigestMessage(taskIds: readonly string[]): string {
   return [
     `[IM.codes task pairs] ${taskIds.length} pairs are queued without a brief: ${taskIds.join(', ')}.`,
+    TASK_PAIR_TITLE_RULE,
     `Give one a brief with ${marker('QUEUE', '<taskId>', 'title="..."')}, then its brief, then ${buildBriefEndHint('<taskId>')}; or dispatch it yourself with ${marker('DISPATCH', '<taskId>', 'executor=<session> auditor=<session>')}. No further reminders until each pair's state changes.`,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
@@ -210,6 +225,7 @@ export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<Task
   });
   return [
     `[IM.codes task pairs] project ${project} has no execution pool: ask the user which executor/auditor models to use (Settings → execution pool, or name executormodel=/auditormodel= on the task). ${pairs.length} pair(s) are waiting:`,
+    TASK_PAIR_TITLE_RULE,
     ...lines,
     'Each starts automatically once a pool is configured or the missing model is named on it -- no further reminders until then.',
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
@@ -218,7 +234,7 @@ export function buildNoPoolAskMessage(project: string, pairs: readonly Pick<Task
 
 /** One queued pair with no brief: how Brain can give it one. */
 export function buildNoBriefLine(taskId: string): string {
-  return `queued without a brief: give it one with ${marker('QUEUE', taskId, 'title="..."')}, then its brief, then ${buildBriefEndHint(taskId)}; or dispatch it yourself with ${marker('DISPATCH', taskId, 'executor=<session> auditor=<session>')}.`;
+  return `${TASK_PAIR_TITLE_RULE} queued without a brief: give it one with ${marker('QUEUE', taskId, 'title="..."')}, then its brief, then ${buildBriefEndHint(taskId)}; or dispatch it yourself with ${marker('DISPATCH', taskId, 'title="..." executor=<session> auditor=<session>')}.`;
 }
 
 /**
@@ -229,7 +245,8 @@ export function buildNoBriefLine(taskId: string): string {
 export function buildLegacyPlaceholderDigestMessage(taskIds: readonly string[]): string {
   return [
     `[IM.codes task pairs] ${taskIds.length} legacy task(s) were not imported as pairs: their only objective is the old wrapper's placeholder, so there is no real brief to recover: ${taskIds.join(', ')}.`,
-    `Give one a real brief and dispatch it yourself, e.g. ${marker('QUEUE', '<taskId>', 'title="..."')}, then its brief, then ${buildBriefEndHint('<taskId>')}; or ${marker('DISPATCH', '<taskId>', 'executor=<session> auditor=<session>')} if you already know who should do it.`,
+    TASK_PAIR_TITLE_RULE,
+    `Give one a real brief and dispatch it yourself, e.g. ${marker('QUEUE', '<taskId>', 'title="..."')}, then its brief, then ${buildBriefEndHint('<taskId>')}; or ${marker('DISPATCH', '<taskId>', 'title="..." executor=<session> auditor=<session>')} if you already know who should do it.`,
   ].join('\n');
 }
 
@@ -303,6 +320,7 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
     ?? `Material: the executor did not name a workspace and none could be resolved; ask ${pair.executor} for its worktree path and head, or its task-directory path.`;
   return [
     header(pair),
+    TASK_PAIR_TITLE_RULE,
     `Audit request, round ${Math.max(1, pair.round)}, from executor ${pair.executor} (blocking=${pair.blocking.join(',')}).`,
     `${where}${material.source === 'workspace' ? ' (resolved by the daemon from the executor session)' : ''}`,
     `Their validation (full suites for code) comes from them via send_message. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
@@ -325,6 +343,7 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
   const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? `auditor ${pair.auditor}` : pair.auditor === TASK_PAIR_NO_AUDITOR ? 'no auditor' : 'an auditor the daemon is assigning';
   return [
     header(pair),
+    TASK_PAIR_TITLE_RULE,
     ...(pair.brief ? [pair.brief] : []),
     `You are the executor of this task pair, with ${auditor}. Write ${marker('STARTED', pair.taskId)} when you begin.`,
     blockingSummaryLine(pair),
@@ -400,6 +419,7 @@ export function buildExecutorHandoffMessage(pair: TaskPairState, previousExecuto
   return [
     header(pair),
     `You are now the executor of this task${previousExecutor ? `, taking over from ${previousExecutor}` : ''} (${reason}). Round ${Math.max(1, pair.round)}, status ${pair.status}${auditor}.`,
+    TASK_PAIR_TITLE_RULE,
     workplaceLine(pair),
     next,
     TASK_PAIR_WORKSPACE_RULES,
@@ -411,6 +431,7 @@ export function buildExecutorHandoffMessage(pair: TaskPairState, previousExecuto
 export function buildDispatchTrailer(pair: TaskPairState): string {
   return [
     '',
+    TASK_PAIR_TITLE_RULE,
     `[IM.codes task ${pair.taskId} · auditor: ${pair.auditor ?? 'none'}] Write ${marker('STARTED', pair.taskId)} when you begin and finish with ${readyMarker(pair)}; follow ${TASK_PAIR_CONTRACT_ID} and ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}). ${workplaceLine(pair)} ${TASK_PAIR_WORKSPACE_RULES} ${NO_LEGACY_ARTIFACTS}`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
@@ -420,6 +441,7 @@ export function buildDispatchTrailer(pair: TaskPairState): string {
 export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
   return [
     header(pair),
+    TASK_PAIR_TITLE_RULE,
     `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
     blockingSummaryLine(pair),
     NO_LEGACY_ARTIFACTS,

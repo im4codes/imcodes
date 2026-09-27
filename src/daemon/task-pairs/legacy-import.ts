@@ -30,7 +30,7 @@ import {
   buildLegacyPlaceholderDigestMessage,
   formatTaskPairMarker,
 } from './messages.js';
-import { emitTaskPairDaemonEvent } from './service.js';
+import { emitTaskPairDaemonEvent, taskPairService } from './service.js';
 
 const TERMINAL_LEGACY: readonly SupervisionTaskLifecycleStatus[] = ['pushed', 'finalized', 'cancelled'];
 /**
@@ -321,6 +321,13 @@ export function importLegacyTasks(
         legacyTaskId: task.taskId,
         liveness: { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: 0, progressAuditorAt: 0, lastTickAt: now, notified: [] },
       });
+      taskPairService.ensureTaskPairTitle(
+        task.projectName,
+        task.taskId,
+        task.objective,
+        pair.brain,
+        { mechanicalTitle: true },
+      );
       store.recordEvent({
         id: `${LEGACY_IMPORT_EVENT_PREFIX}${task.taskId}`, project: task.projectName, taskId: task.taskId, writer: 'daemon', role: 'daemon',
         verb: 'IMPORT', attrs: { legacyStatus: task.status }, effect: 'imported', unusual: false, source: 'legacy_import',

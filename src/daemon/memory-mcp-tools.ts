@@ -1,5 +1,5 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
-import { emitTaskPairDaemonEvent } from './task-pairs/service.js';
+import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
 import { projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { randomUUID } from 'node:crypto';
@@ -1523,7 +1523,7 @@ function pairChecklistTarget(caller: McpRuntimeCaller, sessions: readonly Sessio
 function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
-  return { taskId: pair.state.taskId, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, ...taskPairChecklistCounts(markdown) };
+  return { taskId: pair.state.taskId, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, ...taskPairChecklistCounts(markdown) };
 }
 
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
@@ -1840,10 +1840,16 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
       const markdown = typeof args.markdown === 'string' ? args.markdown : undefined;
-      if (markdown === undefined) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown is required');
+      const title = typeof args.title === 'string' ? args.title.trim() : undefined;
+      if (markdown === undefined && !title) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown or title is required');
       const pair = pairChecklistTarget(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
       if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
-      return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;
+      if (title) {
+        const savedTitle = taskPairService.setTaskPairTitle(pair.project, pair.state.taskId, title, caller.sessionName ?? 'unknown');
+        if (!savedTitle) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may set a valid task title');
+      }
+      const saved = markdown === undefined ? getTaskPairStore().getPair(pair.project, pair.state.taskId) : savePairBrief(pair, markdown, caller.sessionName ?? 'unknown');
+      return pairChecklistView(saved)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
@@ -3742,7 +3748,7 @@ function toolResult(result: ToolResult, name?: MemoryMcpToolName): CallToolResul
 
 const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: z.object({ taskId: z.string().optional().describe('Pair task id.') }),
-  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().describe('Complete Markdown brief.') }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().optional().describe('Complete Markdown brief.'), title: z.string().min(1).optional().describe('Short specific title in the owner UI language; Brain only.') }).refine((value) => value.markdown !== undefined || value.title !== undefined, { message: 'markdown or title is required' }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: z.object({ taskId: z.string().optional().describe('Pair task id.'), items: z.array(z.number().int().positive()).describe('1-based checklist item numbers.'), box: z.enum(['implemented', 'audited']).describe('Box to update.'), checked: z.boolean().describe('New state.') }),
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
     query: z.string().describe('Text query; hits include sourceLookup for expansion.'),

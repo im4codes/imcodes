@@ -873,8 +873,8 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
-    description: 'Replace pair brief.',
-    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), markdown: { type: 'string', description: 'Complete Markdown brief.' } }, ['markdown']),
+    description: 'Replace pair brief or set a Brain-only title.',
+    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), markdown: { type: 'string', description: 'Complete Markdown brief.' }, title: { type: 'string', minLength: 1, description: 'Owner-locale title.' } }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: {

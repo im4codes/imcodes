@@ -135,7 +135,7 @@ describe('Brain work dispatch opens driven pairs', () => {
     await flush();
     expect(pairs()).toEqual([expect.objectContaining({
       taskId: result.taskId, brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working',
-      title: 'Transcribe the three m4a files and summarize decisions.',
+      title: '(untitled task)',
     })]);
     expect(result.assignmentId).toBe(`pair:${result.taskId}:executor`);
     expect(dispatchMessage).toHaveBeenCalledTimes(1);
@@ -218,7 +218,7 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(newWork.taskId).not.toBe('T-mentioned');
     await flush();
     expect(pairs().map((entry) => entry.taskId).sort()).toEqual(['T-mentioned', newWork.taskId].sort());
-    expect(pairs().find((entry) => entry.taskId === newWork.taskId)).toMatchObject({ executor: EXEC2, title: 'Fix Y' });
+    expect(pairs().find((entry) => entry.taskId === newWork.taskId)).toMatchObject({ executor: EXEC2, title: '(untitled task)' });
   });
 
   it('a handover message to the reassigned executor of an existing pair binds to it, never opening a second pair', async () => {

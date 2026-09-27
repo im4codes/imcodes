@@ -316,7 +316,7 @@ describe('one-time legacy import', () => {
     expect(importLegacyTasks(registry, 5_000)).toBe(2);
     expect(importLegacyTasks(registry, 6_000)).toBe(0);
     expect(getTaskPairStore().getPair(PROJECT, 'tsk_stuck')?.state).toMatchObject({
-      status: 'in_audit', executor: EXEC, auditor: AUD, brain: BRAIN, title: 'objective of tsk_stuck',
+      status: 'in_audit', executor: EXEC, auditor: AUD, brain: BRAIN, title: '(untitled task)',
     });
     expect(getTaskPairStore().getPair(PROJECT, 'tsk_noaud')?.state).toMatchObject({
       status: 'working', executor: EXEC, flags: ['needs_auditor'], brain: 'deck_legacyproj_brain',
