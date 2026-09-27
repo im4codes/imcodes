@@ -23,6 +23,7 @@
  */
 
 import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
+import { recordPerfRender } from '../perf-render-debug.js';
 import { useTranslation } from 'react-i18next';
 import {
   P2P_EDGE_CONDITION_KINDS,
@@ -323,6 +324,7 @@ const inspectorCardStyle = {
 } as const;
 
 export function AdvancedWorkflowCanvasEditor({ value, onChange, readOnly }: AdvancedWorkflowCanvasEditorProps) {
+  recordPerfRender('AdvancedWorkflowCanvasEditor');
   const { t } = useTranslation();
   const diagnostics = useMemo(() => validateP2pWorkflowDraft(value).diagnostics, [value]);
   // Audit fix (e940d73f-a8e / N3) — detect legacy nodes that violate the

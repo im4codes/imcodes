@@ -31,6 +31,7 @@ import {
   REMOTE_DESKTOP_OVERLAY_CLASS,
 } from '../remote-desktop-pointer-overlay.js';
 import { downloadAttachment } from '../api.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 import {
   canRevealSavedDownload,
   revealSavedDownload,
@@ -435,6 +436,7 @@ export function RemoteDesktopPanel({
   onFocus,
   quickData,
 }: RemoteDesktopPanelProps) {
+  recordPerfRender('RemoteDesktopPanel');
   const { t } = useTranslation();
   const [snapshot, setSnapshot] = useState<RemoteDesktopSnapshot>(INITIAL_SNAPSHOT);
   // Computed once, lazily, rather than on every render: what this machine's
