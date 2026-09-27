@@ -31,6 +31,10 @@ import {
   shutdownDirectFileTransfers,
 } from '../../src/daemon/direct-file-transfer.js';
 import {
+  __callDirectFileTransferHostForTests as callHostForTests,
+  __setDirectFileTransferWorkerHostForTests as setWorkerHost,
+} from '../../src/daemon/direct-file-transfer-worker.js';
+import {
   releaseClientUploadClaim,
   tryClaimClientUpload,
 } from '../../src/daemon/file-transfer-handler.js';
@@ -160,9 +164,27 @@ function sender() {
 }
 
 beforeEach(() => { spawned = []; resetProxy(); installFakeWorkers(); });
-afterEach(() => { vi.useRealTimers(); setWorkerFactory(null); resetProxy(); });
+afterEach(() => { vi.useRealTimers(); setWorkerFactory(null); setWorkerHost(null); resetProxy(); });
 
 describe('direct file transfer worker boundary', () => {
+  it('bounds a stalled host metadata RPC so startup stalls become retryable', async () => {
+    vi.useFakeTimers();
+    setWorkerHost(async () => new Promise<never>(() => undefined));
+
+    const pending = callHostForTests(DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE, [{
+      clientUploadId: 'upload-timeout-proof',
+      filename: 'source.bin',
+      originalName: 'source.bin',
+      resolved: '/tmp/source.bin',
+      size: 1,
+    }]);
+    const settled = expect(pending).rejects.toMatchObject({
+      code: DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT,
+    });
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.HOST_CALL_TIMEOUT_MS);
+    await settled;
+  });
+
   it('R-3: routes one control envelope to exactly its own sender', async () => {
     const a = sender();
     const b = sender();

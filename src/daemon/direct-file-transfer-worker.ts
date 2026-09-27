@@ -99,10 +99,25 @@ function post(envelope: Record<string, unknown>): void {
 interface PendingHostCall {
   resolve: (value: unknown) => void;
   reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout> | null;
 }
 
 const pendingHostCalls = new Map<string, PendingHostCall>();
 let hostCallSeq = 0;
+
+class DirectFileTransferHostCallTimeout extends Error {
+  readonly code = DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT;
+
+  constructor() {
+    super(DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT);
+    this.name = 'DirectFileTransferHostCallTimeout';
+  }
+}
+
+function isHostCallTimeout(error: unknown): boolean {
+  return error instanceof DirectFileTransferHostCallTimeout
+    || (error as { code?: unknown } | null)?.code === DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT;
+}
 
 /**
  * In-process host, for tests that exercise the state machine directly.
@@ -121,22 +136,51 @@ export function __setDirectFileTransferWorkerHostForTests(
 }
 
 function callHost(method: string, args: unknown[]): Promise<unknown> {
-  if (inProcessHost) return inProcessHost(method, args);
+  if (inProcessHost) {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new DirectFileTransferHostCallTimeout()), DIRECT_FILE_TRANSFER_LIMITS.HOST_CALL_TIMEOUT_MS);
+      timer.unref?.();
+    });
+    return Promise.race([inProcessHost(method, args), timeout]).finally(() => {
+      if (timer) clearTimeout(timer);
+    });
+  }
   if (!childProcessPost && !inProcessPost) {
     return Promise.reject(new Error('direct_file_transfer_host_unavailable'));
   }
   hostCallSeq += 1;
   const callId = `dft-host-${activeWorkerGeneration}-${hostCallSeq}`;
   return new Promise<unknown>((resolve, reject) => {
-    pendingHostCalls.set(callId, { resolve, reject });
-    post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL, callId, method, args });
+    const timer = setTimeout(() => {
+      const pending = pendingHostCalls.get(callId);
+      if (!pending) return;
+      pendingHostCalls.delete(callId);
+      pending.reject(new DirectFileTransferHostCallTimeout());
+    }, DIRECT_FILE_TRANSFER_LIMITS.HOST_CALL_TIMEOUT_MS);
+    timer.unref?.();
+    pendingHostCalls.set(callId, { resolve, reject, timer });
+    try {
+      post({ type: DIRECT_FILE_TRANSFER_WORKER_MSG.HOST_CALL, callId, method, args });
+    } catch (error) {
+      clearTimeout(timer);
+      pendingHostCalls.delete(callId);
+      reject(error instanceof Error ? error : new Error(String(error)));
+    }
   });
+}
+
+/** Test-only seam for proving that a stalled host RPC is bounded. */
+export function __callDirectFileTransferHostForTests(method: string, args: unknown[]): Promise<unknown> {
+  if (process.env.NODE_ENV !== 'test') throw new Error('test-only direct file transfer host seam');
+  return callHost(method, args);
 }
 
 function settleHostCall(callId: string, ok: boolean, value: unknown, error?: string): void {
   const pending = pendingHostCalls.get(callId);
   if (!pending) return;
   pendingHostCalls.delete(callId);
+  if (pending.timer) clearTimeout(pending.timer);
   if (ok) pending.resolve(value);
   else pending.reject(new Error(error ?? 'direct_file_transfer_host_call_failed'));
 }
@@ -151,6 +195,7 @@ function settleHostCall(callId: string, ok: boolean, value: unknown, error?: str
 function rejectAllHostCalls(reason: string): void {
   for (const [callId, pending] of [...pendingHostCalls]) {
     pendingHostCalls.delete(callId);
+    if (pending.timer) clearTimeout(pending.timer);
     pending.reject(new Error(reason));
   }
 }
@@ -1163,6 +1208,7 @@ const RETRYABLE_TRANSPORT_LOSS: ReadonlySet<string> = new Set([
   DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED,
   DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED,
   DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
+  DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT,
 ]);
 
 function isRetryableTransportLoss(error: DirectFileTransferError, retryable: boolean): boolean {
@@ -1848,7 +1894,12 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
         void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
       } else if (transfer.authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
         void startUpload(transfer, parsed.value.resumeOffset ?? 0)
-          .catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error)));
+          .catch((error) => void failTransfer(
+            transfer,
+            isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
+            true,
+            errorDetail(error),
+          ));
       } else {
         void startDownload(transfer, parsed.value.resumeOffset ?? 0)
           .catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, false, errorDetail(error)));
@@ -1867,7 +1918,12 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
     }
     if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH) {
       void finishUpload(transfer, parsed.value.totalBytes, parsed.value.sha256).catch((error) => {
-        void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error));
+        void failTransfer(
+          transfer,
+          isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
+          true,
+          errorDetail(error),
+        );
       });
       return;
     }
@@ -2297,7 +2353,19 @@ export async function handleDirectFileTransferCommand(message: unknown, sender: 
     return true;
   }
   if (command.type === DIRECT_FILE_TRANSFER_MSG.PREPARE) {
-    await prepareOperation(command, sender);
+    try {
+      await prepareOperation(command, sender);
+    } catch (error) {
+      // Host metadata/claim RPCs are independent of the WebRTC worker. A
+      // daemon startup stall must become an explicit retryable response, not
+      // an unhandled command rejection that leaves the browser waiting until
+      // its full connect deadline and then showing a red upload.
+      if (isHostCallTimeout(error)) {
+        refuseOperation(command, sender, DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT, true);
+      } else {
+        throw error;
+      }
+    }
     return true;
   }
   if (command.type === DIRECT_FILE_TRANSFER_MSG.STATUS_QUERY) {

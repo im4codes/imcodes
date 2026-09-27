@@ -301,6 +301,22 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('answers a PREPARE with a retryable host timeout instead of hanging during daemon startup', async () => {
+    vi.useFakeTimers();
+    lookupAttachmentByClientUploadId.mockImplementationOnce(() => new Promise<never>(() => undefined));
+    const { direct, sent, sender } = await readyLease();
+    const authority = uploadPrepare();
+    const pending = direct.handleDirectFileTransferCommand(authority, sender);
+    await vi.advanceTimersByTimeAsync(DIRECT_FILE_TRANSFER_LIMITS.HOST_CALL_TIMEOUT_MS);
+    await pending;
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      error: DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT,
+      retryable: true,
+    }));
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('reports a closed lease across the child boundary so the proxy stops tracking it', async () => {
     // The proxy remembers every established lease so it can tell the browser
     // when a generation dies holding one. Only this side knows when a lease

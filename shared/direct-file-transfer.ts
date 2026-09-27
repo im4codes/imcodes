@@ -120,6 +120,8 @@ export const DIRECT_FILE_TRANSFER_ERROR = {
   WRITE_FAILED: 'write_failed',
   CANCELED: 'canceled',
   INTERNAL_ERROR: 'internal_error',
+  /** The daemon host was busy/unavailable while committing transfer metadata. */
+  HOST_CALL_TIMEOUT: 'host_call_timeout',
 } as const;
 
 export type DirectFileTransferError = typeof DIRECT_FILE_TRANSFER_ERROR[keyof typeof DIRECT_FILE_TRANSFER_ERROR];
@@ -142,6 +144,7 @@ const DIRECT_FILE_TRANSFER_RETRYABLE_TRANSPORT_ERRORS = new Set<DirectFileTransf
   DIRECT_FILE_TRANSFER_ERROR.ICE_RESTART_FAILED,
   DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED,
   DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT,
+  DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT,
   DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR,
 ]);
 
@@ -239,6 +242,8 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   LEASE_RENEW_LEAD_MS: 2 * 60 * 1000,
   RESUME_TICKET_TTL_MS: 10 * 60 * 1000,
   STATUS_RECOVERY_DEADLINE_MS: 15 * 1000,
+  /** Bound worker→daemon metadata RPCs so startup stalls become retryable. */
+  HOST_CALL_TIMEOUT_MS: 15 * 1000,
   /**
    * A receiver may still be draining its durable write queue after the browser
    * has handed the last chunk to SCTP.  Poll the authoritative operation
