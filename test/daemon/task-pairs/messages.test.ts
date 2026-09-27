@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { scanTaskPairMarkers, type TaskPairState } from '../../../shared/task-pair.js';
-import { buildBriefEndHint, buildNoBriefLine, buildNudgeMessage } from '../../../src/daemon/task-pairs/messages.js';
+import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildNoBriefLine, buildNudgeMessage } from '../../../src/daemon/task-pairs/messages.js';
 
 function basePair(overrides: Partial<TaskPairState> = {}): TaskPairState {
   return {
@@ -20,6 +20,11 @@ function basePair(overrides: Partial<TaskPairState> = {}): TaskPairState {
  * its own line, it must actually parse, or the pair hangs.
  */
 describe('daemon-authored marker examples parse when copied verbatim onto their own line', () => {
+  it('includes the auditor proposal rule in assignment and audit-request briefs', () => {
+    const pair = basePair({ material: { path: '/workspace', at: 1 } });
+    expect(buildAuditorAssignmentMessage(pair)).toMatch(/concrete solution/);
+    expect(buildAuditRequestMessage(pair, { path: '/workspace', source: 'executor' })).toMatch(/concrete solution/);
+  });
   it('a QUEUE marker extracted from buildNoBriefLine parses to the right verb and taskId', () => {
     const text = buildNoBriefLine('tsk_x');
     const markerLine = text.match(/<!-- IMCODES_TASK\s.*?-->/)?.[0];

@@ -130,11 +130,13 @@ export const TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE: string =
  * daemon's own Brain-notification code can be reviewed against the same text.
  */
 export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
-  'Report to Brain only at the end: DONE (or a PASS ready to integrate), a '
-  + 'BLOCKED/NEEDS_INPUT the pair cannot resolve itself, or a reassignment. '
-  + 'Executor and auditor settle REWORK rounds, non-blocking findings, '
-  + 'progress and answerable questions between themselves -- no Brain '
-  + 'messages for those.';
+  'Routine progress, REWORK rounds and non-blocking findings stay inside the '
+  + 'pair. Escalate to Brain immediately (send_message or BLOCKED/NEEDS_INPUT) '
+  + 'when the pair cannot decide scope/acceptance, conflicting approaches, '
+  + 'ownership overlap, an unreachable target, an environment/infra problem, '
+  + 'or the same blocking finding repeats for 2 rounds; include the options '
+  + 'and a recommendation. At the end report DONE (or a PASS ready to '
+  + 'integrate), or a BLOCKED/NEEDS_INPUT the pair cannot resolve.';
 
 /**
  * Stated in the pairs contract and the executor/auditor briefs (owner
@@ -150,7 +152,18 @@ export const TASK_PAIR_ASK_DONT_JUST_REPLY_RULE: string =
   + 'the Brain session, or a BLOCKED/NEEDS_INPUT marker with note="...", '
   + 'which the daemon relays to Brain), then continue other work or wait -- '
   + 'never leave the question only in your own reply. Questions for your '
-  + 'partner (executor/auditor) go to them by message the same way.';
+  + 'partner (executor/auditor) go to them by message the same way. If the '
+  + 'pair still cannot decide, escalate to Brain with options and a '
+  + 'recommendation instead of looping.';
+
+/** Shared auditor direction used in contracts and every generated brief. */
+export const TASK_PAIR_AUDITOR_PROPOSAL_RULE: string =
+  'For every blocking finding, propose a concrete solution: approach, likely '
+  + 'files/functions, trade-offs, and (optionally) a causal test; give an '
+  + 'appropriate proposal for non-blocking findings too. The auditor '
+  + 'co-owns convergence, without writing the executor\'s code. If a decision '
+  + 'is not yours to make, escalate it to Brain with options and a '
+  + 'recommendation rather than repeating REWORK.';
 
 /**
  * Stated in the pairs contract and the executor brief. Owner report: two
@@ -492,6 +505,12 @@ export interface TaskPairState {
   /** The workspace the daemon created for the pair (see task-pairs/workspace.ts). */
   workspace?: TaskPairWorkspace;
   workspaceRecoveryEscalatedAt?: number;
+  /** Enforcement bookkeeping for auditor proposals and repeated REWORK. */
+  auditorProposalNudgeRound?: number;
+  reworkBlockingSetKey?: string;
+  reworkBlockingSetRepeatCount?: number;
+  reworkRepeatEscalatedRound?: number;
+  reworkFindingSummary?: string;
   /** Workspace Brain asked for on DISPATCH/QUEUE (`workspace=dir`); otherwise chosen by the project. */
   workspaceKind?: TaskPairWorkspaceKind;
   /** Queue priority requested by the Brain; urgent queued work runs before normal FIFO work. */
@@ -578,6 +597,8 @@ export type TaskPairIntent =
   | { kind: 'correction'; to: string; judgement: TaskPairVerdictJudgement }
   | { kind: 'done_reminder'; to: string }
   | { kind: 'rework_notice'; to: string; counts: TaskPairSeverityCounts }
+  | { kind: 'auditor_proposal_nudge'; to: string }
+  | { kind: 'rework_repeat_escalation'; to: string; counts: TaskPairSeverityCounts; summary?: string }
   /** An audit round opened: tell the auditor where the material is. */
   | { kind: 'audit_request'; to: string }
   | { kind: 'replace_auditor'; reason: 'executor_blocked' }
@@ -611,6 +632,8 @@ export interface TaskPairApplyContext {
   projectBlocking?: readonly AuditSeverity[];
   now: number;
   source: TaskPairEventSource;
+  /** Full assistant turn, used only for lightweight auditor-proposal enforcement. */
+  turnText?: string;
 }
 
 export function isTerminalTaskPairStatus(status: TaskPairStatus): boolean {
@@ -1081,7 +1104,7 @@ export function applyTaskPairMarker(
         pair.lastVerdict = { verb, counts: verdict.counts, judgement: verdict.judgement, round: pair.round };
         return done('recorded', { verdict });
       }
-      applyVerdict(pair, verb, verdict, ctx.writer, intents);
+      applyVerdict(pair, verb, verdict, ctx.writer, intents, ctx);
       if (role === 'brain') resetCapFlagsOnBrainAction(pair);
       return done(isAppliedVerdict(verdict.judgement) ? 'verdict' : 'verdict_held', { verdict });
     }
@@ -1183,6 +1206,7 @@ function applyVerdict(
   verdict: TaskPairVerdictJudgementResult,
   writer: string,
   intents: TaskPairIntent[],
+  ctx?: TaskPairApplyContext,
 ): void {
   pair.lastVerdict = { verb, counts: verdict.counts, judgement: verdict.judgement, round: pair.round };
   if (!isAppliedVerdict(verdict.judgement)) {
@@ -1195,11 +1219,41 @@ function applyVerdict(
   if (verb === 'PASS') {
     pair.status = 'passed';
     pair.passRound = pair.round;
+    pair.reworkBlockingSetKey = undefined;
+    pair.reworkBlockingSetRepeatCount = undefined;
+    pair.reworkRepeatEscalatedRound = undefined;
+    pair.reworkFindingSummary = undefined;
   } else {
     const wasRework = pair.status === 'rework';
     pair.status = 'rework';
     if (!wasRework && pair.executor) intents.push({ kind: 'rework_notice', to: pair.executor, counts: verdict.counts });
+    const key = pair.blocking.map((level) => `${level}:${verdict.counts[level] ?? 0}`).join(',');
+    const repeatCount = pair.reworkBlockingSetKey === key ? (pair.reworkBlockingSetRepeatCount ?? 0) + 1 : 1;
+    pair.reworkBlockingSetKey = key;
+    pair.reworkBlockingSetRepeatCount = repeatCount;
+    pair.reworkFindingSummary = ctx?.turnText
+      ? stripTaskPairMarkersForDisplay(ctx.turnText).trim().slice(0, 800) || undefined
+      : undefined;
+    if (ctx?.writer === pair.auditor && ctx.turnText && !hasAuditorProposal(ctx.turnText) && pair.auditor
+      && pair.auditor !== TASK_PAIR_NO_AUDITOR
+      && pair.auditorProposalNudgeRound !== pair.round) {
+      pair.auditorProposalNudgeRound = pair.round;
+      intents.push({ kind: 'auditor_proposal_nudge', to: pair.auditor });
+    }
+    if (repeatCount === 2 && pair.reworkRepeatEscalatedRound !== pair.round) {
+      pair.reworkRepeatEscalatedRound = pair.round;
+      intents.push({
+        kind: 'rework_repeat_escalation', to: pair.brain, counts: verdict.counts,
+        ...(pair.reworkFindingSummary ? { summary: pair.reworkFindingSummary } : {}),
+      });
+    }
   }
+}
+
+/** Deliberately lightweight: require an explicit solution/recommendation cue. */
+export function hasAuditorProposal(text: string | undefined): boolean {
+  if (!text) return false;
+  return /\b(?:proposed?\s+(?:solution|fix|approach)|recommend(?:ation|ed)?|trade[- ]?off|suggest(?:ed|ion)?|approach)\b|(?:方案|建议|取舍|修复方向)/iu.test(text);
 }
 
 function isTrue(value: string | undefined): boolean {
@@ -1296,7 +1350,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
-    `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4], then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. PASS/REWORK applies only while status is in_audit and material is present; otherwise it is recorded as unusual and cannot advance the pair. After a real PASS, only the executor may DONE. CANCEL and role-changing verbs are Brain/daemon-only; invalid participant markers are recorded as unusual with a bounded notice. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
+    `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4]. ${TASK_PAIR_AUDITOR_PROPOSAL_RULE} Then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. If scope, approach, ownership, an unreachable target, environment, or a repeated blocking set cannot be decided by the pair, escalate to Brain with options and a recommendation instead of looping. PASS/REWORK applies only while status is in_audit and material is present; otherwise it is recorded as unusual and cannot advance the pair. After a real PASS, only the executor may DONE. CANCEL and role-changing verbs are Brain/daemon-only; invalid participant markers are recorded as unusual with a bounded notice. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
     `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. Include title="<short specific title>" in the owner's UI language, for example DISPATCH tsk_demo title="Fix login retry" executor=<session> auditor=<session>. DISPATCH <taskId> title="..." executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,

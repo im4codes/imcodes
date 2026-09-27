@@ -122,6 +122,7 @@ export function buildAuditConvergenceContract(): string {
       forbid: 'minimal point patch',
       test: 'a counterexample covering the class',
       reaudit: 'repair delta plus closure of every prior blocking class',
+      proposal: 'the executor may adopt or argue against the auditor\'s concrete proposal; disagreement or an undecidable choice goes to Brain with options and a recommendation',
     },
     evidence: {
       structuredResults: 'default-accept exact-bound implementer structured test results after binding and coherence review; the auditor does not repeat them',
@@ -142,7 +143,7 @@ export function buildAuditConvergenceContract(): string {
     commentOrDocOnly: 'binding check only, no re-audit',
     roles: {
       orchestrator: 'forward only the contractRef and its params in every audit, re-audit and rework brief; never paste this body',
-      auditor: 'report every finding in one pass; PASS only when no blocking finding remains',
+      auditor: 'report every finding in one pass and propose a concrete solution for every blocking finding (approach, likely files/functions, trade-offs, optionally a test); give appropriate proposals for non-blocking findings, co-own convergence, and escalate undecidable scope/approach/ownership/environment or repeated-blocking questions to Brain with options and a recommendation; PASS only when no blocking finding remains',
       implementer: 'fix every blocking finding for its whole class before requesting re-audit',
     },
   });

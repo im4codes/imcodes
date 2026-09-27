@@ -144,6 +144,9 @@ describe('audit convergence contract', () => {
     // The body lives in the system prompt; briefs travel by reference only.
     expect(contract.roles.orchestrator).toMatch(/contractRef/);
     expect(contract.roles.orchestrator).toMatch(/never paste/);
+    expect(contract.roles.auditor).toMatch(/concrete solution/);
+    expect(contract.roles.auditor).toMatch(/escalate undecidable/);
+    expect(contract.rework.proposal).toMatch(/executor may adopt or argue/);
   });
 
   it('references the contract by id with only the parameters a message needs', () => {

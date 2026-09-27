@@ -59,6 +59,7 @@ import {
   buildPassDoneNoticeMessage,
   buildReworkNoticeMessage,
   buildUntitledTaskTitleRequest,
+  buildAuditorProposalNudgeMessage,
 } from './messages.js';
 
 /** Intents that need the pool, the heartbeat or the queue (see scheduler.ts). */
@@ -356,6 +357,7 @@ export class TaskPairService {
           projectBlocking,
           now,
           source: input.source,
+          turnText: input.turnText,
         })
       : { effect: 'unresolved', unusual: true, intents: [] as TaskPairIntent[] } satisfies TaskPairTransition;
     const role = taskPairRoleOf(existing?.state ?? transition.pair, input.writer);
@@ -738,6 +740,12 @@ export class TaskPairService {
             break;
           case 'rework_notice':
             await sendTaskPairMessage(intent.to, pair.taskId, 'rework', buildReworkNoticeMessage(pair, intent.counts));
+            break;
+          case 'auditor_proposal_nudge':
+            await sendTaskPairMessage(intent.to, pair.taskId, 'auditor-proposal-nudge', buildAuditorProposalNudgeMessage(pair));
+            break;
+          case 'rework_repeat_escalation':
+            await sendTaskPairMessage(intent.to, pair.taskId, 'brain-rework-repeat', buildRepeatedReworkBrainNoticeMessage(pair, intent.counts, intent.summary));
             break;
           case 'brain_notice':
             await sendTaskPairMessage(pair.brain, pair.taskId, `brain-${intent.flag}`, buildBrainNoticeMessage(pair, intent.flag));

@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
+  TASK_PAIR_AUDITOR_PROPOSAL_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_INTEGRATION_RULE,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
@@ -62,6 +63,26 @@ function withStatus(status: TaskPairStatus, extra = ''): TaskPairState {
 }
 
 describe('task-pair marker grammar', () => {
+  it('nudges an auditor once when REWORK has no concrete proposal', () => {
+    const base = withStatus('in_audit');
+    const result = applyTaskPairMarker(base, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding [P0]: this is broken.' }));
+    expect(result.pair?.status).toBe('rework');
+    expect(result.intents.filter((intent) => intent.kind === 'auditor_proposal_nudge')).toHaveLength(1);
+    const again = applyTaskPairMarker(result.pair, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding [P0]: this is broken.' }));
+    expect(again.intents.filter((intent) => intent.kind === 'auditor_proposal_nudge')).toHaveLength(0);
+  });
+
+  it('does not nudge when the auditor gives a concrete proposal and escalates repeated blocking sets', () => {
+    const base = withStatus('in_audit');
+    const proposal = 'Finding [P0]. Proposed solution: update src/foo.ts and add a regression test; trade-off is one extra lookup.';
+    const first = applyTaskPairMarker(base, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: proposal }));
+    const nextRound = { ...first.pair!, status: 'in_audit' as const, round: 2, material: { path: '/workspace', at: 1_000 } };
+    const second = applyTaskPairMarker(nextRound, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: proposal }));
+    expect(second.intents.filter((intent) => intent.kind === 'auditor_proposal_nudge')).toHaveLength(0);
+    const escalation = second.intents.find((intent) => intent.kind === 'rework_repeat_escalation');
+    expect(escalation).toMatchObject({ kind: 'rework_repeat_escalation', summary: proposal });
+    expect(TASK_PAIR_AUDITOR_PROPOSAL_RULE).toMatch(/concrete solution/);
+  });
   it('records the real start and clears capacity flags when queued work begins', () => {
     const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-start executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
     queued.flags = ['waiting_for_capacity', 'no_pool_configured'];
@@ -134,11 +155,12 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('QUEUE <taskId> ... and its');
   });
 
-  it('ships a contract stating a project\'s own workflow takes precedence, and that Brain hears only final/terminal states', () => {
+  it('ships a contract stating a project\'s own workflow takes precedence, and that routine progress stays in-pair while decisions escalate', () => {
     const body = buildTaskPairMarkerContract();
     expect(body).toContain('takes precedence over');
     expect(body).toContain(TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE);
-    expect(body).toContain('Report to Brain only at the end');
+    expect(body).toContain('Routine progress, REWORK rounds');
+    expect(body).toContain('same blocking finding repeats for 2 rounds');
     expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
   });
 
