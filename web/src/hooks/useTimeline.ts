@@ -863,6 +863,21 @@ function scheduleBrowserFrame(callback: () => void): () => void {
   return () => clearTimeout(id);
 }
 
+/**
+ * Timeline deltas are background work. Prefer the browser idle queue so input
+ * and paint get a turn before a burst of streaming assistant updates. The
+ * timeout keeps a quiet-but-busy page from starving the stream indefinitely;
+ * test environments without requestIdleCallback use the existing frame
+ * scheduler.
+ */
+function scheduleTimelineIdle(callback: () => void): () => void {
+  if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+    const id = window.requestIdleCallback(() => callback(), { timeout: 50 });
+    return () => window.cancelIdleCallback?.(id);
+  }
+  return scheduleBrowserFrame(callback);
+}
+
 function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) => void): () => void {
   const store = getTimelineStore(cacheKey);
   const wrapped = () => listener(store.getSnapshot().events);
@@ -3460,7 +3475,11 @@ export function useTimeline(
   /** Merge a batch of events into state (dedup + O(n) merge).
    *  Both `prev` and `incoming` are assumed mostly sorted by timestamp.
    *  Uses two-pointer merge instead of concatenate + full sort. */
-  const mergeEvents = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
+  const mergeEvents = useCallback((
+    incoming: TimelineEvent[],
+    maxEvents = MAX_MEMORY_EVENTS,
+    options?: { updateCache?: boolean },
+  ) => {
     setEvents((prev) => {
       const effectiveMax = maxEvents === MAX_MEMORY_EVENTS
         ? retainedTimelineMergeLimit(prev, getCachedEvents(cacheKeyRef.current ?? '') ?? [])
@@ -3469,7 +3488,9 @@ export function useTimeline(
       const base = removeReconciledLocalUserMessages(sharedBase, incoming);
       const result = mergeTimelineEvents(base, incoming, effectiveMax);
       if (result === base) return base;
-      if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, result);
+      if (options?.updateCache !== false && cacheKeyRef.current) {
+        setCachedEvents(cacheKeyRef.current, result);
+      }
       return result;
     });
   }, []);
@@ -3650,7 +3671,15 @@ export function useTimeline(
     const incoming = [...pendingRealtimeEventsRef.current.values()];
     pendingRealtimeEventsRef.current.clear();
     if (incoming.length === 0) return;
-    mergeEvents(incoming);
+    // Streaming assistant snapshots are already coalesced by eventId. They
+    // are ephemeral UI deltas; updating the shared cache/store on every frame
+    // fans out to sibling panes and schedules snapshot persistence. The final
+    // non-streaming event (or the idle persistence timer) publishes the latest
+    // value durably, so keep this hot path local to the mounted pane.
+    const streamingOnly = incoming.every(
+      (event) => event.type === 'assistant.text' && event.payload?.streaming === true,
+    );
+    mergeEvents(incoming, MAX_MEMORY_EVENTS, { updateCache: !streamingOnly });
     idbPutEvents(incoming);
   }, [idbPutEvents, mergeEvents]);
 
@@ -3736,7 +3765,7 @@ export function useTimeline(
     const existing = pendingRealtimeEventsRef.current.get(event.eventId);
     pendingRealtimeEventsRef.current.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
     if (pendingRealtimeFlushCancelRef.current) return;
-    pendingRealtimeFlushCancelRef.current = scheduleBrowserFrame(flushPendingRealtimeEvents);
+    pendingRealtimeFlushCancelRef.current = scheduleTimelineIdle(flushPendingRealtimeEvents);
   }, [appendEvent, flushPendingRealtimeEvents, idbPutEvents, scheduleStreamingIdlePersist]);
 
   useEffect(() => () => {
