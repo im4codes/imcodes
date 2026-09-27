@@ -104,20 +104,31 @@ export function resolveSessionTabsBottom(doc: Document | null = typeof document 
     state = { tabBar: doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR), bottom: 0, dirty: true, observedRoot: null };
     sessionTabMeasureCache.set(doc, state);
     const invalidate = () => { state!.dirty = true; };
-    if (typeof MutationObserver !== 'undefined' && doc.documentElement) {
+    if (typeof MutationObserver !== 'undefined' && state.tabBar) {
       state.mutationObserver = new MutationObserver(invalidate);
-      state.mutationObserver.observe(doc.documentElement, { childList: true, subtree: true });
-      state.observedRoot = doc.documentElement;
+      // Observe only the stable tab bar. Observing document.subtree would
+      // invalidate the snapshot for every chat/timeline DOM mutation and put
+      // the layout read back on the pointer hot path.
+      state.mutationObserver.observe(state.tabBar, { childList: true, subtree: true });
+      state.observedRoot = state.tabBar;
     }
     if (typeof ResizeObserver !== 'undefined') {
       state.resizeObserver = new ResizeObserver(invalidate);
       if (state.tabBar) state.resizeObserver.observe(state.tabBar);
     }
   }
+  // MutationObserver delivery is asynchronous; detect a removed/replaced tab
+  // bar synchronously before taking the cached fast path.
+  if (!state.tabBar?.isConnected) state.dirty = true;
   if (!state.dirty) return state.bottom;
   const tabBar = state.tabBar?.isConnected
     ? state.tabBar
     : (state.tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR));
+  if (tabBar && !state.mutationObserver && typeof MutationObserver !== 'undefined') {
+    state.mutationObserver = new MutationObserver(() => { state!.dirty = true; });
+    state.mutationObserver.observe(tabBar, { childList: true, subtree: true });
+    state.observedRoot = tabBar;
+  }
   if (tabBar) state.resizeObserver?.observe(tabBar);
   const tabBarBottom = tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
   const tabButtons = tabBar
