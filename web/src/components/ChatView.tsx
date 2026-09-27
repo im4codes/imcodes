@@ -199,6 +199,8 @@ interface Props {
   onLoadMessageContext?: (eventId: string, eventTs: number) => Promise<boolean>;
   /** Compact pinned panels reuse ChatView but intentionally omit message-pin chrome. */
   messagePinsEnabled?: boolean;
+  /** Sub-session windows scope the task-pair panel to their own assignments. */
+  scopeTaskPairs?: boolean;
 }
 
 function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
@@ -2310,7 +2312,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   </>;
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -4035,7 +4037,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 }}
               />
             )}
-            {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} />}
+            {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} />}
           </div>
         )}
         {showRefreshOverlay && (

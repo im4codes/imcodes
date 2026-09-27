@@ -21,13 +21,15 @@ function markdownWithoutChecklist(brief: string): string {
   }).join('\n').trim();
 }
 
-export function TaskPairBrief(props: { brief?: string; taskId: string; className?: string }) {
+export function TaskPairBrief(props: { brief?: string; taskId: string; className?: string; defaultOpen?: boolean }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
+  const [open, setOpen] = useState(() => props.defaultOpen === true);
   const [copied, setCopied] = useState(false);
   const brief = typeof props.brief === 'string' ? props.brief.trim() : '';
   if (!brief) return null;
   const checklist = parseTaskPairChecklist(brief);
+  const implementedCount = checklist.filter((item) => item.implemented).length;
+  const auditedCount = checklist.filter((item) => item.audited).length;
   const copy = async () => {
     try {
       if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(brief);
@@ -50,6 +52,9 @@ export function TaskPairBrief(props: { brief?: string; taskId: string; className
         <button type="button" class="task-pair-brief-copy" onClick={() => { void copy(); }} aria-label={t('taskPair.brief_copy')}>
           {copied ? t('taskPair.brief_copied') : t('taskPair.brief_copy')}
         </button>
+        {checklist.length > 0 && <span class="task-pair-brief-checklist-summary" aria-label={`${t('taskPair.implemented')} ${implementedCount}/${checklist.length}, ${t('taskPair.audited')} ${auditedCount}/${checklist.length}`}>
+          {t('taskPair.implemented')}: {implementedCount}/{checklist.length} · {t('taskPair.audited')}: {auditedCount}/{checklist.length}
+        </span>}
       </div>
       {open && <div id={`task-pair-brief-content-${props.taskId}`} class="task-pair-brief-content" role="region" aria-label={t('taskPair.brief_content')}>
         {markdownWithoutChecklist(brief) && <ChatMarkdown text={markdownWithoutChecklist(brief)} cacheKey={`task-pair-brief:${props.taskId}`} />}

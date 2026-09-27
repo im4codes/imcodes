@@ -70,6 +70,10 @@ export async function runPairBriefScenario() {
   await page.screenshot({ path: SCREENSHOT, fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(100);
+  if (await panel.getByTestId('task-pair-status-rows').count() === 0) {
+    await panel.locator('.task-pair-status-toggle').click();
+  }
+  await panel.getByTestId('task-pair-status-rows').waitFor({ state: 'visible' });
   await rowsScroller.evaluate((element) => {
     element.scrollTop = element.scrollHeight;
   });

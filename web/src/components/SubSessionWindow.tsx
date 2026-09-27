@@ -1060,6 +1060,7 @@ export function SubSessionWindow({
             onPreviewFile={stableOnPreviewFile}
             onOpenLocalWebPreview={onOpenLocalWebPreview ? stableOnOpenLocalWebPreview : undefined}
             serverId={serverId}
+            scopeTaskPairs
             onQuote={addQuote}
             agentType={sessionInfo?.agentType ?? sub.type}
             onResendFailed={handleResendFailed}

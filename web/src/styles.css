@@ -14629,6 +14629,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-brief-actions button { border: 0; background: transparent; color: var(--chrome-accent, #67e8f9); padding: 1px 3px; font: inherit; font-size: 10px; cursor: pointer; }
 .task-pair-brief-actions button:hover { text-decoration: underline; }
 .task-pair-brief-copy { opacity: .78; }
+.task-pair-brief-checklist-summary { font-size: 9px; opacity: .8; white-space: nowrap; }
 .task-pair-brief-content { max-height: min(38vh, 420px); overflow: auto; overscroll-behavior-y: auto; margin-top: 4px; padding: 7px 8px; border: 1px solid color-mix(in srgb, currentColor 18%, transparent); border-radius: 7px; background: color-mix(in srgb, var(--chrome-panel, #0d1422) 78%, transparent); font-size: 11px; line-height: 1.4; }
 .task-pair-brief-content .chat-rich-text { min-width: 0; }
 .task-pair-brief-content .chat-rich-text > :first-child { margin-top: 0; }

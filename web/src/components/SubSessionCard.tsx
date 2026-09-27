@@ -512,6 +512,7 @@ function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashTo
               onForceSync={forceRefresh}
               onScrollBottomFn={setChatScrollFn}
               preview
+              scopeTaskPairs
               agentType={sub.type}
               onResendFailed={handleResendFailed}
             />

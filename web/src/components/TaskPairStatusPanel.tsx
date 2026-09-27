@@ -146,7 +146,7 @@ function resolveSessionModel(
   return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
 }
 
-export function TaskPairStatusPanel({ events, sessions, serverId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null }) {
+export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(mobileLayout);
   const [collapsed, setCollapsed] = useState(() => readCollapsed(serverId, mobileLayout()));
@@ -216,13 +216,20 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   }
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
-  const allRows = [...latest.values()].filter((row) => status(row.payload.toStatus));
+  const allRows = [...latest.values()].filter((row) => {
+    if (!status(row.payload.toStatus)) return false;
+    if (!scopeSessionId) return true;
+    return String(row.payload.executor ?? '') === scopeSessionId || String(row.payload.auditor ?? '') === scopeSessionId;
+  });
   const groupFor = (value: TaskPairStatus) => value === 'queued' ? 'queued' : value === 'awaiting_brain_decision' ? 'awaiting_brain_decision' : value === 'rework' ? 'rework' : value === 'in_audit' || value === 'awaiting_audit' ? 'audit' : value === 'done' || value === 'cancelled' || value === 'passed' ? 'recent' : 'working';
   const groups = (['working', 'audit', 'rework', 'queued', 'awaiting_brain_decision', 'recent'] as const).map((key) => {
     const rows = allRows.filter((row) => groupFor(row.payload.toStatus as TaskPairStatus) === key);
     if (key === 'queued') rows.sort((a, b) => Number(a.payload.queuePosition ?? Number.MAX_SAFE_INTEGER) - Number(b.payload.queuePosition ?? Number.MAX_SAFE_INTEGER));
     return { key, rows: key === 'recent' ? rows.slice(-MAX_ROWS) : rows };
   }).filter((group) => group.rows.length > 0);
+  const scopedDefaultTaskId = scopeSessionId
+    ? (allRows.find((row) => ['working', 'in_audit', 'awaiting_audit', 'rework'].includes(String(row.payload.toStatus)))?.payload.taskId ?? allRows[0]?.payload.taskId)
+    : undefined;
   const counts = allRows.reduce<{ working: number; audit: number; queued: number; awaitingBrain: number }>((result, row) => {
     const value = row.payload.toStatus;
     if (value === 'working' || value === 'rework') result.working += 1;
@@ -231,7 +238,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
     else if (value === 'queued') result.queued += 1;
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
-  if (latest.size === 0) return null;
+  if (latest.size === 0 || allRows.length === 0) return null;
   const toggle = () => persistCollapsed(!collapsed);
   const toggleWithKeyboard = (event: KeyboardEvent) => {
     if (event.key !== 'Enter' && event.key !== ' ') return;
@@ -290,7 +297,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
             {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
-          <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} taskId={String(payload.taskId)} />
+          <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
           <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
           <div class="task-pair-status-row-roles">
             <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? unassigned(payload.executorModel)}</span>
@@ -308,7 +315,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
 }
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
-export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null }) {
+export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
   const { t } = useTranslation();
   const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events));

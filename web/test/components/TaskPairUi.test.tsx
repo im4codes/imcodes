@@ -127,6 +127,21 @@ describe('TaskPairStatusPanel', () => {
     expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Implement it');
     expect(screen.getAllByRole('checkbox')).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'taskPair.brief_copy' })).toBeTruthy();
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
+  });
+  it('scopes sub-window rows to its own assignments and expands its active brief by default', () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [
+        { taskId: 'mine', title: 'Mine', brief: '- [x][ ] Mine it', pair: { status: 'working', executor: 'sub-window', updatedAt: 1 } },
+        { taskId: 'other', title: 'Other', brief: '- [ ][x] Other it', pair: { status: 'working', executor: 'another-session', updatedAt: 2 } },
+      ],
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="sub-scope" scopeSessionId="sub-window" />);
+    expect(screen.getByText('Mine')).toBeTruthy();
+    expect(screen.queryByText('Other')).toBeNull();
+    expect(view.container.querySelector('.task-pair-brief-content')).toBeTruthy();
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
   });
   it('keeps all 30 pair rows in a scroll container so the last row is reachable', () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
