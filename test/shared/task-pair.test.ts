@@ -83,6 +83,14 @@ describe('task-pair marker grammar', () => {
     expect(escalation).toMatchObject({ kind: 'rework_repeat_escalation', summary: proposal });
     expect(TASK_PAIR_AUDITOR_PROPOSAL_RULE).toMatch(/concrete solution/);
   });
+
+  it('does not escalate two unrelated findings that happen to have equal severity counts', () => {
+    const base = withStatus('in_audit');
+    const first = applyTaskPairMarker(base, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding A [P0]. Proposed solution: fix src/a.ts.' }));
+    const nextRound = { ...first.pair!, status: 'in_audit' as const, round: 2, material: { path: '/workspace', at: 1_000 } };
+    const second = applyTaskPairMarker(nextRound, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding B [P0]. Proposed solution: fix src/b.ts.' }));
+    expect(second.intents.filter((intent) => intent.kind === 'rework_repeat_escalation')).toHaveLength(0);
+  });
   it('records the real start and clears capacity flags when queued work begins', () => {
     const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-start executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
     queued.flags = ['waiting_for_capacity', 'no_pool_configured'];

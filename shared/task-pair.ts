@@ -1227,14 +1227,18 @@ function applyVerdict(
     const wasRework = pair.status === 'rework';
     pair.status = 'rework';
     if (!wasRework && pair.executor) intents.push({ kind: 'rework_notice', to: pair.executor, counts: verdict.counts });
-    const key = pair.blocking.map((level) => `${level}:${verdict.counts[level] ?? 0}`).join(',');
+    const turnText = ctx?.turnText;
+    const findingSummary = turnText
+      ? stripTaskPairMarkersForDisplay(turnText).trim().slice(0, 800) || undefined
+      : undefined;
+    // Counts alone are not a finding identity: two unrelated P0s with the
+    // same count must not trigger the repeated-blocking escalation.
+    const findingKey = findingSummary?.toLocaleLowerCase().replace(/\s+/gu, ' ').trim() ?? '';
+    const key = `${pair.blocking.map((level) => `${level}:${verdict.counts[level] ?? 0}`).join(',')}|${findingKey}`;
     const repeatCount = pair.reworkBlockingSetKey === key ? (pair.reworkBlockingSetRepeatCount ?? 0) + 1 : 1;
     pair.reworkBlockingSetKey = key;
     pair.reworkBlockingSetRepeatCount = repeatCount;
-    const turnText = ctx?.turnText;
-    pair.reworkFindingSummary = turnText
-      ? stripTaskPairMarkersForDisplay(turnText).trim().slice(0, 800) || undefined
-      : undefined;
+    pair.reworkFindingSummary = findingSummary;
     if (ctx?.writer === pair.auditor && turnText && !hasAuditorProposal(turnText) && pair.auditor
       && pair.auditor !== TASK_PAIR_NO_AUDITOR
       && pair.auditorProposalNudgeRound !== pair.round) {

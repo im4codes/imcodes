@@ -298,7 +298,7 @@ describe('task-pair marker ingestion', () => {
     await say(AUD, '<!-- IMCODES_TASK REWORK T9 blocking=P0 p0=1 p1=2 -->');
     await flush();
     expect(sent.find((entry) => entry.target === EXEC)?.text).toContain('whole class');
-    expect(sent.find((entry) => entry.target === AUD)?.text).toContain('concrete proposal');
+    expect(sent.find((entry) => entry.target === AUD && entry.text.includes('Your REWORK did not'))?.text).toContain('concrete proposal');
   });
 
   it('records audited DONE without PASS and sends a bounded policy notice', async () => {
