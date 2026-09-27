@@ -162,6 +162,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#intervalMs = intervalMs;
     this.#nextTickAt = this.#now() + intervalMs;
     this.publishBadges();
+    // Admit queued work immediately after a daemon restart instead of waiting
+    // for the first heartbeat interval.
+    void this.#runQueueSweep().catch((error) => logger.warn({ err: error }, 'task-pair: initial queue sweep failed'));
     this.#timer = setInterval(() => {
       void this.tick().catch((error) => logger.warn({ err: error }, 'task-pair: heartbeat tick failed'));
     }, intervalMs);
@@ -170,6 +173,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // running, and workspace refresh, so an idle pair does not have to wait
     // for the next full heartbeat to be nudged.
     this.#bothIdleTimer = setInterval(() => {
+      void this.#runQueueSweep().catch((error) => logger.warn({ err: error }, 'task-pair: queue sweep failed'));
       void this.checkBothIdlePairs().catch((error) => logger.warn({ err: error }, 'task-pair: both-idle check failed'));
     }, TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS);
     this.#bothIdleTimer.unref?.();
@@ -234,10 +238,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
    * projection without reviving the retired legacy supervision engine.
    */
   observeTimelineEvent(event: { sessionId: string; type: string; payload: Record<string, unknown> }): void {
-    const pairs = getTaskPairStore().listActivePairs().filter((stored) => (
-      isPairsEngineProject(stored.project) && stored.state.brain === event.sessionId
+    const activePairs = getTaskPairStore().listActivePairs().filter((stored) => isPairsEngineProject(stored.project));
+    const pairs = activePairs.filter((stored) => (
+      stored.state.brain === event.sessionId
     ));
-    if (pairs.length === 0) return;
+    const participantPairs = activePairs.filter((stored) => (
+      stored.state.executor === event.sessionId || stored.state.auditor === event.sessionId
+    ));
+    if (pairs.length === 0 && participantPairs.length === 0) return;
     // A real Brain reply (chat text, marker delivery, or a user message from
     // the main session) resolves the current reminder immediately, even when
     // the event arrives through the lifecycle observer rather than pair
@@ -260,11 +268,32 @@ export class TaskPairAutomation implements TaskPairScheduler {
     } else if (event.type === 'session.state') {
       const state = String(event.payload.state ?? '').toLowerCase();
       if (state === 'running' || state === 'idle') this.publishBadges();
+      if (state === 'idle') {
+        const keys = new Set(participantPairs.map((stored) => `${stored.project}\u0000${stored.state.brain}`));
+        for (const key of keys) {
+          const [project, brain] = key.split('\u0000');
+          if (project && brain) void this.runQueue(project, brain).catch((error) => logger.warn({ err: error, project, brain }, 'task-pair: idle queue admission failed'));
+        }
+      }
     } else if (event.type === 'user.message' && event.payload.automation !== true
       && String(event.payload.text ?? '').trim()) {
       this.#mainHeartbeatPaused.delete(event.sessionId);
       this.#mainHeartbeatPauseCleared.add(event.sessionId);
       this.publishBadges();
+    }
+  }
+
+  /** Safety admission sweep; bounded to 30s so missed lifecycle events cannot stall a queue. */
+  async #runQueueSweep(): Promise<void> {
+    const keys = new Set<string>();
+    for (const stored of getTaskPairStore().listActivePairs()) {
+      if (isPairsEngineProject(stored.project) && stored.state.status === 'queued') {
+        keys.add(`${stored.project}\u0000${stored.state.brain}`);
+      }
+    }
+    for (const key of keys) {
+      const [project, brain] = key.split('\u0000');
+      if (project && brain) await this.runQueue(project, brain);
     }
   }
   /**
@@ -1308,11 +1337,20 @@ export class TaskPairAutomation implements TaskPairScheduler {
    * is the only path that tells Brain about this, and only once it has
    * actually persisted.
    */
-  #flagQuiet(project: string, taskId: string, flag: TaskPairFlag): void {
+  #flagQuiet(project: string, taskId: string, flag: TaskPairFlag, detail?: string): void {
     const store = getTaskPairStore();
     const stored = store.getPair(project, taskId);
-    if (!stored || stored.state.flags.includes(flag)) return;
-    store.savePair(project, { ...stored.state, flags: [...stored.state.flags, flag], updatedAt: this.#now() });
+    if (!stored) return;
+    const hasFlag = stored.state.flags.includes(flag);
+    const nextReason = flag === 'waiting_for_capacity' && detail !== undefined ? detail : stored.state.capacityWaitReason;
+    if (hasFlag && nextReason === stored.state.capacityWaitReason) return;
+    const next = {
+      ...stored.state,
+      flags: hasFlag ? stored.state.flags : [...stored.state.flags, flag],
+      ...(flag === 'waiting_for_capacity' && detail !== undefined ? { capacityWaitReason: detail } : {}),
+      updatedAt: this.#now(),
+    };
+    store.savePair(project, next);
   }
 
   /**
@@ -1442,7 +1480,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
     let open = pairs.filter((pair) => TASK_PAIR_OPEN_STATUSES.includes(pair.state.status)).length;
     const queued = pairs.filter((pair) => pair.state.status === 'queued').sort(compareQueuedTaskPairs);
     for (const stored of queued) {
-      if (open >= max) return;
+      if (open >= max) {
+        this.#flagQuiet(project, stored.state.taskId, 'waiting_for_capacity', `waiting for concurrency capacity (${open}/${max} open pairs)`);
+        return;
+      }
       const pair = stored.state;
       // A brief-less pair imported from legacy supervision has no real work to
       // start: park it (one batched Brain notice) until Brain adds a brief.
@@ -1460,11 +1501,22 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const namedParticipantHeld = (session: string | undefined): boolean => !!session
         && session !== TASK_PAIR_NO_AUDITOR
         && getTaskPairStore().isParticipantOfOpenPair(session, pair.taskId);
-      if ((pair.executor && (namedParticipantHeld(pair.executor) || this.#busy(pair.executor)))
-        || (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR
-          && (namedParticipantHeld(pair.auditor) || this.#busy(pair.auditor)))) {
-        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
-        this.#logQueueSkip(project, pair, 'named participant held by another open pair or busy');
+      const heldSession = [pair.executor, pair.auditor]
+        .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
+        .find((session) => namedParticipantHeld(session));
+      const busySession = !heldSession && [pair.executor, pair.auditor]
+        .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
+        .find((session) => this.#busy(session));
+      if (heldSession || busySession) {
+        const holder = heldSession
+          ? getTaskPairStore().listActivePairs().find((candidate) => candidate.state.taskId !== pair.taskId
+            && (candidate.state.executor === heldSession || candidate.state.auditor === heldSession))
+          : undefined;
+        const detail = heldSession
+          ? `waiting for ${heldSession} (busy in ${holder?.state.taskId ?? 'another open pair'})`
+          : `waiting for ${busySession} (session busy)`;
+        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity', detail);
+        this.#logQueueSkip(project, pair, detail);
         continue;
       }
       // Owner rule: no execution pool configured and no model named for a
@@ -1497,8 +1549,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
         // provisioned. Brain hears about it only via the combined, rate-
         // limited stall notice (see #checkQueueStalls) once it has actually
         // persisted a long time.
-        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
-        this.#logQueueSkip(project, pair, !executor ? 'executor capacity unavailable' : !auditor ? 'auditor capacity unavailable' : 'executor and auditor collide');
+        const detail = !executor ? 'waiting for an executor from the configured pool' : !auditor ? 'waiting for an auditor from the configured pool' : 'waiting for distinct executor and auditor sessions';
+        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity', detail);
+        this.#logQueueSkip(project, pair, detail);
         continue;
       }
       const result = taskPairService.applyMarker({
@@ -1511,7 +1564,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       });
       const dispatched = result.pair ?? store.getPair(project, pair.taskId)?.state;
       if (!dispatched) continue;
-      const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'no_pool_configured') };
+      const cleaned = { ...dispatched, flags: dispatched.flags.filter((flag) => flag !== 'waiting_for_capacity' && flag !== 'no_pool_configured'), capacityWaitReason: undefined };
       store.savePair(project, cleaned);
       open += 1;
       if (pair.brief !== undefined) {

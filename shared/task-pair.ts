@@ -593,6 +593,8 @@ export interface TaskPairState {
   /** The workspace the daemon created for the pair (see task-pairs/workspace.ts). */
   workspace?: TaskPairWorkspace;
   workspaceRecoveryEscalatedAt?: number;
+  /** Human-readable reason a queued pair is waiting for capacity. */
+  capacityWaitReason?: string;
   /** Enforcement bookkeeping for auditor proposals and repeated REWORK. */
   auditorProposalNudgeRound?: number;
   /** Workspace Brain asked for on DISPATCH/QUEUE (`workspace=dir`); otherwise chosen by the project. */
@@ -815,6 +817,7 @@ export function markTaskPairStarted(pair: TaskPairState, now: number): void {
   pair.startedAt = now;
   removeFlag(pair, 'waiting_for_capacity');
   removeFlag(pair, 'no_pool_configured');
+  delete pair.capacityWaitReason;
 }
 
 /**

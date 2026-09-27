@@ -442,6 +442,13 @@ export class TaskPairService {
       && !(busyQueued && intent.kind === 'slot_changed')
     ));
     this.#track(this.#executeIntents(input.project, stored?.state, immediateIntents));
+    // A terminal transition always frees its named participant and must wake
+    // queue admission immediately, even when the transition's slot_changed
+    // intent was suppressed because this pair had observed a stale binding.
+    if (stored && transition.toStatus && isTerminalTaskPairStatus(transition.toStatus)
+      && transition.fromStatus && !isTerminalTaskPairStatus(transition.fromStatus)) {
+      if (this.#scheduler?.runQueue) this.#track(Promise.resolve(this.#scheduler.runQueue(input.project, stored.state.brain)));
+    }
     if (holdsAutoPickAuditor && stored) this.#track(this.#gracePickAuditor(input.project, stored.state.taskId));
     // A pair Brain opens (DISPATCH marker, plain or task-tagged dispatch) tells
     // its participants what a pair is. The queue sends its own brief. A

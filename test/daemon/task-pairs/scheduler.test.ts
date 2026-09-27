@@ -195,6 +195,21 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(pair('WAIT')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
   });
 
+  it('re-runs admission when a named busy participant transitions idle', async () => {
+    queuePairDirect('IDLE-ADMIT', 'brief');
+    const queued = getTaskPairStore().getPair(PROJECT, 'IDLE-ADMIT')!.state;
+    getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC, auditor: 'none' });
+    busy.add(EXEC);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('IDLE-ADMIT').status).toBe('queued');
+    expect(pair('IDLE-ADMIT').capacityWaitReason).toContain(`waiting for ${EXEC}`);
+
+    busy.delete(EXEC);
+    automation.observeTimelineEvent({ sessionId: EXEC, type: 'session.state', payload: { state: 'idle' } });
+    await flush();
+    expect(pair('IDLE-ADMIT')).toMatchObject({ status: 'working', executor: EXEC, auditor: 'none' });
+  });
+
   it('reports persisted participant double-bookings once at startup without cancelling either pair', async () => {
     const state = (taskId: string): TaskPairState => ({
       taskId, brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working', flags: [], flagSides: {},

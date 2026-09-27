@@ -1662,6 +1662,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       updatedAt: state.updatedAt,
       flags: state.flags,
       brief: state.brief ?? null,
+      waitingReason: state.flags.includes('waiting_for_capacity') ? (state.capacityWaitReason ?? null) : null,
     };
   };
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
