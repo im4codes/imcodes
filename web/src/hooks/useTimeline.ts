@@ -3936,7 +3936,11 @@ export function useTimeline(
       // a cache cursor exists, a reconnect catch-up may continue through
       // bounded pages to close a real gap. Manual refresh is already a single
       // latest-window read.
-      const hadLocalEvents = eventsRef.current.length > 0;
+      // Only local cache/IDB rows should unlock multi-page catch-up. Live
+      // events may arrive before this delayed HTTP task fires on a cold pane;
+      // using eventsRef here would misclassify that cold start as cached and
+      // immediately walk the entire historical backlog.
+      const hadLocalEvents = localRestoredIdsRef.current.size > 0;
       const maxPages = mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
       if (visible) {
