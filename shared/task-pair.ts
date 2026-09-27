@@ -1231,10 +1231,11 @@ function applyVerdict(
     const repeatCount = pair.reworkBlockingSetKey === key ? (pair.reworkBlockingSetRepeatCount ?? 0) + 1 : 1;
     pair.reworkBlockingSetKey = key;
     pair.reworkBlockingSetRepeatCount = repeatCount;
-    pair.reworkFindingSummary = ctx?.turnText
-      ? stripTaskPairMarkersForDisplay(ctx.turnText).trim().slice(0, 800) || undefined
+    const turnText = ctx?.turnText;
+    pair.reworkFindingSummary = turnText
+      ? stripTaskPairMarkersForDisplay(turnText).trim().slice(0, 800) || undefined
       : undefined;
-    if (ctx?.writer === pair.auditor && ctx.turnText && !hasAuditorProposal(ctx.turnText) && pair.auditor
+    if (ctx?.writer === pair.auditor && turnText && !hasAuditorProposal(turnText) && pair.auditor
       && pair.auditor !== TASK_PAIR_NO_AUDITOR
       && pair.auditorProposalNudgeRound !== pair.round) {
       pair.auditorProposalNudgeRound = pair.round;
