@@ -4,7 +4,7 @@ import { removeSession, upsertSession } from '../../../src/store/session-store.j
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
-import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
+import { TaskPairAutomation, isTaskPairBrainReminderDue, isTaskPairBrainReminderGapSatisfied, resolveTaskPairBrainReminderInterval } from '../../../src/daemon/task-pairs/scheduler.js';
 import { isSessionWorking } from '../../../src/daemon/session-working.js';
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
 import { getSupervisionTaskRegistry } from '../../../src/daemon/supervision-state-store.js';
@@ -23,6 +23,21 @@ const EXEC = 'deck_sub_schedexec';
 const AUD = 'deck_sub_schedaud';
 const SPARE = 'deck_sub_schedspare';
 const SPARE2 = 'deck_sub_schedspare2';
+
+describe('Brain reminder cadence contract', () => {
+  it('uses 5 minutes, then 10, then a capped 15-minute interval', () => {
+    expect(resolveTaskPairBrainReminderInterval(0)).toBe(5 * 60_000);
+    expect(resolveTaskPairBrainReminderInterval(1)).toBe(10 * 60_000);
+    expect(resolveTaskPairBrainReminderInterval(2)).toBe(15 * 60_000);
+    expect(resolveTaskPairBrainReminderInterval(99)).toBe(15 * 60_000);
+    expect(isTaskPairBrainReminderDue(0, 5 * 60_000, 0)).toBe(true);
+    expect(isTaskPairBrainReminderDue(0, 5 * 60_000 - 1, 0)).toBe(false);
+    expect(isTaskPairBrainReminderDue(0, 15 * 60_000, 1)).toBe(true);
+    expect(isTaskPairBrainReminderGapSatisfied(10 * 60_000 - 1, 0, 0)).toBe(true);
+    expect(isTaskPairBrainReminderGapSatisfied(10 * 60_000 - 1, 1, 1)).toBe(false);
+    expect(isTaskPairBrainReminderGapSatisfied(11 * 60_000, 1, 1)).toBe(true);
+  });
+});
 
 function session(name: string, role: SessionRecord['role'], extra: Partial<SessionRecord> = {}): SessionRecord {
   return {
@@ -151,6 +166,8 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(2);
     expect(pair('T1').flags).toContain('executor_silent');
     expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(1);
+    expect(getTaskPairStore().listEvents(PROJECT, 'T1').some((event) => event.verb === 'NUDGE')).toBe(true);
+    expect(getTaskPairStore().getPair(PROJECT, 'T1')?.liveness.lastNudgedAt).toBeDefined();
     // Progress clears the silence and nudging resumes on the next idle ticks.
     now += 1;
     marker(EXEC, '<!-- IMCODES_TASK WORKING T1 -->');
@@ -205,6 +222,8 @@ describe('task-pair heartbeat, replacement and queue', () => {
 
     sent = [];
     await tick(4);
+    // The first reminder is constrained by the ten-minute inter-message gap;
+    // later cadence is covered by the pure interval contract test above.
     expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
     expect(sentTo(BRAIN, 'brain-decision-reminder')[0]?.text).toContain('CANCEL <taskId>');
 
@@ -832,6 +851,25 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
     await flush();
     expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+  });
+
+  it('records one deduplicated REMIND skip while Brain is busy, then delivers when idle', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-remind-skip', brain: BRAIN, status: 'working', flags: ['blocked'], flagSides: { blocked: 'executor' }, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now - 6 * 60_000, updatedAt: now - 6 * 60_000,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    busy.add(BRAIN);
+    automation.publishBadges();
+    const skipped = getTaskPairStore().listEvents(PROJECT, 'brain-remind-skip').filter((event) => event.verb === 'REMIND');
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0]?.effect).toBe('skipped');
+    automation.publishBadges();
+    expect(getTaskPairStore().listEvents(PROJECT, 'brain-remind-skip').filter((event) => event.verb === 'REMIND')).toHaveLength(1);
+    busy.delete(BRAIN);
     automation.publishBadges();
     await flush();
     expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);

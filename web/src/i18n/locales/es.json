@@ -4316,6 +4316,7 @@
     "verdict_held": "veredicto retenido: reglas de severidad",
     "round": "Ronda {{round}}",
     "blocking": "Bloqueantes {{levels}}",
+    "last_nudged": "Último recordatorio hace {{duration}} min",
     "severity": "{{level}}×{{count}}",
     "verb": {
       "dispatch": "asignada",
@@ -4363,6 +4364,7 @@
       "all_providers_limited": "Todos los proveedores limitados",
       "auditor_capacity_hold": "Auditor en espera (capacidad)",
       "no_pool_configured": "Sin grupo de ejecución configurado",
+      "brain_reminder_due": "Recordatorio pendiente para Brain",
       "policy_violation": "Violación de política"
     },
     "settings": {

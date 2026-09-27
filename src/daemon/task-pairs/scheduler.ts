@@ -21,6 +21,10 @@ import logger from '../../util/logger.js';
 import { getSession } from '../../store/session-store.js';
 import {
   TASK_PAIR_BOTH_IDLE_NUDGE_MS,
+  TASK_PAIR_BRAIN_REMINDER_INITIAL_MS,
+  TASK_PAIR_BRAIN_REMINDER_SECOND_MS,
+  TASK_PAIR_BRAIN_REMINDER_REPEAT_MS,
+  TASK_PAIR_BRAIN_MIN_GAP_MS,
   TASK_PAIR_HEARTBEAT_MS,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
@@ -107,6 +111,22 @@ export function resolveTaskPairBothIdleNudgeMs(env: NodeJS.ProcessEnv = process.
   return Number.isFinite(raw) && raw >= 1_000 ? raw : TASK_PAIR_BOTH_IDLE_NUDGE_MS;
 }
 
+/** Public pure helpers keep the cadence contract regression-testable without
+ * starting a daemon timer or depending on session state. */
+export function resolveTaskPairBrainReminderInterval(count: number): number {
+  return count <= 0 ? TASK_PAIR_BRAIN_REMINDER_INITIAL_MS
+    : count === 1 ? TASK_PAIR_BRAIN_REMINDER_SECOND_MS : TASK_PAIR_BRAIN_REMINDER_REPEAT_MS;
+}
+
+export function isTaskPairBrainReminderDue(waitStartedAt: number, now: number, count = 0): boolean {
+  return now - waitStartedAt >= resolveTaskPairBrainReminderInterval(count);
+}
+
+export function isTaskPairBrainReminderGapSatisfied(now: number, lastDeliveryAt = 0, lastBrainActivityAt = 0): boolean {
+  const latest = Math.max(lastDeliveryAt, lastBrainActivityAt);
+  return latest === 0 || now - latest >= TASK_PAIR_BRAIN_MIN_GAP_MS;
+}
+
 async function defaultImportLegacy(now: number): Promise<void> {
   const [{ importLegacyTasks }, { getSupervisionTaskRegistry }] = await Promise.all([
     import('./legacy-import.js'),
@@ -182,6 +202,18 @@ export class TaskPairAutomation implements TaskPairScheduler {
       isPairsEngineProject(stored.project) && stored.state.brain === event.sessionId
     ));
     if (pairs.length === 0) return;
+    // A real Brain reply (chat text, marker delivery, or a user message from
+    // the main session) resolves the current reminder immediately, even when
+    // the event arrives through the lifecycle observer rather than pair
+    // service ingestion.
+    const replyText = String(event.payload.text ?? event.payload.message ?? '').trim();
+    if (replyText && event.type !== 'agent.status' && event.type !== 'session.state') {
+      const at = this.#now();
+      for (const stored of pairs) {
+        const next = { ...stored.liveness, brainLastActivityAt: at, brainWaitKey: undefined, brainWaitStartedAt: undefined, brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: at, brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined };
+        getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, next);
+      }
+    }
     if (event.type === 'agent.status') {
       const status = String(event.payload.status ?? '').toLowerCase();
       if (status === 'needs_input' || status === 'supervision_needs_input') {
@@ -428,7 +460,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
   publishBadges(): void {
     const next = new Set<string>();
     const mainPairs = new Map<string, StoredTaskPair[]>();
-    for (const stored of getTaskPairStore().listActivePairs()) {
+    const now = this.#now();
+    for (const original of getTaskPairStore().listActivePairs()) {
+      const stored = this.#refreshBrainReminder(original, now);
       if (!TASK_PAIR_OPEN_STATUSES.includes(stored.state.status) || !isPairsEngineProject(stored.project)) continue;
       for (const session of [stored.state.executor, stored.state.auditor]) {
         if (session && session !== TASK_PAIR_NO_AUDITOR) next.add(session);
@@ -456,31 +490,43 @@ export class TaskPairAutomation implements TaskPairScheduler {
     for (const [brain, pairs] of mainPairs) {
       const brainRecord = getSession(brain);
       if (!brainRecord || brainRecord.role !== 'brain') continue;
-      const actionable = pairs.filter((pair) => this.#mainHeartbeatNeedsAction(pair)).map((pair) => pair.state);
-      const hasNeedsInput = pairs.some((pair) => pair.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION);
+      const actionable = pairs.filter((pair) => this.#mainHeartbeatNeedsAction(pair));
+      const hasNeedsInput = pairs.some((pair) => pair.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION || pair.state.flags.includes('needs_input'));
       if (actionable.length === 0 && !hasNeedsInput) continue;
       mainSessions.add(brain);
-      const paused = this.#mainHeartbeatPaused.has(brain)
-        || (hasNeedsInput && !this.#mainHeartbeatPauseCleared.has(brain));
-      if (paused) {
+      const explicitlyPaused = this.#mainHeartbeatPaused.has(brain);
+      const awaitingDecisionPause = hasNeedsInput && !this.#mainHeartbeatPauseCleared.has(brain);
+      if (explicitlyPaused || awaitingDecisionPause) {
         setSupervisionHeartbeatProjection(brain, {
           state: SUPERVISION_HEARTBEAT_STATE.PAUSED_NEEDS_INPUT,
           kind: SUPERVISION_HEARTBEAT_KIND.PAIR,
           updatedAt: this.#now(),
         }, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
-        continue;
+        if (explicitlyPaused) {
+          for (const due of actionable.filter((pair) => pair.liveness.brainReminderDue)) this.#recordReminderSkip(due, 'brain_needs_input', now);
+          continue;
+        }
+        // Awaiting-decision is shown as paused for the legacy projection, but
+        // a due cadence reminder is still delivered through the aggregate
+        // heartbeat.  Until the first due point, keep the projection paused.
+        if (awaitingDecisionPause && !actionable.some((pair) => pair.liveness.brainReminderDue)) continue;
       }
       if (actionable.length === 0 || this.#busy(brain)) {
+        if (this.#busy(brain)) {
+          for (const due of actionable.filter((pair) => pair.liveness.brainReminderDue)) this.#recordReminderSkip(due, 'brain_busy', now);
+        }
         clearSupervisionHeartbeatProjectionSource(brain, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
         continue;
       }
-      const nextHeartbeatAt = Math.max(this.#nextTickAt, this.#now());
-      setSupervisionHeartbeatProjection(brain, {
-        state: SUPERVISION_HEARTBEAT_STATE.ARMED,
-        kind: SUPERVISION_HEARTBEAT_KIND.PAIR,
-        nextHeartbeatAt,
-        updatedAt: this.#now(),
-      }, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
+      if (!awaitingDecisionPause) {
+        const nextHeartbeatAt = Math.max(this.#nextTickAt, this.#now());
+        setSupervisionHeartbeatProjection(brain, {
+          state: SUPERVISION_HEARTBEAT_STATE.ARMED,
+          kind: SUPERVISION_HEARTBEAT_KIND.PAIR,
+          nextHeartbeatAt,
+          updatedAt: this.#now(),
+        }, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
+      }
       this.#deliverMainHeartbeat(brain, actionable);
     }
     for (const brain of this.#mainHeartbeatSessions) {
@@ -499,29 +545,115 @@ export class TaskPairAutomation implements TaskPairScheduler {
 
   #mainHeartbeatNeedsAction(stored: StoredTaskPair): boolean {
     const pair = stored.state;
-    // A PASS transition already emits the per-pair Brain notice. Keep the
-    // aggregate heartbeat as a backstop for imported/reconstructed passed
-    // pairs, but do not duplicate that notice on a capacity-only tick.
-    if (pair.status === 'passed') return !stored.liveness.notified.includes(`pass-done-notice:${pair.round}`);
+    if (stored.liveness.brainReminderDue) return true;
     return pair.flags.some((flag) => [
       'blocked', 'needs_input', 'needs_auditor', 'executor_silent', 'verdict_inconsistent',
       'awaiting_audit_ignored', 'replacement_churn', 'markers_unresolved', 'all_providers_limited',
-      'auditor_capacity_hold', 'no_pool_configured', 'policy_violation',
+      'auditor_capacity_hold', 'no_pool_configured', 'policy_violation', 'waiting_for_capacity',
     ].includes(flag));
   }
 
-  #deliverMainHeartbeat(brain: string, pairs: readonly TaskPairState[]): void {
-    const fingerprint = pairs.map((pair) => `${pair.taskId}:${pair.status}:${pair.round}:${pair.flags.join(',')}`).sort().join('|');
-    if (!fingerprint || this.#mainHeartbeatDelivered.get(brain) === fingerprint || this.#mainHeartbeatPending.has(brain)) return;
+  #deliverMainHeartbeat(brain: string, storedPairs: readonly StoredTaskPair[]): void {
+    const fingerprint = storedPairs.map((stored) => {
+      const pair = stored.state;
+      return `${pair.taskId}:${pair.status}:${pair.round}:${pair.flags.join(',')}:r${stored.liveness.brainReminderCount ?? 0}:d${stored.liveness.brainReminderDue ? 1 : 0}`;
+    }).sort().join('|');
+    if (!fingerprint || this.#mainHeartbeatDelivered.get(brain) === fingerprint) return;
+    if (this.#mainHeartbeatPending.has(brain)) {
+      for (const due of storedPairs.filter((pair) => pair.liveness.brainReminderDue)) this.#recordReminderSkip(due, 'delivery_pending', this.#now());
+      return;
+    }
     this.#mainHeartbeatPending.add(brain);
-    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-heartbeat', buildBrainHeartbeatMessage(pairs))
+    const onlyAwaitingDecision = storedPairs.length === 1 && storedPairs[0]!.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
+    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, onlyAwaitingDecision ? 'brain-decision-reminder' : 'brain-heartbeat', buildBrainHeartbeatMessage(storedPairs.map((stored) => stored.state)))
       .then((result) => {
         if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
-          this.#mainHeartbeatDelivered.set(brain, fingerprint);
+          const at = this.#now();
+          const store = getTaskPairStore();
+          const post = storedPairs.map((stored) => {
+            const pair = stored.state;
+            const reminder = stored.liveness.brainReminderDue;
+            const count = (stored.liveness.brainReminderCount ?? 0) + (reminder ? 1 : 0);
+            return `${pair.taskId}:${pair.status}:${pair.round}:${pair.flags.join(',')}:r${count}:d0`;
+          }).sort().join('|');
+          this.#mainHeartbeatDelivered.set(brain, post);
+          for (const stored of storedPairs) {
+            if (!stored.liveness.brainReminderDue) continue;
+            store.saveLiveness(stored.project, stored.state.taskId, {
+              ...stored.liveness,
+              brainReminderDue: false,
+              brainReminderLastAt: at,
+              brainReminderCount: (stored.liveness.brainReminderCount ?? 0) + 1,
+              brainReminderLastDecisionAt: undefined,
+              brainReminderLastDecisionReason: undefined,
+            });
+            this.#recordLivenessDecision(stored, 'REMIND', 'sent', 'brain_idle', at);
+          }
         }
       })
       .finally(() => { this.#mainHeartbeatPending.delete(brain); })
       .catch(() => { /* delivery logs its own failure; retry on the next state change */ });
+  }
+
+  #brainWaitKey(pair: TaskPairState): string | undefined {
+    const relevant = pair.flags.filter((flag) => flag === 'blocked' || flag === 'needs_input').sort().join(',');
+    if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) return `awaiting:${pair.round}:${relevant}`;
+    if (pair.status === 'passed') return `passed:${pair.round}`;
+    if (relevant) return `flags:${pair.round}:${relevant}`;
+    return undefined;
+  }
+
+  #refreshBrainReminder(stored: StoredTaskPair, now: number): StoredTaskPair {
+    const key = this.#brainWaitKey(stored.state);
+    const current = stored.liveness;
+    if (!key) {
+      if (!current.brainWaitKey && !current.brainReminderDue) return stored;
+      const cleared = { ...current, brainWaitKey: undefined, brainWaitStartedAt: undefined, brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: undefined, brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined };
+      getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, cleared);
+      return { ...stored, liveness: cleared };
+    }
+    let next = current;
+    if (current.brainWaitKey !== key) {
+      next = { ...current, brainWaitKey: key, brainWaitStartedAt: Math.min(stored.state.updatedAt, now), brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: undefined, brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined };
+    } else if (current.brainWaitStartedAt === undefined) {
+      next = { ...current, brainWaitStartedAt: Math.min(stored.state.updatedAt, now), brainReminderCount: current.brainReminderCount ?? 0 };
+    }
+    const started = next.brainReminderLastAt ?? next.brainWaitStartedAt ?? now;
+    const count = next.brainReminderCount ?? 0;
+    const lastBrainTouch = Math.max(next.brainReminderLastAt ?? 0, next.brainLastActivityAt ?? 0);
+    const gapElapsed = isTaskPairBrainReminderGapSatisfied(now, next.brainReminderLastAt, next.brainLastActivityAt);
+    // A transient provider-capacity hold is not a Brain decision wait.  Keep
+    // the durable wait key, but defer its cadence until capacity clears so a
+    // held executor does not receive an unrelated aggregate heartbeat.
+    const heldByProvider = [stored.state.executor, stored.state.auditor]
+      .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
+      .some((session) => hasRecentTaskPairProviderError(session, now, this.#intervalMs));
+    const cadenceEligible = !heldByProvider
+      && !stored.state.flags.includes('waiting_for_capacity')
+      && !stored.state.flags.includes('all_providers_limited');
+    const due = cadenceEligible && !next.brainReminderResolvedAt && gapElapsed
+      && isTaskPairBrainReminderDue(started, now, count) && !next.brainReminderDue;
+    if (due) next = { ...next, brainReminderDue: true };
+    if (next !== current) getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, next);
+    return next === current ? stored : { ...stored, liveness: next };
+  }
+
+  #recordLivenessDecision(stored: StoredTaskPair, verb: 'NUDGE' | 'REMIND', effect: string, reason: string, at: number): void {
+    const id = `heartbeat:${verb.toLowerCase()}:${stored.project}:${stored.state.taskId}:${at}:${reason}`;
+    getTaskPairStore().recordEvent({
+      id, project: stored.project, taskId: stored.state.taskId, writer: 'daemon', role: 'daemon', verb,
+      attrs: { reason }, effect, unusual: false, source: 'heartbeat', fromStatus: stored.state.status, toStatus: stored.state.status, at,
+    });
+    logger.info({ taskId: stored.state.taskId, verb, effect, reason }, `task-pair: ${verb.toLowerCase()} decision`);
+  }
+
+  #recordReminderSkip(stored: StoredTaskPair, reason: string, at: number): void {
+    const live = stored.liveness;
+    if (!live.brainReminderDue) return;
+    if (live.brainReminderLastDecisionReason === reason) return;
+    const next = { ...live, brainReminderLastDecisionAt: at, brainReminderLastDecisionReason: reason };
+    getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, next);
+    this.#recordLivenessDecision({ ...stored, liveness: next }, 'REMIND', 'skipped', reason, at);
   }
 
   async #tickPair(stored: StoredTaskPair, now: number): Promise<void> {
@@ -546,17 +678,6 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const previousTick = liveness.lastTickAt;
     liveness.lastTickAt = now;
     if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
-      const reminderKey = `awaiting-brain-decision:${pair.round}`;
-      if (!liveness.notified.includes(reminderKey)) {
-        liveness.silenceExecutor += 1;
-        if (liveness.silenceExecutor >= TASK_PAIR_SILENCE_LIMIT) {
-          liveness.notified.push(reminderKey);
-          store.saveLiveness(stored.project, pair.taskId, liveness);
-          await sendTaskPairMessage(pair.brain, pair.taskId, 'brain-decision-reminder', buildBrainLine(pair,
-            `Executor ${pair.executor ?? '(unknown)'} reported completion without an auditor. Decide with DONE <taskId> force=true to accept or CANCEL <taskId>; dispatch/brief/message more work to resume it.`));
-          return;
-        }
-      }
       store.saveLiveness(stored.project, pair.taskId, liveness);
       return;
     }
@@ -636,7 +757,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (silence < TASK_PAIR_SILENCE_LIMIT) {
       // A capacity-limited session cannot answer right now; a nudge would
       // just fail again. Silently back off and retry on the next heartbeat.
-      if (!capacityLimited) await sendTaskPairMessage(session, pair.taskId, `nudge-${side}`, buildNudgeMessage(pair, side));
+      if (!capacityLimited) {
+        liveness.lastNudgedAt = now;
+        store.saveLiveness(stored.project, pair.taskId, liveness);
+        await sendTaskPairMessage(session, pair.taskId, `nudge-${side}`, buildNudgeMessage(pair, side));
+        this.#recordLivenessDecision({ ...stored, liveness }, 'NUDGE', 'sent', `heartbeat_${side}`, now);
+      } else {
+        this.#recordLivenessDecision({ ...stored, liveness }, 'NUDGE', 'skipped', `capacity_${side}`, now);
+      }
       return;
     }
     if (silence === TASK_PAIR_SILENCE_LIMIT) {
@@ -694,8 +822,6 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!executor) return false;
     const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
     const isHeld = (sessionName: string) => this.#busy(sessionName) || this.#rateLimited(sessionName) || this.#capacityLimited(sessionName);
-    if (isHeld(executor) || (auditor && isHeld(auditor))) return false;
-
     const liveness = stored.liveness;
     const executorIdleSince = liveness.activityExecutorAt ?? liveness.progressExecutorAt;
     // The shared idle spell begins when the LAST participant became idle.
@@ -703,6 +829,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
       ? Math.max(executorIdleSince, liveness.activityAuditorAt ?? liveness.progressAuditorAt)
       : executorIdleSince;
     if (now - idleSince < this.#bothIdleNudgeMs) return false;
+    if (isHeld(executor) || (auditor && isHeld(auditor))) {
+      this.#recordLivenessDecision(stored, 'NUDGE', 'skipped', 'participant_held', now);
+      return false;
+    }
     // The fast trigger fires once per uninterrupted idle spell. A later
     // ordinary heartbeat remains responsible for its normal silence cadence.
     // Equality is a valid re-arm boundary: activity can share the same
@@ -757,8 +887,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const executor = pair.executor;
     if (!executor) return false;
     const auditor = pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined;
-    if (pair.flagSides.blocked || pair.flagSides.needs_input) return false;
-    if (pair.flags.includes('executor_silent')) return false;
+    if (pair.flagSides.blocked || pair.flagSides.needs_input) {
+      this.#recordLivenessDecision({ project, state: pair, liveness, queueOrder: 0 }, 'NUDGE', 'skipped', 'participant_flagged', now);
+      return false;
+    }
+    if (pair.flags.includes('executor_silent')) {
+      this.#recordLivenessDecision({ project, state: pair, liveness, queueOrder: 0 }, 'NUDGE', 'skipped', 'executor_already_escalated', now);
+      return false;
+    }
 
     const target = taskPairSideToAct(pair) === 'auditor' && auditor ? 'auditor' : 'executor';
     const targetSession = target === 'auditor' ? auditor! : executor;
@@ -767,6 +903,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       ...liveness,
       notified: [...liveness.notified],
       bothIdleNudgedAt: now,
+      lastNudgedAt: now,
       ...(target === 'executor' ? { silenceExecutor: silence } : { silenceAuditor: silence }),
     };
     getTaskPairStore().saveLiveness(project, pair.taskId, nextLiveness);
@@ -776,7 +913,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
         ? `This is repeated quiet heartbeat ${silence}; take ownership now.`
         : 'Both sides are idle; take ownership of the next action now.';
       await sendTaskPairMessage(targetSession, pair.taskId, `nudge-${target}`, buildNudgeMessage(pair, target, repeat));
+      this.#recordLivenessDecision({ project, state: pair, liveness: nextLiveness, queueOrder: 0 }, 'NUDGE', 'sent', 'both_idle', now);
     } else if (silence === TASK_PAIR_SILENCE_LIMIT) {
+      this.#recordLivenessDecision({ project, state: pair, liveness: nextLiveness, queueOrder: 0 }, 'NUDGE', 'escalated', 'both_idle_silence_limit', now);
       if (target === 'auditor') await this.replaceAuditor(project, pair.taskId, `auditor silent for ${TASK_PAIR_SILENCE_LIMIT} both-idle checks`);
       else this.#escalateExecutor(project, pair.taskId, `both executor and auditor idle for ${TASK_PAIR_SILENCE_LIMIT} both-idle checks`);
     }

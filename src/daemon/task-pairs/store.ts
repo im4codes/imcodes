@@ -45,6 +45,18 @@ export interface TaskPairLiveness {
   activityAuditorAt?: number;
   /** Last time the fast both-idle check (scheduler.ts) sent a nudge; dedupes against the ordinary heartbeat tick's own check of the same idle spell. */
   bothIdleNudgedAt?: number;
+  /** Durable Brain reminder state; survives daemon restart and retries while busy. */
+  brainWaitKey?: string;
+  brainWaitStartedAt?: number;
+  brainReminderCount?: number;
+  brainReminderLastAt?: number;
+  brainReminderDue?: boolean;
+  brainReminderResolvedAt?: number;
+  brainLastActivityAt?: number;
+  brainReminderLastDecisionAt?: number;
+  brainReminderLastDecisionReason?: string;
+  /** Last participant nudge shown in the task console. */
+  lastNudgedAt?: number;
   lastTickAt: number;
   /** Escalations already sent, so each is sent once. */
   notified: string[];
@@ -361,6 +373,16 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     activityExecutorAt: Number(raw.activityExecutorAt ?? progressExecutorAt),
     activityAuditorAt: Number(raw.activityAuditorAt ?? progressAuditorAt),
     ...(Number.isFinite(Number(raw.bothIdleNudgedAt)) ? { bothIdleNudgedAt: Number(raw.bothIdleNudgedAt) } : {}),
+    ...(typeof raw.brainWaitKey === 'string' ? { brainWaitKey: raw.brainWaitKey } : {}),
+    ...(Number.isFinite(Number(raw.brainWaitStartedAt)) ? { brainWaitStartedAt: Number(raw.brainWaitStartedAt) } : {}),
+    ...(Number.isFinite(Number(raw.brainReminderCount)) ? { brainReminderCount: Number(raw.brainReminderCount) } : {}),
+    ...(Number.isFinite(Number(raw.brainReminderLastAt)) ? { brainReminderLastAt: Number(raw.brainReminderLastAt) } : {}),
+    ...(raw.brainReminderDue === true ? { brainReminderDue: true } : {}),
+    ...(Number.isFinite(Number(raw.brainReminderResolvedAt)) ? { brainReminderResolvedAt: Number(raw.brainReminderResolvedAt) } : {}),
+    ...(Number.isFinite(Number(raw.brainLastActivityAt)) ? { brainLastActivityAt: Number(raw.brainLastActivityAt) } : {}),
+    ...(Number.isFinite(Number(raw.brainReminderLastDecisionAt)) ? { brainReminderLastDecisionAt: Number(raw.brainReminderLastDecisionAt) } : {}),
+    ...(typeof raw.brainReminderLastDecisionReason === 'string' ? { brainReminderLastDecisionReason: raw.brainReminderLastDecisionReason } : {}),
+    ...(Number.isFinite(Number(raw.lastNudgedAt)) ? { lastNudgedAt: Number(raw.lastNudgedAt) } : {}),
     lastTickAt: Number(raw.lastTickAt ?? 0),
     notified: Array.isArray(raw.notified) ? raw.notified.map(String) : [],
   };

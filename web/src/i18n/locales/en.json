@@ -4316,6 +4316,7 @@
     "verdict_held": "verdict held: severity rules",
     "round": "Round {{round}}",
     "blocking": "Blocking {{levels}}",
+    "last_nudged": "Last nudged {{duration}} min ago",
     "severity": "{{level}}×{{count}}",
     "verb": {
       "dispatch": "dispatched",
@@ -4363,6 +4364,7 @@
       "all_providers_limited": "All providers limited",
       "auditor_capacity_hold": "Auditor holding (capacity)",
       "no_pool_configured": "No execution pool configured",
+      "brain_reminder_due": "Brain reminder due",
       "policy_violation": "Policy violation"
     },
     "settings": {

@@ -4315,6 +4315,7 @@
     "verdict_held": "판정 보류: 심각도 규칙",
     "round": "{{round}}라운드",
     "blocking": "차단 수준 {{levels}}",
+    "last_nudged": "{{duration}}분 전에 알림",
     "severity": "{{level}}×{{count}}",
     "verb": {
       "dispatch": "배정됨",
@@ -4362,6 +4363,7 @@
       "all_providers_limited": "모든 공급자 제한됨",
       "auditor_capacity_hold": "감사자 대기(용량)",
       "no_pool_configured": "실행 풀 미구성",
+      "brain_reminder_due": "Brain 처리 대기",
       "policy_violation": "정책 위반"
     },
     "settings": {

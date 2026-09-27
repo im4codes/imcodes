@@ -462,6 +462,8 @@ export interface SupervisionConsolePairInfo {
   auditorState?: SupervisionConsoleSessionState;
   brief?: string;
   checklist?: { total: number; implemented: number; audited: number };
+  /** Most recent participant nudge, used for liveness visibility. */
+  lastNudgedAt?: number;
 }
 
 export interface SupervisionTaskConsoleTaskRow {

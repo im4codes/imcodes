@@ -4315,6 +4315,7 @@
     "verdict_held": "вердикт отложен: правила серьёзности",
     "round": "Раунд {{round}}",
     "blocking": "Блокирующие {{levels}}",
+    "last_nudged": "Последнее напоминание {{duration}} мин назад",
     "severity": "{{level}}×{{count}}",
     "verb": {
       "dispatch": "назначена",
@@ -4362,6 +4363,7 @@
       "all_providers_limited": "Все провайдеры лимитированы",
       "auditor_capacity_hold": "Аудитор ждёт (перегрузка)",
       "no_pool_configured": "Пул выполнения не настроен",
+      "brain_reminder_due": "Ожидается напоминание Brain",
       "policy_violation": "Нарушение политики"
     },
     "settings": {

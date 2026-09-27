@@ -4315,6 +4315,7 @@
     "verdict_held": "判定保留：重大度ルール",
     "round": "第 {{round}} ラウンド",
     "blocking": "ブロッキング {{levels}}",
+    "last_nudged": "{{duration}}分前に催促",
     "severity": "{{level}}×{{count}}",
     "verb": {
       "dispatch": "割り当て済み",
@@ -4362,6 +4363,7 @@
       "all_providers_limited": "全プロバイダー制限中",
       "auditor_capacity_hold": "監査者待機中(容量)",
       "no_pool_configured": "実行プール未設定",
+      "brain_reminder_due": "Brain の対応待ち",
       "policy_violation": "ポリシー違反"
     },
     "settings": {

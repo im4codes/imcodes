@@ -150,6 +150,7 @@ const FLAG_EXPLANATIONS: Partial<Record<TaskPairFlag, string>> = {
   blocked: 'a participant reported being blocked',
   needs_input: 'a participant is waiting on input',
   no_pool_configured: 'this project has no execution pool configured and no model was named for this role',
+  brain_reminder_due: 'the Brain has not yet handled this pair',
 };
 
 export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag, detail?: string): string {
@@ -208,6 +209,8 @@ export function buildBrainHeartbeatMessage(pairs: readonly TaskPairState[]): str
   const lines = pairs.map((pair) => {
     const reason = pair.status === 'passed'
       ? 'audit passed; commit locally and DONE'
+      : pair.status === 'awaiting_brain_decision'
+        ? 'executor reported completion without an auditor; decide with DONE <taskId> force=true or CANCEL <taskId>'
       : pair.flags.length > 0
         ? pair.flags.join(', ')
         : pair.status;

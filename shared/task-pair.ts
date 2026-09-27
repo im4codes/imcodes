@@ -268,9 +268,16 @@ export const TASK_PAIR_FLAGS = [
   'blocked', 'needs_input', 'unaudited', 'needs_auditor', 'over_limit', 'off_pool', 'economy_unreviewed',
   'waiting_for_capacity', 'executor_silent', 'verdict_inconsistent', 'awaiting_audit_ignored',
   'replacement_churn', 'markers_unresolved', 'all_providers_limited', 'auditor_capacity_hold', 'policy_violation',
-  'no_pool_configured',
+  'no_pool_configured', 'brain_reminder_due',
 ] as const;
 export type TaskPairFlag = typeof TASK_PAIR_FLAGS[number];
+
+/** Brain escalation reminder cadence: 5m, then 10m, then no more than 15m. */
+export const TASK_PAIR_BRAIN_REMINDER_INITIAL_MS = 5 * 60_000;
+export const TASK_PAIR_BRAIN_REMINDER_SECOND_MS = 10 * 60_000;
+export const TASK_PAIR_BRAIN_REMINDER_REPEAT_MS = 15 * 60_000;
+/** Hard minimum between any two aggregate Brain heartbeat/reminder messages. */
+export const TASK_PAIR_BRAIN_MIN_GAP_MS = 10 * 60_000;
 
 export const TASK_PAIR_ROLES = ['brain', 'executor', 'auditor', 'other', 'daemon'] as const;
 export type TaskPairRole = typeof TASK_PAIR_ROLES[number];

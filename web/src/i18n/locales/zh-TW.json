@@ -4316,6 +4316,7 @@
     "verdict_held": "結論未採納：不符合嚴重等級規則",
     "round": "第 {{round}} 輪",
     "blocking": "阻斷等級 {{levels}}",
+    "last_nudged": "最近提醒於 {{duration}} 分鐘前",
     "severity": "{{level}}×{{count}}",
     "verb": {
       "dispatch": "已派發",
@@ -4363,6 +4364,7 @@
       "all_providers_limited": "所有服務商均受限",
       "auditor_capacity_hold": "審計者容量保持中",
       "no_pool_configured": "未設定執行池",
+      "brain_reminder_due": "需要提醒 Brain",
       "policy_violation": "策略違規"
     },
     "settings": {

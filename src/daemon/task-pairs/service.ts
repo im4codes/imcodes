@@ -71,6 +71,8 @@ export interface TaskPairScheduler {
   runQueue?(project: string, brain: string): void | Promise<void>;
   /** A consistent PASS was applied (economy-review bookkeeping). */
   flagEconomyUnreviewed?(project: string, taskId: string): void;
+  /** Re-arm/clear the single aggregate Brain heartbeat after liveness changes. */
+  publishBadges?(): void;
 }
 
 export interface ApplyMarkerInput {
@@ -630,10 +632,20 @@ export class TaskPairService {
     const pairs = getTaskPairStore().pairsForSession(writer)
       .filter((pair) => TASK_PAIR_OPEN_STATUSES.includes(pair.state.status));
     for (const pair of pairs) this.#stampActivity(pair, writer, now);
+    if (pairs.some((pair) => pair.state.brain === writer)) this.#scheduler?.publishBadges?.();
   }
 
   #stampProgress(pair: StoredTaskPair, writer: string, now: number): void {
     const liveness = { ...pair.liveness };
+    if (pair.state.brain === writer) {
+      liveness.brainLastActivityAt = now;
+      liveness.brainWaitKey = undefined;
+      liveness.brainWaitStartedAt = undefined;
+      liveness.brainReminderCount = 0;
+      liveness.brainReminderResolvedAt = now;
+      liveness.brainReminderDue = undefined;
+      liveness.brainReminderLastAt = undefined;
+    }
     if (pair.state.executor === writer) {
       liveness.progressExecutorAt = now;
       liveness.activityExecutorAt = now;
@@ -651,6 +663,18 @@ export class TaskPairService {
 
   #stampActivity(pair: StoredTaskPair, writer: string, now: number): void {
     const liveness = { ...pair.liveness };
+    // Any real Brain reply resolves the current wait immediately.  A later
+    // state transition starts a new wait key and therefore a fresh 5-minute
+    // cadence; this is deliberately durable so a restart cannot re-remind.
+    if (pair.state.brain === writer) {
+      liveness.brainLastActivityAt = now;
+      liveness.brainWaitKey = undefined;
+      liveness.brainWaitStartedAt = undefined;
+      liveness.brainReminderCount = 0;
+      liveness.brainReminderResolvedAt = now;
+      liveness.brainReminderDue = undefined;
+      liveness.brainReminderLastAt = undefined;
+    }
     if (pair.state.executor === writer) {
       liveness.activityExecutorAt = now;
       liveness.silenceExecutor = 0;
@@ -677,6 +701,15 @@ export class TaskPairService {
     if (role === 'auditor') { next.progressAuditorAt = now; next.silenceAuditor = 0; }
     if (role === 'executor') next.activityExecutorAt = now;
     if (role === 'auditor') next.activityAuditorAt = now;
+    if (role === 'brain') {
+      next.brainLastActivityAt = now;
+      next.brainWaitKey = undefined;
+      next.brainWaitStartedAt = undefined;
+      next.brainReminderCount = 0;
+      next.brainReminderResolvedAt = now;
+      next.brainReminderDue = undefined;
+      next.brainReminderLastAt = undefined;
+    }
     next.bothIdleNudgedAt = undefined;
     // A new auditor starts with a clean slate.
     if (transition.effect === 'reassigned_auditor') {

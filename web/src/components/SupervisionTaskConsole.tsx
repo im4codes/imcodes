@@ -203,6 +203,7 @@ function TaskPairConsoleDetails({ pair }: { pair: SupervisionConsolePairInfo }) 
         <span key={flag} class={`supervision-task-console-pair-flag flag-${flag}`}>{t(`taskPair.flag.${flag}`)}</span>
       ))}
       {pair.checklist && <span class="supervision-task-console-checklist-progress">{t('taskPair.checklist_progress', { implemented: pair.checklist.implemented, audited: pair.checklist.audited, total: pair.checklist.total })}</span>}
+      {pair.lastNudgedAt !== undefined && <span>{t('taskPair.last_nudged', { duration: Math.max(1, Math.round((Date.now() - pair.lastNudgedAt) / 60_000)) })}</span>}
       {pair.brief && <div class="supervision-task-console-checklist">{parseTaskPairChecklist(pair.brief).map((item) => (
         <div class="supervision-task-console-checklist-row" key={item.index}>
           <input type="checkbox" checked={item.implemented} readOnly aria-label={t('taskPair.implemented')} />

@@ -639,6 +639,7 @@ export class SupervisionConsoleProducer {
           ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = this.#resolveSessionPresentation?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorModel: p?.model ?? pair.auditorModel, auditorState: p?.state }; })() : pair.auditor === TASK_PAIR_NO_AUDITOR ? { auditorModel: TASK_PAIR_NO_AUDITOR } : pair.auditorModel ? { auditorModel: pair.auditorModel } : {}),
           ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
           ...(pair.brief ? { brief: pair.brief, checklist: taskPairChecklistCounts(pair.brief) } : {}),
+          ...(stored.liveness.lastNudgedAt !== undefined ? { lastNudgedAt: stored.liveness.lastNudgedAt } : {}),
         },
       });
       const roles: Array<['implementer' | 'auditor', string | undefined, number]> = [
