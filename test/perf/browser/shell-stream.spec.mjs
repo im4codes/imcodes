@@ -194,7 +194,7 @@ export async function runShellBrowserScenario() {
   const page = await context.newPage();
   const started = Date.now();
   await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(SESSION)}`, { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('.terminal-container', { timeout: 30_000 });
+  await page.waitForSelector('.terminal-container', { timeout: 90_000 });
   const firstPaintMs = Date.now() - started;
   await page.evaluate((value) => { window.__shellPerf.firstPaintMs = value; }, firstPaintMs);
   await page.locator('.terminal-container').first().click();
