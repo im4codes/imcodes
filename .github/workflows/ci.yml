@@ -27,10 +27,13 @@ on:
 # protection. Lint/typecheck/test on those three branches pay for this
 # with an occasional wasted matrix run on a commit a newer push already
 # superseded; that is strictly cheaper than an interrupted publish.
+# Runs are no longer serialized at workflow scope. Validation jobs below may
+# be superseded, while release jobs use their own non-cancelling group. This
+# lets a newer dev push start immediately without ever cancelling a publish or
+# Docker push that already passed the gates.
 concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request'
-    || (github.event_name == 'push' && startsWith(github.ref, 'refs/heads/repro/')) }}
+  group: ci-run-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: false
 
 env:
   NODE_VERSION_PRIMARY: '24'
@@ -88,11 +91,16 @@ jobs:
   # ── Daemon unit tests ─────────────────────────────────────────────────────
 
   unit-tests:
-    name: Unit Tests (Node ${{ matrix.node }})
+    name: Unit Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-node${{ matrix.node }}-shard${{ matrix.shard }}
+      cancel-in-progress: true
     strategy:
       matrix:
         node: ['22', '24']
+        shard: [1, 2, 3]
     steps:
       - name: Checkout
         id: checkout_1
@@ -138,11 +146,15 @@ jobs:
           cache: 'npm'
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/3
 
   preview-dist-smoke:
     name: Preview Dist Smoke
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-preview-dist-smoke
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -154,7 +166,11 @@ jobs:
 
   embedding-real-tests:
     name: Embedding Integration Tests
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-embedding-real-tests
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -176,8 +192,16 @@ jobs:
   # ── macOS daemon unit tests ─────────────────────────────────────────────
 
   macos-unit-tests:
-    name: Unit Tests (macOS)
+    name: Unit Tests (macOS, shard ${{ matrix.shard }})
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: macos-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-macos-shard${{ matrix.shard }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -190,7 +214,7 @@ jobs:
         run: tmux new-session -d -s init && tmux kill-session -t init
       - run: ./scripts/ci-npm-ci.sh .
       - run: npm run build
-      - run: npm run test:unit
+      - run: npm run test:unit -- --shard=${{ matrix.shard }}/3
 
   # ── macOS remote-desktop components (built from the immutable SDK) ────────
 
@@ -203,7 +227,11 @@ jobs:
   # regressions that are almost never architecture-specific.
   macos-remote-desktop-components:
     name: macOS Remote Desktop (from SDK)
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: macos-15
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-macos-remote-desktop-components
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -280,7 +308,11 @@ jobs:
 
   windows-unit-tests:
     name: Unit Tests (Windows)
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: windows-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-windows-unit-tests
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -312,7 +344,11 @@ jobs:
 
   windows-conpty-tests:
     name: Unit Tests (Windows ConPTY)
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: windows-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-windows-conpty-tests
+      cancel-in-progress: true
     steps:
       - name: Checkout
         id: checkout_1
@@ -369,7 +405,11 @@ jobs:
 
   web-tests-unit:
     name: Web Tests (Unit)
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-web-tests-unit
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -382,7 +422,11 @@ jobs:
 
   web-tests-components:
     name: Web Tests (Components)
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-web-tests-components
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -395,7 +439,11 @@ jobs:
 
   web-chat-perf:
     name: Web Chat Timeline Perf Guard
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-web-chat-perf
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -427,7 +475,11 @@ jobs:
 
   server-tests:
     name: Server Unit Tests
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-server-tests
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -452,7 +504,11 @@ jobs:
 
   server-db-tests:
     name: Server DB Integration Tests
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-server-db-tests
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -504,8 +560,11 @@ jobs:
 
   e2e-tests:
     name: E2E Tests
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
-    needs: [unit-tests]
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-e2e-tests
+      cancel-in-progress: true
     steps:
       - name: Checkout
         id: checkout_1
@@ -582,8 +641,11 @@ jobs:
 
   repo-integration-tests:
     name: Repo Provider Integration Tests
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
-    needs: [unit-tests]
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-repo-integration-tests
+      cancel-in-progress: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -610,7 +672,11 @@ jobs:
 
   coverage-shard:
     name: Coverage shard ${{ matrix.shard }}
+    if: github.event_name != 'pull_request' || github.head_ref != 'dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-validation-${{ github.workflow }}-${{ github.ref }}-shard${{ matrix.shard }}
+      cancel-in-progress: true
     strategy:
       fail-fast: false
       max-parallel: 4
@@ -710,6 +776,9 @@ jobs:
   publish:
     name: Publish to npm
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-release-publish-${{ github.ref }}
+      cancel-in-progress: false
     needs: [docker]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     permissions:
@@ -789,6 +858,9 @@ jobs:
     name: Resolve release version
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-release-version-${{ github.ref }}
+      cancel-in-progress: false
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
     steps:
@@ -812,6 +884,9 @@ jobs:
     needs: [release_version]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ${{ matrix.runner }}
+    concurrency:
+      group: ci-release-${{ github.ref }}-${{ matrix.key }}
+      cancel-in-progress: false
     env:
       IMCODES_BUILD_VERSION: ${{ needs.release_version.outputs.app_version }}
     strategy:
@@ -868,6 +943,7 @@ jobs:
           "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Import macOS release-signing identity
         if: runner.os == 'macOS'
+        id: mac_identity
         env:
           IMCODES_MACOS_SIGNING_P12_BASE64: ${{ secrets.IMCODES_MACOS_SIGNING_P12_BASE64 }}
           IMCODES_MACOS_SIGNING_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_SIGNING_P12_PASSWORD }}
@@ -878,7 +954,22 @@ jobs:
           IDENTITY="$(node scripts/macos-release-signing.mjs import)"
           # The fingerprint, not the common name: a name can match several
           # certificates, and a release pins the exact one it signed with.
-          echo "IMCODES_MACOS_SIGNING_IDENTITY=$(printf '%s' "$IDENTITY" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).sha1))')" >> "$GITHUB_ENV"
+          SHA1="$(printf '%s' "$IDENTITY" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).sha1))')"
+          echo "IMCODES_MACOS_SIGNING_IDENTITY=$SHA1" >> "$GITHUB_ENV"
+          echo "sha1=$SHA1" >> "$GITHUB_OUTPUT"
+      # The expensive remote-desktop binaries do not embed the release version;
+      # only their manifest does. Cache them by their real source/toolchain and
+      # signing inputs, then rebind that small manifest field per release.
+      # Verification still runs on every hit, so a corrupt or mismatched cache
+      # can never reach Docker. The node/app artifacts are always rebuilt and
+      # notarized because their release version is embedded in their bytes.
+      - name: Restore macOS remote-desktop component outputs
+        if: runner.os == 'macOS'
+        id: macos_release_cache
+        uses: actions/cache/restore@v4
+        with:
+          path: dist-node-exe/remote-desktop-worker
+          key: imcodes-macos-components-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}-${{ steps.mac_identity.outputs.sha1 }}-${{ hashFiles('package-lock.json', 'native/macos-remote-desktop/**', 'scripts/build-macos-remote-desktop-release.mjs', 'scripts/macos-remote-desktop-build.mjs', 'scripts/macos-remote-desktop-*.mjs', 'scripts/macos-remote-desktop-*.ts', 'scripts/install-libwebrtc-sdk.mjs', 'scripts/libwebrtc-sdk-artifacts.mjs', 'scripts/libwebrtc-sdk-targets.mjs', 'scripts/macos-release-signing.mjs', 'scripts/module-entry.mjs', 'scripts/remote-desktop-worker-artifacts.mjs', 'shared/**', 'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json') }}-v3
       - name: Write macOS notary API key
         if: runner.os == 'macOS'
         env:
@@ -895,18 +986,23 @@ jobs:
           echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
       - name: Build controlled-node executable
         run: npm run build:node-exe
-      - name: Notarize macOS controlled-node executable
+      - name: Notarize macOS executable and app in parallel
         if: runner.os == 'macOS'
         env:
           IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
           IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
         run: |
           set -euo pipefail
-          # Apple documents that a standalone binary gets a ticket but cannot
-          # have one stapled to it, so this records the notarization without
-          # claiming an offline-verifiable ticket. Users reach this file through
-          # the install command or the app, neither of which quarantines it.
-          node scripts/macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos
+          APP="dist-node-exe/aiDesk.to by IM.codes.app"
+          # These notarizations are independent; overlap Apple's network
+          # round trips while retaining strict waits and app stapler validation.
+          node scripts/macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos >"$RUNNER_TEMP/notary-node.log" 2>&1 &
+          node_pid=$!
+          node scripts/macos-release-signing.mjs notarize "$APP" >"$RUNNER_TEMP/notary-app.log" 2>&1 &
+          app_pid=$!
+          wait "$node_pid"
+          wait "$app_pid"
+          xcrun stapler validate "$APP"
       - name: Prove the signed macOS executable still runs
         if: runner.os == 'macOS'
         run: |
@@ -916,24 +1012,6 @@ jobs:
           # correct; a binary that signs and notarizes can still die on launch
           # without them, and that failure would otherwise reach users first.
           ./dist-node-exe/imcodes-node-macos --version
-      - name: Build and notarize the aiDesk application bundle
-        if: runner.os == 'macOS'
-        env:
-          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
-          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
-        run: |
-          set -euo pipefail
-          # One signed bundle holding every helper that needs a permission, so
-          # macOS attributes Screen Recording and Accessibility to the app the
-          # person chose rather than to whatever launched a helper. Unlike the
-          # bare executable this one CAN carry its notarization ticket, so it
-          # verifies with no network.
-          # Built during `build:node-exe`, before the manifest recorded the
-          # helper archive's hash -- swapping the archive afterwards makes
-          # every consumer reject the set as tampered with.
-          APP="dist-node-exe/aiDesk.to by IM.codes.app"
-          node scripts/macos-release-signing.mjs notarize "$APP"
-          xcrun stapler validate "$APP"
       - name: Build, sign and notarize the aiDesk disk image
         if: runner.os == 'macOS'
         env:
@@ -970,7 +1048,7 @@ jobs:
           path: ${{ runner.temp }}/libwebrtc-sdk-archives
           key: imcodes-libwebrtc-macos-${{ hashFiles('native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json', 'native/macos-remote-desktop/libwebrtc-sdk-x64.lock.json') }}-v1
       - name: Build, sign and notarize the macOS remote-desktop components
-        if: runner.os == 'macOS'
+        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           # IMCODES_MACOS_SIGNING_IDENTITY and IMCODES_MACOS_NOTARY_KEY_PATH
@@ -1010,6 +1088,28 @@ jobs:
             # packaging and upload to do. The archive stays for the cache.
             rm -rf "$sdk"
           done
+      - name: Rebind cached component manifests to this release version
+        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit == 'true'
+        run: |
+          node --input-type=module <<'NODE'
+          import { readdir, readFile, writeFile } from 'node:fs/promises';
+          import { join } from 'node:path';
+          const root = 'dist-node-exe/remote-desktop-worker';
+          async function walk(dir) {
+            for (const entry of await readdir(dir, { withFileTypes: true })) {
+              const path = join(dir, entry.name);
+              if (entry.isDirectory()) await walk(path);
+              else if (entry.name.endsWith('.manifest.json')) {
+                const value = JSON.parse(await readFile(path, 'utf8'));
+                if (typeof value.workerVersion === 'string') {
+                  value.workerVersion = process.env.IMCODES_BUILD_VERSION;
+                  await writeFile(path, `${JSON.stringify(value, null, 2)}\n`, 'utf8');
+                }
+              }
+            }
+          }
+          await walk(root);
+          NODE
       - name: Verify the macOS remote-desktop component sets
         if: runner.os == 'macOS'
         run: |
@@ -1018,6 +1118,27 @@ jobs:
             node scripts/remote-desktop-worker-artifacts.mjs verify \
               dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
           done
+      - name: Verify restored macOS component signatures and trust
+        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            root="dist-node-exe/remote-desktop-worker/darwin-$arch"
+            for component in \
+              imcodes-remote-desktop-worker \
+              imcodes-remote-desktop-launch-agent \
+              imcodes-remote-desktop-disclosure \
+              imcodes-virtual-display-helper; do
+              codesign --verify --strict --deep --verbose=2 "$root/$component"
+              spctl --assess --type execute -vv "$root/$component"
+            done
+          done
+      - name: Save macOS remote-desktop component outputs
+        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: dist-node-exe/remote-desktop-worker
+          key: imcodes-macos-components-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}-${{ steps.mac_identity.outputs.sha1 }}-${{ hashFiles('package-lock.json', 'native/macos-remote-desktop/**', 'scripts/build-macos-remote-desktop-release.mjs', 'scripts/macos-remote-desktop-build.mjs', 'scripts/macos-remote-desktop-*.mjs', 'scripts/macos-remote-desktop-*.ts', 'scripts/install-libwebrtc-sdk.mjs', 'scripts/libwebrtc-sdk-artifacts.mjs', 'scripts/libwebrtc-sdk-targets.mjs', 'scripts/macos-release-signing.mjs', 'scripts/module-entry.mjs', 'scripts/remote-desktop-worker-artifacts.mjs', 'shared/**', 'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json') }}-v3
       # The Linux remote-desktop worker. Same reasoning as the macOS block
       # above: without this the image ships a Linux controlled node that can
       # self-upgrade but has no worker binary, so LinuxRemoteDesktopWorkerHost
@@ -1239,6 +1360,9 @@ jobs:
   docker:
     name: Docker Build & Push
     runs-on: ubuntu-latest
+    concurrency:
+      group: ci-release-docker-${{ github.ref }}
+      cancel-in-progress: false
     needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     outputs:
@@ -1503,7 +1627,12 @@ jobs:
   android-release:
     name: Android Release Build
     runs-on: ubuntu-latest
-    needs: [lint, typecheck, secret-scan, unit-tests, web-tests-unit, web-tests-components, server-tests, e2e-tests]
+    concurrency:
+      group: ci-release-android-${{ github.ref }}
+      cancel-in-progress: false
+    # Same test gate as docker (minus the node-exe artifacts it packages), so
+    # the Android and Docker release builds start together and run in parallel.
+    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
     permissions:
       contents: write
