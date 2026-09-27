@@ -672,6 +672,83 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(pair('D3').status).toBe('working');
   });
 
+  it('starts a queued pair exactly once when its task-bound send reaches the named executor', async () => {
+    queuePairDirect('BOUND_SEND', 'bound brief');
+    const queued = pair('BOUND_SEND');
+    getTaskPairStore().savePair(PROJECT, {
+      ...queued,
+      executor: EXEC,
+      auditor: AUD,
+      flags: ['waiting_for_capacity'],
+    });
+    const queuedAt = pair('BOUND_SEND').createdAt;
+    const transition = taskPairService.implicitDispatch({
+      project: PROJECT,
+      sender: BRAIN,
+      target: EXEC,
+      taskId: 'BOUND_SEND',
+      eventId: 'bound-send-start',
+      brief: 'bound brief',
+    });
+    expect(transition?.effect).toBe('status');
+    expect(pair('BOUND_SEND')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
+    expect(pair('BOUND_SEND').startedAt).toBeGreaterThanOrEqual(queuedAt);
+    expect(pair('BOUND_SEND').flags).not.toContain('waiting_for_capacity');
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(sentTo(EXEC, 'dispatch')).toHaveLength(0);
+  });
+
+  it('starts a queued pair on the executor STARTED marker with a fresh start time', async () => {
+    queuePairDirect('BOUND_STARTED', 'started brief');
+    const queued = pair('BOUND_STARTED');
+    getTaskPairStore().savePair(PROJECT, {
+      ...queued,
+      executor: EXEC,
+      auditor: AUD,
+      flags: ['waiting_for_capacity', 'no_pool_configured'],
+    });
+    const queuedAt = pair('BOUND_STARTED').createdAt;
+    now += 5_000;
+    marker(EXEC, '<!-- IMCODES_TASK STARTED BOUND_STARTED -->');
+    expect(pair('BOUND_STARTED').status).toBe('working');
+    expect(pair('BOUND_STARTED').startedAt).toBe(now);
+    expect(pair('BOUND_STARTED').startedAt).toBeGreaterThan(queuedAt);
+    expect(pair('BOUND_STARTED').flags).not.toContain('waiting_for_capacity');
+    expect(pair('BOUND_STARTED').flags).not.toContain('no_pool_configured');
+  });
+
+  it('does not start queued work from an auditor-directed task-bound send', async () => {
+    queuePairDirect('AUDITOR_SEND', 'auditor-only brief');
+    const queued = pair('AUDITOR_SEND');
+    getTaskPairStore().savePair(PROJECT, {
+      ...queued,
+      executor: EXEC,
+      auditor: AUD,
+      flags: ['waiting_for_capacity'],
+    });
+    const transition = taskPairService.implicitDispatch({
+      project: PROJECT,
+      sender: BRAIN,
+      target: AUD,
+      taskId: 'AUDITOR_SEND',
+      eventId: 'auditor-send-recorded',
+    });
+    expect(transition?.effect).toBe('recorded');
+    expect(pair('AUDITOR_SEND').status).toBe('queued');
+    expect(pair('AUDITOR_SEND').startedAt).toBeUndefined();
+  });
+
+  it('keeps a queued pair waiting when its named executor is busy with another task', async () => {
+    busy.add(EXEC);
+    queuePairDirect('BUSY_OTHER', 'busy brief');
+    const queued = pair('BUSY_OTHER');
+    getTaskPairStore().savePair(PROJECT, { ...queued, executor: EXEC, auditor: AUD });
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('BUSY_OTHER').status).toBe('queued');
+    expect(pair('BUSY_OTHER').flags).toContain('waiting_for_capacity');
+    expect(pair('BUSY_OTHER').startedAt).toBeUndefined();
+  });
+
   it('urgent=true on DISPATCH jumps a queued pair ahead of earlier-queued normal work, same as QUEUE', async () => {
     candidates = [SPARE, SPARE2, AUD, EXEC];
     marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');

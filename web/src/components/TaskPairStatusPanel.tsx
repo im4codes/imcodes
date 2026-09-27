@@ -19,7 +19,7 @@ function normalizeSnapshot(detail: { tasks?: readonly Record<string, unknown>[];
   return detail.tasks.map((task) => {
     const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
     const executor = roles.find((role) => role.role === 'implementer'); const auditor = roles.find((role) => role.role === 'auditor');
-    return { ...pair, taskId: task.taskId, title: task.title, toStatus: pair.status ?? task.status, startedAt: pair.createdAt ?? task.updatedAt, queuePosition: pair.queuePosition, executor: pair.executor, auditor: pair.auditor, executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel, auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel, executorModel: executor?.observedModel ?? pair.executorModel, auditorModel: auditor?.observedModel ?? pair.auditorModel, executorState: executor?.sessionState ?? pair.executorState, auditorState: auditor?.sessionState ?? pair.auditorState };
+    return { ...pair, taskId: task.taskId, title: task.title, toStatus: pair.status ?? task.status, startedAt: pair.startedAt ?? pair.createdAt ?? task.updatedAt, queuePosition: pair.queuePosition, executor: pair.executor, auditor: pair.auditor, executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel, auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel, executorModel: executor?.observedModel ?? pair.executorModel, auditorModel: auditor?.observedModel ?? pair.auditorModel, executorState: executor?.sessionState ?? pair.executorState, auditorState: auditor?.sessionState ?? pair.auditorState };
   });
 }
 
@@ -68,7 +68,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
       if (Array.isArray(detail.tasks)) {
         setSnapshotRows(normalizeSnapshot(detail));
       } else if (detail.op === 'task_upsert' && detail.task) {
-        setSnapshotRows((current) => current ? [...current.filter((row) => row.taskId !== detail.task!.taskId), { ...(detail.task!.pair as Record<string, unknown> ?? {}), taskId: detail.task!.taskId, title: detail.task!.title, toStatus: (detail.task!.pair as Record<string, unknown> | undefined)?.status ?? detail.task!.status, startedAt: (detail.task!.pair as Record<string, unknown> | undefined)?.createdAt ?? detail.task!.updatedAt }] : current);
+        setSnapshotRows((current) => current ? [...current.filter((row) => row.taskId !== detail.task!.taskId), { ...(detail.task!.pair as Record<string, unknown> ?? {}), taskId: detail.task!.taskId, title: detail.task!.title, toStatus: (detail.task!.pair as Record<string, unknown> | undefined)?.status ?? detail.task!.status, startedAt: (detail.task!.pair as Record<string, unknown> | undefined)?.startedAt ?? (detail.task!.pair as Record<string, unknown> | undefined)?.createdAt ?? detail.task!.updatedAt }] : current);
       } else if (detail.op === 'task_remove' && detail.removedId) setSnapshotRows((current) => current?.filter((row) => row.taskId !== detail.removedId) ?? current);
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);

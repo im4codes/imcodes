@@ -517,6 +517,24 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const existing = store.getPair(project, input.taskId);
     if (existing) {
+      // A task-bound send is itself evidence that the named participant has
+      // begun work.  This is especially important for a queued pair whose
+      // executor is already busy: waiting for the queue drain would otherwise
+      // resend the brief later, even though this send started the task.
+      const queuedActivity = existing.state.status === 'queued'
+        && (input.sender === existing.state.executor
+          || input.target === existing.state.executor);
+      if (queuedActivity) {
+        const resumed = this.applyMarker({
+          project,
+          writer: input.sender,
+          marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: input.taskId, attrs: {} },
+          source: 'implicit_dispatch',
+          eventId: input.eventId,
+        });
+        noteTaskPairFocus(input.target, input.taskId);
+        return resumed;
+      }
       // Record only: ordinary traffic (materials to the auditor, replies,
       // Brain messages) never changes a pair's roles or status.
       const state = existing.state;

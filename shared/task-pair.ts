@@ -501,6 +501,9 @@ export interface TaskPairState {
    * Cleared whenever Brain/the daemon reopens the pair (D-armed on revival).
    */
   closedNoticeSentTo?: readonly string[];
+  /** Actual start time. Undefined while queued; unlike createdAt this does not
+   * include time spent waiting for a named participant or a free slot. */
+  startedAt?: number;
   createdAt: number;
   updatedAt: number;
 }
@@ -682,6 +685,19 @@ function removeFlag(pair: TaskPairState, flag: TaskPairFlag): void {
   pair.flags = pair.flags.filter((existing) => existing !== flag);
 }
 
+/**
+ * Single transition helper for every queued -> working path. Keeping this in
+ * the shared state machine prevents queue drain, STARTED/WORKING markers and
+ * task-bound sends from disagreeing about the panel's elapsed time or leaving
+ * stale capacity flags behind.
+ */
+export function markTaskPairStarted(pair: TaskPairState, now: number): void {
+  pair.status = 'working';
+  pair.startedAt = now;
+  removeFlag(pair, 'waiting_for_capacity');
+  removeFlag(pair, 'no_pool_configured');
+}
+
 function clonePair(pair: TaskPairState): TaskPairState {
   return {
     ...pair,
@@ -710,6 +726,7 @@ function newPair(taskId: string, brain: string, ctx: TaskPairApplyContext, statu
     previousAuditors: [],
     capCounts: {},
     capRound: 0,
+    ...(status !== 'queued' ? { startedAt: ctx.now } : {}),
     createdAt: ctx.now,
     updatedAt: ctx.now,
   };
@@ -948,7 +965,7 @@ export function applyTaskPairMarker(
       if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
         setRolesFromAttrs(pair, attrs, intents);
         if (marker.brief !== undefined) pair.brief = marker.brief;
-        pair.status = 'working';
+        markTaskPairStarted(pair, ctx.now);
         return done('dispatched');
       }
       // A (re)start of a queued/closed pair is capacity-gated exactly like
@@ -969,7 +986,7 @@ export function applyTaskPairMarker(
       setRolesFromAttrs(pair, attrs, intents);
       if (!pair.executor) intents.push({ kind: 'pick_executor' });
       if (pair.status === 'queued' || terminal) {
-        pair.status = 'working';
+        markTaskPairStarted(pair, ctx.now);
         intents.push({ kind: 'slot_changed' });
       }
       return done('dispatched');
@@ -977,15 +994,17 @@ export function applyTaskPairMarker(
     case 'STARTED':
     case 'WORKING': {
       if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && (role === 'executor' || roleAuthority)) {
-        pair.status = 'working';
+        markTaskPairStarted(pair, ctx.now);
         return done('status');
       }
       if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
         return reject(`Only the executor or Brain may resume ${marker.taskId} while it awaits Brain's decision; your marker was recorded but not applied.`);
       }
+      const startsPair = pair.status === 'queued' || terminal;
       if (pair.status === 'in_audit' || pair.status === 'passed' || terminal) unusual = true;
       if (terminal) intents.push({ kind: 'slot_changed' });
-      pair.status = 'working';
+      if (startsPair) markTaskPairStarted(pair, ctx.now);
+      else pair.status = 'working';
       return done('status');
     }
     case 'READY_FOR_AUDIT': {

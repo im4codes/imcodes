@@ -1631,7 +1631,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       queuePosition: state.status === 'queued' ? (queuePositions.get(state.taskId) ?? null) : null,
       urgent: (state as TaskPairState & { urgent?: boolean }).urgent === true,
       queuedAt: state.createdAt,
-      startedAt: state.status === 'queued' ? null : state.createdAt,
+      startedAt: state.status === 'queued' ? null : (state.startedAt ?? state.createdAt),
       updatedAt: state.updatedAt,
       flags: state.flags,
       brief: state.brief ?? null,

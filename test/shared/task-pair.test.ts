@@ -62,6 +62,16 @@ function withStatus(status: TaskPairStatus, extra = ''): TaskPairState {
 }
 
 describe('task-pair marker grammar', () => {
+  it('records the real start and clears capacity flags when queued work begins', () => {
+    const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-start executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
+    queued.flags = ['waiting_for_capacity', 'no_pool_configured'];
+    const started = applyTaskPairMarker(queued, marker('<!-- IMCODES_TASK STARTED T-start -->'), ctx(EXEC, { now: 9_000 })).pair!;
+    expect(started.status).toBe('working');
+    expect(started.startedAt).toBe(9_000);
+    expect(started.flags).not.toContain('waiting_for_capacity');
+    expect(started.flags).not.toContain('no_pool_configured');
+  });
+
   it('parses verbs case-insensitively with bare and quoted attributes', () => {
     const scanned = marker('<!-- IMCODES_TASK rework T42 blocking=P0 p0=1 p1=2 note="null check \\"missing\\" in login.ts" -->');
     expect(scanned).toMatchObject({
