@@ -90,6 +90,11 @@ describe('CI release-speed wiring', () => {
     expect(controlled).not.toContain('imcodes-macos-components-${{ github.sha }}');
     expect(controlled).toContain('Verify the macOS remote-desktop component sets');
     expect(controlled).toContain('Verify restored macOS component signatures and trust');
+    expect(controlled).toContain('id: macos_cached_signature_check');
+    expect(controlled).toContain('continue-on-error: true');
+    expect(controlled).toContain('Discard invalid cached macOS components');
+    expect(controlled).toContain('steps.macos_cached_signature_check.outcome != \'success\'');
+    expect(controlled).toContain('rm -rf dist-node-exe/remote-desktop-worker');
     expect(controlled).toContain('codesign --verify --strict --deep --verbose=2');
     expect(controlled).toContain('spctl --assess --type execute -vv');
     expect(controlled).toContain('steps.macos_release_cache.outputs.cache-hit != \'true\'');
@@ -98,5 +103,6 @@ describe('CI release-speed wiring', () => {
     expect(controlled).toContain('app_pid=$!');
     expect(controlled).toContain('wait "$node_pid"');
     expect(controlled).toContain('wait "$app_pid"');
+    expect(controlled).toContain("startsWith(github.ref, 'refs/heads/repro/ci-speed2-')");
   });
 });
