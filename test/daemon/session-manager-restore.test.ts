@@ -18,7 +18,7 @@ const {
   newSessionMock, timelineEmitMock, getSessionMock, respawnPaneMock,
   releaseSessionChildResourcesMock, registerTmuxSessionResourceMock,
   initializeSessionResourceLifecycleMock,
-  sessionExistsMock,
+  sessionExistsMock, existsSyncMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
@@ -41,7 +41,14 @@ const {
   registerTmuxSessionResourceMock: vi.fn().mockResolvedValue(undefined),
   initializeSessionResourceLifecycleMock: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
   sessionExistsMock: vi.fn().mockResolvedValue(true),
+  existsSyncMock: vi.fn(),
   removeSessionMock: vi.fn(),
+}));
+
+
+vi.mock('node:fs', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('node:fs')>()),
+  existsSync: existsSyncMock,
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -153,6 +160,10 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     releaseSessionChildResourcesMock.mockResolvedValue({ released: 0, failed: 0 });
     initializeSessionResourceLifecycleMock.mockResolvedValue({ released: 0, failed: 0, preserved: 0 });
     sessionExistsMock.mockResolvedValue(true);
+    existsSyncMock.mockImplementation((path: unknown) => {
+      const value = String(path);
+      return !value.includes('missing') && !value.includes('definitely-missing');
+    });
   });
 
   it('gives the daemon startup sweep a live session-store provider for orphan authority', async () => {
@@ -457,13 +468,16 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     } as const;
     const good = {
       name: 'deck_sync_w1', projectName: 'sync', role: 'w1', agentType: 'shell',
-      projectDir: '/valid/sync-project', state: 'running', restarts: 0, restartTimestamps: [],
+      projectDir: process.env.HOME!, state: 'running', restarts: 0, restartTimestamps: [],
       createdAt: Date.now(), updatedAt: Date.now(),
     } as const;
     storeMock.mockImplementation(() => [bad, good]);
     tmuxListMock.mockResolvedValue([]);
     sessionExistsMock.mockResolvedValue(false);
     newSessionMock.mockRejectedValueOnce(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+    // This fixture models an existing valid project; cwd existence is covered
+    // by the dedicated missing-path cases below.
+    existsSyncMock.mockReturnValue(true);
 
     await expect(restoreFromStore()).resolves.toBeUndefined();
 
@@ -490,6 +504,25 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
 
     expect(newSessionMock).not.toHaveBeenCalled();
     expect(updateSessionStateMock).not.toHaveBeenCalled();
+  });
+
+  it('marks a transport session with a missing cwd before provider launch', async () => {
+    const bad = {
+      name: 'verify_transport_missing_cwd', projectName: 'verify', role: 'brain',
+      agentType: 'claude-code-sdk', runtimeType: 'transport',
+      projectDir: 'C:\\definitely-missing-imcodes-cwd', state: 'idle',
+      restarts: 0, restartTimestamps: [], createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    storeMock.mockReturnValue([bad]);
+    tmuxListMock.mockResolvedValue([]);
+    sessionExistsMock.mockResolvedValue(false);
+
+    await expect(restoreFromStore()).resolves.toBeUndefined();
+
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      bad.name, 'error', 'Working directory not found: C:\\definitely-missing-imcodes-cwd',
+    );
+    expect(restartSessionMock).not.toHaveBeenCalled();
   });
 
   it('persists idle before respawning a dead pane', async () => {

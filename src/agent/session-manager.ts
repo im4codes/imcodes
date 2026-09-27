@@ -1,6 +1,7 @@
 import { queuedUserMessageAttribution } from './transport-queued-user-message.js';
 import { newSession, killSession, sessionExists, isPaneAlive, respawnPane, listSessions as tmuxListSessions, sendKeys, sendKey, capturePane, showBuffer, getPaneId, getPaneCwd, getPaneStartCommand, cleanupOrphanFifos, BACKEND } from './tmux.js';
 import { randomUUID } from 'node:crypto';
+import { existsSync } from 'node:fs';
 import { ClaudeCodeDriver } from './drivers/claude-code.js';
 import { CodexDriver } from './drivers/codex.js';
 import { OpenCodeDriver } from './drivers/opencode.js';
@@ -659,6 +660,13 @@ export async function restoreFromStore(): Promise<void> {
   logger.debug({ totalSessions: all.length, liveTmux: live.length }, 'restoreFromStore: starting reconciliation');
   for (const s of all) {
     if (isStoredTransportSession(s)) {
+      // Transport sessions are normally handed to restoreTransportSessions,
+      // but that path intentionally assumes providers validate cwd later.
+      // Mark a missing persisted directory here so an invalid transport cannot
+      // remain apparently healthy or be retried on every boot.
+      if (s.state !== 'error' && s.projectDir && !existsSync(s.projectDir)) {
+        markLaunchFailure(s, new Error(`${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}: ${s.projectDir}`));
+      }
       // Handled by restoreTransportSessions() after provider connects
       continue;
     }
@@ -762,6 +770,14 @@ export async function restoreFromStore(): Promise<void> {
     // visible in the session list until the user fixes the path and retries.
     if (!isLiveSession && s.state === 'error' && isPersistedWorkingDirectoryError(s.error)) {
       logger.warn({ session: hydrated.name, projectDir: hydrated.projectDir }, 'Skipping restore for session with missing working directory');
+      continue;
+    }
+    // Some transport providers accept a missing cwd and only fail later,
+    // which would otherwise leave the persisted record looking healthy and
+    // retry it on every boot. Detect the path before any provider launch so
+    // every backend gets the same durable, user-actionable error state.
+    if (!isLiveSession && hydrated.projectDir && !existsSync(hydrated.projectDir)) {
+      markLaunchFailure(hydrated, new Error(`${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}: ${hydrated.projectDir}`));
       continue;
     }
     if (!isLiveSession) {
