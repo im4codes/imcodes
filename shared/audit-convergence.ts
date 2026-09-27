@@ -125,7 +125,7 @@ export function buildAuditConvergenceContract(): string {
       proposal: 'the executor may adopt or argue against the auditor\'s concrete proposal; disagreement or an undecidable choice goes to Brain with options and a recommendation',
     },
     evidence: {
-      structuredResults: 'the executor READY_FOR_AUDIT report must state exact commands, machine, exact HEAD, pass/fail/skip counts per suite, and any failure with base-reproduction proof; default-accept that exact-bound report after binding and coherence review; the auditor does not repeat complete suites',
+      structuredResults: 'the executor READY_FOR_AUDIT report must state exact commands, machine, exact HEAD, pass/fail/skip counts per suite, and any failure with base-reproduction proof; default-accept exact-bound implementer structured test results after binding and coherence review; the auditor does not repeat complete suites',
       auditorExecution: 'only when the executor test report/evidence is missing or for one confident concrete suspicion; one test file/few named tests or one mutant, maxWorkers<=2, seconds-to-a-few-minutes; never full project/build/coverage/e2e',
       suspicion: 'run the small targeted check directly and state why; do not REWORK merely to request that check',
       rawArtifacts: 'raw logs, transcripts, hashes, and bundle attachments are never PASS prerequisites; their absence never causes REWORK',
