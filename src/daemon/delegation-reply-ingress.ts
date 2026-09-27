@@ -823,7 +823,8 @@ async function deliverRecord(record: DelegationReplyRecord): Promise<DelegationR
     }
 
     // A task-bound structured return is exact coordinator work. Busy runtimes
-    // persist it in the ordinary FIFO; idle runtimes start one continuation.
+    // use the provider append boundary (with durable FIFO fallback); idle
+    // runtimes start one continuation.
     // Once SQLite owns the queued clientMessageId the delegation outbox closes,
     // so neither a timer nor a user reminder can duplicate the wake.
     if (taskBound) {
