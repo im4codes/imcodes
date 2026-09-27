@@ -23,6 +23,7 @@ import {
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_RETENTION_MS,
+  isComplexSupervisionTaskBrief,
   applyTaskPairMarker,
   isTerminalTaskPairStatus,
   mayContainTaskPairMarker,
@@ -590,7 +591,11 @@ export class TaskPairService {
       // dispatch with none holds the auto-pick for the grace window unless
       // this send itself carried a real objective (clearly new work, no
       // reason to wait).
-      ...(!input.auditor && !input.hasObjective ? { suppressAutoPickAuditor: true } : {}),
+      // A task-bound objective is audited only when it crosses the shared
+      // complexity threshold. Small requests remain lightweight unless the
+      // user explicitly named an auditor.
+      ...(!input.auditor && (!input.hasObjective || !isComplexSupervisionTaskBrief(input.brief))
+        ? { suppressAutoPickAuditor: true } : {}),
     });
     this.ensureTaskPairTitle(project, input.taskId, input.brief, input.sender, { mechanicalTitle: input.titleExplicit !== true });
     return transition;

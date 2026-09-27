@@ -1220,6 +1220,16 @@ describe('session-mgmt persistence routes', () => {
           preset: 'MiniMax Owner',
           timeoutMs: 55_000,
           promptVersion: 'supervision_decision_v1',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: {
+              configs: [{
+                capabilityId: 'supervision-exec-v1:transport:codex-sdk:openai:gpt-6-luna',
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'transport', model: 'gpt-6-luna', role: 'executor',
+              }],
+            },
+            economyTaskPool: { configs: [] },
+          },
         },
       }),
     });
@@ -1236,6 +1246,7 @@ describe('session-mgmt persistence routes', () => {
       model: 'MiniMax-M2.7',
       preset: 'MiniMax Owner',
     }));
+    expect(stored.executionPools.primaryDevelopmentPool.configs[0].role).toBe('executor');
     // The daemon's own poll would notice this within five seconds regardless,
     // but manual task dispatch right after a fresh save must not race that
     // window -- the save pushes an immediate refresh over the existing WS link.

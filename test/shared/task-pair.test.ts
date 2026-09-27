@@ -10,6 +10,7 @@ import {
   TASK_PAIR_VERBS,
   applyTaskPairMarker,
   buildTaskPairMarkerContract,
+  isComplexSupervisionTaskBrief,
   judgeTaskPairVerdict,
   scanTaskPairMarkers,
   stripTaskPairMarkersForDisplay,
@@ -87,6 +88,11 @@ describe('task-pair marker grammar', () => {
     expect(result.intents.some((intent) => intent.kind === 'brain_notice')).toBe(false);
   });
 
+  it('classifies substantial work for automatic audited pairing while leaving tiny queries unpaired', () => {
+    expect(isComplexSupervisionTaskBrief('What is the current status?')).toBe(false);
+    expect(isComplexSupervisionTaskBrief('Fix the login bug in src/a.ts and web/b.ts, then run the test suite')).toBe(true);
+    expect(isComplexSupervisionTaskBrief('在 211 实机测试并修复跨文件回归问题')).toBe(true);
+  });
   it('records the real start and clears capacity flags when queued work begins', () => {
     const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-start executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
     queued.flags = ['waiting_for_capacity', 'no_pool_configured'];

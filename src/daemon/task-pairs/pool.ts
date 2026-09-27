@@ -31,6 +31,7 @@ import {
   buildSupervisionExecutionCapabilityId,
   isExcludedDevelopmentModel,
   normalizeSupervisionExecutionModel,
+  supervisionTierPriority,
   supervisionExecutionConfigAllowsRole,
   type SupervisionExecutionConfig,
   type SupervisionExecutionPoolKind,
@@ -172,7 +173,18 @@ export function listTaskPairCandidates(input: {
       && !hasPending(session.name)
       && !store.isParticipantOfOpenPair(session.name)
     ))
-    .sort((a, b) => a.updatedAt - b.updatedAt || a.name.localeCompare(b.name));
+    .sort((a, b) => {
+      // Tier policy is only an automatic preference. Named models return
+      // through the explicit override path above and are never reordered.
+      if (!input.requestedModel) {
+        const ar = poolConfigOf(a);
+        const br = poolConfigOf(b);
+        const tier = (ar ? supervisionTierPriority(ar, input.role) : 99)
+          - (br ? supervisionTierPriority(br, input.role) : 99);
+        if (tier !== 0) return tier;
+      }
+      return a.updatedAt - b.updatedAt || a.name.localeCompare(b.name);
+    });
   if (!input.avoidProviderFamily) return candidates;
   const otherFamily = candidates.filter((session) => sessionProviderFamily(session) !== input.avoidProviderFamily);
   const sameFamily = candidates.filter((session) => sessionProviderFamily(session) === input.avoidProviderFamily);
@@ -256,8 +268,9 @@ export function roleEligibleProvisionConfig(input: {
   if (matches.length === 0) {
     return input.requestedModel ? resolveRequestedModelProvisionConfig(input.requestedModel) : undefined;
   }
-  if (!input.avoidProviderFamily) return matches[0];
-  return matches.find((config) => config.providerFamily !== input.avoidProviderFamily) ?? matches[0];
+  const ordered = [...matches].sort((a, b) => supervisionTierPriority(a, input.role) - supervisionTierPriority(b, input.role));
+  if (!input.avoidProviderFamily) return ordered[0];
+  return ordered.find((config) => config.providerFamily !== input.avoidProviderFamily) ?? ordered[0];
 }
 
 /** Provider rate/usage limit as seen by delegation availability. */

@@ -14,6 +14,8 @@ import {
   buildSupervisionPoolGateGuidance,
   SUPERVISION_AUTOMATION_POOL_GATE_REASONS,
   SUPERVISION_AUDIT_ROUTING_REASONS,
+  resolveSupervisionTierPair,
+  supervisionTierPriority,
   type SupervisionExecutionConfig,
 } from '../../shared/supervision-execution-pool.js';
 import { SUPERVISION_SUPPORTED_UI_LOCALES } from '../../shared/supervision-config.js';
@@ -44,6 +46,41 @@ const actual = (entry: SupervisionExecutionConfig, overrides = {}) => ({
 });
 
 describe('supervision execution pools', () => {
+  it('preserves an explicit role when capability-id dedupe sees a role-less duplicate', () => {
+    const duplicate = { ...gpt56, role: 'executor' as const };
+    const normalized = normalizeSupervisionExecutionPools({
+      state: 'configured',
+      primaryDevelopmentPool: { configs: [duplicate, gpt56] },
+      economyTaskPool: { configs: [] },
+    });
+    expect(normalized.primaryDevelopmentPool.configs).toHaveLength(1);
+    expect(normalized.primaryDevelopmentPool.configs[0]?.role).toBe('executor');
+  });
+
+  it('resolves the ordered Luna/Sol tier before lower-priority families', () => {
+    const entries = [
+      config('deepseek-sdk', 'deepseek', 'deepseek-pro'),
+      config('codex-sdk', 'openai', 'gpt-6-sol'),
+      config('codex-sdk', 'openai', 'gpt-6-luna'),
+      config('claude-code-sdk', 'anthropic', 'claude-sonnet'),
+      config('claude-code-sdk', 'anthropic', 'claude-haiku'),
+    ];
+    const pair = resolveSupervisionTierPair(entries);
+    expect(pair.executor?.model).toBe('gpt-6-luna');
+    expect(pair.auditor?.model).toBe('gpt-6-sol');
+    expect(supervisionTierPriority(entries[2]!, 'executor')).toBe(0);
+  });
+
+  it('matches versioned Claude and DeepSeek family ids', () => {
+    const entries = [
+      config('claude-code-sdk', 'anthropic', 'claude-3-5-sonnet'),
+      config('claude-code-sdk', 'anthropic', 'claude-3-haiku'),
+      config('deepseek-sdk', 'deepseek', 'deepseek-v4-flash-free'),
+      config('deepseek-sdk', 'deepseek', 'deepseek-v4-pro'),
+    ];
+    expect(resolveSupervisionTierPair(entries).executor?.model).toBe('claude-3-haiku');
+    expect(resolveSupervisionTierPair(entries).auditor?.model).toBe('claude-3-5-sonnet');
+  });
   it('keeps migration narrow and never auto-enables small or 27B models', () => {
     expect(migrateLegacySupervisionExecutionPools({ backend: 'codex-sdk', model: 'gpt-5.6' }).primaryDevelopmentPool.configs).toEqual([gpt56]);
     for (const model of ['gpt-5.3-codex-spark', 'gpt-5.4-mini', 'qwen-27b']) {

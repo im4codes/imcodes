@@ -13,6 +13,51 @@ export type SupervisionExecutionPoolKind = typeof SUPERVISION_EXECUTION_POOL_KIN
 export const SUPERVISION_EXECUTION_POOL_ROLES = ['executor', 'auditor', 'both'] as const;
 export type SupervisionExecutionPoolRole = typeof SUPERVISION_EXECUTION_POOL_ROLES[number];
 
+/** Ordered automatic pairing policy.  Keep this as data so daemon, server and
+ * settings can resolve the same preference without provider-specific branches. */
+export const SUPERVISION_TIER_PAIRS = [
+  { executor: 'gpt-6-luna', auditor: 'gpt-6-sol' },
+  { executor: 'claude-haiku', auditor: 'claude-sonnet' },
+  { executor: 'deepseek-flash', auditor: 'deepseek-pro' },
+] as const;
+export type SupervisionTierPair = typeof SUPERVISION_TIER_PAIRS[number];
+
+function modelFamily(model: string): string {
+  return model.toLowerCase().replace(/[^a-z0-9]+/g, '-');
+}
+
+function matchesTierModel(model: string, tierModel: string): boolean {
+  const normalized = modelFamily(model);
+  // Provider model ids carry versions and suffixes (`claude-3-5-sonnet`,
+  // `deepseek-v4-flash-free`), so matching the whole canonical alias is too
+  // strict. Match the stable family token while retaining a provider prefix
+  // for the ambiguous DeepSeek/OpenAI `pro` names.
+  if (tierModel === 'claude-haiku') return normalized.includes('haiku');
+  if (tierModel === 'claude-sonnet') return normalized.includes('sonnet');
+  if (tierModel === 'deepseek-flash') return normalized.includes('deepseek') && normalized.includes('flash');
+  if (tierModel === 'deepseek-pro') return normalized.includes('deepseek') && (normalized.includes('pro') || normalized.includes('reasoner'));
+  return normalized.includes(modelFamily(tierModel));
+}
+
+/** Return the highest-priority executor/auditor configs present in a pool.
+ * Explicit model/session requests bypass this helper in the daemon. */
+export function resolveSupervisionTierPair(
+  configs: readonly SupervisionExecutionConfig[],
+): { executor?: SupervisionExecutionConfig; auditor?: SupervisionExecutionConfig; tier?: SupervisionTierPair } {
+  for (const tier of SUPERVISION_TIER_PAIRS) {
+    const executor = configs.find((config) => matchesTierModel(config.model, tier.executor));
+    const auditor = configs.find((config) => matchesTierModel(config.model, tier.auditor));
+    if (executor || auditor) return { executor, auditor, tier };
+  }
+  return {};
+}
+
+/** Lower number wins when automatic picks choose among configured entries. */
+export function supervisionTierPriority(config: SupervisionExecutionConfig, role: 'executor' | 'auditor'): number {
+  const index = SUPERVISION_TIER_PAIRS.findIndex((tier) => matchesTierModel(config.model, role === 'executor' ? tier.executor : tier.auditor));
+  return index < 0 ? SUPERVISION_TIER_PAIRS.length : index;
+}
+
 export const SUPERVISION_EXECUTION_POOL_CONFIG_STATES = ['configured', 'legacy_unconfigured'] as const;
 export type SupervisionExecutionPoolConfigState = typeof SUPERVISION_EXECUTION_POOL_CONFIG_STATES[number];
 
@@ -320,8 +365,28 @@ function normalizePool(value: unknown, kind: SupervisionExecutionPoolKind): Supe
     ? source.configs.map(normalizeSupervisionExecutionConfig).filter((item): item is SupervisionExecutionConfig => !!item)
     : [];
   const poolEligibleConfigs = kind === 'primary' ? configs.filter((item) => !isExcludedDevelopmentModel(item.model)) : configs;
+  // capabilityId identifies the runtime, not its pair role.  When old clients
+  // send duplicate entries, do not let the last (role-less) copy erase an
+  // explicit role during normalization/sync.  Conflicting roles are widened
+  // to `both`, which is the only lossless representation for one capability.
+  const byCapability = new Map<string, SupervisionExecutionConfig>();
+  for (const item of poolEligibleConfigs) {
+    const previous = byCapability.get(item.capabilityId);
+    if (!previous) { byCapability.set(item.capabilityId, item); continue; }
+    const previousRole = previous.role;
+    const itemRole = item.role;
+    const mergedRole = previousRole === undefined ? itemRole
+      : itemRole === undefined ? previousRole
+        : previousRole === itemRole ? previousRole : 'both';
+    if (mergedRole === undefined || mergedRole === 'both') {
+      const { role: _role, ...withoutRole } = item;
+      byCapability.set(item.capabilityId, withoutRole);
+    } else {
+      byCapability.set(item.capabilityId, { ...item, role: mergedRole });
+    }
+  }
   return {
-    configs: [...new Map(poolEligibleConfigs.map((item) => [item.capabilityId, item])).values()],
+    configs: [...byCapability.values()],
     controls: {
       maxConcurrency: positive(controls.maxConcurrency, DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[kind].maxConcurrency),
       maxSpawned: positive(controls.maxSpawned, DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS[kind].maxSpawned),

@@ -164,5 +164,32 @@ describe('supervisor defaults cache', () => {
       // touches executionPools, unlike enrichSnapshotWithGlobalDefaults.
       expect(result.mode).toBe(sessionSnapshot.mode);
     });
+
+    it('retains executor/auditor roles across daemon sync and restart hydration', async () => {
+      const roleConfig = {
+        ...claudeConfig,
+        model: 'gpt-6-luna',
+        agentType: 'codex-sdk',
+        providerFamily: 'openai',
+        role: 'executor' as const,
+      };
+      const rolePools = {
+        state: 'configured' as const,
+        primaryDevelopmentPool: {
+          configs: [{ ...roleConfig, capabilityId: buildSupervisionExecutionCapabilityId(roleConfig) }],
+          controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.primary,
+        },
+        economyTaskPool: { configs: [], controls: DEFAULT_SUPERVISION_EXECUTION_POOL_CONTROLS.economy },
+      };
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: true,
+        json: async () => ({ defaults: { backend: 'codex-sdk', model: 'gpt-6-luna', executionPools: rolePools } }),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      await refreshSupervisorDefaultsCache();
+      __setCachedSupervisorDefaultsForTests(null);
+      __reloadSupervisorDefaultsCacheFromDiskForTests();
+      expect(getCachedSupervisorDefaults()?.executionPools.primaryDevelopmentPool.configs[0]?.role).toBe('executor');
+    });
   });
 });

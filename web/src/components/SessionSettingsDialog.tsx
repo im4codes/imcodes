@@ -617,8 +617,13 @@ function updateExecutionPoolSelection(
   const primary = pools.primaryDevelopmentPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
   const economy = pools.economyTaskPool.configs.filter((item) => item.capabilityId !== config.capabilityId);
   const selectedPool = pool === 'primary' ? pools.primaryDevelopmentPool : pools.economyTaskPool;
+  // Reusing an already configured capability must retain its role when it is
+  // moved between pools.  The capability id intentionally excludes role.
+  const existingConfig = [...pools.primaryDevelopmentPool.configs, ...pools.economyTaskPool.configs]
+    .find((item) => item.capabilityId === config.capabilityId);
+  const configToAdd = existingConfig ?? config;
   if (!selectedPool.configs.some((item) => item.capabilityId === config.capabilityId)) {
-    (pool === 'primary' ? primary : economy).push(config);
+    (pool === 'primary' ? primary : economy).push(configToAdd);
   }
   return {
     ...pools,
@@ -628,7 +633,7 @@ function updateExecutionPoolSelection(
   };
 }
 
-/** Which pair role a primary-pool entry may serve. Auditors always come from the primary pool. */
+/** Which pair role a pool entry may serve. Auditors currently pick from the primary pool. */
 function updateExecutionPoolRole(
   pools: SupervisionExecutionPoolsConfig,
   capabilityId: string,
@@ -637,7 +642,11 @@ function updateExecutionPoolRole(
   const applyRole = (config: SupervisionExecutionConfig): SupervisionExecutionConfig => (
     config.capabilityId === capabilityId ? { ...config, role } : config
   );
-  return { ...pools, primaryDevelopmentPool: { ...pools.primaryDevelopmentPool, configs: pools.primaryDevelopmentPool.configs.map(applyRole) } };
+  return {
+    ...pools,
+    primaryDevelopmentPool: { ...pools.primaryDevelopmentPool, configs: pools.primaryDevelopmentPool.configs.map(applyRole) },
+    economyTaskPool: { ...pools.economyTaskPool, configs: pools.economyTaskPool.configs.map(applyRole) },
+  };
 }
 
 function SupervisionExecutionPoolsEditor({
