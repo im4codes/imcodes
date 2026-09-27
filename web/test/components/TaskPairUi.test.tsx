@@ -259,6 +259,8 @@ describe('TaskPairStatusPanel', () => {
     expect(container.querySelector('button.task-pair-status-toggle')).toBeNull();
     expect(compact?.getAttribute('role')).toBe('button');
     expect(compact?.getAttribute('aria-label')).toContain('taskPair.panel_expand');
+    // Owner rule: the collapsed mobile strip has no separate expand arrow.
+    expect(compact?.querySelector('.task-pair-status-collapse-icon')).toBeNull();
 
     fireEvent.click(compact!);
     expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
@@ -552,6 +554,19 @@ describe('TaskPairStatusPanel', () => {
   };
   const cssRule = (css: string, selector: string) =>
     new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+
+  it('keeps the collapsed mobile strip borderless and no taller than the titlebar line', () => {
+    const css = readCss();
+    const mobile = css.slice(css.indexOf('@media (max-width: 720px)'));
+    const container = cssRule(mobile, '.task-pair-status-panel.is-mobile.is-collapsed');
+    expect(container).toMatch(/border:\s*0/);
+    expect(container).toMatch(/background:\s*transparent/);
+    expect(container).toMatch(/box-shadow:\s*none/);
+    const strip = cssRule(mobile, '.task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact');
+    expect(strip).toMatch(/min-height:\s*0/);
+    expect(strip).not.toMatch(/min-height:\s*44px/);
+    expect(strip).not.toMatch(/border:\s*1px/);
+  });
 
   it('fills its parent height with the rows list owning the scroll, not a fixed height on the panel', () => {
     const css = readCss();

@@ -14565,14 +14565,23 @@ button.quick-agent-delegation-preset.active {
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; height: min(42vh, 420px); max-height: min(42vh, 420px); overflow: hidden; }
   .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; max-height: none; }
-  /* The compact strip is the mobile disclosure control itself. Keep the
-     whole icon/count row comfortably tappable without reserving space for a
-     second expand button. */
+  /* Owner rule: the collapsed mobile task status is a bare inline strip in
+     the titlebar -- no border/background, no expand button, and it must not
+     make the titlebar any taller. The strip itself is the disclosure control;
+     an invisible, layout-free overlay keeps a comfortable tap target. */
+  .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed,
+  .task-pair-status-panel.is-mobile.is-collapsed {
+    border: 0; border-radius: 0; background: transparent; box-shadow: none; margin: 0; padding: 0;
+  }
   .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact {
-    min-width: 44px; min-height: 44px; padding: 4px 6px; align-items: center;
+    position: relative; min-width: 0; min-height: 0; height: auto; padding: 0 2px;
+    border: 0; background: transparent; align-items: center; line-height: inherit;
+  }
+  .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact::before {
+    content: ''; position: absolute; inset: -10px -4px;
   }
   .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact .task-pair-status-icons {
-    min-height: 36px; align-items: center;
+    min-height: 0; align-items: center;
   }
   .chat-titlebar > .task-pair-status-panel:not(.is-collapsed) {
     position: absolute; inset: calc(100% + 4px) 8px auto; width: auto; max-width: none;
