@@ -120,6 +120,8 @@ export interface ChatTimelineHarnessApi {
   /** True once the first mount's effects have run. */
   ready: boolean;
   eventCount(): number;
+  /** Replaces the live event list (used by deterministic integration probes). */
+  setEvents(events: TimelineEvent[]): void;
   /** Appends one new event under a fresh `eventId`. Returns that id. */
   appendEvent(options?: { type?: string; text?: string }): string;
   /**
@@ -187,6 +189,9 @@ const harness: ChatTimelineHarnessApi = {
   renderStartMs: 0,
   ready: false,
   eventCount: () => currentEvents.length,
+  setEvents(events) {
+    publish([...events]);
+  },
   appendEvent(options = {}) {
     const type = options.type ?? 'assistant.text';
     const text = options.text ?? `Harness appended message ${harnessCounter + 1}.`;
