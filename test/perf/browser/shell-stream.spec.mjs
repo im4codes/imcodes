@@ -122,6 +122,7 @@ async function copyUrlAtColumns(page, targetCols, url) {
     if (!selected.includes(value)) throw new Error('xterm selection did not contain the printed URL');
     return { selected, cols: term.cols };
   }, { value: url, session: SESSION });
+  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
   await page.keyboard.press('Control+C');
   // TerminalView intentionally does not await clipboard.writeText; allow the
   // browser task that records the copy to settle before reading it.
