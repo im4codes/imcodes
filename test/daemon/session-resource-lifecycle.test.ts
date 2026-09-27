@@ -22,11 +22,17 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture(now = 1_000) {
+type TmuxIdentity = { paneId: string; sessionInstanceId: string; runtimeEpoch: string } | null | undefined;
+
+// Never probe the host's real tmux: whether `tmux` is installed or a server is
+// running differs between CI runners. Default to "liveness unknown" (null),
+// which the registry treats fail-closed; tests override it when they model a
+// live or positively-gone pane.
+async function fixture(now = 1_000, resolveTmuxIdentity: () => Promise<TmuxIdentity> = async () => null) {
   const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
   roots.push(directory);
   const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
-  const registry = new SessionResourceRegistry({ directory, now: () => now, cleanup });
+  const registry = new SessionResourceRegistry({ directory, now: () => now, cleanup, resolveTmuxIdentity });
   return { registry, cleanup, directory };
 }
 
@@ -115,9 +121,13 @@ describe('session resource lifecycle', () => {
   });
 
   it('rebinds the same logical tmux pane to a successor epoch without permitting owner reuse', async () => {
-    const { registry } = await fixture();
     const prior = owner();
     const successor = { ...prior, runtimeEpoch: 'epoch-b' };
+    // The pane is live and belongs to the successor, so a different instance
+    // must not be able to take it over.
+    const { registry } = await fixture(1_000, async () => ({
+      paneId: '%1', sessionInstanceId: successor.sessionInstanceId, runtimeEpoch: successor.runtimeEpoch,
+    }));
     await registry.register({
       resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: prior,
       handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%1' },
