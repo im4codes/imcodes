@@ -30,6 +30,11 @@ export type StackOrderEntry = string | { id: string };
 export const DESKTOP_BOTTOM_WINDOW_RESERVE_PX = 100;
 const SESSION_TAB_BUTTON_SELECTOR = '.tab-bar [role="tab"]';
 const SESSION_TAB_BAR_SELECTOR = '.tab-bar';
+const sessionTabMeasureCache = new WeakMap<HTMLElement, {
+  childCount: number;
+  barBottom: number;
+  bottom: number;
+}>();
 /**
  * Last-resort floor for the workspace top. `.main` is the content column, which
  * sits below the app header by construction, so its top is always a safe
@@ -88,20 +93,53 @@ export function reserveWorkspaceBottom(
 
 export function resolveSessionTabsBottom(doc: Document | null = typeof document === 'undefined' ? null : document): number {
   if (!doc) return 0;
-  const tabButtons = Array.from(doc.querySelectorAll<HTMLElement>(SESSION_TAB_BUTTON_SELECTOR));
+  // The desktop drag/resize path asks for this bound on every pointer frame.
+  // Avoid a document-wide querySelectorAll there: the tab bar itself is stable
+  // while a window is being moved, so cache the button measurement until its
+  // child count or own geometry changes.
+  const tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR);
+  const tabBarBottom = tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
+  if (tabBar) {
+    const cached = sessionTabMeasureCache.get(tabBar);
+    if (cached
+      && cached.childCount === tabBar.childElementCount
+      && cached.barBottom === tabBarBottom) {
+      return cached.bottom;
+    }
+  }
+  const tabButtons = tabBar
+    ? Array.from(tabBar.querySelectorAll<HTMLElement>('[role="tab"]'))
+    : [];
   const tabButtonBottoms = tabButtons
     .map((button) => finiteOr(button.getBoundingClientRect().bottom, 0))
     .filter((bottom) => bottom > 0);
-  if (tabButtonBottoms.length > 0) return Math.max(...tabButtonBottoms);
+  if (tabButtonBottoms.length > 0) {
+    const bottom = Math.max(...tabButtonBottoms);
+    if (tabBar) {
+      sessionTabMeasureCache.set(tabBar, {
+        childCount: tabBar.childElementCount,
+        barBottom: tabBarBottom,
+        bottom,
+      });
+    }
+    return bottom;
+  }
 
   // A present-but-unmeasured tab bar reports bottom 0 (pre-layout, or hidden).
   // Returning that is the same failure as having no tab bar at all, so only
   // accept a positive measurement and otherwise fall through to the floor
   // below. The previous version returned the 0 and pinned the window to the
   // top of the viewport, under the app header.
-  const tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR);
-  const tabBarBottom = tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
-  if (tabBarBottom > 0) return tabBarBottom;
+  if (tabBarBottom > 0) {
+    if (tabBar) {
+      sessionTabMeasureCache.set(tabBar, {
+        childCount: tabBar.childElementCount,
+        barBottom: tabBarBottom,
+        bottom: tabBarBottom,
+      });
+    }
+    return tabBarBottom;
+  }
 
   // Falling through to 0 pins a window to the very top of the viewport, which
   // slides its own title bar — and the close button in it — underneath the app
