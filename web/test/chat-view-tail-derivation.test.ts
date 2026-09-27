@@ -209,6 +209,13 @@ it('computes measured viewport ranges with overscan and exact spacer conservatio
   expect(range.topSpacer + range.bottomSpacer).toBeLessThanOrEqual(range.totalHeight);
 });
 
+it('clamps a stale resume scroll offset so virtualization never renders a blank range', () => {
+  const range = __computeVirtualChatRangeForTests(Array.from({ length: 32 }, () => 72), 999_999, 320, 6);
+  expect(range.start).toBeLessThan(range.end);
+  expect(range.bottomSpacer).toBe(0);
+  expect(range.topSpacer).toBeLessThan(range.totalHeight);
+});
+
 it('finalizes a merged assistant block when its latest event is terminal', () => {
   const items = __buildViewItemsForTests([
     ev(1, 'assistant.text', { text: 'partial', streaming: true }),

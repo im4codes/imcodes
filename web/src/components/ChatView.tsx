@@ -2066,7 +2066,12 @@ export function __computeVirtualChatRangeForTests(
   const offsets = new Array<number>(heights.length + 1);
   offsets[0] = 0;
   for (let i = 0; i < heights.length; i += 1) offsets[i + 1] = offsets[i] + Math.max(1, heights[i] || 0);
-  const top = Math.max(0, scrollTop);
+  // A foreground restore can briefly retain the old scrollTop while the
+  // cache-backed list is replaced with a shorter tail. Clamp before choosing
+  // a range; otherwise start can equal length and the virtualizer renders only
+  // spacers, producing the empty black chat region reported on iOS.
+  const maxScrollTop = Math.max(0, offsets[heights.length] - Math.max(1, viewportHeight));
+  const top = Math.min(maxScrollTop, Math.max(0, scrollTop));
   const bottom = top + Math.max(1, viewportHeight);
   let start = 0;
   while (start < heights.length && offsets[start + 1] < top) start += 1;
@@ -2130,6 +2135,8 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
   const scrollTopRef = useRef(0);
   const viewportRef = useRef(0);
   const rafRef = useRef<number | null>(null);
+  const wasAtBottomRef = useRef(true);
+  const itemSignatureRef = useRef<string | null>(null);
   const estimate = 72;
   const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimate;
 
@@ -2143,6 +2150,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
     const onScroll = () => {
       scrollTopRef.current = root.scrollTop;
       viewportRef.current = root.clientHeight;
+      wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
       if (rafRef.current !== null) return;
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
@@ -2156,6 +2164,27 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
       rafRef.current = null;
     };
   }, [enabled, scrollRef]);
+
+  // Resume/cache replay can replace the children without dispatching a scroll
+  // event. Reconcile the real viewport before the next paint: keep a viewer
+  // who was following at the bottom, and clamp an old offset if the restored
+  // content became shorter. This prevents a stale high scrollTop from making
+  // the computed virtual range empty while preserving readers' numeric anchor.
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const signature = items.map((item) => item.key).join('\u0001');
+    if (itemSignatureRef.current === signature) return;
+    itemSignatureRef.current = signature;
+    const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    if (wasAtBottomRef.current) root.scrollTop = root.scrollHeight;
+    else if (root.scrollTop > maxScrollTop) root.scrollTop = maxScrollTop;
+    scrollTopRef.current = root.scrollTop;
+    viewportRef.current = root.clientHeight;
+    wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
+    setLayoutVersion((version) => version + 1);
+  }, [enabled, items, scrollRef]);
 
   // Pin/search navigation can target an item outside the mounted overscan
   // range. Move the real scroll viewport to its measured offset first; the

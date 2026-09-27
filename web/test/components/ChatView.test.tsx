@@ -713,6 +713,66 @@ describe('ChatView', () => {
     expect(screen.queryByText('chat.loading')).toBeNull();
   });
 
+  it('keeps the bottom visible when a foreground cache replay replaces a long virtualized tail', async () => {
+    const makeEvents = (count: number) => Array.from({ length: count }, (_, index) => ({
+      eventId: `resume-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `resume-message-${index}` },
+    }));
+    const { container, rerender } = render(
+      <ChatView events={makeEvents(40) as any} loading={false} sessionId="deck_resume_bottom" />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 2_880;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 320 });
+    await waitFor(() => expect(scrollTopValue).toBe(2_880));
+
+    // A fast foreground replay can temporarily publish a shorter cache tail
+    // while the old scrollTop is still retained by WebKit.
+    scrollHeightValue = 1_800;
+    rerender(<ChatView events={makeEvents(25) as any} loading={false} sessionId="deck_resume_bottom" />);
+    await waitFor(() => expect(scrollTopValue).toBe(1_800));
+    expect(screen.getByText('resume-message-24')).toBeTruthy();
+  });
+
+  it('preserves a reader anchor while a foreground history delta arrives', async () => {
+    const makeEvents = (suffix: string) => Array.from({ length: 40 }, (_, index) => ({
+      eventId: `anchor-${index}`,
+      type: 'user.message',
+      ts: 1_700_000_000_000 + index,
+      payload: { text: `anchor-${suffix}-${index}` },
+    }));
+    const { container, rerender } = render(
+      <ChatView events={makeEvents('before') as any} loading={false} sessionId="deck_resume_reader" />,
+    );
+    const scrollEl = container.querySelector('.chat-view') as HTMLDivElement;
+    let scrollTopValue = 0;
+    let scrollHeightValue = 2_880;
+    Object.defineProperty(scrollEl, 'scrollTop', {
+      configurable: true,
+      get: () => scrollTopValue,
+      set: (value) => { scrollTopValue = value; },
+    });
+    Object.defineProperty(scrollEl, 'scrollHeight', { configurable: true, get: () => scrollHeightValue });
+    Object.defineProperty(scrollEl, 'clientHeight', { configurable: true, value: 320 });
+    await waitFor(() => expect(scrollTopValue).toBe(2_880));
+    scrollTopValue = 900;
+    fireEvent.wheel(scrollEl, { deltaY: -20 });
+    fireEvent.scroll(scrollEl);
+    scrollHeightValue = 3_000;
+    rerender(<ChatView events={makeEvents('after') as any} loading={false} sessionId="deck_resume_reader" />);
+    await waitFor(() => expect(screen.getByText('anchor-after-6')).toBeTruthy());
+    expect(scrollTopValue).toBe(900);
+  });
+
   it('shows the loading placeholder only when nothing is cached yet', () => {
     render(
       <ChatView
