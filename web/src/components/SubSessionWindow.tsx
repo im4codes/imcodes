@@ -401,6 +401,10 @@ export function SubSessionWindow({
 
   const [quotes, setQuotes] = useState<string[]>([]);
   const [composerText, setComposerText] = useState('');
+  // Keep text entered into the lightweight inactive-window composer while the
+  // full SessionControls tree is deferred. Promotion on focus hands this
+  // value to SessionControls so typing is never lost during startup.
+  const [deferredComposerText, setDeferredComposerText] = useState('');
   const executionRouting = useExecutionRouting(serverId ?? null);
   const {
     state: executionCloneLaunchState,
@@ -1094,7 +1098,15 @@ export function SubSessionWindow({
         )}
         {visible && !active && viewMode === 'chat' && (
           <div class="subsession-preview-shell" aria-live="polite">
-            {inactiveWindowPreview || statusText || '—'}
+            <div>{inactiveWindowPreview || statusText || '—'}</div>
+            <input
+              class="subsession-deferred-composer"
+              value={deferredComposerText}
+              onInput={(event) => setDeferredComposerText((event.currentTarget as HTMLInputElement).value)}
+              onFocus={onFocus}
+              aria-label={t('chat.input.placeholder')}
+              placeholder={t('chat.input.placeholder')}
+            />
           </div>
         )}
       </div>
@@ -1203,8 +1215,11 @@ export function SubSessionWindow({
         detectedModel={effectiveDetectedModel ?? lastUsage?.model}
         quotes={quotes}
         onRemoveQuote={removeQuote}
-        pendingPrefillText={pendingPrefillText}
-        onPendingPrefillApplied={onPendingPrefillApplied}
+        pendingPrefillText={pendingPrefillText ?? (deferredComposerText || null)}
+        onPendingPrefillApplied={() => {
+          setDeferredComposerText('');
+          onPendingPrefillApplied?.();
+        }}
         onVersionSensitiveAction={onVersionSensitiveAction}
         onComposerTextChange={setComposerText}
       /> : visible ? <div class="subsession-controls-deferred" aria-hidden="true" /> : null}
