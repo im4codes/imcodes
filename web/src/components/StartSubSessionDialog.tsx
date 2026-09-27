@@ -12,6 +12,7 @@ import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_
 import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
+import { ModelCombobox } from './ModelCombobox.js';
 import { usePresetModelSelection } from '../hooks/usePresetModelSelection.js';
 import {
   buildCcPresetFromDraft,
@@ -821,22 +822,15 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                   ))}
                 </select>
               ) : (
-                <input
-                  class="input"
-                  type="text"
-                  list={`sub-session-model-options-${type}`}
+                <ModelCombobox
+                  className="input"
+                  id={`sub-session-model-${type}`}
+                  options={modelSuggestions}
                   placeholder={t('session.supervision.selectModel')}
                   value={requestedModel}
-                  onInput={(e) => setRequestedModel((e.target as HTMLInputElement).value)}
+                  onChange={setRequestedModel}
                   style={{ width: '100%' }}
                 />
-              )}
-              {modelSuggestions.length > 0 && (
-                <datalist id={`sub-session-model-options-${type}`}>
-                  {modelSuggestions.map((model) => (
-                    <option key={model} value={model} />
-                  ))}
-                </datalist>
               )}
               {type === 'grok-sdk' && transportModels.error && (
                 <div role="alert" style={{ marginTop: 6, color: '#fca5a5', fontSize: 12 }}>

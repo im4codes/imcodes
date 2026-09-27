@@ -25,6 +25,7 @@ import {
   useTransportModels,
   supportsDynamicTransportModels,
 } from "../hooks/useTransportModels.js";
+import { ModelCombobox } from "./ModelCombobox.js";
 import { usePresetModelSelection } from "../hooks/usePresetModelSelection.js";
 import { QwenCodingPlanHint } from "./QwenCodingPlanHint.js";
 import {
@@ -953,29 +954,16 @@ export function NewSessionDialog({
                 ))}
               </select>
             ) : (
-              <input
-                type="text"
-                list={`new-session-model-options-${agentType}`}
+              <ModelCombobox
+                options={modelSuggestions}
+                id={`new-session-model-${agentType}`}
                 placeholder={t("session.supervision.selectModel")}
                 value={requestedModel}
                 disabled={starting}
-                onInput={(e) =>
-                  setRequestedModel((e.target as HTMLInputElement).value)
-                }
-                autoComplete="off"
-                autoCorrect="off"
-                autoCapitalize="off"
-                spellcheck={false}
-                data-lpignore="true"
-                data-1p-ignore
+                onChange={setRequestedModel}
+                className="input"
+                style={{ width: "100%" }}
               />
-            )}
-            {modelSuggestions.length > 0 && (
-              <datalist id={`new-session-model-options-${agentType}`}>
-                {modelSuggestions.map((model) => (
-                  <option key={model} value={model} />
-                ))}
-              </datalist>
             )}
             {agentType === "grok-sdk" && transportModels.error && (
               <div role="alert" style={{ marginTop: 6, color: "#fca5a5", fontSize: 12 }}>
