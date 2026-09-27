@@ -478,6 +478,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
             <div class="subcard-preview-terminal-placeholder" aria-hidden="true" />
           ) : (
             <ChatView
+              visible={isOpen || isFocused}
               events={events}
               loading={false}
               refreshing={refreshing}

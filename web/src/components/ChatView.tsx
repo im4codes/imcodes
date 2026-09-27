@@ -168,6 +168,8 @@ interface Props {
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
   preview?: boolean;
+  /** False for retained/collapsed windows: keep data cached but pause all chat timers. */
+  visible?: boolean;
   /** When provided, clicking file paths opens the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** When provided, the right-side file panel is available. */
@@ -2224,7 +2226,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
   </>;
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   // Sent on every chatFileReference:true request (path click, preview, download).
@@ -2777,10 +2779,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   );
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
   useEffect(() => {
-    if (!hasAgentsStatusRows) return undefined;
+    if (!visible || !hasAgentsStatusRows) return undefined;
     const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [hasAgentsStatusRows]);
+  }, [hasAgentsStatusRows, visible]);
   // Preview cards reuse the existing Agents panel when background work exists.
   // The aggregator only accepts sdkSubagent events, so ordinary Bash tool calls
   // never make this control or panel appear.
@@ -3048,6 +3050,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   const scheduleFollowFrame = useCoalescedFrame();
 
   const scrollToBottom = (engageFollow: boolean = true) => {
+    if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el) return;
     if (engageFollow) {
@@ -3474,6 +3477,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // Keep the active chat pinned to bottom when layout changes reduce available height
   // (for example, when the sub-session bar appears after tab switch).
   useEffect(() => {
+    if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
 
@@ -3499,7 +3503,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, [preview, scheduleFollowFrame]);
+  }, [preview, scheduleFollowFrame, visible]);
 
   // Hold the bottom through the post-mount layout settle.
   //
@@ -3522,6 +3526,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // never engages follow itself, it stays out of the way of the load-older anchor,
   // and it only fires on an actual height change so a quiet mount costs nothing.
   useEffect(() => {
+    if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el) return;
     let lastScrollHeight = el.scrollHeight;
@@ -3547,7 +3552,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       scrollToBottom(false);
     }, CHAT_MOUNT_SETTLE_TICK_MS);
     return () => clearInterval(timer);
-  }, [sessionId, preview]);
+  }, [sessionId, preview, visible]);
 
   // Touch gesture mode is based on pointer coarseness only. Narrow desktop
   // windows still need native selection and the Copy/Quote popup.
@@ -4137,7 +4142,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             if (item.type === 'tool-activity') {
-              return <ToolActivitySummary key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
@@ -4661,6 +4666,7 @@ function ToolActivityPeek({
 /** One-line live tool telemetry for Simple view; expands details on demand. */
 function ToolActivitySummary({
   events,
+  visible = true,
   onPathClick,
   onUrlClick,
   onDownload,
@@ -4670,6 +4676,7 @@ function ToolActivitySummary({
   serverId,
 }: {
   events: TimelineEvent[];
+  visible?: boolean;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
@@ -4695,7 +4702,7 @@ function ToolActivitySummary({
   const counts = getToolActivityCounts(events);
   // Tick only while something is actually running: a settled group must not keep
   // a timer alive, and the shared ticker stops once its last listener leaves.
-  const nowMs = useNowTicker(counts.running > 0);
+  const nowMs = useNowTicker(visible && counts.running > 0);
   const last = getLastToolActivity(events, nowMs);
   const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
   // Same one-line preview the full row shows, so this reads as a miniature of it

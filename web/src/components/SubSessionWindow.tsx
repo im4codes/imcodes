@@ -1032,8 +1032,9 @@ export function SubSessionWindow({
               mobileInput={isShell}
             />}
         </div>
-        {viewMode === 'chat' && (
+        {visible && viewMode === 'chat' && (
           <ChatView
+            visible={visible}
             events={events}
             loading={false}
             refreshing={refreshing}

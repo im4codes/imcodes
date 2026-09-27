@@ -437,6 +437,7 @@ export function SessionPane({
       {/* Chat view: only rendered when active + in chat mode */}
       {chatVisible && (
         <ChatView
+          visible={isActive}
           events={timelineEvents}
           loading={timelineLoading}
           refreshing={timelineRefreshing}
