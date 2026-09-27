@@ -289,6 +289,29 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN)).toHaveLength(1);
   });
 
+  it('does not deliver merely when a busy Brain becomes idle before the first cadence slot', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-idle-transition', brain: BRAIN, status: 'working', flags: ['blocked'],
+      flagSides: { blocked: 'executor' }, round: 1, blocking: ['P0'], previousAuditors: [],
+      capCounts: {}, capRound: 0, createdAt: now - 60_000, updatedAt: now - 60_000,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    busy.add(BRAIN);
+    automation.publishBadges();
+    expect(sentTo(BRAIN)).toHaveLength(0);
+
+    busy.delete(BRAIN);
+    automation.publishBadges();
+    expect(sentTo(BRAIN)).toHaveLength(0);
+    expect(getTaskPairStore().listEvents(PROJECT, 'brain-idle-transition').some((event) => (
+      event.verb === 'REMIND' && event.effect === 'skipped' && event.attrs.reason === 'cadence_not_due'
+    ))).toBe(true);
+
+    now += 5 * 60_000;
+    automation.publishBadges();
+    expect(sentTo(BRAIN)).toHaveLength(1);
+  });
+
   it('nudges whoever holds the ball when both sides are idle (in_audit with a real auditor: the auditor), but stands down when either side has activity', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH BOTH_IDLE executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT BOTH_IDLE -->');
@@ -906,6 +929,12 @@ describe('task-pair heartbeat, replacement and queue', () => {
     automation.publishBadges();
     expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
     await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    // The user reply is also Brain activity, so the hard ten-minute global
+    // gap is the later boundary for this re-armed wait.
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
     expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
     automation.publishBadges();
     await flush();
@@ -943,6 +972,10 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
     automation.observeTimelineEvent({ sessionId: BRAIN, type: 'user.message', payload: { text: 'I have decided', automation: false } });
     expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    now += 10 * 60_000;
+    automation.publishBadges();
     await flush();
     expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
   });

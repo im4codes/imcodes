@@ -555,13 +555,20 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   #deliverMainHeartbeat(brain: string, storedPairs: readonly StoredTaskPair[]): void {
-    const deliveryPairs = storedPairs.filter((stored) => {
+    const candidatePairs = storedPairs.filter((stored) => {
       if (stored.liveness.brainReminderDue || stored.state.status !== 'passed') return true;
       const held = [stored.state.executor, stored.state.auditor]
         .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
         .some((session) => hasRecentTaskPairProviderError(session, this.#now(), this.#intervalMs));
       return !held;
     });
+    // The projection may remain armed while a pair waits for its next
+    // cadence slot, but idling the Brain must never itself trigger delivery.
+    // Only a durable reminderDue slot can enter the aggregate message.
+    for (const candidate of candidatePairs.filter((stored) => !stored.liveness.brainReminderDue)) {
+      this.#recordReminderSkip(candidate, 'cadence_not_due', this.#now());
+    }
+    const deliveryPairs = candidatePairs.filter((stored) => stored.liveness.brainReminderDue);
     if (deliveryPairs.length === 0) return;
     const store = getTaskPairStore();
     const allBrainPairs = store.listActivePairs().filter((stored) => (
@@ -723,7 +730,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
 
   #recordReminderSkip(stored: StoredTaskPair, reason: string, at: number): void {
     const live = stored.liveness;
-    if (!live.brainReminderDue) return;
+    if (!live.brainReminderDue && reason !== 'cadence_not_due') return;
     if (live.brainReminderLastDecisionReason === reason) return;
     const next = { ...live, brainReminderLastDecisionAt: at, brainReminderLastDecisionReason: reason };
     getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, next);
