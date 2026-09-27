@@ -56,14 +56,26 @@ export async function runPairBriefScenario() {
   await page.waitForTimeout(50);
   const outerAfterWheel = await rowsScroller.evaluate((element) => element.scrollTop);
   assert.ok(outerAfterWheel > outerBeforeWheel, 'brief edge scroll chains to the outer task list');
-  await rows.nth(29).scrollIntoViewIfNeeded();
   assert.equal(await rows.count(), 30);
   assert.equal(await numbers.nth(0).textContent(), '1');
   assert.equal(await numbers.nth(29).textContent(), '30');
+  await rowsScroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  await page.waitForTimeout(50);
+  const lastRow = rows.nth(29);
+  const lastBox = await lastRow.boundingBox();
+  const rowsBox = await rowsScroller.boundingBox();
+  assert.ok(lastBox && rowsBox && lastBox.y + lastBox.height <= rowsBox.y + rowsBox.height + 2, 'last task row is reachable');
   await page.screenshot({ path: SCREENSHOT, fullPage: true });
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(100);
-  await rows.nth(29).scrollIntoViewIfNeeded();
+  await rowsScroller.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const mobileLastBox = await lastRow.boundingBox();
+  const mobileRowsBox = await rowsScroller.boundingBox();
+  assert.ok(mobileLastBox && mobileRowsBox && mobileLastBox.y + mobileLastBox.height <= mobileRowsBox.y + mobileRowsBox.height + 2, 'mobile last task row is reachable');
   await page.screenshot({ path: MOBILE_SCREENSHOT, fullPage: true });
   const result = { rows: await rows.count(), lastRow: await panel.getByText('Browser-visible pair title 30').isVisible(), sequence: true, nestedBrief: true, desktopScreenshot: SCREENSHOT, mobileScreenshot: MOBILE_SCREENSHOT };
   await browser.close();
