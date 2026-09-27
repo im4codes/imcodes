@@ -608,10 +608,48 @@ jobs:
 
   # ── Coverage ──────────────────────────────────────────────────────────────
 
+  coverage-shard:
+    name: Coverage shard ${{ matrix.shard }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        shard: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION_PRIMARY }}
+          cache: 'npm'
+      # Keep this build in every shard: packaging and postinstall tests may
+      # land in any shard, and the build is short compared with test runtime.
+      - run: ./scripts/ci-npm-ci.sh .
+      - name: Install web deps (needed for tsx component tests)
+        run: ./scripts/ci-npm-ci.sh web
+      - name: Install server deps (needed for server route tests)
+        run: ./scripts/ci-npm-ci.sh server
+      - run: npm run build
+      - name: Run coverage shard
+        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/4 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob
+        env:
+          # Shards only need JSON input for the merge; final reports are made
+          # once by the merge job, avoiding four lcov/text/reporting passes.
+          COVERAGE_REPORTERS: json
+      - name: Upload coverage shard
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-shard-${{ matrix.shard }}
+          path: |
+            coverage/shard-${{ matrix.shard }}/
+            .vitest-reports/
+          if-no-files-found: error
+
   coverage:
     name: Coverage Report
     runs-on: ubuntu-latest
-    needs: [unit-tests, web-tests-unit, web-tests-components]
+    needs: [coverage-shard]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -620,24 +658,31 @@ jobs:
         with:
           node-version: ${{ env.NODE_VERSION_PRIMARY }}
           cache: 'npm'
-      # tmux is no longer needed here: `test:coverage` skips the e2e project
-      # (which spawns real tmux + agent processes), saving ~1 min per run.
-      #
-      # `npm run build` IS still needed: although most tests resolve from
-      # `src/` via vitest's tsx transform, two suites assert against the
-      # built output and FAIL without `dist/`:
-      #   - test/packaging.test.ts             (verifies bin/main/files paths)
-      #   - test/util/postinstall-sharp-repair.test.ts (executes dist/.../postinstall-sharp-repair.js)
-      # Both run in the `daemon` project, which is included in coverage. They
-      # pass in the regular Unit Tests jobs because those run `npm run build`
-      # first; coverage must do the same.
       - run: ./scripts/ci-npm-ci.sh .
-      - name: Install web deps (needed for tsx component tests)
-        run: ./scripts/ci-npm-ci.sh web
-      - name: Install server deps (needed for server route tests)
-        run: ./scripts/ci-npm-ci.sh server
-      - run: npm run build
-      - run: npm run test:coverage
+      - name: Download coverage shard 1
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-1
+          path: coverage/shards/shard-1
+      - name: Download coverage shard 2
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-2
+          path: coverage/shards/shard-2
+      - name: Download coverage shard 3
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-3
+          path: coverage/shards/shard-3
+      - name: Download coverage shard 4
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-shard-4
+          path: coverage/shards/shard-4
+      - name: Merge coverage reports
+        run: npm run coverage:merge -- coverage/shards coverage
+      - name: Write coverage summary and enforce thresholds
+        run: npm run coverage:summary && npm run coverage:check
       - name: Upload coverage artifact
         if: always()
         uses: actions/upload-artifact@v4
@@ -645,13 +690,13 @@ jobs:
           name: coverage-report
           path: |
             coverage/
-            !coverage/tmp/
+            !coverage/shards/
           if-no-files-found: error
       - name: Upload to Codecov
         if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4
         with:
-          token: ${{ env.CODECOV_TOKEN }}
+          token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: false
       - name: Skip Codecov upload when token is unavailable
         if: ${{ env.CODECOV_TOKEN == '' }}

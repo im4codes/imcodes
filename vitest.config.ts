@@ -1,5 +1,10 @@
 import { defineConfig } from 'vitest/config';
 
+const configuredCoverageReporters = process.env.COVERAGE_REPORTERS
+  ?.split(',')
+  .map((reporter) => reporter.trim())
+  .filter(Boolean);
+
 /**
  * Probe files owned by test/setup/isolated-home.test.ts. They are NOT tests in
  * their own right: each one only means something when the harness runs it
@@ -123,9 +128,9 @@ export default defineConfig({
       // - `text`         — short terminal table at the end of the run.
       // Local dev keeps `html` so developers can browse coverage in a
       // browser; CI never needs it.
-      reporter: process.env.CI
+      reporter: configuredCoverageReporters ?? (process.env.CI
         ? ['lcovonly', 'json-summary', 'json', 'text']
-        : ['text', 'html'],
+        : ['text', 'html']),
       // Only instrument actual source — never tests, build outputs, or
       // ancillary scripts. v8 instrumentation cost scales with the size of
       // the included tree.
