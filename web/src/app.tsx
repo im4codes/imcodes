@@ -2455,7 +2455,12 @@ export function App() {
       const next = new Set(prev);
       next.delete(id);
       return next;
-    });
+    // Keep the minimized pane mounted as a cheap summary shell.  Removing it
+    // from the retained set made the canonical 19-window run report only the
+    // nine full panes and forced a cold remount on restore.  `visible=false`
+    // keeps its subscription/history summary path while SubSessionWindow
+    // suppresses full controls and ChatView work until restoration.
+    }, { retainPrevious: true });
     removeDesktopWindow(DESKTOP_WINDOW_IDS.subSession(id));
   }, [clearSubSessionMaximized, removeDesktopWindow, setOpenSubIds]);
 
