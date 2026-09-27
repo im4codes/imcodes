@@ -318,7 +318,9 @@ export function SubSessionWindow({
     // Keep visible inactive windows live-subscribed, but defer their expensive
     // history/IDB bootstrap until focus. This preserves the full live stream
     // contract without issuing N large history reads during startup.
-    bootstrapWhenVisible: active,
+    // On-screen windows must paint their local cache and obtain one bounded
+    // tail/delta even before focus; hidden windows defer bootstrap entirely.
+    bootstrapWhenVisible: visible,
   });
 
   // Re-surface a still-pending question in the dedicated dialog from history

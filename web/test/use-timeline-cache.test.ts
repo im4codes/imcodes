@@ -428,7 +428,7 @@ describe('useTimeline window-isolated cache bounds', () => {
     expect(fetchHistorySpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ afterTs: undefined, limit: 300 }),
+      expect.objectContaining({ afterTs: undefined, limit: 200 }),
     );
   });
 
@@ -817,7 +817,7 @@ describe('useTimeline window-isolated cache bounds', () => {
     });
 
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     expect(fetchHistorySpy).toHaveBeenCalled();
   });
 
@@ -863,7 +863,7 @@ describe('useTimeline window-isolated cache bounds', () => {
       await flushMicrotasks();
     });
 
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     expect(fetchHistorySpy).toHaveBeenCalled();
 
     await act(async () => {
@@ -1739,7 +1739,7 @@ describe('useTimeline window-isolated cache bounds', () => {
     render(h(Probe));
 
     await waitFor(() => {
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
       expect(fetchTextTailSpy).not.toHaveBeenCalled();
       expect(screen.getByTestId('probe').getAttribute('data-text-tail')).toBe('skipped');
     });
@@ -1772,7 +1772,7 @@ describe('useTimeline window-isolated cache bounds', () => {
     view.rerender(h(Probe, { tick: 1 }));
 
     await waitFor(() => {
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     });
   });
 
@@ -2064,7 +2064,7 @@ describe('useTimeline window-isolated cache bounds', () => {
     render(h(Probe));
 
     await waitFor(() => {
-      expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+      expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     });
 
     await act(async () => {
@@ -2759,7 +2759,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('complete cached output');
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 9);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 9);
     });
 
     await act(async () => {
@@ -3128,7 +3128,7 @@ describe('useTimeline window-isolated cache bounds', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('live cached text');
     });
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 0);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 0);
 
     await act(async () => {
       handler?.({
@@ -3732,7 +3732,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     // Initial mount already has cached cursor state, so it asks only for the
     // missed tail instead of re-downloading a full recent-history snapshot.
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 4999);
     sendTimelineHistoryRequest.mockClear();
 
     // Simulate browser WS reconnect. useTimeline should now gap-fill using
@@ -3743,7 +3743,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     expect(ws.sendTimelineReplayRequest).toHaveBeenCalledWith(sessionName, 2, 1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 4999);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 4999);
   });
   it('reports the cache step as empty, not done, when this device has no copy', async () => {
     // A bare "done" rendered a ✓ next to a blank chat, which reads as "your
@@ -4271,7 +4271,7 @@ describe('useTimeline window-isolated cache bounds', () => {
       }
       render(h(Probe));
 
-      await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName));
+      await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200));
       expect(screen.getByTestId('probe-idb-stall').getAttribute('data-cache')).toBe('running');
       expect(screen.getByTestId('probe-idb-stall').getAttribute('data-daemon')).toBe('running');
     });

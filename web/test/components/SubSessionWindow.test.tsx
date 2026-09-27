@@ -1408,7 +1408,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       sub.sessionName,
       ws,
       undefined,
-      { isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: false },
+      { isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true },
     );
   });
 
@@ -2043,7 +2043,7 @@ describe('SDK window startup budget', () => {
   it('enables history bootstrap when an on-screen window receives focus', () => {
     const sub = makeSubSession({ id: 'sdk-focus', sessionName: 'deck_sub_sdk-focus', type: 'codex-sdk', runtimeType: 'transport' });
     const view = render(<SubSessionWindow sub={sub} ws={ws} connected active={false} visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />);
-    expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: false });
+    expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true });
     view.rerender(<SubSessionWindow sub={sub} ws={ws} connected active visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />);
     expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: true, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true });
   });
