@@ -1,6 +1,5 @@
 import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
-import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '../../../shared/timeline-protocol.ts';
 
 const require = createRequire(new URL('../../../server/package.json', import.meta.url));
 let Client;
@@ -79,7 +78,7 @@ const ws = new WebSocket(`${serverUrl}/api/server/${encodeURIComponent(serverId)
 await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
 process.stdout.write(JSON.stringify({ phase: 'socket_open' }) + '\n');
 ws.send(JSON.stringify({ type: 'auth', serverId, token, daemonVersion: 'perf-harness' }));
-ws.send(JSON.stringify({ type: 'daemon.hello', daemonId: serverId, capabilities: [TIMELINE_PROTOCOL_CAPABILITY], timelineProtocolRevision: 1, helloEpoch: 1, sentAt: Date.now() }));
+ws.send(JSON.stringify({ type: 'daemon.hello', daemonId: serverId, capabilities: ['timeline.protocol.v1'], timelineProtocolRevision: 1, helloEpoch: 1, sentAt: Date.now() }));
 
 const epoch = 1;
 const history = new Map(historyNames.map((name) => [name, []]));
@@ -88,7 +87,7 @@ function sendEvent(name, type, payload) {
   const event = { eventId: `perf-${name}-${events.length + 1}`, sessionId: name, epoch, seq: events.length + 1, ts: Date.now(), type, payload };
   events.push(event);
   history.set(name, events);
-  ws.send(JSON.stringify({ type: TIMELINE_MESSAGES.EVENT, event }));
+  ws.send(JSON.stringify({ type: 'timeline.event', event }));
 }
 for (const [index, name] of activeTimelineNames.entries()) {
   sendEvent(name, 'user.message', { text: `Perf session ${index + 1} ready` });
@@ -145,10 +144,10 @@ ws.on('message', (raw) => {
     return;
   }
   if (typeof msg.sessionName !== 'string') return;
-  if (msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST || msg.type === TIMELINE_MESSAGES.REPLAY_REQUEST || msg.type === TIMELINE_MESSAGES.PAGE_REQUEST) {
+  if (msg.type === 'timeline.history_request' || msg.type === 'timeline.replay_request' || msg.type === 'timeline.page_request') {
     const events = history.get(msg.sessionName) ?? [];
     const afterSeq = Number(msg.cursor?.afterSeq ?? msg.afterSeq ?? 0);
-    const type = msg.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : (msg.type === TIMELINE_MESSAGES.REPLAY_REQUEST ? TIMELINE_MESSAGES.REPLAY : TIMELINE_MESSAGES.HISTORY);
+    const type = msg.type === 'timeline.page_request' ? 'timeline.page' : (msg.type === 'timeline.replay_request' ? 'timeline.replay' : 'timeline.history');
     ws.send(JSON.stringify({ type, sessionName: msg.sessionName, requestId: msg.requestId, status: 'ok', source: 'cache', epoch, events: events.filter((event) => event.seq > afterSeq), hasMore: false, payloadTruncated: false }));
   }
 });
