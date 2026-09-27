@@ -254,6 +254,23 @@ export async function runShellBrowserScenario() {
 
   const inputLatency = await measureKeystrokeEcho(page);
 
+  // CI/211 can run many unrelated browser suites concurrently.  This focused
+  // mode preserves the real daemon/server/browser path while collecting the
+  // two acceptance metrics that are otherwise buried late in the full flow.
+  if (process.env.IMC_SHELL_FOCUSED === '1') {
+    const focusedUrl = `https://example.test/remote-desktop/${'x'.repeat(260)}`;
+    const focusedCopies = [];
+    for (const columns of [80, 120, 200]) focusedCopies.push(await copyUrlAtColumns(page, columns, focusedUrl));
+    await page.setViewportSize({ width: 390, height: 844 });
+    await page.waitForTimeout(200);
+    focusedCopies.push(await copyUrlAtColumns(page, 0, focusedUrl));
+    for (const result of focusedCopies) assert.equal(result.exact, true, `focused wrapped URL copy must be exact at ${result.requestedCols || 'mobile'} columns`);
+    const focusedMetrics = await page.evaluate(() => ({ firstPaintMs: window.__shellPerf?.firstPaintMs ?? 0 }));
+    console.log(JSON.stringify({ focused: true, inputLatency, urlCopies: focusedCopies, metrics: focusedMetrics }));
+    await browser.close();
+    return { firstPaintMs, recovery: 0, metrics: focusedMetrics, inputLatency, urlCopies: focusedCopies, keyBarCount: 0, desktopScreenshot: '', mobileScreenshot: '', checksums: {} };
+  }
+
   // Input path: fast text, editing keys, history, interrupts and controls.
   const typed = 'typed-once-in-order';
   await typeCommand(page, `printf '%s\\n' '${typed}'`, typed);
