@@ -74,6 +74,8 @@ import {
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { enqueueDurableResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import { registerExecutionPoolMcpTools, type ExecutionPoolMcpToolDeps } from './execution-pool-mcp-tools.js';
+import { getCachedSupervisorDefaults, refreshSupervisorDefaultsCache, updateSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -81,6 +83,7 @@ export interface MemoryMcpServerOptions {
   messagePinToolDeps?: MessagePinMcpToolDeps;
   /** Injected by tests; production binds the real registry. */
   supervisionToolDeps?: SupervisionMcpToolDeps;
+  executionPoolToolDeps?: ExecutionPoolMcpToolDeps;
   resourceGuard?: MemoryMcpResourceGuard;
   /** Tools this connection never publishes (see resolveTaskPairWithheldMcpTools). */
   withheldTools?: readonly string[];
@@ -318,6 +321,7 @@ export function createMemoryMcpServer(
   exactStoreToolDeps: ExactStoreMcpToolDeps = {},
   supervisionToolDeps: SupervisionMcpToolDeps = {},
   catalogOptions: MemoryMcpServerCatalogOptions = {},
+  executionPoolToolDeps: ExecutionPoolMcpToolDeps = {},
 ): McpServer {
   const server = new McpServer({
     name: IMCODES_MEMORY_MCP_SERVER_NAME,
@@ -345,6 +349,14 @@ export function createMemoryMcpServer(
   for (const [name, tool] of registerSupervisionMcpTools(server, caller, supervisionToolDeps, toolDeps.legacyToolForwarder)) {
     registered.set(name, tool);
   }
+  for (const [name, tool] of registerExecutionPoolMcpTools(server, caller, {
+    getDefaults: executionPoolToolDeps.getDefaults ?? (async () => {
+      await refreshSupervisorDefaultsCache();
+      return getCachedSupervisorDefaults();
+    }),
+    setDefaults: executionPoolToolDeps.setDefaults ?? ((runtimeCaller, defaults) => updateSupervisorDefaultsCache(defaults)),
+    isProjectBrain: executionPoolToolDeps.isProjectBrain ?? supervisionToolDeps.isProjectBrain,
+  })) registered.set(name, tool);
   // Withheld tools are gone from this connection: not listed, not discoverable
   // through mcp_tool_search and not callable.
   // Legacy supervision is retired globally.  Keep the optional withheld list
@@ -818,6 +830,7 @@ export function createMemoryMcpServerFromEnv(options: MemoryMcpServerOptions = {
       daemonAdmissionOwner: admissionOwner,
       ...(options.withheldTools ? { withheldTools: options.withheldTools } : {}),
     },
+    options.executionPoolToolDeps,
   );
 }
 

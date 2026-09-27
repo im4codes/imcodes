@@ -158,6 +158,29 @@ export async function refreshSupervisorDefaultsCache(): Promise<void> {
   }
 }
 
+/** Persist an MCP/web pool change through the server's owner-authenticated route. */
+export async function updateSupervisorDefaultsCache(value: SupervisorDefaultConfig): Promise<SupervisorDefaultConfig | null> {
+  const creds = await loadCredentials();
+  if (!creds) return null;
+  try {
+    const response = await fetch(`${creds.workerUrl}/api/server/${creds.serverId}/supervision/user-defaults/daemon`, {
+      method: 'PUT',
+      headers: { Authorization: `Bearer ${creds.token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ defaults: value }),
+    });
+    if (!response.ok) return null;
+    const body = await response.json() as { defaults?: Partial<SupervisorDefaultConfig> | null };
+    const next = normalizeSupervisorDefaultConfig(body.defaults ?? value);
+    cachedSupervisorDefaults = next;
+    lastFetchedAt = Date.now();
+    persistCachedSupervisorDefaultsToDisk(next);
+    return next;
+  } catch (err) {
+    logger.debug({ err }, 'supervisor-defaults-cache: update failed');
+    return null;
+  }
+}
+
 /** Full global runtime used authoritatively by every supervised session. */
 export function getCachedSupervisorDefaults(): SupervisorDefaultConfig | null {
   return cachedSupervisorDefaults;

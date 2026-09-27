@@ -1225,6 +1225,10 @@ export interface SupervisorDefaultConfig {
   backupPreset?: string;
   /** Exactly two user-configured execution pools. Legacy/unconfigured is fail-closed. */
   executionPools: SupervisionExecutionPoolsConfig;
+  /** Project-wide pair policy mirrored by the daemon and MCP control plane. */
+  pairEngine?: TaskPairEngine;
+  pairMaxConcurrency?: number;
+  mode?: SupervisionMode;
 }
 
 export interface SessionSupervisionSnapshot extends SupervisorDefaultConfig {
@@ -1392,6 +1396,12 @@ export function normalizeSupervisorDefaultConfig(
       model,
       executionPools: merged.executionPools,
     }),
+    ...(merged.pairEngine === 'pairs' || merged.pairEngine === 'legacy' ? { pairEngine: merged.pairEngine } : {}),
+    ...(typeof merged.pairMaxConcurrency === 'number' && Number.isFinite(merged.pairMaxConcurrency) && merged.pairMaxConcurrency >= 1
+      ? { pairMaxConcurrency: Math.floor(merged.pairMaxConcurrency) }
+      : {}),
+    ...(merged.mode === SUPERVISION_MODE.SUPERVISED || merged.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+      ? { mode: merged.mode } : {}),
     ...(customInstructions ? { customInstructions } : {}),
     ...(preset ? { preset } : {}),
     ...(backup.backend && backup.model ? {

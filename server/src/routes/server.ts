@@ -46,7 +46,8 @@ import {
   type SharedContextProjectionScope,
 } from '../../../shared/memory-scope.js';
 import { computeProjectionContentHash } from '../memory/citation.js';
-import { SUPERVISION_USER_DEFAULT_PREF_KEY } from '../../../shared/supervision-config.js';
+import logger from '../util/logger.js';
+import { SUPERVISION_USER_DEFAULT_PREF_KEY, parseSupervisorDefaultConfig, normalizeSupervisorDefaultConfig } from '../../../shared/supervision-config.js';
 import {
   MEMORY_FEATURE_CONFIG_PREF_KEY,
   parseMemoryFeatureFlagValuesJson,
@@ -541,6 +542,23 @@ serverRoutes.get('/:id/supervision/user-defaults/daemon', async (c) => {
     } catch { /* malformed pref → treat as empty */ }
   }
   return c.json({ defaults: parsed });
+});
+
+serverRoutes.put('/:id/supervision/user-defaults/daemon', async (c) => {
+  const serverId = c.req.param('id');
+  const authed = await authenticateDaemonServer(c, serverId);
+  if (!authed.ok) return daemonAuthFailure(c, authed);
+  const body = await c.req.json().catch(() => null) as { defaults?: unknown } | null;
+  const parsed = parseSupervisorDefaultConfig(body?.defaults);
+  if (!parsed) return c.json({ error: 'invalid_supervision_defaults' }, 400);
+  const defaults = normalizeSupervisorDefaultConfig(parsed);
+  await setUserPref(c.env.DB, authed.auth.userId, SUPERVISION_USER_DEFAULT_PREF_KEY, JSON.stringify(defaults));
+  try {
+    WsBridge.get(serverId).sendToDaemon(JSON.stringify({ type: DAEMON_COMMAND_TYPES.SUPERVISOR_DEFAULTS_CHANGED }));
+  } catch (err) {
+    logger.debug({ serverId, err }, 'daemon supervisor defaults push failed');
+  }
+  return c.json({ ok: true, defaults });
 });
 
 /**
