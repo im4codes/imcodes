@@ -834,10 +834,10 @@ describe('WsClient', () => {
 
     expect(client.connected).toBe(true);
     expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(1);
-    // Keep the first paint-sized burst synchronous, then yield the backlog in
-    // bounded timer batches so mounted timelines can render between batches.
-    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(32);
-    for (let i = 0; i < 24; i++) await vi.advanceTimersByTimeAsync(1);
+    // Keep one event synchronous, then yield the backlog in bounded timer
+    // batches so mounted timelines can render between batches.
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(1);
+    await vi.advanceTimersByTimeAsync(200);
     expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(1_000);
     client.disconnect();
     vi.useRealTimers();
@@ -864,11 +864,11 @@ describe('WsClient', () => {
       }) });
     }
 
-    // Thirty-two events are allowed through for first paint. The queued 968
-    // intermediate states collapse to the latest state for this session/type.
-    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(32);
+    // One event is allowed through for first paint. The queued intermediate
+    // states collapse to the latest state for this session/type.
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(1);
     await vi.advanceTimersByTimeAsync(1);
-    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(33);
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(2);
     const delivered = handler.mock.calls
       .map(([msg]) => msg)
       .filter((msg) => msg?.type === 'timeline.event')
