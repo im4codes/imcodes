@@ -555,6 +555,16 @@ describe('TaskPairStatusPanel', () => {
   const cssRule = (css: string, selector: string) =>
     new RegExp(`${selector.replace(/[.:]/g, '\\$&')} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
 
+  it('shrinks a collapsed titlebar panel to its strip instead of keeping the expanded height', () => {
+    const css = readCss();
+    const desktop = cssRule(css, '.chat-titlebar > .task-pair-status-panel.is-collapsed');
+    expect(desktop).toMatch(/height:\s*auto/);
+    expect(desktop).toMatch(/max-height:\s*none/);
+    const mobile = css.slice(css.indexOf('@media (max-width: 720px)'));
+    expect(cssRule(mobile, '.task-pair-status-panel.is-collapsed')).toMatch(/height:\s*auto/);
+    expect(cssRule(mobile, '.chat-titlebar > .task-pair-status-panel.is-collapsed')).toMatch(/height:\s*auto/);
+  });
+
   it('keeps the collapsed mobile strip borderless and no taller than the titlebar line', () => {
     const css = readCss();
     const mobile = css.slice(css.indexOf('@media (max-width: 720px)'));

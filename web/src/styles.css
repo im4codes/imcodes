@@ -14533,6 +14533,9 @@ button.quick-agent-delegation-preset.active {
 }
 .chat-titlebar > .task-pair-status-panel.is-collapsed {
   position: absolute; right: 8px; top: calc(100% + 4px); z-index: 13;
+  /* The expanded titlebar panel has a fixed height; a collapsed one must
+     shrink to its icon strip, never keep an empty full-height frame. */
+  height: auto; max-height: none; overflow: visible;
   display: inline-flex; width: auto; max-width: calc(100% - 16px);
   margin: 0; border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
   border-radius: 8px; background: color-mix(in srgb, var(--chrome-panel, #0f172a) 88%, transparent);
@@ -14564,7 +14567,7 @@ button.quick-agent-delegation-preset.active {
 .chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-pinned-last-sent { margin-right: 10px; }
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; height: min(42vh, 420px); max-height: min(42vh, 420px); overflow: hidden; }
-  .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; max-height: none; }
+  .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; height: auto; max-height: none; overflow: visible; }
   /* Owner rule: the collapsed mobile task status is a bare inline strip in
      the titlebar -- no border/background, no expand button, and it must not
      make the titlebar any taller. The strip itself is the disclosure control;
@@ -14589,7 +14592,7 @@ button.quick-agent-delegation-preset.active {
     border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
     box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
   }
-  .chat-titlebar > .task-pair-status-panel.is-collapsed { position: static; }
+  .chat-titlebar > .task-pair-status-panel.is-collapsed { position: static; height: auto; max-height: none; overflow: visible; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
   /* Compact single-line "last sent" banner on mobile (tap to expand). */
