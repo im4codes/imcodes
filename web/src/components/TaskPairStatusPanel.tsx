@@ -320,7 +320,6 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
 export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
-  const { t } = useTranslation();
   const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events));
   const [authorityUnavailable, setAuthorityUnavailable] = useState(() => Boolean(initialSnapshot?.authorityUnavailable));
@@ -348,6 +347,10 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
   }, []);
   if (!active) return null;
-  if (authorityUnavailable) return <aside class="task-pair-status-panel task-pair-status-panel-authority-error" data-testid="task-pair-status-panel-authority-error" role="alert">{t('supervision_task_console.unsupported')}</aside>;
+  // Owner rule: load silently, never cover the chat. While the authoritative
+  // snapshot for a new scope is pending (or unavailable), render nothing: stale
+  // rows from the previous scope must not show, and no full-size placeholder
+  // box may cover the conversation. The panel reappears with fresh data.
+  if (authorityUnavailable) return null;
   return <TaskPairStatusPanel {...props} />;
 }

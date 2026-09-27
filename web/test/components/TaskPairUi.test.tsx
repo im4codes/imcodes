@@ -210,16 +210,21 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText('History only')).toBeNull();
     expect(screen.getByText(/Authoritative task 0/).parentElement?.textContent).toContain('taskPair.panel_started');
   });
-  it('shows an explicit unsupported-daemon hint instead of a partial event-derived list', async () => {
-    render(<TaskPairStatusPanelHost events={[{ eventId: 'partial', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'partial', title: 'Partial', toStatus: 'working' } }] as never} serverId="unsupported" />);
+  it('stays silent while authority is unavailable: no partial list and no covering box', async () => {
+    const { container } = render(<TaskPairStatusPanelHost events={[{ eventId: 'partial', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'partial', title: 'Partial', toStatus: 'working' } }] as never} serverId="unsupported" />);
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true } }));
-    await waitFor(() => expect(screen.getByTestId('task-pair-status-panel-authority-error')).toBeTruthy());
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeNull());
     expect(screen.queryByText('Partial')).toBeNull();
+    expect(screen.queryByText('supervision_task_console.unsupported')).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
   });
-  it('shows the unsupported-daemon hint even when the chat has no pair history', async () => {
-    render(<TaskPairStatusPanelHost events={[]} serverId="unsupported-empty" />);
+  it('stays silent on a scope reset and shows the panel again once a fresh snapshot arrives', async () => {
+    const { container } = render(<TaskPairStatusPanelHost events={[]} serverId="unsupported-empty" />);
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true, error: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE } }));
-    expect(await waitFor(() => screen.getByTestId('task-pair-status-panel-authority-error'))).toBeTruthy();
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { scopeReset: true } }));
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeNull());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks: [{ taskId: 'fresh', title: 'Fresh task', status: 'planned', pair: { status: 'working', round: 0, blocking: ['P0'], createdAt: 1, startedAt: 1, updatedAt: 1 } }], assignments: [], authoritative: true } }));
+    await waitFor(() => expect(container.querySelector('.task-pair-status-panel')).toBeTruthy());
   });
   it('maps authoritative decision flags while preserving pair timestamps', () => {
     const snapshot = taskConsoleStateToPairSnapshot({
