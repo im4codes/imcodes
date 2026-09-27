@@ -427,7 +427,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
    */
   publishBadges(): void {
     const next = new Set<string>();
-    const mainPairs = new Map<string, TaskPairState[]>();
+    const mainPairs = new Map<string, StoredTaskPair[]>();
     for (const stored of getTaskPairStore().listActivePairs()) {
       if (!TASK_PAIR_OPEN_STATUSES.includes(stored.state.status) || !isPairsEngineProject(stored.project)) continue;
       for (const session of [stored.state.executor, stored.state.auditor]) {
@@ -435,7 +435,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
       const brain = stored.state.brain || projectBrainSession(stored.project);
       const list = mainPairs.get(brain) ?? [];
-      list.push(stored.state);
+      list.push(stored);
       mainPairs.set(brain, list);
     }
     const nextHeartbeatAt = Math.max(this.#nextTickAt, this.#now());
@@ -456,8 +456,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
     for (const [brain, pairs] of mainPairs) {
       const brainRecord = getSession(brain);
       if (!brainRecord || brainRecord.role !== 'brain') continue;
-      const actionable = pairs.filter((pair) => this.#mainHeartbeatNeedsAction(pair));
-      const hasNeedsInput = pairs.some((pair) => pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION);
+      const actionable = pairs.filter((pair) => this.#mainHeartbeatNeedsAction(pair)).map((pair) => pair.state);
+      const hasNeedsInput = pairs.some((pair) => pair.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION);
       if (actionable.length === 0 && !hasNeedsInput) continue;
       mainSessions.add(brain);
       const paused = this.#mainHeartbeatPaused.has(brain)
@@ -497,12 +497,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
   }
 
-  #mainHeartbeatNeedsAction(pair: TaskPairState): boolean {
-    if (pair.status === 'passed') return true;
+  #mainHeartbeatNeedsAction(stored: StoredTaskPair): boolean {
+    const pair = stored.state;
+    // A PASS transition already emits the per-pair Brain notice. Keep the
+    // aggregate heartbeat as a backstop for imported/reconstructed passed
+    // pairs, but do not duplicate that notice on a capacity-only tick.
+    if (pair.status === 'passed') return !stored.liveness.notified.includes(`pass-done-notice:${pair.round}`);
     return pair.flags.some((flag) => [
       'blocked', 'needs_input', 'needs_auditor', 'executor_silent', 'verdict_inconsistent',
       'awaiting_audit_ignored', 'replacement_churn', 'markers_unresolved', 'all_providers_limited',
-      'auditor_capacity_hold', 'no_pool_configured', 'policy_violation', 'waiting_for_capacity',
+      'auditor_capacity_hold', 'no_pool_configured', 'policy_violation',
     ].includes(flag));
   }
 
