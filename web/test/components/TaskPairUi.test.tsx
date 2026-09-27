@@ -142,6 +142,8 @@ describe('TaskPairStatusPanel', () => {
     expect(rows).toBeTruthy();
     expect(rows?.className).toContain('task-pair-status-rows');
     expect(view.container.querySelectorAll('.task-pair-status-row')).toHaveLength(30);
+    expect(view.container.querySelector('.task-pair-status-row .task-pair-status-sequence')?.textContent).toBe('1');
+    expect(view.container.querySelectorAll('.task-pair-status-sequence')[29]?.textContent).toBe('30');
     expect(screen.getByText('Scrollable task 30')).toBeTruthy();
   });
   it('does not mount responsive panel effects for an ordinary chat, then activates on pair snapshot data', async () => {

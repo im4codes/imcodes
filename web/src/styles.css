@@ -14607,6 +14607,7 @@ button.quick-agent-delegation-preset.active {
    own status colour (via --task-pair-status-* from .task-pair-chip--STATUS,
    reused rather than duplicated), with a hover lift for affordance. */
 .task-pair-status-row {
+  position: relative;
   display: grid; gap: 4px; margin: 6px 0 0; padding: 8px 9px; border-radius: 10px; font-size: 11px;
   background: color-mix(in srgb, var(--task-pair-status-border, var(--border-color, rgba(128, 128, 128, 0.35))) 7%, var(--chrome-panel, #0d1422) 93%);
   border: 1px solid color-mix(in srgb, var(--task-pair-status-border, var(--border-color, rgba(128, 128, 128, 0.35))) 45%, transparent);
@@ -14665,3 +14666,5 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-checklist-row { display: grid; grid-template-columns: 1.2rem 1.2rem minmax(0, 1fr); align-items: center; gap: 4px; }
 .supervision-task-console-checklist-row span { overflow-wrap: anywhere; }
 .supervision-task-console-checklist-progress { font-size: 0.8em; opacity: 0.8; }
+
+.task-pair-status-sequence { position: absolute; top: 6px; right: 8px; min-width: 1.4em; color: color-mix(in srgb, currentColor 58%, transparent); font-size: 9px; line-height: 1.2; text-align: right; font-variant-numeric: tabular-nums; pointer-events: none; }

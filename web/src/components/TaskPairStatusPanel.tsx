@@ -276,9 +276,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
       {toggleContent}
     </button>}
     {!collapsed && <div class="task-pair-status-rows" data-testid="task-pair-status-rows">
-      {groups.map((group) => {
+      {(() => { let sequence = 0; return groups.map((group) => {
         const heading = <h4>{group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const endedAt = terminal ? finiteTimestamp(payload.endedAt ?? payload.updatedAt, row.startedAt) : now; const elapsedSeconds = Math.max(0, Math.floor((endedAt - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const endedAt = terminal ? finiteTimestamp(payload.endedAt ?? payload.updatedAt, row.startedAt) : now; const elapsedSeconds = Math.max(0, Math.floor((endedAt - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+          <span class="task-pair-status-sequence" aria-label={`#${sequenceNumber}`}>{sequenceNumber}</span>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
               <span class="task-pair-status-badge-dot" aria-hidden="true" />
@@ -301,7 +302,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
         return group.key === 'recent'
           ? <details class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}><summary>{heading}</summary>{content}</details>
           : <section class={`task-pair-status-group task-pair-status-group-${group.key}`} key={group.key}>{heading}{content}</section>;
-      })}
+      }); })()}
     </div>}
   </aside>;
 }
