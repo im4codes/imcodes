@@ -76,6 +76,7 @@ import { printDirectSendResult, printSendResult } from './cli/send-output.js';
 import { runAuditReplyCommand } from './cli/audit-reply.js';
 import { resolveLiveHookPort } from './daemon/hook-port.js';
 import {
+  DAEMON_SERVER_LINK_FRESH_MS,
   formatDurationSeconds,
   getDaemonServerLinkFreshness,
   readDaemonFilesystemSpace,
@@ -157,6 +158,15 @@ function formatDaemonLinkStatus(
   freshness: DaemonServerLinkFreshness,
 ): string {
   const link = runtimeStatus?.serverLink;
+  const eventLoop = runtimeStatus?.eventLoop;
+  const stallAgeMs = eventLoop ? Math.max(0, Date.now() - eventLoop.lastStallAt) : Infinity;
+  if (eventLoop && eventLoop.lastStallMs >= 100 && stallAgeMs <= DAEMON_SERVER_LINK_FRESH_MS) {
+    const phase = eventLoop.phase ? ` (phase ${eventLoop.phase})` : '';
+    const duration = eventLoop.lastStallMs < 1_000
+      ? `${Math.round(eventLoop.lastStallMs)}ms`
+      : formatDurationSeconds(Math.floor(eventLoop.lastStallMs / 1000));
+    return `\x1b[31mevent loop blocked ${duration}${phase}\x1b[0m`;
+  }
   if (!link || freshness.status === 'unknown') return '\x1b[33munknown\x1b[0m (no link health report yet)';
   const proofSuffix = freshness.staleMs !== null
     ? `, last proof ${formatDurationSeconds(Math.floor(freshness.staleMs / 1000))} ago`

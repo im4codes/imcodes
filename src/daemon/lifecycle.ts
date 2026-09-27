@@ -27,6 +27,7 @@ import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/da
 import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
 import { EXECUTION_CLONE_TIMELINE } from '../../shared/execution-clone.js';
 import { startLatencyTracer } from './latency-tracer.js';
+import { startEventLoopWatchdog, stopEventLoopWatchdog } from './event-loop-watchdog.js';
 import { supervisionAutomation } from './supervision-automation.js';
 import {
   getSupervisionHeartbeatProjectionForWire,
@@ -1609,6 +1610,7 @@ export async function startup(): Promise<DaemonContext> {
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
   startEventLoopDelayMonitor();
+  startEventLoopWatchdog();
   startLatencyTracer();
 
   logger.info('Daemon started');
@@ -2025,6 +2027,7 @@ async function performShutdown(exitCode: number): Promise<void> {
     if (contextMaterializationTimer) clearInterval(contextMaterializationTimer);
     if (gcTimer) clearInterval(gcTimer);
     if (eventLoopDelayTimer) clearInterval(eventLoopDelayTimer);
+    stopEventLoopWatchdog();
     if (capabilityCandidateCleanupTimer) {
       clearInterval(capabilityCandidateCleanupTimer);
       capabilityCandidateCleanupTimer = null;

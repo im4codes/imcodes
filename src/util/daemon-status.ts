@@ -40,6 +40,15 @@ export interface DaemonRuntimeStatus {
   serverLink?: DaemonServerLinkRuntimeStatus;
   resources?: DaemonResourceSnapshot;
   diagnostics?: DaemonRuntimeDiagnosticsSnapshot;
+  eventLoop?: DaemonEventLoopRuntimeStatus;
+}
+
+export interface DaemonEventLoopRuntimeStatus {
+  lastStallAt: number;
+  lastStallMs: number;
+  maxStallMs: number;
+  stallCount: number;
+  phase?: string;
 }
 
 export type DaemonServerLinkRuntimeState = 'connecting' | 'connected' | 'disconnected';
@@ -72,6 +81,14 @@ export interface DaemonServerLinkRuntimeUpdate {
   lastSendFailedAt?: number;
   lastError?: string;
   clearError?: boolean;
+}
+
+export interface DaemonEventLoopStallUpdate {
+  stallMs: number;
+  phase?: string;
+  nowMs?: number;
+  baseDir?: string;
+  pid?: number;
 }
 
 export interface DaemonRuntimeDiagnosticsSnapshot {
@@ -348,6 +365,7 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
     const serverLink = parseDaemonServerLinkRuntimeStatus(parsed.serverLink);
     const resources = parseDaemonResourceSnapshot(parsed.resources);
     const diagnostics = parseDaemonRuntimeDiagnosticsSnapshot(parsed.diagnostics);
+    const eventLoop = parseDaemonEventLoopRuntimeStatus(parsed.eventLoop);
     return {
       pid,
       startedAt,
@@ -357,6 +375,7 @@ export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeSt
       ...(serverLink ? { serverLink } : {}),
       ...(resources ? { resources } : {}),
       ...(diagnostics ? { diagnostics } : {}),
+      ...(eventLoop ? { eventLoop } : {}),
     };
   } catch {
     return null;
@@ -388,6 +407,7 @@ export function recordDaemonStart(input: {
     // ride it along on writes that already happen (start + heartbeat) — no
     // dedicated polling timer / extra disk writes.
     resources: captureDaemonResourceSnapshot(nowMs),
+    ...(previous?.eventLoop ? { eventLoop: previous.eventLoop } : {}),
     ...definedDiagnostics(),
   };
 
@@ -429,7 +449,38 @@ export function recordDaemonServerLinkStatus(input: DaemonServerLinkRuntimeUpdat
     // (throttled to ~10s), so there is no extra disk I/O for it.
     resources: captureDaemonResourceSnapshot(nowMs),
     serverLink: nextLink,
+    ...(samePid && previous?.eventLoop ? { eventLoop: previous.eventLoop } : {}),
     ...definedDiagnostics(),
+  };
+  return writeDaemonRuntimeStatus(next, baseDir, nowMs);
+}
+
+/** Persist a phase-tagged main-thread stall for `imcodes status`. */
+export function recordDaemonEventLoopStall(input: DaemonEventLoopStallUpdate): DaemonRuntimeStatus | null {
+  const nowMs = input.nowMs ?? Date.now();
+  const pid = input.pid ?? process.pid;
+  if (!Number.isSafeInteger(pid) || pid <= 0 || !Number.isFinite(input.stallMs) || input.stallMs < 0) return null;
+  const baseDir = input.baseDir ?? defaultDaemonRuntimeStatusDir();
+  const previous = readDaemonRuntimeStatus(baseDir);
+  const samePid = previous?.pid === pid;
+  const prior = samePid ? previous?.eventLoop : undefined;
+  const eventLoop: DaemonEventLoopRuntimeStatus = {
+    lastStallAt: nowMs,
+    lastStallMs: Number(input.stallMs.toFixed(3)),
+    maxStallMs: Number(Math.max(prior?.maxStallMs ?? 0, input.stallMs).toFixed(3)),
+    stallCount: (prior?.stallCount ?? 0) + 1,
+    ...(input.phase ? { phase: input.phase } : prior?.phase ? { phase: prior.phase } : {}),
+  };
+  const next: DaemonRuntimeStatus = {
+    pid,
+    startedAt: samePid && previous ? previous.startedAt : nowMs,
+    updatedAt: nowMs,
+    restartCount: samePid && previous ? previous.restartCount : previous?.restartCount ?? 0,
+    ...(samePid && previous?.version ? { version: previous.version } : {}),
+    ...(samePid && previous?.serverLink ? { serverLink: previous.serverLink } : {}),
+    ...(samePid && previous?.resources ? { resources: previous.resources } : {}),
+    ...(samePid && previous?.diagnostics ? { diagnostics: previous.diagnostics } : {}),
+    eventLoop,
   };
   return writeDaemonRuntimeStatus(next, baseDir, nowMs);
 }
@@ -587,6 +638,20 @@ function parseDaemonServerLinkRuntimeStatus(value: unknown): DaemonServerLinkRun
     ...definedNonNegativeInteger('lastHeartbeatSentAt', raw.lastHeartbeatSentAt),
     ...definedNonNegativeInteger('lastSendFailedAt', raw.lastSendFailedAt),
     ...definedString('lastError', raw.lastError),
+  };
+}
+
+function parseDaemonEventLoopRuntimeStatus(value: unknown): DaemonEventLoopRuntimeStatus | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const raw = value as Record<string, unknown>;
+  const lastStallAt = coerceNonNegativeSafeInteger(raw.lastStallAt);
+  const lastStallMs = typeof raw.lastStallMs === 'number' && Number.isFinite(raw.lastStallMs) && raw.lastStallMs >= 0 ? raw.lastStallMs : null;
+  const maxStallMs = typeof raw.maxStallMs === 'number' && Number.isFinite(raw.maxStallMs) && raw.maxStallMs >= 0 ? raw.maxStallMs : null;
+  const stallCount = coerceNonNegativeSafeInteger(raw.stallCount);
+  if (lastStallAt === null || lastStallMs === null || maxStallMs === null || stallCount === null) return null;
+  return {
+    lastStallAt, lastStallMs, maxStallMs, stallCount,
+    ...(typeof raw.phase === 'string' && raw.phase ? { phase: raw.phase } : {}),
   };
 }
 

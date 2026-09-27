@@ -53,6 +53,12 @@ import {
   type SupervisionHandoffDecision,
 } from '../../shared/supervision-audit-handoff.js';
 import type { SupervisionMigrationDb } from './supervision-store-migrations.js';
+import { yieldToEventLoop } from './event-loop-yield.js';
+import { traceAsync, traceSync } from './latency-tracer.js';
+import { setEventLoopWatchdogPhase } from './event-loop-watchdog.js';
+
+/** Keep one SQLite transaction small enough that the daemon heartbeat can run. */
+export const SUPERVISION_PROJECTION_CHUNK_SIZE = 32;
 
 /** Named points a test can throw from to simulate a real crash. */
 export const SUPERVISION_CRASH_BOUNDARIES = [
@@ -139,6 +145,8 @@ export class SupervisionConsoleProducer {
    * Nothing writes assignments inside a pass, so one read per pass is exact.
    */
   #passAssignmentRows: Map<string, SupervisionTaskConsoleAssignmentRow[]> | null = null;
+  /** Prevent timer/resubscribe storms from running duplicate large replays. */
+  readonly #asyncReplayInFlight = new Map<string, Promise<number>>();
 
   constructor(db: SupervisionMigrationDb, options: SupervisionProducerOptions) {
     this.#db = db;
@@ -239,14 +247,16 @@ export class SupervisionConsoleProducer {
   #readDurableRegistryEvents(
     scope: SupervisionTaskConsoleScope,
     afterEventId: number | null,
+    limit: number = SUPERVISION_PROJECTION_CHUNK_SIZE,
   ): DurableRegistryEventRow[] {
     const rows = this.#db.prepare(
       `SELECT e.id, e.task_id, e.assignment_id
        FROM supervision_task_events e
        INNER JOIN supervision_tasks t ON t.task_id = e.task_id
        WHERE t.project_name = ? AND e.id > ?
-       ORDER BY e.id ASC`,
-    ).all(scope.projectName, afterEventId ?? 0) as Array<Record<string, unknown>>;
+       ORDER BY e.id ASC
+       LIMIT ?`,
+    ).all(scope.projectName, afterEventId ?? 0, limit) as Array<Record<string, unknown>>;
     return rows.map((row) => ({
       id: Number(row.id),
       taskId: String(row.task_id),
@@ -311,11 +321,87 @@ export class SupervisionConsoleProducer {
     scope: SupervisionTaskConsoleScope,
     options: { deliver?: boolean } = {},
   ): number {
+    setEventLoopWatchdogPhase('supervision-console.synchronize-durable-events');
+    return traceSync('supervision-console.synchronize-durable-events', { projectName: scope.projectName }, () => this.#withAssignmentPass(() => {
+      this.ensureProjectionBaseline(scope);
+      const cursor = this.restoreCursor(scope);
+      let committedCount = 0;
+      let afterEventId = cursor.lastDurableEventId;
+      while (true) {
+        const events = this.#readDurableRegistryEvents(scope, afterEventId);
+        if (events.length === 0) break;
+        const committed = this.#commitDurableEventChunk(scope, events);
+        committedCount += committed.length;
+        if (options.deliver !== false) {
+          for (const item of committed) this.#deliver(item.frame, item.projectionVersion, scope);
+        }
+        afterEventId = events[events.length - 1]!.id;
+        if (events.length < SUPERVISION_PROJECTION_CHUNK_SIZE) break;
+      }
+      return committedCount;
+    }));
+  }
+
+  /**
+   * Large catch-up path used by the socket subscription handler. It commits
+   * bounded chunks and yields between them; unlike the historical synchronous
+   * implementation, a 1,000-event backlog cannot monopolize the main thread.
+   */
+  async synchronizeDurableEventsAsync(
+    scope: SupervisionTaskConsoleScope,
+    options: { deliver?: boolean } = {},
+  ): Promise<number> {
+    const replayKey = JSON.stringify([scope.projectName, scope.coordinatorSessionName]);
+    const pending = this.#asyncReplayInFlight.get(replayKey);
+    if (pending) return pending;
+    setEventLoopWatchdogPhase('supervision-console.synchronize-durable-events-async');
+    let work: Promise<number>;
+    work = traceAsync('supervision-console.synchronize-durable-events-async', { projectName: scope.projectName }, () => this.#withAssignmentPassAsync(async () => {
+      this.ensureProjectionBaseline(scope);
+      const cursor = this.restoreCursor(scope);
+      let committedCount = 0;
+      let afterEventId = cursor.lastDurableEventId;
+      let firstPage = true;
+      while (true) {
+        if (!firstPage) await yieldToEventLoop();
+        firstPage = false;
+        const events = this.#readDurableRegistryEvents(scope, afterEventId);
+        if (events.length === 0) break;
+        const committed = this.#commitDurableEventChunk(scope, events);
+        committedCount += committed.length;
+        if (options.deliver !== false) {
+          for (const item of committed) this.#deliver(item.frame, item.projectionVersion, scope);
+        }
+        afterEventId = events[events.length - 1]!.id;
+        if (events.length < SUPERVISION_PROJECTION_CHUNK_SIZE) break;
+      }
+      return committedCount;
+    }).finally(() => {
+      if (this.#asyncReplayInFlight.get(replayKey) === work) this.#asyncReplayInFlight.delete(replayKey);
+    }));
+    this.#asyncReplayInFlight.set(replayKey, work);
+    return work;
+  }
+
+  /** Avoid starting the async path for the small projections used by ordinary subscriptions/tests. */
+  needsYieldedDurableReplay(scope: SupervisionTaskConsoleScope): boolean {
     this.ensureProjectionBaseline(scope);
     const cursor = this.restoreCursor(scope);
-    const events = this.#readDurableRegistryEvents(scope, cursor.lastDurableEventId);
-    if (events.length === 0) return 0;
-    const committed = this.#withAssignmentPass(() => this.#transaction(() => events.map((event) => {
+    const rows = this.#db.prepare(
+      `SELECT 1 AS found
+       FROM supervision_task_events e
+       INNER JOIN supervision_tasks t ON t.task_id = e.task_id
+       WHERE t.project_name = ? AND e.id > ?
+       LIMIT ?`,
+    ).all(scope.projectName, cursor.lastDurableEventId ?? 0, SUPERVISION_PROJECTION_CHUNK_SIZE + 1) as Array<{ found?: number }>;
+    return rows.length > SUPERVISION_PROJECTION_CHUNK_SIZE;
+  }
+
+  #commitDurableEventChunk(
+    scope: SupervisionTaskConsoleScope,
+    events: DurableRegistryEventRow[],
+  ): Array<{ frame: SupervisionTaskConsoleDelta; projectionVersion: number }> {
+    return this.#transaction(() => events.map((event) => {
       const projectionVersion = this.#nextProjectionVersion(scope, event.id);
       const frame = this.#buildDurableDelta(scope, event, projectionVersion);
       this.#db.prepare(
@@ -326,11 +412,7 @@ export class SupervisionConsoleProducer {
       ).run(scope.projectName, scope.coordinatorSessionName, event.id, projectionVersion,
         this.#epoch, JSON.stringify(frame), this.#now(), this.#now());
       return { frame, projectionVersion };
-    })));
-    if (options.deliver !== false) {
-      for (const item of committed) this.#deliver(item.frame, item.projectionVersion, scope);
-    }
-    return committed.length;
+    }));
   }
 
   /**
@@ -443,6 +525,16 @@ export class SupervisionConsoleProducer {
     this.#passAssignmentRows = new Map();
     try {
       return fn();
+    } finally {
+      this.#passAssignmentRows = null;
+    }
+  }
+
+  async #withAssignmentPassAsync<T>(fn: () => Promise<T>): Promise<T> {
+    if (this.#passAssignmentRows) return fn();
+    this.#passAssignmentRows = new Map();
+    try {
+      return await fn();
     } finally {
       this.#passAssignmentRows = null;
     }
@@ -699,7 +791,9 @@ export class SupervisionConsoleProducer {
   }
 
   buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
-    return this.#withAssignmentPass(() => this.#buildSnapshot(scope, subscriptionId));
+    setEventLoopWatchdogPhase('supervision-console.build-snapshot');
+    return traceSync('supervision-console.build-snapshot', { projectName: scope.projectName },
+      () => this.#withAssignmentPass(() => this.#buildSnapshot(scope, subscriptionId)));
   }
 
   #buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {

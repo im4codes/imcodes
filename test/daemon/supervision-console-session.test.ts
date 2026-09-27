@@ -68,6 +68,34 @@ describe('subscribe', () => {
     expect(sent[0].projectionEpoch).toBe(EPOCH);
   });
 
+  it('yields a large replay before sending the snapshot', async () => {
+    producer.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < 96; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    expect(registry.handleFrame(subscribe())).toBe(true);
+    expect(sent).toHaveLength(0);
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'sub-1' });
+  });
+
+  it('coalesces a resubscribe storm into one yielding replay and answers the latest id', async () => {
+    producer.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < 96; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    for (let i = 0; i < 12; i += 1) {
+      expect(registry.handleFrame(subscribe({ subscriptionId: `storm-${i}` }))).toBe(true);
+    }
+    expect(sent).toHaveLength(0);
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'storm-11' });
+  });
+
   it('is SILENT for an unauthorized scope: no frame at all', () => {
     expect(registry.handleFrame(subscribe({ scope: OTHER }))).toBe(true);
     expect(sent).toHaveLength(0);

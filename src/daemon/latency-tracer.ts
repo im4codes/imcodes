@@ -7,6 +7,7 @@ import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { recordDaemonEventLoopStall } from '../util/daemon-status.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -77,6 +78,7 @@ let lastCpuAt = performance.now();
 let lastElu = performance.eventLoopUtilization();
 let expectedDriftAt = 0;
 let latestEventLoopLagMs = 0;
+let lastPersistedStallAt = 0;
 const commandReceipts = new Map<string, CommandReceipt>();
 const activeSpanStack: RecentSpan[] = [];
 const recentSpans: RecentSpan[] = [];
@@ -415,10 +417,16 @@ export function startLatencyTracer(): void {
     const recentCommand = findRecentCommand(now);
     const commandBurst = summarizeRecentCommandBurst(now);
     const reason = active ? 'active_span' : recent ? 'recent_span' : recentSend ? 'recent_server_send' : recentGc ? 'gc' : recentCommand ? 'recent_command' : 'unknown';
+    const phase = active?.name ?? recent?.name ?? recentSend?.msgType ?? reason;
+    if (now - lastPersistedStallAt >= 1_000) {
+      lastPersistedStallAt = now;
+      recordDaemonEventLoopStall({ stallMs: drift, phase });
+    }
     writeTrace('event_loop_block', {
       driftMs: roundMs(drift),
       thresholdMs: driftThresholdMs(),
       attributionReason: reason,
+      phase,
       attributed: reason !== 'unknown',
       ...(active ? {
         likelyActiveSpan: active.name,

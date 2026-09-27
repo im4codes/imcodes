@@ -63,6 +63,9 @@ function readScope(value: unknown): SupervisionTaskConsoleScope | undefined {
 export class SupervisionConsoleSessionRegistry {
   readonly #deps: SupervisionConsoleSessionDeps;
   readonly #subscriptions = new Map<string, ActiveSubscription>();
+  /** Coalesce repeated subscribe storms while a large replay is yielding. */
+  readonly #durableReplayInFlight = new Map<string, Promise<void>>();
+  readonly #latestReplayRecord = new Map<string, Record<string, unknown>>();
   #refused = 0;
 
   constructor(deps: SupervisionConsoleSessionDeps) {
@@ -98,6 +101,73 @@ export class SupervisionConsoleSessionRegistry {
   }
 
   #handleSubscribe(record: Record<string, unknown>): boolean {
+    const scope = readScope(record.scope);
+    let needsYieldedReplay = false;
+    if (scope && this.#deps.authorize(scope)) {
+      try {
+        needsYieldedReplay = this.#deps.producer.needsYieldedDurableReplay(scope);
+      } catch {
+        // Let the synchronous path's correlated UNAVAILABLE handling report
+        // projection/database failures to the current subscription.
+        return this.#handleSubscribeSync(record);
+      }
+    }
+    if (scope && this.#deps.authorize(scope) && needsYieldedReplay) {
+      const key = scopeKey(scope);
+      const subscriptionId = typeof record.subscriptionId === 'string' ? record.subscriptionId : '';
+      if (subscriptionId) {
+        const countBefore = this.#subscriptions.size;
+        this.#subscriptions.set(key, { subscriptionId, scope });
+        if (this.#subscriptions.size !== countBefore) {
+          this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
+        }
+      }
+      this.#latestReplayRecord.set(key, record);
+      if (this.#durableReplayInFlight.has(key)) return true;
+      // A large replay is deliberately detached from the inbound WS callback:
+      // it yields between SQLite chunks so heartbeat/control traffic remains
+      // serviceable while the snapshot catches up.
+      let work: Promise<void>;
+      work = this.#handleSubscribeYielded(record).finally(() => {
+        if (this.#durableReplayInFlight.get(key) === work) {
+          this.#durableReplayInFlight.delete(key);
+          this.#latestReplayRecord.delete(key);
+        }
+      });
+      this.#durableReplayInFlight.set(key, work);
+      return true;
+    }
+    return this.#handleSubscribeSync(record);
+  }
+
+  async #handleSubscribeYielded(record: Record<string, unknown>): Promise<void> {
+    const scope = readScope(record.scope);
+    const subscriptionId = typeof record.subscriptionId === 'string' ? record.subscriptionId : '';
+    if (!scope || !subscriptionId || !this.#deps.authorize(scope)) return;
+    try {
+      this.#deps.producer.ensureProjectionBaseline(scope);
+      await this.#deps.producer.synchronizeDurableEventsAsync(scope, { deliver: false });
+      const key = scopeKey(scope);
+      const active = this.#subscriptions.get(key);
+      if (!active) return;
+      // A resubscribe storm may have replaced the id while replay was yielding;
+      // acknowledge the latest subscription, not the stale frame that started
+      // this work.  The latest record also preserves its cursor/schema fields.
+      const latest = this.#latestReplayRecord.get(key) ?? record;
+      this.#handleSubscribeSync({ ...latest, subscriptionId: active.subscriptionId });
+    } catch (error) {
+      this.#deps.onError?.(error);
+      this.#deps.send({
+        type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+        subscriptionId,
+        scope,
+        reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
+        retryable: true,
+      });
+    }
+  }
+
+  #handleSubscribeSync(record: Record<string, unknown>): boolean {
     const scope = readScope(record.scope);
     const subscriptionId = typeof record.subscriptionId === 'string' ? record.subscriptionId : '';
     if (!scope || !subscriptionId) return true;
@@ -237,7 +307,11 @@ export class SupervisionConsoleSessionRegistry {
   /** Project newly committed registry events for every currently viewed scope. */
   refreshActiveSubscriptions(): void {
     for (const subscription of this.#subscriptions.values()) {
-      this.#deps.producer.synchronizeDurableEvents(subscription.scope);
+      if (this.#deps.producer.needsYieldedDurableReplay(subscription.scope)) {
+        void this.#deps.producer.synchronizeDurableEventsAsync(subscription.scope).catch((error) => this.#deps.onError?.(error));
+      } else {
+        this.#deps.producer.synchronizeDurableEvents(subscription.scope);
+      }
     }
   }
 }

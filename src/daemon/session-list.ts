@@ -127,24 +127,30 @@ function resolveTransportSessionListState(
  * the supervision console. It observes the live transport runtime and its
  * structured queue; it never guesses from elapsed heartbeat time.
  */
-export function resolveAuthoritativeSessionListState(record: SessionRecord): SessionListItem['state'] {
+export function resolveAuthoritativeSessionListState(record: SessionRecord, projectedQueue?: QueueSnapshot | null): SessionListItem['state'] {
   const runtime = record.runtimeType === 'transport' ? getTransportRuntime(record.name) : undefined;
   const runtimeState = resolveTransportSessionListState(record, runtime);
   if (record.runtimeType === 'transport') expireResendEntries(record.name);
-  const queuePayload = record.runtimeType === 'transport'
-    ? buildTransportQueueSnapshotPayload(record.name, 'session_list')
+  const queueSnapshot = record.runtimeType === 'transport'
+    ? (projectedQueue ?? buildTransportQueueSnapshotPayload(record.name, 'session_list').queueSnapshot)
     : null;
-  const hasPendingQueue = (queuePayload?.pendingMessageEntries.length ?? 0) > 0;
+  const hasPendingQueue = (queueSnapshot?.pendingMessageEntries.length ?? 0) > 0;
   return hasPendingQueue
     ? (runtime ? (runtimeState === 'idle' ? 'queued' : runtimeState) : 'queued')
     : runtimeState;
 }
 
 function baseItem(s: SessionRecord): SessionListItem {
-  const state = resolveAuthoritativeSessionListState(s);
+  // Expire resend entries before taking the single queue snapshot; otherwise
+  // state resolution can invalidate a snapshot that still reports old work.
+  if (s.runtimeType === 'transport') expireResendEntries(s.name);
   const queuePayload = s.runtimeType === 'transport'
     ? buildTransportQueueSnapshotPayload(s.name, 'session_list')
     : null;
+  // Build the transport queue projection once per item. This used to happen
+  // once in state resolution and again while assembling the payload, doubling
+  // the synchronous SQLite/legacy-backfill work for every transport session.
+  const state = resolveAuthoritativeSessionListState(s, queuePayload?.queueSnapshot ?? null);
   // DAEMON-AUTHORITATIVE template eligibility. Computed from the persisted
   // record (not the resolved transport `state` above) so it stays deterministic
   // and matches the clone-create gate's view of the session.

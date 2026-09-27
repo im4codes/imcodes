@@ -214,6 +214,76 @@ describe('bounded projection cost on a large backlog', () => {
     p.buildSnapshot(SCOPE, 'sub-2');
     expect(calls).toBe(ASSIGNMENTS);
   });
+
+  it('yields between durable replay chunks so timers can run during a backlog', async () => {
+    seedTask('implementing');
+    const EVENTS = 96;
+    const p = producer({ broadcast: false });
+    p.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < EVENTS; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_console', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    let timerRan = false;
+    const timer = new Promise<void>((resolve) => setTimeout(() => { timerRan = true; resolve(); }, 0));
+    await p.synchronizeDurableEventsAsync(SCOPE, { deliver: false });
+    await timer;
+    expect(timerRan).toBe(true);
+    expect(p.restoreCursor(SCOPE).lastDurableEventId).toBe(EVENTS);
+  });
+
+  it('keeps a synthetic 1,000-event replay below the heartbeat starvation bound', async () => {
+    seedTask('implementing');
+    const EVENTS = 1_000;
+    const p = producer({ broadcast: false });
+    p.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < EVENTS; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_console', NULL, 'implementing', 'implementing', '{}', ?)`).run(10 + i);
+    }
+    const delays: number[] = [];
+    let expected = performance.now() + 10;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      delays.push(Math.max(0, now - expected));
+      expected = now + 10;
+    }, 10);
+    await p.synchronizeDurableEventsAsync(SCOPE, { deliver: false });
+    clearInterval(timer);
+    expect(Math.max(...delays, 0)).toBeLessThan(200);
+    expect(p.restoreCursor(SCOPE).lastDurableEventId).toBe(EVENTS);
+  });
+
+  it('keeps a 215-shaped multi-task backlog paged and heartbeat-serviceable', async () => {
+    const TASKS = 215;
+    const EVENTS = 2_150;
+    const p = producer({ broadcast: false });
+    p.ensureProjectionBaseline(SCOPE);
+    for (let i = 0; i < TASKS; i += 1) {
+      db.prepare(`INSERT INTO supervision_tasks
+        (task_id, project_name, top_level_task_id, classification, status, payload_json, created_at, updated_at)
+        VALUES (?, 'codedeck', ?, 'slice', 'implementing', '{}', ?, ?)`).run(`tsk_215_${i}`, `top_${i}`, 1, 1);
+    }
+    for (let i = 0; i < EVENTS; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES (?, NULL, 'implementing', 'implementing', '{}', ?)`).run(`tsk_215_${i % TASKS}`, 10 + i);
+    }
+    let ticks = 0;
+    let maxDelay = 0;
+    let expected = performance.now() + 10;
+    const timer = setInterval(() => {
+      const now = performance.now();
+      maxDelay = Math.max(maxDelay, Math.max(0, now - expected));
+      expected = now + 10;
+      ticks += 1;
+    }, 10);
+    const committed = await p.synchronizeDurableEventsAsync(SCOPE, { deliver: false });
+    clearInterval(timer);
+    expect(committed).toBe(EVENTS);
+    expect(ticks).toBeGreaterThan(1);
+    expect(maxDelay).toBeLessThan(200);
+    expect(p.restoreCursor(SCOPE).lastDurableEventId).toBe(EVENTS);
+  });
 });
 
 describe('restart reconstruction from SQLite alone', () => {
