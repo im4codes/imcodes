@@ -249,6 +249,26 @@ describe('TaskPairStatusPanel', () => {
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
   });
 
+  it('treats a phone user agent as mobile even when the viewport is wider than the breakpoint', () => {
+    const events = [{ eventId: 'wide-phone', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'wide-phone', title: 'Wide phone', toStatus: 'working' } }] as never;
+    const originalMatch = window.matchMedia;
+    const originalUa = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent');
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    Object.defineProperty(window.navigator, 'userAgent', { configurable: true, value: 'Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 Chrome/140 Mobile Safari/537.36' });
+    try {
+      window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:wide-phone:mobile');
+      const { container } = render(<TaskPairStatusPanel events={events} serverId="wide-phone" />);
+      const panel = container.querySelector('.task-pair-status-panel');
+      expect(panel?.classList.contains('is-mobile')).toBe(true);
+      expect(panel?.classList.contains('is-collapsed')).toBe(true);
+      expect(container.querySelector('.task-pair-status-collapse-icon')).toBeNull();
+    } finally {
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatch });
+      if (originalUa) Object.defineProperty(window.navigator, 'userAgent', originalUa);
+      else delete (window.navigator as { userAgent?: string }).userAgent;
+    }
+  });
+
   it('uses the mobile compact strip as the only expand control and keeps collapse visible when expanded', () => {
     const events = [{ eventId: 'mobile-compact', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-compact', title: 'Mobile task', toStatus: 'working' } }] as never;
     const original = window.matchMedia;
@@ -567,7 +587,8 @@ describe('TaskPairStatusPanel', () => {
 
   it('keeps the collapsed mobile strip borderless and no taller than the titlebar line', () => {
     const css = readCss();
-    const mobile = css.slice(css.indexOf('@media (max-width: 720px)'));
+    // Keyed on .is-mobile, not a width query: wide mobile WebViews must match too.
+    const mobile = css.slice(0, css.indexOf('@media (max-width: 720px) {\n  .task-pair-status-panel {'));
     const container = cssRule(mobile, '.task-pair-status-panel.is-mobile.is-collapsed');
     expect(container).toMatch(/border:\s*0/);
     expect(container).toMatch(/background:\s*transparent/);

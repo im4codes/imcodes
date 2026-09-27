@@ -1,3 +1,4 @@
+import { isMobileUserAgent } from '../mobile-device.js';
 import { useCallback, useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
@@ -13,6 +14,9 @@ export function collapsedStorageKey(serverId: string | null | undefined, mobile:
   return `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}${scope}:${mobile ? 'mobile' : 'desktop'}`;
 }
 function mobileLayout(): boolean {
+  // Agree with the app shell's mobile layout (device-based) first; the width
+  // query alone misses mobile WebViews wider than the breakpoint.
+  if (isMobileUserAgent()) return true;
   try { return window.matchMedia?.('(max-width: 720px)').matches ?? false; } catch { return false; }
 }
 
@@ -157,7 +161,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   useEffect(() => {
     const media = window.matchMedia?.('(max-width: 720px)');
     if (!media) return undefined;
-    const onChange = () => { setIsMobile(media.matches); setCollapsed(readCollapsed(serverId, media.matches)); };
+    const onChange = () => { const mobile = mobileLayout(); setIsMobile(mobile); setCollapsed(readCollapsed(serverId, mobile)); };
     media.addEventListener?.('change', onChange);
     window.addEventListener('resize', onChange);
     return () => { media.removeEventListener?.('change', onChange); window.removeEventListener('resize', onChange); };

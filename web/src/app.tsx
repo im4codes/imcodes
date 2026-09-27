@@ -213,6 +213,7 @@ import {
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
+import { isMobileUserAgent } from './mobile-device.js';
 import {
   getAuthKey,
   clearAuthKey,
@@ -3654,7 +3655,7 @@ export function App() {
     }
   }, [activeSession, bringSubToFront, runVersionSensitiveAction, setPinnedPanels, subSessions, trans]);
 
-  const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
+  const isMobile = isMobileUserAgent();
   isMobileRef.current = isMobile;
   const desktopLayoutCapable = !isMobile;
   const visibleTeamDiscussions = useMemo(() => discussions.filter((discussion) => (
