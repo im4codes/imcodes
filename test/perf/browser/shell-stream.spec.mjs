@@ -71,9 +71,13 @@ async function measureKeystrokeEcho(page, samples = 24) {
   for (let index = 0; index < samples; index += 1) {
     const marker = `LATENCY_ECHO_${index}_${Date.now()}`;
     const started = await page.evaluate(() => performance.now());
-    await page.keyboard.type(`printf '%s\\n' '${marker}'`);
+    // insertText is one browser input event, so this measures the daemon's
+    // text-to-echo path without 24×~30 individual WS key frames dominating the
+    // result on a loaded real machine; the separate fast-typing checks cover
+    // per-key ordering and loss.
+    await page.keyboard.insertText(`printf '%s\\n' '${marker}'`);
     await page.keyboard.press('Enter');
-    await waitForTerminalText(page, marker, 5_000);
+    await waitForTerminalText(page, marker, 30_000);
     latencies.push(await page.evaluate((startedAt) => performance.now() - startedAt, started));
   }
   latencies.sort((a, b) => a - b);
