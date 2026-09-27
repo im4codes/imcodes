@@ -39,6 +39,12 @@ function normalizeSnapshot(detail: { tasks?: readonly Record<string, unknown>[];
 
 type SessionLabelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null };
 
+function hasPairActivity(events: readonly TimelineEvent[]): boolean {
+  if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
+  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly unknown[] } }).__imcodesTaskPairSnapshot;
+  return Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0;
+}
+
 function resolveSessionLabel(
   id: string,
   payloadLabel: unknown,
@@ -210,4 +216,20 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
       })}
     </div>}
   </aside>;
+}
+
+/** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
+export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null }) {
+  const [active, setActive] = useState(() => hasPairActivity(props.events));
+  useEffect(() => { if (!active && hasPairActivity(props.events)) setActive(true); }, [active, props.events]);
+  useEffect(() => {
+    if (active) return undefined;
+    const onSnapshot = (event: Event) => {
+      const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; op?: string; task?: unknown } | undefined;
+      if ((Array.isArray(detail?.tasks) && detail.tasks.length > 0) || detail?.op === 'task_upsert' || detail?.task) setActive(true);
+    };
+    window.addEventListener('supervision:task-pairs', onSnapshot);
+    return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
+  }, [active]);
+  return active ? <TaskPairStatusPanel {...props} /> : null;
 }

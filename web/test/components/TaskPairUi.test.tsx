@@ -14,7 +14,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
-import { TaskPairStatusPanel } from '../../src/components/TaskPairStatusPanel.js';
+import { TaskPairStatusPanel, TaskPairStatusPanelHost } from '../../src/components/TaskPairStatusPanel.js';
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
@@ -109,6 +109,20 @@ describe('TaskPairEventChip workspace events', () => {
 describe('TaskPairStatusPanel', () => {
   beforeEach(() => window.localStorage.clear());
   afterEach(() => cleanup());
+  it('does not mount responsive panel effects for an ordinary chat, then activates on pair snapshot data', async () => {
+    const originalMatchMedia = window.matchMedia;
+    const matchMedia = vi.fn(() => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }));
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: matchMedia });
+    render(<TaskPairStatusPanelHost events={[]} serverId="ordinary" />);
+    expect(screen.queryByTestId('task-pair-status-panel')).toBeNull();
+    expect(matchMedia).not.toHaveBeenCalled();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { tasks: [{ taskId: 'host-task', title: 'Host task', pair: { status: 'working' } }] };
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot }));
+    expect(await waitFor(() => screen.getByTestId('task-pair-status-panel'))).toBeTruthy();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia });
+  });
   it('defaults collapsed on mobile but expanded on desktop, with independent layout keys', () => {
     const events = [{ eventId: 'layout-default', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-default', title: 'Layout default', toStatus: 'working' } }] as never;
     const original = window.matchMedia;

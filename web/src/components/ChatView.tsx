@@ -115,7 +115,7 @@ import {
 } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
-import { TaskPairStatusPanel } from './TaskPairStatusPanel.js';
+import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -3920,7 +3920,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 }}
               />
             )}
-            {!!sessionId && <TaskPairStatusPanel events={events} sessions={sessions} serverId={serverId} />}
+            {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} />}
           </div>
         )}
         {showRefreshOverlay && (
