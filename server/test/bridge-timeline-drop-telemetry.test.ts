@@ -367,8 +367,11 @@ describe('WsBridge timeline drop telemetry', () => {
     slow.emit('message', JSON.stringify({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: SESSION, mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY }));
     await flushAsync();
     slow.sent.length = 0;
-    for (let seq = 1; seq <= 70000; seq += 1) {
-      daemon.emit('message', timelineEvent('user.message', `message-${seq}`));
+    // Use fewer, larger durable frames so the test exercises the 64 MiB
+    // ceiling without spending tens of seconds parsing 70k tiny events on
+    // resource-constrained CI workers.
+    for (let seq = 1; seq <= 10_000; seq += 1) {
+      daemon.emit('message', timelineEvent('user.message', `message-${seq}-${'x'.repeat(8192)}`));
     }
     await flushAsync();
     expect(slow.closed).toBe(true);
