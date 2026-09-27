@@ -121,7 +121,21 @@ async function copyUrlAtColumns(page, targetCols, url) {
     term.selectAll();
     const selected = term.getSelection();
     if (!selected.includes(value)) throw new Error('xterm selection did not contain the printed URL');
-    return { selected, cols: term.cols };
+    const position = term.getSelectionPosition();
+    const continuationRows = [];
+    if (position) {
+      for (let row = position.start.y + 1; row <= position.end.y; row += 1) {
+        continuationRows.push(term.buffer.active.getLine(row)?.isWrapped ?? false);
+      }
+    }
+    const lines = selected.split('\n');
+    let joined = lines[0] ?? '';
+    for (let index = 1; index < lines.length; index += 1) {
+      const line = lines[index] ?? '';
+      if (continuationRows[index - 1]) joined = joined.replace(/\s+$/u, '') + line;
+      else joined += `\n${line}`;
+    }
+    return { selected, joined, cols: term.cols };
   }, { value: url, session: SESSION });
   await page.locator('.xterm-helper-textarea').focus().catch(() => {});
   await page.keyboard.press('Control+C');
@@ -130,7 +144,7 @@ async function copyUrlAtColumns(page, targetCols, url) {
   await page.waitForTimeout(100);
   const copied = await page.evaluate(async () => window.__imcShellLastCopied || await navigator.clipboard?.readText?.() || '');
   const normalized = copied.replace(/\r?\n/g, '');
-  const selectedNormalized = selection.selected.replace(/\r?\n/g, '');
+  const selectedNormalized = selection.joined.replace(/\r?\n/g, '');
   const selectedOccurrences = selectedNormalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
   const copiedOccurrences = normalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
   const clipboardExact = copiedOccurrences.length === 1 && copiedOccurrences[0] === url;
