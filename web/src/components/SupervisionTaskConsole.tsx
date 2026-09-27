@@ -25,6 +25,7 @@ import {
 } from '../supervision-task-console-preferences.js';
 import {
   SUPERVISION_TASK_CONSOLE_PHASE,
+  SUPERVISION_TASK_CONSOLE_SYNC_STATE,
   type SupervisionTaskConsoleEventEvidence,
   type SupervisionTaskConsoleReducerState,
 } from '../supervision-task-console-reducer.js';
@@ -33,6 +34,7 @@ import {
   type SupervisionTaskConsoleVisibilityInput,
 } from '../supervision-task-console-visibility.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
+import { TASK_PAIR_OPEN_STATUSES, TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, type TaskPairStatus } from '@shared/task-pair.js';
 
 const DESKTOP_MIN_WIDTH = 720;
 const DESKTOP_DEFAULT_WIDTH = 720;
@@ -44,6 +46,87 @@ const FOCUSABLE_SELECTOR = [
   'select:not([disabled])', 'textarea:not([disabled])',
   '[tabindex]:not([tabindex="-1"])',
 ].join(',');
+
+const BRAIN_DECISION_FLAGS = new Set(['blocked', 'needs_input', 'waiting_for_capacity']);
+
+function legacyPairStatus(task: SupervisionTaskConsoleTaskRow): TaskPairStatus {
+  if (task.phase === 'audit') return 'in_audit';
+  if (task.phase === 'rework') return 'rework';
+  if (task.phase === 'final') return 'done';
+  if (task.phase === 'integration') return 'working';
+  return 'working';
+}
+
+/** Adapt the authoritative console projection for the compact chat panel. */
+export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleReducerState) {
+  const tasks = Object.values(state.tasks).flatMap((task) => {
+    const pair = task.pair ?? {
+      status: legacyPairStatus(task),
+      flags: [],
+      round: 0,
+      blocking: [],
+      createdAt: task.updatedAt,
+      startedAt: task.updatedAt,
+      updatedAt: task.updatedAt,
+    };
+    const flags = [...(pair.flags ?? [])];
+    const waitingForBrain = flags.some((flag) => BRAIN_DECISION_FLAGS.has(flag));
+    const normalizedPair = {
+      ...pair,
+      status: waitingForBrain ? TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION : pair.status,
+      flags,
+    };
+    // The supervision projection can retain completed history.  The compact
+    // panel is an open-pair indicator, so do not reintroduce terminal rows.
+    if (!TASK_PAIR_OPEN_STATUSES.includes(normalizedPair.status)) return [];
+    return [{
+      taskId: task.taskId,
+      title: task.title,
+      updatedAt: task.updatedAt,
+      pair: normalizedPair,
+    }];
+  });
+  return {
+    tasks,
+    assignments: Object.values(state.assignments),
+    authoritative: true,
+  };
+}
+
+/** Keeps the compact chat panel authoritative even when the full console is closed. */
+export function SupervisionTaskPairSnapshotBridge(props: {
+  ws: WsClient | null;
+  connected: boolean;
+  userId: string;
+  serverId: string;
+  projectName: string;
+  coordinatorSessionName: string;
+}) {
+  const { state } = useSupervisionTaskConsole({
+    ws: props.ws,
+    connected: props.connected,
+    userId: props.userId,
+    serverId: props.serverId,
+    scope: { projectName: props.projectName, coordinatorSessionName: props.coordinatorSessionName },
+  });
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    // Cached projections are marked STALE and must not silently replace the
+    // daemon's authoritative list.  Publish only a live, fully synced snapshot.
+    if (state.hasAuthoritativeSnapshot && state.syncState === SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED) {
+      const detail = taskConsoleStateToPairSnapshot(state);
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
+      return;
+    }
+    if (state.phase === SUPERVISION_TASK_CONSOLE_PHASE.ERROR) {
+      const detail = { authorityUnavailable: true, error: state.error ?? 'unsupported' };
+      (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
+    }
+  }, [state]);
+  return null;
+}
 
 export function supervisionConsoleMaxWidth(viewportWidth: number): number {
   return Math.max(320, Math.min(DESKTOP_MAX_WIDTH, Math.floor(viewportWidth * DESKTOP_VIEWPORT_CAP)));

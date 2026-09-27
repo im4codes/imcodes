@@ -41,6 +41,7 @@ import { SessionTabs } from './components/SessionTabs.js';
 import { SessionPane } from './components/SessionPane.js';
 import {
   SupervisionTaskConsole,
+  SupervisionTaskPairSnapshotBridge,
   SupervisionTaskConsoleToggle,
   supervisionTaskConsolePreferenceBounds,
 } from './components/SupervisionTaskConsole.js';
@@ -6723,6 +6724,16 @@ export function App() {
               </div>
               )}
               </div>
+              {auth?.userId && selectedServerId && activeSessionInfo && wsRef.current && (
+                <SupervisionTaskPairSnapshotBridge
+                  ws={wsRef.current}
+                  connected={connected && daemonOnline}
+                  userId={auth.userId}
+                  serverId={selectedServerId}
+                  projectName={activeSessionInfo.project}
+                  coordinatorSessionName={activeSessionInfo.name}
+                />
+              )}
               {showSupervisionTaskConsole && canViewTaskConsole && activeSessionInfo && (
                 <SupervisionTaskConsole
                   key={`${auth.userId}:${selectedServerId}:${activeSessionInfo.project}:${activeSessionInfo.name}`}

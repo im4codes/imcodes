@@ -15,6 +15,7 @@ vi.mock('react-i18next', () => ({
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
 import { TaskPairStatusPanel, TaskPairStatusPanelHost } from '../../src/components/TaskPairStatusPanel.js';
+import { taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
@@ -125,6 +126,50 @@ describe('TaskPairStatusPanel', () => {
     expect(await waitFor(() => screen.getByTestId('task-pair-status-panel'))).toBeTruthy();
     delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMatchMedia });
+  });
+  it('renders every authoritative open pair beyond loaded chat history and buckets blocked rows for Brain', async () => {
+    const tasks = Array.from({ length: 7 }, (_, index) => ({
+      taskId: `authoritative-${index}`,
+      title: `Authoritative task ${index}`,
+      pair: {
+        status: index < 3 ? 'working' : index === 3 ? 'in_audit' : index < 6 ? 'awaiting_brain_decision' : 'working',
+        flags: index < 3 ? [] : index < 6 ? ['blocked'] : [],
+        startedAt: 1_790_476_778_973 + index,
+        updatedAt: 1_790_476_778_973 + index,
+        executor: `executor-${index}`,
+        auditor: 'none',
+      },
+    }));
+    render(<TaskPairStatusPanelHost events={[{ eventId: 'history-only', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'history-only', title: 'History only', toStatus: 'working' } }] as never} serverId="authoritative" />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks, assignments: [], authoritative: true } }));
+    await waitFor(() => expect(screen.getAllByText(/Authoritative task/)).toHaveLength(7));
+    expect(screen.getByText(/taskPair.status.awaiting_brain_decision \(2\)/)).toBeTruthy();
+    expect(screen.queryByText('History only')).toBeNull();
+    expect(screen.getByText(/Authoritative task 0/).parentElement?.textContent).toContain('taskPair.panel_started');
+  });
+  it('shows an explicit unsupported-daemon hint instead of a partial event-derived list', async () => {
+    render(<TaskPairStatusPanelHost events={[{ eventId: 'partial', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'partial', title: 'Partial', toStatus: 'working' } }] as never} serverId="unsupported" />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true } }));
+    await waitFor(() => expect(screen.getByTestId('task-pair-status-panel-authority-error')).toBeTruthy());
+    expect(screen.queryByText('Partial')).toBeNull();
+  });
+  it('maps authoritative decision flags while preserving pair timestamps', () => {
+    const snapshot = taskConsoleStateToPairSnapshot({
+      tasks: {
+        blocked: {
+          taskId: 'blocked', title: 'Blocked', phase: 'active', updatedAt: 200,
+          pair: { status: 'working', flags: ['blocked'], round: 1, blocking: ['P0'], createdAt: 100, startedAt: 123, updatedAt: 200 },
+        },
+        done: {
+          taskId: 'done', title: 'Done', phase: 'final', updatedAt: 300,
+          pair: { status: 'done', flags: [], round: 1, blocking: [], createdAt: 100, startedAt: 100, updatedAt: 300 },
+        },
+      },
+      assignments: {},
+    } as never);
+    expect(snapshot.tasks).toHaveLength(1);
+    expect(snapshot.tasks[0].pair.status).toBe('awaiting_brain_decision');
+    expect(snapshot.tasks[0].pair.startedAt).toBe(123);
   });
   it('defaults collapsed on mobile but expanded on desktop, with independent layout keys', () => {
     const events = [{ eventId: 'layout-default', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-default', title: 'Layout default', toStatus: 'working' } }] as never;

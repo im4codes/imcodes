@@ -113,8 +113,8 @@ type SessionLabelEntry = { name: string; label?: string | null; activeModel?: st
 
 function hasPairActivity(events: readonly TimelineEvent[]): boolean {
   if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
-  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly unknown[] } }).__imcodesTaskPairSnapshot;
-  return Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0;
+  const snapshot = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly unknown[]; authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
+  return Boolean(snapshot?.authorityUnavailable) || (Array.isArray(snapshot?.tasks) && snapshot.tasks.length > 0);
 }
 
 function resolveSessionLabel(
@@ -210,8 +210,8 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => { const timer = window.setInterval(() => setNow(Date.now()), 1000); return () => window.clearInterval(timer); }, []);
   const allRows = [...latest.values()].filter((row) => status(row.payload.toStatus));
-  const groupFor = (value: TaskPairStatus) => value === 'queued' ? 'queued' : value === 'rework' ? 'rework' : value === 'in_audit' || value === 'awaiting_audit' ? 'audit' : value === 'done' || value === 'cancelled' || value === 'passed' ? 'recent' : 'working';
-  const groups = (['working', 'audit', 'rework', 'queued', 'recent'] as const).map((key) => {
+  const groupFor = (value: TaskPairStatus) => value === 'queued' ? 'queued' : value === 'awaiting_brain_decision' ? 'awaiting_brain_decision' : value === 'rework' ? 'rework' : value === 'in_audit' || value === 'awaiting_audit' ? 'audit' : value === 'done' || value === 'cancelled' || value === 'passed' ? 'recent' : 'working';
+  const groups = (['working', 'audit', 'rework', 'queued', 'awaiting_brain_decision', 'recent'] as const).map((key) => {
     const rows = allRows.filter((row) => groupFor(row.payload.toStatus as TaskPairStatus) === key);
     if (key === 'queued') rows.sort((a, b) => Number(a.payload.queuePosition ?? Number.MAX_SAFE_INTEGER) - Number(b.payload.queuePosition ?? Number.MAX_SAFE_INTEGER));
     return { key, rows: key === 'recent' ? rows.slice(-MAX_ROWS) : rows };
@@ -270,7 +270,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
     </button>}
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
-        const heading = <h4>{t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
+        const heading = <h4>{group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
         const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const endedAt = terminal ? finiteTimestamp(payload.endedAt ?? payload.updatedAt, row.startedAt) : now; const elapsedSeconds = Math.max(0, Math.floor((endedAt - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
@@ -300,16 +300,22 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
 export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null }) {
+  const { t } = useTranslation();
+  const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events));
+  const [authorityUnavailable, setAuthorityUnavailable] = useState(() => Boolean(initialSnapshot?.authorityUnavailable));
   useEffect(() => { if (!active && hasPairActivity(props.events)) setActive(true); }, [active, props.events]);
   useEffect(() => {
-    if (active) return undefined;
     const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; op?: string; task?: unknown } | undefined;
+      const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined;
       if ((Array.isArray(detail?.tasks) && detail.tasks.length > 0) || detail?.op === 'task_upsert' || detail?.task) setActive(true);
+      if (detail && 'authorityUnavailable' in detail) setAuthorityUnavailable(Boolean(detail.authorityUnavailable));
+      else if (detail && Array.isArray(detail.tasks)) setAuthorityUnavailable(false);
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
-  }, [active]);
-  return active ? <TaskPairStatusPanel {...props} /> : null;
+  }, []);
+  if (!active) return null;
+  if (authorityUnavailable) return <aside class="task-pair-status-panel task-pair-status-panel-authority-error" data-testid="task-pair-status-panel-authority-error" role="alert">{t('supervision_task_console.unsupported')}</aside>;
+  return <TaskPairStatusPanel {...props} />;
 }
