@@ -1325,6 +1325,10 @@ const transportResendAuthorityRetries = new Map<string, {
 }>();
 const transportErrorRecoveryInFlight = new Map<string, Promise<boolean>>();
 
+function hasDurableTransportQueueEntries(sessionName: string): boolean {
+  return getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === sessionName);
+}
+
 function previewTransportQueueText(text: string): string {
   const normalized = text.replace(/\s+/g, ' ').trim();
   return normalized.length > 120 ? `${normalized.slice(0, 117)}...` : normalized;
@@ -1346,9 +1350,11 @@ function buildTransportQueueSessionStatePayload(
 export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): DaemonTransportQueuesSnapshot {
   const resendQueues = listFreshResendQueues(nowMs);
   const resendBySession = new Map(resendQueues.map((queue) => [queue.sessionName, queue.entries]));
+  const durableBySession = new Map(getTransportQueueStore().listLiveQueueSessions().map((queue) => [queue.sessionName, queue]));
   const sessionNames = new Set<string>([
     ...transportRuntimes.keys(),
     ...resendQueues.map((queue) => queue.sessionName),
+    ...durableBySession.keys(),
   ]);
   for (const session of storeSessions()) {
     if (isStoredTransportSession(session)) {
@@ -1362,6 +1368,7 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
     runtime?.drainPendingIfIdle?.('transport-queue-diagnostics');
     const runtimeSnapshot = runtime?.getDiagnosticSnapshot(nowMs);
     const resendEntries = resendBySession.get(sessionName) ?? [];
+    const durable = durableBySession.get(sessionName);
     return {
       sessionName,
       ...(record?.agentType ? { agentType: record.agentType } : {}),
@@ -1375,6 +1382,7 @@ export function collectTransportQueueDiagnostics(nowMs: number = Date.now()): Da
       ...(runtimeSnapshot ? { lastActivityAt: runtimeSnapshot.lastActivityAt } : {}),
       ...(runtimeSnapshot ? { lastActivityAgeMs: runtimeSnapshot.lastActivityAgeMs } : {}),
       resendCount: resendEntries.length,
+      ...(durable ? { oldestQueuedAt: durable.oldestQueuedAt, oldestQueuedAgeMs: Math.max(0, nowMs - durable.oldestQueuedAt) } : {}),
       ...(resendEntries.length
         ? {
             resendEntries: resendEntries.map((entry) => ({
@@ -2681,7 +2689,7 @@ export async function restoreTransportSessions(
     && (s.providerId ?? s.agentType) === providerId
     && !!s.providerSessionId
     && (!options.sessionName || s.name === options.sessionName)
-    && (!options.onlyWithPendingResend || getResendCount(s.name) > 0),
+    && (!options.onlyWithPendingResend || getResendCount(s.name) > 0 || hasDurableTransportQueueEntries(s.name)),
   ).map((s) => ({ ...s, providerId, providerSessionId: s.providerSessionId! } as Restorable));
   const restoreOne = async (s: Restorable, index: number): Promise<void> => {
     let expectedAuthority = buildRestoreAuthority(s);

@@ -17,6 +17,7 @@ import {
   type QueueStoredEntry,
   type QueueSupervisionReference,
 } from '../../shared/transport-queue-types.js';
+import { transportQueueStaleThresholdMs } from '../../shared/transport-queue-types.js';
 import { buildQueueProjectionEntry } from '../../shared/transport-queue-privacy.js';
 import { resolveTransportConversationKey } from '../agent/transport-resume-opts.js';
 import { getSession } from '../store/session-store.js';
@@ -124,6 +125,19 @@ export interface QueueDegradedDiagnostic {
   errorClass: string;
 }
 
+export interface LiveTransportQueueSession {
+  sessionName: string;
+  pendingCount: number;
+  oldestQueuedAt: number;
+}
+
+export interface StaleDelegationQueueEntry {
+  sessionName: string;
+  clientMessageId: string;
+  createdAt: number;
+  text: string;
+}
+
 export type QueueSafeMutationResult<T> =
   | { ok: true; result: T }
   | { ok: false; snapshot: QueueSnapshot; diagnostic: QueueDegradedDiagnostic };
@@ -137,6 +151,11 @@ function normalizeSessionName(sessionName: string): string {
 function requireNonEmpty(value: string, label: string): string {
   if (!value) throw new Error(`transport queue ${label} is required`);
   return value;
+}
+
+function cronScheduleId(commandId: string | undefined): string | undefined {
+  const match = typeof commandId === 'string' ? /^cron:([^:]+):/.exec(commandId.trim()) : null;
+  return match?.[1] || undefined;
 }
 
 function nowMs(input?: number): number {
@@ -558,6 +577,20 @@ export class TransportQueueStore {
         this.deleteSessionQueueStateRows(sessionName);
         meta = this.ensureMeta(sessionName, now, recipient);
       }
+      // Cron executions are identified by `cron:<scheduleId>:...`. A busy
+      // target may receive many fires before becoming idle; retain only the
+      // newest pending fire for each schedule. This is durable, so the rule
+      // also holds across a daemon restart.
+      const cronSchedule = cronScheduleId(input.commandId);
+      if (cronSchedule) {
+        this.db.prepare(`
+          UPDATE queue_entries
+          SET status = 'expired', failure_reason = 'expired', drop_reason = 'superseded',
+            handoff_id = NULL, handoff_started_at = NULL, handoff_expires_at = NULL, updated_at = ?
+          WHERE session_name = ? AND status = 'queued'
+            AND command_id LIKE ?
+        `).run(now, sessionName, `cron:${cronSchedule}:%`);
+      }
       if (evictClientMessageId) {
         this.db.prepare('DELETE FROM queue_entries WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
         this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?').run(sessionName, evictClientMessageId);
@@ -603,6 +636,67 @@ export class TransportQueueStore {
         queueSnapshot: this.readSnapshot(sessionName, 'enqueue', version),
         ...(evictClientMessageId ? { dropSnapshot: this.readSnapshot(sessionName, 'drop', { ...version, dropReason: 'capacity_evicted' }) } : {}),
       };
+    } catch (err) {
+      this.db.exec('ROLLBACK');
+      throw err;
+    }
+  }
+
+  /** List durable live rows even when no in-memory runtime/resend holder exists. */
+  listLiveQueueSessions(): LiveTransportQueueSession[] {
+    const rows = this.db.prepare(`
+      SELECT session_name AS sessionName,
+        COUNT(*) AS pendingCount,
+        MIN(created_at) AS oldestQueuedAt
+      FROM queue_entries
+      WHERE status IN ('queued', 'handoff_inflight', 'dispatching')
+      GROUP BY session_name
+      ORDER BY oldestQueuedAt ASC, sessionName ASC
+    `).all() as Array<{ sessionName: string; pendingCount: number; oldestQueuedAt: number }>;
+    return rows.map((row) => ({
+      sessionName: String(row.sessionName),
+      pendingCount: Number(row.pendingCount),
+      oldestQueuedAt: Number(row.oldestQueuedAt),
+    }));
+  }
+
+  /**
+   * Move stale Brain→agent delegation rows to a terminal failed state. The
+   * returned rows let the caller emit one sender notice; terminal state makes
+   * the operation idempotent across every periodic sweep and restart.
+   */
+  expireStaleDelegationEntries(
+    now = Date.now(),
+    thresholdMs = transportQueueStaleThresholdMs(process.env),
+  ): StaleDelegationQueueEntry[] {
+    const cutoff = now - Math.max(1_000, thresholdMs);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const rows = this.db.prepare(`
+        SELECT session_name AS sessionName, client_message_id AS clientMessageId,
+          created_at AS createdAt, text
+        FROM queue_entries
+        WHERE status = 'queued' AND created_at < ?
+          AND text LIKE '<imcodes-agent-delegation-sender-v1>%'
+        ORDER BY created_at ASC
+      `).all(cutoff) as unknown as StaleDelegationQueueEntry[];
+      if (rows.length > 0) {
+        this.db.prepare(`
+          UPDATE queue_entries
+          SET status = 'expired', failure_reason = 'expired', drop_reason = 'stale_expired',
+            handoff_id = NULL, handoff_started_at = NULL, handoff_expires_at = NULL, updated_at = ?
+          WHERE status = 'queued' AND created_at < ?
+            AND text LIKE '<imcodes-agent-delegation-sender-v1>%'
+        `).run(now, cutoff);
+        for (const row of rows) {
+          this.db.prepare('DELETE FROM queue_private_material WHERE session_name = ? AND client_message_id = ?')
+            .run(row.sessionName, row.clientMessageId);
+        }
+        const sessions = [...new Set(rows.map((row) => row.sessionName))];
+        for (const sessionName of sessions) this.bumpVersion(sessionName, now);
+      }
+      this.db.exec('COMMIT');
+      return rows;
     } catch (err) {
       this.db.exec('ROLLBACK');
       throw err;

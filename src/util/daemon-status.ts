@@ -101,6 +101,9 @@ export interface DaemonTransportQueueSessionSnapshot {
   lastActivityAt?: number;
   lastActivityAgeMs?: number;
   resendCount: number;
+  /** Oldest durable queued row, if any; used to expose queue age to operators. */
+  oldestQueuedAt?: number;
+  oldestQueuedAgeMs?: number;
   resendEntries?: Array<{
     commandId: string;
     queuedAt: number;
@@ -651,6 +654,8 @@ function parseDaemonTransportQueueSessionSnapshot(value: unknown): DaemonTranspo
   const resendCount = coerceNonNegativeSafeInteger(raw.resendCount);
   if (!sessionName || pendingCount === null || resendCount === null) return null;
   const pendingVersion = coerceNonNegativeSafeInteger(raw.pendingVersion);
+  const oldestQueuedAt = coerceNonNegativeSafeInteger(raw.oldestQueuedAt);
+  const oldestQueuedAgeMs = coerceNonNegativeSafeInteger(raw.oldestQueuedAgeMs);
   const activeDispatchCount = coerceNonNegativeSafeInteger(raw.activeDispatchCount);
   const lastActivityAt = coerceNonNegativeSafeInteger(raw.lastActivityAt);
   const lastActivityAgeMs = coerceNonNegativeSafeInteger(raw.lastActivityAgeMs);
@@ -664,6 +669,8 @@ function parseDaemonTransportQueueSessionSnapshot(value: unknown): DaemonTranspo
     ...(typeof raw.sending === 'boolean' ? { sending: raw.sending } : {}),
     pendingCount,
     ...(pendingVersion !== null ? { pendingVersion } : {}),
+    ...(oldestQueuedAt !== null ? { oldestQueuedAt } : {}),
+    ...(oldestQueuedAgeMs !== null ? { oldestQueuedAgeMs } : {}),
     ...(activeDispatchCount !== null ? { activeDispatchCount } : {}),
     ...(typeof raw.stalePendingRecoveryActive === 'boolean' ? { stalePendingRecoveryActive: raw.stalePendingRecoveryActive } : {}),
     ...(typeof raw.providerSessionBound === 'boolean' ? { providerSessionBound: raw.providerSessionBound } : {}),

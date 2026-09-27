@@ -80,6 +80,20 @@ describe('transport-resend-queue', () => {
     expect(getResendCount('s1')).toBe(2);
   });
 
+  it('coalesces repeated cron fires to one pending delivery per schedule', () => {
+    enqueueResend('cron-target', {
+      text: 'first fire', commandId: 'cron:schedule-1:exec-1', clientMessageId: 'cron-1', queuedAt: Date.now(),
+    });
+    enqueueResend('cron-target', {
+      text: 'second fire', commandId: 'cron:schedule-1:exec-2', clientMessageId: 'cron-2', queuedAt: Date.now(),
+    });
+    expect(getResendEntries('cron-target').map((entry) => entry.clientMessageId)).toEqual(['cron-2']);
+    expect(getTransportQueueStore().readSnapshot('cron-target').pendingMessageEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['cron-2']);
+    expect(getTransportQueueStore().readSnapshot('cron-target').failedMessageEntries)
+      .toEqual([expect.objectContaining({ clientMessageId: 'cron-1', dropReason: 'superseded' })]);
+  });
+
   it('preserves append delivery intent in memory and durable private material', () => {
     enqueueResend('s-append', {
       text: 'append after restore',

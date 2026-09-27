@@ -4,7 +4,7 @@ import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isSessionWorking } from './session-working.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, type SessionRecord } from '../store/session-store.js';
-import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore } from '../agent/session-manager.js';
+import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
@@ -61,6 +61,8 @@ import { backfillProjectionEmbeddings } from '../context/projection-embedding-ma
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-scheduling.js';
 import { getResendCount } from './transport-resend-queue.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
+import { TRANSPORT_QUEUE_SWEEP_INTERVAL_MS } from '../../shared/transport-queue-types.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
@@ -892,6 +894,7 @@ export async function startup(): Promise<DaemonContext> {
     // each RE-connect, re-broadcast every transport session's current state.
     setServerLinkReconnectResyncHandler(() => {
       resyncTransportSessionStatesAfterLinkRestore();
+      void reconcileDurableTransportQueues();
       // Sub-sessions need the same treatment.
       //
       // The server drops its `activeSubSessions` map when the daemon socket
@@ -1370,6 +1373,9 @@ export async function startup(): Promise<DaemonContext> {
       const record = sessions.find((s) => s.name === payload.session);
       const display = resolvePushDisplayContext(payload.session, sessions);
       if (payload.event === 'idle') {
+        // Hooks are one of the idle observation paths; reconcile the durable
+        // queue even when this particular runtime missed the in-process edge.
+        void reconcileDurableTransportQueues();
         // Shell/script sessions are always "idle" — skip to avoid noise
         if (record?.agentType === 'shell' || record?.agentType === 'script') return;
         // notifySessionIdle is handled by the unified timeline listener below
@@ -1561,6 +1567,7 @@ export async function startup(): Promise<DaemonContext> {
   });
   setupSignalHandlers();
   startHealthPoller();
+  startDurableTransportQueueSweep();
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
   startUsageSyncWorker(workerUrl, serverId, token);
@@ -1689,7 +1696,9 @@ function hasRestorableLocalTransportSessions(
     if (!(s.runtimeType === 'transport' || isTransportAgent(s.agentType))) return false;
     if (effectiveProviderId !== providerId) return false;
     if (!s.providerSessionId) return false;
-    if (options.onlyWithPendingResend && getResendCount(s.name) === 0) return false;
+    if (options.onlyWithPendingResend
+      && getResendCount(s.name) === 0
+      && !getTransportQueueStore().listLiveQueueSessions().some((item) => item.sessionName === s.name)) return false;
     if (options.onlyMissingRuntime && getTransportRuntime(s.name)?.providerSessionId) return false;
     return true;
   });
@@ -1978,6 +1987,7 @@ async function performShutdown(exitCode: number): Promise<void> {
 
   try {
     if (healthTimer) clearInterval(healthTimer);
+    if (transportQueueSweepTimer) clearInterval(transportQueueSweepTimer);
     if (codexQuotaTimer) clearInterval(codexQuotaTimer);
     if (contextReplicationTimer) clearInterval(contextReplicationTimer);
     usageSyncWorker?.stop();
@@ -2032,6 +2042,8 @@ const CONTEXT_MATERIALIZATION_POLL_MS = 15_000;
  */
 const GC_POLL_MS = parseInt(process.env.IMCODES_GC_POLL_MS ?? '300000', 10);
 let healthTimer: ReturnType<typeof setInterval> | null = null;
+let transportQueueSweepTimer: ReturnType<typeof setInterval> | null = null;
+let transportQueueSweepInFlight: Promise<void> | null = null;
 const memoryCompressionAutoContinuedRunIds = new Set<string>();
 const codexAutoContinuedActivityGenerations = new Set<string>();
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
@@ -2209,6 +2221,82 @@ function startHealthPoller(): void {
       logger.warn({ err }, 'Execution-clone sweep error');
     }
   }, HEALTH_POLL_MS);
+}
+
+/**
+ * Reconcile durable queue rows independently of in-process idle hooks. Rows
+ * can outlive a runtime (hook outage, restart, or a deferred sub-session), so
+ * the SQLite authority is the sweep's source of truth. The sweep is bounded
+ * and idempotent: a live runtime rehydrates and drains when idle; a missing
+ * runtime is launched once and its normal restore path performs the drain.
+ */
+async function reconcileDurableTransportQueues(): Promise<void> {
+  if (transportQueueSweepInFlight) return transportQueueSweepInFlight;
+  const run = (async () => {
+    const store = getTransportQueueStore();
+    const stale = store.expireStaleDelegationEntries();
+    if (stale.length > 0) {
+      const bySender = new Map<string, Array<{ sessionName: string; createdAt: number; firstLine: string }>>();
+      for (const entry of stale) {
+        const sender = /Message from IM\.codes session:\s*([A-Za-z0-9_-]+)/.exec(entry.text)?.[1];
+        if (!sender) continue;
+        const list = bySender.get(sender) ?? [];
+        if (list.length < 20) {
+          const firstLine = entry.text.split(/\r?\n/).find((line) => line.trim() && !line.startsWith('<imcodes-'))?.trim() ?? 'delegation';
+          list.push({ sessionName: entry.sessionName, createdAt: entry.createdAt, firstLine: firstLine.slice(0, 120) });
+        }
+        bySender.set(sender, list);
+      }
+      for (const [sender, entries] of bySender) {
+        timelineEmitter.emit(sender, 'assistant.text', {
+          ...attachDaemonUserNotice(
+            DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED,
+            `⚠️ ${entries.length} 条过期的代理消息已丢弃，请重新发送仍然相关的任务。\n${entries
+              .map((entry) => `- ${entry.sessionName} @ ${new Date(entry.createdAt).toISOString()}: ${entry.firstLine}`)
+              .join('\n')}`,
+            { count: entries.length, reason: 'stale_expired' },
+          ),
+          streaming: false,
+          memoryExcluded: true,
+        }, { source: 'daemon', confidence: 'high' });
+        logger.info({ sender, entries }, 'transport queue stale delegation rows expired and sender notified');
+      }
+    }
+    for (const candidate of store.listLiveQueueSessions()) {
+      const runtime = getTransportRuntime(candidate.sessionName);
+      try {
+        if (runtime?.providerSessionId) {
+          const recovered = runtime.rehydratePendingFromStore();
+          if (recovered > 0) runtime.drainPendingIfIdle('durable-queue-sweep');
+          continue;
+        }
+        const session = getSession(candidate.sessionName);
+        if (!session || !isTransportAgent(session.agentType) || !session.providerSessionId) {
+          logger.warn({ sessionName: candidate.sessionName, pendingCount: candidate.pendingCount }, 'transport queue row has no restorable target');
+          continue;
+        }
+        void ensureTransportRuntimeForPendingResend(candidate.sessionName).catch((err) => {
+          logger.warn({ err, sessionName: candidate.sessionName }, 'durable transport queue sweep runtime restore failed');
+        });
+      } catch (err) {
+        logger.warn({ err, sessionName: candidate.sessionName }, 'durable transport queue sweep failed');
+      }
+    }
+  })();
+  transportQueueSweepInFlight = run;
+  try {
+    await run;
+  } finally {
+    if (transportQueueSweepInFlight === run) transportQueueSweepInFlight = null;
+  }
+}
+
+function startDurableTransportQueueSweep(): void {
+  void reconcileDurableTransportQueues();
+  transportQueueSweepTimer = setInterval(() => {
+    void reconcileDurableTransportQueues();
+  }, TRANSPORT_QUEUE_SWEEP_INTERVAL_MS);
+  transportQueueSweepTimer.unref?.();
 }
 
 

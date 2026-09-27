@@ -41,6 +41,11 @@ export const RESEND_EXPIRY_MS = 5 * 60 * 1000;
 /** Per-session cap to prevent unbounded growth during prolonged outages. */
 export const MAX_RESEND_ENTRIES = 10;
 
+function cronScheduleId(commandId: string | undefined): string | undefined {
+  const match = typeof commandId === 'string' ? /^cron:([^:]+):/.exec(commandId.trim()) : null;
+  return match?.[1] || undefined;
+}
+
 export interface ResendEntry {
   /**
    * The runtime this work is addressed to, captured from the live SessionRecord
@@ -192,7 +197,7 @@ function enqueueResendInternal(
   entry: ResendEntry,
   retainInMemory: boolean,
 ): EnqueueResendResult {
-  const list = queues.get(sessionName) ?? [];
+  let list = queues.get(sessionName) ?? [];
   const clientMessageId = entry.clientMessageId?.trim() || randomUUID();
   let droppedOldest = false;
   const normalizedEntry: ResendEntry = {
@@ -383,6 +388,19 @@ function enqueueResendInternal(
       queueSnapshot,
       ...(dropSnapshot ? { dropSnapshot } : {}),
     };
+  }
+  // The durable store marks older pending fires as superseded. Mirror that
+  // decision in the in-memory holder so a same-process drain cannot replay
+  // entries that were already coalesced in SQLite.
+  const schedule = cronScheduleId(normalizedEntry.commandId);
+  if (schedule) {
+    const before = list.length;
+    const kept = list.filter((candidate) => cronScheduleId(candidate.commandId) !== schedule);
+    if (kept.length !== before) {
+      list = kept;
+      queues.set(sessionName, list);
+      bumpTransportQueueRevision(sessionName);
+    }
   }
   if (list.length >= MAX_RESEND_ENTRIES) {
     const removed = list.shift();

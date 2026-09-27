@@ -44,6 +44,35 @@ afterEach(() => {
 });
 
 describe('TransportQueueStore', () => {
+  it('coalesces pending cron fires by schedule id and exposes durable queue age', () => {
+    const sessionName = 'deck_cron_coalesce';
+    store.enqueue({ sessionName, clientMessageId: 'cron-1', commandId: 'cron:schedule-1:exec-1', text: 'first', now: 100 });
+    store.enqueue({ sessionName, clientMessageId: 'cron-2', commandId: 'cron:schedule-1:exec-2', text: 'second', now: 200 });
+
+    expect(store.readSnapshot(sessionName).pendingMessageEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['cron-2']);
+    expect(store.readSnapshot(sessionName).failedMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'cron-1', dropReason: 'superseded' }),
+    ]);
+    expect(store.listLiveQueueSessions()).toEqual([
+      { sessionName, pendingCount: 1, oldestQueuedAt: 200 },
+    ]);
+  });
+
+  it('expires stale delegation rows once and returns them for a sender notice', () => {
+    const sessionName = 'deck_sub_stale_target';
+    const text = '<imcodes-agent-delegation-sender-v1>\nMessage from IM.codes session: deck_brain\n\nold work';
+    store.enqueue({ sessionName, clientMessageId: 'stale-1', commandId: 'stale-1', text, now: 1_000 });
+    expect(store.expireStaleDelegationEntries(5_000, 2_000)).toEqual([
+      expect.objectContaining({ sessionName, clientMessageId: 'stale-1', text }),
+    ]);
+    expect(store.expireStaleDelegationEntries(6_000, 2_000)).toEqual([]);
+    expect(store.readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+    expect(store.readSnapshot(sessionName).failedMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'stale-1', dropReason: 'stale_expired' }),
+    ]);
+  });
+
   it('CAS-retires the exact stale audit recipient and defeats a late old-generation enqueue', () => {
     const sessionName = 'deck_sub_stale_auditor';
     const assignmentId = 'asg_e7r';

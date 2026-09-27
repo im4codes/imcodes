@@ -39,6 +39,8 @@ export type QueueSupervisionAdmission = 'authorized' | 'stale' | 'retry';
 
 export type QueueDropReason =
   | 'expired'
+  | 'stale_expired'
+  | 'superseded'
   | 'capacity_evicted'
   | 'user_cleared'
   | 'user_stopped'
@@ -147,6 +149,7 @@ export interface QueueProjectionEntry {
   activityGeneration?: number | string;
   replacesClientMessageId?: string;
   failureReason?: QueueFailureReason;
+  dropReason?: QueueDropReason;
   attachments?: QueueAttachmentProjection[];
   sharedActor?: QueueSharedActorProjection;
   supervisionReference?: QueueSupervisionReference;
@@ -232,6 +235,17 @@ export const TRANSPORT_QUEUE_COMMANDS = {
 /** Bound one append request even if a malformed client sends an oversized id list. */
 export const TRANSPORT_QUEUE_APPEND_MAX_ENTRIES = 200;
 
+/** Durable transport liveness backstops. Override the stale threshold in tests or deployments. */
+export const TRANSPORT_QUEUE_DEFAULT_STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+export const TRANSPORT_QUEUE_SWEEP_INTERVAL_MS = 5_000;
+
+export function transportQueueStaleThresholdMs(env: { readonly [key: string]: string | undefined } = {}): number {
+  const configured = Number(env.IMCODES_TRANSPORT_QUEUE_STALE_THRESHOLD_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.max(1_000, Math.floor(configured))
+    : TRANSPORT_QUEUE_DEFAULT_STALE_THRESHOLD_MS;
+}
+
 export const LIVE_QUEUE_ENTRY_STATUSES = new Set<QueueEntryStatus>([
   'queued',
   'handoff_inflight',
@@ -254,6 +268,8 @@ export const QUEUE_RESET_REASONS = new Set<QueueResetReason>([
 
 export const QUEUE_DROP_REASONS = new Set<QueueDropReason>([
   'expired',
+  'stale_expired',
+  'superseded',
   'capacity_evicted',
   'user_cleared',
   'user_stopped',
