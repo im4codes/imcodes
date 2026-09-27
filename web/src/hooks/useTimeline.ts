@@ -845,10 +845,23 @@ function getCachedEvents(cacheKey: string): TimelineEvent[] | undefined {
   return eventsCache.get(cacheKey);
 }
 
-function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
-  const bounded = events.length > MAX_WINDOW_CACHED_EVENTS
+function boundCachedEvents(events: TimelineEvent[]): TimelineEvent[] {
+  return events.length > MAX_WINDOW_CACHED_EVENTS
     ? events.slice(events.length - MAX_WINDOW_CACHED_EVENTS)
     : events;
+}
+
+/** Update the per-session memory/snapshot cache without notifying sibling hook
+ * subscribers. Streaming deltas use this path so each mounted pane renders its
+ * own local frame while companion panes/tabs are not fanned out on every tick. */
+function setCachedEventsLocal(cacheKey: string, events: TimelineEvent[]): void {
+  const bounded = boundCachedEvents(events);
+  eventsCache.set(cacheKey, bounded);
+  scheduleTimelineSnapshotPersist(cacheKey, bounded);
+}
+
+function setCachedEvents(cacheKey: string, events: TimelineEvent[]): void {
+  const bounded = boundCachedEvents(events);
   getTimelineStore(cacheKey).replace(bounded, undefined, undefined, MAX_WINDOW_CACHED_EVENTS);
   eventsCache.set(cacheKey, bounded);
   scheduleTimelineSnapshotPersist(cacheKey, bounded);
@@ -3488,8 +3501,12 @@ export function useTimeline(
       const base = removeReconciledLocalUserMessages(sharedBase, incoming);
       const result = mergeTimelineEvents(base, incoming, effectiveMax);
       if (result === base) return base;
-      if (options?.updateCache !== false && cacheKeyRef.current) {
-        setCachedEvents(cacheKeyRef.current, result);
+      if (cacheKeyRef.current) {
+        if (options?.updateCache === false) {
+          setCachedEventsLocal(cacheKeyRef.current, result);
+        } else {
+          setCachedEvents(cacheKeyRef.current, result);
+        }
       }
       return result;
     });
@@ -3679,9 +3696,12 @@ export function useTimeline(
     const streamingOnly = incoming.every(
       (event) => event.type === 'assistant.text' && event.payload?.streaming === true,
     );
-    // Keep the latest streaming snapshot in the in-memory cache so reopening
-    // a pane paints immediately; defer only the expensive IndexedDB write.
-    mergeEvents(incoming, MAX_MEMORY_EVENTS);
+    // Streaming snapshots are local presentation deltas. Do not publish every
+    // typewriter frame to the shared cache/store: that fans out to every open
+    // pane (and companion tab) and can monopolize the renderer while a second
+    // tab is still settling its route. The final event and idle persistence
+    // below retain the authoritative text for cache-first restore.
+    mergeEvents(incoming, MAX_MEMORY_EVENTS, { updateCache: !streamingOnly });
     // Idle persistence writes the latest streaming snapshot (and a final
     // event writes immediately). Avoid an IndexedDB transaction for every
     // typewriter delta; those synchronous writes were the remaining hidden
