@@ -111,6 +111,7 @@ import { extractSessionSupervisionSnapshot } from '../../shared/supervision-conf
 import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
+import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
@@ -133,6 +134,11 @@ function markLaunchFailure(record: Pick<SessionRecord, 'name' | 'projectDir'>, c
   updateSessionState(record.name, 'error', message);
   emitSessionEvent('error', record.name, message);
   return isWorkingDirectoryFailure ? new Error(message) : (cause instanceof Error ? cause : new Error(message));
+}
+
+function isPersistedWorkingDirectoryError(error: string | undefined): boolean {
+  return typeof error === 'string'
+    && error.startsWith(`${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}:`);
 }
 
 function storedProviderResumeIdOwners(providerId: string, resumeId: string): string[] {
@@ -508,6 +514,33 @@ export async function initOnStartup(): Promise<void> {
   } catch (err) {
     logger.warn({ err }, 'cleanupKnownTestTerminalSessions failed — daemon continues');
   }
+  // Test harness sessions can survive a killed daemon even when their terminal
+  // backend is already gone. Remove the persisted records too, otherwise the
+  // restore pass resurrects them on every boot. Keep this predicate shared with
+  // terminal cleanup so Windows-shaped paths (C:\\tmp\\existing-project) and
+  // the legacy deck_existing_brain fixture cannot drift apart.
+  try {
+    const leaked = storeSessions().filter((record) => isKnownTestSessionLike({
+      name: record.name,
+      projectName: record.projectName,
+      projectDir: record.projectDir,
+      parentSession: record.parentSession,
+      cwd: record.projectDir,
+    }));
+    for (const record of leaked) {
+      // The terminal-list sweep above is best-effort (ConPTY/tmux can be
+      // unavailable during boot). Retry the backend kill by persisted name so
+      // a leaked process cannot survive merely because enumeration failed.
+      await killSession(record.name).catch(() => {});
+      removeSession(record.name);
+      emitSessionPersist(null, record.name);
+    }
+    if (leaked.length > 0) {
+      logger.info({ count: leaked.length, sessions: leaked.map((record) => record.name) }, 'Removed leaked test sessions from persistent store');
+    }
+  } catch (err) {
+    logger.warn({ err }, 'Persistent test-session cleanup failed — daemon continues');
+  }
   try {
     const activeProcessOwners: SessionRecord[] = [];
     for (const record of storeSessions()) {
@@ -725,10 +758,16 @@ export async function restoreFromStore(): Promise<void> {
     const paneAlive = isLiveSession ? await isPaneAlive(s.name) : false;
     logger.debug({ session: s.name, agentType: s.agentType, isLive: isLiveSession, paneAlive, ccSessionId: s.ccSessionId ?? null, watching: isWatching(s.name) }, 'restoreFromStore: processing main session');
 
+    // Durable cwd errors are intentionally not auto-retried. They remain
+    // visible in the session list until the user fixes the path and retries.
+    if (!isLiveSession && s.state === 'error' && isPersistedWorkingDirectoryError(s.error)) {
+      logger.warn({ session: hydrated.name, projectDir: hydrated.projectDir }, 'Skipping restore for session with missing working directory');
+      continue;
+    }
     if (!isLiveSession) {
       logger.info({ session: hydrated.name }, 'Missing on restore, restarting');
       try { await restartSession(hydrated); } catch (err) {
-        logger.error({ err, session: hydrated.name }, 'Failed to restart session on restore — skipping (tmux may be unavailable)');
+        logger.error({ err, session: hydrated.name, backend: BACKEND }, 'Failed to restart session on restore — skipping');
         const message = err instanceof Error ? err.message : String(err);
         updateSessionState(hydrated.name, 'error', message);
         emitSessionEvent('error', hydrated.name, message);

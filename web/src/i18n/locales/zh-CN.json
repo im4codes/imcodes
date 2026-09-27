@@ -996,7 +996,9 @@
       "loading": "正在加载可用模型…",
       "unsupported": "此会话类型不支持切换模型。"
     },
-    "capacity_retrying": "将在 {{seconds}} 秒后重试（第 {{attempt}} 次）"
+    "capacity_retrying": "将在 {{seconds}} 秒后重试（第 {{attempt}} 次）",
+    "state_error": "会话错误",
+    "state_error_detail": "错误：{{error}}"
   },
   "server": {
     "upgrade_daemon": "↑ 升级 Daemon",

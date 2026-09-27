@@ -996,7 +996,9 @@
       "loading": "Cargando modelos disponibles…",
       "unsupported": "Este tipo de sesión no permite cambiar el modelo."
     },
-    "capacity_retrying": "Reintentando en {{seconds}} s (intento {{attempt}})"
+    "capacity_retrying": "Reintentando en {{seconds}} s (intento {{attempt}})",
+    "state_error": "Error de sesión",
+    "state_error_detail": "Error: {{error}}"
   },
   "server": {
     "upgrade_daemon": "↑ Actualizar Daemon",

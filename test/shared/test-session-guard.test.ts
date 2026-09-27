@@ -66,6 +66,8 @@ describe('test session guard', () => {
     expect(isKnownTestProjectDir('/tmp/imc_p2p_wf_test_abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/existing-project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/existing-project/sub')).toBe(true);
+    expect(isKnownTestProjectDir('C:\\tmp\\existing-project')).toBe(true);
+    expect(isKnownTestProjectDir('C:\\tmp\\existing-project\\sub')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/execclone-abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/imc_execclone_abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/Users/me/src/myapp')).toBe(false);
@@ -90,6 +92,14 @@ describe('test session guard', () => {
       cwd: '/Users/me/project',
       parentSession: 'deck_cd_brain',
     })).toBe(false);
+  });
+
+  it('matches the leaked existing-brain fixture by every persisted identity field', () => {
+    expect(isKnownTestSessionLike({
+      name: 'deck_existing_brain',
+      projectName: 'existing',
+      projectDir: 'C:\\tmp\\existing-project',
+    })).toBe(true);
   });
 
   it('matches execution-clone test sub-sessions by name or temp cwd', () => {

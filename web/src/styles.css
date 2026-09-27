@@ -417,6 +417,7 @@ html.native-ios-mac .chat-dl-btn {
 .tab-wrap.tab-drop-target { border-left: 2px solid var(--chrome-accent); filter: drop-shadow(0 0 8px rgba(34,211,238,0.45)); }
 .tab-dragging { opacity: 0.4; }
 .tab-pin { font-size: 10px; margin-right: 4px; color: var(--chrome-warm); filter: drop-shadow(0 0 4px rgba(245,158,11,0.42)); }
+.tab-session-error { margin-left: 4px; font-size: 11px; line-height: 1; flex-shrink: 0; }
 .tab.pinned { box-shadow: inset 0 1px 0 rgba(245,158,11,0.28); }
 .tab { min-height: 34px; padding: 0 15px; cursor: pointer; color: #7b8797; border: 1px solid transparent; border-bottom: none; border-radius: 7px 7px 0 0; white-space: nowrap; font-size: 12px; font-weight: 600; transition: color 0.14s, background 0.14s, border-color 0.14s, box-shadow 0.14s; background: rgba(15,23,42,0.38); display: flex; align-items: center; position: relative; overflow: hidden; }
 .tab::before { content: ''; position: absolute; left: 8px; right: 8px; bottom: 0; height: 2px; border-radius: 999px 999px 0 0; background: transparent; pointer-events: none; }

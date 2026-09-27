@@ -12,7 +12,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // ── All mocks hoisted so factories can reference them ─────────────────────────
 
 const {
-  storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock, reserveSessionFileMock,
+  storeMock, tmuxListMock, startWatchingMock, startWatchingFileMock, reserveSessionFileMock, removeSessionMock,
   isWatchingMock, restartSessionMock, getPaneStartCommandMock, upsertSessionMock, updateSessionStateMock,
   discoverLatestOpenCodeSessionIdMock, opencodeStartWatchingMock, opencodeIsWatchingMock,
   newSessionMock, timelineEmitMock, getSessionMock, respawnPaneMock,
@@ -41,6 +41,7 @@ const {
   registerTmuxSessionResourceMock: vi.fn().mockResolvedValue(undefined),
   initializeSessionResourceLifecycleMock: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
   sessionExistsMock: vi.fn().mockResolvedValue(true),
+  removeSessionMock: vi.fn(),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -48,7 +49,7 @@ vi.mock('../../src/store/session-store.js', () => ({
   upsertSession: upsertSessionMock,
   updateSessionState: updateSessionStateMock,
   getSession: getSessionMock,
-  removeSession: vi.fn(),
+  removeSession: removeSessionMock,
 }));
 
 vi.mock('../../src/agent/tmux.js', () => ({
@@ -176,6 +177,24 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     }));
     storeMock.mockReturnValue(refreshed);
     expect(options.listSessionsForOrphanSweep()).toBe(refreshed);
+  });
+
+  it('purges leaked test records from the persistent store before startup reconciliation', async () => {
+    storeMock.mockReturnValue([
+      {
+        name: 'deck_existing_brain', projectName: 'existing', projectDir: '/tmp/existing-project',
+        agentType: 'claude-code', runtimeType: 'process', role: 'brain', state: 'idle',
+      },
+      {
+        name: 'deck_real_brain', projectName: 'real', projectDir: '/Users/me/project',
+        agentType: 'claude-code', runtimeType: 'process', role: 'brain', state: 'idle',
+      },
+    ]);
+
+    await initOnStartup();
+
+    expect(removeSessionMock).toHaveBeenCalledWith('deck_existing_brain');
+    expect(removeSessionMock).not.toHaveBeenCalledWith('deck_real_brain');
   });
 
   it('does NOT call startWatching for deck_sub_* sessions (prevents JSONL file stealing)', async () => {
@@ -455,6 +474,22 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
       good.name, 'error', expect.anything(),
     );
     expect(newSessionMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not retry a cwd-missing session already persisted as an error', async () => {
+    const bad = {
+      name: 'deck_missing_cwd_persisted', projectName: 'missing', role: 'brain', agentType: 'shell',
+      projectDir: 'C:\\work\\deleted', state: 'error',
+      error: 'Working directory not found: C:\\work\\deleted', restarts: 1, restartTimestamps: [Date.now()],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    storeMock.mockReturnValue([bad]);
+    tmuxListMock.mockResolvedValue([]);
+
+    await expect(restoreFromStore()).resolves.toBeUndefined();
+
+    expect(newSessionMock).not.toHaveBeenCalled();
+    expect(updateSessionStateMock).not.toHaveBeenCalled();
   });
 
   it('persists idle before respawning a dead pane', async () => {

@@ -46,6 +46,28 @@ describe('context-store worker client lifecycle repair', () => {
     client.dispose();
   });
 
+  it('fails closed with a clear runtime error when the child Node lacks node:sqlite', async () => {
+    const { client, workers } = createHarness();
+    client.start();
+    const ready = client.whenReady();
+    workers[0].emit('message', {
+      type: 'worker_runtime_error',
+      code: 'node_sqlite_unavailable',
+      message: '[context-store-worker] node:sqlite unavailable; node=v20.0.0 execPath=C:\\Program Files\\IM.codes\\node.exe',
+    });
+    await ready;
+    expect(client.isReady).toBe(false);
+    expect(workers[0].terminate).toHaveBeenCalledOnce();
+    await expect(client.run('getContextMeta', ['runtime'])).rejects.toMatchObject({
+      code: CONTEXT_STORE_RPC_ERROR.unavailable,
+      message: expect.stringContaining('context-store worker unavailable'),
+    });
+    // An unsupported executable is not repaired by hot respawn; avoid a
+    // repeated child crash loop while retaining the actionable diagnostic.
+    expect(workers).toHaveLength(1);
+    client.dispose();
+  });
+
   it('settles whenReady on pre-ready clean exit', async () => {
     const { client, workers } = createHarness();
     const ready = client.whenReady();

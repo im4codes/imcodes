@@ -246,6 +246,10 @@ export class ContextStoreWorkerClient {
    *  `call`/`fireAndForget` lazily `ensureWorker()`, so a test can spawn a worker
    *  without entering production owner mode. */
   private started = false;
+  /** Set when the child proves its Node runtime lacks node:sqlite. Retrying
+   * forever cannot repair an unsupported executable and only creates noisy
+   * respawn churn; callers receive the normal bounded unavailable error. */
+  private runtimeUnsupported = false;
 
   constructor(
     private readonly createWorker: ContextStoreWorkerFactory = (url) => spawnChildProcessWorker(url),
@@ -357,6 +361,7 @@ export class ContextStoreWorkerClient {
   /** Returns null when a spawn is not permitted right now (retirement gate). */
   private ensureWorker(): ContextStoreWorkerHandle | null {
     if (this.worker) return this.worker;
+    if (this.runtimeUnsupported) return null;
     if (this.retirementBlocksSpawn()) return null;
     this.clearRebuildTimer();
     this.warmReady = false;
@@ -472,6 +477,21 @@ export class ContextStoreWorkerClient {
     if (this.retirement?.generation === generation) return;
     if (!this.worker) return;
     if (!msg || typeof msg !== 'object') return;
+    if ((msg as { type?: unknown }).type === 'worker_runtime_error') {
+      const runtimeError = msg as { code?: unknown; message?: unknown };
+      if (runtimeError.code === 'node_sqlite_unavailable') {
+        this.runtimeUnsupported = true;
+        const detail = typeof runtimeError.message === 'string'
+          ? runtimeError.message
+          : 'context-store worker Node runtime does not support node:sqlite';
+        this.markWorkerUnavailable(
+          generation,
+          new ContextStoreError(CONTEXT_STORE_RPC_ERROR.workerError, detail),
+          { reason: CONTEXT_STORE_WORKER_DOWN_REASON.workerError },
+        );
+      }
+      return;
+    }
     if ((msg as { type?: unknown }).type === 'ready') {
       const warmupError = (msg as { warmupError?: unknown }).warmupError;
       if (typeof warmupError === 'string' && warmupError) {

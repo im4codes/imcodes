@@ -513,6 +513,25 @@ describe('session-store', () => {
       expect(s?.restartTimestamps).toEqual([]);
     });
 
+    it('preserves a cwd-missing error across daemon reloads so restore does not retry it', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_missing_cwd_brain: {
+            name: 'deck_missing_cwd_brain', projectName: 'missing', role: 'brain',
+            agentType: 'shell', projectDir: 'C:\\work\\gone', state: 'error',
+            error: 'Working directory not found: C:\\work\\gone', restarts: 1,
+            restartTimestamps: [Date.now() - 1_000], createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+      const { loadStore, getSession } = await importSessionStore();
+      await loadStore();
+      expect(getSession('deck_missing_cwd_brain')).toEqual(expect.objectContaining({
+        state: 'error',
+        error: 'Working directory not found: C:\\work\\gone',
+      }));
+    });
+
     it('does not touch sessions in healthy states (idle / running / stopped)', async () => {
       await writeSessionsFixture({
         sessions: {

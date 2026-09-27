@@ -532,6 +532,16 @@ function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAl
                 {isPinned && <span class="tab-pin">📌</span>}
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
+                {s.state === 'error' && (
+                  <span
+                    class="tab-session-error"
+                    role="img"
+                    aria-label={s.error ?? t('session.state_error')}
+                    title={s.error ?? t('session.state_error')}
+                  >
+                    ⚠️
+                  </span>
+                )}
                 {p2pSessionLabels?.has(s.name) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
                 <SharedStateIndicator state={s.sharedState} compact iconOnly />
                 {/* tool call indicator removed — too flashy */}

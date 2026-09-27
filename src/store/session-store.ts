@@ -21,6 +21,7 @@ import { emitSessionStateProbeCorrection } from './session-state-probe-events.js
 import { assertNotRealImcodesPathInTests, isRealImcodesPath, isUnderTestRunner } from '../util/test-home-guard.js';
 import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type DaemonProcessIdentity } from '../daemon/instance-lock.js';
 import logger from '../util/logger.js';
+import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
 
 const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
@@ -558,6 +559,16 @@ function reconcilePersistedSessions(): boolean {
     if (!session.runtimeType && typeof session.agentType === 'string') {
       session.runtimeType = getSessionRuntimeType(session.agentType);
       mutated = true;
+    }
+    // A missing working directory is a durable user-actionable condition. Do
+    // not silently turn it back into `stopped` on every daemon boot: restore
+    // would retry the same invalid path forever (notably ConPTY error 267 on
+    // Windows). The user can fix the directory and then explicitly restart.
+    const hasMissingWorkingDirectoryError = session.state === 'error'
+      && typeof session.error === 'string'
+      && session.error.startsWith(`${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}:`);
+    if (hasMissingWorkingDirectoryError) {
+      continue;
     }
     if (session.state === 'error') {
       session.state = 'stopped';

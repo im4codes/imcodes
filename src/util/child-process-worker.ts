@@ -72,6 +72,10 @@ export function spawnChildProcessWorker(
   options: { env?: Record<string, string | undefined> } = {},
 ): ChildProcessWorkerHandle {
   const child = fork(fileURLToPath(bootstrapUrl), [], {
+    // Be explicit: fork otherwise inherits the parent implicitly. Recording the
+    // exact executable in diagnostics makes it clear which bundled/system Node
+    // owns node:sqlite on Windows and prevents accidental PATH resolution.
+    execPath: process.execPath,
     execArgv: [],
     env: { ...process.env, ...options.env },
     serialization: 'advanced',

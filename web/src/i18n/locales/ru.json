@@ -996,7 +996,9 @@
       "loading": "Загрузка доступных моделей…",
       "unsupported": "Этот тип сеанса не поддерживает смену модели."
     },
-    "capacity_retrying": "Повтор через {{seconds}} с (попытка {{attempt}})"
+    "capacity_retrying": "Повтор через {{seconds}} с (попытка {{attempt}})",
+    "state_error": "Ошибка сеанса",
+    "state_error_detail": "Ошибка: {{error}}"
   },
   "server": {
     "upgrade_daemon": "↑ Обновить Daemon",
