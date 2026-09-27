@@ -242,7 +242,7 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(companion.sentStrings.some((raw) => JSON.parse(raw).type === TIMELINE_MESSAGES.EVENT)).toBe(false);
   });
 
-  it('never coalesces a healthy full-mode stream, including latest-value updates', async () => {
+  it('coalesces healthy full-mode latest-value updates while retaining the newest frame', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const full = new MockWs();
     bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
@@ -267,13 +267,84 @@ describe('WsBridge timeline drop telemetry', () => {
         },
       }));
     }
-    await flushAsync();
+    await new Promise<void>((resolve) => setTimeout(resolve, 75));
     const statuses = full.sentStrings
       .map((raw) => JSON.parse(raw))
       .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT && msg.event?.type === 'agent.status');
-    expect(statuses).toHaveLength(4);
-    expect(statuses.map((msg) => msg.event.seq)).toEqual([1, 2, 3, 4]);
-    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED)).toBe(0);
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]?.event.seq).toBe(4);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      eventType: 'agent.status',
+    })).toBe(3);
+  });
+
+  it('flushes a terminal state immediately after coalescing and never loses the final', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    const emit = (type: string, payload: Record<string, unknown>, seq: number) => daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { eventId: `terminal-${seq}`, sessionId: SESSION, ts: Date.now(), seq, epoch: 1, type, payload },
+    }));
+
+    emit('agent.status', { status: 'working', label: 'token 1' }, 1);
+    emit('agent.status', { status: 'working', label: 'token 2' }, 2);
+    emit('session.state', { state: 'idle' }, 3);
+    await flushAsync();
+
+    const events = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+      .map((msg) => msg.event);
+    expect(events.map((event) => [event.type, event.seq])).toEqual([
+      ['agent.status', 2],
+      ['session.state', 3],
+    ]);
+  });
+
+  it('suppresses unchanged latest-value payloads per socket before coalescing', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    const emit = (type: string, payload: Record<string, unknown>, seq: number) => daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { eventId: `unchanged-${seq}`, sessionId: SESSION, ts: Date.now(), seq, epoch: 1, type, payload },
+    }));
+
+    emit('agent.status', { status: 'working' }, 1);
+    emit('agent.status', { status: 'working' }, 2);
+    emit('session.state', { state: 'idle' }, 3);
+    emit('session.state', { state: 'idle' }, 4);
+    await flushAsync();
+
+    const events = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+      .map((msg) => msg.event);
+    expect(events.map((event) => [event.type, event.seq])).toEqual([
+      ['agent.status', 1],
+      ['session.state', 3],
+    ]);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+      eventType: 'agent.status',
+    })).toBe(0);
+    expect(bridge.timelineQueueStatsForTests(summary as never)).toEqual({ bytes: 0, pending: 0, pendingGaps: 0 });
   });
 
   it('keeps a healthy summary socket gap-free under realistic status/tool load', async () => {

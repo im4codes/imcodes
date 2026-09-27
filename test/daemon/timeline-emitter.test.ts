@@ -77,6 +77,25 @@ describe('TimelineEmitter — seq counter', () => {
     expect(timelineStore.append).toHaveBeenCalledTimes(2);
   });
 
+  it('emits latest-value signals only when their payload changes', () => {
+    const firstStatus = emitter.emit('session-a', 'agent.status', { status: 'working', label: 'token 1' });
+    const duplicateStatus = emitter.emit('session-a', 'agent.status', { label: 'token 1', status: 'working' });
+    const changedStatus = emitter.emit('session-a', 'agent.status', { status: 'working', label: 'token 2' });
+    const firstUsage = emitter.emit('session-a', 'usage.update', { inputTokens: 10, outputTokens: 2 });
+    const duplicateUsage = emitter.emit('session-a', 'usage.update', { outputTokens: 2, inputTokens: 10 });
+    const firstState = emitter.emit('session-a', 'session.state', { state: 'idle' });
+    const duplicateState = emitter.emit('session-a', 'session.state', { state: 'idle' });
+
+    expect(firstStatus?.seq).toBe(1);
+    expect(duplicateStatus?.seq).toBe(0);
+    expect(changedStatus?.seq).toBe(2);
+    expect(firstUsage?.seq).toBe(3);
+    expect(duplicateUsage?.seq).toBe(0);
+    expect(firstState?.seq).toBe(4);
+    expect(duplicateState?.seq).toBe(0);
+    expect(timelineStore.append).toHaveBeenCalledTimes(4);
+  });
+
   it('forwards one startup-probe correction through the registered timeline bridge', () => {
     emitSessionStateProbeCorrection('deck_probe_bridge_brain', 'idle');
 

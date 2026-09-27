@@ -54,12 +54,31 @@ function isTrustedTempPath(filePath: string): boolean {
 
 const MAX_BUFFER = 500;
 
+/**
+ * Latest-value signals are snapshots.  Providers and terminal probes can call
+ * emit repeatedly with freshly allocated payload objects, so reference
+ * equality cannot suppress unchanged frames.  Sort object keys recursively to
+ * make the fingerprint independent of construction order.
+ */
+function timelinePayloadFingerprint(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map((entry) => timelinePayloadFingerprint(entry)).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${timelinePayloadFingerprint(record[key])}`).join(',')}}`;
+}
+
+function signalFingerprintKey(sessionId: string, type: TimelineEventType): string {
+  return `${sessionId}\u0000${type}`;
+}
+
 export class TimelineEmitter {
   private seqMap = new Map<string, number>();
   private buffer = new Map<string, TimelineEvent[]>();
   private handlers = new Set<(e: TimelineEvent) => void>();
   /** Track last session.state per session to deduplicate repeated idle events */
   private lastSessionState = new Map<string, string>();
+  /** Exact payload fingerprints for latest-value signal deduplication. */
+  private lastSignalPayload = new Map<string, string>();
   /** Track recent user.message per session to deduplicate (text → timestamp) */
   private recentUserMsg = new Map<string, { text: string; ts: number }>();
   /** Daemon startup timestamp — changes on restart, used for epoch-based seq continuity */
@@ -124,15 +143,11 @@ export class TimelineEmitter {
       });
     };
 
-    // Deduplicate session.state — skip repeated same-state events to avoid UI flicker,
-    // but still return a synthetic event so callers (store updates, idle callbacks) proceed.
-    //
-    // Only a complete structured queue authority can bypass state-only dedupe.
-    // Individual queue-looking fields are not authoritative: accepting an
-    // entries array, epoch, authority id, or version by itself lets a partial
-    // legacy/stale payload masquerade as a live queue mutation. Legacy
-    // diagnostic fields such as pendingCount/pendingMessages are likewise not
-    // queue authority. Session errors remain independently deliverable.
+    // Deduplicate latest-value signals — skip repeated snapshots to avoid UI
+    // churn and daemon/server bandwidth, but still return a synthetic event so
+    // callers (store updates, idle callbacks) proceed. Queue-authoritative and
+    // error-bearing session states intentionally retain their established edge
+    // semantics: every such mutation is independently meaningful.
     if (type === 'session.state') {
       const state = String(payload.state ?? '');
       const pendingMessageVersion = typeof payload.pendingMessageVersion === 'number'
@@ -145,14 +160,24 @@ export class TimelineEmitter {
         && typeof pendingMessageVersion === 'number'
         && Number.isFinite(pendingMessageVersion);
       const hasErrorMutation = 'error' in payload;
-      if (!hasStructuredQueueMutation && !hasErrorMutation
-        && this.lastSessionState.get(sessionId) === state) {
-        // State unchanged AND no queue/error snapshot — don't emit to
-        // handlers/UI, but still return synthetic event for caller.
+      if (!hasStructuredQueueMutation && !hasErrorMutation) {
+        const key = signalFingerprintKey(sessionId, type);
+        const fingerprint = timelinePayloadFingerprint({ state });
+        if (this.lastSignalPayload.get(key) === fingerprint) {
+          finishTrace('synthetic');
+          return { eventId: '', sessionId, ts: Date.now(), seq: 0, epoch: this.epoch, source: opts?.source ?? 'daemon', confidence: opts?.confidence ?? 'high', type, payload } as TimelineEvent;
+        }
+        this.lastSignalPayload.set(key, fingerprint);
+      }
+      this.lastSessionState.set(sessionId, state);
+    } else if (type === 'agent.status' || type === 'usage.update') {
+      const key = signalFingerprintKey(sessionId, type);
+      const fingerprint = timelinePayloadFingerprint(payload);
+      if (this.lastSignalPayload.get(key) === fingerprint) {
         finishTrace('synthetic');
         return { eventId: '', sessionId, ts: Date.now(), seq: 0, epoch: this.epoch, source: opts?.source ?? 'daemon', confidence: opts?.confidence ?? 'high', type, payload } as TimelineEvent;
       }
-      this.lastSessionState.set(sessionId, state);
+      this.lastSignalPayload.set(key, fingerprint);
     }
 
     // Reset same-state dedup on visible activity so the next idle is meaningful
@@ -168,6 +193,7 @@ export class TimelineEmitter {
       || (type === 'agent.status' && payload.status)
     ) {
       this.lastSessionState.delete(sessionId);
+      this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'session.state'));
     }
 
     // Deduplicate user.message — skip if same session + same text within 5s
@@ -466,6 +492,9 @@ export class TimelineEmitter {
     this.buffer.delete(sessionId);
     this.seqMap.delete(sessionId);
     this.lastSessionState.delete(sessionId);
+    this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'session.state'));
+    this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'agent.status'));
+    this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'usage.update'));
     this.recentUserMsg.delete(sessionId);
   }
 }

@@ -37,6 +37,20 @@ export const TIMELINE_SUBSCRIPTION_MODES = {
 export type TimelineSubscriptionMode =
   (typeof TIMELINE_SUBSCRIPTION_MODES)[keyof typeof TIMELINE_SUBSCRIPTION_MODES];
 
+/**
+ * Latest-value timeline signals are presentation snapshots, not a history of
+ * every meter tick. Keep one bounded coalescing window shared by daemon/server
+ * implementations so hidden and visible sockets have the same latency bound.
+ */
+/** Full/visible sockets remain at an animation-frame-scale cadence. */
+export const TIMELINE_FULL_LATEST_VALUE_COALESCE_WINDOW_MS = 50 as const;
+/** Hidden sockets trade intermediate meter freshness for the byte budget. */
+export const TIMELINE_SUMMARY_LATEST_VALUE_COALESCE_WINDOW_MS = 250 as const;
+
+/** States that must bypass latest-value coalescing and reach the browser now. */
+export const TIMELINE_TERMINAL_SESSION_STATES = ['idle', 'error', 'stopped'] as const;
+export type TimelineTerminalSessionState = (typeof TIMELINE_TERMINAL_SESSION_STATES)[number];
+
 export interface TimelineSubscribeRequest {
   type: typeof TIMELINE_MESSAGES.SUBSCRIBE;
   sessionName: string;
