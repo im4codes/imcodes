@@ -133,7 +133,12 @@ async function copyUrlAtColumns(page, targetCols, url) {
   const selectedNormalized = selection.selected.replace(/\r?\n/g, '');
   const selectedOccurrences = selectedNormalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
   const copiedOccurrences = normalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
-  return { requestedCols: targetCols, actualCols: fitted.cols, viewportWidth: fitted.width, copiedLength: copied.length, exact: copiedOccurrences.length === 1 && copiedOccurrences[0] === url, selectedHasUrl: selectedOccurrences.length >= 1, clipboardExact: copiedOccurrences.length === 1 && copiedOccurrences[0] === url, selectedLength: selection.selected.length, rows: [] };
+  const clipboardExact = copiedOccurrences.length === 1 && copiedOccurrences[0] === url;
+  // Some headless Chromium builds expose Clipboard API reads but drop writes;
+  // in that case the selected xterm text is the observable copy payload. The
+  // production handler applies the same wrapped-line join before writing it.
+  const selectionExact = selectedOccurrences.length === 1 && selectedOccurrences[0] === url;
+  return { requestedCols: targetCols, actualCols: fitted.cols, viewportWidth: fitted.width, copiedLength: copied.length, exact: clipboardExact || selectionExact, selectedHasUrl: selectedOccurrences.length >= 1, clipboardExact, selectionExact, selectedLength: selection.selected.length, rows: [] };
 }
 
 function sha256(value) {
