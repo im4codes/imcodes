@@ -1103,8 +1103,13 @@ export function SubSessionWindow({
         />
       )}
 
-      {/* Full SessionControls — with sub-session action overrides */}
-      <SessionControls
+      {/* Full SessionControls — with sub-session action overrides. Inactive
+          windows keep a cheap footer shell; mounting SessionControls for every
+          restored window starts independent status/open-spec/rebuild work and
+          defeats the per-session timeline store. The window's capture handler
+          focuses it before a click reaches this shell, so it upgrades on the
+          next render without losing the user's first interaction. */}
+      {active ? <SessionControls
         ws={ws}
         connected={connected}
         activeSession={controlsSessionInfo}
@@ -1163,7 +1168,7 @@ export function SubSessionWindow({
         onPendingPrefillApplied={onPendingPrefillApplied}
         onVersionSensitiveAction={onVersionSensitiveAction}
         onComposerTextChange={setComposerText}
-      />
+      /> : visible ? <div class="subsession-controls-deferred" aria-hidden="true" /> : null}
       </div>
 
       {/* Per-sub-session file browser. Mobile: full-screen overlay.
