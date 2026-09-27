@@ -108,6 +108,7 @@ async function copyUrlAtColumns(page, targetCols, url) {
   const encoded = Buffer.from(url).toString('base64');
   await pasteCommand(page, `printf '%s' '${encoded}' | base64 -d > /tmp/url.txt; cat /tmp/url.txt; printf 'Z9\\n'`, 'Z9');
   const selection = await page.evaluate(({ value, session }) => {
+    window.__imcShellLastCopied = '';
     const candidates = Object.values(window.__imcShellTerminals ?? {});
     const fallback = window.__imcShellTerminals?.[session] ?? window.__imcShellTerminal;
     const term = candidates.find((candidate) => {
@@ -127,7 +128,7 @@ async function copyUrlAtColumns(page, targetCols, url) {
   // TerminalView intentionally does not await clipboard.writeText; allow the
   // browser task that records the copy to settle before reading it.
   await page.waitForTimeout(100);
-  const copied = await page.evaluate(() => navigator.clipboard?.readText?.() ?? '');
+  const copied = await page.evaluate(async () => window.__imcShellLastCopied || await navigator.clipboard?.readText?.() || '');
   const normalized = copied.replace(/\r?\n/g, '');
   const selectedNormalized = selection.selected.replace(/\r?\n/g, '');
   const selectedOccurrences = selectedNormalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];

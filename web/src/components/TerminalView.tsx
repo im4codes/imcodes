@@ -252,6 +252,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       __IMC_SHELL_BROWSER_TEST__?: boolean;
       __imcShellTerminal?: Terminal;
       __imcShellTerminals?: Record<string, Terminal>;
+      __imcShellLastCopied?: string;
     };
     if (testWindow.__IMC_SHELL_BROWSER_TEST__) {
       testWindow.__imcShellTerminals ??= {};
@@ -269,7 +270,9 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
             continuationRows.push(term.buffer.active.getLine(row)?.isWrapped ?? false);
           }
         }
-        void navigator.clipboard.writeText(joinWrappedTerminalSelection(term.getSelection(), continuationRows));
+        const copiedText = joinWrappedTerminalSelection(term.getSelection(), continuationRows);
+        if (testWindow.__IMC_SHELL_BROWSER_TEST__) testWindow.__imcShellLastCopied = copiedText;
+        void navigator.clipboard.writeText(copiedText);
         return false; // prevent sending ^C to tmux when we're copying
       }
       return true;
