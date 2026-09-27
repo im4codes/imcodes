@@ -605,6 +605,10 @@ const TIMELINE_SOCKET_QUEUE_MAX_ITEMS = 65_536;
 const TIMELINE_SOCKET_BUFFERED_HIGH_WATER = 16 * 1024 * 1024;
 /** Bound gap-control traffic when a peer remains congested for a long time. */
 const TIMELINE_SOCKET_GAP_RATE_MAX = 16;
+/** Frames whose send completes synchronously are drained in bounded batches
+ *  per event-loop turn, then the pump yields (no recursion, no starvation). */
+const TIMELINE_QUEUE_PUMP_BATCH = 256;
+const TIMELINE_QUEUE_PUMP_BUDGET_MS = 4;
 const TIMELINE_SOCKET_GAP_RATE_WINDOW_MS = 1_000;
 const TIMELINE_SOCKET_MAX_PENDING_GAPS = 256;
 
@@ -757,6 +761,10 @@ class TerminalForwardQueue {
 
 type TimelineQueuePriority = 'final' | 'durable' | 'coalescible';
 
+function timelineQueuePriorityRank(priority: TimelineQueuePriority): number {
+  return priority === 'final' ? 0 : priority === 'durable' ? 1 : 2;
+}
+
 interface TimelineQueueEvent {
   data: string;
   sessionId: string;
@@ -785,6 +793,7 @@ export class TimelineOutboundQueue {
   private gapFlushTimer?: NodeJS.Timeout;
   private gapFlushHandler?: (event: TimelineQueueEvent) => void;
   private disposed = false;
+  private pumpScheduled = false;
 
   isIdle(): boolean {
     return !this.sending && this.pending.length === 0 && this.bytes === 0;
@@ -828,7 +837,7 @@ export class TimelineOutboundQueue {
       this.pending[existingIndex] = item;
       this.bytes += Buffer.byteLength(item.data, 'utf8');
     } else {
-      this.pending.push(item);
+      this.insertByPriority(item);
       this.bytes += Buffer.byteLength(item.data, 'utf8');
     }
 
@@ -932,36 +941,68 @@ export class TimelineOutboundQueue {
     this.gapEpisodes.clear();
   }
 
+  /** Keep `pending` ordered final → durable → coalescible (FIFO within a
+   *  priority) at insertion time, so dequeue never re-sorts the backlog. */
+  private insertByPriority(item: TimelineQueueEvent): void {
+    const rank = timelineQueuePriorityRank(item.priority);
+    const last = this.pending[this.pending.length - 1];
+    if (!last || timelineQueuePriorityRank(last.priority) <= rank) {
+      this.pending.push(item);
+      return;
+    }
+    const index = this.pending.findIndex((entry) => timelineQueuePriorityRank(entry.priority) > rank);
+    this.pending.splice(index < 0 ? this.pending.length : index, 0, item);
+  }
+
+  private schedulePump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
+    if (this.pumpScheduled) return;
+    this.pumpScheduled = true;
+    setImmediate(() => {
+      this.pumpScheduled = false;
+      this.pump(ws, onGap);
+    });
+  }
+
   private pump(ws: WebSocket, onGap: (event: TimelineQueueEvent) => void): void {
-    if (this.disposed || this.sending || this.pending.length === 0) return;
-    this.pending.sort((a, b) => {
-      const rank = (value: TimelineQueuePriority): number => value === 'final' ? 0 : value === 'durable' ? 1 : 2;
-      return rank(a.priority) - rank(b.priority);
-    });
-    const item = this.pending.shift();
-    if (!item) return;
-    this.bytes -= Buffer.byteLength(item.data, 'utf8');
-    this.sending = true;
-    safeSend(ws, item.data, (error) => {
-      if (this.disposed) return;
-      this.sending = false;
-      // A close/reload is not congestion: there is no browser left to
-      // backfill, and emitting a gap on the closing socket creates telemetry
-      // noise during normal reconnects. Only a failed send on an open socket
-      // belongs to the congestion episode.
-      if (error && ws.readyState === WebSocket.OPEN) {
-        this.noteGap(item);
-        this.scheduleGapFlush(onGap);
-      } else if (error) {
-        this.pendingGaps.clear();
-        this.gapEpisodes.clear();
+    const deadline = performance.now() + TIMELINE_QUEUE_PUMP_BUDGET_MS;
+    let sent = 0;
+    while (!this.disposed && !this.sending && this.pending.length > 0) {
+      // Synchronous completions are drained iteratively (never recursively)
+      // and only up to a bounded batch/time budget per turn, then the pump
+      // yields so one congested socket cannot starve the event loop.
+      if (sent >= TIMELINE_QUEUE_PUMP_BATCH || performance.now() > deadline) {
+        this.schedulePump(ws, onGap);
+        return;
       }
-      this.finishCongestionEpisode();
-      // ws implementations (and test/production adapters) may invoke the
-      // completion callback synchronously. Defer the next dequeue so a large
-      // queue cannot recurse through safeSend/pump until the stack overflows.
-      setImmediate(() => this.pump(ws, onGap));
-    });
+      const item = this.pending.shift()!;
+      this.bytes -= Buffer.byteLength(item.data, 'utf8');
+      this.sending = true;
+      sent += 1;
+      let insideSend = true;
+      let completedSynchronously = false;
+      safeSend(ws, item.data, (error) => {
+        if (this.disposed) return;
+        this.sending = false;
+        // A close/reload is not congestion: there is no browser left to
+        // backfill, and emitting a gap on the closing socket creates telemetry
+        // noise during normal reconnects. Only a failed send on an open socket
+        // belongs to the congestion episode.
+        if (error && ws.readyState === WebSocket.OPEN) {
+          this.noteGap(item);
+          this.scheduleGapFlush(onGap);
+        } else if (error) {
+          this.pendingGaps.clear();
+          this.gapEpisodes.clear();
+        }
+        this.finishCongestionEpisode();
+        // A synchronous completion continues the surrounding loop; an
+        // asynchronous one already runs on a fresh stack.
+        if (insideSend) completedSynchronously = true;
+        else this.pump(ws, onGap);
+      });
+      insideSend = false;
+      if (!completedSynchronously) break;
+    }
     this.finishCongestionEpisode();
   }
 }
