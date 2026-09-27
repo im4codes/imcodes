@@ -4625,9 +4625,15 @@ export class WsBridge {
       && response.type !== TIMELINE_MESSAGES.PAGE
       && response.type !== TIMELINE_MESSAGES.REPLAY) return response;
     if (!Array.isArray(response.events)) return response;
-    const events = response.events
+    const inputEvents = response.events;
+    const events = inputEvents
       .filter((event): event is Record<string, unknown> => isPlainRecord(event) && this.isTimelineSummaryEvent(event))
       .map((event) => this.summarizeTimelineEvent(event));
+    incrementCounter('ws_bridge_timeline_summary_projection', {
+      responseType: String(response.type),
+      inputEvents: String(inputEvents.length),
+      outputEvents: String(events.length),
+    });
     return { ...response, events };
   }
 
@@ -8757,6 +8763,10 @@ export class WsBridge {
       ? event.payload as Record<string, unknown>
       : {};
     if (type === 'assistant.text') return payload.streaming !== true;
+    // Provider adapters may use assistant.final/assistant.message for the
+    // committed answer.  Summary/history projection must retain every
+    // terminal assistant event, not just the canonical assistant.text name.
+    if (type.startsWith('assistant.')) return payload.streaming !== true;
     if (type === 'user.message' || type === 'ask.question' || type === 'task_pair.event'
       || type === 'memory.context' || type === 'memory.compression' || type.startsWith('peer_audit.')
       || type.startsWith('delegation.') || type.startsWith('execution_clone.')) return true;

@@ -409,7 +409,7 @@ describe('WsBridge timeline drop telemetry', () => {
       epoch: 1,
       events: [
         { eventId: 'replay-stream', sessionId: SESSION, seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'partial', streaming: true } },
-        { eventId: 'replay-final', sessionId: SESSION, seq: 2, epoch: 1, type: 'assistant.text', payload: { text: 'complete', streaming: false } },
+        { eventId: 'replay-final', sessionId: SESSION, seq: 2, epoch: 1, type: 'assistant.final', payload: { text: 'complete', streaming: false } },
       ],
     }));
     await flushAsync();
