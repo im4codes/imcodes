@@ -175,6 +175,39 @@ afterEach(() => {
 });
 
 describe('SupervisionTaskConsole', () => {
+  it('shows a pair title and expands its full Markdown brief with checklist columns', () => {
+    const base = state();
+    const view = render(
+      <SupervisionTaskConsoleView
+        state={{
+          ...base,
+          tasks: {
+            ...base.tasks,
+            'task-1': {
+              ...base.tasks['task-1']!,
+              title: 'Pair title',
+              pair: {
+                status: 'working', flags: [], round: 1, blocking: [],
+                brief: '# Objective\n\nFull **brief** text.\n\n- [x][ ] Ship it',
+              },
+            },
+          },
+        }}
+        mobile={false}
+        now={NOW}
+        width={720}
+        maxWidth={920}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(screen.getByText('Pair title')).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
+    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Full brief text.');
+    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Ship it');
+    expect(screen.getAllByRole('checkbox')).toHaveLength(2);
+  });
+
   it('offers the compact toggle to an original Brain and shared-main viewers without elevating other roles', () => {
     const onToggle = vi.fn();
     const view = render(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: null, sharedAccessRole: null }} open={false} onToggle={onToggle} />);

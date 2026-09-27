@@ -4,6 +4,7 @@ import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
 import { formatElapsedDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
+import { TaskPairBrief } from './TaskPairBrief.js';
 
 const MAX_ROWS = 6;
 
@@ -92,6 +93,7 @@ function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Reco
       ...pair,
       taskId: task.taskId,
       title: task.title,
+      brief: typeof task.brief === 'string' && task.brief.trim() ? task.brief : pair.brief,
       toStatus,
       startedAt,
       updatedAt,
@@ -287,6 +289,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
             {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
+          <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} taskId={String(payload.taskId)} />
           <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
           <div class="task-pair-status-row-roles">
             <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? unassigned(payload.executorModel)}</span>

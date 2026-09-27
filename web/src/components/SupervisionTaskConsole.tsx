@@ -15,7 +15,6 @@ import {
 } from '@shared/supervision-task-console.js';
 import { isSupervisionTaskLifecycleStatus } from '@shared/supervision-config.js';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
-import { parseTaskPairChecklist } from '@shared/task-pair-checklist.js';
 import type { WsClient } from '../ws-client.js';
 import { useSupervisionTaskConsole } from '../hooks/useSupervisionTaskConsole.js';
 import {
@@ -35,6 +34,7 @@ import {
 } from '../supervision-task-console-visibility.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import { TASK_PAIR_OPEN_STATUSES, TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, type TaskPairStatus } from '@shared/task-pair.js';
+import { TaskPairBrief } from './TaskPairBrief.js';
 
 const DESKTOP_MIN_WIDTH = 720;
 const DESKTOP_DEFAULT_WIDTH = 720;
@@ -83,11 +83,13 @@ export function taskConsoleStateToPairSnapshot(state: SupervisionTaskConsoleRedu
     // The supervision projection can retain completed history.  The compact
     // panel is an open-pair indicator, so do not reintroduce terminal rows.
     if (!TASK_PAIR_PANEL_VISIBLE_STATUSES.includes(normalizedPair.status)) return [];
+    const { brief, ...snapshotPair } = normalizedPair;
     return [{
       taskId: task.taskId,
       title: task.title,
+      ...(typeof brief === 'string' && brief.trim() ? { brief } : {}),
       updatedAt: task.updatedAt,
-      pair: normalizedPair,
+      pair: snapshotPair,
     }];
   });
   return {
@@ -186,7 +188,7 @@ export function SupervisionTaskConsoleToggle(props: {
 }
 
 /** Pair round, severity counts of the last verdict, and flags (`pairs` engine rows only). */
-function TaskPairConsoleDetails({ pair }: { pair: SupervisionConsolePairInfo }) {
+function TaskPairConsoleDetails({ pair, taskId }: { pair: SupervisionConsolePairInfo; taskId: string }) {
   const { t } = useTranslation();
   const counts = pair.severityCounts
     ? AUDIT_SEVERITY_LEVELS
@@ -204,13 +206,7 @@ function TaskPairConsoleDetails({ pair }: { pair: SupervisionConsolePairInfo }) 
       ))}
       {pair.checklist && <span class="supervision-task-console-checklist-progress">{t('taskPair.checklist_progress', { implemented: pair.checklist.implemented, audited: pair.checklist.audited, total: pair.checklist.total })}</span>}
       {pair.lastNudgedAt !== undefined && <span>{t('taskPair.last_nudged', { duration: Math.max(1, Math.round((Date.now() - pair.lastNudgedAt) / 60_000)) })}</span>}
-      {pair.brief && <div class="supervision-task-console-checklist">{parseTaskPairChecklist(pair.brief).map((item) => (
-        <div class="supervision-task-console-checklist-row" key={item.index}>
-          <input type="checkbox" checked={item.implemented} readOnly aria-label={t('taskPair.implemented')} />
-          <input type="checkbox" checked={item.audited} readOnly aria-label={t('taskPair.audited')} />
-          <span>{item.text}</span>
-        </div>
-      ))}</div>}
+      <TaskPairBrief brief={pair.brief} taskId={taskId} className="supervision-task-console-brief" />
     </div>
   );
 }
@@ -442,7 +438,7 @@ function TaskCard(props: {
           {auditor && <SessionButton assignment={auditor} taskStatus={props.task.status} taskTab={taskTab} lane="auditor" onNavigateSession={props.onNavigateSession} />}
         </div>
       </div>
-      {props.task.pair && <TaskPairConsoleDetails pair={props.task.pair} />}
+      {props.task.pair && <TaskPairConsoleDetails pair={props.task.pair} taskId={props.task.taskId} />}
       {!props.task.pair && (props.task.blocker || props.task.currentAction || props.task.nextAction) && <div class="supervision-task-console-task-meta">
         {props.task.blocker && <span class="is-blocker">{props.task.blocker}</span>}
         {props.task.currentAction && <span>{t('supervision_task_console.current_action')}: {props.task.currentAction}</span>}

@@ -4414,6 +4414,12 @@
     "implemented": "Implementado",
     "audited": "Auditado",
     "panel_collapse": "Contraer estado de tareas",
-    "panel_expand": "Expandir estado de tareas"
+    "panel_expand": "Expandir estado de tareas",
+    "brief_expand": "Mostrar contenido",
+    "brief_collapse": "Ocultar contenido",
+    "brief_copy": "Copiar resumen",
+    "brief_copied": "Copiado",
+    "brief_content": "Contenido de la tarea",
+    "brief_checklist": "Lista de comprobación"
   }
 }

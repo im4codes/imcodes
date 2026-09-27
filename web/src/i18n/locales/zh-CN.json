@@ -4414,6 +4414,12 @@
     "implemented": "实现",
     "audited": "审计",
     "panel_collapse": "收起任务状态",
-    "panel_expand": "展开任务状态"
+    "panel_expand": "展开任务状态",
+    "brief_expand": "显示任务内容",
+    "brief_collapse": "隐藏任务内容",
+    "brief_copy": "复制任务内容",
+    "brief_copied": "已复制",
+    "brief_content": "任务内容",
+    "brief_checklist": "检查清单"
   }
 }

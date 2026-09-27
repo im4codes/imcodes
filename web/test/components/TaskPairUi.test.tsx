@@ -114,6 +114,20 @@ describe('TaskPairStatusPanel', () => {
     delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
   });
   afterEach(() => cleanup());
+  it('keeps the title as the headline and expands the full brief with two checklist columns', () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [{ taskId: 'brief-task', title: 'Readable title', brief: '# Goal\n\nDetails **matter**.\n\n- [x][ ] Implement it', pair: { status: 'working', updatedAt: 1 } }],
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="brief" />);
+    expect(screen.getByText('Readable title')).toBeTruthy();
+    expect(screen.queryByText('Details matter.')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.brief_expand' }));
+    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Details matter.');
+    expect(view.container.querySelector('.task-pair-brief-content')?.textContent).toContain('Implement it');
+    expect(screen.getAllByRole('checkbox')).toHaveLength(2);
+    expect(screen.getByRole('button', { name: 'taskPair.brief_copy' })).toBeTruthy();
+  });
   it('does not mount responsive panel effects for an ordinary chat, then activates on pair snapshot data', async () => {
     const originalMatchMedia = window.matchMedia;
     const matchMedia = vi.fn(() => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }));
@@ -165,7 +179,7 @@ describe('TaskPairStatusPanel', () => {
       tasks: {
         blocked: {
           taskId: 'blocked', title: 'Blocked', phase: 'active', updatedAt: 200,
-          pair: { status: 'working', flags: ['blocked'], round: 1, blocking: ['P0'], createdAt: 100, startedAt: 123, updatedAt: 200 },
+          pair: { status: 'working', flags: ['blocked'], round: 1, blocking: ['P0'], createdAt: 100, startedAt: 123, updatedAt: 200, brief: 'Keep this brief' },
         },
         done: {
           taskId: 'done', title: 'Done', phase: 'final', updatedAt: 300,
@@ -177,6 +191,7 @@ describe('TaskPairStatusPanel', () => {
     expect(snapshot.tasks).toHaveLength(1);
     expect(snapshot.tasks[0].pair.status).toBe('awaiting_brain_decision');
     expect(snapshot.tasks[0].pair.startedAt).toBe(123);
+    expect(snapshot.tasks[0].brief).toBe('Keep this brief');
   });
   it('clears the prior scope snapshot before the next authoritative sync', async () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = { tasks: [{ taskId: 'old-scope', title: 'Old scope', pair: { status: 'working' } }] };

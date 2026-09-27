@@ -4413,6 +4413,12 @@
     "implemented": "구현",
     "audited": "감사",
     "panel_collapse": "작업 상태 접기",
-    "panel_expand": "작업 상태 펼치기"
+    "panel_expand": "작업 상태 펼치기",
+    "brief_expand": "작업 내용 표시",
+    "brief_collapse": "작업 내용 숨기기",
+    "brief_copy": "작업 내용 복사",
+    "brief_copied": "복사됨",
+    "brief_content": "작업 내용",
+    "brief_checklist": "체크리스트"
   }
 }

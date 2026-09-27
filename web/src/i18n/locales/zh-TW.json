@@ -4414,6 +4414,12 @@
     "implemented": "實作",
     "audited": "審計",
     "panel_collapse": "收起任務狀態",
-    "panel_expand": "展開任務狀態"
+    "panel_expand": "展開任務狀態",
+    "brief_expand": "顯示任務內容",
+    "brief_collapse": "隱藏任務內容",
+    "brief_copy": "複製任務內容",
+    "brief_copied": "已複製",
+    "brief_content": "任務內容",
+    "brief_checklist": "檢查清單"
   }
 }

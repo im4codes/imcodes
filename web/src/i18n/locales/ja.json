@@ -4413,6 +4413,12 @@
     "implemented": "実装",
     "audited": "監査",
     "panel_collapse": "タスク状態を折りたたむ",
-    "panel_expand": "タスク状態を展開"
+    "panel_expand": "タスク状態を展開",
+    "brief_expand": "タスク内容を表示",
+    "brief_collapse": "タスク内容を隠す",
+    "brief_copy": "概要をコピー",
+    "brief_copied": "コピーしました",
+    "brief_content": "タスク内容",
+    "brief_checklist": "チェックリスト"
   }
 }

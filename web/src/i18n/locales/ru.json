@@ -4413,6 +4413,12 @@
     "implemented": "Реализовано",
     "audited": "Проверено",
     "panel_collapse": "Свернуть состояние задач",
-    "panel_expand": "Развернуть состояние задач"
+    "panel_expand": "Развернуть состояние задач",
+    "brief_expand": "Показать содержание",
+    "brief_collapse": "Скрыть содержание",
+    "brief_copy": "Копировать описание",
+    "brief_copied": "Скопировано",
+    "brief_content": "Содержание задачи",
+    "brief_checklist": "Чек-лист"
   }
 }
