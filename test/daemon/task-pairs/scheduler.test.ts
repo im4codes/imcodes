@@ -53,6 +53,7 @@ let busy: Set<string>;
 let limited: Set<string>;
 let candidates: string[];
 let provisioned: string | undefined;
+let throwDelivery = false;
 let automation: TaskPairAutomation;
 let turn = 0;
 
@@ -132,7 +133,11 @@ describe('task-pair heartbeat, replacement and queue', () => {
     limited = new Set();
     candidates = [SPARE];
     provisioned = undefined;
-    setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { sent.push({ target, text, id }); } });
+    throwDelivery = false;
+    setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => {
+      if (throwDelivery) throw new Error('synthetic transport failure');
+      sent.push({ target, text, id });
+    } });
     for (const record of [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2'), session(SPARE, 'w3'), session(SPARE2, 'w4')]) {
       upsertSession(record);
     }
@@ -265,6 +270,22 @@ describe('task-pair heartbeat, replacement and queue', () => {
     ))).toBe(true);
 
     await tick(1); // the shared watermark has aged past ten minutes
+    expect(sentTo(BRAIN)).toHaveLength(1);
+  });
+
+  it('clears a reserved global watermark when the Brain transport rejects so the next tick retries', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH GAP_RETRY executor=${EXEC} auditor=none -->`);
+    marker(EXEC, '<!-- IMCODES_TASK DONE GAP_RETRY -->');
+    await flush();
+    sent = [];
+    throwDelivery = true;
+    await tick(4);
+    await flush();
+    expect(sentTo(BRAIN)).toHaveLength(0);
+    expect(getTaskPairStore().getPair(PROJECT, 'GAP_RETRY')?.liveness.brainGlobalLastDeliveryAt).toBeUndefined();
+
+    throwDelivery = false;
+    await tick(1);
     expect(sentTo(BRAIN)).toHaveLength(1);
   });
 

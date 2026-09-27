@@ -609,6 +609,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
         brainGlobalLastDeliveryAt: reservationAt,
       });
     }
+    const clearReservation = (): void => {
+      for (const reserved of reservationPairs) {
+        const current = store.getPair(reserved.project, reserved.state.taskId);
+        if (current?.liveness.brainGlobalLastDeliveryAt !== reservationAt) continue;
+        store.saveLiveness(reserved.project, reserved.state.taskId, {
+          ...current.liveness,
+          brainGlobalLastDeliveryAt: undefined,
+        });
+      }
+    };
     const onlyAwaitingDecision = deliveryPairs.length === 1 && deliveryPairs[0]!.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
     void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, onlyAwaitingDecision ? 'brain-decision-reminder' : 'brain-heartbeat', buildBrainHeartbeatMessage(deliveryPairs.map((stored) => stored.state)))
       .then((result) => {
@@ -647,18 +657,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
         } else {
           // A missing target or failed transport did not deliver a heartbeat;
           // do not leave a speculative reservation suppressing reminders.
-          for (const reserved of reservationPairs) {
-            const current = store.getPair(reserved.project, reserved.state.taskId);
-            if (current?.liveness.brainGlobalLastDeliveryAt !== reservationAt) continue;
-            store.saveLiveness(reserved.project, reserved.state.taskId, {
-              ...current.liveness,
-              brainGlobalLastDeliveryAt: undefined,
-            });
-          }
+          clearReservation();
         }
       })
       .finally(() => { this.#mainHeartbeatPending.delete(brain); })
-      .catch(() => { /* delivery logs its own failure; retry on the next state change */ });
+      .catch(() => {
+        // test and provider transports may reject before delivery.ts can
+        // normalize the result; clear the reservation so the next tick can
+        // retry instead of suppressing all future reminders for ten minutes.
+        clearReservation();
+      });
   }
 
   #brainWaitKey(pair: TaskPairState): string | undefined {
