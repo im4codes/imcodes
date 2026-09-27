@@ -74,6 +74,13 @@ describe('Linux unit templates', () => {
     }
   });
 
+  it('escapes printf conversions so systemd does not expand them as specifiers', () => {
+    const diagnostics = renderSystemdTerminalDiagnostics();
+    // In a unit file `%s` is the user's shell; only `%%` survives as a literal `%`.
+    expect(diagnostics.replace(/%%/g, '')).not.toMatch(/%[a-zA-Z]/);
+    expect(diagnostics).toContain('result=%%s exit=%%s/%%s at %%s');
+  });
+
   it('proves an unrecoverable launch cannot loop thousands of times', () => {
     // Without a start limit, RestartSec=5 alone yields 17280 executions per day.
     expect(unboundedStartAttemptsPerDay(5)).toBe(17_280);

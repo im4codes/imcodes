@@ -32,9 +32,13 @@ export function renderSystemdStartLimitBlock(): string {
  * `SERVICE_RESULT`, `EXIT_CODE` and `EXIT_STATUS` are exported by systemd to
  * `ExecStopPost` only, so the give-up that follows a start-limit trip leaves an
  * actionable record instead of silence.
+ *
+ * `%` is a systemd specifier prefix in unit files (`%s` = the user's shell), so
+ * printf's conversions must be written `%%s`; unescaped, every field logged as
+ * the login shell (e.g. "result=/usr/bin/fish exit=/usr/bin/fish/...").
  */
 export function renderSystemdTerminalDiagnostics(): string {
-  return 'ExecStopPost=/bin/sh -c \'printf "[imcodes] unit stopped result=%s exit=%s/%s at %s\\n"'
+  return 'ExecStopPost=/bin/sh -c \'printf "[imcodes] unit stopped result=%%s exit=%%s/%%s at %%s\\n"'
     + ' "$SERVICE_RESULT" "$EXIT_CODE" "$EXIT_STATUS" "$(date -Is)"'
     + ' >> "$HOME/.imcodes/daemon-service.log" 2>/dev/null || true\'';
 }
