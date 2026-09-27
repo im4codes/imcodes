@@ -576,6 +576,8 @@ export class WsClient {
   private transportSubscriptionReplayHistory = new Map<string, boolean>();
   /** Transport-chat subscriptions confirmed sent on the current browser WS. */
   private sentTransportSubscriptions = new Set<string>();
+  /** Last sub-session rebuild payload sent on this socket. */
+  private sentSubSessionRebuildSignature: string | null = null;
   /** Ref-counted per-session timeline subscriptions. Full wins while any view is visible. */
   private timelineSubscriptions = new Map<string, Map<symbol, TimelineSubscriptionMode>>();
   private sentTimelineSubscriptions = new Map<string, TimelineSubscriptionMode>();
@@ -1366,6 +1368,8 @@ export class WsClient {
   }
 
   subSessionRebuildAll(subSessions: Array<{ id: string; type: string; runtimeType?: 'process' | 'transport' | null; providerId?: string | null; providerSessionId?: string | null; shellBin?: string | null; cwd?: string | null; ccSessionId?: string | null; geminiSessionId?: string | null; parentSession?: string | null; label?: string | null; ccPresetId?: string | null; requestedModel?: string | null; activeModel?: string | null; effort?: import('../../shared/effort-levels.js').TransportEffortLevel | null; transportConfig?: Record<string, unknown> | null }>): void {
+    const signature = JSON.stringify(subSessions);
+    if (signature === this.sentSubSessionRebuildSignature) return;
     // Send in size-bounded batches.
     //
     // One message carrying every sub-session crosses the 60 KB outbound cap at
@@ -1386,9 +1390,11 @@ export class WsClient {
     // rejects that locally, before the socket. In a bare loop that throw ends
     // the loop, so every later batch is lost too and nothing retries until the
     // next connection. Isolate each batch and keep going.
+    let sent = false;
     for (const batch of chunkSubSessionRebuildBatches(subSessions)) {
       try {
         this.send({ type: 'subsession.rebuild_all', subSessions: batch });
+        sent = true;
       } catch (err) {
         console.warn(
           '[ws] subsession.rebuild_all batch dropped',
@@ -1397,6 +1403,7 @@ export class WsClient {
         );
       }
     }
+    if (sent || subSessions.length === 0) this.sentSubSessionRebuildSignature = signature;
   }
 
   subSessionDetectShells(): void {
@@ -2204,6 +2211,9 @@ export class WsClient {
       this._connecting = false;
       this._connected = true;
       this._probePending = false;
+      // Rebuild state is scoped to the actual WebSocket. Probe recovery keeps
+      // this signature; a new socket receives one fresh rebuild payload.
+      this.sentSubSessionRebuildSignature = null;
       this.flushPendingInput();
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;

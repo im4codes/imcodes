@@ -123,6 +123,20 @@ describe('WsClient', () => {
     client.disconnect();
   });
 
+  it('dedupes identical sub-session rebuild payloads on one socket', async () => {
+    const client = await connectClient();
+    const payload = [{ id: 'sub-1', type: 'claude-code', runtimeType: 'transport' as const, label: 'worker' }];
+    lastWs!.send.mockClear();
+
+    client.subSessionRebuildAll(payload);
+    client.subSessionRebuildAll(payload);
+
+    const rebuilds = lastWs!.send.mock.calls
+      .map(([raw]) => JSON.parse(String(raw)) as { type?: string });
+    expect(rebuilds.filter((message) => message.type === 'subsession.rebuild_all')).toHaveLength(1);
+    client.disconnect();
+  });
+
   it('opens a WebSocket on connect()', async () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     client.connect();
