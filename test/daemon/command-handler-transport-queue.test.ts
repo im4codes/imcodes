@@ -565,6 +565,36 @@ describe('handleWebCommand transport queue behavior', () => {
     }
   });
 
+  it('sends the receipt before synchronous locale persistence', async () => {
+    const order: string[] = [];
+    serverLink.send.mockImplementation((message: Record<string, unknown>) => {
+      if (message.type === 'command.ack' && message.commandId === 'cmd-locale-ack-order') order.push('wire-ack');
+    });
+    upsertSessionMock.mockImplementation(() => { order.push('locale-write'); });
+    getSessionMock.mockReturnValue({
+      name: 'deck_transport_brain',
+      projectName: 'transport',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      runtimeType: 'transport',
+      state: 'running',
+      transportConfig: { supervision: { uiLocale: 'en' } },
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: 'ack before metadata',
+      commandId: 'cmd-locale-ack-order',
+      uiLocale: 'zh-CN',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(order).toContain('wire-ack');
+    expect(order).toContain('locale-write');
+    expect(order.indexOf('wire-ack')).toBeLessThan(order.indexOf('locale-write'));
+  });
+
   // ── F4 regression suite (audit f395d49c-78c) ─────────────────────────────
   //
   // Before this fix, `handleSend` read `record = getSession(sessionName)` and

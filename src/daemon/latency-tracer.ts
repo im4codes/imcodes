@@ -15,6 +15,7 @@ interface CommandReceipt {
   receivedAt: number;
   commandId: string;
   sessionName?: string;
+  eventLoopLagMs?: number;
 }
 
 interface RecentSpan {
@@ -38,6 +39,7 @@ interface RecentCommand {
   requestId?: string;
   sessionName?: string;
   commandBytes?: number;
+  eventLoopLagMs?: number;
 }
 
 interface RecentServerSend {
@@ -74,6 +76,7 @@ let lastCpu = process.cpuUsage();
 let lastCpuAt = performance.now();
 let lastElu = performance.eventLoopUtilization();
 let expectedDriftAt = 0;
+let latestEventLoopLagMs = 0;
 const commandReceipts = new Map<string, CommandReceipt>();
 const activeSpanStack: RecentSpan[] = [];
 const recentSpans: RecentSpan[] = [];
@@ -403,6 +406,7 @@ export function startLatencyTracer(): void {
     const now = performance.now();
     const drift = now - expectedDriftAt;
     expectedDriftAt = now + driftMs;
+    latestEventLoopLagMs = Math.max(0, drift);
     if (drift < driftThresholdMs()) return;
     const active = activeSpanStack.at(-1) ?? null;
     const recent = findRecentSpan(now);
@@ -489,7 +493,9 @@ export async function traceAsync<T>(name: string, meta: JsonRecord | undefined, 
 }
 
 export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
-  if (!enabled) return;
+  // Receipt timestamps are kept even when file tracing is disabled so the
+  // server-link send path can measure ordinary ack latency without requiring a
+  // diagnostic flag. The bounded map is cheap; writeTrace remains a no-op.
   const type = typeof cmd.type === 'string' ? cmd.type : '<non-string>';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim() ? cmd.commandId.trim() : undefined;
   const requestId = typeof cmd.requestId === 'string' && cmd.requestId.trim() ? cmd.requestId.trim() : undefined;
@@ -502,6 +508,7 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
       receivedAt: performance.now(),
       commandId,
       ...(sessionName ? { sessionName } : {}),
+      eventLoopLagMs: roundMs(latestEventLoopLagMs),
     });
   }
   let commandBytes: number | undefined;
@@ -517,6 +524,7 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
     ...(requestId ? { requestId } : {}),
     ...(sessionName ? { sessionName } : {}),
     ...(commandBytes !== undefined ? { commandBytes } : {}),
+    eventLoopLagMs: roundMs(latestEventLoopLagMs),
   });
   writeTrace('web_command_received', {
     type,
@@ -524,7 +532,9 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
     ...(requestId ? { requestId } : {}),
     ...(sessionName ? { sessionName } : {}),
     ...(commandBytes !== undefined ? { commandBytes } : {}),
+    eventLoopLagMs: roundMs(latestEventLoopLagMs),
   });
+  cleanupCommandReceipts();
 }
 
 export function traceCommandAsync(cmd: Record<string, unknown>, name: string, fn: () => Promise<void>): Promise<void> {
@@ -572,7 +582,6 @@ export function recordServerSend(input: {
   recipientCount?: number;
   success: boolean;
 }): void {
-  if (!enabled) return;
   const sendTotalMs = input.stringifyMs + input.wsSendMs;
   const isAck = input.msgType === MSG_COMMAND_ACK;
   const plane = classifyServerSendPlane(input.msgType);
@@ -587,6 +596,22 @@ export function recordServerSend(input: {
       sessionName = receipt.sessionName;
       commandReceipts.delete(input.commandId);
     }
+  }
+
+  // Keep the production path observable without enabling file tracing. Only
+  // slow acks are logged; normal receipts remain silent and allocation-light.
+  if (!enabled) {
+    if (ackLatencyMs !== undefined && ackLatencyMs >= ackSlowMs()) {
+      logger.warn({
+        commandId: input.commandId,
+        sessionName,
+        commandType,
+        ackLatencyMs: roundMs(ackLatencyMs),
+        ackSlowThresholdMs: ackSlowMs(),
+        ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
+      }, 'command.ack latency exceeded threshold');
+    }
+    return;
   }
 
   const slow = sendTotalMs >= sendThresholdMs()
@@ -620,6 +645,7 @@ export function recordServerSend(input: {
     ...(input.commandId ? { commandId: input.commandId } : {}),
     ...(commandType ? { commandType } : {}),
     ...(sessionName ? { sessionName } : {}),
+    ...(receipt?.eventLoopLagMs !== undefined ? { eventLoopLagMsAtReceive: receipt.eventLoopLagMs } : {}),
     jsonBytes: input.jsonBytes,
     stringifyMs: roundMs(input.stringifyMs),
     wsSendMs: roundMs(input.wsSendMs),

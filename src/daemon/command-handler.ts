@@ -836,19 +836,10 @@ function schedulePreferencePersistence(input: {
 }
 
 /**
- * Reliable `command.ack` emission — enqueue into the on-disk outbox BEFORE the
- * network send so that a transient serverLink outage doesn't silently drop the
- * ack. The outbox flushes on the next successful reconnect + auth; the server's
- * seenCommandAcks LRU dedups replays so the browser sees the ack exactly once.
- *
- * Replaces the original `try { serverLink.send({ type: 'command.ack', ... }) }
- * catch {}` pattern that existed in ~15 sites across handleSessionSend's
- * transport/P2P/queue paths. Keeping it all funnelled through one helper makes
- * it impossible to forget the outbox hook on a new code path.
- *
- * Does NOT emit the corresponding `timelineEmitter.emit(..., 'command.ack', ...)`
- * — call sites still do that explicitly so they can choose whether the ack is
- * timeline-visible (process path) or not (some P2P internal paths).
+ * Reliable `command.ack` emission. The wire receipt is sent first so that
+ * durable outbox/timeline work cannot delay the daemon-receipt contract.
+ * Failed sends are persisted for retry; successful sends are marked acked
+ * after enqueue completes.
  */
 function emitCommandAckReliable(
   serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
@@ -860,21 +851,6 @@ function emitCommandAckReliable(
     [key: string]: unknown;
   },
 ): void {
-  const outbox = getDefaultAckOutbox();
-  outbox
-    .enqueue({
-      commandId: params.commandId,
-      sessionName: params.sessionName,
-      status: params.status,
-      ...(params.error ? { error: params.error } : {}),
-      extras: Object.fromEntries(Object.entries(params).filter(([key, value]) => (
-        !['commandId', 'sessionName', 'status', 'error'].includes(key) && value !== undefined
-      ))),
-      ts: Date.now(),
-    })
-    .catch((err) =>
-      logger.error({ commandId: params.commandId, err }, 'ackOutbox.enqueue failed'),
-    );
   const sent = trySendCommandAck(serverLink, {
     commandId: params.commandId,
     sessionName: params.sessionName,
@@ -882,13 +858,24 @@ function emitCommandAckReliable(
     error: params.error,
     ...Object.fromEntries(Object.entries(params).filter(([key]) => !['commandId', 'sessionName', 'status', 'error'].includes(key))),
   });
-  if (sent) {
-    outbox
-      .markAcked(params.commandId)
-      .catch((err) =>
-        logger.warn({ commandId: params.commandId, err }, 'ackOutbox.markAcked failed'),
-      );
-  } else {
+  const outbox = getDefaultAckOutbox();
+  const enqueue = outbox.enqueue({
+    commandId: params.commandId,
+    sessionName: params.sessionName,
+    status: params.status,
+    ...(params.error ? { error: params.error } : {}),
+    extras: Object.fromEntries(Object.entries(params).filter(([key, value]) => (
+      !['commandId', 'sessionName', 'status', 'error'].includes(key) && value !== undefined
+    ))),
+    ts: Date.now(),
+  });
+  enqueue.then(() => {
+    if (!sent) return;
+    return outbox.markAcked(params.commandId);
+  }).catch((err) => {
+    logger.error({ commandId: params.commandId, err }, 'ackOutbox enqueue/ack failed');
+  });
+  if (!sent) {
     logger.warn(
       { commandId: params.commandId },
       'command.ack not sent, queued for retry via outbox',
@@ -3899,34 +3886,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
   const requestedUiLocale = normalizeSupervisionUiLocale(cmd.uiLocale);
-  // The web sends `uiLocale` on every send, not through a separate settings
-  // save. Persist it onto the session record here (best-effort, synchronous,
-  // debounced-write only -- see session-store.ts) so it durably outlives this
-  // one turn: background work unrelated to any live prompt (e.g. task-pair
-  // title generation, src/daemon/task-pairs/engine.ts's `brainUiLocale`) reads
-  // it from the record later, not from the in-request overlay further below
-  // that exists only to steer this turn's own prompts.
-  if (requestedUiLocale && sessionName) {
-    try {
-      const existingRecord = getSession(sessionName);
-      // patchTransportConfigUiLocale stores this under its own sibling
-      // transportConfig key, never inside transportConfig.supervision: that
-      // object is a strictly validated snapshot that may be intentionally
-      // absent, invalid, or legacy-repair-only, and either rebuilding it
-      // through the normalizer or merely adding a field to it here would
-      // silently change what every other reader sees (lost config, or an
-      // unconfigured/repair-pending session on an ordinary send).
-      if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
-        && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
-        upsertSession({
-          ...existingRecord,
-          transportConfig: patchTransportConfigUiLocale(existingRecord.transportConfig ?? null, requestedUiLocale),
-        });
-      }
-    } catch (error) {
-      logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
-    }
-  }
   // Omission/unknown values are the safe default: ordinary durable FIFO.
   // Only the exact explicit append value may request a provider-native steer.
   const requestedDeliveryMode = cmd.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
@@ -4133,6 +4092,37 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
     emitAcceptedReceiptAck();
+  }
+
+  // Persist UI locale only after the daemon-receipt ack has reached the client.
+  // This metadata write is best-effort and must not delay ordinary session.send.
+  // The web sends `uiLocale` on every send, not through a separate settings
+  // save. Persist it onto the session record here (best-effort, synchronous,
+  // debounced-write only -- see session-store.ts) so it durably outlives this
+  // one turn: background work unrelated to any live prompt (e.g. task-pair
+  // title generation, src/daemon/task-pairs/engine.ts's `brainUiLocale`) reads
+  // it from the record later, not from the in-request overlay further below
+  // that exists only to steer this turn's own prompts.
+  if (requestedUiLocale && sessionName) {
+    try {
+      const existingRecord = getSession(sessionName);
+      // patchTransportConfigUiLocale stores this under its own sibling
+      // transportConfig key, never inside transportConfig.supervision: that
+      // object is a strictly validated snapshot that may be intentionally
+      // absent, invalid, or legacy-repair-only, and either rebuilding it
+      // through the normalizer or merely adding a field to it here would
+      // silently change what every other reader sees (lost config, or an
+      // unconfigured/repair-pending session on an ordinary send).
+      if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
+        && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
+        upsertSession({
+          ...existingRecord,
+          transportConfig: patchTransportConfigUiLocale(existingRecord.transportConfig ?? null, requestedUiLocale),
+        });
+      }
+    } catch (error) {
+      logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
+    }
   }
 
   if (trimmedText === '/stop') {
@@ -5190,7 +5180,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 }
 
-/** Emit command.ack to local timeline + outbox + server. Idempotent per commandId. */
+/** Emit command.ack to the wire first, then local timeline and durable outbox. */
 function emitCommandAck(
   sessionName: string,
   commandId: string,
@@ -5198,25 +5188,25 @@ function emitCommandAck(
   error: string | undefined,
   serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
 ): void {
+  const sent = trySendCommandAck(serverLink, { commandId, sessionName, status, error });
   const ackPayload: Record<string, unknown> = { commandId, status };
   if (error) ackPayload.error = error;
   timelineEmitter.emit(sessionName, 'command.ack', ackPayload);
   const outbox = getDefaultAckOutbox();
-  outbox.enqueue({
+  const enqueue = outbox.enqueue({
     commandId,
     sessionName,
     status,
     error,
     ts: Date.now(),
-  }).catch((err) => {
-    logger.error({ commandId, err }, 'ackOutbox.enqueue failed');
   });
-  const sent = trySendCommandAck(serverLink, { commandId, sessionName, status, error });
-  if (sent) {
-    outbox.markAcked(commandId).catch((err) => {
-      logger.warn({ commandId, err }, 'ackOutbox.markAcked failed');
-    });
-  } else {
+  enqueue.then(() => {
+    if (!sent) return;
+    return outbox.markAcked(commandId);
+  }).catch((err) => {
+    logger.error({ commandId, err }, 'ackOutbox enqueue/ack failed');
+  });
+  if (!sent) {
     logger.warn({ commandId }, 'command.ack not sent, queued for retry');
   }
 }

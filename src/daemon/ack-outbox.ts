@@ -97,8 +97,9 @@ export class AckOutbox {
   }
 
   /**
-   * Enqueue an ack before attempting to send. The in-memory map is updated
-   * synchronously (so flushOnReconnect / snapshot reflect it immediately);
+   * Enqueue an ack for retry. The in-memory map is updated synchronously
+   * (so flushOnReconnect / snapshot reflect it immediately); callers may send
+   * the wire receipt first when receipt liveness is the priority.
    * disk persistence runs fire-and-forget through the serialized `writing`
    * promise chain. Callers MUST NOT await this if they hold a lock — the
    * actual durability is best-effort by design.
