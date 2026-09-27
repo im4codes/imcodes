@@ -3679,7 +3679,9 @@ export function useTimeline(
     const streamingOnly = incoming.every(
       (event) => event.type === 'assistant.text' && event.payload?.streaming === true,
     );
-    mergeEvents(incoming, MAX_MEMORY_EVENTS, { updateCache: !streamingOnly });
+    // Keep the latest streaming snapshot in the in-memory cache so reopening
+    // a pane paints immediately; defer only the expensive IndexedDB write.
+    mergeEvents(incoming, MAX_MEMORY_EVENTS);
     // Idle persistence writes the latest streaming snapshot (and a final
     // event writes immediately). Avoid an IndexedDB transaction for every
     // typewriter delta; those synchronous writes were the remaining hidden
@@ -3696,6 +3698,7 @@ export function useTimeline(
   const streamingIdlePersistKeyRef = useRef<string | null>(null);
   const streamingIdlePersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flushStreamingIdlePersist = useCallback((fromIdleTimer = false) => {
+    // eslint-disable-next-line no-console
     if (streamingIdlePersistTimerRef.current) {
       clearTimeout(streamingIdlePersistTimerRef.current);
       streamingIdlePersistTimerRef.current = null;
@@ -3735,10 +3738,12 @@ export function useTimeline(
     // this opportunistic repair; open preview cards must not each start one.
     if (fromIdleTimer && hasStuckStream && key === cacheKeyRef.current
       && isActiveSessionRef.current) {
+      // eslint-disable-next-line no-console
       fireHttpBackfillRef.current(0, { phase: 'refresh', visible: false, force: true, mode: 'manualLatestWindow' });
     }
   }, []);
   const scheduleStreamingIdlePersist = useCallback((eventId: string) => {
+    // eslint-disable-next-line no-console
     const key = cacheKeyRef.current;
     if (!key) return;
     // Session changed mid-stream → flush the previous session's pending first.
