@@ -4,7 +4,7 @@
  */
 import { useState, useEffect, useMemo, useRef, useCallback } from 'preact/hooks';
 import type { JSX } from 'preact';
-import { createPortal } from 'preact/compat';
+import { createPortal, memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { SubSessionCard } from './SubSessionCard.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
@@ -352,7 +352,7 @@ function renderTechClock(text: string): JSX.Element {
   );
 }
 
-function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
+function CollapsedSubSessionButtonImpl({ sub, accentColor, isOpen, isFocused, idleFlashToken, usage, sharedState, inP2p, draggable, onEntryPointerDown, onEntryTouchStart, onEntryClick, onEntryDoubleClick, onEntryDragStart, onEntryDragOver, onEntryDragEnd, t, detectedModel, orientation = 'horizontal' }: CollapsedSubSessionButtonProps) {
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
   const label = sub.label ? `${formatLabel(sub.label)} · ${agentTag}` : agentTag;
@@ -406,6 +406,43 @@ function CollapsedSubSessionButton({ sub, accentColor, isOpen, isFocused, idleFl
     </button>
   );
 }
+
+function sameCollapsedSub(a: SubSession, b: SubSession): boolean {
+  return a.sessionName === b.sessionName
+    && a.id === b.id
+    && a.type === b.type
+    && a.state === b.state
+    && a.label === b.label
+    && a.runtimeType === b.runtimeType
+    && a.activeModel === b.activeModel
+    && a.requestedModel === b.requestedModel
+    && a.modelDisplay === b.modelDisplay;
+}
+
+const CollapsedSubSessionButton = memo(CollapsedSubSessionButtonImpl, (prev, next) => (
+  sameCollapsedSub(prev.sub, next.sub)
+  && prev.accentColor === next.accentColor
+  && prev.isOpen === next.isOpen
+  && prev.isFocused === next.isFocused
+  && prev.idleFlashToken === next.idleFlashToken
+  && prev.usage?.inputTokens === next.usage?.inputTokens
+  && prev.usage?.cacheTokens === next.usage?.cacheTokens
+  && prev.usage?.contextWindow === next.usage?.contextWindow
+  && prev.usage?.model === next.usage?.model
+  && prev.sharedState === next.sharedState
+  && prev.inP2p === next.inP2p
+  && prev.draggable === next.draggable
+  && prev.onEntryPointerDown === next.onEntryPointerDown
+  && prev.onEntryTouchStart === next.onEntryTouchStart
+  && prev.onEntryClick === next.onEntryClick
+  && prev.onEntryDoubleClick === next.onEntryDoubleClick
+  && prev.onEntryDragStart === next.onEntryDragStart
+  && prev.onEntryDragOver === next.onEntryDragOver
+  && prev.onEntryDragEnd === next.onEntryDragEnd
+  && prev.t === next.t
+  && prev.detectedModel === next.detectedModel
+  && prev.orientation === next.orientation
+));
 
 function ExpandedSubSessionPlaceholder({ sub, accentColor, cardSize, sharedState, inP2p, t }: { sub: SubSession; accentColor: string; cardSize: CardSize; sharedState?: SharedStateSummary | null; inP2p: boolean; t: (key: string, vars?: Record<string, unknown>) => string }) {
   const agentTag = sub.type === 'shell' ? (sub.shellBin?.split(/[/\\]/).pop() ?? 'shell') : sub.type;
