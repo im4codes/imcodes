@@ -296,7 +296,9 @@ export async function runShellBrowserScenario() {
   const renderedBurstStart = renderedBurstNormalized.lastIndexOf('BURST_BEGIN');
   const renderedBurstEnd = renderedBurstNormalized.indexOf('BURST_END', renderedBurstStart + 'BURST_BEGIN'.length);
   assert.ok(renderedBurstStart >= 0 && renderedBurstEnd >= 0, 'xterm buffer must contain burst delimiters');
-  const renderedBurstExtract = renderedBurstNormalized.slice(renderedBurstStart + 'BURST_BEGIN'.length, renderedBurstEnd);
+  const renderedBurstPayloadStart = renderedBurstStart + 'BURST_BEGIN'.length;
+  const renderedBurstExtract = renderedBurstNormalized.slice(renderedBurstPayloadStart, renderedBurstPayloadStart + burstSource.length);
+  assert.equal(renderedBurstNormalized.slice(renderedBurstPayloadStart + burstSource.length, renderedBurstPayloadStart + burstSource.length + burstHash.length), burstHash, 'xterm buffer burst hash must follow source');
   if (sha256(renderedBurstExtract) !== burstHash) {
     let mismatch = 0;
     while (mismatch < renderedBurstExtract.length && renderedBurstExtract[mismatch] === burstSource[mismatch]) mismatch += 1;
