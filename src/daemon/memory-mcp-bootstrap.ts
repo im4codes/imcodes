@@ -448,6 +448,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   const configuredParentPollMs = Number(process.env.IMCODES_MCP_PARENT_POLL_MS);
   installMcpStdioLifecycle({
     stdin: process.stdin,
+    stdout: process.stdout,
     shutdown,
     exit: (code) => process.exit(code),
     getParentPid: () => process.ppid,

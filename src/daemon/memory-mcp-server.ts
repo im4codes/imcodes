@@ -862,6 +862,7 @@ export async function runMemoryMcpServer(options: MemoryMcpServerOptions = {}): 
   const declaredParentPid = Number(env[IMCODES_MCP_PARENT_PID_ENV]);
   installMcpStdioLifecycle({
     stdin: process.stdin,
+    stdout: process.stdout,
     shutdown: () => activeShutdown(),
     exit: (code) => process.exit(code),
     getParentPid: () => process.ppid,

@@ -51,6 +51,7 @@ export const MCP_PROCESS_START_PARENT_PID = process.ppid;
 export const MCP_STDIO_SHUTDOWN_REASON = {
   STDIN_END: MCP_BOOTSTRAP_EXIT_REASON.STDIN_END,
   STDIN_CLOSE: MCP_BOOTSTRAP_EXIT_REASON.STDIN_CLOSE,
+  STDOUT_ERROR: MCP_BOOTSTRAP_EXIT_REASON.STDOUT_ERROR,
   PARENT_EXITED: MCP_BOOTSTRAP_EXIT_REASON.PARENT_EXITED,
   DECLARED_PARENT_MISMATCH: MCP_BOOTSTRAP_EXIT_REASON.DECLARED_PARENT_MISMATCH,
 } as const;
@@ -75,8 +76,16 @@ export interface McpStdioLifecycleStream {
   off?(event: 'end' | 'close', listener: () => void): unknown;
 }
 
+export interface McpStdioOutputStream {
+  on(event: 'error', listener: (error: unknown) => void): unknown;
+  off?(event: 'error', listener: (error: unknown) => void): unknown;
+}
+
 export interface McpStdioLifecycleOptions {
   stdin: McpStdioLifecycleStream;
+  /** stdout is optional for embedders, but production passes process.stdout so
+   * EPIPE cannot become an unhandled write/retry loop. */
+  stdout?: McpStdioOutputStream;
   /** Idempotent teardown. Invoked at most once by this module. */
   shutdown: () => Promise<void>;
   exit: (code: number) => void;
@@ -138,6 +147,7 @@ export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () 
     }
     options.stdin.off?.('end', onEnd);
     options.stdin.off?.('close', onClose);
+    options.stdout?.off?.('error', onOutputError);
   };
 
   // `shutdown` is documented idempotent, but this module must not depend on
@@ -170,9 +180,11 @@ export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () 
 
   function onEnd(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDIN_END); }
   function onClose(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDIN_CLOSE); }
+  function onOutputError(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDOUT_ERROR); }
 
   options.stdin.on('end', onEnd);
   options.stdin.on('close', onClose);
+  options.stdout?.on('error', onOutputError);
 
   timer = setIntervalFn(() => {
     if (options.getParentPid() !== options.initialParentPid) trigger(MCP_STDIO_SHUTDOWN_REASON.PARENT_EXITED);

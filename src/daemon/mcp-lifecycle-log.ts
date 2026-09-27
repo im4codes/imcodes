@@ -37,6 +37,7 @@ export type McpLifecycleEvent = typeof MCP_LIFECYCLE_EVENT[keyof typeof MCP_LIFE
 export const MCP_BOOTSTRAP_EXIT_REASON = {
   STDIN_END: 'stdin_end',
   STDIN_CLOSE: 'stdin_close',
+  STDOUT_ERROR: 'stdout_error',
   PARENT_EXITED: 'parent_exited',
   DECLARED_PARENT_MISMATCH: 'declared_parent_mismatch',
   SIGTERM: 'SIGTERM',

@@ -466,6 +466,23 @@ describe('installMcpStdioLifecycle', () => {
     };
   }
 
+  function fakeStdout() {
+    const listeners = new Array<(error: unknown) => void>();
+    return {
+      on(_event: 'error', listener: (error: unknown) => void) {
+        listeners.push(listener);
+        return this;
+      },
+      off(_event: 'error', listener: (error: unknown) => void) {
+        const index = listeners.indexOf(listener);
+        if (index >= 0) listeners.splice(index, 1);
+        return this;
+      },
+      emitError(error: unknown) { for (const listener of [...listeners]) listener(error); },
+      count() { return listeners.length; },
+    };
+  }
+
   it('shuts down on stdin EOF alone, with no parent change and no tick', async () => {
     // Without this, deleting the EOF wiring changes no test outcome: the
     // process happens to exit anyway because the loop drains. That accident is
@@ -605,6 +622,27 @@ describe('installMcpStdioLifecycle', () => {
     stdin.emit('end');
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(exits).toBe(1);
+  });
+
+  it('exits when stdout reports EPIPE instead of retrying writes', async () => {
+    const stdin = fakeStdin();
+    const stdout = fakeStdout();
+    let exits = 0;
+    let shutdowns = 0;
+    installMcpStdioLifecycle({
+      stdin,
+      stdout,
+      shutdown: async () => { shutdowns += 1; },
+      exit: () => { exits += 1; },
+      getParentPid: () => 7,
+      initialParentPid: 7,
+      setIntervalFn: () => ({}),
+    });
+    stdout.emitError(Object.assign(new Error('broken pipe'), { code: 'EPIPE' }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(shutdowns).toBe(1);
+    expect(exits).toBe(1);
+    expect(stdout.count()).toBe(0);
   });
 
   it('does not shut down while the parent pid is unchanged', async () => {
