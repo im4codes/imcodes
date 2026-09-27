@@ -1,5 +1,6 @@
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
+import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.ts';
 
 const require = createRequire(new URL('../../../web/package.json', import.meta.url));
 const { chromium } = require('@playwright/test');
@@ -103,7 +104,7 @@ async function openRealSession(context, session, { manualProtocol = session.inde
     ws[direction === 'sent' ? 'bytesSent' : 'bytesReceived'] += bytes;
     try {
       const msg = JSON.parse(payload);
-      if (direction === 'sent' && msg.type === 'timeline.subscribe' && msg.sessionName) {
+      if (direction === 'sent' && msg.type === TIMELINE_MESSAGES.SUBSCRIBE && msg.sessionName) {
         ws.sessionModes[msg.sessionName] = msg.mode === 'summary' ? 'summary' : 'full';
         if (msg.sessionName === session.name) ws.mode = ws.sessionModes[msg.sessionName];
       }
@@ -115,21 +116,21 @@ async function openRealSession(context, session, { manualProtocol = session.inde
         if (eventMode === 'summary') ws.hiddenSummaryBytes += bytes;
         if (type === 'assistant.text' && msg.event?.payload?.streaming === false) ws.finalSessions[eventSession ?? 'unknown'] = true;
       }
-      if (direction === 'sent' && (msg.type === 'timeline.history_request' || msg.type === 'timeline.page_request' || msg.type === 'timeline.replay_request') && msg.requestId) {
+      if (direction === 'sent' && (msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST || msg.type === TIMELINE_MESSAGES.PAGE_REQUEST || msg.type === TIMELINE_MESSAGES.REPLAY_REQUEST) && msg.requestId) {
         ws.pendingHistory[msg.requestId] = { requestId: msg.requestId, type: msg.type, sentAt: Date.now() };
       }
-      if (direction === 'received' && (msg.type === 'timeline.history' || msg.type === 'timeline.page' || msg.type === 'timeline.replay') && msg.requestId) {
+      if (direction === 'received' && (msg.type === TIMELINE_MESSAGES.HISTORY || msg.type === TIMELINE_MESSAGES.PAGE || msg.type === TIMELINE_MESSAGES.REPLAY) && msg.requestId) {
         const pending = ws.pendingHistory[msg.requestId];
         if (pending) { ws.historyTimings.push({ ...pending, receivedAt: Date.now(), durationMs: Date.now() - pending.sentAt, bytes }); delete ws.pendingHistory[msg.requestId]; }
       }
       ws.byType[type] = (ws.byType[type] ?? 0) + bytes;
       ws.framesByType[type] = (ws.framesByType[type] ?? 0) + 1;
       const socket = ws.sockets[requestId] ??= { requestId, mode: ws.mode, sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, byType: {}, bufferedAmount: 0 };
-      if (direction === 'sent' && msg.type === 'timeline.subscribe' && msg.sessionName) socket.mode = ws.sessionModes[msg.sessionName] ?? ws.mode;
+      if (direction === 'sent' && msg.type === TIMELINE_MESSAGES.SUBSCRIBE && msg.sessionName) socket.mode = ws.sessionModes[msg.sessionName] ?? ws.mode;
       socket[direction === 'sent' ? 'sent' : 'received'] += 1;
       socket[direction === 'sent' ? 'bytesSent' : 'bytesReceived'] += bytes;
       socket.byType[type] = (socket.byType[type] ?? 0) + bytes;
-      if (direction === 'received' && type === 'timeline.seq_gap' && ws.seqGaps.length < 20) {
+      if (direction === 'received' && type === TIMELINE_MESSAGES.SEQ_GAP && ws.seqGaps.length < 20) {
         ws.seqGaps.push({ epoch: msg.epoch, fromSeq: msg.fromSeq, toSeq: msg.toSeq, reason: msg.reason, sessionId: msg.sessionId });
       }
     } catch { ws.byType.unknown = (ws.byType.unknown ?? 0) + bytes; }
@@ -255,7 +256,7 @@ async function openRealSession(context, session, { manualProtocol = session.inde
   session.__diagnostics.readiness = readiness;
   session.__diagnostics.phase = 'route-evaluate';
   await evaluateBounded((hash) => { if (window.location.hash !== hash) window.location.hash = hash; window.dispatchEvent(new HashChangeEvent('hashchange')); }, `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(session.name)}`, 2_000, 'route evaluate');
-  if (manualProtocol) { session.__diagnostics.phase = 'manual-protocol'; await Promise.race([page.evaluate(async ({ serverId, sessionName, mode }) => {
+  if (manualProtocol) { session.__diagnostics.phase = 'manual-protocol'; await Promise.race([page.evaluate(async ({ serverId, sessionName, mode, messages, historyLimit }) => {
     const csrf = document.cookie.match(/(?:^|; )rcc_csrf=([^;]+)/)?.[1];
     let ticketResponse;
     for (let attempt = 0; attempt < 60; attempt += 1) {
@@ -283,11 +284,11 @@ async function openRealSession(context, session, { manualProtocol = session.inde
       const timer = setTimeout(() => reject(new Error('browser websocket open timeout')), 5_000);
       socket.addEventListener('open', () => {
         clearTimeout(timer);
-        socket.send(JSON.stringify({ type: 'timeline.subscribe', sessionName, mode }));
+        socket.send(JSON.stringify({ type: messages.SUBSCRIBE, sessionName, mode }));
         // Request the authoritative timeline immediately. This exercises the
         // real server backfill path and lets the browser verify that reveals
         // converge without relying on a fabricated client-side history.
-        socket.send(JSON.stringify({ type: 'timeline.history_request', sessionName, requestId: `perf-${sessionName}`, afterSeq: 0, limit: historyLimit }));
+        socket.send(JSON.stringify({ type: messages.HISTORY_REQUEST, sessionName, requestId: `perf-${sessionName}`, afterSeq: 0, limit: historyLimit }));
         socket.send(JSON.stringify({ type: 'perf.debug.timeline_metrics', requestId: `perf-debug-${sessionName}-initial` }));
         window.__perfDebugTimer = setInterval(() => {
           if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: 'perf.debug.timeline_metrics', requestId: `perf-debug-${sessionName}-${Date.now()}` }));
@@ -303,7 +304,7 @@ async function openRealSession(context, session, { manualProtocol = session.inde
       });
       window.__perfBufferedSamples = [];
       window.__perfBufferedTimer = setInterval(() => window.__perfBufferedSamples.push(socket.bufferedAmount), 100);
-  }, { serverId: SERVER_ID, sessionName: session.name, mode }), new Promise((_, reject) => setTimeout(() => reject(new Error('manual protocol timeout')), 8_000))]); }
+  }, { serverId: SERVER_ID, sessionName: session.name, mode, messages: { SUBSCRIBE: TIMELINE_MESSAGES.SUBSCRIBE, HISTORY_REQUEST: TIMELINE_MESSAGES.HISTORY_REQUEST }, historyLimit }), new Promise((_, reject) => setTimeout(() => reject(new Error('manual protocol timeout')), 8_000))]); }
   // Auth initialization is asynchronous in the real SPA. Re-apply the URL
   // route after its /me request settles so the app performs its own session
   // inventory request rather than leaving the initial empty route selected.
@@ -604,7 +605,7 @@ export async function runHarness() {
         correctness.failures.push(`toggle failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    correctness.authoritativeBackfill = pages.every((page) => (page.__perfWs?.byType?.['timeline.history'] ?? 0) > 0);
+    correctness.authoritativeBackfill = pages.every((page) => (page.__perfWs?.byType?.[TIMELINE_MESSAGES.HISTORY] ?? 0) > 0);
     const longChats = {};
     const longChatCorrectness = {};
     if (process.env.IMC_PERF_LONG_CHATS !== '0') for (const size of [500, 2000, 8000]) {
