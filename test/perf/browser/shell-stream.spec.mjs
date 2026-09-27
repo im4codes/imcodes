@@ -260,7 +260,9 @@ export async function runShellBrowserScenario() {
     const perf = window.__shellPerf;
     if (perf) { perf.longTasks = 0; perf.frames = 0; perf.frameStart = performance.now(); }
   });
-  const burstCommand = `python3 -c "import hashlib,sys;d='0123456789abcdef'*16384;sys.stdout.write('BURST_BEGIN');sys.stdout.write(d);sys.stdout.write('\\n'+hashlib.sha256(d.encode()).hexdigest()+'\\nBURST_END\\n')"`;
+  // Disable tty input echo around the burst so the concurrently queued input
+  // cannot be interleaved into the byte-exact output region being checked.
+  const burstCommand = `stty -echo; python3 -c "import hashlib,sys;d='0123456789abcdef'*16384;sys.stdout.write('BURST_BEGIN');sys.stdout.write(d);sys.stdout.write('\\n'+hashlib.sha256(d.encode()).hexdigest()+'\\nBURST_END\\n')"; stty echo`;
   // Use one browser input event for this long command so the test isolates
   // output backpressure rather than making the shell parse hundreds of
   // independent tmux send-keys processes.
