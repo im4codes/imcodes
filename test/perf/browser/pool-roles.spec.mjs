@@ -7,6 +7,7 @@ const { chromium } = require('@playwright/test');
 const BASE_URL = process.env.IMC_PERF_BASE_URL ?? 'http://127.0.0.1:19138';
 const SERVER_ID = process.env.IMC_PERF_SERVER_ID ?? 'imc_shell_real_server';
 const SESSION = process.env.IMC_PERF_SHELL_SESSION ?? 'deck_shell_perf_brain';
+const POOL_SESSION = process.env.IMC_PERF_POOL_SESSION ?? 'deck_pool_roles_brain';
 const JWT_KEY = process.env.IMC_PERF_JWT_SIGNING_KEY ?? 'perf-only-jwt-jwt-signing-key-32-bytes-minimum';
 const SCREENSHOT = process.env.IMC_POOL_ROLES_SCREENSHOT ?? '/repo/perf-results/pool-roles.png';
 const CSRF_TOKEN = 'imc-shell-perf-csrf-token';
@@ -32,15 +33,19 @@ async function runPoolRoleScenario() {
   ]);
   await context.addInitScript(({ serverId }) => {
     window.__IMC_SHELL_BROWSER_TEST__ = true;
+    if (typeof crypto.randomUUID !== 'function') {
+      Object.defineProperty(crypto, 'randomUUID', { configurable: true, value: () => '00000000-0000-4000-8000-000000000001' });
+    }
     localStorage.setItem('rcc_api_key', 'imc_shell_perf_browser_key');
     localStorage.setItem('rcc_server', serverId);
   }, { serverId: SERVER_ID });
   const page = await context.newPage();
-  await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(SESSION)}`, { waitUntil: 'domcontentloaded' });
+  await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(POOL_SESSION)}`, { waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('#app', { timeout: 60_000 });
   try {
-    await page.waitForSelector('.terminal-container', { timeout: 180_000 });
+    await page.waitForSelector('button[title="Session actions"]', { timeout: 60_000 });
   } catch (error) {
-    console.error(JSON.stringify({ url: page.url(), body: (await page.locator('body').innerText().catch(() => '')).slice(0, 4000) }));
+    console.error(JSON.stringify({ url: page.url(), body: (await page.locator('body').innerText().catch(() => '')).slice(0, 5000) }));
     throw error;
   }
 
@@ -74,12 +79,41 @@ async function runPoolRoleScenario() {
       executor: configs.find((entry) => entry.role === 'executor')?.model,
       auditor: configs.find((entry) => entry.role === 'auditor')?.model,
     };
-  }, { serverId: SERVER_ID, session: SESSION, csrf: CSRF_TOKEN });
+  }, { serverId: SERVER_ID, session: POOL_SESSION, csrf: CSRF_TOKEN });
 
   assert.equal(result.executor, 'gpt-6-luna');
   assert.equal(result.auditor, 'opus[1M]');
   assert.equal(result.reloaded.find((entry) => entry.model === 'gpt-6-luna')?.role, 'executor');
   assert.equal(result.reloaded.find((entry) => entry.model === 'opus[1M]')?.role, 'auditor');
+
+  // Exercise the real settings surface, not just the route.  The role selects
+  // are rendered from this same persisted snapshot, and Save goes through the
+  // production SessionSettingsDialog callback/API path.
+  await page.locator('button[title="Session actions"]').click();
+  const menu = page.locator('.session-actions-menu');
+  console.log(`session actions menu: ${await menu.innerText().catch(() => '')}`);
+  const supervisionMenu = menu.locator('button').filter({ hasText: /Supervision settings|Peer audit|supervision/i }).last();
+  await supervisionMenu.click();
+  const roleSelects = page.locator('select[data-testid^="supervision-execution-pool-role-"]');
+  await roleSelects.first().waitFor({ state: 'visible', timeout: 30_000 });
+  console.log(`role selects: ${JSON.stringify(await roleSelects.evaluateAll((items) => items.map((item) => ({ aria: item.getAttribute('aria-label'), value: item.value }))))}`);
+  const lunaRole = page.locator('select[aria-label*="gpt-6-luna"]');
+  const auditorRole = page.locator('select[aria-label*="opus"]');
+  await lunaRole.selectOption('auditor');
+  await auditorRole.selectOption('executor');
+  await lunaRole.selectOption('executor');
+  await auditorRole.selectOption('auditor');
+  const saveButton = page.getByRole('button', { name: 'Save', exact: true });
+  await saveButton.click();
+  await page.locator('.session-settings-dialog').waitFor({ state: 'hidden', timeout: 30_000 });
+
+  await page.reload({ waitUntil: 'domcontentloaded' });
+  await page.waitForSelector('button[title="Session actions"]', { timeout: 60_000 });
+  await page.locator('button[title="Session actions"]').click();
+  await page.locator('.session-actions-menu button').filter({ hasText: /Supervision settings|Peer audit|supervision/i }).last().click();
+  await page.locator('select[data-testid^="supervision-execution-pool-role-"]').first().waitFor({ state: 'visible', timeout: 30_000 });
+  assert.equal(await page.locator('select[aria-label*="gpt-6-luna"]').inputValue(), 'executor');
+  assert.equal(await page.locator('select[aria-label*="opus"]').inputValue(), 'auditor');
   await page.screenshot({ path: SCREENSHOT, fullPage: true });
   await browser.close();
   return { rolePersistence: true, executor: result.executor, auditor: result.auditor, screenshot: SCREENSHOT };
