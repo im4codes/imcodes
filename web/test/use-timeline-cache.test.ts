@@ -2759,7 +2759,14 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('complete cached output');
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 9);
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+        sessionName,
+        200,
+        undefined,
+        undefined,
+        { epoch: 1, afterSeq: 10, direction: 'newer' },
+        1024 * 1024,
+      );
     });
 
     await act(async () => {
@@ -3128,7 +3135,14 @@ describe('useTimeline window-isolated cache bounds', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('live cached text');
     });
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 0);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName,
+      200,
+      undefined,
+      undefined,
+      { epoch: 7, afterSeq: 1, direction: 'newer' },
+      1024 * 1024,
+    );
 
     await act(async () => {
       handler?.({
@@ -3732,7 +3746,14 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     // Initial mount already has cached cursor state, so it asks only for the
     // missed tail instead of re-downloading a full recent-history snapshot.
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 4999);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName,
+      200,
+      undefined,
+      undefined,
+      { epoch: 1, afterSeq: 2, direction: 'newer' },
+      1024 * 1024,
+    );
     sendTimelineHistoryRequest.mockClear();
 
     // Simulate browser WS reconnect. useTimeline should now gap-fill using
@@ -3743,7 +3764,14 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     expect(ws.sendTimelineReplayRequest).toHaveBeenCalledWith(sessionName, 2, 1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 4999);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName,
+      200,
+      undefined,
+      undefined,
+      { epoch: 1, afterSeq: 2, direction: 'newer' },
+      1024 * 1024,
+    );
   });
   it('reports the cache step as empty, not done, when this device has no copy', async () => {
     // A bare "done" rendered a ✓ next to a blank chat, which reads as "your

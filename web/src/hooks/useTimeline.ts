@@ -2274,7 +2274,30 @@ export function useTimeline(
   const buildForwardHistoryArgs = useCallback((
     limit?: number,
     sourceEvents: TimelineEvent[] = eventsRef.current,
-  ): { limit?: number; afterTs?: number } | undefined => {
+  ): { limit?: number; afterTs?: number; cursor?: TimelineCursor } | undefined => {
+    // A local event cache already has the authoritative ordered cursor. Prefer
+    // an epoch/afterSeq delta so startup/reveal never downloads another full
+    // tail merely because timestamps overlap or many events share one ts.
+    // Epoch changes are handled by the server as a bounded history request.
+    let cachedEpoch = -1;
+    let cachedSeq = -1;
+    for (const event of sourceEvents) {
+      if (!Number.isFinite(event.epoch) || !Number.isFinite(event.seq)) continue;
+      if (event.epoch > cachedEpoch || (event.epoch === cachedEpoch && event.seq > cachedSeq)) {
+        cachedEpoch = event.epoch;
+        cachedSeq = event.seq;
+      }
+    }
+    if (cachedEpoch >= 0 && cachedSeq >= 0 && sourceEvents.length > 0) {
+      return {
+        limit: limit ?? MAX_FORWARD_PAGE_EVENTS,
+        cursor: {
+          epoch: cachedEpoch,
+          afterSeq: cachedSeq,
+          direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+        },
+      };
+    }
     const afterTs = getTimelineHistoryAfterTs(sourceEvents);
     if (afterTs !== undefined) {
       return { limit: limit ?? MAX_FORWARD_PAGE_EVENTS, afterTs };
@@ -4871,8 +4894,10 @@ export function useTimeline(
           } else {
             replayRequestIdRef.current = null;
           }
-          const afterTs = getTimelineHistoryAfterTs(current);
-          sendForwardHistoryRequest('refresh', { limit: MAX_MEMORY_EVENTS, afterTs });
+          // Reuse the cached epoch/seq cursor for the durable leg too. The
+          // replay request covers in-memory streaming deltas; history should
+          // fetch only the contiguous durable tail after that same cursor.
+          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS, current));
 
           // Fire HTTP backfill with a ~600ms delay to let the bridge's async
           // `terminal.subscribe` ownership-check race resolve; any live
