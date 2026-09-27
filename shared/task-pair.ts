@@ -136,7 +136,9 @@ export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
   + 'ownership overlap, an unreachable target, or an environment/infra '
   + 'problem that the pair genuinely cannot resolve; include the options and '
   + 'a recommendation. At the end report DONE (or a PASS ready to '
-  + 'integrate), or a BLOCKED/NEEDS_INPUT the pair cannot resolve.';
+  + 'integrate), or a BLOCKED/NEEDS_INPUT the pair cannot resolve. The only '
+  + 'other Brain contact is an auditor\'s conditional non-convergence report '
+  + 'at REWORK rounds 2, 4, 6… when the pair is not clearly converging.';
 
 /**
  * Stated in the pairs contract and the executor/auditor briefs (owner
@@ -174,7 +176,9 @@ export const TASK_PAIR_VALIDATION_REPORT_RULE: string =
 
 export const TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE: string =
   'Do not send Brain status updates, intermediate heads, or test-run requests; '
-  + 'Brain hears only final PASS/DONE or a genuine undecidable escalation.';
+  + 'Brain hears only final PASS/DONE, a genuinely undecidable escalation, or '
+  + 'the auditor\'s conditional non-convergence report at REWORK rounds 2, '
+  + '4, 6… when the pair is not clearly converging.';
 
 export const TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE: string =
   'At REWORK rounds 2, 4, 6… assess convergence. If the pair is not clearly '

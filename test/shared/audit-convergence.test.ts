@@ -147,6 +147,8 @@ describe('audit convergence contract', () => {
     expect(contract.roles.orchestrator).toMatch(/never paste/);
     expect(contract.roles.auditor).toMatch(/concrete solution/);
     expect(contract.roles.auditor).toMatch(/escalate only genuinely undecidable/);
+    expect(contract.roles.auditor).toMatch(/REWORK rounds 2, 4, 6/);
+    expect(contract.roles.auditor).toMatch(/non-convergence report/);
     expect(contract.rework.proposal).toMatch(/executor may adopt or argue/);
   });
 

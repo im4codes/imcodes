@@ -143,7 +143,7 @@ export function buildAuditConvergenceContract(): string {
     commentOrDocOnly: 'binding check only, no re-audit',
     roles: {
       orchestrator: 'forward only the contractRef and its params in every audit, re-audit and rework brief; never paste this body',
-      auditor: 'report every finding in one pass and propose a concrete solution for every blocking finding (approach, likely files/functions, trade-offs, optionally a test); give appropriate proposals for non-blocking findings, co-own convergence, and escalate only genuinely undecidable scope/approach/ownership/environment questions to Brain with options and a recommendation; PASS only when no blocking finding remains',
+      auditor: 'report every finding in one pass and propose a concrete solution for every blocking finding (approach, likely files/functions, trade-offs, optionally a test); give appropriate proposals for non-blocking findings, co-own convergence, and escalate only genuinely undecidable scope/approach/ownership/environment questions to Brain with options and a recommendation. At REWORK rounds 2, 4, 6… assess convergence; if the pair is not clearly converging, the auditor may send Brain one concise checkpoint report with the problem, attempts, options, and recommendation; otherwise keep resolving inside the pair. PASS only when no blocking finding remains',
       implementer: 'fix every blocking finding for its whole class before requesting re-audit',
     },
   });

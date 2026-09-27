@@ -165,6 +165,7 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain(TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE);
     expect(body).toContain('Routine progress, REWORK rounds');
     expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
+    expect(body).toContain('conditional non-convergence report');
   });
 
   it('ships a contract stating auditor=none is a real choice with its own self-validation/report rules, not a lesser one', () => {
