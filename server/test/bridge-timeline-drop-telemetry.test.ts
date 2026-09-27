@@ -400,7 +400,7 @@ describe('WsBridge timeline drop telemetry', () => {
         },
       },
     }));
-    await flushAsync();
+    await new Promise<void>((resolve) => setTimeout(resolve, 300));
     const event = summary.sentStrings.map((raw) => JSON.parse(raw))
       .find((msg) => msg.type === TIMELINE_MESSAGES.EVENT)?.event;
     expect(event?.payload).toEqual({ status: 'working', model: 'codex', progress: 0.5 });
