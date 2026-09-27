@@ -192,7 +192,7 @@ describe('memory MCP shared contracts', () => {
     expect(sendMessage.description).toContain('append by default');
     expect(sendMessage.description).toContain('durable FIFO fallback');
     expect(sendMessage.description).toContain('queue is opt-in FIFO only');
-    expect(sendMessage.description).toContain('delivered/queued/failed status');
+    expect(sendMessage.description).toContain('Returns status');
     expect(delegationReply.description).toContain('append-only');
     expect(delegationReply.inputSchema.properties).not.toHaveProperty('replyCapability');
     const peerAuditReply = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PEER_AUDIT_REPLY];

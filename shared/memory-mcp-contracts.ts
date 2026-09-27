@@ -778,7 +778,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default (busy turns use the provider append boundary, idle turns start immediately) with durable FIFO fallback only when append is unavailable. queue is opt-in FIFO only. Returns delivered/queued/failed status.',
+    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default; busy turns use provider append with durable FIFO fallback, idle turns start immediately. queue is opt-in FIFO only. Returns status.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from an explicit execution identity or configured pool.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
