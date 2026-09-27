@@ -4621,7 +4621,9 @@ export class WsBridge {
     pending: PendingTimelineRequest,
   ): Record<string, unknown> {
     if (pending.mode !== TIMELINE_SUBSCRIPTION_MODES.SUMMARY) return response;
-    if (response.type !== TIMELINE_MESSAGES.HISTORY && response.type !== TIMELINE_MESSAGES.PAGE) return response;
+    if (response.type !== TIMELINE_MESSAGES.HISTORY
+      && response.type !== TIMELINE_MESSAGES.PAGE
+      && response.type !== TIMELINE_MESSAGES.REPLAY) return response;
     if (!Array.isArray(response.events)) return response;
     const events = response.events
       .filter((event): event is Record<string, unknown> => isPlainRecord(event) && this.isTimelineSummaryEvent(event))

@@ -385,6 +385,42 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(bridge.timelineQueueStatsForTests(summary as never)).toEqual({ bytes: 0, pending: 0, pendingGaps: 0 });
   });
 
+  it('projects replay backfill for a summary request without leaking streaming text', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: SESSION,
+      requestId: 'summary-replay-1',
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName: SESSION,
+      requestId: 'summary-replay-1',
+      epoch: 1,
+      events: [
+        { eventId: 'replay-stream', sessionId: SESSION, seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'partial', streaming: true } },
+        { eventId: 'replay-final', sessionId: SESSION, seq: 2, epoch: 1, type: 'assistant.text', payload: { text: 'complete', streaming: false } },
+      ],
+    }));
+    await flushAsync();
+    const response = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .find((msg) => msg.type === TIMELINE_MESSAGES.REPLAY && msg.requestId === 'summary-replay-1');
+    expect(response?.events).toHaveLength(1);
+    expect(response?.events[0]?.eventId).toBe('replay-final');
+    expect(JSON.stringify(response)).not.toContain('partial');
+  });
+
   it('keeps a healthy summary socket gap-free under realistic status/tool load', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const summary = new AsyncHealthyWs();
