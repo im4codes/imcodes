@@ -235,6 +235,11 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
   if (latest.size === 0) return null;
   const toggle = () => persistCollapsed(!collapsed);
+  const toggleWithKeyboard = (event: KeyboardEvent) => {
+    if (event.key !== 'Enter' && event.key !== ' ') return;
+    event.preventDefault();
+    toggle();
+  };
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
   const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session
@@ -252,22 +257,26 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
     second: t('taskPair.panel_duration_second'),
     separator: t('taskPair.panel_duration_separator'),
   };
+  const toggleLabel = `${t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} — ${t('taskPair.panel_title')}`;
+  const toggleContent = collapsed ? <span class="task-pair-status-icons" role="group" aria-label={t('taskPair.panel_title')}>
+    <span class={`task-pair-status-icon task-pair-status-icon--working${counts.working === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_working')} aria-label={t('taskPair.panel_icon_working')}><span aria-hidden="true">▶</span><b>{counts.working}</b></span>
+    <span class={`task-pair-status-icon task-pair-status-icon--audit${counts.audit === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_audit')} aria-label={t('taskPair.panel_icon_audit')}><span aria-hidden="true">◉</span><b>{counts.audit}</b></span>
+    <span class={`task-pair-status-icon task-pair-status-icon--queued${counts.queued === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_queued')} aria-label={t('taskPair.panel_icon_queued')}><span aria-hidden="true">⏳</span><b>{counts.queued}</b></span>
+    <span class={`task-pair-status-icon task-pair-status-icon--awaiting${counts.awaitingBrain === 0 ? ' is-zero' : ' is-highlighted'}`} title={t('taskPair.panel_icon_awaiting_brain')} aria-label={t('taskPair.panel_icon_awaiting_brain')}><span aria-hidden="true">🧠</span><b>{counts.awaitingBrain}</b></span>
+    <span class="task-pair-status-collapse-icon" aria-hidden="true">⌄</span>
+  </span> : <><strong>{t('taskPair.panel_title')}</strong>
+    <span class="task-pair-status-summary">
+      <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--working">{t('taskPair.panel_count_working', { count: counts.working })}</span>
+      <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--in_audit">{t('taskPair.panel_count_audit', { count: counts.audit })}</span>
+      <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
+      <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
+    </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
   return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
-    <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={`${t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} — ${t('taskPair.panel_title')}`} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
-      {collapsed ? <span class="task-pair-status-icons" role="group" aria-label={t('taskPair.panel_title')}>
-        <span class={`task-pair-status-icon task-pair-status-icon--working${counts.working === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_working')} aria-label={t('taskPair.panel_icon_working')}><span aria-hidden="true">▶</span><b>{counts.working}</b></span>
-        <span class={`task-pair-status-icon task-pair-status-icon--audit${counts.audit === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_audit')} aria-label={t('taskPair.panel_icon_audit')}><span aria-hidden="true">◉</span><b>{counts.audit}</b></span>
-        <span class={`task-pair-status-icon task-pair-status-icon--queued${counts.queued === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_queued')} aria-label={t('taskPair.panel_icon_queued')}><span aria-hidden="true">⏳</span><b>{counts.queued}</b></span>
-        <span class={`task-pair-status-icon task-pair-status-icon--awaiting${counts.awaitingBrain === 0 ? ' is-zero' : ' is-highlighted'}`} title={t('taskPair.panel_icon_awaiting_brain')} aria-label={t('taskPair.panel_icon_awaiting_brain')}><span aria-hidden="true">🧠</span><b>{counts.awaitingBrain}</b></span>
-        <span class="task-pair-status-collapse-icon" aria-hidden="true">⌄</span>
-      </span> : <><strong>{t('taskPair.panel_title')}</strong>
-        <span class="task-pair-status-summary">
-          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--working">{t('taskPair.panel_count_working', { count: counts.working })}</span>
-          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--in_audit">{t('taskPair.panel_count_audit', { count: counts.audit })}</span>
-          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
-          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
-        </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>}
-    </button>
+    {isMobile && collapsed ? <div class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard}>
+      {toggleContent}
+    </div> : <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
+      {toggleContent}
+    </button>}
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
         const heading = <h4>{t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;

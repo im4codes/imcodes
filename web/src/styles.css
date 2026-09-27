@@ -14551,6 +14551,15 @@ button.quick-agent-delegation-preset.active {
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; max-height: 42vh; }
   .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; max-height: none; }
+  /* The compact strip is the mobile disclosure control itself. Keep the
+     whole icon/count row comfortably tappable without reserving space for a
+     second expand button. */
+  .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact {
+    min-width: 44px; min-height: 44px; padding: 4px 6px; align-items: center;
+  }
+  .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact .task-pair-status-icons {
+    min-height: 36px; align-items: center;
+  }
   .chat-titlebar > .task-pair-status-panel:not(.is-collapsed) {
     position: absolute; inset: calc(100% + 4px) 8px auto; width: auto; max-width: none;
     max-height: min(65vh, calc(100dvh - 160px)); z-index: 20; overflow: hidden;

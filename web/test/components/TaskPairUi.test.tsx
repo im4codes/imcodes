@@ -140,6 +140,32 @@ describe('TaskPairStatusPanel', () => {
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
   });
 
+  it('uses the mobile compact strip as the only expand control and keeps collapse visible when expanded', () => {
+    const events = [{ eventId: 'mobile-compact', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-compact', title: 'Mobile task', toStatus: 'working' } }] as never;
+    const original = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="mobile-compact" />);
+    const compact = container.querySelector('.task-pair-status-compact') as HTMLElement | null;
+    expect(compact?.tagName).toBe('DIV');
+    expect(container.querySelector('button.task-pair-status-toggle')).toBeNull();
+    expect(compact?.getAttribute('role')).toBe('button');
+    expect(compact?.getAttribute('aria-label')).toContain('taskPair.panel_expand');
+
+    fireEvent.click(compact!);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    expect(screen.getByRole('button', { name: /taskPair\.panel_collapse/ })).toBeTruthy();
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+
+    const compactAgain = container.querySelector('.task-pair-status-compact') as HTMLElement;
+    fireEvent.keyDown(compactAgain, { key: 'Enter' });
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
+    fireEvent.keyDown(container.querySelector('.task-pair-status-compact') as HTMLElement, { key: ' ' });
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
   it('uses a stored layout preference and labels the visible collapse control', () => {
     const events = [{ eventId: 'layout-stored', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-stored', title: 'Stored', toStatus: 'working' } }] as never;
     window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:stored:desktop', '1');
