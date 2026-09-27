@@ -154,6 +154,11 @@ describe('TaskPairStatusPanel', () => {
     await waitFor(() => expect(screen.getByTestId('task-pair-status-panel-authority-error')).toBeTruthy());
     expect(screen.queryByText('Partial')).toBeNull();
   });
+  it('shows the unsupported-daemon hint even when the chat has no pair history', async () => {
+    render(<TaskPairStatusPanelHost events={[]} serverId="unsupported-empty" />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true, error: 'projection_unavailable' } }));
+    expect(await waitFor(() => screen.getByTestId('task-pair-status-panel-authority-error'))).toBeTruthy();
+  });
   it('maps authoritative decision flags while preserving pair timestamps', () => {
     const snapshot = taskConsoleStateToPairSnapshot({
       tasks: {

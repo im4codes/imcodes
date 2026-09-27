@@ -172,6 +172,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
       const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean; op?: string; task?: Record<string, unknown>; removedId?: string } | undefined;
       if (!detail) return;
       if (detail.scopeReset) {
+        (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
         setSnapshotRows(null);
         return;
       }
@@ -313,12 +314,20 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
     const onSnapshot = (event: Event) => {
       const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined;
       if (detail?.scopeReset) {
-        setAuthorityUnavailable(false);
+        setActive(true);
+        setAuthorityUnavailable(true);
         return;
       }
-      if ((Array.isArray(detail?.tasks) && detail.tasks.length > 0) || detail?.op === 'task_upsert' || detail?.task) setActive(true);
-      if (detail && 'authorityUnavailable' in detail) setAuthorityUnavailable(Boolean(detail.authorityUnavailable));
-      else if (detail && Array.isArray(detail.tasks)) setAuthorityUnavailable(false);
+      if ((Array.isArray(detail?.tasks) && detail.tasks.length > 0) || detail?.op === 'task_upsert' || detail?.task) {
+        if (Array.isArray(detail?.tasks)) (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
+        setActive(true);
+      }
+      if (detail && 'authorityUnavailable' in detail) {
+        setAuthorityUnavailable(Boolean(detail.authorityUnavailable));
+        setActive(true);
+      } else if (detail && Array.isArray(detail.tasks)) {
+        setAuthorityUnavailable(false);
+      }
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
