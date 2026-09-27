@@ -4407,6 +4407,8 @@
     "panel_model_separator": " · ",
     "checklist_progress": "Реализовано {{implemented}}/{{total}} · Проверено {{audited}}/{{total}}",
     "implemented": "Реализовано",
-    "audited": "Проверено"
+    "audited": "Проверено",
+    "panel_collapse": "Свернуть состояние задач",
+    "panel_expand": "Развернуть состояние задач"
   }
 }

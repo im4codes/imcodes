@@ -4408,6 +4408,8 @@
     "panel_model_separator": " · ",
     "checklist_progress": "實作 {{implemented}}/{{total}} · 審計 {{audited}}/{{total}}",
     "implemented": "實作",
-    "audited": "審計"
+    "audited": "審計",
+    "panel_collapse": "收起任務狀態",
+    "panel_expand": "展開任務狀態"
   }
 }

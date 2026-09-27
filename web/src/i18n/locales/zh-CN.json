@@ -4408,6 +4408,8 @@
     "panel_model_separator": " · ",
     "checklist_progress": "实现 {{implemented}}/{{total}} · 审计 {{audited}}/{{total}}",
     "implemented": "实现",
-    "audited": "审计"
+    "audited": "审计",
+    "panel_collapse": "收起任务状态",
+    "panel_expand": "展开任务状态"
   }
 }

@@ -4408,6 +4408,8 @@
     "panel_model_separator": " · ",
     "checklist_progress": "Implementado {{implemented}}/{{total}} · Auditado {{audited}}/{{total}}",
     "implemented": "Implementado",
-    "audited": "Auditado"
+    "audited": "Auditado",
+    "panel_collapse": "Contraer estado de tareas",
+    "panel_expand": "Expandir estado de tareas"
   }
 }

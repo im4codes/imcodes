@@ -14510,6 +14510,25 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-panel.is-collapsed .task-pair-status-toggle {
   width: auto; padding: 1px 2px; justify-content: flex-start; align-items: center; gap: 0;
 }
+.chat-titlebar { position: relative; }
+.chat-titlebar > .task-pair-status-panel {
+  top: calc(100% + 4px); right: 8px; bottom: auto; max-height: min(65vh, calc(100dvh - 160px));
+  width: min(var(--task-pair-panel-width), calc(100% - 16px));
+}
+.chat-titlebar > .task-pair-status-panel.is-collapsed {
+  position: absolute; right: 8px; top: calc(100% + 4px); z-index: 13;
+  display: inline-flex; width: auto; max-width: calc(100% - 16px);
+  margin: 0; border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
+  border-radius: 8px; background: color-mix(in srgb, var(--chrome-panel, #0f172a) 88%, transparent);
+  box-shadow: 0 3px 12px color-mix(in srgb, #000 25%, transparent);
+}
+.task-pair-status-toggle { cursor: pointer; }
+.task-pair-status-toggle:hover, .task-pair-status-toggle:focus-visible {
+  background: color-mix(in srgb, var(--chrome-accent, #38bdf8) 12%, transparent);
+  outline: 2px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 55%, transparent);
+  outline-offset: -2px;
+}
+.task-pair-status-collapse-icon { display: inline-flex; align-items: center; justify-content: center; min-width: 24px; height: 22px; border: 1px solid currentColor; border-radius: 5px; font-size: 16px; line-height: 1; opacity: .8; }
 .task-pair-status-icons { display: inline-flex; align-items: center; gap: 3px; }
 .task-pair-status-icon {
   display: inline-flex; min-width: 27px; height: 22px; align-items: center; justify-content: center; gap: 2px;
@@ -14530,6 +14549,13 @@ button.quick-agent-delegation-preset.active {
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; max-height: 42vh; }
   .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; max-height: none; }
+  .chat-titlebar > .task-pair-status-panel:not(.is-collapsed) {
+    position: absolute; inset: calc(100% + 4px) 8px auto; width: auto; max-width: none;
+    max-height: min(65vh, calc(100dvh - 160px)); z-index: 20; overflow: hidden;
+    border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
+    box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
+  }
+  .chat-titlebar > .task-pair-status-panel.is-collapsed { position: static; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
   /* Compact single-line "last sent" banner on mobile (tap to expand). */

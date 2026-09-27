@@ -4407,6 +4407,8 @@
     "panel_model_separator": " · ",
     "checklist_progress": "구현 {{implemented}}/{{total}} · 감사 {{audited}}/{{total}}",
     "implemented": "구현",
-    "audited": "감사"
+    "audited": "감사",
+    "panel_collapse": "작업 상태 접기",
+    "panel_expand": "작업 상태 펼치기"
   }
 }

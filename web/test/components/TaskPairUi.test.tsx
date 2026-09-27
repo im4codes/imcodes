@@ -109,6 +109,27 @@ describe('TaskPairEventChip workspace events', () => {
 describe('TaskPairStatusPanel', () => {
   beforeEach(() => window.localStorage.clear());
   afterEach(() => cleanup());
+  it('defaults collapsed on mobile but expanded on desktop, with independent layout keys', () => {
+    const events = [{ eventId: 'layout-default', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-default', title: 'Layout default', toStatus: 'working' } }] as never;
+    const original = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: (query: string) => ({ matches: query.includes('max-width'), media: query, addEventListener: () => {}, removeEventListener: () => {} }) });
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="layout" />);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    cleanup();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    render(<TaskPairStatusPanel events={events} serverId="layout" />);
+    expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:layout:mobile')).toBeNull();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
+  it('uses a stored layout preference and labels the visible collapse control', () => {
+    const events = [{ eventId: 'layout-stored', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-stored', title: 'Stored', toStatus: 'working' } }] as never;
+    window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:stored:desktop', '1');
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="stored" />);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    expect(screen.getByRole('button', { name: /panel_expand.*panel_title/ })).toBeTruthy();
+  });
   it('renders four compact status icons when collapsed, highlights Brain decisions, and scopes persistence per server', () => {
     window.localStorage.clear();
     const events = [
@@ -281,6 +302,14 @@ describe('TaskPairStatusPanel', () => {
     const panelRule = cssRule(css, '.task-pair-status-panel');
     const topOffset = /top:\s*(\d+)px/.exec(panelRule)?.[1];
     expect(Number(topOffset)).toBeGreaterThanOrEqual(34);
+  });
+
+  it('anchors the desktop collapsed toolbar to the right rail and floats mobile expansion', () => {
+    const css = readCss();
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*position:\s*absolute/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*right:\s*8px/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)\s*\{[^}]*position:\s*absolute/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*min\(65vh/);
   });
 
   it('gives the panel an opaque background from tokens that are actually defined, so it never renders transparent over the toolbar or chat text', () => {

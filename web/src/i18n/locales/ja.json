@@ -4407,6 +4407,8 @@
     "panel_model_separator": " · ",
     "checklist_progress": "実装 {{implemented}}/{{total}} · 監査 {{audited}}/{{total}}",
     "implemented": "実装",
-    "audited": "監査"
+    "audited": "監査",
+    "panel_collapse": "タスク状態を折りたたむ",
+    "panel_expand": "タスク状態を展開"
   }
 }

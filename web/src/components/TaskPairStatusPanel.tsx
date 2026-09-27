@@ -1,15 +1,29 @@
-import { useEffect, useState } from 'preact/hooks';
+import { useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
-import { TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
 import { formatElapsedDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 
-const STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed';
 const MAX_ROWS = 6;
 
-function collapsedStorageKey(serverId?: string | null): string {
-  return serverId ? `${STORAGE_KEY}:${serverId}` : STORAGE_KEY;
+export function collapsedStorageKey(serverId: string | null | undefined, mobile: boolean): string {
+  const scope = serverId ? `:${serverId}` : '';
+  return `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}${scope}:${mobile ? 'mobile' : 'desktop'}`;
+}
+function legacyCollapsedStorageKey(serverId?: string | null): string {
+  return serverId ? `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}:${serverId}` : TASK_PAIR_STATUS_PANEL_STORAGE_KEY;
+}
+
+function mobileLayout(): boolean {
+  try { return window.matchMedia?.('(max-width: 720px)').matches ?? false; } catch { return false; }
+}
+
+function readCollapsed(serverId: string | null | undefined, mobile: boolean): boolean {
+  try {
+    const stored = window.localStorage.getItem(collapsedStorageKey(serverId, mobile)) ?? window.localStorage.getItem(legacyCollapsedStorageKey(serverId));
+    return stored === null ? mobile : stored === '1';
+  } catch { return mobile; }
 }
 
 function status(value: unknown): value is TaskPairStatus {
@@ -58,12 +72,28 @@ function resolveSessionModel(
 
 export function TaskPairStatusPanel({ events, sessions, serverId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null }) {
   const { t } = useTranslation();
-  const [collapsed, setCollapsed] = useState(() => {
-    try { return window.localStorage.getItem(collapsedStorageKey(serverId)) === '1'; } catch { return false; }
-  });
+  const [isMobile, setIsMobile] = useState(mobileLayout);
+  const [collapsed, setCollapsed] = useState(() => readCollapsed(serverId, mobileLayout()));
+  const panelRef = useRef<HTMLElement>(null);
   useEffect(() => {
-    try { setCollapsed(window.localStorage.getItem(collapsedStorageKey(serverId)) === '1'); } catch { setCollapsed(false); }
-  }, [serverId]);
+    const media = window.matchMedia?.('(max-width: 720px)');
+    if (!media) return undefined;
+    const onChange = () => { setIsMobile(media.matches); setCollapsed(readCollapsed(serverId, media.matches)); };
+    media.addEventListener?.('change', onChange);
+    window.addEventListener('resize', onChange);
+    return () => { media.removeEventListener?.('change', onChange); window.removeEventListener('resize', onChange); };
+  }, []);
+  useEffect(() => {
+    setCollapsed(readCollapsed(serverId, isMobile));
+  }, [serverId, isMobile]);
+  useEffect(() => {
+    if (collapsed) return undefined;
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setCollapsed(true); };
+    const onPointerDown = (event: PointerEvent) => { if (!panelRef.current?.contains(event.target as Node)) setCollapsed(true); };
+    window.addEventListener('keydown', onKeyDown);
+    window.addEventListener('pointerdown', onPointerDown);
+    return () => { window.removeEventListener('keydown', onKeyDown); window.removeEventListener('pointerdown', onPointerDown); };
+  }, [collapsed]);
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
@@ -118,7 +148,13 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
   if (latest.size === 0) return null;
-  const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(collapsedStorageKey(serverId), next ? '1' : '0'); } catch {} return next; });
+  const toggle = () => setCollapsed((value) => { const next = !value; try {
+    const encoded = next ? '1' : '0';
+    window.localStorage.setItem(collapsedStorageKey(serverId, isMobile), encoded);
+    // Keep the pre-layout key in sync for existing installations; reads prefer
+    // the layout-specific value, so desktop/mobile preferences remain isolated.
+    window.localStorage.setItem(legacyCollapsedStorageKey(serverId), encoded);
+  } catch {} return next; });
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
   const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session
@@ -136,20 +172,21 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
     second: t('taskPair.panel_duration_second'),
     separator: t('taskPair.panel_duration_separator'),
   };
-  return <aside class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}`} data-testid="task-pair-status-panel">
-    <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} onClick={toggle}>
+  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
+    <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={`${t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} — ${t('taskPair.panel_title')}`} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
       {collapsed ? <span class="task-pair-status-icons" role="group" aria-label={t('taskPair.panel_title')}>
         <span class={`task-pair-status-icon task-pair-status-icon--working${counts.working === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_working')} aria-label={t('taskPair.panel_icon_working')}><span aria-hidden="true">▶</span><b>{counts.working}</b></span>
         <span class={`task-pair-status-icon task-pair-status-icon--audit${counts.audit === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_audit')} aria-label={t('taskPair.panel_icon_audit')}><span aria-hidden="true">◉</span><b>{counts.audit}</b></span>
         <span class={`task-pair-status-icon task-pair-status-icon--queued${counts.queued === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_queued')} aria-label={t('taskPair.panel_icon_queued')}><span aria-hidden="true">⏳</span><b>{counts.queued}</b></span>
         <span class={`task-pair-status-icon task-pair-status-icon--awaiting${counts.awaitingBrain === 0 ? ' is-zero' : ' is-highlighted'}`} title={t('taskPair.panel_icon_awaiting_brain')} aria-label={t('taskPair.panel_icon_awaiting_brain')}><span aria-hidden="true">🧠</span><b>{counts.awaitingBrain}</b></span>
+        <span class="task-pair-status-collapse-icon" aria-hidden="true">⌄</span>
       </span> : <><strong>{t('taskPair.panel_title')}</strong>
         <span class="task-pair-status-summary">
           <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--working">{t('taskPair.panel_count_working', { count: counts.working })}</span>
           <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--in_audit">{t('taskPair.panel_count_audit', { count: counts.audit })}</span>
           <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
           <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
-        </span></>}
+        </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>}
     </button>
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
