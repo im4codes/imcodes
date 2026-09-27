@@ -657,12 +657,31 @@ describe('installMcpStdioLifecycle', () => {
       // test fire immediately; only a CHANGE proves the parent is gone.
       getParentPid: () => 1,
       initialParentPid: 1,
+      allowInitParent: true,
       setIntervalFn: (handler) => { tick = handler; return {}; },
     });
     tick?.();
     tick?.();
     await new Promise((r) => { const t = setTimeout(r, 0); t.unref?.(); });
     expect(shutdowns).toBe(0);
+  });
+
+  it('rejects a direct launch that was already reparented to init', async () => {
+    const stdin = fakeStdin();
+    let exits = 0;
+    const reasons: McpStdioShutdownReason[] = [];
+    installMcpStdioLifecycle({
+      stdin,
+      shutdown: async () => {},
+      exit: () => { exits += 1; },
+      getParentPid: () => 1,
+      initialParentPid: 1,
+      setIntervalFn: () => ({}),
+      onShutdown: (reason) => reasons.push(reason),
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(reasons).toEqual([MCP_STDIO_SHUTDOWN_REASON.PARENT_EXITED]);
+    expect(exits).toBe(1);
   });
 
   it('unrefs its poll so the guard never keeps the process alive', () => {

@@ -21,10 +21,10 @@
  * current handle set — one future `setInterval` without `unref` would silently
  * restore the leak.
  *
- * Liveness is decided by comparing against the parent observed AT STARTUP, not
- * against a constant such as PID 1. A launcher that legitimately runs as init
- * would make a `ppid === 1` test fire immediately, trading a leak for an
- * outage; only a CHANGE proves the original parent is gone.
+ * Liveness is decided by comparing against the parent observed AT STARTUP.
+ * A direct stdio launch that starts with PPID 0/1 is treated as already
+ * orphaned by default; callers with a legitimate init parent can opt in via
+ * `allowInitParent`.
  */
 
 import { MCP_BOOTSTRAP_EXIT_REASON } from './mcp-lifecycle-log.js';
@@ -99,9 +99,17 @@ export interface McpStdioLifecycleOptions {
    * Checked once at install: a mismatch proves this process was already
    * reparented before it ever looked, which PPID alone cannot show. Absent,
    * the snapshot above is the only authority -- deliberately, because exiting
-   * on a bare `ppid === 1` would kill a server whose launcher really is init.
+   * on a bare `ppid === 1` is safe for stdio MCP by default; a legitimate init
+   * launcher must explicitly opt in with `allowInitParent`.
    */
   expectedParentPid?: number;
+  /**
+   * Permit a process intentionally launched by init/systemd. Stdio MCP
+   * servers normally belong to an agent CLI, so production leaves this false
+   * and treats an initial PPID of 0/1 without a declaration as an already
+   * orphaned launch.
+   */
+  allowInitParent?: boolean;
   /** Called once the guard is armed, so a caller can report it. */
   onArmed?: (parentPid: number) => void;
   /**
@@ -109,8 +117,8 @@ export interface McpStdioLifecycleOptions {
    * before teardown starts, so the reason survives even if teardown hangs.
    */
   onShutdown?: (reason: McpStdioShutdownReason, detail: { parentPid: number }) => void;
-  /** Bounded poll period. Defaults to 30s: a leaked process wastes a machine
-   *  for days, so detection latency is irrelevant next to the cost of polling. */
+  /** Bounded poll period. Defaults to 1s so a parent loss is repaired within
+   *  the user-visible few-second orphan bound without a busy loop. */
   parentPollMs?: number;
   /** Maximum time teardown may hold the process after a terminal trigger. */
   shutdownGraceMs?: number;
@@ -118,7 +126,7 @@ export interface McpStdioLifecycleOptions {
   clearIntervalFn?: (handle: unknown) => void;
 }
 
-export const DEFAULT_MCP_PARENT_POLL_MS = 30_000;
+export const DEFAULT_MCP_PARENT_POLL_MS = 1_000;
 export const DEFAULT_MCP_SHUTDOWN_GRACE_MS = 5_000;
 
 /**
@@ -200,6 +208,16 @@ export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () 
   if (options.expectedParentPid !== undefined
     && options.getParentPid() !== options.expectedParentPid) {
     trigger(MCP_STDIO_SHUTDOWN_REASON.DECLARED_PARENT_MISMATCH);
+  } else if (
+    options.expectedParentPid === undefined
+    && options.allowInitParent !== true
+    && options.initialParentPid <= 1
+  ) {
+    // A direct launch can be reparented before the first JS instruction. In
+    // that case PPID never changes and polling alone cannot distinguish it
+    // from a live child of init; stdio MCP has no useful service mode, so fail
+    // closed rather than leave a process that can spin forever.
+    trigger(MCP_STDIO_SHUTDOWN_REASON.PARENT_EXITED);
   }
 
   return stop;
