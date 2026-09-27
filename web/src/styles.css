@@ -6880,6 +6880,7 @@ html.native-ios-mac .chat-dl-btn {
 .subcard-stop-btn { flex: 0 0 auto; width: 28px; min-width: 28px; margin-left: 0; border-radius: 6px; border: 1px solid rgba(239,68,68,0.55); background: rgba(127,29,29,0.32); color: #f87171; cursor: pointer; font-size: 11px; line-height: 1; display: inline-flex; align-items: center; justify-content: center; padding: 0; transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease; }
 .subcard-stop-btn:hover:not(:disabled) { background: rgba(127,29,29,0.48); border-color: rgba(248,113,113,0.8); color: #fca5a5; }
 .subsession-controls-deferred { flex: 0 0 42px; min-height: 42px; border-top: 1px solid rgba(125,211,252,0.12); background: linear-gradient(180deg, #0a101b, #080d16); border-radius: 0 0 8px 8px; pointer-events: none; }
+.subsession-preview-shell { flex: 1; min-height: 0; overflow: hidden; padding: 12px 14px; color: #cbd5e1; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.45; background: #080d16; }
 .subcard-stop-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 .subcard-input-area .menu-dropdown { z-index: 10000; right: auto; left: 0; max-width: calc(100vw - 24px); }
 .subcard-input-area .qp { z-index: 10002; }
