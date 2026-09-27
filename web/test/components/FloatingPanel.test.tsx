@@ -108,6 +108,9 @@ describe('FloatingPanel', () => {
       expect(handle.className).toContain('resize-hover-surface');
       expect(handle.className).toContain(`resize-${dir}`);
     }
+    const layer = screen.getByTestId('floating-panel-handle-classes').querySelector('.resize-handle-layer');
+    expect(layer).not.toBeNull();
+    expect(layer?.parentElement).toBe(screen.getByTestId('floating-panel-handle-classes'));
   });
 
   it('mirrors target-phase mouse hover into an explicit cross-engine class for every direction', () => {

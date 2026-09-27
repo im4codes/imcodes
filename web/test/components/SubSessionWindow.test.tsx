@@ -338,6 +338,9 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(handle?.className).toContain('resize-handle');
       expect(handle?.className).toContain('resize-hover-surface');
     }
+    const layer = container.querySelector('.resize-handle-layer') as HTMLElement | null;
+    expect(layer).not.toBeNull();
+    expect(layer?.parentElement?.lastElementChild).toBe(layer);
 
     const southEast = container.querySelector('.resize-se') as HTMLElement;
     fireEvent.mouseEnter(southEast);

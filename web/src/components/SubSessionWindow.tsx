@@ -953,11 +953,6 @@ export function SubSessionWindow({
       onMouseDown={onFocus}
     >
       {activeIdleFlashToken ? <IdleFlashLayer key={`subwindow-idle-${activeIdleFlashToken}`} variant="frame" /> : null}
-      {/* 8-direction resize handles (desktop only) */}
-      {!isMobile && !isDesktopMaximized && RESIZE_DIRS.map((dir) => (
-        <div key={dir} class={resizeHandleClass(dir, resizingDir)} {...resizeHandleHoverEvents} onMouseDown={onResizeMouseDown(dir)} />
-      ))}
-
       {/* Header */}
       <div
         class="subsession-header"
@@ -1183,6 +1178,19 @@ export function SubSessionWindow({
         onComposerTextChange={setComposerText}
       /> : visible ? <div class="subsession-controls-deferred" aria-hidden="true" /> : null}
       </div>
+
+      {/* Keep resize hit surfaces in a final sibling layer.  The composer,
+          usage footer, task panel, and SDK panels may each create their own
+          stacking context; placing handles after the content and giving them
+          the shared raised z-index prevents any of those descendants from
+          stealing the bottom edge/corner hit test. */}
+      {!isMobile && !isDesktopMaximized && (
+        <div class="resize-handle-layer" aria-hidden="true">
+          {RESIZE_DIRS.map((dir) => (
+            <div key={dir} class={resizeHandleClass(dir, resizingDir)} {...resizeHandleHoverEvents} onMouseDown={onResizeMouseDown(dir)} />
+          ))}
+        </div>
+      )}
 
       {/* Per-sub-session file browser. Mobile: full-screen overlay.
           Desktop: floating panel layered via the shared desktop window stack

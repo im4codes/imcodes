@@ -393,15 +393,17 @@ export function FloatingPanel({
       {/* Resize handles */}
       {!isDesktopMaximized && (
         <>
-          {RESIZE_DIRS.map((dir) => (
-            <div
-              key={dir}
-              data-testid={`floating-resize-${dir}`}
-              className={resizeHandleClass(dir, resizingDir)}
-              {...resizeHandleHoverEvents}
-              onMouseDown={onResizeMouseDown(dir)}
-            />
-          ))}
+          <div className="resize-handle-layer" aria-hidden="true">
+            {RESIZE_DIRS.map((dir) => (
+              <div
+                key={dir}
+                data-testid={`floating-resize-${dir}`}
+                className={resizeHandleClass(dir, resizingDir)}
+                {...resizeHandleHoverEvents}
+                onMouseDown={onResizeMouseDown(dir)}
+              />
+            ))}
+          </div>
           <div
             data-testid="floating-bottom-drag"
             onMouseDown={startDrag}

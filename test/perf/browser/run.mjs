@@ -5,6 +5,7 @@ import { runHarness } from './many-windows.spec.mjs';
 
 const outputDir = process.env.IMC_PERF_OUTPUT ?? `perf-results/${new Date().toISOString().replaceAll(':', '-')}`;
 await mkdir(outputDir, { recursive: true });
+process.env.IMC_PERF_OUTPUT = outputDir;
 const loadAverage = async () => {
   try { return (await readFile('/proc/loadavg', 'utf8')).trim(); } catch { return 'unknown'; }
 };

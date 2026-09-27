@@ -42,6 +42,69 @@ async function collectWindowDiagnostics(page) {
   }).catch(() => ({ domNodes: 0, heapBytes: 0, globalDiagnosticKeys: [], globalDiagnosticKeyCount: 0, textLength: 0 }));
 }
 
+/**
+ * Exercise the real resize hit surfaces, not just their DOM existence.  The
+ * handles sit over the composer/footer and task-panel overlays in production,
+ * so elementsFromPoint plus a real mouse drag is the only useful regression
+ * check for this contract.
+ */
+async function checkResizeHandles(page, outputDir) {
+  const directions = ['nw', 'n', 'ne', 'w', 'e', 'sw', 's', 'se'];
+  const topWindowBox = () => page.locator('.subsession-window:visible').evaluateAll((items) => {
+    const visible = items.map((element, index) => ({ element, index, rect: element.getBoundingClientRect(), z: Number.parseInt(getComputedStyle(element).zIndex, 10) || 0 }))
+      .filter(({ rect }) => rect.width > 0 && rect.height > 0)
+      // Equal-z windows are painted in DOM order; pick the last one so the
+      // hit-test assertion follows the browser's actual topmost window.
+      .sort((a, b) => (b.z - a.z) || (b.index - a.index));
+    const item = visible[0];
+    return item ? { x: item.rect.x, y: item.rect.y, width: item.rect.width, height: item.rect.height } : null;
+  });
+  const before = await topWindowBox();
+  if (!before) return { pass: false, failures: ['no visible sub-session window'], hitTests: [], drags: [] };
+  const hitTests = await page.evaluate((rect) => {
+    const points = {
+      nw: [rect.left + 8, rect.top + 8], n: [rect.left + rect.width / 2, rect.top + 3],
+      ne: [rect.right - 8, rect.top + 8], w: [rect.left + 3, rect.top + rect.height / 2],
+      e: [rect.right - 3, rect.top + rect.height / 2], sw: [rect.left + 8, rect.bottom - 8],
+      s: [rect.left + rect.width / 2, rect.bottom - 3], se: [rect.right - 8, rect.bottom - 8],
+    };
+    return Object.entries(points).map(([dir, [x, y]]) => ({
+      dir, x, y,
+      stack: document.elementsFromPoint(x, y).slice(0, 5).map((el) => ({
+        tag: el.tagName, className: typeof el.className === 'string' ? el.className : '',
+        testId: el.getAttribute('data-testid'),
+      })),
+    }));
+  }, { left: before.x, top: before.y, right: before.x + before.width, bottom: before.y + before.height, width: before.width, height: before.height });
+  const failures = hitTests.filter((entry) => !entry.stack.some((item) => item.className.split?.(/\s+/).includes(`resize-${entry.dir}`)))
+    .map((entry) => `hit-test ${entry.dir} top=${JSON.stringify(entry.stack[0] ?? null)}`);
+  const output = outputDir ?? '/tmp';
+  await page.screenshot({ path: `${output}/resize-handles-before.png`, animations: 'disabled' }).catch(() => {});
+  const drags = [];
+  const delta = { nw: [-8, -8], n: [0, 8], ne: [8, -8], w: [-8, 0], e: [8, 0], sw: [-8, 8], s: [0, -8], se: [-8, -8] };
+  for (const dir of directions) {
+    const box = await topWindowBox();
+    if (!box) { failures.push(`drag ${dir} window disappeared`); break; }
+    const [dx, dy] = delta[dir];
+    const point = {
+      nw: [box.x + 8, box.y + 8], n: [box.x + box.width / 2, box.y + 3], ne: [box.x + box.width - 8, box.y + 8],
+      w: [box.x + 3, box.y + box.height / 2], e: [box.x + box.width - 3, box.y + box.height / 2],
+      sw: [box.x + 8, box.y + box.height - 8], s: [box.x + box.width / 2, box.y + box.height - 3], se: [box.x + box.width - 8, box.y + box.height - 8],
+    }[dir];
+    await page.mouse.move(point[0], point[1]);
+    await page.mouse.down();
+    await page.mouse.move(point[0] + dx, point[1] + dy, { steps: 2 });
+    await page.mouse.up();
+    await page.waitForTimeout(80);
+    const after = await topWindowBox();
+    const changed = !!after && (Math.abs(after.width - box.width) > 0.5 || Math.abs(after.height - box.height) > 0.5 || Math.abs(after.x - box.x) > 0.5 || Math.abs(after.y - box.y) > 0.5);
+    drags.push({ dir, before: { x: box.x, y: box.y, width: box.width, height: box.height }, after: after && { x: after.x, y: after.y, width: after.width, height: after.height }, changed });
+    if (!changed) failures.push(`drag ${dir} did not change geometry`);
+  }
+  await page.screenshot({ path: `${output}/resize-handles-after.png`, animations: 'disabled' }).catch(() => {});
+  return { pass: failures.length === 0, failures, hitTests, drags };
+}
+
 
 async function persistCheckpoint(payload) {
   const file = process.env.IMC_PERF_CHECKPOINT;
@@ -390,6 +453,14 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
       stallDiagnostics.push({ sessionId: main.id, phase: 'single-page-window-open', stalledAt: seen, state: stallState, ...(main.__diagnostics ?? {}) });
       await persistCheckpoint({ status: 'stalled-single-page', stalledAt: seen, windowCurve, stallDiagnostics, correctness });
     }
+    if (seen > 0) {
+      const resizeCheck = await checkResizeHandles(page, process.env.IMC_PERF_OUTPUT).catch((error) => ({ pass: false, failures: [`resize harness error: ${error instanceof Error ? error.message : String(error)}`], hitTests: [], drags: [] }));
+      correctness.resizeHandles = resizeCheck.pass;
+      stallDiagnostics.push({ sessionId: main.name, phase: 'resize-handles', ...resizeCheck });
+      for (const failure of resizeCheck.failures) correctness.failures.push(failure);
+      await persistCheckpoint({ status: 'resize-handles-checked', windowCurve, stallDiagnostics, correctness });
+      process.stdout.write(`${JSON.stringify({ phase: 'resize-handles', ...resizeCheck })}\n`);
+    }
     // Minimize ten mounted sub-windows through the same close/hide controls a
     // user operates. This exercises summary subscriptions rather than merely
     // marking localStorage ids as hidden.
@@ -561,7 +632,7 @@ export async function runHarness() {
   const pageBySession = new Map();
   const windowCurve = [];
   const stallDiagnostics = [];
-  const correctness = { fullStream: true, hiddenFinal: true, restored: true, toggled: true, authoritativeBackfill: true, failures: [] };
+  const correctness = { fullStream: true, hiddenFinal: true, restored: true, toggled: true, authoritativeBackfill: true, resizeHandles: true, failures: [] };
   try {
     if (process.env.IMC_PERF_LAYOUT !== 'tabs') {
       return await runSinglePageScenario(context, workload, { windowCurve, stallDiagnostics, correctness, pageBySession });

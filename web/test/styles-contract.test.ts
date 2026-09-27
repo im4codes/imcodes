@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 
 function* cssStructuralBraces(source: string, start = 0): Generator<{ character: '{' | '}'; index: number }> {
   let quote: '"' | "'" | undefined;
@@ -78,6 +78,10 @@ function extractDirectStyleRule(block: string, selector: RegExp): string | undef
 
 describe('styles.css regression contracts', () => {
   const css = readFileSync(resolve(__dirname, '../src/styles.css'), 'utf8');
+  const builtCssDir = resolve(__dirname, '../dist/assets');
+  const builtCss = existsSync(builtCssDir)
+    ? readdirSync(builtCssDir).filter((file) => file.endsWith('.css')).map((file) => readFileSync(join(builtCssDir, file), 'utf8')).join('\n')
+    : '';
   const cssWithoutComments = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
   it('keeps the desktop rail exactly one bottom card wide and its vertical cards compact and scrollable', () => {
@@ -1128,12 +1132,25 @@ describe('styles.css regression contracts', () => {
   it('keeps all floating-window resize handles in the browser hit-test tree', () => {
     const handleRule = css.match(/\.resize-handle\s*\{[^}]*\}/)?.[0];
     expect(handleRule, '.resize-handle rule missing').toBeTruthy();
-    expect(handleRule).toMatch(/background:\s*rgb\(0 0 0 \/ 0\.1%\)/);
+    expect(handleRule).toMatch(/background:\s*rgb\(0 0 0 \/ 1%\)/);
     expect(handleRule).toMatch(/pointer-events:\s*auto/);
     expect(handleRule).toMatch(/touch-action:\s*none/);
+    const layerRule = css.match(/\.resize-handle-layer\s*\{[^}]*\}/)?.[0];
+    expect(layerRule, '.resize-handle-layer rule missing').toBeTruthy();
+    expect(layerRule).toMatch(/z-index:\s*9999/);
+    expect(layerRule).toMatch(/pointer-events:\s*none/);
     for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
       expect(css).toMatch(new RegExp(`\\.resize-${dir}[^,{]*\\{`));
     }
+  });
+
+  it.skipIf(!builtCss)('keeps the built resize surface painted after minification', () => {
+    const handleRule = builtCss.match(/\.resize-handle\{[^}]*\}/)?.[0];
+    expect(handleRule, 'built .resize-handle rule missing').toBeTruthy();
+    expect(handleRule).toMatch(/background:(?!#0000(?:;|}))/);
+    expect(handleRule).toMatch(/pointer-events:auto/);
+    expect(handleRule).toMatch(/touch-action:none/);
+    expect(builtCss).toMatch(/\.resize-handle-layer\{[^}]*z-index:9999/);
   });
 
   it('routes remote-desktop hover through a painted HTML surface above video', () => {

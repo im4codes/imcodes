@@ -7297,14 +7297,28 @@ html.native-ios-mac .chat-dl-btn {
         "resizable" signal is not confined to the few pixels under the cursor. */
 .resize-handle {
   position: absolute;
-  z-index: 10;
+  z-index: 10000;
   /* Keep the hit surface painted even though it is visually transparent.
      Blink/WebKit can prune an empty transparent layer from hit testing (most
      noticeable over the content/footer at the bottom of a floating window),
      which leaves only the top corner handles responding to hover/drag. */
-  background: rgb(0 0 0 / 0.1%);
+  /* Keep a real, non-zero paint after production minification.  Alpha values
+     below 1/255 quantize to #0000 in Lightning CSS, which removes the layer
+     from Blink hit testing (the old 0.1% value caused bottom handles to die
+     only in the built app). */
+  background: rgb(0 0 0 / 1%);
   pointer-events: auto;
   touch-action: none;
+}
+
+/* The layer is a final direct child of each floating window.  It covers the
+   frame without intercepting anything except its own handle children, so
+   composer/footer/task-panel stacking contexts cannot sit above bottom grips. */
+.resize-handle-layer {
+  position: absolute;
+  inset: 0;
+  z-index: 9999;
+  pointer-events: none;
 }
 
 /* The visible mark. Hidden at rest; revealed on hover, and kept lit for the
@@ -7344,7 +7358,7 @@ html.native-ios-mac .chat-dl-btn {
 /* Corners: the largest targets, drawn as an L-bracket so the diagonal grab
    point reads as a grip instead of two edges crossing. Above the edges in the
    stack because the two overlap along the first 16px of every side. */
-.resize-ne, .resize-nw, .resize-se, .resize-sw { width: 16px; height: 16px; z-index: 11; }
+.resize-ne, .resize-nw, .resize-se, .resize-sw { width: 16px; height: 16px; z-index: 10001; }
 .resize-nw { top: 0; left: 0; cursor: nw-resize; }
 .resize-ne { top: 0; right: 0; cursor: ne-resize; }
 .resize-sw { bottom: 0; left: 0; cursor: sw-resize; }
