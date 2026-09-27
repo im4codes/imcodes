@@ -1108,12 +1108,21 @@ export class WsClient {
     for (const sessionId of this.transportSubscriptions) {
       const wasSent = this.sentTransportSubscriptions.has(sessionId);
       const replayHistory = this.transportSubscriptionReplayHistory.get(sessionId) !== false;
-      if (!this.sendTransportSubscribe(sessionId, replayHistory && !wasSent)) break;
+      // Probe recovery explicitly repairs the server-side subscription even
+      // though the browser socket never closed. This is distinct from a
+      // metadata/render effect repeating the same desired subscription.
+      if (!this.sendTransportSubscribe(sessionId, replayHistory && !wasSent, true)) break;
     }
   }
 
-  private sendTransportSubscribe(sessionId: string, forceHistory: boolean): boolean {
+  private sendTransportSubscribe(sessionId: string, forceHistory: boolean, forceResubscribe = false): boolean {
     if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return false;
+    // Subscription effects run from several session surfaces and may observe
+    // metadata-only updates. Once this socket has sent the desired live
+    // subscription, repeating the same frame just replays history/server work
+    // and can starve the browser under many windows. A true forceHistory is an
+    // explicit upgrade/reconnect replay and remains allowed.
+    if (this.sentTransportSubscriptions.has(sessionId) && !forceHistory && !forceResubscribe) return true;
     try {
       this.send({
         type: TRANSPORT_MSG.CHAT_SUBSCRIBE,

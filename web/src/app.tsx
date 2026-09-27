@@ -4760,18 +4760,25 @@ export function App() {
   // Key includes runtimeType + agentType so effect re-runs when WebSocket merge
   // corrects null→'transport' or a pre-migration row relies on agentType fallback.
   const transportSessionKey = sessions.map((s) => `${s.name}:${s.runtimeType}:${s.agentType}`).sort().join(',');
+  const transportSubscribedSessionsRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     const ws = wsRef.current;
-    if (!ws?.connected || sessions.length === 0) return;
-    const names = listGlobalTransportSubscriptionNames(sessions);
-    for (const name of names) {
-      try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
+    const names = ws?.connected ? listGlobalTransportSubscriptionNames(sessions) : [];
+    const desired = new Set(names);
+    // Diff the desired set instead of using effect cleanup to unsubscribe the
+    // entire population. Session metadata updates can churn this effect's key
+    // while the same sessions remain present; cleanup/re-subscribe then emits
+    // thousands of chat.subscribe frames during a large-window restore.
+    for (const name of transportSubscribedSessionsRef.current) {
+      if (desired.has(name)) continue;
+      try { ws?.unsubscribeTransportSession(name); } catch { /* ignore */ }
     }
-    return () => {
-      for (const name of names) {
-        try { ws.unsubscribeTransportSession(name); } catch { /* ignore */ }
+    if (ws?.connected) {
+      for (const name of desired) {
+        try { ws.subscribeTransportSession(name, { replayHistory: false }); } catch { /* ignore */ }
       }
-    };
+    }
+    transportSubscribedSessionsRef.current = desired;
   // NOTE: `sessions` (the raw array) is intentionally omitted from the dep
   // array. Including it caused a subscribe/unsubscribe flap loop — every
   // setState produces a new array reference even when contents are identical,

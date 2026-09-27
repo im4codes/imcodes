@@ -1427,8 +1427,7 @@ describe('WsClient', () => {
 
       socket.send.mockClear();
       client.subscribeTransportSession('passive-session', { replayHistory: false });
-      expect(socket.send).toHaveBeenCalledWith(expect.stringContaining('"forceHistory":false'));
-      expect(socket.send).not.toHaveBeenCalledWith(expect.stringContaining('"forceHistory":true'));
+      expect(socket.send).not.toHaveBeenCalled();
       client.disconnect();
       vi.useRealTimers();
     });
