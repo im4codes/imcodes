@@ -495,7 +495,9 @@ export async function traceAsync<T>(name: string, meta: JsonRecord | undefined, 
 export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
   // Receipt timestamps are kept even when file tracing is disabled so the
   // server-link send path can measure ordinary ack latency without requiring a
-  // diagnostic flag. The bounded map is cheap; writeTrace remains a no-op.
+  // diagnostic flag. The bounded map is cheap; avoid JSON work unless tracing
+  // is enabled so instrumentation never becomes the hot-path blocker.
+  const receivedAt = performance.now();
   const type = typeof cmd.type === 'string' ? cmd.type : '<non-string>';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim() ? cmd.commandId.trim() : undefined;
   const requestId = typeof cmd.requestId === 'string' && cmd.requestId.trim() ? cmd.requestId.trim() : undefined;
@@ -505,11 +507,15 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
   if (commandId) {
     commandReceipts.set(commandId, {
       type,
-      receivedAt: performance.now(),
+      receivedAt,
       commandId,
       ...(sessionName ? { sessionName } : {}),
       eventLoopLagMs: roundMs(latestEventLoopLagMs),
     });
+  }
+  if (!enabled) {
+    cleanupCommandReceipts(receivedAt);
+    return;
   }
   let commandBytes: number | undefined;
   try {
@@ -519,7 +525,7 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
   }
   rememberRecentCommand({
     type,
-    receivedAt: performance.now(),
+    receivedAt,
     ...(commandId ? { commandId } : {}),
     ...(requestId ? { requestId } : {}),
     ...(sessionName ? { sessionName } : {}),
@@ -534,7 +540,7 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
     ...(commandBytes !== undefined ? { commandBytes } : {}),
     eventLoopLagMs: roundMs(latestEventLoopLagMs),
   });
-  cleanupCommandReceipts();
+  cleanupCommandReceipts(receivedAt);
 }
 
 export function traceCommandAsync(cmd: Record<string, unknown>, name: string, fn: () => Promise<void>): Promise<void> {
