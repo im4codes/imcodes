@@ -1450,7 +1450,7 @@ describe('docker compose validates both network strategies', () => {
 
   beforeAll(() => {
     if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  }, 300_000);
 
   function renderDeployment(relayMinPort: number, relayMaxPort: number, rangeOrigin: 'capacity' | 'configured') {
     return {
@@ -1780,7 +1780,7 @@ describe('retained Windows artifact versions survive Server image replacement', 
 
   beforeAll(() => {
     if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  }, 300_000);
 
   async function templates() {
     return await import('../../src/setup/templates.js');
@@ -2128,7 +2128,7 @@ describe('legacy discovery distinguishes unreadable from absent, against real co
 
   beforeAll(() => {
     if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  }, 300_000);
 
   it.skipIf(!dockerAvailable)('blocks replacement when the legacy directory cannot be listed', async () => {
     // The masked form (`ls ... 2>/dev/null || true`) turned EACCES into exit 0
@@ -2205,7 +2205,7 @@ describe('a stopped pre-fix Server still gets migrated', () => {
 
   beforeAll(() => {
     if (dockerAvailable) ensureDockerFixtureImages();
-  });
+  }, 300_000);
 
   it.skipIf(!dockerAvailable)('stages pinned bytes from an exited legacy container and survives replacement', async () => {
     // `compose ps -q` hides stopped containers, so an exited or
