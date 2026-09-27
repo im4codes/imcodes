@@ -35,10 +35,13 @@ vi.mock('../../src/store/session-store.js', () => ({
 import type { SessionRecord } from '../../src/store/session-store.js';
 import {
   TASK_PAIR_ENGINE_ENV,
+  TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS,
   TASK_PAIR_TIMELINE_EVENT,
   taskPairBindingId,
   type TaskPairEngine,
 } from '../../shared/task-pair.js';
+
+const UNTITLED_TASK_TITLE = TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[1];
 import {
   DELEGATION_AUTHORITY_MCP_SERVER,
   projectDelegationClaim,
@@ -215,9 +218,11 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     const created = await send(caller(BRAIN), dispatchInput);
     if (created.status !== 'accepted' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
+    // No explicit title was given, so the pair starts under the neutral
+    // placeholder (no UI locale in this test) until the Brain names it; the
+    // objective alone is never promoted to a title.
     expect(created).toMatchObject({
-      taskTitle: 'Add one README sentence',
-      taskObjective: 'Add one README sentence',
+      taskTitle: UNTITLED_TASK_TITLE,
       assignmentId: taskPairBindingId(taskId, 'executor'),
     });
     // The Brain turn's delegation claim is substantiated by this receipt.
@@ -231,7 +236,7 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     // The pair is open with the Brain's target as executor, and the daemon
     // picked the Opus sub-session (the pool's auditor role) as auditor and told it so.
     expect(pairOf(taskId)).toMatchObject({
-      status: 'working', brain: BRAIN, executor: EXEC, auditor: AUD, round: 0, title: 'Add one README sentence',
+      status: 'working', brain: BRAIN, executor: EXEC, auditor: AUD, round: 0, title: UNTITLED_TASK_TITLE,
     });
     expect(pairOf(taskId)?.flags).not.toContain('needs_auditor');
     expect(delivered.some((entry) => entry.target === AUD && entry.text.includes(taskId))).toBe(true);
@@ -263,8 +268,9 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     const verbs = pairEvents
       .filter((event) => event.session === BRAIN && event.payload.taskId === taskId)
       .map((event) => event.payload.verb);
-    // REASSIGN is the daemon's own auditor pick.
-    expect(verbs).toEqual(['DISPATCH', 'REASSIGN', 'READY_FOR_AUDIT', 'REWORK', 'READY_FOR_AUDIT', 'PASS', 'DONE']);
+    // REASSIGN is the daemon's own auditor pick; TITLE is the neutral
+    // placeholder applied to the untitled pair.
+    expect(verbs).toEqual(['DISPATCH', 'REASSIGN', 'TITLE', 'READY_FOR_AUDIT', 'REWORK', 'READY_FOR_AUDIT', 'PASS', 'DONE']);
 
     // A closed pair is out of the heartbeat: the next tick nudges nobody.
     const before = delivered.length;
