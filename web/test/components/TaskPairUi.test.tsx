@@ -138,7 +138,6 @@ describe('TaskPairStatusPanel', () => {
       assignments: [],
     };
     const view = render(<TaskPairStatusPanel events={[]} serverId="scroll" />);
-    fireEvent.click(screen.getByRole('button', { name: 'taskPair.panel_expand' }));
     const rows = view.container.querySelector('[data-testid="task-pair-status-rows"]') as HTMLElement | null;
     expect(rows).toBeTruthy();
     expect(rows?.className).toContain('task-pair-status-rows');
