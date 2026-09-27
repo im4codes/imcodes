@@ -123,6 +123,9 @@ async function copyUrlAtColumns(page, targetCols, url) {
     return { selected, cols: term.cols };
   }, { value: url, session: SESSION });
   await page.keyboard.press('Control+C');
+  // TerminalView intentionally does not await clipboard.writeText; allow the
+  // browser task that records the copy to settle before reading it.
+  await page.waitForTimeout(100);
   const copied = await page.evaluate(() => navigator.clipboard?.readText?.() ?? '');
   const normalized = copied.replace(/\r?\n/g, '');
   const selectedNormalized = selection.selected.replace(/\r?\n/g, '');
