@@ -1,4 +1,5 @@
 import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
+import { stat } from 'node:fs/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { createIdempotentShutdown, installMcpStdioLifecycle,
@@ -76,6 +77,7 @@ import { enqueueDurableResend, recipientFromSessionRecord } from './transport-re
 import { getTransportQueueStore } from './transport-queue-store.js';
 import { registerExecutionPoolMcpTools, type ExecutionPoolMcpToolDeps } from './execution-pool-mcp-tools.js';
 import { getCachedSupervisorDefaults, refreshSupervisorDefaultsCache, updateSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
+import { fileTransferMcpTimeoutMs } from '../../shared/transport/file-transfer.js';
 
 export interface MemoryMcpServerOptions {
   env?: Record<string, string | undefined>;
@@ -293,6 +295,22 @@ function installMemoryMcpResourceGuard(
   daemonAdmissionEnabled: boolean,
   daemonAdmissionOwner: SessionResourceOwner | null,
 ): void {
+  const transferTimeout = async (name: string, args: unknown[]): Promise<number | undefined> => {
+    if (name !== MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE
+      && name !== MEMORY_MCP_TOOL_NAMES.FETCH_FILE_FROM_MACHINE) return undefined;
+    const input = args[0];
+    const sourcePath = input && typeof input === 'object' && !Array.isArray(input)
+      ? (input as { sourcePath?: unknown }).sourcePath
+      : undefined;
+    if (name === MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE && typeof sourcePath === 'string') {
+      const size = await stat(sourcePath).then((value) => value.size).catch(() => undefined);
+      return fileTransferMcpTimeoutMs(size);
+    }
+    // A remote fetch has no local size metadata before its path handle is
+    // opened. Use the transfer floor; the direct/relay attempts each have
+    // their own bounded timers and the MCP operation can still be retried.
+    return fileTransferMcpTimeoutMs();
+  };
   const original = server.registerTool.bind(server);
   server.registerTool = ((name: string, config: unknown, callback: (...args: unknown[]) => unknown) => {
     const guarded = async (...args: unknown[]) => guard.run(name, async () => {
@@ -304,7 +322,7 @@ function installMemoryMcpResourceGuard(
       } finally {
         await releaseDaemonTaskAdmission(caller, daemonAdmissionOwner, lease);
       }
-    });
+    }, await transferTimeout(name, args));
     return original(
       name,
       config as Parameters<typeof original>[1],

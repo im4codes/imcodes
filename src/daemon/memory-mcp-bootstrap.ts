@@ -40,7 +40,10 @@ const catalogs = catalog as BootstrapCatalog;
 const BACKEND_START_TIMEOUT_MS = 60_000;
 const QUEUED_REQUEST_TIMEOUT_MS = 30_000;
 const IN_FLIGHT_REQUEST_TIMEOUT_MS = 30_000;
-const TOOL_CALL_DEFAULT_TIMEOUT_MS = 15 * 60_000;
+// Keep the transport-side watchdog at least as large as the resource guard's
+// maximum transfer budget. A 2 GiB relay can legitimately outlive the old
+// 15-minute bootstrap timer even while every individual attempt is bounded.
+const TOOL_CALL_DEFAULT_TIMEOUT_MS = 60 * 60_000;
 const TOOL_CALL_TIMEOUT_HEADROOM_MS = 60_000;
 const TOOL_CALL_MAX_DECLARED_TIMEOUT_MS = 60 * 60_000;
 const BACKEND_STABLE_UPTIME_MS = 30_000;

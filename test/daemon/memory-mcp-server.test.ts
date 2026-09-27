@@ -1,5 +1,5 @@
 import { readFileSync } from 'node:fs';
-import { mkdir, mkdtemp, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -338,6 +338,47 @@ describe('memory MCP stdio server', () => {
     } finally {
       await client.close();
       await server.close();
+    }
+  });
+
+  it('uses the transfer budget instead of the ordinary MCP timeout for send_file_to_machine', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-mcp-transfer-timeout-'));
+    const sourcePath = join(dir, 'payload.bin');
+    await writeFile(sourcePath, Buffer.alloc(1024));
+    const guard = new MemoryMcpResourceGuard({
+      maxConcurrent: 2,
+      maxRssBytes: Number.MAX_SAFE_INTEGER,
+      requestTimeoutMs: 1,
+      memoryUsage: () => ({ rss: 1 }),
+    });
+    const caller: McpRuntimeCaller = {
+      transport: 'stdio', userId: 'user-1', namespace, sessionName: 'deck_proj_brain',
+      projectName: 'proj', projectRoot: '/tmp/proj', serverId: 'srv-1', providerId: 'codex-sdk',
+    };
+    const sendFileToMachine = vi.fn(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      return { ok: true as const, remotePath: '/staging/payload.bin', attachmentId: 'a'.repeat(32), size: 1024, transport: 'relay' as const };
+    });
+    const server = createMemoryMcpServer(caller, {
+      machineDeps: {
+        listMachines: async () => [],
+        execRemote: async () => ({ outcome: 'completed' as const }),
+        sendFileToMachine,
+      },
+    }, {}, {}, { resourceGuard: guard, toolCatalogMode: 'static_full' });
+    const client = new Client({ name: 'memory-mcp-transfer-timeout-test', version: '0.1.0' }, {});
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await Promise.all([client.connect(clientTransport), server.connect(serverTransport)]);
+      await expect(client.callTool({
+        name: MEMORY_MCP_TOOL_NAMES.SEND_FILE_TO_MACHINE,
+        arguments: { machine: '1472527657', sourcePath },
+      })).resolves.toMatchObject({ isError: false, structuredContent: { status: 'ok', transport: 'relay' } });
+      expect(sendFileToMachine).toHaveBeenCalledOnce();
+    } finally {
+      await client.close();
+      await server.close();
+      await rm(dir, { recursive: true, force: true });
     }
   });
 

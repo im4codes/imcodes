@@ -43,6 +43,12 @@ describe('machine direct file-transfer trust boundary', () => {
       .toBeGreaterThanOrEqual(26);
   });
 
+  it('bounds the direct control wait so relay fallback is not payload-timeout bound', () => {
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS).toBeGreaterThanOrEqual(20_000);
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS)
+      .toBeLessThan(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS);
+  });
+
   it('refreshes authority from the receiving hop clock regardless of sender clock skew', () => {
     const receivedAt = Date.parse('2026-08-03T12:00:00.000Z');
     for (const expiresAt of [receivedAt - 30 * 86_400_000, receivedAt + 30 * 86_400_000]) {

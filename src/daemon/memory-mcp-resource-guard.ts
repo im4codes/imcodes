@@ -53,8 +53,15 @@ export class MemoryMcpResourceGuard {
     };
   }
 
-  async run<T>(operationName: string, operation: () => Promise<T> | T): Promise<T> {
+  /** The configured budget for ordinary MCP calls. Transfer callers may use a
+   * larger operation-specific budget via run(..., timeoutMs). */
+  get requestTimeoutMs(): number {
+    return this.options.requestTimeoutMs;
+  }
+
+  async run<T>(operationName: string, operation: () => Promise<T> | T, timeoutMs = this.options.requestTimeoutMs): Promise<T> {
     if (!operationName) throw new Error('invalid_memory_mcp_operation');
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error('invalid_memory_mcp_timeout');
     if (this.cpuOverloaded) throw new Error(MEMORY_MCP_RESOURCE_ERROR.CPU_OVERLOAD);
     if (this.active >= this.options.maxConcurrent) throw new Error(MEMORY_MCP_RESOURCE_ERROR.CONCURRENCY_LIMIT);
     if (this.options.memoryUsage().rss > this.options.maxRssBytes) throw new Error(MEMORY_MCP_RESOURCE_ERROR.MEMORY_LIMIT);
@@ -66,7 +73,7 @@ export class MemoryMcpResourceGuard {
       return await Promise.race([
         underlying,
         new Promise<never>((_resolve, reject) => {
-          timeout = setTimeout(() => reject(new Error(`${MEMORY_MCP_RESOURCE_ERROR.REQUEST_TIMEOUT}:${operationName}`)), this.options.requestTimeoutMs);
+          timeout = setTimeout(() => reject(new Error(`${MEMORY_MCP_RESOURCE_ERROR.REQUEST_TIMEOUT}:${operationName}`)), timeoutMs);
           timeout.unref?.();
         }),
       ]);

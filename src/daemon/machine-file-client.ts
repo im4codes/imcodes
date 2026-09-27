@@ -156,6 +156,11 @@ function parseMachineFileSourceIdentity(
   return identity;
 }
 
+function transferErrorDetail(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  return String(error);
+}
+
 export async function sendFileToMachine(options: SendFileToMachineOptions): Promise<MachineFileTransferResult> {
   const source = await resolveReadableRegularFile(options.sourcePath);
   const doFetch = options.fetchImpl ?? fetch;
@@ -171,6 +176,7 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
   // The MCP process does not own the daemon's long-lived ServerLink, so the
   // direct attempt uses a short authenticated HTTP control request while file
   // bytes stay on the routed-LAN TCP socket.
+  let directFailure = 'direct setup unavailable';
   {
     const requestId = randomBytes(24).toString('base64url');
     const capability = randomBytes(32).toString('base64url');
@@ -192,7 +198,10 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
         device: source.device,
         inode: source.inode,
       },
-    }).catch(() => null);
+    }).catch((error: unknown) => {
+      directFailure = `direct listener setup failed: ${transferErrorDetail(error)}`;
+      return null;
+    });
     if (sender) {
       try {
         const response = await doFetch(
@@ -201,7 +210,7 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
             method: 'POST',
             headers: { ...authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority), 'content-type': 'application/json' },
             body: JSON.stringify({ ...requestBase, candidates: sender.candidates }),
-            signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
+            signal: boundedTransferSignal(options.signal, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS),
           },
         );
         const body = await readBoundedJson(response);
@@ -219,9 +228,9 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
             remotePath: attachment.daemonPath,
           };
         }
-      } catch {
-        // Any direct-control, connect, authentication, or transfer failure falls
-        // through to the existing staged Server upload below.
+        directFailure = `direct upload rejected at control response: ${typeof body.error === 'string' ? body.error : `http_${response.status}`}`;
+      } catch (error) {
+        directFailure = `direct upload failed during control/transfer: ${transferErrorDetail(error)}`;
       } finally {
         sender.close();
       }
@@ -233,11 +242,13 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
   const sourceBlob = await openAsBlob(source.path);
   let committedBytes = 0;
   let attachment: AttachmentRef | null = null;
+  let lastRelayFailure: string | undefined;
   while (!attachment) {
     const end = Math.min(source.size, committedBytes + FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES);
     const chunk = sourceBlob.slice(committedBytes, end, sourceBlob.type);
     let response: Response | null = null;
     let body: Record<string, unknown> | null = null;
+    lastRelayFailure = undefined;
     for (let attempt = 0; attempt <= FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS; attempt += 1) {
       const form = new FormData();
       form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE, chunk, basename(source.path));
@@ -259,9 +270,10 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
         body = await readBoundedJson(response);
         if (response.ok || response.status === 409) break;
         if (![408, 425, 429].includes(response.status) && response.status < 500) break;
-      } catch {
+      } catch (error) {
         response = null;
         body = null;
+        lastRelayFailure = transferErrorDetail(error);
       }
       if (attempt < FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) {
         await new Promise((resolveDelay) => setTimeout(
@@ -270,7 +282,12 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
         ));
       }
     }
-    if (!response || !body) throw new MachineControlPlaneError('transport', 'file upload transport failed');
+    if (!response || !body) {
+      throw new MachineControlPlaneError(
+        'transport',
+        `${directFailure}; relay upload stalled at ${committedBytes}/${source.size} bytes: ${lastRelayFailure ?? 'no response'}`,
+      );
+    }
     if (!response.ok) {
       const receiverOffset = typeof body.committedBytes === 'number' ? body.committedBytes : -1;
       if (response.status === 409 && Number.isSafeInteger(receiverOffset)
@@ -278,7 +295,10 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
         committedBytes = receiverOffset;
         continue;
       }
-      throw new MachineControlPlaneError('http_status', typeof body.error === 'string' ? body.error : `http_${response.status}`);
+      throw new MachineControlPlaneError(
+        'http_status',
+        `${directFailure}; relay upload rejected at ${committedBytes}/${source.size} bytes: ${typeof body.error === 'string' ? body.error : `http_${response.status}`}`,
+      );
     }
     if (body.complete === false) {
       const receiverOffset = body.committedBytes;
@@ -342,6 +362,7 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
   const base = options.serverUrl.replace(/\/+$/, '');
   const headers = authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority);
   const prepared = await prepareDestination(options.destinationPath, options.overwrite === true);
+  let directFailure = 'direct setup unavailable';
 
   {
     const requestId = randomBytes(24).toString('base64url');
@@ -351,14 +372,17 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
       capability: randomBytes(32).toString('base64url'),
       expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
     } as const;
-    const receiver = await startMachineDirectFetchReceiver({ tempPath: prepared.temp, request: requestBase }).catch(() => null);
+    const receiver = await startMachineDirectFetchReceiver({ tempPath: prepared.temp, request: requestBase }).catch((error: unknown) => {
+      directFailure = `direct receiver setup failed: ${transferErrorDetail(error)}`;
+      return null;
+    });
     if (receiver) {
       try {
         const response = await doFetch(`${base}/api/server/${encodeURIComponent(options.targetServerId)}/machine-direct-fetch`, {
           method: 'POST',
           headers: { ...headers, 'content-type': 'application/json' },
           body: JSON.stringify({ ...requestBase, sourcePath: options.sourcePath, candidates: receiver.candidates }),
-          signal: boundedTransferSignal(options.signal, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS),
+          signal: boundedTransferSignal(options.signal, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS),
         });
         const body = await readBoundedJson(response);
         const terminal = validateMachineDirectFetchResponse(body);
@@ -377,9 +401,9 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
             destinationPath: prepared.destination,
           };
         }
-      } catch {
-        // Capability, control, connection, authentication, and pre-commit
-        // failures all enter the existing bounded Server download below.
+        directFailure = `direct fetch rejected at control response: ${typeof body.error === 'string' ? body.error : `http_${response.status}`}`;
+      } catch (error) {
+        directFailure = `direct fetch failed during control/transfer: ${transferErrorDetail(error)}`;
       } finally {
         receiver.close();
       }
@@ -394,8 +418,8 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
       body: JSON.stringify({ path: options.sourcePath }),
       signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
     });
-  } catch {
-    throw new MachineControlPlaneError('transport', 'file handle transport failed');
+  } catch (error) {
+    throw new MachineControlPlaneError('transport', `${directFailure}; relay file handle transport failed: ${transferErrorDetail(error)}`);
   }
   const handleBody = await readBoundedJson(handleResponse);
   if (!handleResponse.ok) {
@@ -403,7 +427,7 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
     if (reason === FILE_PATH_HANDLE_ERROR.FILE_TOO_LARGE) {
       throw new MachineControlPlaneError('malformed', 'source file is too large for Server relay fallback');
     }
-    throw new MachineControlPlaneError('http_status', reason);
+    throw new MachineControlPlaneError('http_status', `${directFailure}; relay file handle rejected: ${reason}`);
   }
   const attachment = parseAttachmentResponse(handleBody);
   const sourceIdentity = parseMachineFileSourceIdentity(handleBody, attachment);
@@ -500,6 +524,6 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
       await discardMachineFetchResume(prepared.temp);
     }
     if (error instanceof MachineControlPlaneError) throw error;
-    throw new MachineControlPlaneError('transport', 'file download failed');
+    throw new MachineControlPlaneError('transport', `${directFailure}; relay download failed during stream/commit: ${transferErrorDetail(error)}`);
   }
 }

@@ -40,6 +40,26 @@ describe('memory MCP resource budget', () => {
     }
   });
 
+  it('allows a transfer-sized operation budget to outlive the ordinary MCP timeout', async () => {
+    vi.useFakeTimers();
+    try {
+      let release!: () => void;
+      const guard = new MemoryMcpResourceGuard({
+        maxConcurrent: 1,
+        maxRssBytes: 100,
+        requestTimeoutMs: 50,
+        memoryUsage: () => ({ rss: 1 }),
+      });
+      const transfer = guard.run('send_file_to_machine', () => new Promise<void>((resolve) => { release = resolve; }), 300);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(vi.getTimerCount()).toBeGreaterThan(0);
+      release();
+      await transfer;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('reports sustained single-core CPU and daemon/session memory backpressure deterministically', () => {
     const alarm = vi.fn();
     const guard = new MemoryMcpResourceGuard({ maxConcurrent: 1, maxRssBytes: 100, requestTimeoutMs: 50, memoryUsage: () => ({ rss: 1 }), cpuStrikeLimit: 2, onSustainedCpu: alarm });

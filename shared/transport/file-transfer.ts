@@ -81,6 +81,30 @@ export const FILE_TRANSFER_LIMITS = {
   UPLOAD_DIR: '/tmp/imcodes-uploads',
 } as const;
 
+/**
+ * The MCP resource guard must not apply the ordinary short request budget to a
+ * machine transfer.  A transfer is already bounded per HTTP/direct attempt;
+ * this outer budget is a safety net for the whole resumable operation.  The
+ * size component makes the budget grow with legitimate payloads while the cap
+ * still prevents a permanently stalled operation from occupying the MCP
+ * process forever.
+ */
+export const FILE_TRANSFER_MCP_TIMEOUT = {
+  MIN_MS: FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS,
+  /** Conservative floor used when a remote fetch size is not known locally. */
+  PER_MIB_MS: 250,
+  MAX_MS: 60 * 60 * 1000,
+} as const;
+
+export function fileTransferMcpTimeoutMs(sizeBytes?: number): number {
+  const size = Number.isSafeInteger(sizeBytes) && (sizeBytes as number) >= 0 ? sizeBytes as number : 0;
+  const sizeBudget = Math.ceil(size / (1024 * 1024)) * FILE_TRANSFER_MCP_TIMEOUT.PER_MIB_MS;
+  return Math.min(
+    FILE_TRANSFER_MCP_TIMEOUT.MAX_MS,
+    Math.max(FILE_TRANSFER_MCP_TIMEOUT.MIN_MS, FILE_TRANSFER_MCP_TIMEOUT.MIN_MS + sizeBudget),
+  );
+}
+
 // ── Capability advertisement ────────────────────────────────────────────────
 
 export const FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY = 'file.transfer.upload_fetch.v1' as const;

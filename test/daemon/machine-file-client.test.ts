@@ -159,6 +159,33 @@ describe('machine file client', () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  it('reports the direct stage and relay byte boundary when both paths fail', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-transfer-stages-'));
+    dirs.push(dir);
+    const sourcePath = join(dir, 'stages.txt');
+    await writeFile(sourcePath, 'hello');
+    startMachineDirectSenderMock.mockResolvedValueOnce({
+      candidates: [{ host: '192.0.2.1', port: 45123 }],
+      completion: Promise.resolve(),
+      close: vi.fn(),
+    });
+    const fetchMock = vi.fn(async (url: string | URL | Request) => {
+      const pathname = new URL(String(url)).pathname;
+      return pathname.endsWith('/machine-direct-upload')
+        ? new Response(JSON.stringify({ error: 'direct_timeout' }), { status: 504 })
+        : new Response(JSON.stringify({ error: 'relay_denied' }), { status: 400 });
+    });
+
+    const error = await sendFileToMachine({
+      serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token',
+      targetServerId: 'controlled-1', sourcePath, fetchImpl: fetchMock as typeof fetch,
+    }).catch((value: unknown) => value as { kind?: string; message?: string });
+    expect(error).toMatchObject({ kind: 'http_status' });
+    expect(error.message).toContain('direct upload rejected at control response: direct_timeout');
+    expect(error.message).toContain('relay upload rejected at 0/5 bytes: relay_denied');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it('falls back when a direct success response is correlated to another request', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-mismatched-direct-'));
     dirs.push(dir);
