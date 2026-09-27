@@ -11,7 +11,7 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import {
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
-  TASK_PAIR_OPEN_STATUSES,
+  TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_TERMINAL_STATUSES,
   type TaskPairEngine,
   type TaskPairEventSource,
@@ -244,9 +244,11 @@ export class TaskPairStore {
     ));
   }
 
-  isParticipantOfOpenPair(sessionName: string): boolean {
+  /** True when a session is reserved by any non-terminal pair, including queued work. */
+  isParticipantOfOpenPair(sessionName: string, exceptTaskId?: string): boolean {
     return this.listActivePairs().some((pair) => (
-      TASK_PAIR_OPEN_STATUSES.includes(pair.state.status)
+      pair.state.taskId !== exceptTaskId
+      && TASK_PAIR_PARTICIPANT_STATUSES.includes(pair.state.status)
       && (pair.state.executor === sessionName || pair.state.auditor === sessionName)
     ));
   }

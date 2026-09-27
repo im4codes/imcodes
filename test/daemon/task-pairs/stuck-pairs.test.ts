@@ -299,7 +299,18 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
     // leave Q2 queued instead of open -- clear that residue so Q2 starts, the
     // same convention sevenPassedPairs() uses below.
     pendingThisTick.clear();
-    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH Q2 executor=${EXEC} auditor=${AUD} -->`);
+    // Seed a legacy duplicate directly to exercise liveness attribution for
+    // the startup-repair path. New dispatches correctly remain queued when a
+    // participant is already reserved, so they cannot create this state.
+    const q1 = getTaskPairStore().getPair(PROJECT, 'Q1')!;
+    getTaskPairStore().savePair(PROJECT, {
+      ...q1.state,
+      taskId: 'Q2',
+      title: 'Q2',
+      status: 'working',
+      createdAt: now,
+      updatedAt: now,
+    }, { liveness: { ...q1.liveness } });
     await flush();
     expect(pair('Q2').status).toBe('working');
     const before = getTaskPairStore().getPair(PROJECT, 'Q1')!.liveness.progressExecutorAt;

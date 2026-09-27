@@ -182,6 +182,38 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(3);
   });
 
+  it('queues a named participant held by another pair, then starts it when that pair ends', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HOLD executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH WAIT executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('WAIT')).toMatchObject({ status: 'queued', executor: EXEC, auditor: AUD, flags: ['waiting_for_capacity'] });
+    expect(sentTo(BRAIN, 'participant-busy')).toHaveLength(1);
+
+    marker(BRAIN, '<!-- IMCODES_TASK CANCEL HOLD -->');
+    await flush();
+    expect(pair('WAIT')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
+  });
+
+  it('reports persisted participant double-bookings once at startup without cancelling either pair', async () => {
+    const state = (taskId: string): TaskPairState => ({
+      taskId, brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working', flags: [], flagSides: {},
+      round: 0, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0,
+      createdAt: now, startedAt: now, updatedAt: now,
+    });
+    getTaskPairStore().savePair(PROJECT, state('STARTUP-A'));
+    getTaskPairStore().savePair(PROJECT, state('STARTUP-B'));
+    await automation.tick();
+    await flush();
+    expect(sentTo(BRAIN, 'participant-conflicts-startup')).toHaveLength(1);
+    expect(pair('STARTUP-A').status).toBe('working');
+    expect(pair('STARTUP-B').status).toBe('working');
+    sent = [];
+    await automation.tick();
+    await flush();
+    expect(sentTo(BRAIN, 'participant-conflicts-startup')).toHaveLength(0);
+  });
+
   it('never nudges a running side or a side that made progress', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH T2 executor=${EXEC} auditor=${AUD} -->`);
     await flush();

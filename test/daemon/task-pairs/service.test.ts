@@ -130,6 +130,39 @@ describe('task-pair marker ingestion', () => {
     expect(seen[0]?.payload).toMatchObject({ taskId: 'T1', verb: 'DISPATCH', toStatus: 'queued', role: 'brain', source: 'marker' });
   });
 
+  it('keeps named DISPATCH, REASSIGN, and implicit dispatch participants queued when another pair holds them', () => {
+    // Keep this test at the service boundary: the real scheduler is covered
+    // separately, while this proves every role-binding entry path supplies
+    // the same cross-pair reservation guard.
+    service.setScheduler({ onIntent: () => undefined });
+    const apply = (writer: string, taskId: string, verb: 'DISPATCH' | 'REASSIGN', attrs: Record<string, string>, source: 'marker' | 'queue' = 'marker') => service.applyMarker({
+      project: PROJECT,
+      writer,
+      marker: { verb, knownVerb: verb, taskId, attrs },
+      source,
+      eventId: `busy-${taskId}-${verb}-${source}`,
+    });
+    apply(BRAIN, 'holding', 'DISPATCH', { executor: EXEC, auditor: AUD });
+    apply('daemon', 'holding', 'DISPATCH', { executor: EXEC, auditor: AUD }, 'queue');
+    expect(pair('holding')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
+
+    apply(BRAIN, 'named-new', 'DISPATCH', { executor: EXEC, auditor: AUD });
+    expect(pair('named-new')).toMatchObject({ status: 'queued', executor: EXEC, auditor: AUD, flags: ['waiting_for_capacity'] });
+    expect(sent.some((entry) => entry.target === BRAIN && entry.text.includes('holding'))).toBe(true);
+
+    apply(BRAIN, 'reassigned', 'DISPATCH', { executor: PROC, auditor: 'none' });
+    apply('daemon', 'reassigned', 'DISPATCH', { executor: PROC, auditor: 'none' }, 'queue');
+    apply(BRAIN, 'reassigned', 'REASSIGN', { executor: EXEC });
+    expect(pair('reassigned')).toMatchObject({ status: 'queued', executor: EXEC, flags: ['waiting_for_capacity'] });
+
+    const implicit = service.implicitDispatch({
+      project: PROJECT, sender: BRAIN, target: EXEC, taskId: 'implicit-new', hasObjective: true,
+      brief: 'new work', eventId: 'busy-implicit-new',
+    });
+    expect(implicit?.pair).toMatchObject({ status: 'queued', executor: EXEC });
+    expect(pair('implicit-new')).toMatchObject({ status: 'queued', executor: EXEC, flags: ['waiting_for_capacity'] });
+  });
+
   it('keeps DISPATCH deduplication independent per executor target', () => {
     for (const [taskId, target] of [['D1', EXEC], ['D2', PROC]] as const) {
       service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId, attrs: { executor: target, auditor: AUD } }, source: 'marker', now: Date.now(), eventId: `dedup-${taskId}` });
@@ -261,7 +294,9 @@ describe('task-pair marker ingestion', () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T8 executor=${EXEC} auditor=${AUD} -->`);
     await say(EXEC, '<!-- IMCODES_TASK DONE - -->');
     expect(pair('T7')?.status).toBe('in_audit');
-    expect(pair('T8')?.status).toBe('working');
+    // The executor is already reserved by T7, so the explicitly named T8
+    // remains queued instead of double-booking the same session.
+    expect(pair('T8')?.status).toBe('queued');
   });
 
   it('never falls back to the project checkout when material is unresolved: asks the executor, tells the auditor it is pending', async () => {

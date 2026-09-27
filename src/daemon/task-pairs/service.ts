@@ -354,6 +354,9 @@ export class TaskPairService {
           resolveProjectAuthoritativeSupervisionSnapshot(input.project, listSessions()),
         )
       : undefined;
+    const namedSessions = [input.marker.attrs.executor, input.marker.attrs.auditor]
+      .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR);
+    const busySessions = new Set(namedSessions.filter((session) => store.isParticipantOfOpenPair(session, taskId)));
     const transition = taskId
       ? applyTaskPairMarker(existing?.state, { ...input.marker, taskId }, {
           writer: input.writer,
@@ -362,6 +365,7 @@ export class TaskPairService {
           now,
           source: input.source,
           turnText: input.turnText,
+          ...(busySessions.size > 0 ? { busySessions } : {}),
         })
       : { effect: 'unresolved', unusual: true, intents: [] as TaskPairIntent[] } satisfies TaskPairTransition;
     const role = taskPairRoleOf(existing?.state ?? transition.pair, input.writer);
@@ -402,6 +406,7 @@ export class TaskPairService {
       stored = store.savePair(input.project, pairToSave, {
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
       });
+      if (busySessions.size > 0) stored = this.#noteParticipantConflicts(input.project, stored, busySessions);
       this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
     }
     if (stored && input.marker.attrs.title && stored.state.brain === input.writer
@@ -421,9 +426,14 @@ export class TaskPairService {
     this.#emitEvent(input, taskId ?? input.marker.taskId, role, transition, stored?.state ?? existing?.state);
     const holdsAutoPickAuditor = input.suppressAutoPickAuditor
       && transition.intents.some((intent) => intent.kind === 'pick_auditor');
-    const immediateIntents = holdsAutoPickAuditor
-      ? transition.intents.filter((intent) => intent.kind !== 'pick_auditor')
-      : transition.intents;
+    // A named participant held by another pair is deliberately parked. Do
+    // not recursively ask a queue runner to dispatch it immediately; the
+    // holding pair's terminal slot change (or the next heartbeat) will retry.
+    const busyQueued = busySessions.size > 0 && stored?.state.status === 'queued';
+    const immediateIntents = transition.intents.filter((intent) => (
+      !(holdsAutoPickAuditor && intent.kind === 'pick_auditor')
+      && !(busyQueued && intent.kind === 'slot_changed')
+    ));
     this.#track(this.#executeIntents(input.project, stored?.state, immediateIntents));
     if (holdsAutoPickAuditor && stored) this.#track(this.#gracePickAuditor(input.project, stored.state.taskId));
     // A pair Brain opens (DISPATCH marker, plain or task-tagged dispatch) tells
@@ -486,6 +496,44 @@ export class TaskPairService {
       this.#recentBrainDispatch.set(`${input.project}\u0000${transition.pair.brain}\u0000${transition.pair.executor}`, { taskId: transition.pair.taskId, at: Date.now() });
     }
     return transition;
+  }
+
+  /** Keep an explicitly named participant queued and tell its Brain once per holder pair. */
+  #noteParticipantConflicts(project: string, stored: StoredTaskPair, busySessions: ReadonlySet<string>): StoredTaskPair {
+    const store = getTaskPairStore();
+    const conflicts = store.listActivePairs()
+      .filter((candidate) => candidate.project !== project || candidate.state.taskId !== stored.state.taskId)
+      .filter((candidate) => busySessions.has(candidate.state.executor ?? '') || busySessions.has(candidate.state.auditor ?? ''))
+      .filter((candidate) => !isTerminalTaskPairStatus(candidate.state.status));
+    if (conflicts.length === 0) return stored;
+    const details = conflicts.map((candidate) => {
+      const held = [candidate.state.executor, candidate.state.auditor]
+        .filter((session): session is string => !!session && busySessions.has(session));
+      return `${held.join('/')} held by ${candidate.state.taskId}`;
+    });
+    const current = stored.state;
+    const nextState = current.status === 'queued' && !current.flags.includes('waiting_for_capacity')
+      ? { ...current, flags: [...current.flags, 'waiting_for_capacity' as const], updatedAt: Date.now() }
+      : current;
+    const fresh = conflicts.filter((candidate) => details.some((detail) => detail.endsWith(` ${candidate.state.taskId}`)));
+    const freshKeys = fresh
+      .map((candidate) => `participant_busy:${candidate.state.taskId}`)
+      .filter((key) => !stored.liveness.notified.includes(key));
+    const liveness = freshKeys.length > 0
+      ? { ...stored.liveness, notified: [...stored.liveness.notified, ...freshKeys] }
+      : stored.liveness;
+    const saved = nextState !== current || liveness !== stored.liveness
+      ? store.savePair(project, nextState, { liveness })
+      : stored;
+    if (freshKeys.length > 0) {
+      this.#track(sendTaskPairMessage(
+        saved.state.brain,
+        saved.state.taskId,
+        'participant-busy',
+        `Named participant conflict: ${details.join('; ')}. ${saved.state.taskId} remains queued and will start when the holding pair ends.`,
+      ));
+    }
+    return saved;
   }
 
   /**

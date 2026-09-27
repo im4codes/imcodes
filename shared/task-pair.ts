@@ -263,6 +263,10 @@ export type TaskPairStatus = typeof TASK_PAIR_STATUSES[number];
 export const TASK_PAIR_TERMINAL_STATUSES: readonly TaskPairStatus[] = ['done', 'cancelled'];
 /** Statuses that occupy a concurrency slot. */
 export const TASK_PAIR_OPEN_STATUSES: readonly TaskPairStatus[] = ['working', 'in_audit', 'awaiting_audit', TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, 'rework', 'passed'];
+/** Every non-terminal status reserves its named executor/auditor participants, including queued pairs. */
+export const TASK_PAIR_PARTICIPANT_STATUSES: readonly TaskPairStatus[] = TASK_PAIR_STATUSES.filter(
+  (status) => !TASK_PAIR_TERMINAL_STATUSES.includes(status),
+);
 
 export const TASK_PAIR_FLAGS = [
   'blocked', 'needs_input', 'unaudited', 'needs_auditor', 'over_limit', 'off_pool', 'economy_unreviewed',
@@ -665,6 +669,8 @@ export interface TaskPairApplyContext {
   projectBlocking?: readonly AuditSeverity[];
   now: number;
   source: TaskPairEventSource;
+  /** Named sessions already held by a different non-terminal pair. */
+  busySessions?: ReadonlySet<string>;
   /** Full assistant turn, used only for lightweight auditor-proposal enforcement. */
   turnText?: string;
 }
@@ -846,6 +852,12 @@ function setRolesFromAttrs(pair: TaskPairState, attrs: Record<string, string>, i
   }
 }
 
+function namedParticipantIsBusy(attrs: Record<string, string>, busySessions: ReadonlySet<string> | undefined): boolean {
+  if (!busySessions) return false;
+  return (attrs.executor !== undefined && busySessions.has(attrs.executor))
+    || (attrs.auditor !== undefined && attrs.auditor !== TASK_PAIR_NO_AUDITOR && busySessions.has(attrs.auditor));
+}
+
 const PROGRESS_VERBS: readonly TaskPairVerb[] = ['DISPATCH', 'STARTED', 'WORKING', 'READY_FOR_AUDIT', 'PASS', 'REWORK', 'DONE'];
 
 function clearSideFlags(pair: TaskPairState, role: TaskPairRole): void {
@@ -913,11 +925,13 @@ export function applyTaskPairMarker(
           if (marker.brief !== undefined) pair.brief = marker.brief;
           return { pair, toStatus: 'queued', effect: 'created', unusual: false, intents: [{ kind: 'slot_changed' }] };
         }
-        const pair = newPair(marker.taskId, ctx.writer, ctx, 'working');
-        setRolesFromAttrs(pair, attrs, intents);
+        const queuedForBusyParticipant = namedParticipantIsBusy(attrs, ctx.busySessions);
+        const pair = newPair(marker.taskId, ctx.writer, ctx, queuedForBusyParticipant ? 'queued' : 'working');
+        if (queuedForBusyParticipant) setRolesFromAttrsQueued(pair, attrs);
+        else setRolesFromAttrs(pair, attrs, intents);
         if (marker.brief !== undefined) pair.brief = marker.brief;
-        if (!pair.executor) intents.push({ kind: 'pick_executor' });
-        return { pair, toStatus: 'working', effect: 'created', unusual: false, intents };
+        if (!queuedForBusyParticipant && !pair.executor) intents.push({ kind: 'pick_executor' });
+        return { pair, toStatus: pair.status, effect: 'created', unusual: false, intents };
       }
       case 'STARTED':
       case 'WORKING':
@@ -1047,8 +1061,15 @@ export function applyTaskPairMarker(
       if (terminal) unusual = true;
       resetCaps(pair);
       if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
-        setRolesFromAttrs(pair, attrs, intents);
+        const queuedForBusyParticipant = namedParticipantIsBusy(attrs, ctx.busySessions);
+        if (queuedForBusyParticipant) setRolesFromAttrsQueued(pair, attrs);
+        else setRolesFromAttrs(pair, attrs, intents);
         if (marker.brief !== undefined) pair.brief = marker.brief;
+        if (queuedForBusyParticipant) {
+          pair.status = 'queued';
+          intents.push({ kind: 'slot_changed' });
+          return done('dispatched');
+        }
         markTaskPairStarted(pair, ctx.now);
         return done('dispatched');
       }
@@ -1067,8 +1088,15 @@ export function applyTaskPairMarker(
         return done('dispatched');
       }
       if (terminal) pair.closedNoticeSentTo = undefined;
-      setRolesFromAttrs(pair, attrs, intents);
-      if (!pair.executor) intents.push({ kind: 'pick_executor' });
+      const queuedForBusyParticipant = namedParticipantIsBusy(attrs, ctx.busySessions);
+      if (queuedForBusyParticipant) setRolesFromAttrsQueued(pair, attrs);
+      else setRolesFromAttrs(pair, attrs, intents);
+      if (!queuedForBusyParticipant && !pair.executor) intents.push({ kind: 'pick_executor' });
+      if (queuedForBusyParticipant) {
+        pair.status = 'queued';
+        intents.push({ kind: 'slot_changed' });
+        return done('dispatched');
+      }
       if (pair.status === 'queued' || terminal) {
         markTaskPairStarted(pair, ctx.now);
         intents.push({ kind: 'slot_changed' });
@@ -1199,6 +1227,10 @@ export function applyTaskPairMarker(
       if (role === 'brain') resetCapFlagsOnBrainAction(pair);
       const auditorBefore = pair.auditor;
       setRolesFromAttrs(pair, attrs, intents);
+      if (namedParticipantIsBusy(attrs, ctx.busySessions)) {
+        pair.status = 'queued';
+        intents.push({ kind: 'slot_changed' });
+      }
       if (!pair.executor && attrs.executormodel) intents.push({ kind: 'pick_executor' });
       if (attrs.executor) removeFlag(pair, 'executor_silent');
       if (attrs.auditor === TASK_PAIR_NO_AUDITOR && pair.status === 'in_audit') pair.status = 'working';

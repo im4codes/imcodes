@@ -155,6 +155,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #mainHeartbeatDelivered = new Map<string, string>();
   #mainHeartbeatPending = new Set<string>();
   #mainHeartbeatSessions = new Set<string>();
+  #startupParticipantCheckDone = false;
 
   start(intervalMs = resolveTaskPairHeartbeatMs()): void {
     if (this.#timer) return;
@@ -182,6 +183,41 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   #now(): number { return (this.#deps.now ?? Date.now)(); }
+
+  /** Report persisted double-bookings once, without cancelling or rewriting them. */
+  #reportStartupParticipantConflicts(): void {
+    const bySession = new Map<string, StoredTaskPair[]>();
+    for (const stored of getTaskPairStore().listActivePairs()) {
+      if (!isPairsEngineProject(stored.project)) continue;
+      for (const session of [stored.state.executor, stored.state.auditor]) {
+        if (!session || session === TASK_PAIR_NO_AUDITOR) continue;
+        const list = bySession.get(session) ?? [];
+        list.push(stored);
+        bySession.set(session, list);
+      }
+    }
+    const conflicts = [...bySession.entries()]
+      .map(([session, pairs]) => ({ session, pairs: pairs.filter((pair, index) => pairs.findIndex((other) => other.state.taskId === pair.state.taskId) === index) }))
+      .filter((entry) => entry.pairs.length > 1);
+    if (conflicts.length === 0) return;
+    const byBrain = new Map<string, string[]>();
+    for (const conflict of conflicts) {
+      const line = `${conflict.session}: ${conflict.pairs.map((pair) => pair.state.taskId).join(', ')}`;
+      for (const pair of conflict.pairs) {
+        const lines = byBrain.get(pair.state.brain) ?? [];
+        if (!lines.includes(line)) lines.push(line);
+        byBrain.set(pair.state.brain, lines);
+      }
+    }
+    for (const [brain, lines] of byBrain) {
+      void sendTaskPairMessage(
+        brain,
+        '__startup__',
+        'participant-conflicts-startup',
+        `Startup detected existing open-pair double-booking (no pair was cancelled): ${lines.join('; ')}. Resolve the assignments; future dispatches will wait instead of double-booking.`,
+      ).catch(() => { /* delivery logs its own failure */ });
+    }
+  }
   /** Busy state as of the tick's first look at a session (see tick()). */
   #tickBusy?: Map<string, boolean>;
   #busy(session: string): boolean {
@@ -347,6 +383,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
       await (this.#deps.importLegacy ?? defaultImportLegacy)(now);
     } catch (error) {
       logger.warn({ err: error }, 'task-pair: legacy import failed');
+    }
+    if (!this.#startupParticipantCheckDone) {
+      this.#startupParticipantCheckDone = true;
+      this.#reportStartupParticipantConflicts();
     }
     const brains = new Map<string, string>();
     // One busy snapshot per tick: the nudge this tick queues for one pair must
@@ -1413,15 +1453,18 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#logQueueSkip(project, pair, 'legacy pair has no brief');
         continue;
       }
-      // A session named explicitly on QUEUE (executor=/auditor=) is a
-      // reservation, but it is only BOUND at start: while queued it never
-      // occupies a window (TASK_PAIR_OPEN_STATUSES excludes 'queued'), so
-      // another pair may freely pick it in the meantime. If it is busy right
-      // now, this pair waits for it rather than silently substituting an
-      // auto-pick -- the owner named that session on purpose.
-      if ((pair.executor && this.#busy(pair.executor)) || (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && this.#busy(pair.auditor))) {
+      // A session named explicitly on QUEUE (executor=/auditor=) is reserved
+      // even while queued. If it is held by another pair or busy right now,
+      // this pair waits for it rather than silently substituting an auto-pick
+      // -- the owner named that session on purpose.
+      const namedParticipantHeld = (session: string | undefined): boolean => !!session
+        && session !== TASK_PAIR_NO_AUDITOR
+        && getTaskPairStore().isParticipantOfOpenPair(session, pair.taskId);
+      if ((pair.executor && (namedParticipantHeld(pair.executor) || this.#busy(pair.executor)))
+        || (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR
+          && (namedParticipantHeld(pair.auditor) || this.#busy(pair.auditor)))) {
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity');
-        this.#logQueueSkip(project, pair, 'named participant busy');
+        this.#logQueueSkip(project, pair, 'named participant held by another open pair or busy');
         continue;
       }
       // Owner rule: no execution pool configured and no model named for a
