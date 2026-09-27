@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
@@ -74,6 +74,49 @@ function installCommandMocks() {
 }
 
 /** Isolated project dir, mocked child_process/os/readline, per test. */
+const DOCKER_FIXTURE_IMAGES = ['busybox:1.36', 'alpine:3.20'] as const;
+type DockerResult = { status: number | null; stdout?: string; stderr?: string };
+type DockerRunner = (args: string[]) => DockerResult;
+let dockerFixtureImagesReady = false;
+
+/** Warm runtime fixture images once and surface registry errors clearly. */
+function ensureDockerFixtureImages(run: DockerRunner = (args) => spawnSync('docker', args, {
+  encoding: 'utf8',
+  timeout: 300_000,
+})): void {
+  if (dockerFixtureImagesReady) return;
+  for (const image of DOCKER_FIXTURE_IMAGES) {
+    const present = run(['image', 'inspect', image]);
+    if (present.status === 0) continue;
+    let last: DockerResult = present;
+    for (let attempt = 1; attempt <= 3; attempt += 1) {
+      last = run(['pull', image]);
+      if (last.status === 0) break;
+      if (attempt < 3) {
+        const delayMs = attempt * 250;
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delayMs);
+      }
+    }
+    if (last.status !== 0) {
+      const detail = String(last.stderr ?? last.stdout ?? '').trim() || `exit ${last.status ?? 'unknown'}`;
+      throw new Error(`Docker fixture image ${image} pull failed after 3 attempts: ${detail}`);
+    }
+  }
+  dockerFixtureImagesReady = true;
+}
+
+describe('Docker fixture image preparation', () => {
+  it('surfaces pull stderr when a registry pull fails', () => {
+    dockerFixtureImagesReady = false;
+    const result = (args: string[]): DockerResult => args[0] === 'image'
+      ? { status: 1, stderr: 'No such image' }
+      : { status: 125, stderr: 'toomanyrequests: rate limit exceeded' };
+    expect(() => ensureDockerFixtureImages(result)).toThrow(
+      /busybox:1\.36 pull failed after 3 attempts: toomanyrequests: rate limit exceeded/,
+    );
+  });
+});
+
 function useIsolatedSetupEnvironment(): void {
   beforeEach(() => {
     vi.resetModules();
@@ -1400,6 +1443,10 @@ describe('docker compose validates both network strategies', () => {
     }
   })();
 
+  beforeAll(() => {
+    if (dockerAvailable) ensureDockerFixtureImages();
+  });
+
   function renderDeployment(relayMinPort: number, relayMaxPort: number, rangeOrigin: 'capacity' | 'configured') {
     return {
       enabled: true as const,
@@ -1725,6 +1772,10 @@ describe('retained Windows artifact versions survive Server image replacement', 
       return false;
     }
   })();
+
+  beforeAll(() => {
+    if (dockerAvailable) ensureDockerFixtureImages();
+  });
 
   async function templates() {
     return await import('../../src/setup/templates.js');
@@ -2070,6 +2121,10 @@ describe('legacy discovery distinguishes unreadable from absent, against real co
     }
   })();
 
+  beforeAll(() => {
+    if (dockerAvailable) ensureDockerFixtureImages();
+  });
+
   it.skipIf(!dockerAvailable)('blocks replacement when the legacy directory cannot be listed', async () => {
     // The masked form (`ls ... 2>/dev/null || true`) turned EACCES into exit 0
     // with empty stdout, so the failure state was unreachable for precisely the
@@ -2142,6 +2197,10 @@ describe('a stopped pre-fix Server still gets migrated', () => {
       return false;
     }
   })();
+
+  beforeAll(() => {
+    if (dockerAvailable) ensureDockerFixtureImages();
+  });
 
   it.skipIf(!dockerAvailable)('stages pinned bytes from an exited legacy container and survives replacement', async () => {
     // `compose ps -q` hides stopped containers, so an exited or
