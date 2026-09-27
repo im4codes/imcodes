@@ -12,8 +12,10 @@ import type { CompressionInput } from '../../src/context/summary-compressor.js';
  */
 
 const countTokensSpy = vi.hoisted(() => vi.fn((text: string) => Math.ceil(text.length / 4)));
+const countTokensAsyncSpy = vi.hoisted(() => vi.fn(async (text: string) => Math.ceil(text.length / 4)));
 vi.mock('../../src/context/tokenizer.js', () => ({
   countTokens: countTokensSpy,
+  countTokensAsync: countTokensAsyncSpy,
   countMessagesTokens: vi.fn(() => 0),
 }));
 

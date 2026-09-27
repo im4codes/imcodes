@@ -560,7 +560,7 @@ it('consumes handoff before a late STOP cancellation can trigger a duplicate ret
   await runtime.kill();
 });
 
-it('returns session.send acknowledgement before a slow handoff build and proceeds after the bounded wait', async () => {
+it('returns session.send acknowledgement and dispatches without waiting for a slow handoff build', async () => {
   const provider = makeProvider();
   const runtime = new TransportSessionRuntime(provider, 'handoff-ack-order');
   await runtime.initialize({ sessionKey: 'handoff-ack-order' });
@@ -570,6 +570,7 @@ it('returns session.send acknowledgement before a slow handoff build and proceed
   expect(result).toBe('sent');
   expect(Date.now() - started).toBeLessThan(250);
   await waitForProviderSend(provider);
+  expect(Date.now() - started).toBeLessThan(250);
   await runtime.kill();
 });
 

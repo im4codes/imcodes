@@ -24,7 +24,7 @@ import type {
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
 import { serializeContextNamespace, serializeContextTarget } from './context-keys.js';
-import { countTokens } from './tokenizer.js';
+import { countTokensAsync } from './tokenizer.js';
 import { loadMemoryConfig, type MemoryConfig } from './memory-config.js';
 import { createMemoryConfigResolver, resolveMemoryConfigForNamespace, type MemoryConfigResolver } from './memory-config-resolver.js';
 import { computeFingerprint } from '../../shared/memory-fingerprint.js';
@@ -356,9 +356,14 @@ export class MaterializationCoordinator {
         previousSummary: undefined,
         modelConfig: this.modelConfig,
         mode: 'auto',
-        targetTokens: memoryConfig.autoMaterializationTargetTokens > 0
-          ? memoryConfig.autoMaterializationTargetTokens
-          : computeTargetTokens(countTokens(events.map((event) => event.content ?? '').join('\n')), 'auto'),
+        // Let the compressor derive the exact provider-backed target when the
+        // memory config does not override it. Computing the same budget here
+        // first adds an avoidable worker round-trip before the post-response
+        // background path can finish (and can make skill-review scheduling
+        // appear blocked on a cold tokenizer worker).
+        ...(memoryConfig.autoMaterializationTargetTokens > 0
+          ? { targetTokens: memoryConfig.autoMaterializationTargetTokens }
+          : {}),
         maxEventChars: memoryConfig.maxEventChars,
         previousSummaryMaxTokens: memoryConfig.previousSummaryMaxTokens,
         extraRedactPatterns: memoryConfig.extraRedactPatterns,
@@ -907,7 +912,7 @@ async function collectPinnedNotesForNamespace(namespace: ContextNamespace): Prom
   const notes: string[] = [];
   let tokenTotal = 0;
   for (const note of await getContextStoreClient().run<PinnedNote[]>('listPinnedNotes', [namespaceKey])) {
-    const noteTokens = countTokens(note.content);
+    const noteTokens = await countTokensAsync(note.content);
     if (tokenTotal + noteTokens > 1000) {
       incrementCounter('mem.pinned_notes_overflow', { namespace: namespaceKey });
       warnOncePerHour('pinned_notes_overflow', { namespace: namespaceKey });
@@ -967,7 +972,7 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
       highSignalEventCount: archiveEvents.length,
       targetTokens: effectiveMemoryConfig.manualCompactTargetTokens > 0
         ? effectiveMemoryConfig.manualCompactTargetTokens
-        : computeTargetTokens(countTokens(summary), 'manual'),
+        : computeTargetTokens(await countTokensAsync(summary), 'manual'),
     },
     createdAt: previousMaster?.createdAt ?? now,
     updatedAt: now,

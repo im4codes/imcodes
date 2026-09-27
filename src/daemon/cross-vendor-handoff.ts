@@ -1,4 +1,4 @@
-import { countTokens } from '../context/tokenizer.js';
+import { countTokensAsync } from '../context/tokenizer.js';
 import { timelineStore } from './timeline-store.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
@@ -111,18 +111,18 @@ export async function buildCrossVendorHandoffPack(record: SessionRecord, cutoff:
   const hardCap = CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens;
   const maxTokens = Math.min(config.maxTokens, hardCap);
   let bounded = text;
-  while (countTokens(bounded) > maxTokens && bounded.length > 32) {
+  while (await countTokensAsync(bounded) > maxTokens && bounded.length > 32) {
     bounded = bounded.slice(0, Math.max(32, Math.floor(bounded.length * 0.85)));
   }
-  if (countTokens(bounded) > maxTokens) {
+  if (await countTokensAsync(bounded) > maxTokens) {
     let low = 0;
     let high = bounded.length;
     while (low < high) {
       const mid = Math.ceil((low + high) / 2);
-      if (countTokens(bounded.slice(0, mid)) > maxTokens) high = mid - 1;
+      if (await countTokensAsync(bounded.slice(0, mid)) > maxTokens) high = mid - 1;
       else low = mid;
     }
     bounded = bounded.slice(0, low);
   }
-  return { text: bounded, sourceAgentType: record.agentType, sourceRuntimeType: record.runtimeType ?? 'process', sourceConversationKey: sourceConversationKey(record), cutoff, createdAt: Date.now(), tokenCount: countTokens(bounded) };
+  return { text: bounded, sourceAgentType: record.agentType, sourceRuntimeType: record.runtimeType ?? 'process', sourceConversationKey: sourceConversationKey(record), cutoff, createdAt: Date.now(), tokenCount: await countTokensAsync(bounded) };
 }

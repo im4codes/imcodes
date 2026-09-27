@@ -29,6 +29,7 @@ const mcpCpuSamples = new Map<string, {
   strikes: number;
   pressureReported: boolean;
 }>();
+const MCP_CPU_SAMPLE_CONCURRENCY = 8;
 
 function usable(value: string | null | undefined): value is string {
   return typeof value === 'string' && value.trim().length > 0;
@@ -260,10 +261,10 @@ export async function sweepMemoryMcpCpu(
 ): Promise<void> {
   const records = await dependencies.listResources();
   const liveIds = new Set<string>();
-  for (const record of records) {
-    if (record.kind !== SESSION_RESOURCE_KIND.MCP || record.handle.type !== SESSION_RESOURCE_HANDLE_TYPE.PID) continue;
+  const sampleRecord = async (record: SessionResourceRecord): Promise<void> => {
+    if (record.kind !== SESSION_RESOURCE_KIND.MCP || record.handle.type !== SESSION_RESOURCE_HANDLE_TYPE.PID) return;
     liveIds.add(record.resourceId);
-    if (record.handle.pid === process.pid) continue;
+    if (record.handle.pid === process.pid) return;
     const cpuMs = await dependencies.sampleCpuMillis(record.handle.pid);
     if (cpuMs === null) {
       mcpCpuSamples.delete(record.resourceId);
@@ -273,7 +274,7 @@ export async function sweepMemoryMcpCpu(
       // the active host bound to a closed stdio generation. Only an exact PID +
       // process-start observation may authorize that destructive recovery.
       const exactProcessCurrent = await dependencies.pidHandleIsCurrent(record.handle);
-      if (exactProcessCurrent !== false) continue;
+      if (exactProcessCurrent !== false) return;
       // The MCP stdio process is already gone. Restarting its owner cannot
       // reconnect the current host to that closed transport generation; it
       // only kills otherwise healthy agent work. Drop the stale registry row
@@ -283,14 +284,14 @@ export async function sweepMemoryMcpCpu(
         record.owner,
         SESSION_RESOURCE_RELEASE_REASON.PROCESS_MISSING,
       );
-      continue;
+      return;
     }
     const previous = mcpCpuSamples.get(record.resourceId);
     if (!previous) {
       mcpCpuSamples.set(record.resourceId, {
         cpuMs, sampledAt: now, strikes: 0, pressureReported: false,
       });
-      continue;
+      return;
     }
     const wallMs = now - previous.sampledAt;
     const cpuRatio = wallMs > 0 ? Math.max(0, cpuMs - previous.cpuMs) / wallMs : 0;
@@ -322,6 +323,19 @@ export async function sweepMemoryMcpCpu(
         dependencies.reportSustainedCpu?.(record, cpuRatio);
       }
     }
+  };
+  const candidates = records.filter((record): record is SessionResourceRecord =>
+    record.kind === SESSION_RESOURCE_KIND.MCP
+      && record.handle.type === SESSION_RESOURCE_HANDLE_TYPE.PID,
+  );
+  // Sampling each process starts an independent `ps`/PowerShell child. Run a
+  // bounded batch in parallel instead of serially waiting for every process;
+  // a large MCP population must not turn one watchdog tick into a long queue
+  // of main-thread callbacks. The batch boundary also caps child-process
+  // pressure and yields between groups.
+  for (let offset = 0; offset < candidates.length; offset += MCP_CPU_SAMPLE_CONCURRENCY) {
+    const batch = candidates.slice(offset, offset + MCP_CPU_SAMPLE_CONCURRENCY);
+    await Promise.all(batch.map((record) => sampleRecord(record)));
   }
   for (const resourceId of mcpCpuSamples.keys()) {
     if (!liveIds.has(resourceId)) mcpCpuSamples.delete(resourceId);

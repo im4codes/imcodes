@@ -133,6 +133,30 @@ describe('memory MCP watchdog process identity', () => {
     );
     expect(deps.reportSustainedCpu).not.toHaveBeenCalled();
   });
+
+  it('samples a large MCP population in bounded parallel batches', async () => {
+    const records = Array.from({ length: 16 }, (_, index) => mcpRecord(`mcp:batch-${index}`));
+    let inFlight = 0;
+    let maxInFlight = 0;
+    const deps = {
+      listResources: vi.fn().mockResolvedValue(records),
+      sampleCpuMillis: vi.fn().mockImplementation(async () => {
+        inFlight += 1;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        inFlight -= 1;
+        return 0;
+      }),
+      pidHandleIsCurrent: vi.fn(),
+      releaseResource: vi.fn(),
+    };
+
+    await sweepMemoryMcpCpu(10_000, deps);
+
+    expect(maxInFlight).toBeGreaterThan(1);
+    expect(maxInFlight).toBeLessThanOrEqual(8);
+    expect(deps.sampleCpuMillis).toHaveBeenCalledTimes(records.length);
+  });
 });
 
 function session(name: string, state: SessionRecord['state']): SessionRecord {

@@ -22,7 +22,7 @@ import {
   type ProcessingProviderSessionConfig as CompressionProviderSessionConfig,
 } from './processing-provider-config.js';
 import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
-import { countTokens } from './tokenizer.js';
+import { countTokensAsync } from './tokenizer.js';
 import { compressToolEvent } from './tool-compressors.js';
 import { redactSensitiveText } from '../util/redact-secrets.js';
 import { ensurePinnedNotesSection, redactSummaryPreservingPinned } from '../util/redact-with-pinned-region.js';
@@ -329,6 +329,7 @@ export const __testing__ = {
   recordFailure,
   classifyCompressionError,
   truncateEventText,
+  trimToTokenBudget,
 };
 
 // ── Compression provider (shared with the global registry singleton) ─────────
@@ -442,7 +443,7 @@ export async function localOnlyCompressor(input: CompressionInput): Promise<Comp
     usedBackup: false,
     fromSdk: true,
     inputTokens: 0,
-    outputTokens: countTokens(summary),
+    outputTokens: await countTokensAsync(summary),
     targetTokens: input.targetTokens ?? 0,
     durationMs: 0,
   };
@@ -646,19 +647,19 @@ export function computeTargetTokens(inputTokens: number, mode: CompressionMode =
   return Math.max(min, Math.min(max, computed));
 }
 
-function trimToTokenBudget(text: string, maxTokens: number): string {
-  if (countTokens(text) <= maxTokens) return text;
+async function trimToTokenBudget(text: string, maxTokens: number): Promise<string> {
+  if (await countTokensAsync(text) <= maxTokens) return text;
   let lo = 0;
   let hi = text.length;
   while (lo < hi) {
     const mid = Math.floor((lo + hi + 1) / 2);
-    if (countTokens(text.slice(0, mid)) <= maxTokens) lo = mid;
+    if (await countTokensAsync(text.slice(0, mid)) <= maxTokens) lo = mid;
     else hi = mid - 1;
   }
   return text.slice(0, lo).trimEnd() + '\n\n[... earlier summary truncated to bound prompt token budget ...]';
 }
 
-function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DEFAULT_PREVIOUS_SUMMARY_MAX_TOKENS): string | undefined {
+async function trimPreviousSummary(previousSummary: string | undefined, maxTokens = DEFAULT_PREVIOUS_SUMMARY_MAX_TOKENS): Promise<string | undefined> {
   if (!previousSummary) return previousSummary;
   return trimToTokenBudget(previousSummary, maxTokens);
 }
@@ -668,7 +669,7 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
   const mode = input.mode ?? 'auto';
   const startedAt = Date.now();
   const extraRedactPatterns = input.extraRedactPatterns ?? [];
-  const previousSummary = trimPreviousSummary(
+  const previousSummary = await trimPreviousSummary(
     mode === 'auto'
       ? undefined
       : input.previousSummary
@@ -683,7 +684,7 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
       summary,
       model: '', backend: '', usedBackup: false, fromSdk: false,
       inputTokens: 0,
-      outputTokens: countTokens(summary),
+      outputTokens: await countTokensAsync(summary),
       targetTokens: input.targetTokens ?? 0,
       durationMs: Date.now() - startedAt,
     };
@@ -716,7 +717,7 @@ async function compressWithSdkInner(input: CompressionInput): Promise<Compressio
     maxEventChars: input.maxEventChars ?? DEFAULT_MAX_EVENT_CHARS,
     extraRedactPatterns,
   });
-  const inputTokens = countTokens(`${previousSummary ?? ''}
+  const inputTokens = await countTokensAsync(`${previousSummary ?? ''}
 ${serializedEvents}`);
   const targetTokens = input.targetTokens ?? computeTargetTokens(inputTokens, mode);
   const prompt = buildCompressionPrompt(events, previousSummary, targetTokens, {
@@ -745,7 +746,7 @@ ${serializedEvents}`);
         model: modelConfig.primaryContextModel,
         backend: modelConfig.primaryContextBackend,
         usedBackup: false, fromSdk: true,
-        inputTokens, outputTokens: countTokens(summary),
+        inputTokens, outputTokens: await countTokensAsync(summary),
         targetTokens, durationMs: Date.now() - startedAt,
       };
     } catch (err) {
@@ -776,7 +777,7 @@ ${serializedEvents}`);
           model: modelConfig.backupContextModel,
           backend: modelConfig.backupContextBackend,
           usedBackup: true, fromSdk: true,
-          inputTokens, outputTokens: countTokens(summary),
+          inputTokens, outputTokens: await countTokensAsync(summary),
           targetTokens, durationMs: Date.now() - startedAt,
         };
       } catch (err) {
@@ -803,7 +804,7 @@ ${serializedEvents}`);
   return {
     summary: fallbackSummary,
     model: 'local-fallback', backend: 'none', usedBackup: false, fromSdk: false,
-    inputTokens, outputTokens: countTokens(fallbackSummary),
+    inputTokens, outputTokens: await countTokensAsync(fallbackSummary),
     targetTokens, durationMs: Date.now() - startedAt,
     errorCode: errorClassification?.code,
     errorMessage: errorMessage ? errorMessage.slice(0, 500) : undefined,

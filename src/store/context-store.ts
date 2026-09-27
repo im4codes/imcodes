@@ -26,7 +26,7 @@ import { serializeContextNamespace, serializeContextTarget } from '../context/co
 import { isMemoryNoiseSummary } from '../../shared/memory-noise-patterns.js';
 import { computeFingerprint, normalizeSummaryForFingerprint } from '../../shared/memory-fingerprint.js';
 import { memoryTextMatchesQuery } from '../../shared/memory-search-text.js';
-import { countTokens } from '../context/tokenizer.js';
+import { countTokensFallback } from '../context/tokenizer.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import { mergeSourceIds } from './source-id-merge.js';
@@ -1595,7 +1595,7 @@ export function archiveEventsForMaterializationForDb(database: DatabaseSyncInsta
       JSON.stringify(event.metadata ?? null),
       event.createdAt,
       archivedAt,
-      countTokens(content),
+      countTokensFallback(content),
     );
   }
 }
@@ -3123,7 +3123,7 @@ export function searchArchiveFts(query: string, limit = 20, filters: ArchiveSear
 }
 
 export function countStagedTokens(target: ContextTargetRef): number {
-  return listContextEvents(target).reduce((sum, event) => sum + countTokens(event.content ?? ''), 0);
+  return listContextEvents(target).reduce((sum, event) => sum + countTokensFallback(event.content ?? ''), 0);
 }
 
 export function estimateStagedTokenUpperBound(target: ContextTargetRef): number {
