@@ -118,7 +118,8 @@ describe('audit convergence contract', () => {
     expect(contract.firstPass.review).toMatch(/code plus the exact-revision implementer validation report/);
     expect(contract.rework.fix).toMatch(/whole invariant class/);
     expect(contract.rework.forbid).toMatch(/point patch/);
-    expect(contract.evidence.structuredResults).toMatch(/default-accept exact-bound implementer structured test results/);
+    expect(contract.evidence.structuredResults).toMatch(/executor READY_FOR_AUDIT report must state exact commands/);
+    expect(contract.evidence.structuredResults).toMatch(/does not repeat complete suites/);
     expect(contract.evidence.structuredResults).toMatch(/does not repeat/);
     expect(contract.evidence.auditorExecution).toMatch(/one test file\/few named tests or one mutant/);
     expect(contract.evidence.auditorExecution).toMatch(/maxWorkers<=2/);
