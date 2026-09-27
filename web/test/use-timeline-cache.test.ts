@@ -25,6 +25,7 @@ import {
   __resetLocalHistoryPruneStateForTests,
   __resetTimelineCacheForTests,
   __setTimelineCacheForTests,
+  __shouldRequestNewerTimelineCursorForTests,
   ingestTimelineEventForCache,
   useTimeline,
 } from '../src/hooks/useTimeline.js';
@@ -2286,6 +2287,85 @@ describe('useTimeline window-isolated cache bounds', () => {
       expect(screen.getByTestId('older').getAttribute('data-loading')).toBe('false');
       expect(screen.getByTestId('older').getAttribute('data-older')).toBe('false');
     });
+  });
+
+  it('bounds repeated newer cursors after a filtered summary page', async () => {
+    const sessionName = `deck_summary_cursor_guard_${Date.now()}`;
+    let handler: ((msg: ServerMessage) => void) | null = null;
+    let requestCount = 0;
+    const requestIds: string[] = [];
+    const sendTimelineHistoryRequest = vi.fn(() => {
+      const requestId = `history-${++requestCount}`;
+      requestIds.push(requestId);
+      return requestId;
+    });
+    const cachedEvent: TimelineEvent = {
+      eventId: `${sessionName}-cached`,
+      sessionId: sessionName,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.final',
+      payload: { text: 'cached final' },
+    };
+    __setTimelineCacheForTests(sessionName, [cachedEvent]);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: (next: (msg: ServerMessage) => void) => {
+        handler = next;
+        return () => { if (handler === next) handler = null; };
+      },
+      sendTimelineHistoryRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe() {
+      const { events } = useTimeline(sessionName, ws, undefined, {
+        isActiveSession: false,
+        isVisible: false,
+        subscriptionMode: 'summary',
+      });
+      return h('div', { 'data-testid': 'summary-cursor-events' }, String(events.length));
+    }
+
+    render(h(Probe));
+    await waitFor(() => {
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+        sessionName,
+        200,
+        undefined,
+        undefined,
+        expect.objectContaining({ epoch: 1, afterSeq: 10, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER }),
+        1024 * 1024,
+      );
+    });
+
+    const repeatedCursor = { epoch: 1, afterSeq: 10, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER } as const;
+    await act(async () => {
+      handler?.({
+        type: TIMELINE_MESSAGES.HISTORY,
+        sessionName,
+        requestId: requestIds[0],
+        epoch: 1,
+        events: [],
+        hasMore: true,
+        nextCursor: repeatedCursor,
+        status: TIMELINE_RESPONSE_STATUS.PARTIAL,
+        payloadTruncated: true,
+      } as ServerMessage);
+    });
+    await flushMicrotasks();
+
+    // A filtered page can be empty, but the same cursor must not cause a
+    // second request (the old behavior produced hundreds of thousands).
+    expect(requestCount).toBe(1);
+    expect(__shouldRequestNewerTimelineCursorForTests(null, repeatedCursor)).toBe(true);
+    expect(__shouldRequestNewerTimelineCursorForTests(
+      JSON.stringify(['newer', 1, 10, null, null]),
+      repeatedCursor,
+    )).toBe(false);
   });
 
   it('never lets a late load-earlier response rewrite the window switched in afterward', async () => {

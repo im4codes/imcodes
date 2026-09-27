@@ -1966,6 +1966,37 @@ function getOlderTimelineCursor(msg: TimelineEventsServerMessage): TimelineCurso
   return typeof cursor.beforeTs === 'number' ? cursor : null;
 }
 
+/**
+ * Return a stable identity for a paging cursor.  A summary projection may
+ * legitimately filter every event from a page while preserving the original
+ * paging metadata; if a buggy/old server repeats that cursor, the client must
+ * not turn the empty page into an unbounded request loop.
+ */
+function timelineCursorKey(cursor: TimelineCursor): string {
+  return JSON.stringify([
+    cursor.direction,
+    cursor.epoch,
+    cursor.afterSeq ?? null,
+    cursor.beforeTs ?? null,
+    cursor.afterTs ?? null,
+  ]);
+}
+
+/** Exposed for the pagination regression test; production uses the same key. */
+function shouldRequestNewerTimelineCursor(
+  previousCursorKey: string | null,
+  nextCursor: TimelineCursor,
+): boolean {
+  return previousCursorKey !== timelineCursorKey(nextCursor);
+}
+
+export function __shouldRequestNewerTimelineCursorForTests(
+  previousCursorKey: string | null,
+  nextCursor: TimelineCursor,
+): boolean {
+  return shouldRequestNewerTimelineCursor(previousCursorKey, nextCursor);
+}
+
 function hasStructuredOlderPage(msg: TimelineEventsServerMessage): boolean {
   return msg.hasMore === true && getOlderTimelineCursor(msg) !== null;
 }
@@ -2202,6 +2233,10 @@ export function useTimeline(
   const historyRequestIdRef = useRef<string | null>(null);
   const olderRequestIdRef = useRef<string | null>(null);
   const olderCursorRef = useRef<TimelineCursor | null>(null);
+  // Tracks the last newer cursor put on the wire.  A filtered summary page
+  // can contain no events while still reporting hasMore; repeating its cursor
+  // must not recurse into an unbounded history request loop.
+  const newerCursorKeyRef = useRef<string | null>(null);
   const historyLoadedRef = useRef<string | null>(null); // tracks which session has been loaded
   const historyRetryRef = useRef(0); // retry count for empty history responses
   const historyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -2259,6 +2294,15 @@ export function useTimeline(
     args?: { limit?: number; afterTs?: number; cursor?: TimelineCursor },
   ) => {
     if (!ws || !sessionId) return null;
+    const cursor = args?.cursor;
+    if (cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER) {
+      const cursorKey = timelineCursorKey(cursor);
+      if (!shouldRequestNewerTimelineCursor(newerCursorKeyRef.current, cursor)) return null;
+      newerCursorKeyRef.current = cursorKey;
+    } else {
+      // A fresh tail/bootstrap starts a new paging chain.
+      newerCursorKeyRef.current = null;
+    }
     // Keep every daemon history/page request on the shared 200-event wire
     // budget, even legacy callers that still pass MAX_MEMORY_EVENTS (300).
     const boundedLimit = Math.min(args?.limit ?? MAX_FORWARD_PAGE_EVENTS, MAX_FORWARD_PAGE_EVENTS);
