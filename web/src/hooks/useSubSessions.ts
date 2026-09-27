@@ -131,6 +131,7 @@ export function useSubSessions(
   const [subSessions, setSubSessions] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
   const rebuiltRef = useRef(false);
+  const lastProbeRecoveryLoadAtRef = useRef(0);
 
   // A half-open WebSocket that gets healed by a ping/pong probe surfaces as a
   // `connected` event with reason `probe_recovered` — WITHOUT the app's
@@ -172,6 +173,13 @@ export function useSubSessions(
       return;
     }
     rebuiltRef.current = false;
+    // A probe can recover on the first inbound timeline frame and then repeat
+    // while the socket is busy. The WsClient rate-limits lifecycle notices,
+    // but keep this guard at the API boundary too so an older client or a
+    // duplicate notice cannot refetch the same sub-session list in a loop.
+    if (reconnectTick > 0 && Date.now() - lastProbeRecoveryLoadAtRef.current < 15_000) {
+      return;
+    }
     const gen = ++loadGenRef.current;
     let attempt = 0;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -183,6 +191,7 @@ export function useSubSessions(
           if (gen !== loadGenRef.current) return;
           console.warn(`[sub-sessions] loaded ${list.length} for server ${serverId}`);
           loadedGenRef.current = gen;
+          if (reconnectTick > 0) lastProbeRecoveryLoadAtRef.current = Date.now();
           setSubSessions((prev) => {
             const previousById = new Map(prev.map((existing) => [existing.id, existing] as const));
             return list.map((s) => mergeLoadedSubSession(s, previousById.get(s.id)));

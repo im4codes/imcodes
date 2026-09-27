@@ -155,6 +155,14 @@ describe('useSubSessions rebuild gating', () => {
     // Reload re-fires, cascading into a fresh rebuild → subsession.sync(state).
     await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(2));
     await waitFor(() => expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(2));
+
+    // A burst of duplicate probe-recovery notices must not turn one socket
+    // recovery into an API storm while the sub-session windows are streaming.
+    await act(async () => {
+      fire({ type: 'session.event', event: 'connected', session: '', state: 'connected', reason: 'probe_recovered' });
+    });
+    await new Promise((r) => setTimeout(r, 10));
+    expect(listSubSessions).toHaveBeenCalledTimes(2);
   });
 
   // The trigger is precise: only `probe_recovered` (where the boolean can't flip)

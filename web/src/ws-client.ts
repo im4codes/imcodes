@@ -518,6 +518,14 @@ export class WsClient {
   private _visibilityListener: (() => void) | null = null;
   private _missedHeartbeatPongs = 0;
   private _resumeProbeMisses = 0;
+  /**
+   * A busy socket can deliver timeline frames while a foreground probe is
+   * waiting for its pong.  Those frames prove liveness, but must not each
+   * synthesize a `probe_recovered` lifecycle event: the app treats that event
+   * as a control-plane resync and would otherwise refetch app-build,
+   * session-list and sub-sessions once per incoming frame.
+   */
+  private _lastProbeRecoveryNoticeAt = 0;
   private _onLatency: ((ms: number) => void) | null = null;
   private p2pWorkflowPendingRequests = new Map<string, ReturnType<typeof setTimeout>>();
   private p2pWorkflowRequestScope: P2pWorkflowRequestScope = {};
@@ -1587,6 +1595,9 @@ export class WsClient {
     this._connected = true;
     this.flushPendingInput();
     this.flushSubscriptionDiffAfterProbeRecovery();
+    const now = Date.now();
+    if (now - this._lastProbeRecoveryNoticeAt < 15_000) return;
+    this._lastProbeRecoveryNoticeAt = now;
     this.dispatch({
       type: 'session.event',
       event: 'connected',
@@ -2179,6 +2190,7 @@ export class WsClient {
       this.clearWsOpenTimer();
       this._connecting = false;
       this._connected = true;
+      this._lastProbeRecoveryNoticeAt = 0;
       this.flushPendingInput();
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;

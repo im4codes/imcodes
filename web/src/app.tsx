@@ -1732,6 +1732,10 @@ export function App() {
   const loadedWebBuildId = useMemo(() => getLoadedWebBuildId(), []);
   const [appUpdateNotice, setAppUpdateNotice] = useState<AppUpdateNotice | null>(null);
   const appUpdateRequiredRef = useRef(false);
+  const appBuildCheckRef = useRef<{ startedAt: number; inFlight: Promise<boolean> | null }>({
+    startedAt: 0,
+    inFlight: null,
+  });
   const markAppUpdateRequired = useCallback((detail: AppUpdateRequiredDetail) => {
     appUpdateRequiredRef.current = true;
     setAppUpdateNotice((prev) => ({
@@ -1745,16 +1749,33 @@ export function App() {
     }));
   }, [loadedWebBuildId]);
   const checkForAppUpdate = useCallback(async (options?: { blocking?: boolean; featureLabel?: string }) => {
-    const current = await fetchCurrentAppBuildInfo();
-    if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
-    markAppUpdateRequired({
-      reason: 'build_mismatch',
-      currentBuildId: current.buildId,
-      loadedBuildId: loadedWebBuildId,
-      blocking: options?.blocking,
-      featureLabel: options?.featureLabel,
-    });
-    return true;
+    const now = Date.now();
+    const state = appBuildCheckRef.current;
+    // Probe recovery is a liveness signal, not a reason to re-fetch the same
+    // build marker for every timeline frame. Coalesce an in-flight request and
+    // keep non-blocking lifecycle checks to one request per 15 seconds. An
+    // explicit version-sensitive action may still force a fresh check.
+    if (state.inFlight) return state.inFlight;
+    if (!options?.blocking && now - state.startedAt < 15_000) return false;
+    state.startedAt = now;
+    const request = (async () => {
+      const current = await fetchCurrentAppBuildInfo();
+      if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
+      markAppUpdateRequired({
+        reason: 'build_mismatch',
+        currentBuildId: current.buildId,
+        loadedBuildId: loadedWebBuildId,
+        blocking: options?.blocking,
+        featureLabel: options?.featureLabel,
+      });
+      return true;
+    })();
+    state.inFlight = request;
+    try {
+      return await request;
+    } finally {
+      if (appBuildCheckRef.current.inFlight === request) appBuildCheckRef.current.inFlight = null;
+    }
   }, [loadedWebBuildId, markAppUpdateRequired]);
   const showAppUpdateBlocker = useCallback((featureLabel?: string, reason: AppUpdateReason = 'version_sensitive_feature') => {
     markAppUpdateRequired({

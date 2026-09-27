@@ -756,6 +756,32 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it('rate-limits probe recovery lifecycle notices while timeline frames keep arriving', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    client.probeConnection();
+    socket.emit('message', { data: JSON.stringify({ type: 'session_list', sessions: [] }) });
+    expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(1);
+
+    // A second probe can be triggered while the first recovered socket is
+    // still busy. Its first timeline frame restores the connected bit, but
+    // must not fan out another expensive app-level resync immediately.
+    client.probeConnection();
+    socket.emit('message', { data: JSON.stringify({ type: 'timeline.event', event: { sessionId: 's1', eventId: 'e1', seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'x' } } }) });
+    expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(1);
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('send() is a safe no-op when not connected (does not throw)', () => {
     // Fire-and-forget transport must never throw to React effects/listeners —
     // an uncaught throw crashes the ChatView via the ErrorBoundary.
