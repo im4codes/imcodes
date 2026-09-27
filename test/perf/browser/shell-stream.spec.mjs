@@ -390,6 +390,7 @@ export async function runShellBrowserScenario() {
     const summarize = (text) => ({ counts: nonces.map((nonce) => text.split(nonce).length - 1), order: nonces.map((nonce) => text.indexOf(nonce)) });
     return { session, handles, panes: panes.map(({ index, text }) => ({ index, ...summarize(text) })), active: handles.find((entry) => entry.name === session) ?? null };
   }, { nonces: recoveryNonces, session: SESSION });
+  console.error(JSON.stringify({ recoveryNonceEvidence: recoveryInput, nonces: recoveryNonces }));
   assert.ok(recoveryInput.active, 'replacement terminal handle must retain session identity');
   assert.deepEqual(recoveryInput.active.counts, [1, 1], 'each recovery nonce must be echoed exactly once by the replacement pane');
   assert.ok(recoveryInput.active.order[0] >= 0 && recoveryInput.active.order[1] > recoveryInput.active.order[0], 'recovery nonce order must be preserved');
