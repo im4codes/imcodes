@@ -11,7 +11,7 @@
  * throw at a named boundary and assert the durable state that results, which is
  * the only way to show the transaction actually holds.
  */
-import { compareQueuedTaskPairs, TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
+import { compareQueuedTaskPairs, isTerminalTaskPairStatus, TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
 import { taskPairChecklistCounts } from '../../shared/task-pair-checklist.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isPairsEngineProject } from './task-pairs/engine.js';
@@ -629,6 +629,9 @@ export class SupervisionConsoleProducer {
           round: pair.round,
           blocking: [...pair.blocking],
           createdAt: pair.createdAt,
+          ...(pair.startedAt !== undefined ? { startedAt: pair.startedAt } : {}),
+          updatedAt: pair.updatedAt,
+          ...(isTerminalTaskPairStatus(pair.status) ? { endedAt: pair.updatedAt } : {}),
           queueOrder: stored.queueOrder,
           ...(queuePositions.has(pair.taskId) ? { queuePosition: queuePositions.get(pair.taskId) } : {}),
           ...(pair.urgent ? { urgent: true } : {}),

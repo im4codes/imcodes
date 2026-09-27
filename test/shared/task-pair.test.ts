@@ -277,6 +277,48 @@ describe('task-pair state machine', () => {
     });
   });
 
+  it('records late participant markers after PASS without reopening the pair', () => {
+    const passed = apply(withStatus('in_audit'), AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->').pair!;
+    expect(passed.status).toBe('passed');
+    for (const [writer, verb] of [
+      [EXEC, 'READY_FOR_AUDIT'],
+      [EXEC, 'REWORK'],
+      [AUD, 'PASS'],
+      [EXEC, 'STARTED'],
+      [EXEC, 'WORKING'],
+    ] as const) {
+      const result = apply(passed, writer, `<!-- IMCODES_TASK ${verb} T42${verb === 'READY_FOR_AUDIT' ? ' path=/workspace' : verb === 'REWORK' ? ' blocking=P0 p0=1' : ''} -->`);
+      expect(result).toMatchObject({ effect: 'recorded', unusual: true, fromStatus: 'passed', toStatus: 'passed' });
+      expect(result.pair).toBeUndefined();
+    }
+    // The executor's ordinary close remains the one participant transition
+    // allowed after PASS.
+    expect(apply(passed, EXEC, '<!-- IMCODES_TASK DONE T42 -->').pair?.status).toBe('done');
+  });
+
+  it('records late READY/REWORK/PASS after DONE without changing terminal state', () => {
+    const done = withStatus('done');
+    for (const [writer, verb] of [
+      [EXEC, 'READY_FOR_AUDIT'],
+      [AUD, 'REWORK'],
+      [AUD, 'PASS'],
+    ] as const) {
+      const suffix = verb === 'READY_FOR_AUDIT' ? ' path=/workspace' : verb === 'REWORK' ? ' blocking=P0 p0=1' : ' blocking=P0';
+      const result = apply(done, writer, `<!-- IMCODES_TASK ${verb} T42${suffix} -->`);
+      expect(result).toMatchObject({ effect: 'recorded', unusual: true, fromStatus: 'done', toStatus: 'done' });
+      expect(result.pair?.status ?? done.status).toBe('done');
+    }
+  });
+
+  it('requires a fresh material-backed in_audit round before PASS after REWORK', () => {
+    const rework = apply(withStatus('in_audit'), AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->').pair!;
+    const stalePass = apply(rework, AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->');
+    expect(stalePass).toMatchObject({ effect: 'recorded', unusual: true, fromStatus: 'rework', toStatus: 'rework' });
+    expect(stalePass.pair?.status).toBe('rework');
+    const fresh = apply(rework, EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->').pair!;
+    expect(apply(fresh, AUD, '<!-- IMCODES_TASK PASS T42 blocking=P0 -->').pair?.status).toBe('passed');
+  });
+
   it('bounds the correction loop at the per-round cap and then tells Brain once', () => {
     let pair = withStatus('in_audit');
     const corrections: unknown[] = [];

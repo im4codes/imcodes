@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
-import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
+import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
 import { formatElapsedDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 
@@ -26,14 +26,53 @@ function status(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
 }
 
-function normalizeSnapshot(detail: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] }): readonly Record<string, unknown>[] | null {
+type TaskPairConsoleSnapshotDetail = { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] };
+
+function finiteTimestamp(value: unknown, fallback: number): number {
+  const numeric = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
+}
+
+function mergeDefined(
+  previous: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  const merged = { ...(previous ?? {}) };
+  for (const [key, value] of Object.entries(incoming)) if (value !== undefined) merged[key] = value;
+  return merged;
+}
+
+function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Record<string, unknown>[] | null {
   if (!Array.isArray(detail.tasks)) return null;
   const byTask = new Map<string, Record<string, unknown>[]>();
   for (const assignment of detail.assignments ?? []) { const id = typeof assignment.taskId === 'string' ? assignment.taskId : ''; if (id) byTask.set(id, [...(byTask.get(id) ?? []), assignment]); }
   return detail.tasks.map((task) => {
     const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
     const executor = roles.find((role) => role.role === 'implementer'); const auditor = roles.find((role) => role.role === 'auditor');
-    return { ...pair, taskId: task.taskId, title: task.title, toStatus: pair.status ?? task.status, startedAt: pair.startedAt ?? pair.createdAt ?? task.updatedAt, queuePosition: pair.queuePosition, executor: pair.executor, auditor: pair.auditor, executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel, auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel, executorModel: executor?.observedModel ?? pair.executorModel, auditorModel: auditor?.observedModel ?? pair.auditorModel, executorState: executor?.sessionState ?? pair.executorState, auditorState: auditor?.sessionState ?? pair.auditorState };
+    const toStatus = pair.status ?? task.status;
+    const startedAt = finiteTimestamp(pair.startedAt ?? pair.createdAt ?? task.updatedAt, Date.now());
+    const updatedAt = finiteTimestamp(pair.updatedAt ?? task.updatedAt, startedAt);
+    const endedAt = TASK_PAIR_TERMINAL_STATUSES.includes(toStatus as TaskPairStatus)
+      ? finiteTimestamp(pair.endedAt ?? task.updatedAt, updatedAt)
+      : undefined;
+    return {
+      ...pair,
+      taskId: task.taskId,
+      title: task.title,
+      toStatus,
+      startedAt,
+      updatedAt,
+      ...(endedAt !== undefined ? { endedAt } : {}),
+      queuePosition: pair.queuePosition,
+      executor: pair.executor,
+      auditor: pair.auditor,
+      executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel,
+      auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel,
+      executorModel: executor?.observedModel ?? pair.executorModel,
+      auditorModel: auditor?.observedModel ?? pair.auditorModel,
+      executorState: executor?.sessionState ?? pair.executorState,
+      auditorState: auditor?.sessionState ?? pair.auditorState,
+    };
   });
 }
 
@@ -111,7 +150,14 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
       if (Array.isArray(detail.tasks)) {
         setSnapshotRows(normalizeSnapshot(detail));
       } else if (detail.op === 'task_upsert' && detail.task) {
-        setSnapshotRows((current) => current ? [...current.filter((row) => row.taskId !== detail.task!.taskId), { ...(detail.task!.pair as Record<string, unknown> ?? {}), taskId: detail.task!.taskId, title: detail.task!.title, toStatus: (detail.task!.pair as Record<string, unknown> | undefined)?.status ?? detail.task!.status, startedAt: (detail.task!.pair as Record<string, unknown> | undefined)?.startedAt ?? (detail.task!.pair as Record<string, unknown> | undefined)?.createdAt ?? detail.task!.updatedAt }] : current);
+        setSnapshotRows((current) => {
+          if (!current) return current;
+          const normalized = normalizeSnapshot({ tasks: [detail.task!], assignments: detail.assignments });
+          const incoming = normalized?.[0];
+          if (!incoming) return current;
+          const previous = current.find((row) => row.taskId === incoming.taskId);
+          return [...current.filter((row) => row.taskId !== incoming.taskId), mergeDefined(previous, incoming)];
+        });
       } else if (detail.op === 'task_remove' && detail.removedId) setSnapshotRows((current) => current?.filter((row) => row.taskId !== detail.removedId) ?? current);
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
@@ -191,7 +237,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
         const heading = <h4>{t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const endedAt = terminal ? finiteTimestamp(payload.endedAt ?? payload.updatedAt, row.startedAt) : now; const elapsedSeconds = Math.max(0, Math.floor((endedAt - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
               <span class="task-pair-status-badge-dot" aria-hidden="true" />

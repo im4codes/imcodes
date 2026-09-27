@@ -448,6 +448,10 @@ export interface SupervisionConsolePairInfo {
   severityCounts?: TaskPairSeverityCounts;
   lastVerdict?: 'PASS' | 'REWORK';
   createdAt?: number;
+  /** Pair-engine lifecycle clock, used by compact panels for frozen terminal duration. */
+  startedAt?: number;
+  updatedAt?: number;
+  endedAt?: number;
   queueOrder?: number;
   queuePosition?: number;
   executorLabel?: string;

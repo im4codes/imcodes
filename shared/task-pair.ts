@@ -939,6 +939,24 @@ export function applyTaskPairMarker(
   let unusual = role === 'other';
   if (PROGRESS_VERBS.includes(verb)) clearSideFlags(pair, role);
 
+  // Once a pair has earned PASS, or has been closed, participant progress
+  // markers are historical noise.  In particular, a delayed
+  // READY_FOR_AUDIT after PASS must not reopen an audit round (the owner
+  // report observed exactly that sequence).  Only the explicit Brain/daemon
+  // lifecycle controls below (DISPATCH/QUEUE/REASSIGN/CANCEL) may change a
+  // passed/terminal pair; the executor's DONE-after-PASS remains valid.
+  // Keep this guard before any material/round mutation so a late marker is
+  // truly record-only and cannot alter the authoritative pair snapshot.
+  const guardedAfterPass = pair.status === 'passed' && (
+    verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT'
+      || verb === 'PASS' || verb === 'REWORK'
+  );
+  const guardedAfterClose = terminal && (
+    verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT'
+      || verb === 'PASS' || verb === 'REWORK'
+  );
+  if (guardedAfterPass || guardedAfterClose) return recorded(existing);
+
   const done = (effect: string, extra: Partial<TaskPairTransition> = {}): TaskPairTransition => ({
     pair, fromStatus, toStatus: pair.status, effect, unusual, intents, ...extra,
   });

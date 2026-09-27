@@ -107,7 +107,10 @@ describe('TaskPairEventChip workspace events', () => {
   });
 });
 describe('TaskPairStatusPanel', () => {
-  beforeEach(() => window.localStorage.clear());
+  beforeEach(() => {
+    window.localStorage.clear();
+    delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+  });
   afterEach(() => cleanup());
   it('does not mount responsive panel effects for an ordinary chat, then activates on pair snapshot data', async () => {
     const originalMatchMedia = window.matchMedia;
@@ -250,6 +253,59 @@ describe('TaskPairStatusPanel', () => {
     await waitFor(() => expect(screen.getByText('Snapshot task')).toBeTruthy());
     expect(screen.getByText('Cx6')).toBeTruthy();
     expect(screen.getByText('!')).toBeTruthy();
+  });
+
+  it('renders a terminal snapshot as done and freezes its elapsed duration', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    try {
+      render(<TaskPairStatusPanel events={[{
+        eventId: 'stale-rework', type: 'task_pair.event', ts: 10_000,
+        payload: { taskId: 'terminal-1', title: 'Finished pair', toStatus: 'rework', round: 1 },
+      }] as never} />);
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+        tasks: [{ taskId: 'terminal-1', title: 'Finished pair', updatedAt: 15_000, pair: { status: 'done', createdAt: 5_000, startedAt: 6_000, updatedAt: 15_000 } }],
+        assignments: [],
+      } }));
+      await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
+      const meta = document.querySelector('[data-status="done"] .task-pair-status-row-meta')!;
+      const before = meta.textContent;
+      vi.advanceTimersByTime(30_000);
+      await waitFor(() => expect(meta.textContent).toBe(before));
+      expect(screen.queryByText(/panel_rework_count/)).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('applies a live authoritative DONE upsert over the prior row without waiting for chat history', async () => {
+    render(<TaskPairStatusPanel events={[]} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'live-done', title: 'Live finish', updatedAt: 10_000, pair: { status: 'rework', createdAt: 1_000, startedAt: 2_000, updatedAt: 10_000 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(document.querySelector('[data-status="rework"]')).toBeTruthy());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      op: 'task_upsert',
+      task: { taskId: 'live-done', title: 'Live finish', updatedAt: 12_000, pair: { status: 'done', createdAt: 1_000, startedAt: 2_000, updatedAt: 12_000 } },
+    } }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-status="done"]')).toBeTruthy();
+      expect(document.querySelector('[data-status="rework"]')).toBeNull();
+    });
+  });
+
+  it('replaces a stale row when reconnect resync delivers the authoritative snapshot', async () => {
+    render(<TaskPairStatusPanel events={[{
+      eventId: 'stale', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'resync-1', title: 'Resync pair', toStatus: 'rework' },
+    }] as never} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'resync-1', title: 'Resync pair', updatedAt: 100, pair: { status: 'done', createdAt: 10, startedAt: 20, updatedAt: 100 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
+    expect(document.querySelector('[data-status="rework"]')).toBeNull();
   });
 
   it('renders the complete title without exposing the task id in metadata', () => {
