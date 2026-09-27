@@ -9,8 +9,10 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { resolveImcodesHome, windowsDaemonLockPipeName } from '../util/windows-daemon-lock.js';
+
+export { WINDOWS_DAEMON_LOCK_PIPE, normalizeWindowsLockPath, resolveImcodesHome, windowsDaemonLockPipeName } from '../util/windows-daemon-lock.js';
 
 export interface DaemonProcessIdentity {
   pid: number;
@@ -241,7 +243,7 @@ function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.length <= 10_000 && value.every((item) => typeof item === 'string');
 }
 
-export function readInstanceLockMetadata(metadataPath = join(homedir(), '.imcodes', 'daemon.lock.json')): InstanceLockMetadata | null {
+export function readInstanceLockMetadata(metadataPath = join(resolveImcodesHome(), 'daemon.lock.json')): InstanceLockMetadata | null {
   try {
     const parsed = JSON.parse(readFileSync(metadataPath, 'utf8')) as Partial<InstanceLockMetadata>;
     if (parsed.version !== 1 || !Number.isSafeInteger(parsed.pid) || (parsed.pid ?? 0) <= 0
@@ -387,19 +389,23 @@ async function probeSocket(path: string, timeoutMs: number): Promise<{ connected
  * regardless of what any PID or unit state claims.
  */
 export async function isAuthoritySocketReachable(
-  socketPath: string = join(homedir(), '.imcodes', 'daemon.sock'),
+  socketPath?: string,
   timeoutMs = 500,
 ): Promise<boolean> {
-  const result = await probeSocket(socketPath, timeoutMs);
+  const authorityPath = socketPath ?? (process.platform === 'win32'
+    ? windowsDaemonLockPipeName()
+    : join(resolveImcodesHome(), 'daemon.sock'));
+  const result = await probeSocket(authorityPath, timeoutMs);
   return result.connected;
 }
 
 export async function acquireInstanceLock(options: AcquireInstanceLockOptions = {}): Promise<InstanceLockHandle> {
+  const stateHome = resolveImcodesHome({ socketPath: options.socketPath });
   const socketPath = process.platform === 'win32'
-    ? '\\\\.\\pipe\\imcodes-daemon-lock'
-    : (options.socketPath ?? join(homedir(), '.imcodes', 'daemon.sock'));
-  const metadataPath = options.metadataPath ?? (options.socketPath ? `${options.socketPath}.lock.json` : join(homedir(), '.imcodes', 'daemon.lock.json'));
-  const pidPath = options.pidPath ?? (options.socketPath ? `${metadataPath}.pid` : join(homedir(), '.imcodes', 'daemon.pid'));
+    ? windowsDaemonLockPipeName({ socketPath: options.socketPath })
+    : (options.socketPath ?? join(stateHome, 'daemon.sock'));
+  const metadataPath = options.metadataPath ?? (options.socketPath ? `${options.socketPath}.lock.json` : join(stateHome, 'daemon.lock.json'));
+  const pidPath = options.pidPath ?? (options.socketPath ? `${metadataPath}.pid` : join(stateHome, 'daemon.pid'));
   const identity = options.currentIdentity ?? currentDaemonProcessIdentity();
   const stringProbe = options.probeProcessStartToken;
   const processProbe: (pid: number) => ProcessLiveness = options.probeProcessLiveness

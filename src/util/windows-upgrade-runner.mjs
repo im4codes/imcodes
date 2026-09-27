@@ -60,8 +60,9 @@ import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 
 const HOME = homedir();
-const LOCK = join(HOME, '.imcodes', 'upgrade.lock');
-const PIDFILE = join(HOME, '.imcodes', 'daemon.pid');
+const IMCODES_HOME = process.env.IMCODES_HOME?.trim() || join(HOME, '.imcodes');
+const LOCK = join(IMCODES_HOME, 'upgrade.lock');
+const PIDFILE = join(IMCODES_HOME, 'daemon.pid');
 const DAEMON_TASK = 'imcodes-daemon';
 
 const LOG_FILE = process.argv[2];

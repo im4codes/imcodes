@@ -95,6 +95,7 @@ import { PROJECT_ROOT } from './util/project-root.js';
 import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.js';
 import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
 import { daemonProcessAppearsRunning, isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
+import { resolveImcodesHome } from './util/windows-daemon-lock.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
@@ -275,7 +276,7 @@ function formatStorageStatus(storage: DaemonFilesystemSpace | null): string {
 /** Kill any lingering imcodes daemon processes after launchctl unload.
  *  Uses PID file (~/.imcodes/daemon.pid) for reliable targeting. */
 function killStaleImcodesProcesses(): void {
-  const pidPath = resolve(homedir(), '.imcodes', 'daemon.pid');
+  const pidPath = resolve(resolveImcodesHome(), 'daemon.pid');
   let pid: number | null = null;
   try {
     const raw = readFileSync(pidPath, 'utf8').trim();
@@ -494,7 +495,7 @@ program
     // Check daemon process status
     let daemonPid: string | null = null;
     let daemonRunning = false;
-    const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
+    const pidFile = join(resolveImcodesHome(), 'daemon.pid');
     try {
       const storedPid = readFileSync(pidFile, 'utf8').trim();
       if (storedPid) {
@@ -1136,7 +1137,7 @@ program
     } else if (platform === 'win32') {
       // Kill daemon process — watchdog will auto-relaunch with new version in ~5s.
       console.log('Restarting daemon (watchdog will relaunch with new version)...');
-      const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
+      const pidFile = resolve(resolveImcodesHome(), 'daemon.pid');
       try {
         const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
         if (pid && pid !== process.pid) {

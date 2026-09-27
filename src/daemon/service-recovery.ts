@@ -1,5 +1,4 @@
 import { readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
   probeProcessLiveness,
@@ -7,6 +6,7 @@ import {
   type InstanceLockMetadata,
   type ProcessLiveness,
 } from './instance-lock.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 
 /**
  * Recovery for the one state systemd cannot resolve on its own.
@@ -146,7 +146,7 @@ export async function recoverFalseActiveDaemonService(
   };
 }
 
-const RECOVERY_STAMP_PATH = join(homedir(), '.imcodes', 'daemon.recovery-stamp');
+const RECOVERY_STAMP_PATH = join(resolveImcodesHome(), 'daemon.recovery-stamp');
 
 export function readRecoveryStamp(path = RECOVERY_STAMP_PATH): ServiceRecoveryStamp | null {
   try {
@@ -179,9 +179,9 @@ export function writeRecoveryStamp(stamp: ServiceRecoveryStamp, path = RECOVERY_
 }
 
 export function removeInstanceLockArtifacts(
-  metadataPath = join(homedir(), '.imcodes', 'daemon.lock.json'),
-  pidPath = join(homedir(), '.imcodes', 'daemon.pid'),
-  socketPath = join(homedir(), '.imcodes', 'daemon.sock'),
+  metadataPath = join(resolveImcodesHome(), 'daemon.lock.json'),
+  pidPath = join(resolveImcodesHome(), 'daemon.pid'),
+  socketPath = join(resolveImcodesHome(), 'daemon.sock'),
 ): void {
   for (const path of [socketPath, metadataPath, pidPath]) {
     try { unlinkSync(path); } catch { /* already absent */ }

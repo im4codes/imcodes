@@ -18,6 +18,7 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { assertNotRealImcodesPathInTests, isRealImcodesPath, isUnderTestRunner } from '../util/test-home-guard.js';
 import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type DaemonProcessIdentity } from '../daemon/instance-lock.js';
 import logger from '../util/logger.js';
@@ -281,7 +282,7 @@ let storeAuthoritative = false;
 
 export function markSessionStoreAuthoritative(
   identity?: DaemonProcessIdentity,
-  metadataPath = join(homedir(), '.imcodes', 'daemon.lock.json'),
+  metadataPath = join(resolveImcodesHome(), 'daemon.lock.json'),
 ): void {
   storeAuthoritative = true;
   if (identity) {
@@ -293,7 +294,7 @@ export function markSessionStoreAuthoritative(
 /** The daemon calls this immediately after acquiring its instance lock. */
 export function configureSessionStoreWriteAuthority(
   identity: DaemonProcessIdentity,
-  metadataPath = join(homedir(), '.imcodes', 'daemon.lock.json'),
+  metadataPath = join(resolveImcodesHome(), 'daemon.lock.json'),
 ): void {
   storeWriteAuthority = { identity, metadataPath };
   warnedReadOnlyWrite = false;

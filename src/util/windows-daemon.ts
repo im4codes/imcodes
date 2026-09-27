@@ -2,12 +2,13 @@ import { execSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { resolveImcodesHome, windowsDaemonLockPipeName } from './windows-daemon-lock.js';
 
 const WINDOWS_DAEMON_TASK = 'imcodes-daemon';
 const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
 function readDaemonPid(currentPid?: number): number | null {
-  const pidFile = resolve(homedir(), '.imcodes', 'daemon.pid');
+  const pidFile = resolve(resolveImcodesHome(), 'daemon.pid');
   try {
     const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
     if (!pid || pid <= 0 || pid === currentPid) return null;
@@ -128,7 +129,7 @@ function findStaleWatchdogPids(): number[] {
 // ── Launcher methods (all hidden — no visible windows) ──────────────────────
 
 function tryStartVbsLauncher(): boolean {
-  const vbs = resolve(homedir(), '.imcodes', 'daemon-launcher.vbs');
+  const vbs = resolve(resolveImcodesHome(), 'daemon-launcher.vbs');
   if (!existsSync(vbs)) return false;
   spawn('wscript', [vbs], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   return true;
@@ -184,7 +185,7 @@ function tryStartStartupShortcut(): boolean {
  *  weird ACL, fall back to PowerShell `Remove-Item -Force`. */
 function clearUpgradeLock(): boolean {
   if (process.platform !== 'win32') return false;
-  const lockPath = resolve(homedir(), '.imcodes', 'upgrade.lock');
+  const lockPath = resolve(resolveImcodesHome(), 'upgrade.lock');
   if (!existsSync(lockPath)) return false;
   try {
     rmSync(lockPath, { force: true });
@@ -270,7 +271,8 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
 }
 
 /** Forcefully kill any node.exe process that is listening on the imcodes
- *  daemon's named pipe (`\\.\pipe\imcodes-daemon-lock`).  This handles the
+ *  daemon's home-scoped named pipe (the default is
+ *  `windowsDaemonLockPipeName()`).  This handles the
  *  edge case where an orphan daemon survives `taskkill` because it was
  *  spawned with elevated privileges.  We use `wmic process delete` (the
  *  one method that works against permission-denied targets in our test
@@ -283,6 +285,7 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
  *  Returns true if at least one orphan was killed. */
 export function killOrphanDaemonProcesses(): boolean {
   if (process.platform !== 'win32') return false;
+  const lockPipeName = windowsDaemonLockPipeName();
   let killed = false;
   let scriptDir: string | null = null;
   try {
@@ -303,7 +306,8 @@ export function killOrphanDaemonProcesses(): boolean {
     // both cases (the .cmd shim resolves to the dist path internally).
     writeFileSync(
       scriptPath,
-      "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
+      `# instance-lock-pipe: ${lockPipeName}\r\n` +
+        "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
         "Where-Object { $_.CommandLine -like '*node_modules\\imcodes\\dist*' } | " +
         "ForEach-Object { $_.ProcessId }\r\n",
     );
