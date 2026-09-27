@@ -56,6 +56,11 @@ export default defineConfig(({ mode }) => ({
       },
     },
   },
+  // The fixture preview is consumed from the compose network (the browser
+  // reaches it as `web:4300`). Vite rejects that hostname by default; keep
+  // the allow-list scoped to the test-only fixtures mode so production
+  // previews retain their normal host protection.
+  preview: mode === 'fixtures' ? { allowedHosts: true } : undefined,
   build: {
     outDir: 'dist',
     target: 'es2020',
