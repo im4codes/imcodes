@@ -262,7 +262,7 @@ describe('SubSessionWindow metadata wiring', () => {
       payload: { text: 'cached final answer', streaming: false },
     }];
 
-    render(
+    const view = render(
       <SubSessionWindow
         sub={makeSubSession({ type: 'codex-sdk', runtimeType: 'transport' as any })}
         ws={ws}
@@ -284,6 +284,28 @@ describe('SubSessionWindow metadata wiring', () => {
       expect(document.querySelector('.subsession-preview-shell')?.textContent).toContain('cached final answer');
       expect(chatViewPropsSpy).not.toHaveBeenCalled();
       expect(document.querySelector('[data-testid="usage-footer"]')).toBeNull();
+    });
+
+    fireEvent.input(document.querySelector('.subsession-deferred-composer')!, { target: { value: 'draft survives focus' } });
+    view.rerender(
+      <SubSessionWindow
+        sub={makeSubSession({ type: 'codex-sdk', runtimeType: 'transport' as any })}
+        ws={ws}
+        connected={true}
+        active={true}
+        visible={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+    await waitFor(() => {
+      expect(sessionControlsSpy.mock.calls.at(-1)?.[0].pendingPrefillText).toBe('draft survives focus');
     });
   });
 
