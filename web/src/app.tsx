@@ -876,8 +876,11 @@ export function App() {
   const autoEntryRunRef = useRef(0);
   const [showMobileServerMenu, setShowMobileServerMenu] = useState(false);
   const [showMobileFileBrowser, setShowMobileFileBrowser] = useState(false);
+  // On phones the console is a large overlay: never re-open it by itself at
+  // launch (owner: load silently, no big box on open). It opens only from its
+  // toggle. Desktop keeps the remembered side-panel state.
   const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
-    () => loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
+    () => !isMobileUserAgent() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
   );
   const toggleSupervisionTaskConsole = useCallback(() => {
     setShowSupervisionTaskConsole((open) => {
