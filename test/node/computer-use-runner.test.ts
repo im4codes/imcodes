@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 import {
   browserExecutableCandidatesForTest,
   browserAutomationEndpointForTest,
+  browserAttachEndpointForTest,
   browserLaunchArgsForTest,
   browserCdpExceptionMessageForTest,
   browserSelectorScriptForTest,
@@ -326,6 +327,13 @@ describe('computer use runner open-computer-use CLI', () => {
     ).error).toContain('signed Open Computer Use app is unavailable');
   });
 
+  it('turns a missing Linux Open Computer Use helper into an actionable desktop-only state', () => {
+    const result = normalizeComputerUseErrorForTest('list_apps', 'spawn open-computer-use ENOENT', 'linux');
+    expect(result.error).toContain('Open Computer Use helper is not installed');
+    expect(result.error).toContain('browser_* tools');
+    expect(result.error).not.toContain('ENOENT');
+  });
+
   it('makes Windows fast coordinate pointer actions per-monitor DPI-aware before geometry calls', () => {
     const source = readFileSync('src/node/computer-use-runner.ts', 'utf8');
     const setAwareness = source.indexOf('[void][ImcodesFastPointer]::SetProcessDpiAwareness(2)');
@@ -431,6 +439,21 @@ describe('computer use runner open-computer-use CLI', () => {
         cdpPort: 45123,
       },
     });
+  });
+
+  it('converts the HTTP snapshot CDP base into a page-target attach', () => {
+    expect(browserAttachEndpointForTest('http://127.0.0.1:43833')).toEqual({
+      base: 'http://127.0.0.1:43833',
+      endpoint: 'http://127.0.0.1:43833/',
+      needsPageTarget: true,
+    });
+    expect(browserAttachEndpointForTest('ws://127.0.0.1:43833/devtools/browser/abc')).toEqual({
+      base: 'http://127.0.0.1:43833',
+      endpoint: 'ws://127.0.0.1:43833/devtools/browser/abc',
+      needsPageTarget: true,
+    });
+    expect(browserAttachEndpointForTest('ws://127.0.0.1:43833/devtools/page/abc').needsPageTarget).toBe(false);
+    expect(() => browserAttachEndpointForTest('127.0.0.1:43833')).toThrow('browser_cdp_endpoint_invalid');
   });
 
   it('captures a bounded model-visible browser viewport image when requested', async () => {

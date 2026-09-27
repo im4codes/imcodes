@@ -1118,6 +1118,11 @@ function actionableComputerUseError(
   platform: NodeJS.Platform = process.platform,
 ): string {
   const text = message.trim() || 'computer use tool failed';
+  if (!isBrowserUseTool(tool)
+    && platform === 'linux'
+    && /(?:spawn|exec)\s+open-computer-use\s+ENOENT|open_computer_use_mcp_(?:not_running|exited:.*ENOENT)/iu.test(text)) {
+    return 'Desktop app control is unavailable because the Open Computer Use helper is not installed on this Linux host. Install or repair the packaged Open Computer Use helper; browser automation is separate and remains available through browser_* tools.';
+  }
   if (isBrowserUseTool(tool) && text.includes('browser_executable_not_found')) {
     return 'No supported browser is installed on this machine. Install Google Chrome, Chromium, or Microsoft Edge, then retry the browser request.';
   }
@@ -1726,6 +1731,37 @@ export interface BrowserAutomationEndpoint {
   cdpPort: number;
 }
 
+interface BrowserAttachEndpoint {
+  base: string;
+  endpoint: string;
+  needsPageTarget: boolean;
+}
+
+/** Normalize HTTP snapshot endpoints and websocket CDP endpoints for attach. */
+function browserAttachEndpoint(cdpEndpoint: string): BrowserAttachEndpoint {
+  let parsed: URL;
+  try {
+    parsed = new URL(cdpEndpoint);
+  } catch {
+    throw new Error('browser_cdp_endpoint_invalid: expected an http(s) or ws(s) CDP endpoint');
+  }
+  const isHttp = parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  const isWebSocket = parsed.protocol === 'ws:' || parsed.protocol === 'wss:';
+  if (!isHttp && !isWebSocket) {
+    throw new Error('browser_cdp_endpoint_invalid: expected an http(s) or ws(s) CDP endpoint');
+  }
+  const baseProtocol = parsed.protocol === 'https:' || parsed.protocol === 'wss:' ? 'https:' : 'http:';
+  return {
+    base: `${baseProtocol}//${parsed.host}`,
+    endpoint: parsed.toString(),
+    needsPageTarget: isHttp || parsed.pathname.includes('/devtools/browser/'),
+  };
+}
+
+export function browserAttachEndpointForTest(cdpEndpoint: string): BrowserAttachEndpoint {
+  return browserAttachEndpoint(cdpEndpoint);
+}
+
 function browserAutomationEndpoint(cdpEndpoint: string | null): BrowserAutomationEndpoint | undefined {
   if (!cdpEndpoint) return undefined;
   const url = new URL(cdpEndpoint);
@@ -1862,13 +1898,16 @@ class BrowserUseController {
 
   /** Attach to an already-running browser over CDP. */
   private async attach(cdpEndpoint: string, args: Record<string, unknown>, timeoutMs: number): Promise<CdpClient> {
-    const base = `http://${new URL(cdpEndpoint).host}`;
+    const parsedEndpoint = browserAttachEndpoint(cdpEndpoint);
+    const { base } = parsedEndpoint;
     const browserUserAgent = await this.waitForCdp(base, Date.now() + Math.min(timeoutMs, 10_000)).catch(() => '');
-    let endpoint = cdpEndpoint;
+    let endpoint = parsedEndpoint.endpoint;
     // A browser-level endpoint (`/devtools/browser/<id>`) carries only the
     // Browser/Target domains — `Page.navigate` does not exist on it. Open a real
     // page target so the page-level tools work against an attached browser.
-    if (/\/devtools\/browser\//.test(cdpEndpoint)) {
+    // Snapshot automation.cdpEndpoint is an HTTP base and needs the same page
+    // target step; passing it straight to WebSocket yields a misleading 404.
+    if (parsedEndpoint.needsPageTarget) {
       const target = await this.newPageTarget(base, optionalStringArg(args, 'url') ?? 'about:blank');
       endpoint = target.webSocketDebuggerUrl;
     }
