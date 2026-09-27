@@ -342,6 +342,21 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   }, [ws, sub.sessionName, sub.state, serverId, sharedState?.activeDispatchId]);
 
   const busy = useMemo(() => isVisuallyBusy(sub.state, !!getActiveThinkingTs(events)), [events, sub.state]);
+  // Summary cards receive frequent session.state/agent.status frames. Those
+  // frames do not change the rendered transcript, so they must not trigger a
+  // layout read/write scroll pass for every open card. Follow only when the
+  // chronological tail is actual chat/terminal content.
+  const latestContentToken = (() => {
+    const event = events[events.length - 1];
+    if (!event || !(
+      event.type === 'assistant.text'
+      || event.type === 'tool.call'
+      || event.type === 'tool.result'
+      || event.type === 'user.message'
+    )) return '';
+    const text = typeof event.payload.text === 'string' ? event.payload.text : '';
+    return event.eventId + ':' + event.seq + ':' + text;
+  })();
   // Preview cards always follow the latest content.
   useEffect(() => {
     const el = previewRef.current;
@@ -360,7 +375,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // single post-unlock frame. See useCoalescedFrame for the full rationale.
   useEffect(() => {
     scheduleFollowFrame(() => { forceFollowLatest(); });
-  }, [events, sub.state, forceFollowLatest, scheduleFollowFrame]);
+  }, [latestContentToken, sub.state, forceFollowLatest, scheduleFollowFrame]);
   const scrollToBottom = useCallback(() => {
     forceFollowLatest();
   }, [forceFollowLatest]);
