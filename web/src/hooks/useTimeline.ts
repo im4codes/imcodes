@@ -3665,18 +3665,6 @@ export function useTimeline(
 
   const pendingRealtimeEventsRef = useRef(new Map<string, TimelineEvent>());
   const pendingRealtimeFlushCancelRef = useRef<(() => void) | null>(null);
-  const pendingRealtimePersistRef = useRef<TimelineEvent[]>([]);
-  const pendingRealtimePersistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const scheduleRealtimePersist = useCallback((events: TimelineEvent[]) => {
-    pendingRealtimePersistRef.current.push(...events);
-    if (pendingRealtimePersistTimerRef.current) return;
-    pendingRealtimePersistTimerRef.current = setTimeout(() => {
-      pendingRealtimePersistTimerRef.current = null;
-      const queued = pendingRealtimePersistRef.current.splice(0);
-      if (queued.length > 0) idbPutEvents(queued);
-    }, 100);
-  }, [idbPutEvents]);
 
   const flushPendingRealtimeEvents = useCallback(() => {
     pendingRealtimeFlushCancelRef.current = null;
@@ -3696,8 +3684,8 @@ export function useTimeline(
     // event writes immediately). Avoid an IndexedDB transaction for every
     // typewriter delta; those synchronous writes were the remaining hidden
     // fan-out on summary windows.
-    if (!streamingOnly) scheduleRealtimePersist(incoming);
-  }, [mergeEvents, scheduleRealtimePersist]);
+    if (!streamingOnly) idbPutEvents(incoming);
+  }, [idbPutEvents, mergeEvents]);
 
   // ── Streaming idle-persist ──────────────────────────────────────────────
   // Debounced IDB write for streaming assistant.text: each delta resets the
@@ -3788,11 +3776,6 @@ export function useTimeline(
     pendingRealtimeFlushCancelRef.current?.();
     pendingRealtimeFlushCancelRef.current = null;
     pendingRealtimeEventsRef.current.clear();
-    if (pendingRealtimePersistTimerRef.current) {
-      clearTimeout(pendingRealtimePersistTimerRef.current);
-      pendingRealtimePersistTimerRef.current = null;
-    }
-    pendingRealtimePersistRef.current = [];
     flushStreamingIdlePersist();
   }, [flushStreamingIdlePersist]);
 
