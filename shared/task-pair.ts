@@ -186,6 +186,10 @@ export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
   + 'other Brain contact is an auditor\'s conditional non-convergence report '
   + 'at REWORK rounds 2, 4, 6… when the pair is not clearly converging.';
 
+/** Short liveness rule shown with Brain decision notices. */
+export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
+  'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';
+
 /**
  * Stated in the pairs contract and the executor/auditor briefs (owner
  * evidence: an executor's questions written only in its own reply, never
@@ -807,6 +811,20 @@ export function markTaskPairStarted(pair: TaskPairState, now: number): void {
   removeFlag(pair, 'no_pool_configured');
 }
 
+/**
+ * A reply from the pair's Brain resolves a participant's wait, regardless of
+ * which side raised it.  Keep this separate from participant progress: a
+ * Brain reply is authoritative input, not work performed by the participant.
+ */
+export function resolveTaskPairBrainWait(pair: TaskPairState, now: number): void {
+  removeFlag(pair, 'blocked');
+  removeFlag(pair, 'needs_input');
+  delete pair.flagSides.blocked;
+  delete pair.flagSides.needs_input;
+  pair.blockedNote = undefined;
+  if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) markTaskPairStarted(pair, now);
+}
+
 function clonePair(pair: TaskPairState): TaskPairState {
   return {
     ...pair,
@@ -897,9 +915,9 @@ function namedParticipantIsBusy(attrs: Record<string, string>, busySessions: Rea
 
 const PROGRESS_VERBS: readonly TaskPairVerb[] = ['DISPATCH', 'STARTED', 'WORKING', 'READY_FOR_AUDIT', 'PASS', 'REWORK', 'DONE'];
 
-function clearSideFlags(pair: TaskPairState, role: TaskPairRole): void {
+function clearSideFlags(pair: TaskPairState, role: TaskPairRole, all = false): void {
   for (const flag of ['blocked', 'needs_input'] as const) {
-    if (pair.flagSides[flag] === role) {
+    if (all || pair.flagSides[flag] === role) {
       removeFlag(pair, flag);
       delete pair.flagSides[flag];
       pair.blockedNote = undefined;
@@ -1047,7 +1065,10 @@ export function applyTaskPairMarker(
   pair.updatedAt = ctx.now;
   const terminal = isTerminalTaskPairStatus(pair.status);
   let unusual = role === 'other';
-  if (PROGRESS_VERBS.includes(verb)) clearSideFlags(pair, role);
+  if (PROGRESS_VERBS.includes(verb)
+    || (roleAuthority && (verb === 'QUEUE' || verb === 'REASSIGN'))) {
+    clearSideFlags(pair, role, roleAuthority);
+  }
 
   // Once a pair has earned PASS, or has been closed, participant progress
   // markers are historical noise.  In particular, a delayed
@@ -1279,6 +1300,7 @@ export function applyTaskPairMarker(
     case 'REASSIGN': {
       if (!roleAuthority || terminal) return recorded(existing);
       if (role === 'brain') resetCapFlagsOnBrainAction(pair);
+      if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) markTaskPairStarted(pair, ctx.now);
       const auditorBefore = pair.auditor;
       setRolesFromAttrs(pair, attrs, intents);
       if (namedParticipantIsBusy(attrs, ctx.busySessions)) {

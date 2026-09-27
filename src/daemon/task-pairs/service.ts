@@ -26,6 +26,7 @@ import {
   TASK_PAIR_WORKSPACE_RETENTION_MS,
   isComplexSupervisionTaskBrief,
   applyTaskPairMarker,
+  resolveTaskPairBrainWait,
   isTerminalTaskPairStatus,
   mayContainTaskPairMarker,
   scanTaskPairMarkers,
@@ -648,6 +649,15 @@ export class TaskPairService {
     const existing = store.getPair(project, input.taskId);
     if (existing) {
       this.ensureTaskPairTitle(project, input.taskId, input.brief ?? existing.state.brief ?? existing.state.title, input.sender, { mechanicalTitle: input.titleExplicit !== true });
+      if (input.sender === existing.state.brain
+        && (input.target === existing.state.executor
+          || (existing.state.auditor && existing.state.auditor !== TASK_PAIR_NO_AUDITOR && input.target === existing.state.auditor))) {
+        const resolved = this.resolveBrainReply(project, input.taskId, input.sender, input.target, input.eventId);
+        if (resolved) {
+          noteTaskPairFocus(input.target, input.taskId);
+          return resolved;
+        }
+      }
       // A task-bound send is itself evidence that the named participant has
       // begun work.  This is especially important for a queued pair whose
       // executor is already busy: waiting for the queue drain would otherwise
@@ -721,6 +731,53 @@ export class TaskPairService {
     });
     this.ensureTaskPairTitle(project, input.taskId, input.brief, input.sender, { mechanicalTitle: input.titleExplicit !== true });
     return transition;
+  }
+
+  /** Resolve participant waits from an authoritative Brain reply. */
+  resolveBrainReply(
+    project: string,
+    taskId: string,
+    writer: string,
+    target: string,
+    messageId: string,
+  ): TaskPairTransition | undefined {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored || stored.state.brain !== writer
+      || (target !== stored.state.executor
+        && (stored.state.auditor === undefined || stored.state.auditor === TASK_PAIR_NO_AUDITOR || target !== stored.state.auditor))) return undefined;
+    const hadWait = stored.state.flags.includes('blocked')
+      || stored.state.flags.includes('needs_input')
+      || stored.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
+    if (!hadWait) return undefined;
+    const now = Date.now();
+    const next = { ...stored.state, flags: [...stored.state.flags], flagSides: { ...stored.state.flagSides }, updatedAt: now };
+    resolveTaskPairBrainWait(next, now);
+    const liveness = {
+      ...stored.liveness,
+      brainLastActivityAt: now,
+      brainWaitKey: undefined,
+      brainWaitStartedAt: undefined,
+      brainReminderCount: 0,
+      brainReminderLastAt: undefined,
+      brainReminderDue: undefined,
+      brainReminderResolvedAt: now,
+      brainReminderLastDecisionAt: undefined,
+      brainReminderLastDecisionReason: undefined,
+    };
+    store.savePair(project, next, { liveness });
+    const eventId = `brain-resolved:${messageId}`;
+    if (!store.recordEvent({
+      id: eventId, project, taskId, writer, role: 'brain', verb: 'BRAIN_RESOLVED',
+      attrs: { messageId, target }, effect: 'brain_resolved', unusual: false,
+      source: 'implicit_dispatch', fromStatus: stored.state.status, toStatus: next.status, at: now,
+    })) return { effect: 'replayed', unusual: false, intents: [] };
+    emitTaskPairDaemonEvent(next, {
+      eventId, verb: 'BRAIN_RESOLVED', effect: 'brain_resolved', source: 'implicit_dispatch',
+      fromStatus: stored.state.status, toStatus: next.status, unusual: false,
+    });
+    this.#scheduler?.publishBadges?.();
+    return { pair: next, fromStatus: stored.state.status, toStatus: next.status, effect: 'brain_resolved', unusual: false, intents: [] };
   }
 
   /**

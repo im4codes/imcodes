@@ -128,6 +128,22 @@ describe('task-pair marker grammar', () => {
     expect(started.flags).not.toContain('no_pool_configured');
   });
 
+  it('lets a Brain marker clear either side wait and resume an awaiting pair', () => {
+    const blocked = apply(withStatus('rework'), EXEC, '<!-- IMCODES_TASK BLOCKED T42 note="executor wait" -->');
+    expect(blocked.pair?.flags).toContain('blocked');
+    const cleared = apply(blocked.pair, BRAIN, '<!-- IMCODES_TASK REASSIGN T42 executor=' + EXEC + ' -->');
+    expect(cleared.pair).toMatchObject({ status: 'rework', flags: [] });
+    expect(cleared.pair?.blockedNote).toBeUndefined();
+
+    const awaiting = withStatus('awaiting_brain_decision');
+    awaiting.flags = ['needs_input'];
+    awaiting.flagSides.needs_input = 'auditor';
+    awaiting.blockedNote = 'auditor wait';
+    const resumed = apply(awaiting, BRAIN, '<!-- IMCODES_TASK WORKING T42 -->');
+    expect(resumed.pair).toMatchObject({ status: 'working', flags: [] });
+    expect(resumed.pair?.blockedNote).toBeUndefined();
+  });
+
   it('parses verbs case-insensitively with bare and quoted attributes', () => {
     const scanned = marker('<!-- IMCODES_TASK rework T42 blocking=P0 p0=1 p1=2 note="null check \\"missing\\" in login.ts" -->');
     expect(scanned).toMatchObject({

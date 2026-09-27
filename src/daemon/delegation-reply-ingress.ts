@@ -45,6 +45,8 @@ import { endedTaskOfDelegationReply } from './delegation-reply-task-liveness.js'
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import { PROVIDER_ACTIVE_TURN_DELIVERY_KINDS } from '../agent/transport-provider.js';
 import { deterministicAutomaticAuditDeliveryMessageId } from '../../shared/send-message-id.js';
+import { projectOfSession } from './task-pairs/engine.js';
+import { taskPairService } from './task-pairs/service.js';
 
 const retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const reconciliationTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -990,6 +992,19 @@ export async function submitDelegationReply(input: {
           ? AGENT_DELEGATION_REPLY_ERRORS.IDENTITY_MISMATCH
           : AGENT_DELEGATION_REPLY_ERRORS.INVALID_DELEGATION_ID;
     return { ok: false, error };
+  }
+  // A Brain may answer a blocked/needs-input participant through the durable
+  // delegation-reply path. Resolve the pair immediately, before delivery is
+  // retried, so heartbeat reminders and the panel stop waiting at once.
+  if (received.record.taskId && senderName) {
+    const project = projectOfSession(senderName) ?? projectOfSession(received.record.target.sessionName);
+    if (project) taskPairService.resolveBrainReply(
+      project,
+      received.record.taskId,
+      senderName,
+      received.record.target.sessionName,
+      received.record.notificationId,
+    );
   }
   // The reply is durable before this observation. A worker cancelled in the
   // race between its final tool call and completion cannot update lifecycle,

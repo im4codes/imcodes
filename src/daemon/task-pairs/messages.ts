@@ -11,6 +11,7 @@ import {
   TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
   TASK_PAIR_VALIDATION_REPORT_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
+  TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
   TASK_PAIR_MARKER_TAG,
@@ -167,6 +168,7 @@ export function buildBrainNoticeMessage(pair: TaskPairState, flag: TaskPairFlag,
     header(pair),
     `Needs your decision: ${FLAG_EXPLANATIONS[flag] ?? flag}. Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, status ${pair.status}, round ${pair.round}.`,
     ...(resolvedDetail ? [`Why: ${resolvedDetail}.`] : []),
+    TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
     resolve,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
@@ -195,6 +197,7 @@ export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrain
   return [
     `[IM.codes task pairs] Needs your decision on ${notices.length} pairs:`,
     ...lines,
+    TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
     `Resolve each with a marker, e.g. ${marker('REASSIGN', '<taskId>', 'auditor=<session>')}, ${marker('DONE', '<taskId>', 'force=true')}, or ${marker('CANCEL', '<taskId>')}. No further reminders until each pair's state changes.`,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');
@@ -219,6 +222,7 @@ export function buildBrainHeartbeatMessage(pairs: readonly TaskPairState[]): str
   return [
     `[IM.codes task pairs] Brain heartbeat: ${pairs.length} pair(s) need action.`,
     ...lines,
+    TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
     `Resolve with the task marker for each pair (for example <!-- IMCODES_TASK DONE <taskId> force=true -->, REASSIGN, or CANCEL).`,
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
   ].join('\n');

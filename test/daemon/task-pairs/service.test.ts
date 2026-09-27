@@ -22,6 +22,7 @@ const PROJECT = 'pairsproj';
 const BRAIN = 'deck_pairsproj_brain';
 const EXEC = 'deck_sub_pairsexec';
 const AUD = 'deck_sub_pairsaud';
+const AUD2 = 'deck_sub_pairsaud2';
 const PROC = 'deck_pairsproj_w1';
 const OTHER_PROJECT_SESSION = 'deck_otherproj_brain';
 
@@ -98,7 +99,7 @@ describe('task-pair marker ingestion', () => {
     sent = [];
     setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { sent.push({ target, text, id }); } });
     for (const record of [
-      session(BRAIN, 'brain'), session(EXEC, 'w2'), session(AUD, 'w3'), session(PROC, 'w1', 'claude-code'),
+      session(BRAIN, 'brain'), session(EXEC, 'w2'), session(AUD, 'w3'), session(AUD2, 'w4'), session(PROC, 'w1', 'claude-code'),
       session(OTHER_PROJECT_SESSION, 'brain', 'claude-code-sdk', 'otherproj'),
     ]) upsertSession(record);
     service = new TaskPairService();
@@ -110,7 +111,7 @@ describe('task-pair marker ingestion', () => {
     await service.dispose();
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
-    for (const name of [BRAIN, EXEC, AUD, PROC, OTHER_PROJECT_SESSION]) removeSession(name);
+    for (const name of [BRAIN, EXEC, AUD, AUD2, PROC, OTHER_PROJECT_SESSION]) removeSession(name);
     if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
   });
@@ -161,6 +162,47 @@ describe('task-pair marker ingestion', () => {
     });
     expect(implicit?.pair).toMatchObject({ status: 'queued', executor: EXEC });
     expect(pair('implicit-new')).toMatchObject({ status: 'queued', executor: EXEC, flags: ['waiting_for_capacity'] });
+  });
+
+  it('resolves executor and auditor waits from a Brain task-bound reply', () => {
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'brain-resolve-exec', attrs: { executor: EXEC, auditor: AUD } }, source: 'marker', eventId: 'resolve-dispatch-exec' });
+    service.applyMarker({ project: PROJECT, writer: EXEC, marker: { verb: 'BLOCKED', knownVerb: 'BLOCKED', taskId: 'brain-resolve-exec', attrs: { note: 'waiting for a decision' } }, source: 'marker', eventId: 'resolve-blocked-exec' });
+    getTaskPairStore().saveLiveness(PROJECT, 'brain-resolve-exec', {
+      ...getTaskPairStore().getPair(PROJECT, 'brain-resolve-exec')!.liveness,
+      brainWaitKey: 'brain-resolve-exec:blocked', brainReminderDue: true, brainReminderCount: 2,
+      brainReminderLastDecisionReason: 'brain_busy',
+    });
+    const resolvedExec = service.implicitDispatch({ project: PROJECT, sender: BRAIN, target: EXEC, taskId: 'brain-resolve-exec', eventId: 'resolve-brain-exec' });
+    expect(resolvedExec?.effect).toBe('brain_resolved');
+    expect(pair('brain-resolve-exec')).toMatchObject({ status: 'working', flags: [] });
+    expect(pair('brain-resolve-exec')?.blockedNote).toBeUndefined();
+    const resolvedLiveness = getTaskPairStore().getPair(PROJECT, 'brain-resolve-exec')?.liveness;
+    expect(resolvedLiveness?.brainReminderCount).toBe(0);
+    expect(resolvedLiveness?.brainReminderDue).toBeUndefined();
+    expect(resolvedLiveness?.brainWaitKey).toBeUndefined();
+    expect(resolvedLiveness?.brainReminderLastDecisionReason).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'brain-resolve-exec').some((event) => event.verb === 'BRAIN_RESOLVED' && event.attrs.messageId === 'resolve-brain-exec')).toBe(true);
+
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'brain-resolve-aud', attrs: { executor: PROC, auditor: AUD2 } }, source: 'marker', eventId: 'resolve-dispatch-aud' });
+    service.applyMarker({ project: PROJECT, writer: AUD2, marker: { verb: 'NEEDS_INPUT', knownVerb: 'NEEDS_INPUT', taskId: 'brain-resolve-aud', attrs: { note: 'need scope' } }, source: 'marker', eventId: 'resolve-needs-aud' });
+    const resolvedAud = service.implicitDispatch({ project: PROJECT, sender: BRAIN, target: AUD2, taskId: 'brain-resolve-aud', eventId: 'resolve-brain-aud' });
+    expect(resolvedAud?.effect).toBe('brain_resolved');
+    expect(pair('brain-resolve-aud')).toMatchObject({ status: 'working', flags: [] });
+    expect(pair('brain-resolve-aud')?.blockedNote).toBeUndefined();
+  });
+
+  it('resumes awaiting-brain-decision and rejects non-Brain replies', () => {
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'brain-awaiting', attrs: { executor: EXEC, auditor: 'none' } }, source: 'marker', eventId: 'awaiting-dispatch' });
+    service.applyMarker({ project: PROJECT, writer: EXEC, marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'brain-awaiting', attrs: {} }, source: 'marker', eventId: 'awaiting-done' });
+    expect(pair('brain-awaiting')?.status).toBe('awaiting_brain_decision');
+    const resumed = service.implicitDispatch({ project: PROJECT, sender: BRAIN, target: EXEC, taskId: 'brain-awaiting', eventId: 'awaiting-brain-reply' });
+    expect(resumed?.effect).toBe('brain_resolved');
+    expect(pair('brain-awaiting')?.status).toBe('working');
+
+    service.applyMarker({ project: PROJECT, writer: EXEC, marker: { verb: 'BLOCKED', knownVerb: 'BLOCKED', taskId: 'brain-awaiting', attrs: { note: 'new wait' } }, source: 'marker', eventId: 'awaiting-reraise' });
+    const ignored = service.implicitDispatch({ project: PROJECT, sender: AUD, target: EXEC, taskId: 'brain-awaiting', eventId: 'non-brain-reply' });
+    expect(ignored?.effect).toBe('recorded');
+    expect(pair('brain-awaiting')).toMatchObject({ flags: ['blocked'], blockedNote: 'new wait' });
   });
 
   it('keeps DISPATCH deduplication independent per executor target', () => {
