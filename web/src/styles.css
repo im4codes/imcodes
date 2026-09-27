@@ -4973,14 +4973,6 @@ html.native-ios-mac .chat-dl-btn {
    line of context, never the full message. Tap-again jumps to the
    message in chat history for the full content. */
 .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
-@media (max-width: 720px) {
-  .chat-pinned-last-sent { flex-direction: row; align-items: center; gap: 6px; min-width: 0; padding: 4px 8px; }
-  .chat-pinned-last-sent-meta { flex: 0 0 auto; flex-wrap: nowrap; gap: 4px; }
-  .chat-pinned-last-sent-actor { display: none; }
-  .chat-pinned-last-sent-text { display: block; min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; word-break: normal; }
-  .chat-pinned-last-sent.chat-pinned-expanded { align-items: flex-start; }
-  .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; white-space: normal; word-break: break-word; }
-}
 .chat-view {
   --chat-machine-chip-border: rgba(148, 163, 184, 0.24);
   --chat-machine-chip-bg: rgba(71, 85, 105, 0.18);
@@ -14530,6 +14522,13 @@ button.quick-agent-delegation-preset.active {
   .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; max-height: none; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
+  /* Compact single-line "last sent" banner on mobile (tap to expand). */
+  .chat-pinned-last-sent { flex-direction: row; align-items: center; gap: 6px; min-width: 0; padding: 4px 8px; }
+  .chat-pinned-last-sent-meta { flex: 0 0 auto; flex-wrap: nowrap; gap: 4px; }
+  .chat-pinned-last-sent-actor { display: none; }
+  .chat-pinned-last-sent-text { display: block; min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; word-break: normal; }
+  .chat-pinned-last-sent.chat-pinned-expanded { align-items: flex-start; }
+  .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; white-space: normal; word-break: break-word; }
 }
 .task-pair-status-toggle {
   width: 100%; display: flex; flex-wrap: wrap; justify-content: space-between; align-items: baseline; gap: 4px 8px;
