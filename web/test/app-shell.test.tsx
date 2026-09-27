@@ -2663,7 +2663,7 @@ describe('App shell', () => {
     expect(screen.queryByTestId('floating-panel-controlled-nodes')).toBeNull();
   }, 20_000);
 
-  it('keeps remote control out of the desktop sidebar while retaining the toolbar entry', async () => {
+  it('offers remote control once in the desktop sidebar, beside AI Desk, while retaining the toolbar entry', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
     localStorage.setItem('rcc_server', 'srv-1');
     localStorage.setItem('rcc_session', 'deck_alpha_brain');
@@ -2693,7 +2693,13 @@ describe('App shell', () => {
     // The desktop layout has no daemon status bar at all, so without this the
     // button existed on mobile only.
     await waitFor(() => expect(toolbar()!.querySelector('.daemon-remote-desktop-btn')).toBeTruthy());
-    expect(screen.getByTestId('sidebar-panel').querySelector('.daemon-remote-desktop-btn')).toBeNull();
+    // Owner request: exactly one remote-desktop button in the sidebar, placed
+    // right after the AI Desk split button (not the old redundant footer one).
+    const sidebarButtons = Array.from(screen.getByTestId('sidebar-panel').querySelectorAll('.daemon-remote-desktop-btn'));
+    expect(sidebarButtons.length).toBe(1);
+    const aiDeskGroup = screen.getByTestId('sidebar-panel').querySelector('.controlled-nodes-shortcut-group');
+    expect(aiDeskGroup).toBeTruthy();
+    expect(aiDeskGroup!.compareDocumentPosition(sidebarButtons[0]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
   it('keeps remote control out of the mobile sidebar footer while retaining the toolbar entry', async () => {

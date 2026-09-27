@@ -6178,9 +6178,11 @@ export function App() {
                 />
               </div>
               {/* Owner: a remote-desktop button right of the AI Desk dropdown on
-                  desktop, the same control as the session toolbars. */}
+                  desktop, the same control as the session toolbars. One
+                  button only: the login-screen setup stays in the toolbar. */}
               <DaemonRemoteDesktopControl
                 compact
+                offerLoginScreenSetup={false}
                 ws={wsRef.current}
                 serverId={selectedServerId}
                 serverName={selectedServerInfo?.name}
