@@ -17,6 +17,7 @@ import {
   type AuditSeverity,
 } from './audit-convergence.js';
 import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.js';
+import { parseTaskPairChecklist, updateTaskPairChecklist } from './task-pair-checklist.js';
 
 export const TASK_PAIR_CONTRACT_ID = 'task_pair_markers_v1' as const;
 export const TASK_PAIR_MARKER_TAG = 'IMCODES_TASK' as const;
@@ -34,7 +35,43 @@ export const TASK_PAIR_ENGINE_HOOK_PATH = '/task-pairs/engine' as const;
  * pairs Brain never carries a `supervision_*` contract.
  */
 export const TASK_PAIR_BRAIN_CONTRACT_ID = 'task_pair_brain_v1' as const;
-export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; first box is implementation, second audit; single-box "- [ ]" is not audited. Use pair_task_get/update/check to edit the whole brief.';
+export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; a single-box "- [ ]" item has no audit box; number items 1..N in brief order. The executor ticks each implemented box as soon as that item is done and all delivered items before READY_FOR_AUDIT; the auditor ticks each audited box when verified and all verified items before PASS; on REWORK the auditor unticks failed items and names their numbers. Tick only work really done or verified. Use pair_task_get/update/check or the CHECK marker to update the whole brief.';
+export const TASK_PAIR_CHECK_VERB = 'CHECK' as const;
+export const TASK_PAIR_CHECKLIST_AUTO_TICK_VERB = 'CHECKLIST_AUTO_TICK' as const;
+export const TASK_PAIR_CHECKLIST_BOXES = ['implemented', 'audited'] as const;
+export type TaskPairChecklistBox = typeof TASK_PAIR_CHECKLIST_BOXES[number];
+
+export interface TaskPairChecklistCheck {
+  box: TaskPairChecklistBox;
+  indexes: number[];
+  checked: boolean;
+}
+
+/** Parse compact CHECK marker attributes without silently accepting bad input. */
+export function parseTaskPairChecklistCheck(attrs: Record<string, string>): TaskPairChecklistCheck | undefined {
+  const box = attrs.box;
+  if (!(TASK_PAIR_CHECKLIST_BOXES as readonly string[]).includes(box ?? '')) return undefined;
+  const rawItems = attrs.items;
+  if (!rawItems) return undefined;
+  if (rawItems !== 'all' && !/^\d+(?:,\d+)*$/u.test(rawItems)) return undefined;
+  const indexes = rawItems === 'all'
+    ? undefined
+    : rawItems.split(',').map((value) => Number.parseInt(value, 10));
+  if (indexes && (indexes.length === 0 || indexes.some((index) => !Number.isSafeInteger(index) || index < 1))) return undefined;
+  const checkedRaw = attrs.checked;
+  if (checkedRaw !== undefined && checkedRaw !== 'true' && checkedRaw !== 'false') return undefined;
+  return { box: box as TaskPairChecklistBox, indexes: indexes ?? [], checked: checkedRaw !== 'false' };
+}
+
+export function resolveTaskPairChecklistIndexes(markdown: string, check: TaskPairChecklistCheck): number[] {
+  if (check.indexes.length > 0) return [...new Set(check.indexes)].sort((a, b) => a - b);
+  return parseTaskPairChecklist(markdown).map((item) => item.index);
+}
+
+export function applyTaskPairChecklistCheck(markdown: string, check: TaskPairChecklistCheck): { markdown: string; indexes: number[] } {
+  const indexes = resolveTaskPairChecklistIndexes(markdown, check);
+  return { markdown: updateTaskPairChecklist(markdown, indexes, check.box, check.checked), indexes };
+}
 
 /** Shared default used by implicit dispatch when no auditor was named. */
 export function isComplexSupervisionTaskBrief(brief: string | undefined): boolean {
@@ -249,7 +286,7 @@ export const TASK_PAIR_INFER_TASK_ID = '-' as const;
 
 export const TASK_PAIR_VERBS = [
   'DISPATCH', 'QUEUE', 'STARTED', 'WORKING', 'READY_FOR_AUDIT', 'PASS', 'REWORK',
-  'DONE', 'BLOCKED', 'NEEDS_INPUT', 'REASSIGN', 'CANCEL',
+  'DONE', 'BLOCKED', 'NEEDS_INPUT', 'REASSIGN', 'CANCEL', TASK_PAIR_CHECK_VERB,
 ] as const;
 export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 
@@ -286,7 +323,7 @@ export const TASK_PAIR_BRAIN_MIN_GAP_MS = 10 * 60_000;
 export const TASK_PAIR_ROLES = ['brain', 'executor', 'auditor', 'other', 'daemon'] as const;
 export type TaskPairRole = typeof TASK_PAIR_ROLES[number];
 
-export const TASK_PAIR_EVENT_SOURCES = ['marker', 'implicit_dispatch', 'legacy_tool', 'legacy_import', 'heartbeat', 'queue', 'mcp'] as const;
+export const TASK_PAIR_EVENT_SOURCES = ['marker', 'implicit_dispatch', 'legacy_tool', 'legacy_import', 'heartbeat', 'queue', 'mcp', 'daemon'] as const;
 export type TaskPairEventSource = typeof TASK_PAIR_EVENT_SOURCES[number];
 
 /** Reasons for marker-triggered daemon messages; each is capped per round. */
@@ -961,6 +998,9 @@ export function applyTaskPairMarker(
         return { ...recorded(undefined), intents: [{ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId,
           text: `No audit round is open for ${marker.taskId}. Brain must dispatch the pair and an executor must submit material with READY_FOR_AUDIT before the auditor can write ${verb}.` }] };
       }
+      case 'CHECK':
+        return { ...recorded(undefined), effect: 'recorded', intents: [{ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId,
+          text: `No task pair ${marker.taskId} exists for this CHECK marker; it was recorded but not applied.` }] };
       case 'CANCEL':
         return { ...recorded(undefined), intents: [{ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId,
           text: `Only Brain or the daemon may CANCEL ${marker.taskId}; your marker was recorded but not applied.` }] };
@@ -1019,11 +1059,11 @@ export function applyTaskPairMarker(
   // truly record-only and cannot alter the authoritative pair snapshot.
   const guardedAfterPass = pair.status === 'passed' && (
     verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT'
-      || verb === 'PASS' || verb === 'REWORK'
+      || verb === 'PASS' || verb === 'REWORK' || verb === TASK_PAIR_CHECK_VERB
   );
   const guardedAfterClose = terminal && (
     verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT'
-      || verb === 'PASS' || verb === 'REWORK'
+      || verb === 'PASS' || verb === 'REWORK' || verb === TASK_PAIR_CHECK_VERB
   );
   if (guardedAfterPass || guardedAfterClose) return recorded(existing);
 
@@ -1035,6 +1075,20 @@ export function applyTaskPairMarker(
     intents.push({ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId, text });
     return done('recorded', { unusual: true });
   };
+
+  if (verb === TASK_PAIR_CHECK_VERB) {
+    const check = parseTaskPairChecklistCheck(attrs);
+    if (!check) return reject('CHECK requires box=implemented|audited, items=1,2,5|all, and optional checked=true|false.');
+    const allowed = role === 'brain' || role === 'daemon'
+      || (check.box === 'implemented' && role === 'executor')
+      || (check.box === 'audited' && role === 'auditor');
+    if (!allowed) return reject(`Only the executor may CHECK implemented items and only the auditor may CHECK audited items for ${marker.taskId}; Brain may update either box.`);
+    const currentBrief = pair.brief ?? '';
+    const applied = applyTaskPairChecklistCheck(currentBrief, check);
+    if (applied.indexes.length === 0 || applied.markdown === currentBrief) return done('checklist_unchanged');
+    pair.brief = applied.markdown;
+    return done('checklist_updated');
+  }
 
   switch (verb) {
     case 'QUEUE': {
@@ -1396,7 +1450,7 @@ export function buildTaskPairMarkerContract(): string {
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
-    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL. taskId "-" means your single open task.',
+    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CHECK. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited, Brain either. taskId "-" means your single open task.',
     'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. Only after the assigned auditor applies PASS in a material-backed audit round may the executor commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with DONE (accept) or CANCEL; further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
     TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_WORKSPACE_RULES,

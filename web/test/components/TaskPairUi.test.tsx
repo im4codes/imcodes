@@ -129,6 +129,20 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getByRole('button', { name: 'taskPair.brief_copy' })).toBeTruthy();
     expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1');
   });
+  it('updates checklist progress live when the daemon snapshot changes', async () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: [{ taskId: 'live-brief', title: 'Live checklist', brief: '- [ ][ ] Implement it', pair: { status: 'working', updatedAt: 1 } }],
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="live-brief" />);
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 0/1');
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'live-brief', title: 'Live checklist', brief: '- [x][x] Implement it', pair: { status: 'working', updatedAt: 2 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.implemented: 1/1'));
+    expect(view.container.querySelector('.task-pair-brief-checklist-summary')?.textContent).toContain('taskPair.audited: 1/1');
+  });
   it('scopes sub-window rows to its own assignments and expands its active brief by default', () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
       tasks: [

@@ -187,6 +187,27 @@ describe('task-pair marker ingestion', () => {
     expect(pair('T2')).toMatchObject({ status: 'in_audit', round: 1 });
   });
 
+  it('auto-ticks implemented items on READY and both boxes on PASS, recording each tick', async () => {
+    await say(BRAIN, '<!-- IMCODES_TASK QUEUE T-check title="Checklist" auditor=' + AUD + ' -->\n- [ ][ ] first\n- [ ][ ] second\n<!-- IMCODES_TASK_END T-check -->');
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-check executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T-check path=/workspace -->');
+    expect(pair('T-check')?.brief).toContain('- [x][ ] first');
+    expect(pair('T-check')?.brief).toContain('- [x][ ] second');
+    expect(getTaskPairStore().listEvents(PROJECT, 'T-check').filter((event) => event.verb === 'CHECKLIST_AUTO_TICK')).toHaveLength(1);
+    await say(AUD, '<!-- IMCODES_TASK PASS T-check -->');
+    expect(pair('T-check')?.brief).toBe('- [x][x] first\n- [x][x] second');
+    expect(getTaskPairStore().listEvents(PROJECT, 'T-check').filter((event) => event.verb === 'CHECKLIST_AUTO_TICK')).toHaveLength(2);
+  });
+
+  it('auto-ticks implemented items when an auditor=none executor reports DONE', async () => {
+    await say(BRAIN, '<!-- IMCODES_TASK QUEUE T-no-audit title="Checklist" auditor=none -->\n- [ ][ ] first\n<!-- IMCODES_TASK_END T-no-audit -->');
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-no-audit executor=${EXEC} auditor=none -->`);
+    await say(EXEC, '<!-- IMCODES_TASK DONE T-no-audit -->');
+    expect(pair('T-no-audit')?.status).toBe('awaiting_brain_decision');
+    expect(pair('T-no-audit')?.brief).toBe('- [x][ ] first');
+    expect(getTaskPairStore().listEvents(PROJECT, 'T-no-audit').some((event) => event.verb === 'CHECKLIST_AUTO_TICK')).toBe(true);
+  });
+
   it('never applies the same turn twice', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T3 executor=${EXEC} auditor=${AUD} -->`);
     await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T3 path=/workspace -->', {}, 'fixed-turn');

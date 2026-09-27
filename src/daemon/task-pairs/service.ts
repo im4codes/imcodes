@@ -14,6 +14,7 @@ import type { TimelineEvent } from '../timeline-event.js';
 import logger from '../../util/logger.js';
 import {
   TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS,
+  TASK_PAIR_CHECKLIST_AUTO_TICK_VERB,
   TASK_PAIR_INFER_TASK_ID,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
@@ -37,6 +38,7 @@ import {
   type TaskPairState,
   type TaskPairTransition,
 } from '../../../shared/task-pair.js';
+import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
@@ -409,6 +411,10 @@ export class TaskPairService {
       if (busySessions.size > 0) stored = this.#noteParticipantConflicts(input.project, stored, busySessions);
       this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
     }
+    if (stored && transition.pair && this.#shouldAutoTickChecklist(input.marker.knownVerb, transition, stored.state)) {
+      stored = this.#autoTickChecklist(input.project, stored, input.eventId, now, input.marker.knownVerb!);
+      transition.pair = stored.state;
+    }
     if (stored && input.marker.attrs.title && stored.state.brain === input.writer
       && isUsableTaskPairTitle(input.marker.attrs.title, stored.state.taskId)) {
       this.#clearTitleRequest(stored.state.brain, stored.state.taskId);
@@ -496,6 +502,72 @@ export class TaskPairService {
       this.#recentBrainDispatch.set(`${input.project}\u0000${transition.pair.brain}\u0000${transition.pair.executor}`, { taskId: transition.pair.taskId, at: Date.now() });
     }
     return transition;
+  }
+
+  #shouldAutoTickChecklist(
+    verb: TaskPairMarker['knownVerb'],
+    transition: TaskPairTransition,
+    pair: TaskPairState,
+  ): boolean {
+    if (!pair.brief) return false;
+    if (verb === 'READY_FOR_AUDIT' && transition.toStatus === 'in_audit') {
+      return parseTaskPairChecklist(pair.brief).every((item) => !item.implemented);
+    }
+    if (verb === 'PASS' && transition.toStatus === 'passed') return true;
+    return verb === 'DONE'
+      && pair.auditor === TASK_PAIR_NO_AUDITOR
+      && (transition.toStatus === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION || transition.toStatus === 'done');
+  }
+
+  #autoTickChecklist(
+    project: string,
+    stored: StoredTaskPair,
+    parentEventId: string,
+    now: number,
+    markerVerb: string,
+  ): StoredTaskPair {
+    const store = getTaskPairStore();
+    let current = stored;
+    const boxes = markerVerb === 'PASS' ? ['implemented', 'audited'] as const : ['implemented'] as const;
+    for (const box of boxes) {
+      const items = parseTaskPairChecklist(current.state.brief ?? '')
+        .filter((item) => !item[box])
+        .map((item) => item.index);
+      if (items.length === 0) continue;
+      const previous = current.state;
+      const markdown = updateTaskPairChecklist(previous.brief ?? '', items, box, true);
+      if (markdown === (previous.brief ?? '')) continue;
+      const next = { ...previous, brief: markdown, updatedAt: now };
+      current = store.savePair(project, next, { liveness: current.liveness });
+      const eventId = `${parentEventId}:checklist-auto:${box}`;
+      const role = taskPairRoleOf(previous, 'daemon');
+      if (store.recordEvent({
+        id: eventId,
+        project,
+        taskId: previous.taskId,
+        writer: 'daemon',
+        role,
+        verb: TASK_PAIR_CHECKLIST_AUTO_TICK_VERB,
+        attrs: { box, items: items.join(','), checked: 'true' },
+        effect: 'checklist_auto_tick',
+        unusual: false,
+        source: 'daemon',
+        fromStatus: previous.status,
+        toStatus: next.status,
+        at: now,
+      })) {
+        emitTaskPairDaemonEvent(current.state, {
+          eventId,
+          verb: TASK_PAIR_CHECKLIST_AUTO_TICK_VERB,
+          effect: 'checklist_auto_tick',
+          source: 'daemon',
+          fromStatus: previous.status,
+          toStatus: next.status,
+          unusual: false,
+        });
+      }
+    }
+    return current;
   }
 
   /** Keep an explicitly named participant queued and tell its Brain once per holder pair. */

@@ -8,6 +8,9 @@ import {
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   TASK_PAIR_STATUSES,
   TASK_PAIR_VERBS,
+  TASK_PAIR_CHECKLIST_RULE,
+  parseTaskPairChecklistCheck,
+  applyTaskPairChecklistCheck,
   applyTaskPairMarker,
   buildTaskPairMarkerContract,
   isComplexSupervisionTaskBrief,
@@ -64,6 +67,28 @@ function withStatus(status: TaskPairStatus, extra = ''): TaskPairState {
 }
 
 describe('task-pair marker grammar', () => {
+  it('parses CHECK markers with numbered items, all, and checked=false', () => {
+    expect(parseTaskPairChecklistCheck({ box: 'implemented', items: '1,2,5' })).toEqual({ box: 'implemented', indexes: [1, 2, 5], checked: true });
+    expect(parseTaskPairChecklistCheck({ box: 'audited', items: 'all', checked: 'false' })).toEqual({ box: 'audited', indexes: [], checked: false });
+    expect(parseTaskPairChecklistCheck({ box: 'implemented', items: '1x' })).toBeUndefined();
+    expect(parseTaskPairChecklistCheck({ box: 'other', items: 'all' })).toBeUndefined();
+  });
+
+  it('applies CHECK only to the role-owned box and updates the brief', () => {
+    const base = { ...dispatched(), brief: '- [ ][ ] first\n- [ ][ ] second' };
+    const implemented = apply(base, EXEC, '<!-- IMCODES_TASK CHECK T42 box=implemented items=1 -->');
+    expect(implemented.pair?.brief).toBe('- [x][ ] first\n- [ ][ ] second');
+    expect(apply(implemented.pair, EXEC, '<!-- IMCODES_TASK CHECK T42 box=audited items=1 -->').unusual).toBe(true);
+    const audited = apply(implemented.pair, AUD, '<!-- IMCODES_TASK CHECK T42 box=audited items=1 -->');
+    expect(audited.pair?.brief).toBe('- [x][x] first\n- [ ][ ] second');
+  });
+
+  it('publishes the checklist cadence in the contract rule', () => {
+    expect(TASK_PAIR_CHECKLIST_RULE).toContain('as soon as that item is done');
+    expect(TASK_PAIR_CHECKLIST_RULE).toContain('on REWORK the auditor unticks failed items');
+    expect(buildTaskPairMarkerContract()).toContain('CHECK <taskId> box=implemented|audited');
+  });
+
   it('nudges an auditor once when REWORK has no concrete proposal', () => {
     const base = withStatus('in_audit');
     const result = applyTaskPairMarker(base, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding [P0]: this is broken.' }));
