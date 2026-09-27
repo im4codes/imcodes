@@ -22,6 +22,8 @@ const databaseUrl = process.env.DATABASE_URL ?? 'postgresql://imcodes_perf:perf-
 const userId = 'imc_perf_user';
 const apiKey = 'deck_perf_browser_key';
 const sessions = Number(process.env.IMC_PERF_SESSIONS ?? 20);
+const streamingSessions = Number(process.env.IMC_PERF_STREAMING_SESSIONS ?? (process.env.IMC_PERF_VARIANT === 'streaming-off' ? 0 : 5));
+const streamHz = Number(process.env.IMC_PERF_STREAM_HZ ?? 25);
 const perfSeed = (0x4d57494e).toString(36);
 const sessionNames = Array.from({ length: sessions }, (_, index) => `deck_perflat_imcperf-${perfSeed}-${index.toString(36)}_brain`);
 const subSessionIds = Array.from({ length: Math.max(0, sessions - 1) }, (_, index) => `perfsub${index.toString(36)}`);
@@ -32,7 +34,7 @@ const allSessionNames = [...sessionNames, ...longChatSessions.map((item) => item
 const historyNames = [...allSessionNames, ...subSessionNames];
 const hash = crypto.createHash('sha256').update(token).digest('hex');
 const apiKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
-process.stdout.write(JSON.stringify({ phase: 'starting', sessions }) + '\n');
+process.stdout.write(JSON.stringify({ phase: 'starting', sessions, streamHz, expectedRates: { assistantTextPerSecond: streamingSessions * streamHz, agentStatusPerSecond: Math.max(0, sessions - streamingSessions) * streamHz, sessionStatePerSecond: sessions, usagePerSecond: Math.min(3, sessions) * streamHz } }) + '\n');
 
 const client = new Client({ connectionString: databaseUrl });
 for (let attempt = 0; attempt < 60; attempt += 1) {
@@ -58,9 +60,10 @@ for (let attempt = 0; attempt < 60; attempt += 1) {
     }
     for (let index = 0; index < subSessionIds.length; index += 1) {
       const id = subSessionIds[index];
-      await client.query(`INSERT INTO sub_sessions (id, server_id, type, cwd, label, parent_session, created_at, updated_at)
-        VALUES ($1, $2, 'codex', '/tmp/imc-perf-project', $3, $4, $5, $5)
-        ON CONFLICT (id, server_id) DO UPDATE SET closed_at=NULL, parent_session=EXCLUDED.parent_session, updated_at=EXCLUDED.updated_at`, [id, serverId, `Perf sub ${index + 1}`, sessionNames[0], now]);
+      const providerId = index % 2 === 0 ? 'codex-sdk' : 'claude-code-sdk';
+      await client.query(`INSERT INTO sub_sessions (id, server_id, type, cwd, label, parent_session, runtime_type, provider_id, provider_session_id, requested_model, created_at, updated_at)
+        VALUES ($1, $2, $5, '/tmp/imc-perf-project', $3, $4, 'transport', $5, $6, $7, $8, $8)
+        ON CONFLICT (id, server_id) DO UPDATE SET type=EXCLUDED.type, closed_at=NULL, parent_session=EXCLUDED.parent_session, runtime_type=EXCLUDED.runtime_type, provider_id=EXCLUDED.provider_id, provider_session_id=EXCLUDED.provider_session_id, requested_model=EXCLUDED.requested_model, updated_at=EXCLUDED.updated_at`, [id, serverId, `Perf SDK sub ${index + 1}`, sessionNames[0], providerId, `perf-provider-${id}`, index % 2 === 0 ? 'gpt-6-sol' : 'claude-sonnet-4', now]);
     }
     break;
   } catch (error) {
@@ -103,6 +106,13 @@ for (const { name, size } of longChatSessions) {
   events.push({ eventId: `perf-${name}-${size}`, sessionId: name, epoch, seq: size, ts: Date.now() + size, type: 'assistant.text', payload: { text: `Long chat final ${size}`, streaming: false } });
 }
 const announce = () => ws.send(JSON.stringify({ type: 'session_list', daemonVersion: 'perf-harness', sessions: allSessionNames.map((name, index) => ({ name, project: 'perflat-imcperf', projectDir: '/tmp/imc-perf-project', role: 'brain', agentType: 'perf', state: 'idle', runtimeType: 'transport', label: name.includes('-long') ? name.slice(name.indexOf('-long') + 1, -6) : `Perf ${index + 1}` })) }));
+const announceSubSession = (id) => {
+  const index = subSessionIds.indexOf(id);
+  if (index < 0) return;
+  const providerId = index % 2 === 0 ? 'codex-sdk' : 'claude-code-sdk';
+  ws.send(JSON.stringify({ type: 'subsession.created', id, sessionName: subSessionNames[index], state: 'idle', runtimeType: 'transport', providerId, providerSessionId: `perf-provider-${id}`, parentSession: sessionNames[0], label: `Perf SDK sub ${index + 1}`, requestedModel: index % 2 === 0 ? 'gpt-6-sol' : 'claude-sonnet-4', cwd: '/tmp/imc-perf-project' }));
+};
+const announceAllSubSessions = () => subSessionIds.forEach(announceSubSession);
 announce();
 const announceTimer = setInterval(announce, 2_000);
 process.stdout.write(JSON.stringify({ connected: true, serverId, sessions: sessionNames.length }) + '\n');
@@ -130,6 +140,10 @@ ws.on('message', (raw) => {
     ws.send(JSON.stringify({ type: 'p2p.config.save_response', requestId: msg.requestId, ok: true }));
     return;
   }
+  if (msg.type === 'subsession.rebuild_all') {
+    for (const item of Array.isArray(msg.subSessions) ? msg.subSessions : []) announceSubSession(item.id);
+    return;
+  }
   if (typeof msg.sessionName !== 'string') return;
   if (msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST || msg.type === TIMELINE_MESSAGES.REPLAY_REQUEST || msg.type === TIMELINE_MESSAGES.PAGE_REQUEST) {
     const events = history.get(msg.sessionName) ?? [];
@@ -140,14 +154,16 @@ ws.on('message', (raw) => {
 });
 
 let burst = 0;
+let ticks = 0;
 const tick = setInterval(() => {
+  ticks += 1;
   for (let index = 0; index < activeTimelineNames.length; index += 1) {
     const name = activeTimelineNames[index];
-    if (index < 5) sendEvent(name, 'assistant.text', { text: `stream-${++burst}`, streaming: true });
+    if (index < streamingSessions) sendEvent(name, 'assistant.text', { text: `stream-${++burst}`, streaming: true });
     else sendEvent(name, 'agent.status', { status: 'working', burst });
     if (index < 3) sendEvent(name, 'usage.update', { inputTokens: burst, outputTokens: burst * 2 });
   }
-  if (burst > 0 && burst % 250 === 0) for (const name of sessionNames) sendEvent(name, 'assistant.text', { text: `Final answer for ${name}.`, streaming: false });
+  if (ticks % 250 === 0) for (const name of activeTimelineNames) sendEvent(name, 'assistant.text', { text: `Final answer for ${name}.`, streaming: false });
   if (burst % 25 === 0) for (const name of sessionNames) sendEvent(name, 'session.state', { state: 'idle' });
-}, 40);
+}, Math.max(1, Math.round(1000 / streamHz)));
 process.on('SIGTERM', () => { clearInterval(tick); clearInterval(announceTimer); ws.close(); process.exit(0); });

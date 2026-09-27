@@ -6,7 +6,9 @@ export const DEFAULT_WORKLOAD = Object.freeze({
   sessions: 20,
   streamingSessions: 5,
   hiddenSessions: 10,
-  statusHz: 12,
+  // The canonical fake daemon emits one status/usage tick alongside each
+  // 25 Hz transport tick (375 status/s across 15 non-streaming sessions).
+  statusHz: 25,
   streamHz: 25,
 });
 

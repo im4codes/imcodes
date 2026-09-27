@@ -16,6 +16,7 @@ const webBuildId = process.env.WEB_BUILD_ID
     .slice(0, 12);
 
 export default defineConfig(({ mode }) => ({
+  // Harness-only opt-in keeps production bundles unchanged while enabling CDP profile source mapping.
   define: {
     __BUILD_TIME__: JSON.stringify(buildTime),
     __WEB_BUILD_ID__: JSON.stringify(webBuildId),
@@ -58,6 +59,7 @@ export default defineConfig(({ mode }) => ({
   build: {
     outDir: 'dist',
     target: 'es2020',
+    sourcemap: process.env.IMC_PERF_SOURCEMAP === '1',
     rollupOptions: {
       // Fixture harness entry is added ONLY for the dedicated fixtures build
       // (`vite build --mode fixtures`, see the `build:fixtures` npm script).

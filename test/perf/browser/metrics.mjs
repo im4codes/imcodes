@@ -6,7 +6,7 @@ const percentile = (values, p) => {
 
 export async function installObservers(page) {
   await page.addInitScript(() => {
-    const state = { longTasks: [], inputDelays: [], scriptedInputDelays: [], scriptedInputTimes: [], frames: 0, droppedFrames: 0, lastFrame: performance.now(), timelineEvents: 0, eventCountByType: {}, timerDrift: [], ws: { sent: 0, received: 0, bytesSent: 0, byType: {}, byMode: {}, expectedHiddenFullBytes: 0, hiddenSummaryBytes: 0 } };
+    const state = { startedAt: performance.now(), longTasks: [], inputDelays: [], scriptedInputDelays: [], scriptedInputTimes: [], frames: 0, rafCallbacks: 0, droppedFrames: 0, lastFrame: performance.now(), animationCounts: [], timelineEvents: 0, eventCountByType: {}, timerDrift: [], ws: { sent: 0, received: 0, bytesSent: 0, byType: {}, byMode: {}, expectedHiddenFullBytes: 0, hiddenSummaryBytes: 0 } };
     window.__manyWindowsMetrics = state;
     try {
       new PerformanceObserver((list) => state.longTasks.push(...list.getEntries().map((entry) => entry.duration))).observe({ type: 'longtask', buffered: true });
@@ -17,11 +17,13 @@ export async function installObservers(page) {
     const frame = (now) => {
       const gap = now - state.lastFrame;
       state.frames += 1;
+      state.rafCallbacks += 1;
       if (gap > 34) state.droppedFrames += Math.max(0, Math.round(gap / 16.67) - 1);
       state.lastFrame = now;
       requestAnimationFrame(frame);
     };
     requestAnimationFrame(frame);
+    setInterval(() => { state.animationCounts.push({ at: performance.now(), count: document.getAnimations?.().length ?? 0 }); }, 1_000);
     const timerStarted = performance.now();
     let timerTicks = 0;
     const timerTick = () => {
@@ -58,7 +60,7 @@ export async function installObservers(page) {
 }
 
 export async function collectMetrics(page) {
-  const browser = await page.evaluate(() => ({ ...window.__manyWindowsMetrics, heap: (performance.memory?.usedJSHeapSize ?? 0), bufferedAmount: [...(window.__perfBufferedSamples ?? [])] }));
+  const browser = await page.evaluate(() => ({ ...window.__manyWindowsMetrics, now: performance.now(), heap: (performance.memory?.usedJSHeapSize ?? 0), bufferedAmount: [...(window.__perfBufferedSamples ?? [])], renderDebug: window.__imcodesRenderDebug ?? null }));
   let heap = browser.heap;
   try {
     const session = await page.context().newCDPSession(page);
@@ -71,7 +73,8 @@ export async function collectMetrics(page) {
     inputDelay: { p95: percentile([...browser.inputDelays, ...browser.scriptedInputDelays], 0.95) },
     bufferedAmount: { p95: percentile(browser.bufferedAmount, 0.95), max: Math.max(0, ...browser.bufferedAmount) },
     fps: { frames: browser.frames, dropped: browser.droppedFrames },
-    probe: { timelineEvents: browser.timelineEvents ?? 0, eventCountByType: browser.eventCountByType ?? {}, timerDrift: browser.timerDrift ?? [] },
+    probe: { timelineEvents: browser.timelineEvents ?? 0, eventCountByType: browser.eventCountByType ?? {}, timerDrift: browser.timerDrift ?? [], rafCallbacks: browser.rafCallbacks ?? 0, rafPerSecond: browser.startedAt ? (browser.rafCallbacks * 1000 / Math.max(1, browser.now - browser.startedAt)) : 0, animationCounts: browser.animationCounts ?? [] },
+    renderDebug: browser.renderDebug,
     ws: browser.ws,
     heapBytes: heap,
   };
@@ -86,7 +89,8 @@ export function aggregate(metrics) {
     inputDelay: { p95: percentile(input, 0.95) },
     heapBytes: { first: heap[0] ?? 0, last: heap.at(-1) ?? 0, delta: (heap.at(-1) ?? 0) - (heap[0] ?? 0) },
     fps: { frames: metrics.reduce((sum, x) => sum + (x.fps?.frames ?? 0), 0), dropped: metrics.reduce((sum, x) => sum + (x.fps?.dropped ?? 0), 0) },
-    probe: { timelineEvents: metrics.reduce((sum, x) => sum + (x.probe?.timelineEvents ?? 0), 0), eventCountByType: metrics.reduce((sum, x) => { for (const [type, count] of Object.entries(x.probe?.eventCountByType ?? {})) sum[type] = (sum[type] ?? 0) + count; return sum; }, {}), timerDrift: metrics.flatMap((x) => x.probe?.timerDrift ?? []) },
+    probe: { timelineEvents: metrics.reduce((sum, x) => sum + (x.probe?.timelineEvents ?? 0), 0), eventCountByType: metrics.reduce((sum, x) => { for (const [type, count] of Object.entries(x.probe?.eventCountByType ?? {})) sum[type] = (sum[type] ?? 0) + count; return sum; }, {}), timerDrift: metrics.flatMap((x) => x.probe?.timerDrift ?? []), rafPerSecond: metrics.reduce((sum, x) => sum + (x.probe?.rafPerSecond ?? 0), 0), animationCounts: metrics.flatMap((x) => x.probe?.animationCounts ?? []) },
+    renderDebug: metrics.map((x) => x.renderDebug).filter(Boolean),
     ws: metrics.reduce((sum, x) => {
       for (const [type, bytes] of Object.entries(x.ws.byType ?? {})) sum.byType[type] = (sum.byType[type] ?? 0) + bytes;
       for (const [type, count] of Object.entries(x.ws.framesByType ?? {})) sum.framesByType[type] = (sum.framesByType[type] ?? 0) + count;
@@ -99,12 +103,17 @@ export function aggregate(metrics) {
         for (const [type, bytes] of Object.entries(socket.byType ?? {})) out.byType[type] = (out.byType[type] ?? 0) + bytes;
       }
       for (const [mode, bytes] of Object.entries(x.ws.byMode ?? {})) sum.byMode[mode] = (sum.byMode[mode] ?? 0) + bytes;
+      for (const [mode, types] of Object.entries(x.ws.byModeType ?? {})) {
+        const out = sum.byModeType[mode] ??= {};
+        for (const [type, bytes] of Object.entries(types)) out[type] = (out[type] ?? 0) + bytes;
+      }
+      Object.assign(sum.sessionModes, x.ws.sessionModes ?? {});
       Object.assign(sum.finalSessions, x.ws.finalSessions ?? {});
       sum.sent += x.ws.sent; sum.received += x.ws.received; sum.bytesSent += x.ws.bytesSent; sum.bytesReceived += x.ws.bytesReceived;
       sum.bufferedAmount.p95 = Math.max(sum.bufferedAmount.p95, x.bufferedAmount?.p95 ?? 0);
       sum.bufferedAmount.max = Math.max(sum.bufferedAmount.max, x.bufferedAmount?.max ?? 0);
       sum.expectedHiddenFullBytes += x.ws.expectedHiddenFullBytes ?? 0; sum.hiddenSummaryBytes += x.ws.hiddenSummaryBytes ?? 0;
       return sum;
-    }, { sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, byType: {}, framesByType: {}, seqGaps: [], historyTimings: [], sockets: {}, byMode: {}, finalSessions: {}, bufferedAmount: { p95: 0, max: 0 }, expectedHiddenFullBytes: 0, hiddenSummaryBytes: 0 }),
+    }, { sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, byType: {}, framesByType: {}, byModeType: {}, seqGaps: [], historyTimings: [], sockets: {}, byMode: {}, sessionModes: {}, finalSessions: {}, bufferedAmount: { p95: 0, max: 0 }, expectedHiddenFullBytes: 0, hiddenSummaryBytes: 0 }),
   };
 }

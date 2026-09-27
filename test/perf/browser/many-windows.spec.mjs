@@ -80,7 +80,8 @@ async function openRealSession(context, session, { manualProtocol = session.inde
   ]);
   page.setDefaultTimeout(10_000);
   page.setDefaultNavigationTimeout(15_000);
-  const diagnostics = { console: [], failedRequests: [] };
+  const diagnostics = { console: [], failedRequests: [], crashed: false };
+  page.on('crash', () => { diagnostics.crashed = true; session.__diagnostics = diagnostics; });
   session.__page = page;
   session.__diagnostics = diagnostics;
   page.on('console', (message) => {
@@ -97,7 +98,7 @@ async function openRealSession(context, session, { manualProtocol = session.inde
   await installObservers(page);
   diagnostics.phase = 'observers-installed';
   const mode = session.index < 10 ? 'full' : 'summary';
-  const ws = { sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, byType: {}, framesByType: {}, seqGaps: [], historyTimings: [], pendingHistory: {}, byMode: { [mode]: 0 }, sessionModes: {}, finalSessions: {}, mode, expectedHiddenFullBytes: 0, hiddenSummaryBytes: 0 };
+  const ws = { sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, byType: {}, framesByType: {}, byModeType: {}, seqGaps: [], historyTimings: [], pendingHistory: {}, byMode: { [mode]: 0 }, sessionModes: {}, finalSessions: {}, mode, expectedHiddenFullBytes: 0, hiddenSummaryBytes: 0 };
   const record = (payload, direction, requestId = 'unknown') => {
     const bytes = Buffer.byteLength(payload, 'utf8');
     ws[direction === 'sent' ? 'sent' : 'received'] += 1;
@@ -113,11 +114,13 @@ async function openRealSession(context, session, { manualProtocol = session.inde
         const eventSession = msg.sessionId ?? msg.event?.sessionId ?? msg.event?.payload?.sessionId;
         const eventMode = eventSession && ws.sessionModes[eventSession] ? ws.sessionModes[eventSession] : ws.mode;
         ws.byMode[eventMode] = (ws.byMode[eventMode] ?? 0) + bytes;
+        const modeTypes = ws.byModeType[eventMode] ??= {};
+        modeTypes[type] = (modeTypes[type] ?? 0) + bytes;
         if (eventMode === 'summary') ws.hiddenSummaryBytes += bytes;
         if (type === 'assistant.text' && msg.event?.payload?.streaming === false) ws.finalSessions[eventSession ?? 'unknown'] = true;
       }
       if (direction === 'sent' && (msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST || msg.type === TIMELINE_MESSAGES.PAGE_REQUEST || msg.type === TIMELINE_MESSAGES.REPLAY_REQUEST) && msg.requestId) {
-        ws.pendingHistory[msg.requestId] = { requestId: msg.requestId, type: msg.type, sentAt: Date.now() };
+        ws.pendingHistory[msg.requestId] = { requestId: msg.requestId, type: msg.type, sentAt: Date.now(), epoch: msg.epoch ?? msg.cursor?.epoch ?? null, afterSeq: msg.afterSeq ?? msg.cursor?.afterSeq ?? null };
       }
       if (direction === 'received' && (msg.type === TIMELINE_MESSAGES.HISTORY || msg.type === TIMELINE_MESSAGES.PAGE || msg.type === TIMELINE_MESSAGES.REPLAY) && msg.requestId) {
         const pending = ws.pendingHistory[msg.requestId];
@@ -231,7 +234,13 @@ async function openRealSession(context, session, { manualProtocol = session.inde
         session.__profilePath = profilePath;
       }
     } catch {}
-    return { networkLog: [...networkLog], tracePath, profilePath, performanceSamples: [...performanceSamples] };
+    const performanceDeltas = [];
+    for (let i = 1; i < performanceSamples.length; i += 1) {
+      const prev = performanceSamples[i - 1]; const cur = performanceSamples[i];
+      const seconds = Math.max(0.001, (cur.at - prev.at) / 1000);
+      performanceDeltas.push({ at: cur.at, seconds, TaskDurationPerSecond: ((cur.TaskDuration ?? 0) - (prev.TaskDuration ?? 0)) / seconds, ScriptDurationPerSecond: ((cur.ScriptDuration ?? 0) - (prev.ScriptDuration ?? 0)) / seconds, LayoutDurationPerSecond: ((cur.LayoutDuration ?? 0) - (prev.LayoutDuration ?? 0)) / seconds, RecalcStyleDurationPerSecond: ((cur.RecalcStyleDuration ?? 0) - (prev.RecalcStyleDuration ?? 0)) / seconds, LayoutCountPerSecond: ((cur.LayoutCount ?? 0) - (prev.LayoutCount ?? 0)) / seconds, RecalcStyleCountPerSecond: ((cur.RecalcStyleCount ?? 0) - (prev.RecalcStyleCount ?? 0)) / seconds });
+    }
+    return { networkLog: [...networkLog], tracePath, profilePath, performanceSamples: [...performanceSamples], performanceDeltas };
   };
 
   if (cdp) {
@@ -335,13 +344,16 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
       new Promise((_, reject) => setTimeout(() => reject(new Error('main-page-open-timeout')), openTimeoutMs)),
     ]);
     pageBySession.set(main.id, page);
-    const targetWindows = Math.max(1, Number(process.env.IMC_PERF_SUB_WINDOWS ?? (workload.sessions.length - 1)));
+    const totalSubWindows = Math.max(0, Number(process.env.IMC_PERF_SUB_WINDOWS ?? (workload.sessions.length - 1)));
+    const seededHidden = process.env.IMC_PERF_SEED_MINIMIZED !== '0' && process.env.IMC_PERF_LAYOUT !== 'tabs' && process.env.IMC_PERF_VARIANT !== 'all-hidden';
+    const targetWindows = Math.max(1, seededHidden ? totalSubWindows - Math.min(10, totalSubWindows) : totalSubWindows);
     const started = Date.now();
     let seen = 0;
     const boundedStep = (promise, label, timeoutMs = 2_000) => Promise.race([
       promise,
       new Promise((_, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), timeoutMs)),
     ]);
+    process.stdout.write(`${JSON.stringify({ phase: 'opening-single-page', mounted: seen, target: targetWindows })}\n`);
     while (Date.now() - started < windowOpenTimeoutMs && seen < targetWindows) {
       let state = { domNodes: 0, heapBytes: 0, globalDiagnosticKeys: [], globalDiagnosticKeyCount: 0, textLength: 0 };
       let count = 0;
@@ -351,6 +363,7 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
       try { visible = await boundedStep(page.locator('.subsession-window').evaluateAll((items) => items.filter((item) => getComputedStyle(item).display !== 'none').length), 'visible window count'); } catch {}
       if (count > seen) {
         seen = count;
+        process.stdout.write(`${JSON.stringify({ phase: 'window-mounted', mounted: seen, target: targetWindows })}\n`);
         windowCurve.push({ index: seen, sessionId: main.name, subWindows: count, visibleSubWindows: visible, ...state });
         if (seen === 5 || seen === 10) windowCurve.at(-1).heapSnapshot = await captureHeapSnapshot(page, `single-page-windows-${seen}`);
         await persistCheckpoint({ status: 'opening-single-page', windowCurve, stallDiagnostics, correctness });
@@ -359,36 +372,70 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
       await pageWait(250);
     }
     if (seen < targetWindows) {
+      if (main.__diagnostics?.crashed) correctness.failures.push(`renderer crashed at ${main.__diagnostics.phase ?? 'unknown phase'}`);
       correctness.failures.push(`single-page sub-window stall ${seen}/${targetWindows}`);
       correctness.restored = false;
+      const stallState = await Promise.race([
+        page.evaluate(() => ({
+          readyState: document.readyState,
+          url: location.href,
+          bodyText: document.body?.innerText?.slice(0, 2_000) ?? '',
+          subWindows: document.querySelectorAll('.subsession-window').length,
+          retained: document.querySelectorAll('[data-subsession-retained]').length,
+          localStorageKeys: Object.keys(localStorage).filter((key) => key.startsWith('rcc_open_subs_')),
+          openSubState: (() => { const key = Object.keys(localStorage).find((item) => item.startsWith('rcc_open_subs_')); return key ? localStorage.getItem(key) : null; })(),
+        })),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 2_000)),
+      ]).catch(() => ({ evaluateFailed: true }));
+      stallDiagnostics.push({ sessionId: main.id, phase: 'single-page-window-open', stalledAt: seen, state: stallState, ...(main.__diagnostics ?? {}) });
       await persistCheckpoint({ status: 'stalled-single-page', stalledAt: seen, windowCurve, stallDiagnostics, correctness });
     }
     // Minimize ten mounted sub-windows through the same close/hide controls a
     // user operates. This exercises summary subscriptions rather than merely
     // marking localStorage ids as hidden.
-    const hiddenTarget = Math.min(10, seen);
-    const mountedWindows = page.locator('.subsession-window');
-    for (let index = 0; index < hiddenTarget; index += 1) {
-      await mountedWindows.nth(index).locator('.subsession-close-btn').click({ timeout: 2_000 }).catch(() => {});
+    const hiddenTarget = process.env.IMC_PERF_VARIANT === 'all-hidden' ? totalSubWindows : Math.min(10, totalSubWindows);
+    const mountedWindows = page.locator('.subsession-window:visible');
+    const uiHideCount = seededHidden ? 0 : Math.min(hiddenTarget, seen);
+    for (let index = 0; index < uiHideCount; index += 1) {
+      // Select the current front visible window. Desktop commands intentionally
+      // require a focus click followed by the command click when inactive.
+      const hide = mountedWindows.first().locator('.subsession-close-btn');
+      await boundedStep(hide.click({ timeout: 1_500, force: true }), 'hide click', 2_500).catch(() => {});
+      await pageWait(500);
+      await boundedStep(hide.click({ timeout: 1_500, force: true }), 'hide confirm click', 2_500).catch(() => {});
+      await pageWait(500);
     }
     if (hiddenTarget) await pageWait(1_000);
-    const hiddenFinals = Object.keys(page.__perfWs?.finalSessions ?? {}).length;
-    if (hiddenTarget && hiddenFinals < hiddenTarget) {
-      correctness.hiddenFinal = false;
-      correctness.failures.push(`hidden final frames ${hiddenFinals}/${hiddenTarget}`);
-    } else if (hiddenTarget) correctness.hiddenFinal = true;
+    const visibleAfterHide = await boundedStep(page.locator('.subsession-window:visible').count(), 'visible count after hide', 2_000).catch(() => seen);
+    const modeAfterHide = { ...(page.__perfWs?.sessionModes ?? {}) };
+    const hiddenModeDiagnostics = { hiddenTarget, visibleAfterHide, modeAfterHide };
+    const sdkModes = Object.entries(modeAfterHide).filter(([name]) => name.startsWith('deck_sub_')).map(([, mode]) => mode);
+    const hiddenModes = sdkModes;
+    const expectedSummary = hiddenTarget;
+    const expectedFull = Math.max(0, totalSubWindows - hiddenTarget);
+    if (hiddenTarget && hiddenModes.filter((mode) => mode === 'summary').length < expectedSummary) {
+      correctness.failures.push(`hidden subscription modes ${hiddenModes.filter((mode) => mode === 'summary').length}/${expectedSummary}`);
+    }
+    if (hiddenTarget && hiddenModes.filter((mode) => mode === 'full').length < expectedFull) {
+      correctness.failures.push(`visible subscription modes ${hiddenModes.filter((mode) => mode === 'full').length}/${expectedFull}`);
+    }
     // Exercise the application's own quick close/restore UI, not a synthetic
     // visibility flag. The same control is used by real users to minimize all
     // floating sub-session windows and restore them from the quick-closed list.
     const quick = page.locator('.subsession-close-all-strip');
     if (await boundedStep(quick.count(), 'quick-close control', 2_000).catch(() => 0)) {
-      await quick.click({ timeout: 2_000 }).catch(() => {});
+      await boundedStep(quick.click({ timeout: 1_500 }), 'quick close', 2_500).catch(() => {});
       await pageWait(500);
-      await quick.click({ timeout: 2_000 }).catch(() => {});
+      await boundedStep(quick.click({ timeout: 1_500 }), 'quick restore', 2_500).catch(() => {});
       await pageWait(1_000);
+      hiddenModeDiagnostics.modeAfterRestore = { ...(page.__perfWs?.sessionModes ?? {}) };
     } else {
       correctness.toggled = false;
       correctness.failures.push('single-page quick close/restore control missing');
+    }
+    const restoredModes = Object.entries(hiddenModeDiagnostics.modeAfterRestore ?? {}).filter(([name]) => name.startsWith('deck_sub_')).map(([, mode]) => mode);
+    if (hiddenTarget && restoredModes.filter((mode) => mode === 'full').length < seen) {
+      correctness.failures.push(`restored subscription modes ${restoredModes.filter((mode) => mode === 'full').length}/${seen}`);
     }
     const body = await Promise.race([readBodyText(page, 3_000), pageWait(3_000).then(() => null)]);
     if (!body?.includes('Final answer for') && !hiddenTarget) {
@@ -398,6 +445,18 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     // Keep the primary one-page scenario alive for the requested measurement
     // duration instead of ending immediately after mount/restore.
     await pageWait(durationMs);
+    // Finals are emitted by the deterministic daemon during the measurement
+    // window.  Evaluate the hidden-final invariant after that window, not
+    // immediately after the minimize gesture (which races the first final).
+    const hiddenNames = Object.entries(modeAfterHide)
+      .filter(([name, mode]) => name.startsWith('deck_sub_') && mode === 'summary')
+      .map(([name]) => name);
+    const finalSessions = page.__perfWs?.finalSessions ?? {};
+    const hiddenFinals = hiddenNames.filter((name) => finalSessions[name]).length;
+    if (hiddenTarget && hiddenFinals < hiddenTarget) {
+      correctness.hiddenFinal = false;
+      correctness.failures.push(`hidden final frames ${hiddenFinals}/${hiddenTarget}`);
+    } else if (hiddenTarget) correctness.hiddenFinal = true;
     const item = await Promise.race([
       collectMetrics(page),
       pageWait(5_000).then(() => ({ longTask: { p50: 0, p95: 0, max: 0 }, inputDelay: { p95: 0 }, heapBytes: 0, fps: { frames: 0, dropped: 0 }, bufferedAmount: { p95: 0, max: 0 }, ws: page.__perfWs ?? { sent: 0, received: 0, bytesSent: 0, bytesReceived: 0, byType: {}, framesByType: {}, seqGaps: [], sockets: {}, byMode: {}, bufferedAmount: { p95: 0, max: 0 } } })),
@@ -426,7 +485,14 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
         correctness.failures.push(`companion open failed: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics: aggregate(companionItem ? [item, companionItem] : [item]) };
+    const metrics = aggregate(companionItem ? [item, companionItem] : [item]);
+    const modeEntries = Object.entries(modeAfterHide).filter(([name]) => name.startsWith('deck_sub_'));
+    const visibleSdkCount = modeEntries.filter(([, mode]) => mode === 'full').length;
+    const hiddenSdkCount = modeEntries.filter(([, mode]) => mode === 'summary').length;
+    metrics.ws.expectedHiddenFullBytes = visibleSdkCount
+      ? ((metrics.ws.byMode?.full ?? 0) / visibleSdkCount) * hiddenSdkCount
+      : 0;
+    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
   } catch (error) {
     correctness.failures.push(`single-page open failed: ${error instanceof Error ? error.message : String(error)}`);
     correctness.restored = false;
@@ -439,9 +505,24 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
 
 export async function runHarness() {
   const requestedSessions = Number(process.env.IMC_PERF_SESSIONS ?? 20);
-  const workload = buildWorkload({ seed: Number(process.env.IMC_PERF_SEED ?? 0x4d57494e), sessions: requestedSessions, hiddenSessions: Math.min(10, Math.max(0, requestedSessions - 1)), streamingSessions: Math.min(5, requestedSessions) });
+  const variant = process.env.IMC_PERF_VARIANT ?? 'baseline';
+  const workload = buildWorkload({
+    seed: Number(process.env.IMC_PERF_SEED ?? 0x4d57494e),
+    sessions: requestedSessions,
+    hiddenSessions: Math.min(10, Math.max(0, requestedSessions - 1)),
+    streamingSessions: variant === 'streaming-off' ? 0 : Math.min(5, requestedSessions),
+    statusHz: Number(process.env.IMC_PERF_STATUS_HZ ?? 12),
+    streamHz: Number(process.env.IMC_PERF_STREAM_HZ ?? 25),
+  });
   const browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
-  const context = await browser.newContext();
+  const context = await browser.newContext({ reducedMotion: variant === 'reduced-motion' ? 'reduce' : undefined });
+  if (variant === 'reduced-motion') {
+    await context.addInitScript(() => {
+      const style = document.createElement('style');
+      style.textContent = '*,:before,:after{animation:none!important;transition:none!important;caret-color:transparent!important}';
+      document.documentElement.appendChild(style);
+    });
+  }
   // Chromium only exposes crypto.randomUUID in secure contexts. The compose
   // server is intentionally HTTP-only, so provide the standards-equivalent
   // test shim before the real app bundle runs.
@@ -450,6 +531,9 @@ export async function runHarness() {
       globalThis.crypto.randomUUID = () => ([1e7] + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, (c) => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16));
     }
   });
+  if (process.env.IMC_PERF_RENDER_DEBUG === '1') {
+    await context.addInitScript(() => { window.__imcodesRenderDebug = { enabled: true, frames: [], counts: {} }; });
+  }
   await context.addCookies([
     { name: 'rcc_session', value: perfJwt(), url: BASE_URL },
     // The compose server uses the standard double-submit CSRF check for the
@@ -463,9 +547,15 @@ export async function runHarness() {
   }, { apiKey: API_KEY, baseUrl: BASE_URL });
   if (process.env.IMC_PERF_LAYOUT !== 'tabs') {
     const subIds = Array.from({ length: Math.max(0, requestedSessions - 1) }, (_, index) => `perfsub${index.toString(36)}`);
-    await context.addInitScript(({ main, subIds }) => {
-      localStorage.setItem(`rcc_open_subs_${main}`, JSON.stringify(subIds));
-    }, { main: workload.sessions[0]?.name, subIds });
+    await context.addInitScript(({ main, subIds, serverId, seedMinimized }) => {
+      // Seed the app's own persisted quick-closed set so the primary scenario
+      // starts with nine visible SDK panes and ten minimized summary panes.
+      // The subsequent close/restore actions still exercise the real UI.
+      const hidden = seedMinimized ? subIds.slice(Math.max(0, subIds.length - 10)) : [];
+      const visible = seedMinimized ? subIds.slice(0, Math.max(0, subIds.length - hidden.length)) : subIds;
+      localStorage.setItem(`rcc_open_subs_${main}`, JSON.stringify(visible));
+      if (hidden.length) localStorage.setItem(`rcc_subcard_quick_closed_v1:${encodeURIComponent(serverId)}:${encodeURIComponent(main)}`, JSON.stringify(hidden));
+    }, { main: workload.sessions[0]?.name, subIds, serverId: SERVER_ID, seedMinimized: process.env.IMC_PERF_SEED_MINIMIZED !== '0' });
   }
   const pages = [];
   const pageBySession = new Map();
@@ -630,8 +720,14 @@ export async function runHarness() {
     }));
     const full = metrics.filter((item) => item.ws.mode === 'full');
     const hidden = metrics.filter((item) => item.ws.mode === 'summary');
-    const expectedPerHidden = full.length ? full.reduce((sum, item) => sum + item.ws.bytesReceived, 0) / full.length : 0;
-    for (const item of hidden) item.ws.expectedHiddenFullBytes = expectedPerHidden;
+    const mainMetric = metrics[0] ?? { ws: { sessionModes: {}, byMode: {} } };
+    const sessionModes = mainMetric.ws.sessionModes ?? {};
+    const visibleSdkCount = Object.entries(sessionModes).filter(([name, mode]) => name.startsWith('deck_sub_') && mode === 'full').length;
+    const hiddenSdkCount = Object.entries(sessionModes).filter(([name, mode]) => name.startsWith('deck_sub_') && mode === 'summary').length;
+    const expectedHiddenFullBytes = visibleSdkCount ? ((mainMetric.ws.byMode?.full ?? 0) / visibleSdkCount) * hiddenSdkCount : 0;
+    // Store the budget once: it is the sum of per-socket full budgets for all
+    // hidden sockets, in the same units as hiddenSummaryBytes.
+    mainMetric.ws.expectedHiddenFullBytes = expectedHiddenFullBytes;
     correctness.longChats = longChatCorrectness;
     correctness.failures.push(...Object.entries(longChatCorrectness).filter(([, ok]) => !ok).map(([size]) => `missing long-chat final ${size}`));
     return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs, restoreTotalMs, windowCurve, stallDiagnostics, longChats, serverDebug: serverDebugSamples, metrics: aggregate(metrics) };

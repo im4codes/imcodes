@@ -29,6 +29,8 @@ COPY shared/ ./shared/
 # Build web (BUILD_TIME arg ensures cache is busted on each CI run)
 ARG BUILD_TIME
 ENV BUILD_TIME=${BUILD_TIME}
+ARG IMC_PERF_SOURCEMAP=0
+ENV IMC_PERF_SOURCEMAP=$IMC_PERF_SOURCEMAP
 RUN cd web && npm run build
 
 # Generate OTA update bundle + manifest

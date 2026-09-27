@@ -12,6 +12,7 @@ services:
       timeout: 2s
       retries: 20
     cpus: 1.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
     mem_limit: 512m
     pids_limit: 128
 
@@ -20,6 +21,7 @@ services:
       context: ../../..
       dockerfile: server/Dockerfile
       args:
+        IMC_PERF_SOURCEMAP: ${IMC_PERF_SOURCEMAP:-1}
         PRELOAD_EMBEDDING_MODEL: "0"
     environment:
       DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
@@ -40,6 +42,7 @@ services:
     # containers continue using server:19138 on their private network.
     ports: ["127.0.0.1:${IMC_PERF_PORT_BASE:-19138}:19138"]
     cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
     mem_limit: 1g
     pids_limit: 256
 
@@ -57,6 +60,7 @@ services:
       start_period: 30s
       retries: 180
     cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
     mem_limit: 4g
     shm_size: 1g
     pids_limit: 512
@@ -76,11 +80,14 @@ services:
       IMC_PERF_SERVER_URL: ws://server:19138
       IMC_PERF_DAEMON_TOKEN: imc-perf-daemon-token
       NODE_PATH: /app/node_modules
+      IMC_PERF_VARIANT: ${IMC_PERF_VARIANT:-baseline}
+      IMC_PERF_STREAMING_SESSIONS: ${IMC_PERF_STREAMING_SESSIONS:-5}
     command: ["node", "/repo/test/perf/browser/daemon-client.mjs"]
     depends_on:
       server:
         condition: service_started
     cpus: 1.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
     mem_limit: 768m
     pids_limit: 256
 
@@ -91,7 +98,9 @@ services:
     working_dir: /repo
     volumes:
       - ../../..:/repo
-      - perf_results:/repo/perf-results
+      - type: bind
+        source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
+        target: /repo/perf-results
     environment:
       HOME: /tmp/imc-perf-home
       IMCODES_HOME: /tmp/imc-perf-home/.imcodes
@@ -105,6 +114,14 @@ services:
       IMC_PERF_SUB_WINDOWS: ${IMC_PERF_SUB_WINDOWS:-19}
       IMC_PERF_OPEN_TIMEOUT_MS: ${IMC_PERF_OPEN_TIMEOUT_MS:-120000}
       IMC_PERF_WINDOW_TIMEOUT_MS: ${IMC_PERF_WINDOW_TIMEOUT_MS:-90000}
+      IMC_PERF_VARIANT: ${IMC_PERF_VARIANT:-baseline}
+      IMC_PERF_STREAMING_SESSIONS: ${IMC_PERF_STREAMING_SESSIONS:-5}
+      IMC_PERF_SEED_MINIMIZED: ${IMC_PERF_SEED_MINIMIZED:-1}
+      IMC_PERF_HARNESS_SHA: ${IMC_PERF_HARNESS_SHA:-unknown}
+      IMC_PERF_HARNESS_DIRTY: ${IMC_PERF_HARNESS_DIRTY:-unknown}
+      IMC_PERF_LOCK_WAIT_MS: ${IMC_PERF_LOCK_WAIT_MS:-0}
+      IMC_PERF_LOADAVG_BEFORE: ${IMC_PERF_LOADAVG_BEFORE:-unknown}
+      IMC_PERF_RENDER_DEBUG: ${IMC_PERF_RENDER_DEBUG:-0}
     command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/run.mjs"]
     depends_on:
       web:
@@ -112,6 +129,7 @@ services:
       server:
         condition: service_started
     cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
     mem_limit: 4g
     shm_size: 1g
     pids_limit: 512
