@@ -128,6 +128,23 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getAllByRole('checkbox')).toHaveLength(2);
     expect(screen.getByRole('button', { name: 'taskPair.brief_copy' })).toBeTruthy();
   });
+  it('keeps all 30 pair rows in a scroll container so the last row is reachable', () => {
+    (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
+      tasks: Array.from({ length: 30 }, (_, index) => ({
+        taskId: `scroll-${index}`,
+        title: `Scrollable task ${index + 1}`,
+        pair: { status: 'working', updatedAt: index + 1 },
+      })),
+      assignments: [],
+    };
+    const view = render(<TaskPairStatusPanel events={[]} serverId="scroll" />);
+    fireEvent.click(screen.getByRole('button', { name: 'taskPair.panel_expand' }));
+    const rows = view.container.querySelector('[data-testid="task-pair-status-rows"]') as HTMLElement | null;
+    expect(rows).toBeTruthy();
+    expect(rows?.className).toContain('task-pair-status-rows');
+    expect(view.container.querySelectorAll('.task-pair-status-row')).toHaveLength(30);
+    expect(screen.getByText('Scrollable task 30')).toBeTruthy();
+  });
   it('does not mount responsive panel effects for an ordinary chat, then activates on pair snapshot data', async () => {
     const originalMatchMedia = window.matchMedia;
     const matchMedia = vi.fn(() => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }));
