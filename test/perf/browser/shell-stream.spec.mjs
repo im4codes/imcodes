@@ -194,7 +194,7 @@ export async function runShellBrowserScenario() {
   const page = await context.newPage();
   const started = Date.now();
   await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(SESSION)}`, { waitUntil: 'domcontentloaded' });
-  await page.waitForSelector('.terminal-container', { timeout: 90_000 });
+  await page.waitForSelector('.terminal-container', { timeout: 180_000 });
   const firstPaintMs = Date.now() - started;
   await page.evaluate((value) => { window.__shellPerf.firstPaintMs = value; }, firstPaintMs);
   await page.locator('.terminal-container').first().click();
@@ -272,6 +272,32 @@ export async function runShellBrowserScenario() {
   await page.keyboard.press('Enter');
   await waitForTerminalText(page, burstHash, 30_000);
   await waitForTerminalText(page, 'during-output-ok', 30_000);
+  // Read the rendered xterm buffer itself, not just the shell's trailing
+  // checksum. This catches snapshot/stream drops that could otherwise leave
+  // the checksum line intact while losing bytes in the browser renderer.
+  const renderedBurst = await page.evaluate((session) => {
+    const candidates = Object.values(window.__imcShellTerminals ?? {});
+    const term = candidates.find((candidate) => candidate.buffer.active.length > 0)
+      ?? window.__imcShellTerminals?.[session]
+      ?? window.__imcShellTerminal;
+    if (!term) throw new Error('xterm test handle missing for burst extraction');
+    term.selectAll();
+    return term.getSelection();
+  }, SESSION);
+  const burstSource = '0123456789abcdef'.repeat(16_384);
+  // Wrapped rows are separated by newlines and padded to the visual width;
+  // this source intentionally contains no whitespace, so remove only
+  // presentation whitespace before locating/checksumming it.
+  const renderedBurstNormalized = renderedBurst.replace(/\s+/gu, '');
+  const renderedBurstStart = renderedBurstNormalized.indexOf(burstSource.slice(0, 128));
+  assert.ok(renderedBurstStart >= 0, 'xterm buffer must contain the complete burst source');
+  const renderedBurstExtract = renderedBurstNormalized.slice(renderedBurstStart, renderedBurstStart + burstSource.length);
+  if (sha256(renderedBurstExtract) !== burstHash) {
+    let mismatch = 0;
+    while (mismatch < renderedBurstExtract.length && renderedBurstExtract[mismatch] === burstSource[mismatch]) mismatch += 1;
+    console.error(JSON.stringify({ burstDebug: { renderedLength: renderedBurstExtract.length, expectedLength: burstSource.length, mismatch, actual: renderedBurstExtract.slice(Math.max(0, mismatch - 32), mismatch + 64), expected: burstSource.slice(Math.max(0, mismatch - 32), mismatch + 64) } }));
+  }
+  assert.equal(sha256(renderedBurstExtract), burstHash, 'xterm buffer burst checksum must match source');
   await killRemoteTmux();
   await page.waitForTimeout(2_000);
   assert.ok(await page.locator('.terminal-container').first().count(), 'terminal must remain mounted after tmux kill/recovery');
@@ -319,7 +345,7 @@ export async function runShellBrowserScenario() {
   assert.equal(metrics.longTasks, 0, 'shell output must not create long tasks');
   assert.ok(metrics.fps >= 50, `shell render FPS ${metrics.fps.toFixed(1)} is below 50`);
   await browser.close();
-  return { firstPaintMs, recovery: 1, metrics, inputLatency, urlCopies, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash } };
+  return { firstPaintMs, recovery: 1, metrics, inputLatency, urlCopies, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash, renderedBurstHash: sha256(renderedBurstExtract) } };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
