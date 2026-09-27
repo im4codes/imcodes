@@ -22,6 +22,19 @@ const SCOPE: SupervisionTaskConsoleScope = {
   coordinatorSessionName: 'deck_alpha_brain',
 };
 
+// These are pair-console statuses that can cross the supervision boundary when
+// the web and daemon are on different contract versions. They must remain
+// visible as neutral rows rather than being treated as lifecycle work.
+const PAIR_CONSOLE_STATUSES = [
+  'queued',
+  'working',
+  'in_audit',
+  'rework',
+  'passed',
+  'done',
+  'awaiting_brain_decision',
+] as const;
+
 function snapshot(
   overrides: Partial<SupervisionTaskConsoleSnapshot> = {},
 ): SupervisionTaskConsoleSnapshot {
@@ -319,6 +332,62 @@ describe('supervision task console reducer', () => {
     expect(unknownAssignment.tasks['task-1']).toBeDefined();
     expect(unknownAssignment.assignments['assignment-1']).toMatchObject({ status: 'planned', unknownStatus: 'future_status' });
     expect(unknownAssignment.lastDurableEventId).toBe(4);
+  });
+
+  it('quarantines every pair-console status in a snapshot without a resync', () => {
+    for (const status of PAIR_CONSOLE_STATUSES) {
+      const next = supervisionTaskConsoleReducer(subscribingState(), {
+        type: 'snapshot_received',
+        payload: snapshot({
+          tasks: [...snapshot().tasks, {
+            taskId: `pair-${status}`,
+            title: `Pair ${status}`,
+            status: status as never,
+            phase: status === 'rework' ? 'rework' : status === 'passed' ? 'audit' : 'active',
+            validationState: 'unknown',
+            updatedAt: 1,
+            lastEventId: 3,
+          }],
+          assignments: snapshot().assignments,
+        }),
+      });
+      expect(next.phase, status).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+      expect(next.resyncReason, status).toBeNull();
+      const row = next.tasks[`pair-${status}`];
+      if (status === 'rework' || status === 'passed') {
+        expect(row, status).toMatchObject({ status });
+      } else {
+        expect(row, status).toMatchObject({ status: 'planned', phase: 'active', unknownStatus: status });
+      }
+      expect(next.tasks['task-1'], status).toBeDefined();
+    }
+  });
+
+  it('quarantines every pair-console status in a delta while advancing the cursor', () => {
+    for (const status of PAIR_CONSOLE_STATUSES) {
+      const next = supervisionTaskConsoleReducer(readyState(), {
+        type: 'delta_received',
+        payload: delta({
+          task: {
+            ...delta().task!,
+            taskId: `pair-${status}`,
+            status: status as never,
+            phase: status === 'rework' ? 'rework' : status === 'passed' ? 'audit' : 'active',
+          },
+          eventId: 4,
+          lastDurableEventId: 4,
+        }),
+      });
+      expect(next.phase, status).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+      expect(next.resyncReason, status).toBeNull();
+      const row = next.tasks[`pair-${status}`];
+      if (status === 'rework' || status === 'passed') {
+        expect(row, status).toMatchObject({ status });
+      } else {
+        expect(row, status).toMatchObject({ status: 'planned', unknownStatus: status });
+      }
+      expect(next.lastDurableEventId, status).toBe(4);
+    }
   });
 
   it('drops malformed delayed frames before validating a replaced subscription', () => {

@@ -26,6 +26,16 @@ import {
   writeSupervisionTaskConsoleCache,
 } from '../../src/supervision-task-console-cache.js';
 
+const PAIR_CONSOLE_STATUSES = [
+  'queued',
+  'working',
+  'in_audit',
+  'rework',
+  'passed',
+  'done',
+  'awaiting_brain_decision',
+] as const;
+
 // Preact chooses the native lowercase event name only when the DOM advertises
 // `onpointerdown`. jsdom does not, so without this capability marker Preact
 // registers a case-sensitive `PointerDown` listener and a realistic
@@ -303,6 +313,32 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.getByText('Build live task console')).toBeTruthy();
     expect(screen.getByText('Future task status')).toBeTruthy();
     expect(screen.getAllByText('supervision_task_console.unknown_status').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('keeps every leaked pair-console status neutral and out of global alerts', () => {
+    const base = state();
+    const leakedTasks = Object.fromEntries(PAIR_CONSOLE_STATUSES.map((status) => [
+      `pair-${status}`,
+      {
+        taskId: `pair-${status}`, title: `Pair ${status}`, status: 'implementing', phase: 'active',
+        unknownStatus: status, validationState: 'unknown', updatedAt: NOW, lastEventId: 22,
+      },
+    ]));
+    render(
+      <SupervisionTaskConsoleView
+        state={{ ...base, tasks: { ...base.tasks, ...leakedTasks } }}
+        mobile={false}
+        now={NOW}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    for (const status of PAIR_CONSOLE_STATUSES) {
+      expect(screen.getByText(`Pair ${status}`)).toBeTruthy();
+    }
+    expect(screen.getAllByText('supervision_task_console.unknown_status').length)
+      .toBeGreaterThanOrEqual(PAIR_CONSOLE_STATUSES.length);
     expect(screen.queryByRole('alert')).toBeNull();
   });
 
