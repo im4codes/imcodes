@@ -969,7 +969,7 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: dist-node-exe/remote-desktop-worker
-          key: imcodes-macos-components-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}-${{ steps.mac_identity.outputs.sha1 }}-${{ hashFiles('native/macos-remote-desktop/**', 'scripts/macos-remote-desktop-*.mjs', 'scripts/macos-remote-desktop-*.ts', 'scripts/remote-desktop-worker-artifacts.mjs', 'shared/**', 'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json') }}-v2
+          key: imcodes-macos-components-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}-${{ steps.mac_identity.outputs.sha1 }}-${{ hashFiles('package-lock.json', 'native/macos-remote-desktop/**', 'scripts/build-macos-remote-desktop-release.mjs', 'scripts/macos-remote-desktop-build.mjs', 'scripts/macos-remote-desktop-*.mjs', 'scripts/macos-remote-desktop-*.ts', 'scripts/install-libwebrtc-sdk.mjs', 'scripts/libwebrtc-sdk-artifacts.mjs', 'scripts/libwebrtc-sdk-targets.mjs', 'scripts/macos-release-signing.mjs', 'scripts/module-entry.mjs', 'scripts/remote-desktop-worker-artifacts.mjs', 'shared/**', 'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json') }}-v3
       - name: Write macOS notary API key
         if: runner.os == 'macOS'
         env:
@@ -1138,7 +1138,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: dist-node-exe/remote-desktop-worker
-          key: imcodes-macos-components-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}-${{ steps.mac_identity.outputs.sha1 }}-${{ hashFiles('native/macos-remote-desktop/**', 'scripts/macos-remote-desktop-*.mjs', 'scripts/macos-remote-desktop-*.ts', 'scripts/remote-desktop-worker-artifacts.mjs', 'shared/**', 'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json') }}-v2
+          key: imcodes-macos-components-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}-${{ steps.mac_identity.outputs.sha1 }}-${{ hashFiles('package-lock.json', 'native/macos-remote-desktop/**', 'scripts/build-macos-remote-desktop-release.mjs', 'scripts/macos-remote-desktop-build.mjs', 'scripts/macos-remote-desktop-*.mjs', 'scripts/macos-remote-desktop-*.ts', 'scripts/install-libwebrtc-sdk.mjs', 'scripts/libwebrtc-sdk-artifacts.mjs', 'scripts/libwebrtc-sdk-targets.mjs', 'scripts/macos-release-signing.mjs', 'scripts/module-entry.mjs', 'scripts/remote-desktop-worker-artifacts.mjs', 'shared/**', 'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json') }}-v3
       # The Linux remote-desktop worker. Same reasoning as the macOS block
       # above: without this the image ships a Linux controlled node that can
       # self-upgrade but has no worker binary, so LinuxRemoteDesktopWorkerHost

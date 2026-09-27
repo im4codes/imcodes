@@ -49,7 +49,26 @@ describe('CI release-speed wiring', () => {
     expect(controlled).toContain('actions/cache/save@v4');
     expect(controlled).toContain('steps.mac_identity.outputs.sha1');
     expect(controlled).toContain('imcodes-macos-components-${{ runner.os }}-${{ env.NODE_VERSION_PRIMARY }}');
-    expect(controlled).toContain('hashFiles(\'native/macos-remote-desktop/**\', \'scripts/macos-remote-desktop-*.mjs\', \'scripts/macos-remote-desktop-*.ts\', \'scripts/remote-desktop-worker-artifacts.mjs\', \'shared/**\', \'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json\')');
+    // Keep the cache tied to the complete build-input closure. In particular,
+    // changing the builder or an installer/verifier must force a miss rather
+    // than reusing signed binaries produced by the old code.
+    for (const input of [
+      'package-lock.json',
+      'native/macos-remote-desktop/**',
+      'scripts/build-macos-remote-desktop-release.mjs',
+      'scripts/macos-remote-desktop-build.mjs',
+      'scripts/install-libwebrtc-sdk.mjs',
+      'scripts/libwebrtc-sdk-artifacts.mjs',
+      'scripts/libwebrtc-sdk-targets.mjs',
+      'scripts/macos-release-signing.mjs',
+      'scripts/module-entry.mjs',
+      'scripts/remote-desktop-worker-artifacts.mjs',
+      'shared/**',
+      'native/macos-remote-desktop/libwebrtc-sdk-*.lock.json',
+    ]) {
+      expect(controlled, input).toContain(input);
+    }
+    expect(controlled).toContain('-v3');
     expect(controlled).not.toContain('imcodes-macos-components-${{ github.sha }}');
     expect(controlled).toContain('Verify the macOS remote-desktop component sets');
     expect(controlled).toContain('Verify restored macOS component signatures and trust');
