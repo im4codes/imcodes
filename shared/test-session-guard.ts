@@ -6,6 +6,18 @@ export interface TestSessionGuardInput {
   cwd?: string | null;
 }
 
+/**
+ * Processes launched by a test harness must use an isolated HOME. Keep this
+ * predicate in shared/ so daemon entry points and spawned helpers cannot drift
+ * into different definitions of "test process".
+ */
+export function isTestSessionGuardedEnvironment(env: NodeJS.ProcessEnv = process.env): boolean {
+  return (typeof env.VITEST === 'string' && env.VITEST.length > 0)
+    || env.NODE_ENV === 'test'
+    || env.IMCODES_TEST_MODE === '1'
+    || (typeof env.IMCODES_TEST_HOME === 'string' && env.IMCODES_TEST_HOME.length > 0);
+}
+
 const SESSION_NAME_PATTERNS: RegExp[] = [
   /^e2e_/i,
   /^deck_e2e/i,

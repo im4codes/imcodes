@@ -408,8 +408,26 @@ program
   .command('stop')
   .description('Stop the daemon gracefully')
   .action(async () => {
-    const { shutdown } = await import('./daemon/lifecycle.js');
-    await shutdown(0);
+    // `imcodes stop` is normally a separate CLI process, not the process that
+    // acquired daemon.sock. Calling lifecycle.shutdown() here used to flush
+    // this process's never-loaded empty session store over the live daemon.
+    // Delegate to the service manager; a foreground invocation without an
+    // installed service simply exits without touching sessions.json.
+    const platform = process.platform;
+    if (platform === 'darwin') {
+      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      if (existsSync(plist)) {
+        execSync(`launchctl unload "${plist}"`, { stdio: 'inherit' });
+        return;
+      }
+    } else if (platform === 'linux') {
+      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      if (existsSync(userService)) {
+        execSync('systemctl --user stop imcodes', { stdio: 'inherit' });
+        return;
+      }
+    }
+    console.log('No installed daemon service found; nothing to stop.');
   });
 
 program

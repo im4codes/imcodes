@@ -1,4 +1,4 @@
-import { readFile, writeFile, mkdir } from 'node:fs/promises';
+import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
@@ -18,11 +18,14 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
-import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
+import { assertNotRealImcodesPathInTests, isRealImcodesPath, isUnderTestRunner } from '../util/test-home-guard.js';
+import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type DaemonProcessIdentity } from '../daemon/instance-lock.js';
+import logger from '../util/logger.js';
 
 const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
 const IDENTITY_PROMPT_REF_PREFIX = 'p';
+const SESSION_STORE_BACKUP_COUNT = 5;
 
 function storeDir(): string {
   return join(homedir(), '.imcodes');
@@ -251,11 +254,20 @@ export interface LoadStoreOptions {
   probe?: boolean;
 }
 
+export interface SessionStoreWriteAuthority {
+  identity: DaemonProcessIdentity;
+  metadataPath: string;
+}
+
 let writeTimer: ReturnType<typeof setTimeout> | null = null;
 let writeTimerPath: string | null = null;
 let writeQueue: Promise<void> = Promise.resolve();
 let pendingWrite: Promise<void> | null = null;
 let store: SessionStore = { sessions: {} };
+let storeLoaded = false;
+let storeWriteAuthority: SessionStoreWriteAuthority | null = null;
+let allowEmptyStoreWrite = false;
+let warnedReadOnlyWrite = false;
 /**
  * Set once by the daemon after its startup load: from then on this process's
  * in-memory store is the authority for sessions.json, and a read-only refresh
@@ -266,13 +278,38 @@ let store: SessionStore = { sessions: {} };
  */
 let storeAuthoritative = false;
 
-export function markSessionStoreAuthoritative(): void {
+export function markSessionStoreAuthoritative(
+  identity?: DaemonProcessIdentity,
+  metadataPath = join(homedir(), '.imcodes', 'daemon.lock.json'),
+): void {
   storeAuthoritative = true;
+  if (identity) {
+    storeWriteAuthority = { identity, metadataPath };
+    warnedReadOnlyWrite = false;
+  }
+}
+
+/** The daemon calls this immediately after acquiring its instance lock. */
+export function configureSessionStoreWriteAuthority(
+  identity: DaemonProcessIdentity,
+  metadataPath = join(homedir(), '.imcodes', 'daemon.lock.json'),
+): void {
+  storeWriteAuthority = { identity, metadataPath };
+  warnedReadOnlyWrite = false;
+}
+
+/** Explicit administrative action allowing an empty store to replace a non-empty snapshot. */
+export function authorizeEmptySessionStoreWrite(): void {
+  allowEmptyStoreWrite = true;
 }
 
 /** Test seam: return to the non-authoritative (consumer) default. */
 export function resetSessionStoreAuthorityForTests(): void {
   storeAuthoritative = false;
+  storeWriteAuthority = null;
+  storeLoaded = false;
+  allowEmptyStoreWrite = false;
+  warnedReadOnlyWrite = false;
 }
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
@@ -311,6 +348,69 @@ function serializeStore(): string {
     identityPrompts,
   };
   return JSON.stringify(persistedStore, null, 2);
+}
+
+function persistedSessionCount(raw: string): number | null {
+  try {
+    const hydrated = hydrateStore(JSON.parse(raw));
+    return hydrated ? Object.keys(hydrated.store.sessions).length : null;
+  } catch {
+    return null;
+  }
+}
+
+function testSessionWouldTouchRealStore(targetPath: string): boolean {
+  return isRealImcodesPath(targetPath) && Object.values(store.sessions).some((record) => isKnownTestSessionLike({
+    name: record.name,
+    projectName: record.projectName,
+    projectDir: record.projectDir,
+    parentSession: record.parentSession,
+  }));
+}
+
+function hasWriteAuthority(targetPath: string): boolean {
+  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
+  if (testSessionWouldTouchRealStore(targetPath)) {
+    throw new Error(`refusing to persist test-looking sessions in the real ~/.imcodes (${targetPath})`);
+  }
+  // Vitest and explicitly marked test processes are allowed to exercise the
+  // real persistence implementation, but only inside an isolated HOME.
+  if (isUnderTestRunner() && !isRealImcodesPath(targetPath)) return true;
+  const authority = storeWriteAuthority;
+  if (!authority) {
+    if (!warnedReadOnlyWrite) {
+      warnedReadOnlyWrite = true;
+      logger.warn({ targetPath }, 'Session store is read-only: process does not own the daemon instance lock');
+    }
+    return false;
+  }
+  const lock = readInstanceLockMetadata(authority.metadataPath);
+  if (!lock
+    || lock.pid !== authority.identity.pid
+    || lock.startToken !== authority.identity.startToken
+    || !isRecordedProcessIdentityCurrent(authority.identity)) {
+    if (!warnedReadOnlyWrite) {
+      warnedReadOnlyWrite = true;
+      logger.warn({ targetPath }, 'Session store write refused: daemon lock ownership changed');
+    }
+    return false;
+  }
+  return true;
+}
+
+async function readNewestBackup(targetPath: string): Promise<{ store: SessionStore; legacy: boolean } | null> {
+  for (let index = 1; index <= SESSION_STORE_BACKUP_COUNT; index += 1) {
+    try {
+      const raw = await readFile(`${targetPath}.${index}`, 'utf8');
+      const hydrated = hydrateStore(JSON.parse(raw));
+      if (hydrated && Object.keys(hydrated.store.sessions).length > 0) return hydrated;
+    } catch {
+      // A missing or partially-written older backup is skipped. The next
+      // rotation remains usable and startup must never fail just because one
+      // historical snapshot is corrupt.
+    }
+  }
+  return null;
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -367,14 +467,23 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   // there is a no-op rather than a disk overwrite of live memory.
   if (options.probe === false && storeAuthoritative) return store;
   await drainPendingWritesForRead();
-  await mkdir(dirname(targetPath), { recursive: true });
+  if (hasWriteAuthority(targetPath)) await mkdir(dirname(targetPath), { recursive: true });
   let loadedLegacySnapshot = false;
+  let loadedFromBackup = false;
   try {
     const raw = await readFile(targetPath, 'utf8');
     const hydrated = hydrateStore(JSON.parse(raw));
     if (hydrated) {
       store = hydrated.store;
       loadedLegacySnapshot = hydrated.legacy;
+      if (Object.keys(store.sessions).length === 0) {
+        const backup = await readNewestBackup(targetPath);
+        if (backup) {
+          store = backup.store;
+          loadedLegacySnapshot = backup.legacy;
+          loadedFromBackup = true;
+        }
+      }
     }
   } catch (err) {
     // Reset to an empty store ONLY when the file genuinely doesn't exist. A
@@ -385,8 +494,19 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
     // momentarily expose zero sessions, which surfaced as flaky CI:
     // `send_message` intermittently returned status:'error' (target not found).
     if ((err as { code?: string } | null)?.code === 'ENOENT') {
-      store = { sessions: {} };
+      const backup = await readNewestBackup(targetPath);
+      if (backup) {
+        store = backup.store;
+        loadedLegacySnapshot = backup.legacy;
+        loadedFromBackup = true;
+      } else {
+        store = { sessions: {} };
+      }
     }
+  }
+  storeLoaded = true;
+  if (loadedFromBackup) {
+    logger.warn({ targetPath }, 'Session store was empty; restored the newest non-empty backup');
   }
   // Read-only consumers (probe:false — e.g. an MCP tool refreshing its send
   // targets) return the freshly-read snapshot as-is: NO prune/reconcile/probe
@@ -395,7 +515,7 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
   // the daemon's external writes — intermittently dropping a just-added session
   // and failing send_message (flaky CI at the memory-mcp send-refresh path).
   if (options.probe === false) return store;
-  if (loadedLegacySnapshot) scheduleWrite(targetPath);
+  if (loadedLegacySnapshot || loadedFromBackup) scheduleWrite(targetPath);
   if (pruneNonPersistableSessions()) scheduleWrite(targetPath);
   if (reconcilePersistedSessions()) scheduleWrite(targetPath);
   // Probe actual state of each session via terminal detection.
@@ -499,10 +619,38 @@ function scheduleWrite(targetPath = storePath()): void {
 async function writeStoreToDisk(bestEffort: boolean, targetPath = storePath()): Promise<void> {
   // Outside the best-effort catch on purpose: a test reaching the real store
   // must fail loudly, never be swallowed as a lost write.
-  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
+  if (!hasWriteAuthority(targetPath)) return;
   try {
     await mkdir(dirname(targetPath), { recursive: true });
-    await writeFile(targetPath, serializeStore(), 'utf8');
+    const serialized = serializeStore();
+    const nextCount = persistedSessionCount(serialized) ?? 0;
+    let existingRaw: string | null = null;
+    try { existingRaw = await readFile(targetPath, 'utf8'); } catch { /* first write */ }
+    const existingCount = existingRaw === null ? 0 : persistedSessionCount(existingRaw);
+    const existingHasBytes = existingRaw !== null && existingRaw.trim().length > 0;
+    if (existingHasBytes && (existingCount === null || existingCount > 0)
+      && nextCount === 0 && !allowEmptyStoreWrite) {
+      logger.error({ targetPath, existingCount }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
+      return;
+    }
+
+    // Keep a bounded history before every replacement. Rotation and the final
+    // rename happen on the same filesystem, so readers see either the old
+    // complete JSON or the new complete JSON, never a truncated file.
+    for (let index = SESSION_STORE_BACKUP_COUNT; index >= 2; index -= 1) {
+      try { await rename(`${targetPath}.${index - 1}`, `${targetPath}.${index}`); } catch { /* absent */ }
+    }
+    if (existingRaw !== null && existingCount !== null) {
+      await copyFile(targetPath, `${targetPath}.1`);
+    }
+    const temporary = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
+    try {
+      await writeFile(temporary, serialized, { encoding: 'utf8', mode: 0o600 });
+      await rename(temporary, targetPath);
+    } finally {
+      try { await rename(temporary, `${temporary}.stale`); } catch { /* already renamed */ }
+    }
+    allowEmptyStoreWrite = false;
   } catch (error) {
     if (!bestEffort) throw error;
     // Tests may tear down temp HOME dirs while a debounced write is pending.
@@ -730,6 +878,10 @@ export function updateSessionState(name: string, state: SessionState, error?: st
 }
 
 export async function flushStore(): Promise<void> {
+  // A CLI stop/status process can import lifecycle.shutdown without ever
+  // loading the daemon store or acquiring its lock. It must not flush the
+  // initial empty in-memory value over the live daemon's sessions.
+  if (!storeLoaded && !isUnderTestRunner()) return;
   const targetPath = writeTimerPath ?? storePath();
   if (writeTimer) {
     clearTimeout(writeTimer);

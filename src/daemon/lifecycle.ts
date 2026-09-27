@@ -3,7 +3,7 @@ import { taskPairService } from './task-pairs/service.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isSessionWorking } from './session-working.js';
-import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, type SessionRecord } from '../store/session-store.js';
+import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
@@ -589,6 +589,11 @@ export async function startup(): Promise<DaemonContext> {
     changeId: 'memory-system-1.1-foundations',
   }, 'Daemon starting');
   lockServer = await acquireInstanceLock();
+  // Fence session-store writes to the exact process/start token that acquired
+  // the daemon lock. This must happen BEFORE loadStore: startup reconciliation
+  // can schedule a migration/probe write, and a non-owner must never be able
+  // to persist its transient (possibly empty) in-memory view.
+  configureSessionStoreWriteAuthority(lockServer.identity, lockServer.metadataPath);
   cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
   // Captures an initial heap snapshot into the runtime status; subsequent

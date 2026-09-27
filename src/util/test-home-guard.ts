@@ -15,6 +15,7 @@
  */
 import { userInfo } from 'node:os';
 import { join, resolve, sep } from 'node:path';
+import { isTestSessionGuardedEnvironment } from '../../shared/test-session-guard.js';
 
 function realImcodesDir(): string | undefined {
   try {
@@ -25,7 +26,7 @@ function realImcodesDir(): string | undefined {
 }
 
 export function isUnderTestRunner(env: NodeJS.ProcessEnv = process.env): boolean {
-  return typeof env.VITEST === 'string' && env.VITEST.length > 0;
+  return isTestSessionGuardedEnvironment(env);
 }
 
 /** True when `target` is the real ~/.imcodes or anything inside it. */
