@@ -205,12 +205,12 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     // 1. The Brain opens the work the legacy way: a new objective, no taskId.
     const dispatchInput: SendMessageInput = {
       target: EXEC,
-      message: 'Add one meaningful README sentence and validate it.',
+      message: 'Implement a cross-file README update, add tests, and validate the integration.',
       reply: true,
       idempotencyKey: 'pairs-e2e-readme',
       task: {
         classification: 'independent_top_level',
-        objective: 'Add one README sentence',
+        objective: 'Implement a cross-file README update, add tests, and validate the integration.',
         acceptance: ['one audit PASS'],
         ownedFiles: ['README.md'],
       },
