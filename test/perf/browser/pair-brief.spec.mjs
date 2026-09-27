@@ -13,7 +13,7 @@ export async function runPairBriefScenario() {
   const page = await context.newPage();
   await page.goto(`${BASE_URL}/src/fixtures/chat-timeline/index.html?size=30&windows=1`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('[data-chat-timeline-harness="ready"]', { timeout: 60_000 });
-  const brief = '# Browser brief\n\nThe full **task content** is visible.\n\n- [x][ ] Implement the UI\n- [ ][x] Audit the UI';
+  const brief = '# Browser brief\n\nThe full **task content** is visible.\n\n- [x][ ] Implement the UI\n- [ ][x] Audit the UI\n\n' + Array.from({ length: 24 }, (_, index) => `Additional brief line ${index + 1}.`).join('\n');
   const tasks = Array.from({ length: 30 }, (_, index) => ({
     taskId: `pair-brief-browser-${index + 1}`,
     title: `Browser-visible pair title ${index + 1}`,
@@ -42,9 +42,20 @@ export async function runPairBriefScenario() {
   const expand = panel.getByRole('button', { name: /show task content|显示任务内容|顯示任務內容|mostrar contenido|タスク内容を表示|작업 내용 표시|показать содержание/i }).first();
   await expand.click();
   await panel.getByText('Browser-visible pair title 30').waitFor({ state: 'visible' });
-  await panel.getByText('task content', { exact: false }).waitFor({ state: 'visible' });
+  const expandedBrief = panel.locator('.task-pair-brief-content').first();
+  await expandedBrief.getByText('task content', { exact: false }).waitFor({ state: 'visible' });
   const rows = panel.locator('.task-pair-status-row');
   const numbers = panel.locator('.task-pair-status-sequence');
+  const rowsScroller = panel.getByTestId('task-pair-status-rows');
+  await expandedBrief.evaluate((element) => {
+    element.scrollTop = element.scrollHeight;
+  });
+  const outerBeforeWheel = await rowsScroller.evaluate((element) => element.scrollTop);
+  await expandedBrief.hover();
+  await page.mouse.wheel(0, 800);
+  await page.waitForTimeout(50);
+  const outerAfterWheel = await rowsScroller.evaluate((element) => element.scrollTop);
+  assert.ok(outerAfterWheel > outerBeforeWheel, 'brief edge scroll chains to the outer task list');
   await rows.nth(29).scrollIntoViewIfNeeded();
   assert.equal(await rows.count(), 30);
   assert.equal(await numbers.nth(0).textContent(), '1');
