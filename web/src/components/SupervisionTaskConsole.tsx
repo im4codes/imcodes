@@ -523,6 +523,11 @@ export function SupervisionTaskConsoleView(props: {
     allTasks.filter((task) => supervisionConsoleTabForTask(task, assignmentsByTask.get(task.taskId) ?? []) === 'pending'),
     assignmentsByTask,
   ), [allTasks, assignmentsByTask]);
+  // Unknown rows remain visible in their neutral tab, but must not inflate
+  // lifecycle counts (an unknown status is not evidence of active work).
+  const activeTaskCount = activeTasks.filter((task) => !task.unknownStatus).length;
+  const pendingTaskCount = pendingTasks.filter((task) => !task.unknownStatus).length;
+  const historyTaskCount = historyTasks.filter((task) => !task.unknownStatus).length;
 
   useEffect(() => { if (props.mobile) closeRef.current?.focus(); }, [props.mobile]);
 
@@ -607,9 +612,9 @@ export function SupervisionTaskConsoleView(props: {
           && <button type="button" class="supervision-task-console-retry" onClick={props.onRetry}>{t('supervision_task_console.retry')}</button>}
       </div>
       {bodyState === 'ready' && <div class="supervision-task-console-tabs" role="tablist" aria-label={t('supervision_task_console.tabs_label')}>
-        <button ref={activeTabRef} type="button" role="tab" id="task-console-tab-active" aria-selected={activeTab === 'active'} aria-controls="task-console-panel-active" tabIndex={activeTab === 'active' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'active')} onClick={() => setActiveTab('active')}>{t('supervision_task_console.tab_active')} <span>{activeTasks.length}</span></button>
-        <button ref={pendingTabRef} type="button" role="tab" id="task-console-tab-pending" aria-selected={activeTab === 'pending'} aria-controls="task-console-panel-pending" tabIndex={activeTab === 'pending' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'pending')} onClick={() => setActiveTab('pending')}>{t('supervision_task_console.tab_pending')} <span>{pendingTasks.length}</span></button>
-        <button ref={historyTabRef} type="button" role="tab" id="task-console-tab-history" aria-selected={activeTab === 'history'} aria-controls="task-console-panel-history" tabIndex={activeTab === 'history' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'history')} onClick={() => setActiveTab('history')}>{t('supervision_task_console.tab_history')} <span>{historyTasks.length}</span></button>
+        <button ref={activeTabRef} type="button" role="tab" id="task-console-tab-active" aria-selected={activeTab === 'active'} aria-controls="task-console-panel-active" tabIndex={activeTab === 'active' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'active')} onClick={() => setActiveTab('active')}>{t('supervision_task_console.tab_active')} <span>{activeTaskCount}</span></button>
+        <button ref={pendingTabRef} type="button" role="tab" id="task-console-tab-pending" aria-selected={activeTab === 'pending'} aria-controls="task-console-panel-pending" tabIndex={activeTab === 'pending' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'pending')} onClick={() => setActiveTab('pending')}>{t('supervision_task_console.tab_pending')} <span>{pendingTaskCount}</span></button>
+        <button ref={historyTabRef} type="button" role="tab" id="task-console-tab-history" aria-selected={activeTab === 'history'} aria-controls="task-console-panel-history" tabIndex={activeTab === 'history' ? 0 : -1} onKeyDown={(event) => onTabKeyDown(event, 'history')} onClick={() => setActiveTab('history')}>{t('supervision_task_console.tab_history')} <span>{historyTaskCount}</span></button>
       </div>}
       <div class="supervision-task-console-body" data-state={bodyState}>
         {bodyState === 'loading' && <div class="supervision-task-console-state"><span class="spinner" />{t('supervision_task_console.loading')}</div>}
