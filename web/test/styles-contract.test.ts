@@ -1125,6 +1125,17 @@ describe('styles.css regression contracts', () => {
     expect(css).toMatch(/\.resize-hover-surface\s*\{[^}]*transform:\s*translateZ\(0\)/);
   });
 
+  it('keeps all floating-window resize handles in the browser hit-test tree', () => {
+    const handleRule = css.match(/\.resize-handle\s*\{[^}]*\}/)?.[0];
+    expect(handleRule, '.resize-handle rule missing').toBeTruthy();
+    expect(handleRule).toMatch(/background:\s*rgb\(0 0 0 \/ 0\.1%\)/);
+    expect(handleRule).toMatch(/pointer-events:\s*auto/);
+    expect(handleRule).toMatch(/touch-action:\s*none/);
+    for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
+      expect(css).toMatch(new RegExp(`\\.resize-${dir}[^,{]*\\{`));
+    }
+  });
+
   it('routes remote-desktop hover through a painted HTML surface above video', () => {
     const videoRule = css.match(/\.remote-desktop-stage video\s*\{[^}]*\}/)?.[0];
     expect(videoRule, '.remote-desktop-stage video rule missing').toBeTruthy();

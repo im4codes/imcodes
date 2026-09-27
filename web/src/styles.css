@@ -7293,7 +7293,17 @@ html.native-ios-mac .chat-dl-btn {
         rest, fading in only on hover/drag;
      3. the whole window frame lights up (see the outline rule below), so the
         "resizable" signal is not confined to the few pixels under the cursor. */
-.resize-handle { position: absolute; z-index: 10; }
+.resize-handle {
+  position: absolute;
+  z-index: 10;
+  /* Keep the hit surface painted even though it is visually transparent.
+     Blink/WebKit can prune an empty transparent layer from hit testing (most
+     noticeable over the content/footer at the bottom of a floating window),
+     which leaves only the top corner handles responding to hover/drag. */
+  background: rgb(0 0 0 / 0.1%);
+  pointer-events: auto;
+  touch-action: none;
+}
 
 /* The visible mark. Hidden at rest; revealed on hover, and kept lit for the
    whole drag via `.is-resizing` — during a resize the pointer routinely leaves

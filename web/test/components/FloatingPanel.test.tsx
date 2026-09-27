@@ -110,19 +110,21 @@ describe('FloatingPanel', () => {
     }
   });
 
-  it('mirrors target-phase mouse hover into an explicit cross-engine class', () => {
+  it('mirrors target-phase mouse hover into an explicit cross-engine class for every direction', () => {
     render(
       <FloatingPanel id="handle-hover" title="Preview" onClose={() => {}}>
         <div>content</div>
       </FloatingPanel>,
     );
 
-    const handle = screen.getByTestId('floating-resize-e');
-    expect(handle.className).not.toContain('is-pointer-hovered');
-    fireEvent.mouseEnter(handle);
-    expect(handle.className).toContain('is-pointer-hovered');
-    fireEvent.mouseLeave(handle);
-    expect(handle.className).not.toContain('is-pointer-hovered');
+    for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
+      const handle = screen.getByTestId(`floating-resize-${dir}`);
+      expect(handle.className).not.toContain('is-pointer-hovered');
+      fireEvent.mouseEnter(handle);
+      expect(handle.className).toContain('is-pointer-hovered');
+      fireEvent.mouseLeave(handle);
+      expect(handle.className).not.toContain('is-pointer-hovered');
+    }
   });
 
   it('keeps the dragged handle and the frame lit for the whole resize', () => {
@@ -163,6 +165,36 @@ describe('FloatingPanel', () => {
 
     const panel = screen.getByTestId('floating-panel-clamp-north') as HTMLElement;
     expect(panel.style.top).toBe('0px');
+  });
+
+  it('resizes from each corner while keeping the opposite corner anchored', () => {
+    const cases = [
+      { dir: 'nw', dx: -20, dy: -30, left: '80px', top: '70px', width: '720px', height: '530px' },
+      { dir: 'ne', dx: 20, dy: -30, left: '100px', top: '70px', width: '720px', height: '530px' },
+      { dir: 'sw', dx: -20, dy: 30, left: '80px', top: '100px', width: '720px', height: '530px' },
+      { dir: 'se', dx: 20, dy: 30, left: '100px', top: '100px', width: '720px', height: '530px' },
+    ] as const;
+
+    for (const testCase of cases) {
+      localStorage.setItem(`rcc_float_corner-${testCase.dir}`, JSON.stringify({ x: 100, y: 100, w: 700, h: 500 }));
+      render(
+        <FloatingPanel id={`corner-${testCase.dir}`} title="Preview" onClose={() => {}}>
+          <div>content</div>
+        </FloatingPanel>,
+      );
+
+      const handle = screen.getByTestId(`floating-resize-${testCase.dir}`);
+      fireEvent.mouseDown(handle, { clientX: 100, clientY: 100 });
+      fireEvent.mouseMove(document, { clientX: 100 + testCase.dx, clientY: 100 + testCase.dy });
+      fireEvent.mouseUp(document);
+
+      const panel = screen.getByTestId(`floating-panel-corner-${testCase.dir}`) as HTMLElement;
+      expect(panel.style.left).toBe(testCase.left);
+      expect(panel.style.top).toBe(testCase.top);
+      expect(panel.style.width).toBe(testCase.width);
+      expect(panel.style.height).toBe(testCase.height);
+      cleanup();
+    }
   });
 
   it('clamps upward drag to the session tab button bottom', () => {

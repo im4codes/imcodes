@@ -314,6 +314,38 @@ describe('SubSessionWindow metadata wiring', () => {
     expect(root.style.getPropertyValue('--subsession-accent-color')).toBe('#34d399');
   });
 
+  it('renders and highlights all eight desktop resize handles, including the bottom corners', () => {
+    const { container } = render(
+      <SubSessionWindow
+        sub={makeSubSession()}
+        ws={ws}
+        connected={true}
+        active={true}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+        onMinimize={vi.fn()}
+        onClose={vi.fn()}
+        onRestart={vi.fn()}
+        onRename={vi.fn()}
+        zIndex={1}
+        onFocus={vi.fn()}
+      />,
+    );
+
+    for (const dir of ['n', 's', 'e', 'w', 'ne', 'nw', 'se', 'sw']) {
+      const handle = container.querySelector(`.resize-${dir}`) as HTMLElement | null;
+      expect(handle).not.toBeNull();
+      expect(handle?.className).toContain('resize-handle');
+      expect(handle?.className).toContain('resize-hover-surface');
+    }
+
+    const southEast = container.querySelector('.resize-se') as HTMLElement;
+    fireEvent.mouseEnter(southEast);
+    expect(southEast.className).toContain('is-pointer-hovered');
+    fireEvent.mouseLeave(southEast);
+    expect(southEast.className).not.toContain('is-pointer-hovered');
+  });
+
   it('focuses an inactive desktop window before allowing hide/minimize actions', () => {
     const onFocus = vi.fn();
     const onMinimize = vi.fn();
