@@ -856,7 +856,10 @@ jobs:
 
   release_version:
     name: Resolve release version
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    # Repro refs are intentionally limited to the controlled-node job below:
+    # they let us prove cache miss/hit behavior without enabling Docker,
+    # Android, or npm publish on a throwaway branch.
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/repro/ci-speed2-')
     runs-on: ubuntu-latest
     concurrency:
       group: ci-release-version-${{ github.ref }}
@@ -872,7 +875,7 @@ jobs:
         run: |
           set -euo pipefail
           COMMIT_COUNT=$(( $(git rev-list --count HEAD) + 620 ))
-          if [ "${GITHUB_REF}" = "refs/heads/dev" ]; then
+          if [ "${GITHUB_REF}" = "refs/heads/dev" ] || [[ "${GITHUB_REF}" == refs/heads/repro/ci-speed2-* ]]; then
             APP_VERSION="$(date -u +%Y).$(date -u +%-m).${COMMIT_COUNT}-dev.${GITHUB_RUN_NUMBER}"
           else
             APP_VERSION="$(date -u +%Y.%-m).${COMMIT_COUNT}"
@@ -882,7 +885,9 @@ jobs:
   controlled-node-executables:
     name: Controlled Node Executable (${{ matrix.key }})
     needs: [release_version]
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
+    # Repro refs run only this matrix (and release_version) so cache miss/hit
+    # can be exercised without granting any release side effects.
+    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev' || startsWith(github.ref, 'refs/heads/repro/ci-speed2-')
     runs-on: ${{ matrix.runner }}
     concurrency:
       group: ci-release-${{ github.ref }}-${{ matrix.key }}
@@ -1047,8 +1052,60 @@ jobs:
         with:
           path: ${{ runner.temp }}/libwebrtc-sdk-archives
           key: imcodes-libwebrtc-macos-${{ hashFiles('native/macos-remote-desktop/libwebrtc-sdk-arm64.lock.json', 'native/macos-remote-desktop/libwebrtc-sdk-x64.lock.json') }}-v1
+      - name: Verify restored macOS component signatures and trust
+        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit == 'true'
+        id: macos_cached_signature_check
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          assess_standalone() {
+            local artifact="$1"
+            local output status
+            set +e
+            output="$(spctl --assess --type execute -vv "$artifact" 2>&1)"
+            status=$?
+            set -e
+            printf '%s\n' "$output"
+            if [ "$status" -eq 0 ]; then
+              return 0
+            fi
+            # These are bare Mach-O executables, not app bundles. Gatekeeper's
+            # successful notarized verdict for that artifact type is exit 3
+            # with this wording (and no source= refusal). Treating it as a
+            # generic failure was the original cache-hit regression.
+            if [[ "$output" == *"the code is valid but does not seem to be an app"* ]] \
+              && [[ "$output" == *"origin=Developer ID Application:"* ]] \
+              && [[ "$output" != *"source="* ]]; then
+              echo "$artifact: accepted as notarized standalone executable"
+              return 0
+            fi
+            return "$status"
+          }
+          for arch in arm64 x64; do
+            root="dist-node-exe/remote-desktop-worker/darwin-$arch"
+            for component in \
+              imcodes-remote-desktop-worker \
+              imcodes-remote-desktop-launch-agent \
+              imcodes-remote-desktop-disclosure \
+              imcodes-virtual-display-helper; do
+              codesign --verify --strict --deep --verbose=2 "$root/$component"
+              assess_standalone "$root/$component"
+            done
+          done
+
+      # actions/cache preserves file bytes but cannot guarantee every macOS
+      # trust attribute/ticket survives archive restore. A failed cache-only
+      # trust check is therefore a cache miss, not a release failure: discard
+      # the restored tree and rebuild/sign/notarize from the pinned SDK.
+      - name: Discard invalid cached macOS components
+        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit == 'true' && steps.macos_cached_signature_check.outcome != 'success'
+        run: |
+          set -euo pipefail
+          rm -rf dist-node-exe/remote-desktop-worker
+          echo 'Cached macOS components failed trust verification; rebuilding from the pinned SDK.'
+
       - name: Build, sign and notarize the macOS remote-desktop components
-        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit != 'true'
+        if: runner.os == 'macOS' && (steps.macos_release_cache.outputs.cache-hit != 'true' || steps.macos_cached_signature_check.outcome != 'success')
         env:
           GH_TOKEN: ${{ github.token }}
           # IMCODES_MACOS_SIGNING_IDENTITY and IMCODES_MACOS_NOTARY_KEY_PATH
@@ -1117,21 +1174,6 @@ jobs:
           for arch in arm64 x64; do
             node scripts/remote-desktop-worker-artifacts.mjs verify \
               dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
-          done
-      - name: Verify restored macOS component signatures and trust
-        if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit == 'true'
-        run: |
-          set -euo pipefail
-          for arch in arm64 x64; do
-            root="dist-node-exe/remote-desktop-worker/darwin-$arch"
-            for component in \
-              imcodes-remote-desktop-worker \
-              imcodes-remote-desktop-launch-agent \
-              imcodes-remote-desktop-disclosure \
-              imcodes-virtual-display-helper; do
-              codesign --verify --strict --deep --verbose=2 "$root/$component"
-              spctl --assess --type execute -vv "$root/$component"
-            done
           done
       - name: Save macOS remote-desktop component outputs
         if: runner.os == 'macOS' && steps.macos_release_cache.outputs.cache-hit != 'true'
