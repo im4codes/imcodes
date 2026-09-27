@@ -174,18 +174,28 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getByRole('button', { name: /panel_expand.*panel_title/ })).toBeTruthy();
   });
 
-  it('persists Escape/outside close and never leaks desktop state into mobile', () => {
+  it('closes only from the collapse control and ignores Escape/outside taps on both layouts', () => {
     const events = [{ eventId: 'close-persist', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'close-persist', title: 'Close', toStatus: 'working' } }] as never;
     const original = window.matchMedia;
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:close:desktop');
+    window.localStorage.removeItem('imcodes.task-pair-status-panel.collapsed:close:mobile');
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
-    const { unmount } = render(<TaskPairStatusPanel events={events} serverId="close" />);
+    const { container, unmount } = render(<TaskPairStatusPanel events={events} serverId="close" />);
     fireEvent.keyDown(window, { key: 'Escape' });
-    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:close:desktop')).toBe('1');
+    fireEvent.pointerDown(document.body);
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
+    expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
     unmount();
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
     render(<TaskPairStatusPanel events={events} serverId="close" />);
+    const compact = document.querySelector('.task-pair-status-compact') as HTMLElement;
+    fireEvent.click(compact);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    fireEvent.pointerDown(document.body);
+    expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
     expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
-    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:close:mobile')).toBeNull();
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
   });
   it('renders four compact status icons when collapsed, highlights Brain decisions, and scopes persistence per server', () => {

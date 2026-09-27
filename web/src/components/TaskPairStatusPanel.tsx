@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
@@ -148,7 +148,6 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(mobileLayout);
   const [collapsed, setCollapsed] = useState(() => readCollapsed(serverId, mobileLayout()));
-  const panelRef = useRef<HTMLElement>(null);
   const persistCollapsed = useCallback((next: boolean) => {
     setCollapsed(next);
     try { window.localStorage.setItem(collapsedStorageKey(serverId, isMobile), next ? '1' : '0'); } catch {}
@@ -164,14 +163,6 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   useEffect(() => {
     setCollapsed(readCollapsed(serverId, isMobile));
   }, [serverId, isMobile]);
-  useEffect(() => {
-    if (collapsed) return undefined;
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') persistCollapsed(true); };
-    const onPointerDown = (event: PointerEvent) => { if (!panelRef.current?.contains(event.target as Node)) persistCollapsed(true); };
-    window.addEventListener('keydown', onKeyDown);
-    window.addEventListener('pointerdown', onPointerDown);
-    return () => { window.removeEventListener('keydown', onKeyDown); window.removeEventListener('pointerdown', onPointerDown); };
-  }, [collapsed, persistCollapsed]);
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
@@ -271,7 +262,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
     </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
-  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
+  return <aside class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
     {isMobile && collapsed ? <div class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard}>
       {toggleContent}
     </div> : <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
