@@ -29,7 +29,7 @@ export async function runPairBriefScenario() {
   };
   await context.addInitScript(({ serverId, initialSnapshot }) => {
     window.__IMC_SHELL_BROWSER_TEST__ = true;
-    localStorage.setItem('rcc_api_key', 'imc_shell_perf_browser_key');
+    localStorage.setItem('rcc_api_key', 'deck_perf_browser_key');
     localStorage.setItem('rcc_server', serverId);
     window.__imcodesTaskPairSnapshot = initialSnapshot;
   }, { serverId: SERVER_ID, initialSnapshot: snapshot });
