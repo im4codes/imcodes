@@ -518,6 +518,8 @@ export class WsClient {
   private _visibilityListener: (() => void) | null = null;
   private _missedHeartbeatPongs = 0;
   private _resumeProbeMisses = 0;
+  /** Coalesce concurrent control-plane session-list requests. */
+  private sessionListRequestTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * A busy socket can deliver timeline frames while a foreground probe is
    * waiting for its pong.  Those frames prove liveness, but must not each
@@ -1306,7 +1308,12 @@ export class WsClient {
 
   /** Request the current session list from the daemon. */
   requestSessionList(): void {
+    if (this.sessionListRequestTimer) return;
+    if (!this._connected || !this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     this.send({ type: 'get_sessions' });
+    this.sessionListRequestTimer = setTimeout(() => {
+      this.sessionListRequestTimer = null;
+    }, 2_000);
   }
 
   /** Authorize (or revoke) the daemon reading the local Claude token for the
@@ -2375,6 +2382,8 @@ export class WsClient {
     this.clearTerminalSubscriptionTimers();
     this.clearTransportHistoryReplayTimers();
     this.clearNonCriticalSendTimers();
+    if (this.sessionListRequestTimer) clearTimeout(this.sessionListRequestTimer);
+    this.sessionListRequestTimer = null;
     this.clearP2pWorkflowPendingRequests();
     // Capability state belongs to a single daemon WS; on socket teardown
     // the cached snapshot is no longer authoritative and must be cleared
@@ -2576,6 +2585,10 @@ export class WsClient {
   }
 
   private dispatch(msg: ServerMessage): void {
+    if (msg.type === 'session_list') {
+      if (this.sessionListRequestTimer) clearTimeout(this.sessionListRequestTimer);
+      this.sessionListRequestTimer = null;
+    }
     this.settleOwnedDataRequest(msg);
     this.settleP2pWorkflowRequest(msg);
     // Daemon lifecycle generations are independent from the browser↔Server
