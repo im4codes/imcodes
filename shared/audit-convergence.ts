@@ -125,8 +125,8 @@ export function buildAuditConvergenceContract(): string {
       proposal: 'the executor may adopt or argue against the auditor\'s concrete proposal; disagreement or an undecidable choice goes to Brain with options and a recommendation',
     },
     evidence: {
-      structuredResults: 'default-accept exact-bound implementer structured test results after binding and coherence review; the auditor does not repeat them',
-      auditorExecution: 'only for no usable exact-revision report or one confident concrete suspicion; one test file/few named tests or one mutant, maxWorkers<=2, seconds-to-a-few-minutes; never full project/build/coverage/e2e',
+      structuredResults: 'the executor READY_FOR_AUDIT report must state exact commands, machine, exact HEAD, pass/fail/skip counts per suite, and any failure with base-reproduction proof; default-accept that exact-bound report after binding and coherence review; the auditor does not repeat complete suites',
+      auditorExecution: 'only when the executor test report/evidence is missing or for one confident concrete suspicion; one test file/few named tests or one mutant, maxWorkers<=2, seconds-to-a-few-minutes; never full project/build/coverage/e2e',
       suspicion: 'run the small targeted check directly and state why; do not REWORK merely to request that check',
       rawArtifacts: 'raw logs, transcripts, hashes, and bundle attachments are never PASS prerequisites; their absence never causes REWORK',
       integrity: 'never fabricate results; PASS needs an authoritative accepted implementer report or a passed auditor exception check',
@@ -143,7 +143,7 @@ export function buildAuditConvergenceContract(): string {
     commentOrDocOnly: 'binding check only, no re-audit',
     roles: {
       orchestrator: 'forward only the contractRef and its params in every audit, re-audit and rework brief; never paste this body',
-      auditor: 'report every finding in one pass and propose a concrete solution for every blocking finding (approach, likely files/functions, trade-offs, optionally a test); give appropriate proposals for non-blocking findings, co-own convergence, and escalate undecidable scope/approach/ownership/environment or repeated-blocking questions to Brain with options and a recommendation; PASS only when no blocking finding remains',
+      auditor: 'report every finding in one pass and propose a concrete solution for every blocking finding (approach, likely files/functions, trade-offs, optionally a test); give appropriate proposals for non-blocking findings, co-own convergence, and escalate only genuinely undecidable scope/approach/ownership/environment questions to Brain with options and a recommendation; PASS only when no blocking finding remains',
       implementer: 'fix every blocking finding for its whole class before requesting re-audit',
     },
   });

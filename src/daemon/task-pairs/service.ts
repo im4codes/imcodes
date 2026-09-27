@@ -744,9 +744,6 @@ export class TaskPairService {
           case 'auditor_proposal_nudge':
             await sendTaskPairMessage(intent.to, pair.taskId, 'auditor-proposal-nudge', buildAuditorProposalNudgeMessage(pair));
             break;
-          case 'rework_repeat_escalation':
-            await sendTaskPairMessage(intent.to, pair.taskId, 'brain-rework-repeat', buildRepeatedReworkBrainNoticeMessage(pair, intent.counts, intent.summary));
-            break;
           case 'brain_notice':
             await sendTaskPairMessage(pair.brain, pair.taskId, `brain-${intent.flag}`, buildBrainNoticeMessage(pair, intent.flag));
             break;

@@ -7,6 +7,8 @@ import { AUDIT_CONVERGENCE_CONTRACT_ID, type AuditSeverity } from '../../../shar
 import {
   TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
   TASK_PAIR_AUDITOR_PROPOSAL_RULE,
+  TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
+  TASK_PAIR_VALIDATION_REPORT_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
@@ -120,17 +122,6 @@ export function buildAuditorProposalNudgeMessage(pair: TaskPairState): string {
     'Your REWORK did not include a concrete proposal in the findings.',
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
     `Keep the existing blocking set and resend the verdict; this reminder is capped to once for round ${pair.round}.`,
-    contracts(pair.blocking),
-  ].join('\n');
-}
-
-export function buildRepeatedReworkBrainNoticeMessage(pair: TaskPairState, counts: TaskPairSeverityCounts, summary?: string): string {
-  return [
-    header(pair),
-    `The same blocking finding set repeated for 2 consecutive REWORK rounds (${formatTaskPairSeverityCounts(counts)}).`,
-    'Needs your decision: the pair must choose between the available approaches or clarify scope/ownership/environment. Options and a recommendation should be recorded before another REWORK loop.',
-    ...(summary ? [`Finding summary: ${summary}`] : []),
-    `Executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'}, round ${pair.round}.`,
     contracts(pair.blocking),
   ].join('\n');
 }
@@ -331,6 +322,8 @@ export function buildAuditorHandoffMessage(pair: TaskPairState): string {
     `You are now the auditor of this task for executor ${pair.executor} (round ${Math.max(1, pair.round)}; blocking=${pair.blocking.join(',')}).${previous}`,
     `The material is the executor's workspace named on READY_FOR_AUDIT (a worktree at a head, or a task-directory path; relayed to you), plus the validation they send you. Judge it by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
+    TASK_PAIR_VALIDATION_REPORT_RULE,
+    TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
     blockingSummaryLine(pair),
     ...(where ? [where] : []),
     `${NO_LEGACY_ARTIFACTS} If the material cannot be reached, write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0.`,
@@ -349,6 +342,8 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
     `${where}${material.source === 'workspace' ? ' (resolved by the daemon from the executor session)' : ''}`,
     `Their validation (full suites for code) comes from them via send_message. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
+    TASK_PAIR_VALIDATION_REPORT_RULE,
+    TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
     `${NO_LEGACY_ARTIFACTS} If the material cannot be reached (executor limited/offline, workspace unreadable), write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0 or REWORK.`,
     contracts(pair.blocking),
   ].join('\n');
@@ -377,6 +372,8 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
       ? `No audit window for this pair -- do proportionate self-validation instead (full suites for code), then commit locally in the worktree (never push any branch). Report straight to Brain in the same closing reply as your ${marker('DONE', pair.taskId)}: what changed, your worktree path and HEAD (or file paths for non-code work), and your validation result. Brain merges commits into dev and pushes dev; the daemon relays that reply to Brain as the completion notice, so write it as if Brain will read only that.`
       : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. After their PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write ${marker('DONE', pair.taskId)}; Brain merges into dev and pushes dev.`,
     TASK_PAIR_WORKSPACE_RULES,
+    TASK_PAIR_VALIDATION_REPORT_RULE,
+    TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
     NO_LEGACY_ARTIFACTS,
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
@@ -471,6 +468,8 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
     TASK_PAIR_TITLE_RULE,
     `You are the auditor of this task for executor ${pair.executor}. On READY_FOR_AUDIT the daemon relays their workspace (worktree and head, or task-directory path), and they send you their validation; judge that by ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}) and write PASS or REWORK with severity counts.`,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
+    TASK_PAIR_VALIDATION_REPORT_RULE,
+    TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
     blockingSummaryLine(pair),
     NO_LEGACY_ARTIFACTS,
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,

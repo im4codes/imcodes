@@ -72,25 +72,14 @@ describe('task-pair marker grammar', () => {
     expect(again.intents.filter((intent) => intent.kind === 'auditor_proposal_nudge')).toHaveLength(0);
   });
 
-  it('does not nudge when the auditor gives a concrete proposal and escalates repeated blocking sets', () => {
+  it('does not nudge when the auditor gives a concrete proposal', () => {
     const base = withStatus('in_audit');
     const proposal = 'Finding [P0]. Proposed solution: update src/foo.ts and add a regression test; trade-off is one extra lookup.';
     const first = applyTaskPairMarker(base, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: proposal }));
-    const nextRound = { ...first.pair!, status: 'in_audit' as const, round: 2, material: { path: '/workspace', at: 1_000 } };
-    const second = applyTaskPairMarker(nextRound, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: proposal }));
-    expect(second.intents.filter((intent) => intent.kind === 'auditor_proposal_nudge')).toHaveLength(0);
-    const escalation = second.intents.find((intent) => intent.kind === 'rework_repeat_escalation');
-    expect(escalation).toMatchObject({ kind: 'rework_repeat_escalation', summary: proposal });
+    expect(first.intents.filter((intent) => intent.kind === 'auditor_proposal_nudge')).toHaveLength(0);
     expect(TASK_PAIR_AUDITOR_PROPOSAL_RULE).toMatch(/concrete solution/);
   });
 
-  it('does not escalate two unrelated findings that happen to have equal severity counts', () => {
-    const base = withStatus('in_audit');
-    const first = applyTaskPairMarker(base, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding A [P0]. Proposed solution: fix src/a.ts.' }));
-    const nextRound = { ...first.pair!, status: 'in_audit' as const, round: 2, material: { path: '/workspace', at: 1_000 } };
-    const second = applyTaskPairMarker(nextRound, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding B [P0]. Proposed solution: fix src/b.ts.' }));
-    expect(second.intents.filter((intent) => intent.kind === 'rework_repeat_escalation')).toHaveLength(0);
-  });
   it('records the real start and clears capacity flags when queued work begins', () => {
     const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-start executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
     queued.flags = ['waiting_for_capacity', 'no_pool_configured'];
@@ -168,7 +157,6 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('takes precedence over');
     expect(body).toContain(TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE);
     expect(body).toContain('Routine progress, REWORK rounds');
-    expect(body).toContain('same blocking finding repeats for 2 rounds');
     expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
   });
 
