@@ -12,6 +12,7 @@ import { ChatView } from './ChatView.js';
 import { resolveContextWindow } from '../model-context.js';
 import { bestModelLabel } from '../model-label.js';
 import { TerminalView } from './TerminalView.js';
+import { TerminalTextPreview } from './TerminalTextPreview.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { cancelSessionViaHttp } from '../api.js';
 import type { WsClient } from '../ws-client.js';
@@ -475,7 +476,14 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
             />
           ) : isShell ? (
-            <div class="subcard-preview-terminal-placeholder" aria-hidden="true" />
+            <TerminalTextPreview
+              sessionName={sub.sessionName}
+              ws={ws}
+              connected={connected}
+              onDiff={(apply) => onDiff(sub.sessionName, apply)}
+              onHistory={(apply) => onHistory(sub.sessionName, apply)}
+              onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
+            />
           ) : (
             <ChatView
               visible={isOpen || isFocused}

@@ -500,7 +500,8 @@ describe('SubSessionCard', () => {
 
   it('keeps shell cards in raw terminal preview mode', async () => {
     const releaseRaw = vi.fn();
-    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), subscribeTerminal: vi.fn() } as any;
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), onTerminalRaw: vi.fn(() => vi.fn()), subscribeTerminal: vi.fn() } as any;
+    const historyApplyers: Array<(content: string) => void> = [];
     const view = render(
       <SubSessionCard
         sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
@@ -509,7 +510,7 @@ describe('SubSessionCard', () => {
         isOpen={false}
         onOpen={vi.fn()}
         onDiff={vi.fn()}
-        onHistory={vi.fn()}
+        onHistory={(_session, apply) => { historyApplyers.push(apply); }}
       />,
     );
 
@@ -522,6 +523,50 @@ describe('SubSessionCard', () => {
 
     view.unmount();
     expect(releaseRaw).toHaveBeenCalledOnce();
+  });
+
+  it('keeps recent shell output visible in a closed card without mounting xterm', async () => {
+    const releaseRaw = vi.fn();
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), onTerminalRaw: vi.fn(() => vi.fn()) } as any;
+    const historyApplyers: Array<(content: string) => void> = [];
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={(_session, apply) => { historyApplyers.push(apply); }}
+      />,
+    );
+
+    await waitFor(() => expect(historyApplyers.length).toBeGreaterThan(0));
+    historyApplyers.at(-1)?.('\u001b[32mrecent output\u001b[0m\nsecond line');
+    await waitFor(() => {
+      expect(container.querySelector('.subcard-terminal-text-preview')?.textContent).toContain('recent output');
+      expect(container.querySelector('.subcard-terminal-text-preview')?.textContent).toContain('second line');
+    });
+    expect(terminalViewPropsSpy).not.toHaveBeenCalled();
+  });
+
+  it('mounts the live terminal immediately when a shell card opens', () => {
+    const ws = { holdTerminalRaw: vi.fn(() => vi.fn()), onTerminalRaw: vi.fn(() => vi.fn()) } as any;
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(terminalViewPropsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_sub_sub-card-1',
+      preview: true,
+    }));
   });
 
   it('fallback shell card cleanup unsubscribes instead of entering passive mode', async () => {
