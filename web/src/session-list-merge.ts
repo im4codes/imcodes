@@ -169,6 +169,14 @@ export function mergeSessionListEntry(
     providerId: incoming.providerId ?? existing?.providerId,
     agentVersion: incoming.agentVersion,
     state: incoming.state as SessionInfo['state'],
+    // Keep the local idle proof across the authoritative session-list refresh
+    // triggered by a stale-turn acknowledgement.  The daemon snapshot carries
+    // the canonical state but not the browser observation timestamp; dropping
+    // this marker here would immediately resurrect a stale timeline turn in
+    // the composer after the refresh.
+    authoritativeIdleAt: incoming.state === 'idle'
+      ? existing?.authoritativeIdleAt
+      : undefined,
     error: incoming.state === 'error'
       ? (incoming.error ?? existing?.error ?? null)
       : null,

@@ -35,6 +35,7 @@ import { useTranslation } from 'react-i18next';
 import { ErrorBoundary } from './components/ErrorBoundary.js';
 import { LanguageSwitcher } from './components/LanguageSwitcher.js';
 import { LoginPage } from './pages/LoginPage.js';
+import { isActiveTurnFinishedError } from './session-live-status.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
 import { SessionPane } from './components/SessionPane.js';
@@ -4500,6 +4501,29 @@ export function App() {
         console.error('[daemon.error]', msg.kind, msg.message, msg.stack);
         // Auto-dismiss after 10 seconds
         setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== id)), 10_000);
+      }
+      // The daemon's stale-turn response is authoritative even when the
+      // terminal session.state idle frame was lost during a hidden-window
+      // burst/reconnect. Reconcile the local session immediately so queued
+      // sends stop waiting on a stale running flag; the next session_list
+      // refresh supplies the queue snapshot.
+      if (msg.type === 'command.ack'
+        && msg.status === 'error'
+        && isActiveTurnFinishedError(msg.error)
+        && typeof msg.session === 'string') {
+        const staleSession = msg.session;
+        if (isSubSessionName(staleSession)) {
+          const subId = staleSession.slice('deck_sub_'.length);
+          updateSubLocal(subId, { state: 'idle', authoritativeIdleAt: Date.now() });
+        } else {
+          setSessions((prev) => prev.map((session) => (
+            session.name === staleSession
+              ? { ...session, state: 'idle' as SessionInfo['state'], authoritativeIdleAt: Date.now() }
+              : session
+          )));
+        }
+        watchProjectionStore.updateSessionState(staleSession, 'idle');
+        ws.requestSessionList();
       }
       // P2P command errors surface as `command.ack status:error` with a
       // specific `error` code. `useTimeline` handles them per-session by

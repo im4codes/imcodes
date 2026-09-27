@@ -8872,7 +8872,12 @@ export class WsBridge {
         && TIMELINE_TERMINAL_SESSION_STATES.includes(String(payload.state) as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number]);
       const terminalUsage = eventType === 'usage.update' && payload.streaming === false;
       const latestValueEvent = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update';
-      if (latestValueEvent && this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload)) continue;
+      // Terminal states are authoritative transition boundaries. Never
+      // suppress them as duplicate latest values: a reconnecting browser may
+      // have missed the preceding running frame and otherwise stays stuck on
+      // a stale running flag forever.
+      if (latestValueEvent && !terminalSessionState && !terminalUsage
+        && this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload)) continue;
       const coalescible = (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')
         && !terminalSessionState && !terminalUsage;
       const priority = eventType === 'assistant.text' && payload.streaming !== true

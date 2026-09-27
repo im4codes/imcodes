@@ -18,7 +18,11 @@ import { registerSessionStateProbeObserver } from '../store/session-state-probe-
 import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import { recordTimelineEmit } from './latency-tracer.js';
-import { TIMELINE_RESPONSE_SOURCES, type TimelineResponseSource } from '../../shared/timeline-protocol.js';
+import {
+  TIMELINE_RESPONSE_SOURCES,
+  TIMELINE_TERMINAL_SESSION_STATES,
+  type TimelineResponseSource,
+} from '../../shared/timeline-protocol.js';
 import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { isSessionModelSwitchCommandText } from '../../shared/session-control-commands.js';
 import { recordAssistantFileReadGrants } from './session-file-read-grants.js';
@@ -160,7 +164,10 @@ export class TimelineEmitter {
         && typeof pendingMessageVersion === 'number'
         && Number.isFinite(pendingMessageVersion);
       const hasErrorMutation = 'error' in payload;
-      if (!hasStructuredQueueMutation && !hasErrorMutation) {
+      const terminalState = TIMELINE_TERMINAL_SESSION_STATES.includes(
+        state as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number],
+      );
+      if (!terminalState && !hasStructuredQueueMutation && !hasErrorMutation) {
         const key = signalFingerprintKey(sessionId, type);
         const fingerprint = timelinePayloadFingerprint({ state });
         if (this.lastSignalPayload.get(key) === fingerprint) {

@@ -290,12 +290,18 @@ export function SessionPane({
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
-  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
   const pendingUserSend = useMemo(() => hasPendingUserSend(timelineEvents), [timelineEvents]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
   const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(timelineEvents), [timelineEvents]);
   const timelineLastEventTs =
     timelineEvents.length > 0 ? (timelineEvents[timelineEvents.length - 1]?.ts ?? null) : null;
+  const activeTimelineTurn = useMemo(() => (
+    session.authoritativeIdleAt != null
+      && timelineLastEventTs != null
+      && timelineLastEventTs <= session.authoritativeIdleAt
+      ? false
+      : hasActiveTimelineTurn(timelineEvents)
+  ), [session.authoritativeIdleAt, timelineEvents, timelineLastEventTs]);
   const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({
@@ -304,10 +310,11 @@ export function SessionPane({
       activeThinking: !!activeThinkingTs,
       activeToolCall,
       activeTransportTurn: activeTimelineTurn,
+      authoritativeIdleAt: session.authoritativeIdleAt,
       timelineStateTs: timelineSessionStateInfo.ts,
       timelineLastEventTs,
     }),
-    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.authoritativeIdleAt, session.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
   // shell / script sessions have no agent state, no token usage, no quota —
   // suppress the footer entirely so they don't see misleading "Agent

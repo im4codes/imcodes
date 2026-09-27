@@ -231,6 +231,17 @@ describe('mergeSessionListEntry — supervision preservation', () => {
 });
 
 describe('mergeSessionListEntry — general field behavior', () => {
+  it('preserves an authoritative idle marker through the session-list refresh after a stale-turn ack', () => {
+    const observedAt = 1_790_504_500_000;
+    const existing = makeExisting({ authoritativeIdleAt: observedAt, state: 'idle' });
+
+    const refreshedIdle = mergeSessionListEntry({ ...BASE_INCOMING, state: 'idle' }, existing);
+    expect(refreshedIdle.authoritativeIdleAt).toBe(observedAt);
+
+    const refreshedRunning = mergeSessionListEntry({ ...BASE_INCOMING, state: 'running' }, refreshedIdle);
+    expect(refreshedRunning.authoritativeIdleAt).toBeUndefined();
+  });
+
   it('copies incoming non-supervision fields across', () => {
     const merged = mergeSessionListEntry({
       ...BASE_INCOMING,

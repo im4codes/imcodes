@@ -338,11 +338,17 @@ export function SubSessionWindow({
   // Extract active agent status (e.g. "Reading file...")
   const statusText = useMemo(() => getActiveStatusText(events), [events]);
   const activeToolCall = useMemo(() => hasActiveToolCall(events), [events]);
-  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(events), [events]);
   const pendingUserSend = useMemo(() => hasPendingUserSend(events), [events]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(events), [events]);
   const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
   const timelineLastEventTs = events.length > 0 ? (events[events.length - 1]?.ts ?? null) : null;
+  const activeTimelineTurn = useMemo(() => (
+    sub.authoritativeIdleAt != null
+      && timelineLastEventTs != null
+      && timelineLastEventTs <= sub.authoritativeIdleAt
+      ? false
+      : hasActiveTimelineTurn(events)
+  ), [events, sub.authoritativeIdleAt, timelineLastEventTs]);
   const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({
@@ -351,10 +357,11 @@ export function SubSessionWindow({
       activeThinking: !!activeThinkingTs,
       activeToolCall,
       activeTransportTurn: activeTimelineTurn,
+      authoritativeIdleAt: sub.authoritativeIdleAt,
       timelineStateTs: timelineSessionStateInfo.ts,
       timelineLastEventTs,
     }),
-    [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, sub.authoritativeIdleAt, sub.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
 
   // Dedicated per-sub-session file browser state. Each sub-session has its own

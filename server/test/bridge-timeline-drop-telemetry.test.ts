@@ -310,6 +310,43 @@ describe('WsBridge timeline drop telemetry', () => {
     ]);
   });
 
+  it('delivers repeated idle transitions to both full and summary subscribers', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const full = new MockWs();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    full.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+    }));
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    full.sent.length = 0;
+    summary.sent.length = 0;
+
+    for (const seq of [1, 2]) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: { eventId: `idle-${seq}`, sessionId: SESSION, ts: Date.now(), seq, epoch: 1, type: 'session.state', payload: { state: 'idle' } },
+      }));
+    }
+    await flushAsync();
+
+    for (const socket of [full, summary]) {
+      const seqs = socket.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT && msg.event?.type === 'session.state')
+        .map((msg) => msg.event.seq);
+      expect(seqs).toEqual([1, 2]);
+    }
+  });
+
   it('suppresses unchanged latest-value payloads per socket before coalescing', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const summary = new MockWs();
@@ -339,6 +376,7 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(events.map((event) => [event.type, event.seq])).toEqual([
       ['agent.status', 1],
       ['session.state', 3],
+      ['session.state', 4],
     ]);
     expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
       mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,

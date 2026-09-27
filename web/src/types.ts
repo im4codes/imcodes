@@ -43,6 +43,8 @@ export interface SessionInfo {
   providerId?: string;
   agentVersion?: string;
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
+  /** Local proof that a stale-turn acknowledgement observed the provider idle. */
+  authoritativeIdleAt?: number;
   error?: string | null;
   label?: string | null;
   userCreated?: boolean;

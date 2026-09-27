@@ -1099,6 +1099,32 @@ describe('sub-session realtime state sync', () => {
     }));
     expect(captured[0]?.state).toBe('error');
   });
+
+  it('reconciles a stale-turn acknowledgement to idle for minimized/reconnecting sub-sessions', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'run-stale-ack',
+      sessionName: 'deck_sub_run-stale-ack',
+      sessionType: 'codex-sdk',
+      state: 'running',
+    }));
+    expect(captured[0]?.state).toBe('running');
+
+    // The idle timeline frame can be lost while the window is hidden. The
+    // reliable stale-turn ack must still release the local queue gate.
+    act(() => send({
+      type: 'command.ack',
+      session: 'deck_sub_run-stale-ack',
+      commandId: 'stop-1',
+      status: 'error',
+      error: 'The active turn already finished',
+    }));
+    expect(captured[0]?.state).toBe('idle');
+  });
 });
 
 describe('sub-session close behavior', () => {

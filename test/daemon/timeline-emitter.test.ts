@@ -77,7 +77,7 @@ describe('TimelineEmitter — seq counter', () => {
     expect(timelineStore.append).toHaveBeenCalledTimes(2);
   });
 
-  it('emits latest-value signals only when their payload changes', () => {
+  it('emits latest-value signals only when their payload changes, except terminal state edges', () => {
     const firstStatus = emitter.emit('session-a', 'agent.status', { status: 'working', label: 'token 1' });
     const duplicateStatus = emitter.emit('session-a', 'agent.status', { label: 'token 1', status: 'working' });
     const changedStatus = emitter.emit('session-a', 'agent.status', { status: 'working', label: 'token 2' });
@@ -92,8 +92,8 @@ describe('TimelineEmitter — seq counter', () => {
     expect(firstUsage?.seq).toBe(3);
     expect(duplicateUsage?.seq).toBe(0);
     expect(firstState?.seq).toBe(4);
-    expect(duplicateState?.seq).toBe(0);
-    expect(timelineStore.append).toHaveBeenCalledTimes(4);
+    expect(duplicateState?.seq).toBe(5);
+    expect(timelineStore.append).toHaveBeenCalledTimes(5);
   });
 
   it('forwards one startup-probe correction through the registered timeline bridge', () => {
@@ -345,7 +345,8 @@ describe('TimelineEmitter — on/off handlers', () => {
  *
  * These tests pin the fixed contract:
  *   T1 — complete structured queue authority snapshots MUST reach handlers.
- *   T2 — plain idle/running events (no payload mutation) ARE still deduped.
+ *   T2 — terminal idle events are always delivered; non-terminal running
+ *        snapshots (with no payload mutation) remain deduped.
  *   T2b — events with `error` payload are NEVER deduped.
  */
 describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression)', () => {
@@ -398,7 +399,7 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     expect(received[0].pendingCount).toBe(1);
   });
 
-  it('T2: successive idle (or running) events with no payload mutation are still deduped (avoid UI flicker)', () => {
+  it('T2: terminal idle events always reach handlers while running snapshots remain deduped', () => {
     const emitter = new TimelineEmitter();
     const received: Array<Record<string, unknown>> = [];
     emitter.on((e) => {
@@ -408,9 +409,10 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     emitter.emit('session-i', 'session.state', { state: 'idle' });
     emitter.emit('session-i', 'session.state', { state: 'idle' });
     emitter.emit('session-i', 'session.state', { state: 'idle' });
-    // Only the first idle reaches the handler — original dedup intact for
-    // payloads that don't carry a queue snapshot or error.
-    expect(received).toHaveLength(1);
+    // Idle is an authoritative transition boundary, even when the payload is
+    // byte-for-byte identical. A missed idle is what leaves the web queue
+    // waiting forever on a stale running flag.
+    expect(received.filter((p) => p.state === 'idle')).toHaveLength(3);
 
     emitter.emit('session-r', 'session.state', { state: 'running' });
     emitter.emit('session-r', 'session.state', { state: 'running' });

@@ -51,6 +51,15 @@ export function isRunningSessionState(sessionState: string | null | undefined): 
   return isWorkingSessionState(sessionState);
 }
 
+/**
+ * A cancel/append acknowledgement can race the provider's final idle event.
+ * Treat this daemon response as an authoritative idle observation so a stale
+ * browser-local running flag cannot hold the transport queue forever.
+ */
+export function isActiveTurnFinishedError(value: unknown): boolean {
+  return typeof value === 'string' && /^the active turn already finished$/i.test(value.trim());
+}
+
 export function isStoppingSessionState(sessionState: string | null | undefined): boolean {
   return sessionState === 'stopping';
 }
@@ -75,6 +84,7 @@ export interface ResolveTimelineBackedSessionStateInput {
   timelineStateTs?: number | null;
   timelineLastEventTs?: number | null;
   now?: number;
+  authoritativeIdleAt?: number | null;
 }
 
 const NON_RUNNING_AUTHORITATIVE_STATES = new Set(['idle', 'stopped', 'stopping', 'error']);
@@ -97,7 +107,10 @@ export function resolveTimelineBackedSessionState(input: ResolveTimelineBackedSe
     && NON_RUNNING_AUTHORITATIVE_STATES.has(sessionState)
     && input.activeThinking !== true
     && input.activeToolCall !== true
-    && input.activeTransportTurn !== true
+    && (input.activeTransportTurn !== true
+      || (input.authoritativeIdleAt != null
+        && input.timelineLastEventTs != null
+        && input.timelineLastEventTs <= input.authoritativeIdleAt))
   ) {
     return sessionState;
   }

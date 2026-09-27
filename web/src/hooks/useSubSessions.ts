@@ -28,11 +28,14 @@ import {
 } from '@shared/supervision-heartbeat.js';
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/transport-queue-types.js';
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
+import { isActiveTurnFinishedError } from '../session-live-status.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
   /** runtime state from daemon */
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
+  /** Local proof that a stale-turn acknowledgement observed the provider idle. */
+  authoritativeIdleAt?: number;
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
   queueEpoch?: string | null;
@@ -267,6 +270,22 @@ export function useSubSessions(
       };
 
       if (isValidTransportQueueWireEvent(msg) && applyStructuredQueueEvent(msg)) return;
+
+      // A stale append/stop acknowledgement is itself authoritative: the
+      // daemon has already observed that no turn is active. Reconcile the
+      // sub-session immediately instead of waiting for a session.state frame
+      // that may have been coalesced while this window was hidden/reconnecting.
+      if (msg.type === 'command.ack'
+        && msg.status === 'error'
+        && isActiveTurnFinishedError(msg.error)
+        && typeof msg.session === 'string'
+        && msg.session.startsWith('deck_sub_')) {
+        const id = msg.session.slice('deck_sub_'.length);
+        setSubSessions((prev) => prev.map((s) => s.id === id
+          ? { ...s, state: 'idle', authoritativeIdleAt: Date.now() }
+          : s));
+        return;
+      }
 
       let sessionName: string | undefined;
       let state: string | undefined;
@@ -689,7 +708,7 @@ export function useSubSessions(
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
   const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession,
-    'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'transportConfig'
+    'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'state' | 'authoritativeIdleAt' | 'transportConfig'
     | 'requestedModel' | 'activeModel' | 'modelDisplay'
   >>) => {
     setSubSessions((prev) => prev.map((s) =>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { deriveSessionLiveStatus, isRunningSessionState, resolveTimelineBackedSessionState } from '../src/session-live-status.js';
+import { deriveSessionLiveStatus, isActiveTurnFinishedError, isRunningSessionState, resolveTimelineBackedSessionState } from '../src/session-live-status.js';
 import { SESSION_CONTROL_TIMELINE_REASON_USER_CANCEL } from '@shared/session-control-commands.js';
 import {
   createTransportQueueReducerState,
@@ -7,6 +7,13 @@ import {
 } from '../../shared/transport-queue-reducer.js';
 
 describe('session-live-status', () => {
+  it('recognizes the authoritative stale-turn acknowledgement used to clear a stuck queue', () => {
+    expect(isActiveTurnFinishedError('The active turn already finished')).toBe(true);
+    expect(isActiveTurnFinishedError(' the active turn already finished ')).toBe(true);
+    expect(isActiveTurnFinishedError('Queued message not found')).toBe(false);
+    expect(isActiveTurnFinishedError(undefined)).toBe(false);
+  });
+
   it('treats authoritative running state as busy even when timeline tail is settled', () => {
     const status = deriveSessionLiveStatus({ sessionState: 'running', activeTransportTurn: false });
     expect(status.mode).toBe('running');
@@ -77,6 +84,16 @@ describe('session-live-status', () => {
       activeThinking: false,
       activeToolCall: false,
       activeTransportTurn: false,
+    })).toBe('idle');
+  });
+
+  it('lets a stale-turn idle acknowledgement override a stale active-turn hint', () => {
+    expect(resolveTimelineBackedSessionState({
+      timelineState: 'running',
+      sessionState: 'idle',
+      activeTransportTurn: true,
+      timelineLastEventTs: 10_000,
+      authoritativeIdleAt: 20_000,
     })).toBe('idle');
   });
 

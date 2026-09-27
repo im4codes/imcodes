@@ -40,6 +40,7 @@ import {
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_PROTOCOL_REVISION,
+  TIMELINE_TERMINAL_SESSION_STATES,
   type TimelineCursor,
   type TimelineDetailRefV1,
   type TimelineDetailResponse,
@@ -2672,7 +2673,12 @@ export class WsClient {
       return false;
     }
     const eventType = msg.event?.type;
-    const coalescedType = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update'
+    const terminalSessionState = eventType === 'session.state'
+      && TIMELINE_TERMINAL_SESSION_STATES.includes(
+        String(msg.event?.payload?.state ?? '') as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number],
+      );
+    const coalescedType = !terminalSessionState
+      && (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')
       ? eventType
       : null;
     if (coalescedType) {
@@ -2708,7 +2714,11 @@ export class WsClient {
     const batch = this.pendingTimelineEvents.splice(0, TIMELINE_EVENT_FLUSH_BATCH);
     for (const event of batch) {
       const eventType = event.event?.type;
-      if (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update') {
+      const terminalSessionState = eventType === 'session.state'
+        && TIMELINE_TERMINAL_SESSION_STATES.includes(
+          String(event.event?.payload?.state ?? '') as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number],
+        );
+      if (!terminalSessionState && (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')) {
         const sessionId = typeof event.event?.sessionId === 'string' ? event.event.sessionId : '';
         const key = `${sessionId}\0${eventType}`;
         if (this.pendingTimelineCoalesced.get(key) !== event) continue;
