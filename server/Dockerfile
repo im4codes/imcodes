@@ -1,5 +1,11 @@
+# The Node base image for every stage. CI passes the first registry that is
+# currently reachable (authenticated Docker Hub, then mirror.gcr.io, then
+# public.ecr.aws): anonymous public.ecr.aws pulls hit "toomanyrequests: Data
+# limit exceeded" and blocked releases. Local builds keep this default.
+ARG NODE_BASE_IMAGE=public.ecr.aws/docker/library/node:24-bookworm-slim
+
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS builder
+FROM ${NODE_BASE_IMAGE} AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends zip python3 make g++ \
@@ -54,7 +60,7 @@ RUN cd server && npm run build
 #   • HF_TRANSFORMERS_VERSION (pinned here in lock-step with server/package.json)
 #   • server/scripts/preload-embedding-model.mjs
 #   • shared/embedding-config.ts (model name / dtype)
-FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS embedding-model
+FROM ${NODE_BASE_IMAGE} AS embedding-model
 
 WORKDIR /app
 
@@ -82,7 +88,7 @@ RUN mkdir -p /app/embedding-cache \
  && if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node ./scripts/preload-embedding-model.mjs; fi
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS runtime
+FROM ${NODE_BASE_IMAGE} AS runtime
 
 WORKDIR /app
 

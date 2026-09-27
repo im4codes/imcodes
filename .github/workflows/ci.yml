@@ -1360,6 +1360,33 @@ jobs:
           echo "version=${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
           echo "app_version=$(date -u +%Y.%-m).${COMMIT_COUNT}" >> "$GITHUB_OUTPUT"
 
+      # The Dockerfile's Node base image is a build arg. Anonymous pulls from
+      # public.ecr.aws intermittently fail with "toomanyrequests: Data limit
+      # exceeded" and blocked the release; pick the first registry whose
+      # manifest resolves right now, preferring the Docker Hub login above.
+      - name: Resolve reachable Node base image
+        id: base_image
+        run: |
+          set -euo pipefail
+          candidates=(
+            docker.io/library/node:24-bookworm-slim
+            mirror.gcr.io/library/node:24-bookworm-slim
+            public.ecr.aws/docker/library/node:24-bookworm-slim
+          )
+          for attempt in 1 2 3; do
+            for image in "${candidates[@]}"; do
+              if docker buildx imagetools inspect "$image" >/dev/null 2>&1; then
+                echo "Using Node base image: $image (attempt $attempt)"
+                echo "image=$image" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "::warning::Node base image unavailable right now: $image"
+            done
+            sleep $((attempt * 20))
+          done
+          echo "::error::No Node base image registry is reachable" >&2
+          exit 1
+
       # Build the image into the local docker daemon first so we can smoke-test
       # it BEFORE pushing. Without this step, an image whose Node process
       # crashes on startup (e.g. ERR_MODULE_NOT_FOUND from a missing prod dep)
@@ -1372,6 +1399,7 @@ jobs:
           platforms: linux/amd64
           tags: imcodes-smoke:test
           build-args: |
+            NODE_BASE_IMAGE=${{ steps.base_image.outputs.image }}
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
@@ -1423,6 +1451,7 @@ jobs:
           platforms: linux/amd64
           tags: ${{ steps.tags.outputs.tags }}
           build-args: |
+            NODE_BASE_IMAGE=${{ steps.base_image.outputs.image }}
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
