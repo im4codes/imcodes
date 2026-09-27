@@ -289,7 +289,7 @@ describe('SupervisionTaskConsole', () => {
           tasks: {
             ...base.tasks,
             'task-unknown': {
-              taskId: 'task-unknown', title: 'Future task status', status: 'planned', phase: 'active',
+              taskId: 'task-unknown', title: 'Future task status', status: 'implementing', phase: 'active',
               unknownStatus: 'future_status', validationState: 'unknown', updatedAt: NOW, lastEventId: 22,
             },
           },
