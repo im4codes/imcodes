@@ -512,6 +512,10 @@ export class WsClient {
   private _destroyed = false;
   /** Timeline backlog delivery is yielded after a small first-paint burst. */
   private pendingTimelineEvents: TimelineEventMessage[] = [];
+  /** Latest queued transient status per session/type. These events are state
+   * snapshots, not durable content; retaining every intermediate frame while
+   * a reconnect backlog drains turns a burst into a render storm. */
+  private pendingTimelineCoalesced = new Map<string, TimelineEventMessage>();
   private timelineEventFlushTimer: ReturnType<typeof setTimeout> | null = null;
   private timelineEventsSinceYield = 0;
   private _pingLatency: number | null = null;
@@ -681,6 +685,7 @@ export class WsClient {
     if (this.timelineEventFlushTimer) clearTimeout(this.timelineEventFlushTimer);
     this.timelineEventFlushTimer = null;
     this.pendingTimelineEvents = [];
+    this.pendingTimelineCoalesced.clear();
     this.timelineEventsSinceYield = 0;
     this._connecting = false;
     this.clearTimers();
@@ -2658,7 +2663,26 @@ export class WsClient {
       this.timelineEventsSinceYield += 1;
       return false;
     }
-    this.pendingTimelineEvents.push(msg);
+    const eventType = msg.event?.type;
+    const coalescedType = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update'
+      ? eventType
+      : null;
+    if (coalescedType) {
+      const sessionId = typeof msg.event?.sessionId === 'string' ? msg.event.sessionId : '';
+      const key = `${sessionId}\0${coalescedType}`;
+      const previous = this.pendingTimelineCoalesced.get(key);
+      if (previous) {
+        // Keep the original queue position so durable events retain their
+        // relative order, while replacing stale transient state in place.
+        const index = this.pendingTimelineEvents.indexOf(previous);
+        if (index >= 0) this.pendingTimelineEvents[index] = msg;
+      } else {
+        this.pendingTimelineEvents.push(msg);
+      }
+      this.pendingTimelineCoalesced.set(key, msg);
+    } else {
+      this.pendingTimelineEvents.push(msg);
+    }
     if (!this.timelineEventFlushTimer) {
       this.timelineEventFlushTimer = setTimeout(() => this.flushTimelineEvents(), 0);
     }
@@ -2669,11 +2693,21 @@ export class WsClient {
     this.timelineEventFlushTimer = null;
     if (this._destroyed) {
       this.pendingTimelineEvents = [];
+      this.pendingTimelineCoalesced.clear();
       this.timelineEventsSinceYield = 0;
       return;
     }
     const batch = this.pendingTimelineEvents.splice(0, TIMELINE_EVENT_FLUSH_BATCH);
-    for (const event of batch) this.dispatch(event);
+    for (const event of batch) {
+      const eventType = event.event?.type;
+      if (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update') {
+        const sessionId = typeof event.event?.sessionId === 'string' ? event.event.sessionId : '';
+        const key = `${sessionId}\0${eventType}`;
+        if (this.pendingTimelineCoalesced.get(key) !== event) continue;
+        this.pendingTimelineCoalesced.delete(key);
+      }
+      this.dispatch(event);
+    }
     if (this.pendingTimelineEvents.length > 0) {
       this.timelineEventFlushTimer = setTimeout(() => this.flushTimelineEvents(), 0);
     } else {

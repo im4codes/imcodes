@@ -843,6 +843,42 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
+  it('coalesces queued transient status frames per session while preserving durable events', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    for (let i = 0; i < 1_000; i++) {
+      socket.emit('message', { data: JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 's1', eventId: `state-${i}`, seq: i + 1, epoch: 1,
+          type: 'session.state', payload: { state: i % 2 ? 'working' : 'idle' },
+        },
+      }) });
+    }
+
+    // Thirty-two events are allowed through for first paint. The queued 968
+    // intermediate states collapse to the latest state for this session/type.
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(32);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(33);
+    const delivered = handler.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'timeline.event')
+      .at(-1);
+    expect(delivered?.event?.eventId).toBe('state-999');
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
   it('send() is a safe no-op when not connected (does not throw)', () => {
     // Fire-and-forget transport must never throw to React effects/listeners —
     // an uncaught throw crashes the ChatView via the ErrorBoundary.
