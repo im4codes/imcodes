@@ -884,45 +884,48 @@ describe('useTimeline window-isolated cache bounds', () => {
       .toContain('restored without sending a message');
   });
 
-  it('keeps a visible inactive window full and requests only the cached after-seq delta', async () => {
+  it('does not walk older pages before first paint when the visible pane is cold', async () => {
     vi.useFakeTimers();
-    const sessionName = `deck_visible_cached_${Date.now()}`;
-    const serverId = `srv-visible-cached-${Date.now()}`;
-    const cached = makeEvents(sessionName, 4);
-    __setTimelineCacheForTests(`${serverId}:${sessionName}`, cached);
-    const sendTimelineHistoryRequest = vi.fn(() => 'history-visible-cached');
+    const sessionName = `deck_visible_cold_bound_${Date.now()}`;
+    const serverId = `srv-visible-cold-bound-${Date.now()}`;
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-visible-cold-bound');
     const ws: WsClient = {
       connected: true,
-      onMessage: () => () => undefined,
+      onMessage: () => () => {},
       sendTimelineHistoryRequest,
     } as unknown as WsClient;
+
+    vi.spyOn(TimelineDB.prototype, 'open').mockResolvedValue();
+    vi.spyOn(TimelineDB.prototype, 'getRecentEvents').mockResolvedValue([]);
+    vi.spyOn(TimelineDB.prototype, 'getLastSeqAndEpoch').mockResolvedValue(null);
+    fetchHistorySpy.mockResolvedValue({
+      events: makeEvents(sessionName, 200),
+      epoch: 1,
+      hasMore: true,
+      nextCursor: { epoch: 1, beforeTs: 0, direction: TIMELINE_CURSOR_DIRECTIONS.OLDER },
+    });
 
     function Probe() {
       const timeline = useTimeline(sessionName, ws, serverId, {
         isActiveSession: false,
         isVisible: true,
-        subscriptionMode: 'full',
         bootstrapWhenVisible: true,
       });
-      return h('div', { 'data-testid': 'visible-cached-probe' },
-        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+      return h('div', { 'data-testid': 'visible-cold-bound-probe' }, String(timeline.events.length));
     }
 
     render(h(Probe));
-    // Cache is visible in the first render, before any WS response.
-    expect(screen.getByTestId('visible-cached-probe').textContent).toContain(`${sessionName}-3`);
     await act(async () => {
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(300);
+      await flushMicrotasks();
+      // A capped cold bootstrap must not chain historical pages in the
+      // background; one bounded tail is enough for first paint.
+      await vi.advanceTimersByTimeAsync(2_000);
       await flushMicrotasks();
     });
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
-      sessionName,
-      200,
-      undefined,
-      undefined,
-      { epoch: 1, afterSeq: 3, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER },
-      1024 * 1024,
-    );
+
+    expect(fetchHistorySpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('visible-cold-bound-probe').textContent).toBe('200');
   });
 
   it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
@@ -2800,14 +2803,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('complete cached output');
-      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
-        sessionName,
-        200,
-        undefined,
-        undefined,
-        { epoch: 1, afterSeq: 10, direction: 'newer' },
-        1024 * 1024,
-      );
+      expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 9);
     });
 
     await act(async () => {
@@ -3176,14 +3172,7 @@ describe('useTimeline window-isolated cache bounds', () => {
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toBe('live cached text');
     });
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
-      sessionName,
-      200,
-      undefined,
-      undefined,
-      { epoch: 7, afterSeq: 1, direction: 'newer' },
-      1024 * 1024,
-    );
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 0);
 
     await act(async () => {
       handler?.({
@@ -3787,14 +3776,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     // Initial mount already has cached cursor state, so it asks only for the
     // missed tail instead of re-downloading a full recent-history snapshot.
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
-      sessionName,
-      200,
-      undefined,
-      undefined,
-      { epoch: 1, afterSeq: 2, direction: 'newer' },
-      1024 * 1024,
-    );
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 4999);
     sendTimelineHistoryRequest.mockClear();
 
     // Simulate browser WS reconnect. useTimeline should now gap-fill using
@@ -3805,14 +3787,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     expect(ws.sendTimelineReplayRequest).toHaveBeenCalledWith(sessionName, 2, 1);
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
-      sessionName,
-      200,
-      undefined,
-      undefined,
-      { epoch: 1, afterSeq: 2, direction: 'newer' },
-      1024 * 1024,
-    );
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200, 4999);
   });
   it('reports the cache step as empty, not done, when this device has no copy', async () => {
     // A bare "done" rendered a ✓ next to a blank chat, which reads as "your

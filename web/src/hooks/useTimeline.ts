@@ -3930,7 +3930,14 @@ export function useTimeline(
       }
       if (gate) gate.inFlight += 1;
       const afterTs = mode === 'manualLatestWindow' ? undefined : getTimelineHistoryAfterTs(eventsRef.current);
-      const maxPages = mode === 'manualLatestWindow' ? 1 : undefined;
+      // A cold visible pane has no local cursor to anchor a delta. Paint one
+      // bounded newest page and let the live subscription carry forward; do
+      // not walk the entire historical backlog before the first render. Once
+      // a cache cursor exists, a reconnect catch-up may continue through
+      // bounded pages to close a real gap. Manual refresh is already a single
+      // latest-window read.
+      const hadLocalEvents = eventsRef.current.length > 0;
+      const maxPages = mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
       if (visible) {
         httpBackfillInFlightRef.current[mode] += 1;
@@ -4018,6 +4025,7 @@ export function useTimeline(
           // SAME dedupe/coalescing every other fireHttpBackfill call goes
           // through; only the resume cursor and round counter carry forward.
           if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined
+            && hadLocalEvents
             && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
             backfillDebug('fireHttpBackfill: cap_hit → chaining next round', {
               sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: outcome.resumeBeforeTs,
