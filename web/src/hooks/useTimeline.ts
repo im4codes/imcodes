@@ -3978,7 +3978,7 @@ export function useTimeline(
               limit: MAX_FORWARD_PAGE_EVENTS,
               timeoutMs: resolveBackfillTimeoutMs(opts),
             })),
-            mergePage: (events) => {
+            mergePage: async (events) => {
               if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
               const recovered = events.filter(
                 (ev): ev is TimelineEvent => !!ev && typeof ev === 'object'
@@ -3990,12 +3990,23 @@ export function useTimeline(
               );
               if (recovered.length === 0) return { candidateCount: 0, minTs: null, maxTs: null };
               backfillDebug('fireHttpBackfill: merging page', { sessionId: backfillSessionId, count: recovered.length });
-              mergeEvents(recovered);
-              for (const recoveredEvent of recovered) {
-                settleOptimisticByCommandAckEvent(recoveredEvent);
-                settleOptimisticByTimelineProgress(recoveredEvent);
+              // Apply large pages in small turns.  A 200-event page can carry
+              // megabytes of markdown/tool payload; merging it synchronously
+              // blocks input and first paint across every mounted pane.
+              const APPLY_CHUNK = 20;
+              for (let offset = 0; offset < recovered.length; offset += APPLY_CHUNK) {
+                if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
+                const chunk = recovered.slice(offset, offset + APPLY_CHUNK);
+                mergeEvents(chunk);
+                for (const recoveredEvent of chunk) {
+                  settleOptimisticByCommandAckEvent(recoveredEvent);
+                  settleOptimisticByTimelineProgress(recoveredEvent);
+                }
+                idbPutEvents(chunk);
+                if (offset + APPLY_CHUNK < recovered.length) {
+                  await new Promise<void>((resolve) => setTimeout(resolve, 0));
+                }
               }
-              idbPutEvents(recovered);
               let minTs = Infinity;
               let maxTs = -Infinity;
               for (const recoveredEvent of recovered) {

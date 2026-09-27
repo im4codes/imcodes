@@ -29,11 +29,15 @@ export type StackOrderEntry = string | { id: string };
 
 export const DESKTOP_BOTTOM_WINDOW_RESERVE_PX = 100;
 const SESSION_TAB_BAR_SELECTOR = '.tab-bar';
-const sessionTabMeasureCache = new WeakMap<HTMLElement, {
-  childCount: number;
-  barBottom: number;
+interface SessionTabMeasureState {
+  tabBar: HTMLElement | null;
   bottom: number;
-}>();
+  dirty: boolean;
+  observedRoot: Node | null;
+  mutationObserver?: MutationObserver;
+  resizeObserver?: ResizeObserver;
+}
+const sessionTabMeasureCache = new WeakMap<Document, SessionTabMeasureState>();
 /**
  * Last-resort floor for the workspace top. `.main` is the content column, which
  * sits below the app header by construction, so its top is always a safe
@@ -92,20 +96,30 @@ export function reserveWorkspaceBottom(
 
 export function resolveSessionTabsBottom(doc: Document | null = typeof document === 'undefined' ? null : document): number {
   if (!doc) return 0;
-  // The desktop drag/resize path asks for this bound on every pointer frame.
-  // Avoid a document-wide querySelectorAll there: the tab bar itself is stable
-  // while a window is being moved, so cache the button measurement until its
-  // child count or own geometry changes.
-  const tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR);
-  const tabBarBottom = tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
-  if (tabBar) {
-    const cached = sessionTabMeasureCache.get(tabBar);
-    if (cached
-      && cached.childCount === tabBar.childElementCount
-      && cached.barBottom === tabBarBottom) {
-      return cached.bottom;
+  // Pointer frames must not read layout or walk the document.  A single
+  // observer invalidates this snapshot when tabs/geometry change; hot calls
+  // return the last number without querySelectorAll/getBoundingClientRect.
+  let state = sessionTabMeasureCache.get(doc);
+  if (!state) {
+    state = { tabBar: doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR), bottom: 0, dirty: true, observedRoot: null };
+    sessionTabMeasureCache.set(doc, state);
+    const invalidate = () => { state!.dirty = true; };
+    if (typeof MutationObserver !== 'undefined' && doc.documentElement) {
+      state.mutationObserver = new MutationObserver(invalidate);
+      state.mutationObserver.observe(doc.documentElement, { childList: true, subtree: true });
+      state.observedRoot = doc.documentElement;
+    }
+    if (typeof ResizeObserver !== 'undefined') {
+      state.resizeObserver = new ResizeObserver(invalidate);
+      if (state.tabBar) state.resizeObserver.observe(state.tabBar);
     }
   }
+  if (!state.dirty) return state.bottom;
+  const tabBar = state.tabBar?.isConnected
+    ? state.tabBar
+    : (state.tabBar = doc.querySelector<HTMLElement>(SESSION_TAB_BAR_SELECTOR));
+  if (tabBar) state.resizeObserver?.observe(tabBar);
+  const tabBarBottom = tabBar ? Math.max(0, finiteOr(tabBar.getBoundingClientRect().bottom, 0)) : 0;
   const tabButtons = tabBar
     ? Array.from(tabBar.querySelectorAll<HTMLElement>('[role="tab"]'))
     : [];
@@ -114,13 +128,8 @@ export function resolveSessionTabsBottom(doc: Document | null = typeof document 
     .filter((bottom) => bottom > 0);
   if (tabButtonBottoms.length > 0) {
     const bottom = Math.max(...tabButtonBottoms);
-    if (tabBar) {
-      sessionTabMeasureCache.set(tabBar, {
-        childCount: tabBar.childElementCount,
-        barBottom: tabBarBottom,
-        bottom,
-      });
-    }
+    state.bottom = bottom;
+    state.dirty = false;
     return bottom;
   }
 
@@ -130,13 +139,8 @@ export function resolveSessionTabsBottom(doc: Document | null = typeof document 
   // below. The previous version returned the 0 and pinned the window to the
   // top of the viewport, under the app header.
   if (tabBarBottom > 0) {
-    if (tabBar) {
-      sessionTabMeasureCache.set(tabBar, {
-        childCount: tabBar.childElementCount,
-        barBottom: tabBarBottom,
-        bottom: tabBarBottom,
-      });
-    }
+    state.bottom = tabBarBottom;
+    state.dirty = false;
     return tabBarBottom;
   }
 
@@ -150,7 +154,11 @@ export function resolveSessionTabsBottom(doc: Document | null = typeof document 
   // `.main` starts below the header, so its top is a strictly safer floor. This
   // can only push the boundary DOWN relative to the old behaviour.
   const mainContent = doc.querySelector<HTMLElement>(MAIN_CONTENT_SELECTOR);
-  return mainContent ? Math.max(0, finiteOr(mainContent.getBoundingClientRect().top, 0)) : 0;
+  state.bottom = mainContent ? Math.max(0, finiteOr(mainContent.getBoundingClientRect().top, 0)) : 0;
+  // Keep probing while the tab bar has not mounted yet; the first render can
+  // occur before the app inserts it and MutationObserver delivery is async.
+  state.dirty = !tabBar;
+  return state.bottom;
 }
 
 export function viewportWorkspaceBelowSessionTabs(options: {

@@ -450,8 +450,12 @@ function utf8ByteLength(text: string): number {
 
 /** Envelope + margin for `{"type":"subsession.rebuild_all","subSessions":[…]}`. */
 const SUBSESSION_REBUILD_BATCH_BUDGET_BYTES = DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES - 2_048;
-const TIMELINE_EVENT_IMMEDIATE_BURST = 32;
-const TIMELINE_EVENT_FLUSH_BATCH = 50;
+// Let the first durable event paint, then yield.  A burst of 32 synchronous
+// dispatches made every mounted pane reduce before the browser could handle
+// input, producing the startup long-task wedge.  Transient state is coalesced
+// per session while queued; durable events retain order and are never dropped.
+const TIMELINE_EVENT_IMMEDIATE_BURST = 1;
+const TIMELINE_EVENT_FLUSH_BATCH = 8;
 
 /**
  * Split a rebuild list into batches that each serialize under the outbound cap.

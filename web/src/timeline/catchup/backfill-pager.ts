@@ -98,7 +98,9 @@ export interface NewestWindowBackfillDeps {
    * the min/max `ts` across them (`minTs` drives the next window's upper bound).
    * `minTs: null` signals "no usable cursor" (empty / all-malformed page).
    */
-  mergePage: (events: unknown[]) => { candidateCount: number; minTs: number | null; maxTs: number | null };
+  mergePage: (events: unknown[]) =>
+    | { candidateCount: number; minTs: number | null; maxTs: number | null }
+    | Promise<{ candidateCount: number; minTs: number | null; maxTs: number | null }>;
   /**
    * The page size requested per fetch. A page with `events.length >= limit` is a
    * full window slice (there may be more below → continue); `< limit` proves the
@@ -170,7 +172,9 @@ export async function runNewestWindowBackfill(
     if (page === null) {
       return { terminal: 'transient_null', pageCount, totalNew };
     }
-    const { candidateCount, minTs } = deps.mergePage(page.events);
+    // A page can contain hundreds of events.  Allow consumers to yield while
+    // applying it so a reconnect/backfill never monopolizes the renderer.
+    const { candidateCount, minTs } = await deps.mergePage(page.events);
     pageCount += 1;
     totalNew += candidateCount;
 

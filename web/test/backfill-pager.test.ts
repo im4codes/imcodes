@@ -293,4 +293,28 @@ describe('runNewestWindowBackfill (Tier-0 newest-first window)', () => {
     expect(seenArgs.map((a) => a.afterTs)).toEqual([undefined, undefined]);
     expect(seenArgs.map((a) => a.beforeTs)).toEqual([undefined, 81]);
   });
+
+  it('awaits async page merges so large backfills can yield between chunks', async () => {
+    const turns: string[] = [];
+    let timerObserved = false;
+    const timer = new Promise<void>((resolve) => setTimeout(() => {
+      timerObserved = true;
+      turns.push('timer');
+      resolve();
+    }, 0));
+    const outcomePromise = runNewestWindowBackfill(0, {
+      limit: 2,
+      fetchPage: async () => ({ events: [{ ts: 2 }, { ts: 1 }], hasMore: false } as BackfillPage),
+      maxPages: 1,
+      mergePage: async (events) => {
+        turns.push('merge-start');
+        await timer;
+        turns.push('merge-end');
+        return countingMerge(events);
+      },
+    });
+    await outcomePromise;
+    expect(timerObserved).toBe(true);
+    expect(turns).toEqual(['merge-start', 'timer', 'merge-end']);
+  });
 });
