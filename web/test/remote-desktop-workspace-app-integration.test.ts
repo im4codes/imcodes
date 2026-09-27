@@ -15,6 +15,14 @@ describe('remote desktop workspace App integration', () => {
     expect(openActionBindings.length).toBeGreaterThanOrEqual(6);
   });
 
+  it('puts a remote-desktop button right after the desktop AI Desk dropdown', () => {
+    const group = appSource.indexOf('<div class="controlled-nodes-shortcut-group">');
+    expect(group).toBeGreaterThan(-1);
+    const groupEnd = appSource.indexOf('</div>', appSource.indexOf('<ControlledNodeQuickMenu', group));
+    const next = appSource.slice(groupEnd, groupEnd + 600);
+    expect(next).toMatch(/<DaemonRemoteDesktopControl[\s\S]*?compact[\s\S]*?onOpen=\{openRemoteDesktop\}/);
+  });
+
   it('clears protected tabs and all manager owners when authentication disappears', () => {
     expect(appSource).toMatch(/if \(auth\) return;[\s\S]*remoteDesktopConnectionManager\.stopAll\(REMOTE_DESKTOP_STOP_ORIGIN\.APP_SIGN_OUT\);[\s\S]*setRemoteDesktopWorkspace\(createRemoteDesktopWorkspaceState\(\)\);/);
     expect(appSource).toContain('removeDesktopWindow(REMOTE_DESKTOP_WORKSPACE_WINDOW_ID);');

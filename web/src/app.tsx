@@ -6177,6 +6177,17 @@ export function App() {
                   onConnectById={openRemoteDesktopById}
                 />
               </div>
+              {/* Owner: a remote-desktop button right of the AI Desk dropdown on
+                  desktop, the same control as the session toolbars. */}
+              <DaemonRemoteDesktopControl
+                compact
+                ws={wsRef.current}
+                serverId={selectedServerId}
+                serverName={selectedServerInfo?.name}
+                daemonOnline={daemonOnline}
+                onOpen={openRemoteDesktop}
+                canSetUp={!selectedShareTarget}
+              />
               {/* Session-list show/hide toggle — same as the mobile sidebar ⊞ button */}
               <button
                 class="btn"
