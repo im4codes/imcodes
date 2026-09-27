@@ -1539,6 +1539,10 @@ export async function startup(): Promise<DaemonContext> {
     // payload even when no pair row was saved. Resolve by participant so main
     // sessions and sub-sessions follow the same refresh path.
     timelineEmitter.on((event) => {
+      // The pairs engine owns the Brain heartbeat projection. Keep this call
+      // before the participant-only refresh filter so user messages and
+      // needs-input status from the main session can pause/re-arm it too.
+      taskPairAutomation.observeTimelineEvent(event);
       if (event.type !== 'session.state' && event.type !== 'assistant.thinking' && event.type !== 'assistant.text'
         && event.type !== 'tool.call' && event.type !== 'tool.result') return;
       for (const pair of getTaskPairStore().pairsForSession(event.sessionId)) {

@@ -18,6 +18,7 @@ import {
   setSupervisionHeartbeatProjection,
 } from '../supervision-heartbeat-projection.js';
 import logger from '../../util/logger.js';
+import { getSession } from '../../store/session-store.js';
 import {
   TASK_PAIR_BOTH_IDLE_NUDGE_MS,
   TASK_PAIR_HEARTBEAT_MS,
@@ -34,7 +35,7 @@ import {
   type TaskPairState,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
-import { isPairsEngineProject, resolveTaskPairMaxConcurrency } from './engine.js';
+import { isPairsEngineProject, projectBrainSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { sendTaskPairMessage } from './delivery.js';
 import { hasRecentTaskPairProviderError } from './provider-errors.js';
 import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from './service.js';
@@ -54,6 +55,7 @@ import {
 } from './pool.js';
 import {
   buildAggregatedBrainNoticeMessage,
+  buildBrainHeartbeatMessage,
   buildAuditorAssignmentMessage,
   buildAuditorHandoffMessage,
   buildBrainLine,
@@ -127,6 +129,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #bothIdleNudgeMs = resolveTaskPairBothIdleNudgeMs();
   #nextTickAt = 0;
   #badgeSessions = new Set<string>();
+  /** Main Brain heartbeat state is separate from participant pair badges. */
+  #mainHeartbeatPaused = new Set<string>();
+  #mainHeartbeatPauseCleared = new Set<string>();
+  #mainHeartbeatDelivered = new Map<string, string>();
+  #mainHeartbeatPending = new Set<string>();
+  #mainHeartbeatSessions = new Set<string>();
 
   start(intervalMs = resolveTaskPairHeartbeatMs()): void {
     if (this.#timer) return;
@@ -162,6 +170,34 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const busy = (this.#deps.isBusy ?? ((name) => isSessionBusy(name)))(session);
     this.#tickBusy?.set(session, busy);
     return busy;
+  }
+
+  /**
+   * Feed the main-session timeline into the pairs heartbeat.  This is called
+   * by lifecycle's single timeline listener so a user reply re-arms the
+   * projection without reviving the retired legacy supervision engine.
+   */
+  observeTimelineEvent(event: { sessionId: string; type: string; payload: Record<string, unknown> }): void {
+    const pairs = getTaskPairStore().listActivePairs().filter((stored) => (
+      isPairsEngineProject(stored.project) && stored.state.brain === event.sessionId
+    ));
+    if (pairs.length === 0) return;
+    if (event.type === 'agent.status') {
+      const status = String(event.payload.status ?? '').toLowerCase();
+      if (status === 'needs_input' || status === 'supervision_needs_input') {
+        this.#mainHeartbeatPaused.add(event.sessionId);
+        this.#mainHeartbeatPauseCleared.delete(event.sessionId);
+        this.publishBadges();
+      }
+    } else if (event.type === 'session.state') {
+      const state = String(event.payload.state ?? '').toLowerCase();
+      if (state === 'running' || state === 'idle') this.publishBadges();
+    } else if (event.type === 'user.message' && event.payload.automation !== true
+      && String(event.payload.text ?? '').trim()) {
+      this.#mainHeartbeatPaused.delete(event.sessionId);
+      this.#mainHeartbeatPauseCleared.add(event.sessionId);
+      this.publishBadges();
+    }
   }
   /**
    * A real, structured rate/usage limit (`provider_rate_limited`, a weekly
@@ -391,11 +427,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
    */
   publishBadges(): void {
     const next = new Set<string>();
+    const mainPairs = new Map<string, TaskPairState[]>();
     for (const stored of getTaskPairStore().listActivePairs()) {
       if (!TASK_PAIR_OPEN_STATUSES.includes(stored.state.status) || !isPairsEngineProject(stored.project)) continue;
       for (const session of [stored.state.executor, stored.state.auditor]) {
         if (session && session !== TASK_PAIR_NO_AUDITOR) next.add(session);
       }
+      const brain = stored.state.brain || projectBrainSession(stored.project);
+      const list = mainPairs.get(brain) ?? [];
+      list.push(stored.state);
+      mainPairs.set(brain, list);
     }
     const nextHeartbeatAt = Math.max(this.#nextTickAt, this.#now());
     for (const session of next) {
@@ -410,6 +451,73 @@ export class TaskPairAutomation implements TaskPairScheduler {
       if (!next.has(session)) clearSupervisionHeartbeatProjectionSource(session, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.PAIR);
     }
     this.#badgeSessions = next;
+
+    const mainSessions = new Set<string>();
+    for (const [brain, pairs] of mainPairs) {
+      const brainRecord = getSession(brain);
+      if (!brainRecord || brainRecord.role !== 'brain') continue;
+      const actionable = pairs.filter((pair) => this.#mainHeartbeatNeedsAction(pair));
+      const hasNeedsInput = pairs.some((pair) => pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION);
+      if (actionable.length === 0 && !hasNeedsInput) continue;
+      mainSessions.add(brain);
+      const paused = this.#mainHeartbeatPaused.has(brain)
+        || (hasNeedsInput && !this.#mainHeartbeatPauseCleared.has(brain));
+      if (paused) {
+        setSupervisionHeartbeatProjection(brain, {
+          state: SUPERVISION_HEARTBEAT_STATE.PAUSED_NEEDS_INPUT,
+          kind: SUPERVISION_HEARTBEAT_KIND.PAIR,
+          updatedAt: this.#now(),
+        }, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
+        continue;
+      }
+      if (actionable.length === 0 || this.#busy(brain)) {
+        clearSupervisionHeartbeatProjectionSource(brain, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
+        continue;
+      }
+      const nextHeartbeatAt = Math.max(this.#nextTickAt, this.#now());
+      setSupervisionHeartbeatProjection(brain, {
+        state: SUPERVISION_HEARTBEAT_STATE.ARMED,
+        kind: SUPERVISION_HEARTBEAT_KIND.PAIR,
+        nextHeartbeatAt,
+        updatedAt: this.#now(),
+      }, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
+      this.#deliverMainHeartbeat(brain, actionable);
+    }
+    for (const brain of this.#mainHeartbeatSessions) {
+      if (!mainSessions.has(brain)) {
+        clearSupervisionHeartbeatProjectionSource(brain, SUPERVISION_HEARTBEAT_PROJECTION_SOURCE.BRAIN);
+        this.#mainHeartbeatPaused.delete(brain);
+        this.#mainHeartbeatPauseCleared.delete(brain);
+        this.#mainHeartbeatPending.delete(brain);
+      }
+    }
+    this.#mainHeartbeatSessions = mainSessions;
+    for (const brain of this.#mainHeartbeatDelivered.keys()) {
+      if (!mainSessions.has(brain)) this.#mainHeartbeatDelivered.delete(brain);
+    }
+  }
+
+  #mainHeartbeatNeedsAction(pair: TaskPairState): boolean {
+    if (pair.status === 'passed') return true;
+    return pair.flags.some((flag) => [
+      'blocked', 'needs_input', 'needs_auditor', 'executor_silent', 'verdict_inconsistent',
+      'awaiting_audit_ignored', 'replacement_churn', 'markers_unresolved', 'all_providers_limited',
+      'auditor_capacity_hold', 'no_pool_configured', 'policy_violation', 'waiting_for_capacity',
+    ].includes(flag));
+  }
+
+  #deliverMainHeartbeat(brain: string, pairs: readonly TaskPairState[]): void {
+    const fingerprint = pairs.map((pair) => `${pair.taskId}:${pair.status}:${pair.round}:${pair.flags.join(',')}`).sort().join('|');
+    if (!fingerprint || this.#mainHeartbeatDelivered.get(brain) === fingerprint || this.#mainHeartbeatPending.has(brain)) return;
+    this.#mainHeartbeatPending.add(brain);
+    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, 'brain-heartbeat', buildBrainHeartbeatMessage(pairs))
+      .then((result) => {
+        if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
+          this.#mainHeartbeatDelivered.set(brain, fingerprint);
+        }
+      })
+      .finally(() => { this.#mainHeartbeatPending.delete(brain); })
+      .catch(() => { /* delivery logs its own failure; retry on the next state change */ });
   }
 
   async #tickPair(stored: StoredTaskPair, now: number): Promise<void> {

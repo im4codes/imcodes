@@ -13,7 +13,7 @@ import {
   defaultHasActiveSupervisionLease,
 } from '../../../src/daemon/supervision-auto-provision.js';
 import type { TaskPairState } from '../../../shared/task-pair.js';
-import { getSupervisionHeartbeatProjection } from '../../../src/daemon/supervision-heartbeat-projection.js';
+import { clearSupervisionHeartbeatProjectionsForTests, getSupervisionHeartbeatProjection } from '../../../src/daemon/supervision-heartbeat-projection.js';
 import { normalizeSessionSupervisionSnapshot, SUPERVISION_MODE } from '../../../shared/supervision-config.js';
 import { buildSupervisionExecutionCapabilityId, normalizeSupervisionExecutionModel } from '../../../shared/supervision-execution-pool.js';
 
@@ -110,6 +110,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
 
   beforeEach(() => {
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    clearSupervisionHeartbeatProjectionsForTests();
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     sent = [];
     busy = new Set();
@@ -133,6 +134,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
   });
 
   afterEach(() => {
+    clearSupervisionHeartbeatProjectionsForTests();
     taskPairService.setScheduler(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
@@ -813,6 +815,69 @@ describe('task-pair heartbeat, replacement and queue', () => {
     await flush();
     automation.publishBadges();
     expect(getSupervisionHeartbeatProjection(EXEC)?.state ?? 'off').toBe('off');
+  });
+
+  it('arms the main Brain only for actionable idle pairs and defers without stacking while busy', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-pass', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    busy.add(BRAIN);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    busy.delete(BRAIN);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+  });
+
+  it('pauses the main heartbeat on NEEDS_INPUT and re-arms after a real user message', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-blocked', brain: BRAIN, status: 'passed', flags: ['blocked'], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'agent.status', payload: { status: 'supervision_needs_input' } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
+    automation.observeTimelineEvent({ sessionId: BRAIN, type: 'user.message', payload: { text: 'I have decided', automation: false } });
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
+  });
+
+  it('clears the Brain projection when the last open pair ends', () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-clear', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state).toBe('armed');
+    getTaskPairStore().savePair(PROJECT, { ...pair('brain-clear'), status: 'done', updatedAt: now });
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+  });
+
+  it('reconstructs a paused Brain projection from the durable awaiting-decision state after restart', () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-restart', brain: BRAIN, status: 'awaiting_brain_decision', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: now, updatedAt: now,
+      executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
+    clearSupervisionHeartbeatProjectionsForTests();
+    const restarted = new TaskPairAutomation({ now: () => now, isBusy: (name) => busy.has(name) });
+    restarted.publishBadges();
+    expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'paused_needs_input', kind: 'pair' });
   });
 
   it('imports in-flight legacy tasks of a project switched back to pairs on the next tick, without a restart', async () => {

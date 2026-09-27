@@ -200,6 +200,28 @@ export function buildAggregatedBrainNoticeMessage(notices: readonly PendingBrain
 }
 
 /**
+ * One concise, deduplicated heartbeat for a project's Brain.  Participant
+ * nudges continue to use their per-pair delivery keys; this digest is only for
+ * actionable work that needs the Brain's decision or integration.
+ */
+export function buildBrainHeartbeatMessage(pairs: readonly TaskPairState[]): string {
+  const lines = pairs.map((pair) => {
+    const reason = pair.status === 'passed'
+      ? 'audit passed; commit locally and DONE'
+      : pair.flags.length > 0
+        ? pair.flags.join(', ')
+        : pair.status;
+    return `- ${pair.taskId}${pair.title ? ` "${pair.title}"` : ''}: ${reason} (executor ${pair.executor ?? '-'}, auditor ${pair.auditor ?? '-'})`;
+  });
+  return [
+    `[IM.codes task pairs] Brain heartbeat: ${pairs.length} pair(s) need action.`,
+    ...lines,
+    `Resolve with the task marker for each pair (for example <!-- IMCODES_TASK DONE <taskId> force=true -->, REASSIGN, or CANCEL).`,
+    `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
+  ].join('\n');
+}
+
+/**
  * One combined, rate-limited notice for queued pairs that have been unable
  * to start for a long time (owner correction: an ordinary, self-resolving
  * queue miss gets no per-pair notice at all; see scheduler.ts#checkQueueStalls).

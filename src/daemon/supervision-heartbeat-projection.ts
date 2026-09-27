@@ -11,6 +11,8 @@ export const SUPERVISION_HEARTBEAT_PROJECTION_SOURCE = {
   ASSIGNMENT: 'assignment',
   /** Marker-driven task pairs: the pair heartbeat of an executor or auditor. */
   PAIR: 'pair',
+  /** The aggregate heartbeat for the project's main Brain session. */
+  BRAIN: 'brain',
 } as const;
 type ProjectionSource = (typeof SUPERVISION_HEARTBEAT_PROJECTION_SOURCE)[keyof typeof SUPERVISION_HEARTBEAT_PROJECTION_SOURCE];
 
