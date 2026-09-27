@@ -105,6 +105,11 @@ function ensureDockerFixtureImages(run: DockerRunner = (args) => spawnSync('dock
   dockerFixtureImagesReady = true;
 }
 
+function expectDockerSuccess(result: DockerResult, operation: string): void {
+  const detail = String(result.stderr ?? result.stdout ?? '').trim();
+  expect(result.status, `${operation} failed${detail ? `: ${detail}` : ''}`).toBe(0);
+}
+
 describe('Docker fixture image preparation', () => {
   it('surfaces pull stderr when a registry pull fails', () => {
     dockerFixtureImagesReady = false;
@@ -1911,10 +1916,10 @@ describe('retained Windows artifact versions survive Server image replacement', 
 
     try {
       // 1. Pre-fix container: no volume, retained bytes in the writable layer.
-      expect(docker(['run', '-d', '--name', oldName, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
-      expect(docker(['exec', oldName, 'sh', '-c',
+      expectDockerSuccess(docker(['run', '-d', '--name', oldName, 'busybox:1.36', 'sleep', '300']), 'start legacy container');
+      expectDockerSuccess(docker(['exec', oldName, 'sh', '-c',
         `mkdir -p ${LEGACY_NODE_EXE_VERSION_DIR}/win-x64 && printf pinned-legacy-bytes > ${legacyPinned}`,
-      ]).status).toBe(0);
+      ]), 'seed legacy retained bytes');
 
       // 2. Stage before replacement.
       const staged = stageRetainedArtifactVersions('docker compose', process.cwd(), {
@@ -1926,9 +1931,9 @@ describe('retained Windows artifact versions survive Server image replacement', 
       expect(readFileSync(join(stagedDir, 'win-x64', `${digest}.bin`), 'utf8')).toBe('pinned-legacy-bytes');
 
       // 3. Replacement: old container gone, new one starts on an EMPTY volume.
-      expect(docker(['rm', '-f', oldName]).status).toBe(0);
-      expect(docker(['run', '-d', '--name', newName, '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
-        'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expectDockerSuccess(docker(['rm', '-f', oldName]), 'remove legacy container');
+      expectDockerSuccess(docker(['run', '-d', '--name', newName, '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
+        'busybox:1.36', 'sleep', '300']), 'start replacement container');
       const beforeRestore = docker(['exec', newName, 'sh', '-c', `cat ${durablePinned} 2>/dev/null || true`]);
       expect(beforeRestore.stdout.trim(), 'the replacement starts with nothing; migration is what saves it').toBe('');
 
@@ -1940,7 +1945,7 @@ describe('retained Windows artifact versions survive Server image replacement', 
       expect(afterRestore.stdout.trim()).toBe('pinned-legacy-bytes');
 
       // 5. And they now survive every FURTHER replacement, from a different image.
-      expect(docker(['rm', '-f', newName]).status).toBe(0);
+      expectDockerSuccess(docker(['rm', '-f', newName]), 'remove replacement container');
       const afterSecondReplacement = docker(['run', '--rm', '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
         'alpine:3.20', 'cat', durablePinned]);
       expect(afterSecondReplacement.status, afterSecondReplacement.stderr).toBe(0);
@@ -2154,12 +2159,12 @@ describe('legacy discovery distinguishes unreadable from absent, against real co
 
     try {
       // Root prepares a versions directory that a non-root user cannot read.
-      expect(docker(['run', '--rm', '-v', `${volume}:${artifactRoot}`, '--name', prep, 'busybox:1.36',
+      expectDockerSuccess(docker(['run', '--rm', '-v', `${volume}:${artifactRoot}`, '--name', prep, 'busybox:1.36',
         'sh', '-c', `mkdir -p ${LEGACY_NODE_EXE_VERSION_DIR} && chmod 000 ${LEGACY_NODE_EXE_VERSION_DIR}`,
-      ]).status).toBe(0);
+      ]), 'prepare unreadable legacy directory');
       // The "legacy server" runs as that non-root user, so `ls` genuinely fails.
-      expect(docker(['run', '-d', '--name', legacy, '--user', '1000:1000',
-        '-v', `${volume}:${artifactRoot}`, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expectDockerSuccess(docker(['run', '-d', '--name', legacy, '--user', '1000:1000',
+        '-v', `${volume}:${artifactRoot}`, 'busybox:1.36', 'sleep', '300']), 'start unreadable legacy container');
 
       const unreadable = stageRetainedArtifactVersions('docker compose', process.cwd(), realRunQuiet(legacy));
       expect(unreadable.kind, 'an unreadable legacy directory is a failure, not an absence').toBe('failed');
@@ -2169,14 +2174,14 @@ describe('legacy discovery distinguishes unreadable from absent, against real co
         .toThrow(/Refusing to replace the server container/);
 
       // Missing directory: benign, must NOT block.
-      expect(docker(['run', '-d', '--name', missingBox, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expectDockerSuccess(docker(['run', '-d', '--name', missingBox, 'busybox:1.36', 'sleep', '300']), 'start missing-tree container');
       const missing = stageRetainedArtifactVersions('docker compose', process.cwd(), realRunQuiet(missingBox));
       expect(missing.kind, 'a missing legacy directory is nothing to migrate').toBe('none');
       expect(() => assertRetainedArtifactStagingSafe(missing)).not.toThrow();
 
       // Present but empty and readable: also benign, must NOT block.
-      expect(docker(['run', '-d', '--name', emptyBox, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
-      expect(docker(['exec', emptyBox, 'mkdir', '-p', LEGACY_NODE_EXE_VERSION_DIR]).status).toBe(0);
+      expectDockerSuccess(docker(['run', '-d', '--name', emptyBox, 'busybox:1.36', 'sleep', '300']), 'start empty-tree container');
+      expectDockerSuccess(docker(['exec', emptyBox, 'mkdir', '-p', LEGACY_NODE_EXE_VERSION_DIR]), 'create empty legacy directory');
       const empty = stageRetainedArtifactVersions('docker compose', process.cwd(), realRunQuiet(emptyBox));
       expect(empty.kind, 'an empty readable legacy directory is nothing to migrate').toBe('none');
       expect(() => assertRetainedArtifactStagingSafe(empty)).not.toThrow();
@@ -2239,11 +2244,11 @@ describe('a stopped pre-fix Server still gets migrated', () => {
 
     try {
       // A legacy container that has since exited, with retained bytes on its layer.
-      expect(docker(['run', '-d', '--name', stopped, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
-      expect(docker(['exec', stopped, 'sh', '-c',
+      expectDockerSuccess(docker(['run', '-d', '--name', stopped, 'busybox:1.36', 'sleep', '300']), 'start stopped legacy container');
+      expectDockerSuccess(docker(['exec', stopped, 'sh', '-c',
         `mkdir -p ${LEGACY_NODE_EXE_VERSION_DIR}/win-x64 && printf stopped-pinned-bytes > ${LEGACY_NODE_EXE_VERSION_DIR}/win-x64/${digest}.bin`,
-      ]).status).toBe(0);
-      expect(docker(['stop', stopped]).status).toBe(0);
+      ]), 'seed stopped legacy bytes');
+      expectDockerSuccess(docker(['stop', stopped]), 'stop legacy container');
 
       const staged = stageRetainedArtifactVersions('docker compose', process.cwd(), withContainer(stopped));
       expect(staged.kind, 'a stopped legacy container must still be migrated').toBe('staged');
@@ -2252,9 +2257,9 @@ describe('a stopped pre-fix Server still gets migrated', () => {
       expect(() => assertRetainedArtifactStagingSafe(staged)).not.toThrow();
 
       // Replacement, then restore into the durable volume.
-      expect(docker(['rm', '-f', stopped]).status).toBe(0);
-      expect(docker(['run', '-d', '--name', replacement, '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
-        'busybox:1.36', 'sleep', '300']).status).toBe(0);
+      expectDockerSuccess(docker(['rm', '-f', stopped]), 'remove stopped legacy container');
+      expectDockerSuccess(docker(['run', '-d', '--name', replacement, '-v', `${volume}:${NODE_EXE_VERSION_DIR}`,
+        'busybox:1.36', 'sleep', '300']), 'start stopped replacement container');
       expect(restoreRetainedArtifactVersions('docker compose', process.cwd(), stagedDir, withContainer(replacement, true)))
         .toBe(true);
       const after = docker(['exec', replacement, 'cat', `${NODE_EXE_VERSION_DIR}/win-x64/${digest}.bin`]);
@@ -2263,8 +2268,8 @@ describe('a stopped pre-fix Server still gets migrated', () => {
       rmSync(stagedDir, { recursive: true, force: true });
 
       // A stopped container with no legacy directory stays benign and upgradeable.
-      expect(docker(['run', '-d', '--name', emptyStopped, 'busybox:1.36', 'sleep', '300']).status).toBe(0);
-      expect(docker(['stop', emptyStopped]).status).toBe(0);
+      expectDockerSuccess(docker(['run', '-d', '--name', emptyStopped, 'busybox:1.36', 'sleep', '300']), 'start empty stopped container');
+      expectDockerSuccess(docker(['stop', emptyStopped]), 'stop empty container');
       const none = stageRetainedArtifactVersions('docker compose', process.cwd(), withContainer(emptyStopped));
       expect(none.kind, 'a stopped container with no legacy tree has nothing to migrate').toBe('none');
       expect(() => assertRetainedArtifactStagingSafe(none)).not.toThrow();
