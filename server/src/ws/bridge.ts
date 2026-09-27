@@ -326,7 +326,7 @@ import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
 } from '../../../shared/timeline-delivery-telemetry.js';
-import { addCounter, incrementCounter } from '../util/metrics.js';
+import { addCounter, incrementCounter, snapshotCounters } from '../util/metrics.js';
 import { logAudit } from '../security/audit.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -414,6 +414,9 @@ import {
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
   TIMELINE_SUBSCRIPTION_MODES,
+  TIMELINE_FULL_LATEST_VALUE_COALESCE_WINDOW_MS,
+  TIMELINE_SUMMARY_LATEST_VALUE_COALESCE_WINDOW_MS,
+  TIMELINE_TERMINAL_SESSION_STATES,
   type TimelineSubscriptionMode,
 } from '../../../shared/timeline-protocol.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../../shared/timeline-payload-budget.js';
@@ -613,6 +616,18 @@ const TIMELINE_SOCKET_GAP_RATE_WINDOW_MS = 1_000;
 const TIMELINE_SOCKET_MAX_PENDING_GAPS = 256;
 
 /**
+ * Stable identity for latest-value timeline payloads.  Daemons may construct
+ * equivalent objects in a different key order on each tick; treating those
+ * as different values would defeat unchanged-payload suppression.
+ */
+function timelinePayloadFingerprint(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(timelinePayloadFingerprint).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map((key) => `${JSON.stringify(key)}:${timelinePayloadFingerprint(record[key])}`).join(',')}}`;
+}
+
+/**
  * Safe ws.send: checks readyState, wraps in try/catch.
  * Returns true if sent, false if socket not open or send threw.
  * Calls onFail() if the send could not be delivered.
@@ -776,6 +791,13 @@ interface TimelineQueueEvent {
   gapToSeq?: number;
 }
 
+interface TimelineEnqueueOptions {
+  /** Delay latest-value frames by one bounded presentation window. */
+  coalesceWindowMs?: number;
+  /** Flush delayed latest-value frames before this durable/terminal event. */
+  flushCoalesced?: boolean;
+}
+
 /**
  * Per-browser timeline queue. It deliberately owns only timeline events;
  * command acknowledgements, stop and approval frames continue through the
@@ -794,9 +816,12 @@ export class TimelineOutboundQueue {
   private gapFlushHandler?: (event: TimelineQueueEvent) => void;
   private disposed = false;
   private pumpScheduled = false;
+  private pendingCoalesced = new Map<string, TimelineQueueEvent>();
+  private coalesceTimer?: NodeJS.Timeout;
 
   isIdle(): boolean {
-    return !this.sending && this.pending.length === 0 && this.bytes === 0;
+    return !this.sending && this.pending.length === 0 && this.bytes === 0
+      && this.pendingCoalesced.size === 0 && !this.coalesceTimer;
   }
 
   statsForTests(): { bytes: number; pending: number; pendingGaps: number } {
@@ -806,15 +831,81 @@ export class TimelineOutboundQueue {
   dispose(): void {
     this.disposed = true;
     if (this.gapFlushTimer) clearTimeout(this.gapFlushTimer);
+    if (this.coalesceTimer) clearTimeout(this.coalesceTimer);
     this.gapFlushTimer = undefined;
+    this.coalesceTimer = undefined;
     this.pending = [];
     this.bytes = 0;
     this.pendingGaps.clear();
+    this.pendingCoalesced.clear();
     this.gapEpisodes.clear();
     this.gapSentAt = [];
   }
 
-  enqueue(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
+  /** Compose-only diagnostics; never used by the delivery path. */
+  snapshot(): { bytes: number; pending: number; sending: boolean } {
+    return { bytes: this.bytes, pending: this.pending.length, sending: this.sending };
+  }
+
+  enqueue(
+    ws: WebSocket,
+    item: TimelineQueueEvent,
+    onGap: (event: TimelineQueueEvent) => void,
+    onCoalesced?: () => void,
+    options?: TimelineEnqueueOptions,
+  ): void {
+    if (options?.flushCoalesced) this.flushCoalesced(ws, onGap, onCoalesced);
+    if (item.priority === 'coalescible' && options?.coalesceWindowMs !== undefined) {
+      this.enqueueCoalesced(ws, item, onGap, onCoalesced, options.coalesceWindowMs);
+      return;
+    }
+    this.enqueueImmediate(ws, item, onGap, onCoalesced);
+  }
+
+  private enqueueCoalesced(
+    ws: WebSocket,
+    item: TimelineQueueEvent,
+    onGap: (event: TimelineQueueEvent) => void,
+    onCoalesced: (() => void) | undefined,
+    windowMs: number,
+  ): void {
+    const key = item.coalesceKey ?? `${item.sessionId}\u0000${item.priority}`;
+    const previous = this.pendingCoalesced.get(key);
+    if (previous) {
+      // A pressured socket still needs an explicit seq gap for values replaced
+      // while it was unable to drain. Healthy presentation-window coalescing
+      // intentionally does not manufacture gaps.
+      if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER) {
+        this.noteGap(previous);
+      }
+      onCoalesced?.();
+    }
+    this.pendingCoalesced.set(key, item);
+    if (this.coalesceTimer) return;
+    this.coalesceTimer = setTimeout(() => {
+      this.coalesceTimer = undefined;
+      this.flushCoalesced(ws, onGap, onCoalesced);
+    }, Math.max(1, windowMs));
+    this.coalesceTimer.unref?.();
+  }
+
+  private flushCoalesced(
+    ws: WebSocket,
+    onGap: (event: TimelineQueueEvent) => void,
+    onCoalesced?: () => void,
+  ): void {
+    if (this.coalesceTimer) {
+      clearTimeout(this.coalesceTimer);
+      this.coalesceTimer = undefined;
+    }
+    if (this.pendingCoalesced.size === 0) return;
+    const pending = [...this.pendingCoalesced.values()]
+      .sort((a, b) => a.seq - b.seq);
+    this.pendingCoalesced.clear();
+    for (const item of pending) this.enqueueImmediate(ws, item, onGap, onCoalesced);
+  }
+
+  private enqueueImmediate(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
     const bufferedAmount = typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0;
     const wasSocketPressured = bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER;
     const existingIndex = item.coalesceKey
@@ -1154,8 +1245,10 @@ type PendingHttpTimelineRequest = {
 
 type PendingTimelineRequest = {
   socket: WebSocket;
-  sessionName?: string;
   timer: ReturnType<typeof setTimeout>;
+  /** Subscription context captured when the request was admitted. */
+  sessionName?: string;
+  mode?: TimelineSubscriptionMode;
 };
 
 type TimelineDataPlaneRoute = 'browser_request' | 'http_request' | 'subscriber_fallback';
@@ -2058,6 +2151,8 @@ export class WsBridge {
   private timelineProtocolSockets = new Set<WebSocket>();
   /** Bounded live timeline queues; control frames never use these queues. */
   private timelineQueues = new Map<WebSocket, TimelineOutboundQueue>();
+  /** Last delivered/pending value per socket, used to suppress unchanged signals. */
+  private timelineLatestValueFingerprints = new Map<WebSocket, Map<string, string>>();
 
   /** browser socket → userId (for session ownership checks) */
   private browserUserIds = new Map<WebSocket, string>();
@@ -3700,7 +3795,11 @@ export class WsBridge {
     return true;
   }
 
-  private registerPendingTimelineRequest(ws: WebSocket, msg: Record<string, unknown>): void {
+  private registerPendingTimelineRequest(
+    ws: WebSocket,
+    msg: Record<string, unknown>,
+    mode?: TimelineSubscriptionMode,
+  ): void {
     const requestId = optionalString(msg.requestId);
     if (!requestId) return;
     const previous = this.pendingTimelineRequests.get(requestId);
@@ -3713,10 +3812,18 @@ export class WsBridge {
       this.cancelDaemonTimelineRequest(requestId);
     }, TIMELINE_PENDING_UNICAST_TIMEOUT_MS);
     timer.unref?.();
+    const sessionName = optionalString(msg.sessionName);
+    const subscriptionMode = mode
+      ?? (msg.mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+        ? TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+        : msg.mode === TIMELINE_SUBSCRIPTION_MODES.FULL
+          ? TIMELINE_SUBSCRIPTION_MODES.FULL
+          : sessionName ? this.timelineSubscriptions.get(ws)?.get(sessionName) : undefined);
     this.pendingTimelineRequests.set(requestId, {
       socket: ws,
-      sessionName: optionalString(msg.sessionName),
       timer,
+      ...(sessionName ? { sessionName } : {}),
+      ...(subscriptionMode ? { mode: subscriptionMode } : {}),
     });
   }
 
@@ -3870,6 +3977,7 @@ export class WsBridge {
       subscriptions = new Map();
       this.timelineSubscriptions.set(ws, subscriptions);
     }
+    this.clearTimelineLatestValueFingerprints(ws, sessionName);
     subscriptions.set(sessionName, mode);
 
     // A mode switch can carry the last cursor in one round trip. Reuse the
@@ -3891,7 +3999,7 @@ export class WsBridge {
         requestId,
         cursor: { epoch, afterSeq, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER },
       };
-      this.registerPendingTimelineRequest(ws, history);
+      this.registerPendingTimelineRequest(ws, history, mode);
       this.sendToDaemon(JSON.stringify(history));
     }
   }
@@ -4501,6 +4609,26 @@ export class WsBridge {
     }]);
   }
 
+  /**
+   * Apply the same summary projection to request/response backfills that live
+   * fanout already applies.  A history response is routed directly to the
+   * requesting socket, so it cannot pass through deliverTimelineEventToSubscribers;
+   * without this projection a minimized summary window receives streaming text
+   * during cold backfill and loses the bytes/finality guarantees of summary mode.
+   */
+  private shapeTimelineResponseForSocket(
+    response: Record<string, unknown>,
+    pending: PendingTimelineRequest,
+  ): Record<string, unknown> {
+    if (pending.mode !== TIMELINE_SUBSCRIPTION_MODES.SUMMARY) return response;
+    if (response.type !== TIMELINE_MESSAGES.HISTORY && response.type !== TIMELINE_MESSAGES.PAGE) return response;
+    if (!Array.isArray(response.events)) return response;
+    const events = response.events
+      .filter((event): event is Record<string, unknown> => isPlainRecord(event) && this.isTimelineSummaryEvent(event))
+      .map((event) => this.summarizeTimelineEvent(event));
+    return { ...response, events };
+  }
+
   private handleTimelineDataPlaneResponse(msg: Record<string, unknown>, type: string): void {
     const primaryRequestId = optionalString(msg.requestId);
     if (primaryRequestId) {
@@ -4548,20 +4676,16 @@ export class WsBridge {
           payload: timelineResponseForRequestId(msg, requestId),
           estimatedBytes: estimateTimelineDataPlaneBytes(msg),
         })),
-        ...socketDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => {
-          const response = timelineResponseForRequestId(msg, requestId);
-          const mode = pending.sessionName
-            ? this.timelineSubscriptions.get(pending.socket)?.get(pending.sessionName)
-            : undefined;
-          const payload = this.filterTimelineResponseForMode(response, mode);
-          return {
-            origin: 'browser_request',
-            requestId,
-            socket: pending.socket,
-            payload,
-            estimatedBytes: estimateTimelineDataPlaneBytes(payload),
-          };
-        }),
+        ...socketDeliveries.map(({ requestId, pending }): TimelineDataPlaneAttachment => ({
+          origin: 'browser_request',
+          requestId,
+          socket: pending.socket,
+          payload: this.shapeTimelineResponseForSocket(
+            timelineResponseForRequestId(msg, requestId),
+            pending,
+          ),
+          estimatedBytes: estimateTimelineDataPlaneBytes(msg),
+        })),
       ];
       this.enqueueTimelineDataPlaneFanout(attachments, {
         type,
@@ -6173,6 +6297,21 @@ export class WsBridge {
         return;
       }
 
+      // Test-only observability for the real-browser performance harness. It
+      // is disabled unless explicitly enabled in the compose environment and
+      // exposes counters plus live per-socket queue/buffer state without
+      // routing through the daemon or delaying any control frame.
+      if (msg.type === 'perf.debug.timeline_metrics' && process.env.IMCODES_PERF_DEBUG === '1') {
+        const sockets = [...this.browserSockets].map((socket, index) => ({
+          index,
+          bufferedAmount: typeof socket.bufferedAmount === 'number' ? socket.bufferedAmount : 0,
+          queue: this.timelineQueues.get(socket)?.snapshot() ?? { bytes: 0, pending: 0, sending: false },
+          subscriptions: [...(this.timelineSubscriptions.get(socket)?.entries() ?? [])].map(([sessionName, mode]) => ({ sessionName, mode })),
+        }));
+        safeSend(ws, JSON.stringify({ type: msg.type, requestId: msg.requestId, counters: snapshotCounters(), sockets }));
+        return;
+      }
+
       if (this.browserShareStates.has(ws)) {
         const shareCommandDecision = await this.evaluateShareScopedBrowserCommand(ws, msg);
         if (!shareCommandDecision.allowed) {
@@ -6457,6 +6596,7 @@ export class WsBridge {
       if (msg.type === TIMELINE_MESSAGES.UNSUBSCRIBE && typeof msg.sessionName === 'string') {
         this.timelineProtocolSockets.add(ws);
         this.timelineSubscriptions.get(ws)?.delete(msg.sessionName);
+        this.clearTimelineLatestValueFingerprints(ws, msg.sessionName);
         return;
       }
 
@@ -8624,10 +8764,25 @@ export class WsBridge {
 
   private summarizeTimelineEvent(event: Record<string, unknown>): Record<string, unknown> {
     const type = typeof event.type === 'string' ? event.type : '';
-    if (type !== 'tool.call' && type !== 'tool.result') return event;
     const payload = event.payload && typeof event.payload === 'object'
       ? event.payload as Record<string, unknown>
       : {};
+    // Summary sockets need the latest state/status/usage values, not the
+    // transport's often-large diagnostic/detail trees. Keep primitive fields
+    // (state, status, model, token/cost counters, timestamps) and discard
+    // nested payloads so background windows cannot receive megabytes of
+    // repeated status metadata. Full-mode delivery remains byte-for-byte
+    // unchanged. This is deliberately generic because providers add fields
+    // over time; primitive values are the stable, renderable projection.
+    if (type === 'session.state' || type === 'agent.status' || type === 'usage.update') {
+      const compactPayload: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(payload)) {
+        if (typeof value === 'string') compactPayload[key] = value.length > 256 ? `${value.slice(0, 256)}…` : value;
+        else if (typeof value === 'number' || typeof value === 'boolean') compactPayload[key] = value;
+      }
+      return { ...event, summary: true, payload: compactPayload };
+    }
+    if (type !== 'tool.call' && type !== 'tool.result') return event;
     const previewFields = ['command', 'description', 'input', 'output', 'text', 'error', 'status'];
     const preview: Record<string, unknown> = {};
     for (const key of previewFields) {
@@ -8643,24 +8798,36 @@ export class WsBridge {
     };
   }
 
-  /** Apply the wire-level summary policy to either live or replayed events. */
-  private filterTimelineEventsForMode(
-    events: readonly Record<string, unknown>[],
-    mode: TimelineSubscriptionMode | undefined,
-  ): Record<string, unknown>[] {
-    if (mode !== TIMELINE_SUBSCRIPTION_MODES.SUMMARY) return [...events];
-    return events
-      .filter((event) => this.isTimelineSummaryEvent(event))
-      .map((event) => this.summarizeTimelineEvent(event));
+  private suppressUnchangedTimelineValue(
+    ws: WebSocket,
+    sessionName: string,
+    eventType: string,
+    payload: Record<string, unknown>,
+  ): boolean {
+    let fingerprints = this.timelineLatestValueFingerprints.get(ws);
+    if (!fingerprints) {
+      fingerprints = new Map();
+      this.timelineLatestValueFingerprints.set(ws, fingerprints);
+    }
+    const key = `${sessionName}\u0000${eventType}`;
+    const fingerprint = timelinePayloadFingerprint(payload);
+    if (fingerprints.get(key) === fingerprint) return true;
+    fingerprints.set(key, fingerprint);
+    return false;
   }
 
-  private filterTimelineResponseForMode(
-    response: Record<string, unknown>,
-    mode: TimelineSubscriptionMode | undefined,
-  ): Record<string, unknown> {
-    if (mode !== TIMELINE_SUBSCRIPTION_MODES.SUMMARY || !Array.isArray(response.events)) return response;
-    const events = response.events.filter(isPlainRecord) as Record<string, unknown>[];
-    return { ...response, events: this.filterTimelineEventsForMode(events, mode) };
+  private clearTimelineLatestValueFingerprints(ws: WebSocket, sessionName?: string): void {
+    if (!sessionName) {
+      this.timelineLatestValueFingerprints.delete(ws);
+      return;
+    }
+    const fingerprints = this.timelineLatestValueFingerprints.get(ws);
+    if (!fingerprints) return;
+    const prefix = `${sessionName}\u0000`;
+    for (const key of fingerprints.keys()) {
+      if (key.startsWith(prefix)) fingerprints.delete(key);
+    }
+    if (fingerprints.size === 0) this.timelineLatestValueFingerprints.delete(ws);
   }
 
   private deliverTimelineEventToSubscribers(
@@ -8693,16 +8860,24 @@ export class WsBridge {
     for (const ws of sockets) {
       const mode = this.timelineSubscriptions.get(ws)?.get(sessionName);
       if (this.timelineProtocolSockets.has(ws) && !mode) continue;
-      const outgoingEvent = this.filterTimelineEventsForMode([rawEvent], mode)[0];
-      if (!outgoingEvent) continue;
+      if (mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY && !this.isTimelineSummaryEvent(rawEvent)) continue;
+      const outgoingEvent = mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+        ? this.summarizeTimelineEvent(rawEvent)
+        : rawEvent;
       const outgoingEnvelope = { ...envelope, event: outgoingEvent };
       const msg = this.tryParseJsonRecord(JSON.stringify(outgoingEnvelope));
       const outgoing = this.filterShareOutgoingJson(ws, msg, JSON.stringify(outgoingEnvelope));
       if (!outgoing) continue;
-      const coalescible = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update';
+      const terminalSessionState = eventType === 'session.state'
+        && TIMELINE_TERMINAL_SESSION_STATES.includes(String(payload.state) as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number]);
+      const terminalUsage = eventType === 'usage.update' && payload.streaming === false;
+      const latestValueEvent = eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update';
+      if (latestValueEvent && this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload)) continue;
+      const coalescible = (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')
+        && !terminalSessionState && !terminalUsage;
       const priority = eventType === 'assistant.text' && payload.streaming !== true
         ? 'final'
-        : coalescible ? 'coalescible' : 'durable';
+        : terminalSessionState || terminalUsage ? 'final' : coalescible ? 'coalescible' : 'durable';
       const item: TimelineQueueEvent = {
         data: outgoing,
         sessionId,
@@ -8711,27 +8886,20 @@ export class WsBridge {
         priority,
         ...(coalescible ? { coalesceKey: `${sessionId}\0${eventType}` } : {}),
       };
-      // Active/visible windows are latency-sensitive. A healthy full-mode
-      // socket takes the direct path: no coalescing, no queue scheduling, and
-      // every streaming delta remains ordered. Only a real bufferedAmount
-      // overflow falls back to the bounded queue/gap path.
-      const existingQueue = this.timelineQueues.get(ws);
-      const activeQueue = existingQueue && !existingQueue.isIdle() ? existingQueue : undefined;
-      if ((mode === TIMELINE_SUBSCRIPTION_MODES.FULL || !activeQueue)
-        && (typeof ws.bufferedAmount !== 'number' || ws.bufferedAmount <= TIMELINE_SOCKET_BUFFERED_HIGH_WATER)) {
-        incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
-        addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
-        if (safeSend(ws, outgoing)) recipients += 1;
-        continue;
-      }
-      let queue = activeQueue;
+      // Latest-value signals are coalesced for every mode, including healthy
+      // full sockets. This is deliberately a presentation-window delay, not
+      // backpressure: text deltas stay direct/durable and terminal state is
+      // flushed ahead of the next final event.
+      let queue = this.timelineQueues.get(ws);
       if (!queue) {
         queue = new TimelineOutboundQueue();
         this.timelineQueues.set(ws, queue);
       }
       incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_RECIPIENT, { mode: mode ?? 'legacy', eventType });
       addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BYTES, Buffer.byteLength(outgoing, 'utf8'), { mode: mode ?? 'legacy', eventType });
-      addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BUFFERED, typeof ws.bufferedAmount === 'number' ? ws.bufferedAmount : 0, { mode: mode ?? 'legacy' });
+      if (typeof ws.bufferedAmount === 'number' && ws.bufferedAmount > TIMELINE_SOCKET_BUFFERED_HIGH_WATER) {
+        addCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_BUFFERED, ws.bufferedAmount, { mode: mode ?? 'legacy' });
+      }
       queue.enqueue(ws, item, (dropped) => {
         incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_GAP, { mode: mode ?? 'legacy', eventType });
         incrementCounter('ws_bridge_timeline_socket_gap', { reason: dropped.priority });
@@ -8747,6 +8915,13 @@ export class WsBridge {
         safeSend(ws, JSON.stringify(gap));
       }, () => {
         incrementCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, { mode: mode ?? 'legacy', eventType });
+      }, {
+        coalesceWindowMs: coalescible
+          ? mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY
+            ? TIMELINE_SUMMARY_LATEST_VALUE_COALESCE_WINDOW_MS
+            : TIMELINE_FULL_LATEST_VALUE_COALESCE_WINDOW_MS
+          : undefined,
+        flushCoalesced: !coalescible,
       });
       recipients += 1;
     }
@@ -9025,6 +9200,7 @@ export class WsBridge {
     this.transportSubscriptions.delete(ws);
     this.timelineSubscriptions.delete(ws);
     this.timelineProtocolSockets.delete(ws);
+    this.clearTimelineLatestValueFingerprints(ws);
     this.cancelTimelineDataPlaneForSocket(ws);
     this.timelineQueues.get(ws)?.dispose();
     this.timelineQueues.delete(ws);
