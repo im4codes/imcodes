@@ -4104,6 +4104,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // it from the record later, not from the in-request overlay further below
   // that exists only to steer this turn's own prompts.
   if (requestedUiLocale && sessionName) {
+    queueMicrotask(() => {
     try {
       const existingRecord = getSession(sessionName);
       // patchTransportConfigUiLocale stores this under its own sibling
@@ -4123,6 +4124,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     } catch (error) {
       logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
     }
+    });
   }
 
   if (trimmedText === '/stop') {
