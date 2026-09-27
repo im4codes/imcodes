@@ -40,6 +40,7 @@ import { useMachines } from '../hooks/useMachines.js';
 import { buildMachineSendExtra } from '../util/machine-send.js';
 import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 
 const TYPE_ICON: Record<string, string> = {
   'claude-code': '⚡',
@@ -143,6 +144,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
 }
 
 function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+  recordPerfRender('SubSessionCard');
   const { t } = useTranslation();
   // Shared alias data so the compact card's plain-text composer resolves
   // `;;(name)` markers the same way the main SessionControls composer does

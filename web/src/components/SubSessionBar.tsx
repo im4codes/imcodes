@@ -39,6 +39,7 @@ import {
   getSubSessionAccentColorMap,
 } from '../subsession-accent-colors.js';
 import { OpenSpecAutoDeliverRunBar } from './OpenSpecAutoDeliver.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 import type { OpenSpecAutoDeliverProjection } from '../openspec-auto-deliver.js';
 import {
   SUBSESSION_DESKTOP_DOCK_SIDE,
@@ -763,6 +764,7 @@ function DaemonStatsModal({
 }
 
 export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayoutCapable = true, desktopLayout = SUBSESSION_DESKTOP_LAYOUT.HORIZONTAL, onDesktopLayoutChange, desktopDockSide = SUBSESSION_DESKTOP_DOCK_SIDE.RIGHT, onDesktopDockSideChange, verticalRailHost, teamDiscussionLayout = TEAM_DISCUSSION_LAYOUT.BOTTOM, onTeamDiscussionLayoutChange, teamDiscussionRailHost, idleFlashTokens, sharedSubSessionStates, onOpen, onFocus, onClose, onCloseAllOpen, onRestoreQuickClosed, onOpenMaximized, onMaximize, onRestore, onRestoreThenClose, onRestart, onNew, onViewAutoDeliver, onViewDiscussions, onViewDiscussion, onViewRepo, onViewCron, openSpecAutoProjection, openSpecAutoStopPending = false, openSpecAutoCompact = false, onOpenSpecAutoView, onOpenSpecAutoStop, onOpenSpecAutoToggleCompact, onOpenSpecAutoHide, discussions = [], totalRunningDiscussions = 0, onStopDiscussion, ws, connected, onDiff, onHistory, serverId, quickClosePersistenceScope, subUsages, detectedModels, focusedSubId, collapsed: controlledCollapsed, onCollapsedChange, onVisualOrderChange, quickData, sessions, allSubSessions, p2pSessionLabels, onSubTransportConfigSaved }: Props) {
+  recordPerfRender('SubSessionBar');
   const { t } = useTranslation();
   const isMobile = !desktopLayoutCapable;
   const isVerticalRail = desktopLayoutCapable && desktopLayout === SUBSESSION_DESKTOP_LAYOUT.VERTICAL;

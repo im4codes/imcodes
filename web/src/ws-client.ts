@@ -6,6 +6,7 @@ import type { TerminalDiff } from './types.js';
 import type { TransportPendingMessageEntry } from './transport-queue.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
+import { markPerfFrame } from './perf-render-debug.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '@shared/daemon-upgrade.js';
@@ -2617,6 +2618,7 @@ export class WsClient {
   }
 
   private dispatch(msg: ServerMessage): void {
+    if (msg.type === TIMELINE_MESSAGES.EVENT) markPerfFrame(msg.event?.type ?? 'other');
     if (msg.type === 'session_list') {
       this.sessionListRequestInFlight = false;
     }

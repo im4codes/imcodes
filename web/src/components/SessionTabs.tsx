@@ -8,6 +8,7 @@ import { getAgentBadgeConfig } from '../agent-display.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -76,6 +77,7 @@ function readLegacyOrder(): string[] {
 }
 
 function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+  recordPerfRender('SessionTabs');
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);

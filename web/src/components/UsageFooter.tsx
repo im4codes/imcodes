@@ -30,6 +30,7 @@ import {
   ProviderQuotaLine,
   useProviderQuotaLabel,
 } from './ProviderQuotaLine.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 
 interface Props {
   usage: UsageData;
@@ -89,6 +90,7 @@ const fmt = (n: number) =>
   : String(n);
 
 function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, onRefreshHistory, historyRefreshing = false, historyStatus, wsClient, connected }: Props) {
+  recordPerfRender('UsageFooter');
   const { t } = useTranslation();
   const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
 

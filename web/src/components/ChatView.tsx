@@ -19,6 +19,7 @@ import {
   type CronRunTimelineProjection,
 } from '@shared/cron-types.js';
 import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 import { localizeChatDownloadError } from '../chat-download-error.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
@@ -2227,6 +2228,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
 }
 
 function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+  recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
   // Sent on every chatFileReference:true request (path click, preview, download).
