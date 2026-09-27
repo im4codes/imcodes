@@ -2444,7 +2444,8 @@ describe('App shell', () => {
     }, 'deck_sub_alpha_helper'));
 
     await waitFor(() => {
-      expect(screen.queryByTestId('sub-session-window-sub-1')).toBeNull();
+      const hiddenSource = screen.getByTestId('sub-session-window-sub-1');
+      expect(hiddenSource.getAttribute('data-visible')).toBe('false');
       expect(screen.getByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
       expect(chatScrollMock).not.toHaveBeenCalled();
     });
