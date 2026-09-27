@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'preact/hooks';
+import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
@@ -11,17 +11,13 @@ export function collapsedStorageKey(serverId: string | null | undefined, mobile:
   const scope = serverId ? `:${serverId}` : '';
   return `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}${scope}:${mobile ? 'mobile' : 'desktop'}`;
 }
-function legacyCollapsedStorageKey(serverId?: string | null): string {
-  return serverId ? `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}:${serverId}` : TASK_PAIR_STATUS_PANEL_STORAGE_KEY;
-}
-
 function mobileLayout(): boolean {
   try { return window.matchMedia?.('(max-width: 720px)').matches ?? false; } catch { return false; }
 }
 
 function readCollapsed(serverId: string | null | undefined, mobile: boolean): boolean {
   try {
-    const stored = window.localStorage.getItem(collapsedStorageKey(serverId, mobile)) ?? window.localStorage.getItem(legacyCollapsedStorageKey(serverId));
+    const stored = window.localStorage.getItem(collapsedStorageKey(serverId, mobile));
     return stored === null ? mobile : stored === '1';
   } catch { return mobile; }
 }
@@ -75,6 +71,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   const [isMobile, setIsMobile] = useState(mobileLayout);
   const [collapsed, setCollapsed] = useState(() => readCollapsed(serverId, mobileLayout()));
   const panelRef = useRef<HTMLElement>(null);
+  const persistCollapsed = useCallback((next: boolean) => {
+    setCollapsed(next);
+    try { window.localStorage.setItem(collapsedStorageKey(serverId, isMobile), next ? '1' : '0'); } catch {}
+  }, [serverId, isMobile]);
   useEffect(() => {
     const media = window.matchMedia?.('(max-width: 720px)');
     if (!media) return undefined;
@@ -88,12 +88,12 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
   }, [serverId, isMobile]);
   useEffect(() => {
     if (collapsed) return undefined;
-    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') setCollapsed(true); };
-    const onPointerDown = (event: PointerEvent) => { if (!panelRef.current?.contains(event.target as Node)) setCollapsed(true); };
+    const onKeyDown = (event: KeyboardEvent) => { if (event.key === 'Escape') persistCollapsed(true); };
+    const onPointerDown = (event: PointerEvent) => { if (!panelRef.current?.contains(event.target as Node)) persistCollapsed(true); };
     window.addEventListener('keydown', onKeyDown);
     window.addEventListener('pointerdown', onPointerDown);
     return () => { window.removeEventListener('keydown', onKeyDown); window.removeEventListener('pointerdown', onPointerDown); };
-  }, [collapsed]);
+  }, [collapsed, persistCollapsed]);
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
@@ -148,13 +148,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
   if (latest.size === 0) return null;
-  const toggle = () => setCollapsed((value) => { const next = !value; try {
-    const encoded = next ? '1' : '0';
-    window.localStorage.setItem(collapsedStorageKey(serverId, isMobile), encoded);
-    // Keep the pre-layout key in sync for existing installations; reads prefer
-    // the layout-specific value, so desktop/mobile preferences remain isolated.
-    window.localStorage.setItem(legacyCollapsedStorageKey(serverId), encoded);
-  } catch {} return next; });
+  const toggle = () => persistCollapsed(!collapsed);
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
   const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session

@@ -130,6 +130,21 @@ describe('TaskPairStatusPanel', () => {
     expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
     expect(screen.getByRole('button', { name: /panel_expand.*panel_title/ })).toBeTruthy();
   });
+
+  it('persists Escape/outside close and never leaks desktop state into mobile', () => {
+    const events = [{ eventId: 'close-persist', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'close-persist', title: 'Close', toStatus: 'working' } }] as never;
+    const original = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const { unmount } = render(<TaskPairStatusPanel events={events} serverId="close" />);
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:close:desktop')).toBe('1');
+    unmount();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    render(<TaskPairStatusPanel events={events} serverId="close" />);
+    expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:close:mobile')).toBeNull();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
   it('renders four compact status icons when collapsed, highlights Brain decisions, and scopes persistence per server', () => {
     window.localStorage.clear();
     const events = [
@@ -143,12 +158,12 @@ describe('TaskPairStatusPanel', () => {
     const icons = container.querySelectorAll('.task-pair-status-icon');
     expect(icons).toHaveLength(4);
     expect(container.querySelector('.task-pair-status-icon--awaiting.is-highlighted')).toBeTruthy();
-    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-a')).toBe('1');
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-a:desktop')).toBe('1');
     cleanup();
     render(<TaskPairStatusPanel events={events} serverId="server-b" />);
     expect(document.querySelector('.task-pair-status-icons')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
-    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-b')).toBe('1');
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-b:desktop')).toBe('1');
   });
 
   it('groups live pair state, keeps counts while collapsed, and persists collapse', () => {
@@ -165,7 +180,7 @@ describe('TaskPairStatusPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
     expect(screen.queryByText('Build panel')).toBeNull();
     expect(container.querySelector('.task-pair-status-icons')).toBeTruthy();
-    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed')).toBe('1');
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:desktop')).toBe('1');
   });
 
   it('shows queued pairs in queue order with assignment fallback and urgency', () => {
