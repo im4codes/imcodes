@@ -510,11 +510,12 @@ serverRoutes.get('/:id/shared-context/runtime-config/daemon', async (c) => {
   const serverRow = authed.auth;
   const persisted = await getServerSharedContextRuntimeConfig(c.env.DB, serverId);
   const personalSyncEnabled = await getPersonalMemorySyncEnabled(c.env.DB, serverRow.userId);
+  const config = normalizeSharedContextRuntimeConfig({
+    ...(persisted ?? defaultSharedContextRuntimeConfig()),
+    enablePersonalMemorySync: personalSyncEnabled,
+  });
   return c.json({
-    config: {
-      ...(persisted ?? defaultSharedContextRuntimeConfig()),
-      enablePersonalMemorySync: personalSyncEnabled,
-    },
+    config,
   });
 });
 

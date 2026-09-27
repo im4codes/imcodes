@@ -22,6 +22,15 @@ vi.mock('@anthropic-ai/claude-agent-sdk', () => ({
   query: (...args: unknown[]) => queryMock(...args),
 }));
 
+vi.mock('../../src/agent/transport-paths.js', () => ({
+  resolveClaudeCodePathForSdk: () => '/usr/bin/claude',
+}));
+
+const ensureProviderConnectedMock = vi.hoisted(() => vi.fn());
+vi.mock('../../src/agent/provider-registry.js', () => ({
+  ensureProviderConnected: (...args: unknown[]) => ensureProviderConnectedMock(...args),
+}));
+
 function event(content: string, index: number): CompressionInput['events'][number] {
   return {
     id: `event-${index}`,
@@ -35,8 +44,9 @@ describe('summary compressor keeps the main thread free', () => {
   beforeEach(async () => {
     countTokensSpy.mockClear();
     queryMock.mockReset();
-    const { resetActiveCompressionRunsForTests, resumeAcceptingCompression } = await import('../../src/context/summary-compressor.js');
+    const { resetActiveCompressionRunsForTests, resetFailureTracking, resumeAcceptingCompression } = await import('../../src/context/summary-compressor.js');
     resetActiveCompressionRunsForTests();
+    resetFailureTracking();
     resumeAcceptingCompression();
   });
 
@@ -82,5 +92,42 @@ describe('summary compressor keeps the main thread free', () => {
     expect(result).toMatchObject({ backend: 'none', model: 'local-fallback', fromSdk: false });
     expect(queryMock).not.toHaveBeenCalled();
     expect(countTokensSpy).not.toHaveBeenCalled();
+  });
+
+  it('uses the configured backup when the primary provider fails', async () => {
+    const provider = {
+      createSession: vi.fn().mockResolvedValue('compression-primary-session'),
+      endSession: vi.fn().mockResolvedValue(undefined),
+      send: vi.fn().mockRejectedValue(new Error('invalid api key')),
+      onComplete: vi.fn(() => () => undefined),
+      onError: vi.fn(() => () => undefined),
+    };
+    ensureProviderConnectedMock.mockResolvedValue(provider);
+    queryMock.mockReturnValue((async function* () {
+      yield {
+        type: 'assistant',
+        message: { content: [{ type: 'text', text: '## Done\nBackup summary' }] },
+      };
+    })());
+
+    const { compressWithSdk } = await import('../../src/context/summary-compressor.js');
+    const result = await compressWithSdk({
+      events: [event('primary fails', 0)],
+      modelConfig: {
+        primaryContextBackend: 'codex-sdk',
+        primaryContextModel: 'gpt-6-luna',
+        backupContextBackend: 'claude-code-sdk',
+        backupContextModel: 'haiku',
+      },
+    });
+
+    expect(result).toMatchObject({
+      backend: 'claude-code-sdk',
+      model: 'haiku',
+      usedBackup: true,
+      fromSdk: true,
+    });
+    expect(provider.send).toHaveBeenCalledTimes(1);
+    expect(queryMock).toHaveBeenCalledTimes(1);
   });
 });

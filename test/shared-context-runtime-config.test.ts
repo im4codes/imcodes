@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import {
+  DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+  DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
+  DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
   DEFAULT_MEMORY_SCORING_WEIGHTS,
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
@@ -15,13 +17,15 @@ import {
 } from '../shared/shared-context-runtime-config.js';
 
 describe('shared-context-runtime-config', () => {
-  it('defaults memory compression to Codex 5.3 Spark', () => {
+  it('defaults memory compression to Codex gpt-6-luna with Claude Haiku backup', () => {
     const result = defaultSharedContextRuntimeConfig();
 
     expect(DEFAULT_PRIMARY_CONTEXT_BACKEND).toBe('codex-sdk');
-    expect(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+    expect(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL).toBe(DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL);
     expect(result.primaryContextBackend).toBe('codex-sdk');
-    expect(result.primaryContextModel).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+    expect(result.primaryContextModel).toBe(DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL);
+    expect(result.backupContextBackend).toBe(DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+    expect(result.backupContextModel).toBe(DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
   });
 
   it('uses backend-specific defaults when model is missing', () => {
@@ -30,8 +34,8 @@ describe('shared-context-runtime-config', () => {
     });
     expect(result.primaryContextBackend).toBe('qwen');
     expect(result.primaryContextModel).toBe(getDefaultSharedContextModelForBackend('qwen'));
-    expect(result.backupContextBackend).toBeUndefined();
-    expect(result.backupContextModel).toBeUndefined();
+    expect(result.backupContextBackend).toBe(DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+    expect(result.backupContextModel).toBe(DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
     expect(result.memoryRecallMinScore).toBe(DEFAULT_MEMORY_RECALL_MIN_SCORE);
     expect(result.memoryScoringWeights).toEqual(DEFAULT_MEMORY_SCORING_WEIGHTS);
     expect(result.enablePersonalMemorySync).toBe(true);
@@ -68,6 +72,17 @@ describe('shared-context-runtime-config', () => {
     expect(result.primaryContextModel).toBe('sonnet');
     expect(result.backupContextBackend).toBe('qwen');
     expect(result.backupContextModel).toBe(getDefaultSharedContextModelForBackend('qwen'));
+  });
+
+  it('fills only missing runtime selections while preserving saved primary values', () => {
+    const result = normalizeSharedContextRuntimeConfig({
+      primaryContextBackend: 'claude-code-sdk',
+      primaryContextModel: 'opus[1M]',
+    });
+    expect(result.primaryContextBackend).toBe('claude-code-sdk');
+    expect(result.primaryContextModel).toBe('opus[1M]');
+    expect(result.backupContextBackend).toBe(DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+    expect(result.backupContextModel).toBe(DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
   });
 
   it('passes through primaryContextSdk and backupContextSdk when provided', () => {

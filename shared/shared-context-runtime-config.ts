@@ -3,7 +3,6 @@ import { DEFAULT_PRIMARY_CONTEXT_MODEL } from './context-model-defaults.js';
 import {
   CLAUDE_CODE_MODEL_IDS,
   CODEX_MODEL_IDS,
-  DEFAULT_CODEX_AUTOMATION_MODEL,
   looksLikeCodexModelId,
   normalizeClaudeCodeModelId,
 } from '../src/shared/models/options.js';
@@ -18,9 +17,12 @@ export { DEFAULT_MEMORY_SCORING_WEIGHTS, normalizeMemoryScoringWeights } from '.
 
 export const SHARED_CONTEXT_RUNTIME_BACKENDS = ['claude-code-sdk', 'codex-sdk', 'qwen', 'openclaw'] as const satisfies readonly SharedContextRuntimeBackend[];
 export const DEFAULT_PRIMARY_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'codex-sdk';
+export const DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL = 'gpt-6-luna';
+export const DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND: SharedContextRuntimeBackend = 'claude-code-sdk';
+export const DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL = 'haiku';
 export const DEFAULT_CONTEXT_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = {
   'claude-code-sdk': DEFAULT_PRIMARY_CONTEXT_MODEL,
-  'codex-sdk': DEFAULT_CODEX_AUTOMATION_MODEL,
+  'codex-sdk': DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
   qwen: 'qwen3-coder-plus',
   openclaw: DEFAULT_PRIMARY_CONTEXT_MODEL,
 };
@@ -56,8 +58,8 @@ export function defaultSharedContextRuntimeConfig(): ContextModelConfig {
     primaryContextBackend: DEFAULT_PRIMARY_CONTEXT_BACKEND,
     primaryContextModel: DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
     primaryContextPreset: undefined,
-    backupContextBackend: undefined,
-    backupContextModel: undefined,
+    backupContextBackend: DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+    backupContextModel: DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
     backupContextPreset: undefined,
     memoryRecallMinScore: DEFAULT_MEMORY_RECALL_MIN_SCORE,
     memoryScoringWeights: { ...DEFAULT_MEMORY_SCORING_WEIGHTS },
@@ -210,11 +212,21 @@ export function normalizeSharedContextRuntimeConfig(
   const primaryContextModel = rawPrimaryContextModel && isKnownSharedContextModelForBackend(normalizedPrimaryBackend, rawPrimaryContextModel, primaryContextPreset)
     ? rawPrimaryContextModel
     : getDefaultSharedContextModelForBackend(normalizedPrimaryBackend);
-  const backup = normalizeOptionalSharedContextRuntimeSelection({
-    backend: input?.backupContextBackend,
-    model: input?.backupContextModel,
-    preset: input?.backupContextPreset,
-  });
+  const hasBackupSelection = Boolean(
+    input?.backupContextBackend?.trim()
+      || input?.backupContextModel?.trim()
+      || input?.backupContextPreset?.trim(),
+  );
+  const backup = hasBackupSelection
+    ? normalizeOptionalSharedContextRuntimeSelection({
+      backend: input?.backupContextBackend,
+      model: input?.backupContextModel,
+      preset: input?.backupContextPreset,
+    })
+    : {
+      backend: DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+      model: DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
+    };
   const rawMinInterval = input?.materializationMinIntervalMs;
   const materializationMinIntervalMs = typeof rawMinInterval === 'number' && rawMinInterval > 0 ? rawMinInterval : undefined;
   const memoryRecallMinScore = normalizeMemoryRecallMinScore(input?.memoryRecallMinScore);

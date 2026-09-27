@@ -6,7 +6,7 @@ import { useState } from 'preact/hooks';
 import { act } from 'preact/test-utils';
 import { MEMORY_WS } from '@shared/memory-ws.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME } from '@shared/feature-flags.js';
-import { DEFAULT_CODEX_AUTOMATION_MODEL } from '../../../src/shared/models/options.js';
+import { DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL } from '@shared/shared-context-runtime-config.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
@@ -437,7 +437,7 @@ describe('SharedContextManagementPanel', () => {
 
     await waitFor(() => expect(updateSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1', {
       primaryContextBackend: 'codex-sdk',
-      primaryContextModel: DEFAULT_CODEX_AUTOMATION_MODEL,
+      primaryContextModel: DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL,
       primaryContextPreset: undefined,
       backupContextBackend: 'qwen',
       backupContextModel: 'qwen3-coder-plus',
@@ -453,6 +453,40 @@ describe('SharedContextManagementPanel', () => {
     }));
     expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-5.4');
     expect(await screen.findByText('sharedContext.management.processingSavedPrimaryBackend')).toBeDefined();
+  });
+
+  it('pre-fills memory processing with the Codex Luna primary and Claude Haiku backup when unconfigured', async () => {
+    const snapshot = {
+      primaryContextBackend: 'codex-sdk',
+      primaryContextModel: 'gpt-6-luna',
+      primaryContextPreset: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
+      backupContextPreset: undefined,
+      memoryRecallMinScore: 0.4,
+      memoryScoringWeights: { similarity: 0.4, recency: 0.25, frequency: 0.15, project: 0.2 },
+      enablePersonalMemorySync: false,
+    };
+    fetchSharedContextRuntimeConfigMock.mockResolvedValueOnce({
+      snapshot: {
+        persisted: snapshot,
+        effective: snapshot,
+        envPrimaryOverrideActive: false,
+        envBackupOverrideActive: false,
+        defaultPrimaryContextBackend: 'codex-sdk',
+        defaultPrimaryContextModel: 'gpt-6-luna',
+      },
+    });
+    render(<SharedContextManagementPanel serverId="srv-1" />);
+    await act(async () => {
+      fireEvent.click(screen.getByText('sharedContext.management.tabs.processing'));
+    });
+    await waitFor(() => expect(fetchSharedContextRuntimeConfigMock).toHaveBeenCalledWith('srv-1'));
+
+    expect(screen.getByLabelText('sharedContext.management.processingPrimaryBackend: codex-sdk')).toBeDefined();
+    expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('gpt-6-luna');
+    expect(screen.getByLabelText('sharedContext.management.processingBackupBackend: claude-code-sdk')).toBeDefined();
+    expect((screen.getByLabelText('backup:model') as HTMLSelectElement).value).toBe('haiku');
   });
 
   it('loads and saves the message recall threshold from memory settings', async () => {
@@ -476,8 +510,8 @@ describe('SharedContextManagementPanel', () => {
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
       primaryContextPreset: undefined,
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.36,
       memoryScoringWeights: {
@@ -517,8 +551,8 @@ describe('SharedContextManagementPanel', () => {
       primaryContextBackend: 'claude-code-sdk',
       primaryContextModel: 'sonnet',
       primaryContextPreset: undefined,
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {
@@ -563,7 +597,7 @@ describe('SharedContextManagementPanel', () => {
     expect((screen.getByLabelText('primary:model') as HTMLSelectElement).value).toBe('qwen3-coder-plus');
   });
 
-  it('defaults Codex-backed memory processing to Spark while keeping GPT-5.6 selectable', async () => {
+  it('defaults Codex-backed memory processing to gpt-6-luna while keeping GPT-5.6 selectable', async () => {
     render(<SharedContextManagementPanel serverId="srv-1" />);
     await flush();
 
@@ -578,7 +612,7 @@ describe('SharedContextManagementPanel', () => {
     });
 
     const primaryModel = await screen.findByLabelText('primary:model') as HTMLSelectElement;
-    expect(primaryModel.value).toBe(DEFAULT_CODEX_AUTOMATION_MODEL);
+    expect(primaryModel.value).toBe(DEFAULT_MEMORY_PRIMARY_CONTEXT_MODEL);
     expect([...primaryModel.options].some((option) => option.value === 'gpt-5.6')).toBe(true);
   });
 
@@ -705,8 +739,8 @@ describe('SharedContextManagementPanel', () => {
       primaryContextBackend: 'qwen',
       primaryContextModel: 'qwen-team-model-v2',
       primaryContextPreset: 'Qwen Team',
-      backupContextBackend: undefined,
-      backupContextModel: undefined,
+      backupContextBackend: 'claude-code-sdk',
+      backupContextModel: 'haiku',
       backupContextPreset: undefined,
       memoryRecallMinScore: 0.4,
       memoryScoringWeights: {

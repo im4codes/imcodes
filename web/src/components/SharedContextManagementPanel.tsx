@@ -39,6 +39,8 @@ import { OBSERVATION_CLASSES, type ObservationClass } from '@shared/memory-obser
 import {
   DEFAULT_MEMORY_RECALL_MIN_SCORE,
   DEFAULT_MEMORY_SCORING_WEIGHTS,
+  DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND,
+  DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
   DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL,
   doesSharedContextBackendSupportPresets,
@@ -2118,8 +2120,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     setProcessingPrimaryBackend(view.snapshot.persisted.primaryContextBackend);
     setProcessingPrimaryModel(view.snapshot.persisted.primaryContextModel);
     setProcessingPrimaryPreset(view.snapshot.persisted.primaryContextPreset ?? '');
-    setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? view.snapshot.persisted.primaryContextBackend);
-    setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? '');
+    setProcessingBackupBackend(view.snapshot.persisted.backupContextBackend ?? DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+    setProcessingBackupModel(view.snapshot.persisted.backupContextModel ?? DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
     setProcessingBackupPreset(view.snapshot.persisted.backupContextPreset ?? '');
     setProcessingMemoryRecallMinScore(view.snapshot.persisted.memoryRecallMinScore ?? DEFAULT_MEMORY_RECALL_MIN_SCORE);
     setProcessingMemoryScoringWeights(normalizeMemoryScoringWeights(view.snapshot.persisted.memoryScoringWeights ?? DEFAULT_MEMORY_SCORING_WEIGHTS));
@@ -2146,8 +2148,8 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
       setProcessingPrimaryBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
       setProcessingPrimaryModel(DEFAULT_PRIMARY_CONTEXT_RUNTIME_MODEL);
       setProcessingPrimaryPreset('');
-      setProcessingBackupBackend(DEFAULT_PRIMARY_CONTEXT_BACKEND);
-      setProcessingBackupModel('');
+      setProcessingBackupBackend(DEFAULT_MEMORY_BACKUP_CONTEXT_BACKEND);
+      setProcessingBackupModel(DEFAULT_MEMORY_BACKUP_CONTEXT_MODEL);
       setProcessingBackupPreset('');
       setProcessingMemoryRecallMinScore(DEFAULT_MEMORY_RECALL_MIN_SCORE);
       setProcessingMemoryScoringWeights({ ...DEFAULT_MEMORY_SCORING_WEIGHTS });

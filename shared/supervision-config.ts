@@ -2,14 +2,13 @@ import { advanceMarkdownFence, type MarkdownFenceState } from './markdown-fence.
 import { normalizeAuditBlockingSeverities, type AuditSeverity } from './audit-convergence.js';
 import type { TaskPairEngine } from './task-pair.js';
 import type { SharedContextRuntimeBackend } from './context-types.js';
-import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS } from '../src/shared/models/options.js';
+import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, DEFAULT_CODEX_AUTOMATION_MODEL } from '../src/shared/models/options.js';
 import { PROVIDER_ERROR_CODES } from './provider-error-codes.js';
 import { QWEN_MODEL_IDS } from './qwen-models.js';
 import {
   DEFAULT_CONTEXT_MODEL_BY_BACKEND,
   DEFAULT_PRIMARY_CONTEXT_BACKEND,
   SHARED_CONTEXT_RUNTIME_BACKENDS,
-  getDefaultSharedContextModelForBackend,
   inferSharedContextRuntimeBackend,
   isKnownSharedContextModelForBackend,
   normalizeSharedContextPresetValue,
@@ -1373,7 +1372,7 @@ export function normalizeSupervisorDefaultConfig(
   const rawModel = trimString(merged.model);
   const model = rawModel && isKnownSharedContextModelForBackend(normalizedBackend, rawModel, preset)
     ? rawModel
-    : getDefaultSharedContextModelForBackend(normalizedBackend);
+    : getDefaultSupervisionModelForBackend(normalizedBackend);
   const customInstructions = trimString(merged.customInstructions);
   const backup = normalizeOptionalSharedContextRuntimeSelection({
     backend: merged.backupBackend,
@@ -1886,13 +1885,13 @@ export function resolveSupervisionModelForBackend(
   previousBackend?: SharedContextRuntimeBackend,
 ): string {
   const trimmed = currentModel.trim();
-  if (!trimmed) return getDefaultSharedContextModelForBackend(nextBackend);
-  if (previousBackend && trimmed === getDefaultSharedContextModelForBackend(previousBackend)) {
-    return getDefaultSharedContextModelForBackend(nextBackend);
+  if (!trimmed) return getDefaultSupervisionModelForBackend(nextBackend);
+  if (previousBackend && trimmed === getDefaultSupervisionModelForBackend(previousBackend)) {
+    return getDefaultSupervisionModelForBackend(nextBackend);
   }
   if (nextBackend === 'openclaw') return trimmed;
   if (!isKnownSharedContextModelForBackend(nextBackend, trimmed)) {
-    return getDefaultSharedContextModelForBackend(nextBackend);
+    return getDefaultSupervisionModelForBackend(nextBackend);
   }
   return trimmed;
 }
@@ -2014,7 +2013,14 @@ export function isSupportedSupervisionSessionType(value: string | null | undefin
   return isSupportedSupervisionTargetSessionType(value);
 }
 
-export const DEFAULT_SUPERVISION_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = DEFAULT_CONTEXT_MODEL_BY_BACKEND;
+export const DEFAULT_SUPERVISION_MODEL_BY_BACKEND: Record<SharedContextRuntimeBackend, string> = {
+  ...DEFAULT_CONTEXT_MODEL_BY_BACKEND,
+  'codex-sdk': DEFAULT_CODEX_AUTOMATION_MODEL,
+};
+
+export function getDefaultSupervisionModelForBackend(backend: SharedContextRuntimeBackend): string {
+  return DEFAULT_SUPERVISION_MODEL_BY_BACKEND[backend];
+}
 
 /**
  * Merge rule for supervision custom instructions. See design.md §2 of
