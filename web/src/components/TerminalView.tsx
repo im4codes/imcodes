@@ -121,6 +121,11 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   previewRef.current = preview;
   const pendingRawChunksRef = useRef<Uint8Array[]>([]);
   const pendingRawBytesRef = useRef(0);
+  // xterm's parser is asynchronous.  Serialise completed frame writes so a
+  // timer flush cannot enter term.write while the previous frame is still
+  // being parsed (which can interleave bytes during high-volume PTY output).
+  const rawWriteQueueRef = useRef<Uint8Array[]>([]);
+  const rawWriteInFlightRef = useRef(false);
   const rawFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRawWriteAtRef = useRef(0);
 
@@ -172,19 +177,30 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     clearRawFlushTimer();
     pendingRawChunksRef.current = [];
     pendingRawBytesRef.current = 0;
+    rawWriteQueueRef.current = [];
   }, [clearRawFlushTimer]);
 
-  const writeRawToTerminal = useCallback((data: Uint8Array) => {
+  const drainRawWriteQueue = useCallback(() => {
+    if (rawWriteInFlightRef.current) return;
     const term = termRef.current;
-    if (!term) return;
+    const data = rawWriteQueueRef.current.shift();
+    if (!term || !data) return;
+    rawWriteInFlightRef.current = true;
     lastRawWriteAtRef.current = Date.now();
     term.write(data, () => {
       // Snap to bottom after each PTY write. CC redraws its UI from cursor-home
       // (\x1b[H) which makes xterm follow the cursor to the top; snapping here
       // ensures the viewport stays at the bottom showing the latest output.
       term.scrollToBottom();
+      rawWriteInFlightRef.current = false;
+      drainRawWriteQueue();
     });
   }, []);
+
+  const writeRawToTerminal = useCallback((data: Uint8Array) => {
+    rawWriteQueueRef.current.push(data);
+    drainRawWriteQueue();
+  }, [drainRawWriteQueue]);
 
   const flushPendingRaw = useCallback(() => {
     clearRawFlushTimer();
