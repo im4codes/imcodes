@@ -19,6 +19,7 @@ import { taskConsoleStateToPairSnapshot } from '../../src/components/Supervision
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
 import { TaskPairSettingsSection, type TaskPairSettingsValue } from '../../src/components/TaskPairSettingsSection.js';
+import { SUPERVISION_CONSOLE_UNAVAILABLE_REASONS } from '../../../shared/supervision-task-console.js';
 import {
   TASK_PAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EFFECTS,
@@ -156,7 +157,7 @@ describe('TaskPairStatusPanel', () => {
   });
   it('shows the unsupported-daemon hint even when the chat has no pair history', async () => {
     render(<TaskPairStatusPanelHost events={[]} serverId="unsupported-empty" />);
-    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true, error: 'projection_unavailable' } }));
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { authorityUnavailable: true, error: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE } }));
     expect(await waitFor(() => screen.getByTestId('task-pair-status-panel-authority-error'))).toBeTruthy();
   });
   it('maps authoritative decision flags while preserving pair timestamps', () => {
