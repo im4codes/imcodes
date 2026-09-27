@@ -37,8 +37,20 @@ export async function runPairBriefScenario() {
   await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(SESSION)}`, { waitUntil: 'domcontentloaded' });
   await page.waitForSelector('#app', { timeout: 60_000 });
   await page.waitForSelector('button[title="Session actions"]', { timeout: 60_000 });
-  await page.evaluate((detail) => window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail })), snapshot);
+  const publishSnapshot = async () => page.evaluate((detail) => {
+    window.__imcodesTaskPairSnapshot = detail;
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
+  }, snapshot);
+  // The authoritative controller emits its initial scope-reset after the chat
+  // socket settles; publish after that reset and retry briefly to avoid racing
+  // the controller while still exercising the real mounted panel.
+  await page.waitForTimeout(2_000);
   const panel = page.getByTestId('task-pair-status-panel');
+  for (let attempt = 0; attempt < 8; attempt += 1) {
+    await publishSnapshot();
+    if (await panel.isVisible().catch(() => false)) break;
+    await page.waitForTimeout(500);
+  }
   await panel.waitFor({ state: 'visible', timeout: 30_000 });
   const expand = panel.getByRole('button', { name: /show task content|显示任务内容|顯示任務內容|mostrar contenido|タスク内容を表示|작업 내용 표시|показать содержание/i });
   await expand.click();
