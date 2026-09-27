@@ -242,14 +242,14 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(companion.sentStrings.some((raw) => JSON.parse(raw).type === TIMELINE_MESSAGES.EVENT)).toBe(false);
   });
 
-  it('coalesces healthy full-mode latest-value updates while retaining the newest frame', async () => {
+  it('coalesces healthy summary-mode latest-value updates while retaining the newest frame', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const full = new MockWs();
     bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
     full.emit('message', JSON.stringify({
       type: TIMELINE_MESSAGES.SUBSCRIBE,
       sessionName: SESSION,
-      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
     }));
     await flushAsync();
     full.sent.length = 0;
@@ -267,16 +267,52 @@ describe('WsBridge timeline drop telemetry', () => {
         },
       }));
     }
-    await new Promise<void>((resolve) => setTimeout(resolve, 75));
+    await new Promise<void>((resolve) => setTimeout(resolve, 300));
     const statuses = full.sentStrings
       .map((raw) => JSON.parse(raw))
       .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT && msg.event?.type === 'agent.status');
     expect(statuses).toHaveLength(1);
     expect(statuses[0]?.event.seq).toBe(4);
     expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
-      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
       eventType: 'agent.status',
     })).toBe(3);
+  });
+
+  it('keeps healthy full-mode latest-value updates live', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const full = new MockWs();
+    bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
+    full.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+    }));
+    await flushAsync();
+    full.sent.length = 0;
+    for (let seq = 1; seq <= 4; seq += 1) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `full-status-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 1,
+          type: 'agent.status',
+          payload: { status: `step-${seq}` },
+        },
+      }));
+    }
+    await flushAsync();
+    const statuses = full.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT && msg.event?.type === 'agent.status');
+    expect(statuses.map((msg) => msg.event.seq)).toEqual([1, 2, 3, 4]);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      eventType: 'agent.status',
+    })).toBe(0);
   });
 
   it('flushes a terminal state immediately after coalescing and never loses the final', async () => {

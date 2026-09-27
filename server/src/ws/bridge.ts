@@ -8888,9 +8888,11 @@ export class WsBridge {
       // suppress them as duplicate latest values: a reconnecting browser may
       // have missed the preceding running frame and otherwise stays stuck on
       // a stale running flag forever.
-      if (latestValueEvent && !terminalSessionState && !terminalUsage
+      const summaryMode = mode === TIMELINE_SUBSCRIPTION_MODES.SUMMARY;
+      if (summaryMode && latestValueEvent && !terminalSessionState && !terminalUsage
         && this.suppressUnchangedTimelineValue(ws, sessionName, eventType, payload)) continue;
       const coalescible = (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')
+        && summaryMode
         && !terminalSessionState && !terminalUsage;
       const priority = eventType === 'assistant.text' && payload.streaming !== true
         ? 'final'
@@ -8903,10 +8905,9 @@ export class WsBridge {
         priority,
         ...(coalescible ? { coalesceKey: `${sessionId}\0${eventType}` } : {}),
       };
-      // Latest-value signals are coalesced for every mode, including healthy
-      // full sockets. This is deliberately a presentation-window delay, not
-      // backpressure: text deltas stay direct/durable and terminal state is
-      // flushed ahead of the next final event.
+      // Latest-value signals are coalesced only for summary sockets. Full
+      // (visible) sockets remain fully live; text and status frames retain
+      // their provider cadence while terminal state is always authoritative.
       let queue = this.timelineQueues.get(ws);
       if (!queue) {
         queue = new TimelineOutboundQueue();

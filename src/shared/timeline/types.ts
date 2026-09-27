@@ -314,6 +314,8 @@ export interface TimelineEvent {
   timelineCompleteness?: TimelineEventCompleteness;
   detailRefs?: TimelineDetailRef[];
   hidden?: boolean;
+  /** True when the server projected this event for a minimized/summary view. */
+  summary?: boolean;
 }
 
 /** Public, sanitized payload rendered for a terminal peer-audit attempt.

@@ -20,7 +20,7 @@ import { __resetTimelineCacheForTests, useTimeline } from '../src/hooks/useTimel
 function evt(i: number, type: string, payload: Record<string, unknown> = {}): TimelineEvent {
   return {
     eventId: `${type}-${i}`, type, sessionId: 'deck_perf_brain',
-    ts: 1000 + i, epoch: 1, seq: i, source: 'daemon', confidence: 'high', payload,
+    ts: 1000 + i, epoch: 1, seq: i, source: 'daemon', confidence: 'high', summary: true, payload,
   } as unknown as TimelineEvent;
 }
 
@@ -107,6 +107,18 @@ describe('last-value timeline events are frame-coalesced', () => {
     // pending frame that fires into a dead component.
     expect(() => cleanup()).not.toThrow();
     await act(async () => { vi.runOnlyPendingTimers(); await Promise.resolve(); });
+  }, 60_000);
+
+  it('does not rebuild a full-mode timeline for live status frames', async () => {
+    const t = harness();
+    await mount(t);
+    const before = t.renders();
+    for (let i = 0; i < 200; i++) {
+      act(() => { t.send({ ...evt(i, 'agent.status', { status: `working-${i}` }), summary: false } as TimelineEvent); });
+    }
+    await act(async () => { vi.runOnlyPendingTimers(); await Promise.resolve(); await Promise.resolve(); });
+    expect(t.renders() - before).toBe(0);
+    expect(t.events().filter((event) => event.type === 'agent.status')).toHaveLength(0);
   }, 60_000);
 
   it('control: streaming and tool events keep their existing coalescing', async () => {

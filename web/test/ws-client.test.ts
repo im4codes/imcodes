@@ -859,7 +859,7 @@ describe('WsClient', () => {
         type: 'timeline.event',
         event: {
           sessionId: 's1', eventId: `state-${i}`, seq: i + 1, epoch: 1,
-          type: 'session.state', payload: { state: 'running' },
+          type: 'session.state', summary: true, payload: { state: 'running' },
         },
       }) });
     }
@@ -874,6 +874,38 @@ describe('WsClient', () => {
       .filter((msg) => msg?.type === 'timeline.event')
       .at(-1);
     expect(delivered?.event?.eventId).toBe('state-999');
+
+    client.disconnect();
+    vi.useRealTimers();
+  });
+
+  it('keeps full-mode transient status frames live', async () => {
+    vi.useFakeTimers();
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    const handler = vi.fn();
+    client.onMessage(handler);
+    client.connect();
+    await vi.advanceTimersByTimeAsync(0);
+    lastWs!.emit('open');
+    const socket = lastWs!;
+    handler.mockClear();
+
+    for (let i = 0; i < 100; i++) {
+      socket.emit('message', { data: JSON.stringify({
+        type: 'timeline.event',
+        event: {
+          sessionId: 's1', eventId: `full-state-${i}`, seq: i + 1, epoch: 1,
+          type: 'session.state', payload: { state: 'running' },
+        },
+      }) });
+    }
+
+    await vi.advanceTimersByTimeAsync(100);
+    const delivered = handler.mock.calls
+      .map(([msg]) => msg)
+      .filter((msg) => msg?.type === 'timeline.event');
+    expect(delivered).toHaveLength(100);
+    expect(delivered.at(-1)?.event?.eventId).toBe('full-state-99');
 
     client.disconnect();
     vi.useRealTimers();

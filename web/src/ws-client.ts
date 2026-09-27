@@ -2677,7 +2677,8 @@ export class WsClient {
       && TIMELINE_TERMINAL_SESSION_STATES.includes(
         String(msg.event?.payload?.state ?? '') as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number],
       );
-    const coalescedType = !terminalSessionState
+    const summaryEvent = msg.event.summary === true;
+    const coalescedType = summaryEvent && !terminalSessionState
       && (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')
       ? eventType
       : null;
@@ -2718,7 +2719,8 @@ export class WsClient {
         && TIMELINE_TERMINAL_SESSION_STATES.includes(
           String(event.event?.payload?.state ?? '') as (typeof TIMELINE_TERMINAL_SESSION_STATES)[number],
         );
-      if (!terminalSessionState && (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')) {
+      if (event.event.summary === true && !terminalSessionState
+        && (eventType === 'session.state' || eventType === 'agent.status' || eventType === 'usage.update')) {
         const sessionId = typeof event.event?.sessionId === 'string' ? event.event.sessionId : '';
         const key = `${sessionId}\0${eventType}`;
         if (this.pendingTimelineCoalesced.get(key) !== event) continue;

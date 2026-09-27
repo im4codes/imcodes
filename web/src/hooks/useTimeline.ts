@@ -1359,7 +1359,7 @@ function shouldFrameCoalesceTimelineEvent(event: TimelineEvent): boolean {
     // authoritative value wins and a superseded one was never going to be
     // displayed. Queue reconciliation rides on session.state and still applies,
     // one frame later rather than in the same call stack.
-    || isLastValueTimelineEventType(event.type);
+    || (event.summary === true && isLastValueTimelineEventType(event.type));
 }
 
 const pendingTimelineCacheIngests = new Map<string, Map<string, TimelineEvent>>();
@@ -3830,6 +3830,15 @@ export function useTimeline(
   }, [flushStreamingIdlePersist]);
 
   const appendRealtimeEvent = useCallback((event: TimelineEvent) => {
+    // Full-mode sockets deliver status/usage frames live for authoritative
+    // subscribers, but these last-value signals are not chat rows. Keep them
+    // out of the rendered timeline so a 25 Hz status stream cannot rebuild the
+    // whole window tree; queue/session reconciliation above still observes the
+    // event and the next durable/final event advances the same cursor.
+    if (event.summary !== true && isLastValueTimelineEventType(event.type)) {
+      pendingRealtimeEventsRef.current.delete(event.eventId);
+      return;
+    }
     if (!shouldFrameCoalesceTimelineEvent(event)) {
       pendingRealtimeEventsRef.current.delete(event.eventId);
       // A final (non-streaming) version arrived — idbPutEvents persists it below,
