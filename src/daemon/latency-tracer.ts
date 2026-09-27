@@ -588,8 +588,9 @@ export function recordServerSend(input: {
   let ackLatencyMs: number | undefined;
   let commandType: string | undefined;
   let sessionName: string | undefined;
+  let receipt: CommandReceipt | undefined;
   if (isAck && input.commandId) {
-    const receipt = commandReceipts.get(input.commandId);
+    receipt = commandReceipts.get(input.commandId);
     if (receipt) {
       ackLatencyMs = performance.now() - receipt.receivedAt;
       commandType = receipt.type;
