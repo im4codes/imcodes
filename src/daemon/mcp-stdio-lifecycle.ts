@@ -103,11 +103,14 @@ export interface McpStdioLifecycleOptions {
   /** Bounded poll period. Defaults to 30s: a leaked process wastes a machine
    *  for days, so detection latency is irrelevant next to the cost of polling. */
   parentPollMs?: number;
+  /** Maximum time teardown may hold the process after a terminal trigger. */
+  shutdownGraceMs?: number;
   setIntervalFn?: (handler: () => void, ms: number) => { unref?: () => void };
   clearIntervalFn?: (handle: unknown) => void;
 }
 
 export const DEFAULT_MCP_PARENT_POLL_MS = 30_000;
+export const DEFAULT_MCP_SHUTDOWN_GRACE_MS = 5_000;
 
 /**
  * Wire EOF and parent-loss shutdown. Returns a disposer that removes the
@@ -116,6 +119,10 @@ export const DEFAULT_MCP_PARENT_POLL_MS = 30_000;
  */
 export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () => void {
   const pollMs = Math.max(1, Math.trunc(options.parentPollMs ?? DEFAULT_MCP_PARENT_POLL_MS));
+  const shutdownGraceMs = Math.max(
+    0,
+    Math.trunc(options.shutdownGraceMs ?? DEFAULT_MCP_SHUTDOWN_GRACE_MS),
+  );
   const setIntervalFn = options.setIntervalFn
     ?? ((handler, ms) => setInterval(handler, ms) as unknown as { unref?: () => void });
   const clearIntervalFn = options.clearIntervalFn
@@ -140,9 +147,25 @@ export function installMcpStdioLifecycle(options: McpStdioLifecycleOptions): () 
     triggered = true;
     stop();
     try { options.onShutdown?.(reason, { parentPid: options.getParentPid() }); } catch { /* reporting only */ }
-    void options.shutdown()
+    // The MCP SDK may wait on a peer that has already disappeared. Cleanup is
+    // best-effort, but an orphan whose stdin is still held open must leave even
+    // when server.close() or resource release never settles. Promise.resolve
+    // also turns a synchronous shutdown throw into a handled rejection.
+    let exited = false;
+    const exit = () => {
+      if (exited) return;
+      exited = true;
+      options.exit(0);
+    };
+    const forceExit = setTimeout(exit, shutdownGraceMs);
+    forceExit.unref?.();
+    void Promise.resolve()
+      .then(() => options.shutdown())
       .catch(() => { /* teardown is best-effort; exiting still matters */ })
-      .finally(() => options.exit(0));
+      .finally(() => {
+        clearTimeout(forceExit);
+        exit();
+      });
   };
 
   function onEnd(): void { trigger(MCP_STDIO_SHUTDOWN_REASON.STDIN_END); }

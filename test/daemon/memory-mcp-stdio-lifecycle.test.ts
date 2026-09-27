@@ -569,6 +569,44 @@ describe('installMcpStdioLifecycle', () => {
     expect(stdin.count('end'), 'listeners are removed so a late event cannot re-enter').toBe(0);
   });
 
+  it('forces exit when teardown never settles after parent loss', async () => {
+    const stdin = fakeStdin();
+    let exits = 0;
+    let tick: (() => void) | null = null;
+    let ppid = 100;
+    installMcpStdioLifecycle({
+      stdin,
+      shutdown: () => new Promise<void>(() => {}),
+      exit: () => { exits += 1; },
+      getParentPid: () => ppid,
+      initialParentPid: 100,
+      shutdownGraceMs: 10,
+      setIntervalFn: (handler) => { tick = handler; return {}; },
+    });
+
+    ppid = 1;
+    tick?.();
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(exits, 'a stuck transport must not leave an orphan alive').toBe(1);
+  });
+
+  it('still exits when shutdown throws synchronously', async () => {
+    const stdin = fakeStdin();
+    let exits = 0;
+    installMcpStdioLifecycle({
+      stdin,
+      shutdown: () => { throw new Error('transport already gone'); },
+      exit: () => { exits += 1; },
+      getParentPid: () => 7,
+      initialParentPid: 7,
+      shutdownGraceMs: 100,
+      setIntervalFn: () => ({}),
+    });
+    stdin.emit('end');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(exits).toBe(1);
+  });
+
   it('does not shut down while the parent pid is unchanged', async () => {
     const stdin = fakeStdin();
     let shutdowns = 0;
