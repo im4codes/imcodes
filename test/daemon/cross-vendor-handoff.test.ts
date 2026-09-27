@@ -36,6 +36,7 @@ describe('cross-vendor handoff contract', () => {
       maxTokens: CROSS_VENDOR_HANDOFF_DEFAULTS.maxTokens,
       recentTurns: CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns,
       timeoutMs: CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs,
+      providerWaitMs: CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs,
       includeToolPreviews: false,
     });
     expect(normalizeCrossVendorHandoffConfig({ maxTokens: 99_999, recentTurns: 0, timeoutMs: 1 })).toMatchObject({

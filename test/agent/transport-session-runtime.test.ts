@@ -560,17 +560,25 @@ it('consumes handoff before a late STOP cancellation can trigger a duplicate ret
   await runtime.kill();
 });
 
-it('returns session.send acknowledgement and dispatches without waiting for a slow handoff build', async () => {
+it('returns session.send acknowledgement while waiting, then dispatches the first turn with the resolved handoff', async () => {
   const provider = makeProvider();
+  const send = provider.send as ReturnType<typeof vi.fn>;
   const runtime = new TransportSessionRuntime(provider, 'handoff-ack-order');
   await runtime.initialize({ sessionKey: 'handoff-ack-order' });
-  runtime.setPendingHandoffReady(new Promise(() => undefined));
+  let resolveHandoff!: (pack: { text: string; sourceAgentType: string; sourceRuntimeType: 'transport'; sourceConversationKey: string; cutoff: { epoch: number; seq: number; ts: number }; createdAt: number; tokenCount: number }) => void;
+  const ready = new Promise<Parameters<typeof resolveHandoff>[0]>((resolve) => { resolveHandoff = resolve; });
+  runtime.setPendingHandoffReady(ready, 200);
   const started = Date.now();
   const result = runtime.send('ordinary', 'ack-order');
   expect(result).toBe('sent');
   expect(Date.now() - started).toBeLessThan(250);
+  resolveHandoff({
+    text: 'prior context', sourceAgentType: 'claude-code', sourceRuntimeType: 'transport', sourceConversationKey: 'source',
+    cutoff: { epoch: 1, seq: 2, ts: 3 }, createdAt: Date.now(), tokenCount: 2,
+  });
   await waitForProviderSend(provider);
-  expect(Date.now() - started).toBeLessThan(250);
+  expect(send.mock.calls[0]?.[1]?.messagePreamble).toContain('prior context');
+  expect(Date.now() - started).toBeLessThan(500);
   await runtime.kill();
 });
 

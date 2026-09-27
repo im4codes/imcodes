@@ -25,6 +25,8 @@ export interface CrossVendorHandoffConfig {
   maxTokens: number;
   recentTurns: number;
   timeoutMs: number;
+  /** Maximum time the first target turn waits for the async pack. */
+  providerWaitMs: number;
   includeToolPreviews: boolean;
 }
 
@@ -85,6 +87,7 @@ export function normalizeCrossVendorHandoffConfig(input?: Partial<CrossVendorHan
     maxTokens: Math.max(1, Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.hardMaxTokens, maxTokens)),
     recentTurns: Math.max(1, Math.min(100, Math.trunc(input?.recentTurns ?? CROSS_VENDOR_HANDOFF_DEFAULTS.recentTurns))),
     timeoutMs: Math.max(250, Math.min(30_000, Math.trunc(input?.timeoutMs ?? CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs))),
+    providerWaitMs: Math.max(0, Math.min(CROSS_VENDOR_HANDOFF_DEFAULTS.timeoutMs, Math.trunc(input?.providerWaitMs ?? CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs))),
     includeToolPreviews: input?.includeToolPreviews === true,
   };
 }

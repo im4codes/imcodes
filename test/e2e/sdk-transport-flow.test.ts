@@ -754,6 +754,9 @@ describe('sdk transport flow e2e', () => {
 
     handleWebCommand({ type: 'session.send', session: 'deck_settings_preset_brain', text: 'hello', commandId: 'cmd-settings-preset' }, serverLink);
     await flushAsync();
+    // Cross-vendor handoff tokenization is worker-backed. Wait for the actual
+    // provider dispatch instead of assuming one microtask flush is sufficient.
+    await waitForCondition(() => mocks.claudeCalls.length > 0, 5000);
 
     const claudeCall = mocks.claudeCalls.at(-1);
     expect(claudeCall?.options.env).toMatchObject({

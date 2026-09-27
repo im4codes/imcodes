@@ -96,7 +96,7 @@ import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../s
 import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
-import { type CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
+import { CROSS_VENDOR_HANDOFF_DEFAULTS, type CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
 import {
   SUPERVISION_CONTRACT_PREAMBLE_END,
@@ -634,6 +634,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _startupMemoryInjected = false;
   private _pendingHandoff: CrossVendorHandoffPack | null = null;
   private _pendingHandoffReady: Promise<CrossVendorHandoffPack | undefined> | undefined;
+  private _pendingHandoffWaitMs: number = CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs;
   private _onPendingHandoffConsumed?: () => void;
   /** Last provider-visible preference context block injected into this provider conversation.
    *  Preferences are stable session context, not per-turn recall; repeat injection
@@ -2363,8 +2364,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._pendingHandoffReady = undefined;
   }
 
-  setPendingHandoffReady(ready: Promise<CrossVendorHandoffPack | undefined>): void {
+  setPendingHandoffReady(
+    ready: Promise<CrossVendorHandoffPack | undefined>,
+    providerWaitMs: number = CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs,
+  ): void {
     this._pendingHandoffReady = ready;
+    this._pendingHandoffWaitMs = Math.max(0, providerWaitMs);
   }
 
   /** Called once after a provider accepts the turn carrying the handoff. */
@@ -3896,17 +3901,19 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     void (async () => {
       if (!isTransportSlashControl(message) && !this._pendingHandoff && this._pendingHandoffReady) {
-        // Handoff construction now performs exact token accounting in a worker.
-        // Do not hold the first user turn behind that asynchronous build: a
-        // settings restart must be able to dispatch immediately with the
-        // already-initialized provider environment (including ccPreset). If the
-        // pack resolves before a later turn, adopt it for that turn; the
-        // launch-side guarded callback also persists it for recovery.
+        // The first target turn must carry the cross-vendor context whenever
+        // the worker pack is ready, but session.send itself remains an immediate
+        // acknowledgement. Wait only the bounded providerWaitMs window; a slow
+        // build is adopted by the guarded launch callback for a later turn.
         const ready = this._pendingHandoffReady;
         this._pendingHandoffReady = undefined;
-        void ready.then((pack) => {
-          if (pack && !this._pendingHandoff) this._pendingHandoff = pack;
-        }).catch(() => undefined);
+        const waitMs = this._pendingHandoffWaitMs;
+        const timeout = new Promise<undefined>((resolve) => {
+          const timer = setTimeout(() => resolve(undefined), waitMs);
+          timer.unref?.();
+        });
+        const pack = await Promise.race([ready.catch(() => undefined), timeout]);
+        if (pack && !this._pendingHandoff) this._pendingHandoff = pack;
       }
       await this.refreshContextBootstrap({ phase: 'dispatch' });
       if (this.isDispatchLocallyCancelled(dispatchId)) {

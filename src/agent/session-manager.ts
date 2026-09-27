@@ -1367,7 +1367,7 @@ export async function relaunchSessionWithSettings(
         const pending = current?.crossVendorHandoff?.pending;
         if (pending) markConsumed(pending);
       });
-      launchedTransport.setPendingHandoffReady(guardedPromise);
+      launchedTransport.setPendingHandoffReady(guardedPromise, handoffConfig.providerWaitMs);
     }
     void guardedPromise.then(async (pack) => {
       if (!pack || !isCurrentLaunch()) return;
