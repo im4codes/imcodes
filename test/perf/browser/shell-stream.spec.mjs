@@ -39,6 +39,17 @@ async function typeCommand(page, command, marker, timeout = 15_000) {
   return waitForTerminalText(page, marker, timeout);
 }
 
+async function focusShellTerminal(page) {
+  const focused = await page.evaluate((session) => {
+    const term = window.__imcShellTerminals?.[session] ?? window.__imcShellTerminal;
+    if (!term) return false;
+    term.focus();
+    return true;
+  }, SESSION);
+  if (!focused) await page.locator('.terminal-container').last().click();
+  await page.locator('.xterm-helper-textarea').last().focus().catch(() => {});
+}
+
 async function pasteCommand(page, command, marker, timeout = 15_000) {
   const usedClipboardApi = await page.evaluate(async (value) => {
     if (navigator.clipboard?.writeText && !window.__shellClipboardStub) {
@@ -65,8 +76,7 @@ async function pasteCommand(page, command, marker, timeout = 15_000) {
 }
 
 async function measureKeystrokeEcho(page, samples = 24) {
-  await page.locator('.terminal-container').first().click();
-  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
+  await focusShellTerminal(page);
   const latencies = [];
   for (let index = 0; index < samples; index += 1) {
     const marker = `LATENCY_ECHO_${index}_${Date.now()}`;
@@ -106,8 +116,7 @@ async function fitViewportToColumns(page, targetCols) {
 
 async function copyUrlAtColumns(page, targetCols, url) {
   const fitted = await fitViewportToColumns(page, targetCols);
-  await page.locator('.terminal-container').first().click();
-  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
+  await focusShellTerminal(page);
   await page.keyboard.press('Control+C');
   const encoded = Buffer.from(url).toString('base64');
   await pasteCommand(page, `printf '%s' '${encoded}' | base64 -d > /tmp/url.txt; cat /tmp/url.txt; printf 'Z9\\n'`, 'Z9');
@@ -141,7 +150,7 @@ async function copyUrlAtColumns(page, targetCols, url) {
     }
     return { selected, joined, cols: term.cols };
   }, { value: url, session: SESSION });
-  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
+  await focusShellTerminal(page);
   await page.keyboard.press('Control+C');
   // TerminalView intentionally does not await clipboard.writeText; allow the
   // browser task that records the copy to settle before reading it.
@@ -234,8 +243,7 @@ export async function runShellBrowserScenario() {
   await page.waitForSelector('.terminal-container', { timeout: 180_000 });
   const firstPaintMs = Date.now() - started;
   await page.evaluate((value) => { window.__shellPerf.firstPaintMs = value; }, firstPaintMs);
-  await page.locator('.terminal-container').first().click();
-  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
+  await focusShellTerminal(page);
   // Do not race xterm's snapshot/stream handoff: wait until the shell has
   // rendered a prompt before injecting the first keystroke.
   await page.waitForFunction(() => {
@@ -345,8 +353,7 @@ export async function runShellBrowserScenario() {
   await killRemoteTmux();
   await page.waitForTimeout(2_000);
   assert.ok(await page.locator('.terminal-container').first().count(), 'terminal must remain mounted after tmux kill/recovery');
-  await page.locator('.terminal-container').first().click();
-  await page.locator('.xterm-helper-textarea').focus().catch(() => {});
+  await focusShellTerminal(page);
   await page.waitForTimeout(500);
   await typeCommand(page, "printf 'after-reconnect\\n'", 'after-reconnect', 90_000);
 
