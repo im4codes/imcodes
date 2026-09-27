@@ -631,6 +631,18 @@ describe('TaskPairStatusPanel', () => {
     expect(rowsRule).not.toMatch(/max-height/);
   });
 
+  it('anchors the expanded panel to chat-main and reserves scroll room for the final row', () => {
+    const css = readCss();
+    const directPanel = /\.chat-main > \.task-pair-status-panel:not\(\.is-collapsed\) \{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(directPanel).toMatch(/top:\s*40px/);
+    expect(directPanel).toMatch(/bottom:\s*0/);
+    expect(directPanel).toMatch(/height:\s*auto/);
+    expect(directPanel).toMatch(/max-height:\s*none/);
+    const rowsRule = cssRule(css, '.task-pair-status-rows');
+    expect(rowsRule).toMatch(/scroll-padding-bottom:\s*16px/);
+    expect(rowsRule).toMatch(/padding:\s*0 8px 16px/);
+  });
+
   it('starts below the sidebar toolbar cluster instead of z-index-stacking over it (which would still block its clicks)', () => {
     const css = readCss();
     // .chat-top-actions floats at top:6px, its tallest button is 24px, and the

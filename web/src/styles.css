@@ -14543,6 +14543,21 @@ button.quick-agent-delegation-preset.active {
   border-radius: 8px; background: color-mix(in srgb, var(--chrome-panel, #0f172a) 88%, transparent);
   box-shadow: 0 3px 12px color-mix(in srgb, #000 25%, transparent);
 }
+/* The expanded panel belongs to chat-main, not the titlebar. Anchoring it to
+   chat-main makes bottom:0 clear the composer and sub-window chrome instead
+   of extending past an overflow-hidden titlebar ancestor. */
+.chat-main > .task-pair-status-panel:not(.is-collapsed) {
+  position: absolute; top: 40px; right: 0; bottom: 0; height: auto; max-height: none;
+  width: min(var(--task-pair-panel-width), 100%); max-width: var(--task-pair-panel-width); overflow: hidden;
+}
+.chat-main > .task-pair-status-panel.is-collapsed {
+  position: absolute; top: 4px; right: 8px; bottom: auto; z-index: 13;
+  height: auto; max-height: none; overflow: visible; display: inline-flex;
+  width: auto; max-width: calc(100% - 16px); margin: 0;
+  border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
+  border-radius: 8px; background: color-mix(in srgb, var(--chrome-panel, #0f172a) 88%, transparent);
+  box-shadow: 0 3px 12px color-mix(in srgb, #000 25%, transparent);
+}
 .task-pair-status-toggle { cursor: pointer; }
 .task-pair-status-toggle:hover, .task-pair-status-toggle:focus-visible {
   background: color-mix(in srgb, var(--chrome-accent, #38bdf8) 12%, transparent);
@@ -14597,6 +14612,14 @@ button.quick-agent-delegation-preset.active {
     box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
   }
   .chat-titlebar > .task-pair-status-panel.is-collapsed { position: static; height: auto; max-height: none; overflow: visible; }
+  .chat-main > .task-pair-status-panel:not(.is-collapsed) {
+    inset: 40px 8px 0; width: auto; max-width: none; height: auto; max-height: none; z-index: 20;
+    border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
+    box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
+  }
+  .chat-main > .task-pair-status-panel.is-collapsed {
+    position: absolute; top: 4px; right: 8px; bottom: auto; height: auto; max-height: none; overflow: visible;
+  }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
   /* Compact single-line "last sent" banner on mobile (tap to expand). */
@@ -14613,7 +14636,7 @@ button.quick-agent-delegation-preset.active {
 }
 .task-pair-status-toggle strong { min-width: 0; overflow-wrap: anywhere; }
 .task-pair-status-summary { display: flex; flex-wrap: wrap; gap: 4px; min-width: 0; }
-.task-pair-status-rows { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; padding: 0 8px 8px; }
+.task-pair-status-rows { flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden; overscroll-behavior: contain; scrollbar-gutter: stable; scroll-padding-bottom: 16px; padding: 0 8px 16px; }
 .task-pair-status-group { margin: 0 0 6px; }
 .task-pair-status-group h4 { display: flex; align-items: center; gap: 5px; margin: 6px 0 0; padding-top: 3px; border-top: 1px solid color-mix(in srgb, currentColor 22%, transparent); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; opacity: .78; }
 .task-pair-status-group h4 small { display: inline-flex; align-items: center; justify-content: center; min-width: 15px; height: 15px; padding: 0 4px; border-radius: 999px; background: color-mix(in srgb, currentColor 16%, transparent); font-family: ui-monospace, SFMono-Regular, monospace; font-size: 9px; opacity: .85; }
