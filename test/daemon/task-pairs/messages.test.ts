@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { scanTaskPairMarkers, type TaskPairState } from '../../../shared/task-pair.js';
-import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildNoBriefLine, buildNudgeMessage } from '../../../src/daemon/task-pairs/messages.js';
+import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildNoBriefLine, buildNudgeMessage, buildUntitledTaskTitleRequest } from '../../../src/daemon/task-pairs/messages.js';
 
 function basePair(overrides: Partial<TaskPairState> = {}): TaskPairState {
   return {
@@ -20,6 +20,13 @@ function basePair(overrides: Partial<TaskPairState> = {}): TaskPairState {
  * its own line, it must actually parse, or the pair hangs.
  */
 describe('daemon-authored marker examples parse when copied verbatim onto their own line', () => {
+  it('describes title reminders as non-terminal metadata updates', () => {
+    const text = buildUntitledTaskTitleRequest(['tsk_x'], 'en');
+    expect(text).toContain('pair_task_update({taskId,title})');
+    expect(text).toContain('title-only');
+    expect(text).toContain('never reopens');
+    expect(text).toContain('cancelled/done');
+  });
   it('includes the auditor proposal rule in assignment and audit-request briefs', () => {
     const pair = basePair({ material: { path: '/workspace', at: 1 } });
     expect(buildAuditorAssignmentMessage(pair)).toMatch(/concrete solution/);

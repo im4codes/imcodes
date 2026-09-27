@@ -300,11 +300,9 @@ describe('pair workspaces', () => {
     const firstEnd = await endedAt('REOPEN');
     expect(pair('REOPEN').workspace).toMatchObject({ status: 'ended', endedAt: firstEnd });
 
-    // A Brain DISPATCH marker is the supported way to reopen a cancelled pair.
-    // It changes the terminal status directly and does not call ensureWorkspace
-    // (the slot_changed intent only runs the queue), so marker ingestion itself
-    // must clear the old endedAt before the next termination.
-    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH REOPEN executor=${EXEC} auditor=none -->`);
+    // A Brain QUEUE marker is the explicit lifecycle operation that reopens a
+    // cancelled pair; title-only DISPATCH is metadata-only and must not do so.
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE REOPEN executor=${EXEC} auditor=none -->`);
     await vi.waitFor(() => expect(pair('REOPEN').workspace?.status).toBe('active'));
     expect(pair('REOPEN').workspace?.endedAt).toBeUndefined();
     await new Promise((resolve) => setTimeout(resolve, 2));
@@ -426,7 +424,7 @@ describe('pair workspaces', () => {
     expect(existsSync(join(path, '..'))).toBe(false);
   });
 
-  it('Brain re-dispatching a cancelled pair reuses the same worktree, never resetting or recreating it', async () => {
+  it('Brain re-queueing a cancelled pair reuses the same worktree, never resetting or recreating it', async () => {
     const path = await opened('REQ1');
     writeFileSync(join(path, 'in-progress.txt'), 'not yet committed\n');
     marker(BRAIN, '<!-- IMCODES_TASK CANCEL REQ1 -->');
@@ -435,11 +433,11 @@ describe('pair workspaces', () => {
     expect(existsSync(join(path, 'in-progress.txt'))).toBe(true);
 
     // A participant marker must not revive it (see the shared-level test for
-    // the full class); only the Brain's own DISPATCH does.
+    // the full class); only the Brain's own QUEUE does.
     marker(EXEC, '<!-- IMCODES_TASK STARTED REQ1 -->');
     expect(pair('REQ1').status).toBe('cancelled');
 
-    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH REQ1 executor=${EXEC} auditor=${AUD} -->`);
+    marker(BRAIN, `<!-- IMCODES_TASK QUEUE REQ1 executor=${EXEC} auditor=${AUD} -->`);
     await vi.waitFor(() => expect(pair('REQ1').workspace?.status).toBe('active'));
     expect(pair('REQ1').workspace?.path).toBe(path);
     // The file from before the cancel is still there: reopening reused the

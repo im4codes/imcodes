@@ -18,7 +18,7 @@ import { TaskPairService, taskPairService } from '../../../src/daemon/task-pairs
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
 import { handleWebCommand } from '../../../src/daemon/command-handler.js';
 import { hasInvalidSessionSupervisionSnapshot, patchTransportConfigUiLocale, type SupervisionUiLocale } from '../../../shared/supervision-config.js';
-import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS, TASK_PAIR_TIMELINE_EVENT } from '../../../shared/task-pair.js';
+import { TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS, TASK_PAIR_TIMELINE_EVENT, scanTaskPairMarkers } from '../../../shared/task-pair.js';
 
 const PROJECT = 'titleproj';
 const BRAIN = 'deck_titleproj_brain';
@@ -173,6 +173,15 @@ describe('task-pair title generation', () => {
     await say(BRAIN, '<!-- IMCODES_TASK QUEUE T15 -->\nOffline task.\n<!-- IMCODES_TASK_END T15 -->');
     await service.waitForIdle();
     expect(sent).toHaveLength(0);
+  });
+
+  it('does not remind Brain about a title after the pair becomes terminal before flush', async () => {
+    setBrainLocale('en');
+    const queue = scanTaskPairMarkers('<!-- IMCODES_TASK QUEUE T16 -->\nWork.\n<!-- IMCODES_TASK_END T16 -->').markers[0]!;
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: queue, source: 'marker', now: 1, eventId: 'queue-t16' });
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: scanTaskPairMarkers('<!-- IMCODES_TASK CANCEL T16 -->').markers[0]!, source: 'marker', now: 2, eventId: 'cancel-t16' });
+    await service.waitForIdle();
+    expect(sent.filter((entry) => entry.target === BRAIN && entry.id.includes('title-request'))).toHaveLength(0);
   });
 
   it('lets Brain set a queued title with a marker without changing the brief', async () => {

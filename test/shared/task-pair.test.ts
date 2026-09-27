@@ -476,6 +476,33 @@ describe('task-pair state machine', () => {
     expect(apply(withStatus('done'), EXEC, '<!-- IMCODES_TASK DONE T42 -->')).toMatchObject({ effect: 'recorded' });
   });
 
+  it('treats Brain title-only DISPATCH as metadata in every pair status', () => {
+    for (const status of ['cancelled', 'done', 'passed', 'queued', 'working'] as const) {
+      const existing = withStatus(status);
+      existing.flags = ['blocked'];
+      existing.flagSides.blocked = 'executor';
+      const result = apply(existing, BRAIN, '<!-- IMCODES_TASK DISPATCH T42 title="Correct title" -->');
+      expect(result).toMatchObject({
+        effect: 'title_updated',
+        unusual: false,
+        fromStatus: status,
+        toStatus: status,
+        intents: [],
+      });
+      expect(result.pair).toMatchObject({ status, title: 'Correct title', flags: ['blocked'] });
+    }
+  });
+
+  it('rejects lifecycle DISPATCH attributes on a terminal pair instead of reviving it', () => {
+    for (const status of ['cancelled', 'done'] as const) {
+      const result = apply(withStatus(status), BRAIN, '<!-- IMCODES_TASK DISPATCH T42 title="Retry" executor=deck_sub_new -->');
+      expect(result).toMatchObject({ effect: 'recorded', unusual: true, fromStatus: status, toStatus: status });
+      expect(result.pair?.status).toBe(status);
+      expect(result.intents).toContainEqual(expect.objectContaining({ kind: 'policy_notice', to: BRAIN }));
+      expect(result.intents).not.toContainEqual(expect.objectContaining({ kind: 'slot_changed' }));
+    }
+  });
+
   it('never lets a participant revive a closed (cancelled or done) pair; only the Brain or daemon can, and the writer is told it is closed (tsk_83375afb5a)', () => {
     for (const status of ['cancelled', 'done'] as const) {
       const closed = withStatus(status);
@@ -491,10 +518,11 @@ describe('task-pair state machine', () => {
         expect(result.unusual, `${status} ${writer} ${line}`).toBe(true);
         expect(result.intents, `${status} ${writer} ${line}`).toEqual([{ kind: 'closed_pair_notice', to: writer }]);
       }
-      // The Brain (and the daemon, its equivalent) can still revive it
-      // explicitly -- a genuine marker-sourced DISPATCH reopens into 'queued'
-      // now (capacity-gated like QUEUE), same mechanics as QUEUE itself.
-      expect(apply(closed, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair?.status).toBe('queued');
+      // A lifecycle DISPATCH must not silently revive a terminal pair; Brain
+      // uses QUEUE when an explicit reopen is intended.
+      expect(apply(closed, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`)).toMatchObject({
+        effect: 'recorded', unusual: true, fromStatus: status, toStatus: status,
+      });
       expect(apply(closed, BRAIN, '<!-- IMCODES_TASK QUEUE T42 title="retry" -->').pair?.status).toBe('queued');
     }
   });
@@ -527,7 +555,7 @@ describe('task-pair state machine', () => {
       [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
     ]);
     expect(pair.closedNoticeSentTo).toEqual([EXEC]);
-    const reopened = apply(pair, BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`).pair!;
+    const reopened = apply(pair, BRAIN, '<!-- IMCODES_TASK QUEUE T42 title="retry" -->').pair!;
     expect(reopened.closedNoticeSentTo).toBeUndefined();
   });
 

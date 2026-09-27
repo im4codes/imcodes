@@ -89,6 +89,12 @@ export const TASK_PAIR_TITLE_RULE =
   + 'Do not use a raw taskId, "Brain: …", or a copied message prefix; the '
   + 'daemon supplies a neutral localized placeholder and asks the project '
   + 'Brain for the final title asynchronously when omitted.';
+/** Lifecycle semantics for title reminders sent as marker examples. */
+export const TASK_PAIR_TITLE_MARKER_RULE =
+  'A Brain DISPATCH with only title="..." is a metadata-only title update: '
+  + 'it never reopens, requeues, or wakes an existing pair, including a '
+  + 'cancelled or done pair. A DISPATCH with lifecycle attributes cannot '
+  + 'revive a cancelled or done pair; use a new taskId instead.';
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
 /** Directory-name prefix of a pair's executor worktree, beside legacy `asg_…` assignment worktrees. */
@@ -1061,11 +1067,29 @@ export function applyTaskPairMarker(
     };
   }
 
+  // Brain title reminders use DISPATCH for historical compatibility. A
+  // title-only marker is metadata, never lifecycle control, so handle it
+  // before cloning/flag clearing/cap resets in the normal state machine.
+  const titleOnlyDispatch = verb === 'DISPATCH'
+    && Object.keys(attrs).length === 1
+    && attrs.title !== undefined
+    && (marker.brief === undefined || marker.brief.trim() === '');
+  if (titleOnlyDispatch) {
+    if (!roleAuthority || !attrs.title.trim()) return recorded(existing);
+    const pair = clonePair(existing);
+    pair.updatedAt = ctx.now;
+    pair.title = attrs.title.trim();
+    return {
+      pair, fromStatus: existing.status, toStatus: existing.status,
+      effect: 'title_updated', unusual: false, intents: [],
+    };
+  }
+
   const pair = clonePair(existing);
   pair.updatedAt = ctx.now;
   const terminal = isTerminalTaskPairStatus(pair.status);
   let unusual = role === 'other';
-  if (PROGRESS_VERBS.includes(verb)
+  if ((PROGRESS_VERBS.includes(verb) && !(terminal && verb === 'DISPATCH'))
     || (roleAuthority && (verb === 'QUEUE' || verb === 'REASSIGN'))) {
     clearSideFlags(pair, role, roleAuthority);
   }
@@ -1133,7 +1157,9 @@ export function applyTaskPairMarker(
     case 'DISPATCH': {
       // Roles change only through the pair's Brain or the daemon.
       if (!roleAuthority) return recorded(existing);
-      if (terminal) unusual = true;
+      if (terminal) {
+        return reject(`Task ${marker.taskId} is ${pair.status}; only a title-only DISPATCH may update it. Use a new taskId instead of reviving a terminal pair.`);
+      }
       resetCaps(pair);
       if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) {
         const queuedForBusyParticipant = namedParticipantIsBusy(attrs, ctx.busySessions);
@@ -1469,6 +1495,7 @@ export function buildTaskPairMarkerContract(): string {
   return [
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
     TASK_PAIR_TITLE_RULE,
+    TASK_PAIR_TITLE_MARKER_RULE,
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,

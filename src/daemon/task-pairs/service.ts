@@ -1266,7 +1266,19 @@ export class TaskPairService {
     if (state.lastAttemptAt !== undefined && now - state.lastAttemptAt < TaskPairService.TITLE_REQUEST_RETRY_MS) return;
     state.lastAttemptAt = now;
     this.#writeTitleRequest(brain, state);
-    const ids = state.pending.slice(0, 100);
+    // A pair can become terminal after its title request was queued.  Filter
+    // the durable batch at send time as well as at enqueue time so a delayed
+    // reminder never asks Brain to revive a cancelled/done pair.
+    const activeIds = new Set(getTaskPairStore().listActivePairs()
+      .filter((storedPair) => storedPair.state.brain === brain)
+      .map((storedPair) => storedPair.state.taskId));
+    const pending = state.pending.filter((taskId) => activeIds.has(taskId));
+    if (pending.length !== state.pending.length) {
+      state.pending = pending;
+      this.#writeTitleRequest(brain, state);
+    }
+    if (pending.length === 0) return;
+    const ids = pending.slice(0, 100);
     await sendTaskPairMessage(
       brain,
       'title-request',

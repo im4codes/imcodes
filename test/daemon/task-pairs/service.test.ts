@@ -470,7 +470,7 @@ describe('task-pair marker ingestion', () => {
     expect(brief?.text).toContain('Ask, don\'t just reply');
   });
 
-  it('delivers the stored brief again when Brain re-dispatches a cancelled pair', async () => {
+  it('delivers the stored brief again when Brain explicitly requeues a cancelled pair', async () => {
     await say(BRAIN, '<!-- IMCODES_TASK QUEUE T14 title="Retry after cancel" -->\nRedo the thing that got cancelled.\n<!-- IMCODES_TASK_END T14 -->');
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T14 executor=${EXEC} auditor=${AUD} -->`);
     await vi.waitFor(() => expect(sent.filter((entry) => entry.target === EXEC)).toHaveLength(1));
@@ -478,7 +478,7 @@ describe('task-pair marker ingestion', () => {
     await flush();
     expect(pair('T14')?.status).toBe('cancelled');
     sent = [];
-    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T14 executor=${EXEC} auditor=${AUD} -->`);
+    await say(BRAIN, `<!-- IMCODES_TASK QUEUE T14 executor=${EXEC} auditor=${AUD} -->`);
     await vi.waitFor(() => expect(sent.some((entry) => entry.target === EXEC)).toBe(true));
     expect(pair('T14')?.status).toBe('working');
     const brief = sent.find((entry) => entry.target === EXEC);

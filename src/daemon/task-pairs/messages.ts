@@ -18,6 +18,7 @@ import {
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   TASK_PAIR_TITLE_RULE,
+  TASK_PAIR_TITLE_MARKER_RULE,
   TASK_PAIR_WORKS_DIR,
   TASK_PAIR_WORKSPACE_RULES,
   formatTaskPairSeverityCounts,
@@ -53,8 +54,9 @@ export function buildUntitledTaskTitleRequest(
   const language = locale ? ` in the owner's UI language (${locale})` : ' in the owner\'s UI language';
   return [
     `[IM.codes task titles] Please assign short, specific titles${language} for: ${taskIds.join(', ')}.`,
-    'Reply with one marker per task, for example <!-- IMCODES_TASK DISPATCH tsk_demo title="Fix login retry" -->; title= updates the existing pair without changing its brief.',
+    'Reply with one title-only update per non-terminal task, preferably via pair_task_update({taskId,title}). If using a marker, use only <!-- IMCODES_TASK DISPATCH tsk_demo title="Fix login retry" -->; this updates metadata without changing the brief or lifecycle and never reopens a cancelled/done pair.',
     TASK_PAIR_TITLE_RULE,
+    TASK_PAIR_TITLE_MARKER_RULE,
     'This is one batched reminder; do not retry immediately. Use pair_task_update with {taskId, title} if preferred.',
   ].join('\n');
 }
