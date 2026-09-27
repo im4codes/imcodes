@@ -430,6 +430,33 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     expect(callback).toHaveBeenCalledWith('error', record.name, expect.stringContaining('Working directory not found: /proj'));
   });
 
+  it('restores the rest of the store when one invalid cwd fails, marking only that session error', async () => {
+    const bad = {
+      name: 'deck_sync_brain', projectName: 'sync', role: 'brain', agentType: 'shell',
+      projectDir: '/missing/sync-project', state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    const good = {
+      name: 'deck_sync_w1', projectName: 'sync', role: 'w1', agentType: 'shell',
+      projectDir: '/valid/sync-project', state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+    storeMock.mockImplementation(() => [bad, good]);
+    tmuxListMock.mockResolvedValue([]);
+    sessionExistsMock.mockResolvedValue(false);
+    newSessionMock.mockRejectedValueOnce(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+
+    await expect(restoreFromStore()).resolves.toBeUndefined();
+
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      bad.name, 'error', expect.stringContaining('Working directory not found'),
+    );
+    expect(updateSessionStateMock).not.toHaveBeenCalledWith(
+      good.name, 'error', expect.anything(),
+    );
+    expect(newSessionMock).toHaveBeenCalledTimes(2);
+  });
+
   it('persists idle before respawning a dead pane', async () => {
     const now = Date.now();
 

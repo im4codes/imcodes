@@ -500,6 +500,7 @@ export async function syncSessionsFromWorker(
     if (plan.status === WORKER_SESSION_SYNC_STATUS.APPLIED) {
       await Promise.all([
         ...plan.remoteTestSessions.map(async (session) => {
+          if (session.state === 'stopped') return;
           await deleteSessionFromWorker(workerUrl, serverId, token, session.name);
           remoteTestDeletedCount++;
         }),
