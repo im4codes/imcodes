@@ -2369,6 +2369,59 @@ describe('useTimeline window-isolated cache bounds', () => {
     )).toBe(false);
   });
 
+  it('resets the newer cursor guard when switching sessions with an identical cursor', async () => {
+    const sessionA = `deck_cursor_switch_a_${Date.now()}`;
+    const sessionB = `deck_cursor_switch_b_${Date.now()}`;
+    const eventFor = (sessionId: string): TimelineEvent => ({
+      eventId: `${sessionId}-cached`,
+      sessionId,
+      ts: 10,
+      epoch: 1,
+      seq: 10,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.final',
+      payload: { text: `${sessionId} cached final` },
+    });
+    __setTimelineCacheForTests(sessionA, [eventFor(sessionA)]);
+    __setTimelineCacheForTests(sessionB, [eventFor(sessionB)]);
+
+    const sendTimelineHistoryRequest = vi.fn(() => `history-${sendTimelineHistoryRequest.mock.calls.length + 1}`);
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => {},
+      sendTimelineHistoryRequest,
+      supportsTimelineProtocolRevision: vi.fn(() => true),
+    } as unknown as WsClient;
+
+    function Probe({ session }: { session: string }) {
+      useTimeline(session, ws, undefined, {
+        isActiveSession: true,
+        isVisible: false,
+        subscriptionMode: 'summary',
+      });
+      return h('div', { 'data-testid': 'cursor-switch' }, session);
+    }
+
+    const view = render(h(Probe, { session: sessionA }));
+    await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1));
+    expect(sendTimelineHistoryRequest.mock.calls[0]?.[4]).toMatchObject({
+      epoch: 1,
+      afterSeq: 10,
+      direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+    });
+
+    sendTimelineHistoryRequest.mockClear();
+    view.rerender(h(Probe, { session: sessionB }));
+    await waitFor(() => expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1));
+    expect(sendTimelineHistoryRequest.mock.calls[0]?.[0]).toBe(sessionB);
+    expect(sendTimelineHistoryRequest.mock.calls[0]?.[4]).toMatchObject({
+      epoch: 1,
+      afterSeq: 10,
+      direction: TIMELINE_CURSOR_DIRECTIONS.NEWER,
+    });
+  });
+
   it('never lets a late load-earlier response rewrite the window switched in afterward', async () => {
     const serverId = `srv-window-switch-${Date.now()}`;
     const sessionA = `deck_window_a_${Date.now()}`;

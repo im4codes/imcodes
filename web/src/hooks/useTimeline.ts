@@ -2414,6 +2414,10 @@ export function useTimeline(
     const cacheKeyChanged = previous.cacheKey !== nextKey;
     const activated = !previous.active && isActiveSession;
     synchronousSeedTriggerRef.current = { cacheKey: nextKey, active: isActiveSession };
+    // A newer cursor is scoped to one session/cache chain.  Reset it before
+    // the next bootstrap request so two sessions with identical epoch/seq
+    // cursors cannot suppress the new session's first delta fetch.
+    if (cacheKeyChanged) newerCursorKeyRef.current = null;
     if (!cacheKeyChanged && !activated) return;
     if (!cacheKeyChanged && activated && eventsRef.current.length > 0) return;
 
@@ -2458,6 +2462,10 @@ export function useTimeline(
   // (window minimized). The memory cache (eventsCache) preserves them for instant
   // restore when the window reopens.
   useEffect(() => {
+    // Keep the guard scoped to the current session even when the synchronous
+    // seed effect has no work to do (for example a cold cache or disabled
+    // history branch).
+    newerCursorKeyRef.current = null;
     if (!sessionId) {
       setLoading(false);
       setHttpRefreshing(false);
