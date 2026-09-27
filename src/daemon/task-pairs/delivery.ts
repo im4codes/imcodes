@@ -2,10 +2,11 @@
  * Daemon-authored messages to pair participants (nudges, reminders, handoffs,
  * dispatched briefs, Brain notices).
  *
- * Every message is an ordinary durable-FIFO send, never the priority control
- * path and never a mid-turn append, and it is committed to the timeline once
- * as an automation row. A message for a pair is skipped while an earlier
- * message for the same pair and reason is still queued, so nothing piles up.
+ * Every message is an append-by-default inter-session send, never the priority
+ * control path. Providers that cannot append retain the durable FIFO fallback,
+ * and it is committed to the timeline once as an automation row. A message
+ * for a pair is skipped while an earlier message for the same pair and reason
+ * is still pending, so nothing piles up.
  */
 import { CHAT_MESSAGE_ORIGINS } from '../../../shared/chat-message-origin.js';
 import { randomUUID } from 'node:crypto';
@@ -14,6 +15,7 @@ import { timelineEmitter } from '../timeline-emitter.js';
 import { getTransportRuntime } from '../../agent/session-manager.js';
 import { dispatchSessionMessage } from '../session-dispatch.js';
 import { createSendDispatchId, type SendMessageId } from '../../../shared/send-message-id.js';
+import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
 import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NUDGE_ID_PREFIX } from '../../../shared/task-pair.js';
 import logger from '../../util/logger.js';
 
@@ -89,6 +91,7 @@ export async function sendTaskPairMessage(
       // Our own id prefix is what makes the pending-queue dedupe possible.
       messageId: messageId as SendMessageId,
       durableQueue: true,
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
       suppressTimeline: true,
       messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
     });

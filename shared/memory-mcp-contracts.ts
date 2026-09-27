@@ -778,14 +778,14 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: {
     name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
-    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Existing-task continuations MUST append (default), with durable FIFO fallback; queue always uses FIFO for new work. Returns delivered/queued/failed status.',
+    description: 'Send to an exact send_list_targets target; Callers and labels are invalid targets. Inter-session sends append by default (busy turns use the provider append boundary, idle turns start immediately) with durable FIFO fallback only when append is unavailable. queue is opt-in FIFO only. Returns delivered/queued/failed status.',
     inputSchema: objectSchema({
       target: stringSchema('Exact target session. May be omitted only when task.autoProvision=true, which authorizes the daemon to reuse/provision from an explicit execution identity or configured pool.'),
       message: stringSchema(`Required complete task/request text to deliver, up to ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} UTF-8 bytes. Include the desired role and output, such as audit findings, discussion input, plan, implementation request, or verification result.`),
       deliveryMode: {
         type: 'string',
         enum: [...Object.values(MEMORY_MCP_SEND_DELIVERY_MODES)],
-        description: 'append joins the active task with FIFO fallback; queue never inserts into the active turn and rejects an existing taskId.',
+        description: 'append is the default direct inter-session mode with durable fallback; queue is explicit FIFO and never inserts into the active turn.',
       },
       files: {
         type: 'array',

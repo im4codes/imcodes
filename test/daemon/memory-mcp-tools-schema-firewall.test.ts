@@ -1194,7 +1194,7 @@ describe('memory MCP tool schema firewall', () => {
     try {
       const contract = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
       expect(contract.inputSchema.properties?.deliveryMode).toMatchObject({ enum: ['append', 'queue'] });
-      expect(contract.description).toContain('Existing-task continuations MUST append');
+      expect(contract.description).toContain('Inter-session sends append by default');
       const result = await client.callTool({
         name: MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE,
         arguments: {

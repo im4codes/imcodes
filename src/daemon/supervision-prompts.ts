@@ -357,14 +357,15 @@ function buildBrainSupervisedWorkDelegationContractObject() {
     fanout: {
       sameTask: 'append_exact_existing_session_even_when_busy',
       newTask: 'distinct_ready_target_per_task_while_any_remain',
-      order: ['ready_distinct', 'allowed_auto_provision', 'busy_durable_fifo'],
+      order: ['ready_distinct', 'allowed_auto_provision', 'busy_append'],
       reserve: 'atomic_on_selection',
-      busyFifo: 'only_after_ready_and_auto_provision_exhausted',
+      busyFifo: 'provider_fallback_only',
       // The case the exception used to swallow, stated as its own rule so it
-      // cannot be reasoned away: everything busy is a QUEUE, not an absence.
+      // cannot be reasoned away: everything busy remains delegable through
+      // append, not an absence or a reason to run work in Brain.
       allBusyQueueable: {
         is: 'delegable',
-        route: 'imcodes_send_message_durable_fifo',
+        route: 'imcodes_send_message_append',
         brain: 'waiting',
         isNot: ['capability_unavailable', 'delegation_exception'],
         forbid: ['main_window_execution', 'provider_native_task_participation'],
@@ -728,7 +729,7 @@ export function buildSupervisionMessagingContract(): string {
   return JSON.stringify({
     contractId: SUPERVISION_CONTRACT_IDS.MESSAGING,
     v: 1,
-    send_message: { existingTask: 'append', busy: 'durable_fifo', queue: 'genuinely_new_work_only', replacementObject: false },
+    send_message: { existingTask: 'append', busy: 'append', queue: 'explicit_only', replacementObject: false },
     binding: { unchanged: 'continue_existing', changed: 'delta_only', unknownOrMismatch: 'fail_closed' },
     delegation_reply: { auth: 'daemon_session', mode: 'append_only', verdict: false },
     peer_audit_reply: { verdictChannel: 'only', bind: ['taskId', 'assignmentId', 'attemptId', 'revision'], progress: true, final: ['PASS', 'REWORK'] },

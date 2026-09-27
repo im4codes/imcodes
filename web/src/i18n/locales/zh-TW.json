@@ -278,6 +278,7 @@
       "transport_recovering": "⏳ 提供者正在恢復；{{count}} 則排隊訊息將在恢復後自動重傳。",
       "transport_auto_restart_failed": "⚠️ 提供者自動重啟失敗。請手動重啟工作階段。",
       "queued_messages_expired": "⚠️ {{count}} 則排隊訊息超過 {{minutes}} 分鐘未送達。請重新傳送。",
+      "stale_delegation_messages_expired": "⚠️ {{count}} 則過期的代理訊息已捨棄：{{detail}}。請重新傳送相關任務。",
       "queued_messages_failed": "⚠️ 重新連線後仍有 {{count}} 則排隊訊息未送達。請重新傳送。",
       "delegation_context_omitted": "委派上下文不可用；僅轉送乾淨任務。",
       "audit_worker_provision_refused": "自動審計工作器配置遭拒；已使用有界的忙碌工作階段佇列備援。",

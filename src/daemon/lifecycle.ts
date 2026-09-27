@@ -2283,11 +2283,16 @@ async function reconcileDurableTransportQueues(): Promise<void> {
       for (const [sender, entries] of bySender) {
         timelineEmitter.emit(sender, 'assistant.text', {
           ...attachDaemonUserNotice(
-            DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED,
+            DAEMON_USER_NOTICE_CODE.STALE_DELEGATION_MESSAGES_EXPIRED,
             `⚠️ ${entries.length} 条过期的代理消息已丢弃，请重新发送仍然相关的任务。\n${entries
               .map((entry) => `- ${entry.sessionName} @ ${new Date(entry.createdAt).toISOString()}: ${entry.firstLine}`)
               .join('\n')}`,
-            { count: entries.length, reason: 'stale_expired' },
+            {
+              count: entries.length,
+              detail: entries
+                .map((entry) => `${entry.sessionName}: ${entry.firstLine}`)
+                .join('; '),
+            },
           ),
           streaming: false,
           memoryExcluded: true,

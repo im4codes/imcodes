@@ -189,9 +189,9 @@ describe('memory MCP shared contracts', () => {
     expect(sendList.description).toContain('if this returns no items');
     expect(sendMessage.description).toContain('exact send_list_targets target');
     expect(sendMessage.description).toContain('Callers and labels are invalid targets');
-    expect(sendMessage.description).toContain('append (default)');
+    expect(sendMessage.description).toContain('append by default');
     expect(sendMessage.description).toContain('durable FIFO fallback');
-    expect(sendMessage.description).toContain('queue always uses FIFO');
+    expect(sendMessage.description).toContain('queue is opt-in FIFO only');
     expect(sendMessage.description).toContain('delivered/queued/failed status');
     expect(delegationReply.description).toContain('append-only');
     expect(delegationReply.inputSchema.properties).not.toHaveProperty('replyCapability');

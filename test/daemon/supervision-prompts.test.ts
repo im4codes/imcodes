@@ -89,7 +89,7 @@ describe('supervision prompts', () => {
 
     const messaging = JSON.parse(buildSupervisionMessagingContract());
     expect(messaging.send_message).toEqual({
-      existingTask: 'append', busy: 'durable_fifo', queue: 'genuinely_new_work_only', replacementObject: false,
+      existingTask: 'append', busy: 'append', queue: 'explicit_only', replacementObject: false,
     });
     expect(messaging.peer_audit_reply).toMatchObject({ verdictChannel: 'only' });
     // target/ignore/order are defined ONCE, by the delegation-eligibility
@@ -109,7 +109,7 @@ describe('supervision prompts', () => {
       target: 'live_started_authorized_transport',
       require: ['same_project_pool', 'exact_identity', 'availability'],
       ignore: ['replyCapable', 'restartDurableDeliveryId'],
-      order: ['ready', 'auto_provision', 'busy_fifo'],
+      order: ['ready', 'auto_provision', 'busy_append'],
       forbidRuntimeTypes: ['process'],
     });
   });
@@ -896,7 +896,7 @@ describe('supervision user authority clause', () => {
     // Compression must not have dropped any pre-existing safety semantics.
     const messaging = JSON.parse(buildSupervisionMessagingContract());
     expect(messaging.send_message).toEqual({
-      existingTask: 'append', busy: 'durable_fifo', queue: 'genuinely_new_work_only', replacementObject: false,
+      existingTask: 'append', busy: 'append', queue: 'explicit_only', replacementObject: false,
     });
     expect(messaging.binding).toEqual({
       unchanged: 'continue_existing', changed: 'delta_only', unknownOrMismatch: 'fail_closed',
@@ -936,7 +936,7 @@ describe('supervision user authority clause', () => {
     expect(eligibility.independentAudit.automatic).toMatchObject({
       target: 'live_started_authorized_transport',
       ignore: ['replyCapable', 'restartDurableDeliveryId'],
-      order: ['ready', 'auto_provision', 'busy_fifo'],
+      order: ['ready', 'auto_provision', 'busy_append'],
     });
   });
 

@@ -108,6 +108,7 @@ describe('peer-audit dedicated dispatch', () => {
       undefined,
       undefined,
       {
+        deliveryMode: 'append',
         // A queued brief drains as the daemon's message, not the human's input.
         messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
         peerAudit: { contractVersion: 'peer_audit_v1', attemptHash: expect.any(String) },

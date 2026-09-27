@@ -415,6 +415,7 @@ import {
   MEMORY_MCP_DISABLED_FLAGS,
   MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_TOOL_NAMES,
+  type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
 import {
   MCP_FEATURE_FLAGS_BY_NAME,
@@ -3886,8 +3887,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
   const requestedUiLocale = normalizeSupervisionUiLocale(cmd.uiLocale);
-  // Omission/unknown values are the safe default: ordinary durable FIFO.
-  // Only the exact explicit append value may request a provider-native steer.
+  // This is the browser's human composer path, not an inter-session send.
+  // Preserve its ordinary provider send semantics; node-to-node callers use
+  // the session-dispatch boundary, whose omission default is append.
   const requestedDeliveryMode = cmd.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
     ? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
     : undefined;
@@ -5346,6 +5348,7 @@ export async function sendProcessSessionMessageForAutomation(
   sessionName: string,
   text: string,
   options?: {
+    deliveryMode?: MemoryMcpSendDeliveryMode;
     suppressTimeline?: boolean;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;

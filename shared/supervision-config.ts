@@ -835,7 +835,7 @@ export const SUPERVISION_DELEGATION_ELIGIBILITY_POLICY = {
     target: 'live_started_authorized_transport',
     require: ['same_project_pool', 'exact_identity', 'availability'] as const,
     ignore: ['replyCapable', 'restartDurableDeliveryId'] as const,
-    order: ['ready', 'auto_provision', 'busy_fifo'] as const,
+    order: ['ready', 'auto_provision', 'busy_append'] as const,
     forbidRuntimeTypes: ['process'] as const,
   },
 } as const;

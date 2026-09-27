@@ -221,6 +221,11 @@ export async function dispatchSessionMessage(
   message: string,
   options: SessionDispatchMessageOptions,
 ): Promise<SessionDispatchMessageResult> {
+  // Inter-session traffic is append-by-default. Callers that explicitly need
+  // ordinary FIFO waiting must opt into `deliveryMode=queue`; keeping the
+  // normalization at this runtime-neutral boundary prevents task-pair,
+  // cron, relay, and named-send paths from silently reverting to FIFO.
+  const deliveryMode = options.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     // `/clear` is daemon-managed: a fresh provider conversation, exactly as
     // from the browser. Handing it to runtime.send made it ordinary model text
@@ -264,7 +269,7 @@ export async function dispatchSessionMessage(
         // which cannot resume a turn currently parked in wait_agent. The resend
         // handoff owns exactly-once provider admission and falls back to FIFO
         // only when native append is unavailable.
-        ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+        ...(deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
           ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
           : {}),
         queuedAt: Date.now(),
@@ -292,7 +297,7 @@ export async function dispatchSessionMessage(
         ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
         ...(options.suppressTimeline ? { timelineCommitted: true } : {}),
-        ...(options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+        ...(deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
           ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
           : {}),
         queuedAt: Date.now(),
@@ -308,14 +313,13 @@ export async function dispatchSessionMessage(
       void ensureTransportRuntimeForPendingResend(target.name);
       return 'queued';
     }
-    if (options.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
-      const result = options.queueSupervisionReference
-        ? await runtime.appendExternalMessageToActiveTurn(
-            message,
-            options.messageId,
-            options.queueSupervisionReference,
-          )
-        : await runtime.appendExternalMessageToActiveTurn(message, options.messageId);
+    if (deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
+      const appendExternal = runtime.appendExternalMessageToActiveTurn;
+      const result = typeof appendExternal === 'function'
+        ? options.queueSupervisionReference
+          ? await appendExternal.call(runtime, message, options.messageId, options.queueSupervisionReference)
+          : await appendExternal.call(runtime, message, options.messageId)
+        : 'unsupported';
       if (result === 'retry') {
         throw new Error('transport supervision authority temporarily unavailable');
       }
@@ -398,15 +402,29 @@ export async function dispatchSessionMessage(
   }
 
   const { sendProcessSessionMessageForAutomation } = await import('./command-handler.js');
+  const processDeliveryMode = deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE
+    ? { deliveryMode }
+    : {};
   const userMessageMetadata = options.messageOrigin
     ? { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: options.messageOrigin } }
     : {};
   if (options.suppressTimeline) {
-    await sendProcessSessionMessageForAutomation(target.name, message, { suppressTimeline: true, ...userMessageMetadata });
+    await sendProcessSessionMessageForAutomation(target.name, message, {
+      suppressTimeline: true,
+      ...processDeliveryMode,
+      ...userMessageMetadata,
+    });
   } else if (options.messageOrigin) {
-    await sendProcessSessionMessageForAutomation(target.name, message, userMessageMetadata);
+    await sendProcessSessionMessageForAutomation(target.name, message, {
+      ...processDeliveryMode,
+      ...userMessageMetadata,
+    });
   } else {
-    await sendProcessSessionMessageForAutomation(target.name, message);
+    if (deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE) {
+      await sendProcessSessionMessageForAutomation(target.name, message, processDeliveryMode);
+    } else {
+      await sendProcessSessionMessageForAutomation(target.name, message);
+    }
   }
 }
 
@@ -460,14 +478,28 @@ export async function dispatchPeerAuditMessage(input: {
   if ((target.runtimeType ?? getSessionRuntimeType(target.agentType)) === 'transport') {
     const runtime = getTransportRuntime(target.name);
     if (!runtime) return { ok: false, error: PEER_AUDIT_PREFLIGHT_ERRORS.TARGET_INELIGIBLE };
-    const disposition = runtime.send(input.brief, messageId, undefined, undefined, {
-      // If it queues, the drain projects it: a daemon audit brief, not the human's input.
-      messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+    const privateMetadata = {
+      // If the durable fallback queues, the drain projects it as a daemon
+      // audit brief, not the human's input.
       peerAudit: {
         contractVersion: PEER_AUDIT_CONTRACT_VERSION,
         attemptHash: createHash('sha256').update(input.attemptId).digest('base64url'),
       },
-    });
+    };
+    const metadata = {
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      messageOrigin: CHAT_MESSAGE_ORIGINS.SYSTEM,
+      ...privateMetadata,
+    };
+    const appendExternal = runtime.appendExternalMessageToActiveTurn;
+    const appendResult = typeof appendExternal === 'function'
+      ? await appendExternal.call(runtime, input.brief, messageId, undefined, undefined, privateMetadata)
+      : 'unsupported';
+    // If it queues, the drain projects it: a daemon audit brief, not the
+    // human's input. Unsupported providers retain the durable fallback.
+    const disposition = appendResult === 'sent' || appendResult === 'appended'
+      ? 'sent'
+      : runtime.send(input.brief, messageId, undefined, undefined, metadata);
     const queueEpoch = disposition === 'queued'
       ? buildTransportQueueSnapshotPayload(target.name, 'peer_audit').queueEpoch
       : undefined;

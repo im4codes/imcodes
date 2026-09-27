@@ -39,6 +39,7 @@ export const DAEMON_USER_NOTICE_CODE = {
   TRANSPORT_RECOVERING: 'transport_recovering',
   TRANSPORT_AUTO_RESTART_FAILED: 'transport_auto_restart_failed',
   QUEUED_MESSAGES_EXPIRED: 'queued_messages_expired',
+  STALE_DELEGATION_MESSAGES_EXPIRED: 'stale_delegation_messages_expired',
   QUEUED_MESSAGES_FAILED: 'queued_messages_failed',
   DELEGATION_CONTEXT_OMITTED: 'delegation_context_omitted',
   AUDIT_WORKER_PROVISION_REFUSED: 'audit_worker_provision_refused',
@@ -85,6 +86,7 @@ export const DAEMON_USER_NOTICE_PARAM_KEYS: Readonly<Partial<Record<DaemonUserNo
   [DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING]: ['count', 'detail'],
   [DAEMON_USER_NOTICE_CODE.TRANSPORT_AUTO_RESTART_FAILED]: ['detail'],
   [DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED]: ['count', 'minutes'],
+  [DAEMON_USER_NOTICE_CODE.STALE_DELEGATION_MESSAGES_EXPIRED]: ['count', 'detail'],
   [DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_FAILED]: ['count'],
   [DAEMON_USER_NOTICE_CODE.AUDIT_WORKER_PROVISION_REFUSED]: ['detail'],
   [DAEMON_USER_NOTICE_CODE.SESSION_STOP_FAILED]: ['detail'],
@@ -219,6 +221,8 @@ export function formatDaemonUserNoticeEnglish(
       return 'Automatic provider restart failed. Restart the session manually to recover.';
     case DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED:
       return `${numberParam(params, 'count')} queued message(s) expired after ${numberParam(params, 'minutes')} minutes. Send them again.`;
+    case DAEMON_USER_NOTICE_CODE.STALE_DELEGATION_MESSAGES_EXPIRED:
+      return `${numberParam(params, 'count')} stale delegation message(s) were discarded: ${stringParam(params, 'detail')}. Send the affected tasks again.`;
     case DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_FAILED:
       return `${numberParam(params, 'count')} queued message(s) still could not be delivered after reconnecting. Send them again.`;
     case DAEMON_USER_NOTICE_CODE.DELEGATION_CONTEXT_OMITTED:

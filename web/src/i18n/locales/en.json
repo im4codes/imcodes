@@ -278,6 +278,7 @@
       "transport_recovering": "⏳ The provider is recovering; {{count}} queued message(s) will be resent automatically.",
       "transport_auto_restart_failed": "⚠️ Automatic provider restart failed. Restart the session manually to recover.",
       "queued_messages_expired": "⚠️ {{count}} queued message(s) expired after {{minutes}} minutes. Send them again.",
+      "stale_delegation_messages_expired": "⚠️ {{count}} stale delegation message(s) were discarded: {{detail}}. Send the affected tasks again.",
       "queued_messages_failed": "⚠️ {{count}} queued message(s) still could not be delivered after reconnecting. Send them again.",
       "delegation_context_omitted": "Delegation context was unavailable; only the clean task was forwarded.",
       "audit_worker_provision_refused": "Automatic audit worker provisioning was refused; using the bounded busy-session queue fallback.",

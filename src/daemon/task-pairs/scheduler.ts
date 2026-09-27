@@ -3,8 +3,8 @@
  * auditor replacement (D6.5), executor escalation (D6.5a), and the
  * auto-dispatching concurrency queue (D7).
  *
- * Every message goes through `sendTaskPairMessage` (ordinary durable FIFO,
- * one pending message per pair and reason). Liveness is judged per side: only
+ * Every message goes through `sendTaskPairMessage` (append by default, with a
+ * durable FIFO fallback, and one pending message per pair and reason). Liveness is judged per side: only
  * the side whose turn it is decides whether to nudge, and a silent side gets
  * at most TASK_PAIR_SILENCE_LIMIT - 1 nudges before it escalates.
  */

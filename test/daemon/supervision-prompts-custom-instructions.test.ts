@@ -89,12 +89,12 @@ describe('supervision prompt custom-instructions merge', () => {
         fanout: {
           sameTask: 'append_exact_existing_session_even_when_busy',
           newTask: 'distinct_ready_target_per_task_while_any_remain',
-          order: ['ready_distinct', 'allowed_auto_provision', 'busy_durable_fifo'],
+          order: ['ready_distinct', 'allowed_auto_provision', 'busy_append'],
           reserve: 'atomic_on_selection',
-          busyFifo: 'only_after_ready_and_auto_provision_exhausted',
+          busyFifo: 'provider_fallback_only',
           allBusyQueueable: {
             is: 'delegable',
-            route: 'imcodes_send_message_durable_fifo',
+            route: 'imcodes_send_message_append',
             brain: 'waiting',
             isNot: ['capability_unavailable', 'delegation_exception'],
             forbid: ['main_window_execution', 'provider_native_task_participation'],
@@ -498,7 +498,7 @@ describe('Brain work-delegation contract placement and budget', () => {
       const fanout = (contract as unknown as { fanout: Record<string, unknown> }).fanout;
       expect(fanout.sameTask).toBe('append_exact_existing_session_even_when_busy');
       expect(fanout.newTask).toBe('distinct_ready_target_per_task_while_any_remain');
-      expect(fanout.order).toEqual(['ready_distinct', 'allowed_auto_provision', 'busy_durable_fifo']);
+      expect(fanout.order).toEqual(['ready_distinct', 'allowed_auto_provision', 'busy_append']);
       expect(fanout.reserve).toBe('atomic_on_selection');
       expect(fanout.noGlobalAgentCap).toBe(true);
       expect(contract.fallback.notWhen).toEqual([
@@ -529,7 +529,7 @@ describe('Brain work-delegation contract placement and budget', () => {
       }
       const allBusy = contract.fanout.allBusyQueueable;
       expect(allBusy.is).toBe('delegable');
-      expect(allBusy.route).toBe('imcodes_send_message_durable_fifo');
+      expect(allBusy.route).toBe('imcodes_send_message_append');
       expect(allBusy.brain).toBe('waiting');
       expect(allBusy.isNot).toEqual(['capability_unavailable', 'delegation_exception']);
       expect(allBusy.forbid).toEqual([

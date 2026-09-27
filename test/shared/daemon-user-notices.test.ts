@@ -80,6 +80,7 @@ describe('daemon user notice contract', () => {
       [DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING, ['count', 'detail']],
       [DAEMON_USER_NOTICE_CODE.TRANSPORT_AUTO_RESTART_FAILED, ['detail']],
       [DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED, ['count', 'minutes']],
+      [DAEMON_USER_NOTICE_CODE.STALE_DELEGATION_MESSAGES_EXPIRED, ['count', 'detail']],
       [DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_FAILED, ['count']],
       [DAEMON_USER_NOTICE_CODE.AUDIT_WORKER_PROVISION_REFUSED, ['detail']],
       [DAEMON_USER_NOTICE_CODE.SESSION_STOP_FAILED, ['detail']],
@@ -100,6 +101,20 @@ describe('daemon user notice contract', () => {
     for (const [code, expectedKeys] of dynamic) {
       expect(DAEMON_USER_NOTICE_PARAM_KEYS[code as keyof typeof DAEMON_USER_NOTICE_PARAM_KEYS], code)
         .toEqual(expect.arrayContaining(expectedKeys));
+    }
+  });
+
+  it('renders every notice with emitter-shaped params without raw placeholders', () => {
+    for (const code of Object.values(DAEMON_USER_NOTICE_CODE)) {
+      const params = Object.fromEntries(
+        (DAEMON_USER_NOTICE_PARAM_KEYS[code] ?? []).map((key) => [
+          key,
+          key === 'count' || key === 'limit' || key === 'minutes' ? 2 : 'test-detail',
+        ]),
+      );
+      const payload = createDaemonUserNoticePayload(code, params);
+      expect(payload.text, code).not.toContain('{{');
+      expect(payload.text, code).not.toContain('}}');
     }
   });
 
