@@ -28,7 +28,6 @@ export interface DomRectLike {
 export type StackOrderEntry = string | { id: string };
 
 export const DESKTOP_BOTTOM_WINDOW_RESERVE_PX = 100;
-const SESSION_TAB_BUTTON_SELECTOR = '.tab-bar [role="tab"]';
 const SESSION_TAB_BAR_SELECTOR = '.tab-bar';
 const sessionTabMeasureCache = new WeakMap<HTMLElement, {
   childCount: number;
