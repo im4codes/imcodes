@@ -2292,12 +2292,13 @@ export function useTimeline(
   const sendForwardHistoryRequest = useCallback((
     phase: Exclude<TimelineHistoryPhase, 'idle'>,
     args?: { limit?: number; afterTs?: number; cursor?: TimelineCursor },
+    allowSameNewerCursor = false,
   ) => {
     if (!ws || !sessionId) return null;
     const cursor = args?.cursor;
     if (cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER) {
       const cursorKey = timelineCursorKey(cursor);
-      if (!shouldRequestNewerTimelineCursor(newerCursorKeyRef.current, cursor)) return null;
+      if (!allowSameNewerCursor && !shouldRequestNewerTimelineCursor(newerCursorKeyRef.current, cursor)) return null;
       newerCursorKeyRef.current = cursorKey;
     } else {
       // A fresh tail/bootstrap starts a new paging chain.
@@ -5019,7 +5020,11 @@ export function useTimeline(
           // Reuse the cached epoch/seq cursor for the durable leg too. The
           // replay request covers in-memory streaming deltas; history should
           // fetch only the contiguous durable tail after that same cursor.
-          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS, current));
+          // A reconnect is an explicit refresh, not a continuation of the
+          // previous response chain. It must be allowed to re-issue the same
+          // durable cursor after a disconnect, while response-driven pages
+          // remain guarded against non-advancing cursors.
+          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS, current), true);
 
           // Fire HTTP backfill with a ~600ms delay to let the bridge's async
           // `terminal.subscribe` ownership-check race resolve; any live
