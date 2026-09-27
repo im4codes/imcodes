@@ -18,6 +18,8 @@ describe('test session guard', () => {
     expect(isKnownTestSessionName('deck_perflat_abc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_perflat_abc123_w2')).toBe(true);
     expect(isKnownTestSessionName('deck_storm_abc123_probe')).toBe(true);
+    expect(isKnownTestSessionName('deck_existing_brain')).toBe(true);
+    expect(isKnownTestSessionName('deck_existing_w1')).toBe(true);
     expect(isKnownTestSessionName('imc_perf_test_abc123')).toBe(true);
     expect(isKnownTestSessionName('deck_wtproj_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_sub_wtexec')).toBe(true);
@@ -49,6 +51,7 @@ describe('test session guard', () => {
     expect(isKnownTestProjectName('shutdownabc123')).toBe(true);
     expect(isKnownTestProjectName('perflat_abc123')).toBe(true);
     expect(isKnownTestProjectName('storm_abc123')).toBe(true);
+    expect(isKnownTestProjectName('existing')).toBe(true);
     expect(isKnownTestProjectName('imc_perf_test_abc123')).toBe(true);
     expect(isKnownTestProjectName('imcodes-test-preview-dist')).toBe(true);
     expect(isKnownTestProjectName('imcodes-test-p2p-workflow-dist')).toBe(true);
@@ -61,6 +64,8 @@ describe('test session guard', () => {
     expect(isKnownTestProjectDir('/tmp/imcodes-test-preview-dist-abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/imcodes-test-p2p-workflow-abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/imc_p2p_wf_test_abc123/project')).toBe(true);
+    expect(isKnownTestProjectDir('/tmp/existing-project')).toBe(true);
+    expect(isKnownTestProjectDir('/tmp/existing-project/sub')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/execclone-abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/tmp/imc_execclone_abc123/project')).toBe(true);
     expect(isKnownTestProjectDir('/Users/me/src/myapp')).toBe(false);

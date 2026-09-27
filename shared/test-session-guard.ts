@@ -45,6 +45,8 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   // test/daemon/task-pairs/pairs-workspace.test.ts fixtures.
   /^deck_wtproj_brain$/i,
   /^deck_sub_wt(?:exec|aud)$/i,
+  // test/daemon/lifecycle-worker-session-sync.test.ts legacy fixtures.
+  /^deck_existing_(?:brain|w\d+)$/i,
 ];
 
 const PROJECT_NAME_PATTERNS: RegExp[] = [
@@ -63,6 +65,7 @@ const PROJECT_NAME_PATTERNS: RegExp[] = [
   /^p2pworkflow[a-z0-9-]+$/i,
   /^e2e[-_]/i,
   /^wtproj$/i,
+  /^existing$/i,
 ];
 
 const PROJECT_DIR_PATTERNS: RegExp[] = [
@@ -77,6 +80,7 @@ const PROJECT_DIR_PATTERNS: RegExp[] = [
   /[/\\]tmp[/\\].*imc_p2p_wf_test_/i,
   // Temporary cwd/project dirs used by execution-clone lifecycle TESTS.
   /[/\\]tmp[/\\].*execclone[-_]/i,
+  /[/\\]tmp[/\\]existing-project(?:[/\\]|$)/i,
 ];
 
 function normalize(value: string | null | undefined): string | undefined {

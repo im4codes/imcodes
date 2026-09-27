@@ -110,10 +110,29 @@ import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
 import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
+import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
 
 function isStoredTransportSession(record: Pick<SessionRecord, 'runtimeType' | 'agentType'>): boolean {
   return record.runtimeType === RUNTIME_TYPES.TRANSPORT
     || isTransportAgent(record.agentType as AgentType);
+}
+
+function markLaunchFailure(record: Pick<SessionRecord, 'name' | 'projectDir'>, cause: unknown): Error {
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  const code = typeof cause === 'object' && cause !== null && 'code' in cause
+    ? String((cause as { code?: unknown }).code)
+    : '';
+  const isWorkingDirectoryFailure = raw.includes(SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND)
+    || code === 'ENOENT'
+    || code === 'ENOTDIR'
+    || code === '267'
+    || /error code:\s*267\b/i.test(raw);
+  const message = isWorkingDirectoryFailure
+    ? `${SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND}: ${record.projectDir}`
+    : raw;
+  updateSessionState(record.name, 'error', message);
+  emitSessionEvent('error', record.name, message);
+  return isWorkingDirectoryFailure ? new Error(message) : (cause instanceof Error ? cause : new Error(message));
 }
 
 function storedProviderResumeIdOwners(providerId: string, resumeId: string): string[] {
@@ -849,7 +868,6 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     logger.info({ session: record.name }, 'Skipping restart for transport session');
     return false;
   }
-
   const now = Date.now();
   const windowStart = now - RESTART_WINDOW_MS;
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
@@ -879,18 +897,22 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
   };
   upsertSession(updated);
 
-  await launchSession({
-    name: effectiveRecord.name,
-    projectName: effectiveRecord.projectName,
-    role: effectiveRecord.role,
-    agentType: effectiveRecord.agentType as AgentType,
-    projectDir: effectiveRecord.projectDir,
-    skipStore: true,
-    ccSessionId: effectiveRecord.ccSessionId,
-    codexSessionId: effectiveRecord.codexSessionId,
-    geminiSessionId: effectiveRecord.geminiSessionId,
-    opencodeSessionId: effectiveRecord.opencodeSessionId,
-  });
+  try {
+    await launchSession({
+      name: effectiveRecord.name,
+      projectName: effectiveRecord.projectName,
+      role: effectiveRecord.role,
+      agentType: effectiveRecord.agentType as AgentType,
+      projectDir: effectiveRecord.projectDir,
+      skipStore: true,
+      ccSessionId: effectiveRecord.ccSessionId,
+      codexSessionId: effectiveRecord.codexSessionId,
+      geminiSessionId: effectiveRecord.geminiSessionId,
+      opencodeSessionId: effectiveRecord.opencodeSessionId,
+    });
+    } catch (error) {
+      throw markLaunchFailure(record, error);
+  }
 
   // A health-check restart can race a dead tmux server while the browser's
   // terminal subscription is still alive. Rebind its pipe immediately after
@@ -915,7 +937,6 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     logger.info({ session: record.name }, 'Skipping respawn for transport session');
     return false;
   }
-
   const now = Date.now();
   const windowStart = now - RESTART_WINDOW_MS;
   const recentRestarts = record.restartTimestamps.filter((t) => t > windowStart);
@@ -983,12 +1004,16 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
     const { resolvePresetEnv } = await import('../daemon/cc-presets.js');
     Object.assign(mergedEnv, await resolvePresetEnv(record.ccPreset, ccSessionId));
   }
-  if (BACKEND === 'conpty') {
-    await respawnPane(record.name, cmd, { env: mergedEnv });
-  } else {
-    const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
-    const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
-    await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+  try {
+    if (BACKEND === 'conpty') {
+      await respawnPane(record.name, cmd, { env: mergedEnv });
+    } else {
+      const sq = (s: string) => `'${s.replace(/'/g, "'\\''")}'`;
+      const envPrefix = Object.entries(mergedEnv).map(([k, v]) => `export ${k}=${sq(v)}`).join('; ');
+      await respawnPane(record.name, `${envPrefix}; ${cmd}`);
+    }
+  } catch (error) {
+    throw markLaunchFailure(record, error);
   }
 
   // Immediately rebind pipe-pane stream (don't wait for old pipe close + 1s delay)
@@ -3885,7 +3910,13 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
     const launchStart = Date.now();
     nativeAgentsFenced = isNativeAgentFenceRequiredForLaunch({ sessionName: name, role, parentSession: opts.parentSession });
     const launchCmd = driver.buildLaunchCommand(name, { cwd: projectDir, fresh, ccSessionId, codexSessionId, geminiSessionId, opencodeSessionId, nativeAgentsFenced });
-    await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
+    try {
+      await newSession(name, launchCmd, { cwd: projectDir, env: mergedEnv });
+    } catch (error) {
+      const existing = getSession(name);
+      if (existing) throw markLaunchFailure(existing, error);
+      throw error;
+    }
     launchedNativeAgentFence = {
       fence: processLaunchFence(agentType, {
         nativeAgentsFenced,

@@ -265,6 +265,32 @@ describe('session-store', () => {
       await writeFile(join(dir, 'sessions.json'), JSON.stringify(content), 'utf8');
     }
 
+    it('purges the leaked existing-project fixture before restoring sessions', async () => {
+      await writeSessionsFixture({
+        sessions: {
+          deck_existing_brain: {
+            name: 'deck_existing_brain', projectName: 'existing', projectDir: '/tmp/existing-project',
+            role: 'brain', agentType: 'claude-code', state: 'idle', createdAt: 1, updatedAt: 1,
+          },
+          deck_real_brain: {
+            name: 'deck_real_brain', projectName: 'real', projectDir: '/Users/me/project',
+            role: 'brain', agentType: 'claude-code', state: 'idle', createdAt: 1, updatedAt: 1,
+          },
+        },
+      });
+
+      const store = await importSessionStore();
+      await store.loadStore();
+      expect(store.getSession('deck_existing_brain')).toBeUndefined();
+      expect(store.getSession('deck_real_brain')).toBeDefined();
+      await store.flushStore();
+      const persisted = JSON.parse(await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')) as {
+        sessions: Record<string, unknown>;
+      };
+      expect(persisted.sessions.deck_existing_brain).toBeUndefined();
+      expect(persisted.sessions.deck_real_brain).toBeDefined();
+    });
+
     it('deduplicates repeated identity prompts on disk and hydrates them exactly on reload', async () => {
       const prompt = `shared identity\n${'provider-safe instructions\n'.repeat(3_000)}`;
       const store = await importSessionStore();
@@ -684,4 +710,3 @@ describe('session-store', () => {
     expect(raw).toContain('deck_cd_brain');
   });
 });
-

@@ -18,6 +18,7 @@ const {
   newSessionMock, timelineEmitMock, getSessionMock, respawnPaneMock,
   releaseSessionChildResourcesMock, registerTmuxSessionResourceMock,
   initializeSessionResourceLifecycleMock,
+  sessionExistsMock,
 } = vi.hoisted(() => ({
   storeMock: vi.fn(),
   tmuxListMock: vi.fn().mockResolvedValue(['deck_Cd_brain', 'deck_sub_5907196l']),
@@ -39,6 +40,7 @@ const {
   releaseSessionChildResourcesMock: vi.fn().mockResolvedValue({ released: 0, failed: 0 }),
   registerTmuxSessionResourceMock: vi.fn().mockResolvedValue(undefined),
   initializeSessionResourceLifecycleMock: vi.fn().mockResolvedValue({ released: 0, failed: 0, preserved: 0 }),
+  sessionExistsMock: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('../../src/store/session-store.js', () => ({
@@ -54,7 +56,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: tmuxListMock,
   newSession: newSessionMock,
   killSession: vi.fn().mockResolvedValue(undefined),
-  sessionExists: vi.fn().mockResolvedValue(true),
+  sessionExists: sessionExistsMock,
   isPaneAlive: vi.fn().mockResolvedValue(true),
   respawnPane: respawnPaneMock,
   capturePane: vi.fn().mockResolvedValue([]),
@@ -149,6 +151,7 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
     respawnPaneMock.mockResolvedValue(undefined);
     releaseSessionChildResourcesMock.mockResolvedValue({ released: 0, failed: 0 });
     initializeSessionResourceLifecycleMock.mockResolvedValue({ released: 0, failed: 0, preserved: 0 });
+    sessionExistsMock.mockResolvedValue(true);
   });
 
   it('gives the daemon startup sweep a live session-store provider for orphan authority', async () => {
@@ -388,6 +391,43 @@ describe('restoreFromStore — sub-session JSONL watcher regression', () => {
       name: 'deck_restart_brain',
       state: 'idle',
     }));
+  });
+
+  it('marks a missing cwd as an error and never launches it again', async () => {
+    newSessionMock.mockRejectedValueOnce(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }));
+    sessionExistsMock.mockResolvedValueOnce(false);
+    const callback = vi.fn();
+    setSessionEventCallback(callback);
+    const record = {
+      name: 'deck_missing_cwd_brain', projectName: 'missing', role: 'brain', agentType: 'shell',
+      projectDir: '/missing/project', state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+
+    await expect(restartSession(record)).rejects.toThrow(/Working directory not found/);
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      record.name, 'error', expect.stringContaining('Working directory not found'),
+    );
+    expect(callback).toHaveBeenCalledWith('error', record.name, expect.stringContaining('Working directory not found'));
+    expect(newSessionMock).toHaveBeenCalledOnce();
+  });
+
+  it('converts a ConPTY spawn failure into a stable cwd error and stops retry work', async () => {
+    newSessionMock.mockRejectedValueOnce(new Error('Cannot create process, error code: 267'));
+    sessionExistsMock.mockResolvedValueOnce(false);
+    const callback = vi.fn();
+    setSessionEventCallback(callback);
+    const record = {
+      name: 'deck_spawn_267_brain', projectName: 'spawn', role: 'brain', agentType: 'shell',
+      projectDir: '/proj', state: 'running', restarts: 0, restartTimestamps: [],
+      createdAt: Date.now(), updatedAt: Date.now(),
+    } as const;
+
+    await expect(restartSession(record)).rejects.toThrow('Working directory not found: /proj');
+    expect(updateSessionStateMock).toHaveBeenCalledWith(
+      record.name, 'error', 'Working directory not found: /proj',
+    );
+    expect(callback).toHaveBeenCalledWith('error', record.name, expect.stringContaining('Working directory not found: /proj'));
   });
 
   it('persists idle before respawning a dead pane', async () => {
