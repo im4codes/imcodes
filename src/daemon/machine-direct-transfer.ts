@@ -409,17 +409,23 @@ async function readEncryptedMachineDirectFrame(
   requestId: string,
   counter: bigint,
   timeoutMs: number,
+  stallTimeoutMs: number = MACHINE_DIRECT_FILE_TRANSFER_LIMITS.STALL_TIMEOUT_MS,
 ): Promise<Buffer> {
+  // `timeoutMs` is the overall transfer budget used by the caller.  Bound
+  // each individual frame read separately so a dead/stalled peer fails over
+  // promptly, while a healthy transfer that keeps making progress may run for
+  // the full overall budget.
+  const frameTimeoutMs = Math.min(timeoutMs, stallTimeoutMs);
   const lengthHeader = await withTimeout(
     authenticated.reader.readExact(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.FRAME_LENGTH_HEADER_BYTES),
-    timeoutMs,
+    frameTimeoutMs,
     'transfer_timeout',
   );
   const length = lengthHeader.readUInt32BE(0);
   if (!isValidMachineDirectEncryptedFrameLength(length)) {
     throw new MachineDirectProtocolError('invalid_frame_length');
   }
-  const encrypted = await withTimeout(authenticated.reader.readExact(length), timeoutMs, 'transfer_timeout');
+  const encrypted = await withTimeout(authenticated.reader.readExact(length), frameTimeoutMs, 'transfer_timeout');
   return decryptMachineDirectFrame(authenticated.key, requestId, counter, encrypted);
 }
 
@@ -703,6 +709,7 @@ export async function startMachineDirectFetchReceiver(options: {
   tempPath: string;
   request: Omit<MachineDirectFetchRequest, 'candidates' | 'sourcePath'>;
   transferTimeoutMs?: number;
+  stallTimeoutMs?: number;
 }): Promise<MachineDirectFetchReceiver | null> {
   let activeConnections = 0;
   let settled = false;
@@ -749,6 +756,7 @@ export async function startMachineDirectFetchReceiver(options: {
           options.request.requestId,
           counter++,
           timeoutMs,
+          options.stallTimeoutMs,
         ));
         if (!start.sourceIdentity) {
           throw new MachineDirectProtocolError('source_identity_missing');
@@ -772,6 +780,7 @@ export async function startMachineDirectFetchReceiver(options: {
             options.request.requestId,
             counter++,
             timeoutMs,
+            options.stallTimeoutMs,
           );
           if (plaintext[0] === MACHINE_DIRECT_FRAME_TYPE.DATA) {
             loaded += plaintext.length - 1;
@@ -863,7 +872,7 @@ export async function startMachineDirectFetchReceiver(options: {
 
 export async function receiveMachineDirectUpload(
   request: MachineDirectUploadRequest,
-  options: { transferTimeoutMs?: number } = {},
+  options: { transferTimeoutMs?: number; stallTimeoutMs?: number } = {},
 ): Promise<MachineDirectUploadResponse> {
   const existing = lookupAttachmentByClientUploadId(request.clientUploadId);
   if (existing) return { type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE, requestId: request.requestId, attachment: existing };
@@ -940,7 +949,13 @@ export async function receiveMachineDirectUpload(
     let loaded = partial.size;
     for (;;) {
       const transferTimeoutMs = options.transferTimeoutMs ?? MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS;
-      const plaintext = await readEncryptedMachineDirectFrame(channel, request.requestId, counter++, transferTimeoutMs);
+      const plaintext = await readEncryptedMachineDirectFrame(
+        channel,
+        request.requestId,
+        counter++,
+        transferTimeoutMs,
+        options.stallTimeoutMs,
+      );
       if (plaintext[0] === MACHINE_DIRECT_FRAME_TYPE.DATA) {
         loaded += plaintext.length - 1;
         if (loaded > request.size) throw new MachineDirectProtocolError('size_mismatch');

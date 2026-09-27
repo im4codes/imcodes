@@ -56,6 +56,9 @@ export const MACHINE_DIRECT_FILE_TRANSFER_ERROR = {
   SOURCE_INVALID: 'source_invalid',
 } as const;
 
+const MACHINE_DIRECT_TRANSFER_TIMEOUT_MS = 300_000;
+const MACHINE_DIRECT_CONTROL_GRACE_MS = 10_000;
+
 export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   MAX_CANDIDATES: 16,
   MAX_CONTROL_BYTES: 32 * 1024,
@@ -73,12 +76,14 @@ export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   // a healthy international path on the former four-second edge.
   CONNECT_TIMEOUT_MS: 8_000,
   HANDSHAKE_TIMEOUT_MS: 8_000,
-  // The control request must not wait for a dead peer for the full payload
-  // budget. A healthy direct transfer either completes within this window or
-  // falls back to the resumable relay path; the relay itself remains bounded
-  // by FILE_TRANSFER_LIMITS.UPLOAD/DOWNLOAD_TIMEOUT_MS.
-  CONTROL_TIMEOUT_MS: 30_000,
-  TRANSFER_TIMEOUT_MS: 300_000,
+  // A control response is deliberately held by the Server until the target
+  // reports DONE.  Therefore its budget must cover the entire direct transfer
+  // rather than imposing a shorter total cap that would kill healthy, slow
+  // transfers and incorrectly force relay (or fail for relay-ineligible
+  // files).  Dead/stalled peers are bounded independently by STALL_TIMEOUT_MS.
+  STALL_TIMEOUT_MS: 30_000,
+  TRANSFER_TIMEOUT_MS: MACHINE_DIRECT_TRANSFER_TIMEOUT_MS,
+  CONTROL_TIMEOUT_MS: MACHINE_DIRECT_TRANSFER_TIMEOUT_MS + MACHINE_DIRECT_CONTROL_GRACE_MS,
   // This is only the window to begin an authenticated direct connection. Each
   // control hop re-mints it from its own clock, so it can be generous without
   // relying on synchronized machines or extending an in-flight transfer.

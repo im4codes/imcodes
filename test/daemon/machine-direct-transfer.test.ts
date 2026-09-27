@@ -159,6 +159,54 @@ describe('machine direct encrypted TCP transfer', () => {
     receiver!.close();
   });
 
+  it('detects a stalled frame before the overall transfer budget', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-stall-'));
+    cleanup.push(dir);
+    const tempPath = join(dir, '.full-destination.part');
+    const stallTimeoutMs = 50;
+    const request = {
+        type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
+        requestId: randomBytes(24).toString('base64url'),
+        capability: randomBytes(32).toString('base64url'),
+        expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
+    } as const;
+    const receiver = await startMachineDirectFetchReceiver({
+      tempPath,
+      request,
+      transferTimeoutMs: stallTimeoutMs + 5_000,
+      stallTimeoutMs,
+    });
+    expect(receiver).not.toBeNull();
+    const socket = connect({ host: receiver!.candidates[0]!.host, port: receiver!.candidates[0]!.port });
+    await new Promise<void>((resolve, reject) => {
+      socket.once('connect', resolve);
+      socket.once('error', reject);
+    });
+    const targetHello = validateMachineDirectTargetHello(await readJsonLine(socket));
+    expect(targetHello).not.toBeNull();
+    const sourceNonce = randomBytes(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.NONCE_BYTES).toString('base64url');
+    socket.write(`${JSON.stringify({
+      type: MACHINE_DIRECT_HANDSHAKE_MSG.SOURCE_HELLO,
+      requestId: request.requestId,
+      nonce: sourceNonce,
+      proof: createMachineDirectProof(request.capability, 'source', request.requestId, targetHello!.nonce, sourceNonce),
+    })}\n`);
+    const key = deriveMachineDirectTransferKey(request.capability, targetHello!.nonce, sourceNonce, request.requestId);
+    socket.write(encryptMachineDirectFrame(
+      key,
+      request.requestId,
+      0n,
+      Buffer.from([MACHINE_DIRECT_FRAME_TYPE.START, ...Buffer.from(JSON.stringify({ size: 1, originalName: 'stall.bin', sourceIdentity: { size: 1, mtimeMs: 1, device: 1, inode: 1 } }))]),
+    ));
+    let rejected = false;
+    const completion = receiver!.completion.catch(() => { rejected = true; });
+    await new Promise((resolve) => setTimeout(resolve, stallTimeoutMs + 25));
+    expect(rejected).toBe(true);
+    socket.destroy();
+    receiver!.close();
+    await completion;
+  });
+
   it('resumes a reverse machine-direct fetch after a connection loss without rewriting its prefix', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-resume-'));
     cleanup.push(dir);

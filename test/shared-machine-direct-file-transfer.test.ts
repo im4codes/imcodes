@@ -43,10 +43,12 @@ describe('machine direct file-transfer trust boundary', () => {
       .toBeGreaterThanOrEqual(26);
   });
 
-  it('bounds the direct control wait so relay fallback is not payload-timeout bound', () => {
-    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS).toBeGreaterThanOrEqual(20_000);
-    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS)
+  it('keeps control and payload budgets aligned while using a shorter per-frame stall window', () => {
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.STALL_TIMEOUT_MS).toBe(30_000);
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.STALL_TIMEOUT_MS)
       .toBeLessThan(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS);
+    expect(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS)
+      .toBeGreaterThanOrEqual(MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS);
   });
 
   it('refreshes authority from the receiving hop clock regardless of sender clock skew', () => {
