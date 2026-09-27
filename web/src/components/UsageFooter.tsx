@@ -522,13 +522,11 @@ export const UsageFooter = memo(UsageFooterImpl, (prev, next) => (
   && prev.transportActivityDetail === next.transportActivityDetail
   && prev.sessionError === next.sessionError
   && prev.now === next.now
-  && prev.onRunExecutionClones === next.onRunExecutionClones
   && prev.runExecutionClonesBusy === next.runExecutionClonesBusy
   && prev.runExecutionClonesDisabled === next.runExecutionClonesDisabled
   && prev.runExecutionClonesTitle === next.runExecutionClonesTitle
   && prev.runExecutionClonesCount === next.runExecutionClonesCount
   && prev.runExecutionClonesFeedback === next.runExecutionClonesFeedback
-  && prev.onRefreshHistory === next.onRefreshHistory
   && prev.historyRefreshing === next.historyRefreshing
   && prev.historyStatus === next.historyStatus
   && prev.wsClient === next.wsClient

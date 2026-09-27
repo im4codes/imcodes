@@ -679,18 +679,8 @@ export const SessionTabs = memo(SessionTabsImpl, (prev, next) => (
   && prev.latencyMs === next.latencyMs
   && prev.idleAlerts === next.idleAlerts
   && prev.p2pSessionLabels === next.p2pSessionLabels
-  && prev.onAlertDismiss === next.onAlertDismiss
-  && prev.onSelect === next.onSelect
-  && prev.onNewSession === next.onNewSession
-  && prev.onStopProject === next.onStopProject
   && prev.canStopProject === next.canStopProject
-  && prev.onRestartProject === next.onRestartProject
-  && prev.onCloneSession === next.onCloneSession
-  && prev.onOpenSessionSettings === next.onOpenSessionSettings
-  && prev.onShareSession === next.onShareSession
   && prev.renameRequest === next.renameRequest
-  && prev.onRenameHandled === next.onRenameHandled
-  && prev.onRenameSession === next.onRenameSession
   && prev.sessionsLoaded === next.sessionsLoaded
   && prev.pinned === next.pinned
   && prev.setPinnedArr === next.setPinnedArr

@@ -664,12 +664,6 @@ export const SubSessionCard = memo(SubSessionCardImpl, (prev, next) => (
   && prev.cardH === next.cardH
   && prev.quickData === next.quickData
   && prev.serverId === next.serverId
-  && prev.onOpen === next.onOpen
-  && prev.onClose === next.onClose
-  && prev.onRestart === next.onRestart
-  && prev.onDiff === next.onDiff
-  && prev.onHistory === next.onHistory
-  && prev.onTransportConfigSaved === next.onTransportConfigSaved
   && prev.inP2p === next.inP2p
   && prev.sharedState === next.sharedState
   && prev.accentColor === next.accentColor
