@@ -368,9 +368,31 @@ export async function runShellBrowserScenario() {
     console.error(JSON.stringify({ burstDebug: { renderedLength: renderedBurstExtract.length, expectedLength: burstSource.length, mismatch, actual: renderedBurstExtract.slice(Math.max(0, mismatch - 32), mismatch + 64), expected: burstSource.slice(Math.max(0, mismatch - 32), mismatch + 64) } }));
   }
   assert.equal(sha256(renderedBurstExtract), burstHash, 'xterm buffer burst checksum must match source');
+  // Kill tmux and immediately queue two nonce-tagged inputs. The command
+  // text contains only base64, so each decoded nonce can appear once in
+  // output; stale-pane echoes, duplicate retries, and reordering are visible.
+  const recoveryNonces = [`RECOVER_A_${Date.now()}_${Math.random().toString(16).slice(2)}`, `RECOVER_B_${Date.now()}_${Math.random().toString(16).slice(2)}`];
+  const recoveryCommands = recoveryNonces.map((nonce) => `printf '%s\\n' '${Buffer.from(nonce).toString('base64')}' | base64 -d`);
   await killRemoteTmux();
-  await page.waitForTimeout(2_000);
-  assert.ok(await page.locator('.terminal-container').first().count(), 'terminal must remain mounted after tmux kill/recovery');
+  await focusShellTerminal(page);
+  await page.keyboard.insertText(recoveryCommands[0]);
+  await page.keyboard.press('Enter');
+  await page.keyboard.insertText(recoveryCommands[1]);
+  await page.keyboard.press('Enter');
+  await waitForTerminalText(page, recoveryNonces[1], 90_000);
+  const recoveryInput = await page.evaluate(({ nonces, session }) => {
+    const panes = [...document.querySelectorAll('.terminal-container .xterm-rows')].map((node, index) => ({ index, text: node.textContent ?? '' }));
+    const handles = Object.entries(window.__imcShellTerminals ?? {}).map(([name, term]) => {
+      let text = '';
+      for (let row = 0; row < term.buffer.active.length; row += 1) text += term.buffer.active.getLine(row)?.translateToString(true) ?? '';
+      return { name, counts: nonces.map((nonce) => text.split(nonce).length - 1), order: nonces.map((nonce) => text.indexOf(nonce)) };
+    });
+    const summarize = (text) => ({ counts: nonces.map((nonce) => text.split(nonce).length - 1), order: nonces.map((nonce) => text.indexOf(nonce)) });
+    return { session, handles, panes: panes.map(({ index, text }) => ({ index, ...summarize(text) })), active: handles.find((entry) => entry.name === session) ?? null };
+  }, { nonces: recoveryNonces, session: SESSION });
+  assert.ok(recoveryInput.active, 'replacement terminal handle must retain session identity');
+  assert.deepEqual(recoveryInput.active.counts, [1, 1], 'each recovery nonce must be echoed exactly once by the replacement pane');
+  assert.ok(recoveryInput.active.order[0] >= 0 && recoveryInput.active.order[1] > recoveryInput.active.order[0], 'recovery nonce order must be preserved');
   await focusShellTerminal(page);
   await page.waitForTimeout(500);
   await typeCommand(page, "printf 'after-reconnect\\n'", 'after-reconnect', 90_000);
@@ -414,7 +436,7 @@ export async function runShellBrowserScenario() {
   assert.equal(metrics.longTasks, 0, 'shell output must not create long tasks');
   assert.ok(metrics.fps >= 50, `shell render FPS ${metrics.fps.toFixed(1)} is below 50`);
   await browser.close();
-  return { firstPaintMs, recovery: 1, metrics, inputLatency, urlCopies, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash, renderedBurstHash: sha256(renderedBurstExtract) } };
+  return { firstPaintMs, recovery: 1, recoveryInput, metrics, inputLatency, urlCopies, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash, renderedBurstHash: sha256(renderedBurstExtract) } };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
