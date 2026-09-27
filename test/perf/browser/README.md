@@ -51,6 +51,10 @@ are real app sessions backed by daemon history. `results.json` contains Long
 Task, input-delay, FPS/dropped-frame, JS heap, and CDP WebSocket counters plus
 correctness checks. `summary.md` applies the plan targets (Long Task p95 <50 ms,
 input p95 <100 ms, restore <100 ms, and correctness/backfill convergence).
+Set `IMC_PERF_SCROLL_JITTER=1` to sample the real `.chat-view` during the
+streaming window; the report then fails if `scrollTop` moves backwards or the
+bottom gap exceeds 1 px, and records the sample count and maxima in
+`results.json`/`summary.md`.
 When `IMCODES_PERF_DEBUG=1` (the compose default), the harness also polls the
 compose-only `perf.debug.timeline_metrics` socket frame. Its `serverDebug`
 array contains the server's live per-socket `bufferedAmount`, outbound queue

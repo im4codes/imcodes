@@ -75,6 +75,7 @@ import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationC
 import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
 import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
 import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
+import { computeMeasuredScrollCorrection } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
@@ -2119,6 +2120,12 @@ interface VirtualizedViewItemsProps {
   enabled: boolean;
   /** A pinned/search target that must be mounted before its caller locates it. */
   revealKey?: string;
+  /**
+   * Applies the one physical scroll correction caused by row measurement.
+   * The virtualizer reports the correction, but ChatView remains the single
+   * owner of scroll policy (follow vs reading anchor).
+   */
+  onMeasuredLayout?: (root: HTMLDivElement, wasAtBottom: boolean, anchorDelta: number) => void;
   renderItem: (item: ViewItem) => h.JSX.Element;
 }
 
@@ -2129,7 +2136,7 @@ interface VirtualizedViewItemsProps {
  * remains the owner of follow/anchor policy and therefore streaming and history
  * prepend semantics stay unchanged.
  */
-function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem }: VirtualizedViewItemsProps) {
+function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasuredLayout, renderItem }: VirtualizedViewItemsProps) {
   const heightsRef = useRef(new Map<string, number>());
   const [layoutVersion, setLayoutVersion] = useState(0);
   const scrollTopRef = useRef(0);
@@ -2261,7 +2268,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
     const observer = new ResizeObserver((entries) => {
       let changed = false;
       let anchorDelta = 0;
-      const atBottom = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
+      const wasAtBottom = wasAtBottomRef.current;
       for (const entry of entries) {
         const key = (entry.target as HTMLElement).dataset.virtualKey;
         if (!key) continue;
@@ -2269,19 +2276,23 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
         const previous = heightsRef.current.get(key) ?? 72;
         if (previous === height) continue;
         const index = itemIndex.get(key);
-        if (index !== undefined && !atBottom && offsetBefore(index) < root.scrollTop) anchorDelta += height - previous;
+        if (index !== undefined && !wasAtBottom && offsetBefore(index) < root.scrollTop) anchorDelta += height - previous;
         heightsRef.current.set(key, height);
         changed = true;
       }
-      if (anchorDelta !== 0 && !atBottom) {
-        root.scrollTop += anchorDelta;
-        scrollTopRef.current = root.scrollTop;
-      }
-      if (changed) setLayoutVersion((v) => v + 1);
+      // Do not infer pin state from the post-growth geometry: with
+      // `overflow-anchor: none`, a row growing at the bottom makes the current
+      // distance non-zero even though the user was pinned immediately before
+      // the measurement. That used to classify a pinned stream as a reader
+      // anchor, then fight ChatView's follow pass on the next frame.
+      if (!changed) return;
+      onMeasuredLayout?.(root, wasAtBottom, anchorDelta);
+      scrollTopRef.current = root.scrollTop;
+      setLayoutVersion((v) => v + 1);
     });
     root.querySelectorAll<HTMLElement>('[data-virtual-key]').forEach((node) => observer.observe(node));
     return () => observer.disconnect();
-  }, [enabled, items, layoutVersion, scrollRef]);
+  }, [enabled, items, layoutVersion, onMeasuredLayout, scrollRef]);
 
   // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
   // real viewport exists, preserving deterministic rendering and accessibility.
@@ -3146,6 +3157,31 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       lastScrollTopRef.current = node.scrollTop;
     });
   };
+
+  // Virtualized row measurements are the only layout correction that may
+  // adjust the viewport outside the normal content-follow effects. Keep that
+  // correction here so one owner decides whether the user is pinned or
+  // reading an older anchor. In particular, use the pre-measurement pin bit:
+  // after a streaming row grows, the post-growth distance is necessarily
+  // non-zero when `overflow-anchor` is disabled and must not be mistaken for a
+  // user scroll-away.
+  const applyMeasuredLayoutScroll = useCallback((root: HTMLDivElement, wasAtBottom: boolean, anchorDelta: number) => {
+    const correction = computeMeasuredScrollCorrection({
+      wasAtBottom,
+      autoFollow: autoScrollRef.current,
+      currentTop: root.scrollTop,
+      scrollHeight: root.scrollHeight,
+      clientHeight: root.clientHeight,
+      anchorDelta,
+    });
+    if (!correction) return;
+    if (correction.kind === 'pin') {
+      markProgrammaticScroll();
+      root.scrollTop = correction.targetTop;
+      return;
+    }
+    root.scrollTop += correction.delta;
+  }, []);
 
   // (No `followIfEngaged` helper: the two callsites that need it are also
   // preview-aware, and inlining `if (preview || autoScrollRef.current)`
@@ -4187,6 +4223,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             scrollRef={scrollRef}
             enabled={!preview}
             revealKey={virtualRevealKey}
+            onMeasuredLayout={applyMeasuredLayoutScroll}
             renderItem={(item) => {
             if (item.type === 'supervision-status-run') {
               return <SupervisionStatusRun key={item.key} item={item} />;

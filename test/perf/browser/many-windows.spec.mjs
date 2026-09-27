@@ -15,6 +15,65 @@ const durationMs = Number(process.env.IMC_PERF_DURATION_MS ?? 10_000);
 const openTimeoutMs = Number(process.env.IMC_PERF_OPEN_TIMEOUT_MS ?? 120_000);
 const windowOpenTimeoutMs = Number(process.env.IMC_PERF_WINDOW_TIMEOUT_MS ?? 90_000);
 
+/**
+ * Capture the real chat viewport while the daemon emits streaming deltas.
+ * A pinned viewport may advance as rows grow, but it must never move
+ * backwards or accumulate a visible gap from the bottom.  Keeping this probe
+ * in the canonical browser harness makes the regression check run against
+ * Chromium's actual layout/ResizeObserver ordering rather than a DOM mock.
+ */
+function analyzeScrollJitter(samples) {
+  if (!Array.isArray(samples) || samples.length < 2) {
+    return { pass: false, samples: samples?.length ?? 0, maxBackwardPx: 0, maxBottomGapPx: 0, failure: 'insufficient samples' };
+  }
+  let maxBackwardPx = 0;
+  let maxBottomGapPx = 0;
+  for (let index = 1; index < samples.length; index += 1) {
+    const previous = samples[index - 1];
+    const current = samples[index];
+    maxBackwardPx = Math.max(maxBackwardPx, previous.top - current.top);
+    maxBottomGapPx = Math.max(maxBottomGapPx, current.bottomGap);
+  }
+  return {
+    pass: maxBackwardPx <= 1 && maxBottomGapPx <= 1,
+    samples: samples.length,
+    maxBackwardPx,
+    maxBottomGapPx,
+  };
+}
+
+async function startScrollJitterProbe(page) {
+  if (process.env.IMC_PERF_SCROLL_JITTER !== '1' || !page) return false;
+  return page.evaluate(() => {
+    const root = document.querySelector('.chat-view');
+    if (!root) return false;
+    const state = { active: true, samples: [] };
+    const sample = () => {
+      if (!state.active) return;
+      state.samples.push({
+        t: performance.now(),
+        top: root.scrollTop,
+        bottomGap: Math.max(0, root.scrollHeight - root.clientHeight - root.scrollTop),
+      });
+      requestAnimationFrame(sample);
+    };
+    window.__imcScrollJitter = state;
+    requestAnimationFrame(sample);
+    return true;
+  }).catch(() => false);
+}
+
+async function stopScrollJitterProbe(page) {
+  if (process.env.IMC_PERF_SCROLL_JITTER !== '1' || !page) return null;
+  const samples = await page.evaluate(() => {
+    const state = window.__imcScrollJitter;
+    if (!state) return [];
+    state.active = false;
+    return state.samples;
+  }).catch(() => []);
+  return analyzeScrollJitter(samples);
+}
+
 function perfJwt() {
   const b64 = (value) => Buffer.from(value).toString('base64url');
   const header = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
@@ -514,8 +573,11 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
       correctness.failures.push('single-page missing authoritative final');
     }
     // Keep the primary one-page scenario alive for the requested measurement
-    // duration instead of ending immediately after mount/restore.
+    // duration instead of ending immediately after mount/restore. When
+    // enabled, the probe samples the real viewport during this stream.
+    await startScrollJitterProbe(page);
     await pageWait(durationMs);
+    const scrollJitter = await stopScrollJitterProbe(page);
     // Finals are emitted by the deterministic daemon during the measurement
     // window.  Evaluate the hidden-final invariant after that window, not
     // immediately after the minimize gesture (which races the first final).
@@ -563,7 +625,7 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     metrics.ws.expectedHiddenFullBytes = visibleSdkCount
       ? ((metrics.ws.byMode?.full ?? 0) / visibleSdkCount) * hiddenSdkCount
       : 0;
-    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
+    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
   } catch (error) {
     correctness.failures.push(`single-page open failed: ${error instanceof Error ? error.message : String(error)}`);
     correctness.restored = false;
@@ -721,6 +783,7 @@ export async function runHarness() {
     }
     if (pages[0]) await pages[0].bringToFront();
     await Promise.all(pages.map((page) => page.evaluate(() => window.__startPerfInput?.()).catch(() => null)));
+    await startScrollJitterProbe(pages[0]);
     await pageWait(durationMs);
     // Capture server-side queue/counter samples before restore reloads replace
     // the manual protocol page's in-memory debug buffer.
@@ -739,6 +802,7 @@ export async function runHarness() {
         correctness.fullStream = false; correctness.failures.push(`missing stream ${session.id}`);
       }
     }
+    const scrollJitter = await stopScrollJitterProbe(pages[0]);
     const restoreStarted = Date.now();
     const restoreDurations = await Promise.all(pages.map(async (page) => {
       const started = Date.now();
@@ -801,7 +865,7 @@ export async function runHarness() {
     mainMetric.ws.expectedHiddenFullBytes = expectedHiddenFullBytes;
     correctness.longChats = longChatCorrectness;
     correctness.failures.push(...Object.entries(longChatCorrectness).filter(([, ok]) => !ok).map(([size]) => `missing long-chat final ${size}`));
-    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs, restoreTotalMs, windowCurve, stallDiagnostics, longChats, serverDebug: serverDebugSamples, metrics: aggregate(metrics) };
+    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs, restoreTotalMs, windowCurve, stallDiagnostics, longChats, scrollJitter, serverDebug: serverDebugSamples, metrics: aggregate(metrics) };
   } finally {
     await Promise.race([context.close(), new Promise((resolve) => setTimeout(resolve, 15_000))]).catch(() => {});
     await Promise.race([browser.close(), new Promise((resolve) => setTimeout(resolve, 15_000))]).catch(() => {});

@@ -41,10 +41,14 @@ const checks = {
       ? Object.values(value).every(Boolean)
       : value === true),
 };
+if (process.env.IMC_PERF_SCROLL_JITTER === '1') checks.scrollJitter = result.scrollJitter?.pass === true;
 const report = { schema: 1, generatedAt: new Date().toISOString(), revision: process.env.IMC_PERF_REVISION ?? 'unknown', harness: { sha: process.env.IMC_PERF_HARNESS_SHA ?? 'unknown', dirty: process.env.IMC_PERF_HARNESS_DIRTY === '1', lockWaitMs: Number(process.env.IMC_PERF_LOCK_WAIT_MS ?? 0), loadAverageBefore: process.env.IMC_PERF_LOADAVG_BEFORE ?? 'unknown', loadAverageAfter: await loadAverage() }, targets, checks, result };
 await writeFile(`${outputDir}/results.json`, `${JSON.stringify(report, null, 2)}\n`);
 const hiddenReduction = result.metrics.ws.expectedHiddenFullBytes > 0 ? 1 - (result.metrics.ws.hiddenSummaryBytes / result.metrics.ws.expectedHiddenFullBytes) : 0;
-await writeFile(`${outputDir}/summary.md`, `# Many-windows browser performance\n\n- Revision: \`${report.revision}\`\n- Long Task p95: ${result.metrics.longTask.p95.toFixed(2)} ms (target < ${targets.longTaskP95Ms})\n- Input delay p95: ${result.metrics.inputDelay.p95.toFixed(2)} ms (target < ${targets.inputP95Ms})\n- Hidden bytes reduction: ${(hiddenReduction * 100).toFixed(1)}% (target ≥ ${targets.hiddenBytesReduction * 100}%)\n- Restore 20 windows (worst single page): ${result.restoreMs} ms (total ${result.restoreTotalMs} ms; target < ${targets.restoreWorstTaskMs})\n- Correctness: ${checks.correctness ? 'PASS' : 'FAIL'}\n\nMachine-readable data: [results.json](./results.json)\n`);
+const jitterLine = process.env.IMC_PERF_SCROLL_JITTER === '1'
+  ? `- Scroll jitter: ${result.scrollJitter?.pass ? 'PASS' : 'FAIL'} (${result.scrollJitter?.samples ?? 0} samples, max backward ${result.scrollJitter?.maxBackwardPx ?? 'n/a'} px, max bottom gap ${result.scrollJitter?.maxBottomGapPx ?? 'n/a'} px)\n`
+  : '';
+await writeFile(`${outputDir}/summary.md`, `# Many-windows browser performance\n\n- Revision: \`${report.revision}\`\n- Long Task p95: ${result.metrics.longTask.p95.toFixed(2)} ms (target < ${targets.longTaskP95Ms})\n- Input delay p95: ${result.metrics.inputDelay.p95.toFixed(2)} ms (target < ${targets.inputP95Ms})\n- Hidden bytes reduction: ${(hiddenReduction * 100).toFixed(1)}% (target ≥ ${targets.hiddenBytesReduction * 100}%)\n- Restore 20 windows (worst single page): ${result.restoreMs} ms (total ${result.restoreTotalMs} ms; target < ${targets.restoreWorstTaskMs})\n- Correctness: ${checks.correctness ? 'PASS' : 'FAIL'}\n${jitterLine}\nMachine-readable data: [results.json](./results.json)\n`);
 const exitCode = Object.values(checks).every(Boolean) ? 0 : 1;
 process.stdout.write(`${JSON.stringify({ outputDir, checks, revision: report.revision })}\n`, () => {
   // A wedged renderer can leave Playwright IPC handles alive; always emit the
