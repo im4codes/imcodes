@@ -2137,6 +2137,8 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
   const rafRef = useRef<number | null>(null);
   const wasAtBottomRef = useRef(true);
   const itemSignatureRef = useRef<string | null>(null);
+  const resumeSnapshotRef = useRef<{ scrollTop: number; atBottom: boolean } | null>(null);
+  const [resumeGeneration, setResumeGeneration] = useState(0);
   const estimate = 72;
   const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimate;
 
@@ -2165,6 +2167,40 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
     };
   }, [enabled, scrollRef]);
 
+  // iOS may reset the nested scrollTop while the WebView is backgrounded,
+  // without a useful scroll event when it becomes visible again. Capture the
+  // logical position before hiding and reconcile it on pageshow/visibility
+  // resume, rather than letting the old virtual range point at empty space.
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const capture = () => {
+      if (document.visibilityState !== 'hidden') return;
+      resumeSnapshotRef.current = {
+        scrollTop: scrollTopRef.current,
+        atBottom: wasAtBottomRef.current,
+      };
+    };
+    const resume = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (!resumeSnapshotRef.current) {
+        const root = scrollRef.current;
+        if (root) resumeSnapshotRef.current = {
+          scrollTop: scrollTopRef.current,
+          atBottom: wasAtBottomRef.current,
+        };
+      }
+      setResumeGeneration((generation) => generation + 1);
+    };
+    document.addEventListener('visibilitychange', capture);
+    document.addEventListener('visibilitychange', resume);
+    window.addEventListener('pageshow', resume);
+    return () => {
+      document.removeEventListener('visibilitychange', capture);
+      document.removeEventListener('visibilitychange', resume);
+      window.removeEventListener('pageshow', resume);
+    };
+  }, [enabled, scrollRef]);
+
   // Resume/cache replay can replace the children without dispatching a scroll
   // event. Reconcile the real viewport before the next paint: keep a viewer
   // who was following at the bottom, and clamp an old offset if the restored
@@ -2174,17 +2210,24 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, renderItem
     if (!enabled) return;
     const root = scrollRef.current;
     if (!root) return;
-    const signature = items.map((item) => item.key).join('\u0001');
+    const signature = `${resumeGeneration}:${items.map((item) => item.key).join('\u0001')}`;
     if (itemSignatureRef.current === signature) return;
     itemSignatureRef.current = signature;
     const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
-    if (wasAtBottomRef.current) root.scrollTop = root.scrollHeight;
-    else if (root.scrollTop > maxScrollTop) root.scrollTop = maxScrollTop;
+    const resumeSnapshot = resumeSnapshotRef.current;
+    if (resumeSnapshot?.atBottom || (!resumeSnapshot && wasAtBottomRef.current)) {
+      root.scrollTop = root.scrollHeight;
+    } else {
+      const preferredTop = resumeSnapshot?.scrollTop ?? root.scrollTop;
+      if (preferredTop > maxScrollTop) root.scrollTop = maxScrollTop;
+      else if (resumeSnapshot && Math.abs(root.scrollTop - preferredTop) > 1) root.scrollTop = preferredTop;
+    }
+    resumeSnapshotRef.current = null;
     scrollTopRef.current = root.scrollTop;
     viewportRef.current = root.clientHeight;
     wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
     setLayoutVersion((version) => version + 1);
-  }, [enabled, items, scrollRef]);
+  }, [enabled, items, scrollRef, resumeGeneration]);
 
   // Pin/search navigation can target an item outside the mounted overscan
   // range. Move the real scroll viewport to its measured offset first; the
