@@ -4942,7 +4942,7 @@ export function useTimeline(
             response: null,
           });
           setRefreshing(true);
-          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS));
+          sendForwardHistoryRequest('refresh', buildForwardHistoryArgs(MAX_MEMORY_EVENTS), true);
           // `manualLatestWindow`: a daemon reconnect means the daemon→server link
           // was down, and live timeline events are control-plane — `trySend`
           // drops them silently with no queue and no replay, and the reconnect
