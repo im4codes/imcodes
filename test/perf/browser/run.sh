@@ -24,11 +24,28 @@ while (($#)); do
     *) echo "usage: $0 [--app <git-ref>] [--project <name>] [--port-base <port>] [--web-port-base <port>]" >&2; exit 2 ;;
   esac
 done
-exec 9>"$LOCK_FILE"
+# Callers sometimes wrap this script in `flock <LOCK_FILE> ...` themselves.
+# A second flock on the same file from a new open file description would then
+# wait on its own parent until the timeout, stalling the whole host queue.
+# Reuse an ancestor's hold (or an explicit IMC_PERF_LOCK_HELD=1) instead.
+ancestor_holds_lock() {
+  local pid="$PPID" args
+  while [[ -n "$pid" && "$pid" -gt 1 ]]; do
+    args="$(ps -o args= -p "$pid" 2>/dev/null || true)"
+    [[ "$args" == flock*"$LOCK_FILE"* ]] && return 0
+    pid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')"
+  done
+  return 1
+}
 lock_started_ms="$(date +%s%3N)"
-if ! flock -w "$(( (LOCK_TIMEOUT_MS + 999) / 1000 ))" 9; then
-  echo "perf harness lock timeout after ${LOCK_TIMEOUT_MS}ms: ${LOCK_FILE}" >&2
-  exit 4
+if [[ "${IMC_PERF_LOCK_HELD:-0}" == 1 ]] || ancestor_holds_lock; then
+  echo "perf harness: ${LOCK_FILE} already held by the caller; not re-locking" >&2
+else
+  exec 9>"$LOCK_FILE"
+  if ! flock -w "$(( (LOCK_TIMEOUT_MS + 999) / 1000 ))" 9; then
+    echo "perf harness lock timeout after ${LOCK_TIMEOUT_MS}ms: ${LOCK_FILE}" >&2
+    exit 4
+  fi
 fi
 lock_wait_ms="$(( $(date +%s%3N) - lock_started_ms ))"
 loadavg_before="$(cat /proc/loadavg 2>/dev/null || echo unknown)"
