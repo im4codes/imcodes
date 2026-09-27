@@ -47,8 +47,10 @@ async function focusShellTerminal(page) {
     term.focus();
     return true;
   }, SESSION);
-  if (!focused) await page.locator('.terminal-container').last().click();
-  await page.locator('.xterm-helper-textarea').last().focus().catch(() => {});
+  if (!focused) {
+    await page.locator('.terminal-container').last().click();
+    await page.locator('.xterm-helper-textarea').last().focus().catch(() => {});
+  }
 }
 
 async function pasteCommand(page, command, marker, timeout = 15_000) {
