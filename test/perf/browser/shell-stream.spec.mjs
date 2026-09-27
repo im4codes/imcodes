@@ -289,7 +289,9 @@ export async function runShellBrowserScenario() {
   // this source intentionally contains no whitespace, so remove only
   // presentation whitespace before locating/checksumming it.
   const renderedBurstNormalized = renderedBurst.replace(/\s+/gu, '');
-  const renderedBurstStart = renderedBurstNormalized.indexOf('BURST_BEGIN');
+  // The command echo also contains the delimiter; the output delimiter is
+  // the final occurrence before the matching end marker.
+  const renderedBurstStart = renderedBurstNormalized.lastIndexOf('BURST_BEGIN');
   const renderedBurstEnd = renderedBurstNormalized.indexOf('BURST_END', renderedBurstStart + 'BURST_BEGIN'.length);
   assert.ok(renderedBurstStart >= 0 && renderedBurstEnd >= 0, 'xterm buffer must contain burst delimiters');
   const renderedBurstExtract = renderedBurstNormalized.slice(renderedBurstStart + 'BURST_BEGIN'.length, renderedBurstEnd);
