@@ -183,7 +183,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
 
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
 
     expect(fetchSpy).toHaveBeenCalledTimes(1);
     expect(fetchSpy).toHaveBeenCalledWith(
@@ -194,7 +194,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     expect(fetchSpy).toHaveBeenCalledWith(
       serverId,
       sessionName,
-      expect.objectContaining({ limit: 300, timeoutMs: 12_000 }),
+      expect.objectContaining({ limit: 200, timeoutMs: 12_000 }),
     );
 
     await waitFor(() => {
@@ -343,7 +343,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     render(h(Probe));
     await waitFor(() => {
-      expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName);
+    expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 200);
     });
 
     await act(async () => {
@@ -367,7 +367,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
     const [, fetchedSession, options] = fetchSpy.mock.calls[0]!;
     expect(fetchedSession).toBe(sessionName);
-    expect(options).toEqual(expect.objectContaining({ limit: 300, timeoutMs: 12_000 }));
+    expect(options).toEqual(expect.objectContaining({ limit: 200, timeoutMs: 12_000 }));
     expect((options as { afterTs?: number }).afterTs).toBeUndefined();
 
     await waitFor(() => {
@@ -525,7 +525,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     const options = fetchSpy.mock.calls.at(-1)![2];
     // Latest-window catch-up: no lower bound so the dropped terminal is fetched.
     expect((options as { afterTs?: number }).afterTs).toBeUndefined();
-    expect(options).toEqual(expect.objectContaining({ limit: 300 }));
+    expect(options).toEqual(expect.objectContaining({ limit: 200 }));
   });
 
   it('does NOT fire the stall recovery when the terminal (streaming:false) arrives before the idle window', async () => {
@@ -646,7 +646,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     await waitFor(() => { expect(fetchSpy).toHaveBeenCalled(); });
     const options = fetchSpy.mock.calls.at(-1)![2];
     expect((options as { afterTs?: number }).afterTs).toBeUndefined();
-    expect(options).toEqual(expect.objectContaining({ limit: 300 }));
+    expect(options).toEqual(expect.objectContaining({ limit: 200 }));
     await waitFor(() => {
       expect(screen.getByTestId('probe').textContent).toContain('idle');
     });
@@ -758,8 +758,11 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     );
     expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(
       sessionName,
-      300,
-      7499,
+      200,
+      undefined,
+      undefined,
+      { epoch: 1, afterSeq: 3, direction: 'newer' },
+      1024 * 1024,
     );
 
     // Before the delay expires, backfill should not have fired.
@@ -874,7 +877,14 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
 
     expect(sendTimelineHistoryRequest).toHaveBeenCalledTimes(1);
-    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(sessionName, 300, 999);
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName,
+      200,
+      undefined,
+      undefined,
+      { epoch: 1, afterSeq: 1, direction: 'newer' },
+      1024 * 1024,
+    );
 
     await act(async () => { await vi.advanceTimersByTimeAsync(650); });
     expect(fetchSpy).toHaveBeenCalledTimes(1);

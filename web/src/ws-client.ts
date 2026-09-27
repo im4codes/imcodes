@@ -449,6 +449,8 @@ function utf8ByteLength(text: string): number {
 
 /** Envelope + margin for `{"type":"subsession.rebuild_all","subSessions":[…]}`. */
 const SUBSESSION_REBUILD_BATCH_BUDGET_BYTES = DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES - 2_048;
+const TIMELINE_EVENT_IMMEDIATE_BURST = 32;
+const TIMELINE_EVENT_FLUSH_BATCH = 50;
 
 /**
  * Split a rebuild list into batches that each serialize under the outbound cap.
@@ -508,6 +510,10 @@ export class WsClient {
   private pendingInputBytes = 0;
   private _connecting = false;
   private _destroyed = false;
+  /** Timeline backlog delivery is yielded after a small first-paint burst. */
+  private pendingTimelineEvents: TimelineEventMessage[] = [];
+  private timelineEventFlushTimer: ReturnType<typeof setTimeout> | null = null;
+  private timelineEventsSinceYield = 0;
   private _pingLatency: number | null = null;
   private _pingSentAt: number | null = null;
   /** Wall-clock time of the last received pong. Used by `probeConnection` to
@@ -672,6 +678,10 @@ export class WsClient {
 
   disconnect(): void {
     this._destroyed = true;
+    if (this.timelineEventFlushTimer) clearTimeout(this.timelineEventFlushTimer);
+    this.timelineEventFlushTimer = null;
+    this.pendingTimelineEvents = [];
+    this.timelineEventsSinceYield = 0;
     this._connecting = false;
     this.clearTimers();
     if (this.ws) {
@@ -2272,6 +2282,7 @@ export class WsClient {
         // before dispatch so any listener that immediately re-asks
         // `isDaemonCapabilityStale()` sees the fresh value.
         this.bumpDaemonLastSeenIfFromDaemon(msg);
+        if (msg.type === TIMELINE_MESSAGES.EVENT && this.deferTimelineEvent(msg)) return;
         this.dispatch(msg);
       } catch {
         // ignore parse errors
@@ -2633,6 +2644,40 @@ export class WsClient {
       } catch {
         // ignore handler errors
       }
+    }
+  }
+
+  /**
+   * A reconnect can deliver thousands of timeline.event frames in one socket
+   * turn. Dispatching each synchronously lets every mounted timeline run its
+   * reducer before the browser can paint. Keep the first small burst
+   * immediate for fast first paint, then yield in bounded batches.
+   */
+  private deferTimelineEvent(msg: TimelineEventMessage): boolean {
+    if (this.pendingTimelineEvents.length === 0 && this.timelineEventsSinceYield < TIMELINE_EVENT_IMMEDIATE_BURST) {
+      this.timelineEventsSinceYield += 1;
+      return false;
+    }
+    this.pendingTimelineEvents.push(msg);
+    if (!this.timelineEventFlushTimer) {
+      this.timelineEventFlushTimer = setTimeout(() => this.flushTimelineEvents(), 0);
+    }
+    return true;
+  }
+
+  private flushTimelineEvents(): void {
+    this.timelineEventFlushTimer = null;
+    if (this._destroyed) {
+      this.pendingTimelineEvents = [];
+      this.timelineEventsSinceYield = 0;
+      return;
+    }
+    const batch = this.pendingTimelineEvents.splice(0, TIMELINE_EVENT_FLUSH_BATCH);
+    for (const event of batch) this.dispatch(event);
+    if (this.pendingTimelineEvents.length > 0) {
+      this.timelineEventFlushTimer = setTimeout(() => this.flushTimelineEvents(), 0);
+    } else {
+      this.timelineEventsSinceYield = 0;
     }
   }
 

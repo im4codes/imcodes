@@ -1243,7 +1243,14 @@ describe('useTimeline optimistic send flow', () => {
     expect(ref.current!.events).toHaveLength(1);
     expect(ref.current!.events[0].payload.pending).toBe(true);
     expect(ref.current!.events[0].payload.text).toBe('still visible');
-    expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith('deck_opt_reconnect_pending', 300);
+    expect(ws.sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      'deck_opt_reconnect_pending',
+      200,
+      undefined,
+      undefined,
+      { epoch: 0, afterSeq: 0, direction: 'newer' },
+      1024 * 1024,
+    );
   });
 
   it('does not show ack_timeout failure when authoritative history arrives', () => {

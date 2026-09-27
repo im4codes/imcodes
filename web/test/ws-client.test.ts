@@ -834,6 +834,11 @@ describe('WsClient', () => {
 
     expect(client.connected).toBe(true);
     expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(1);
+    // Keep the first paint-sized burst synchronous, then yield the backlog in
+    // bounded timer batches so mounted timelines can render between batches.
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(32);
+    for (let i = 0; i < 24; i++) await vi.advanceTimersByTimeAsync(1);
+    expect(handler.mock.calls.filter(([msg]) => msg?.type === 'timeline.event')).toHaveLength(1_000);
     client.disconnect();
     vi.useRealTimers();
   });
