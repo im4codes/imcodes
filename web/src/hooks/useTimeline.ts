@@ -2455,15 +2455,12 @@ export function useTimeline(
 
     const requestDaemonHistory = (visible: boolean, limit?: number, sourceEvents?: TimelineEvent[], force = false): void => {
       if (!wsConnected || !ws) return;
-      // Gate WS-side timeline.history_request behind isActiveSession the same
-      // way fireHttpBackfill is gated. SubSessionCard mounts one useTimeline
-      // per sub-session card; with the gate missing, every non-focused card
-      // also asked the daemon for history on mount/reconnect, which (a) drove
-      // the daemon to recoverOpenCodeSessionRecord + exportOpenCodeSession for
-      // OpenCode-typed cards the user never opened, and (b) overwhelmed the
-      // WS bridge with N concurrent timeline.history_request calls per
-      // reconnect. Inactive cards still render previews from memory/IDB
-      // cache and live WS event pushes; they don't need their own backfill.
+      // Gate passive card/hidden history requests, but let an on-screen chat
+      // window request its bounded after-seq delta even when it is not focused.
+      // SubSessionCard mounts one useTimeline per preview; those remain cache /
+      // live-event only. A visible floating window must stay authoritative
+      // after a reconnect without waiting for focus, while its cached rows
+      // still paint synchronously before this request runs.
       //
       // EXCEPTION: when local cache is completely empty (cold IDB branch
       // below), inactive sessions MUST be allowed exactly one history
@@ -2476,7 +2473,7 @@ export function useTimeline(
       // mount-effect dep array includes `isActiveSession`) and the gate
       // passes — at which point the bootstrap path issues its history
       // request as normal.
-      if (!isActiveSessionRef.current && !force) {
+      if (!isActiveSessionRef.current && !shouldBootstrapVisibleHistoryRef.current && !force) {
         updateHistoryStep('daemon', 'skipped', 'bootstrap');
         setLoading(false);
         setRefreshing(false);

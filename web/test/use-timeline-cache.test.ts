@@ -884,6 +884,47 @@ describe('useTimeline window-isolated cache bounds', () => {
       .toContain('restored without sending a message');
   });
 
+  it('keeps a visible inactive window full and requests only the cached after-seq delta', async () => {
+    vi.useFakeTimers();
+    const sessionName = `deck_visible_cached_${Date.now()}`;
+    const serverId = `srv-visible-cached-${Date.now()}`;
+    const cached = makeEvents(sessionName, 4);
+    __setTimelineCacheForTests(`${serverId}:${sessionName}`, cached);
+    const sendTimelineHistoryRequest = vi.fn(() => 'history-visible-cached');
+    const ws: WsClient = {
+      connected: true,
+      onMessage: () => () => undefined,
+      sendTimelineHistoryRequest,
+    } as unknown as WsClient;
+
+    function Probe() {
+      const timeline = useTimeline(sessionName, ws, serverId, {
+        isActiveSession: false,
+        isVisible: true,
+        subscriptionMode: 'full',
+        bootstrapWhenVisible: true,
+      });
+      return h('div', { 'data-testid': 'visible-cached-probe' },
+        timeline.events.map((event) => String(event.payload.text ?? '')).join('|'));
+    }
+
+    render(h(Probe));
+    // Cache is visible in the first render, before any WS response.
+    expect(screen.getByTestId('visible-cached-probe').textContent).toContain(`${sessionName}-3`);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+      await flushMicrotasks();
+    });
+    expect(sendTimelineHistoryRequest).toHaveBeenCalledWith(
+      sessionName,
+      200,
+      undefined,
+      undefined,
+      { epoch: 1, afterSeq: 3, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER },
+      1024 * 1024,
+    );
+  });
+
   it('falls back to raw sessionId IDB key when the scoped read is empty (cacheKey scope drift)', async () => {
     // Regression for the scope-drift bug — PR-4 in
     // .imc/discussions/e9dbc48c-dda.md. When the app mounts before
