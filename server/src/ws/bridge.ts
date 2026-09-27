@@ -1190,7 +1190,11 @@ const TIMELINE_PENDING_UNICAST_TIMEOUT_MS = 30_000;
 const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP = 4096;
 const TIMELINE_DATA_PLANE_MAX_IN_FLIGHT = 4;
 const DEFAULT_TIMELINE_DATA_PLANE_QUEUE_MAX_BYTES = 64 * 1024 * 1024;
-const DEFAULT_TIMELINE_DATA_PLANE_SOCKET_MAX_BYTES = 32 * 1024 * 1024;
+// A single browser socket can legitimately fan out the bounded first page for
+// every visible/hidden window at once. Keep the per-socket cap hard-bounded,
+// but leave enough room for twenty <=2 MiB pages to queue without rejecting a
+// normal one-page open burst (the global/user caps remain independent guards).
+const DEFAULT_TIMELINE_DATA_PLANE_SOCKET_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMELINE_DATA_PLANE_USER_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMELINE_DATA_PLANE_JOB_DEADLINE_MS = 60_000;
 let timelineDataPlaneQueueCap = DEFAULT_TIMELINE_DATA_PLANE_QUEUE_CAP;
