@@ -57,10 +57,19 @@ import {
   rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 
-const HOME = homedir();
-const IMCODES_HOME = process.env.IMCODES_HOME?.trim() || join(HOME, '.imcodes');
+// IMCODES_HOME is already the state directory.  Otherwise honor an explicit
+// HOME override before falling back to the platform homedir; this keeps
+// upgrade.lock and daemon.pid scoped to the same instance as the daemon lock.
+function resolveImcodesStateDir() {
+  const configured = process.env.IMCODES_HOME?.trim();
+  if (configured) return resolve(configured);
+  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+  return resolve(join(home, '.imcodes'));
+}
+
+const IMCODES_HOME = resolveImcodesStateDir();
 const LOCK = join(IMCODES_HOME, 'upgrade.lock');
 const PIDFILE = join(IMCODES_HOME, 'daemon.pid');
 const DAEMON_TASK = 'imcodes-daemon';
@@ -433,7 +442,7 @@ async function main() {
   // Step 1: Acquire upgrade lock (watchdog will park on it).
   // Use a directory write — even if upgrade.lock's parent .imcodes
   // doesn't yet exist for some reason, mkdir is idempotent.
-  mkdirSync(join(HOME, '.imcodes'), { recursive: true });
+  mkdirSync(IMCODES_HOME, { recursive: true });
   writeFileSync(LOCK, 'upgrade');
   trace(1, 'lock-acquired');
 

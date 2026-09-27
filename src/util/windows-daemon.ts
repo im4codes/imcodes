@@ -2,7 +2,15 @@ import { execSync, spawn } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { resolveImcodesHome, windowsDaemonLockPipeName } from './windows-daemon-lock.js';
+import {
+  WINDOWS_DAEMON_LOCK_PIPE,
+  resolveImcodesHome,
+  windowsDaemonLockPipeName,
+} from './windows-daemon-lock.js';
+import {
+  isRecordedProcessIdentityCurrent,
+  readInstanceLockMetadata,
+} from '../daemon/instance-lock.js';
 
 const WINDOWS_DAEMON_TASK = 'imcodes-daemon';
 const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
@@ -16,6 +24,10 @@ function readDaemonPid(currentPid?: number): number | null {
   } catch {
     return null;
   }
+}
+
+function isHomeScopedInstance(): boolean {
+  return windowsDaemonLockPipeName() !== WINDOWS_DAEMON_LOCK_PIPE;
 }
 
 function isPidAlive(pid: number): boolean {
@@ -50,6 +62,9 @@ function sleepMs(ms: number): void {
  *  This function is best-effort: it logs nothing and swallows all errors. */
 export function killAllStaleWatchdogs(): void {
   if (process.platform !== 'win32') return;
+  // A custom HOME has no ownership authority over the machine-wide watchdog.
+  // Never broad-kill another isolated instance's watchdog.
+  if (isHomeScopedInstance()) return;
   const pids = findStaleWatchdogPids();
   for (const pid of pids) {
     try {
@@ -136,6 +151,7 @@ function tryStartVbsLauncher(): boolean {
 }
 
 function tryStartScheduledTask(): boolean {
+  if (isHomeScopedInstance()) return false;
   try {
     execSync(`schtasks /Run /TN ${WINDOWS_DAEMON_TASK}`, {
       stdio: 'ignore', windowsHide: true,
@@ -148,6 +164,7 @@ function tryStartScheduledTask(): boolean {
 }
 
 function tryStartStartupShortcut(): boolean {
+  if (isHomeScopedInstance()) return false;
   const startupCmd = resolve(
     homedir(),
     'AppData',
@@ -286,6 +303,27 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
 export function killOrphanDaemonProcesses(): boolean {
   if (process.platform !== 'win32') return false;
   const lockPipeName = windowsDaemonLockPipeName();
+
+  // Non-default homes are isolated instances.  Never run the legacy broad
+  // node_modules scan for them: it can taskkill a different HOME's daemon.
+  // Read and verify this HOME's lock identity first, then target only that
+  // recorded PID.  The default HOME retains the legacy recovery scan for old
+  // installations whose metadata may be missing.
+  if (lockPipeName !== WINDOWS_DAEMON_LOCK_PIPE) {
+    const metadata = readInstanceLockMetadata();
+    if (!metadata || metadata.socketPath !== lockPipeName
+      || !isRecordedProcessIdentityCurrent(metadata)) return false;
+    const pid = metadata.pid;
+    if (pid === process.pid) return false;
+    try {
+      execSync(`taskkill /f /pid ${pid}`, {
+        stdio: 'ignore', windowsHide: true,
+        timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
+      });
+    } catch { /* already dead or bounded timeout */ }
+    return !isPidAlive(pid);
+  }
+
   let killed = false;
   let scriptDir: string | null = null;
   try {

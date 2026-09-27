@@ -131,7 +131,7 @@ function runPreflight(sb: Sandbox): { stderr: string; status: number | null } {
       PATH: `${sb.shimDir}:${process.env.PATH ?? ''}`,
       HOME: sb.homeDir,
       USERPROFILE: sb.homeDir,        // Windows env name; preflight uses homedir() either way
-      IMCODES_HOME: sb.homeDir,
+      IMCODES_HOME: join(sb.homeDir, '.imcodes'),
       IMCODES_LAUNCH_REPAIR_LOG: sb.repairLog,
       // Keep npm and module lookup hermetic; the shim never reaches the
       // registry, and no ambient NODE_PATH/global cache may influence checks.
@@ -149,6 +149,15 @@ function runPreflight(sb: Sandbox): { stderr: string; status: number | null } {
 }
 
 describe('src/util/windows-launch-preflight.mjs', () => {
+  it('uses a state-dir IMCODES_HOME or overridden HOME consistently', () => {
+    const src = readFileSync(PREFLIGHT_SRC, 'utf8');
+    expect(src).toContain('function resolveImcodesStateDir()');
+    expect(src).toMatch(/process\.env\.IMCODES_HOME\?\.trim\(\)/);
+    expect(src).toMatch(/process\.env\.HOME\?\.trim\(\)\s*\|\|\s*process\.env\.USERPROFILE\?\.trim\(\)\s*\|\|\s*homedir\(\)/);
+    expect(src).toContain("const lockDir = join(IMCODES_HOME, 'upgrade.lock.d')");
+    expect(src).not.toContain("join(process.env.IMCODES_HOME ?? homedir(), '.imcodes'");
+  });
+
   it('healthy install: exits 0 without invoking npm', () => {
     const sb = makeSandbox({});
     try {

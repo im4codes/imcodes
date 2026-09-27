@@ -50,6 +50,14 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
     expect(src).toContain('process.argv[6]');
   });
 
+  it('scopes state to IMCODES_HOME or the overridden HOME, without appending .imcodes twice', () => {
+    expect(src).toContain('function resolveImcodesStateDir()');
+    expect(src).toMatch(/process\.env\.IMCODES_HOME\?\.trim\(\)/);
+    expect(src).toMatch(/process\.env\.HOME\?\.trim\(\)\s*\|\|\s*process\.env\.USERPROFILE\?\.trim\(\)\s*\|\|\s*homedir\(\)/);
+    expect(src).toContain("return resolve(join(home, '.imcodes'))");
+    expect(src).toContain('const IMCODES_HOME = resolveImcodesStateDir()');
+  });
+
   it('declares NPM_INSTALL_TIMEOUT_MS and FAST_CMD_TIMEOUT_MS as named constants', () => {
     // Hard-coded magic numbers in spawnSync calls are how unbounded waits
     // sneak back in.  Force the values to live as named constants the

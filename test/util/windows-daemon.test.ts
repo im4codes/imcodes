@@ -13,7 +13,10 @@ const state = vi.hoisted(() => ({
   execCalls: [] as string[],
   spawnCalls: [] as Array<{ cmd: string; args: string[] }>,
   rmSyncCalls: [] as string[],
+  lockMetadata: null as null | { pid: number; startToken: string; socketPath: string; version: 1; acquiredAt: number; sessionIds: string[]; residualResources: string[] },
 }));
+const originalHome = process.env.HOME;
+const originalImcodesHome = process.env.IMCODES_HOME;
 
 vi.mock('node:os', () => ({ homedir: () => 'C:\\Users\\tester' }));
 
@@ -40,10 +43,19 @@ vi.mock('node:fs', () => ({
   }),
 }));
 
+vi.mock('../../src/daemon/instance-lock.js', () => ({
+  readInstanceLockMetadata: () => state.lockMetadata,
+  isRecordedProcessIdentityCurrent: () => true,
+}));
+
 vi.mock('node:child_process', () => ({
   execSync: vi.fn((cmd: string) => {
     state.execCalls.push(cmd);
-    if (cmd.startsWith('taskkill ')) return '';
+    if (cmd.startsWith('taskkill ')) {
+      const match = cmd.match(/\/pid\s+(\d+)/i);
+      if (match) state.alivePids.delete(Number(match[1]));
+      return '';
+    }
     if (cmd.includes('schtasks /End')) return '';
     if (cmd.includes('schtasks /Run')) {
       if (!state.scheduledTaskRunOk) throw new Error('run failed');
@@ -59,6 +71,11 @@ vi.mock('node:child_process', () => ({
 
 function reset(): void {
   vi.resetModules();
+  // The production helper honors HOME overrides. Keep this mocked Windows
+  // fixture on the default home so legacy broad-recovery tests exercise the
+  // default branch; scoped behavior is covered separately below.
+  process.env.HOME = 'C:\\Users\\tester';
+  delete process.env.IMCODES_HOME;
   state.pidContents = [''];
   state.pidIndex = 0;
   state.scheduledTaskRunOk = false;
@@ -69,6 +86,7 @@ function reset(): void {
   state.execCalls = [];
   state.spawnCalls = [];
   state.rmSyncCalls = [];
+  state.lockMetadata = null;
   vi.spyOn(process, 'platform', 'get').mockReturnValue('win32');
   vi.spyOn(process, 'kill').mockImplementation(((pid: number) => {
     if (!state.alivePids.has(pid)) throw new Error('not running');
@@ -82,6 +100,10 @@ describe('restartWindowsDaemon', () => {
   beforeEach(reset);
   afterEach(() => {
     vi.restoreAllMocks();
+    if (originalHome === undefined) delete process.env.HOME;
+    else process.env.HOME = originalHome;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
   });
 
   // ── Launcher priority ──
@@ -237,5 +259,26 @@ describe('restartWindowsDaemon', () => {
 
     // No rmSync calls when lock is absent — avoids fs noise on the happy path.
     expect(state.rmSyncCalls).toEqual([]);
+  });
+
+  it('scoped cleanup targets only the current HOME lock owner, never a broad node scan', async () => {
+    process.env.HOME = 'C:\\Users\\scoped-a';
+    const { windowsDaemonLockPipeName } = await import('../../src/util/windows-daemon-lock.js');
+    const pipe = windowsDaemonLockPipeName();
+    state.lockMetadata = {
+      version: 1,
+      pid: 777,
+      startToken: 'windows:777-start',
+      acquiredAt: Date.now(),
+      socketPath: pipe,
+      sessionIds: [],
+      residualResources: [],
+    };
+    state.alivePids = new Set([777]);
+
+    const { killOrphanDaemonProcesses } = await import('../../src/util/windows-daemon.js');
+    expect(killOrphanDaemonProcesses()).toBe(true);
+    expect(state.execCalls).toContain('taskkill /f /pid 777');
+    expect(state.execCalls.some((call) => call.includes('find-orphans.ps1'))).toBe(false);
   });
 });
