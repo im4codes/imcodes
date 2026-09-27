@@ -460,6 +460,70 @@ describe('WsBridge timeline drop telemetry', () => {
     });
   });
 
+  it('filters history backfill for summary sockets and restores full content after a mode switch', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const browser = new MockWs();
+    bridge.handleBrowserConnection(browser as never, 'user-1', makeDb());
+
+    const events = [
+      {
+        eventId: 'stream-1', sessionId: SESSION, ts: 1, seq: 43, epoch: 7,
+        type: 'assistant.text', payload: { text: 'partial', streaming: true },
+      },
+      {
+        eventId: 'final-1', sessionId: SESSION, ts: 2, seq: 44, epoch: 7,
+        type: 'assistant.text', payload: { text: 'complete', streaming: false },
+      },
+    ];
+
+    browser.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+      epoch: 7,
+      afterSeq: 42,
+      requestId: 'summary-history-1',
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: SESSION,
+      requestId: 'summary-history-1',
+      epoch: 7,
+      events,
+    }));
+    await flushAsync();
+
+    let history = browser.sentStrings
+      .map((raw) => JSON.parse(raw) as { type: string; events?: Array<Record<string, unknown>> })
+      .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+    expect(history?.events?.map((event) => event.eventId)).toEqual(['final-1']);
+
+    browser.sent.length = 0;
+    browser.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      epoch: 7,
+      afterSeq: 42,
+      requestId: 'full-history-1',
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: SESSION,
+      requestId: 'full-history-1',
+      epoch: 7,
+      events,
+    }));
+    await flushAsync();
+
+    history = browser.sentStrings
+      .map((raw) => JSON.parse(raw) as { type: string; events?: Array<Record<string, unknown>> })
+      .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+    expect(history?.events?.map((event) => event.eventId)).toEqual(['stream-1', 'final-1']);
+  });
+
   it('closes a stalled socket before trimming durable events and keeps queue memory bounded', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const slow = new SlowWs();
