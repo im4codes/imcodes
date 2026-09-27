@@ -155,17 +155,26 @@ export async function runShellBrowserScenario() {
   await context.addCookies([{ name: 'rcc_session', value: jwt(), url: BASE_URL }, { name: 'rcc_csrf', value: 'imc-shell-perf-csrf-token', url: BASE_URL }]);
   await context.addInitScript(({ apiKey, serverId }) => {
     window.__IMC_SHELL_BROWSER_TEST__ = true;
-    if (!navigator.clipboard) {
-      window.__shellClipboardStub = true;
-      window.__shellClipboardText = '';
-      Object.defineProperty(navigator, 'clipboard', {
-        configurable: true,
-        value: {
-          writeText: async (value) => { window.__shellClipboardText = value; },
-          readText: async () => window.__shellClipboardText,
+    // Keep clipboard assertions deterministic in headless Chromium: HTTP
+    // origins can expose navigator.clipboard while silently dropping writes.
+    // The app still uses its real Clipboard API call; this harness adapter
+    // records the exact value and falls back to the native API when usable.
+    window.__shellClipboardStub = true;
+    window.__shellClipboardText = '';
+    const nativeClipboard = navigator.clipboard;
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: {
+        writeText: async (value) => {
+          window.__shellClipboardText = value;
+          try { await nativeClipboard?.writeText(value); } catch { /* headless HTTP */ }
         },
-      });
-    }
+        readText: async () => {
+          if (window.__shellClipboardText) return window.__shellClipboardText;
+          try { return await nativeClipboard?.readText?.() ?? ''; } catch { return ''; }
+        },
+      },
+    });
     if (typeof crypto.randomUUID !== 'function') {
       crypto.randomUUID = () => {
         const bytes = new Uint8Array(16);
