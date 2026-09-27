@@ -13,7 +13,7 @@ const MOBILE_SCREENSHOT = process.env.IMC_PAIR_BRIEF_MOBILE_SCREENSHOT ?? '/repo
 
 function jwt() {
   const b64 = (value) => Buffer.from(value).toString('base64url');
-  const input = `${b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64(JSON.stringify({ sub: 'imc_pair_brief_browser', role: 'owner', type: 'web', iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 3600 }))}`;
+  const input = `${b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64(JSON.stringify({ sub: 'imc_perf_user', role: 'owner', type: 'web', iat: Math.floor(Date.now() / 1000), exp: Math.floor(Date.now() / 1000) + 3600 }))}`;
   return `${input}.${crypto.createHmac('sha256', JWT_KEY).update(input).digest('base64url')}`;
 }
 
