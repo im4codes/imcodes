@@ -557,9 +557,9 @@ describe('SessionPane', () => {
     );
 
     expect(chatViewSpy).toHaveBeenCalled();
-    expect(terminalViewSpy).toHaveBeenCalled();
-    const lastTerminalProps = terminalViewSpy.mock.calls.at(-1)?.[0];
-    expect(lastTerminalProps?.active).toBe(false);
+    // Transport sessions stay in chat mode; the inactive terminal is now
+    // lazily unmounted rather than keeping an xterm instance alive.
+    expect(terminalViewSpy).not.toHaveBeenCalled();
     fireEvent.click(screen.getByRole('button', { name: 'send' }));
     expect(addOptimisticUserMessageMock).toHaveBeenCalledWith('queued text', 'test-cmd-1', {});
   });

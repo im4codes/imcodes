@@ -491,7 +491,9 @@ describe('SubSessionCard', () => {
         text: 'echo hi',
         commandId: expect.any(String),
       }));
-      expect(terminalScrollBottomSpy).toHaveBeenCalled();
+      // Closed shell cards keep only the lightweight preview placeholder; the
+      // terminal is mounted when the card/window is actually opened.
+      expect(terminalScrollBottomSpy).not.toHaveBeenCalled();
     });
     expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
@@ -515,9 +517,7 @@ describe('SubSessionCard', () => {
       expect(ws.holdTerminalRaw).toHaveBeenCalledWith('deck_sub_sub-card-1');
     });
 
-    const props = terminalViewPropsSpy.mock.calls.at(-1)?.[0];
-    expect(props.preview).toBe(true);
-    expect(props.mobileInput).toBe(true);
+    expect(terminalViewPropsSpy).not.toHaveBeenCalled();
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
 
     view.unmount();
