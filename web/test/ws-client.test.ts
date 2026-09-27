@@ -106,6 +106,23 @@ describe('WsClient', () => {
     expect(client.connected).toBe(false);
   });
 
+  it('coalesces concurrent session-list requests until the response arrives', async () => {
+    const client = new WsClient('http://localhost:8787', 'srv-1');
+    client.connect();
+    await flushAsync();
+    lastWs!.emit('open');
+    lastWs!.send.mockClear();
+
+    client.requestSessionList();
+    client.requestSessionList();
+    expect(lastWs!.send.mock.calls.filter(([raw]) => String(raw).includes('get_sessions'))).toHaveLength(1);
+
+    lastWs!.emit('message', { data: JSON.stringify({ type: 'session_list', sessions: [] }) });
+    client.requestSessionList();
+    expect(lastWs!.send.mock.calls.filter(([raw]) => String(raw).includes('get_sessions'))).toHaveLength(2);
+    client.disconnect();
+  });
+
   it('opens a WebSocket on connect()', async () => {
     const client = new WsClient('http://localhost:8787', 'srv-1');
     client.connect();
