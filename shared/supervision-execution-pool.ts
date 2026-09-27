@@ -158,6 +158,15 @@ export interface SupervisionExecutionConfig {
   role?: SupervisionExecutionPoolRole;
 }
 
+/** Wire fields required when a caller explicitly selects an execution identity. */
+export const SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS = [
+  'capabilityId',
+  'agentType',
+  'providerFamily',
+  'runtimeType',
+  'model',
+] as const;
+
 /** Effective role of a pool entry: absent/invalid normalizes to 'both'. */
 export function supervisionExecutionConfigRole(config: SupervisionExecutionConfig): SupervisionExecutionPoolRole {
   return config.role === 'executor' || config.role === 'auditor' ? config.role : 'both';

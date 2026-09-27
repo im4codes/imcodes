@@ -124,6 +124,7 @@ import {
   type SupervisionTaskMetadata,
 } from '../../shared/supervision-config.js';
 import {
+  SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS,
   SUPERVISION_EXECUTION_POOL_KINDS,
   normalizeSupervisionEconomyTaskPolicy,
   normalizeSupervisionExecutionConfig,
@@ -996,20 +997,46 @@ const TASK_ARG_ALLOWED_KEYS: ReadonlySet<string> = new Set([
   'autoProvision', 'requestedExecutionType', 'economyPolicy',
 ]);
 
-function parseTaskArg(value: unknown): SupervisionTaskMetadata | undefined | 'invalid' {
+type TaskArgParseFailure = { error: string };
+type TaskArgParseResult = SupervisionTaskMetadata | undefined | TaskArgParseFailure;
+
+function taskArgFailure(error: string): TaskArgParseFailure {
+  return { error };
+}
+
+function parseTaskArg(value: unknown): TaskArgParseResult {
   if (value === undefined || value === null) return undefined;
-  if (typeof value !== 'object' || Array.isArray(value)) return 'invalid';
+  if (typeof value !== 'object' || Array.isArray(value)) return taskArgFailure('task metadata must be an object');
   const record = value as Record<string, unknown>;
-  if (Object.keys(record).some((key) => !TASK_ARG_ALLOWED_KEYS.has(key))) return 'invalid';
+  const unsupportedKey = Object.keys(record).find((key) => !TASK_ARG_ALLOWED_KEYS.has(key));
+  if (unsupportedKey) return taskArgFailure(`task.${unsupportedKey} is not supported`);
   const stringField = (key: string): string | undefined => typeof record[key] === 'string' && record[key].trim() ? record[key].trim() : undefined;
   const arrayField = (key: string): string[] | undefined => Array.isArray(record[key]) ? (record[key] as unknown[]).filter((item): item is string => typeof item === 'string') : undefined;
-  const requestedExecutionType = normalizeSupervisionExecutionConfig(record.requestedExecutionType);
+  let requestedExecutionType: ReturnType<typeof normalizeSupervisionExecutionConfig>;
+  if (record.requestedExecutionType !== undefined && record.requestedExecutionType !== null) {
+    if (typeof record.requestedExecutionType !== 'object' || Array.isArray(record.requestedExecutionType)) {
+      return taskArgFailure('task.requestedExecutionType must be an object');
+    }
+    const requested = record.requestedExecutionType as Record<string, unknown>;
+    const missingField = SUPERVISION_EXECUTION_CONFIG_REQUIRED_FIELDS.find((field) => (
+      typeof requested[field] !== 'string' || !requested[field].trim()
+    ));
+    if (missingField) return taskArgFailure(`task.requestedExecutionType.${missingField} is required`);
+    if (requested.runtimeType !== 'process' && requested.runtimeType !== 'transport') {
+      return taskArgFailure('task.requestedExecutionType.runtimeType must be process or transport');
+    }
+    requestedExecutionType = normalizeSupervisionExecutionConfig(requested);
+    if (!requestedExecutionType) {
+      return taskArgFailure('task.requestedExecutionType is invalid; capabilityId must match the canonical execution identity');
+    }
+  }
   const economyPolicy = normalizeSupervisionEconomyTaskPolicy(record.economyPolicy);
-  if (record.requestedExecutionType != null && !requestedExecutionType) return 'invalid';
-  if (record.economyPolicy != null && !economyPolicy) return 'invalid';
-  if (record.executionPool != null && record.executionPool !== 'primary' && record.executionPool !== 'economy') return 'invalid';
-  if (record.auditPolicy != null && !isSupervisionTaskAuditPolicy(record.auditPolicy)) return 'invalid';
-  if (record.autoProvision !== undefined && record.autoProvision !== true) return 'invalid';
+  if (record.economyPolicy != null && !economyPolicy) return taskArgFailure('task.economyPolicy is invalid');
+  if (record.executionPool != null && record.executionPool !== 'primary' && record.executionPool !== 'economy') {
+    return taskArgFailure('task.executionPool must be primary or economy');
+  }
+  if (record.auditPolicy != null && !isSupervisionTaskAuditPolicy(record.auditPolicy)) return taskArgFailure('task.auditPolicy is invalid');
+  if (record.autoProvision !== undefined && record.autoProvision !== true) return taskArgFailure('task.autoProvision must be true when provided');
   return {
     taskId: stringField('taskId'),
     assignmentId: stringField('assignmentId'),
@@ -2702,7 +2729,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const audit = parseAuditArg(args.audit);
       if (audit === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'audit request is invalid');
       const task = parseTaskArg(args.task);
-      if (task === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'task metadata is invalid');
+      if (task && 'error' in task) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, task.error);
       // A session's working project directory is authoritative even when the
       // directory is not a Git checkout. Older/restored MCP registrations can
       // omit PROJECT_ROOT, so recover it from the live session record before
@@ -3913,7 +3940,8 @@ const schemas = {
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),
       integrationOwner: z.string().optional(), baseRevision: z.string().optional(), currentRevision: z.string().optional(), auditAttemptId: z.string().optional(), auditRevision: z.string().optional(),
       auditPolicy: z.enum(SUPERVISION_TASK_AUDIT_POLICIES).optional(),
-      executionPool: z.enum(['primary', 'economy']).optional(), autoProvision: z.literal(true).optional(),
+      executionPool: z.enum(['primary', 'economy']).optional(),
+      autoProvision: z.literal(true).optional(),
       requestedExecutionType: z.object({
         capabilityId: z.string(),
         agentType: z.string(),

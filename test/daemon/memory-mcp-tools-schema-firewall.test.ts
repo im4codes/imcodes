@@ -1176,6 +1176,95 @@ describe('memory MCP tool schema firewall', () => {
     }
   });
 
+  it('reports field-level autoProvision metadata errors and accepts the pool-shaped sibling payload', async () => {
+    const root = process.cwd();
+    const self = sessionRecord({
+      projectDir: root, runtimeType: 'process', activeModel: 'gpt-6-sol', sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch',
+      transportConfig: {
+        supervision: {
+          mode: 'off',
+          executionPools: {
+            state: 'configured',
+            primaryDevelopmentPool: { configs: [{
+              agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+              capabilityId: buildSupervisionExecutionCapabilityId({
+                agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+              }),
+            }] },
+            economyTaskPool: { configs: [] },
+          },
+        },
+      },
+    });
+    const target = sessionRecord({
+      name: 'deck_sub_pool_payload_target', role: 'w1', parentSession: self.name,
+      userCreated: true, projectDir: root, agentType: 'codex-sdk', providerId: 'openai', runtimeType: 'process',
+      activeModel: 'gpt-6-luna', sessionInstanceId: 'pool-target-instance', runtimeEpoch: 'pool-target-epoch',
+    });
+    const canonicalConfig = {
+      agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process' as const,
+      model: 'gpt-6-luna',
+      capabilityId: buildSupervisionExecutionCapabilityId({
+        agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+      }),
+    };
+    const provisionSupervisionTarget = vi.fn(async () => ({
+      ok: true as const, target,
+      evidence: { selectedPool: 'primary' as const, selectedConfig: canonicalConfig, origin: 'spawned' as const, createdSessionName: target.name },
+    }));
+    const dispatchMessage = vi.fn(async () => undefined);
+    const ensureSupervisionAssignmentWorktree = vi.fn(async (input: { assignmentId: string }) => ({
+      ok: true as const,
+      worktreePath: `${root}/.imcodes-worktrees/${input.assignmentId}`,
+      baseRevision: 'a'.repeat(40),
+      created: true,
+    }));
+    const handlers = createMemoryMcpToolHandlers(caller({ projectRoot: root }), {
+      sendDeps: {
+        listSessions: () => [self, target], provisionSupervisionTarget, dispatchMessage,
+        ensureSupervisionAssignmentWorktree,
+      },
+    });
+    const send = handlers[MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE];
+
+    await expect(send({
+      message: 'spawn', idempotencyKey: 'metadata-missing-capability',
+      task: { autoProvision: true, requestedExecutionType: {
+        agentType: 'codex-sdk', providerFamily: 'openai', runtimeType: 'process', model: 'gpt-6-luna',
+      } },
+    })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: 'task.requestedExecutionType.capabilityId is required',
+    });
+
+    await expect(send({
+      message: 'spawn', idempotencyKey: 'metadata-wrong-capability',
+      task: { autoProvision: true, requestedExecutionType: { ...canonicalConfig, capabilityId: 'codex' } },
+    })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      message: 'task.requestedExecutionType is invalid; capabilityId must match the canonical execution identity',
+    });
+
+    await expect(send({ message: 'spawn', task: { autoProvision: true } })).resolves.toMatchObject({
+      status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+      error: 'task.autoProvision requires no target/broadcast/clone and a non-empty idempotencyKey',
+    });
+
+    // The successful sibling shape: identity comes from the configured pool,
+    // while idempotencyKey is top-level (not nested under task).
+    const poolResult = await send({
+      message: 'spawn from pool', idempotencyKey: 'pool-shaped-sibling-payload',
+      task: {
+        autoProvision: true, executionPool: 'primary', classification: 'independent_top_level',
+        baseRevision: 'a'.repeat(40),
+      },
+    });
+    expect(poolResult).toMatchObject({ status: 'accepted', provisioning: { createdSessionName: target.name } });
+    expect(provisionSupervisionTarget).toHaveBeenCalledWith(expect.objectContaining({
+      pool: 'primary', idempotencyKey: 'pool-shaped-sibling-payload',
+    }));
+  });
+
   it('carries deliveryMode through MCP ingress and refuses queue for an existing task continuation', async () => {
     const self = sessionRecord({
       sessionInstanceId: 'self-instance', runtimeEpoch: 'self-epoch', runtimeType: 'transport',
