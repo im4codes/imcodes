@@ -2323,7 +2323,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     function Probe() {
       const { events } = useTimeline(sessionName, ws, undefined, {
-        isActiveSession: false,
+        isActiveSession: true,
         isVisible: false,
         subscriptionMode: 'summary',
       });
@@ -2341,6 +2341,7 @@ describe('useTimeline window-isolated cache bounds', () => {
         1024 * 1024,
       );
     });
+    const initialRequestCount = requestCount;
 
     const repeatedCursor = { epoch: 1, afterSeq: 10, direction: TIMELINE_CURSOR_DIRECTIONS.NEWER } as const;
     await act(async () => {
@@ -2360,7 +2361,7 @@ describe('useTimeline window-isolated cache bounds', () => {
 
     // A filtered page can be empty, but the same cursor must not cause a
     // second request (the old behavior produced hundreds of thousands).
-    expect(requestCount).toBe(1);
+    expect(requestCount).toBe(initialRequestCount);
     expect(__shouldRequestNewerTimelineCursorForTests(null, repeatedCursor)).toBe(true);
     expect(__shouldRequestNewerTimelineCursorForTests(
       JSON.stringify(['newer', 1, 10, null, null]),

@@ -448,7 +448,8 @@ describe('WsBridge timeline drop telemetry', () => {
         { eventId: 'history-stream', sessionId: SESSION, seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'partial', streaming: true } },
         { eventId: 'history-final', sessionId: SESSION, seq: 2, epoch: 1, type: 'assistant.text', payload: { text: 'authoritative final', streaming: false } },
       ],
-      hasMore: false,
+      hasMore: true,
+      nextCursor: { epoch: 1, afterSeq: 2, direction: 'newer' },
     }));
     await flushAsync();
     const response = summary.sentStrings
@@ -457,6 +458,8 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(response?.events).toHaveLength(1);
     expect(response?.events[0]?.eventId).toBe('history-final');
     expect(response?.events[0]?.payload?.text).toBe('authoritative final');
+    expect(response?.hasMore).toBe(true);
+    expect(response?.nextCursor).toEqual({ epoch: 1, afterSeq: 2, direction: 'newer' });
   });
 
   it('keeps a healthy summary socket gap-free under realistic status/tool load', async () => {
