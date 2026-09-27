@@ -986,9 +986,13 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     const sessionMap = new Map(subSessions.map((s) => [s.id, s]));
     return dragOrder.map((id) => sessionMap.get(id)).filter(Boolean) as SubSession[];
   }, [subSessions, dragOrder]);
-  const accentColorsById = useMemo(() => getSubSessionAccentColorMap(orderedSessions), [orderedSessions]);
   const orderedSessionIds = useMemo(() => orderedSessions.map((sub) => sub.id), [orderedSessions]);
   const orderedSessionIdsKey = orderedSessionIds.join(',');
+  // Status/state frames replace the SubSession objects while preserving the
+  // same ordered ids. Accent assignment is structural, so do not recompute it
+  // for every metadata update (the per-card components receive the latest
+  // object separately).
+  const accentColorsById = useMemo(() => getSubSessionAccentColorMap(orderedSessions), [orderedSessionIdsKey]);
   const orderedSessionsRef = useRef(orderedSessions);
   orderedSessionsRef.current = orderedSessions;
   const dragOrderRef = useRef(dragOrder);
@@ -1000,11 +1004,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
     : EXPANDED_PREVIEW_INITIAL_COUNT;
   const hydratedExpandedPreviewIds = useMemo(
     () => new Set(orderedSessions.slice(0, currentExpandedPreviewBudget).map((sub) => sub.id)),
-    [currentExpandedPreviewBudget, orderedSessions],
+    [currentExpandedPreviewBudget, orderedSessionIdsKey],
   );
   const openSubWindowCount = useMemo(
-    () => orderedSessions.filter((sub) => openIds.has(sub.id)).length,
-    [openIds, orderedSessions],
+    () => orderedSessionIds.filter((id) => openIds.has(id)).length,
+    [openIds, orderedSessionIdsKey],
   );
   const restorableQuickClosedIds = useMemo(() => {
     if (quickClosedIds.length === 0) return [];
