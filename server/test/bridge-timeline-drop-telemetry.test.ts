@@ -421,6 +421,44 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(JSON.stringify(response)).not.toContain('partial');
   });
 
+  it('delivers a non-empty terminal history page to a summary request', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: SESSION,
+      requestId: 'summary-history-terminal-1',
+      limit: 200,
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: SESSION,
+      requestId: 'summary-history-terminal-1',
+      epoch: 1,
+      events: [
+        { eventId: 'history-stream', sessionId: SESSION, seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'partial', streaming: true } },
+        { eventId: 'history-final', sessionId: SESSION, seq: 2, epoch: 1, type: 'assistant.text', payload: { text: 'authoritative final', streaming: false } },
+      ],
+      hasMore: false,
+    }));
+    await flushAsync();
+    const response = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY && msg.requestId === 'summary-history-terminal-1');
+    expect(response?.events).toHaveLength(1);
+    expect(response?.events[0]?.eventId).toBe('history-final');
+    expect(response?.events[0]?.payload?.text).toBe('authoritative final');
+  });
+
   it('keeps a healthy summary socket gap-free under realistic status/tool load', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const summary = new AsyncHealthyWs();
