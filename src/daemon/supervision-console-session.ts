@@ -38,6 +38,26 @@ interface ActiveSubscription {
 }
 
 /**
+ * A browser can emit a burst of SUBSCRIBE frames while recovering a malformed
+ * projection.  Keep the guard on the connection (this registry is per WS),
+ * rather than globally: one noisy viewer must not throttle another viewer's
+ * authorized scope.  The limits only suppress the expensive durable replay;
+ * each accepted subscription still receives a current snapshot/replay below.
+ */
+const SUBSCRIBE_DEDUP_WINDOW_MS = 1_000;
+const SUBSCRIBE_RATE_WINDOW_MS = 5 * 60_000;
+const SUBSCRIBE_SYNC_LIMIT = 6;
+
+interface SubscribeBudget {
+  windowStartedAt: number;
+  requestCount: number;
+  lastAt: number;
+  lastSubscriptionId: string;
+  lastFingerprint: string;
+  lastSyncAt: number;
+}
+
+/**
  * Composite map key for a scope.
  *
  * JSON array rather than a delimiter-joined string: it is unambiguous for any
@@ -60,12 +80,26 @@ function readScope(value: unknown): SupervisionTaskConsoleScope | undefined {
   return { projectName, coordinatorSessionName };
 }
 
+function subscribeFingerprint(record: Record<string, unknown>, scope: SupervisionTaskConsoleScope): string {
+  return JSON.stringify([
+    scopeKey(scope),
+    record.subscriptionId,
+    record.afterEventId ?? null,
+    record.projectionVersion ?? null,
+    record.lastDurableEventId ?? null,
+    record.projectionEpoch ?? null,
+    record.schemaVersion ?? null,
+    record.statusContractVersion ?? null,
+  ]);
+}
+
 export class SupervisionConsoleSessionRegistry {
   readonly #deps: SupervisionConsoleSessionDeps;
   readonly #subscriptions = new Map<string, ActiveSubscription>();
   /** Coalesce repeated subscribe storms while a large replay is yielding. */
   readonly #durableReplayInFlight = new Map<string, Promise<void>>();
   readonly #latestReplayRecord = new Map<string, Record<string, unknown>>();
+  readonly #subscribeBudgets = new Map<string, SubscribeBudget>();
   #refused = 0;
 
   constructor(deps: SupervisionConsoleSessionDeps) {
@@ -175,10 +209,39 @@ export class SupervisionConsoleSessionRegistry {
       this.#refused += 1;
       return true; // silent: no frame, no existence disclosure
     }
+    const now = this.#deps.now?.() ?? Date.now();
+    const key = scopeKey(scope);
+    const fingerprint = subscribeFingerprint(record, scope);
+    let budget = this.#subscribeBudgets.get(key);
+    if (!budget || now - budget.windowStartedAt >= SUBSCRIBE_RATE_WINDOW_MS) {
+      budget = {
+        windowStartedAt: now,
+        requestCount: 0,
+        lastAt: now,
+        lastSubscriptionId: subscriptionId,
+        lastFingerprint: fingerprint,
+        lastSyncAt: Number.NEGATIVE_INFINITY,
+      };
+      this.#subscribeBudgets.set(key, budget);
+    } else if (budget.lastSubscriptionId === subscriptionId
+      && budget.lastFingerprint === fingerprint
+      && now - budget.lastAt < SUBSCRIBE_DEDUP_WINDOW_MS) {
+      // The same frame may be retried by the WS layer.  It already has an
+      // authoritative response (or is still being processed), so doing the
+      // projection again only amplifies a malformed-status storm.
+      return true;
+    }
+    budget.requestCount += 1;
+    const synchronize = budget.requestCount <= SUBSCRIBE_SYNC_LIMIT
+      && now - budget.lastSyncAt >= SUBSCRIBE_DEDUP_WINDOW_MS;
+    budget.lastAt = now;
+    budget.lastSubscriptionId = subscriptionId;
+    budget.lastFingerprint = fingerprint;
+    if (synchronize) budget.lastSyncAt = now;
     // A newer subscribe supersedes the previous one for this scope, which is
     // what makes a late snapshot from the old one droppable at the browser.
     const countBefore = this.#subscriptions.size;
-    this.#subscriptions.set(scopeKey(scope), { subscriptionId, scope });
+    this.#subscriptions.set(key, { subscriptionId, scope });
     if (this.#subscriptions.size !== countBefore) {
       this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
     }
@@ -192,7 +255,12 @@ export class SupervisionConsoleSessionRegistry {
       // Do not broadcast during subscribe catch-up: a full-snapshot client is
       // not ready for deltas yet, while a resume client is replayed below from
       // the just-written outbox in exact order.
-      this.#deps.producer.synchronizeDurableEvents(scope, { deliver: false });
+      // Once the per-viewer budget is exhausted, continue serving the current
+      // projection but do not repeatedly replay the same durable backlog.
+      // This is intentionally before any cursor/pending-frame work: the old
+      // client used to reconnect immediately on every unknown row, and each
+      // subscribe could otherwise run a full synchronous synchronization.
+      if (synchronize) this.#deps.producer.synchronizeDurableEvents(scope, { deliver: false });
       if (afterEventId === null) return this.#sendSnapshot(scope, subscriptionId);
 
       const clientVersion = typeof record.projectionVersion === 'number' ? record.projectionVersion : 0;
@@ -260,7 +328,9 @@ export class SupervisionConsoleSessionRegistry {
     if (!scope) return true;
     const active = this.#subscriptions.get(scopeKey(scope));
     if (active && active.subscriptionId === record.subscriptionId) {
-      this.#subscriptions.delete(scopeKey(scope));
+      const key = scopeKey(scope);
+      this.#subscriptions.delete(key);
+      this.#subscribeBudgets.delete(key);
       this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
     }
     return true;

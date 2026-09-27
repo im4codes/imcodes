@@ -1,5 +1,5 @@
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { SupervisionConsoleSessionRegistry } from '../../src/daemon/supervision-console-session.js';
 import { SupervisionConsoleProducer } from '../../src/daemon/supervision-console-producer.js';
 import { migrateSupervisionStore, type SupervisionMigrationDb } from '../../src/daemon/supervision-store-migrations.js';
@@ -55,6 +55,7 @@ beforeEach(() => {
   });
   registry = new SupervisionConsoleSessionRegistry({
     producer, send: (f) => sent.push(f), authorize: (s) => s.coordinatorSessionName === SCOPE.coordinatorSessionName,
+    now: () => clock,
   });
 });
 
@@ -94,6 +95,27 @@ describe('subscribe', () => {
     await new Promise<void>((resolve) => setTimeout(resolve, 40));
     expect(sent).toHaveLength(1);
     expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'storm-11' });
+  });
+
+  it('deduplicates an identical subscribe retry on the same connection', () => {
+    const synchronize = vi.spyOn(producer, 'synchronizeDurableEvents');
+    expect(registry.handleFrame(subscribe())).toBe(true);
+    expect(registry.handleFrame(subscribe())).toBe(true);
+    expect(synchronize).toHaveBeenCalledTimes(1);
+    expect(sent).toHaveLength(1);
+  });
+
+  it('rate-limits durable synchronization while still answering fresh subscription ids', () => {
+    const synchronize = vi.spyOn(producer, 'synchronizeDurableEvents');
+    for (let i = 0; i < 8; i += 1) {
+      clock = i * 1_100;
+      registry.handleFrame(subscribe({ subscriptionId: `sub-${i}` }));
+    }
+    // The first six attempts are the per-viewer budget; subsequent retries
+    // still receive a snapshot but cannot replay the same durable backlog.
+    expect(synchronize).toHaveBeenCalledTimes(6);
+    expect(sent).toHaveLength(8);
+    expect(registry.activeSubscriptionId(SCOPE)).toBe('sub-7');
   });
 
   it('is SILENT for an unauthorized scope: no frame at all', () => {
