@@ -29,6 +29,58 @@ export function watchdogCommandLineMatchesHome(commandLine, stateHome, defaultSt
   return preceding !== '\\' && preceding !== ':';
 }
 
+/**
+ * Match a daemon process command line to one state home.  Unlike watchdogs,
+ * daemon processes have no safe legacy no-path exception: a package path by
+ * itself does not identify which HOME owns the process.  Callers therefore
+ * must only kill a process when its command line contains the canonical state
+ * directory (for example an IMCODES_HOME/--home argument).  A command that
+ * names another state directory can never match by prefix or substring.
+ */
+export function daemonCommandLineMatchesHome(commandLine, stateHome, defaultStateHome = stateHome) {
+  const normalized = String(commandLine ?? '').replaceAll('/', '\\').toLowerCase();
+  const target = normalizeHome(stateHome);
+  // Require a path boundary after the canonical state home.  This prevents
+  // C:\\Temp\\lock from matching C:\\Temp\\lock2 while still accepting a
+  // quoted path followed by a switch, separator, or end of command line.
+  const escaped = target.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const targetRe = new RegExp(`(?:^|[\\s"'=])${escaped}(?=$|[\\s"'/\\\\])`, 'i');
+  return targetRe.test(normalized);
+}
+
+/** Parse PID/command-line process listings through the daemon matcher. */
+export function parseDaemonProcessListing(output, stateHome, defaultStateHome = stateHome) {
+  const pids = new Set();
+  let pendingPid = null;
+  let pendingCommand = '';
+  const flush = () => {
+    if (pendingPid !== null && daemonCommandLineMatchesHome(pendingCommand, stateHome, defaultStateHome)) {
+      pids.add(pendingPid);
+    }
+    pendingPid = null;
+    pendingCommand = '';
+  };
+  for (const raw of String(output ?? '').split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) { flush(); continue; }
+    if (line.includes('\t')) {
+      const [pidText, ...commandParts] = line.split('\t');
+      const pid = Number.parseInt(pidText.trim(), 10);
+      if (Number.isFinite(pid) && pid > 0
+        && daemonCommandLineMatchesHome(commandParts.join('\t'), stateHome, defaultStateHome)) {
+        pids.add(pid);
+      }
+      continue;
+    }
+    const pidMatch = line.match(/^ProcessId=(\d+)$/i);
+    if (pidMatch) { pendingPid = Number.parseInt(pidMatch[1], 10); continue; }
+    const commandMatch = line.match(/^CommandLine=(.*)$/i);
+    if (commandMatch) { pendingCommand = commandMatch[1]; continue; }
+  }
+  flush();
+  return [...pids];
+}
+
 /** Parse PowerShell tab output or WMIC key/value blocks and apply the matcher. */
 export function parseWatchdogProcessListing(output, stateHome, defaultStateHome = stateHome) {
   const pids = new Set();
