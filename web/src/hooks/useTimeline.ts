@@ -3680,7 +3680,11 @@ export function useTimeline(
       (event) => event.type === 'assistant.text' && event.payload?.streaming === true,
     );
     mergeEvents(incoming, MAX_MEMORY_EVENTS, { updateCache: !streamingOnly });
-    idbPutEvents(incoming);
+    // Idle persistence writes the latest streaming snapshot (and a final
+    // event writes immediately). Avoid an IndexedDB transaction for every
+    // typewriter delta; those synchronous writes were the remaining hidden
+    // fan-out on summary windows.
+    if (!streamingOnly) idbPutEvents(incoming);
   }, [idbPutEvents, mergeEvents]);
 
   // ── Streaming idle-persist ──────────────────────────────────────────────
