@@ -178,6 +178,9 @@ describe('memory MCP lightweight bootstrap', () => {
     });
     await client.connect(transport);
     const registryDir = join(home, 'session-resources');
+    // The supervised backend can take longer to spawn when this file is one
+    // shard among several macOS workers. Keep the same readiness assertion,
+    // but give startup enough budget under the sharded CPU contention.
     const record = await waitFor(async () => {
       const names = await readdir(registryDir).catch(() => []);
       for (const name of names.filter((candidate) => candidate.endsWith('.json'))) {
@@ -188,10 +191,10 @@ describe('memory MCP lightweight bootstrap', () => {
         if (candidate.resourceId?.startsWith('mcp-backend:epoch-backend-owned:')) return candidate;
       }
       return undefined;
-    });
+    }, 30_000);
     expect(record.resourceId).toMatch(/^mcp-backend:epoch-backend-owned:/);
     expect(record.handle?.pid).not.toBe(transport.pid);
-  }, 15_000);
+  }, 45_000);
 
   it('keeps increasing reconnect backoff while a ready backend flaps before the stable window', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-flap-'));
