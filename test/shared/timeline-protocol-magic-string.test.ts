@@ -87,6 +87,10 @@ const KNOWN_COMPATIBILITY_TESTS = new Set([
   'web/test/timeline-db.test.ts',
   'web/test/use-timeline-cache.test.ts',
   'web/test/use-timeline-optimistic.test.ts',
+  // The browser perf daemon is a protocol-faithful compatibility fixture;
+  // keeping wire literals here avoids coupling the standalone .mjs harness
+  // to the TypeScript shared package at runtime.
+  'test/perf/browser/daemon-client.mjs',
 ]);
 
 const SOURCE_EXTENSIONS = new Set(['.cjs', '.js', '.jsx', '.mjs', '.ts', '.tsx']);
