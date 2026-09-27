@@ -4105,25 +4105,25 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // that exists only to steer this turn's own prompts.
   if (requestedUiLocale && sessionName) {
     queueMicrotask(() => {
-    try {
-      const existingRecord = getSession(sessionName);
-      // patchTransportConfigUiLocale stores this under its own sibling
-      // transportConfig key, never inside transportConfig.supervision: that
-      // object is a strictly validated snapshot that may be intentionally
-      // absent, invalid, or legacy-repair-only, and either rebuilding it
-      // through the normalizer or merely adding a field to it here would
-      // silently change what every other reader sees (lost config, or an
-      // unconfigured/repair-pending session on an ordinary send).
-      if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
-        && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
-        upsertSession({
-          ...existingRecord,
-          transportConfig: patchTransportConfigUiLocale(existingRecord.transportConfig ?? null, requestedUiLocale),
-        });
+      try {
+        const existingRecord = getSession(sessionName);
+        // patchTransportConfigUiLocale stores this under its own sibling
+        // transportConfig key, never inside transportConfig.supervision: that
+        // object is a strictly validated snapshot that may be intentionally
+        // absent, invalid, or legacy-repair-only, and either rebuilding it
+        // through the normalizer or merely adding a field to it here would
+        // silently change what every other reader sees (lost config, or an
+        // unconfigured/repair-pending session on an ordinary send).
+        if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
+          && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
+          upsertSession({
+            ...existingRecord,
+            transportConfig: patchTransportConfigUiLocale(existingRecord.transportConfig ?? null, requestedUiLocale),
+          });
+        }
+      } catch (error) {
+        logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
       }
-    } catch (error) {
-      logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
-    }
     });
   }
 
