@@ -8,6 +8,7 @@ import {
   IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
 } from '../../src/agent/providers/getDefaultMcpServers.js';
 import { writeProcessedProjection } from '../../src/store/context-store.js';
+import { timelineStore } from '../../src/daemon/timeline-store.js';
 
 const SESSION_CC = `deck_ccsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
 const SESSION_CX = `deck_cxsdk_${Math.random().toString(36).slice(2, 8)}_brain`;
@@ -752,6 +753,20 @@ describe('sdk transport flow e2e', () => {
     expect(switched?.agentType).toBe('claude-code-sdk');
     expect(switched?.ccPreset).toBe('MiniMax');
 
+    // Seed the source timeline so this test exercises the real cross-vendor
+    // handoff builder. The resulting pack resolves asynchronously while the
+    // first target dispatch waits within providerWaitMs.
+    const readPreferred = vi.spyOn(timelineStore, 'readPreferred').mockResolvedValue([{
+      eventId: 'settings-prior-user',
+      sessionId: 'deck_settings_preset_brain',
+      ts: 10,
+      seq: 1,
+      epoch: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'user.message',
+      payload: { text: 'prior conversation context' },
+    }] as any);
     handleWebCommand({ type: 'session.send', session: 'deck_settings_preset_brain', text: 'hello', commandId: 'cmd-settings-preset' }, serverLink);
     await flushAsync();
     // Cross-vendor handoff tokenization is worker-backed. Wait for the actual
@@ -766,6 +781,12 @@ describe('sdk transport flow e2e', () => {
     });
     expect(claudeCall?.options.model).toBe('MiniMax-M2.7');
     expect(claudePresetAppend(claudeCall?.options)).toContain('Authoritative runtime model: MiniMax-M2.7.');
+    // This is one captured first post-switch provider call: preserve both the
+    // handoff context and the unchanged cc-preset routing contract together.
+    const serializedPrompt = JSON.stringify(claudeCall?.prompt);
+    expect(serializedPrompt).toContain('[claude-code handoff —');
+    expect(serializedPrompt).toContain('IM.codes cross-vendor handoff');
+    readPreferred.mockRestore();
   });
 
   it('pushes a corrective session_list when settings restart fails', async () => {
