@@ -58,6 +58,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
+import { parseWatchdogProcessListing } from './windows-daemon-watchdog.mjs';
 
 // IMCODES_HOME is already the state directory.  Otherwise honor an explicit
 // HOME override before falling back to the platform homedir; this keeps
@@ -73,9 +74,7 @@ const IMCODES_HOME = resolveImcodesStateDir();
 const LOCK = join(IMCODES_HOME, 'upgrade.lock');
 const PIDFILE = join(IMCODES_HOME, 'daemon.pid');
 const DAEMON_TASK = 'imcodes-daemon';
-const DEFAULT_STATE_DIR = resolve(join(homedir(), '.imcodes')).toLowerCase();
-const SCOPED_STATE_DIR = IMCODES_HOME.toLowerCase() !== DEFAULT_STATE_DIR;
-const WATCHDOG_PATH = `${IMCODES_HOME.replaceAll('\\', '/').replace(/[\\/]+$/, '').replaceAll('/', '\\')}\\daemon-watchdog.cmd`;
+const DEFAULT_STATE_DIR = resolve(join(homedir(), '.imcodes'));
 
 const LOG_FILE = process.argv[2];
 const NPM_CMD = process.argv[3];
@@ -288,30 +287,25 @@ function killStaleWatchdogs() {
   // available — extremely unlikely on a stock Windows install — wmic is
   // our fallback.  Both query Win32_Process by command-line pattern
   // ('*daemon-watchdog*') so this is locale-independent.
-  const escapedWatchdogPath = WATCHDOG_PATH.replaceAll("'", "''");
-  const scopeClause = SCOPED_STATE_DIR ? ` -and $_.CommandLine -like '*${escapedWatchdogPath}*'` : '';
   const psScript =
     "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-    `Where-Object { $_.CommandLine -like '*daemon-watchdog*'${scopeClause} } | ` +
-    "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
+    "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+    "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }";
   try {
-    execSync(`powershell -NoProfile -NonInteractive -Command "${psScript}"`, {
-      stdio: 'ignore', windowsHide: true,
+    const out = execSync(`powershell -NoProfile -NonInteractive -Command "${psScript}"`, {
+      encoding: 'utf8', windowsHide: true,
     });
+    for (const pid of parseWatchdogProcessListing(out, IMCODES_HOME, DEFAULT_STATE_DIR)) {
+      tryKillPid(pid);
+    }
     return;
   } catch { /* fall through to wmic */ }
   try {
     const out = execSync(
-      SCOPED_STATE_DIR
-        ? `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%' and CommandLine like '%${escapedWatchdogPath.replaceAll('\\', '\\\\')}%'" get ProcessId /format:list`
-        : 'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%'" get ProcessId,CommandLine /format:list`,
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
     );
-    const pids = out.split(/\r?\n/)
-      .map((line) => line.match(/^ProcessId=(\d+)/))
-      .filter((m) => m !== null)
-      .map((m) => parseInt(m[1], 10))
-      .filter((pid) => Number.isFinite(pid) && pid > 0);
+    const pids = parseWatchdogProcessListing(out, IMCODES_HOME, DEFAULT_STATE_DIR);
     for (const pid of pids) tryKillPid(pid);
   } catch { /* both methods failed — best effort */ }
 }

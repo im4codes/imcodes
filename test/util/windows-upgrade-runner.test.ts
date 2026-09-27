@@ -59,9 +59,9 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
   });
 
   it('scopes stale watchdog cleanup for custom state dirs while preserving default recovery', () => {
-    expect(src).toContain('const SCOPED_STATE_DIR = IMCODES_HOME.toLowerCase() !== DEFAULT_STATE_DIR');
-    expect(src).toContain("const scopeClause = SCOPED_STATE_DIR");
-    expect(src).toContain("CommandLine like '%daemon-watchdog%' and CommandLine like '%");
+    expect(src).toContain("import { parseWatchdogProcessListing } from './windows-daemon-watchdog.mjs'");
+    expect(src).toContain("CommandLine like '%daemon-watchdog%'\" get ProcessId,CommandLine");
+    expect(src).toContain('parseWatchdogProcessListing(out, IMCODES_HOME, DEFAULT_STATE_DIR)');
   });
 
   it('declares NPM_INSTALL_TIMEOUT_MS and FAST_CMD_TIMEOUT_MS as named constants', () => {

@@ -6,10 +6,8 @@ import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import {
   resolveImcodesHome,
-  windowsDaemonLockPipeName,
-  windowsDaemonWatchdogPath,
-  WINDOWS_DAEMON_LOCK_PIPE,
 } from './windows-daemon-lock.js';
+import { parseWatchdogProcessListing } from './windows-daemon-watchdog.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -427,12 +425,11 @@ export async function regenerateAllArtifacts(): Promise<void> {
 
 function killAllStaleWatchdogsBeforeRegen(): void {
   if (process.platform !== 'win32') return;
-  // A custom HOME must not broad-kill another isolated instance's watchdog.
-  // Its watchdog artifact lives under the resolved state directory, so the
-  // scoped query below only matches that path; default HOME keeps legacy scan.
-  const scopedHome = windowsDaemonLockPipeName() !== WINDOWS_DAEMON_LOCK_PIPE;
-  const homePattern = windowsDaemonWatchdogPath(resolveImcodesHome()).replaceAll("'", "''");
-  const scopeClause = scopedHome ? ` -and $_.CommandLine -like '*${homePattern}*'` : '';
+  // Bind cleanup to the exact resolved state-home artifact for both default
+  // and scoped homes. The default pipe remains backward-compatible, but a
+  // default restart must not kill another isolated instance's watchdog.
+  const currentHome = resolveImcodesHome();
+  const defaultHome = path.resolve(homedir(), '.imcodes');
   // PowerShell first (works on every Windows including ones where wmic is gone)
   // CRITICAL: use a temp .ps1 file, NOT `-Command "..."` — nested double
   // quotes inside the script body get truncated by cmd.exe→powershell
@@ -445,8 +442,8 @@ function killAllStaleWatchdogsBeforeRegen(): void {
     writeFileSync(
       scriptPath,
       "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-      `Where-Object { $_.CommandLine -like '*daemon-watchdog*'${scopeClause} } | ` +
-        "ForEach-Object { $_.ProcessId }\r\n",
+      "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+        "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }\r\n",
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
@@ -455,10 +452,7 @@ function killAllStaleWatchdogsBeforeRegen(): void {
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
       },
     );
-    for (const line of out.split(/\r?\n/)) {
-      const pid = parseInt(line.trim(), 10);
-      if (Number.isFinite(pid) && pid > 0) pids.push(pid);
-    }
+    pids.push(...parseWatchdogProcessListing(out, currentHome, defaultHome));
   } catch { /* fall through */ } finally {
     if (scriptDir) {
       try { rmSync(scriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -467,20 +461,13 @@ function killAllStaleWatchdogsBeforeRegen(): void {
   if (pids.length === 0) {
     try {
       const out = execSync(
-        scopedHome
-          ? `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%' and CommandLine like '%${homePattern.replaceAll('\\', '\\\\')}%'" get ProcessId /format:list`
-          : 'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+        `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%'" get ProcessId,CommandLine /format:list`,
         {
           encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
           timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
         },
       );
-      pids = out
-        .split(/\r?\n/)
-        .map((line) => line.match(/^ProcessId=(\d+)/))
-        .filter((m): m is RegExpMatchArray => m !== null)
-        .map((m) => parseInt(m[1], 10))
-        .filter((pid) => Number.isFinite(pid) && pid > 0);
+      pids = parseWatchdogProcessListing(out, currentHome, defaultHome);
     } catch { /* both methods failed */ }
   }
   for (const pid of pids) {

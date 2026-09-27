@@ -5,9 +5,12 @@ import { join, resolve } from 'node:path';
 import {
   WINDOWS_DAEMON_LOCK_PIPE,
   resolveImcodesHome,
-  windowsDaemonWatchdogPath,
   windowsDaemonLockPipeName,
 } from './windows-daemon-lock.js';
+import {
+  parseWatchdogProcessListing,
+  watchdogCommandLineMatchesHome as sharedWatchdogCommandLineMatchesHome,
+} from './windows-daemon-watchdog.mjs';
 import {
   isRecordedProcessIdentityCurrent,
   readInstanceLockMetadata,
@@ -72,7 +75,8 @@ function sleepMs(ms: number): void {
  *  This function is best-effort: it logs nothing and swallows all errors. */
 export function killAllStaleWatchdogs(): void {
   if (process.platform !== 'win32') return;
-  const pids = findStaleWatchdogPids(resolveImcodesHome(), isHomeScopedInstance());
+  // Match the exact canonical artifact for both default and scoped homes.
+  const pids = findStaleWatchdogPids(resolveImcodesHome());
   for (const pid of pids) {
     try {
       // `/T` has hung indefinitely on real Task Scheduler VBS -> CMD -> Node
@@ -96,16 +100,13 @@ export function killAllStaleWatchdogs(): void {
  *  closes the outer quote prematurely and the script becomes truncated.
  *  This was the root cause of the CI failure. */
 export function watchdogCommandLineMatchesHome(commandLine: string, stateHome: string): boolean {
-  const normalizedCommand = commandLine.replaceAll('/', '\\').toLowerCase();
-  const watchdogPath = windowsDaemonWatchdogPath(stateHome);
-  return normalizedCommand.includes(watchdogPath);
+  return sharedWatchdogCommandLineMatchesHome(commandLine, stateHome, defaultStateHome());
 }
 
-function findStaleWatchdogPids(stateHome?: string, scoped = false): number[] {
+function findStaleWatchdogPids(stateHome?: string): number[] {
   const pids = new Set<number>();
-  const homePattern = windowsDaemonWatchdogPath(stateHome ?? resolveImcodesHome())
-    .replaceAll("'", "''");
-  const scopeClause = scoped ? ` -and $_.CommandLine -like '*${homePattern}*'` : '';
+  const currentHome = stateHome ?? resolveImcodesHome();
+  const defaultHome = defaultStateHome();
   // ── PowerShell path (works on every Windows since 7) ────────────────────
   let scriptDir: string | null = null;
   try {
@@ -117,8 +118,8 @@ function findStaleWatchdogPids(stateHome?: string, scoped = false): number[] {
     writeFileSync(
       scriptPath,
       "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-      `Where-Object { $_.CommandLine -like '*daemon-watchdog*'${scopeClause} } | ` +
-        "ForEach-Object { $_.ProcessId }\r\n",
+      "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+        "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }\r\n",
     );
     const out = execSync(
       `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "${scriptPath}"`,
@@ -127,10 +128,7 @@ function findStaleWatchdogPids(stateHome?: string, scoped = false): number[] {
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
       },
     );
-    for (const line of out.split(/\r?\n/)) {
-      const pid = parseInt(line.trim(), 10);
-      if (Number.isFinite(pid) && pid > 0) pids.add(pid);
-    }
+    for (const pid of parseWatchdogProcessListing(out, currentHome, defaultHome)) pids.add(pid);
   } catch { /* fall through to wmic */ } finally {
     if (scriptDir) {
       try { rmSync(scriptDir, { recursive: true, force: true }); } catch { /* ignore */ }
@@ -140,23 +138,19 @@ function findStaleWatchdogPids(stateHome?: string, scoped = false): number[] {
   // ── Legacy wmic path ────────────────────────────────────────────────────
   try {
     const out = execSync(
-      scoped
-        ? `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%' and CommandLine like '%${homePattern.replaceAll('\\', '\\\\')}%'" get ProcessId /format:list`
-        : 'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%'" get ProcessId,CommandLine /format:list`,
       {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
       },
     );
-    for (const line of out.split(/\r?\n/)) {
-      const m = line.match(/^ProcessId=(\d+)/);
-      if (m) {
-        const pid = parseInt(m[1], 10);
-        if (Number.isFinite(pid) && pid > 0) pids.add(pid);
-      }
-    }
+    for (const pid of parseWatchdogProcessListing(out, currentHome, defaultHome)) pids.add(pid);
   } catch { /* both methods failed */ }
   return [...pids];
+}
+
+function defaultStateHome(): string {
+  return resolve(join(homedir(), '.imcodes'));
 }
 
 // ── Launcher methods (all hidden — no visible windows) ──────────────────────
