@@ -8989,8 +8989,9 @@ export class WsBridge {
   private sendToRawSessionSubscribers(sessionName: string, data: string | Buffer): void {
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (sessions.get(sessionName) !== true) continue;
-      if (this.timelineProtocolSockets.has(ws)
-        && this.timelineSubscriptions.get(ws)?.get(sessionName) !== TIMELINE_SUBSCRIPTION_MODES.FULL) continue;
+      // Terminal PTY streaming is an independent data plane from timeline
+      // subscriptions. A browser commonly keeps its timeline in summary mode
+      // while the terminal is visible; that must not suppress raw PTY bytes.
       if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
       queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
