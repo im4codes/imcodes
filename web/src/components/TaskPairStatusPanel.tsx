@@ -8,6 +8,10 @@ import { watchProjectionStore } from '../watch-projection.js';
 const STORAGE_KEY = 'imcodes.task-pair-status-panel.collapsed';
 const MAX_ROWS = 6;
 
+function collapsedStorageKey(serverId?: string | null): string {
+  return serverId ? `${STORAGE_KEY}:${serverId}` : STORAGE_KEY;
+}
+
 function status(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
 }
@@ -52,11 +56,14 @@ function resolveSessionModel(
   return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
 }
 
-export function TaskPairStatusPanel({ events, sessions }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[] }) {
+export function TaskPairStatusPanel({ events, sessions, serverId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null }) {
   const { t } = useTranslation();
   const [collapsed, setCollapsed] = useState(() => {
-    try { return window.localStorage.getItem(STORAGE_KEY) === '1'; } catch { return false; }
+    try { return window.localStorage.getItem(collapsedStorageKey(serverId)) === '1'; } catch { return false; }
   });
+  useEffect(() => {
+    try { setCollapsed(window.localStorage.getItem(collapsedStorageKey(serverId)) === '1'); } catch { setCollapsed(false); }
+  }, [serverId]);
   const [snapshotRows, setSnapshotRows] = useState<readonly Record<string, unknown>[] | null>(() => {
     const detail = (window as Window & { __imcodesTaskPairSnapshot?: { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] } }).__imcodesTaskPairSnapshot;
     return detail ? normalizeSnapshot(detail) : null;
@@ -75,6 +82,14 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
   }, []);
   const latest = new Map<string, { payload: Record<string, unknown>; startedAt: number; updatedAt: number }>();
+  const reworkCounts = new Map<string, number>();
+  for (const event of events) {
+    if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
+    const eventPayload = event.payload as Record<string, unknown>;
+    if (typeof eventPayload.taskId === 'string' && eventPayload.verb === 'REWORK') {
+      reworkCounts.set(eventPayload.taskId, (reworkCounts.get(eventPayload.taskId) ?? 0) + 1);
+    }
+  }
   if (snapshotRows) for (const payload of snapshotRows) if (typeof payload.taskId === 'string') latest.set(payload.taskId, { payload, startedAt: Number(payload.startedAt ?? Date.now()), updatedAt: Number(payload.updatedAt ?? Date.now()) });
   for (const event of events) {
     if (snapshotRows) break;
@@ -103,7 +118,7 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
     return result;
   }, { working: 0, audit: 0, queued: 0, awaitingBrain: 0 });
   if (latest.size === 0) return null;
-  const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(STORAGE_KEY, next ? '1' : '0'); } catch {} return next; });
+  const toggle = () => setCollapsed((value) => { const next = !value; try { window.localStorage.setItem(collapsedStorageKey(serverId), next ? '1' : '0'); } catch {} return next; });
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
   const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session
@@ -123,24 +138,29 @@ export function TaskPairStatusPanel({ events, sessions }: { events: readonly Tim
   };
   return <aside class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}`} data-testid="task-pair-status-panel">
     <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} onClick={toggle}>
-      <strong>{t('taskPair.panel_title')}</strong>
-      <span class="task-pair-status-summary">
-        <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--working">{t('taskPair.panel_count_working', { count: counts.working })}</span>
-        <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--in_audit">{t('taskPair.panel_count_audit', { count: counts.audit })}</span>
-        <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
-        <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
-      </span>
+      {collapsed ? <span class="task-pair-status-icons" role="group" aria-label={t('taskPair.panel_title')}>
+        <span class={`task-pair-status-icon task-pair-status-icon--working${counts.working === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_working')} aria-label={t('taskPair.panel_icon_working')}><span aria-hidden="true">▶</span><b>{counts.working}</b></span>
+        <span class={`task-pair-status-icon task-pair-status-icon--audit${counts.audit === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_audit')} aria-label={t('taskPair.panel_icon_audit')}><span aria-hidden="true">◉</span><b>{counts.audit}</b></span>
+        <span class={`task-pair-status-icon task-pair-status-icon--queued${counts.queued === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_queued')} aria-label={t('taskPair.panel_icon_queued')}><span aria-hidden="true">⏳</span><b>{counts.queued}</b></span>
+        <span class={`task-pair-status-icon task-pair-status-icon--awaiting${counts.awaitingBrain === 0 ? ' is-zero' : ' is-highlighted'}`} title={t('taskPair.panel_icon_awaiting_brain')} aria-label={t('taskPair.panel_icon_awaiting_brain')}><span aria-hidden="true">🧠</span><b>{counts.awaitingBrain}</b></span>
+      </span> : <><strong>{t('taskPair.panel_title')}</strong>
+        <span class="task-pair-status-summary">
+          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--working">{t('taskPair.panel_count_working', { count: counts.working })}</span>
+          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--in_audit">{t('taskPair.panel_count_audit', { count: counts.audit })}</span>
+          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
+          <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
+        </span></>}
     </button>
     {!collapsed && <div class="task-pair-status-rows">
       {groups.map((group) => {
         const heading = <h4>{t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const queued = group.key === 'queued'; const elapsedSeconds = Math.max(0, Math.floor((now - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
               <span class="task-pair-status-badge-dot" aria-hidden="true" />
-              {taskStatus === 'rework' ? t('taskPair.status.rework_round', { round: payload.round ?? 1 }) : t(`taskPair.status.${taskStatus}`)}
+              {taskStatus === 'rework' ? t('taskPair.panel_rework_count', { count: reworkCount }) : t(`taskPair.status.${taskStatus}`)}
             </span>
-            {!queued && <span class="task-pair-status-round-badge">{t('taskPair.panel_round', { round: payload.round ?? 0 })}</span>}
+            {!queued && auditRound > 0 && <span class="task-pair-status-round-badge">{t('taskPair.panel_round', { round: auditRound })}</span>}
             {!queued && <span class="task-pair-status-round-badge task-pair-status-blocking-badge">{t('taskPair.blocking', { levels: Array.isArray(payload.blocking) ? payload.blocking.join(',') : 'P0' })}</span>}
             {queued && payload.urgent === true && <span class="task-pair-status-urgent">!</span>}
           </div>

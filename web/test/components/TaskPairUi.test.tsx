@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
-import { afterEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -107,13 +107,35 @@ describe('TaskPairEventChip workspace events', () => {
   });
 });
 describe('TaskPairStatusPanel', () => {
+  beforeEach(() => window.localStorage.clear());
   afterEach(() => cleanup());
+  it('renders four compact status icons when collapsed, highlights Brain decisions, and scopes persistence per server', () => {
+    window.localStorage.clear();
+    const events = [
+      { eventId: 'compact-working', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-w', title: 'Working', toStatus: 'working' } },
+      { eventId: 'compact-audit', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-a', title: 'Audit', toStatus: 'in_audit' } },
+      { eventId: 'compact-queue', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-q', title: 'Queued', toStatus: 'queued' } },
+      { eventId: 'compact-brain', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'compact-b', title: 'Decision', toStatus: 'awaiting_brain_decision' } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="server-a" />);
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    const icons = container.querySelectorAll('.task-pair-status-icon');
+    expect(icons).toHaveLength(4);
+    expect(container.querySelector('.task-pair-status-icon--awaiting.is-highlighted')).toBeTruthy();
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-a')).toBe('1');
+    cleanup();
+    render(<TaskPairStatusPanel events={events} serverId="server-b" />);
+    expect(document.querySelector('.task-pair-status-icons')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
+    expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:server-b')).toBe('1');
+  });
+
   it('groups live pair state, keeps counts while collapsed, and persists collapse', () => {
     const events = [
       { eventId: 'p1', type: 'task_pair.event', ts: Date.now() - 2_000, payload: { taskId: 'T1', title: 'Build panel', toStatus: 'working', executor: 'deck_sub_w', executorLabel: 'Cx6', round: 1 } },
       { eventId: 'p2', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'T2', title: 'Audit panel', toStatus: 'in_audit', auditor: 'deck_sub_a', auditorLabel: 'CC2', round: 2 } },
     ] as never;
-    render(<TaskPairStatusPanel events={events} />);
+    const { container } = render(<TaskPairStatusPanel events={events} />);
     expect(screen.getByText('Build panel')).toBeTruthy();
     expect(screen.getByText('Cx6')).toBeTruthy();
     expect(screen.getByText('CC2')).toBeTruthy();
@@ -121,9 +143,7 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.queryByText('CC2 (deck_sub_a)')).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: /taskPair.panel_title/ }));
     expect(screen.queryByText('Build panel')).toBeNull();
-    expect(screen.getByText(/taskPair.panel_count_working/)).toBeTruthy();
-    expect(screen.getByText(/taskPair.panel_count_audit/)).toBeTruthy();
-    expect(screen.getByText(/taskPair.panel_count_queued/)).toBeTruthy();
+    expect(container.querySelector('.task-pair-status-icons')).toBeTruthy();
     expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed')).toBe('1');
   });
 
@@ -139,6 +159,20 @@ describe('TaskPairStatusPanel', () => {
     expect(screen.getByText('Cx6')).toBeTruthy();
     expect(screen.getAllByText(/taskPair.panel_unassigned/).length).toBeGreaterThan(0);
     expect(screen.getByText('!')).toBeTruthy();
+  });
+
+  it('shows a one-based rework count when the audit round is still zero', () => {
+    const events = [{
+      eventId: 'rework-1', type: 'task_pair.event', ts: Date.now() - 100,
+      payload: { taskId: 'RW1', title: 'Needs rework', toStatus: 'rework', verb: 'REWORK', round: 0 },
+    }, {
+      eventId: 'rework-2', type: 'task_pair.event', ts: Date.now(),
+      payload: { taskId: 'RW1', title: 'Needs rework', toStatus: 'rework', verb: 'REWORK', round: 0 },
+    }] as never;
+    render(<TaskPairStatusPanel events={events} />);
+    expect(screen.getByText('taskPair.panel_rework_count:{"count":2}')).toBeTruthy();
+    expect(screen.queryByText(/rework_round.*0/)).toBeNull();
+    expect(screen.queryByText(/taskPair.panel_round/)).toBeNull();
   });
 
   it('shows requested models for queued unassigned roles and no audit for auditor=none', () => {
@@ -375,6 +409,7 @@ describe('TaskPairStatusPanel', () => {
         expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
         expect(taskPair[key], `${locale}.${key}`).toContain('{{count}}');
       }
+      for (const key of ['panel_icon_working', 'panel_icon_audit', 'panel_icon_queued', 'panel_icon_awaiting_brain', 'panel_rework_count']) expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
       expect(taskPair.panel_counts, `${locale}.panel_counts should be removed`).toBeUndefined();
     }
   });

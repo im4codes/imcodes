@@ -121,9 +121,9 @@ describe('styles.css regression contracts', () => {
     const mobileBottomCardRule = cssWithoutComments.match(
       /@media\s*\(max-width:\s*640px\)\s*\{\s*\.subsession-card:not\(\.subsession-card-rail\)\s*\{[^}]*\}/,
     )?.[0];
-    expect(mobileBottomCardRule).toMatch(/min-height:\s*50px/);
+    expect(mobileBottomCardRule).toMatch(/min-height:\s*42px/);
     expect(mobileBottomCardRule).toMatch(/gap:\s*1px/);
-    expect(mobileBottomCardRule).toMatch(/padding:\s*3px\s+1px/);
+    expect(mobileBottomCardRule).toMatch(/padding:\s*2px\s+1px/);
 
     expect(cssWithoutComments).not.toMatch(/\.subsession-vertical-rail-host\s*\{[^}]*(?:136px|148px)/);
   });

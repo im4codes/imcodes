@@ -207,6 +207,24 @@ describe('ChatView — pinned last-sent banner', () => {
     expect(banner!.textContent).toContain('investigate the recall latency regression');
   });
 
+  it('keeps a long last-sent preview compact and reveals the full text on tap', async () => {
+    const longText = `${'a'.repeat(190)} /Users/example/project/very/long/path/file.txt`;
+    const events = [userEvent('u-long', longText, 1000), assistantEvent('a-long', 'done', 2000)];
+    const { container } = render(<ChatView events={events} loading={false} sessionId="deck_demo_brain" />);
+    await waitFor(() => expect(instances.length).toBeGreaterThan(0));
+    act(() => instances[instances.length - 1].fire([{
+      isIntersecting: false,
+      boundingClientRect: { bottom: -10, top: -30, height: 20, width: 100, left: 0, right: 100 } as DOMRectReadOnly,
+      rootBounds: { top: 0, bottom: 500, height: 500, width: 500, left: 0, right: 500 } as DOMRectReadOnly,
+    }]));
+    const banner = container.querySelector('.chat-pinned-last-sent') as HTMLElement;
+    const preview = banner.querySelector('.chat-pinned-last-sent-text') as HTMLElement;
+    expect(preview.textContent).toContain('…');
+    expect(preview.textContent).not.toContain('/Users/example/project/very/long/path/file.txt');
+    fireEvent.click(banner);
+    expect((banner.querySelector('.chat-pinned-last-sent-text') as HTMLElement).textContent).toBe(longText);
+  });
+
   it('pins the human message, not a later agent delivery or daemon injection', async () => {
     const agentDelivery = `${AGENT_DELEGATION_SENDER_MARKER}\nMessage from IM.codes session: deck_sub_peer (label: Cx2)\n\n收到，本次复审已结束。`;
     const events = [

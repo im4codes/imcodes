@@ -2346,6 +2346,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     [events, sessionId, lastSentUserMessage?.eventId],
   );
   const pinnedPreviewText = recentMemoryProblemPreview ?? lastSentUserMessage?.text ?? '';
+  const pinnedCompactPreviewText = useMemo(() => {
+    const compact = pinnedPreviewText.replace(/\s+/g, ' ').trim();
+    return compact.length > 180 ? `${compact.slice(0, 177)}…` : compact;
+  }, [pinnedPreviewText]);
   const pinnedPreviewUsesMemory = !!recentMemoryProblemPreview;
   // Reset the expand state whenever the pinned target/summary changes so a new
   // message never inherits the expanded state of an older one.
@@ -3880,7 +3884,6 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               padding: '4px 8px',
               minHeight: 30,
               flexShrink: 0,
-              position: 'relative',
               borderBottom: '1px solid rgba(51,65,85,0.5)',
               background: 'rgba(15,23,42,0.35)',
             }}
@@ -3917,6 +3920,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 }}
               />
             )}
+            {!!sessionId && <TaskPairStatusPanel events={events} sessions={sessions} serverId={serverId} />}
           </div>
         )}
         {showRefreshOverlay && (
@@ -3984,10 +3988,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               )}
               <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
-            <span class="chat-pinned-last-sent-text">{pinnedPreviewText}</span>
+            <span class="chat-pinned-last-sent-text">{pinnedExpanded ? pinnedPreviewText : pinnedCompactPreviewText}</span>
           </div>
         )}
-        {!preview && !!sessionId && !sessionId.includes('deck_sub_') && <TaskPairStatusPanel events={events} sessions={sessions} />}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
           onWheel={preview ? undefined : handleWheel}
           onTouchStart={preview ? undefined : handleTouchStart}

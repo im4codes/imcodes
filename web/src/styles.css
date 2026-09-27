@@ -4973,6 +4973,14 @@ html.native-ios-mac .chat-dl-btn {
    line of context, never the full message. Tap-again jumps to the
    message in chat history for the full content. */
 .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { -webkit-line-clamp: 3; line-clamp: 3; }
+@media (max-width: 720px) {
+  .chat-pinned-last-sent { flex-direction: row; align-items: center; gap: 6px; min-width: 0; padding: 4px 8px; }
+  .chat-pinned-last-sent-meta { flex: 0 0 auto; flex-wrap: nowrap; gap: 4px; }
+  .chat-pinned-last-sent-actor { display: none; }
+  .chat-pinned-last-sent-text { display: block; min-width: 0; flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; word-break: normal; }
+  .chat-pinned-last-sent.chat-pinned-expanded { align-items: flex-start; }
+  .chat-pinned-last-sent.chat-pinned-expanded .chat-pinned-last-sent-text { display: -webkit-box; -webkit-line-clamp: 3; line-clamp: 3; white-space: normal; word-break: break-word; }
+}
 .chat-view {
   --chat-machine-chip-border: rgba(148, 163, 184, 0.24);
   --chat-machine-chip-bg: rgba(71, 85, 105, 0.18);
@@ -6933,7 +6941,8 @@ html.native-ios-mac .chat-dl-btn {
 .subsession-card-ctx-fill { display: block; height: 100%; background: linear-gradient(90deg, var(--chrome-accent), var(--chrome-accent-2)); border-radius: 999px; transition: width 0.3s; box-shadow: 0 0 8px rgba(34,211,238,0.5); }
 
 @media (max-width: 640px) {
-  .subsession-card:not(.subsession-card-rail) { min-height: 50px; gap: 1px; padding: 3px 1px; }
+  .subsession-card:not(.subsession-card-rail) { min-height: 42px; gap: 1px; padding: 2px 1px; }
+  .subsession-bar { gap: 4px; padding: 3px 8px calc(3px + env(safe-area-inset-bottom, 0px)); }
 }
 
 /* Desktop vertical sub-session rail. It is an ordinary flex child between the
@@ -14491,14 +14500,34 @@ button.quick-agent-delegation-preset.active {
   flex-direction: column;
   min-height: 0;
 }
+.task-pair-status-panel.is-collapsed {
+  position: static; inset: auto; width: auto; max-width: none; height: auto; max-height: none;
+  margin: 0; border: 0; background: transparent; box-shadow: none;
+  display: inline-flex; flex: 0 0 auto; font-family: inherit;
+}
+.task-pair-status-panel.is-collapsed .task-pair-status-toggle {
+  width: auto; padding: 1px 2px; justify-content: flex-start; align-items: center; gap: 0;
+}
+.task-pair-status-icons { display: inline-flex; align-items: center; gap: 3px; }
+.task-pair-status-icon {
+  display: inline-flex; min-width: 27px; height: 22px; align-items: center; justify-content: center; gap: 2px;
+  padding: 1px 4px; border: 1px solid color-mix(in srgb, currentColor 24%, transparent); border-radius: 6px;
+  font-size: 11px; line-height: 1; font-variant-numeric: tabular-nums;
+}
+.task-pair-status-icon.is-zero { opacity: .38; }
+.task-pair-status-icon.is-highlighted { color: var(--status-waiting-text, #fbbf24); border-color: color-mix(in srgb, currentColor 52%, transparent); background: color-mix(in srgb, currentColor 12%, transparent); }
+.task-pair-status-icon b { font-size: 10px; font-weight: 700; }
 .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: calc(var(--task-pair-panel-width) + 12px); }
 /* The pinned "last sent" banner is a flow sibling of the panel (not inside
    .chat-view), so the .chat-view padding-right above never reaches it -- it
    still spans the full wrap width and its right edge sits under the panel.
    Reserve the same width here so the banner and the panel never overlap. */
 .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: calc(var(--task-pair-panel-width) + 12px); }
+.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-view { padding-right: 12px; }
+.chat-view-wrap:has(.task-pair-status-panel.is-collapsed) .chat-pinned-last-sent { margin-right: 10px; }
 @media (max-width: 720px) {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; max-height: 42vh; }
+  .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; max-height: none; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-view { padding-right: 12px; }
   .chat-view-wrap:has(.task-pair-status-panel) .chat-pinned-last-sent { margin-right: 10px; }
 }
