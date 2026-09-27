@@ -73,6 +73,9 @@ const IMCODES_HOME = resolveImcodesStateDir();
 const LOCK = join(IMCODES_HOME, 'upgrade.lock');
 const PIDFILE = join(IMCODES_HOME, 'daemon.pid');
 const DAEMON_TASK = 'imcodes-daemon';
+const DEFAULT_STATE_DIR = resolve(join(homedir(), '.imcodes')).toLowerCase();
+const SCOPED_STATE_DIR = IMCODES_HOME.toLowerCase() !== DEFAULT_STATE_DIR;
+const WATCHDOG_PATH = `${IMCODES_HOME.replaceAll('\\', '/').replace(/[\\/]+$/, '').replaceAll('/', '\\')}\\daemon-watchdog.cmd`;
 
 const LOG_FILE = process.argv[2];
 const NPM_CMD = process.argv[3];
@@ -285,9 +288,11 @@ function killStaleWatchdogs() {
   // available — extremely unlikely on a stock Windows install — wmic is
   // our fallback.  Both query Win32_Process by command-line pattern
   // ('*daemon-watchdog*') so this is locale-independent.
+  const escapedWatchdogPath = WATCHDOG_PATH.replaceAll("'", "''");
+  const scopeClause = SCOPED_STATE_DIR ? ` -and $_.CommandLine -like '*${escapedWatchdogPath}*'` : '';
   const psScript =
     "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-    "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+    `Where-Object { $_.CommandLine -like '*daemon-watchdog*'${scopeClause} } | ` +
     "ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }";
   try {
     execSync(`powershell -NoProfile -NonInteractive -Command "${psScript}"`, {
@@ -297,7 +302,9 @@ function killStaleWatchdogs() {
   } catch { /* fall through to wmic */ }
   try {
     const out = execSync(
-      'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      SCOPED_STATE_DIR
+        ? `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%' and CommandLine like '%${escapedWatchdogPath.replaceAll('\\', '\\\\')}%'" get ProcessId /format:list`
+        : 'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true },
     );
     const pids = out.split(/\r?\n/)

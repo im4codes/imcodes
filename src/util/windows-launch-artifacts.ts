@@ -4,7 +4,12 @@ import { execFileSync, execSync } from 'child_process';
 import path, { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
-import { resolveImcodesHome, windowsDaemonLockPipeName, WINDOWS_DAEMON_LOCK_PIPE } from './windows-daemon-lock.js';
+import {
+  resolveImcodesHome,
+  windowsDaemonLockPipeName,
+  windowsDaemonWatchdogPath,
+  WINDOWS_DAEMON_LOCK_PIPE,
+} from './windows-daemon-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -426,7 +431,7 @@ function killAllStaleWatchdogsBeforeRegen(): void {
   // Its watchdog artifact lives under the resolved state directory, so the
   // scoped query below only matches that path; default HOME keeps legacy scan.
   const scopedHome = windowsDaemonLockPipeName() !== WINDOWS_DAEMON_LOCK_PIPE;
-  const homePattern = resolveImcodesHome().replaceAll("'", "''");
+  const homePattern = windowsDaemonWatchdogPath(resolveImcodesHome()).replaceAll("'", "''");
   const scopeClause = scopedHome ? ` -and $_.CommandLine -like '*${homePattern}*'` : '';
   // PowerShell first (works on every Windows including ones where wmic is gone)
   // CRITICAL: use a temp .ps1 file, NOT `-Command "..."` — nested double

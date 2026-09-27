@@ -68,6 +68,16 @@ export function normalizeWindowsLockPath(path: string): string {
 }
 
 /**
+ * Return the canonical watchdog artifact path used for process identity
+ * matching.  Matching the complete artifact (rather than an arbitrary home
+ * substring) prevents a scoped home such as `C:\\Temp\\lock` from matching
+ * the sibling `C:\\Temp\\lock2` process.
+ */
+export function windowsDaemonWatchdogPath(homePath: string): string {
+  return `${normalizeWindowsLockPath(homePath)}\\daemon-watchdog.cmd`;
+}
+
+/**
  * Return the named pipe used by the daemon instance lock.
  *
  * The default home intentionally retains the historical pipe for backward

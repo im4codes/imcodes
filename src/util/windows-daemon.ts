@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import {
   WINDOWS_DAEMON_LOCK_PIPE,
   resolveImcodesHome,
+  windowsDaemonWatchdogPath,
   windowsDaemonLockPipeName,
 } from './windows-daemon-lock.js';
 import {
@@ -96,13 +97,14 @@ export function killAllStaleWatchdogs(): void {
  *  This was the root cause of the CI failure. */
 export function watchdogCommandLineMatchesHome(commandLine: string, stateHome: string): boolean {
   const normalizedCommand = commandLine.replaceAll('/', '\\').toLowerCase();
-  const normalizedHome = stateHome.replaceAll('/', '\\').replace(/[\\]+$/, '').toLowerCase();
-  return normalizedCommand.includes('daemon-watchdog') && normalizedCommand.includes(normalizedHome);
+  const watchdogPath = windowsDaemonWatchdogPath(stateHome);
+  return normalizedCommand.includes(watchdogPath);
 }
 
 function findStaleWatchdogPids(stateHome?: string, scoped = false): number[] {
   const pids = new Set<number>();
-  const homePattern = (stateHome ?? resolveImcodesHome()).replaceAll("'", "''");
+  const homePattern = windowsDaemonWatchdogPath(stateHome ?? resolveImcodesHome())
+    .replaceAll("'", "''");
   const scopeClause = scoped ? ` -and $_.CommandLine -like '*${homePattern}*'` : '';
   // ── PowerShell path (works on every Windows since 7) ────────────────────
   let scriptDir: string | null = null;

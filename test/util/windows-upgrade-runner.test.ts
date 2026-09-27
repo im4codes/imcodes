@@ -58,6 +58,12 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
     expect(src).toContain('const IMCODES_HOME = resolveImcodesStateDir()');
   });
 
+  it('scopes stale watchdog cleanup for custom state dirs while preserving default recovery', () => {
+    expect(src).toContain('const SCOPED_STATE_DIR = IMCODES_HOME.toLowerCase() !== DEFAULT_STATE_DIR');
+    expect(src).toContain("const scopeClause = SCOPED_STATE_DIR");
+    expect(src).toContain("CommandLine like '%daemon-watchdog%' and CommandLine like '%");
+  });
+
   it('declares NPM_INSTALL_TIMEOUT_MS and FAST_CMD_TIMEOUT_MS as named constants', () => {
     // Hard-coded magic numbers in spawnSync calls are how unbounded waits
     // sneak back in.  Force the values to live as named constants the

@@ -308,8 +308,10 @@ describe('restartWindowsDaemon', () => {
 
   it('matches only the current scoped watchdog path in an A/B process listing', async () => {
     const { watchdogCommandLineMatchesHome } = await import('../../src/util/windows-daemon.js');
-    const homeA = 'C:\\Temp\\lock-home-a\\.imcodes';
-    const homeB = 'C:\\Temp\\lock-home-b\\.imcodes';
+    // Prefix-related homes are the important counterexample: a bare HOME
+    // substring would make C:\\Temp\\lock match C:\\Temp\\lock2.
+    const homeA = 'C:\\Temp\\lock\\.imcodes';
+    const homeB = 'C:\\Temp\\lock2\\.imcodes';
     const watchdogA = `cmd.exe /c "${homeA}\\daemon-watchdog.cmd"`;
     const watchdogB = `cmd.exe /c "${homeB}\\daemon-watchdog.cmd"`;
     expect(watchdogCommandLineMatchesHome(watchdogA, homeA)).toBe(true);
