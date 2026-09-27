@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
@@ -74,7 +75,7 @@ function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -651,3 +652,44 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     </div>
   );
 }
+
+function sameTabSessions(a: SessionInfo[], b: SessionInfo[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i];
+    const right = b[i];
+    if (left.name !== right.name
+      || left.project !== right.project
+      || left.role !== right.role
+      || left.state !== right.state
+      || left.label !== right.label
+      || left.agentType !== right.agentType
+      || left.runtimeType !== right.runtimeType) return false;
+  }
+  return true;
+}
+
+export const SessionTabs = memo(SessionTabsImpl, (prev, next) => (
+  sameTabSessions(prev.sessions, next.sessions)
+  && prev.activeSession === next.activeSession
+  && prev.connected === next.connected
+  && prev.latencyMs === next.latencyMs
+  && prev.idleAlerts === next.idleAlerts
+  && prev.p2pSessionLabels === next.p2pSessionLabels
+  && prev.onAlertDismiss === next.onAlertDismiss
+  && prev.onSelect === next.onSelect
+  && prev.onNewSession === next.onNewSession
+  && prev.onStopProject === next.onStopProject
+  && prev.canStopProject === next.canStopProject
+  && prev.onRestartProject === next.onRestartProject
+  && prev.onCloneSession === next.onCloneSession
+  && prev.onOpenSessionSettings === next.onOpenSessionSettings
+  && prev.onShareSession === next.onShareSession
+  && prev.renameRequest === next.renameRequest
+  && prev.onRenameHandled === next.onRenameHandled
+  && prev.onRenameSession === next.onRenameSession
+  && prev.sessionsLoaded === next.sessionsLoaded
+  && prev.pinned === next.pinned
+  && prev.setPinnedArr === next.setPinnedArr
+));

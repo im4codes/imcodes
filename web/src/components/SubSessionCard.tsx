@@ -4,6 +4,7 @@
  * Right-edge drag handle lets user resize width independently per card.
  */
 import { useRef, useState, useCallback, useMemo, useEffect } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import type { JSX } from 'preact';
 import { useTranslation } from 'react-i18next';
@@ -141,7 +142,7 @@ function buildCompactSessionInfo(sub: SubSession): SessionInfo {
   };
 }
 
-export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
+function SubSessionCardImpl({ sub, ws, connected, isOpen, isFocused, idleFlashToken, onOpen, onClose, onRestart, onDiff, onHistory, cardW = 350, cardH = 250, quickData, sessions, subSessions, serverId, onTransportConfigSaved, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, previewHydrateDelayMs = 160 }: Props) {
   const { t } = useTranslation();
   // Shared alias data so the compact card's plain-text composer resolves
   // `;;(name)` markers the same way the main SessionControls composer does
@@ -618,3 +619,57 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
     </div>
   );
 }
+
+/**
+ * The parent session list is rebuilt for every daemon status/state frame. Its
+ * records are immutable in practice, but older daemons still send a fresh
+ * object for every row even when the card-visible fields did not change. Keep
+ * those transport updates from re-rendering every preview card. The timeline
+ * hook remains authoritative for content updates inside the card, while this
+ * comparator only filters parent prop churn.
+ */
+function sameCardSession(a: SubSession, b: SubSession): boolean {
+  return a.sessionName === b.sessionName
+    && a.id === b.id
+    && a.type === b.type
+    && a.state === b.state
+    && a.label === b.label
+    && a.cwd === b.cwd
+    && a.runtimeType === b.runtimeType
+    && a.providerId === b.providerId
+    && a.providerSessionId === b.providerSessionId
+    && a.sessionInstanceId === b.sessionInstanceId
+    && a.runtimeEpoch === b.runtimeEpoch
+    && a.requestedModel === b.requestedModel
+    && a.activeModel === b.activeModel
+    && a.modelDisplay === b.modelDisplay
+    && a.planLabel === b.planLabel
+    && a.quotaLabel === b.quotaLabel
+    && a.quotaUsageLabel === b.quotaUsageLabel
+    && a.effort === b.effort
+    && a.supervisionMode === b.supervisionMode
+    && a.transportPendingMessageVersion === b.transportPendingMessageVersion;
+}
+
+export const SubSessionCard = memo(SubSessionCardImpl, (prev, next) => (
+  sameCardSession(prev.sub, next.sub)
+  && prev.ws === next.ws
+  && prev.connected === next.connected
+  && prev.isOpen === next.isOpen
+  && prev.isFocused === next.isFocused
+  && prev.idleFlashToken === next.idleFlashToken
+  && prev.cardW === next.cardW
+  && prev.cardH === next.cardH
+  && prev.quickData === next.quickData
+  && prev.serverId === next.serverId
+  && prev.onOpen === next.onOpen
+  && prev.onClose === next.onClose
+  && prev.onRestart === next.onRestart
+  && prev.onDiff === next.onDiff
+  && prev.onHistory === next.onHistory
+  && prev.onTransportConfigSaved === next.onTransportConfigSaved
+  && prev.inP2p === next.inP2p
+  && prev.sharedState === next.sharedState
+  && prev.accentColor === next.accentColor
+  && prev.previewHydrateDelayMs === next.previewHydrateDelayMs
+));

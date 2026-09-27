@@ -3,6 +3,7 @@
  * Used by both main session (app.tsx) and SubSessionWindow.
  */
 import { useEffect, useMemo, useRef, useState, useCallback } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { resolveContextWindow } from '../model-context.js';
 import { bestModelLabel } from '../model-label.js';
@@ -87,7 +88,7 @@ const fmt = (n: number) =>
   : n >= 1000 ? `${(n / 1000).toFixed(0)}k`
   : String(n);
 
-export function UsageFooter({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, onRefreshHistory, historyRefreshing = false, historyStatus, wsClient, connected }: Props) {
+function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOverride, planLabel, quotaLabel, quotaUsageLabel, quotaMeta, codexCreditsBalance, codexCreditsUnlimited, showCost, activeThinkingTs, statusText, activeToolCall, activeTimelineTurn, pendingUserSend, transportActivityDetail, sessionError, now, onRunExecutionClones, runExecutionClonesBusy, runExecutionClonesDisabled, runExecutionClonesTitle, runExecutionClonesCount, runExecutionClonesFeedback, onRefreshHistory, historyRefreshing = false, historyStatus, wsClient, connected }: Props) {
   const { t } = useTranslation();
   const [sessionUsageOpen, setSessionUsageOpen] = useState(false);
 
@@ -487,3 +488,47 @@ export function UsageFooter({ usage, sessionName, sessionState, agentType, model
     </div>
   );
 }
+
+function sameUsage(a: UsageData, b: UsageData): boolean {
+  return a === b
+    || (a.inputTokens === b.inputTokens
+      && a.cacheTokens === b.cacheTokens
+      && a.contextWindow === b.contextWindow
+      && a.contextWindowSource === b.contextWindowSource
+      && a.model === b.model
+      && a.codexStatus?.capturedAt === b.codexStatus?.capturedAt);
+}
+
+export const UsageFooter = memo(UsageFooterImpl, (prev, next) => (
+  sameUsage(prev.usage, next.usage)
+  && prev.sessionName === next.sessionName
+  && prev.sessionState === next.sessionState
+  && prev.agentType === next.agentType
+  && prev.modelOverride === next.modelOverride
+  && prev.planLabel === next.planLabel
+  && prev.quotaLabel === next.quotaLabel
+  && prev.quotaUsageLabel === next.quotaUsageLabel
+  && prev.quotaMeta === next.quotaMeta
+  && prev.codexCreditsBalance === next.codexCreditsBalance
+  && prev.codexCreditsUnlimited === next.codexCreditsUnlimited
+  && prev.showCost === next.showCost
+  && prev.activeThinkingTs === next.activeThinkingTs
+  && prev.statusText === next.statusText
+  && prev.activeToolCall === next.activeToolCall
+  && prev.activeTimelineTurn === next.activeTimelineTurn
+  && prev.pendingUserSend === next.pendingUserSend
+  && prev.transportActivityDetail === next.transportActivityDetail
+  && prev.sessionError === next.sessionError
+  && prev.now === next.now
+  && prev.onRunExecutionClones === next.onRunExecutionClones
+  && prev.runExecutionClonesBusy === next.runExecutionClonesBusy
+  && prev.runExecutionClonesDisabled === next.runExecutionClonesDisabled
+  && prev.runExecutionClonesTitle === next.runExecutionClonesTitle
+  && prev.runExecutionClonesCount === next.runExecutionClonesCount
+  && prev.runExecutionClonesFeedback === next.runExecutionClonesFeedback
+  && prev.onRefreshHistory === next.onRefreshHistory
+  && prev.historyRefreshing === next.historyRefreshing
+  && prev.historyStatus === next.historyStatus
+  && prev.wsClient === next.wsClient
+  && prev.connected === next.connected
+));
