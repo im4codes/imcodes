@@ -2231,15 +2231,18 @@ export function useTimeline(
     args?: { limit?: number; afterTs?: number; cursor?: TimelineCursor },
   ) => {
     if (!ws || !sessionId) return null;
+    // Keep every daemon history/page request on the shared 200-event wire
+    // budget, even legacy callers that still pass MAX_MEMORY_EVENTS (300).
+    const boundedLimit = Math.min(args?.limit ?? MAX_FORWARD_PAGE_EVENTS, MAX_FORWARD_PAGE_EVENTS);
     const requestId = args?.limit === undefined && args?.afterTs === undefined && args?.cursor === undefined
-      ? ws.sendTimelineHistoryRequest(sessionId)
+      ? ws.sendTimelineHistoryRequest(sessionId, boundedLimit)
       : args?.afterTs === undefined && args?.cursor === undefined
-        ? ws.sendTimelineHistoryRequest(sessionId, args?.limit ?? MAX_MEMORY_EVENTS)
+        ? ws.sendTimelineHistoryRequest(sessionId, boundedLimit)
         : args?.cursor === undefined
-          ? ws.sendTimelineHistoryRequest(sessionId, args?.limit ?? MAX_MEMORY_EVENTS, args?.afterTs)
+          ? ws.sendTimelineHistoryRequest(sessionId, boundedLimit, args?.afterTs)
         : ws.sendTimelineHistoryRequest(
           sessionId,
-          args.limit ?? MAX_MEMORY_EVENTS,
+          boundedLimit,
           args.afterTs,
           undefined,
           args.cursor,
@@ -2274,7 +2277,7 @@ export function useTimeline(
   ): { limit?: number; afterTs?: number } | undefined => {
     const afterTs = getTimelineHistoryAfterTs(sourceEvents);
     if (afterTs !== undefined) {
-      return { limit: limit ?? MAX_MEMORY_EVENTS, afterTs };
+      return { limit: limit ?? MAX_FORWARD_PAGE_EVENTS, afterTs };
     }
     return limit === undefined ? undefined : { limit };
   }, []);
@@ -3500,6 +3503,30 @@ export function useTimeline(
     persistTimelineEvents(key, preferred);
   }, []);
 
+  // A single 1 MiB history envelope can contain hundreds of large events. Do
+  // not merge that envelope in one render/effect turn: yielding between small
+  // chunks keeps input and paint responsive while preserving event order.
+  const HISTORY_APPLY_CHUNK_EVENTS = 10;
+  const mergeHistoryEventsYielding = useCallback((incoming: TimelineEvent[], maxEvents = MAX_MEMORY_EVENTS) => {
+    const key = cacheKeyRef.current;
+    let offset = 0;
+    const drain = (): void => {
+      if (cacheKeyRef.current !== key) return;
+      const chunk = incoming.slice(offset, offset + HISTORY_APPLY_CHUNK_EVENTS);
+      offset += chunk.length;
+      if (chunk.length === 0) return;
+      mergeEvents(chunk, maxEvents);
+      for (const historyEvent of chunk) {
+        applyTimelineTransportQueueEvidence(historyEvent);
+        settleOptimisticByCommandAckEvent(historyEvent);
+        settleOptimisticByTimelineProgress(historyEvent);
+      }
+      idbPutEvents(chunk);
+      if (offset < incoming.length) setTimeout(drain, 0);
+    };
+    drain();
+  }, [applyTimelineTransportQueueEvidence, idbPutEvents, mergeEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress]);
+
   const loadMessageContext = useCallback(async (eventId: string, eventTs: number): Promise<boolean> => {
     if (!serverId || !sessionId || disableHistory || !eventId || !Number.isFinite(eventTs)) return false;
     if (eventsRef.current.some((event) => event.eventId === eventId)) return true;
@@ -3509,7 +3536,7 @@ export function useTimeline(
     try {
       const beforeResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
         beforeTs: eventTs + 1,
-        limit: 500,
+        limit: MAX_FORWARD_PAGE_EVENTS,
         timeoutMs: 12_000,
       });
       if (cacheKeyRef.current !== requestedKey || !beforeResult) return false;
@@ -3530,7 +3557,7 @@ export function useTimeline(
         const afterResult = await fetchTimelineHistoryHttp(serverId, sessionId, {
           afterTs: Math.max(0, eventTs - 1),
           beforeTs,
-          limit: 500,
+          limit: MAX_FORWARD_PAGE_EVENTS,
           timeoutMs: 12_000,
         });
         if (cacheKeyRef.current !== requestedKey || !afterResult) break;
@@ -3873,13 +3900,13 @@ export function useTimeline(
         let terminal: 'caught_up' | 'cap_hit' | 'truncated' | 'transient_null' | 'error' | null = null;
         try {
           const outcome = await runNewestWindowBackfill(afterTs, {
-            limit: MAX_MEMORY_EVENTS,
+            limit: MAX_FORWARD_PAGE_EVENTS,
             maxPages,
             initialBeforeTs: resumeBeforeTs,
             fetchPage: ({ afterTs: at, beforeTs: bt }) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
               afterTs: at,
               ...(bt !== undefined ? { beforeTs: bt } : {}),
-              limit: MAX_MEMORY_EVENTS,
+              limit: MAX_FORWARD_PAGE_EVENTS,
               timeoutMs: resolveBackfillTimeoutMs(opts),
             })),
             mergePage: (events) => {
@@ -4576,7 +4603,7 @@ export function useTimeline(
           .filter((event): event is TimelineEvent => event != null);
         if (provisionalEvents.length === 0) return;
         updateHistoryStep('daemon', 'done', 'bootstrap');
-        replaceEvents(provisionalEvents);
+        mergeHistoryEventsYielding(provisionalEvents.slice(-MAX_FORWARD_PAGE_EVENTS));
         setLoading(false);
         return;
       }
@@ -4597,8 +4624,7 @@ export function useTimeline(
           const olderCursor = getOlderTimelineCursor(msg);
           if (hasStructuredOlderPage(msg) && olderCursor) olderCursorRef.current = olderCursor;
           if (msg.events.length > 0) {
-            mergeEvents(msg.events, MAX_HISTORY_EVENTS);
-            idbPutEvents(msg.events);
+            mergeHistoryEventsYielding(msg.events, MAX_HISTORY_EVENTS);
           }
           if (shouldPreserveOlderAvailability) {
             return;
@@ -4659,15 +4685,10 @@ export function useTimeline(
                 retainedTimelineMergeLimit(withoutProvisionalTransportHistory),
               );
             replaceEvents(next);
+            idbPutEvents(msg.events);
           } else {
-            mergeEvents(msg.events);
+            mergeHistoryEventsYielding(msg.events);
           }
-          for (const historyEvent of msg.events) {
-            applyTimelineTransportQueueEvidence(historyEvent);
-            settleOptimisticByCommandAckEvent(historyEvent);
-            settleOptimisticByTimelineProgress(historyEvent);
-          }
-          idbPutEvents(msg.events);
         } else if (historyRetryRef.current < 2 && ws?.connected && isActiveSessionRef.current && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
           // Legacy empty response with no cached events — retry once after a
           // short delay. Explicit protocol outcomes (empty success, deferred,
@@ -4717,13 +4738,7 @@ export function useTimeline(
         if (replayEvents.length > 0) {
           const maxSeq = replayEvents.reduce((max, e) => Math.max(max, e.seq), 0);
           seqRef.current = Math.max(seqRef.current, maxSeq);
-          mergeEvents(replayEvents);
-          for (const replayEvent of replayEvents) {
-            applyTimelineTransportQueueEvidence(replayEvent);
-            settleOptimisticByCommandAckEvent(replayEvent);
-            settleOptimisticByTimelineProgress(replayEvent);
-          }
-          idbPutEvents(replayEvents);
+          mergeHistoryEventsYielding(replayEvents);
         }
         setRefreshing(false);
       }

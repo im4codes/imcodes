@@ -1375,7 +1375,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       sub.sessionName,
       ws,
       undefined,
-      { isActiveSession: false, isVisible: false, subscriptionMode: 'summary', bootstrapWhenVisible: true },
+      { isActiveSession: false, isVisible: false, subscriptionMode: 'summary', bootstrapWhenVisible: false },
     );
     expect(ws.holdTerminalRaw).not.toHaveBeenCalled();
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
@@ -1408,7 +1408,7 @@ describe('SubSessionWindow terminal subscription raw mode', () => {
       sub.sessionName,
       ws,
       undefined,
-      { isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true },
+      { isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: false },
     );
   });
 
@@ -2009,5 +2009,42 @@ describe('SubSessionWindow remote-desktop quick-open', () => {
     rdButton.click();
     expect(confirmSpy).toHaveBeenCalledTimes(1);
     expect(ws.sent).toEqual([]);
+  });
+});
+
+describe('SDK window startup budget', () => {
+  const ws = {
+    onMessage: vi.fn(() => () => undefined), subscribeTerminal: vi.fn(), unsubscribeTerminal: vi.fn(),
+    sendSnapshotRequest: vi.fn(), sendResize: vi.fn(), getDaemonCapabilitySnapshot: vi.fn(() => null),
+    onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
+  } as any;
+  it('mounts 19 realistic SDK windows with only the focused controls tree', () => {
+    const windows = Array.from({ length: 19 }, (_, index) => makeSubSession({
+      id: `sdk-${index}`, sessionName: `deck_sub_sdk-${index}`, type: index % 2 ? 'claude-code-sdk' : 'codex-sdk',
+      runtimeType: 'transport', providerId: index % 2 ? 'claude-code-sdk' : 'codex-sdk', providerSessionId: `provider-${index}`,
+      requestedModel: 'gpt-5', activeModel: 'gpt-5', cwd: '/workspace/project', state: 'idle',
+    }));
+    const beforeTimeline = useTimelineSpy.mock.calls.length;
+    const beforeControls = sessionControlsSpy.mock.calls.length;
+    render(<>{windows.map((sub, index) => <SubSessionWindow key={sub.id} sub={sub} ws={ws} connected active={index === 0} visible={index < 9} onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000 + index} onFocus={vi.fn()} serverId="srv-1" />)}</>);
+    const timelineCalls = useTimelineSpy.mock.calls.slice(beforeTimeline);
+    expect(timelineCalls.length).toBeLessThanOrEqual(38);
+    const rendersBySession = new Map<string, number>();
+    for (const [sessionName] of timelineCalls) rendersBySession.set(sessionName, (rendersBySession.get(sessionName) ?? 0) + 1);
+    expect(rendersBySession.size).toBe(19);
+    expect(Math.max(...rendersBySession.values())).toBeLessThanOrEqual(2);
+    expect(timelineCalls.filter(([, , , options]) => options.subscriptionMode === 'full').length).toBeGreaterThanOrEqual(9);
+    expect(timelineCalls.filter(([, , , options]) => options.subscriptionMode === 'summary').length).toBeGreaterThanOrEqual(10);
+    expect(sessionControlsSpy.mock.calls.length - beforeControls).toBeLessThanOrEqual(2);
+  });
+  it('does not throw for incomplete transport metadata', () => {
+    expect(() => render(<SubSessionWindow sub={makeSubSession({ id: 'sdk-missing', sessionName: 'deck_sub_sdk-missing', type: 'codex-sdk', runtimeType: null, providerId: null, providerSessionId: null, state: 'unknown' })} ws={ws} connected active visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />)).not.toThrow();
+  });
+  it('enables history bootstrap when an on-screen window receives focus', () => {
+    const sub = makeSubSession({ id: 'sdk-focus', sessionName: 'deck_sub_sdk-focus', type: 'codex-sdk', runtimeType: 'transport' });
+    const view = render(<SubSessionWindow sub={sub} ws={ws} connected active={false} visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />);
+    expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: false });
+    view.rerender(<SubSessionWindow sub={sub} ws={ws} connected active visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />);
+    expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: true, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true });
   });
 });

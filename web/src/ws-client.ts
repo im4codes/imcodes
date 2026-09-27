@@ -2009,7 +2009,7 @@ export class WsClient {
    *  beforeTs: for backward pagination — server returns only older events. */
   sendTimelineHistoryRequest(
     sessionName: string,
-    limit = 500,
+    limit = 200,
     afterTs?: number,
     beforeTs?: number,
     cursor?: TimelineCursor,

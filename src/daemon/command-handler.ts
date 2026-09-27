@@ -6376,7 +6376,15 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     };
   }
 
-  const { events, truncated, source = TIMELINE_RESPONSE_SOURCES.RING_BUFFER } = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  const replay = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  // Replay is a gap-fill path, but it can span the whole in-memory ring when
+  // a browser reconnects after a busy SDK turn. Keep it on the same bounded
+  // 200-event wire contract as history/page responses; the newer cursor lets
+  // the client request another page when more events remain.
+  const events = replay.events.length > TIMELINE_HISTORY_LIMITS.MAX_EVENTS
+    ? replay.events.slice(-TIMELINE_HISTORY_LIMITS.MAX_EVENTS)
+    : replay.events;
+  const truncated = replay.truncated || events.length < replay.events.length;
   const shaped = shapeTimelineEventsForTransport(events, {
     detailSink: getDefaultTimelineDetailStore(),
   }, resolveTimelineSupervisionTaskProjection);
@@ -6386,7 +6394,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     truncated,
     epoch: timelineEmitter.epoch,
     status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
-    source,
+    source: replay.source,
     payloadBytes: shaped.payloadBytes,
     payloadTruncated,
     hasMore: shaped.droppedEvents > 0,

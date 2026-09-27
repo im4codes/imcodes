@@ -315,7 +315,10 @@ export function SubSessionWindow({
     isActiveSession: active,
     isVisible: visible,
     subscriptionMode: visible ? 'full' : 'summary',
-    bootstrapWhenVisible: true,
+    // Keep visible inactive windows live-subscribed, but defer their expensive
+    // history/IDB bootstrap until focus. This preserves the full live stream
+    // contract without issuing N large history reads during startup.
+    bootstrapWhenVisible: active,
   });
 
   // Re-surface a still-pending question in the dedicated dialog from history
