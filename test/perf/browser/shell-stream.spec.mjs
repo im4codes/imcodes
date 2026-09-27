@@ -18,12 +18,13 @@ function jwt() {
 }
 
 async function terminalText(page) {
-  return page.locator('.terminal-container').first().locator('.xterm-rows').innerText().catch(() => '');
+  return page.locator('.terminal-container .xterm-rows').allInnerTexts().then((rows) => rows.join('\n')).catch(() => '');
 }
 
 async function waitForTerminalText(page, needle, timeout = 15_000) {
   try {
-    await page.waitForFunction(({ needle }) => document.querySelector('.terminal-container .xterm-rows')?.innerText.includes(needle), { needle }, { timeout });
+    await page.waitForFunction(({ needle }) => [...document.querySelectorAll('.terminal-container .xterm-rows')]
+      .some((rows) => (rows.textContent ?? '').includes(needle)), { needle }, { timeout });
   } catch (error) {
     const body = await page.locator('body').innerText().catch(() => '');
     const rows = await terminalText(page);
@@ -247,8 +248,8 @@ export async function runShellBrowserScenario() {
   // Do not race xterm's snapshot/stream handoff: wait until the shell has
   // rendered a prompt before injecting the first keystroke.
   await page.waitForFunction(() => {
-    const text = document.querySelector('.terminal-container .xterm-rows')?.innerText ?? '';
-    return /#\s*$/.test(text.trim());
+    return [...document.querySelectorAll('.terminal-container .xterm-rows')]
+      .some((rows) => /#\s*$/.test((rows.textContent ?? '').trim()));
   }, undefined, { timeout: 30_000 });
 
   const inputLatency = await measureKeystrokeEcho(page);
