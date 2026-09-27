@@ -96,6 +96,12 @@ for (const [index, name] of activeTimelineNames.entries()) {
   sendEvent(name, 'tool.result', { name: 'shell', status: 'ok', output: toolBody });
   sendEvent(name, 'session.state', { state: 'idle' });
 }
+if (process.env.IMC_PERF_PAIR_BRIEF === '1') {
+  sendEvent(sessionNames[0], 'task_pair.event', {
+    taskId: 'pair-brief-browser', title: 'Browser-visible pair title', verb: 'DISPATCH', toStatus: 'working',
+    startedAt: Date.now(), updatedAt: Date.now(), brief: '# Browser brief\n\nThe full **task content** is visible.\n\n- [x][ ] Implement the UI\n- [ ][x] Audit the UI',
+  });
+}
 for (const { name, size } of longChatSessions) {
   const events = history.get(name);
   for (let index = 1; index <= size - 2; index += 1) {
