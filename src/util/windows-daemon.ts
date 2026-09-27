@@ -20,6 +20,15 @@ function readDaemonPid(currentPid?: number): number | null {
   try {
     const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
     if (!pid || pid <= 0 || pid === currentPid) return null;
+    // A stale custom-home pid can be reused by another isolated daemon.  Do
+    // not taskkill by number alone: bind it to this HOME's lock metadata and
+    // verify the recorded process start identity before returning it.
+    if (isHomeScopedInstance()) {
+      const metadata = readInstanceLockMetadata();
+      if (!metadata || metadata.pid !== pid
+        || metadata.socketPath !== windowsDaemonLockPipeName()
+        || !isRecordedProcessIdentityCurrent(metadata)) return null;
+    }
     return pid;
   } catch {
     return null;
@@ -62,10 +71,7 @@ function sleepMs(ms: number): void {
  *  This function is best-effort: it logs nothing and swallows all errors. */
 export function killAllStaleWatchdogs(): void {
   if (process.platform !== 'win32') return;
-  // A custom HOME has no ownership authority over the machine-wide watchdog.
-  // Never broad-kill another isolated instance's watchdog.
-  if (isHomeScopedInstance()) return;
-  const pids = findStaleWatchdogPids();
+  const pids = findStaleWatchdogPids(resolveImcodesHome(), isHomeScopedInstance());
   for (const pid of pids) {
     try {
       // `/T` has hung indefinitely on real Task Scheduler VBS -> CMD -> Node
@@ -88,8 +94,16 @@ export function killAllStaleWatchdogs(): void {
  *  (e.g. inside a Filter clause), cmd.exe→powershell command-line parsing
  *  closes the outer quote prematurely and the script becomes truncated.
  *  This was the root cause of the CI failure. */
-function findStaleWatchdogPids(): number[] {
+export function watchdogCommandLineMatchesHome(commandLine: string, stateHome: string): boolean {
+  const normalizedCommand = commandLine.replaceAll('/', '\\').toLowerCase();
+  const normalizedHome = stateHome.replaceAll('/', '\\').replace(/[\\]+$/, '').toLowerCase();
+  return normalizedCommand.includes('daemon-watchdog') && normalizedCommand.includes(normalizedHome);
+}
+
+function findStaleWatchdogPids(stateHome?: string, scoped = false): number[] {
   const pids = new Set<number>();
+  const homePattern = (stateHome ?? resolveImcodesHome()).replaceAll("'", "''");
+  const scopeClause = scoped ? ` -and $_.CommandLine -like '*${homePattern}*'` : '';
   // ── PowerShell path (works on every Windows since 7) ────────────────────
   let scriptDir: string | null = null;
   try {
@@ -101,7 +115,7 @@ function findStaleWatchdogPids(): number[] {
     writeFileSync(
       scriptPath,
       "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-        "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+      `Where-Object { $_.CommandLine -like '*daemon-watchdog*'${scopeClause} } | ` +
         "ForEach-Object { $_.ProcessId }\r\n",
     );
     const out = execSync(
@@ -124,7 +138,9 @@ function findStaleWatchdogPids(): number[] {
   // ── Legacy wmic path ────────────────────────────────────────────────────
   try {
     const out = execSync(
-      'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+      scoped
+        ? `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%' and CommandLine like '%${homePattern.replaceAll('\\', '\\\\')}%'" get ProcessId /format:list`
+        : 'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
       {
         encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
         timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',

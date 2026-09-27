@@ -4,6 +4,7 @@ import { execFileSync, execSync } from 'child_process';
 import path, { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
+import { resolveImcodesHome, windowsDaemonLockPipeName, WINDOWS_DAEMON_LOCK_PIPE } from './windows-daemon-lock.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -14,7 +15,7 @@ const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
 /** Sentinel file that tells the watchdog loop to pause.
  *  Created by the upgrade batch before npm install, deleted after restart. */
-export const UPGRADE_LOCK_FILE = join(homedir(), '.imcodes', 'upgrade.lock');
+export const UPGRADE_LOCK_FILE = join(resolveImcodesHome(), 'upgrade.lock');
 
 export interface LaunchPaths {
   nodeExe: string;
@@ -160,7 +161,7 @@ export function installWindowsScheduledTask(paths: LaunchPaths): boolean {
 
 /** Resolve all paths needed for the Windows daemon launch chain. */
 export function resolveLaunchPaths(): LaunchPaths {
-  const baseDir = join(homedir(), '.imcodes');
+  const baseDir = resolveImcodesHome();
   return {
     nodeExe: process.execPath,
     imcodesScript: join(__dirname, '..', 'index.js'),
@@ -421,6 +422,12 @@ export async function regenerateAllArtifacts(): Promise<void> {
 
 function killAllStaleWatchdogsBeforeRegen(): void {
   if (process.platform !== 'win32') return;
+  // A custom HOME must not broad-kill another isolated instance's watchdog.
+  // Its watchdog artifact lives under the resolved state directory, so the
+  // scoped query below only matches that path; default HOME keeps legacy scan.
+  const scopedHome = windowsDaemonLockPipeName() !== WINDOWS_DAEMON_LOCK_PIPE;
+  const homePattern = resolveImcodesHome().replaceAll("'", "''");
+  const scopeClause = scopedHome ? ` -and $_.CommandLine -like '*${homePattern}*'` : '';
   // PowerShell first (works on every Windows including ones where wmic is gone)
   // CRITICAL: use a temp .ps1 file, NOT `-Command "..."` — nested double
   // quotes inside the script body get truncated by cmd.exe→powershell
@@ -433,7 +440,7 @@ function killAllStaleWatchdogsBeforeRegen(): void {
     writeFileSync(
       scriptPath,
       "Get-CimInstance Win32_Process -Filter \"Name='cmd.exe'\" | " +
-        "Where-Object { $_.CommandLine -like '*daemon-watchdog*' } | " +
+      `Where-Object { $_.CommandLine -like '*daemon-watchdog*'${scopeClause} } | ` +
         "ForEach-Object { $_.ProcessId }\r\n",
     );
     const out = execSync(
@@ -455,7 +462,9 @@ function killAllStaleWatchdogsBeforeRegen(): void {
   if (pids.length === 0) {
     try {
       const out = execSync(
-        'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
+        scopedHome
+          ? `wmic process where "Name='cmd.exe' and CommandLine like '%daemon-watchdog%' and CommandLine like '%${homePattern.replaceAll('\\', '\\\\')}%'" get ProcessId /format:list`
+          : 'wmic process where "Name=\'cmd.exe\' and CommandLine like \'%daemon-watchdog%\'" get ProcessId /format:list',
         {
           encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true,
           timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',

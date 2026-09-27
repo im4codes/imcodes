@@ -281,4 +281,39 @@ describe('restartWindowsDaemon', () => {
     expect(state.execCalls).toContain('taskkill /f /pid 777');
     expect(state.execCalls.some((call) => call.includes('find-orphans.ps1'))).toBe(false);
   });
+
+  it('scoped restart refuses a stale/reused daemon.pid before taskkill', async () => {
+    process.env.HOME = 'C:\\Users\\scoped-a';
+    const { windowsDaemonLockPipeName } = await import('../../src/util/windows-daemon-lock.js');
+    state.pidContents = ['999', '1000'];
+    state.alivePids = new Set([999, 1000]);
+    state.vbsExists = true;
+    state.lockMetadata = {
+      version: 1,
+      pid: 777,
+      startToken: 'windows:777-start',
+      acquiredAt: Date.now(),
+      socketPath: windowsDaemonLockPipeName(),
+      sessionIds: [],
+      residualResources: [],
+    };
+
+    const { restartWindowsDaemon } = await import('../../src/util/windows-daemon.js');
+    // The fixture intentionally keeps stale metadata, so no newly acquired
+    // PID can be observed; the important invariant is that PID 999 is not
+    // taskkilled merely because daemon.pid names it.
+    expect(restartWindowsDaemon()).toBe(false);
+    expect(state.execCalls).not.toContain('taskkill /f /pid 999');
+  });
+
+  it('matches only the current scoped watchdog path in an A/B process listing', async () => {
+    const { watchdogCommandLineMatchesHome } = await import('../../src/util/windows-daemon.js');
+    const homeA = 'C:\\Temp\\lock-home-a\\.imcodes';
+    const homeB = 'C:\\Temp\\lock-home-b\\.imcodes';
+    const watchdogA = `cmd.exe /c "${homeA}\\daemon-watchdog.cmd"`;
+    const watchdogB = `cmd.exe /c "${homeB}\\daemon-watchdog.cmd"`;
+    expect(watchdogCommandLineMatchesHome(watchdogA, homeA)).toBe(true);
+    expect(watchdogCommandLineMatchesHome(watchdogB, homeA)).toBe(false);
+    expect(watchdogCommandLineMatchesHome(watchdogB, homeB)).toBe(true);
+  });
 });
