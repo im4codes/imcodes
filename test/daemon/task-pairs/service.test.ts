@@ -199,6 +199,16 @@ describe('task-pair marker ingestion', () => {
     expect(getTaskPairStore().listEvents(PROJECT, 'T-check').filter((event) => event.verb === 'CHECKLIST_AUTO_TICK')).toHaveLength(2);
   });
 
+  it('fills remaining implemented boxes when READY receives a partially checked brief', async () => {
+    await say(BRAIN, '<!-- IMCODES_TASK QUEUE T-partial title="Checklist" auditor=' + AUD + ' -->\n- [x][ ] first\n- [ ][ ] second\n<!-- IMCODES_TASK_END T-partial -->');
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-partial executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T-partial path=/workspace -->');
+    expect(pair('T-partial')?.brief).toBe('- [x][ ] first\n- [x][ ] second');
+    const ticks = getTaskPairStore().listEvents(PROJECT, 'T-partial').filter((event) => event.verb === 'CHECKLIST_AUTO_TICK');
+    expect(ticks).toHaveLength(1);
+    expect(ticks[0]?.attrs).toMatchObject({ box: 'implemented', items: '2', checked: 'true' });
+  });
+
   it('auto-ticks implemented items when an auditor=none executor reports DONE', async () => {
     await say(BRAIN, '<!-- IMCODES_TASK QUEUE T-no-audit title="Checklist" auditor=none -->\n- [ ][ ] first\n<!-- IMCODES_TASK_END T-no-audit -->');
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-no-audit executor=${EXEC} auditor=none -->`);

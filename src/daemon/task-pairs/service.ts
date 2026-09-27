@@ -511,7 +511,7 @@ export class TaskPairService {
   ): boolean {
     if (!pair.brief) return false;
     if (verb === 'READY_FOR_AUDIT' && transition.toStatus === 'in_audit') {
-      return parseTaskPairChecklist(pair.brief).every((item) => !item.implemented);
+      return parseTaskPairChecklist(pair.brief).some((item) => !item.implemented);
     }
     if (verb === 'PASS' && transition.toStatus === 'passed') return true;
     return verb === 'DONE'
