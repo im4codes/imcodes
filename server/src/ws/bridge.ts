@@ -326,7 +326,7 @@ import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
 } from '../../../shared/timeline-delivery-telemetry.js';
-import { addCounter, incrementCounter } from '../util/metrics.js';
+import { addCounter, incrementCounter, snapshotCounters } from '../util/metrics.js';
 import { logAudit } from '../security/audit.js';
 import { pickReadableSessionDisplay } from '../../../shared/session-display.js';
 import { isKnownTestSessionLike } from '../../../shared/test-session-guard.js';
@@ -812,6 +812,11 @@ export class TimelineOutboundQueue {
     this.pendingGaps.clear();
     this.gapEpisodes.clear();
     this.gapSentAt = [];
+  }
+
+  /** Compose-only diagnostics; never used by the delivery path. */
+  snapshot(): { bytes: number; pending: number; sending: boolean } {
+    return { bytes: this.bytes, pending: this.pending.length, sending: this.sending };
   }
 
   enqueue(ws: WebSocket, item: TimelineQueueEvent, onGap: (event: TimelineQueueEvent) => void, onCoalesced?: () => void): void {
@@ -6158,6 +6163,21 @@ export class WsBridge {
       }
 
       if (typeof msg.type !== 'string') {
+        return;
+      }
+
+      // Test-only observability for the real-browser performance harness. It
+      // is disabled unless explicitly enabled in the compose environment and
+      // exposes counters plus live per-socket queue/buffer state without
+      // routing through the daemon or delaying any control frame.
+      if (msg.type === 'perf.debug.timeline_metrics' && process.env.IMCODES_PERF_DEBUG === '1') {
+        const sockets = [...this.browserSockets].map((socket, index) => ({
+          index,
+          bufferedAmount: typeof socket.bufferedAmount === 'number' ? socket.bufferedAmount : 0,
+          queue: this.timelineQueues.get(socket)?.snapshot() ?? { bytes: 0, pending: 0, sending: false },
+          subscriptions: [...(this.timelineSubscriptions.get(socket)?.entries() ?? [])].map(([sessionName, mode]) => ({ sessionName, mode })),
+        }));
+        safeSend(ws, JSON.stringify({ type: msg.type, requestId: msg.requestId, counters: snapshotCounters(), sockets }));
         return;
       }
 

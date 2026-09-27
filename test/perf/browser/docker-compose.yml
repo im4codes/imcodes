@@ -1,0 +1,121 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: imcodes_perf
+      POSTGRES_USER: imcodes_perf
+      POSTGRES_PASSWORD: perf-only-password
+    tmpfs: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imcodes_perf -d imcodes_perf"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    cpus: 1.0
+    mem_limit: 512m
+    pids_limit: 128
+
+  server:
+    build:
+      context: ../../..
+      dockerfile: server/Dockerfile
+      args:
+        PRELOAD_EMBEDDING_MODEL: "0"
+    environment:
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+      JWT_SIGNING_KEY: perf-only-jwt-jwt-signing-key-32-bytes-minimum
+      NODE_ENV: production
+      PORT: 19138
+      SERVER_URL: http://server:19138
+      # The harness opens the real SPA from the server origin so browser WS
+      # upgrades are same-origin; retain web:4300 for the optional fixture.
+      ALLOWED_ORIGINS: http://web:4300,http://server:19138
+      HOME: /tmp/imc-perf-home
+      IMCODES_HOME: /tmp/imc-perf-home/.imcodes
+      IMCODES_PERF_DEBUG: "1"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Host port is configurable so base/dev/Part-B runs can run in parallel;
+    # containers continue using server:19138 on their private network.
+    ports: ["127.0.0.1:${IMC_PERF_PORT_BASE:-19138}:19138"]
+    cpus: 2.0
+    mem_limit: 1g
+    pids_limit: 256
+
+  web:
+    image: node:24-bookworm-slim
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+    command: ["bash", "-lc", "cd web && npm ci --ignore-scripts --no-audit --no-fund && npm run build:fixtures && npm run serve:fixtures -- --host 0.0.0.0"]
+    ports: ["127.0.0.1:${IMC_PERF_WEB_PORT_BASE:-4300}:4300"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4300/src/fixtures/chat-timeline/index.html').then(() => process.exit(0)).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      start_period: 30s
+      retries: 180
+    cpus: 2.0
+    mem_limit: 4g
+    shm_size: 1g
+    pids_limit: 512
+
+  daemon:
+    image: browser-server
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - perf_home:/tmp/imc-perf-home
+    environment:
+      HOME: /tmp/imc-perf-home
+      IMCODES_HOME: /tmp/imc-perf-home/.imcodes
+      IMCODES_PERF_SERVER_URL: ws://server:19138
+      IMCODES_PERF_MODE: "1"
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+      IMC_PERF_SERVER_URL: ws://server:19138
+      IMC_PERF_DAEMON_TOKEN: imc-perf-daemon-token
+      NODE_PATH: /app/node_modules
+    command: ["node", "/repo/test/perf/browser/daemon-client.mjs"]
+    depends_on:
+      server:
+        condition: service_started
+    cpus: 1.0
+    mem_limit: 768m
+    pids_limit: 256
+
+  harness:
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - perf_results:/repo/perf-results
+    environment:
+      HOME: /tmp/imc-perf-home
+      IMCODES_HOME: /tmp/imc-perf-home/.imcodes
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_FIXTURE_URL: http://web:4300
+      IMC_PERF_REVISION: ${IMC_PERF_REVISION:-unknown}
+      IMC_PERF_JWT_SIGNING_KEY: perf-only-jwt-jwt-signing-key-32-bytes-minimum
+      IMC_PERF_DURATION_MS: ${IMC_PERF_DURATION_MS:-10000}
+      IMC_PERF_SESSIONS: ${IMC_PERF_SESSIONS:-20}
+      IMC_PERF_LONG_CHATS: ${IMC_PERF_LONG_CHATS:-1}
+      IMC_PERF_SUB_WINDOWS: ${IMC_PERF_SUB_WINDOWS:-19}
+      IMC_PERF_OPEN_TIMEOUT_MS: ${IMC_PERF_OPEN_TIMEOUT_MS:-120000}
+      IMC_PERF_WINDOW_TIMEOUT_MS: ${IMC_PERF_WINDOW_TIMEOUT_MS:-90000}
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/run.mjs"]
+    depends_on:
+      web:
+        condition: service_healthy
+      server:
+        condition: service_started
+    cpus: 2.0
+    mem_limit: 4g
+    shm_size: 1g
+    pids_limit: 512
+
+volumes:
+  perf_home:
+  perf_results:
