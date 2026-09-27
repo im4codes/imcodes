@@ -60,7 +60,7 @@ export interface SessionResourceRegistryOptions {
     paneId: string;
     sessionInstanceId: string;
     runtimeEpoch: string;
-  } | undefined>;
+  } | null | undefined>;
   tmuxIdentityTimeoutMs?: number;
   pidHandleIsCurrent?: typeof sessionResourcePidHandleIsCurrent;
   /**
@@ -219,12 +219,14 @@ async function resolveLiveTmuxIdentity(name: string): Promise<{
   paneId: string;
   sessionInstanceId: string;
   runtimeEpoch: string;
-} | undefined> {
+} | null | undefined> {
   try {
     const { getTmuxSessionResourceIdentity } = await import('../agent/tmux.js');
     return await getTmuxSessionResourceIdentity(name, TMUX_IDENTITY_QUERY_TIMEOUT_MS);
   } catch {
-    return undefined;
+    // A failed import/backend probe is not proof that the tmux session is
+    // gone.  Keep the registry fail-closed for this unknown state.
+    return null;
   }
 }
 
@@ -483,16 +485,23 @@ export class SessionResourceRegistry {
           && previous.owner.sessionName === previous.handle.name
           && registration.owner.sessionName === registration.handle.name
           && previous.handle.name === registration.handle.name) {
-          let timeout: number | undefined;
+          let timeout: ReturnType<typeof setTimeout> | undefined;
           const liveIdentity = await Promise.race([
-            this.resolveTmuxIdentity(registration.handle.name).catch(() => undefined),
-            new Promise<undefined>((resolve) => {
-              timeout = globalThis.setTimeout(resolve, this.tmuxIdentityTimeoutMs);
+            this.resolveTmuxIdentity(registration.handle.name).catch(() => null),
+            new Promise<null>((resolve) => {
+              timeout = globalThis.setTimeout(() => resolve(null), this.tmuxIdentityTimeoutMs);
             }),
           ]).finally(() => {
             if (timeout) globalThis.clearTimeout(timeout);
           });
-          replacesStaleTmuxOwner = Boolean(liveIdentity
+          // `undefined` is reserved for a positively missing/dead tmux
+          // session.  In that case a relaunch of the same named session must
+          // be allowed to take over a crash-left registry row.  `null` means
+          // the probe timed out or otherwise could not establish liveness and
+          // therefore remains fail-closed.  A live identity still has to
+          // prove the exact successor tuple, preventing a different owner
+          // from stealing a live session.
+          replacesStaleTmuxOwner = liveIdentity === undefined || Boolean(liveIdentity
             && liveIdentity.paneId === registration.handle.paneId
             && liveIdentity.sessionInstanceId === registration.owner.sessionInstanceId
             && liveIdentity.runtimeEpoch === registration.owner.runtimeEpoch);

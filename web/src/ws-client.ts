@@ -24,6 +24,7 @@ import { PEER_AUDIT_MESSAGES } from '@shared/peer-audit.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
 import { FS_WRITE_MAX_BYTES, FS_WRITE_OUTBOUND_WS_MAX_BYTES } from '@shared/fs-write-limits.js';
+import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 import { CLAUDE_QUOTA_MSG } from '@shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG, type CodexResetCredit, type CodexConsumeOutcome } from '@shared/codex-reset-credits.js';
 import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '@shared/codex-credit-history.js';
@@ -162,7 +163,8 @@ export type ServerMessage =
   | DirectFileTransferServerMessage
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
-  | { type: 'terminal.stream_reset'; session: string; reason: string }
+  | { type: typeof TERMINAL_CONTROL.STREAM_RESET; session: string; reason: string }
+  | { type: typeof TERMINAL_CONTROL.RECOVERY_EXHAUSTED; session: string; reason: string }
   | { type: 'session.event'; event: string; session: string; state: string; reason?: SessionEventReason }
   | { type: 'session.error'; project: string; message: string }
   | { type: 'session.idle'; session: string; project: string; agentType: string; label?: string; parentLabel?: string }
@@ -2283,7 +2285,7 @@ export class WsClient {
           return;
         }
         this.markSocketAliveFromInboundFrame();
-        if (msg.type === 'terminal.stream_reset') {
+        if (msg.type === TERMINAL_CONTROL.STREAM_RESET) {
           this.handleStreamReset(msg.session);
           this.dispatch(msg); // Let TerminalView know to reset terminal state
           return;

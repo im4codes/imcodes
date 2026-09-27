@@ -289,7 +289,10 @@ export async function capturePaneVisible(session: string): Promise<string> {
   if (BACKEND === 'wezterm') {
     return weztermCapturePaneVisible(session);
   }
-  return tmuxRun('capture-pane', '-e', '-p', '-t', session);
+  // -J joins wrapped physical rows.  Without it, copying a long URL from a
+  // snapshot inserts a space at every visual wrap and the next stream frame
+  // starts from a different logical line than xterm's buffer.
+  return tmuxRun('capture-pane', '-e', '-J', '-p', '-t', session);
 }
 
 /**
@@ -298,7 +301,7 @@ export async function capturePaneVisible(session: string): Promise<string> {
  */
 export async function capturePaneHistory(session: string, lines = 1000): Promise<string> {
   requireTmux('capturePaneHistory');
-  return tmuxRun('capture-pane', '-e', '-p', '-t', session, '-S', `-${lines}`, '-E', '-1');
+  return tmuxRun('capture-pane', '-e', '-J', '-p', '-t', session, '-S', `-${lines}`, '-E', '-1');
 }
 
 /**
@@ -691,20 +694,46 @@ export interface TmuxSessionResourceIdentity {
 export async function getTmuxSessionResourceIdentity(
   session: string,
   timeoutMs: number,
-): Promise<TmuxSessionResourceIdentity | undefined> {
-  if (BACKEND !== 'tmux') return undefined;
+): Promise<TmuxSessionResourceIdentity | null | undefined> {
+  if (BACKEND !== 'tmux') return null;
   try {
-    const format = `#{pane_id}\t#{${SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID}}\t#{${SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH}}`;
-    const { stdout } = await execFile('tmux', ['display-message', '-p', '-t', session, format], {
+    // tmux does not expose arbitrary pane environment variables as bare
+    // format tokens. Read the pane id and the session environment separately;
+    // using #{VAR} silently returns an empty string and made every relaunch
+    // look like an unknown live owner (the original black-shell regression).
+    const { stdout: paneStdout } = await execFile('tmux', ['display-message', '-p', '-t', session, '#{pane_id}'], {
       timeout: timeoutMs,
       maxBuffer: 4 * 1024,
     });
-    const [paneId, sessionInstanceId, runtimeEpoch, ...extra] = stdout.trimEnd().split('\t');
-    return paneId && sessionInstanceId && runtimeEpoch && extra.length === 0
+    const readEnv = async (name: string): Promise<string> => {
+      const { stdout } = await execFile('tmux', ['show-environment', '-t', session, name], {
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024,
+      });
+      return stdout.trimEnd();
+    };
+    const [instanceLine, epochLine] = await Promise.all([
+      readEnv(SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID),
+      readEnv(SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH),
+    ]);
+    const paneId = paneStdout.trim();
+    const parseEnv = (line: string, name: string): string => line.startsWith(`${name}=`) ? line.slice(name.length + 1) : '';
+    const sessionInstanceId = parseEnv(instanceLine, SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID);
+    const runtimeEpoch = parseEnv(epochLine, SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH);
+    return paneId && sessionInstanceId && runtimeEpoch
       ? { paneId, sessionInstanceId, runtimeEpoch }
-      : undefined;
-  } catch {
-    return undefined;
+      : null;
+  } catch (error) {
+    const output = `${(error as { stderr?: unknown }).stderr ?? ''} ${(error as Error).message ?? ''}`.toLowerCase();
+    // tmux's explicit missing-session/pane diagnostics are proof that the
+    // old owner is dead.  Timeouts, permission errors, and malformed owner
+    // metadata are deliberately reported as unknown (null) so registration
+    // cannot steal a live resource during a transient probe failure.
+    if (output.includes("can't find session")
+      || output.includes("can't find pane")
+      || output.includes("can't find window")
+      || output.includes('no server running')) return undefined;
+    return null;
   }
 }
 

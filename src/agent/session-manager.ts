@@ -892,6 +892,16 @@ export async function restartSession(record: SessionRecord): Promise<boolean> {
     opencodeSessionId: effectiveRecord.opencodeSessionId,
   });
 
+  // A health-check restart can race a dead tmux server while the browser's
+  // terminal subscription is still alive. Rebind its pipe immediately after
+  // the replacement pane is created so output and input resume in-place.
+  try {
+    const { terminalStreamer } = await import('../daemon/terminal-streamer.js');
+    await terminalStreamer.rebindSession(effectiveRecord.name);
+  } catch (error) {
+    logger.warn({ session: effectiveRecord.name, error }, 'Terminal stream rebind after restart failed');
+  }
+
   return true;
 }
 

@@ -576,6 +576,8 @@
   "session": {
     "restart": "↺ 再起動",
     "restart_plain": "再起動",
+    "terminal_recovery_exhausted": "ターミナルを自動復旧できませんでした。再起動して続行してください。",
+    "terminal_restart": "ターミナルを再起動",
     "delivery_mode_queue": "待機",
     "delivery_mode_append": "追加",
     "delivery_mode_queue_description": "現在の応答が完了してから送信",

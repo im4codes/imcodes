@@ -576,6 +576,8 @@
   "session": {
     "restart": "↺ 重新啟動",
     "restart_plain": "重新啟動",
+    "terminal_recovery_exhausted": "終端機無法自動恢復。請重新啟動後繼續。",
+    "terminal_restart": "重新啟動終端機",
     "delivery_mode_queue": "排隊",
     "delivery_mode_append": "追加",
     "delivery_mode_queue_description": "等待目前回覆結束後再傳送",

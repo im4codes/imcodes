@@ -1,4 +1,5 @@
 import { useEffect, useRef, useCallback, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
 import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { Terminal } from 'xterm';
 import { FitAddon } from '@xterm/addon-fit';
@@ -7,6 +8,7 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import { TERMINAL_MAX_ROWS } from '@shared/terminal-limits.js';
 import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
+import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
 
 interface Props {
   sessionName: string;
@@ -26,10 +28,14 @@ interface Props {
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, allow keyboard input on mobile (for shell/ssh sessions). */
   mobileInput?: boolean;
+  /** Action shown when daemon recovery is exhausted instead of leaving a black pane. */
+  onRestart?: () => void;
 }
 
 const PREVIEW_RAW_FLUSH_MS = 32;
 const PREVIEW_RAW_MAX_BYTES = 16 * 1024;
+const RAW_FLUSH_MS = 16;
+const RAW_MAX_BYTES = 64 * 1024;
 const PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS = 1000;
 
 /**
@@ -82,7 +88,19 @@ function concatChunks(chunks: Uint8Array[], totalBytes: number): Uint8Array {
   return combined;
 }
 
-export function TerminalView({ sessionName, ws, connected, active = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput }: Props) {
+/** Join only soft-wrapped xterm rows; preserve explicit newlines. */
+export function joinWrappedTerminalSelection(selection: string, continuationRows: readonly boolean[]): string {
+  const lines = selection.split('\n');
+  if (lines.length <= 1) return selection;
+  let joined = lines[0] ?? '';
+  for (let i = 1; i < lines.length; i++) {
+    joined += continuationRows[i - 1] ? (lines[i] ?? '') : `\n${lines[i] ?? ''}`;
+  }
+  return joined;
+}
+
+export function TerminalView({ sessionName, ws, connected, active = true, preview = false, onDiff, onHistory, onFocusFn, onFitFn, onScrollBottomFn, mobileInput, onRestart }: Props) {
+  const { t } = useTranslation();
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -132,6 +150,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   const [scrollProgress, setScrollProgress] = useState(1); // 0..1, 1 = bottom
   const scrollHideTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [showScrollbar, setShowScrollbar] = useState(false);
+  const [recoveryError, setRecoveryError] = useState(false);
   const useIosMacTextScale = shouldUseIosMacTextScale();
 
   const clearRawFlushTimer = useCallback(() => {
@@ -170,18 +189,15 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   }, [clearRawFlushTimer, writeRawToTerminal]);
 
   const enqueueRawWrite = useCallback((data: Uint8Array) => {
-    if (!previewRef.current) {
-      writeRawToTerminal(data);
-      return;
-    }
     pendingRawChunksRef.current.push(data);
     pendingRawBytesRef.current += data.byteLength;
-    if (pendingRawBytesRef.current >= PREVIEW_RAW_MAX_BYTES) {
+    const maxBytes = previewRef.current ? PREVIEW_RAW_MAX_BYTES : RAW_MAX_BYTES;
+    if (pendingRawBytesRef.current >= maxBytes) {
       flushPendingRaw();
       return;
     }
     if (!rawFlushTimerRef.current) {
-      rawFlushTimerRef.current = setTimeout(flushPendingRaw, PREVIEW_RAW_FLUSH_MS);
+      rawFlushTimerRef.current = setTimeout(flushPendingRaw, previewRef.current ? PREVIEW_RAW_FLUSH_MS : RAW_FLUSH_MS);
     }
   }, [flushPendingRaw, writeRawToTerminal]);
 
@@ -208,7 +224,14 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     // Copy selected text to clipboard on Ctrl+C / Cmd+C when selection exists
     term.attachCustomKeyEventHandler((ev) => {
       if ((ev.ctrlKey || ev.metaKey) && ev.key === 'c' && term.hasSelection()) {
-        void navigator.clipboard.writeText(term.getSelection());
+        const position = term.getSelectionPosition();
+        const continuationRows: boolean[] = [];
+        if (position) {
+          for (let row = position.start.y + 1; row <= position.end.y; row++) {
+            continuationRows.push(term.buffer.active.getLine(row)?.isWrapped ?? false);
+          }
+        }
+        void navigator.clipboard.writeText(joinWrappedTerminalSelection(term.getSelection(), continuationRows));
         return false; // prevent sending ^C to tmux when we're copying
       }
       return true;
@@ -440,7 +463,11 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   useEffect(() => {
     if (!ws || !active) return;
     const unsub = ws.onMessage((msg) => {
-      if (msg.type === 'terminal.stream_reset' && msg.session === sessionName) {
+      if (msg.type === TERMINAL_CONTROL.RECOVERY_EXHAUSTED && msg.session === sessionName) {
+        setRecoveryError(true);
+        return;
+      }
+      if (msg.type === TERMINAL_CONTROL.STREAM_RESET && msg.session === sessionName) {
         discardPendingRaw();
         termRef.current?.reset();
         linesRef.current = [];
@@ -605,6 +632,28 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         <button class="term-scroll-bottom" onClick={scrollToBottom} title="Scroll to bottom">
           ↓
         </button>
+      )}
+
+      {recoveryError && (
+        <div
+          role="alert"
+          data-testid="terminal-recovery-error"
+          style={{
+            position: 'absolute', inset: 0, display: 'flex', alignItems: 'center',
+            justifyContent: 'center', flexDirection: 'column', gap: 12,
+            background: 'rgba(15, 15, 19, 0.94)', color: '#e2e8f0', padding: 24,
+            textAlign: 'center', zIndex: 3,
+          }}
+        >
+          <div>{t('session.terminal_recovery_exhausted')}</div>
+          <button
+            type="button"
+            class="btn"
+            onClick={() => { setRecoveryError(false); onRestart?.(); }}
+          >
+            {t('session.terminal_restart')}
+          </button>
+        </div>
       )}
     </div>
   );

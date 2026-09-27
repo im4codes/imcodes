@@ -22,3 +22,5 @@ export const TERMINAL_MAX_ROWS = 1024;
 
 /** Companion bound for columns; a frame's width feeds the same string building. */
 export const TERMINAL_MAX_COLS = 2048;
+/** Bounded handoff buffer while a subscriber's initial snapshot is captured. */
+export const TERMINAL_RAW_HANDOFF_MAX_BYTES = 4 * 1024 * 1024;

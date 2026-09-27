@@ -576,6 +576,8 @@
   "session": {
     "restart": "↺ Reiniciar",
     "restart_plain": "Reiniciar",
+    "terminal_recovery_exhausted": "El terminal no pudo recuperarse automáticamente. Reinícialo para continuar.",
+    "terminal_restart": "Reiniciar terminal",
     "delivery_mode_queue": "En cola",
     "delivery_mode_append": "Añadir",
     "delivery_mode_queue_description": "Enviar cuando termine la respuesta actual",

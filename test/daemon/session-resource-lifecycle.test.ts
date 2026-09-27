@@ -167,6 +167,29 @@ describe('session resource lifecycle', () => {
     expect(cleanup).not.toHaveBeenCalled();
   });
 
+  it('takes over a crash-left tmux row when the named session is confirmed gone', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
+    roots.push(directory);
+    const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
+    const registry = new SessionResourceRegistry({
+      directory,
+      now: () => 1_000,
+      cleanup,
+      // The tmux probe distinguishes a confirmed missing session (undefined)
+      // from an unavailable/timeout probe (null), which remains fail-closed.
+      resolveTmuxIdentity: async () => undefined,
+    });
+    await registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: owner('old-instance'),
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%1' },
+    });
+    const successor = { ...owner('new-instance'), runtimeEpoch: 'epoch-b' };
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: successor,
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%2' },
+    })).resolves.toMatchObject({ owner: successor, handle: { paneId: '%2' } });
+  });
+
   it('accepts a recycled tmux pane id only when the live owner tuple matches the successor', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
     roots.push(directory);

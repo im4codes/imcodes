@@ -1337,6 +1337,7 @@ import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
+import { TERMINAL_CONTROL } from '../../shared/terminal-protocol.js';
 
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
@@ -1867,7 +1868,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleDeleteTimelineMessage(cmd, serverLink);
       break;
     case 'session.input':
-      void handleInput(cmd);
+      void handleInput(cmd, serverLink);
       break;
     case 'session.resize':
       void handleResize(cmd);
@@ -5885,7 +5886,7 @@ async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverL
   ackAccepted();
 }
 
-async function handleInput(cmd: Record<string, unknown>): Promise<void> {
+async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const data = cmd.data as string | undefined;
 
@@ -5915,6 +5916,32 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
     }
   } catch (err) {
     logger.error({ sessionName, err }, 'session.input failed');
+    const record = getSession(sessionName);
+    const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+    const tmuxGone = record?.agentType === 'shell'
+      && (message.includes('no server running')
+        || message.includes("can't find pane")
+        || message.includes("can't find session")
+        || message.includes("can't find window"));
+    if (tmuxGone && record) {
+      // Preserve keystrokes that arrive while the tmux server is being
+      // recreated. Concurrent failures share one bounded relaunch, then retry
+      // their original byte in order instead of dropping input.
+      try {
+        await runExclusiveSessionRelaunch(sessionName, async () => {
+          await relaunchSessionWithSettings(record, {
+            agentType: record.agentType as AgentType,
+            projectDir: record.projectDir,
+            label: record.label ?? null,
+            description: record.description ?? null,
+          });
+          handleSubscribe({ session: sessionName, raw: true }, serverLink);
+        });
+        await sendRawInput(sessionName, data);
+      } catch (recoveryError) {
+        logger.warn({ sessionName, recoveryError }, 'session.input recovery failed');
+      }
+    }
   } finally {
     release();
   }
@@ -6039,6 +6066,13 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
       if (latestRecord?.agentType !== 'shell' && latestRecord?.agentType !== 'script') return;
       if (!canAttemptShellBootstrapRecovery(session)) {
         logger.warn({ session, reason }, 'Shell terminal bootstrap recovery suppressed by restart limit');
+        try {
+          subscriber.sendControl?.({
+            type: TERMINAL_CONTROL.RECOVERY_EXHAUSTED,
+            session,
+            reason: 'restart_limit',
+          });
+        } catch { /* best effort */ }
         return;
       }
       logger.warn({ session, reason, agentType: latestRecord.agentType }, 'Shell terminal bootstrap stalled — auto-restarting session');
@@ -6050,6 +6084,10 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
             label: latestRecord.label ?? null,
             description: latestRecord.description ?? null,
           });
+          // A dead tmux pane tears down the old pipe subscription. Reattach
+          // the raw terminal stream after relaunch so the browser can resume
+          // both output and input without requiring a page refresh.
+          handleSubscribe({ session, raw: true }, serverLink);
           await handleGetSessions(serverLink);
           if (session.startsWith('deck_sub_')) {
             try {
@@ -6059,6 +6097,20 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
         } catch (err) {
           logger.error({ session, err }, 'Shell terminal bootstrap auto-restart failed');
           const message = err instanceof Error ? err.message : String(err);
+          // A live different owner is a real conflict and must be surfaced as
+          // an actionable terminal error.  A stale/dead owner is accepted by
+          // SessionResourceRegistry, so this path is reserved for genuine
+          // contention and does not burn the crash-loop budget.
+          if (message.includes('session_resource_owner_conflict')) {
+            shellBootstrapRecoveryAttempts.delete(session);
+            try {
+              subscriber.sendControl?.({
+                type: TERMINAL_CONTROL.RECOVERY_EXHAUSTED,
+                session,
+                reason: 'resource_conflict',
+              });
+            } catch { /* best effort */ }
+          }
           emitSessionInlineError(session, `Shell auto-reconnect failed: ${message}`);
           try { serverLink.send({ type: 'session.error', project: latestRecord.projectName, message }); } catch { /* ignore */ }
           throw err;

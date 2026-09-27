@@ -576,6 +576,8 @@
   "session": {
     "restart": "↺ Перезапустить",
     "restart_plain": "Перезапустить",
+    "terminal_recovery_exhausted": "Терминал не удалось восстановить автоматически. Перезапустите его, чтобы продолжить.",
+    "terminal_restart": "Перезапустить терминал",
     "delivery_mode_queue": "В очередь",
     "delivery_mode_append": "Добавить",
     "delivery_mode_queue_description": "Отправить после завершения текущего ответа",

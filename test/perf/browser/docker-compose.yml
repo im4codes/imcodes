@@ -134,6 +134,64 @@ services:
     shm_size: 1g
     pids_limit: 512
 
+  # Real tmux-backed daemon/browser scenario. Kept behind the shell profile so
+  # the timeline performance harness remains deterministic and isolated.
+  shell-daemon:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/real-daemon.Dockerfile
+    working_dir: /repo
+    volumes:
+      - shell_perf_home:/tmp/imc-shell-home
+    environment:
+      HOME: /tmp/imc-shell-home
+      IMCODES_HOME: /tmp/imc-shell-home/.imcodes
+      IMC_PERF_WORKER_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_DAEMON_TOKEN: imc-shell-real-daemon-token
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+    ports: ["127.0.0.1:${IMC_PERF_SHELL_CONTROL_PORT:-19139}:19139"]
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 256
+
+  shell-harness:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - shell_perf_results:/repo/perf-results
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_API_KEY: imc_shell_perf_browser_key
+      IMC_PERF_SHELL_SESSION: deck_shell_perf_brain
+      IMC_PERF_SHELL_SCREENSHOT: ${IMC_PERF_SHELL_SCREENSHOT:-/repo/perf-results/shell-desktop.png}
+      IMC_PERF_SHELL_MOBILE_SCREENSHOT: ${IMC_PERF_SHELL_MOBILE_SCREENSHOT:-/repo/perf-results/shell-mobile.png}
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/shell-stream.spec.mjs"]
+    depends_on:
+      shell-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+      web:
+        condition: service_healthy
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
 volumes:
   perf_home:
   perf_results:
+  shell_perf_home:
+  shell_perf_results:

@@ -6648,6 +6648,7 @@ export function App() {
                 onDiff={(apply) => registerDiffApplyer(s.name, apply)}
                 onHistory={(apply) => registerHistoryApplyer(s.name, apply)}
                 onStopProject={handleStopProject}
+                onRestart={() => handleRestartProject(s.project)}
                 onRenameSession={() => setRenameRequest(s.name)}
                 onSettings={(openIntent) => setSettingsTarget({ sessionName: s.name, sessionInstanceId: s.sessionInstanceId, runtimeEpoch: s.runtimeEpoch, activeModel: s.activeModel, requestedModel: s.requestedModel, modelDisplay: s.modelDisplay, providerId: s.providerId, label: s.label || '', description: s.description || '', cwd: s.projectDir || '', type: s.agentType || '', parentSession: null, transportConfig: s.transportConfig ?? null, supervisionMode: s.supervisionMode ?? null, openIntent, canControlAutomaticSupervision: canSharedActorControlSession(s.sharedState) && canSessionRoleOwnAutomaticSupervision(s.role) })}
                 onShareSession={selectedShareTarget ? undefined : openShareDialogForSession}

@@ -1035,6 +1035,7 @@ export function SubSessionWindow({
               onFitFn={(fn) => { termFitFnRef.current = fn; }}
               onScrollBottomFn={onTermScrollBottomFn}
               mobileInput={isShell}
+              onRestart={onRestart}
             />}
         </div>
         {visible && viewMode === 'chat' && (

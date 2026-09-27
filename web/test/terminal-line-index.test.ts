@@ -1,5 +1,6 @@
-import { describe, expect, it } from 'vitest';
-import { isRenderableLineIndex, resolveDiffRows } from '../src/components/TerminalView.js';
+import { describe, expect, it, vi } from 'vitest';
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+import { isRenderableLineIndex, resolveDiffRows, joinWrappedTerminalSelection } from '../src/components/TerminalView.js';
 import { TERMINAL_MAX_ROWS } from '@shared/terminal-limits.js';
 
 /**
@@ -71,5 +72,12 @@ describe('resolveDiffRows', () => {
       declaredRows: TERMINAL_MAX_ROWS,
       rows: TERMINAL_MAX_ROWS,
     });
+  });
+});
+
+describe('joinWrappedTerminalSelection', () => {
+  it('joins only xterm soft wraps and preserves explicit newlines', () => {
+    expect(joinWrappedTerminalSelection('https://example/long\nurl?x=1\nnext', [true, false]))
+      .toBe('https://example/longurl?x=1\nnext');
   });
 });

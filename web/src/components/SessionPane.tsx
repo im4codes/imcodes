@@ -101,6 +101,8 @@ export interface SessionPaneProps {
 
   // ── Action callbacks ────────────────────────────────────────────────────────
   onStopProject?: (project: string) => void;
+  /** Restart this session when terminal recovery is exhausted. */
+  onRestart?: () => void;
   onRenameSession?: () => void;
   onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
@@ -148,6 +150,7 @@ export function SessionPane({
   onDiff,
   onHistory,
   onStopProject,
+  onRestart,
   onRenameSession,
   onSettings,
   onShareSession,
@@ -431,6 +434,7 @@ export function SessionPane({
             onFitFn={onFitFn}
             onScrollBottomFn={handleTermScrollFn}
             mobileInput={session.agentType === 'shell'}
+            onRestart={onRestart}
           />}
       </div>
 

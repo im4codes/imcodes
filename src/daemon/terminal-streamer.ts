@@ -28,9 +28,11 @@ import { timelineEmitter } from './timeline-emitter.js';
 import { emitSessionInlineError } from './session-error.js';
 import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
 import { TERMINAL_MAX_COLS, TERMINAL_MAX_ROWS } from '../shared/transport/terminal.js';
+import { TERMINAL_RAW_HANDOFF_MAX_BYTES } from '../../shared/terminal-limits.js';
+import { TERMINAL_CONTROL } from '../../shared/terminal-protocol.js';
 
 const IDLE_THRESHOLD_MS = 5_000; // 5s without raw bytes → idle (Stop hook fires immediately; this is fallback)
-const MAX_RAW_BUFFER = 256 * 1024; // 256KB per-subscriber snapshot-pending buffer
+const MAX_RAW_BUFFER = TERMINAL_RAW_HANDOFF_MAX_BYTES;
 const REBIND_DELAYS_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 const MAX_REBIND_ATTEMPTS = 5;
 const BLANK_BOOTSTRAP_STALL_MS = 1_500;
@@ -933,8 +935,15 @@ export class TerminalStreamer {
       // Check if session still alive
       const alive = await sessionExists(sessionName).catch(() => false);
       if (!alive) {
-        logger.warn({ sessionName }, 'Session gone, stopping pipe rebind');
-        this.errorAllSubscribers(sessionName, new Error('Session no longer exists'));
+        // A tmux pane can disappear while the persisted session record is
+        // still valid. Keep the subscriber alive and hand recovery to the
+        // command handler; removing it here strands the browser with a black
+        // terminal and prevents the relaunch path from reattaching input.
+        logger.warn({ sessionName }, 'Session gone during pipe rebind; requesting shell recovery');
+        const subscribers = this.subscribers.get(sessionName);
+        for (const [sub] of subscribers ?? []) {
+          try { sub.onBootstrapStalled?.('snapshot_failed'); } catch { /* best effort */ }
+        }
         return;
       }
 
@@ -1015,7 +1024,7 @@ export class TerminalStreamer {
 
     // Notify client to reset and resubscribe
     try {
-      sub.sendControl?.({ type: 'terminal.stream_reset', session: sessionName, reason: 'raw_buffer_overflow' });
+      sub.sendControl?.({ type: TERMINAL_CONTROL.STREAM_RESET, session: sessionName, reason: 'raw_buffer_overflow' });
     } catch {
       sub.onError?.(new Error('raw_buffer_overflow'));
     }

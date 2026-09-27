@@ -993,8 +993,8 @@ describe('TerminalStreamer — snapshot coalescing (subscription storm)', () => 
     });
     await vi.advanceTimersByTimeAsync(1);
 
-    // Exceed MAX_RAW_BUFFER (256 KiB) while that snapshot is still pending.
-    onData(Buffer.alloc(300 * 1024, 0x61));
+    // Exceed the bounded 4 MiB handoff buffer while that snapshot is pending.
+    onData(Buffer.alloc(5 * 1024 * 1024, 0x61));
 
     expect(
       control.some((m) => m.type === 'terminal.stream_reset'),

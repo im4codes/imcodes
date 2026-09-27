@@ -5,6 +5,8 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { h } from 'preact';
 import { render, screen } from '@testing-library/preact';
 
+vi.mock('react-i18next', () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
+
 vi.mock('xterm', () => ({
   Terminal: vi.fn().mockImplementation(() => ({
     open: vi.fn(),
@@ -304,6 +306,27 @@ describe('TerminalView', () => {
     expect(event.defaultPrevented).toBe(true);
     expect(mockFocus).toHaveBeenCalled();
     expect(sendInput).toHaveBeenCalledWith('paste-session', 'echo pasted\n');
+  });
+
+  it('shows a localized restart action when daemon recovery is exhausted', async () => {
+    let onMessage: ((msg: unknown) => void) | undefined;
+    const onRestart = vi.fn();
+    render(
+      <TerminalView
+        sessionName="recovery-session"
+        onRestart={onRestart}
+        ws={{
+          onTerminalRaw: vi.fn(() => vi.fn()),
+          onMessage: vi.fn((handler: (msg: unknown) => void) => { onMessage = handler; return vi.fn(); }),
+        } as any}
+      />,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    onMessage?.({ type: 'terminal.recovery_exhausted', session: 'recovery-session', reason: 'restart_limit' });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByTestId('terminal-recovery-error')).toBeTruthy();
+    screen.getByRole('button', { name: 'session.terminal_restart' }).click();
+    expect(onRestart).toHaveBeenCalledOnce();
   });
 });
 

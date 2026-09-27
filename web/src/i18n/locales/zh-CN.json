@@ -576,6 +576,8 @@
   "session": {
     "restart": "↺ 重启",
     "restart_plain": "重启",
+    "terminal_recovery_exhausted": "终端无法自动恢复。请重启后继续。",
+    "terminal_restart": "重启终端",
     "delivery_mode_queue": "排队",
     "delivery_mode_append": "追加",
     "delivery_mode_queue_description": "等待当前回复结束后再发送",
