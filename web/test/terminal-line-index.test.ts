@@ -80,4 +80,9 @@ describe('joinWrappedTerminalSelection', () => {
     expect(joinWrappedTerminalSelection('https://example/long\nurl?x=1\nnext', [true, false]))
       .toBe('https://example/longurl?x=1\nnext');
   });
+
+  it('drops xterm padding at soft-wrap boundaries without changing hard lines', () => {
+    expect(joinWrappedTerminalSelection('https://example/long   \nurl?x=1   \nnext  ', [true, false]))
+      .toBe('https://example/longurl?x=1   \nnext  ');
+  });
 });

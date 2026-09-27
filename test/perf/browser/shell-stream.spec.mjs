@@ -128,7 +128,7 @@ async function copyUrlAtColumns(page, targetCols, url) {
   const selectedNormalized = selection.selected.replace(/\r?\n/g, '');
   const selectedOccurrences = selectedNormalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
   const copiedOccurrences = normalized.match(/https:\/\/example\.test\/remote-desktop\/x{260}/g) ?? [];
-  return { requestedCols: targetCols, actualCols: fitted.cols, viewportWidth: fitted.width, copiedLength: copied.length, exact: selectedOccurrences.length === 1 && selectedOccurrences[0] === url, clipboardExact: copiedOccurrences.length === 1 && copiedOccurrences[0] === url, selectedLength: selection.selected.length, rows: [] };
+  return { requestedCols: targetCols, actualCols: fitted.cols, viewportWidth: fitted.width, copiedLength: copied.length, exact: copiedOccurrences.length === 1 && copiedOccurrences[0] === url, selectedHasUrl: selectedOccurrences.length >= 1, clipboardExact: copiedOccurrences.length === 1 && copiedOccurrences[0] === url, selectedLength: selection.selected.length, rows: [] };
 }
 
 function sha256(value) {

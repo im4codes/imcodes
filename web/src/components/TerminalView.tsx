@@ -94,7 +94,15 @@ export function joinWrappedTerminalSelection(selection: string, continuationRows
   if (lines.length <= 1) return selection;
   let joined = lines[0] ?? '';
   for (let i = 1; i < lines.length; i++) {
-    joined += continuationRows[i - 1] ? (lines[i] ?? '') : `\n${lines[i] ?? ''}`;
+    const line = lines[i] ?? '';
+    // xterm pads a soft-wrapped row to the terminal width. Those padding
+    // spaces are visual only and must not enter copied URLs or other tokens.
+    if (continuationRows[i - 1]) {
+      joined = joined.replace(/\s+$/u, '');
+      joined += line;
+    } else {
+      joined += `\n${line}`;
+    }
   }
   return joined;
 }
