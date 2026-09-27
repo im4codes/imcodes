@@ -3776,6 +3776,7 @@
     "error": "The live task stream is unavailable.",
     "empty": "No supervised tasks yet.",
     "unsupported": "Unsupported task status. Resynchronizing safely.",
+    "unknown_status": "Unknown status",
     "group": {
       "active": "Active",
       "audit": "Audit",

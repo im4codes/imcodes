@@ -98,19 +98,6 @@ function isStaleProjection(
   );
 }
 
-function containsUnknownLifecycleStatus(payload: unknown): boolean {
-  if (!isRecord(payload)) return false;
-  const rows = [
-    ...(Array.isArray(payload.tasks) ? payload.tasks : []),
-    ...(Array.isArray(payload.assignments) ? payload.assignments : []),
-  ];
-  return rows.some((row) => (
-    isRecord(row)
-      && typeof row.status === 'string'
-      && !isSupervisionTaskLifecycleStatus(row.status)
-  ));
-}
-
 function hasUnknownLifecycleStatus(row: unknown): boolean {
   return isRecord(row) && typeof row.status === 'string' && !isSupervisionTaskLifecycleStatus(row.status);
 }
@@ -120,41 +107,34 @@ function hasUnknownLifecycleStatus(row: unknown): boolean {
  * the whole projection instead made the controller resubscribe forever, and
  * every resubscribe forced the daemon to rebuild a full snapshot -- the same
  * unknown row came back each time and pegged the daemon's main thread.
- * Snapshots drop the unknown rows (and assignments of a dropped task); deltas
- * carrying one become the matching removal so the cursor still advances.
+ * Keep the row in a neutral lifecycle bucket so valid rows and the unknown row
+ * remain visible. `unknownStatus` preserves the daemon value for the UI while
+ * the normalized enum/phase keeps the wire validator and tab grouping safe.
  */
-function quarantineUnknownLifecycleRows(payload: unknown): unknown {
+function normalizeUnknownLifecycleRows(payload: unknown): unknown {
   if (!isRecord(payload)) return payload;
   if (payload.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {
     if (!Array.isArray(payload.tasks) || !Array.isArray(payload.assignments)) return payload;
-    if (!containsUnknownLifecycleStatus(payload)) return payload;
-    const droppedTaskIds = new Set(payload.tasks
-      .filter((task) => hasUnknownLifecycleStatus(task) && isRecord(task) && typeof task.taskId === 'string')
-      .map((task) => (task as { taskId: string }).taskId));
+    const normalize = (row: unknown): unknown => {
+      if (!hasUnknownLifecycleStatus(row)) return row;
+      return { ...(row as Record<string, unknown>), status: 'planned', phase: 'active', unknownStatus: (row as Record<string, unknown>).status };
+    };
     return {
       ...payload,
-      tasks: payload.tasks.filter((task) => !hasUnknownLifecycleStatus(task)),
-      assignments: payload.assignments.filter((assignment) => !hasUnknownLifecycleStatus(assignment)
-        && !(isRecord(assignment) && typeof assignment.taskId === 'string' && droppedTaskIds.has(assignment.taskId))),
+      tasks: payload.tasks.map(normalize),
+      assignments: payload.assignments.map(normalize),
     };
   }
   if (payload.type !== SUPERVISION_TASK_CONSOLE_MSG.DELTA) return payload;
-  const task = isRecord(payload.task) ? payload.task : undefined;
-  const assignment = isRecord(payload.assignment) ? payload.assignment : undefined;
-  const { task: _task, assignment: _assignment, ...rest } = payload;
-  if (payload.op === 'task_upsert' && task && hasUnknownLifecycleStatus(task) && typeof task.taskId === 'string') {
-    return { ...rest, op: 'task_remove', removedId: task.taskId };
-  }
-  if (payload.op !== 'assignment_upsert' || !assignment) return payload;
-  const taskUnknown = task !== undefined && hasUnknownLifecycleStatus(task);
-  if (taskUnknown && typeof task?.taskId === 'string') {
-    return { ...rest, op: 'task_remove', removedId: task.taskId };
-  }
-  if (!hasUnknownLifecycleStatus(assignment)) return payload;
-  if (task) return { ...rest, op: 'task_upsert', task };
-  return typeof assignment.assignmentId === 'string'
-    ? { ...rest, op: 'assignment_remove', removedId: assignment.assignmentId }
-    : payload;
+  const normalize = (row: unknown): unknown => {
+    if (!hasUnknownLifecycleStatus(row)) return row;
+    return { ...(row as Record<string, unknown>), status: 'planned', phase: 'active', unknownStatus: (row as Record<string, unknown>).status };
+  };
+  return {
+    ...payload,
+    ...(payload.task ? { task: normalize(payload.task) } : {}),
+    ...(payload.assignment ? { assignment: normalize(payload.assignment) } : {}),
+  };
 }
 
 function indexUnique<T>(
@@ -380,23 +360,19 @@ export function supervisionTaskConsoleReducer(
       };
     case 'snapshot_received': {
       if (isStaleProjection(state, action.payload)) return state;
-      const payload = quarantineUnknownLifecycleRows(action.payload);
+      const payload = normalizeUnknownLifecycleRows(action.payload);
       if (!isValidSupervisionTaskConsoleEvent(payload)
         || payload.type !== SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {
-        return requestResync(state, containsUnknownLifecycleStatus(payload)
-          ? 'status_contract_mismatch'
-          : 'cursor_unknown');
+        return requestResync(state, 'cursor_unknown');
       }
       return applySnapshot(state, payload, action.receivedAt ?? payload.generatedAt);
     }
     case 'delta_received': {
       if (isStaleProjection(state, action.payload)) return state;
-      const payload = quarantineUnknownLifecycleRows(action.payload);
+      const payload = normalizeUnknownLifecycleRows(action.payload);
       if (!isValidSupervisionTaskConsoleEvent(payload)
         || payload.type !== SUPERVISION_TASK_CONSOLE_MSG.DELTA) {
-        return requestResync(state, containsUnknownLifecycleStatus(payload)
-          ? 'status_contract_mismatch'
-          : 'cursor_unknown');
+        return requestResync(state, 'cursor_unknown');
       }
       return applyDelta(state, payload, action.receivedAt ?? state.lastSyncedAt ?? 0);
     }

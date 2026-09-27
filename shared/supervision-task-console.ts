@@ -477,6 +477,12 @@ export interface SupervisionTaskConsoleTaskRow {
   objective?: string;
   /** Fixed enum id. Never free text, never model-authored. */
   status: SupervisionTaskLifecycleStatus;
+  /**
+   * Original daemon status when this client build does not know the enum yet.
+   * `status` is normalized to the neutral planned bucket for structural
+   * validation and sorting; the UI renders this field as "Unknown status".
+   */
+  unknownStatus?: string;
   /** Exact registry revision that owns this aggregate lifecycle. */
   currentRevision?: string;
   ownerSessionName?: string;
@@ -513,6 +519,8 @@ export interface SupervisionTaskConsoleAssignmentRow {
   assignmentId: string;
   taskId: string;
   status: SupervisionTaskLifecycleStatus;
+  /** Original daemon status when `status` was normalized for compatibility. */
+  unknownStatus?: string;
   phase: SupervisionConsoleStatusGroup;
   /** Exact task revision this role assignment is bound to. */
   auditRevision?: string;
@@ -763,6 +771,7 @@ function isTaskRow(value: unknown): boolean {
     && typeof value.title === 'string'
     // Rejects unknown/case-variant/model-authored status.
     && isSupervisionTaskLifecycleStatus(value.status)
+    && (value.unknownStatus === undefined || (typeof value.unknownStatus === 'string' && value.unknownStatus.length > 0))
     && (value.currentRevision === undefined || typeof value.currentRevision === 'string')
     && hasDerivedPhase(value)
     && (value.auditVerdict === undefined || isPeerAuditVerdict(value.auditVerdict))
@@ -778,6 +787,7 @@ function isAssignmentRow(value: unknown): boolean {
     && typeof value.assignmentId === 'string'
     && typeof value.taskId === 'string'
     && isSupervisionTaskLifecycleStatus(value.status)
+    && (value.unknownStatus === undefined || (typeof value.unknownStatus === 'string' && value.unknownStatus.length > 0))
     && (value.auditRevision === undefined || typeof value.auditRevision === 'string')
     && hasDerivedPhase(value)
     && (value.required === undefined || typeof value.required === 'boolean')

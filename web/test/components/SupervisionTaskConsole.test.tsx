@@ -280,6 +280,32 @@ describe('SupervisionTaskConsole', () => {
     expect(document.querySelector('[data-awaiting-external-ci="true"]')).not.toBeNull();
   });
 
+  it('renders a neutral unknown-status row without hiding valid tasks or showing a global alert', () => {
+    const base = state();
+    render(
+      <SupervisionTaskConsoleView
+        state={{
+          ...base,
+          tasks: {
+            ...base.tasks,
+            'task-unknown': {
+              taskId: 'task-unknown', title: 'Future task status', status: 'planned', phase: 'active',
+              unknownStatus: 'future_status', validationState: 'unknown', updatedAt: NOW, lastEventId: 22,
+            },
+          },
+        }}
+        mobile={false}
+        now={NOW}
+        onClose={() => {}}
+        onNavigateSession={() => {}}
+      />,
+    );
+    expect(screen.getByText('Build live task console')).toBeTruthy();
+    expect(screen.getByText('Future task status')).toBeTruthy();
+    expect(screen.getAllByText('supervision_task_console.unknown_status').length).toBeGreaterThan(0);
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
   it('renders the pair status, round, verdict counts and flags of a pairs-engine row', () => {
     const base = state();
     render(

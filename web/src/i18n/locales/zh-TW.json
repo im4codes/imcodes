@@ -3776,6 +3776,7 @@
     "error": "即時任務串流暫不可用。",
     "empty": "暫無監督任務。",
     "unsupported": "任務狀態不受支援，正在安全重新同步。",
+    "unknown_status": "未知狀態",
     "group": {
       "active": "進行中",
       "audit": "稽核",

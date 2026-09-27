@@ -3776,6 +3776,7 @@
     "error": "El flujo de tareas en vivo no está disponible.",
     "empty": "Aún no hay tareas supervisadas.",
     "unsupported": "Estado no compatible. Resincronizando de forma segura.",
+    "unknown_status": "Estado desconocido",
     "group": {
       "active": "Activas",
       "audit": "Auditoría",

@@ -211,7 +211,8 @@ function TaskPairConsoleDetails({ pair, taskId }: { pair: SupervisionConsolePair
   );
 }
 
-function displayStatusKey(status: unknown): string {
+function displayStatusKey(status: unknown, unknownStatus?: string): string {
+  if (unknownStatus) return 'supervision_task_console.unknown_status';
   return isSupervisionTaskLifecycleStatus(status)
     ? `supervision_task_console.status.${status}`
     : 'supervision_task_console.unsupported';
@@ -341,7 +342,7 @@ function SessionButton(props: {
   // active, which made a terminal assignment under a live task indistinguishable
   // from a running one.
   const showRuntimeState = props.taskTab === 'active';
-  const workStateLabel = t(displayStatusKey(assignment.status));
+  const workStateLabel = t(displayStatusKey(assignment.status, assignment.unknownStatus));
   const healthLabel = t(`supervision_task_console.execution_health.${assignment.executionHealth ?? 'unknown'}`);
   const stateLabel = showRuntimeState
     ? t(`supervision_task_console.session_state.${state}`)
@@ -428,7 +429,9 @@ function TaskCard(props: {
             onClick={props.onToggle}
           >
           <span class={`supervision-task-console-status status-${props.task.status}`}>
-            {props.task.pair ? pairStatusLabel(t, props.task.pair) : t(displayStatusKey(props.task.status))}
+            {props.task.unknownStatus
+              ? t('supervision_task_console.unknown_status')
+              : props.task.pair ? pairStatusLabel(t, props.task.pair) : t(displayStatusKey(props.task.status))}
           </span>
           <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
           </button>
@@ -508,7 +511,7 @@ export function SupervisionTaskConsoleView(props: {
     for (const values of grouped.values()) values.sort((left, right) => right.updatedAt - left.updatedAt);
     return grouped;
   }, [props.state.assignments]);
-  const allTasks = useMemo(() => Object.values(props.state.tasks).filter((task) => isSupervisionTaskLifecycleStatus(task.status)), [props.state.tasks]);
+  const allTasks = useMemo(() => Object.values(props.state.tasks), [props.state.tasks]);
   const historyTasks = useMemo(() => allTasks
     .filter((task) => supervisionConsoleTabForTask(task, assignmentsByTask.get(task.taskId) ?? []) === 'history')
     .sort((left, right) => right.updatedAt - left.updatedAt || left.taskId.localeCompare(right.taskId)), [allTasks]);
@@ -631,7 +634,6 @@ export function SupervisionTaskConsoleView(props: {
               : 'supervision_task_console.no_history')}</div>}
           {activeTab === 'history' && historyLimit < historyTasks.length && <button type="button" class="supervision-task-console-show-more" onClick={() => setHistoryLimit((value) => value + HISTORY_PAGE_SIZE)}>{t('supervision_task_console.show_more')}</button>}
         </section>}
-        {bodyState === 'ready' && allTasks.length !== Object.keys(props.state.tasks).length && <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.unsupported')}</div>}
       </div>
     </aside>
   );

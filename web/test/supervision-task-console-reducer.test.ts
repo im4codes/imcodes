@@ -252,7 +252,7 @@ describe('supervision task console reducer', () => {
     }
   });
 
-  it('drops only the unknown-status rows of a snapshot instead of rejecting it and resyncing', () => {
+  it('keeps unknown-status rows as neutral rows instead of rejecting the snapshot', () => {
     const base = snapshot();
     const payload = {
       ...base,
@@ -287,11 +287,13 @@ describe('supervision task console reducer', () => {
     expect(next.syncing).toBe(false);
     expect(next.resyncReason).toBeNull();
     expect(next.resyncGeneration).toBe(subscribingState().resyncGeneration);
-    expect(Object.keys(next.tasks)).toEqual(['task-1']);
-    expect(Object.keys(next.assignments)).toEqual(['assignment-1']);
+    expect(Object.keys(next.tasks)).toEqual(['task-1', 'task-unknown']);
+    expect(next.tasks['task-unknown']).toMatchObject({ status: 'planned', phase: 'active', unknownStatus: 'future_status' });
+    expect(Object.keys(next.assignments)).toEqual(['assignment-1', 'assignment-of-unknown-task', 'assignment-unknown']);
+    expect(next.assignments['assignment-unknown']).toMatchObject({ status: 'planned', phase: 'active', unknownStatus: 'future_status' });
   });
 
-  it('turns a delta carrying an unknown status into a removal of just that row', () => {
+  it('keeps a delta carrying an unknown status and advances the cursor', () => {
     const ready = readyState();
     const unknownTask = supervisionTaskConsoleReducer(ready, {
       type: 'delta_received',
@@ -299,7 +301,7 @@ describe('supervision task console reducer', () => {
     });
     expect(unknownTask.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
     expect(unknownTask.resyncGeneration).toBe(ready.resyncGeneration);
-    expect(unknownTask.tasks['task-1']).toBeUndefined();
+    expect(unknownTask.tasks['task-1']).toMatchObject({ status: 'planned', unknownStatus: 'future_status' });
     expect(unknownTask.lastDurableEventId).toBe(4);
 
     const unknownAssignment = supervisionTaskConsoleReducer(ready, {
@@ -315,7 +317,7 @@ describe('supervision task console reducer', () => {
     });
     expect(unknownAssignment.resyncGeneration).toBe(ready.resyncGeneration);
     expect(unknownAssignment.tasks['task-1']).toBeDefined();
-    expect(unknownAssignment.assignments['assignment-1']).toBeUndefined();
+    expect(unknownAssignment.assignments['assignment-1']).toMatchObject({ status: 'planned', unknownStatus: 'future_status' });
     expect(unknownAssignment.lastDurableEventId).toBe(4);
   });
 
