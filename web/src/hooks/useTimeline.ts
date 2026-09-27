@@ -3830,12 +3830,15 @@ export function useTimeline(
   }, [flushStreamingIdlePersist]);
 
   const appendRealtimeEvent = useCallback((event: TimelineEvent) => {
-    // Full-mode sockets deliver status/usage frames live for authoritative
-    // subscribers, but these last-value signals are not chat rows. Keep them
-    // out of the rendered timeline so a 25 Hz status stream cannot rebuild the
-    // whole window tree; queue/session reconciliation above still observes the
-    // event and the next durable/final event advances the same cursor.
-    if (event.summary !== true && isLastValueTimelineEventType(event.type)) {
+    // Full-mode sockets deliver high-rate status/usage frames live for
+    // authoritative subscribers, but they are telemetry rather than chat rows.
+    // Keep only those two streams out of rendered timeline state so a 25 Hz
+    // feed cannot rebuild the whole window tree. session.state remains a
+    // rendered authoritative signal because queue/session reconciliation and
+    // optimistic-send UI depend on it.
+      const isFullModeTelemetry = event.summary !== true
+      && (event.type === 'agent.status' || event.type === 'usage.update');
+    if (isFullModeTelemetry) {
       pendingRealtimeEventsRef.current.delete(event.eventId);
       return;
     }
