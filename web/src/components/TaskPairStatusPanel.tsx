@@ -42,6 +42,39 @@ function mergeDefined(
   return merged;
 }
 
+function snapshotTimestamp(row: Record<string, unknown>): number {
+  const value = Number(row.updatedAt);
+  return Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function isTerminalRow(row: Record<string, unknown> | undefined): boolean {
+  return Boolean(row && TASK_PAIR_TERMINAL_STATUSES.includes(row.toStatus as TaskPairStatus));
+}
+
+/**
+ * Pair snapshots/upserts can cross on the socket.  Once a terminal row has
+ * been observed, an older (or even newer but non-terminal) participant update
+ * must not resurrect it or restart its elapsed timer.
+ */
+function mergeSnapshotRow(
+  previous: Record<string, unknown> | undefined,
+  incoming: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!previous) return incoming;
+  if (isTerminalRow(previous) && !isTerminalRow(incoming)) return previous;
+  if (snapshotTimestamp(incoming) < snapshotTimestamp(previous)) return previous;
+  return mergeDefined(previous, incoming);
+}
+
+function mergeSnapshotRows(
+  previous: readonly Record<string, unknown>[] | null,
+  incoming: readonly Record<string, unknown>[],
+): readonly Record<string, unknown>[] {
+  if (!previous) return incoming;
+  const previousByTask = new Map(previous.map((row) => [String(row.taskId), row]));
+  return incoming.map((row) => mergeSnapshotRow(previousByTask.get(String(row.taskId)), row));
+}
+
 function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Record<string, unknown>[] | null {
   if (!Array.isArray(detail.tasks)) return null;
   const byTask = new Map<string, Record<string, unknown>[]>();
@@ -148,7 +181,8 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
       const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; op?: string; task?: Record<string, unknown>; removedId?: string } | undefined;
       if (!detail) return;
       if (Array.isArray(detail.tasks)) {
-        setSnapshotRows(normalizeSnapshot(detail));
+        const normalized = normalizeSnapshot(detail);
+        if (normalized) setSnapshotRows((current) => mergeSnapshotRows(current, normalized));
       } else if (detail.op === 'task_upsert' && detail.task) {
         setSnapshotRows((current) => {
           if (!current) return current;
@@ -156,7 +190,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId }: { events: re
           const incoming = normalized?.[0];
           if (!incoming) return current;
           const previous = current.find((row) => row.taskId === incoming.taskId);
-          return [...current.filter((row) => row.taskId !== incoming.taskId), mergeDefined(previous, incoming)];
+          return [...current.filter((row) => row.taskId !== incoming.taskId), mergeSnapshotRow(previous, incoming)];
         });
       } else if (detail.op === 'task_remove' && detail.removedId) setSnapshotRows((current) => current?.filter((row) => row.taskId !== detail.removedId) ?? current);
     };

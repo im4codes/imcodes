@@ -295,6 +295,50 @@ describe('TaskPairStatusPanel', () => {
     });
   });
 
+  it('ignores an out-of-order non-terminal upsert after a terminal row', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    try {
+      render(<TaskPairStatusPanel events={[]} />);
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+        tasks: [{ taskId: 'ordered-upsert', title: 'Ordered upsert', updatedAt: 100, pair: { status: 'done', createdAt: 10, startedAt: 20, updatedAt: 100 } }],
+        assignments: [],
+      } }));
+      await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
+      const meta = document.querySelector('[data-status="done"] .task-pair-status-row-meta')!;
+      const before = meta.textContent;
+      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+        op: 'task_upsert',
+        task: { taskId: 'ordered-upsert', title: 'Ordered upsert', updatedAt: 90, pair: { status: 'rework', createdAt: 10, startedAt: 20, updatedAt: 90 } },
+      } }));
+      await waitFor(() => {
+        expect(document.querySelector('[data-status="done"]')).toBeTruthy();
+        expect(document.querySelector('[data-status="rework"]')).toBeNull();
+      });
+      vi.advanceTimersByTime(30_000);
+      await waitFor(() => expect(meta.textContent).toBe(before));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('ignores an out-of-order non-terminal full snapshot after a terminal row', async () => {
+    render(<TaskPairStatusPanel events={[]} />);
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'ordered-snapshot', title: 'Ordered snapshot', updatedAt: 100, pair: { status: 'done', createdAt: 10, startedAt: 20, updatedAt: 100 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
+    window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
+      tasks: [{ taskId: 'ordered-snapshot', title: 'Ordered snapshot', updatedAt: 90, pair: { status: 'rework', createdAt: 10, startedAt: 20, updatedAt: 90 } }],
+      assignments: [],
+    } }));
+    await waitFor(() => {
+      expect(document.querySelector('[data-status="done"]')).toBeTruthy();
+      expect(document.querySelector('[data-status="rework"]')).toBeNull();
+    });
+  });
+
   it('replaces a stale row when reconnect resync delivers the authoritative snapshot', async () => {
     render(<TaskPairStatusPanel events={[{
       eventId: 'stale', type: 'task_pair.event', ts: Date.now(),
