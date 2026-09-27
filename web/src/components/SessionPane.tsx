@@ -420,18 +420,18 @@ export function SessionPane({
         key={`term-${sessionName}`}
         style={{ display: terminalVisible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
       >
-        <TerminalView
-          sessionName={sessionName}
-          ws={ws}
-          connected={connected}
-          active={terminalVisible}
-          onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
-          onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
-          onFocusFn={onFocusFn}
-          onFitFn={onFitFn}
-          onScrollBottomFn={handleTermScrollFn}
-          mobileInput={session.agentType === 'shell'}
-        />
+        {terminalVisible && <TerminalView
+            sessionName={sessionName}
+            ws={ws}
+            connected={connected}
+            active={terminalVisible}
+            onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
+            onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
+            onFocusFn={onFocusFn}
+            onFitFn={onFitFn}
+            onScrollBottomFn={handleTermScrollFn}
+            mobileInput={session.agentType === 'shell'}
+          />}
       </div>
 
       {/* Chat view: only rendered when active + in chat mode */}

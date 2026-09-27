@@ -151,7 +151,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
   // out-of-band `resolvedMachines` hint the same way SessionControls does. No
   // fail-closed gate (unlike aliases): an unresolved marker stays literal.
   const { machines: machineAll } = useMachines();
-  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken, isOpen || isFocused);
   const isShell = sub.type === 'shell' || sub.type === 'script';
   const [timelineHydrated, setTimelineHydrated] = useState(() => isOpen || isFocused === true);
   useEffect(() => {
@@ -463,7 +463,7 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
       {/* Preview — scrollable, auto-scrolls to bottom on new content */}
       <div style={{ position: 'relative', flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
         <div class={`subcard-preview${isShell ? ' subcard-preview-terminal' : ''}`} ref={previewRef}>
-          {isShell ? (
+          {isShell && (isOpen || isFocused) ? (
             <TerminalView
               sessionName={sub.sessionName}
               ws={ws}
@@ -474,6 +474,8 @@ export function SubSessionCard({ sub, ws, connected, isOpen, isFocused, idleFlas
               onHistory={(apply) => onHistory(sub.sessionName, apply)}
               onScrollBottomFn={(fn) => { termScrollRef.current = fn; }}
             />
+          ) : isShell ? (
+            <div class="subcard-preview-terminal-placeholder" aria-hidden="true" />
           ) : (
             <ChatView
               events={events}

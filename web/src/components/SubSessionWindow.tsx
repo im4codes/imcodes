@@ -280,7 +280,7 @@ export function SubSessionWindow({
   sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
   const { t } = useTranslation();
-  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken);
+  const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken, visible);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);
   const isDesktopMaximized = desktopLayoutCapable && maximized;
   const swipeBackRef = useSwipeBack(isMobile ? onMinimize : null);
@@ -362,7 +362,7 @@ export function SubSessionWindow({
   // stack via the parent-supplied callbacks. Mobile is a no-op (it renders
   // a portaled full-screen overlay, not a managed floating window).
   useEffect(() => {
-    if (isMobile) return;
+    if (isMobile || !visible) return;
     if (showFileBrowser) {
       onDesktopFileBrowserOpen?.();
     } else {
@@ -527,11 +527,12 @@ export function SubSessionWindow({
       cancelAnimationFrame(frame);
       window.removeEventListener('resize', onResize);
     };
-  }, [isMobile, isDesktopMaximized]);
+  }, [isMobile, isDesktopMaximized, visible]);
 
   // Scroll to bottom whenever switching to chat view;
   // force fit + full terminal refresh when switching to terminal view.
   useEffect(() => {
+    if (!visible) return undefined;
     if (viewMode === 'chat') {
       const timer = setTimeout(() => chatScrollRef.current?.(), 50);
       return () => clearTimeout(timer);
@@ -546,7 +547,7 @@ export function SubSessionWindow({
       return () => cancelAnimationFrame(frame);
     }
     return undefined;
-  }, [viewMode, ws, connected, active, sub.sessionName]);
+  }, [viewMode, ws, connected, active, sub.sessionName, visible]);
 
   // Shell/script window: hold the raw PTY stream for the window's ENTIRE
   // visible lifetime — NOT just while focused. Users often keep one at the
@@ -1019,17 +1020,17 @@ export function SubSessionWindow({
       {/* Content */}
       <div class="subsession-content">
         <div style={{ display: viewMode === 'terminal' ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}>
-          <TerminalView
-            sessionName={sub.sessionName}
-            ws={ws}
-            connected={connected}
-            active={(isShell || active) && viewMode === 'terminal'}
-            onDiff={(apply) => onDiff(sub.sessionName, apply)}
-            onHistory={(apply) => onHistory(sub.sessionName, apply)}
-            onFitFn={(fn) => { termFitFnRef.current = fn; }}
-            onScrollBottomFn={onTermScrollBottomFn}
-            mobileInput={isShell}
-          />
+          {visible && <TerminalView
+              sessionName={sub.sessionName}
+              ws={ws}
+              connected={connected}
+              active={(isShell || active) && viewMode === 'terminal'}
+              onDiff={(apply) => onDiff(sub.sessionName, apply)}
+              onHistory={(apply) => onHistory(sub.sessionName, apply)}
+              onFitFn={(fn) => { termFitFnRef.current = fn; }}
+              onScrollBottomFn={onTermScrollBottomFn}
+              mobileInput={isShell}
+            />}
         </div>
         {viewMode === 'chat' && (
           <ChatView

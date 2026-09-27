@@ -1732,10 +1732,7 @@ export function App() {
   const loadedWebBuildId = useMemo(() => getLoadedWebBuildId(), []);
   const [appUpdateNotice, setAppUpdateNotice] = useState<AppUpdateNotice | null>(null);
   const appUpdateRequiredRef = useRef(false);
-  const appBuildCheckRef = useRef<{ startedAt: number; inFlight: Promise<boolean> | null }>({
-    startedAt: 0,
-    inFlight: null,
-  });
+  const appBuildCheckRef = useRef<{ inFlight: Promise<boolean> | null }>({ inFlight: null });
   const markAppUpdateRequired = useCallback((detail: AppUpdateRequiredDetail) => {
     appUpdateRequiredRef.current = true;
     setAppUpdateNotice((prev) => ({
@@ -1749,15 +1746,10 @@ export function App() {
     }));
   }, [loadedWebBuildId]);
   const checkForAppUpdate = useCallback(async (options?: { blocking?: boolean; featureLabel?: string }) => {
-    const now = Date.now();
     const state = appBuildCheckRef.current;
-    // Probe recovery is a liveness signal, not a reason to re-fetch the same
-    // build marker for every timeline frame. Coalesce an in-flight request and
-    // keep non-blocking lifecycle checks to one request per 15 seconds. An
-    // explicit version-sensitive action may still force a fresh check.
+    // Coalesce concurrent checks. Probe recovery never calls this path; only a
+    // real socket reconnect or an explicit version-sensitive action may check.
     if (state.inFlight) return state.inFlight;
-    if (!options?.blocking && now - state.startedAt < 15_000) return false;
-    state.startedAt = now;
     const request = (async () => {
       const current = await fetchCurrentAppBuildInfo();
       if (!current || !isAppBuildMismatch(loadedWebBuildId, current.buildId)) return false;
@@ -3758,7 +3750,8 @@ export function App() {
         if (msg.event === 'connected') {
           setConnected(true);
           setConnecting(false);
-          void checkForAppUpdate();
+          const isProbeRecovered = msg.reason === 'probe_recovered';
+          if (!isProbeRecovered) void checkForAppUpdate();
           // `probe_recovered` only proves the socket is alive; control-plane
           // state (session list, P2P discussions/status) may still be stale
           // because we silently missed live events during the half-open window.
@@ -3766,8 +3759,7 @@ export function App() {
           // `requestActiveTimelineRefresh({resetCooldowns:true})` reset — the
           // active-refresh listener in `useTimeline` already bare-dispatches on
           // probe_recovered (governed by the 15s success-only cooldown).
-          const isProbeRecovered = msg.reason === 'probe_recovered';
-          ws.requestSessionList();
+          if (!isProbeRecovered) ws.requestSessionList();
           // Migrate to scoped p2p list. The active session is captured via the
           // ref to survive useEffect closure; the daemon will fail-closed and
           // return [] if it cannot resolve a project scope from this session,
@@ -3775,7 +3767,7 @@ export function App() {
           // tracked inside the WS client via setP2pWorkflowRequestScope on
           // terminal subscribe — passing it explicitly here just makes the
           // scope source obvious at the call site.
-          {
+          if (!isProbeRecovered) {
             const initialActive = activeSessionRef.current;
             const initialScope = initialActive ? { sessionName: initialActive } : undefined;
             ws.p2pListDiscussions(initialScope);

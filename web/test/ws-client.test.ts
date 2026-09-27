@@ -459,7 +459,7 @@ describe('WsClient', () => {
 
     client.probeConnection();
 
-    expect(client.connected).toBe(false);
+    expect(client.connected).toBe(true);
     expect(handler).toHaveBeenCalledWith({
       type: 'session.event',
       event: 'probing',
@@ -469,11 +469,11 @@ describe('WsClient', () => {
     });
     expect(handler).not.toHaveBeenCalledWith(expect.objectContaining({ event: 'disconnected' }));
     expect(JSON.parse(socket.send.mock.calls[0][0] as string)).toEqual({ type: 'ping' });
-    // During the probe window send() must NOT deliver (no extra socket.send)
-    // and must NOT throw (an uncaught throw here crashes the ChatView).
+    // Probe state is not a disconnect: regular sends remain available on the
+    // open socket and must not be dropped.
     const callsBeforeGuarded = socket.send.mock.calls.length;
     expect(() => client.send({ type: 'session.send', sessionName: 's', text: 'guarded' })).not.toThrow();
-    expect(socket.send.mock.calls.length).toBe(callsBeforeGuarded);
+    expect(socket.send.mock.calls.length).toBe(callsBeforeGuarded + 1);
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     expect(client.connected).toBe(true);
@@ -506,7 +506,7 @@ describe('WsClient', () => {
     const socket = lastWs!;
 
     client.probeConnection();
-    expect(client.connected).toBe(false);
+    expect(client.connected).toBe(true);
     expect(socket.readyState).toBe(MockWebSocket.OPEN);
     socket.send.mockClear();
 
@@ -569,7 +569,7 @@ describe('WsClient', () => {
 
     client.subscribeTerminal('pending-session', true);
     client.subscribeTransportSession('pending-session');
-    expect(socket.send).not.toHaveBeenCalled();
+    expect(socket.send).toHaveBeenCalled();
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     await vi.advanceTimersByTimeAsync(0);
@@ -600,7 +600,7 @@ describe('WsClient', () => {
 
     client.unsubscribeTerminal('gone-session');
     client.unsubscribeTransportSession('gone-session');
-    expect(socket.send).not.toHaveBeenCalled();
+    expect(socket.send).toHaveBeenCalled();
 
     socket.emit('message', { data: JSON.stringify({ type: 'pong' }) });
     await vi.advanceTimersByTimeAsync(0);
@@ -737,7 +737,7 @@ describe('WsClient', () => {
     handler.mockClear();
 
     client.probeConnection();
-    expect(client.connected).toBe(false);
+    expect(client.connected).toBe(true);
 
     socket.emit('message', { data: JSON.stringify({ type: 'session_list', sessions: [] }) });
 
@@ -756,7 +756,7 @@ describe('WsClient', () => {
     vi.useRealTimers();
   });
 
-  it('rate-limits probe recovery lifecycle notices while timeline frames keep arriving', async () => {
+  it('emits one recovery notice per probe, even when timeline frames keep arriving', async () => {
     vi.useFakeTimers();
     const client = new WsClient('http://localhost:8787', 'srv-1');
     const handler = vi.fn();
@@ -776,7 +776,7 @@ describe('WsClient', () => {
     // must not fan out another expensive app-level resync immediately.
     client.probeConnection();
     socket.emit('message', { data: JSON.stringify({ type: 'timeline.event', event: { sessionId: 's1', eventId: 'e1', seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'x' } } }) });
-    expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(1);
+    expect(handler.mock.calls.filter(([msg]) => msg?.reason === 'probe_recovered')).toHaveLength(2);
 
     client.disconnect();
     vi.useRealTimers();

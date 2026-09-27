@@ -525,7 +525,8 @@ export class WsClient {
    * as a control-plane resync and would otherwise refetch app-build,
    * session-list and sub-sessions once per incoming frame.
    */
-  private _lastProbeRecoveryNoticeAt = 0;
+  /** True while a foreground liveness probe is awaiting an inbound frame. */
+  private _probePending = false;
   private _onLatency: ((ms: number) => void) | null = null;
   private p2pWorkflowPendingRequests = new Map<string, ReturnType<typeof setTimeout>>();
   private p2pWorkflowRequestScope: P2pWorkflowRequestScope = {};
@@ -674,6 +675,7 @@ export class WsClient {
       this.ws = null;
     }
     this._connected = false;
+    this._probePending = false;
     this.setDaemonCapabilitySnapshot(null);
   }
 
@@ -818,9 +820,8 @@ export class WsClient {
     // multiple pings/timers when visibility/focus/pageshow all fire.
     if (this._resumeProbeTimer) return;
 
-    const wasConnected = this._connected;
-    this._connected = false;
-    if (wasConnected) {
+    if (!this._probePending) {
+      this._probePending = true;
       this.dispatch({
         type: 'session.event',
         event: 'probing',
@@ -1591,13 +1592,11 @@ export class WsClient {
       clearTimeout(this._resumeProbeTimer);
       this._resumeProbeTimer = null;
     }
-    if (this._connected) return;
-    this._connected = true;
+    if (!this._connected) return;
     this.flushPendingInput();
+    if (!this._probePending) return;
+    this._probePending = false;
     this.flushSubscriptionDiffAfterProbeRecovery();
-    const now = Date.now();
-    if (now - this._lastProbeRecoveryNoticeAt < 15_000) return;
-    this._lastProbeRecoveryNoticeAt = now;
     this.dispatch({
       type: 'session.event',
       event: 'connected',
@@ -2190,7 +2189,7 @@ export class WsClient {
       this.clearWsOpenTimer();
       this._connecting = false;
       this._connected = true;
-      this._lastProbeRecoveryNoticeAt = 0;
+      this._probePending = false;
       this.flushPendingInput();
       this.clearReconnectTimer();
       this.reconnectAttempt = 0;
@@ -2259,6 +2258,7 @@ export class WsClient {
       if (!this.isCurrentSocket(socket, generation)) return;
       const wasConnected = this._connected;
       this._connected = false;
+      this._probePending = false;
       this._connecting = false;
       this.ws = null;
       this.clearSocketTimers();
@@ -2417,6 +2417,7 @@ export class WsClient {
     const wasConnected = this._connected;
     this.ws = null;
     this._connected = false;
+    this._probePending = false;
     this._connecting = false;
     this.clearSocketTimers();
     if (wasConnected) {
@@ -2466,6 +2467,7 @@ export class WsClient {
       this.detachCurrentSocket(4001, force ? 'client refresh' : 'client reconnect stale socket');
     } else if (force) {
       this._connected = false;
+      this._probePending = false;
       this._connecting = false;
       this.clearSocketTimers();
     }

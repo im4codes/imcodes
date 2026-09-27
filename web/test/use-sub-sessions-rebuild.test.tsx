@@ -128,7 +128,7 @@ describe('useSubSessions rebuild gating', () => {
   // flipping. Sub-session reload + rebuild (→ subsession.sync carrying fresh
   // runtime state) must still re-fire, otherwise a sub-session that went idle
   // while the frontend was away stays stuck on `running` (perpetual card pulse).
-  it('resyncs sub-sessions on probe-recovery reconnect even when `connected` never flips', async () => {
+  it('does not refetch sub-sessions on probe recovery when the socket stays open', async () => {
     const handlers: Array<(msg: any) => void> = [];
     const ws = {
       subSessionRebuildAll: vi.fn(),
@@ -152,9 +152,11 @@ describe('useSubSessions rebuild gating', () => {
       fire({ type: 'session.event', event: 'connected', session: '', state: 'connected', reason: 'probe_recovered' });
     });
 
-    // Reload re-fires, cascading into a fresh rebuild → subsession.sync(state).
-    await waitFor(() => expect(listSubSessions).toHaveBeenCalledTimes(2));
-    await waitFor(() => expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(2));
+    // Probe recovery is not a reconnect. The existing list remains valid and
+    // must not trigger a control-plane request storm.
+    await new Promise((r) => setTimeout(r, 10));
+    expect(listSubSessions).toHaveBeenCalledTimes(1);
+    expect(ws.subSessionRebuildAll).toHaveBeenCalledTimes(1);
 
     // A burst of duplicate probe-recovery notices must not turn one socket
     // recovery into an API storm while the sub-session windows are streaming.
@@ -162,7 +164,7 @@ describe('useSubSessions rebuild gating', () => {
       fire({ type: 'session.event', event: 'connected', session: '', state: 'connected', reason: 'probe_recovered' });
     });
     await new Promise((r) => setTimeout(r, 10));
-    expect(listSubSessions).toHaveBeenCalledTimes(2);
+    expect(listSubSessions).toHaveBeenCalledTimes(1);
   });
 
   // The trigger is precise: only `probe_recovered` (where the boolean can't flip)
