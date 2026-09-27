@@ -36,11 +36,29 @@ describe('CI release-speed wiring', () => {
   });
 
   it('uses a non-cancelling release group for every publish gate', () => {
-    for (const name of ['release_version', 'controlled-node-executables', 'docker', 'publish']) {
+    for (const name of ['release_version', 'controlled-node-executables', 'docker', 'publish', 'android-release']) {
       const block = jobBlock(name);
-      expect(block).toContain('group: ci-release-${{ github.ref }}');
+      expect(block).toMatch(/group: ci-release-[^\n]*\$\{\{ github\.ref \}\}/);
       expect(block).toContain('cancel-in-progress: false');
     }
+  });
+
+  it('gives each release job its own concurrency group so docker and android run in parallel', () => {
+    // A shared group admits one running job; the others wait and GitHub keeps
+    // only one pending job per group, cancelling the rest. Sharing one group
+    // serialized android before docker and could cancel docker/publish.
+    const groups = ['release_version', 'docker', 'publish', 'android-release'].map((name) => {
+      const match = /group: (ci-release-[^\n]+)/.exec(jobBlock(name));
+      expect(match, name).toBeTruthy();
+      return match![1].trim();
+    });
+    expect(new Set(groups).size).toBe(groups.length);
+    // Android waits for the same test gate as docker (not the node-exe artifacts).
+    const android = jobBlock('android-release');
+    for (const gate of ['unit-tests', 'macos-unit-tests', 'windows-unit-tests', 'e2e-tests', 'server-db-tests']) {
+      expect(android).toContain(gate);
+    }
+    expect(android).not.toContain('controlled-node-executables');
   });
 
   it('caches version-independent macOS components by real inputs and verifies cache hits', () => {

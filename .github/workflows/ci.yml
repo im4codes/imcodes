@@ -777,7 +777,7 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-release-${{ github.ref }}
+      group: ci-release-publish-${{ github.ref }}
       cancel-in-progress: false
     needs: [docker]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
@@ -859,7 +859,7 @@ jobs:
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-release-${{ github.ref }}
+      group: ci-release-version-${{ github.ref }}
       cancel-in-progress: false
     outputs:
       app_version: ${{ steps.version.outputs.app_version }}
@@ -1361,7 +1361,7 @@ jobs:
     name: Docker Build & Push
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-release-${{ github.ref }}
+      group: ci-release-docker-${{ github.ref }}
       cancel-in-progress: false
     needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests, release_version, controlled-node-executables]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev'
@@ -1628,9 +1628,11 @@ jobs:
     name: Android Release Build
     runs-on: ubuntu-latest
     concurrency:
-      group: ci-release-${{ github.ref }}
+      group: ci-release-android-${{ github.ref }}
       cancel-in-progress: false
-    needs: [lint, typecheck, secret-scan, unit-tests, web-tests-unit, web-tests-components, server-tests, e2e-tests]
+    # Same test gate as docker (minus the node-exe artifacts it packages), so
+    # the Android and Docker release builds start together and run in parallel.
+    needs: [lint, typecheck, secret-scan, unit-tests, macos-unit-tests, windows-unit-tests, windows-conpty-tests, web-tests-unit, web-tests-components, web-chat-perf, server-tests, server-db-tests, e2e-tests]
     if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/dev'
     permissions:
       contents: write
