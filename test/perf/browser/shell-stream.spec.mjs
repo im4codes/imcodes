@@ -260,7 +260,7 @@ export async function runShellBrowserScenario() {
     const perf = window.__shellPerf;
     if (perf) { perf.longTasks = 0; perf.frames = 0; perf.frameStart = performance.now(); }
   });
-  const burstCommand = `python3 -c "import hashlib,sys;d='0123456789abcdef'*16384;sys.stdout.write(d);sys.stdout.write('\\n'+hashlib.sha256(d.encode()).hexdigest()+'\\n')"`;
+  const burstCommand = `python3 -c "import hashlib,sys;d='0123456789abcdef'*16384;sys.stdout.write('BURST_BEGIN');sys.stdout.write(d);sys.stdout.write('\\n'+hashlib.sha256(d.encode()).hexdigest()+'\\nBURST_END\\n')"`;
   // Use one browser input event for this long command so the test isolates
   // output backpressure rather than making the shell parse hundreds of
   // independent tmux send-keys processes.
@@ -289,9 +289,10 @@ export async function runShellBrowserScenario() {
   // this source intentionally contains no whitespace, so remove only
   // presentation whitespace before locating/checksumming it.
   const renderedBurstNormalized = renderedBurst.replace(/\s+/gu, '');
-  const renderedBurstStart = renderedBurstNormalized.indexOf(burstSource.slice(0, 128));
-  assert.ok(renderedBurstStart >= 0, 'xterm buffer must contain the complete burst source');
-  const renderedBurstExtract = renderedBurstNormalized.slice(renderedBurstStart, renderedBurstStart + burstSource.length);
+  const renderedBurstStart = renderedBurstNormalized.indexOf('BURST_BEGIN');
+  const renderedBurstEnd = renderedBurstNormalized.indexOf('BURST_END', renderedBurstStart + 'BURST_BEGIN'.length);
+  assert.ok(renderedBurstStart >= 0 && renderedBurstEnd >= 0, 'xterm buffer must contain burst delimiters');
+  const renderedBurstExtract = renderedBurstNormalized.slice(renderedBurstStart + 'BURST_BEGIN'.length, renderedBurstEnd);
   if (sha256(renderedBurstExtract) !== burstHash) {
     let mismatch = 0;
     while (mismatch < renderedBurstExtract.length && renderedBurstExtract[mismatch] === burstSource[mismatch]) mismatch += 1;
