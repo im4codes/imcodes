@@ -42,6 +42,7 @@ import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import {
   beginDownloadTransfer,
   failDownloadTransfer,
+  isDownloadTransferPaused,
   setDownloadTransferRetry,
 } from '../download-transfer-store.js';
 import {
@@ -1931,7 +1932,7 @@ export function FileBrowser({
               const stillSelected = previewRef.current;
               if (stillSelected.status === 'idle' || !('downloadId' in stillSelected)
                 || stillSelected.path !== selectedPath || stillSelected.downloadId !== previousHandle) {
-                failDownloadTransfer(transfer.id, true);
+                if (!isDownloadTransferPaused(transfer.id)) failDownloadTransfer(transfer.id, true);
                 return;
               }
             }
@@ -1951,6 +1952,7 @@ export function FileBrowser({
           }
         }
         msg = failure instanceof Error ? failure.message : String(failure);
+        if (isDownloadTransferPaused(transfer.id)) return;
         const canceled = isFileUploadCanceled(failure) || signal.aborted;
         failDownloadTransfer(transfer.id, canceled);
         if (canceled) return;

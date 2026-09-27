@@ -5,11 +5,15 @@ import {
   canRevealDownloadTransfer,
   canSaveDownloadTransfer,
   canRetryDownloadTransfer,
+  canPauseDownloadTransfer,
+  canResumeDownloadTransfer,
   cancelDownloadTransfer,
   clearFinishedDownloadTransfers,
   dismissDownloadTransfer,
   getDownloadTransfers,
   retryDownloadTransfer,
+  pauseDownloadTransfer,
+  resumeDownloadTransfer,
   revealDownloadTransfer,
   saveDownloadTransfer,
   subscribeDownloadTransfers,
@@ -55,7 +59,8 @@ export function DownloadTransferCenter() {
   }, []);
   if (items.length === 0) return null;
 
-  const running = items.filter((item) => !inactive(item)).length;
+  const running = items.filter((item) => !inactive(item)
+    && item.status !== DOWNLOAD_TRANSFER_STATUS.PAUSED).length;
   const hasFinished = items.some(terminal);
   return (
     <section class="download-transfer-center" aria-label={t('downloads.title')}>
@@ -82,6 +87,7 @@ export function DownloadTransferCenter() {
         <div class="download-transfer-list" aria-live="polite">
           {items.map((item) => {
             const isInactive = inactive(item);
+            const isPaused = item.status === DOWNLOAD_TRANSFER_STATUS.PAUSED;
             const knownTotal = item.totalBytes !== null && item.totalBytes > 0;
             const percent = knownTotal ? Math.min(100, Math.round((item.loadedBytes / item.totalBytes!) * 100)) : null;
             const displayName = splitDownloadName(item.name);
@@ -129,7 +135,12 @@ export function DownloadTransferCenter() {
                   )}
                 </div>
                 <div class="download-transfer-actions">
-                  {isInactive ? (
+                  {isPaused ? (
+                    <>
+                      <button type="button" onClick={() => void resumeDownloadTransfer(item.id)}>{t('downloads.resume')}</button>
+                      <button type="button" onClick={() => cancelDownloadTransfer(item.id)}>{t('downloads.cancel')}</button>
+                    </>
+                  ) : isInactive ? (
                     <>
                       {canRevealDownloadTransfer(item.id) && (
                         <button
@@ -146,10 +157,18 @@ export function DownloadTransferCenter() {
                       {canRetryDownloadTransfer(item.id) && (
                         <button type="button" onClick={() => void retryDownloadTransfer(item.id)}>{t('downloads.retry')}</button>
                       )}
+                      {canResumeDownloadTransfer(item.id) && (
+                        <button type="button" onClick={() => void resumeDownloadTransfer(item.id)}>{t('downloads.resume')}</button>
+                      )}
                       <button type="button" onClick={() => dismissDownloadTransfer(item.id)}>{t('downloads.dismiss')}</button>
                     </>
                   ) : (
-                    <button type="button" onClick={() => cancelDownloadTransfer(item.id)}>{t('downloads.cancel')}</button>
+                    <>
+                      {canPauseDownloadTransfer(item.id) && (
+                        <button type="button" onClick={() => pauseDownloadTransfer(item.id)}>{t('downloads.pause')}</button>
+                      )}
+                      <button type="button" onClick={() => cancelDownloadTransfer(item.id)}>{t('downloads.cancel')}</button>
+                    </>
                   )}
                 </div>
               </article>

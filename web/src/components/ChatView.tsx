@@ -34,7 +34,12 @@ import {
   selectPreviewDownloadDestination,
   type DirectPreviewDownloadDestination,
 } from '../direct-file-transfer.js';
-import { beginDownloadTransfer, failDownloadTransfer } from '../download-transfer-store.js';
+import {
+  beginDownloadTransfer,
+  failDownloadTransfer,
+  isDownloadTransferPaused,
+  setDownloadTransferRetry,
+} from '../download-transfer-store.js';
 import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
@@ -2709,7 +2714,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     }
     const { downloadAttachment } = await import('../api.js');
     const transfer = beginDownloadTransfer(fileName ?? path);
-    const attempt = async (downloadId: string) => {
+    const attempt = async (downloadId: string, signal: AbortSignal) => {
       const wiring = createDownloadTransferWiring(transfer.id);
       await downloadPreviewWithDirectFallback({
         ws,
@@ -2719,9 +2724,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         sessionName: fileScopeSessionName,
         destination,
         httpFallback: () => (sessionId
-          ? downloadAttachment(serverId, downloadId, sessionId, transfer.signal)
-          : downloadAttachment(serverId, downloadId, undefined, transfer.signal)),
-        signal: transfer.signal,
+          ? downloadAttachment(serverId, downloadId, sessionId, signal)
+          : downloadAttachment(serverId, downloadId, undefined, signal)),
+        signal,
         onSaveReady: wiring.onSaveReady,
         onProgress: wiring.onProgress,
         onMode: wiring.onMode,
@@ -2745,10 +2750,16 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       return isDirectFileTransferStaleHandleError(err)
         || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
     };
+    // A retry requests a fresh path handle, but keeps the same destination and
+    // the direct/HTTP resume prefix owned by the transfer operation.
+    setDownloadTransferRetry(transfer.id, async (signal) => {
+      const next = await requestDownloadId();
+      await attempt(next.downloadId, signal);
+    });
     try {
       try {
         const first = await requestDownloadId();
-        await attempt(first.downloadId);
+        await attempt(first.downloadId, transfer.signal);
         if (first.matchCount > 1) {
           return t('upload.download_resolved_multiple', {
             path: first.resolvedPath,
@@ -2763,7 +2774,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         // fetch a fresh one once, keeping the same chosen destination.
         if (!isStaleHandle(err) || transfer.signal.aborted) throw err;
         const retry = await requestDownloadId();
-        await attempt(retry.downloadId);
+        await attempt(retry.downloadId, transfer.signal);
         if (retry.matchCount > 1) {
           return t('upload.download_resolved_multiple', {
             path: retry.resolvedPath,
@@ -2773,6 +2784,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         if (retry.resolvedPath !== path) return t('upload.download_resolved_to', { path: retry.resolvedPath });
       }
     } catch (err) {
+      if (isDownloadTransferPaused(transfer.id)) return;
       const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
       failDownloadTransfer(transfer.id, canceled);
       if (canceled) return;

@@ -11,6 +11,7 @@ export const DOWNLOAD_TRANSFER_STATUS = {
   FALLING_BACK: 'falling_back',
   HANDED_OFF: 'handed_off',
   READY_TO_SAVE: 'ready_to_save',
+  PAUSED: 'paused',
   COMPLETED: 'completed',
   CANCELED: 'canceled',
   FAILED: 'failed',
@@ -40,7 +41,7 @@ export interface DownloadTransferItem {
 
 type Listener = () => void;
 type ProgressSample = { loadedBytes: number; totalBytes: number | null; now: number };
-type RetryHandler = (signal: AbortSignal) => Promise<void>;
+type RetryHandler = (signal: AbortSignal, resumeFromBytes?: number) => Promise<void>;
 type SaveHandler = () => Promise<void>;
 type Runtime = {
   controller: AbortController;
@@ -55,9 +56,14 @@ type Runtime = {
   lastPublishedAt: number;
   pending: ProgressSample | null;
   timer: ReturnType<typeof setTimeout> | null;
+  stallTimer: ReturnType<typeof setTimeout> | null;
 };
 
 const PUBLISH_INTERVAL_MS = 200;
+/** A stalled stream must become actionable rather than sitting forever. The
+ * transport implementations have their own bounded retries; this watchdog is
+ * the final guard for a wedged browser/daemon callback path. */
+export const DOWNLOAD_STALL_TIMEOUT_MS = 30_000;
 let snapshot: readonly DownloadTransferItem[] = [];
 const listeners = new Set<Listener>();
 const runtimeById = new Map<string, Runtime>();
@@ -85,7 +91,9 @@ function isTerminal(status: DownloadTransferStatus): boolean {
 }
 
 function isInactive(status: DownloadTransferStatus): boolean {
-  return status === DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE || isTerminal(status);
+  return status === DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE
+    || status === DOWNLOAD_TRANSFER_STATUS.PAUSED
+    || isTerminal(status);
 }
 
 function clearRuntimeTimer(runtime: Runtime | undefined): void {
@@ -94,14 +102,38 @@ function clearRuntimeTimer(runtime: Runtime | undefined): void {
   runtime.timer = null;
 }
 
+function clearStallTimer(runtime: Runtime | undefined): void {
+  if (!runtime) return;
+  if (runtime.stallTimer) clearTimeout(runtime.stallTimer);
+  runtime.stallTimer = null;
+}
+
+function armStallTimer(id: string, now: number): void {
+  const runtime = runtimeById.get(id);
+  if (!runtime) return;
+  clearStallTimer(runtime);
+  runtime.stallTimer = setTimeout(() => {
+    runtime.stallTimer = null;
+    const item = snapshot.find((entry) => entry.id === id);
+    if (!item || item.status !== DOWNLOAD_TRANSFER_STATUS.TRANSFERRING) return;
+    // Abort the wedged attempt, retain the durable prefix, and expose the
+    // normal bounded retry path. The next explicit retry passes the preserved
+    // offset to the transport; it never starts from byte zero.
+    runtime.controller.abort();
+    failDownloadTransfer(id, false, Date.now());
+  }, Math.max(1, DOWNLOAD_STALL_TIMEOUT_MS - Math.max(0, Date.now() - now)));
+}
+
 function applyProgress(id: string, sample: ProgressSample): void {
   const runtime = runtimeById.get(id);
   if (!runtime) return;
   clearRuntimeTimer(runtime);
   runtime.pending = null;
+  const current = snapshot.find((item) => item.id === id);
+  const loadedBytes = Math.max(sample.loadedBytes, current?.loadedBytes ?? 0);
   const elapsedMs = Math.max(0, sample.now - runtime.lastSampleAt);
-  if (sample.loadedBytes < runtime.lastSampleBytes) runtime.speedBps = 0;
-  const deltaBytes = Math.max(0, sample.loadedBytes - runtime.lastSampleBytes);
+  if (loadedBytes < runtime.lastSampleBytes) runtime.speedBps = 0;
+  const deltaBytes = Math.max(0, loadedBytes - runtime.lastSampleBytes);
   if (elapsedMs > 0 && deltaBytes > 0) {
     const instantaneous = deltaBytes / (elapsedMs / 1000);
     runtime.speedBps = runtime.speedBps > 0
@@ -109,12 +141,13 @@ function applyProgress(id: string, sample: ProgressSample): void {
       : instantaneous;
   }
   runtime.lastSampleAt = sample.now;
-  runtime.lastSampleBytes = sample.loadedBytes;
+  runtime.lastSampleBytes = loadedBytes;
   runtime.lastPublishedAt = sample.now;
+  armStallTimer(id, sample.now);
   updateItem(id, (item) => ({
     ...item,
     status: DOWNLOAD_TRANSFER_STATUS.TRANSFERRING,
-    loadedBytes: sample.loadedBytes,
+    loadedBytes,
     totalBytes: sample.totalBytes,
     speedBps: runtime.speedBps,
     updatedAt: sample.now,
@@ -145,6 +178,7 @@ export function beginDownloadTransfer(name: string, now = Date.now()): { id: str
     lastPublishedAt: now,
     pending: null,
     timer: null,
+    stallTimer: null,
   });
   publish([{
     id,
@@ -212,12 +246,16 @@ export function canRetryDownloadTransfer(id: string): boolean {
 export async function retryDownloadTransfer(id: string, now = Date.now()): Promise<void> {
   const runtime = runtimeById.get(id);
   const item = snapshot.find((entry) => entry.id === id);
-  if (!runtime?.retry || item?.status !== DOWNLOAD_TRANSFER_STATUS.FAILED) return;
+  if (!runtime?.retry || (item?.status !== DOWNLOAD_TRANSFER_STATUS.FAILED
+    && item?.status !== DOWNLOAD_TRANSFER_STATUS.PAUSED)) return;
   clearRuntimeTimer(runtime);
+  clearStallTimer(runtime);
   runtime.savedFile = null;
   runtime.controller = new AbortController();
   runtime.lastSampleAt = now;
-  runtime.lastSampleBytes = 0;
+  // Keep the durable prefix as the floor for all subsequent samples. The
+  // direct and HTTP transports independently read their persisted offset.
+  runtime.lastSampleBytes = item.loadedBytes;
   runtime.speedBps = 0;
   runtime.lastPublishedAt = now;
   runtime.pending = null;
@@ -225,13 +263,13 @@ export async function retryDownloadTransfer(id: string, now = Date.now()): Promi
     ...current,
     status: DOWNLOAD_TRANSFER_STATUS.PREPARING,
     route: DOWNLOAD_TRANSFER_ROUTE.PENDING,
-    loadedBytes: 0,
+    loadedBytes: item.loadedBytes,
     speedBps: 0,
-    startedAt: now,
+    startedAt: item.startedAt,
     updatedAt: now,
   }));
   try {
-    await runtime.retry(runtime.controller.signal);
+    await runtime.retry(runtime.controller.signal, item.loadedBytes);
   } catch {
     const current = snapshot.find((entry) => entry.id === id);
     if (current && !isTerminal(current.status)) failDownloadTransfer(id);
@@ -275,10 +313,48 @@ export function reportDownloadTransferProgress(
   }
 }
 
+export function canPauseDownloadTransfer(id: string): boolean {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  return !!runtime?.retry && !!item && !isInactive(item.status)
+    && item.status !== DOWNLOAD_TRANSFER_STATUS.PAUSED;
+}
+
+export function canResumeDownloadTransfer(id: string): boolean {
+  const item = snapshot.find((entry) => entry.id === id);
+  return !!item && item.status === DOWNLOAD_TRANSFER_STATUS.PAUSED;
+}
+
+/** Lets the initiating promise distinguish a user pause from cancellation. */
+export function isDownloadTransferPaused(id: string): boolean {
+  return snapshot.find((entry) => entry.id === id)?.status === DOWNLOAD_TRANSFER_STATUS.PAUSED;
+}
+
+export function pauseDownloadTransfer(id: string, now = Date.now()): void {
+  const runtime = runtimeById.get(id);
+  const item = snapshot.find((entry) => entry.id === id);
+  if (!runtime || !item || !canPauseDownloadTransfer(id)) return;
+  runtime.controller.abort();
+  clearRuntimeTimer(runtime);
+  clearStallTimer(runtime);
+  updateItem(id, (current) => ({
+    ...current,
+    status: DOWNLOAD_TRANSFER_STATUS.PAUSED,
+    speedBps: 0,
+    updatedAt: now,
+  }));
+}
+
+export async function resumeDownloadTransfer(id: string, now = Date.now()): Promise<void> {
+  if (!canResumeDownloadTransfer(id)) return;
+  await retryDownloadTransfer(id, now);
+}
+
 function settleDownloadTransfer(id: string, status: DownloadTransferStatus, route?: DownloadTransferRoute, now = Date.now()): void {
   const runtime = runtimeById.get(id);
   if (runtime?.pending) applyProgress(id, { ...runtime.pending, now });
   clearRuntimeTimer(runtime);
+  clearStallTimer(runtime);
   if (runtime) {
     runtime.save = null;
     if (status !== DOWNLOAD_TRANSFER_STATUS.COMPLETED) runtime.savedFile = null;
@@ -335,7 +411,9 @@ export function failDownloadTransfer(id: string, canceled = false, now = Date.no
 export function cancelDownloadTransfer(id: string): void {
   const runtime = runtimeById.get(id);
   const item = snapshot.find((entry) => entry.id === id);
-  if (!runtime || !item || isInactive(item.status) || runtime.controller.signal.aborted) return;
+  if (!runtime || !item || item.status === DOWNLOAD_TRANSFER_STATUS.READY_TO_SAVE
+    || isTerminal(item.status)
+    || (runtime.controller.signal.aborted && item.status !== DOWNLOAD_TRANSFER_STATUS.PAUSED)) return;
   runtime.controller.abort();
   failDownloadTransfer(id, true);
 }
@@ -344,7 +422,10 @@ export function dismissDownloadTransfer(id: string): void {
   const item = snapshot.find((entry) => entry.id === id);
   if (!item || !isInactive(item.status)) return;
   const runtime = runtimeById.get(id);
-  if (runtime) clearRuntimeTimer(runtime);
+  if (runtime) {
+    clearRuntimeTimer(runtime);
+    clearStallTimer(runtime);
+  }
   runtimeById.delete(id);
   publish(snapshot.filter((entry) => entry.id !== id));
 }
@@ -354,14 +435,20 @@ export function clearFinishedDownloadTransfers(): void {
   if (finished.length === 0) return;
   for (const item of finished) {
     const runtime = runtimeById.get(item.id);
-    if (runtime) clearRuntimeTimer(runtime);
+    if (runtime) {
+      clearRuntimeTimer(runtime);
+      clearStallTimer(runtime);
+    }
     runtimeById.delete(item.id);
   }
   publish(snapshot.filter((item) => !isTerminal(item.status)));
 }
 
 export function __resetDownloadTransfersForTests(): void {
-  for (const runtime of runtimeById.values()) clearRuntimeTimer(runtime);
+  for (const runtime of runtimeById.values()) {
+    clearRuntimeTimer(runtime);
+    clearStallTimer(runtime);
+  }
   runtimeById.clear();
   snapshot = [];
   listeners.clear();

@@ -50,6 +50,24 @@ describe('DownloadTransferCenter', () => {
     expect(screen.getByText('downloads.status.canceled')).toBeTruthy();
   });
 
+  it('offers pause and continue while retaining the downloaded prefix', () => {
+    const now = Date.now();
+    const transfer = beginDownloadTransfer('large.iso', now);
+    updateDownloadTransfer(transfer.id, DOWNLOAD_TRANSFER_ROUTE.DIRECT, DOWNLOAD_TRANSFER_STATUS.TRANSFERRING, now);
+    reportDownloadTransferProgress(transfer.id, 512, 1_024, now + 250);
+    setDownloadTransferRetry(transfer.id, vi.fn(async () => undefined));
+    render(<DownloadTransferCenter />);
+
+    fireEvent.click(screen.getByText('downloads.pause'));
+    expect(screen.getByText('downloads.status.paused')).toBeTruthy();
+    expect(getDownloadTransfers()[0]?.loadedBytes).toBe(512);
+    expect(screen.getByText('downloads.resume')).toBeTruthy();
+    // A paused transfer can still be canceled explicitly; the pause itself
+    // never discards the durable prefix.
+    fireEvent.click(screen.getByText('downloads.cancel'));
+    expect(getDownloadTransfers()[0]?.status).toBe(DOWNLOAD_TRANSFER_STATUS.CANCELED);
+  });
+
   it('middle-truncates a long filename while exposing the complete name on hover', () => {
     const name = '355e6ce9c3b8a7a757370f07c41dced1.zh-CN.subtitled.mp4';
     beginDownloadTransfer(name);

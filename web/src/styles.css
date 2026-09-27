@@ -13688,6 +13688,7 @@ button.quick-agent-delegation-preset.active {
   border-color: rgba(56, 189, 248, 0.48);
 }
 .download-transfer-row[data-status='failed'] .download-transfer-status-line { color: #fca5a5; }
+.download-transfer-row[data-status='paused'] .download-transfer-status-line { color: #fde68a; }
 .download-transfer-row[data-status='completed'] .download-transfer-status-line { color: #86efac; }
 
 @keyframes download-transfer-indeterminate {

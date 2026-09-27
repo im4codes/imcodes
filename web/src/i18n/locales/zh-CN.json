@@ -1846,14 +1846,17 @@
       "ready_to_save": "等待保存",
       "completed": "已完成",
       "canceled": "已取消",
-      "failed": "下载失败"
+      "failed": "下载失败",
+      "paused": "已暂停"
     },
     "route": {
       "pending": "等待中",
       "direct": "直连",
       "http": "HTTP",
       "browser": "浏览器"
-    }
+    },
+    "pause": "暂停",
+    "resume": "继续"
   },
   "upload": {
     "upload_file": "上传文件",

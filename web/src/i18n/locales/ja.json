@@ -1845,14 +1845,17 @@
       "ready_to_save": "保存できます",
       "completed": "完了",
       "canceled": "キャンセル済み",
-      "failed": "失敗"
+      "failed": "失敗",
+      "paused": "一時停止中"
     },
     "route": {
       "pending": "待機中",
       "direct": "直接",
       "http": "HTTP",
       "browser": "ブラウザー"
-    }
+    },
+    "pause": "一時停止",
+    "resume": "再開"
   },
   "upload": {
     "upload_file": "ファイルをアップロード",

@@ -1845,14 +1845,17 @@
       "ready_to_save": "Готово к сохранению",
       "completed": "Завершено",
       "canceled": "Отменено",
-      "failed": "Ошибка"
+      "failed": "Ошибка",
+      "paused": "Приостановлено"
     },
     "route": {
       "pending": "Ожидание",
       "direct": "Напрямую",
       "http": "HTTP",
       "browser": "Браузер"
-    }
+    },
+    "pause": "Пауза",
+    "resume": "Продолжить"
   },
   "upload": {
     "upload_file": "Загрузить файл",

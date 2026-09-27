@@ -1845,14 +1845,17 @@
       "ready_to_save": "저장 준비됨",
       "completed": "완료됨",
       "canceled": "취소됨",
-      "failed": "실패"
+      "failed": "실패",
+      "paused": "일시정지됨"
     },
     "route": {
       "pending": "대기 중",
       "direct": "직접",
       "http": "HTTP",
       "browser": "브라우저"
-    }
+    },
+    "pause": "일시정지",
+    "resume": "재개"
   },
   "upload": {
     "upload_file": "파일 업로드",

@@ -1846,14 +1846,17 @@
       "ready_to_save": "Ready to save",
       "completed": "Completed",
       "canceled": "Canceled",
-      "failed": "Failed"
+      "failed": "Failed",
+      "paused": "Paused"
     },
     "route": {
       "pending": "Pending",
       "direct": "Direct",
       "http": "HTTP",
       "browser": "Browser"
-    }
+    },
+    "pause": "Pause",
+    "resume": "Resume"
   },
   "upload": {
     "upload_file": "Upload file",

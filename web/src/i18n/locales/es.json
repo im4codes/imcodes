@@ -1846,14 +1846,17 @@
       "ready_to_save": "Lista para guardar",
       "completed": "Completada",
       "canceled": "Cancelada",
-      "failed": "Fallida"
+      "failed": "Fallida",
+      "paused": "En pausa"
     },
     "route": {
       "pending": "Pendiente",
       "direct": "Directa",
       "http": "HTTP",
       "browser": "Navegador"
-    }
+    },
+    "pause": "Pausar",
+    "resume": "Reanudar"
   },
   "upload": {
     "upload_file": "Subir archivo",
