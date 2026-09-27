@@ -300,7 +300,10 @@ export async function runShellBrowserScenario() {
   await page.setViewportSize({ width: 390, height: 844 });
   await page.waitForTimeout(200);
   urlCopies.push(await copyUrlAtColumns(page, 0, copyUrl));
-  for (const result of urlCopies) assert.equal(result.exact, true, `wrapped URL copy must be exact at ${result.requestedCols || 'mobile'} columns`);
+  for (const result of urlCopies) {
+    console.error(JSON.stringify({ shellUrlCopy: result }));
+    assert.equal(result.exact, true, `wrapped URL copy must be exact at ${result.requestedCols || 'mobile'} columns`);
+  }
 
   const desktopScreenshot = process.env.IMC_PERF_SHELL_SCREENSHOT ?? '/tmp/shell-desktop.png';
   await page.screenshot({ path: desktopScreenshot });
