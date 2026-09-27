@@ -80,6 +80,13 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_AUDITOR_PROPOSAL_RULE).toMatch(/concrete solution/);
   });
 
+  it('reminds the auditor at even REWORK checkpoints without notifying Brain', () => {
+    const base = { ...withStatus('in_audit'), round: 2 };
+    const result = applyTaskPairMarker(base, marker(`<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->`), ctx(AUD, { turnText: 'Finding [P0]. Proposed solution: fix src/a.ts.' }));
+    expect(result.intents.filter((intent) => intent.kind === 'convergence_checkpoint_nudge')).toHaveLength(1);
+    expect(result.intents.some((intent) => intent.kind === 'brain_notice')).toBe(false);
+  });
+
   it('records the real start and clears capacity flags when queued work begins', () => {
     const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-start executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
     queued.flags = ['waiting_for_capacity', 'no_pool_configured'];

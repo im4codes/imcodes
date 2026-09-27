@@ -60,6 +60,7 @@ import {
   buildReworkNoticeMessage,
   buildUntitledTaskTitleRequest,
   buildAuditorProposalNudgeMessage,
+  buildConvergenceCheckpointMessage,
 } from './messages.js';
 
 /** Intents that need the pool, the heartbeat or the queue (see scheduler.ts). */
@@ -743,6 +744,9 @@ export class TaskPairService {
             break;
           case 'auditor_proposal_nudge':
             await sendTaskPairMessage(intent.to, pair.taskId, 'auditor-proposal-nudge', buildAuditorProposalNudgeMessage(pair));
+            break;
+          case 'convergence_checkpoint_nudge':
+            await sendTaskPairMessage(intent.to, pair.taskId, 'convergence-checkpoint', buildConvergenceCheckpointMessage(pair));
             break;
           case 'brain_notice':
             await sendTaskPairMessage(pair.brain, pair.taskId, `brain-${intent.flag}`, buildBrainNoticeMessage(pair, intent.flag));
