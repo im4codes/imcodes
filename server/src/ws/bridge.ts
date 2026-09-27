@@ -8722,10 +8722,25 @@ export class WsBridge {
 
   private summarizeTimelineEvent(event: Record<string, unknown>): Record<string, unknown> {
     const type = typeof event.type === 'string' ? event.type : '';
-    if (type !== 'tool.call' && type !== 'tool.result') return event;
     const payload = event.payload && typeof event.payload === 'object'
       ? event.payload as Record<string, unknown>
       : {};
+    // Summary sockets need the latest state/status/usage values, not the
+    // transport's often-large diagnostic/detail trees. Keep primitive fields
+    // (state, status, model, token/cost counters, timestamps) and discard
+    // nested payloads so background windows cannot receive megabytes of
+    // repeated status metadata. Full-mode delivery remains byte-for-byte
+    // unchanged. This is deliberately generic because providers add fields
+    // over time; primitive values are the stable, renderable projection.
+    if (type === 'session.state' || type === 'agent.status' || type === 'usage.update') {
+      const compactPayload: Record<string, unknown> = {};
+      for (const [key, value] of Object.entries(payload)) {
+        if (typeof value === 'string') compactPayload[key] = value.length > 256 ? `${value.slice(0, 256)}…` : value;
+        else if (typeof value === 'number' || typeof value === 'boolean') compactPayload[key] = value;
+      }
+      return { ...event, summary: true, payload: compactPayload };
+    }
+    if (type !== 'tool.call' && type !== 'tool.result') return event;
     const previewFields = ['command', 'description', 'input', 'output', 'text', 'error', 'status'];
     const preview: Record<string, unknown> = {};
     for (const key of previewFields) {

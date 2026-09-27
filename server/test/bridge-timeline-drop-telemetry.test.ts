@@ -378,6 +378,35 @@ describe('WsBridge timeline drop telemetry', () => {
     expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_GAP)).toBe(0);
   });
 
+  it('compacts large summary status payloads while preserving renderable scalar fields', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new AsyncHealthyWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'summary-status-large', sessionId: SESSION, ts: Date.now(), seq: 1, epoch: 1,
+        type: 'agent.status',
+        payload: {
+          status: 'working', model: 'codex', nestedDiagnostics: { trace: 'x'.repeat(200_000) },
+          details: ['large', 'array'], progress: 0.5,
+        },
+      },
+    }));
+    await flushAsync();
+    const event = summary.sentStrings.map((raw) => JSON.parse(raw))
+      .find((msg) => msg.type === TIMELINE_MESSAGES.EVENT)?.event;
+    expect(event?.payload).toEqual({ status: 'working', model: 'codex', progress: 0.5 });
+    expect(JSON.stringify(event)).not.toContain('nestedDiagnostics');
+  });
+
   it('keeps cumulative healthy traffic gap-free after more than 64 MiB', async () => {
     const { bridge, daemon } = await setupAuthedDaemon();
     const healthy = new AsyncHealthyWs();
