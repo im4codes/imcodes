@@ -63,26 +63,6 @@ function isExecutionCloneTemplateLike(sub: { executionCloneKind?: string | null;
   return sub.executionCloneKind === EXECUTION_CLONE_KIND || typeof sub.parentRunId === 'string';
 }
 
-/**
- * A visible but unfocused window still owns a full live subscription, but it
- * must not synchronously build the full ChatView/UsageFooter tree during a
- * status burst.  Keep the cache visible with a tiny tail projection and
- * promote it to ChatView on focus.  This is intentionally bounded and only
- * reads the last few events; it must remain cheap even for a restored history
- * containing thousands of rows.
- */
-function getInactiveWindowPreview(events: Array<{ type: string; payload: Record<string, unknown> }>): string {
-  for (let index = events.length - 1; index >= Math.max(0, events.length - 12); index -= 1) {
-    const event = events[index];
-    if (!event || event.type === 'agent.status' || event.type === 'usage.update' || event.type === 'session.state') continue;
-    for (const key of ['text', 'output', 'message', 'title'] as const) {
-      const value = event.payload[key];
-      if (typeof value === 'string' && value.trim()) return value.trim().slice(-240);
-    }
-  }
-  return '';
-}
-
 type GetMaximizeBounds = () => WorkspaceBounds | null;
 
 interface Props {
@@ -364,10 +344,6 @@ export function SubSessionWindow({
   const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(events), [events]);
   const timelineLastEventTs = events.length > 0 ? (events[events.length - 1]?.ts ?? null) : null;
   const timelineSessionState = timelineSessionStateInfo.state;
-  const inactiveWindowPreview = useMemo(
-    () => getInactiveWindowPreview(events),
-    [events],
-  );
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({
       timelineState: timelineSessionState,
@@ -1049,7 +1025,7 @@ export function SubSessionWindow({
       {/* Content */}
       <div class="subsession-content">
         <div style={{ display: viewMode === 'terminal' ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}>
-          {visible && active && <TerminalView
+          {visible && <TerminalView
               sessionName={sub.sessionName}
               ws={ws}
               connected={connected}
@@ -1060,13 +1036,8 @@ export function SubSessionWindow({
               onScrollBottomFn={onTermScrollBottomFn}
               mobileInput={isShell}
             />}
-          {visible && !active && viewMode === 'terminal' && (
-            <div class="subsession-preview-shell" aria-live="polite">
-              {inactiveWindowPreview || statusText || '—'}
-            </div>
-          )}
         </div>
-        {visible && active && viewMode === 'chat' && (
+        {visible && viewMode === 'chat' && (
           <ChatView
             visible={visible}
             events={events}
@@ -1092,15 +1063,10 @@ export function SubSessionWindow({
             messagePinsEnabled
           />
         )}
-        {visible && !active && viewMode === 'chat' && (
-          <div class="subsession-preview-shell" aria-live="polite">
-            {inactiveWindowPreview || statusText || '—'}
-          </div>
-        )}
       </div>
 
       {/* Usage footer — shared component */}
-      {!isShell && active && (
+      {!isShell && (
         <UsageFooter
           usage={lastUsage ?? { inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
           sessionName={sub.sessionName}

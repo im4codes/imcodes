@@ -253,40 +253,6 @@ describe('SubSessionWindow metadata wiring', () => {
     }
   });
 
-  it('keeps a cached tail visible without mounting heavy chat/footer work for an unfocused window', async () => {
-    timelineEventsMock = [{
-      eventId: 'cached-final',
-      sessionId: 'deck_sub_sub-1',
-      ts: 10,
-      type: 'assistant.text',
-      payload: { text: 'cached final answer', streaming: false },
-    }];
-
-    render(
-      <SubSessionWindow
-        sub={makeSubSession({ type: 'codex-sdk', runtimeType: 'transport' as any })}
-        ws={ws}
-        connected={true}
-        active={false}
-        visible={true}
-        onDiff={vi.fn()}
-        onHistory={vi.fn()}
-        onMinimize={vi.fn()}
-        onClose={vi.fn()}
-        onRestart={vi.fn()}
-        onRename={vi.fn()}
-        zIndex={1}
-        onFocus={vi.fn()}
-      />,
-    );
-
-    await waitFor(() => {
-      expect(document.querySelector('.subsession-preview-shell')?.textContent).toContain('cached final answer');
-      expect(chatViewPropsSpy).not.toHaveBeenCalled();
-      expect(document.querySelector('[data-testid="usage-footer"]')).toBeNull();
-    });
-  });
-
   it('projects canonical peer-audit identity/model metadata into SessionControls', () => {
     render(
       <SubSessionWindow
