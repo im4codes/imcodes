@@ -430,7 +430,7 @@ export async function runShellBrowserScenario() {
   assert.equal(metrics.longTasks, 0, 'shell output must not create long tasks');
   assert.ok(metrics.fps >= 50, `shell render FPS ${metrics.fps.toFixed(1)} is below 50`);
   await browser.close();
-  return { firstPaintMs, recovery: 1, recoveryInput, metrics, inputLatency, urlCopies, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash, renderedBurstHash: sha256(renderedBurstExtract) } };
+  return { firstPaintMs, recovery: 1, metrics, inputLatency, urlCopies, keyBarCount, desktopScreenshot, mobileScreenshot, checksums: { inputHash, bracketedHash, burstHash, renderedBurstHash: sha256(renderedBurstExtract) } };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
