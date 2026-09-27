@@ -201,7 +201,11 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
       }
     });
     return () => cancelAnimationFrame(frame);
-  }, [activeSession, orderedSessions]);
+  // Session activity updates replace the session objects frequently, but do
+  // not affect which tab should be scrolled into view. Re-running this DOM
+  // measurement for every status frame creates a cross-window layout pass;
+  // only the active tab or tab-count change can require it.
+  }, [activeSession, orderedSessions.length]);
 
   // Mouse-wheel → horizontal scroll for the tab bar. On Windows/Linux a plain
   // mouse wheel only emits vertical `deltaY`, and the browser will NOT translate
