@@ -712,7 +712,7 @@ export function buildSupervisionDelegationEligibilityPolicy(_locale?: Supervisio
     require: ['availability', 'limitGroup', 'replyCapable'],
     replyCapable: true,
     rejectAvailability: ['limited', 'offline', 'missing', 'unknown'],
-    busy: 'queue_only',
+    busy: 'append',
     forbidAgentTypes: 'product_policy',
     independentAudit: {
       self: false,
