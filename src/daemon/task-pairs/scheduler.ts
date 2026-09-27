@@ -546,6 +546,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #mainHeartbeatNeedsAction(stored: StoredTaskPair): boolean {
     const pair = stored.state;
     if (stored.liveness.brainReminderDue) return true;
+    if (pair.status === 'passed') return true;
     return pair.flags.some((flag) => [
       'blocked', 'needs_input', 'needs_auditor', 'executor_silent', 'verdict_inconsistent',
       'awaiting_audit_ignored', 'replacement_churn', 'markers_unresolved', 'all_providers_limited',
@@ -554,40 +555,105 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   #deliverMainHeartbeat(brain: string, storedPairs: readonly StoredTaskPair[]): void {
-    const fingerprint = storedPairs.map((stored) => {
+    const deliveryPairs = storedPairs.filter((stored) => {
+      if (stored.liveness.brainReminderDue || stored.state.status !== 'passed') return true;
+      const held = [stored.state.executor, stored.state.auditor]
+        .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
+        .some((session) => hasRecentTaskPairProviderError(session, this.#now(), this.#intervalMs));
+      return !held;
+    });
+    if (deliveryPairs.length === 0) return;
+    const store = getTaskPairStore();
+    const allBrainPairs = store.listActivePairs().filter((stored) => (
+      isPairsEngineProject(stored.project) && stored.state.brain === brain
+    ));
+    const now = this.#now();
+    // The ten-minute gate is global to a Brain session, not independently
+    // reset for each pair.  Persisting the watermark on every pair makes the
+    // gate survive restart and prevents a second pair from bypassing it.
+    const lastDeliveryValues = allBrainPairs
+      .map((stored) => stored.liveness.brainGlobalLastDeliveryAt)
+      .filter((at): at is number => at !== undefined);
+    const activityValues = allBrainPairs
+      .map((stored) => stored.liveness.brainLastActivityAt)
+      .filter((at): at is number => at !== undefined);
+    const globalLastDelivery = lastDeliveryValues.length > 0 ? Math.max(...lastDeliveryValues) : undefined;
+    const globalActivity = activityValues.length > 0 ? Math.max(...activityValues) : undefined;
+    if (!isTaskPairBrainReminderGapSatisfied(now, globalLastDelivery, globalActivity)) {
+      for (const due of deliveryPairs.filter((pair) => pair.liveness.brainReminderDue)) {
+        this.#recordReminderSkip(due, 'min_gap', now);
+      }
+      return;
+    }
+    const fingerprint = deliveryPairs.map((stored) => {
       const pair = stored.state;
       return `${pair.taskId}:${pair.status}:${pair.round}:${pair.flags.join(',')}:r${stored.liveness.brainReminderCount ?? 0}:d${stored.liveness.brainReminderDue ? 1 : 0}`;
     }).sort().join('|');
     if (!fingerprint || this.#mainHeartbeatDelivered.get(brain) === fingerprint) return;
     if (this.#mainHeartbeatPending.has(brain)) {
-      for (const due of storedPairs.filter((pair) => pair.liveness.brainReminderDue)) this.#recordReminderSkip(due, 'delivery_pending', this.#now());
+      for (const due of deliveryPairs.filter((pair) => pair.liveness.brainReminderDue)) this.#recordReminderSkip(due, 'delivery_pending', this.#now());
       return;
     }
     this.#mainHeartbeatPending.add(brain);
-    const onlyAwaitingDecision = storedPairs.length === 1 && storedPairs[0]!.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
-    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, onlyAwaitingDecision ? 'brain-decision-reminder' : 'brain-heartbeat', buildBrainHeartbeatMessage(storedPairs.map((stored) => stored.state)))
+    // Reserve the shared watermark before handing off the async send.  The
+    // delivery helper awaits its transport, so a second scheduler tick can
+    // otherwise enter this method before the success continuation persists
+    // the timestamp and bypass the global ten-minute gate.  Reserving on all
+    // active pairs makes the boundary durable and visible immediately; a
+    // definitive transport failure below clears only this reservation.
+    const reservationAt = now;
+    const reservationPairs = allBrainPairs;
+    for (const stored of reservationPairs) {
+      store.saveLiveness(stored.project, stored.state.taskId, {
+        ...stored.liveness,
+        brainGlobalLastDeliveryAt: reservationAt,
+      });
+    }
+    const onlyAwaitingDecision = deliveryPairs.length === 1 && deliveryPairs[0]!.state.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION;
+    void sendTaskPairMessage(brain, TASK_PAIR_AGGREGATE_NOTICE_ID, onlyAwaitingDecision ? 'brain-decision-reminder' : 'brain-heartbeat', buildBrainHeartbeatMessage(deliveryPairs.map((stored) => stored.state)))
       .then((result) => {
         if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
           const at = this.#now();
-          const store = getTaskPairStore();
-          const post = storedPairs.map((stored) => {
+          const post = deliveryPairs.map((stored) => {
             const pair = stored.state;
             const reminder = stored.liveness.brainReminderDue;
             const count = (stored.liveness.brainReminderCount ?? 0) + (reminder ? 1 : 0);
             return `${pair.taskId}:${pair.status}:${pair.round}:${pair.flags.join(',')}:r${count}:d0`;
           }).sort().join('|');
           this.#mainHeartbeatDelivered.set(brain, post);
-          for (const stored of storedPairs) {
-            if (!stored.liveness.brainReminderDue) continue;
+          // Advance the global watermark for every active pair sharing this
+          // Brain, including pairs not present in this aggregate's actionable
+          // subset. This is the atomic logical boundary for the min-gap gate.
+          const activeNow = store.listActivePairs().filter((candidate) => (
+            isPairsEngineProject(candidate.project) && candidate.state.brain === brain
+          ));
+          for (const stored of activeNow) {
+            const due = deliveryPairs.find((candidate) => candidate.project === stored.project && candidate.state.taskId === stored.state.taskId);
             store.saveLiveness(stored.project, stored.state.taskId, {
               ...stored.liveness,
-              brainReminderDue: false,
-              brainReminderLastAt: at,
-              brainReminderCount: (stored.liveness.brainReminderCount ?? 0) + 1,
-              brainReminderLastDecisionAt: undefined,
-              brainReminderLastDecisionReason: undefined,
+              brainGlobalLastDeliveryAt: at,
+              ...(due?.liveness.brainReminderDue ? {
+                brainReminderDue: false,
+                brainReminderLastAt: at,
+                brainReminderCount: (stored.liveness.brainReminderCount ?? 0) + 1,
+                brainReminderLastDecisionAt: undefined,
+                brainReminderLastDecisionReason: undefined,
+              } : {}),
             });
-            this.#recordLivenessDecision(stored, 'REMIND', 'sent', 'brain_idle', at);
+            if (due?.liveness.brainReminderDue) {
+              this.#recordLivenessDecision({ ...stored, liveness: { ...stored.liveness, brainGlobalLastDeliveryAt: at } }, 'REMIND', 'sent', 'brain_idle', at);
+            }
+          }
+        } else {
+          // A missing target or failed transport did not deliver a heartbeat;
+          // do not leave a speculative reservation suppressing reminders.
+          for (const reserved of reservationPairs) {
+            const current = store.getPair(reserved.project, reserved.state.taskId);
+            if (current?.liveness.brainGlobalLastDeliveryAt !== reservationAt) continue;
+            store.saveLiveness(reserved.project, reserved.state.taskId, {
+              ...current.liveness,
+              brainGlobalLastDeliveryAt: undefined,
+            });
           }
         }
       })

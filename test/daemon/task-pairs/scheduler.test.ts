@@ -233,6 +233,41 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(pair('NEXT').status).toBe('working');
   });
 
+  it('enforces the ten-minute Brain gap across two pairs sharing one Brain', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH GAP_A executor=${EXEC} auditor=none -->`);
+    marker(EXEC, '<!-- IMCODES_TASK DONE GAP_A -->');
+    await flush();
+    sent = [];
+    await tick(4); // first reminder for GAP_A
+    expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(1);
+    const gapA = getTaskPairStore().getPair(PROJECT, 'GAP_A')!;
+    // Make the prior aggregate boundary explicit at the test clock so the
+    // cross-pair gate is exercised independently of async delivery timing.
+    getTaskPairStore().saveLiveness(PROJECT, 'GAP_A', {
+      ...gapA.liveness,
+      brainGlobalLastDeliveryAt: now,
+    });
+
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH GAP_B executor=${SPARE} auditor=none -->`);
+    marker(SPARE, '<!-- IMCODES_TASK DONE GAP_B -->');
+    await flush();
+    const gapB = getTaskPairStore().getPair(PROJECT, 'GAP_B')!;
+    getTaskPairStore().saveLiveness(PROJECT, 'GAP_B', {
+      ...gapB.liveness,
+      brainWaitStartedAt: now - 20 * 60_000,
+      brainLastActivityAt: now - 20 * 60_000,
+    });
+    sent = [];
+    await tick(1); // GAP_B is due, but only six minutes after GAP_A delivery
+    expect(sentTo(BRAIN, 'brain-decision-reminder')).toHaveLength(0);
+    expect(getTaskPairStore().listEvents(PROJECT, 'GAP_B').some((event) => (
+      event.verb === 'REMIND' && event.effect === 'skipped' && event.attrs.reason === 'min_gap'
+    ))).toBe(true);
+
+    await tick(1); // the shared watermark has aged past ten minutes
+    expect(sentTo(BRAIN)).toHaveLength(1);
+  });
+
   it('nudges whoever holds the ball when both sides are idle (in_audit with a real auditor: the auditor), but stands down when either side has activity', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH BOTH_IDLE executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT BOTH_IDLE -->');

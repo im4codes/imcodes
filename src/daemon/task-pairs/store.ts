@@ -55,6 +55,8 @@ export interface TaskPairLiveness {
   brainLastActivityAt?: number;
   brainReminderLastDecisionAt?: number;
   brainReminderLastDecisionReason?: string;
+  /** Last aggregate Brain heartbeat/reminder delivery for this Brain session. */
+  brainGlobalLastDeliveryAt?: number;
   /** Last participant nudge shown in the task console. */
   lastNudgedAt?: number;
   lastTickAt: number;
@@ -382,6 +384,7 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.brainLastActivityAt)) ? { brainLastActivityAt: Number(raw.brainLastActivityAt) } : {}),
     ...(Number.isFinite(Number(raw.brainReminderLastDecisionAt)) ? { brainReminderLastDecisionAt: Number(raw.brainReminderLastDecisionAt) } : {}),
     ...(typeof raw.brainReminderLastDecisionReason === 'string' ? { brainReminderLastDecisionReason: raw.brainReminderLastDecisionReason } : {}),
+    ...(Number.isFinite(Number(raw.brainGlobalLastDeliveryAt)) ? { brainGlobalLastDeliveryAt: Number(raw.brainGlobalLastDeliveryAt) } : {}),
     ...(Number.isFinite(Number(raw.lastNudgedAt)) ? { lastNudgedAt: Number(raw.lastNudgedAt) } : {}),
     lastTickAt: Number(raw.lastTickAt ?? 0),
     notified: Array.isArray(raw.notified) ? raw.notified.map(String) : [],
