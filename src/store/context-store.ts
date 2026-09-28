@@ -3555,6 +3555,7 @@ export function queryPendingContextEvents(filters: {
 }
 
 export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobType, trigger: ContextJobTrigger, now = Date.now()): ContextJobRecord {
+  clearPanelReadCache();
   const database = ensureDb();
   const targetKey = serializeContextTarget(target);
   const namespaceColumns = namespaceFilterColumnValues(target.namespace);
@@ -3614,6 +3615,7 @@ export function enqueueContextJob(target: ContextTargetRef, jobType: ContextJobT
  * and invoke the compressor; every later caller observes `false` and stops.
  */
 export function claimContextJob(jobId: string, now = Date.now()): boolean {
+  clearPanelReadCache();
   const database = ensureDb();
   const result = database.prepare(`
     UPDATE context_jobs
@@ -3641,6 +3643,7 @@ export function updateContextJobForDb(database: DatabaseSyncInstance, jobId: str
 }
 
 export function updateContextJob(jobId: string, status: ContextJobStatus, updates?: { error?: string; attemptIncrement?: boolean; now?: number }): void {
+  clearPanelReadCache();
   const database = ensureDb();
   updateContextJobForDb(database, jobId, status, updates);
 }
