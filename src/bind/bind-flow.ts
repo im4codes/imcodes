@@ -151,22 +151,27 @@ async function writeWindowsWatchdogFiles(): Promise<void> {
 async function installWindowsStartup(): Promise<void> {
   await writeWindowsWatchdogFiles();
 
+  const { resolveLaunchPaths, windowsDaemonTaskName } = await import('../util/windows-launch-artifacts.js');
+  const paths = resolveLaunchPaths();
+  const taskName = windowsDaemonTaskName(paths);
+  const scoped = taskName !== 'imcodes-daemon';
+  const startupStem = scoped ? taskName : 'imcodes-daemon';
+
   // Remove legacy Startup folder CMD/VBS if present
   const startupDir = join(homedir(), 'AppData', 'Roaming', 'Microsoft', 'Windows', 'Start Menu', 'Programs', 'Startup');
-  for (const old of ['imcodes-daemon.cmd', 'imcodes-daemon.vbs']) {
+  for (const old of [`${startupStem}.cmd`, `${startupStem}.vbs`]) {
     try { await import('fs/promises').then((fs) => fs.unlink(join(startupDir, old))); } catch { /* ignore */ }
   }
 
   // Replace legacy ONLOGON-only registrations with a durable Task Scheduler
   // definition: boot + logon + one-minute liveness trigger, direct ownership
   // of the waiting VBS/watchdog process, and failure restart policy.
-  const { installWindowsScheduledTask, resolveLaunchPaths } = await import('../util/windows-launch-artifacts.js');
-  const paths = resolveLaunchPaths();
+  const { installWindowsScheduledTask } = await import('../util/windows-launch-artifacts.js');
   if (!installWindowsScheduledTask(paths)) {
     // schtasks may require elevation — fall back to startup folder CMD
     console.warn('Task Scheduler registration failed (may need admin). Falling back to Startup folder.');
     await mkdir(startupDir, { recursive: true });
-    const cmdPath = join(startupDir, 'imcodes-daemon.cmd');
+    const cmdPath = join(startupDir, `${startupStem}.cmd`);
     const cmd = `@echo off\r\nchcp 65001 >nul 2>&1\r\nstart "" /min wscript "${paths.vbsPath}"\r\n`;
     await writeFile(cmdPath, cmd, 'utf8');
     return;
