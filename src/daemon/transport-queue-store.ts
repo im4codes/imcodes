@@ -29,9 +29,24 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'transport-queue.sqlite');
+/** Resolve at construction time so a test can install its isolated home after
+ * this module has been imported without ever opening the production queue. */
+function defaultDbPath(): string {
+  const configured = process.env.IMCODES_HOME?.trim();
+  if (configured) return join(configured, 'transport-queue.sqlite');
+  const testHome = process.env.HOME?.trim();
+  if (testHome && testHome !== homedir()) return join(testHome, '.imcodes', 'transport-queue.sqlite');
+  return join(homedir(), '.imcodes', 'transport-queue.sqlite');
+}
 export const MAX_QUEUE_HANDOFF_ATTEMPTS = 3;
 const QUEUE_CANCELLATION_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+
+/** Number of durable sweeps allowed before an ownerless queue is terminally dropped. */
+export const MAX_ORPHAN_QUEUE_RESTORE_ATTEMPTS = 3;
+
+export function shouldQuarantineUnrestorableQueueSession(attempt: number): boolean {
+  return Number.isFinite(attempt) && attempt >= MAX_ORPHAN_QUEUE_RESTORE_ATTEMPTS;
+}
 
 export interface TransportQueueStoreOptions {
   dbPath?: string;
@@ -250,7 +265,7 @@ export class TransportQueueStore {
     } else {
       const dbPath = options.dbPath?.trim()
         || process.env.IMCODES_TRANSPORT_QUEUE_DB_PATH?.trim()
-        || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+        || (process.env.VITEST ? ':memory:' : defaultDbPath());
       assertNotRealImcodesPathInTests(dbPath, 'transport-queue.sqlite');
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       this.db = new DatabaseSync(dbPath);
@@ -650,6 +665,25 @@ export class TransportQueueStore {
         MIN(created_at) AS oldestQueuedAt
       FROM queue_entries
       WHERE status IN ('queued', 'handoff_inflight', 'dispatching')
+      GROUP BY session_name
+      ORDER BY oldestQueuedAt ASC, sessionName ASC
+    `).all() as Array<{ sessionName: string; pendingCount: number; oldestQueuedAt: number }>;
+    return rows.map((row) => ({
+      sessionName: String(row.sessionName),
+      pendingCount: Number(row.pendingCount),
+      oldestQueuedAt: Number(row.oldestQueuedAt),
+    }));
+  }
+
+  /** Sessions with any durable rows, including terminal failures left by a
+   * crashed test/runtime. The lifecycle sweep uses this to quarantine an
+   * ownerless session's complete row set, not only its still-live messages. */
+  listQueueSessionsForReconciliation(): LiveTransportQueueSession[] {
+    const rows = this.db.prepare(`
+      SELECT session_name AS sessionName,
+        COUNT(*) AS pendingCount,
+        MIN(created_at) AS oldestQueuedAt
+      FROM queue_entries
       GROUP BY session_name
       ORDER BY oldestQueuedAt ASC, sessionName ASC
     `).all() as Array<{ sessionName: string; pendingCount: number; oldestQueuedAt: number }>;
@@ -2045,6 +2079,16 @@ export class TransportQueueStore {
       this.db.exec('ROLLBACK');
       throw err;
     }
+  }
+
+  /**
+   * Terminally remove rows whose session can no longer be restored.  This is
+   * intentionally a single atomic operation: the durable sweep can quarantine
+   * a stale fixture/orphan without leaving private material behind for a later
+   * scan to rediscover.
+   */
+  dropUnrestorableSession(sessionNameInput: string, now = Date.now()): QueueSnapshot {
+    return this.dropAll(sessionNameInput, 'expired', now);
   }
 
   reset(

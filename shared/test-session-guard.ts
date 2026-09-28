@@ -49,6 +49,14 @@ const SESSION_NAME_PATTERNS: RegExp[] = [
   /^deck_existing_(?:brain|w\d+)$/i,
 ];
 
+/** Queue-only fixture names. Keep separate from isKnownTestSessionName: these
+ * names are also used by command-handler tests and must not suppress normal
+ * session launch/persistence behavior in an isolated in-memory store. */
+const TRANSPORT_QUEUE_FIXTURE_PATTERNS: RegExp[] = [
+  /^(?:s1|s2|s-snapshot|alpha|beta|b)$/i,
+  /^deck_(?:transport_brain|codex_expired_resend_brain)$/i,
+];
+
 const PROJECT_NAME_PATTERNS: RegExp[] = [
   /^bootmain[a-z0-9-]+$/i,
   /^modeawaree2e[a-z0-9-]+$/i,
@@ -95,6 +103,10 @@ function matchesAny(value: string | undefined, patterns: readonly RegExp[]): boo
 
 export function isKnownTestSessionName(value: string | null | undefined): boolean {
   return matchesAny(normalize(value), SESSION_NAME_PATTERNS);
+}
+
+export function isTransportQueueFixtureSessionName(value: string | null | undefined): boolean {
+  return matchesAny(normalize(value), TRANSPORT_QUEUE_FIXTURE_PATTERNS);
 }
 
 export function isKnownTestProjectName(value: string | null | undefined): boolean {

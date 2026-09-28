@@ -4,10 +4,15 @@ import {
   isKnownTestProjectName,
   isKnownTestSessionLike,
   isKnownTestSessionName,
+  isTransportQueueFixtureSessionName,
 } from '../../shared/test-session-guard.js';
 
 describe('test session guard', () => {
   it('matches known leaked main-session names', () => {
+    for (const fixture of ['s1', 's2', 's-snapshot', 'alpha', 'beta', 'b', 'deck_transport_brain', 'deck_codex_expired_resend_brain']) {
+      expect(isTransportQueueFixtureSessionName(fixture), fixture).toBe(true);
+      expect(isKnownTestSessionName(fixture), fixture).toBe(false);
+    }
     expect(isKnownTestSessionName('deck_bootmainabc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_e2epptestabc123_brain')).toBe(true);
     expect(isKnownTestSessionName('deck_modeawaree2eabc123_brain')).toBe(true);

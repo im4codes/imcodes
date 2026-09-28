@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   getTransportQueueStore,
   resetTransportQueueStoreForTests,
+  shouldQuarantineUnrestorableQueueSession,
   TransportQueueStore,
 } from '../../src/daemon/transport-queue-store.js';
 import {
@@ -44,6 +45,71 @@ afterEach(() => {
 });
 
 describe('TransportQueueStore', () => {
+  it('resolves the default database from the isolated home at construction time', () => {
+    const isolatedHome = mkdtempSync(join(tmpdir(), 'imcodes-queue-home-'));
+    const previous = {
+      vitest: process.env.VITEST,
+      imcodesHome: process.env.IMCODES_HOME,
+    };
+    try {
+      delete process.env.VITEST;
+      process.env.IMCODES_HOME = join(isolatedHome, '.imcodes');
+      const isolatedStore = new TransportQueueStore();
+      isolatedStore.close();
+      expect(existsSync(join(isolatedHome, '.imcodes', 'transport-queue.sqlite'))).toBe(true);
+    } finally {
+      if (previous.vitest === undefined) delete process.env.VITEST;
+      else process.env.VITEST = previous.vitest;
+      if (previous.imcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previous.imcodesHome;
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it('drops an unrestorable queue once the bounded retry threshold is reached', () => {
+    const sessionName = 'deck_queue_orphan_fixture';
+    store.enqueue({ sessionName, clientMessageId: 'orphan-1', text: 'orphan' });
+    expect(store.listLiveQueueSessions()).toEqual([
+      expect.objectContaining({ sessionName, pendingCount: 1 }),
+    ]);
+    expect(shouldQuarantineUnrestorableQueueSession(1)).toBe(false);
+    expect(shouldQuarantineUnrestorableQueueSession(2)).toBe(false);
+    expect(shouldQuarantineUnrestorableQueueSession(3)).toBe(true);
+    store.dropUnrestorableSession(sessionName);
+    expect(store.listLiveQueueSessions()).toEqual([]);
+    expect(store.readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+  });
+
+  it('reconciles queued and terminal orphan rows as one bounded quarantine unit', () => {
+    const sessionName = 'deck_queue_orphan_mixed';
+    store.enqueue({ sessionName, clientMessageId: 'queued', text: 'queued' });
+    store.enqueue({ sessionName, clientMessageId: 'failed', text: 'failed' });
+    store.markFailed(sessionName, 'failed', 'expired');
+    expect(store.listQueueSessionsForReconciliation()).toEqual([
+      expect.objectContaining({ sessionName, pendingCount: 2 }),
+    ]);
+    const scans: number[] = [];
+    for (let attempt = 1; attempt <= 4; attempt += 1) {
+      const candidates = store.listQueueSessionsForReconciliation()
+        .filter((candidate) => candidate.sessionName === sessionName);
+      scans.push(candidates.length);
+      if (attempt === 3) store.dropUnrestorableSession(sessionName);
+    }
+    expect(scans).toEqual([1, 1, 1, 0]);
+    expect(store.readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+    expect(store.readSnapshot(sessionName).failedMessageEntries).toEqual([]);
+  });
+
+  it('includes terminal failed rows when reconciling an orphan session', () => {
+    const sessionName = 'deck_queue_orphan_failed_fixture';
+    store.enqueue({ sessionName, clientMessageId: 'orphan-failed', text: 'orphan' });
+    store.markFailed(sessionName, 'orphan-failed', 'dispatch_failed');
+    expect(store.listLiveQueueSessions()).toEqual([]);
+    expect(store.listQueueSessionsForReconciliation()).toEqual([
+      expect.objectContaining({ sessionName, pendingCount: 1 }),
+    ]);
+  });
+
   it('coalesces pending cron fires by schedule id and exposes durable queue age', () => {
     const sessionName = 'deck_cron_coalesce';
     store.enqueue({ sessionName, clientMessageId: 'cron-1', commandId: 'cron:schedule-1:exec-1', text: 'first', now: 100 });

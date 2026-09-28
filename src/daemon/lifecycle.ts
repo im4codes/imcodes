@@ -62,7 +62,10 @@ import { backfillProjectionEmbeddings } from '../context/projection-embedding-ma
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-scheduling.js';
 import { getResendCount } from './transport-resend-queue.js';
-import { getTransportQueueStore } from './transport-queue-store.js';
+import {
+  getTransportQueueStore,
+  shouldQuarantineUnrestorableQueueSession,
+} from './transport-queue-store.js';
 import { TRANSPORT_QUEUE_SWEEP_INTERVAL_MS } from '../../shared/transport-queue-types.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
@@ -2077,6 +2080,7 @@ const GC_POLL_MS = parseInt(process.env.IMCODES_GC_POLL_MS ?? '300000', 10);
 let healthTimer: ReturnType<typeof setInterval> | null = null;
 let transportQueueSweepTimer: ReturnType<typeof setInterval> | null = null;
 let transportQueueSweepInFlight: Promise<void> | null = null;
+const orphanQueueRestoreAttempts = new Map<string, number>();
 const memoryCompressionAutoContinuedRunIds = new Set<string>();
 const codexAutoContinuedActivityGenerations = new Set<string>();
 let codexQuotaTimer: ReturnType<typeof setInterval> | null = null;
@@ -2300,20 +2304,38 @@ async function reconcileDurableTransportQueues(): Promise<void> {
         logger.info({ sender, entries }, 'transport queue stale delegation rows expired and sender notified');
       }
     }
-    for (const candidate of store.listLiveQueueSessions()) {
+    const liveCandidates = new Map(
+      store.listLiveQueueSessions().map((candidate) => [candidate.sessionName, candidate]),
+    );
+    for (const candidate of store.listQueueSessionsForReconciliation()) {
+      const liveCandidate = liveCandidates.get(candidate.sessionName);
       const runtime = getTransportRuntime(candidate.sessionName);
       try {
-        if (runtime?.providerSessionId) {
+        if (liveCandidate && runtime?.providerSessionId) {
           const recovered = runtime.rehydratePendingFromStore();
           if (recovered > 0) runtime.drainPendingIfIdle('durable-queue-sweep');
           continue;
         }
         const session = getSession(candidate.sessionName);
         if (!session || !isTransportAgent(session.agentType) || !session.providerSessionId) {
-          logger.warn({ sessionName: candidate.sessionName, pendingCount: candidate.pendingCount }, 'transport queue row has no restorable target');
+          const attempt = (orphanQueueRestoreAttempts.get(candidate.sessionName) ?? 0) + 1;
+          orphanQueueRestoreAttempts.set(candidate.sessionName, attempt);
+          if (shouldQuarantineUnrestorableQueueSession(attempt)) {
+            store.dropUnrestorableSession(candidate.sessionName);
+            orphanQueueRestoreAttempts.delete(candidate.sessionName);
+            logger.warn({
+              sessionName: candidate.sessionName,
+              pendingCount: candidate.pendingCount,
+              attempts: attempt,
+              droppedCount: candidate.pendingCount,
+            }, 'transport queue orphan had no restorable target; dropped after bounded retries');
+          }
           continue;
         }
-        void ensureTransportRuntimeForPendingResend(candidate.sessionName).catch((err) => {
+        orphanQueueRestoreAttempts.delete(candidate.sessionName);
+        void ensureTransportRuntimeForPendingResend(candidate.sessionName).then(() => {
+          orphanQueueRestoreAttempts.delete(candidate.sessionName);
+        }).catch((err) => {
           logger.warn({ err, sessionName: candidate.sessionName }, 'durable transport queue sweep runtime restore failed');
         });
       } catch (err) {
