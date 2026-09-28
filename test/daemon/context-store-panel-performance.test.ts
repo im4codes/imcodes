@@ -68,6 +68,9 @@ describe('context-store panel query performance', () => {
 
     // Warm the deferred panel indexes before measuring the steady-state path.
     ensureContextStoreMaintenanceIndexes();
+    getProcessedProjectionStats({ scope: 'personal', userId: 'panel-user' });
+    queryProcessedProjections({ scope: 'personal', userId: 'panel-user', limit: 50 });
+    listMemoryProjectSummaries({ scope: 'personal', userId: 'panel-user' });
     const started = performance.now();
     const stats = getProcessedProjectionStats({ scope: 'personal', userId: 'panel-user' });
     const records = queryProcessedProjections({ scope: 'personal', userId: 'panel-user', limit: 50 });

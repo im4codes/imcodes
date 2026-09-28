@@ -4893,14 +4893,27 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
   const totalRecords = Number(aggregate.total_records ?? 0) || 0;
   const recentSummaryCount = Number(aggregate.recent_summary_count ?? 0) || 0;
   const durableCandidateCount = Number(aggregate.durable_candidate_count ?? 0) || 0;
-  const projectCount = Number(aggregate.project_count ?? 0) || 0;
+  const projectStats = database.prepare(`
+    SELECT COUNT(*) AS project_count FROM (
+      SELECT DISTINCT project_id FROM context_processed_local WHERE ${baseConditions.join(' AND ')}
+      UNION
+      SELECT DISTINCT project_id FROM context_dirty_targets ${getPendingContextWhere(filters, 'dirty')}
+      UNION
+      SELECT DISTINCT project_id FROM context_jobs ${getPendingContextWhere(filters, 'job')}
+    ) WHERE project_id IS NOT NULL AND project_id <> ''
+  `).get(
+    ...baseParams,
+    ...getPendingContextParams(filters, 'dirty'),
+    ...getPendingContextParams(filters, 'job'),
+  ) as Record<string, unknown>;
+  const projectCount = Number(projectStats.project_count ?? 0) || 0;
   const pending = getPendingContextStats(filters);
   return {
     totalRecords,
     matchedRecords,
     recentSummaryCount,
     durableCandidateCount,
-    projectCount: projectCount + pending.projectCount,
+    projectCount,
     stagedEventCount: pending.stagedEventCount,
     dirtyTargetCount: pending.dirtyTargetCount,
     pendingJobCount: pending.pendingJobCount,
@@ -5025,6 +5038,24 @@ function getPendingContextStats(filters: ProcessedProjectionQuery): {
     pendingJobCount,
     projectCount,
   };
+}
+
+function getPendingContextWhere(filters: ProcessedProjectionQuery, kind: 'dirty' | 'job'): string {
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+  appendNamespaceFilterSql(conditions, params, filters);
+  if (kind === 'job') conditions.push("status IN ('pending', 'running')");
+  return conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+}
+
+function getPendingContextParams(filters: ProcessedProjectionQuery, _kind: 'dirty' | 'job'): (string | number)[] {
+  const conditions: string[] = [];
+  const params: (string | number)[] = [];
+  appendNamespaceFilterSql(conditions, params, filters);
+  if (_kind === 'job') {
+    // status is a literal predicate, so there is no additional bind value.
+  }
+  return params;
 }
 
 const STAGED_RECONCILE_BATCH_SIZE = 256;
