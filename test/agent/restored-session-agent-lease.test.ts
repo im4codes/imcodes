@@ -119,4 +119,16 @@ describe('a restored session keeps its startup-sweep lease authority', () => {
       await expect(resource.release()).resolves.toBeUndefined();
     }
   });
+
+  it('does not register or warn for a child that already exited before binding', async () => {
+    const owner = { sessionName: 'deck_alpha_w1', sessionInstanceId: 'i', runtimeEpoch: 'e' };
+    const fakeChild = {
+      pid: 424242,
+      exitCode: 0,
+      signalCode: null,
+      once: () => {},
+    } as unknown as Parameters<typeof bindAgentProcessResource>[1];
+    const resource = bindAgentProcessResource(owner, fakeChild);
+    await expect(resource.release()).resolves.toBeUndefined();
+  });
 });

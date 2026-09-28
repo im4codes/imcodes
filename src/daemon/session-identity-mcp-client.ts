@@ -8,6 +8,9 @@ import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 
 const DEFAULT_TIMEOUT_MS = 15_000;
+/** Keep transient reconnect/fetch failures bounded, but give a daemon a short
+ * chance to ride out a pod handoff or server restart. */
+export const SESSION_IDENTITY_RETRY_DELAYS_MS = Object.freeze([100, 250]);
 
 export interface SessionIdentityEndpoint {
   serverId: string;
@@ -67,34 +70,50 @@ async function request(
 ): Promise<{ status: 'ok'; body: Record<string, unknown> } | Failure> {
   const ep = await endpoint(options);
   if ('status' in ep) return ep;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  timer.unref?.();
-  try {
-    const response = await (options.fetchImpl ?? fetch)(urlFor(ep, scope, scopeKey, extra), {
-      ...init,
-      headers: {
-        Authorization: `Bearer ${ep.token}`,
-        'X-Server-Id': ep.serverId,
-        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
-      },
-      signal: controller.signal,
-    });
-    const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
-    if (!response.ok) {
-      const reason = response.status === 409
-        ? MCP_ERROR_REASONS.REVISION_CONFLICT
-        : response.status === 400 ? MCP_ERROR_REASONS.VALIDATION_FAILED
-          : response.status === 401 || response.status === 403 ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
-            : MCP_ERROR_REASONS.INTERNAL_ERROR;
-      return failure(reason, typeof raw.error === 'string' ? raw.error : `session identity request failed (${response.status})`);
+  const url = urlFor(ep, scope, scopeKey, extra);
+  let lastError = 'session identity request failed';
+  for (let attempt = 0; attempt <= SESSION_IDENTITY_RETRY_DELAYS_MS.length; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await (options.fetchImpl ?? fetch)(url, {
+        ...init,
+        headers: {
+          Authorization: `Bearer ${ep.token}`,
+          'X-Server-Id': ep.serverId,
+          ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        },
+        signal: controller.signal,
+      });
+      const raw = await response.json().catch(() => ({})) as Record<string, unknown>;
+      if (!response.ok) {
+        const reason = response.status === 409
+          ? MCP_ERROR_REASONS.REVISION_CONFLICT
+          : response.status === 400 ? MCP_ERROR_REASONS.VALIDATION_FAILED
+            : response.status === 401 || response.status === 403 ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
+              : MCP_ERROR_REASONS.INTERNAL_ERROR;
+        const message = typeof raw.error === 'string' ? raw.error : `session identity request failed (${response.status})`;
+        // Retry only server-side failures. Validation/auth failures are
+        // deterministic and must be surfaced immediately.
+        if (response.status < 500 || attempt === SESSION_IDENTITY_RETRY_DELAYS_MS.length) {
+          return failure(reason, message);
+        }
+        lastError = message;
+      } else {
+        return { status: 'ok', body: raw };
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (attempt === SESSION_IDENTITY_RETRY_DELAYS_MS.length) {
+        return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, `session identity request failed after retries: ${lastError}`);
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    return { status: 'ok', body: raw };
-  } catch (err) {
-    return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, err instanceof Error ? err.message : String(err));
-  } finally {
-    clearTimeout(timer);
+    await new Promise((resolve) => setTimeout(resolve, SESSION_IDENTITY_RETRY_DELAYS_MS[attempt]!));
   }
+  return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, `session identity request failed after retries: ${lastError}`);
 }
 
 function profileFrom(value: unknown): SessionIdentityProfile | null {
@@ -130,40 +149,52 @@ export async function listSessionIdentityProfiles(
 ): Promise<IdentityListResult> {
   const ep = await endpoint(options);
   if ('status' in ep) return ep;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
-  timer.unref?.();
-  try {
-    const response = await (options.fetchImpl ?? fetch)(
-      `${ep.workerUrl.replace(/\/+$/, '')}${SESSION_IDENTITY_API_PATH}/all`,
-      {
-        headers: { Authorization: `Bearer ${ep.token}`, 'X-Server-Id': ep.serverId },
-        signal: controller.signal,
-      },
-    );
-    const body = await response.json().catch(() => ({})) as Record<string, unknown>;
-    if (!response.ok) {
-      return failure(
-        response.status === 401 || response.status === 403
-          ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
-          : MCP_ERROR_REASONS.INTERNAL_ERROR,
-        typeof body.error === 'string' ? body.error : `session identity request failed (${response.status})`,
+  let lastError = 'session identity request failed';
+  for (let attempt = 0; attempt <= SESSION_IDENTITY_RETRY_DELAYS_MS.length; attempt += 1) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), options.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+    timer.unref?.();
+    try {
+      const response = await (options.fetchImpl ?? fetch)(
+        `${ep.workerUrl.replace(/\/+$/, '')}${SESSION_IDENTITY_API_PATH}/all`,
+        {
+          headers: { Authorization: `Bearer ${ep.token}`, 'X-Server-Id': ep.serverId },
+          signal: controller.signal,
+        },
       );
+      const body = await response.json().catch(() => ({})) as Record<string, unknown>;
+      if (!response.ok) {
+        lastError = typeof body.error === 'string' ? body.error : `session identity request failed (${response.status})`;
+        if (response.status < 500 || attempt === SESSION_IDENTITY_RETRY_DELAYS_MS.length) {
+          return failure(
+            response.status === 401 || response.status === 403
+              ? MCP_ERROR_REASONS.SCOPE_FORBIDDEN
+              : MCP_ERROR_REASONS.INTERNAL_ERROR,
+            lastError,
+          );
+        }
+      } else {
+        const raw = Array.isArray(body.profiles) ? body.profiles : [];
+        return {
+          status: 'ok',
+          serverId: ep.serverId,
+          profiles: raw.flatMap((value) => {
+            const profile = profileFrom(value);
+            return profile ? [profile] : [];
+          }),
+        };
+      }
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+      if (attempt === SESSION_IDENTITY_RETRY_DELAYS_MS.length) {
+        return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, `session identity request failed after retries: ${lastError}`);
+      }
+    } finally {
+      clearTimeout(timer);
     }
-    const raw = Array.isArray(body.profiles) ? body.profiles : [];
-    return {
-      status: 'ok',
-      serverId: ep.serverId,
-      profiles: raw.flatMap((value) => {
-        const profile = profileFrom(value);
-        return profile ? [profile] : [];
-      }),
-    };
-  } catch (err) {
-    return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, err instanceof Error ? err.message : String(err));
-  } finally {
-    clearTimeout(timer);
+    await new Promise((resolve) => setTimeout(resolve, SESSION_IDENTITY_RETRY_DELAYS_MS[attempt]!));
   }
+  return failure(MCP_ERROR_REASONS.INTERNAL_ERROR, `session identity request failed after retries: ${lastError}`);
 }
 
 export async function setSessionIdentityProfile(

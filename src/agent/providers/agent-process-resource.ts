@@ -45,6 +45,11 @@ export function agentResourceOwner(config: Pick<SessionConfig,
 
 const NOOP: AgentProcessResource = { release: async () => {} };
 
+function childHasExited(child: ChildProcess): boolean {
+  return (child.exitCode !== null && child.exitCode !== undefined)
+    || (child.signalCode !== null && child.signalCode !== undefined);
+}
+
 /**
  * Register `child` as a session-owned agent process and release the lease when
  * it exits.
@@ -60,13 +65,20 @@ export function bindAgentProcessResource(
   child: ChildProcess,
 ): AgentProcessResource {
   const pid = child.pid;
-  if (!owner || typeof pid !== 'number' || pid <= 0) return NOOP;
+  // A process that has already exited has no stable OS identity to register.
+  // Treat that race as a normal no-op release rather than warning about a
+  // lease that could never have protected a live child.
+  if (!owner || typeof pid !== 'number' || pid <= 0 || childHasExited(child)) return NOOP;
 
   const registration = registerAgentProcessResource(owner, pid).catch((error) => {
     // A failed registration costs crash-recovery coverage for this child; it
     // must not take down a working session, and in-process teardown still
     // reaps the group. Surfaced rather than swallowed.
-    logger.warn({ err: error, pid, session: owner.sessionName }, 'agent process resource registration failed');
+    const processIdentityUnavailable = error instanceof Error
+      && error.message === 'session_resource_process_identity_unavailable';
+    if (!processIdentityUnavailable || !childHasExited(child)) {
+      logger.warn({ err: error, pid, session: owner.sessionName }, 'agent process resource registration failed');
+    }
     return null;
   });
 

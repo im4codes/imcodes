@@ -51,4 +51,22 @@ describe('session identity online client', () => {
     expect(String(url)).not.toContain('expectedRevision');
     expect(init.method).toBe('DELETE');
   });
+
+  it('retries a transient fetch failure and converges without reporting stale', async () => {
+    const fetchImpl = vi.fn()
+      .mockRejectedValueOnce(new Error('fetch failed'))
+      .mockResolvedValueOnce(jsonResponse({ profiles: [] }));
+    await expect(listSessionIdentityProfiles({ endpoint, fetchImpl })).resolves.toMatchObject({
+      status: 'ok', serverId: 'srv-1', profiles: [],
+    });
+    expect(fetchImpl).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns a bounded, explicit stale error after repeated aborts', async () => {
+    const fetchImpl = vi.fn(async () => { throw new Error('This operation was aborted'); });
+    const result = await listSessionIdentityProfiles({ endpoint, fetchImpl, timeoutMs: 1 });
+    expect(result).toMatchObject({ status: 'error', reason: 'internal_error' });
+    expect(result.message).toContain('failed after retries');
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
 });

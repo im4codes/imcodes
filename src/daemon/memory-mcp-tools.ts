@@ -1772,14 +1772,33 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   };
 
   const refreshIdentityTarget = async (target: SessionRecord) => {
-    const effective = await identityGetEffective({
-      projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
-      sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
-    }, identityOptions);
-    if (effective.status !== 'ok') return effective;
-    const prompt = renderSessionIdentityProfiles(effective.profiles);
-    const applied = await identityApply(target.name, prompt, { refresh: true });
-    return { status: 'ok' as const, target: target.name, profiles: effective.profiles, prompt, applied };
+    try {
+      const effective = await identityGetEffective({
+        projectKey: identityScopeKey(SESSION_IDENTITY_SCOPES.PROJECT, target),
+        sessionKey: identityScopeKey(SESSION_IDENTITY_SCOPES.SESSION, target),
+      }, identityOptions);
+      if (effective.status !== 'ok') {
+        return { status: 'error' as const, target: target.name, state: 'stale' as const, error: effective.message };
+      }
+      const prompt = renderSessionIdentityProfiles(effective.profiles);
+      const applied = await identityApply(target.name, prompt, { refresh: true });
+      if (!applied.applied) {
+        return { status: 'skipped' as const, target: target.name, reason: 'session became unavailable before refresh' };
+      }
+      return {
+        status: applied.refreshPending ? 'pending' as const : 'applied' as const,
+        target: target.name,
+        runtimeType: applied.runtimeType ?? target.runtimeType ?? 'process',
+        ...(applied.refreshPending ? { reason: 'process runtime applies identity on its next turn' } : {}),
+      };
+    } catch (err) {
+      return {
+        status: 'error' as const,
+        target: target.name,
+        state: 'stale' as const,
+        error: err instanceof Error ? err.message : String(err),
+      };
+    }
   };
 
   // Session-scope identity is keyed per exact session name (see
@@ -1816,6 +1835,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     const affected = await affectedIdentitySessions(scope, target, all);
     return Promise.all(affected.map((session) => refreshIdentityTarget(session)));
   };
+  const refreshedTargetNames = (results: readonly { status: string; target?: string }[]) => results
+    .filter((item) => (item.status === 'applied' || item.status === 'pending') && item.target)
+    .map((item) => item.target!);
 
   // Project/user identity is meant to reach every affected session by default;
   // a session-scope override targets one session unless the caller explicitly
@@ -2258,7 +2280,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         profile: { ...saved.profile, content: undefined },
         written: [target.name, ...fanoutWritten],
         ...(fanoutFailed.length ? { writeFailed: fanoutFailed } : {}),
-        refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
+        refreshed: refreshedTargetNames(refreshed),
       };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_CLEAR]: async (input) => {
@@ -2303,22 +2325,70 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         all,
         cleared: [target.name, ...fanoutDeleted],
         ...(fanoutFailed.length ? { clearFailed: fanoutFailed } : {}),
-        refreshed: refreshed.map((item) => item.status === 'ok' ? item.target : null).filter(Boolean),
+        refreshed: refreshedTargetNames(refreshed),
       };
     },
-    [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: async (input) => {
-      const args = pickAllowedMcpArgs(input, ['target']);
+  [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: async (input) => {
+      const args = pickAllowedMcpArgs(input, ['target', 'all', 'targets']);
+      const all = boolArg(args, 'all') === true;
+      const targetNames = Array.isArray(args.targets)
+        ? args.targets.filter((value): value is string => typeof value === 'string' && value.trim().length > 0)
+        : [];
+      if (targetNames.length > 0 && !all) {
+        const sessions = await sendSessions();
+        const callerRecord = caller.sessionName ? sessions.find((session) => session.name === caller.sessionName) : undefined;
+        if (callerRecord?.role !== 'brain') {
+          return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may refresh multiple sessions');
+        }
+        const callerProject = resolveEffectiveProjectName(callerRecord, sessions) ?? callerRecord.projectName;
+        const selected: SessionRecord[] = [];
+        for (const name of targetNames) {
+          const target = sessions.find((session) => session.name === name && session.state !== 'stopped');
+          if (!target) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `target "${name}" not found`);
+          const targetProject = resolveEffectiveProjectName(target, sessions) ?? target.projectName;
+          if (targetProject !== callerProject) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, `target "${name}" is outside the caller project`);
+          if (!selected.some((entry) => entry.name === target.name)) selected.push(target);
+        }
+        const results = await Promise.all(selected.map(refreshIdentityTarget));
+        return {
+          status: results.some((result) => result.status === 'error') ? 'error' : 'ok',
+          targets: results,
+        };
+      }
+      if (all) {
+        const sessions = await sendSessions();
+        const callerRecord = caller.sessionName ? sessions.find((session) => session.name === caller.sessionName) : undefined;
+        if (callerRecord?.role !== 'brain') {
+          return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may refresh all sessions');
+        }
+        const anchor = stringArg(args, 'target') || callerRecord.name;
+        const anchorRecord = sessions.find((session) => session.name === anchor && session.state !== 'stopped');
+        if (!anchorRecord) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `target "${anchor}" not found`);
+        const callerProject = resolveEffectiveProjectName(callerRecord, sessions) ?? callerRecord.projectName;
+        const anchorProject = resolveEffectiveProjectName(anchorRecord, sessions) ?? anchorRecord.projectName;
+        if (callerProject !== anchorProject) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'target is outside the caller project');
+        const selected = sessions.filter((session) => session.state !== 'stopped'
+          && (resolveEffectiveProjectName(session, sessions) ?? session.projectName) === callerProject);
+        const results = await Promise.all(selected.map(refreshIdentityTarget));
+        return {
+          status: results.some((result) => result.status === 'error') ? 'error' : 'ok',
+          all: true,
+          targets: results,
+        };
+      }
       const resolved = await resolveIdentityTarget(stringArg(args, 'target'));
       if (resolved.status === 'error') return resolved.result;
       const { target } = resolved;
       const refreshed = await refreshIdentityTarget(target);
-      if (refreshed.status !== 'ok') return refreshed;
+      if (refreshed.status === 'error') return refreshed;
       return {
         status: 'ok',
         target: target.name,
         runtimeType: target.runtimeType ?? 'process',
         codexThreadResumePending: target.agentType === 'codex-sdk',
-        applied: refreshed.applied,
+        applied: refreshed.status !== 'skipped',
+        refreshStatus: refreshed.status,
+        ...(refreshed.reason ? { reason: refreshed.reason } : {}),
       };
     },
     [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: async (input) => {
@@ -2763,9 +2833,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           }, identityOptions);
           if (saved.status !== 'ok') return { ok: false, error: saved.message };
           const refreshed = await refreshIdentityTarget(target);
-          return refreshed.status === 'ok'
+          return refreshed.status === 'applied' || refreshed.status === 'pending'
             ? { ok: true }
-            : { ok: false, error: refreshed.message };
+            : { ok: false, error: refreshed.error ?? refreshed.reason ?? 'identity refresh unavailable' };
         },
       })) as unknown as Promise<ToolResult>;
     },
@@ -3838,7 +3908,7 @@ const schemas = {
     content: z.string().optional().describe('Inline identity contract.'),
     filePath: z.string().optional().describe('UTF-8 identity file. User/project scope is project-relative; session scope also accepts an absolute daemon-host path.'),
     expectedRevision: z.number().int().nonnegative().optional(),
-    all: z.boolean().optional().describe('Refresh every affected session at once instead of just target. Defaults to true for user/project scope, false for session scope.'),
+    all: z.boolean().optional(),
   }).strict().superRefine((value, context) => {
     if (Boolean(value.content) === Boolean(value.filePath)) {
       context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide exactly one of content or filePath' });
@@ -3848,11 +3918,20 @@ const schemas = {
     identityScope: z.enum(SESSION_IDENTITY_SCOPE_LIST),
     target: z.string().optional().describe('Exact session name used to resolve project/session scope.'),
     expectedRevision: z.number().int().nonnegative().optional(),
-    all: z.boolean().optional().describe('Refresh every affected session at once instead of just target. Defaults to true for user/project scope, false for session scope.'),
+    all: z.boolean().optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]: z.object({
-    target: z.string().optional().describe('Exact session name; defaults to the current session.'),
-  }).strict(),
+    target: z.string().optional(),
+    all: z.boolean().optional(),
+    targets: z.array(z.string().trim().min(1)).min(1).max(50).optional(),
+  }).strict().superRefine((value, context) => {
+    if (value.all && value.targets) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'provide at most one of all or targets' });
+    }
+    if (value.targets && value.target) {
+      context.addIssue({ code: z.ZodIssueCode.custom, message: 'targets cannot be combined with target' });
+    }
+  }),
   [MEMORY_MCP_TOOL_NAMES.SESSION_RESTART]: z.object({
     target: z.string().trim().min(1).optional().describe('Exact session name.'),
     reset: z.boolean().optional().describe('False/omitted: resume. True: start over.'),

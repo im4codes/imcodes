@@ -77,6 +77,49 @@ describe('session identity MCP tools', () => {
     );
   });
 
+  it('lets the Brain refresh every live project session and reports each runtime outcome', async () => {
+    const sessions = [
+      session(),
+      session({ name: 'deck_proj_cc1', role: 'w1', agentType: 'codex-sdk' }),
+      session({ name: 'deck_proj_process', role: 'w2', agentType: 'claude-code' }),
+      session({ name: 'deck_other', role: 'brain', projectName: 'other', contextNamespace: { scope: 'user_private', userId: 'user-1', projectId: 'repo-2' } }),
+    ];
+    const applyEffectiveIdentity = vi.fn(async (name: string) => (
+      name === 'deck_proj_process' ? { applied: true, runtimeType: 'process' as const, refreshPending: true }
+        : { applied: true, runtimeType: 'transport' as const, refreshPending: false }
+    ));
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => sessions },
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity,
+    });
+    const result = await handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]({ all: true });
+    expect(result).toMatchObject({ status: 'ok', all: true });
+    expect((result as { targets: Array<{ target: string; status: string; reason?: string }> }).targets)
+      .toEqual(expect.arrayContaining([
+        { target: 'deck_proj_brain', status: 'applied', runtimeType: 'transport' },
+        { target: 'deck_proj_cc1', status: 'applied', runtimeType: 'transport' },
+        { target: 'deck_proj_process', status: 'pending', runtimeType: 'process', reason: 'process runtime applies identity on its next turn' },
+      ]));
+    expect(applyEffectiveIdentity).not.toHaveBeenCalledWith('deck_other', expect.anything(), expect.anything());
+  });
+
+  it('lets the Brain refresh an explicit target list but rejects a non-Brain fan-out', async () => {
+    const sessions = [session(), session({ name: 'deck_proj_cc1', role: 'w1' })];
+    const handlers = createMemoryMcpToolHandlers(caller, {
+      sendDeps: { listSessions: () => sessions },
+      getEffectiveIdentityProfiles: async () => ({ status: 'ok', profiles: [] }),
+      applyEffectiveIdentity: vi.fn(async () => ({ applied: true, runtimeType: 'transport' as const })),
+    });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]({ targets: ['deck_proj_cc1'] }))
+      .resolves.toMatchObject({ status: 'ok', targets: [{ target: 'deck_proj_cc1', status: 'applied' }] });
+    const workerHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: 'deck_proj_cc1' }, {
+      sendDeps: { listSessions: () => sessions },
+    });
+    await expect(workerHandlers[MEMORY_MCP_TOOL_NAMES.SESSION_IDENTITY_REFRESH]({ all: true }))
+      .resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+  });
+
   it('stores a session override online and refreshes only that session', async () => {
     const sessions = [session(), session({ name: 'deck_proj_cc1', role: 'w1' })];
     const setIdentityProfile = vi.fn(async (input: {
