@@ -8,6 +8,7 @@ import { SupervisionBroker, parseSupervisionDecision } from '../../src/daemon/su
 import type { TransportProvider, ProviderError, SessionConfig } from '../../src/agent/transport-provider.js';
 import { PROVIDER_ERROR_CODES } from '../../src/agent/transport-provider.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
+import { IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV } from '../../shared/memory-mcp-env.js';
 
 // Mock the preset resolver so broker tests don't touch ~/.imcodes/cc-presets.json.
 // Tests that care about preset behaviour inspect `resolverMock.mock.calls` and
@@ -517,6 +518,7 @@ describe('SupervisionBroker', () => {
     await broker.decide({
       snapshot,
       targetSessionId: 'session-instance-a',
+      targetSessionName: 'deck_sub_owner',
       taskRequest: 'first',
       assistantResponse: 'first reply',
     });
@@ -532,7 +534,9 @@ describe('SupervisionBroker', () => {
     expect(provider.endSession).not.toHaveBeenCalled();
     expect(provider.createSession.mock.calls[0]?.[0]).toMatchObject({
       fresh: false,
+      sessionName: 'deck_sub_owner',
       sessionKey: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
+      env: { [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: 'deck_sub_supervision_owner' },
     });
     expect(provider.send.mock.calls[0]?.[0]).toBe(provider.send.mock.calls[1]?.[0]);
   });

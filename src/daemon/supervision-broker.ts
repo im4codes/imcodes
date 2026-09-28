@@ -23,6 +23,7 @@ import { resolveProcessingProviderSessionConfig } from '../context/processing-pr
 import { markEphemeralProviderSid, unmarkEphemeralProviderSid } from '../agent/session-manager.js';
 import logger from '../util/logger.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
+import { IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV } from '../../shared/memory-mcp-env.js';
 
 /**
  * `waiting` exists because the other three cannot express "correctly parked".
@@ -104,6 +105,8 @@ export interface SupervisionBrokerRequest {
    * context without ever sharing a UUID across different sessions.
    */
   targetSessionId?: string;
+  /** Canonical owner session name used for MCP authorization and routing. */
+  targetSessionName?: string;
   taskRequest: string;
   assistantResponse?: string;
   /**
@@ -759,14 +762,28 @@ export class SupervisionBroker {
           await retainedRuntime.provider.endSession(retainedRuntime.providerSessionId).catch(() => {});
           retainedTarget?.runtimes.delete(provider.id);
         }
+        const ownerSessionName = request.targetSessionName?.trim();
+        const helperSourceSessionName = ownerSessionName
+          ? `deck_sub_supervision_${ownerSessionName.replace(/^deck_/, '').replace(/[^A-Za-z0-9_-]/g, '_').slice(-48)}`
+          : undefined;
         providerSessionId = await provider.createSession({
           sessionKey,
+          ...(ownerSessionName ? { sessionName: ownerSessionName } : {}),
           // Retained supervisor conversations own their provider state across
           // decisions. Transient callers keep the historical fresh behaviour.
           fresh: !retainedTarget,
           cwd,
           ...(effectiveAgentId ? { agentId: effectiveAgentId } : {}),
-          ...(resolved.env ? { env: resolved.env } : {}),
+          ...(resolved.env || helperSourceSessionName
+            ? {
+              env: {
+                ...(resolved.env ?? {}),
+                ...(helperSourceSessionName
+                  ? { [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: helperSourceSessionName }
+                  : {}),
+              },
+            }
+            : {}),
           ...(resolved.settings ? { settings: resolved.settings } : {}),
         });
         if (retainedTarget) {

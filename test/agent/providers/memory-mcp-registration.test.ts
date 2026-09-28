@@ -13,6 +13,7 @@ import {
   IMCODES_DAEMON_PROVIDER_ID_ENV,
   IMCODES_DAEMON_SERVER_ID_ENV,
   IMCODES_DAEMON_SESSION_NAME_ENV,
+  IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
   IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
   isMemoryMcpAllowedEnvKey,
@@ -46,6 +47,7 @@ const sessionConfig = {
   cwd: '/tmp/project',
   env: {
     [IMCODES_SESSION_ENV]: 'deck_alpha_worker',
+    [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: 'deck_sub_supervision_alpha',
     IMCODES_SERVER_TOKEN: 'server-secret',
     OAUTH_TOKEN: 'oauth-secret',
   },
@@ -100,6 +102,7 @@ describe('managed provider MCP registration helpers', () => {
       projectId: 'github.com/acme/project',
     });
     expect(server.env[IMCODES_DAEMON_SESSION_NAME_ENV]).toBe('deck_alpha_worker');
+    expect(server.env[IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]).toBe('deck_sub_supervision_alpha');
     expect(server.env[IMCODES_DAEMON_PROJECT_NAME_ENV]).toBe('alpha');
     expect(server.env[IMCODES_DAEMON_PROJECT_ROOT_ENV]).toBe('/tmp/project');
     expect(server.env[IMCODES_DAEMON_SERVER_ID_ENV]).toBe('srv-bound');

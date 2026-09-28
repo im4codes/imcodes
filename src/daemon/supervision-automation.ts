@@ -4385,6 +4385,7 @@ class SupervisionAutomation {
       brokerDecision = await supervisionBroker.decide({
         snapshot: enrichSnapshotWithGlobalDefaults(current.snapshot),
         targetSessionId: record?.sessionInstanceId ?? run.sessionName,
+        targetSessionName: run.sessionName,
         taskRequest: current.userText,
         assistantResponse: current.lastAssistantText,
         recentEvidence: collectRecentSupervisionEvidence(current.sessionName),

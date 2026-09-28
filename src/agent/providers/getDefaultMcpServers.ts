@@ -9,6 +9,7 @@ import {
   IMCODES_DAEMON_SERVER_ID_ENV,
   IMCODES_DAEMON_PROVIDER_ID_ENV,
   IMCODES_DAEMON_SESSION_NAME_ENV,
+  IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV,
   IMCODES_DAEMON_USER_ID_ENV,
   IMCODES_MCP_TOOL_CATALOG_MODE_ENV,
 } from '../../../shared/memory-mcp-env.js';
@@ -145,6 +146,7 @@ function buildIdentityEnv(config: SessionConfig): Record<string, string> {
     [IMCODES_DAEMON_USER_ID_ENV]: namespace?.userId ?? DAEMON_LOCAL_MEMORY_USER_ID,
     [IMCODES_DAEMON_NAMESPACE_ENV]: namespace ? JSON.stringify(namespace) : undefined,
     [IMCODES_DAEMON_SESSION_NAME_ENV]: sessionName,
+    [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: stringValue(config.env?.[IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]),
     [IMCODES_DAEMON_PROJECT_NAME_ENV]: stringValue(config.projectName) ?? projectNameFromSessionName(sessionName),
     [IMCODES_DAEMON_PROJECT_ROOT_ENV]: stringValue(config.cwd),
     [IMCODES_DAEMON_SERVER_ID_ENV]: stringValue(config.serverId),

@@ -11,6 +11,8 @@ export interface McpRuntimeCaller {
   userId: string;
   namespace: ContextNamespace;
   sessionName: string | null;
+  /** Separate write attribution for supervised helpers; authorization stays owner-scoped. */
+  sourceSessionName: string | null;
   projectName: string | null;
   projectRoot: string | null;
   serverId: string | null;
@@ -97,6 +99,7 @@ export function parseMcpRuntimeCallerFromEnv(
   const namespace = namespaceJson ? parseNamespace(namespaceJson) : localNamespace(envUserId ?? undefined);
   const userId = runtimeUserId(envUserId, namespace);
   const rawSessionName = optionalString(env[MEMORY_MCP_ENV_KEYS.SESSION_NAME]);
+  const sourceSessionName = optionalString(env[MEMORY_MCP_ENV_KEYS.SOURCE_SESSION_NAME]);
   if (rawSessionName && !isValidImcodesSessionName(rawSessionName) && !PROVIDER_HOST_SESSION_ID.test(rawSessionName)) {
     throw new MemoryMcpCallerEnvError('[memory-mcp] fail-fast: IMCODES_DAEMON_SESSION_NAME is invalid');
   }
@@ -105,6 +108,7 @@ export function parseMcpRuntimeCallerFromEnv(
     userId,
     namespace,
     sessionName,
+    sourceSessionName,
     projectName: optionalString(env[MEMORY_MCP_ENV_KEYS.PROJECT_NAME]),
     projectRoot: optionalString(env[MEMORY_MCP_ENV_KEYS.PROJECT_ROOT]),
     serverId: optionalString(env[MEMORY_MCP_ENV_KEYS.SERVER_ID]),
@@ -118,6 +122,7 @@ export function deriveMemoryToolCaller(caller: McpRuntimeCaller): MemoryToolCall
     userId: caller.userId,
     namespace: caller.namespace,
     sessionName: caller.sessionName,
+    sourceSessionName: caller.sourceSessionName,
     projectName: caller.projectName,
     serverId: caller.serverId,
   });

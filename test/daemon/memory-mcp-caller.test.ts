@@ -54,6 +54,19 @@ describe('MCP runtime caller env parsing', () => {
     expect(caller.providerId).toBe('codex-sdk');
   });
 
+  it('keeps supervised helper attribution separate from owner authorization', () => {
+    const caller = parseMcpRuntimeCallerFromEnv({
+      [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
+      [MEMORY_MCP_ENV_KEYS.NAMESPACE]: JSON.stringify({ scope: 'personal', userId: 'user-1', projectId: 'repo' }),
+      [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_sub_owner',
+      [MEMORY_MCP_ENV_KEYS.SOURCE_SESSION_NAME]: 'deck_sub_supervision_owner',
+    });
+    expect(caller).toMatchObject({ sessionName: 'deck_sub_owner', sourceSessionName: 'deck_sub_supervision_owner' });
+    expect(deriveMemoryToolCaller(caller)).toMatchObject({
+      sourceSessionName: 'deck_sub_supervision_owner',
+    });
+  });
+
   it('fails fast for invalid namespace or unsafe session name', () => {
     expect(() => parseMcpRuntimeCallerFromEnv({
       [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
