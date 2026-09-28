@@ -117,6 +117,18 @@ describe('cross-machine session identity synchronization', () => {
     );
   });
 
+  it('reports a scoped hydration failure instead of applying a silently truncated identity', async () => {
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+    const result = await syncSessionIdentities({}, {
+      listProfiles: async () => ({ status: 'ok' as const, serverId: 'srv-9', profiles: [], truncated: true }),
+      getEffectiveProfiles: async () => ({ status: 'error' as const, reason: 'internal_error', message: 'scoped read failed' }),
+      listLocalSessions: () => [session({ name: 'zz_session_last' })],
+      applyIdentity,
+    });
+    expect(result).toEqual({ status: 'error', checked: 1, changed: 0, message: 'scoped read failed' });
+    expect(applyIdentity).not.toHaveBeenCalled();
+  });
+
   it('fetches a post-write snapshot for an explicit target instead of joining a stale periodic snapshot', async () => {
     let releasePeriodic!: (value: {
       status: 'ok'; serverId: string; profiles: SessionIdentityProfile[]; truncated: boolean;

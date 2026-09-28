@@ -62,12 +62,13 @@ async function hydrateTruncatedProfiles(
   snapshot: { profiles: SessionIdentityProfile[]; serverId: string },
   options: SessionIdentityClientOptions,
   getEffective: typeof getEffectiveSessionIdentityProfiles,
-): Promise<SessionIdentityProfile[]> {
+): Promise<{ profiles: SessionIdentityProfile[]; error?: string }> {
   const merged = new Map(snapshot.profiles.map((profile) => [
     `${profile.scope}\0${profile.scopeKey}`,
     profile,
   ]));
   let next = 0;
+  let firstError: string | undefined;
   const worker = async () => {
     while (next < sessions.length) {
       const session = sessions[next++];
@@ -79,14 +80,17 @@ async function hydrateTruncatedProfiles(
         }),
         sessionName: session.name,
       }, options);
-      if (result.status !== 'ok') continue;
+      if (result.status !== 'ok') {
+        firstError ??= result.message;
+        continue;
+      }
       for (const profile of result.profiles) {
         merged.set(`${profile.scope}\0${profile.scopeKey}`, profile);
       }
     }
   };
   await Promise.all(Array.from({ length: Math.min(SESSION_IDENTITY_HYDRATION_CONCURRENCY, sessions.length) }, worker));
-  return [...merged.values()];
+  return { profiles: [...merged.values()], ...(firstError ? { error: firstError } : {}) };
 }
 
 /**
@@ -106,14 +110,16 @@ export async function syncSessionIdentities(
       return { status: 'error', checked: 0, changed: 0, message: snapshot.message };
     }
     const sessions = (deps.listLocalSessions ?? listSessions)().filter((session) => session.state !== 'stopped');
-    const profiles = snapshot.truncated
+    const hydrated = snapshot.truncated
       ? await hydrateTruncatedProfiles(
         sessions,
         snapshot,
         options,
         deps.getEffectiveProfiles ?? getEffectiveSessionIdentityProfiles,
       )
-      : snapshot.profiles;
+      : { profiles: snapshot.profiles };
+    if (hydrated.error) return { status: 'error', checked: sessions.length, changed: 0, message: hydrated.error };
+    const profiles = hydrated.profiles;
     let changed = 0;
     for (const session of sessions) {
       const prompt = renderSessionIdentityProfiles(
