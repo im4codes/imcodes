@@ -47,6 +47,11 @@ describe('session identity synchronization bounds', () => {
       [randomHex(8), serverId, 'deck_live', 'repo-live', 'idle', now],
     );
     await db.execute(
+      `INSERT INTO sub_sessions (id, server_id, type, created_at, updated_at)
+       VALUES ($1, $2, 'codex', $3, $3)`,
+      ['deck_sub_1', serverId, now],
+    );
+    await db.execute(
       `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, state, created_at, updated_at)
        VALUES ($1, $2, $3, $4, 'worker', 'codex-sdk', 'stopped', $5, $5)`,
       [randomHex(8), serverId, 'deck_stopped', 'repo-stopped', now],
@@ -98,6 +103,7 @@ describe('session identity synchronization bounds', () => {
       .toBeLessThanOrEqual(SESSION_IDENTITY_SYNC_MAX_PROFILES);
 
     await db.execute('DELETE FROM session_identity_profiles WHERE user_id = $1', [userId]);
+    await db.execute('DELETE FROM sub_sessions WHERE server_id = $1', [serverId]);
     await db.execute('DELETE FROM sessions WHERE server_id = $1', [serverId]);
     await db.execute('DELETE FROM servers WHERE id = $1', [serverId]);
     await db.execute('DELETE FROM users WHERE id = $1', [userId]);
