@@ -3329,6 +3329,7 @@ export function estimateStagedTokenUpperBound(target: ContextTargetRef): number 
 }
 
 export function recordContextEvent(input: Omit<LocalContextEvent, 'id' | 'createdAt'> & Partial<Pick<LocalContextEvent, 'id' | 'createdAt'>>): LocalContextEvent {
+  clearPanelReadCache();
   const database = ensureDb();
   const event: LocalContextEvent = {
     id: input.id ?? randomUUID(),
@@ -5270,6 +5271,7 @@ const RECENT_SUMMARY_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
  * - Age measured from last_used_at (falls back to updated_at if never used)
  */
 export function pruneLocalMemory(now = Date.now()): { archived: number } {
+  clearPanelReadCache();
   const database = ensureDb();
   const cutoff = now - RECENT_SUMMARY_MAX_AGE_MS;
 
@@ -5290,6 +5292,7 @@ export function pruneLocalMemory(now = Date.now()): { archived: number } {
  * Restore a previously archived projection back to active status.
  */
 export function restoreArchivedMemory(id: string): boolean {
+  clearPanelReadCache();
   const database = ensureDb();
   const result = database.prepare(`
     UPDATE context_processed_local
@@ -5304,6 +5307,7 @@ export function restoreArchivedMemory(id: string): boolean {
  * Archive an active projection (manual archive by user).
  */
 export function archiveMemory(id: string): boolean {
+  clearPanelReadCache();
   const database = ensureDb();
   const result = database.prepare(`
     UPDATE context_processed_local
@@ -5320,6 +5324,7 @@ export function archiveMemory(id: string): boolean {
  * Also removes the projection id from pending replication state so deleted items are not re-uploaded.
  */
 export function deleteMemory(id: string): boolean {
+  clearPanelReadCache();
   const database = ensureDb();
   database.exec('BEGIN IMMEDIATE');
   try {
