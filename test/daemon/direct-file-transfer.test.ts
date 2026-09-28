@@ -1578,6 +1578,14 @@ describe('daemon direct file transfer v2 lease broker', () => {
       totalBytes: 5,
     }));
     await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+    const committedTerminals = () => sent.filter((message) => (
+      message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
+      && message.operationId === operationId
+      && message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED
+    ));
+    // The first terminal is emitted after the finalize promise settles; wait
+    // for it so the duplicate is judged against a fully committed upload.
+    await vi.waitFor(() => expect(committedTerminals()).toHaveLength(1));
 
     const existing = await finalizeDirectUploadedFile.mock.results[0]!.value;
     lookupAttachmentByClientUploadId.mockReturnValue(existing);
@@ -1589,11 +1597,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.handleDirectFileTransferCommand(duplicate, sender);
 
     expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce();
-    expect(sent.filter((message) => (
-      message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
-      && message.operationId === operationId
-      && message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED
-    ))).toHaveLength(2);
+    await vi.waitFor(() => expect(committedTerminals()).toHaveLength(2));
     await direct.shutdownDirectFileTransfers();
   });
 
