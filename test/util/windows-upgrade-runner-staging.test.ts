@@ -1,15 +1,20 @@
-import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
 
+import {
+  buildWindowsUpgradeRunnerVbs,
+  stageWindowsUpgradeRunner,
+  WINDOWS_UPGRADE_RUNNER_ENTRY_FILE,
+} from '../../src/util/windows-upgrade-script.js';
 import { WINDOWS_UPGRADE_RUNNER_STAGED_FILES } from '../../src/util/windows-upgrade-runner-staged-files.js';
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const runnerSource = resolve(repoRoot, 'src/util/windows-upgrade-runner.mjs');
-const stagedPaths = new Set(['windows-upgrade-runner.mjs', ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES]);
+const stagedPaths = new Set([WINDOWS_UPGRADE_RUNNER_ENTRY_FILE, ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES]);
 
 function relativeImports(filePath: string): string[] {
   const source = readFileSync(filePath, 'utf8');
@@ -33,26 +38,35 @@ describe('Windows staged upgrade runner closure', () => {
     }
   });
 
-  it('copies the staged set into an empty temp dir and loads with dry-run', () => {
+  it('uses the real staging helper and loads from an empty temp dir with dry-run', () => {
     const stagingDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-stage-test-'));
     try {
-      for (const relativePath of ['windows-upgrade-runner.mjs', ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES]) {
-        const destination = join(stagingDir, relativePath);
-        mkdirSync(dirname(destination), { recursive: true });
-        copyFileSync(
-          relativePath === 'windows-upgrade-runner.mjs'
-            ? runnerSource
-            : resolve(dirname(runnerSource), relativePath),
-          destination,
-        );
-      }
-      const stagedRunner = join(stagingDir, 'windows-upgrade-runner.mjs');
-      const result = spawnSync(process.execPath, [stagedRunner, '--dry-run'], {
+      const { runnerPath } = stageWindowsUpgradeRunner(stagingDir, runnerSource);
+      expect(runnerPath).toBe(join(stagingDir, WINDOWS_UPGRADE_RUNNER_ENTRY_FILE));
+      expect(existsSync(runnerPath)).toBe(true);
+      const result = spawnSync(process.execPath, [runnerPath, '--dry-run'], {
         encoding: 'utf8',
         timeout: 30_000,
       });
       expect(result.status).toBe(0);
       expect(`${result.stdout}${result.stderr}`).toContain('staged dependency closure loaded');
+    } finally {
+      rmSync(stagingDir, { recursive: true, force: true });
+    }
+  });
+
+  it('passes the helper-returned runner path to the VBS launcher', () => {
+    const stagingDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-vbs-test-'));
+    try {
+      const { runnerPath } = stageWindowsUpgradeRunner(stagingDir, runnerSource);
+      const vbs = buildWindowsUpgradeRunnerVbs({
+        nodeExe: process.execPath,
+        runnerPath,
+        args: ['log', 'npm', 'imcodes@next', 'next', stagingDir, '-', 'current'],
+      });
+      expect(vbs).toContain(`""${runnerPath}""`);
+      expect(readFileSync(resolve(repoRoot, 'src/daemon/command-handler.ts'), 'utf8'))
+        .toContain('runnerCopy = stageWindowsUpgradeRunner(scriptDir, runnerSrc).runnerPath');
     } finally {
       rmSync(stagingDir, { recursive: true, force: true });
     }

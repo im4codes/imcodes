@@ -1,6 +1,32 @@
-import { existsSync } from 'node:fs';
-import { dirname, resolve } from 'node:path';
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { WINDOWS_UPGRADE_RUNNER_STAGED_FILES } from './windows-upgrade-runner-staged-files.js';
+
+/** The filename used by the VBS launcher for the staged runner entrypoint. */
+export const WINDOWS_UPGRADE_RUNNER_ENTRY_FILE = 'upgrade.mjs';
+
+/**
+ * Copy the Windows upgrade runner and its relative-import closure into the
+ * per-upgrade temporary directory.  The returned path is the single source
+ * of truth passed to the VBS launcher; callers must not reconstruct it.
+ */
+export function stageWindowsUpgradeRunner(scriptDir: string, runnerSrc: string): { runnerPath: string } {
+  const runnerPath = join(scriptDir, WINDOWS_UPGRADE_RUNNER_ENTRY_FILE);
+  const stagedFiles = [
+    { relativePath: WINDOWS_UPGRADE_RUNNER_ENTRY_FILE, sourcePath: runnerSrc },
+    ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES.map((relativePath) => ({
+      relativePath,
+      sourcePath: resolve(dirname(runnerSrc), relativePath),
+    })),
+  ];
+  for (const { relativePath, sourcePath } of stagedFiles) {
+    const destinationPath = join(scriptDir, relativePath);
+    mkdirSync(dirname(destinationPath), { recursive: true });
+    writeFileSync(destinationPath, readFileSync(sourcePath));
+  }
+  return { runnerPath };
+}
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
