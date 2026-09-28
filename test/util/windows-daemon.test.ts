@@ -17,6 +17,7 @@ const state = vi.hoisted(() => ({
 }));
 const originalHome = process.env.HOME;
 const originalImcodesHome = process.env.IMCODES_HOME;
+const originalUserProfile = process.env.USERPROFILE;
 
 vi.mock('node:os', () => ({ homedir: () => 'C:\\Users\\tester' }));
 
@@ -75,6 +76,7 @@ function reset(): void {
   // fixture on the default home so legacy broad-recovery tests exercise the
   // default branch; scoped behavior is covered separately below.
   process.env.HOME = 'C:\\Users\\tester';
+  process.env.USERPROFILE = 'C:\\Users\\tester';
   delete process.env.IMCODES_HOME;
   state.pidContents = [''];
   state.pidIndex = 0;
@@ -104,6 +106,8 @@ describe('restartWindowsDaemon', () => {
     else process.env.HOME = originalHome;
     if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
     else process.env.IMCODES_HOME = originalImcodesHome;
+    if (originalUserProfile === undefined) delete process.env.USERPROFILE;
+    else process.env.USERPROFILE = originalUserProfile;
   });
 
   // ── Launcher priority ──
