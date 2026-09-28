@@ -126,7 +126,7 @@ describe('writeWatchdogCmd', () => {
     const cmd = written[paths.watchdogPath];
     expect(cmd).toContain('set "IMCODES_HOME=C:\\Temp\\scopeA\\.imcodes"');
     expect(cmd).toContain('set "HOME=C:\\Temp\\scopeA"');
-    expect(cmd).toContain('set "USERPROFILE=C:\\Temp\\scopeA"');
+    expect(cmd).not.toContain('set "USERPROFILE=');
   });
 
   it('emits the preflight self-heal line via the npm shim env-var form when the shim is installed', async () => {
@@ -464,7 +464,8 @@ describe('writeVbsLauncher', () => {
     await writeVbsLauncher(paths);
     const vbs = written[paths.vbsPath];
     expect(vbs).toContain('("IMCODES_HOME") = "C:\\Temp\\scopeA\\.imcodes"');
-    expect(vbs).toContain('("USERPROFILE") = "C:\\Temp\\scopeA"');
+    expect(vbs).toContain('("HOME") = "C:\\Temp\\scopeA"');
+    expect(vbs).not.toContain('("USERPROFILE") =');
   });
 });
 

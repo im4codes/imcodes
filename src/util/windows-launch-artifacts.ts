@@ -44,7 +44,12 @@ function scopedEnvironmentPrefix(paths: LaunchPaths): string {
     || normalizeWindowsTaskHome(currentHome) === normalizeWindowsTaskHome(defaultHome)) return '';
   const userHome = path.win32.dirname(stateHome);
   const quote = (value: string) => value.replaceAll('^', '^^').replaceAll('&', '^&').replaceAll('|', '^|');
-  return `set "IMCODES_HOME=${quote(stateHome)}"\r\nset "HOME=${quote(userHome)}"\r\nset "USERPROFILE=${quote(userHome)}"\r\n`;
+  // Keep USERPROFILE inherited from the real Windows account.  On Windows
+  // Node's homedir() uses USERPROFILE; overriding it here would make a
+  // scoped daemon mistake its isolated home for the legacy default and
+  // register/launch the machine-wide task name.  IMCODES_HOME is the state
+  // identity, while HOME is the scoped shell-home override.
+  return `set "IMCODES_HOME=${quote(stateHome)}"\r\nset "HOME=${quote(userHome)}"\r\n`;
 }
 
 function escapeXmlText(value: string): string {
@@ -388,7 +393,6 @@ export async function writeVbsLauncher(paths: LaunchPaths): Promise<void> {
   const env = scoped
     ? `WshShell.Environment("Process")("IMCODES_HOME") = "${vbsQuote(stateHome)}"\r\n`
       + `WshShell.Environment("Process")("HOME") = "${vbsQuote(path.win32.dirname(stateHome))}"\r\n`
-      + `WshShell.Environment("Process")("USERPROFILE") = "${vbsQuote(path.win32.dirname(stateHome))}"\r\n`
     : '';
   const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\n${env}WshShell.Run """${paths.watchdogPath}""", 0, True\r\n`;
   await writeFile(paths.vbsPath, encodeVbsAsUtf16(vbs));
