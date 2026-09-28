@@ -44,6 +44,7 @@
  *   process.argv[6] = absolute path to script_dir (for self-cleanup)
  *   process.argv[7] = npm registry to pin (or "-" for npm's ambient default)
  *   process.argv[8] = current daemon version (for the latest downgrade guard)
+ *   process.argv[9] = npm global prefix owning the running daemon package
  *
  * Exit code:
  *   0 on success or expected abort (install fail, version mismatch).
@@ -87,6 +88,7 @@ const SCRIPT_DIR = process.argv[6];
 // "-" sentinel means "use npm's ambient/default registry" (no --registry flag).
 const REGISTRY = process.argv[7] && process.argv[7] !== '-' ? process.argv[7] : null;
 const CURRENT_VER = process.argv[8] || null;
+const NPM_PREFIX = process.argv[9]?.trim() || null;
 
 /** Compare two daemon version strings (release + optional prerelease).
  *  Returns <0 if a<b, 0 if equal, >0 if a>b. Mirrors the in-script
@@ -318,6 +320,7 @@ function killStaleWatchdogs() {
  *  this lives under different roots — the only authoritative source
  *  is `npm prefix -g` itself. */
 function resolveNpmPrefix() {
+  if (NPM_PREFIX) return NPM_PREFIX;
   try {
     const r = spawnNpm(NPM_CMD, ['prefix', '-g'], {
       encoding: 'utf8', windowsHide: true,
@@ -467,6 +470,7 @@ async function main() {
     NODE_OPTIONS: '--max-old-space-size=4096',
   };
   log(`installing ${PKG_SPEC}...`);
+  if (NPM_PREFIX) log(`pinning npm prefix: ${NPM_PREFIX}`);
   trace(3, 'pre-npm-install');
   const installStartedAt = Date.now();
   if (REGISTRY) log(`pinning npm registry: ${REGISTRY}`);
@@ -490,6 +494,7 @@ async function main() {
       '--fetch-retry-mintimeout', '10000',
       '--fetch-retry-maxtimeout', '120000',
       '--fetch-timeout', '300000',
+      ...(NPM_PREFIX ? ['--prefix', NPM_PREFIX] : []),
       ...(REGISTRY ? ['--registry', REGISTRY] : []),
       PKG_SPEC,
     ],

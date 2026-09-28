@@ -48,6 +48,8 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
     expect(src).toContain('process.argv[4]');
     expect(src).toContain('process.argv[5]');
     expect(src).toContain('process.argv[6]');
+    expect(src).toContain('process.argv[9]');
+    expect(src).toContain("'--prefix', NPM_PREFIX");
   });
 
   it('scopes state to IMCODES_HOME or the overridden HOME, without appending .imcodes twice', () => {

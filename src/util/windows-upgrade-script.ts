@@ -115,3 +115,17 @@ export function resolveWindowsUpgradeRunnerPath(): string {
   // wrong-path bug.
   return builtSibling;
 }
+
+/** Resolve the npm global prefix that owns a running packaged daemon.
+ * A daemon may be installed under an isolated/custom prefix (nvm/fnm/volta,
+ * or a test HOME).  npm's ambient `prefix -g` can point at a different
+ * installation, so derive the prefix from `<prefix>/node_modules/imcodes/...`.
+ */
+export function resolveWindowsUpgradePrefix(runnerPath: string): string | null {
+  const normalized = runnerPath.replaceAll('\\', '/');
+  const marker = '/node_modules/imcodes/';
+  const index = normalized.toLowerCase().lastIndexOf(marker);
+  if (index <= 0) return null;
+  const prefix = normalized.slice(0, index);
+  return prefix || null;
+}

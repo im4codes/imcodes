@@ -171,6 +171,7 @@ import {
   buildWindowsCleanupVbs,
   buildWindowsUpgradeRunnerVbs,
   resolveWindowsUpgradeRunnerPath,
+  resolveWindowsUpgradePrefix,
   stageWindowsUpgradeRunner,
 } from '../util/windows-upgrade-script.js';
 import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
@@ -8599,6 +8600,7 @@ launchctl load -w "${plist}"`;
     const targetVer = targetVersion ?? 'latest';
 
     const runnerSrc = resolveWindowsUpgradeRunnerPath();
+    const npmPrefix = resolveWindowsUpgradePrefix(runnerSrc);
     let runnerCopy: string;
     try {
       // Stage the runner with its complete relative-import closure because
@@ -8632,7 +8634,7 @@ launchctl load -w "${plist}"`;
     const upgradeVbs = buildWindowsUpgradeRunnerVbs({
       nodeExe: process.execPath,
       runnerPath: runnerCopy,
-      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir, winRegistryArg, DAEMON_VERSION],
+      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir, winRegistryArg, DAEMON_VERSION, npmPrefix ?? ''],
     });
     writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(upgradeVbs));
 

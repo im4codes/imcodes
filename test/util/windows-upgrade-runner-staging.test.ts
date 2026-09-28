@@ -7,6 +7,7 @@ import { describe, expect, it } from 'vitest';
 
 import {
   buildWindowsUpgradeRunnerVbs,
+  resolveWindowsUpgradePrefix,
   stageWindowsUpgradeRunner,
   WINDOWS_UPGRADE_RUNNER_ENTRY_FILE,
 } from '../../src/util/windows-upgrade-script.js';
@@ -22,6 +23,14 @@ function relativeImports(filePath: string): string[] {
 }
 
 describe('Windows staged upgrade runner closure', () => {
+  it('derives the owning npm prefix from default and custom package layouts', () => {
+    expect(resolveWindowsUpgradePrefix('C:\\Users\\admin\\AppData\\Roaming\\npm\\node_modules\\imcodes\\dist\\src\\util\\windows-upgrade-runner.mjs'))
+      .toBe('C:/Users/admin/AppData/Roaming/npm');
+    expect(resolveWindowsUpgradePrefix('C:\\scope3-prefix\\node_modules\\imcodes\\dist\\src\\util\\windows-upgrade-runner.mjs'))
+      .toBe('C:/scope3-prefix');
+    expect(resolveWindowsUpgradePrefix('/tmp/runner.mjs')).toBeNull();
+  });
+
   it('stages every transitive relative import exactly once', () => {
     const pending = [runnerSource];
     const visited = new Set<string>();
