@@ -1,4 +1,32 @@
+import { createHash } from 'node:crypto';
 import { win32 } from 'node:path';
+
+const TASK_BASE_NAMES = Object.freeze({
+  daemon: 'imcodes-daemon',
+  watchdog: 'imcodes-daemon-watchdog',
+  's4u-guard': 'imcodes-daemon-s4u-guard',
+});
+
+/** Canonical identity used by every Windows per-home registration. */
+export function normalizeWindowsTaskHome(home) {
+  return win32.resolve(String(home).replaceAll('/', '\\')).replace(/[\\]+$/, '').toLowerCase();
+}
+
+export function windowsHomeHash(home) {
+  return createHash('sha256').update(normalizeWindowsTaskHome(home), 'utf8').digest('hex').slice(0, 12);
+}
+
+/**
+ * Return the Task Scheduler name for a role/home pair.  The real user's
+ * default installation keeps the historical names; isolated homes receive
+ * the same stable short hash used by the lock pipe.
+ */
+export function windowsTaskName(role, stateHome, defaultHome = stateHome) {
+  const base = TASK_BASE_NAMES[role];
+  if (!base) throw new Error(`unknown_windows_task_role:${role}`);
+  if (normalizeWindowsTaskHome(stateHome) === normalizeWindowsTaskHome(defaultHome)) return base;
+  return `${base}-${windowsHomeHash(stateHome)}`;
+}
 
 const WATCHDOG_FILE = 'daemon-watchdog.cmd';
 

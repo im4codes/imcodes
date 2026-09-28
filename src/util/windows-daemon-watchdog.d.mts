@@ -19,3 +19,10 @@ export function parseDaemonProcessListing(
   stateHome: string,
   defaultStateHome?: string,
 ): number[];
+export function normalizeWindowsTaskHome(home: string): string;
+export function windowsHomeHash(home: string): string;
+export function windowsTaskName(
+  role: 'daemon' | 'watchdog' | 's4u-guard',
+  stateHome: string,
+  defaultHome?: string,
+): string;

@@ -11,13 +11,13 @@ import {
   parseDaemonProcessListing,
   parseWatchdogProcessListing,
   watchdogCommandLineMatchesHome as sharedWatchdogCommandLineMatchesHome,
+  windowsTaskName,
 } from './windows-daemon-watchdog.mjs';
 import {
   isRecordedProcessIdentityCurrent,
   readInstanceLockMetadata,
 } from '../daemon/instance-lock.js';
 
-const WINDOWS_DAEMON_TASK = 'imcodes-daemon';
 const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
 function readDaemonPid(currentPid?: number): number | null {
@@ -42,6 +42,10 @@ function readDaemonPid(currentPid?: number): number | null {
 
 function isHomeScopedInstance(): boolean {
   return windowsDaemonLockPipeName() !== WINDOWS_DAEMON_LOCK_PIPE;
+}
+
+function daemonTaskName(): string {
+  return windowsTaskName('daemon', resolveImcodesHome(), defaultStateHome());
 }
 
 function isPidAlive(pid: number): boolean {
@@ -167,9 +171,8 @@ function tryStartVbsLauncher(): boolean {
 }
 
 function tryStartScheduledTask(): boolean {
-  if (isHomeScopedInstance()) return false;
   try {
-    execSync(`schtasks /Run /TN ${WINDOWS_DAEMON_TASK}`, {
+    execSync(`schtasks /Run /TN ${daemonTaskName()}`, {
       stdio: 'ignore', windowsHide: true,
       timeout: WINDOWS_COMMAND_TIMEOUT_MS, killSignal: 'SIGKILL',
     });

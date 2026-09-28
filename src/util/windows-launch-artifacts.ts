@@ -7,12 +7,11 @@ import { homedir, tmpdir } from 'os';
 import {
   resolveImcodesHome,
 } from './windows-daemon-lock.js';
-import { parseWatchdogProcessListing } from './windows-daemon-watchdog.mjs';
+import { parseWatchdogProcessListing, windowsTaskName, normalizeWindowsTaskHome } from './windows-daemon-watchdog.mjs';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const TASK_NAME = 'imcodes-daemon';
 const TASK_WATCHDOG_INTERVAL = 'PT1M';
 const WINDOWS_COMMAND_TIMEOUT_MS = 15_000;
 
@@ -26,6 +25,26 @@ export interface LaunchPaths {
   watchdogPath: string;
   vbsPath: string;
   logPath: string;
+}
+
+export function windowsDaemonTaskName(paths: LaunchPaths): string {
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const defaultHome = path.win32.join(process.env.USERPROFILE || homedir(), '.imcodes');
+  return windowsTaskName('daemon', stateHome, defaultHome);
+}
+
+function scopedEnvironmentPrefix(paths: LaunchPaths): string {
+  // Synthetic test paths are left on the legacy env-var form. Production
+  // artifacts for a non-default home bake the state/home values into the
+  // launcher so Task Scheduler cannot relaunch the default instance.
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const currentHome = resolveImcodesHome();
+  const defaultHome = path.win32.join(process.env.USERPROFILE || homedir(), '.imcodes');
+  if (normalizeWindowsTaskHome(stateHome) !== normalizeWindowsTaskHome(currentHome)
+    || normalizeWindowsTaskHome(currentHome) === normalizeWindowsTaskHome(defaultHome)) return '';
+  const userHome = path.win32.dirname(stateHome);
+  const quote = (value: string) => value.replaceAll('^', '^^').replaceAll('&', '^&').replaceAll('|', '^|');
+  return `set "IMCODES_HOME=${quote(stateHome)}"\r\nset "HOME=${quote(userHome)}"\r\nset "USERPROFILE=${quote(userHome)}"\r\n`;
 }
 
 function escapeXmlText(value: string): string {
@@ -146,7 +165,7 @@ export function installWindowsScheduledTask(paths: LaunchPaths): boolean {
     const taskXmlPath = join(taskDir, 'imcodes-daemon.xml');
     const xml = windowsDaemonScheduledTaskXml(paths);
     writeFileSync(taskXmlPath, encodeWindowsDaemonScheduledTaskXml(xml), { mode: 0o600 });
-    execFileSync('schtasks', ['/Create', '/TN', TASK_NAME, '/XML', taskXmlPath, '/F'], {
+    execFileSync('schtasks', ['/Create', '/TN', windowsDaemonTaskName(paths), '/XML', taskXmlPath, '/F'], {
       stdio: 'ignore',
       windowsHide: true,
       timeout: WINDOWS_COMMAND_TIMEOUT_MS,
@@ -300,6 +319,7 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   const watchdog = [
     '@echo off',
     'chcp 65001 >nul 2>&1',
+    ...scopedEnvironmentPrefix(paths).trimEnd().split('\r\n').filter(Boolean),
     ':loop',
     'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_lock',
     // Preflight FIRST (when the shim is installed): detects half-
@@ -359,7 +379,18 @@ export function encodeCmdAsUtf8Bom(content: string): Buffer {
  *  `On Error Resume Next` ensures wscript NEVER pops up an error dialog. */
 export async function writeVbsLauncher(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.vbsPath), { recursive: true });
-  const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${paths.watchdogPath}""", 0, True\r\n`;
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const currentHome = resolveImcodesHome();
+  const defaultHome = path.win32.join(process.env.USERPROFILE || homedir(), '.imcodes');
+  const scoped = normalizeWindowsTaskHome(stateHome) === normalizeWindowsTaskHome(currentHome)
+    && normalizeWindowsTaskHome(currentHome) !== normalizeWindowsTaskHome(defaultHome);
+  const vbsQuote = (value: string) => value.replaceAll('"', '""');
+  const env = scoped
+    ? `WshShell.Environment("Process")("IMCODES_HOME") = "${vbsQuote(stateHome)}"\r\n`
+      + `WshShell.Environment("Process")("HOME") = "${vbsQuote(path.win32.dirname(stateHome))}"\r\n`
+      + `WshShell.Environment("Process")("USERPROFILE") = "${vbsQuote(path.win32.dirname(stateHome))}"\r\n`
+    : '';
+  const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\n${env}WshShell.Run """${paths.watchdogPath}""", 0, True\r\n`;
   await writeFile(paths.vbsPath, encodeVbsAsUtf16(vbs));
 }
 
@@ -375,7 +406,7 @@ export function updateSchtasks(paths: LaunchPaths): boolean {
   try {
     execSync([
       'schtasks', '/Change',
-      '/TN', TASK_NAME,
+      '/TN', windowsDaemonTaskName(paths),
       '/TR', `wscript "${paths.vbsPath}"`,
     ].join(' '), {
       stdio: 'ignore', windowsHide: true,

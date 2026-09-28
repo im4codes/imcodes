@@ -58,7 +58,7 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
-import { parseWatchdogProcessListing } from './windows-daemon-watchdog.mjs';
+import { parseWatchdogProcessListing, windowsTaskName } from './windows-daemon-watchdog.mjs';
 
 // IMCODES_HOME is already the state directory.  Otherwise honor an explicit
 // HOME override before falling back to the platform homedir; this keeps
@@ -73,8 +73,8 @@ function resolveImcodesStateDir() {
 const IMCODES_HOME = resolveImcodesStateDir();
 const LOCK = join(IMCODES_HOME, 'upgrade.lock');
 const PIDFILE = join(IMCODES_HOME, 'daemon.pid');
-const DAEMON_TASK = 'imcodes-daemon';
 const DEFAULT_STATE_DIR = resolve(join(homedir(), '.imcodes'));
+const DAEMON_TASK = windowsTaskName('daemon', IMCODES_HOME, DEFAULT_STATE_DIR);
 
 const LOG_FILE = process.argv[2];
 const NPM_CMD = process.argv[3];

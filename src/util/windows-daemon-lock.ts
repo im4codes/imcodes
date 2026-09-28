@@ -1,6 +1,6 @@
-import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join, resolve, win32 } from 'node:path';
+import { normalizeWindowsTaskHome, windowsHomeHash } from './windows-daemon-watchdog.mjs';
 
 /** The pipe name used by the real, default Windows daemon installation. */
 export const WINDOWS_DAEMON_LOCK_PIPE = '\\\\.\\pipe\\imcodes-daemon-lock';
@@ -64,7 +64,7 @@ function resolveLockPath(path: string): string {
  * so case and separator differences must not create separate lock identities.
  */
 export function normalizeWindowsLockPath(path: string): string {
-  return win32.resolve(path.replaceAll('/', '\\')).replace(/[\\]+$/, '').toLowerCase();
+  return normalizeWindowsTaskHome(path);
 }
 
 /**
@@ -82,9 +82,5 @@ export function windowsDaemonLockPipeName(options: WindowsDaemonLockPathOptions 
     return WINDOWS_DAEMON_LOCK_PIPE;
   }
 
-  const digest = createHash('sha256')
-    .update(normalizeWindowsLockPath(homePath), 'utf8')
-    .digest('hex')
-    .slice(0, 12);
-  return `${WINDOWS_DAEMON_LOCK_PIPE_PREFIX}${digest}`;
+  return `${WINDOWS_DAEMON_LOCK_PIPE_PREFIX}${windowsHomeHash(homePath)}`;
 }

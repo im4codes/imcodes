@@ -6,6 +6,7 @@ import {
   encodeWindowsDaemonScheduledTaskXml,
   resolveWindowsDaemonTaskUserId,
   windowsDaemonScheduledTaskXml,
+  windowsDaemonTaskName,
   writeVbsLauncher,
   writeWatchdogCmd,
 } from '../../src/util/windows-launch-artifacts.js';
@@ -70,6 +71,18 @@ describe('writeWatchdogCmd', () => {
     vi.stubEnv('APPDATA', 'C:\\Users\\X\\AppData\\Roaming');
   });
 
+  it('derives scoped task names without changing the default registration', () => {
+    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    const base = {
+      nodeExe: 'node.exe', imcodesScript: 'imcodes.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs', logPath: 'x',
+    };
+    expect(windowsDaemonTaskName(base)).toBe('imcodes-daemon');
+    expect(windowsDaemonTaskName({ ...base, watchdogPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-watchdog.cmd' }))
+      .toMatch(/^imcodes-daemon-[0-9a-f]{12}$/);
+  });
+
   it('generates watchdog with upgrade lock check', async () => {
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
@@ -97,6 +110,23 @@ describe('writeWatchdogCmd', () => {
     // When locked, should wait and loop back (not launch daemon)
     expect(cmd).toContain('Upgrade in progress, waiting');
     expect(cmd).toContain('goto loop');
+  });
+
+  it('bakes scoped HOME environment into the relaunch command', async () => {
+    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
+    const paths = {
+      nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
+      imcodesScript: 'C:\\scopeA-prefix\\node_modules\\imcodes\\dist\\src\\index.js',
+      watchdogPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-launcher.vbs',
+      logPath: 'C:\\Temp\\scopeA\\.imcodes\\watchdog.log',
+    };
+    await writeWatchdogCmd(paths);
+    const cmd = written[paths.watchdogPath];
+    expect(cmd).toContain('set "IMCODES_HOME=C:\\Temp\\scopeA\\.imcodes"');
+    expect(cmd).toContain('set "HOME=C:\\Temp\\scopeA"');
+    expect(cmd).toContain('set "USERPROFILE=C:\\Temp\\scopeA"');
   });
 
   it('emits the preflight self-heal line via the npm shim env-var form when the shim is installed', async () => {
@@ -421,6 +451,20 @@ describe('writeVbsLauncher', () => {
     await writeVbsLauncher(paths);
     const vbs = written[paths.vbsPath];
     expect(vbs).toContain('On Error Resume Next');
+  });
+
+  it('bakes scoped HOME into the Task Scheduler launcher', async () => {
+    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
+    const paths = {
+      nodeExe: '', imcodesScript: '', logPath: '',
+      watchdogPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-launcher.vbs',
+    };
+    await writeVbsLauncher(paths);
+    const vbs = written[paths.vbsPath];
+    expect(vbs).toContain('("IMCODES_HOME") = "C:\\Temp\\scopeA\\.imcodes"');
+    expect(vbs).toContain('("USERPROFILE") = "C:\\Temp\\scopeA"');
   });
 });
 

@@ -6,6 +6,7 @@ import {
   parseDaemonProcessListing,
   parseWatchdogProcessListing,
   watchdogCommandLineMatchesHome,
+  windowsTaskName,
 } from '../../src/util/windows-daemon-watchdog.mjs';
 
 const defaultHome = 'C:\\Users\\tester\\.imcodes';
@@ -13,6 +14,14 @@ const scopedA = 'C:\\Temp\\lock\\.imcodes';
 const scopedB = 'C:\\Temp\\lock2\\.imcodes';
 
 describe('Windows watchdog home matcher', () => {
+  it('uses legacy task names only for the default home and isolates scoped/prefix homes', () => {
+    expect(windowsTaskName('daemon', defaultHome, defaultHome)).toBe('imcodes-daemon');
+    expect(windowsTaskName('daemon', scopedA, defaultHome)).toMatch(/^imcodes-daemon-[0-9a-f]{12}$/);
+    expect(windowsTaskName('daemon', scopedA, defaultHome)).not.toBe(windowsTaskName('daemon', scopedB, defaultHome));
+    expect(windowsTaskName('s4u-guard', scopedA, defaultHome)).toMatch(/^imcodes-daemon-s4u-guard-[0-9a-f]{12}$/);
+    expect(windowsTaskName('watchdog', scopedA, defaultHome)).toMatch(/^imcodes-daemon-watchdog-[0-9a-f]{12}$/);
+    expect(windowsTaskName('daemon', 'C:/Temp/lock/', defaultHome)).toBe(windowsTaskName('daemon', 'c:\\temp\\lock', defaultHome));
+  });
   it('isolates default and scoped A/B artifacts in both directions', () => {
     const defaultCommand = `cmd.exe /c "${canonicalWatchdogPath(defaultHome)}"`;
     const aCommand = `cmd.exe /c "${canonicalWatchdogPath(scopedA)}"`;
