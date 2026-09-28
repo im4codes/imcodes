@@ -763,7 +763,20 @@ export async function isTmuxSessionResourceHandleCurrent(
       const c = await conpty();
       if (!c.conptySessionExists(session) || !c.conptyIsPaneAlive(session)) return false;
       const currentPaneId = String(c.conptyGetPid(session));
-      return currentPaneId === paneId ? true : null;
+      if (currentPaneId === paneId) return true;
+      // A restart may have already created the successor ConPTY, so the
+      // registry's old pane id no longer appears in the live-session map. In
+      // that case distinguish a dead old process (safe stale-owner reclaim)
+      // from a genuinely live foreign owner (fail closed). Numeric ConPTY
+      // pane ids are process ids; an inconclusive/non-numeric id remains null.
+      const oldPid = Number.parseInt(paneId, 10);
+      if (!Number.isInteger(oldPid) || oldPid <= 0) return null;
+      try {
+        process.kill(oldPid, 0);
+        return null;
+      } catch {
+        return false;
+      }
     } catch {
       return null;
     }
