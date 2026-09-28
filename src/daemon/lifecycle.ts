@@ -1842,7 +1842,7 @@ async function performShutdown(exitCode: number): Promise<void> {
       peerAuditService.shutdown();
       if ((BACKEND as string) === 'conpty') {
         const conpty = await import('../agent/conpty.js');
-        for (const name of conpty.conptyListSessions()) conpty.conptyKillSession(name);
+        for (const name of conpty.conptyListSessions()) await conpty.conptyKillSession(name);
       }
       await cgroupValidationProbes?.stopPhase('session');
       logger.info({ shutdownPhase: 'session' }, 'Daemon shutdown phase session completed');

@@ -499,7 +499,7 @@ export async function newSession(name: string, command?: string, opts?: NewSessi
 export async function killSession(name: string): Promise<void> {
   if (BACKEND === 'conpty') {
     const c = await conpty();
-    c.conptyKillSession(name);
+    await c.conptyKillSession(name);
     return;
   }
   if (BACKEND === 'wezterm') {

@@ -9,8 +9,9 @@
  *   Subscribers are wrapped in Readable streams by tmux.ts for terminal streaming.
  */
 
-import { execSync } from 'child_process';
+import { execFile as execFileCallback } from 'node:child_process';
 import { dirname, join } from 'path';
+import { promisify } from 'node:util';
 
 import logger from '../util/logger.js';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
@@ -76,6 +77,7 @@ interface ConptySession {
 }
 
 const sessions = new Map<string, ConptySession>();
+const execFile = promisify(execFileCallback);
 
 // ── Ring buffer helper ──────────────────────────────────────────────────────────
 
@@ -214,14 +216,18 @@ export async function conptyNewSession(
  * Kill a ConPTY session, terminating the entire process tree on Windows.
  * No-op if the session does not exist.
  */
-export function conptyKillSession(name: string): void {
+export async function conptyKillSession(name: string): Promise<void> {
   const session = sessions.get(name);
   if (!session) return;
 
-  // Kill entire process tree on Windows before pty.kill()
+  // Kill the entire process tree without blocking the daemon event loop. The
+  // old execSync taskkill could stall heartbeats/control for several seconds.
   if (process.platform === 'win32') {
     try {
-      execSync(`taskkill /F /T /PID ${session.pty.pid}`, { stdio: 'ignore' });
+      await execFile('taskkill.exe', ['/F', '/T', '/PID', String(session.pty.pid)], {
+        windowsHide: true,
+        timeout: 2_000,
+      });
     } catch {
       // Process may already be dead — ignore
     }
@@ -423,7 +429,7 @@ export async function conptyRespawnPane(name: string, cmd: string, opts?: { env?
   const oldCwd = session?.cwd;
 
   // Kill existing (also removes from map)
-  conptyKillSession(name);
+  await conptyKillSession(name);
 
   // Spawn new session with same name, preserved CWD, and injected env vars
   await conptyNewSession(name, cmd, { cwd: oldCwd, env: opts?.env });
