@@ -438,6 +438,51 @@ describe('file-transfer local handle hardening', () => {
     });
   });
 
+  it('stores id-backed uploads under an id directory using the original filename', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const done = createServerLinkMock();
+    const id = '0123456789abcdef0123456789abcdef';
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'upload-nested',
+      filename: id,
+      originalName: '截图 2026.png',
+      mime: 'image/png',
+      size: 5,
+      content: Buffer.from('hello').toString('base64'),
+    }, done.serverLink as never);
+    const attachment = (done.sent.find((entry) => (entry as { type?: string }).type === 'file.upload_done') as { attachment: { daemonPath: string; id: string; originalName: string } }).attachment;
+    expect(attachment.id).toBe(id);
+    expect(attachment.originalName).toBe('截图 2026.png');
+    expect(attachment.daemonPath).toContain(path.join(id, '截图 2026.png'));
+    await expect(readFile(attachment.daemonPath, 'utf8')).resolves.toBe('hello');
+    await transfer.handleFileDelete({ type: FILE_TRANSFER_MSG.DELETE, requestId: 'delete-nested', attachmentId: id }, done.serverLink as never);
+    await expect(stat(path.dirname(attachment.daemonPath))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('keeps duplicate original names in distinct id directories', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const first = createServerLinkMock();
+    const second = createServerLinkMock();
+    const originalName = '报价单 v2.xlsx';
+    const payload = Buffer.from('same-name');
+    await transfer.handleFileUpload({
+      type: 'file.upload', uploadId: 'upload-duplicate-1', filename: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
+      originalName, sanitizedName: originalName, size: payload.length, content: payload.toString('base64'),
+    }, first.serverLink as never);
+    await transfer.handleFileUpload({
+      type: 'file.upload', uploadId: 'upload-duplicate-2', filename: 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb',
+      originalName, sanitizedName: originalName, size: payload.length, content: payload.toString('base64'),
+    }, second.serverLink as never);
+    const a = (first.sent.find((entry) => (entry as { type?: string }).type === 'file.upload_done') as { attachment: { daemonPath: string } }).attachment;
+    const b = (second.sent.find((entry) => (entry as { type?: string }).type === 'file.upload_done') as { attachment: { daemonPath: string } }).attachment;
+    expect(a.daemonPath).not.toBe(b.daemonPath);
+    expect(a.daemonPath).toContain(path.join('aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', originalName));
+    expect(b.daemonPath).toContain(path.join('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', originalName));
+    await expect(readFile(a.daemonPath)).resolves.toEqual(payload);
+    await expect(readFile(b.daemonPath)).resolves.toEqual(payload);
+  });
+
   it('downloads relay-staged uploads over HTTP and registers the attachment', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
     const fetchMock = vi.fn().mockResolvedValue(new Response('hello', { status: 200 }));
@@ -636,6 +681,9 @@ describe('file-transfer local handle hardening', () => {
     const uploadPath = path.join(fakeHome, '.imcodes', 'uploads', 'delete-me.txt');
     await expect(stat(uploadPath)).resolves.toMatchObject({ size: 5 });
     await expect(stat(`${uploadPath}.meta.json`)).resolves.toBeDefined();
+    const legacyDownload = await transfer.resolveDirectFileDownloadSource('delete-me.txt');
+    expect(legacyDownload.filename).toBe('delete-me.txt');
+    await expect(readFile(legacyDownload.readPath, 'utf8')).resolves.toBe('hello');
 
     const deleted = createServerLinkMock();
     await transfer.handleFileDelete({

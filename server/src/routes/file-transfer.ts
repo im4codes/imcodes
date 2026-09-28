@@ -51,6 +51,7 @@ import {
 } from '../share/machine-access.js';
 import { resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { sanitizeUploadFilename } from '../../../shared/upload-filename.js';
 import { FS_GENERIC_ERROR_CODES } from '../../../shared/fs-error-codes.js';
 import type {
   AttachmentRef,
@@ -340,13 +341,14 @@ async function acceptResumableBrowserChunk(params: {
     } catch { /* first chunk */ }
     if (!meta) {
       if (params.offset !== 0) throw Object.assign(new Error('upload_offset_mismatch'), { committedBytes: 0 });
-      const ext = path.extname(params.originalName).replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
       meta = {
         version: 1,
         serverId: params.serverId,
         userId: params.userId,
         clientUploadId: params.clientUploadId,
-        filename: `${randomHex(16)}${ext}`,
+        // The daemon owns the durable layout. This is the stable attachment
+        // id; the original name is carried separately and sanitized there.
+        filename: randomHex(16),
         originalName: params.originalName,
         ...(params.chunk.type ? { mime: params.chunk.type } : {}),
         ...(params.destinationDirectory ? { destinationDirectory: params.destinationDirectory } : {}),
@@ -460,7 +462,8 @@ function respondBase64Download(
   // both for maximum client compatibility.
   const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
   const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-  c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+  const disposition = mime.toLowerCase().startsWith('image/') ? 'inline' : 'attachment';
+  c.header('Content-Disposition', `${disposition}; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
   return c.body(content, status as 200 | 206);
 }
 
@@ -574,7 +577,8 @@ async function attemptStreamedDownload(
     if (size !== undefined) c.header('Content-Length', String(size));
     const safeFilename = filename.replace(/[^\x20-\x7E]/g, '_').replace(/"/g, '\\"');
     const encodedFilename = encodeURIComponent(filename).replace(/'/g, '%27');
-    c.header('Content-Disposition', `attachment; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
+    const disposition = mime.toLowerCase().startsWith('image/') ? 'inline' : 'attachment';
+    c.header('Content-Disposition', `${disposition}; filename="${safeFilename}"; filename*=UTF-8''${encodedFilename}`);
     c.header('Cache-Control', 'no-store');
     return {
       kind: 'done',
@@ -1184,6 +1188,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   const uploadOffset = typeof rawUploadOffset === 'string' ? Number(rawUploadOffset) : Number.NaN;
   const uploadTotalSize = typeof rawUploadTotalSize === 'string' ? Number(rawUploadTotalSize) : Number.NaN;
   const uploadOriginalName = typeof rawUploadOriginalName === 'string' ? rawUploadOriginalName : '';
+  const storageName = sanitizeUploadFilename(uploadOriginalName || (file instanceof File ? file.name : 'file'));
   const uploadLastModified = typeof rawUploadLastModified === 'string' ? Number(rawUploadLastModified) : Number.NaN;
   if (resumableRequested && (
     !clientUploadId
@@ -1256,8 +1261,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     stagedSize = accepted.committedBytes;
     stagedMime = accepted.mime;
   } else {
-    const ext = path.extname(file.name || '').replace(/[^a-zA-Z0-9.]/g, '').slice(0, 20);
-    filename = `${randomHex(16)}${ext}`;
+    filename = randomHex(16);
     stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
     stagedPath = path.join(stagedDir, filename);
     stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
@@ -1310,6 +1314,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       uploadId,
       filename,
       originalName: (resumableRequested ? uploadOriginalName : file.name) || undefined,
+      sanitizedName: storageName,
       mime: stagedMime,
       size: stagedSize,
       downloadUrl: buildStagedUploadUrl(c.req.url, c.env.SERVER_URL, serverId, uploadId, token),
@@ -1322,6 +1327,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
       uploadId,
       filename,
       originalName: (resumableRequested ? uploadOriginalName : file.name) || undefined,
+      sanitizedName: storageName,
       mime: stagedMime,
       size: stagedSize,
       content: (await readFile(stagedPath)).toString('base64'),

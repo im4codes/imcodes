@@ -1,4 +1,6 @@
 import crypto from 'node:crypto';
+import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises';
+import path from 'node:path';
 import { createRequire } from 'node:module';
 
 const require = createRequire(new URL('../../../server/package.json', import.meta.url));
@@ -33,6 +35,9 @@ const allSessionNames = [...sessionNames, ...longChatSessions.map((item) => item
 const historyNames = [...allSessionNames, ...subSessionNames];
 const hash = crypto.createHash('sha256').update(token).digest('hex');
 const apiKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
+const uploadRoot = process.env.IMC_PERF_UPLOAD_ROOT ?? '/tmp/imc-perf-uploads';
+const uploadRegistry = new Map();
+await mkdir(uploadRoot, { recursive: true });
 process.stdout.write(JSON.stringify({ phase: 'starting', sessions, streamHz, expectedRates: { assistantTextPerSecond: streamingSessions * streamHz, agentStatusPerSecond: Math.max(0, sessions - streamingSessions) * streamHz, sessionStatePerSecond: sessions, usagePerSecond: Math.min(3, sessions) * streamHz } }) + '\n');
 
 const client = new Client({ connectionString: databaseUrl });
@@ -78,7 +83,7 @@ const ws = new WebSocket(`${serverUrl}/api/server/${encodeURIComponent(serverId)
 await new Promise((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
 process.stdout.write(JSON.stringify({ phase: 'socket_open' }) + '\n');
 ws.send(JSON.stringify({ type: 'auth', serverId, token, daemonVersion: 'perf-harness' }));
-ws.send(JSON.stringify({ type: 'daemon.hello', daemonId: serverId, capabilities: ['timeline.protocol.v1'], timelineProtocolRevision: 1, helloEpoch: 1, sentAt: Date.now() }));
+ws.send(JSON.stringify({ type: 'daemon.hello', daemonId: serverId, capabilities: ['timeline.protocol.v1', 'file.transfer.upload_fetch.v1'], timelineProtocolRevision: 1, helloEpoch: 1, sentAt: Date.now() }));
 
 const epoch = 1;
 const history = new Map(historyNames.map((name) => [name, []]));
@@ -122,10 +127,62 @@ announce();
 const announceTimer = setInterval(announce, 2_000);
 process.stdout.write(JSON.stringify({ connected: true, serverId, sessions: sessionNames.length }) + '\n');
 
+async function handleUpload(msg) {
+  const originalName = typeof msg.originalName === 'string' ? msg.originalName : 'file';
+  const sanitizedName = typeof msg.sanitizedName === 'string' && msg.sanitizedName.length > 0
+    ? msg.sanitizedName : originalName.replace(/[\\/:*?"<>|\u0000-\u001f]/g, '_');
+  let bytes;
+  if (msg.type === 'file.upload_fetch' && typeof msg.downloadUrl === 'string') {
+    const response = await fetch(msg.downloadUrl);
+    if (!response.ok) throw new Error(`staged upload fetch failed: ${response.status}`);
+    bytes = Buffer.from(await response.arrayBuffer());
+  } else if (typeof msg.content === 'string') {
+    bytes = Buffer.from(msg.content, 'base64');
+  } else {
+    throw new Error('upload payload missing bytes');
+  }
+  const attachmentId = crypto.randomBytes(16).toString('hex');
+  const attachmentDir = path.join(uploadRoot, attachmentId);
+  const filePath = path.join(attachmentDir, sanitizedName);
+  await mkdir(attachmentDir, { recursive: true });
+  await writeFile(filePath, bytes, { flag: 'wx' });
+  const mime = msg.mime ?? 'application/octet-stream';
+  const record = { id: attachmentId, originalName, sanitizedName, mime, size: bytes.length, filePath };
+  uploadRegistry.set(attachmentId, record);
+  await appendFile(path.join(uploadRoot, 'manifest.ndjson'), `${JSON.stringify(record)}\n`);
+  ws.send(JSON.stringify({ type: 'file.upload_done', uploadId: msg.uploadId, attachment: {
+    id: attachmentId, source: 'upload', serverId, daemonPath: filePath,
+    originalName, sanitizedName, mime, size: bytes.length,
+    createdAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 86400000).toISOString(), downloadable: true,
+  } }));
+}
+
+async function handleDownload(msg) {
+  const record = uploadRegistry.get(msg.attachmentId);
+  if (!record) {
+    ws.send(JSON.stringify({ type: 'file.download_error', downloadId: msg.downloadId, attachmentId: msg.attachmentId, message: 'not_found' }));
+    return;
+  }
+  const bytes = await readFile(record.filePath);
+  ws.send(JSON.stringify({ type: 'file.download_done', downloadId: msg.downloadId, content: bytes.toString('base64'), mime: record.mime, filename: record.originalName, size: bytes.length }));
+}
+
 ws.on('message', (raw) => {
   let msg;
   try { msg = JSON.parse(raw.toString()); } catch { return; }
   if (!msg || typeof msg !== 'object') return;
+  if (msg.type === 'file.upload_fetch' || msg.type === 'file.upload') {
+    void handleUpload(msg).catch((error) => {
+      ws.send(JSON.stringify({ type: 'file.upload_error', uploadId: msg.uploadId, message: error instanceof Error ? error.message : String(error) }));
+    });
+    return;
+  }
+  if (msg.type === 'file.download') {
+    void handleDownload(msg).catch((error) => {
+      ws.send(JSON.stringify({ type: 'file.download_error', downloadId: msg.downloadId, attachmentId: msg.attachmentId, message: error instanceof Error ? error.message : String(error) }));
+    });
+    return;
+  }
   // The real SPA probes these daemon-backed P2P endpoints from every tab.
   // Answer them explicitly so the server's pending-request map does not fill
   // with synthetic requests that this harness forgot to service.

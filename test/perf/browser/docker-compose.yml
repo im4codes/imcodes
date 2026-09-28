@@ -71,6 +71,7 @@ services:
     volumes:
       - ../../..:/repo
       - perf_home:/tmp/imc-perf-home
+      - perf_uploads:/tmp/imc-perf-uploads
     environment:
       HOME: /tmp/imc-perf-home
       IMCODES_HOME: /tmp/imc-perf-home/.imcodes
@@ -82,6 +83,7 @@ services:
       NODE_PATH: /app/node_modules
       IMC_PERF_VARIANT: ${IMC_PERF_VARIANT:-baseline}
       IMC_PERF_STREAMING_SESSIONS: ${IMC_PERF_STREAMING_SESSIONS:-5}
+      IMC_PERF_UPLOAD_ROOT: /tmp/imc-perf-uploads
     command: ["node", "/repo/test/perf/browser/daemon-client.mjs"]
     depends_on:
       server:
@@ -101,6 +103,7 @@ services:
       - type: bind
         source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
         target: /repo/perf-results
+      - perf_uploads:/tmp/imc-perf-uploads:ro
     environment:
       HOME: /tmp/imc-perf-home
       IMCODES_HOME: /tmp/imc-perf-home/.imcodes
@@ -122,6 +125,7 @@ services:
       IMC_PERF_LOCK_WAIT_MS: ${IMC_PERF_LOCK_WAIT_MS:-0}
       IMC_PERF_LOADAVG_BEFORE: ${IMC_PERF_LOADAVG_BEFORE:-unknown}
       IMC_PERF_RENDER_DEBUG: ${IMC_PERF_RENDER_DEBUG:-0}
+      IMC_PERF_UPLOAD_ROOT: /tmp/imc-perf-uploads
     command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/run.mjs"]
     depends_on:
       web:
@@ -195,3 +199,4 @@ volumes:
   perf_results:
   shell_perf_home:
   shell_perf_results:
+  perf_uploads:
