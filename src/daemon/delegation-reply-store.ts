@@ -2,7 +2,6 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 import {
@@ -24,7 +23,7 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'delegation-replies.sqlite');
+function defaultDbPath(): string { return join(resolveImcodesHome(), 'delegation-replies.sqlite'); }
 
 function persistedMessageKind(result: string): AgentDelegationReplyMessageKind {
   try {
@@ -210,7 +209,7 @@ export class DelegationReplyStore {
     } else {
       const dbPath = options.dbPath?.trim()
         || process.env.IMCODES_DELEGATION_REPLY_DB_PATH?.trim()
-        || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+        || (process.env.VITEST ? ':memory:' : defaultDbPath());
       assertNotRealImcodesPathInTests(dbPath, 'delegation-replies.sqlite');
       if (dbPath !== ':memory:') mkdirSync(dirname(dbPath), { recursive: true });
       this.#db = new DatabaseSync(dbPath);

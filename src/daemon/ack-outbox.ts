@@ -17,7 +17,6 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
  */
 
 import { mkdir, readFile, writeFile, appendFile, rename } from 'fs/promises';
-import { homedir } from 'os';
 import { join } from 'path';
 import logger from '../util/logger.js';
 import {
@@ -54,8 +53,7 @@ export interface AckOutboxSender {
   isConnected?: () => boolean;
 }
 
-const DEFAULT_DIR = resolveImcodesHome();
-const DEFAULT_FILE = join(DEFAULT_DIR, 'ack-outbox.jsonl');
+function defaultFile(): string { return join(resolveImcodesHome(), 'ack-outbox.jsonl'); }
 
 export class AckOutbox {
   private entries = new Map<string, AckOutboxEntry>();
@@ -64,7 +62,7 @@ export class AckOutbox {
   private writing: Promise<void> = Promise.resolve();
   private gcTimer?: ReturnType<typeof setInterval>;
 
-  constructor(filePath: string = DEFAULT_FILE) {
+  constructor(filePath: string = defaultFile()) {
     this.filePath = filePath;
   }
 

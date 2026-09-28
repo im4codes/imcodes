@@ -46,13 +46,38 @@ export function resolveImcodesHome(options: WindowsDaemonLockPathOptions = {}): 
   const configuredHome = options.env
     ? options.env.IMCODES_HOME?.trim()
     : process.env.IMCODES_HOME?.trim();
-  if (configuredHome) return resolveLockPath(configuredHome);
 
   // Test runners commonly override HOME without changing USERPROFILE (the
   // value Node uses for homedir() on Windows). Honor that explicit HOME when
   // it points somewhere else so isolated daemons receive their own pipe.
   const configuredUserHome = options.env ? options.env.HOME?.trim() : process.env.HOME?.trim();
-  if (configuredUserHome
+  const configuredUserProfile = options.env ? options.env.USERPROFILE?.trim() : process.env.USERPROFILE?.trim();
+  // Vitest's global setup supplies IMCODES_HOME, while a number of legacy
+  // tests deliberately replace HOME for one module and expect its state under
+  // that replacement. Keep the production rule (IMCODES_HOME wins) intact,
+  // but treat a divergent test HOME as the per-test override; the setup value
+  // is stale only when its parent no longer matches HOME.
+  const runningVitest = process.env.VITEST === 'true' || process.env.VITEST_WORKER_ID !== undefined;
+  if (configuredHome && runningVitest && configuredUserHome) {
+    const configuredParent = looksLikeWindowsPath(configuredHome)
+      ? win32.dirname(configuredHome)
+      : dirname(configuredHome);
+    const sameHome = looksLikeWindowsPath(configuredHome) || looksLikeWindowsPath(configuredUserHome)
+      ? normalizeWindowsLockPath(configuredParent) === normalizeWindowsLockPath(configuredUserHome)
+      : resolve(configuredParent) === resolve(configuredUserHome);
+    if (!sameHome) return resolveLockPath(join(configuredUserHome, '.imcodes'));
+  }
+  if (configuredHome) return resolveLockPath(configuredHome);
+  // On POSIX, HOME is the same source as os.homedir() and test suites often
+  // mock homedir() without rewriting the process environment.  Treating an
+  // ordinary POSIX HOME as authoritative here makes those mocks resolve into
+  // the real developer home.  HOME divergence is only a Windows concern
+  // (where USERPROFILE drives os.homedir()); Windows-shaped paths also let
+  // unit tests exercise that branch on a non-Windows host.
+  const windowsHomeOverride = process.platform === 'win32'
+    || looksLikeWindowsPath(configuredUserHome ?? '')
+    || looksLikeWindowsPath(configuredUserProfile ?? '');
+  if (windowsHomeOverride && configuredUserHome
     && normalizeWindowsLockPath(configuredUserHome) !== normalizeWindowsLockPath(homedir())) {
     return resolveLockPath(join(configuredUserHome, '.imcodes'));
   }

@@ -7,7 +7,6 @@ import { constants as fsConstants, createReadStream, createWriteStream, realpath
 import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, statfs, lstat, unlink, rm, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
-import { homedir } from 'node:os';
 import { Readable, Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
@@ -79,7 +78,7 @@ export interface FileTransferSender {
 }
 
 /** Upload directory — ~/.imcodes/uploads (persists across reboots, unlike /tmp). */
-const UPLOAD_DIR = path.join(resolveImcodesHome(), 'uploads');
+function uploadDir(): string { return path.join(resolveImcodesHome(), 'uploads'); }
 
 // ── Attachment registry ─────────────────────────────────────────────────────
 
@@ -224,7 +223,7 @@ export async function resolveDirectFileDownloadSource(attachmentId: string): Pro
   }
 
   const resolved = path.resolve(entry.daemonPath);
-  const uploadDirResolved = path.resolve(UPLOAD_DIR);
+  const uploadDirResolved = path.resolve(uploadDir());
   const isUpload = resolved.startsWith(uploadDirResolved + path.sep);
   if (!isUpload && entry.source !== 'local') {
     throw new Error('not_found');
@@ -288,10 +287,10 @@ const UPLOAD_ID_RE = /^[a-f0-9]{32}$/i;
 export function resolveUploadPathForName(filename: string, originalName?: string): string {
   const storageId = fileTransferStorageId(filename);
   const filePath = originalName !== undefined && UPLOAD_ID_RE.test(storageId)
-    ? path.join(UPLOAD_DIR, storageId, sanitizeUploadFilename(originalName))
-    : path.join(UPLOAD_DIR, filename);
+    ? path.join(uploadDir(), storageId, sanitizeUploadFilename(originalName))
+    : path.join(uploadDir(), filename);
   const resolved = path.resolve(filePath);
-  if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
+  if (!resolved.startsWith(path.resolve(uploadDir()) + path.sep)) {
     throw new Error('path_traversal');
   }
   return resolved;
@@ -660,7 +659,7 @@ let initialized = false;
  * split-brain the host-call boundary exists to prevent.
  */
 export async function ensureUploadDirectory(): Promise<void> {
-  await mkdir(UPLOAD_DIR, { recursive: true }).catch(() => {});
+  await mkdir(uploadDir(), { recursive: true }).catch(() => {});
 }
 
 export async function initFileTransfer(): Promise<void> {
@@ -674,7 +673,7 @@ export async function initFileTransfer(): Promise<void> {
 /** Scan upload dir and rebuild attachment registry for surviving files. */
 async function recoverRegistry(): Promise<void> {
   try {
-    const files = await readdir(UPLOAD_DIR);
+    const files = await readdir(uploadDir());
     const now = Date.now();
     for (const file of files) {
       if (file.endsWith('.meta.json')) continue; // skip sidecar files
@@ -684,7 +683,7 @@ async function recoverRegistry(): Promise<void> {
       if (file.endsWith(DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX)) continue;
       if (attachmentRegistry.has(file)) continue;
       try {
-        const filePath = path.join(UPLOAD_DIR, file);
+        const filePath = path.join(uploadDir(), file);
         const fileStat = await stat(filePath);
         if (fileStat.isDirectory() && UPLOAD_ID_RE.test(file)) {
           const children = (await readdir(filePath)).filter((name) => name !== '.meta.json');
@@ -855,7 +854,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
 async function deleteUploadedAttachment(entry: AttachmentEntry): Promise<void> {
   if (entry.source !== 'upload') throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
   const resolved = path.resolve(entry.daemonPath);
-  const uploadRoot = path.resolve(UPLOAD_DIR);
+  const uploadRoot = path.resolve(uploadDir());
   if (!resolved.startsWith(`${uploadRoot}${path.sep}`)) throw new Error(FILE_TRANSFER_DELETE_ERROR.FORBIDDEN);
   try {
     await unlink(resolved);
@@ -1349,10 +1348,10 @@ async function cleanupExpiredUploads(): Promise<void> {
 
   // Clean actual files in upload dir
   try {
-    const files = await readdir(UPLOAD_DIR);
+    const files = await readdir(uploadDir());
     for (const file of files) {
       try {
-        const filePath = path.join(UPLOAD_DIR, file);
+        const filePath = path.join(uploadDir(), file);
         const fileStat = await stat(filePath);
         const age = now - fileStat.mtimeMs;
         if (age > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) {

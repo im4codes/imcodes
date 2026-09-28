@@ -1,7 +1,7 @@
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createWriteStream, existsSync, mkdirSync, renameSync, statSync, unlinkSync, type WriteStream } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir, loadavg } from 'node:os';
+import { loadavg } from 'node:os';
 import { PerformanceObserver, monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import logger from '../util/logger.js';
 import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
@@ -59,15 +59,15 @@ interface RecentServerSend {
 }
 
 const TRUE_RE = /^(1|true|yes|on|debug)$/i;
-const DEFAULT_LOG_DIR = join(resolveImcodesHome(), 'logs');
-const DEFAULT_FLAG_FILE = join(resolveImcodesHome(), 'latency-trace.enabled');
-const DEFAULT_LOG_FILE = join(DEFAULT_LOG_DIR, 'latency-trace.ndjson');
+function defaultLogDir(): string { return join(resolveImcodesHome(), 'logs'); }
+function defaultFlagFile(): string { return join(resolveImcodesHome(), 'latency-trace.enabled'); }
+function defaultLogFile(): string { return join(defaultLogDir(), 'latency-trace.ndjson'); }
 const MAX_LOG_SIZE = 100 * 1024 * 1024;
 const MAX_OLD_LOGS = 3;
 const COMMAND_RECEIPT_TTL_MS = 60_000;
 const COMMAND_RECEIPT_MAX = 2_000;
 
-let enabled = envFlag('IMCODES_DAEMON_LATENCY_TRACE') || existsSync(process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? DEFAULT_FLAG_FILE);
+let enabled = false;
 let stream: WriteStream | null = null;
 let started = false;
 let sampleTimer: ReturnType<typeof setInterval> | null = null;
@@ -104,7 +104,7 @@ function numberEnv(name: string, fallback: number, min: number): number {
 }
 
 function logFilePath(): string {
-  return process.env.IMCODES_DAEMON_LATENCY_TRACE_FILE || DEFAULT_LOG_FILE;
+  return process.env.IMCODES_DAEMON_LATENCY_TRACE_FILE || defaultLogFile();
 }
 
 function spanThresholdMs(): number {
@@ -317,12 +317,14 @@ export function isLatencyTracerEnabled(): boolean {
 export function startLatencyTracer(): void {
   if (started) return;
   started = true;
+  enabled = envFlag('IMCODES_DAEMON_LATENCY_TRACE')
+    || existsSync(process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? defaultFlagFile());
   if (!enabled) return;
 
   ensureStream();
   writeTrace('tracer_start', {
     logFile: logFilePath(),
-    flagFile: process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? DEFAULT_FLAG_FILE,
+    flagFile: process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? defaultFlagFile(),
     sampleIntervalMs: sampleIntervalMs(),
     driftThresholdMs: driftThresholdMs(),
     spanThresholdMs: spanThresholdMs(),

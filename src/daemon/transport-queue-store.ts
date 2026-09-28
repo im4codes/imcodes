@@ -1,7 +1,6 @@
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import { mkdirSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 

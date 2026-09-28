@@ -3,7 +3,6 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
 import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
 import type {
   ProjectionSessionMeta,
@@ -22,7 +21,7 @@ type WorkerRequest = {
 }[ProjectionWorkerRequestType];
 
 const PROJECTION_VERSION = 1;
-const TIMELINE_DIR = join(resolveImcodesHome(), 'timeline');
+function timelineDir(): string { return join(resolveImcodesHome(), 'timeline'); }
 const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
   ? workerData.dbPath
   : join(resolveImcodesHome(), 'timeline.sqlite');
@@ -34,7 +33,7 @@ let writesSinceCheckpoint = 0;
 
 function sessionFilePath(sessionId: string): string {
   const safe = sessionId.replace(/[^a-zA-Z0-9_-]/g, '_');
-  return join(TIMELINE_DIR, `${safe}.jsonl`);
+  return join(timelineDir(), `${safe}.jsonl`);
 }
 
 function ensureDb(): DatabaseSyncInstance {

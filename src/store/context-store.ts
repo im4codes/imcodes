@@ -1,5 +1,4 @@
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdirSync, statSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
@@ -87,7 +86,7 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 export type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'shared-agent-context.sqlite');
+function defaultDbPath(): string { return join(resolveImcodesHome(), 'shared-agent-context.sqlite'); }
 const DEFAULT_LOCAL_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
 
 let db: DatabaseSyncInstance | null = null;
@@ -113,7 +112,7 @@ import { assertNotRealImcodesPathInTests } from '../util/test-home-guard.js';
 export { setArchiveBackfillSchedulingEnabled } from './archive-backfill-scheduling.js';
 
 function getDbPath(): string {
-  return process.env.IMCODES_CONTEXT_DB_PATH?.trim() || DEFAULT_DB_PATH;
+  return process.env.IMCODES_CONTEXT_DB_PATH?.trim() || defaultDbPath();
 }
 
 

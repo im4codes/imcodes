@@ -11,7 +11,7 @@ import {
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 
 const DAEMON_CONFLICT_SERVER_NAME = `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`;
-const NOTICE_MARKER = join(resolveImcodesHome(), 'cursor-mcp-notice-shown');
+function noticeMarker(): string { return join(resolveImcodesHome(), 'cursor-mcp-notice-shown'); }
 
 export interface CursorMcpEnsureOptions {
   configPath?: string;
@@ -137,7 +137,7 @@ export async function ensureCursorMcpJsonHasImcodesEntry(options: CursorMcpEnsur
       backupPath ? `Restore the previous file from ${backupPath}.` : 'No previous file existed, so no backup was needed.',
       'IM.codes supplies MCP identity through the daemon-spawned cursor-agent process environment for each managed session.',
     ].join(' ');
-    await writeNoticeOnce(options.noticeMarkerPath ?? NOTICE_MARKER, message);
+    await writeNoticeOnce(options.noticeMarkerPath ?? noticeMarker(), message);
     return {
       serverName,
       configPath,

@@ -7,9 +7,9 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
-const IMCODES_DIR = resolveImcodesHome();
-const CONFIG_PATH = join(IMCODES_DIR, 'openclaw.json');
-const OC_CONFIG_PATH = join(homedir(), '.openclaw', 'openclaw.json');
+function imcodesDir(): string { return resolveImcodesHome(); }
+function configPath(): string { return join(imcodesDir(), 'openclaw.json'); }
+function ocConfigPath(): string { return join(homedir(), '.openclaw', 'openclaw.json'); }
 
 export interface OpenClawConnectionConfig {
   url: string;
@@ -19,15 +19,15 @@ export interface OpenClawConnectionConfig {
 
 /** Save connection config with 0600 permissions */
 export async function saveConfig(config: OpenClawConnectionConfig): Promise<void> {
-  await mkdir(IMCODES_DIR, { recursive: true });
-  await writeFile(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
+  await mkdir(imcodesDir(), { recursive: true });
+  await writeFile(configPath(), JSON.stringify(config, null, 2), { mode: 0o600 });
 }
 
 /** Load saved connection config (returns null if not found) */
 export async function loadConfig(): Promise<OpenClawConnectionConfig | null> {
-  if (!existsSync(CONFIG_PATH)) return null;
+  if (!existsSync(configPath())) return null;
   try {
-    const raw = await readFile(CONFIG_PATH, 'utf8');
+    const raw = await readFile(configPath(), 'utf8');
     return JSON.parse(raw) as OpenClawConnectionConfig;
   } catch {
     return null;
@@ -36,8 +36,8 @@ export async function loadConfig(): Promise<OpenClawConnectionConfig | null> {
 
 /** Remove saved connection config */
 export async function removeConfig(): Promise<void> {
-  if (existsSync(CONFIG_PATH)) {
-    await unlink(CONFIG_PATH);
+  if (existsSync(configPath())) {
+    await unlink(configPath());
   }
 }
 
@@ -46,9 +46,9 @@ export async function removeConfig(): Promise<void> {
  * Returns null if not found.
  */
 export function readLocalOCToken(): string | null {
-  if (!existsSync(OC_CONFIG_PATH)) return null;
+  if (!existsSync(ocConfigPath())) return null;
   try {
-    const raw = readFileSync(OC_CONFIG_PATH, 'utf8');
+    const raw = readFileSync(ocConfigPath(), 'utf8');
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const gateway = parsed['gateway'] as Record<string, unknown> | undefined;
     if (!gateway) return null;

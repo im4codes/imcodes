@@ -3,7 +3,6 @@ import { createRequire } from 'node:module';
 import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   isPeerAuditRound,
@@ -109,7 +108,7 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'supervision-state.sqlite');
+function defaultDbPath(): string { return join(resolveImcodesHome(), 'supervision-state.sqlite'); }
 export const SUPERVISION_STATE_VERSION = 1;
 
 /**
@@ -129,7 +128,7 @@ export function resolveSupervisionTaskRegistryDbPath(
   env: NodeJS.ProcessEnv = process.env,
 ): string {
   return env.IMCODES_SUPERVISION_STATE_DB_PATH?.trim()
-    || (env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+    || (env.VITEST ? ':memory:' : defaultDbPath());
 }
 
 export type PersistedSupervisionWaitPhase = 'waiting' | 'auditing';

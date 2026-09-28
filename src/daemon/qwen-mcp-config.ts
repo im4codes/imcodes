@@ -2,7 +2,6 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { execFile, type ExecFileOptions } from 'node:child_process';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import { promisify } from 'node:util';
 import logger from '../util/logger.js';
 import {
@@ -14,7 +13,7 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-n
 import { MEMORY_MCP_PROVIDER_STATUS_REASON } from '../../shared/memory-ws.js';
 
 const execFileAsync = promisify(execFile);
-const NOTICE_MARKER = join(resolveImcodesHome(), 'qwen-mcp-notice-shown');
+function noticeMarker(): string { return join(resolveImcodesHome(), 'qwen-mcp-notice-shown'); }
 const DAEMON_CONFLICT_SERVER_NAME = `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`;
 
 export interface QwenMcpEnsureOptions {
@@ -209,7 +208,7 @@ export async function ensureQwenMcpHasImcodesEntry(options: QwenMcpEnsureOptions
         'IM.codes never removes user MCP entries automatically.',
         'IM.codes supplies MCP identity through the daemon-spawned qwen process environment for each managed session.',
       ].join(' ');
-      await writeNoticeOnce(options.noticeMarkerPath ?? NOTICE_MARKER, message);
+      await writeNoticeOnce(options.noticeMarkerPath ?? noticeMarker(), message);
       return {
         serverName,
         changed: true,

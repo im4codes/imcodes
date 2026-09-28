@@ -10,7 +10,6 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 
 import { promises as fs } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import {
   getCcPresetAvailableModelIds,
   getCcPresetEffectiveModel,
@@ -23,7 +22,7 @@ import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import logger from '../util/logger.js';
 
-const PRESETS_PATH = join(resolveImcodesHome(), 'cc-presets.json');
+function presetsPath(): string { return join(resolveImcodesHome(), 'cc-presets.json'); }
 
 let cachedPresets: CcPreset[] | null = null;
 
@@ -113,12 +112,12 @@ function normalizePresets(raw: unknown): CcPreset[] {
 export async function loadPresets(): Promise<CcPreset[]> {
   if (cachedPresets) return cachedPresets;
   try {
-    const raw = await fs.readFile(PRESETS_PATH, 'utf8');
+    const raw = await fs.readFile(presetsPath(), 'utf8');
     cachedPresets = normalizePresets(JSON.parse(raw));
     return cachedPresets;
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code !== 'ENOENT') {
-      logger.warn({ err, path: PRESETS_PATH }, 'Failed to load CC presets');
+      logger.warn({ err, path: presetsPath() }, 'Failed to load CC presets');
     }
     cachedPresets = [];
     return cachedPresets;
@@ -127,10 +126,10 @@ export async function loadPresets(): Promise<CcPreset[]> {
 
 export async function savePresets(presets: CcPreset[]): Promise<void> {
   const normalized = normalizePresets(presets);
-  await fs.mkdir(dirname(PRESETS_PATH), { recursive: true });
-  const tempPath = `${PRESETS_PATH}.${process.pid}.${Date.now()}.tmp`;
+  await fs.mkdir(dirname(presetsPath()), { recursive: true });
+  const tempPath = `${presetsPath()}.${process.pid}.${Date.now()}.tmp`;
   await fs.writeFile(tempPath, JSON.stringify(normalized, null, 2), 'utf8');
-  await fs.rename(tempPath, PRESETS_PATH);
+  await fs.rename(tempPath, presetsPath());
   cachedPresets = normalized;
 }
 

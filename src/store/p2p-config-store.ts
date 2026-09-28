@@ -1,6 +1,5 @@
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import logger from '../util/logger.js';
 import { isP2pSavedConfig, type P2pSavedConfig } from '../../shared/p2p-modes.js';
@@ -12,8 +11,8 @@ interface P2pConfigStore {
 
 type P2pConfigStoreLoadIssue = 'missing_file' | 'corrupted_file' | 'validation_failed' | null;
 
-const STORE_DIR = resolveImcodesHome();
-const STORE_PATH = join(STORE_DIR, 'p2p-config.json');
+function storeDir(): string { return resolveImcodesHome(); }
+function storePath(): string { return join(storeDir(), 'p2p-config.json'); }
 
 let loaded = false;
 let store: P2pConfigStore = { version: 1, configs: {} };
@@ -38,13 +37,15 @@ async function ensureLoaded(): Promise<void> {
   if (loaded) return;
   if (!loadPromise) {
     loadPromise = (async () => {
-      await mkdir(STORE_DIR, { recursive: true });
+      const dir = storeDir();
+      const path = storePath();
+      await mkdir(dir, { recursive: true });
       try {
-        const raw = await readFile(STORE_PATH, 'utf8');
+        const raw = await readFile(path, 'utf8');
         const parsed = JSON.parse(raw) as unknown;
         if (!isP2pConfigStore(parsed)) {
           lastLoadIssue = 'validation_failed';
-          logger.warn({ path: STORE_PATH }, 'P2P config store validation failed; resetting local authority cache');
+          logger.warn({ path }, 'P2P config store validation failed; resetting local authority cache');
           resetStore();
           return;
         }
@@ -58,7 +59,7 @@ async function ensureLoaded(): Promise<void> {
           return;
         }
         lastLoadIssue = 'corrupted_file';
-        logger.warn({ err, path: STORE_PATH }, 'P2P config store unreadable; resetting local authority cache');
+        logger.warn({ err, path }, 'P2P config store unreadable; resetting local authority cache');
         resetStore();
       } finally {
         loaded = true;
@@ -69,10 +70,12 @@ async function ensureLoaded(): Promise<void> {
 }
 
 async function persist(): Promise<void> {
-  await mkdir(STORE_DIR, { recursive: true });
-  const tmpPath = `${STORE_PATH}.${process.pid}.${Date.now()}.${persistSequence += 1}.tmp`;
+  const dir = storeDir();
+  const path = storePath();
+  await mkdir(dir, { recursive: true });
+  const tmpPath = `${path}.${process.pid}.${Date.now()}.${persistSequence += 1}.tmp`;
   await writeFile(tmpPath, JSON.stringify(store, null, 2), 'utf8');
-  await rename(tmpPath, STORE_PATH);
+  await rename(tmpPath, path);
   lastLoadIssue = null;
 }
 
@@ -100,7 +103,7 @@ export async function removeSavedP2pConfig(scopeSession: string): Promise<void> 
 }
 
 export function getP2pConfigStoreDiagnostics(): { path: string; lastLoadIssue: P2pConfigStoreLoadIssue } {
-  return { path: STORE_PATH, lastLoadIssue };
+  return { path: storePath(), lastLoadIssue };
 }
 
 export function resetP2pConfigStoreForTests(): void {

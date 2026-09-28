@@ -32,7 +32,6 @@ import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
  */
 import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import logger from '../util/logger.js';
 import { loadCredentials } from '../bind/bind-flow.js';
@@ -49,11 +48,11 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'supervisor-defaults-cache.sqlite');
+function defaultDbPath(): string { return join(resolveImcodesHome(), 'supervisor-defaults-cache.sqlite'); }
 
 function resolveDbPath(): string {
   return process.env.IMCODES_SUPERVISOR_DEFAULTS_CACHE_DB_PATH?.trim()
-    || (process.env.VITEST ? ':memory:' : DEFAULT_DB_PATH);
+    || (process.env.VITEST ? ':memory:' : defaultDbPath());
 }
 
 let db: DatabaseSyncInstance | null = null;
