@@ -282,6 +282,25 @@ describe('restartWindowsDaemon', () => {
     expect(state.execCalls.some((call) => call.includes('find-orphans.ps1'))).toBe(false);
   });
 
+  it('default cleanup still kills its own metadata daemon without scanning other homes', async () => {
+    const { WINDOWS_DAEMON_LOCK_PIPE } = await import('../../src/util/windows-daemon-lock.js');
+    state.lockMetadata = {
+      version: 1,
+      pid: 778,
+      startToken: 'windows:778-start',
+      acquiredAt: Date.now(),
+      socketPath: WINDOWS_DAEMON_LOCK_PIPE,
+      sessionIds: [],
+      residualResources: [],
+    };
+    state.alivePids = new Set([778]);
+
+    const { killOrphanDaemonProcesses } = await import('../../src/util/windows-daemon.js');
+    expect(killOrphanDaemonProcesses()).toBe(true);
+    expect(state.execCalls).toContain('taskkill /f /pid 778');
+    expect(state.execCalls.some((call) => call.includes('find-orphans.ps1'))).toBe(false);
+  });
+
   it('scoped restart refuses a stale/reused daemon.pid before taskkill', async () => {
     process.env.HOME = 'C:\\Users\\scoped-a';
     const { windowsDaemonLockPipeName } = await import('../../src/util/windows-daemon-lock.js');
