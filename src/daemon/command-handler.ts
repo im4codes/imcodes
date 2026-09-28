@@ -172,6 +172,7 @@ import {
   buildWindowsUpgradeRunnerVbs,
   resolveWindowsUpgradeRunnerPath,
 } from '../util/windows-upgrade-script.js';
+import { WINDOWS_UPGRADE_RUNNER_STAGED_FILES } from '../util/windows-upgrade-runner-staged-files.js';
 import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
 import { buildBashNodeDatachannelRepair } from '../util/node-datachannel-repair-script.js';
 import {
@@ -8372,8 +8373,8 @@ async function handleDaemonUpgrade(
   } catch { /* defensive — never block the upgrade on a sentinel read error */ }
 
   const { spawn } = await import('child_process');
-  const { writeFileSync, readFileSync, mkdtempSync, existsSync } = await import('fs');
-  const { join, dirname } = await import('path');
+  const { writeFileSync, readFileSync, mkdtempSync, mkdirSync, existsSync } = await import('fs');
+  const { join, dirname, resolve } = await import('path');
   const { tmpdir, homedir } = await import('os');
 
   const { DAEMON_VERSION } = await import('../util/version.js');
@@ -8600,8 +8601,18 @@ launchctl load -w "${plist}"`;
     const runnerSrc = resolveWindowsUpgradeRunnerPath();
     const runnerCopy = join(scriptDir, 'upgrade.mjs');
     try {
-      // Read+write rather than cpSync so a broken runnerSrc fails loud.
-      writeFileSync(runnerCopy, readFileSync(runnerSrc));
+      // Read+write rather than cpSync so a broken runnerSrc fails loud. The
+      // runner is staged with its complete relative-import closure because
+      // npm can replace the installed package while the upgrade is running.
+      const stagedFiles = ['windows-upgrade-runner.mjs', ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES];
+      for (const relativePath of stagedFiles) {
+        const sourcePath = relativePath === 'windows-upgrade-runner.mjs'
+          ? runnerSrc
+          : resolve(dirname(runnerSrc), relativePath);
+        const destinationPath = join(scriptDir, relativePath);
+        mkdirSync(dirname(destinationPath), { recursive: true });
+        writeFileSync(destinationPath, readFileSync(sourcePath));
+      }
     } catch (err) {
       logger.error({ err, runnerSrc }, 'daemon.upgrade: failed to stage upgrade runner — cannot proceed');
       return;

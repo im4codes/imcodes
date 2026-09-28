@@ -631,25 +631,32 @@ async function main() {
   trace(99, 'main-exit-success');
 }
 
-// Top-level try/finally guarantees the lock gets cleared no matter how
-// main() exits — clean return, abort, or unexpected throw.  This is the
-// invariant the cmd.exe version kept getting wrong.
-main()
-  .catch((e) => {
-    log(`FATAL: ${e?.stack ?? e?.message ?? String(e)}`);
-    trace(99, 'main-exit-fatal');
-  })
-  .finally(() => {
-    const cleared = clearLock();
-    log(cleared ? 'lock released' : 'WARNING: failed to release lock — watchdog self-heal will recover');
-    if (upgradeSucceeded) {
-      log('=== upgrade done — tmp dir scheduled for delete in 60s ===');
-      scheduleTmpDelete();
-    } else {
-      // PRESERVE the tmp dir on any failure path so its upgrade.log is
-      // available for postmortem.  This is the bug from 2026-05-08 that
-      // kept us blind to three consecutive silent failures.
-      log(`=== upgrade FAILED — tmp dir PRESERVED for postmortem: ${SCRIPT_DIR} ===`);
-      log('grep [trace] in upgrade.log to find the last reached step.');
-    }
-  });
+// A staged-runner smoke check loads the module without starting an upgrade.
+// Production invocations never pass these flags; they are only used by the
+// bounded staging guard test.
+if (process.argv.includes('--help') || process.argv.includes('--dry-run')) {
+  console.log('windows-upgrade-runner: staged dependency closure loaded');
+} else {
+  // Top-level try/finally guarantees the lock gets cleared no matter how
+  // main() exits — clean return, abort, or unexpected throw.
+  // This is the invariant the cmd.exe version kept getting wrong.
+  main()
+    .catch((e) => {
+      log(`FATAL: ${e?.stack ?? e?.message ?? String(e)}`);
+      trace(99, 'main-exit-fatal');
+    })
+    .finally(() => {
+      const cleared = clearLock();
+      log(cleared ? 'lock released' : 'WARNING: failed to release lock — watchdog self-heal will recover');
+      if (upgradeSucceeded) {
+        log('=== upgrade done — tmp dir scheduled for delete in 60s ===');
+        scheduleTmpDelete();
+      } else {
+        // PRESERVE the tmp dir on any failure path so its upgrade.log is
+        // available for postmortem.  This is the bug from 2026-05-08 that
+        // kept us blind to three consecutive silent failures.
+        log(`=== upgrade FAILED — tmp dir PRESERVED for postmortem: ${SCRIPT_DIR} ===`);
+        log('grep [trace] in upgrade.log to find the last reached step.');
+      }
+    });
+}
