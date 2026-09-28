@@ -976,7 +976,7 @@ export async function materializeMasterSummary(sessionName: string, namespace?: 
     },
     createdAt: previousMaster?.createdAt ?? now,
     updatedAt: now,
-  }]);
+  }], { priority: 'low' });
   // Best-effort, fire-and-forget write-time embedding (see materializeTarget).
   void ensureProjectionEmbeddingForProjection(masterProjection);
   return masterProjection;

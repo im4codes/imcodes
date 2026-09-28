@@ -125,6 +125,7 @@ export async function runMarkdownMemoryIngest(input: {
         const projection = await getContextStoreClient().run<ProcessedContextProjection>(
           'writeProcessedProjection',
           [projectionInput],
+          { priority: 'low' },
         );
         // Best-effort write-time embedding so recall reads a precomputed BLOB.
         void ensureProjectionEmbeddingForProjection(projection);
