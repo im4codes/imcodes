@@ -82,6 +82,10 @@ function reply(res: ContextStoreRpcResponse): void {
 
 function execute(req: ContextStoreRpcRequest): void {
   const { id, op, args } = req;
+  // A queued request is not a hung request.  Acknowledging execution before
+  // entering synchronous SQLite work lets the client start its RPC budget at
+  // the actual operation, not while the request waits behind backfill.
+  port!.postMessage({ type: 'started', id });
   if (!isContextStoreRpcOp(op)) {
     reply({ id, ok: false, error: { code: CONTEXT_STORE_RPC_ERROR.unsupportedOperation, message: `unknown op: ${String(op)}` } });
     return;
@@ -151,6 +155,8 @@ function maybeCheckpoint(): void {
     // every historical summary there can exceed the RPC timeout and trigger a
     // respawn storm on a large store.
     store.ensureContextStoreMaintenanceIndexes();
+    store.backfillNamespaceFilterColumnsBatch();
+    store.backfillProcessedNoiseBatch();
     store.reconcileMaterializedStagedEventsBatch();
     store.purgeMemoryNoiseProjectionsBatch();
     store.checkpointWal();

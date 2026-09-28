@@ -60,6 +60,8 @@ interface PendingEntry {
    *  observed (and applied) the request. A never-dispatched entry is always
    *  cleanly retryable; a dispatched unsafe-retry op is INDETERMINATE. */
   dispatched: boolean;
+  started: boolean;
+  timeoutMs: number;
 }
 
 /** Point-in-time health of the context-store worker, for logs/diagnostics. */
@@ -512,8 +514,21 @@ export class ContextStoreWorkerClient {
       this.notifyHealth();
       return;
     }
+    if ((msg as { type?: unknown }).type === 'started') {
+      const started = msg as { id?: unknown };
+      if (typeof started.id !== 'number') return;
+      const entry = this.pending.get(started.id);
+      if (!entry || entry.started) return;
+      entry.started = true;
+      if (entry.timer) clearTimeout(entry.timer);
+      const timeoutMs = entry.timeoutMs;
+      entry.timer = timeoutMs > 0 ? setTimeout(() => this.onTimeout(started.id as number), timeoutMs) : null;
+      if (entry.timer && typeof entry.timer.unref === 'function') entry.timer.unref();
+      return;
+    }
     const res = msg as ContextStoreRpcResponse;
     if (typeof res.id !== 'number') return;
+    if ('type' in res) return;
     const entry = this.pending.get(res.id);
     if (!entry) return; // late-response discard (already timed out / settled)
     this.finish(res.id, entry);
@@ -695,6 +710,7 @@ export class ContextStoreWorkerClient {
   private onTimeout(id: number): void {
     const entry = this.pending.get(id);
     if (!entry) return;
+    const queued = !entry.started;
     this.finish(id, entry);
     // A timeout is NOT proof the op did not run - the worker may still be
     // executing it. Reads/idempotent writes keep the plain timeout code; a
@@ -705,7 +721,10 @@ export class ContextStoreWorkerClient {
         new ContextStoreError(CONTEXT_STORE_RPC_ERROR.timeout, `context-store RPC timed out: id ${id}`),
       ),
     );
-    if (!entry.fireAndForget) {
+    // Queue starvation is backpressure, not a sick worker.  In particular do
+    // not increment the generation timeout strike or respawn while a request
+    // has not received the started acknowledgement.
+    if (!entry.fireAndForget && !queued) {
       this.consecutiveTimeouts += 1;
       if (this.consecutiveTimeouts >= consecutiveTimeoutsBeforeRespawn) this.respawn();
     }
@@ -743,15 +762,21 @@ export class ContextStoreWorkerClient {
     const priority = opts.priority ?? defaultPriorityForOp(op);
     const timeoutMs = opts.timeoutMs ?? CONTEXT_STORE_RPC_TIMEOUT_MS.r3r5Management;
     return new Promise<T>((resolve, reject) => {
-      const timer = timeoutMs > 0 ? setTimeout(() => this.onTimeout(id), timeoutMs) : null;
+      // The initial timer is only a generous queue guard. Once the worker
+      // acknowledges execution, it is replaced with the normal operation
+      // budget. Queue expiry never contributes a timeout strike/respawn.
+      const queueTimeoutMs = timeoutMs > 0 ? Math.max(timeoutMs * 4, 30_000) : 0;
+      const timer = queueTimeoutMs > 0 ? setTimeout(() => this.onTimeout(id), queueTimeoutMs) : null;
       if (timer && typeof timer.unref === 'function') timer.unref();
       const entry: PendingEntry = {
         resolve: resolve as (v: unknown) => void,
         reject,
         timer,
         fireAndForget: false,
-        op,
-        dispatched: false,
+      op,
+      dispatched: false,
+      started: false,
+      timeoutMs,
       };
       this.pending.set(id, entry);
       this.awaitedCount += 1;
@@ -788,6 +813,8 @@ export class ContextStoreWorkerClient {
       fireAndForget: true,
       op,
       dispatched: false,
+      started: false,
+      timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background,
     };
     this.pending.set(id, entry);
     this.fireAndForgetCount += 1;

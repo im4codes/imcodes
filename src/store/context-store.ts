@@ -267,14 +267,21 @@ function backfillNamespaceFilterColumnsForTable(
   database: DatabaseSyncInstance,
   table: 'context_staged_events' | 'context_dirty_targets' | 'context_jobs' | 'context_processed_local',
   idColumn: 'id' | 'target_key',
+  limit = 256,
 ): number {
+  const cursorKey = `namespace_filter_cursor_${table}`;
+  if (internalGetContextMeta(database, `${cursorKey}_done`) === '1') return 0;
+  const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0) || 0;
   const rows = database.prepare(`
-    SELECT ${idColumn} AS row_id, namespace_key
+    SELECT rowid, ${idColumn} AS row_id, namespace_key
     FROM ${table}
-    WHERE scope IS NULL
-       OR scope = ''
-  `).all() as Array<{ row_id: string; namespace_key: string }>;
-  if (rows.length === 0) return 0;
+    WHERE rowid > ? AND (scope IS NULL OR scope = '')
+    ORDER BY rowid ASC LIMIT ?
+  `).all(cursor, limit) as Array<{ rowid: number; row_id: string; namespace_key: string }>;
+  if (rows.length === 0) {
+    internalSetContextMeta(database, `${cursorKey}_done`, '1');
+    return 0;
+  }
   const update = database.prepare(`
     UPDATE ${table}
     SET scope = ?,
@@ -290,17 +297,19 @@ function backfillNamespaceFilterColumnsForTable(
     const result = update.run(...values, String(row.row_id)) as { changes?: number };
     updated += result.changes ?? 0;
   }
+  internalSetContextMeta(database, cursorKey, String(rows[rows.length - 1]!.rowid));
+  if (rows.length < limit) internalSetContextMeta(database, `${cursorKey}_done`, '1');
   return updated;
 }
 
-function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance): void {
+function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance, limit = 256): void {
   try {
-    database.exec('BEGIN IMMEDIATE');
+    database.exec('BEGIN');
     const updated =
-      backfillNamespaceFilterColumnsForTable(database, 'context_staged_events', 'id') +
-      backfillNamespaceFilterColumnsForTable(database, 'context_dirty_targets', 'target_key') +
-      backfillNamespaceFilterColumnsForTable(database, 'context_jobs', 'id') +
-      backfillNamespaceFilterColumnsForTable(database, 'context_processed_local', 'id');
+      backfillNamespaceFilterColumnsForTable(database, 'context_staged_events', 'id', limit) +
+      backfillNamespaceFilterColumnsForTable(database, 'context_dirty_targets', 'target_key', limit) +
+      backfillNamespaceFilterColumnsForTable(database, 'context_jobs', 'id', limit) +
+      backfillNamespaceFilterColumnsForTable(database, 'context_processed_local', 'id', limit);
     if (updated > 0) {
       internalSetContextMeta(database, 'migration_namespace_filter_columns_backfilled', String(Date.now()));
     }
@@ -312,6 +321,12 @@ function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance): vo
       error: error instanceof Error ? error.message : String(error),
     });
   }
+}
+
+/** Advance normalized namespace columns without making startup proportional to
+ * the historical row count. */
+export function backfillNamespaceFilterColumnsBatch(limit = 256): void {
+  backfillNamespaceFilterColumnsForDb(ensureDb(), Math.max(1, Math.min(1000, Math.floor(limit))));
 }
 
 function ensureDb(): DatabaseSyncInstance {
@@ -403,6 +418,9 @@ function ensureDb(): DatabaseSyncInstance {
       hit_count INTEGER NOT NULL DEFAULT 0,
       last_used_at INTEGER,
       status TEXT NOT NULL DEFAULT 'active',
+      -- Computed once from the summary at write time.  Panel aggregates can
+      -- exclude legacy/noise rows in SQL without reparsing every summary.
+      is_noise INTEGER NOT NULL DEFAULT 0,
       -- Normalized feature-extraction embedding of the summary, encoded as
       -- little-endian Float32 bytes. NULL when the model was unavailable at
       -- write time; recall lazy-fills these on first read.
@@ -688,6 +706,7 @@ function ensureDb(): DatabaseSyncInstance {
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN summary_fingerprint TEXT');
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN content_hash TEXT');
   tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN origin TEXT');
+  tryAlter(db, 'ALTER TABLE context_processed_local ADD COLUMN is_noise INTEGER NOT NULL DEFAULT 0');
   for (const table of ['context_staged_events', 'context_dirty_targets', 'context_jobs', 'context_processed_local']) {
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN scope TEXT`);
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN enterprise_id TEXT`);
@@ -703,6 +722,8 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_processed_local(scope, user_id, project_id, status, class, updated_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_processed_local_project
       ON context_processed_local(project_id, status, class, updated_at DESC);
+    -- Created/advanced by the idle maintenance pass on large existing stores;
+    -- keeping this out of synchronous warmup avoids a first-start index scan.
     CREATE INDEX IF NOT EXISTS idx_context_staged_events_scope_project
       ON context_staged_events(scope, project_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_context_staged_events_scope_owner_project
@@ -770,6 +791,8 @@ function ensureDb(): DatabaseSyncInstance {
 export function ensureContextStoreMaintenanceIndexes(): { created: number; done: boolean } {
   const database = ensureDb();
   const indexes = [
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_panel ON context_processed_local(scope, enterprise_id, workspace_id, user_id, project_id, status, is_noise, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_project_panel ON context_processed_local(project_id, status, is_noise, class, updated_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_created ON context_jobs(target_key, job_type, status, created_at)',
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_updated ON context_jobs(target_key, job_type, status, updated_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_status_type_updated ON context_jobs(status, job_type, updated_at)',
@@ -782,6 +805,26 @@ export function ensureContextStoreMaintenanceIndexes(): { created: number; done:
   database.exec(indexes[index]!);
   internalSetContextMeta(database, cursorKey, String(index + 1));
   return { created: 1, done: index + 1 >= indexes.length };
+}
+
+const PROCESSED_NOISE_BACKFILL_CURSOR_KEY = 'processed_noise_backfill_rowid';
+
+/** Compute the noise bit once for legacy rows.  This is intentionally a small
+ * cursor pass: it runs from idle maintenance and never makes ensureDb/query
+ * latency proportional to the size of a historical store. */
+export function backfillProcessedNoiseBatch(limit = 256): { processed: number; done: boolean } {
+  const database = ensureDb();
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+  const cursor = Number(internalGetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY) ?? 0) || 0;
+  const rows = database.prepare(`
+    SELECT rowid, summary FROM context_processed_local
+    WHERE rowid > ? ORDER BY rowid ASC LIMIT ?
+  `).all(cursor, safeLimit) as Array<{ rowid: number; summary: string }>;
+  if (rows.length === 0) return { processed: 0, done: true };
+  const update = database.prepare('UPDATE context_processed_local SET is_noise = ? WHERE rowid = ?');
+  for (const row of rows) update.run(isMemoryNoiseSummary(row.summary) ? 1 : 0, row.rowid);
+  internalSetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY, String(rows[rows.length - 1]!.rowid));
+  return { processed: rows.length, done: rows.length < safeLimit };
 }
 
 function decodeTarget(row: Record<string, unknown>, namespace: ContextNamespace): ContextTargetRef {
@@ -3645,8 +3688,8 @@ export function writeProcessedProjectionForDb(
     database.prepare(`
       INSERT INTO context_processed_local (
         id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-        class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+        class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint, is_noise
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
       ON CONFLICT(id) DO UPDATE SET
         namespace_key = excluded.namespace_key,
         scope = excluded.scope,
@@ -3661,6 +3704,7 @@ export function writeProcessedProjectionForDb(
         content_hash = excluded.content_hash,
         origin = excluded.origin,
         updated_at = excluded.updated_at,
+        is_noise = excluded.is_noise,
         summary_fingerprint = NULL
     `).run(
       projection.id,
@@ -3674,6 +3718,7 @@ export function writeProcessedProjectionForDb(
       originForDb,
       projection.createdAt,
       projection.updatedAt,
+      isMemoryNoiseSummary(projection.summary) ? 1 : 0,
     );
     syncProjectionSourcesForDb(database, projection.id, projection.sourceEventIds);
     upsertProjectionObservationForDb(database, {
@@ -3705,8 +3750,8 @@ export function writeProcessedProjectionForDb(
   const row = database.prepare(`
     INSERT INTO context_processed_local (
       id, namespace_key, scope, enterprise_id, workspace_id, user_id, project_id,
-      class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      class, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at, summary_fingerprint, is_noise
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(namespace_key, class, summary_fingerprint) WHERE summary_fingerprint IS NOT NULL DO UPDATE SET
       scope = excluded.scope,
       enterprise_id = excluded.enterprise_id,
@@ -3718,7 +3763,8 @@ export function writeProcessedProjectionForDb(
       content_json = excluded.content_json,
       content_hash = excluded.content_hash,
       origin = excluded.origin,
-      updated_at = excluded.updated_at
+      updated_at = excluded.updated_at,
+      is_noise = excluded.is_noise
     RETURNING id, source_event_ids_json, summary, content_json, content_hash, origin, created_at, updated_at
   `).get(
     projectionId,
@@ -3733,6 +3779,7 @@ export function writeProcessedProjectionForDb(
     createdAt,
     updatedAt,
     fingerprint,
+    isMemoryNoiseSummary(summaryForDb) ? 1 : 0,
   ) as { id: string; source_event_ids_json: string; summary: string; content_json: string; content_hash: string | null; origin: string | null; created_at: number; updated_at: number };
   const returnedIds = parseJson<string[]>(row.source_event_ids_json, mergedIds);
   const returnedOrigin = isMemoryOrigin(row.origin) ? row.origin : originForDb;
@@ -4184,6 +4231,7 @@ export function updateProcessedProjectionSummary(input: {
           content_hash = ?,
           updated_at = ?,
           summary_fingerprint = ?,
+          is_noise = ?,
           embedding = NULL,
           embedding_source = NULL
       WHERE id = ?
@@ -4193,6 +4241,7 @@ export function updateProcessedProjectionSummary(input: {
       projectionContentHash(summary, nextContent),
       now,
       nextSummaryFingerprint,
+      isMemoryNoiseSummary(summary) ? 1 : 0,
       input.projectionId,
     );
 
@@ -4756,14 +4805,23 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
+  // Noise is materialized at write time; never parse summaries while opening
+  // the panel.  A bounded LIKE predicate keeps management search from turning
+  // into an unbounded JS scan when a text query is supplied.
+  conditions.push('is_noise = 0');
+  if (normalizedQuery) {
+    conditions.push('(summary LIKE ? OR content_json LIKE ?)');
+    params.push(`%${normalizedQuery}%`, `%${normalizedQuery}%`);
+  }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   // Apply pagination after all namespace/query/noise filters. The previous
   // limit-before-filter shape could hide older matching project rows behind
   // newer rows from other projects and made exact projection/source lookups
   // unreliable for privacy-safe read tools.
-  const sql = `SELECT * FROM context_processed_local ${where} ORDER BY updated_at DESC`;
-  const rows = database.prepare(sql).all(...params) as Array<Record<string, unknown>>;
+  const candidateLimit = normalizedQuery ? Math.min(1000, Math.max(limit * 4, 100)) : limit;
+  const sql = `SELECT * FROM context_processed_local ${where} ORDER BY updated_at DESC LIMIT ?`;
+  const rows = database.prepare(sql).all(...params, candidateLimit) as Array<Record<string, unknown>>;
 
   const filtered = rows
     .map((row) => {
@@ -4784,18 +4842,10 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
         status: typeof row.status === 'string' ? row.status as ProcessedContextProjectionStatus : 'active',
       } satisfies ProcessedContextProjection;
     })
-    .filter((projection) => {
-      // Namespace + class JS filters — applied regardless of SQL predicate coverage.
-      if (!namespaceMatchesFilters(projection.namespace, filters)) return false;
-      // Class was already in SQL (when provided); still safe to double-check.
-      if (filters.projectionClass && projection.class !== filters.projectionClass) return false;
-      if (isMemoryNoiseSummary(projection.summary)) return false;
-      if (normalizedQuery) {
-        const haystack = `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`;
-        if (!memoryTextMatchesQuery(haystack, normalizedQuery)) return false;
-      }
-      return true;
-    });
+    .filter((projection) => !normalizedQuery || memoryTextMatchesQuery(
+      `${projection.summary}\n${JSON.stringify(projectionSemanticContent(projection.content))}`,
+      normalizedQuery,
+    ));
 
   return filtered.slice(0, limit);
 }
@@ -4824,47 +4874,32 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
-  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
-  // content_json can be the dominant projection-table payload. Base stats do
-  // not inspect it, so do not materialize and clone it across the worker RPC.
-  const selectedContent = normalizedQuery ? ', content_json' : '';
-  const rows = database.prepare(`
-    SELECT namespace_key, class, summary, status${selectedContent}
-    FROM context_processed_local
-    ${where}
-  `).all(...params) as Array<Record<string, unknown>>;
-  let totalRecords = 0;
-  let matchedRecords = 0;
-  let recentSummaryCount = 0;
-  let durableCandidateCount = 0;
-  const projectIds = new Set<string>();
-  for (const row of rows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    const status = typeof row.status === 'string' ? row.status : 'active';
-    if (!filters.includeArchived && status !== 'active') continue;
-    const projectionClass = String(row.class) as ProcessedContextClass;
-    if (filters.projectionClass && projectionClass !== filters.projectionClass) continue;
-    if (isMemoryNoiseSummary(String(row.summary))) continue;
-    totalRecords += 1;
-    if (namespace.projectId) projectIds.add(namespace.projectId);
-    if (projectionClass === 'recent_summary') recentSummaryCount += 1;
-    if (projectionClass === 'durable_memory_candidate') durableCandidateCount += 1;
-    if (!normalizedQuery) {
-      matchedRecords += 1;
-      continue;
-    }
-    const haystack = `${String(row.summary)}\n${JSON.stringify(projectionSemanticContent(parseJson<Record<string, unknown>>(row.content_json, {})))}`.toLowerCase();
-    if (haystack.includes(normalizedQuery)) matchedRecords += 1;
+  conditions.push('is_noise = 0');
+  if (normalizedQuery) {
+    conditions.push('(summary LIKE ? OR content_json LIKE ?)');
+    params.push(`%${normalizedQuery}%`, `%${normalizedQuery}%`);
   }
+  const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const aggregate = database.prepare(`
+    SELECT
+      COUNT(*) AS total_records,
+      SUM(CASE WHEN class = 'recent_summary' THEN 1 ELSE 0 END) AS recent_summary_count,
+      SUM(CASE WHEN class = 'durable_memory_candidate' THEN 1 ELSE 0 END) AS durable_candidate_count,
+      COUNT(DISTINCT project_id) AS project_count
+    FROM context_processed_local ${where}
+  `).get(...params) as Record<string, unknown>;
+  const matchedRecords = Number(aggregate.total_records ?? 0) || 0;
+  const totalRecords = matchedRecords;
+  const recentSummaryCount = Number(aggregate.recent_summary_count ?? 0) || 0;
+  const durableCandidateCount = Number(aggregate.durable_candidate_count ?? 0) || 0;
+  const projectCount = Number(aggregate.project_count ?? 0) || 0;
   const pending = getPendingContextStats(filters);
-  for (const projectId of pending.projectIds) projectIds.add(projectId);
   return {
     totalRecords,
     matchedRecords,
     recentSummaryCount,
     durableCandidateCount,
-    projectCount: projectIds.size,
+    projectCount: projectCount + pending.projectCount,
     stagedEventCount: pending.stagedEventCount,
     dirtyTargetCount: pending.dirtyTargetCount,
     pendingJobCount: pending.pendingJobCount,
@@ -4883,53 +4918,52 @@ export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
+  conditions.push('is_noise = 0');
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = database.prepare(`
-    SELECT namespace_key, project_id, class, summary, updated_at, status
+    SELECT project_id,
+           COUNT(*) AS total_records,
+           SUM(CASE WHEN class = 'recent_summary' THEN 1 ELSE 0 END) AS recent_summary_count,
+           SUM(CASE WHEN class = 'durable_memory_candidate' THEN 1 ELSE 0 END) AS durable_candidate_count,
+           MAX(updated_at) AS updated_at
     FROM context_processed_local
     ${where}
+    AND project_id IS NOT NULL AND project_id <> ''
+    GROUP BY project_id
+    ORDER BY updated_at DESC
+    LIMIT 200
   `).all(...params) as Array<Record<string, unknown>>;
 
   const projects = new Map<string, ContextMemoryProjectView>();
   for (const row of rows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    const status = typeof row.status === 'string' ? row.status : 'active';
-    if (!filters.includeArchived && status !== 'active') continue;
-    if (isMemoryNoiseSummary(String(row.summary))) continue;
-    const projectId = namespace.projectId || (typeof row.project_id === 'string' ? row.project_id.trim() : '');
+    const projectId = typeof row.project_id === 'string' ? row.project_id.trim() : '';
     if (!projectId) continue;
-    const projectionClass = String(row.class) as ProcessedContextClass;
-    const updatedAt = Number(row.updated_at) || undefined;
-    const current = projects.get(projectId) ?? {
+    projects.set(projectId, {
       projectId,
       displayName: projectId,
-      totalRecords: 0,
-      recentSummaryCount: 0,
-      durableCandidateCount: 0,
+      totalRecords: Number(row.total_records ?? 0) || 0,
+      recentSummaryCount: Number(row.recent_summary_count ?? 0) || 0,
+      durableCandidateCount: Number(row.durable_candidate_count ?? 0) || 0,
       pendingEventCount: 0,
-      updatedAt,
-    };
-    current.totalRecords += 1;
-    if (projectionClass === 'recent_summary') current.recentSummaryCount += 1;
-    if (projectionClass === 'durable_memory_candidate') current.durableCandidateCount += 1;
-    current.updatedAt = Math.max(current.updatedAt ?? 0, updatedAt ?? 0) || undefined;
-    projects.set(projectId, current);
+      updatedAt: Number(row.updated_at) || undefined,
+    });
   }
 
   const pendingConditions: string[] = [];
   const pendingParams: (string | number)[] = [];
   appendNamespaceFilterSql(pendingConditions, pendingParams, filters);
+  pendingConditions.push("project_id IS NOT NULL AND project_id <> ''");
   const pendingWhere = pendingConditions.length > 0 ? `WHERE ${pendingConditions.join(' AND ')}` : '';
   const pendingRows = database.prepare(`
-    SELECT namespace_key
+    SELECT project_id, COUNT(*) AS pending_event_count
     FROM context_staged_events
     ${pendingWhere}
+    GROUP BY project_id
+    ORDER BY MAX(created_at) DESC
+    LIMIT 200
   `).all(...pendingParams) as Array<Record<string, unknown>>;
   for (const row of pendingRows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    const projectId = namespace.projectId;
+    const projectId = typeof row.project_id === 'string' ? row.project_id.trim() : '';
     if (!projectId) continue;
     const current = projects.get(projectId) ?? {
       projectId,
@@ -4939,7 +4973,7 @@ export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {
       durableCandidateCount: 0,
       pendingEventCount: 0,
     };
-    current.pendingEventCount = (current.pendingEventCount ?? 0) + 1;
+    current.pendingEventCount = Number(row.pending_event_count ?? 0) || 0;
     projects.set(projectId, current);
   }
 
@@ -4952,52 +4986,43 @@ function getPendingContextStats(filters: ProcessedProjectionQuery): {
   stagedEventCount: number;
   dirtyTargetCount: number;
   pendingJobCount: number;
-  projectIds: Set<string>;
+  projectCount: number;
 } {
   const database = ensureDb();
   const dirtyConditions: string[] = [];
   const dirtyParams: (string | number)[] = [];
   appendNamespaceFilterSql(dirtyConditions, dirtyParams, filters);
   const dirtyWhere = dirtyConditions.length > 0 ? `WHERE ${dirtyConditions.join(' AND ')}` : '';
-  const dirtyRows = database.prepare(`
-    SELECT namespace_key, event_count
-    FROM context_dirty_targets
-    ${dirtyWhere}
-  `).all(...dirtyParams) as Array<Record<string, unknown>>;
+  const dirtyStats = database.prepare(`
+    SELECT COALESCE(SUM(event_count), 0) AS staged_event_count,
+           COUNT(*) AS dirty_target_count,
+           COUNT(DISTINCT project_id) AS project_count
+    FROM context_dirty_targets ${dirtyWhere}
+  `).get(...dirtyParams) as Record<string, unknown>;
   const jobConditions: string[] = ["status IN ('pending', 'running')"];
   const jobParams: (string | number)[] = [];
   appendNamespaceFilterSql(jobConditions, jobParams, filters);
-  const pendingJobRows = database.prepare(`
-    SELECT namespace_key
-    FROM context_jobs
-    WHERE ${jobConditions.join(' AND ')}
-  `).all(...jobParams) as Array<Record<string, unknown>>;
-
-  let stagedEventCount = 0;
-  let dirtyTargetCount = 0;
-  let pendingJobCount = 0;
-  const projectIds = new Set<string>();
-
-  for (const row of dirtyRows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    stagedEventCount += Number(row.event_count);
-    dirtyTargetCount += 1;
-    if (namespace.projectId) projectIds.add(namespace.projectId);
-  }
-
-  for (const row of pendingJobRows) {
-    const namespace = parseNamespaceKey(String(row.namespace_key));
-    if (!namespaceMatchesFilters(namespace, filters)) continue;
-    pendingJobCount += 1;
-    if (namespace.projectId) projectIds.add(namespace.projectId);
-  }
+  const jobStats = database.prepare(`
+    SELECT COUNT(*) AS pending_job_count, COUNT(DISTINCT project_id) AS project_count
+    FROM context_jobs WHERE ${jobConditions.join(' AND ')}
+  `).get(...jobParams) as Record<string, unknown>;
+  const projectStats = database.prepare(`
+    SELECT COUNT(*) AS project_count FROM (
+      SELECT DISTINCT project_id FROM context_dirty_targets ${dirtyWhere}
+      UNION
+      SELECT DISTINCT project_id FROM context_jobs WHERE ${jobConditions.join(' AND ')}
+    ) WHERE project_id IS NOT NULL AND project_id <> ''
+  `).get(...dirtyParams, ...jobParams) as Record<string, unknown>;
+  const stagedEventCount = Number(dirtyStats.staged_event_count ?? 0) || 0;
+  const dirtyTargetCount = Number(dirtyStats.dirty_target_count ?? 0) || 0;
+  const pendingJobCount = Number(jobStats.pending_job_count ?? 0) || 0;
+  const projectCount = Number(projectStats.project_count ?? 0) || 0;
 
   return {
     stagedEventCount,
     dirtyTargetCount,
     pendingJobCount,
-    projectIds,
+    projectCount,
   };
 }
 

@@ -12275,7 +12275,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
-  }]);
+  }], { priority: 'high' });
   const recordsPromise: Promise<unknown> = query
     ? searchLocalMemorySemanticForManagement({
       query,
@@ -12296,9 +12296,9 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       projectionClass,
       limit,
       includeArchived,
-    } satisfies ProcessedProjectionQuery]);
-  const pendingPromise = getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
-  const projectsPromise = getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+    } satisfies ProcessedProjectionQuery], { priority: 'high' });
+  const pendingPromise = getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs], { priority: 'high' });
+  const projectsPromise = getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs], { priority: 'high' });
   // An early return below (e.g. stats fails) must not leave a sibling
   // rejection unobserved — that crashes the daemon on Node's default
   // unhandledRejection policy. This does not affect the real `await`s below;

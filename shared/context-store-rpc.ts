@@ -211,6 +211,13 @@ export function isFireAndForgetOp(op: string): boolean {
 
 /** Ops that should run on the LOW lane (only when no high/normal work queued). */
 export const CONTEXT_STORE_LOW_PRIORITY_OPS = [
+  // Background startup/replication/materialization work. Interactive panel
+  // reads explicitly use the high lane and therefore preempt these requests.
+  'ingestContextEvent',
+  'commitMaterialization',
+  'selectTurnUsageSyncBatch',
+  'recordTurnUsageSyncResults',
+  'recordTurnUsageSyncRequestFailure',
   'checkpointWal',
   'runArchiveBackfillBatch',
   'saveProjectionEmbedding',
@@ -247,6 +254,7 @@ export interface ContextStoreRpcError {
 }
 
 export type ContextStoreRpcResponse =
+  | { type: 'started'; id: number }
   | { id: number; ok: true; result: unknown }
   | { id: number; ok: false; error: ContextStoreRpcError };
 
