@@ -83,8 +83,14 @@ describe('P0 direct transfer native crash containment', () => {
         evidence.push(raw as typeof evidence[number]);
       });
       child.on('exit', (code, signal) => {
-        if (evidence.some((entry) => entry.generation === options.workerData.generation)) return;
-        rejectPrematureExit(new Error(`native_child_exited_before_retirement_budget:${code ?? signal ?? 'unknown'}`));
+        // Node can deliver the child's IPC message and exit notifications in
+        // either order when the parent is under load.  Give the IPC queue one
+        // turn to drain before declaring a missing budget message; otherwise
+        // a valid fixture is reported as a premature exit intermittently.
+        setImmediate(() => {
+          if (evidence.some((entry) => entry.generation === options.workerData.generation)) return;
+          rejectPrematureExit(new Error(`native_child_exited_before_retirement_budget:${code ?? signal ?? 'unknown'}`));
+        });
       });
       return child;
     });

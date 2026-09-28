@@ -49,9 +49,13 @@ describe('direct file transfer survives a blocked daemon loop', () => {
     const emittedAt: number[] = [];
     observeControl((at) => { emittedAt.push(at); });
     const received: unknown[] = [];
+    let resolveFirstReply: (() => void) | undefined;
+    const firstReply = new Promise<void>((resolve) => { resolveFirstReply = resolve; });
     const sender = {
       send: (message: unknown) => {
         received.push(message);
+        resolveFirstReply?.();
+        resolveFirstReply = undefined;
         diag(`main received: ${JSON.stringify(message).slice(0, 120)}`);
         return undefined;
       },
@@ -71,9 +75,14 @@ describe('direct file transfer survives a blocked daemon loop', () => {
       expiresAt: Date.now() + 60_000,
     }, sender);
 
-    // Block the daemon loop hard, then let queued replies drain.
+    // Block the daemon loop hard, then wait for the queued reply itself.  A
+    // fixed sleep is sensitive to loaded-worker scheduling and could expire
+    // before delivery even though the worker made progress during the stall.
     const window = blockMainLoop(1_000);
-    await new Promise((resolve) => setTimeout(resolve, 700));
+    await Promise.race([
+      firstReply,
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('direct_transfer_reply_timeout')), 10_000)),
+    ]);
     diag(`window=${window.from}..${window.to} received=${received.length}`);
 
     // The load-bearing assertion: the worker made progress DURING the stall.
