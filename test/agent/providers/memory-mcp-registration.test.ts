@@ -190,6 +190,15 @@ describe('managed provider MCP registration helpers', () => {
     expect(server.env[IMCODES_DAEMON_SESSION_NAME_ENV]).not.toBe('friendly-worker');
   });
 
+  it('does not mistake a provider resume key for an IM.codes session identity', () => {
+    const server = getDefaultMcpServers({
+      sessionKey: 'ef801947-be9a-4bb7-966d-87be08a40015',
+      bindExistingKey: 'provider-resume-key',
+      contextNamespace: { scope: 'user_private', userId: 'user-1' },
+    })[IMCODES_MEMORY_MCP_SERVER_NAME];
+    expect(server.env[IMCODES_DAEMON_SESSION_NAME_ENV]).toBeUndefined();
+  });
+
   it('keeps Codex app-server startup argv free of daemon identity values', () => {
     const args = getDefaultCodexMcpArgs();
     const serialized = JSON.stringify(args);

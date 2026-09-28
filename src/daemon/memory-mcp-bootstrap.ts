@@ -47,6 +47,8 @@ const TOOL_CALL_DEFAULT_TIMEOUT_MS = 60 * 60_000;
 const TOOL_CALL_TIMEOUT_HEADROOM_MS = 60_000;
 const TOOL_CALL_MAX_DECLARED_TIMEOUT_MS = 60 * 60_000;
 const BACKEND_STABLE_UPTIME_MS = 30_000;
+const BACKEND_CALLER_ENV_EXIT_CODE = 2;
+const BACKEND_FATAL_ERROR_CODE = -32004;
 const MAX_QUEUED_REQUESTS = 64;
 const RESTART_DELAYS_MS = [250, 1_000, 3_000, 5_000] as const;
 
@@ -135,6 +137,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
   let startupTimer: ReturnType<typeof setTimeout> | null = null;
   let stableBackendTimer: ReturnType<typeof setTimeout> | null = null;
+  let backendFatalError: string | null = null;
   let shuttingDown = false;
   let clientInitialized = false;
   const queued: QueuedMessage[] = [];
@@ -255,6 +258,10 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
 
   const enqueue = (message: JsonRpcMessage) => {
     const id = requestId(message);
+    if (backendFatalError) {
+      if (id !== undefined) writeMessage(errorResponse(id, BACKEND_FATAL_ERROR_CODE, backendFatalError));
+      return;
+    }
     if (queued.length >= MAX_QUEUED_REQUESTS) {
       if (id !== undefined) writeMessage(errorResponse(id, -32001, 'memory_mcp_backend_queue_full'));
       return;
@@ -307,6 +314,7 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
     });
     backend = child;
     backendReady = false;
+    let childCallerEnvError: string | null = null;
     const initializeId = `__imcodes_bootstrap_${currentGeneration}_initialize`;
     const listId = `__imcodes_bootstrap_${currentGeneration}_tools`;
 
@@ -368,10 +376,21 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
       }
       writeMessage(message);
     });
-    child.stderr.on('data', (chunk: Buffer) => process.stderr.write(chunk));
+    child.stderr.on('data', (chunk: Buffer) => {
+      const text = String(chunk);
+      // Exit code 2 is reserved for deterministic caller-environment
+      // rejection. Preserve its bounded, already-redacted reason so the
+      // bootstrap can stop the retry loop and return an actionable RPC error.
+      for (const line of text.split(/\r?\n/)) {
+        const match = /^\[memory-mcp\] fail-fast:\s*(.+)$/.exec(line.trim());
+        if (match) childCallerEnvError = match[1]!.slice(0, 500);
+      }
+      process.stderr.write(chunk);
+    });
     child.on('error', (error) => notifyWarning(`backend process error: ${error.message}`));
     child.on('exit', (code, signal) => {
       output.close();
+      const deterministicFailure = code === BACKEND_CALLER_ENV_EXIT_CODE;
       appendMcpLifecycleEvent(MCP_LIFECYCLE_EVENT.BACKEND_EXIT, {
         ...lifecycleFields,
         backendPid: child.pid,
@@ -379,15 +398,39 @@ export async function runMemoryMcpBootstrap(): Promise<void> {
         code,
         signal,
         expected: shuttingDown || backend !== child,
+        ...(deterministicFailure ? {
+          reason: 'caller_env_rejected',
+          error: childCallerEnvError ?? 'caller environment rejected',
+        } : {}),
       });
       if (backend !== child) return;
       backend = null;
       backendReady = false;
+      if (deterministicFailure) {
+        backendFatalError = `memory_mcp_backend_caller_rejected: ${childCallerEnvError ?? 'caller environment rejected'}`;
+        notifyWarning(`backend rejected caller environment; automatic restart disabled: ${childCallerEnvError ?? 'caller environment rejected'}`);
+      }
       for (const request of inFlight.values()) {
         clearTimeout(request.timer);
-        writeMessage(errorResponse(request.id, -32003, 'memory_mcp_backend_restarted'));
+        writeMessage(errorResponse(
+          request.id,
+          deterministicFailure ? BACKEND_FATAL_ERROR_CODE : -32003,
+          deterministicFailure ? backendFatalError! : 'memory_mcp_backend_restarted',
+        ));
       }
       inFlight.clear();
+      if (deterministicFailure) {
+        if (startupTimer) clearTimeout(startupTimer);
+        startupTimer = null;
+        if (stableBackendTimer) clearTimeout(stableBackendTimer);
+        stableBackendTimer = null;
+        for (const item of queued.splice(0)) {
+          if (item.timer) clearTimeout(item.timer);
+          const id = requestId(item.message);
+          if (id !== undefined) writeMessage(errorResponse(id, BACKEND_FATAL_ERROR_CODE, backendFatalError!));
+        }
+        return;
+      }
       if (startupTimer) clearTimeout(startupTimer);
       startupTimer = null;
       if (stableBackendTimer) clearTimeout(stableBackendTimer);

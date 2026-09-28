@@ -138,6 +138,43 @@ describe('memory MCP lightweight bootstrap', () => {
       .resolves.toMatchObject({ structuredContent: { echoed: 'recovered' } });
   }, 15_000);
 
+  it('does not restart a deterministic caller-env rejection and returns its reason', async () => {
+    const home = isolatedImcodesHome();
+    const dir = await mkdtemp(join(tmpdir(), 'memory-mcp-rejected-'));
+    const startLog = join(dir, 'starts.log');
+    const { child, messages } = rawBootstrap({
+      IMCODES_HOME: home,
+      IMCODES_MEMORY_MCP_TEST_CALLER_ENV_ERROR: 'IMCODES_DAEMON_SESSION_NAME is invalid',
+      IMCODES_MEMORY_MCP_TEST_START_LOG: startLog,
+    });
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'raw-test', version: '1' } },
+    })}\n`);
+    await waitFor(() => messages.find((message) => message.id === 1));
+    child.stdin.write(`${JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' })}\n`);
+    child.stdin.write(`${JSON.stringify({
+      jsonrpc: '2.0', id: 77, method: 'tools/call',
+      params: { name: 'fixture_echo', arguments: { value: 'rejected' } },
+    })}\n`);
+    const response = await waitFor(() => messages.find((message) => message.id === 77), 8_000);
+    expect(response).toMatchObject({
+      error: {
+        code: -32004,
+        message: 'memory_mcp_backend_caller_rejected: IMCODES_DAEMON_SESSION_NAME is invalid',
+      },
+    });
+    await new Promise((resolveWait) => setTimeout(resolveWait, 1_000));
+    expect((await readFile(startLog, 'utf8')).trim().split('\n').filter(Boolean)).toHaveLength(1);
+    const events = (await readFile(join(home, 'logs', 'mcp-lifecycle.log'), 'utf8'))
+      .trim().split('\n').filter(Boolean).map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(events).toContainEqual(expect.objectContaining({
+      event: 'backend_exit',
+      reason: 'caller_env_rejected',
+      error: 'IMCODES_DAEMON_SESSION_NAME is invalid',
+    }));
+  }, 15_000);
+
   it('registers the stable bootstrap PID so a stopped session can reap the whole backend chain', async () => {
     const home = await mkdtemp(join(tmpdir(), 'memory-mcp-owner-'));
     const { client, transport } = connect({

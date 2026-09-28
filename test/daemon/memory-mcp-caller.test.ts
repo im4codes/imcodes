@@ -69,4 +69,13 @@ describe('MCP runtime caller env parsing', () => {
       [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'deck_sub_$(whoami)',
     })).toThrow('IMCODES_DAEMON_SESSION_NAME is invalid');
   });
+
+  it('ignores a provider-host UUID left in a resumed MCP environment', () => {
+    const caller = parseMcpRuntimeCallerFromEnv({
+      [MEMORY_MCP_ENV_KEYS.USER_ID]: 'user-1',
+      [MEMORY_MCP_ENV_KEYS.SESSION_NAME]: 'ef801947-be9a-4bb7-966d-87be08a40015',
+    });
+    expect(caller.sessionName).toBeNull();
+    expect(caller.userId).toBe('user-1');
+  });
 });

@@ -10,6 +10,7 @@ if (startLog) appendFileSync(startLog, `${Date.now()}\n`);
 const crashAfterReadyMs = Number(process.env.IMCODES_MEMORY_MCP_TEST_CRASH_AFTER_READY_MS ?? 0);
 const hangCallMarker = process.env.IMCODES_MEMORY_MCP_TEST_HANG_CALL_MARKER;
 const exitCallValue = process.env.IMCODES_MEMORY_MCP_TEST_EXIT_CALL_VALUE;
+const callerEnvError = process.env.IMCODES_MEMORY_MCP_TEST_CALLER_ENV_ERROR;
 const replyLog = process.env.IMCODES_MEMORY_MCP_TEST_REPLY_LOG;
 let readyCrashScheduled = false;
 
@@ -26,6 +27,11 @@ const lines = createInterface({ input: process.stdin, crlfDelay: Infinity });
 lines.on('line', (line) => {
   const message = JSON.parse(line);
   if (message.method === 'initialize') {
+    if (callerEnvError) {
+      process.stderr.write(`[memory-mcp] fail-fast: ${callerEnvError}\n`);
+      process.exit(2);
+      return;
+    }
     if (shouldCrash) {
       process.exit(17);
       return;

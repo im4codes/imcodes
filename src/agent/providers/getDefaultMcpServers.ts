@@ -140,9 +140,7 @@ function namespaceForMcp(config: SessionConfig): SessionConfig['contextNamespace
 function buildIdentityEnv(config: SessionConfig): Record<string, string> {
   const namespace = namespaceForMcp(config);
   const sessionName = stringValue(config.sessionName)
-    ?? stringValue(config.env?.[IMCODES_SESSION_ENV])
-    ?? stringValue(config.bindExistingKey)
-    ?? stringValue(config.sessionKey);
+    ?? stringValue(config.env?.[IMCODES_SESSION_ENV]);
   return buildMemoryMcpServerEnv({
     [IMCODES_DAEMON_USER_ID_ENV]: namespace?.userId ?? DAEMON_LOCAL_MEMORY_USER_ID,
     [IMCODES_DAEMON_NAMESPACE_ENV]: namespace ? JSON.stringify(namespace) : undefined,
