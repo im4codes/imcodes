@@ -126,6 +126,7 @@ describe('writeWatchdogCmd', () => {
     const cmd = written[paths.watchdogPath];
     expect(cmd).toContain('set "IMCODES_HOME=C:\\Temp\\scopeA\\.imcodes"');
     expect(cmd).toContain('set "HOME=C:\\Temp\\scopeA"');
+    expect(cmd).toContain('set "IMCODES_DEFAULT_HOME=C:\\Users\\X"');
     expect(cmd).not.toContain('set "USERPROFILE=');
   });
 
@@ -465,6 +466,7 @@ describe('writeVbsLauncher', () => {
     const vbs = written[paths.vbsPath];
     expect(vbs).toContain('("IMCODES_HOME") = "C:\\Temp\\scopeA\\.imcodes"');
     expect(vbs).toContain('("HOME") = "C:\\Temp\\scopeA"');
+    expect(vbs).toContain('("IMCODES_DEFAULT_HOME") = "C:\\Users\\X"');
     expect(vbs).not.toContain('("USERPROFILE") =');
   });
 });

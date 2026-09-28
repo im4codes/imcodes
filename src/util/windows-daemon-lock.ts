@@ -15,6 +15,15 @@ export interface WindowsDaemonLockPathOptions {
   env?: NodeJS.ProcessEnv;
 }
 
+/** Resolve the immutable legacy installation home used for compatibility.
+ * Scoped launchers may override USERPROFILE/HOME, so callers must be able to
+ * carry the real default explicitly instead of deriving it from the child. */
+export function resolveWindowsDefaultHome(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.IMCODES_DEFAULT_HOME?.trim();
+  if (configured) return resolveLockPath(configured);
+  return resolveLockPath(join(env.USERPROFILE?.trim() || homedir(), '.imcodes'));
+}
+
 /**
  * Resolve the state directory that owns the daemon lock.
  *
@@ -77,7 +86,7 @@ export function normalizeWindowsLockPath(path: string): string {
  */
 export function windowsDaemonLockPipeName(options: WindowsDaemonLockPathOptions = {}): string {
   const homePath = resolveImcodesHome(options);
-  const defaultHome = resolve(join(homedir(), '.imcodes'));
+  const defaultHome = resolveWindowsDefaultHome(options.env ?? process.env);
   if (normalizeWindowsLockPath(homePath) === normalizeWindowsLockPath(defaultHome)) {
     return WINDOWS_DAEMON_LOCK_PIPE;
   }

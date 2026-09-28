@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import {
   WINDOWS_DAEMON_LOCK_PIPE,
   resolveImcodesHome,
+  resolveWindowsDefaultHome,
   windowsDaemonLockPipeName,
 } from './windows-daemon-lock.js';
 import {
@@ -158,7 +159,7 @@ function findStaleWatchdogPids(stateHome?: string): number[] {
 }
 
 function defaultStateHome(): string {
-  return resolve(join(homedir(), '.imcodes'));
+  return resolveWindowsDefaultHome();
 }
 
 // ── Launcher methods (all hidden — no visible windows) ──────────────────────

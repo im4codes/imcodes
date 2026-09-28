@@ -12,7 +12,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { resolveImcodesHome, windowsDaemonLockPipeName } from '../util/windows-daemon-lock.js';
 
-export { WINDOWS_DAEMON_LOCK_PIPE, normalizeWindowsLockPath, resolveImcodesHome, windowsDaemonLockPipeName } from '../util/windows-daemon-lock.js';
+export { WINDOWS_DAEMON_LOCK_PIPE, normalizeWindowsLockPath, resolveImcodesHome, resolveWindowsDefaultHome, windowsDaemonLockPipeName } from '../util/windows-daemon-lock.js';
 
 export interface DaemonProcessIdentity {
   pid: number;

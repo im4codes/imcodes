@@ -41,6 +41,21 @@ describe('Windows daemon lock pipe identity', () => {
     expect(pipe).not.toBe(WINDOWS_DAEMON_LOCK_PIPE);
   });
 
+  it('keeps a scoped pipe when the child overrides USERPROFILE', () => {
+    const scoped = windowsDaemonLockPipeName({
+      env: {
+        IMCODES_HOME: 'C:\\scope\\.imcodes',
+        USERPROFILE: 'C:\\scope',
+        IMCODES_DEFAULT_HOME: 'C:\\Users\\admin',
+      },
+    });
+    expect(scoped).not.toBe(WINDOWS_DAEMON_LOCK_PIPE);
+    expect(scoped).toBe(windowsDaemonLockPipeName({
+      homePath: 'C:\\scope\\.imcodes',
+      env: { IMCODES_DEFAULT_HOME: 'C:\\Users\\admin' },
+    }));
+  });
+
   it('honors a test HOME override even when USERPROFILE is unchanged', () => {
     const pipe = windowsDaemonLockPipeName({ env: { HOME: 'C:\\isolated-home' } });
     expect(pipe).not.toBe(WINDOWS_DAEMON_LOCK_PIPE);

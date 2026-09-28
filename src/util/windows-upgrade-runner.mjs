@@ -73,7 +73,10 @@ function resolveImcodesStateDir() {
 const IMCODES_HOME = resolveImcodesStateDir();
 const LOCK = join(IMCODES_HOME, 'upgrade.lock');
 const PIDFILE = join(IMCODES_HOME, 'daemon.pid');
-const DEFAULT_STATE_DIR = resolve(join(homedir(), '.imcodes'));
+const DEFAULT_STATE_DIR = resolve(join(
+  process.env.IMCODES_DEFAULT_HOME?.trim() || homedir(),
+  '.imcodes',
+));
 const DAEMON_TASK = windowsTaskName('daemon', IMCODES_HOME, DEFAULT_STATE_DIR);
 
 const LOG_FILE = process.argv[2];

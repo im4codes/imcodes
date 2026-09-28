@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { homedir, tmpdir } from 'os';
 import {
   resolveImcodesHome,
+  resolveWindowsDefaultHome,
 } from './windows-daemon-lock.js';
 import { parseWatchdogProcessListing, windowsTaskName, normalizeWindowsTaskHome } from './windows-daemon-watchdog.mjs';
 
@@ -29,7 +30,7 @@ export interface LaunchPaths {
 
 export function windowsDaemonTaskName(paths: LaunchPaths): string {
   const stateHome = path.win32.dirname(paths.watchdogPath);
-  const defaultHome = path.win32.join(process.env.USERPROFILE || homedir(), '.imcodes');
+  const defaultHome = resolveWindowsDefaultHome();
   return windowsTaskName('daemon', stateHome, defaultHome);
 }
 
@@ -39,7 +40,7 @@ function scopedEnvironmentPrefix(paths: LaunchPaths): string {
   // launcher so Task Scheduler cannot relaunch the default instance.
   const stateHome = path.win32.dirname(paths.watchdogPath);
   const currentHome = resolveImcodesHome();
-  const defaultHome = path.win32.join(process.env.USERPROFILE || homedir(), '.imcodes');
+  const defaultHome = resolveWindowsDefaultHome();
   if (normalizeWindowsTaskHome(stateHome) !== normalizeWindowsTaskHome(currentHome)
     || normalizeWindowsTaskHome(currentHome) === normalizeWindowsTaskHome(defaultHome)) return '';
   const userHome = path.win32.dirname(stateHome);
@@ -49,7 +50,7 @@ function scopedEnvironmentPrefix(paths: LaunchPaths): string {
   // scoped daemon mistake its isolated home for the legacy default and
   // register/launch the machine-wide task name.  IMCODES_HOME is the state
   // identity, while HOME is the scoped shell-home override.
-  return `set "IMCODES_HOME=${quote(stateHome)}"\r\nset "HOME=${quote(userHome)}"\r\n`;
+  return `set "IMCODES_HOME=${quote(stateHome)}"\r\nset "HOME=${quote(userHome)}"\r\nset "IMCODES_DEFAULT_HOME=${quote(path.win32.dirname(defaultHome))}"\r\n`;
 }
 
 function escapeXmlText(value: string): string {
@@ -386,13 +387,14 @@ export async function writeVbsLauncher(paths: LaunchPaths): Promise<void> {
   await mkdir(dirname(paths.vbsPath), { recursive: true });
   const stateHome = path.win32.dirname(paths.watchdogPath);
   const currentHome = resolveImcodesHome();
-  const defaultHome = path.win32.join(process.env.USERPROFILE || homedir(), '.imcodes');
+  const defaultHome = resolveWindowsDefaultHome();
   const scoped = normalizeWindowsTaskHome(stateHome) === normalizeWindowsTaskHome(currentHome)
     && normalizeWindowsTaskHome(currentHome) !== normalizeWindowsTaskHome(defaultHome);
   const vbsQuote = (value: string) => value.replaceAll('"', '""');
   const env = scoped
     ? `WshShell.Environment("Process")("IMCODES_HOME") = "${vbsQuote(stateHome)}"\r\n`
       + `WshShell.Environment("Process")("HOME") = "${vbsQuote(path.win32.dirname(stateHome))}"\r\n`
+      + `WshShell.Environment("Process")("IMCODES_DEFAULT_HOME") = "${vbsQuote(path.win32.dirname(defaultHome))}"\r\n`
     : '';
   const vbs = `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\n${env}WshShell.Run """${paths.watchdogPath}""", 0, True\r\n`;
   await writeFile(paths.vbsPath, encodeVbsAsUtf16(vbs));
