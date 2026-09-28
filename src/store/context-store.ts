@@ -4238,6 +4238,7 @@ export function updateProcessedProjectionSummary(input: {
   updatedByUserId?: string;
   now?: number;
 }): ProcessedContextProjection | null {
+  clearPanelReadCache();
   const database = ensureDb();
   const now = input.now ?? Date.now();
   const summary = input.summary.trim();
