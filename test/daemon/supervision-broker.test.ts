@@ -536,7 +536,7 @@ describe('SupervisionBroker', () => {
       fresh: false,
       sessionName: 'deck_sub_owner',
       sessionKey: expect.stringMatching(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i),
-      env: { [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: 'deck_sub_supervision_owner' },
+      env: { [IMCODES_DAEMON_SOURCE_SESSION_NAME_ENV]: 'deck_sub_supervision_sub_owner' },
     });
     expect(provider.send.mock.calls[0]?.[0]).toBe(provider.send.mock.calls[1]?.[0]);
   });
