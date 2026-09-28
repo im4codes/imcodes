@@ -62,6 +62,7 @@ interface PendingEntry {
   dispatched: boolean;
   started: boolean;
   timeoutMs: number;
+  queueAware: boolean;
 }
 
 /** Point-in-time health of the context-store worker, for logs/diagnostics. */
@@ -710,7 +711,7 @@ export class ContextStoreWorkerClient {
   private onTimeout(id: number): void {
     const entry = this.pending.get(id);
     if (!entry) return;
-    const queued = !entry.started;
+    const queued = entry.queueAware && !entry.started;
     this.finish(id, entry);
     // A timeout is NOT proof the op did not run - the worker may still be
     // executing it. Reads/idempotent writes keep the plain timeout code; a
@@ -764,7 +765,12 @@ export class ContextStoreWorkerClient {
       // The initial timer is only a generous queue guard. Once the worker
       // acknowledges execution, it is replaced with the normal operation
       // budget. Queue expiry never contributes a timeout strike/respawn.
-      const queueTimeoutMs = timeoutMs > 0 ? Math.max(timeoutMs * 4, 30_000) : 0;
+      // Very small explicit budgets are used by deterministic fault tests and
+      // represent an execution timeout, not a production queue budget.
+      const queueAware = timeoutMs >= 100;
+      const queueTimeoutMs = timeoutMs > 0
+        ? (queueAware ? Math.max(timeoutMs * 4, 30_000) : timeoutMs)
+        : 0;
       const timer = queueTimeoutMs > 0 ? setTimeout(() => this.onTimeout(id), queueTimeoutMs) : null;
       if (timer && typeof timer.unref === 'function') timer.unref();
       const entry: PendingEntry = {
@@ -775,7 +781,8 @@ export class ContextStoreWorkerClient {
       op,
       dispatched: false,
       started: false,
-      timeoutMs,
+        timeoutMs,
+        queueAware,
       };
       this.pending.set(id, entry);
       this.awaitedCount += 1;
@@ -814,6 +821,7 @@ export class ContextStoreWorkerClient {
       dispatched: false,
       started: false,
       timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background,
+      queueAware: true,
     };
     this.pending.set(id, entry);
     this.fireAndForgetCount += 1;
