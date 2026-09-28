@@ -117,13 +117,13 @@ Report $status`;
 type WindowsShortcutLaunch = (
   command: string,
   onFailure: (detail: string) => void,
-) => void;
+) => void | Promise<void>;
 
 type WindowsActiveUserProcessLaunch = (
   executable: string,
   command: string,
   onFailure: (detail: string) => void,
-) => void;
+) => void | Promise<void>;
 
 export function resolveWindowsPowerShellExecutable(
   environment: Readonly<Record<string, string | undefined>> = process.env,
@@ -159,7 +159,7 @@ export async function ensureWindowsAideskShortcut(input: {
   let launchFailure = false;
   try {
     await (input.grantResultAccess ?? allowWindowsNamedPipeClients)(resultPath);
-    const launch = input.launch ?? ((command, onFailure) => {
+    const launch = input.launch ?? (async (command, onFailure) => {
       const executable = resolveWindowsPowerShellExecutable(input.windowsEnvironment);
       const launchActiveUserProcess = input.launchActiveUserProcess
         ?? ((resolvedExecutable, resolvedCommand, resolvedOnFailure) => {
@@ -168,9 +168,9 @@ export async function ensureWindowsAideskShortcut(input: {
             false, false, false, resolvedOnFailure,
           );
         });
-      launchActiveUserProcess(executable, command, onFailure);
+      await launchActiveUserProcess(executable, command, onFailure);
     });
-    launch(buildWindowsAideskShortcutCommand(input.executablePath, resultPath), () => {
+    await launch(buildWindowsAideskShortcutCommand(input.executablePath, resultPath), () => {
       launchFailure = true;
     });
     const deadline = Date.now() + (input.timeoutMs ?? 15_000);

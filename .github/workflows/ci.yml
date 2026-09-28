@@ -631,7 +631,7 @@ jobs:
         run: ./scripts/ci-npm-ci.sh server
       - run: npm run build
       - name: Run coverage shard
-        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/4 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob
+        run: npm run test:coverage:ci -- --shard=${{ matrix.shard }}/4 --coverage.reportsDirectory=coverage/shard-${{ matrix.shard }} --reporter=blob --reporter=default
         env:
           # Shards only need JSON input for the merge; final reports are made
           # once by the merge job, avoiding four lcov/text/reporting passes.

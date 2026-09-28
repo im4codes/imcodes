@@ -152,14 +152,14 @@ describe('aiDesk desktop entries', () => {
         grantResultAccess: async () => {},
         pollMs: 1,
         timeoutMs: 100,
-        launch: (command) => {
+        launch: async (command) => {
           const encoded = command.split(' ').at(-1)!;
           const script = Buffer.from(encoded, 'base64').toString('utf16le');
           const result64 = /\$resultPath=\$utf8\.GetString\(\[Convert\]::FromBase64String\('([^']+)'\)\)/u
             .exec(script)?.[1];
           const resultPath = Buffer.from(result64!, 'base64').toString('utf8');
           seen.push(script);
-          void writeFile(resultPath, result);
+          await writeFile(resultPath, result);
         },
       })).resolves.toBe(result);
       expect(seen).toHaveLength(1);
@@ -179,13 +179,13 @@ describe('aiDesk desktop entries', () => {
       resultRoot: directory,
       grantResultAccess: async () => {},
       windowsEnvironment: { SystemRoot: 'D:\\Windows' },
-      launchActiveUserProcess: (executable, command) => {
+      launchActiveUserProcess: async (executable, command) => {
         executables.push(executable);
         const encoded = command.split(' ').at(-1)!;
         const script = Buffer.from(encoded, 'base64').toString('utf16le');
         const result64 = /\$resultPath=\$utf8\.GetString\(\[Convert\]::FromBase64String\('([^']+)'\)\)/u
           .exec(script)?.[1];
-        void writeFile(Buffer.from(result64!, 'base64').toString('utf8'), 'created');
+        await writeFile(Buffer.from(result64!, 'base64').toString('utf8'), 'created');
       },
       pollMs: 1,
       timeoutMs: 100,
