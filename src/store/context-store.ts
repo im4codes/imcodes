@@ -770,7 +770,11 @@ function ensureDb(): DatabaseSyncInstance {
     stagedReconciledForPath = dbPath;
   }
   if (materializationRepairRanForPath !== dbPath) {
-    repairMaterializationStateForDb(db, { now: Date.now() });
+    // Startup repair must not scan every historical projection before the
+    // worker can answer interactive RPCs.  A bounded pass is resumed by the
+    // normal idle maintenance loop; explicit repair callers retain the full
+    // sweep behavior by omitting this option.
+    repairMaterializationStateForDb(db, { now: Date.now(), pollutedScanLimit: 256, dirtyReferenceScanLimit: 256 });
     materializationRepairRanForPath = dbPath;
   }
   scheduleArchiveBackfillIfNeeded(db, dbPath);
@@ -1534,6 +1538,10 @@ export interface MaterializationRepairOptions {
   failedJobsRetainPerTarget?: number;
   /** Never retain failed materialization jobs older than this window, except for the newest retained rows. */
   failedJobRetentionMs?: number;
+  /** Limit startup's polluted-projection scan; omitted means an unbounded repair pass. */
+  pollutedScanLimit?: number;
+  /** Limit startup's dirty-target reference scan; omitted means an unbounded repair pass. */
+  dirtyReferenceScanLimit?: number;
 }
 
 export interface MaterializationRepairStats {
@@ -1581,6 +1589,12 @@ function repairMaterializationStateForDb(
   const staleRunningMs = options.staleRunningMs ?? DEFAULT_STALE_RUNNING_JOB_MS;
   const failedJobsRetainPerTarget = Math.max(0, options.failedJobsRetainPerTarget ?? DEFAULT_FAILED_JOB_RETAIN_PER_TARGET);
   const failedJobRetentionMs = Math.max(0, options.failedJobRetentionMs ?? DEFAULT_FAILED_JOB_RETENTION_MS);
+  const pollutedScanLimit = options.pollutedScanLimit === undefined
+    ? undefined
+    : Math.max(1, Math.min(1000, Math.floor(options.pollutedScanLimit)));
+  const dirtyReferenceScanLimit = options.dirtyReferenceScanLimit === undefined
+    ? undefined
+    : Math.max(1, Math.min(1000, Math.floor(options.dirtyReferenceScanLimit)));
 
   const staleCutoff = now - staleRunningMs;
   const staleRunningResult = database.prepare(`
@@ -1598,7 +1612,8 @@ function repairMaterializationStateForDb(
     FROM context_dirty_targets d
     LEFT JOIN context_jobs j ON j.id = d.pending_job_id
     WHERE d.pending_job_id IS NOT NULL
-  `).all() as Array<{ target_key: string; pending_job_id: string | null; status: string | null }>;
+    ${dirtyReferenceScanLimit === undefined ? '' : 'LIMIT ?'}
+  `).all(...(dirtyReferenceScanLimit === undefined ? [] : [dirtyReferenceScanLimit])) as Array<{ target_key: string; pending_job_id: string | null; status: string | null }>;
   let dirtyPendingRefsCleared = 0;
   const clearDirtyStmt = database.prepare('UPDATE context_dirty_targets SET pending_job_id = NULL WHERE target_key = ?');
   for (const row of dirtyRows) {
@@ -1611,7 +1626,8 @@ function repairMaterializationStateForDb(
     SELECT id, summary, content_json
     FROM context_processed_local
     WHERE status = 'active'
-  `).all() as Array<{ id: string; summary: string; content_json: string }>;
+    ${pollutedScanLimit === undefined ? '' : 'LIMIT ?'}
+  `).all(...(pollutedScanLimit === undefined ? [] : [pollutedScanLimit])) as Array<{ id: string; summary: string; content_json: string }>;
   const pollutedIds = pollutedRows
     .filter(isPollutedFallbackProjection)
     .map((row) => row.id);
