@@ -12,7 +12,7 @@ export interface McpRuntimeCaller {
   namespace: ContextNamespace;
   sessionName: string | null;
   /** Separate write attribution for supervised helpers; authorization stays owner-scoped. */
-  sourceSessionName: string | null;
+  sourceSessionName?: string | null;
   projectName: string | null;
   projectRoot: string | null;
   serverId: string | null;

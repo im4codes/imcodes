@@ -1638,6 +1638,7 @@ describe('memory MCP tool schema firewall', () => {
     const cronCreate = vi.fn(async () => ({ status: 'ok', body: { id: 'job-1' } }));
     const handlers = createMemoryMcpToolHandlers(caller({
       sessionName: 'deck_sub_worker',
+      sourceSessionName: 'deck_sub_supervision_worker',
       projectName: 'deck_sub_worker',
       projectRoot: '/work/alpha',
     }), {
@@ -1682,7 +1683,7 @@ describe('memory MCP tool schema firewall', () => {
 
     expect(cronCreate.mock.calls[0][0]).toMatchObject({
       projectName: 'alpha',
-      sourceSessionName: 'deck_sub_worker',
+      sourceSessionName: 'deck_sub_supervision_worker',
       sourceProjectName: 'alpha',
     });
   });
