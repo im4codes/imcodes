@@ -1540,8 +1540,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
     };
   }, [memoryFeatureDisabledBehavior, memoryFeatureLabel, memoryFeatureRecordByFlag, memoryFeaturesStatus, t, ws]);
   const memoryAdminErrorMessage = useCallback((errorCode?: MemoryManagementErrorCode, fallback?: string): string => {
-    if (errorCode) return t(`sharedContext.management.error.${errorCode}`);
-    return fallback ?? t('sharedContext.management.memoryAdminActionFailed');
+    const generic = fallback ?? t('sharedContext.management.memoryAdminActionFailed');
+    // Never surface a raw i18n key: an error code without a translation falls
+    // back to the generic management failure message.
+    if (errorCode) return t(`sharedContext.management.error.${errorCode}`, { defaultValue: generic });
+    return generic;
   }, [t]);
   const markMemoryAdminRequest = useCallback((surface: MemoryAdminRequestSurface): string => {
     const requestId = crypto.randomUUID();
