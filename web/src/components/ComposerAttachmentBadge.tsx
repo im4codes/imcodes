@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import { buildAttachmentDownloadUrl } from '../api.js';
 import { getAttachmentPreview, isPreviewableImageName } from '../attachment-preview-cache.js';
 import { ImageLightbox } from './ImageLightbox.js';
+import { sanitizeUploadFilename } from '@shared/upload-filename.js';
 
 /** Pause before the hover preview opens, so sweeping across chips does not flash them. */
 const HOVER_PREVIEW_DELAY_MS = 140;
@@ -29,7 +30,10 @@ export function ComposerAttachmentBadge({
   seq, name, path, attachmentId, serverId, sessionName, removing, onRemove,
 }: ComposerAttachmentBadgeProps) {
   const { t } = useTranslation();
-  const isImage = isPreviewableImageName(name) || isPreviewableImageName(path);
+  // Keep the user-facing name untouched, but use the shared cross-platform
+  // basename when deciding whether a restored upload is previewable.
+  const storageName = sanitizeUploadFilename(name);
+  const isImage = isPreviewableImageName(name) || isPreviewableImageName(storageName) || isPreviewableImageName(path);
   const badgeRef = useRef<HTMLSpanElement | null>(null);
   const hoverTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [src, setSrc] = useState<string | null>(() => (isImage ? getAttachmentPreview(path) ?? null : null));

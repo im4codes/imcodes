@@ -320,6 +320,7 @@ export interface FileUploadRequest {
   uploadId: string;
   filename: string;
   originalName?: string;
+  sanitizedName?: string;
   mime?: string;
   size: number;
   content: string; // base64
@@ -334,6 +335,7 @@ export interface FileUploadFetchRequest {
   uploadId: string;
   filename: string;
   originalName?: string;
+  sanitizedName?: string;
   mime?: string;
   size: number;
   downloadUrl: string;
@@ -678,10 +680,11 @@ export function validateControlledFileTransferRequest(
   if (value.type === FILE_TRANSFER_MSG.DELETE) return validateFileDeleteRequest(value);
   if (value.type === FILE_TRANSFER_MSG.MACOS_OPEN_FULL_DISK_ACCESS) return validateMacosOpenFullDiskAccessRequest(value);
   if (value.type === 'file.upload_fetch') {
-    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
+    if (!hasOnlyKeys(value, new Set(['type', 'uploadId', 'filename', 'originalName', 'sanitizedName', 'mime', 'size', 'downloadUrl', 'clientUploadId', 'destinationDirectory']))
       || !isTransferId(value.uploadId)
       || typeof value.filename !== 'string' || !/^[a-f0-9]{16,128}(\.[A-Za-z0-9]{1,20})?$/.test(value.filename)
       || (value.originalName !== undefined && !isBoundedString(value.originalName, 1024))
+      || (value.sanitizedName !== undefined && !isBoundedString(value.sanitizedName, 255))
       || (value.mime !== undefined && !isBoundedString(value.mime, 256))
       || (value.clientUploadId !== undefined && !isTransferId(value.clientUploadId))
       || (value.destinationDirectory !== undefined && !isBoundedString(value.destinationDirectory, FILE_TRANSFER_PATH_MAX_BYTES))

@@ -560,6 +560,8 @@ export interface DirectFileTransferUploadInit extends DirectFileTransferOperatio
   direction: typeof DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD;
   clientUploadId: string;
   filename: string;
+  /** Original display name; filename is the sanitized storage basename. */
+  originalName?: string;
   size: number;
   mime?: string;
   sha256?: string;
@@ -1033,7 +1035,7 @@ function isResumeTicket(value: unknown): value is string {
 function isUploadInit(value: Record<string, unknown>, type: string): boolean {
   return hasExactKeys(value,
     ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'clientUploadId', 'filename', 'size'],
-    ['sessionName', 'mime', 'sha256', 'destinationDirectory'],
+    ['sessionName', 'mime', 'sha256', 'destinationDirectory', 'originalName'],
   )
     && value.type === type
     && value.protocolVersion === DIRECT_FILE_TRANSFER_PROTOCOL_VERSION
@@ -1042,6 +1044,7 @@ function isUploadInit(value: Record<string, unknown>, type: string): boolean {
     && isDirectFileTransferClientUploadId(value.clientUploadId)
     && value.clientUploadId === value.operationId
     && isBoundedString(value.filename, DIRECT_FILE_TRANSFER_LIMITS.FILENAME_BYTES)
+    && (value.originalName === undefined || isBoundedString(value.originalName, 1024))
     && isDirectFileTransferSize(value.size)
     && (value.sessionName === undefined || isBoundedString(value.sessionName, DIRECT_FILE_TRANSFER_LIMITS.SESSION_NAME_BYTES))
     && (value.mime === undefined || isBoundedString(value.mime, DIRECT_FILE_TRANSFER_LIMITS.MIME_BYTES))
@@ -1073,7 +1076,7 @@ function authorityKeysFor(value: Record<string, unknown>, type: string): boolean
   const common = ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority', 'authorityExpiresAt', 'channelLabel', 'iceServers'];
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
     const { authority: _authority, authorityExpiresAt: _authorityExpiresAt, channelLabel: _channelLabel, iceServers: _iceServers, ...operation } = value;
-    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256', 'destinationDirectory'])
+    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256', 'destinationDirectory', 'originalName'])
       && isUploadInit(operation, type);
   }
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {

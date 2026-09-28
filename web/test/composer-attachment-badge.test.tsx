@@ -72,6 +72,18 @@ describe('ComposerAttachmentBadge', () => {
       .toBe('https://srv/api/server/s1/uploads/att1/download');
   });
 
+  it('keeps the serverId in the restored preview URL instead of using a host-global route', async () => {
+    buildAttachmentDownloadUrl.mockResolvedValue('https://srv/api/server/server-211/uploads/att1/download?sessionName=deck_x');
+    const { container } = render(
+      <ComposerAttachmentBadge {...base} attachmentId="att1" serverId="server-211" sessionName="deck_x" />,
+    );
+    enter(container.querySelector('.attachment-badge')!, 'mouse');
+    await act(async () => { vi.advanceTimersByTime(200); await Promise.resolve(); });
+    const source = (container.querySelector('.attachment-hover-preview img') as HTMLImageElement).getAttribute('src');
+    expect(source).toContain('/api/server/server-211/uploads/att1/download');
+    expect(buildAttachmentDownloadUrl).toHaveBeenCalledWith('server-211', 'att1', 'deck_x');
+  });
+
   it('does not open a hover popover for touch, but a tap opens the full preview', async () => {
     rememberAttachmentPreview(base.path, new File(['x'], 'image.png', { type: 'image/png' }));
     const { container, getByRole, getByTestId } = render(<ComposerAttachmentBadge {...base} />);
@@ -102,6 +114,14 @@ describe('ComposerAttachmentBadge', () => {
     enter(container.querySelector('.attachment-badge')!, 'mouse');
     act(() => { vi.advanceTimersByTime(500); });
     expect(container.querySelector('.attachment-hover-preview')).toBeNull();
+  });
+
+  it('keeps the original display name while normalizing the storage basename', () => {
+    const { container } = render(
+      <ComposerAttachmentBadge {...base} name="a<b>:c?.png" path="/tmp/up/a_b_c_.png" />,
+    );
+    expect(container.querySelector('.attachment-badge-name')?.textContent).toBe('a<b>:c?.png');
+    expect(container.querySelector('.attachment-badge')?.classList.contains('is-previewable')).toBe(true);
   });
 
   it('removing does not open the preview', () => {

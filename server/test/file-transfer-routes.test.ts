@@ -654,7 +654,7 @@ describe('file-transfer upload route', () => {
     });
 
     const form = new FormData();
-    form.append('file', new File(['hello'], 'hello.txt', { type: 'text/plain' }));
+    form.append('file', new File(['hello'], 'a<b>:c?.txt', { type: 'text/plain' }));
     form.append('clientUploadId', 'client_upload_1234');
 
     const res = await app.request('/api/server/srv-1/upload', {
@@ -674,7 +674,8 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock.mock.calls[0]?.[0]).toEqual(expect.any(String));
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
       type: 'file.upload_fetch',
-      originalName: 'hello.txt',
+      originalName: 'a<b>:c?.txt',
+      sanitizedName: 'a_b_c_.txt',
       mime: 'text/plain',
       size: 5,
       downloadUrl: expect.stringContaining('/api/server/srv-1/upload-staged/'),
@@ -1033,6 +1034,7 @@ describe('file-transfer download route', () => {
 
     expect(response.status).toBe(200);
     expect(response.headers.get('content-type')).toContain('image/png');
+    expect(response.headers.get('content-disposition')).toContain('inline');
     await expect(response.text()).resolves.toBe('shared image bytes');
     expect(mockResolveHttpShareAccessForCoveredSession).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       target: { kind: 'main', serverId: 'srv-1', sessionName: 'deck_project_brain' },
