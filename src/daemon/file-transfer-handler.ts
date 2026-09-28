@@ -3,7 +3,7 @@
  * Handles upload persistence, download resolution, and lifecycle cleanup.
  */
 import { constants as fsConstants, createReadStream, createWriteStream, realpathSync } from 'node:fs';
-import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, statfs, lstat, unlink, rm, realpath as fsRealpath } from 'node:fs/promises';
+import { copyFile, link, mkdir, open, writeFile, readFile, readdir, stat, statfs, lstat, unlink, realpath as fsRealpath } from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { homedir } from 'node:os';
@@ -58,7 +58,6 @@ import { resolveMacosUserSession, launchMacosUserSessionCommand } from '../node/
 import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-file-transfer.js';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { MACHINE_DIRECT_RESUME_FILE_PREFIX } from '../../shared/machine-direct-file-transfer.js';
-import { sanitizeUploadFilename } from '../../shared/upload-filename.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
@@ -277,28 +276,13 @@ async function resolveDownloadTarget(
   }
 }
 
-export function resolveUploadPath(filename: string, originalName?: string): string {
-  return resolveUploadPathForName(filename, originalName);
-}
-
-const UPLOAD_ID_RE = /^[a-f0-9]{32}$/i;
-
-export function resolveUploadPathForName(filename: string, originalName?: string): string {
-  const filePath = originalName !== undefined && UPLOAD_ID_RE.test(filename)
-    ? path.join(UPLOAD_DIR, filename, sanitizeUploadFilename(originalName))
-    : path.join(UPLOAD_DIR, filename);
+export function resolveUploadPath(filename: string): string {
+  const filePath = path.join(UPLOAD_DIR, filename);
   const resolved = path.resolve(filePath);
   if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
     throw new Error('path_traversal');
   }
   return resolved;
-}
-
-function uploadMetadataPath(resolved: string): string {
-  const parent = path.dirname(resolved);
-  return UPLOAD_ID_RE.test(path.basename(parent))
-    ? path.join(parent, '.meta.json')
-    : `${resolved}.meta.json`;
 }
 
 function validateDestinationFileName(originalName: string): string {
@@ -394,7 +378,7 @@ async function finalizeUploadedFile(params: {
     return;
   }
 
-  const metaPath = uploadMetadataPath(resolved);
+  const metaPath = resolved + '.meta.json';
   await writeFile(metaPath, JSON.stringify({ originalName: originalName || filename, mime, clientUploadId })).catch(() => {});
 
   const now = Date.now();
@@ -434,12 +418,13 @@ async function finalizeUploadedFile(params: {
 }
 
 /**
- * Generate the stable daemon-owned attachment id. The original filename is
- * persisted as the basename inside this id directory after shared sanitization.
+ * Generate a daemon-owned upload filename. The user-controlled basename never
+ * becomes part of the persisted path; only a conservative extension survives.
  */
 export function createDirectUploadFilename(originalName: string): string {
-  void originalName;
-  return randomHex(16);
+  const ext = path.extname(originalName);
+  const safeExt = /^\.[A-Za-z0-9]{1,20}$/.test(ext) ? ext : '';
+  return `${randomHex(16)}${safeExt}`;
 }
 
 /** Return a committed upload for idempotent direct/relay retry handling. */
@@ -513,7 +498,7 @@ export async function finalizeDirectUploadedFile(params: {
     );
   }
   const now = Date.now();
-  await writeFile(uploadMetadataPath(params.resolved), JSON.stringify({
+  await writeFile(`${params.resolved}.meta.json`, JSON.stringify({
     originalName: params.originalName,
     mime: params.mime,
     clientUploadId: params.clientUploadId,
@@ -683,36 +668,6 @@ async function recoverRegistry(): Promise<void> {
       try {
         const filePath = path.join(UPLOAD_DIR, file);
         const fileStat = await stat(filePath);
-        if (fileStat.isDirectory() && UPLOAD_ID_RE.test(file)) {
-          const children = (await readdir(filePath)).filter((name) => name !== '.meta.json');
-          const child = children[0];
-          if (!child) continue;
-          const childPath = path.join(filePath, child);
-          const childStat = await stat(childPath);
-          let origName = child;
-          let mime: string | undefined;
-          let clientUploadId: string | undefined;
-          try {
-            const meta = JSON.parse(await readFile(path.join(filePath, '.meta.json'), 'utf8')) as { originalName?: string; mime?: string; clientUploadId?: string };
-            if (meta.originalName) origName = meta.originalName;
-            if (meta.mime) mime = meta.mime;
-            if (typeof meta.clientUploadId === 'string') clientUploadId = meta.clientUploadId;
-          } catch { /* no sidecar or invalid */ }
-          if (now - childStat.mtimeMs > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) continue;
-          attachmentRegistry.set(file, {
-            id: file,
-            daemonPath: path.resolve(childPath),
-            source: 'upload',
-            originalName: origName,
-            mime,
-            size: childStat.size,
-            createdAt: childStat.mtimeMs,
-            expiresAt: childStat.mtimeMs + FILE_TRANSFER_LIMITS.TEMP_TTL_MS,
-            clientUploadId,
-          });
-          continue;
-        }
-        if (!fileStat.isFile()) continue;
         const age = now - fileStat.mtimeMs;
         if (age > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) continue;
 
@@ -751,7 +706,7 @@ async function recoverRegistry(): Promise<void> {
 
 export async function handleFileUpload(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadRequest;
-  const { uploadId, filename, originalName, sanitizedName, mime, content } = msg;
+  const { uploadId, filename, originalName, mime, content } = msg;
   let uploadClaim: symbol | null = null;
 
   try {
@@ -769,8 +724,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
       uploadClaim = turn.claim;
     }
 
-    const resolved = resolveUploadPathForName(filename, sanitizedName || originalName);
-    await mkdir(path.dirname(resolved), { recursive: true });
+    const resolved = resolveUploadPath(filename);
 
     const buffer = Buffer.from(content, 'base64');
     if (buffer.length > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
@@ -801,7 +755,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
 
 export async function handleFileUploadFetch(cmd: Record<string, unknown>, serverLink: FileTransferSender): Promise<void> {
   const msg = cmd as unknown as FileUploadFetchRequest;
-  const { uploadId, filename, originalName, sanitizedName, mime, downloadUrl } = msg;
+  const { uploadId, filename, originalName, mime, downloadUrl } = msg;
   let uploadClaim: symbol | null = null;
 
   try {
@@ -817,8 +771,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
       uploadClaim = turn.claim;
     }
 
-    const resolved = resolveUploadPathForName(filename, sanitizedName || originalName);
-    await mkdir(path.dirname(resolved), { recursive: true });
+    const resolved = resolveUploadPath(filename);
     if (typeof msg.size !== 'number' || msg.size < 0 || msg.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
       throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
     }
@@ -857,15 +810,9 @@ async function deleteUploadedAttachment(entry: AttachmentEntry): Promise<void> {
   } catch (error) {
     if (!isNotFoundError(error)) throw error;
   }
-  await unlink(uploadMetadataPath(resolved)).catch((error) => {
+  await unlink(`${resolved}.meta.json`).catch((error) => {
     if (!isNotFoundError(error)) logger.warn({ attachmentId: entry.id, error }, 'Failed to remove upload metadata');
   });
-  const parent = path.dirname(resolved);
-  if (path.basename(parent) === entry.id && UPLOAD_ID_RE.test(entry.id)) {
-    await rm(parent, { recursive: true, force: true }).catch((error) => {
-      if (!isNotFoundError(error)) logger.warn({ attachmentId: entry.id, error }, 'Failed to remove upload directory');
-    });
-  }
   attachmentRegistry.delete(entry.id);
 }
 
@@ -1351,12 +1298,8 @@ async function cleanupExpiredUploads(): Promise<void> {
         const fileStat = await stat(filePath);
         const age = now - fileStat.mtimeMs;
         if (age > FILE_TRANSFER_LIMITS.TEMP_TTL_MS) {
-          if (fileStat.isDirectory() && UPLOAD_ID_RE.test(file)) {
-            await rm(filePath, { recursive: true, force: true });
-          } else if (fileStat.isFile()) {
-            await unlink(filePath);
-            await unlink(filePath + '.meta.json').catch(() => {});
-          }
+          await unlink(filePath);
+          await unlink(filePath + '.meta.json').catch(() => {});
           logger.debug({ file }, 'Cleaned up expired upload');
         }
       } catch { /* ignore individual file errors */ }

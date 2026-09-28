@@ -6,10 +6,10 @@ import {
   randomBytes,
   timingSafeEqual,
 } from 'node:crypto';
-import { mkdir, open, lstat, readFile, realpath, rename, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import { open, lstat, readFile, realpath, rename, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
 import { homedir, networkInterfaces } from 'node:os';
 import { createServer, connect, isIP, type Server, type Socket } from 'node:net';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, join, resolve } from 'node:path';
 import {
   MACHINE_DIRECT_FILE_TRANSFER_ERROR,
   MACHINE_DIRECT_FILE_TRANSFER_LIMITS,
@@ -943,8 +943,7 @@ export async function receiveMachineDirectUpload(
     socket = await connectAny(request.candidates);
     const channel = await authenticateMachineDirectTarget(socket, request, partial.size);
     const filename = resumeMeta.filename;
-    const resolved = resolveUploadPath(filename, resumeMeta.originalName);
-    await mkdir(dirname(resolved), { recursive: true });
+    const resolved = resolveUploadPath(filename);
     file = await open(temp, 'r+', 0o600);
     let counter = 0n;
     let loaded = partial.size;

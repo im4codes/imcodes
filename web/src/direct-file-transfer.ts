@@ -39,7 +39,6 @@ import {
   type DirectFileTransferOperationInit,
   type DirectFileTransferServerMessage,
 } from '@shared/direct-file-transfer.js';
-import { sanitizeUploadFilename } from '@shared/upload-filename.js';
 import {
   PendingWebRtcCandidates,
   readWebRtcCandidateType,
@@ -1684,8 +1683,7 @@ function makeOperationInit(lease: Lease, active: ActiveAttempt, op: DirectAttemp
       ...base,
       direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
       clientUploadId: op.operationId,
-      filename: sanitizeUploadFilename(op.file.name || 'file'),
-      originalName: op.file.name || 'file',
+      filename: op.file.name || 'file',
       ...(op.file.type ? { mime: op.file.type } : {}),
       ...(op.sessionName ? { sessionName: op.sessionName } : {}),
       ...(op.destinationDirectory ? { destinationDirectory: op.destinationDirectory } : {}),

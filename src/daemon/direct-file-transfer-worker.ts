@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { mkdir, open, readdir, readFile, stat, statfs, unlink, rename, writeFile } from 'node:fs/promises';
+import { open, readdir, readFile, stat, statfs, unlink, rename, writeFile } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import path from 'node:path';
 import logger from '../util/logger.js';
@@ -1574,8 +1574,7 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
     : createDirectUploadFilename(authority.filename);
   const finalPath = priorResume && resumeIdentityMatches
     ? priorResume.finalPath
-    : resolveUploadPath(filename, authority.filename);
-  await mkdir(path.dirname(finalPath), { recursive: true });
+    : resolveUploadPath(filename);
   await ensureDiskCapacity(authority.size, finalPath);
   // Suffix is server-random; nothing the client sent reaches the path.
   const partPath = priorResume && resumeIdentityMatches
@@ -1742,7 +1741,7 @@ async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, 
   const intent: UploadCommitIntent = {
     clientUploadId: authority.clientUploadId,
     filename: finalFilename,
-    originalName: authority.originalName ?? authority.filename,
+    originalName: authority.filename,
     resolved: finalPath,
     size: transfer.received,
     ...(authority.mime ? { mime: authority.mime } : {}),
