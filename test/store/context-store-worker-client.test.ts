@@ -95,6 +95,60 @@ describe('context-store worker client lifecycle repair', () => {
     client.dispose();
   });
 
+  it('records worker execution timing separately from queue wait', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(10_000);
+    const { client, workers } = createHarness();
+    client.start();
+    workers[0].emit('message', { type: 'ready' });
+    await client.whenReady();
+
+    const pending = client.run('getContextMeta', ['slow']);
+    const request = workers[0].postMessage.mock.calls[0][0] as { id: number };
+    workers[0].emit('message', {
+      type: 'started',
+      id: request.id,
+      op: 'getContextMeta',
+      startedAtMs: 8_500,
+    });
+    workers[0].emit('message', { id: request.id, ok: true, result: { value: 'ok' } });
+    await expect(pending).resolves.toEqual({ value: 'ok' });
+    expect(client.getHealthSnapshot().lastSlowOperation).toMatchObject({
+      op: 'getContextMeta',
+      durationMs: 1_500,
+    });
+    client.dispose();
+    vi.useRealTimers();
+  });
+
+  it('defers timeout respawn while a started worker operation may still be progressing', async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(20_000);
+    const { client, workers } = createHarness();
+    client.start();
+    workers[0].emit('message', { type: 'ready' });
+    await client.whenReady();
+
+    for (let i = 0; i < 3; i += 1) {
+      const pending = client.call('getContextMeta', [`slow-${i}`], { priority: 'high', timeoutMs: 1 });
+      const request = workers[0].postMessage.mock.calls.at(-1)?.[0] as { id: number };
+      workers[0].emit('message', {
+        type: 'started',
+        id: request.id,
+        op: 'getContextMeta',
+        startedAtMs: Date.now(),
+      });
+      const assertion = expect(pending).rejects.toMatchObject({ code: CONTEXT_STORE_RPC_ERROR.timeout });
+      await vi.advanceTimersByTimeAsync(1);
+      await assertion;
+    }
+    expect(workers[0].terminate).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(30_000);
+    expect(workers[0].terminate).toHaveBeenCalledTimes(1);
+    client.dispose();
+    vi.useRealTimers();
+  });
+
 
   it('respawns on the next production request after consecutive awaited timeouts', async () => {
     vi.useFakeTimers();

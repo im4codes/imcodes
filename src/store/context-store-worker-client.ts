@@ -23,6 +23,8 @@ import {
   CONTEXT_STORE_RPC_ERROR,
   CONTEXT_STORE_RPC_SELF_HEAL,
   CONTEXT_STORE_RPC_TIMEOUT_MS,
+  CONTEXT_STORE_SLOW_OP_LOG_MS,
+  CONTEXT_STORE_STUCK_WORKER_GRACE_MS,
   CONTEXT_STORE_WORKER_DOWN_REASON,
   CONTEXT_STORE_WORKER_HEALTH,
   contextStoreOpRetryClass,
@@ -63,6 +65,7 @@ interface PendingEntry {
   started: boolean;
   timeoutMs: number;
   queueAware: boolean;
+  startedAtMs: number | null;
 }
 
 /** Point-in-time health of the context-store worker, for logs/diagnostics. */
@@ -87,6 +90,8 @@ export interface ContextStoreHealthSnapshot {
   retryInMs: number;
   pendingAwaited: number;
   pendingFireAndForget: number;
+  /** Most recent worker operation that exceeded the diagnostic slow-op budget. */
+  lastSlowOperation: { op: ContextStoreRpcOp; durationMs: number } | null;
 }
 
 interface ContextStoreWorkerHandle {
@@ -125,6 +130,9 @@ export class ContextStoreWorkerClient {
   private readonly pending = new Map<number, PendingEntry>();
   private awaitedCount = 0;
   private fireAndForgetCount = 0;
+  private lastSlowOperation: { op: ContextStoreRpcOp; durationMs: number } | null = null;
+  private lastWorkerProgressAt = Date.now();
+  private stuckWorkerCheckTimer: NodeJS.Timeout | null = null;
   private warmReady = false;
   private readyPromise: Promise<void> | null = null;
   private readyResolve: (() => void) | null = null;
@@ -211,6 +219,7 @@ export class ContextStoreWorkerClient {
       retryInMs: this.retryDelayRemainingMs(now),
       pendingAwaited: this.awaitedCount,
       pendingFireAndForget: this.fireAndForgetCount,
+      lastSlowOperation: this.lastSlowOperation,
     };
   }
 
@@ -516,11 +525,13 @@ export class ContextStoreWorkerClient {
       return;
     }
     if ((msg as { type?: unknown }).type === 'started') {
-      const started = msg as { id?: unknown };
+      const started = msg as { id?: unknown; op?: unknown; startedAtMs?: unknown };
       if (typeof started.id !== 'number') return;
       const entry = this.pending.get(started.id);
       if (!entry || entry.started) return;
       entry.started = true;
+      this.lastWorkerProgressAt = Date.now();
+      entry.startedAtMs = typeof started.startedAtMs === 'number' ? started.startedAtMs : Date.now();
       if (entry.timer) clearTimeout(entry.timer);
       const timeoutMs = entry.timeoutMs;
       entry.timer = timeoutMs > 0 ? setTimeout(() => this.onTimeout(started.id as number), timeoutMs) : null;
@@ -530,8 +541,25 @@ export class ContextStoreWorkerClient {
     const res = msg as ContextStoreRpcResponse;
     if (typeof res.id !== 'number') return;
     if ('type' in res) return;
+    // A late response is still proof that the worker made progress after the
+    // client-side timeout.  Refresh the liveness clock before discarding it.
+    this.lastWorkerProgressAt = Date.now();
+    this.consecutiveTimeouts = 0;
+    this.clearStuckWorkerCheck();
     const entry = this.pending.get(res.id);
     if (!entry) return; // late-response discard (already timed out / settled)
+    if (entry.started && entry.startedAtMs !== null) {
+      const durationMs = Math.max(0, Date.now() - entry.startedAtMs);
+      if (durationMs >= CONTEXT_STORE_SLOW_OP_LOG_MS) {
+        this.lastSlowOperation = { op: entry.op, durationMs };
+        // The operation's timing starts at the worker's `started` ack, so a
+        // slow record is execution time rather than queue wait. Keep this
+        // structured and op-only: it is safe to correlate with RPC timeout
+        // events without leaking request arguments or memory contents.
+        // eslint-disable-next-line no-console
+        console.warn(`[context-store] slow operation op=${entry.op} durationMs=${durationMs}`);
+      }
+    }
     this.finish(res.id, entry);
     if (res.ok) {
       this.consecutiveTimeouts = 0;
@@ -668,6 +696,7 @@ export class ContextStoreWorkerClient {
   private respawn(): void {
     const now = Date.now();
     if (this.isRespawnCoolingDown(now)) return;
+    this.clearStuckWorkerCheck();
     this.lastRespawnAt = now;
     this.consecutiveTimeoutRespawns += 1;
     // NOTE: `consecutiveTimeouts` is deliberately NOT reset here. It is owned by
@@ -712,6 +741,12 @@ export class ContextStoreWorkerClient {
     const entry = this.pending.get(id);
     if (!entry) return;
     const queued = entry.queueAware && !entry.started;
+    if (!queued) {
+      const durationMs = entry.startedAtMs === null ? entry.timeoutMs : Math.max(0, Date.now() - entry.startedAtMs);
+      this.lastSlowOperation = { op: entry.op, durationMs };
+      // eslint-disable-next-line no-console
+      console.error(`[context-store] RPC timeout op=${entry.op} durationMs=${durationMs} queued=false`);
+    }
     this.finish(id, entry);
     // A timeout is NOT proof the op did not run - the worker may still be
     // executing it. Reads/idempotent writes keep the plain timeout code; a
@@ -726,8 +761,36 @@ export class ContextStoreWorkerClient {
     // has not received the started acknowledgement.
     if (!entry.fireAndForget && !queued) {
       this.consecutiveTimeouts += 1;
-      if (this.consecutiveTimeouts >= consecutiveTimeoutsBeforeRespawn) this.respawn();
+      if (this.consecutiveTimeouts >= consecutiveTimeoutsBeforeRespawn) {
+        // A started operation can still be progressing even though its caller
+        // budget elapsed.  Defer any destructive respawn until a generous
+        // liveness grace period has passed with no worker-side progress.
+        if (entry.started) this.scheduleStuckWorkerCheck();
+        else this.respawn();
+      }
     }
+  }
+
+  private clearStuckWorkerCheck(): void {
+    if (!this.stuckWorkerCheckTimer) return;
+    clearTimeout(this.stuckWorkerCheckTimer);
+    this.stuckWorkerCheckTimer = null;
+  }
+
+  private scheduleStuckWorkerCheck(): void {
+    if (this.stuckWorkerCheckTimer) return;
+    const generation = this.workerGeneration;
+    const timer = setTimeout(() => {
+      this.stuckWorkerCheckTimer = null;
+      if (this.disposed || generation !== this.workerGeneration || !this.worker) return;
+      if (Date.now() - this.lastWorkerProgressAt < CONTEXT_STORE_STUCK_WORKER_GRACE_MS) {
+        this.scheduleStuckWorkerCheck();
+        return;
+      }
+      if (this.consecutiveTimeouts >= consecutiveTimeoutsBeforeRespawn) this.respawn();
+    }, CONTEXT_STORE_STUCK_WORKER_GRACE_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.stuckWorkerCheckTimer = timer;
   }
 
   // ── Dispatch ───────────────────────────────────────────────────────────────
@@ -780,9 +843,10 @@ export class ContextStoreWorkerClient {
         reject,
         timer,
         fireAndForget: false,
-      op,
-      dispatched: false,
-      started: false,
+        op,
+        dispatched: false,
+        started: false,
+        startedAtMs: null,
         timeoutMs,
         queueAware,
       };
@@ -822,6 +886,7 @@ export class ContextStoreWorkerClient {
       op,
       dispatched: false,
       started: false,
+      startedAtMs: null,
       timeoutMs: CONTEXT_STORE_RPC_TIMEOUT_MS.r4Background,
       queueAware: true,
     };
@@ -928,6 +993,7 @@ export class ContextStoreWorkerClient {
 
   dispose(): void {
     this.disposed = true;
+    this.clearStuckWorkerCheck();
     this.clearRebuildTimer();
     // The retirement escalation is deliberately LEFT RUNNING: the child must
     // still be terminated/killed. Nothing can spawn because `disposed` gates

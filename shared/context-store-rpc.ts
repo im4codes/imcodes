@@ -239,6 +239,17 @@ export function defaultPriorityForOp(op: ContextStoreRpcOp): ContextStoreRpcPrio
   return CONTEXT_STORE_RPC_PRIORITY.normal;
 }
 
+/** Diagnostic threshold for worker-side operation timing.  This is deliberately
+ * separate from the RPC timeout: it records slow progress without treating a
+ * queued or long-but-healthy operation as a worker failure. */
+export const CONTEXT_STORE_SLOW_OP_LOG_MS = 1_000;
+
+/** Grace period after an execution timeout before considering a worker stuck.
+ * A started RPC may still be making forward progress and must not trigger a
+ * destructive respawn immediately; late responses/started acknowledgements
+ * refresh the progress clock during this window. */
+export const CONTEXT_STORE_STUCK_WORKER_GRACE_MS = 30_000;
+
 // ── Wire protocol ──────────────────────────────────────────────────────────
 export interface ContextStoreRpcRequest {
   id: number;
@@ -254,7 +265,7 @@ export interface ContextStoreRpcError {
 }
 
 export type ContextStoreRpcResponse =
-  | { type: 'started'; id: number }
+  | { type: 'started'; id: number; op: ContextStoreRpcOp; startedAtMs: number }
   | { id: number; ok: true; result: unknown }
   | { id: number; ok: false; error: ContextStoreRpcError };
 

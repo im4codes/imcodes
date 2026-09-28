@@ -85,7 +85,7 @@ function execute(req: ContextStoreRpcRequest): void {
   // A queued request is not a hung request.  Acknowledging execution before
   // entering synchronous SQLite work lets the client start its RPC budget at
   // the actual operation, not while the request waits behind backfill.
-  port!.postMessage({ type: 'started', id });
+  port!.postMessage({ type: 'started', id, op, startedAtMs: Date.now() });
   if (!isContextStoreRpcOp(op)) {
     reply({ id, ok: false, error: { code: CONTEXT_STORE_RPC_ERROR.unsupportedOperation, message: `unknown op: ${String(op)}` } });
     return;
