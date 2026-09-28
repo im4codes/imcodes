@@ -97,6 +97,17 @@ function makeSandbox(opts: {
       name: 'node-datachannel', version: '0.0.0-test', type: 'module', main: 'index.js',
     }));
     writeFileSync(join(dependencyDir, 'index.js'), "throw new Error('native addon missing');\n");
+
+    // A parent-level decoy models the shared /tmp/node_modules (or global
+    // dependency) present on CI hosts. Bare package imports walk upward and
+    // incorrectly accept this after the local broken copy is removed. The
+    // repair must verify the package-root-local entry instead.
+    const parentDependencyDir = join(root, 'node_modules', 'node-datachannel');
+    mkdirSync(parentDependencyDir, { recursive: true });
+    writeFileSync(join(parentDependencyDir, 'package.json'), JSON.stringify({
+      name: 'node-datachannel', version: 'parent-decoy', type: 'module', main: 'index.js',
+    }));
+    writeFileSync(join(parentDependencyDir, 'index.js'), 'export const parentDecoy = true;\n');
   }
 
   // npm shim — captures argv. Both `npm` and `npm.cmd` so the
@@ -122,6 +133,14 @@ function runPreflight(sb: Sandbox): { stderr: string; status: number | null } {
       USERPROFILE: sb.homeDir,        // Windows env name; preflight uses homedir() either way
       IMCODES_HOME: sb.homeDir,
       IMCODES_LAUNCH_REPAIR_LOG: sb.repairLog,
+      // Keep npm and module lookup hermetic; the shim never reaches the
+      // registry, and no ambient NODE_PATH/global cache may influence checks.
+      NODE_PATH: '',
+      npm_config_cache: join(sb.root, 'npm-cache'),
+      npm_config_prefix: join(sb.root, 'npm-prefix'),
+      npm_config_userconfig: join(sb.root, 'npmrc'),
+      npm_config_update_notifier: 'false',
+      npm_config_offline: 'true',
     },
     encoding: 'utf8',
     timeout: 15_000,
