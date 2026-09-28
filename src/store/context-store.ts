@@ -265,6 +265,23 @@ function appendNamespaceFilterSql(
   }
 }
 
+/** Keep the SQL candidate set bounded without requiring the whole query to be
+ * contiguous.  The final token-aware matcher still decides exact/trigram
+ * semantics; SQL only needs to admit rows containing at least one token. */
+function appendTextSearchSql(
+  conditions: string[],
+  params: (string | number)[],
+  normalizedQuery: string,
+): void {
+  const tokens = normalizedQuery.split(/\s+/).map((token) => token.trim()).filter(Boolean).slice(0, 16);
+  if (tokens.length === 0) return;
+  conditions.push(`(${tokens.map(() => '(summary LIKE ? OR content_json LIKE ?)').join(' OR ')})`);
+  for (const token of tokens) {
+    const pattern = `%${token}%`;
+    params.push(pattern, pattern);
+  }
+}
+
 function hasFilterValue(value: string | undefined): value is string {
   return typeof value === 'string' && value.trim().length > 0;
 }
@@ -1617,6 +1634,10 @@ function repairMaterializationStateForDb(
   database: DatabaseSyncInstance,
   options: MaterializationRepairOptions = {},
 ): MaterializationRepairStats {
+  // Repair mutates projection status/job visibility.  Invalidate the bounded
+  // panel/search snapshot before doing any work so callers cannot observe a
+  // pre-repair active row after it has been archived.
+  clearPanelReadCache();
   const now = options.now ?? Date.now();
   const staleRunningMs = options.staleRunningMs ?? DEFAULT_STALE_RUNNING_JOB_MS;
   const failedJobsRetainPerTarget = Math.max(0, options.failedJobsRetainPerTarget ?? DEFAULT_FAILED_JOB_RETAIN_PER_TARGET);
@@ -4869,8 +4890,7 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
   // into an unbounded JS scan when a text query is supplied.
   conditions.push('is_noise = 0');
   if (normalizedQuery) {
-    conditions.push('(summary LIKE ? OR content_json LIKE ?)');
-    params.push(`%${normalizedQuery}%`, `%${normalizedQuery}%`);
+    appendTextSearchSql(conditions, params, normalizedQuery);
   }
 
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -4949,8 +4969,7 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
   conditions.push('is_noise = 0');
   baseConditions.push('is_noise = 0');
   if (normalizedQuery) {
-    conditions.push('(summary LIKE ? OR content_json LIKE ?)');
-    params.push(`%${normalizedQuery}%`, `%${normalizedQuery}%`);
+    appendTextSearchSql(conditions, params, normalizedQuery);
   }
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const aggregate = database.prepare(`

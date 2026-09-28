@@ -125,7 +125,9 @@ describe('bounded markdown ingest contract', () => {
     });
 
     expect(first).toEqual({ filesChecked: 1, observationsWritten: 2 });
-    expect(second).toEqual({ filesChecked: 1, observationsWritten: 2 });
+    // The second scan still checks the file but skips unchanged content by
+    // mtime/size/hash, avoiding duplicate writes during startup replays.
+    expect(second).toEqual({ filesChecked: 1, observationsWritten: 0 });
     const observations = listContextObservations({ scope: 'personal' });
     const projections = listProcessedProjections(namespace, 'durable_memory_candidate');
     expect(observations).toHaveLength(2);
