@@ -2943,7 +2943,8 @@
         "skill_not_found": "Skill not found.",
         "skill_outside_managed_roots": "The skill is outside the managed skill folders.",
         "registry_file_too_large": "The skill registry file is too large.",
-        "registry_entry_limit_exceeded": "The skill registry has too many entries."
+        "registry_entry_limit_exceeded": "The skill registry has too many entries.",
+        "store_unavailable": "Local memory store is starting or unavailable. Please retry in a moment."
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

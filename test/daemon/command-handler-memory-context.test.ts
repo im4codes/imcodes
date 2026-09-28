@@ -1416,7 +1416,7 @@ describe('handleWebCommand memory context timeline', () => {
       records: [],
       pendingRecords: [],
       projects: [],
-      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE,
       stats: expect.objectContaining({ localUnavailable: true }),
     }));
     // Fired concurrently with the (failing) stats read rather than gated
@@ -1499,7 +1499,7 @@ describe('handleWebCommand memory context timeline', () => {
       type: MEMORY_WS.OBSERVATION_RESPONSE,
       requestId: 'observations-degraded',
       localUnavailable: true,
-      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE,
     }));
 
     serverLink.send.mockClear();
@@ -1524,7 +1524,7 @@ describe('handleWebCommand memory context timeline', () => {
       type: MEMORY_WS.PREF_RESPONSE,
       requestId: 'preferences-degraded',
       localUnavailable: true,
-      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED,
+      errorCode: MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE,
     }));
   });
 

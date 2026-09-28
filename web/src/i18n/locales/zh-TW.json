@@ -2943,7 +2943,8 @@
         "skill_not_found": "未找到該技能。",
         "skill_outside_managed_roots": "該技能不在受管理的技能目錄中。",
         "registry_file_too_large": "技能註冊表檔案過大。",
-        "registry_entry_limit_exceeded": "技能註冊表條目過多。"
+        "registry_entry_limit_exceeded": "技能註冊表條目過多。",
+        "store_unavailable": "本機記憶儲存正在啟動或暫時無法使用，請稍後重試。"
       },
       "memoryToolsTitle": "记忆工具",
       "memoryToolsDescription": "基于已选择的项目身份管理偏好、技能、Markdown 导入、观察记录和 daemon 记忆功能状态。",

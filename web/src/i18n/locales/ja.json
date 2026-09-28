@@ -2942,7 +2942,8 @@
         "skill_not_found": "スキルが見つかりません。",
         "skill_outside_managed_roots": "スキルが管理対象のスキルフォルダ外にあります。",
         "registry_file_too_large": "スキルレジストリファイルが大きすぎます。",
-        "registry_entry_limit_exceeded": "スキルレジストリの項目が多すぎます。"
+        "registry_entry_limit_exceeded": "スキルレジストリの項目が多すぎます。",
+        "store_unavailable": "ローカルメモリーストアを起動中、または一時的に利用できません。しばらくしてから再試行してください。"
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

@@ -382,12 +382,6 @@ function ensureDb(): DatabaseSyncInstance {
     );
     CREATE INDEX IF NOT EXISTS idx_context_jobs_target_status
       ON context_jobs(target_key, status, created_at);
-    CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_created
-      ON context_jobs(target_key, job_type, status, created_at);
-    CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_updated
-      ON context_jobs(target_key, job_type, status, updated_at DESC);
-    CREATE INDEX IF NOT EXISTS idx_context_jobs_status_type_updated
-      ON context_jobs(status, job_type, updated_at);
 
     CREATE TABLE IF NOT EXISTS context_processed_local (
       id TEXT PRIMARY KEY,
@@ -649,8 +643,6 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_turn_usage_sync(usage_authority_id, usage_fact_id);
     CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_attempt
       ON context_turn_usage_sync(sync_status, next_attempt_at_ms, created_at_ms);
-    CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_created
-      ON context_turn_usage_sync(sync_status, created_at_ms);
 
     -- Codex account-level pay-as-you-go usage credit balance, snapshotted
     -- every time a real (non-cached) account/rateLimits/read refresh
@@ -767,6 +759,29 @@ function ensureDb(): DatabaseSyncInstance {
   }
   scheduleArchiveBackfillIfNeeded(db, dbPath);
   return db;
+}
+
+/**
+ * Build optional maintenance indexes outside the synchronous warmup path.
+ * The worker invokes this only from its idle maintenance tick, after it has
+ * already announced readiness; a first start therefore cannot consume the
+ * RPC warmup budget while SQLite scans a large table.
+ */
+export function ensureContextStoreMaintenanceIndexes(): { created: number; done: boolean } {
+  const database = ensureDb();
+  const indexes = [
+    'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_created ON context_jobs(target_key, job_type, status, created_at)',
+    'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_updated ON context_jobs(target_key, job_type, status, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_jobs_status_type_updated ON context_jobs(status, job_type, updated_at)',
+    'CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_created ON context_turn_usage_sync(sync_status, created_at_ms)',
+  ];
+  const cursorKey = 'maintenance_indexes_cursor';
+  const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0);
+  const index = Math.max(0, Math.min(indexes.length, Math.trunc(cursor)));
+  if (index >= indexes.length) return { created: 0, done: true };
+  database.exec(indexes[index]!);
+  internalSetContextMeta(database, cursorKey, String(index + 1));
+  return { created: 1, done: index + 1 >= indexes.length };
 }
 
 function decodeTarget(row: Record<string, unknown>, namespace: ContextNamespace): ContextTargetRef {

@@ -150,6 +150,7 @@ function maybeCheckpoint(): void {
     // idle. It must never be part of ensureDb()'s warmup transaction: loading
     // every historical summary there can exceed the RPC timeout and trigger a
     // respawn storm on a large store.
+    store.ensureContextStoreMaintenanceIndexes();
     store.reconcileMaterializedStagedEventsBatch();
     store.purgeMemoryNoiseProjectionsBatch();
     store.checkpointWal();

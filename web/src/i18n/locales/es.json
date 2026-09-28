@@ -2943,7 +2943,8 @@
         "skill_not_found": "No se encontró la habilidad.",
         "skill_outside_managed_roots": "La habilidad está fuera de las carpetas de habilidades administradas.",
         "registry_file_too_large": "El archivo de registro de habilidades es demasiado grande.",
-        "registry_entry_limit_exceeded": "El registro de habilidades tiene demasiadas entradas."
+        "registry_entry_limit_exceeded": "El registro de habilidades tiene demasiadas entradas.",
+        "store_unavailable": "El almacén de memoria local se está iniciando o no está disponible temporalmente. Vuelve a intentarlo en un momento."
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

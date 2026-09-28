@@ -2942,7 +2942,8 @@
         "skill_not_found": "Навык не найден.",
         "skill_outside_managed_roots": "Навык находится вне управляемых папок навыков.",
         "registry_file_too_large": "Файл реестра навыков слишком большой.",
-        "registry_entry_limit_exceeded": "В реестре навыков слишком много записей."
+        "registry_entry_limit_exceeded": "В реестре навыков слишком много записей.",
+        "store_unavailable": "Локальное хранилище памяти запускается или временно недоступно. Повторите попытку через некоторое время."
       },
       "memoryToolsTitle": "Memory tools",
       "memoryToolsDescription": "Manage preferences, skills, markdown ingest, observations, and daemon memory feature status with the selected project identity.",

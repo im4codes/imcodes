@@ -310,6 +310,7 @@ import type {
   WriteProcessedProjectionInput,
 } from '../store/context-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { CONTEXT_STORE_RPC_ERROR } from '../../shared/context-store-rpc.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import {
   isKnownTestProjectName,
@@ -12259,7 +12260,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     baseStats = await statsPromise;
   } catch (error) {
     logger.warn({ error }, 'personal memory stats unavailable');
-    sendPersonalMemoryUnavailable(serverLink, requestId);
+    sendPersonalMemoryUnavailable(serverLink, requestId, emptyMemoryStatsView(), error);
     return;
   }
 
@@ -12290,7 +12291,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       semantic = await recordsPromise as Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
     } catch (error) {
       logger.warn({ error }, 'personal memory semantic query unavailable');
-      sendPersonalMemoryUnavailable(serverLink, requestId, { ...baseStats, matchedRecords: 0 });
+      sendPersonalMemoryUnavailable(serverLink, requestId, { ...baseStats, matchedRecords: 0 }, error);
       return;
     }
     records = semantic.items
@@ -12331,7 +12332,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       }));
     } catch (error) {
       logger.warn({ error }, 'personal memory records unavailable');
-      sendPersonalMemoryUnavailable(serverLink, requestId, baseStats);
+      sendPersonalMemoryUnavailable(serverLink, requestId, baseStats, error);
       return;
     }
     matchedRecords = baseStats.matchedRecords;
@@ -12347,7 +12348,7 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     [pendingRecords, projects] = await Promise.all([pendingPromise, projectsPromise]);
   } catch (error) {
     logger.warn({ error }, 'personal memory supplemental views unavailable');
-    sendPersonalMemoryUnavailable(serverLink, requestId, stats);
+    sendPersonalMemoryUnavailable(serverLink, requestId, stats, error);
     return;
   }
   // Any caller requesting short refs must consume handles issued by the daemon,
@@ -12640,6 +12641,7 @@ function sendPersonalMemoryUnavailable(
   serverLink: ServerLink,
   requestId: string,
   stats: ContextMemoryStatsView = emptyMemoryStatsView(),
+  error?: unknown,
 ): void {
   serverLink.send({
     type: MEMORY_WS.PERSONAL_RESPONSE,
@@ -12648,12 +12650,30 @@ function sendPersonalMemoryUnavailable(
     records: [],
     pendingRecords: [],
     projects: [],
-    ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+    ...memoryManagementFailure(error),
   });
 }
 
 function memoryManagementError(code: MemoryManagementErrorCode): { errorCode: MemoryManagementErrorCode; error: string } {
   return { errorCode: code, error: code };
+}
+
+function memoryManagementFailure(error: unknown): { errorCode: MemoryManagementErrorCode; error: string } {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : '';
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const unavailable = new Set<string>([
+    CONTEXT_STORE_RPC_ERROR.unavailable,
+    CONTEXT_STORE_RPC_ERROR.timeout,
+    CONTEXT_STORE_RPC_ERROR.workerExit,
+    CONTEXT_STORE_RPC_ERROR.workerError,
+    CONTEXT_STORE_RPC_ERROR.overloaded,
+    CONTEXT_STORE_RPC_ERROR.indeterminate,
+  ]);
+  return memoryManagementError(unavailable.has(code) || /context[- ]store (?:worker )?(?:unavailable|timeout|overloaded)/i.test(message)
+    ? MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE
+    : MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED);
 }
 
 function memoryManagementContextError(): { errorCode: MemoryManagementErrorCode; error: string } {
@@ -13054,7 +13074,7 @@ async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, server
       records: [],
       featureEnabled: true,
       localUnavailable: true,
-      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+      ...memoryManagementFailure(error),
     });
     return;
   }
@@ -13127,7 +13147,7 @@ async function handleMemoryPreferenceCreate(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: true, id: row.id });
   } catch (error) {
     logger.warn({ error }, 'memory preference management create failed');
-    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13186,7 +13206,7 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: true, id: row.id });
   } catch (error) {
     logger.warn({ error }, 'memory preference management update failed');
-    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13311,7 +13331,7 @@ async function handleMemorySkillsRebuild(cmd: Record<string, unknown>, serverLin
     });
   } catch (error) {
     logger.warn({ error }, 'memory skill registry rebuild failed');
-    serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13360,7 +13380,7 @@ async function handleMemorySkillRead(cmd: Record<string, unknown>, serverLink: S
     serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: true, key, layer, content });
   } catch (error) {
     logger.warn({ error }, 'memory skill preview failed');
-    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13430,7 +13450,7 @@ async function handleMemorySkillDelete(cmd: Record<string, unknown>, serverLink:
     serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: true });
   } catch (error) {
     logger.warn({ error }, 'memory skill delete failed');
-    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13480,7 +13500,7 @@ async function handleMemoryMarkdownIngestRun(cmd: Record<string, unknown>, serve
     serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: true, featureEnabled: true, ...result });
   } catch (error) {
     logger.warn({ error }, 'manual markdown memory ingest failed');
-    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13521,7 +13541,7 @@ async function handleMemoryObservationsQuery(cmd: Record<string, unknown>, serve
       records: [],
       featureEnabled: true,
       localUnavailable: true,
-      ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED),
+      ...memoryManagementFailure(error),
     });
     return;
   }
@@ -13619,7 +13639,7 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
     serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: true, id: row.id });
   } catch (error) {
     logger.warn({ error }, 'memory observation update failed');
-    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13670,7 +13690,7 @@ async function handleMemoryObservationDelete(cmd: Record<string, unknown>, serve
     serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success });
   } catch (error) {
     logger.warn({ error }, 'memory observation delete failed');
-    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13927,7 +13947,7 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: true, id: projection.id });
   } catch (error) {
     logger.warn({ error }, 'manual memory create failed');
-    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13979,7 +13999,7 @@ async function handleMemoryUpdate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: true, id });
   } catch (error) {
     logger.warn({ error }, 'manual memory update failed');
-    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -14020,7 +14040,7 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: true, id: pinned.id });
   } catch (error) {
     logger.warn({ error }, 'manual memory pin failed');
-    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
