@@ -95,6 +95,37 @@ let stagedReconciledForPath: string | null = null;
 let materializationRepairRanForPath: string | null = null;
 let archiveBackfillTimer: ReturnType<typeof setTimeout> | null = null;
 let archiveBackfillScheduledForPath: string | null = null;
+// Panel requests can arrive in a burst (stats, records and projects in the
+// same render, followed by a refresh). Keep a very short-lived per-filter
+// snapshot so repeated reads do not rescan a large historical table while
+// background maintenance is yielding. Writes naturally invalidate this via
+// the database path reset; the sub-second TTL bounds staleness for callers
+// that share a long-lived worker connection.
+const PANEL_READ_CACHE_TTL_MS = 250;
+const panelReadCache = new Map<string, { expiresAt: number; value: unknown }>();
+
+function panelCacheKey(kind: string, filters: unknown): string {
+  return `${kind}:${JSON.stringify(filters ?? {})}`;
+}
+
+function panelCacheGet<T>(kind: string, filters: unknown): T | undefined {
+  const key = panelCacheKey(kind, filters);
+  const entry = panelReadCache.get(key);
+  if (!entry) return undefined;
+  if (entry.expiresAt <= Date.now()) {
+    panelReadCache.delete(key);
+    return undefined;
+  }
+  return entry.value as T;
+}
+
+function panelCacheSet(kind: string, filters: unknown, value: unknown): void {
+  panelReadCache.set(panelCacheKey(kind, filters), { expiresAt: Date.now() + PANEL_READ_CACHE_TTL_MS, value });
+}
+
+function clearPanelReadCache(): void {
+  panelReadCache.clear();
+}
 // Whether THIS module instance may schedule the archive-backfill timer. Default
 // enabled so tests, the CLI, and the context-store worker run it. The daemon
 // MAIN thread disables it once it spawns the context-store worker, so the
@@ -1696,6 +1727,7 @@ export function resetContextStoreForTests(): void {
   currentDbPath = null;
   stagedReconciledForPath = null;
   materializationRepairRanForPath = null;
+  clearPanelReadCache();
 }
 
 
@@ -3490,7 +3522,8 @@ export function queryPendingContextEvents(filters: {
     FROM context_staged_events
     ${where}
     ORDER BY created_at DESC
-  `).all(...params) as Array<Record<string, unknown>>;
+    LIMIT ?
+  `).all(...params, typeof filters.limit === 'number' && filters.limit > 0 ? Math.min(100, Math.floor(filters.limit)) : 50) as Array<Record<string, unknown>>;
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
   return rows
@@ -3666,6 +3699,7 @@ export function writeProcessedProjectionForDb(
   database: DatabaseSyncInstance,
   input: WriteProcessedProjectionInput,
 ): ProcessedContextProjection {
+  clearPanelReadCache();
   const now = Date.now();
   const canonicalNamespace = canonicalizeContextNamespace(input.namespace);
   const namespaceKey = serializeContextNamespace(canonicalNamespace);
@@ -4800,6 +4834,8 @@ export interface ProcessedProjectionStats {
 }
 
 export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}): ProcessedContextProjection[] {
+  const cached = panelCacheGet<ProcessedContextProjection[]>('records', filters);
+  if (cached) return cached;
   const database = ensureDb();
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
 
@@ -4870,7 +4906,9 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
       normalizedQuery,
     ));
 
-  return filtered.slice(0, limit);
+  const result = filtered.slice(0, limit);
+  panelCacheSet('records', filters, result);
+  return result;
 }
 
 /** Increment hit_count and update last_used_at for a list of recalled projection IDs. */
@@ -4885,6 +4923,8 @@ export function recordMemoryHits(ids: string[]): void {
 }
 
 export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = {}): ProcessedProjectionStats {
+  const cached = panelCacheGet<ProcessedProjectionStats>('stats', filters);
+  if (cached) return cached;
   const database = ensureDb();
   const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
   const conditions: string[] = [];
@@ -4926,7 +4966,7 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
   // this hot stats path perform a UNION/full-table distinct scan.
   const projectCount = Number(aggregate.project_count ?? 0) || 0;
   const pending = getPendingContextStats(filters);
-  return {
+  const result = {
     totalRecords,
     matchedRecords,
     recentSummaryCount,
@@ -4936,9 +4976,13 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     dirtyTargetCount: pending.dirtyTargetCount,
     pendingJobCount: pending.pendingJobCount,
   };
+  panelCacheSet('stats', filters, result);
+  return result;
 }
 
 export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {}): ContextMemoryProjectView[] {
+  const cached = panelCacheGet<ContextMemoryProjectView[]>('projects', filters);
+  if (cached) return cached;
   const database = ensureDb();
   const conditions: string[] = [];
   const params: (string | number)[] = [];
@@ -5009,9 +5053,11 @@ export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {
     projects.set(projectId, current);
   }
 
-  return Array.from(projects.values())
+  const result = Array.from(projects.values())
     .sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0) || b.totalRecords - a.totalRecords || a.projectId.localeCompare(b.projectId))
     .slice(0, 200);
+  panelCacheSet('projects', filters, result);
+  return result;
 }
 
 function getPendingContextStats(filters: ProcessedProjectionQuery): {
