@@ -4836,7 +4836,14 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
   // newer rows from other projects and made exact projection/source lookups
   // unreliable for privacy-safe read tools.
   const candidateLimit = normalizedQuery ? Math.min(1000, Math.max(limit * 4, 100)) : limit;
-  const sql = `SELECT * FROM context_processed_local ${where} ORDER BY updated_at DESC LIMIT ?`;
+  // Never select embedding/blob columns for the management list.  The old
+  // SELECT * pulled every vector through the worker even though the panel
+  // only renders these scalar projection fields, making a 50-row page
+  // needlessly compete with startup work.
+  const sql = `SELECT id, namespace_key, class, origin, source_event_ids_json,
+      summary, content_json, content_hash, created_at, updated_at, hit_count,
+      last_used_at, status
+    FROM context_processed_local ${where} ORDER BY updated_at DESC LIMIT ?`;
   const rows = database.prepare(sql).all(...params, candidateLimit) as Array<Record<string, unknown>>;
 
   const filtered = rows
