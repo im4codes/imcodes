@@ -2421,6 +2421,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // as the bubble comes back into view.
   const [pinnedAboveViewport, setPinnedAboveViewport] = useState(false);
   const [pinnedExpanded, setPinnedExpanded] = useState(false);
+  // Mobile task status is portaled into this titlebar so its collapsed strip
+  // shares the pinned-message row instead of overlaying the conversation.
+  const chatTitlebarRef = useRef<HTMLDivElement>(null);
+  const chatTopActionsRef = useRef<HTMLDivElement>(null);
   const lastSentUserMessage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
@@ -2891,6 +2895,18 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // a provider diagnostic) makes the entire list disappear even though the
   // aggregator still has authoritative status to show.
   const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
+  const canShowFilePanel = !preview && !!ws;
+  useLayoutEffect(() => {
+    const titlebar = chatTitlebarRef.current;
+    const actions = chatTopActionsRef.current;
+    if (!titlebar || !actions) return undefined;
+    const update = () => titlebar.style.setProperty('--chat-top-actions-reserve', `${Math.ceil(actions.getBoundingClientRect().width) + 8}px`);
+    update();
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(update);
+    observer?.observe(actions);
+    window.addEventListener('resize', update);
+    return () => { observer?.disconnect(); window.removeEventListener('resize', update); };
+  }, [canShowAgentsControl, canShowFilePanel, onForceSync]);
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
@@ -3902,7 +3918,6 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     };
   }, [isTouchDevice, preview, openCtxMenu]);
 
-  const canShowFilePanel = !preview && !!ws;
   const hasRightPanel = showAgentsPane || (canShowFilePanel && showFilePanel);
   // Per-machine chat-window font preference (family + size). Stored in
   // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
@@ -3954,7 +3969,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   return (
     <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
       {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
-        <div class="chat-top-actions">
+        <div ref={chatTopActionsRef} class="chat-top-actions">
           {onForceSync && (
             <button
               class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
@@ -4001,6 +4016,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       <div class="chat-main">
         {!preview && (
           <div
+            ref={chatTitlebarRef}
             class="chat-titlebar"
             style={{
               display: 'flex',
@@ -4051,7 +4067,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             )}
           </div>
         )}
-        {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} />}
+        {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} mobileAnchorRef={chatTitlebarRef} />}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}

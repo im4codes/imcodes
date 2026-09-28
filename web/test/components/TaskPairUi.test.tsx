@@ -316,6 +316,39 @@ describe('TaskPairStatusPanel', () => {
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
   });
 
+  it('portals the collapsed mobile status into the pinned-message header row', async () => {
+    const original = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '(max-width: 720px)', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const titlebar = document.createElement('div');
+    const pin = document.createElement('button');
+    pin.dataset.testid = 'pinned-message-control';
+    titlebar.append(pin);
+    document.body.append(titlebar);
+    const events = [{ eventId: 'mobile-inline', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-inline', title: 'Inline task', toStatus: 'working' } }] as never;
+    render(<TaskPairStatusPanelHost events={events} serverId="mobile-inline" mobileAnchor={titlebar} />);
+    await waitFor(() => expect(titlebar.querySelector('.task-pair-status-panel')).toBeTruthy());
+    const panel = titlebar.querySelector('.task-pair-status-panel')!;
+    expect(panel.classList.contains('is-mobile')).toBe(true);
+    expect(panel.classList.contains('is-collapsed')).toBe(true);
+    expect(titlebar.querySelector('[data-testid="pinned-message-control"]')?.nextElementSibling).toBe(panel);
+    expect(panel.querySelector('.task-pair-status-mobile-label')).toBeTruthy();
+    expect(panel.querySelector('.task-pair-status-collapse-icon')).toBeNull();
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
+  it('keeps the mobile status in the equivalent header row when no pinned message exists', async () => {
+    const original = window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '(max-width: 720px)', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const titlebar = document.createElement('div');
+    document.body.append(titlebar);
+    const events = [{ eventId: 'mobile-header', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-header', title: 'Header task', toStatus: 'working' } }] as never;
+    render(<TaskPairStatusPanelHost events={events} serverId="mobile-header" mobileAnchor={titlebar} />);
+    await waitFor(() => expect(titlebar.querySelector('.task-pair-status-panel')).toBeTruthy());
+    expect(titlebar.children).toHaveLength(1);
+    expect(titlebar.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
   it('uses a stored layout preference and labels the visible collapse control', () => {
     const events = [{ eventId: 'layout-stored', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-stored', title: 'Stored', toStatus: 'working' } }] as never;
     window.localStorage.setItem('imcodes.task-pair-status-panel.collapsed:stored:desktop', '1');

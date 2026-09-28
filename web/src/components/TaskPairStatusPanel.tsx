@@ -1,5 +1,6 @@
 import { isMobileUserAgent } from '../mobile-device.js';
-import { useCallback, useEffect, useState } from 'preact/hooks';
+import { useCallback, useEffect, useLayoutEffect, useState } from 'preact/hooks';
+import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
@@ -267,7 +268,8 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     separator: t('taskPair.panel_duration_separator'),
   };
   const toggleLabel = `${t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} — ${t('taskPair.panel_title')}`;
-  const toggleContent = collapsed ? <span class="task-pair-status-icons" role="group" aria-label={t('taskPair.panel_title')}>
+  const toggleContent = collapsed ? <span class={`task-pair-status-icons${isMobile ? ' task-pair-status-mobile-content' : ''}`} role="group" aria-label={t('taskPair.panel_title')}>
+    {isMobile && <span class="task-pair-status-mobile-label">{t('taskPair.panel_title')}</span>}
     <span class={`task-pair-status-icon task-pair-status-icon--working${counts.working === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_working')} aria-label={t('taskPair.panel_icon_working')}><span aria-hidden="true">▶</span><b>{counts.working}</b></span>
     <span class={`task-pair-status-icon task-pair-status-icon--audit${counts.audit === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_audit')} aria-label={t('taskPair.panel_icon_audit')}><span aria-hidden="true">◉</span><b>{counts.audit}</b></span>
     <span class={`task-pair-status-icon task-pair-status-icon--queued${counts.queued === 0 ? ' is-zero' : ''}`} title={t('taskPair.panel_icon_queued')} aria-label={t('taskPair.panel_icon_queued')}><span aria-hidden="true">⏳</span><b>{counts.queued}</b></span>
@@ -319,11 +321,31 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
 }
 
 /** Avoid mounting responsive panel effects in ordinary chats until pair data exists. */
-export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
+export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null; mobileAnchor?: Element | null; mobileAnchorRef?: { current: Element | null } }) {
   const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events));
   const [authorityUnavailable, setAuthorityUnavailable] = useState(() => Boolean(initialSnapshot?.authorityUnavailable));
-  useEffect(() => { if (!active && hasPairActivity(props.events)) setActive(true); }, [active, props.events]);
+  const [mobile, setMobile] = useState(() => active ? mobileLayout() : false);
+  const [resolvedMobileAnchor, setResolvedMobileAnchor] = useState<Element | null>(() => props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null);
+  useLayoutEffect(() => {
+    const anchor = props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null;
+    if (anchor !== resolvedMobileAnchor) setResolvedMobileAnchor(anchor);
+  }, [active, props.mobileAnchor, props.mobileAnchorRef, resolvedMobileAnchor]);
+  useEffect(() => {
+    if (!active) return undefined;
+    const update = () => setMobile(mobileLayout());
+    update();
+    const media = window.matchMedia?.('(max-width: 720px)');
+    media?.addEventListener?.('change', update);
+    window.addEventListener('resize', update);
+    return () => { media?.removeEventListener?.('change', update); window.removeEventListener('resize', update); };
+  }, [active]);
+  useEffect(() => {
+    if (!active && hasPairActivity(props.events)) {
+      setMobile(mobileLayout());
+      setActive(true);
+    }
+  }, [active, props.events]);
   useEffect(() => {
     const onSnapshot = (event: Event) => {
       const detail = (event as CustomEvent).detail as { tasks?: readonly unknown[]; scopeReset?: boolean; authorityUnavailable?: boolean; op?: string; task?: unknown } | undefined;
@@ -352,5 +374,10 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   // rows from the previous scope must not show, and no full-size placeholder
   // box may cover the conversation. The panel reappears with fresh data.
   if (authorityUnavailable) return null;
-  return <TaskPairStatusPanel {...props} />;
+  const { mobileAnchor, mobileAnchorRef, ...panelProps } = props;
+  const panel = <TaskPairStatusPanel {...panelProps} />;
+  // On phones the collapsed strip belongs to the titlebar row, immediately
+  // after the pinned-message control.  Portal only the active mobile host so
+  // desktop keeps its existing chat-main overlay and dimensions.
+  return mobile && resolvedMobileAnchor ? createPortal(panel, resolvedMobileAnchor) : panel;
 }

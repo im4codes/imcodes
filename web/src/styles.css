@@ -14602,7 +14602,53 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact .task-pair-status-icons {
   min-height: 0; align-items: center;
 }
+.task-pair-status-mobile-label {
+  min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; font-weight: 700;
+}
 @media (max-width: 720px) {
+  /* The mobile host portals into .chat-titlebar. Keep it in the same flex row
+     as the pin control; the status strip is never an overlay or a new bar. */
+  .chat-titlebar {
+    /* .chat-top-actions is an absolute sibling above the titlebar. Reserve
+       its measured width so the status strip can never flow underneath its
+       buttons or badges. */
+    padding-right: max(8px, var(--chat-top-actions-reserve, 56px)) !important;
+  }
+  .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed {
+    position: static; flex: 0 1 auto; min-width: 0; max-width: calc(48% - var(--chat-top-actions-reserve, 56px));
+    width: auto; margin: 0 0 0 auto; display: inline-flex; align-self: center;
+  }
+  .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-compact {
+    min-width: 0; max-width: 100%; overflow: hidden; display: flex; align-items: center;
+  }
+  .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-content {
+    min-width: 0; max-width: 100%; overflow: hidden; flex-wrap: nowrap; gap: 3px;
+  }
+  .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-content .task-pair-status-icon {
+    min-width: auto; height: auto; padding: 0; border: 0; border-radius: 0; flex: 0 0 auto;
+  }
+  .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-label {
+    flex: 1 1 auto;
+  }
+  .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
+    position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; bottom: auto;
+    width: auto; max-width: none; height: min(65vh, calc(100dvh - 160px));
+    max-height: min(65vh, calc(100dvh - 160px)); z-index: 20; overflow: hidden;
+    border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
+    box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
+  }
+  @media (max-width: 350px) {
+    .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed {
+      max-width: calc(100% - var(--chat-top-actions-reserve, 56px));
+    }
+    .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-icon.is-zero {
+      display: none;
+    }
+    .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-label {
+      max-width: 54px;
+    }
+  }
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; height: min(42vh, 420px); max-height: min(42vh, 420px); overflow: hidden; }
   .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; height: auto; max-height: none; overflow: visible; }
   .chat-titlebar > .task-pair-status-panel:not(.is-collapsed) {

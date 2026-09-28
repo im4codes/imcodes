@@ -138,6 +138,7 @@ export interface ChatTimelineHarnessApi {
 const query = readQuery();
 const { events: initialEvents, label: fixtureLabel } = resolveEvents(query);
 const windowCount = query.get('windows') === '4' ? 4 : 1;
+const fixturePinsEnabled = query.get('pins') === '1';
 /** Live events array. Replaced (never mutated) on every harness update. */
 let currentEvents: TimelineEvent[] = initialEvents;
 let publishEvents: ((next: TimelineEvent[]) => void) | null = null;
@@ -266,7 +267,13 @@ function FixtureHarness() {
     >
       {Array.from({ length: windowCount }, (_, i) => (
         <div key={i} class="chat-timeline-fixture-window" data-window-index={i} style={cellStyle}>
-          <ChatView events={events} loading={false} sessionId={`fixture-window-${i}`} />
+          <ChatView
+            events={events}
+            loading={false}
+            sessionId={`fixture-window-${i}`}
+            serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
+            messagePinsEnabled={fixturePinsEnabled}
+          />
         </div>
       ))}
     </div>
