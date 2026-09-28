@@ -4,7 +4,6 @@ import {
   closeSync,
   existsSync,
   fstatSync,
-  fsyncSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -14,6 +13,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { fsyncDescriptorSync, fsyncDirectorySync } from './fsync.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -969,22 +969,7 @@ function readBoundedStateFile(path: string): string {
  * failure; everywhere else a genuine error still propagates, because losing
  * durability silently is exactly the bug this call exists to prevent.
  */
-function syncDirectoryBestEffort(directoryPath: string): void {
-  let handle: number;
-  try {
-    handle = openSync(directoryPath, 'r');
-  } catch (error) {
-    if (process.platform === 'win32') return;
-    throw error;
-  }
-  try {
-    fsyncSync(handle);
-  } catch (error) {
-    if (process.platform !== 'win32') throw error;
-  } finally {
-    closeSync(handle);
-  }
-}
+const syncDirectoryBestEffort = fsyncDirectorySync;
 
 function atomicWriteJson(path: string, value: unknown): void {
   const serialized = `${JSON.stringify(value, null, 2)}\n`;
@@ -996,7 +981,7 @@ function atomicWriteJson(path: string, value: unknown): void {
   try {
     writeFileSync(temporary, serialized, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     const file = openSync(temporary, 'r');
-    try { fsyncSync(file); } finally { closeSync(file); }
+    try { fsyncDescriptorSync(file); } finally { closeSync(file); }
     renameSync(temporary, path);
     // Directory fsync makes the rename itself durable across power loss. It is
     // POSIX-only: Windows refuses fsync on a directory handle with EPERM, and

@@ -61,6 +61,9 @@ export interface SessionResourceRegistryOptions {
     sessionInstanceId: string;
     runtimeEpoch: string;
   } | null | undefined>;
+  /** Proves whether a concrete pane handle is still the live owner. `null`
+   * means the probe was inconclusive and must fail closed. */
+  isTmuxHandleCurrent?: (name: string, paneId: string) => Promise<boolean | null>;
   tmuxIdentityTimeoutMs?: number;
   pidHandleIsCurrent?: typeof sessionResourcePidHandleIsCurrent;
   /**
@@ -329,6 +332,7 @@ export class SessionResourceRegistry {
   private readonly now: () => number;
   private readonly cleanup: SessionResourceCleanup;
   private readonly resolveTmuxIdentity: NonNullable<SessionResourceRegistryOptions['resolveTmuxIdentity']>;
+  private readonly isTmuxHandleCurrent: NonNullable<SessionResourceRegistryOptions['isTmuxHandleCurrent']>;
   private readonly tmuxIdentityTimeoutMs: number;
   private readonly requiresStrongHandles: boolean;
   private readonly pidHandleIsCurrent: typeof sessionResourcePidHandleIsCurrent;
@@ -343,6 +347,12 @@ export class SessionResourceRegistry {
     this.now = options.now ?? Date.now;
     this.cleanup = options.cleanup ?? cleanupSessionResource;
     this.resolveTmuxIdentity = options.resolveTmuxIdentity ?? resolveLiveTmuxIdentity;
+    this.isTmuxHandleCurrent = options.isTmuxHandleCurrent ?? (async (name, paneId) => {
+      const identity = await this.resolveTmuxIdentity(name);
+      if (identity === undefined) return false;
+      if (identity === null) return null;
+      return identity.paneId === paneId ? true : null;
+    });
     this.tmuxIdentityTimeoutMs = options.tmuxIdentityTimeoutMs ?? TMUX_IDENTITY_QUERY_TIMEOUT_MS;
     this.pidHandleIsCurrent = options.pidHandleIsCurrent ?? sessionResourcePidHandleIsCurrent;
     this.requiresStrongHandles = options.cleanup === undefined;
@@ -505,6 +515,18 @@ export class SessionResourceRegistry {
             && liveIdentity.paneId === registration.handle.paneId
             && liveIdentity.sessionInstanceId === registration.owner.sessionInstanceId
             && liveIdentity.runtimeEpoch === registration.owner.runtimeEpoch);
+          // A remain-on-exit pane keeps its name and pane id while its old
+          // owner tuple remains visible. Prove that concrete old handle is
+          // dead before allowing the successor; a foreign live pane returns
+          // null and remains protected by the conflict below.
+          if (!replacesStaleTmuxOwner && liveIdentity !== null
+            && previous.handle.paneId) {
+            const oldHandleCurrent = await this.isTmuxHandleCurrent(
+              previous.handle.name,
+              previous.handle.paneId,
+            );
+            replacesStaleTmuxOwner = oldHandleCurrent === false;
+          }
         }
         if (!sameLogicalTmuxOwner && !replacesStaleTmuxOwner) {
           throw new Error('session_resource_owner_conflict');

@@ -695,6 +695,14 @@ export async function getTmuxSessionResourceIdentity(
   session: string,
   timeoutMs: number,
 ): Promise<TmuxSessionResourceIdentity | null | undefined> {
+  if (BACKEND === 'conpty') {
+    try {
+      const c = await conpty();
+      return c.conptyGetSessionResourceIdentity(session);
+    } catch {
+      return null;
+    }
+  }
   if (BACKEND !== 'tmux') return null;
   try {
     // tmux does not expose arbitrary pane environment variables as bare
@@ -733,6 +741,44 @@ export async function getTmuxSessionResourceIdentity(
       || output.includes("can't find pane")
       || output.includes("can't find window")
       || output.includes('no server running')) return undefined;
+    return null;
+  }
+}
+
+/**
+ * Probe a concrete pane handle for stale-owner reclamation. Unlike the
+ * identity probe above this also checks the pane process: remain-on-exit
+ * keeps a dead tmux pane (and ConPTY keeps an exited entry) addressable by the
+ * same name, so a name-only check cannot prove that the old owner is live.
+ * `null` is reserved for an inconclusive/foreign live pane and callers must
+ * fail closed rather than deleting its registry row.
+ */
+export async function isTmuxSessionResourceHandleCurrent(
+  session: string,
+  paneId: string,
+  timeoutMs = 2_000,
+): Promise<boolean | null> {
+  if (BACKEND === 'conpty') {
+    try {
+      const c = await conpty();
+      if (!c.conptySessionExists(session) || !c.conptyIsPaneAlive(session)) return false;
+      const currentPaneId = String(c.conptyGetPid(session));
+      return currentPaneId === paneId ? true : null;
+    } catch {
+      return null;
+    }
+  }
+  if (BACKEND !== 'tmux') return null;
+  try {
+    const identity = await getTmuxSessionResourceIdentity(session, timeoutMs);
+    if (identity === undefined) return false;
+    if (identity === null || identity.paneId !== paneId) return null;
+    const { stdout } = await execFile('tmux', ['list-panes', '-t', session, '-F', '#{pane_dead}'], {
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024,
+    });
+    return stdout.trim() === '0';
+  } catch {
     return null;
   }
 }

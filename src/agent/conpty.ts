@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 
 import logger from '../util/logger.js';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 
 // ── node-pty type shim (package installed at runtime, not in devDependencies) ───
 
@@ -70,6 +71,8 @@ interface ConptySession {
   cols: number;                      // cached from spawn/resize
   rows: number;                      // cached from spawn/resize
   cwd: string;                       // cached from spawn (no runtime CWD query available)
+  sessionInstanceId?: string;        // resource owner tuple injected at spawn
+  runtimeEpoch?: string;
 }
 
 const sessions = new Map<string, ConptySession>();
@@ -181,6 +184,8 @@ export async function conptyNewSession(
     cols,
     rows,
     cwd,
+    sessionInstanceId: opts?.env?.[SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID],
+    runtimeEpoch: opts?.env?.[SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH],
   };
 
   pty.onData((data: string) => {
@@ -357,6 +362,22 @@ export function conptyGetPid(name: string): number {
   const session = sessions.get(name);
   if (!session) throw new Error(`ConPTY session not found: ${name}`);
   return session.pty.pid;
+}
+
+/** Return the owner tuple injected into a live ConPTY pane, if present. */
+export function conptyGetSessionResourceIdentity(name: string): {
+  paneId: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+} | null | undefined {
+  const session = sessions.get(name);
+  if (!session || session.exited) return undefined;
+  if (!session.sessionInstanceId || !session.runtimeEpoch) return null;
+  return {
+    paneId: String(session.pty.pid),
+    sessionInstanceId: session.sessionInstanceId,
+    runtimeEpoch: session.runtimeEpoch,
+  };
 }
 
 /**

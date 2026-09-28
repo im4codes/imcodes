@@ -4,7 +4,6 @@ import {
   closeSync,
   existsSync,
   fstatSync,
-  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
@@ -13,6 +12,7 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { fsyncDescriptorSync, fsyncDirectorySync } from './fsync.js';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import {
@@ -102,10 +102,9 @@ function atomicWriteJson(path: string, value: unknown): void {
   try {
     writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     const file = openSync(temporary, 'r');
-    try { fsyncSync(file); } finally { closeSync(file); }
+    try { fsyncDescriptorSync(file); } finally { closeSync(file); }
     renameSync(temporary, path);
-    const directory = openSync(dirname(path), 'r');
-    try { fsyncSync(directory); } finally { closeSync(directory); }
+    fsyncDirectorySync(dirname(path));
   } finally {
     rmSync(temporary, { force: true });
   }
@@ -116,7 +115,7 @@ function fsyncPublishedTree(root: string, files: readonly { path: string }[]): v
   for (const entry of files) {
     const path = join(root, entry.path);
     const file = openSync(path, 'r');
-    try { fsyncSync(file); } finally { closeSync(file); }
+    try { fsyncDescriptorSync(file); } finally { closeSync(file); }
     let directory = dirname(path);
     while (directory.startsWith(root) && directory !== root) {
       directories.add(directory);
@@ -124,8 +123,7 @@ function fsyncPublishedTree(root: string, files: readonly { path: string }[]): v
     }
   }
   for (const directory of [...directories].sort((left, right) => right.length - left.length)) {
-    const handle = openSync(directory, 'r');
-    try { fsyncSync(handle); } finally { closeSync(handle); }
+    fsyncDirectorySync(directory);
   }
 }
 
@@ -150,11 +148,6 @@ function contentSafeSourceLabel(value: string): string {
     const leaf = oneLine.split(/[\\/]/).at(-1)?.trim() || 'managed-package';
     return Buffer.byteLength(leaf, 'utf8') <= 256 ? leaf : 'managed-package';
   }
-}
-
-function fsyncDirectory(path: string): void {
-  const directory = openSync(path, 'r');
-  try { fsyncSync(directory); } finally { closeSync(directory); }
 }
 
 const INDEX_KEYS = new Set(['schemaVersion', 'revision', 'entries']);
@@ -697,7 +690,7 @@ export function publishManagedSkillVersion(input: PublishManagedSkillInput, home
     // Remove only its unindexed partial paths; never inspect/delete by name.
     rmSync(finalPath, { recursive: true, force: true });
     rmSync(finalManifestPath, { force: true });
-    fsyncDirectory(registryRoot);
+    fsyncDirectorySync(registryRoot);
   }
   // Cleanup must only remove paths published by this invocation. Another
   // concurrent publisher may win after the preflight existence check; the
@@ -714,9 +707,8 @@ export function publishManagedSkillVersion(input: PublishManagedSkillInput, home
     renameSync(temporaryManifestPath, finalManifestPath);
     ownsFinalManifestPath = true;
     const manifestFile = openSync(finalManifestPath, 'r');
-    try { fsyncSync(manifestFile); } finally { closeSync(manifestFile); }
-    const registryDirectory = openSync(registryRoot, 'r');
-    try { fsyncSync(registryDirectory); } finally { closeSync(registryDirectory); }
+    try { fsyncDescriptorSync(manifestFile); } finally { closeSync(manifestFile); }
+    fsyncDirectorySync(registryRoot);
     return publishIndex(readManagedSkillIndexStrict(homeDir), manifest);
   } catch (error) {
     rmSync(temporaryPath, { recursive: true, force: true });

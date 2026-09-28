@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { closeSync, cpSync, existsSync, fstatSync, fsyncSync, mkdirSync, openSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { closeSync, cpSync, existsSync, fstatSync, mkdirSync, openSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { fsyncDescriptorSync, fsyncDirectorySync } from './fsync.js';
 import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
@@ -153,11 +154,6 @@ function sha256(value: string): string {
 
 function exactJson(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
-}
-
-function fsyncDirectory(path: string): void {
-  const directory = openSync(path, 'r');
-  try { fsyncSync(directory); } finally { closeSync(directory); }
 }
 
 function errorResult(reason: CapabilityErrorResult['reason'], error: string, retryable = false): CapabilityErrorResult {
@@ -646,10 +642,9 @@ export class DaemonCapabilityServiceAdapter implements SharedCapabilityService {
         encoding: 'utf8', mode: 0o600, flag: 'wx',
       });
       const file = openSync(temporary, 'r');
-      try { fsyncSync(file); } finally { closeSync(file); }
+      try { fsyncDescriptorSync(file); } finally { closeSync(file); }
       renameSync(temporary, path);
-      const directory = openSync(dirname(path), 'r');
-      try { fsyncSync(directory); } finally { closeSync(directory); }
+      fsyncDirectorySync(dirname(path));
     } finally {
       rmSync(temporary, { force: true });
     }
@@ -1040,7 +1035,7 @@ export class DaemonCapabilityServiceAdapter implements SharedCapabilityService {
       if (!current || current.activeVersionId !== committedVersionId) return false;
       rmSync(versionPath, { recursive: true, force: true });
       rmSync(manifestPath, { force: true });
-      fsyncDirectory(getManagedSkillRegistryRoot(homeDir, snapshot.capabilityId));
+      fsyncDirectorySync(getManagedSkillRegistryRoot(homeDir, snapshot.capabilityId));
       writeManagedSkillIndex({
         ...index,
         revision: index.revision + 1,
@@ -1154,7 +1149,7 @@ export class DaemonCapabilityServiceAdapter implements SharedCapabilityService {
     rmSync(versionPath, { recursive: true, force: true });
     rmSync(manifestPath, { force: true });
     const registryRoot = getManagedSkillRegistryRoot(homeDir, snapshot.capabilityId);
-    if (existsSync(registryRoot)) fsyncDirectory(registryRoot);
+    if (existsSync(registryRoot)) fsyncDirectorySync(registryRoot);
     return 'restored';
   }
 

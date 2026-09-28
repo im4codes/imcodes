@@ -20,7 +20,12 @@ import {
   type SessionResourceRecord,
 } from './session-resource-registry.js';
 
-const registry = new SessionResourceRegistry();
+const registry = new SessionResourceRegistry({
+  isTmuxHandleCurrent: async (name, paneId) => {
+    const { isTmuxSessionResourceHandleCurrent } = await import('../agent/tmux.js');
+    return isTmuxSessionResourceHandleCurrent(name, paneId);
+  },
+});
 const execFile = promisify(execFileCallback);
 let stopExpirySweep: (() => void) | null = null;
 const mcpCpuSamples = new Map<string, {

@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto';
 import {
   closeSync,
   existsSync,
-  fsyncSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -11,6 +10,7 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { fsyncDescriptorSync, fsyncDirectorySync } from './fsync.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
@@ -104,10 +104,9 @@ function atomicWrite(path: string, value: JournalState): void {
   try {
     writeFileSync(temporary, `${JSON.stringify(value)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     const file = openSync(temporary, 'r');
-    try { fsyncSync(file); } finally { closeSync(file); }
+    try { fsyncDescriptorSync(file); } finally { closeSync(file); }
     renameSync(temporary, path);
-    const directory = openSync(dirname(path), 'r');
-    try { fsyncSync(directory); } finally { closeSync(directory); }
+    fsyncDirectorySync(dirname(path));
   } finally {
     rmSync(temporary, { force: true });
   }
