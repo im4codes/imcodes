@@ -3518,15 +3518,16 @@ export function queryPendingContextEvents(filters: {
   const params: (string | number)[] = [];
   appendNamespaceFilterSql(conditions, params, filters);
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
+  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
+  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? Math.min(100, Math.floor(filters.limit)) : 50;
+  const candidateLimit = normalizedQuery ? Math.min(1000, Math.max(limit * 4, 100)) : limit;
   const rows = database.prepare(`
     SELECT id, namespace_key, session_name, event_type, content, created_at
     FROM context_staged_events
     ${where}
     ORDER BY created_at DESC
     LIMIT ?
-  `).all(...params, typeof filters.limit === 'number' && filters.limit > 0 ? Math.min(100, Math.floor(filters.limit)) : 50) as Array<Record<string, unknown>>;
-  const normalizedQuery = filters.query?.trim().toLowerCase() ?? '';
-  const limit = typeof filters.limit === 'number' && filters.limit > 0 ? filters.limit : 50;
+  `).all(...params, candidateLimit) as Array<Record<string, unknown>>;
   return rows
     .map((row) => {
       const namespace = parseNamespaceKey(String(row.namespace_key));
