@@ -18,6 +18,7 @@ import {
   TASK_PAIR_INFER_TASK_ID,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
+  TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_TITLE_EVENT_VERB,
@@ -298,9 +299,13 @@ export class TaskPairService {
    * call this when the send itself names an objective.
    */
   resolveSingleParticipantOpenPair(sender: string, target: string): string | undefined {
+    // This lookup is the continuation path for a plain Brain send.  It must
+    // cover every durable non-terminal state, not only states that consume a
+    // concurrency slot: queued, passed, and awaiting-brain-decision pairs
+    // still own their executor/auditor until an explicit terminal decision.
     const matches = getTaskPairStore().pairsForSession(target).filter((stored) => {
       const state = stored.state;
-      return state.brain === sender && TASK_PAIR_OPEN_STATUSES.includes(state.status)
+      return state.brain === sender && TASK_PAIR_PARTICIPANT_STATUSES.includes(state.status)
         && (state.executor === target || state.auditor === target);
     });
     return matches.length === 1 ? matches[0]!.state.taskId : undefined;

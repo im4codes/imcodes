@@ -11,7 +11,6 @@ import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import {
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
-  TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_TERMINAL_STATUSES,
   type TaskPairEngine,
   type TaskPairEventSource,
@@ -244,11 +243,15 @@ export class TaskPairStore {
     ));
   }
 
-  /** True when a session is reserved by any non-terminal pair, including queued work. */
+  /**
+   * True when a session is reserved by any non-terminal pair, including
+   * queued/passed/awaiting-decision work. listActivePairs is the single
+   * terminal-state gate, so this remains fail-closed if a future non-terminal
+   * status is added before the participant-status projection is updated.
+   */
   isParticipantOfOpenPair(sessionName: string, exceptTaskId?: string): boolean {
     return this.listActivePairs().some((pair) => (
       pair.state.taskId !== exceptTaskId
-      && TASK_PAIR_PARTICIPANT_STATUSES.includes(pair.state.status)
       && (pair.state.executor === sessionName || pair.state.auditor === sessionName)
     ));
   }

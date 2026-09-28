@@ -35,6 +35,7 @@ import {
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
 import { SUPERVISION_MODE, normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { buildSupervisionExecutionCapabilityId, normalizeSupervisionExecutionModel } from '../../../shared/supervision-execution-pool.js';
+import { TASK_PAIR_PARTICIPANT_STATUSES, TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION } from '../../../shared/task-pair.js';
 
 const PROJECT = 'dispproj';
 const BRAIN = 'deck_dispproj_brain';
@@ -159,6 +160,39 @@ describe('Brain work dispatch opens driven pairs', () => {
     } as never, deps());
     expect(replay).toMatchObject({ status: 'accepted', taskId: result.taskId });
     expect(pairs()).toHaveLength(1);
+  });
+
+  it('continues every non-terminal participant state, including passed and queued, instead of minting an implicit pair', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    const opened = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Initial work.', task: { taskId: 'nonterminal-continue', objective: 'Initial work.' },
+    } as never, deps());
+    expect(opened).toMatchObject({ status: 'accepted', taskId: 'nonterminal-continue' });
+    await flush();
+    const stored = getTaskPairStore().getPair(PROJECT, 'nonterminal-continue')?.state;
+    if (!stored) throw new Error('pair was not created');
+
+    for (const status of TASK_PAIR_PARTICIPANT_STATUSES) {
+      const state = {
+        ...stored,
+        status,
+        auditor: status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION ? 'none' : AUD,
+        flags: status === 'working' ? ['blocked', 'needs_input'] : [],
+        updatedAt: now += 1,
+      } as typeof stored;
+      getTaskPairStore().savePair(PROJECT, state);
+      const followUp = await dispatchSendMessage(brainCaller, {
+        target: EXEC, message: `Continue while ${status}.`,
+      } as never, deps());
+      expect(followUp).toMatchObject({ status: 'accepted', taskId: 'nonterminal-continue' });
+      expect(getTaskPairStore().listActivePairs(PROJECT)).toHaveLength(1);
+    }
+
+    getTaskPairStore().savePair(PROJECT, { ...stored, status: 'done', updatedAt: now += 1 });
+    const fresh = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Start unrelated work.' } as never, deps());
+    expect(fresh.status).toBe('accepted');
+    expect((fresh as { taskId?: string }).taskId).toBeTruthy();
+    expect((fresh as { taskId?: string }).taskId).not.toBe('nonterminal-continue');
   });
 
   it('auto-audit on: a Brain-named task opens exactly that pair, and cron sends or worker sends open none', async () => {
