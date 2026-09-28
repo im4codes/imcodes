@@ -292,6 +292,7 @@ import {
   CODEX_SDK_EFFORT_LEVELS,
   COPILOT_SDK_EFFORT_LEVELS,
   DEFAULT_TRANSPORT_EFFORT,
+  clampTransportEffort,
   OPENCLAW_THINKING_LEVELS,
   PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
@@ -1148,6 +1149,32 @@ function getSupportedEffortLevels(agentType: string | undefined): readonly Trans
               : [];
 }
 
+async function resolveSupportedEffortLevels(
+  record: SessionRecord,
+  agentType: string,
+): Promise<readonly TransportEffortLevel[]> {
+  const fallback = getSupportedEffortLevels(agentType);
+  if (agentType !== 'codex-sdk') return fallback;
+  try {
+    const provider = getProvider(agentType);
+    const catalog = await provider?.listModels?.(false);
+    const modelId = record.activeModel?.trim() || record.requestedModel?.trim();
+    const model = modelId ? catalog?.models.find((entry) => entry.id === modelId) : undefined;
+    if (model?.supportedEffortLevels?.length) return model.supportedEffortLevels;
+    // Idle sessions may not have a provider instance yet. Reuse the daemon's
+    // passive app-server catalog rather than silently falling back to a stale
+    // global list when model/list metadata is already cached on disk.
+    if (!model && modelId) {
+      const runtimeConfig = await getCodexRuntimeConfig({ probe: false }).catch(() => undefined);
+      const cachedModel = runtimeConfig?.models?.find((entry) => entry.id === modelId);
+      if (cachedModel?.supportedEffortLevels?.length) return cachedModel.supportedEffortLevels;
+    }
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 async function applyTransportEffortSwitch(
   record: SessionRecord,
   transportRuntime: TransportSessionRuntime | undefined,
@@ -1156,7 +1183,7 @@ async function applyTransportEffortSwitch(
 ): Promise<SessionThinkingSwitchResult> {
   const sessionName = record.name;
   const agentType = record.agentType ?? '';
-  const allowed = getSupportedEffortLevels(agentType);
+  const allowed = await resolveSupportedEffortLevels(record, agentType);
   if (!allowed.length) {
     return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${agentType || 'this session'}` };
   }
@@ -2973,7 +3000,18 @@ export async function switchSessionModelNow(sessionName: string, model?: string,
   try {
     const latest = getSession(sessionName) ?? target.record;
     const switched = await applyTransportModelSwitch(latest, target.runtime, requested);
-    if (!switched.ok || !thinking?.trim()) return switched;
+    if (!switched.ok) return switched;
+    if (!thinking?.trim()) {
+      const switchedRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
+      const allowed = await resolveSupportedEffortLevels(switchedRecord, switchedRecord.agentType ?? '');
+      const clamped = clampTransportEffort(switchedRecord.effort, allowed);
+      if (switchedRecord.effort && clamped && clamped !== switchedRecord.effort) {
+        const effort = await applyTransportEffortSwitch(switchedRecord, target.runtime, clamped);
+        if (!effort.ok) return effort;
+        return { ...switched, thinking: effort.thinking, previousThinking: effort.previousThinking, thinkingApplied: effort.applied };
+      }
+      return switched;
+    }
     const effortRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
     const effort = await applyTransportEffortSwitch(effortRecord, target.runtime, thinking.trim());
     if (!effort.ok) return effort;
@@ -3020,7 +3058,7 @@ export async function listSessionModelsNow(sessionName: string): Promise<Session
       ...(currentModel ? { currentModel } : {}),
       ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
       models: validated.models,
-      thinkingLevels: [...getSupportedEffortLevels(agentType)],
+      thinkingLevels: [...await resolveSupportedEffortLevels(record, agentType)],
       acceptsAnyModel: false,
       ...(record.ccPreset && agentType === 'claude-code-sdk' ? { note: `preset ${record.ccPreset}` } : {}),
     };
@@ -3043,7 +3081,7 @@ export async function listSessionModelsNow(sessionName: string): Promise<Session
     ...(currentModel ? { currentModel } : {}),
     ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
     models: listed.models.map((model) => model.id),
-    thinkingLevels: [...getSupportedEffortLevels(agentType)],
+    thinkingLevels: [...await resolveSupportedEffortLevels(record, agentType)],
     // Providers without a validated list take any id; this is their picker list.
     acceptsAnyModel: isGenericModelSwitchAgent(agentType),
     ...(note ? { note } : {}),
@@ -11694,7 +11732,7 @@ async function handleTransportListModels(
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const force = cmd.force === true;
   const reply = (payload: {
-    models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+    models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean; supportedEffortLevels?: readonly TransportEffortLevel[] }>;
     defaultModel?: string;
     isAuthenticated?: boolean;
     error?: string;
@@ -11725,7 +11763,7 @@ const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
 const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
 
 type TransportListModelsResult = {
-  models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+  models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean; supportedEffortLevels?: readonly TransportEffortLevel[] }>;
   defaultModel?: string;
   isAuthenticated?: boolean;
   error?: string;
@@ -11866,6 +11904,7 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
         id: model.id,
         ...(model.name ? { name: model.name } : {}),
         ...(model.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+        ...(model.supportedEffortLevels?.length ? { supportedEffortLevels: model.supportedEffortLevels } : {}),
       }))
       : modelIdsToTransportModels(CODEX_MODEL_IDS);
     return {

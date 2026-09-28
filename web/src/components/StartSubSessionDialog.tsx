@@ -7,7 +7,7 @@ import type { WsClient } from '../ws-client.js';
 import type { RemoteSession } from '../hooks/useProviderStatus.js';
 import { parseString, usePref } from '../hooks/usePref.js';
 import { PREF_KEY_DEFAULT_SHELL } from '../constants/prefs.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, PI_EFFORT_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { getSessionAgentGroups, getSessionAgentLabel, SESSION_AGENT_GROUP_LABEL_KEYS } from './session-agent-options.js';
 import { SdkModeRecommendation } from './SdkModeRecommendation.js';
 import { QwenCodingPlanHint } from './QwenCodingPlanHint.js';
@@ -325,10 +325,17 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     onStart(type, selectedShell, cwd || undefined, label || undefined, Object.keys(extra).length > 0 ? extra : undefined);
   };
 
+  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
+  const transportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPreset : undefined,
+  );
+  const selectedDynamicModel = transportModels.models.find((model) => model.id === requestedModel);
   const thinkingLevels = type === 'claude-code-sdk'
     ? CLAUDE_SDK_EFFORT_LEVELS
     : type === 'codex-sdk'
-      ? CODEX_SDK_EFFORT_LEVELS
+      ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
       : type === 'copilot-sdk'
         ? COPILOT_SDK_EFFORT_LEVELS
         : type === 'qwen'
@@ -345,12 +352,11 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
     : type === 'qwen'
       ? t('new_session.compatible_api_via_qwen')
       : t('new_session.api_provider');
-  const dynamicModelsAgentType = supportsDynamicTransportModels(type) ? type : null;
-  const transportModels = useTransportModels(
-    ws,
-    dynamicModelsAgentType,
-    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) ? ccPreset : undefined,
-  );
+  useEffect(() => {
+    if (type !== 'codex-sdk' || !selectedDynamicModel?.supportedEffortLevels?.length) return;
+    const clamped = clampTransportEffort(thinking, selectedDynamicModel.supportedEffortLevels);
+    if (clamped && clamped !== thinking) setThinking(clamped);
+  }, [selectedDynamicModel?.id, selectedDynamicModel?.supportedEffortLevels, thinking, type]);
   const supportsModelSelection = type === 'claude-code-sdk' || type === 'codex-sdk' || type === 'copilot-sdk' || type === 'cursor-headless' || type === 'opencode-sdk' || type === 'gemini-sdk' || type === 'grok-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) || (type === 'qwen' && !!selectedCcPreset);
   const modelSuggestions = useMemo(() => (
     CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(type) && selectedCcPreset
@@ -801,7 +807,7 @@ export function StartSubSessionDialog({ ws, defaultCwd, allowedAgentTypes, overl
                 style={{ width: '100%' }}
               >
                 {thinkingLevels.map((level) => (
-                  <option key={level} value={level}>{formatEffortLevel(level)}</option>
+                  <option key={level} value={level}>{formatEffortLevel(level)}{level === 'ultra' ? ` — ${t('session.thinking_ultra_hint')}` : ''}</option>
                 ))}
               </select>
             </div>

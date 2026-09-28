@@ -63,7 +63,7 @@ import {
 } from '../../../shared/session-control-commands.js';
 import type { TransportAttachment } from '../../../shared/transport-attachments.js';
 import logger from '../../util/logger.js';
-import { CODEX_SDK_EFFORT_LEVELS, type TransportEffortLevel } from '../../../shared/effort-levels.js';
+import { CODEX_SDK_EFFORT_LEVELS, normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../../shared/effort-levels.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { getCodexBaseInstructions } from '../codex-runtime-config.js';
 import { buildGeneratedImageReportingPrompt } from '../../../shared/transport-runtime-prompts.js';
@@ -1082,6 +1082,7 @@ export interface CodexDiscoveredModel {
   id: string;
   name?: string;
   supportsReasoningEffort?: boolean;
+  supportedEffortLevels?: TransportEffortLevel[];
   isDefault?: boolean;
 }
 
@@ -6481,6 +6482,7 @@ export class CodexSdkProvider implements TransportProvider {
           id: m.id,
           ...(m.name ? { name: m.name } : {}),
           ...(m.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+          ...(m.supportedEffortLevels?.length ? { supportedEffortLevels: m.supportedEffortLevels } : {}),
         })),
         ...(cfg.defaultModel ? { defaultModel: cfg.defaultModel } : {}),
         ...(typeof cfg.isAuthenticated === 'boolean' ? { isAuthenticated: cfg.isAuthenticated } : {}),
@@ -6514,13 +6516,17 @@ export class CodexSdkProvider implements TransportProvider {
               : '';
           if (!modelId || seen.has(modelId)) continue;
           seen.add(modelId);
+          const supportedEffortLevels = normalizeSupportedEffortLevels(entry.supportedReasoningEfforts);
           discovered.push({
             id: modelId,
             ...(typeof entry.displayName === 'string' && entry.displayName.trim()
               ? { name: entry.displayName.trim() }
               : {}),
-            ...(Array.isArray(entry.supportedReasoningEfforts) && entry.supportedReasoningEfforts.length > 0
-              ? { supportsReasoningEffort: true }
+            ...(supportedEffortLevels
+              ? {
+                supportsReasoningEffort: true,
+                supportedEffortLevels,
+              }
               : {}),
             ...(entry.isDefault === true ? { isDefault: true } : {}),
           });

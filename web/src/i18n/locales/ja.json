@@ -822,6 +822,8 @@
     "p2p_tag": "Team",
     "thinking": "レベル",
     "thinking_title": "レベル: {{value}}",
+    "thinking_clamped": "このモデルでは{{from}}を利用できないため、{{to}}に変更しました。",
+    "thinking_ultra_hint": "Ultra はタスクを自動的に委任します。",
     "supervision": {
       "title": "セッション監督",
       "help": "すべての Auto セッションで共有するグローバル監督ランタイムを設定します。",

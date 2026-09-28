@@ -170,7 +170,7 @@ describe('getCodexRuntimeConfig', () => {
     expect(config.availableModels).toEqual(['gpt-5.5', 'gpt-5.4-mini']);
     expect(config.defaultModel).toBe('gpt-5.5');
     expect(config.models).toEqual([
-      { id: 'gpt-5.5', name: 'GPT-5.5', supportsReasoningEffort: true, isDefault: true },
+      { id: 'gpt-5.5', name: 'GPT-5.5', supportsReasoningEffort: true, supportedEffortLevels: ['low', 'medium', 'high'], isDefault: true },
       { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
     ]);
     expect(config.planLabel).toBe('Pro');

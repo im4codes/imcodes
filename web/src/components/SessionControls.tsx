@@ -117,7 +117,7 @@ import type { P2pWorkflowDraft } from '@shared/p2p-workflow-types.js';
 import { getQwenAuthTier, QWEN_AUTH_TIERS, QWEN_AUTH_TYPES } from '@shared/qwen-auth.js';
 import { getKnownQwenModelDescription, getKnownQwenModelOptions } from '@shared/qwen-models.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, mergeModelSuggestions, normalizeClaudeCodeModelId } from '../../../src/shared/models/options.js';
-import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
+import { CLAUDE_SDK_EFFORT_LEVELS, CODEX_SDK_EFFORT_LEVELS, COPILOT_SDK_EFFORT_LEVELS, OPENCLAW_THINKING_LEVELS, QWEN_EFFORT_LEVELS, clampTransportEffort, formatEffortLevel, type TransportEffortLevel } from '@shared/effort-levels.js';
 import { resolveEffectiveSessionModel } from '@shared/session-model.js';
 import { CUSTOM_PROVIDER_SDK_AGENT_TYPES } from '@shared/cc-presets.js';
 import { useTransportModels, supportsDynamicTransportModels } from '../hooks/useTransportModels.js';
@@ -1709,6 +1709,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [appendSuccessNotice, setAppendSuccessNotice] = useState<string | null>(null);
   const [deliveryModeNotice, setDeliveryModeNotice] = useState<{ append: boolean; message: string } | null>(null);
   const [supervisionModeNotice, setSupervisionModeNotice] = useState<string | null>(null);
+  const [effortClampNotice, setEffortClampNotice] = useState<string | null>(null);
   const [attachments, setAttachments] = useState<ComposerAttachmentRecord[]>([]);
   const [deletingAttachmentKeys, setDeletingAttachmentKeys] = useState<Set<string>>(() => new Set());
   const [pendingDelegateTarget, setPendingDelegateTarget] = useState<PendingDelegateTarget | null>(null);
@@ -1716,6 +1717,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const appendSuccessTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const deliveryModeNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const supervisionModeNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const effortClampNoticeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const effortClampAppliedRef = useRef<string | null>(null);
   const [localTransportConfig, setLocalTransportConfig] = useState<Record<string, unknown> | null>(activeSession?.transportConfig ?? null);
 
   // Keep external inputRef in sync so parent can call .focus()
@@ -1832,6 +1835,14 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setSupervisionModeNotice(null);
     }, 3500);
   }, [t]);
+  const showEffortClampNotice = useCallback((from: TransportEffortLevel, to: TransportEffortLevel) => {
+    if (effortClampNoticeTimerRef.current) clearTimeout(effortClampNoticeTimerRef.current);
+    setEffortClampNotice(t('session.thinking_clamped', { from: formatEffortLevel(from), to: formatEffortLevel(to) }));
+    effortClampNoticeTimerRef.current = setTimeout(() => {
+      effortClampNoticeTimerRef.current = null;
+      setEffortClampNotice(null);
+    }, 4500);
+  }, [t]);
   const transportQueueAppendFailedLabel = t('session.transport_queue_append_failed');
 
   // Persist input draft across unmount/remount (sub-session minimize/restore)
@@ -1884,6 +1895,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     if (appendSuccessTimerRef.current) clearTimeout(appendSuccessTimerRef.current);
     if (deliveryModeNoticeTimerRef.current) clearTimeout(deliveryModeNoticeTimerRef.current);
     if (supervisionModeNoticeTimerRef.current) clearTimeout(supervisionModeNoticeTimerRef.current);
+    if (effortClampNoticeTimerRef.current) clearTimeout(effortClampNoticeTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -2125,11 +2137,15 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       : CLAUDE_CODE_MODEL_IDS;
   const qwenCompatibleApiSession = activeSession?.agentType === 'qwen'
     && (!!activeSession?.ccPreset || activeSession?.qwenAuthType === QWEN_AUTH_TYPES.API_KEY);
+  const selectedDynamicModel = useMemo(
+    () => dynamicTransportModels.models.find((candidate) => candidate.id === displayedCodexModel || candidate.id === genericTransportModel),
+    [displayedCodexModel, genericTransportModel, dynamicTransportModels.models],
+  );
   const thinkingLevels = useMemo((): readonly TransportEffortLevel[] => (
     activeSession?.agentType === 'claude-code-sdk'
       ? CLAUDE_SDK_EFFORT_LEVELS
       : activeSession?.agentType === 'codex-sdk'
-        ? CODEX_SDK_EFFORT_LEVELS
+        ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
         : activeSession?.agentType === 'qwen'
           ? (qwenCompatibleApiSession ? ['high'] : QWEN_EFFORT_LEVELS)
           : activeSession?.agentType === 'copilot-sdk'
@@ -2137,7 +2153,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           : activeSession?.agentType === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
             : []
-  ), [activeSession?.agentType, qwenCompatibleApiSession]);
+  ), [activeSession?.agentType, qwenCompatibleApiSession, selectedDynamicModel?.supportedEffortLevels]);
   const supportsThinking = thinkingLevels.length > 0;
   // Default the pill to a sensible value whenever the agent supports thinking
   // but the session doesn't yet have an `effort` persisted. Prefer 'high' if
@@ -4212,6 +4228,22 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     return commandId;
   }, [activeSession, cancelActiveTransportTurn, effectiveRuntimeType, i18n?.language, i18n?.resolvedLanguage, makeCommandId, serverId, showStopFeedback, ws]);
 
+  // Provider model metadata is authoritative when available. If a persisted
+  // effort is no longer supported after switching models, immediately clamp
+  // it and tell the daemon so the next turn cannot send an invalid value.
+  useEffect(() => {
+    const supported = selectedDynamicModel?.supportedEffortLevels;
+    const current = activeSession?.effort as TransportEffortLevel | undefined;
+    if (activeSession?.agentType !== 'codex-sdk' || !supported?.length || !current) return;
+    const clamped = clampTransportEffort(current, supported);
+    if (!clamped || clamped === current) return;
+    const key = `${activeSession.name}:${selectedDynamicModel?.id}:${current}->${clamped}`;
+    if (effortClampAppliedRef.current === key) return;
+    effortClampAppliedRef.current = key;
+    sendSessionMessage(`/thinking ${clamped}`);
+    showEffortClampNotice(current, clamped);
+  }, [activeSession?.agentType, activeSession?.effort, activeSession?.name, selectedDynamicModel?.id, selectedDynamicModel?.supportedEffortLevels, sendSessionMessage, showEffortClampNotice]);
+
   const sendQueuedMessageMutation = useCallback((
     type: 'session.edit_queued_message' | 'session.undo_queued_message' | typeof TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
     payload: Record<string, unknown>,
@@ -5618,6 +5650,13 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       </div>,
       document.body,
     )}
+    {effortClampNotice && typeof document !== 'undefined' && createPortal(
+      <div class="queue-append-success-toast composer-supervision-mode-toast" role="status" aria-live="polite">
+        <span class="queue-append-success-toast-icon" aria-hidden="true">✓</span>
+        <span>{effortClampNotice}</span>
+      </div>,
+      document.body,
+    )}
     {mobileFileBrowserOpen && ws && activeSession && createPortal(
       <div class="mobile-fb-overlay" ref={swipeBackRef}>
         <div class="mobile-fb-header">
@@ -6273,7 +6312,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
                     class={`menu-item ${currentThinking === level ? 'menu-item-active' : ''}`}
                     onClick={() => handleThinkingSelect(level)}
                   >
-                    {currentThinking === level ? '● ' : '○ '}{formatEffortLevel(level)}
+                    {currentThinking === level ? '● ' : '○ '}{formatEffortLevel(level)}{level === 'ultra' ? ` — ${t('session.thinking_ultra_hint')}` : ''}
                   </button>
                 ))}
               </div>

@@ -4768,7 +4768,7 @@ describe('CodexSdkProvider', () => {
     });
 
     await expect(resultPromise).resolves.toEqual([
-      { id: 'gpt-5.5', name: 'GPT-5.5', supportsReasoningEffort: true, isDefault: true },
+      { id: 'gpt-5.5', name: 'GPT-5.5', supportsReasoningEffort: true, supportedEffortLevels: ['low', 'high'], isDefault: true },
       { id: 'gpt-5.4-mini', name: 'GPT-5.4 Mini' },
     ]);
   });
@@ -6519,16 +6519,16 @@ describe('CodexSdkProvider', () => {
     });
   });
 
-  it('applies thinking level to subsequent Codex SDK turns', async () => {
+  it('applies Max thinking level exactly to subsequent Codex SDK turns', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });
     await provider.createSession({ sessionKey: 'route-think', cwd: '/tmp/project', effort: 'medium' });
-    provider.setSessionEffort('route-think', 'high');
+    provider.setSessionEffort('route-think', 'max');
 
     await provider.send('route-think', 'hello');
     const child = childProcessMock.children[0];
     const turnStartReq = child.requests.find((req) => req.method === 'turn/start');
-    expect(turnStartReq?.params?.effort).toBe('high');
+    expect(turnStartReq?.params?.effort).toBe('max');
   });
 
   it('propagates per-session IM.codes sender identity env through Codex app-server requests', async () => {

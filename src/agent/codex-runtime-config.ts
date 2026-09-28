@@ -8,6 +8,7 @@ import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 import { isMeaningfulCodexCreditsPayload } from '../../shared/codex-credit-history.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { normalizeSupportedEffortLevels, type TransportEffortLevel } from '../../shared/effort-levels.js';
 
 const CACHE_TTL_MS = 30_000;
 const APP_SERVER_TIMEOUT_MS = 5_000;
@@ -17,6 +18,7 @@ export interface CodexModelInfo {
   id: string;
   name?: string;
   supportsReasoningEffort?: boolean;
+  supportedEffortLevels?: TransportEffortLevel[];
   isDefault?: boolean;
 }
 
@@ -340,13 +342,17 @@ async function readCodexModelsViaAppServer(): Promise<CodexModelInfo[] | undefin
                   : '';
               if (!modelId || seen.has(modelId)) continue;
               seen.add(modelId);
+              const supportedEffortLevels = normalizeSupportedEffortLevels(entry.supportedReasoningEfforts);
               discovered.push({
                 id: modelId,
                 ...(typeof entry.displayName === 'string' && entry.displayName.trim()
                   ? { name: entry.displayName.trim() }
                   : {}),
-                ...(Array.isArray(entry.supportedReasoningEfforts) && entry.supportedReasoningEfforts.length > 0
-                  ? { supportsReasoningEffort: true }
+                ...(supportedEffortLevels
+                  ? {
+                    supportsReasoningEffort: true,
+                    supportedEffortLevels,
+                  }
                   : {}),
                 ...(entry.isDefault === true ? { isDefault: true } : {}),
               });

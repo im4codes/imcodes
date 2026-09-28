@@ -822,6 +822,8 @@
     "p2p_tag": "Team",
     "thinking": "레벨",
     "thinking_title": "레벨: {{value}}",
+    "thinking_clamped": "이 모델에서는 {{from}}을(를) 사용할 수 없어 {{to}}(으)로 전환했습니다.",
+    "thinking_ultra_hint": "Ultra는 작업을 자동으로 위임합니다.",
     "supervision": {
       "title": "세션 감독",
       "help": "모든 Auto 세션이 공유하는 하나의 전역 감독 런타임을 설정합니다.",

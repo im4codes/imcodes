@@ -19,6 +19,7 @@ import {
   PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
   formatEffortLevel,
+  clampTransportEffort,
   type TransportEffortLevel,
 } from "@shared/effort-levels.js";
 import {
@@ -538,11 +539,18 @@ export function NewSessionDialog({
         ? "sdk"
         : null;
   const qwenCompatibleApiPresetSelected = agentType === "qwen" && !!selectedCcPreset;
+  const dynamicModelsAgentType = supportsDynamicTransportModels(agentType) ? agentType : null;
+  const transportModels = useTransportModels(
+    ws,
+    dynamicModelsAgentType,
+    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) ? ccPreset : undefined,
+  );
+  const selectedDynamicModel = transportModels.models.find((model) => model.id === requestedModel);
   const thinkingLevels: readonly TransportEffortLevel[] =
     agentType === "claude-code-sdk"
       ? CLAUDE_SDK_EFFORT_LEVELS
       : agentType === "codex-sdk"
-        ? CODEX_SDK_EFFORT_LEVELS
+        ? (selectedDynamicModel?.supportedEffortLevels ?? CODEX_SDK_EFFORT_LEVELS)
         : agentType === "copilot-sdk"
           ? COPILOT_SDK_EFFORT_LEVELS
           : agentType === "qwen"
@@ -552,6 +560,13 @@ export function NewSessionDialog({
             : agentType === "openclaw"
               ? OPENCLAW_THINKING_LEVELS
               : [];
+  useEffect(() => {
+    if (agentType !== 'codex-sdk' || !selectedDynamicModel?.supportedEffortLevels?.length) return;
+    const clamped = clampTransportEffort(thinking, selectedDynamicModel.supportedEffortLevels);
+    if (!clamped || clamped === thinking) return;
+    setThinking(clamped);
+    onToast?.(t('session.thinking_clamped', { from: formatEffortLevel(thinking), to: formatEffortLevel(clamped) }));
+  }, [agentType, onToast, selectedDynamicModel?.id, selectedDynamicModel?.supportedEffortLevels, t, thinking]);
   const supportsCcPreset = CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType);
   // The third-party SDK switch is a launch mode, not an attribute of the
   // currently highlighted card. Keep its controls mounted while the mode
@@ -577,14 +592,6 @@ export function NewSessionDialog({
     || agentType === "pi"
     || isCodeBuddyProviderId(agentType)
     || (agentType === "qwen" && !!selectedCcPreset);
-  const dynamicModelsAgentType = supportsDynamicTransportModels(agentType)
-    ? agentType
-    : null;
-  const transportModels = useTransportModels(
-    ws,
-    dynamicModelsAgentType,
-    CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) ? ccPreset : undefined,
-  );
   const modelSuggestions = useMemo(() => {
     if (CUSTOM_PROVIDER_SDK_AGENT_TYPES.has(agentType) && selectedCcPreset) {
       return mergeModelSuggestions(
@@ -916,7 +923,7 @@ export function NewSessionDialog({
             >
               {thinkingLevels.map((level) => (
                 <option key={level} value={level}>
-                  {formatEffortLevel(level)}
+                  {formatEffortLevel(level)}{level === 'ultra' ? ` — ${t('session.thinking_ultra_hint')}` : ''}
                 </option>
               ))}
             </select>

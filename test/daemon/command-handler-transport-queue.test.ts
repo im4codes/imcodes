@@ -4532,7 +4532,28 @@ describe('handleWebCommand transport queue behavior', () => {
     it('returns the agent-supported levels for an invalid thinking request', async () => {
       getSessionMock.mockReturnValue({ name: 'deck_sub_bad_effort', projectName: 'p', role: 'w1', agentType: 'codex-sdk', runtimeType: 'transport', state: 'idle' });
       getTransportRuntimeMock.mockReturnValue(undefined);
-      await expect(switchSessionThinkingNow('deck_sub_bad_effort', 'adaptive')).resolves.toMatchObject({ ok: false, code: 'unknown_thinking_level', availableThinkingLevels: ['minimal', 'low', 'medium', 'high', 'xhigh'] });
+      await expect(switchSessionThinkingNow('deck_sub_bad_effort', 'adaptive')).resolves.toMatchObject({ ok: false, code: 'unknown_thinking_level', availableThinkingLevels: ['low', 'medium', 'high', 'xhigh', 'max'] });
+    });
+
+    it('uses the selected Codex model metadata instead of accepting a global effort level', async () => {
+      const setEffort = vi.fn();
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_codex_effort', projectName: 'p', role: 'w1', agentType: 'codex-sdk',
+        runtimeType: 'transport', state: 'running', activeModel: 'gpt-6-luna', effort: 'high',
+      });
+      getProviderMock.mockReturnValue({
+        listModels: vi.fn().mockResolvedValue({
+          models: [{ id: 'gpt-6-luna', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] }],
+        }),
+      });
+      getTransportRuntimeMock.mockReturnValue({ setEffort, pendingCount: 0 });
+
+      await expect(switchSessionThinkingNow('deck_sub_codex_effort', 'ultra')).resolves.toMatchObject({
+        ok: false,
+        code: 'unknown_thinking_level',
+        availableThinkingLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      });
+      expect(setEffort).not.toHaveBeenCalled();
     });
 
     it('rejects thinking control for agents without effort support', async () => {

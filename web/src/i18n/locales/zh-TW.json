@@ -822,6 +822,8 @@
     "p2p_tag": "團隊",
     "thinking": "等級",
     "thinking_title": "等級：{{value}}",
+    "thinking_clamped": "此模型不支援 {{from}}，已切換為 {{to}}。",
+    "thinking_ultra_hint": "Ultra 會自動委派任務。",
     "supervision": {
       "title": "工作階段監督",
       "help": "設定一套供所有 Auto 會話共用的全域監督執行環境。",

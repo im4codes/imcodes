@@ -9,6 +9,7 @@ export interface TransportModelInfo {
   id: string;
   name?: string;
   supportsReasoningEffort?: boolean;
+  supportedEffortLevels?: import('@shared/effort-levels.js').TransportEffortLevel[];
 }
 
 export interface TransportModelState {

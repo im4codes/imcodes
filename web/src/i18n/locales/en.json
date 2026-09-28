@@ -822,6 +822,8 @@
     "p2p_tag": "Team",
     "thinking": "Level",
     "thinking_title": "Level: {{value}}",
+    "thinking_clamped": "Reasoning level {{from}} is unavailable for this model; switched to {{to}}.",
+    "thinking_ultra_hint": "Ultra automatically delegates tasks.",
     "supervision": {
       "title": "Session supervision",
       "help": "Set one global supervisor runtime shared by every Auto-enabled session.",

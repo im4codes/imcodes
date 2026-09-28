@@ -822,6 +822,8 @@
     "p2p_tag": "Team",
     "thinking": "Nivel",
     "thinking_title": "Nivel: {{value}}",
+    "thinking_clamped": "El nivel {{from}} no está disponible para este modelo; se cambió a {{to}}.",
+    "thinking_ultra_hint": "Ultra delega tareas automáticamente.",
     "supervision": {
       "title": "Supervisión de sesión",
       "help": "Configura un runtime global de supervisión compartido por todas las sesiones con Auto.",

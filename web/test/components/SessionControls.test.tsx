@@ -10048,6 +10048,61 @@ afterEach(() => {
     });
   });
 
+  it('renders the selected Codex model effort metadata, including Max and Ultra', async () => {
+    const ws = makeWs();
+    const view = render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-effort-metadata',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-6-luna',
+          effort: 'high',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const request = await waitFor(() => {
+      const found = ws.send.mock.calls
+        .map((call) => call[0])
+        .find((message) => message?.type === 'transport.list_models' && message?.agentType === 'codex-sdk');
+      expect(found).toBeDefined();
+      return found;
+    });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: request.requestId,
+      models: [
+        { id: 'gpt-6-luna', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max'] },
+        { id: 'gpt-6-sol', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] },
+      ],
+    }));
+
+    fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
+    expect(screen.getByRole('button', { name: '○ Max' })).toBeDefined();
+    expect(screen.queryByRole('button', { name: '○ Minimal' })).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: '○ Max' }));
+    expectSendPayload(ws, { sessionName: 'codex-effort-metadata', text: '/thinking max' });
+
+    view.rerender(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-effort-metadata',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-6-sol',
+          effort: 'high',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
+    expect(screen.getByRole('button', { name: /○ Ultra —/ })).toBeDefined();
+  });
+
   it('uses the main-session model command for a worker-role process Codex session', () => {
     const ws = makeWs();
     render(

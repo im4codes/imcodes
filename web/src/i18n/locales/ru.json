@@ -822,6 +822,8 @@
     "p2p_tag": "Team",
     "thinking": "Уровень",
     "thinking_title": "Уровень: {{value}}",
+    "thinking_clamped": "Уровень {{from}} недоступен для этой модели; выбран {{to}}.",
+    "thinking_ultra_hint": "Ultra автоматически делегирует задачи.",
     "supervision": {
       "title": "Контроль сессии",
       "help": "Настройте единый глобальный runtime надзора для всех Auto-сессий.",

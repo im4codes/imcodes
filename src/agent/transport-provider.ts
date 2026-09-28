@@ -813,6 +813,8 @@ export interface ProviderModelInfo {
   id: string;
   name?: string;
   supportsReasoningEffort?: boolean;
+  /** Exact per-model effort values reported by the provider, in provider order. */
+  supportedEffortLevels?: readonly TransportEffortLevel[];
 }
 
 /** Shape returned by TransportProvider.listModels(). */
