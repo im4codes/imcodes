@@ -746,9 +746,6 @@ export class ContextStoreWorkerClient {
     // reads retryable as unavailable; classify only dispatched unsafe mutations
     // as indeterminate so callers cannot replay a possible append/lease.
     const queued = entry.queueAware && !entry.started;
-    const dispatchedUnsafeQueued = queued
-      && entry.dispatched
-      && contextStoreOpRetryClass(entry.op) === CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry;
     if (!queued) {
       const durationMs = entry.startedAtMs === null ? entry.timeoutMs : Math.max(0, Date.now() - entry.startedAtMs);
       this.lastSlowOperation = { op: entry.op, durationMs };
