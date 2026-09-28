@@ -984,6 +984,8 @@
     "identityTooLargeScoped": "La identidad debe ser texto válido de hasta {{limit}} caracteres Unicode.",
     "identityCreateSaveFailed": "La sesión comenzó, pero no se pudo guardar su identidad.",
     "identityCreateApplyFailed": "La sesión comenzó y la identidad se guardó en línea, pero el daemon no confirmó su aplicación. Reinténtalo en los ajustes antes de enviar un mensaje.",
+    "identityApplyTimeout": "La identidad se guardó en línea, pero el daemon aún no confirmó su aplicación. Puede seguir en curso; reinténtalo en los ajustes de la sesión.",
+    "identityApplyFailed": "La identidad se guardó en línea, pero el daemon no pudo aplicarla: {{error}}",
     "identityApply": "Aplicar identidad",
     "modelSettings": {
       "label": "Modelo de la sesión",

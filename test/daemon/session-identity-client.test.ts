@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   clearSessionIdentityProfile,
+  getEffectiveSessionIdentityProfiles,
   listSessionIdentityProfiles,
   setSessionIdentityProfile,
 } from '../../src/daemon/session-identity-mcp-client.js';
@@ -18,7 +19,7 @@ describe('session identity online client', () => {
     }] }));
     const result = await listSessionIdentityProfiles({ endpoint, fetchImpl });
     expect(result).toMatchObject({ status: 'ok', serverId: 'srv-1', profiles: [{ content: 'global identity' }] });
-    expect(fetchImpl).toHaveBeenCalledWith('https://im.example.test/api/session-identities/all', expect.objectContaining({
+    expect(fetchImpl).toHaveBeenCalledWith('https://im.example.test/api/session-identities/all?serverId=srv-1', expect.objectContaining({
       headers: { Authorization: 'Bearer secret-token', 'X-Server-Id': 'srv-1' },
     }));
   });
@@ -68,5 +69,23 @@ describe('session identity online client', () => {
     expect(result).toMatchObject({ status: 'error', reason: 'internal_error' });
     expect(result.message).toContain('failed after retries');
     expect(fetchImpl).toHaveBeenCalledTimes(3);
+  });
+
+  it('refreshes one session with only its effective three scope reads', async () => {
+    const fetchImpl = vi.fn(async (url: string | URL) => {
+      const value = String(url);
+      const scope = new URL(value).searchParams.get('scope');
+      return jsonResponse({ profile: scope === 'user' ? {
+        scope: 'user', scopeKey: '', content: 'global', contentHash: 'h1', revision: 1, updatedAt: 1, source: 'mcp',
+      } : scope === 'session' ? {
+        scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'session', contentHash: 'h2', revision: 1, updatedAt: 1, source: 'mcp',
+      } : null });
+    });
+    const result = await getEffectiveSessionIdentityProfiles({
+      projectKey: 'repo-1', sessionName: 'deck_proj_brain',
+    }, { endpoint, fetchImpl });
+    expect(result).toMatchObject({ status: 'ok', serverId: 'srv-1', profiles: expect.any(Array) });
+    expect(fetchImpl).toHaveBeenCalledTimes(3);
+    expect(fetchImpl.mock.calls.every(([url]) => !String(url).endsWith('/all'))).toBe(true);
   });
 });

@@ -17,7 +17,10 @@ import {
   saveSessionIdentityProfile,
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
-import { requestSessionIdentityRefresh } from '../session-identity-refresh.js';
+import {
+  requestSessionIdentityRefresh,
+  SessionIdentityRefreshError,
+} from '../session-identity-refresh.js';
 import { FileBrowser, type FileBrowserPreviewState } from './file-browser-lazy.js';
 
 type Draft = { content: string; initial: string; revision: number; sourceFile: string; loaded: boolean };
@@ -126,7 +129,13 @@ export function SessionIdentityTabs({
       }
       setRefreshPending(false);
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : String(reason));
+      if (reason instanceof SessionIdentityRefreshError) {
+        setError(reason.code === 'timeout'
+          ? t('session.identityApplyTimeout')
+          : t('session.identityApplyFailed', { error: reason.message }));
+      } else {
+        setError(reason instanceof Error ? reason.message : String(reason));
+      }
     } finally {
       setSaving(false);
     }

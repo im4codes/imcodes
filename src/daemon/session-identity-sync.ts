@@ -8,6 +8,7 @@ import {
   type SessionIdentityProfile,
 } from '../../shared/session-identity.js';
 import {
+  getEffectiveSessionIdentityProfiles,
   listSessionIdentityProfiles,
   type SessionIdentityClientOptions,
 } from './session-identity-mcp-client.js';
@@ -23,6 +24,7 @@ export interface SessionIdentitySyncResult {
 
 export interface SessionIdentitySyncDeps {
   listProfiles?: typeof listSessionIdentityProfiles;
+  getEffectiveProfiles?: typeof getEffectiveSessionIdentityProfiles;
   listLocalSessions?: typeof listSessions;
   applyIdentity?: typeof applyEffectiveSessionIdentity;
 }
@@ -102,12 +104,21 @@ export async function syncSessionIdentity(
   const session = (deps.listLocalSessions ?? listSessions)()
     .find((candidate) => candidate.name === sessionName && candidate.state !== 'stopped');
   if (!session) return { status: 'error', checked: 0, changed: 0, message: 'session identity target is unavailable' };
-  const snapshot = await (deps.listProfiles ?? listSessionIdentityProfiles)(options);
-  if (snapshot.status !== 'ok') {
-    return { status: 'error', checked: 1, changed: 0, message: snapshot.message };
-  }
+  const snapshot = deps.listProfiles
+    ? await deps.listProfiles(options)
+    : await (deps.getEffectiveProfiles ?? getEffectiveSessionIdentityProfiles)({
+      projectKey: sessionIdentityProjectKey({
+        contextNamespace: session.contextNamespace,
+        project: session.projectName,
+      }),
+      sessionName: session.name,
+    }, options);
+  if (snapshot.status !== 'ok') return { status: 'error', checked: 1, changed: 0, message: snapshot.message };
+  const profiles = deps.listProfiles
+    ? profilesForSession(snapshot.profiles, session, snapshot.serverId)
+    : snapshot.profiles;
   const prompt = renderSessionIdentityProfiles(
-    profilesForSession(snapshot.profiles, session, snapshot.serverId),
+    profiles,
   );
   if ((session.identityPrompt?.trim() || undefined) === prompt) {
     return { status: 'ok', checked: 1, changed: 0 };

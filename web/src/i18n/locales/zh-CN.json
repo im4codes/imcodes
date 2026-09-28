@@ -984,6 +984,8 @@
     "identityTooLargeScoped": "身份内容必须是有效文本，不超过 {{limit}} 个 Unicode 字符。",
     "identityCreateSaveFailed": "会话已启动，但会话身份保存失败。",
     "identityCreateApplyFailed": "会话已启动且身份已在线保存，但 daemon 未确认已应用。请先在会话设置中重试，再发送消息。",
+    "identityApplyTimeout": "身份已在线保存，但 daemon 尚未确认应用。可能仍在处理中；请在会话设置中重试。",
+    "identityApplyFailed": "身份已在线保存，但 daemon 无法应用：{{error}}",
     "identityApply": "应用身份",
     "modelSettings": {
       "label": "会话模型",

@@ -984,6 +984,8 @@
     "identityTooLargeScoped": "ID は有効なテキストで、{{limit}} Unicode 文字以内にしてください。",
     "identityCreateSaveFailed": "セッションは開始しましたが、ID を保存できませんでした。",
     "identityCreateApplyFailed": "セッションは開始され ID はオンラインに保存されましたが、daemon が適用を確認しませんでした。メッセージ送信前にセッション設定で再試行してください。",
+    "identityApplyTimeout": "ID はオンラインに保存されましたが、daemon はまだ適用を確認していません。処理中の可能性があります。セッション設定から再試行してください。",
+    "identityApplyFailed": "ID はオンラインに保存されましたが、daemon が適用できませんでした：{{error}}",
     "identityApply": "ID を適用",
     "modelSettings": {
       "label": "セッションモデル",

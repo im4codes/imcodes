@@ -135,4 +135,23 @@ describe('cross-machine session identity synchronization', () => {
       error: 'profile fetch failed',
     });
   });
+
+  it('uses the effective scoped reads for an explicit refresh', async () => {
+    const getEffectiveProfiles = vi.fn(async () => ({
+      status: 'ok' as const,
+      serverId: 'srv-9',
+      profiles: [profile('user', '', 'global'), profile('session', 'srv-9:deck_proj_brain', 'session')],
+    }));
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+    const result = await syncSessionIdentity('deck_proj_brain', {}, {
+      getEffectiveProfiles,
+      listLocalSessions: () => [session({})],
+      applyIdentity,
+    });
+    expect(result).toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(getEffectiveProfiles).toHaveBeenCalledWith({ projectKey: 'repo-1', sessionName: 'deck_proj_brain' }, {});
+    expect(applyIdentity).toHaveBeenCalledWith(
+      'deck_proj_brain', expect.stringContaining('session'), { refresh: true },
+    );
+  });
 });

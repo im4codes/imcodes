@@ -984,6 +984,8 @@
     "identityTooLargeScoped": "ID는 {{limit}}자(유니코드 코드 포인트) 이내의 유효한 텍스트여야 합니다.",
     "identityCreateSaveFailed": "세션은 시작되었지만 세션 ID를 저장하지 못했습니다.",
     "identityCreateApplyFailed": "세션이 시작되고 ID가 온라인에 저장되었지만 daemon이 적용을 확인하지 않았습니다. 메시지를 보내기 전에 세션 설정에서 다시 시도하세요.",
+    "identityApplyTimeout": "ID가 온라인에 저장되었지만 daemon이 아직 적용을 확인하지 않았습니다. 처리 중일 수 있으니 세션 설정에서 다시 시도하세요.",
+    "identityApplyFailed": "ID가 온라인에 저장되었지만 daemon이 적용하지 못했습니다: {{error}}",
     "identityApply": "ID 적용",
     "modelSettings": {
       "label": "세션 모델",

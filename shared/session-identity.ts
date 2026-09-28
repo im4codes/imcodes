@@ -47,6 +47,15 @@ export const SESSION_IDENTITY_BLOCK_CLOSE_TAG = '</imcodes-agent-identity>';
 export const SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS = 512;
 export const SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS = 1_024;
 export const SESSION_IDENTITY_API_PATH = '/api/session-identities';
+/** Bounds for the daemon's cross-session synchronization snapshot. */
+export const SESSION_IDENTITY_SYNC_MAX_PROFILES = 256;
+export const SESSION_IDENTITY_SYNC_MAX_BYTES = 2_000_000;
+export const SESSION_IDENTITY_SYNC_STATEMENT_TIMEOUT_MS = 5_000;
+/** Each HTTP attempt must settle before the browser's 20s confirmation budget. */
+export const SESSION_IDENTITY_REQUEST_TIMEOUT_MS = 5_000;
+/** The browser waits longer than the daemon's normal command-ack deadline so
+ * a late-but-valid acknowledgement is not presented as a failed save. */
+export const SESSION_IDENTITY_REFRESH_TIMEOUT_MS = 20_000;
 
 export const SESSION_IDENTITY_MCP_TOOLS = {
   GET: 'session_identity_get',

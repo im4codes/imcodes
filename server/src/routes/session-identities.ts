@@ -13,9 +13,14 @@ import {
 export const sessionIdentityRoutes = new Hono<{ Bindings: Env; Variables: { userId: string } }>();
 sessionIdentityRoutes.use('/*', requireAuth());
 
-/** One bounded snapshot lets every daemon synchronize all of its local sessions. */
+/** A bounded snapshot lets one daemon synchronize only its live sessions. */
 sessionIdentityRoutes.get('/all', async (c) => {
-  const profiles = await listSessionIdentityProfiles(c.env.DB, c.get('userId' as never) as string);
+  const serverId = c.req.query('serverId') || c.req.header('X-Server-Id') || undefined;
+  const profiles = await listSessionIdentityProfiles(
+    c.env.DB,
+    c.get('userId' as never) as string,
+    serverId,
+  );
   return c.json({ profiles });
 });
 

@@ -984,6 +984,8 @@
     "identityTooLargeScoped": "身份內容必須是有效文字，不超過 {{limit}} 個 Unicode 字元。",
     "identityCreateSaveFailed": "會話已啟動，但會話身份儲存失敗。",
     "identityCreateApplyFailed": "會話已啟動且身份已線上儲存，但 daemon 未確認已套用。請先在會話設定中重試，再傳送訊息。",
+    "identityApplyTimeout": "身份已在線上儲存，但 daemon 尚未確認套用。可能仍在處理中；請在會話設定中重試。",
+    "identityApplyFailed": "身份已在線上儲存，但 daemon 無法套用：{{error}}",
     "identityApply": "套用身份",
     "modelSettings": {
       "label": "工作階段模型",

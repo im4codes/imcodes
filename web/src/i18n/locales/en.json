@@ -984,6 +984,8 @@
     "identityTooLargeScoped": "Identity must be valid text within {{limit}} Unicode characters.",
     "identityCreateSaveFailed": "The session started, but its session identity could not be saved.",
     "identityCreateApplyFailed": "The session started and its identity was saved online, but the daemon did not confirm applying it. Retry in session settings before sending a message.",
+    "identityApplyTimeout": "The identity was saved online, but the daemon has not confirmed applying it yet. It may still be in progress; retry from session settings.",
+    "identityApplyFailed": "The identity was saved online, but the daemon could not apply it: {{error}}",
     "identityApply": "Apply identity",
     "modelSettings": {
       "label": "Session model",

@@ -1,8 +1,21 @@
 import { MSG_COMMAND_ACK } from '@shared/ack-protocol.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import { SESSION_IDENTITY_REFRESH_TIMEOUT_MS } from '@shared/session-identity.js';
 import type { WsClient } from './ws-client.js';
 
-export const SESSION_IDENTITY_REFRESH_TIMEOUT_MS = 10_000;
+export { SESSION_IDENTITY_REFRESH_TIMEOUT_MS } from '@shared/session-identity.js';
+
+export type SessionIdentityRefreshErrorCode = 'timeout' | 'daemon';
+
+export class SessionIdentityRefreshError extends Error {
+  constructor(
+    readonly code: SessionIdentityRefreshErrorCode,
+    message: string,
+  ) {
+    super(message);
+    this.name = 'SessionIdentityRefreshError';
+  }
+}
 
 function createCommandId(): string {
   return globalThis.crypto?.randomUUID?.()
@@ -33,12 +46,12 @@ export function requestSessionIdentityRefresh(
       else resolve();
     };
     const timer = setTimeout(() => {
-      finish(new Error('The daemon did not confirm the identity refresh in time.'));
+      finish(new SessionIdentityRefreshError('timeout', 'The daemon did not confirm the identity refresh in time.'));
     }, timeoutMs);
     unsubscribe = ws.onMessage((message) => {
       if (message.type !== MSG_COMMAND_ACK || message.commandId !== commandId || message.session !== sessionName) return;
       if (message.status === 'error') {
-        finish(new Error(message.error || 'The daemon could not apply the identity.'));
+        finish(new SessionIdentityRefreshError('daemon', message.error || 'The daemon could not apply the identity.'));
         return;
       }
       finish();

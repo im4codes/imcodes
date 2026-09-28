@@ -1,13 +1,15 @@
 import {
   SESSION_IDENTITY_API_PATH,
+  SESSION_IDENTITY_REQUEST_TIMEOUT_MS,
   SESSION_IDENTITY_SCOPES,
+  sessionIdentitySessionKey,
   type SessionIdentityProfile,
   type SessionIdentityScope,
 } from '../../shared/session-identity.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { sanitizeMcpErrorMessage } from '../../shared/mcp-error-sanitize.js';
 
-const DEFAULT_TIMEOUT_MS = 15_000;
+const DEFAULT_TIMEOUT_MS = SESSION_IDENTITY_REQUEST_TIMEOUT_MS;
 /** Keep transient reconnect/fetch failures bounded, but give a daemon a short
  * chance to ride out a pod handoff or server restart. */
 export const SESSION_IDENTITY_RETRY_DELAYS_MS = Object.freeze([100, 250]);
@@ -56,6 +58,10 @@ async function endpoint(options: SessionIdentityClientOptions): Promise<SessionI
 
 function urlFor(ep: SessionIdentityEndpoint, scope: SessionIdentityScope, scopeKey: string, extra?: URLSearchParams): string {
   const query = extra ?? new URLSearchParams();
+  // Keep REST requests on the daemon's server shard.  The header authenticates
+  // the credential, while the query parameter lets multi-replica ingress route
+  // requests before auth middleware runs (and avoids cross-server reads).
+  query.set('serverId', ep.serverId);
   query.set('scope', scope);
   if (scope !== SESSION_IDENTITY_SCOPES.USER) query.set('scopeKey', scopeKey);
   return `${ep.workerUrl.replace(/\/+$/, '')}${SESSION_IDENTITY_API_PATH}?${query.toString()}`;
@@ -156,7 +162,7 @@ export async function listSessionIdentityProfiles(
     timer.unref?.();
     try {
       const response = await (options.fetchImpl ?? fetch)(
-        `${ep.workerUrl.replace(/\/+$/, '')}${SESSION_IDENTITY_API_PATH}/all`,
+        `${ep.workerUrl.replace(/\/+$/, '')}${SESSION_IDENTITY_API_PATH}/all?serverId=${encodeURIComponent(ep.serverId)}`,
         {
           headers: { Authorization: `Bearer ${ep.token}`, 'X-Server-Id': ep.serverId },
           signal: controller.signal,
@@ -223,18 +229,25 @@ export async function clearSessionIdentityProfile(
 }
 
 export async function getEffectiveSessionIdentityProfiles(
-  input: { projectKey: string; sessionKey: string },
+  input: { projectKey: string; sessionKey?: string; sessionName?: string },
   options: SessionIdentityClientOptions = {},
-): Promise<{ status: 'ok'; profiles: SessionIdentityProfile[] } | Failure> {
+): Promise<{ status: 'ok'; serverId: string; profiles: SessionIdentityProfile[] } | Failure> {
+  const ep = await endpoint(options);
+  if ('status' in ep) return ep;
+  const scopedOptions = { ...options, endpoint: ep };
+  const sessionKey = input.sessionName
+    ? sessionIdentitySessionKey(ep.serverId, input.sessionName)
+    : input.sessionKey ?? '';
   const results = await Promise.all([
-    getSessionIdentityProfile(SESSION_IDENTITY_SCOPES.USER, '', options),
-    getSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PROJECT, input.projectKey, options),
-    getSessionIdentityProfile(SESSION_IDENTITY_SCOPES.SESSION, input.sessionKey, options),
+    getSessionIdentityProfile(SESSION_IDENTITY_SCOPES.USER, '', scopedOptions),
+    getSessionIdentityProfile(SESSION_IDENTITY_SCOPES.PROJECT, input.projectKey, scopedOptions),
+    getSessionIdentityProfile(SESSION_IDENTITY_SCOPES.SESSION, sessionKey, scopedOptions),
   ]);
   const failed = results.find((result): result is Failure => result.status === 'error');
   if (failed) return failed;
   return {
     status: 'ok',
+    serverId: ep.serverId,
     profiles: results.flatMap((result) => result.status === 'ok' && result.profile ? [result.profile] : []),
   };
 }
