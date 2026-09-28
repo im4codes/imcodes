@@ -715,12 +715,11 @@ export class ContextStoreWorkerClient {
     // A timeout is NOT proof the op did not run - the worker may still be
     // executing it. Reads/idempotent writes keep the plain timeout code; a
     // dispatched unsafe-retry op becomes `indeterminate` so nobody replays it.
-    entry.reject(
-      this.pendingFailureFor(
-        entry,
-        new ContextStoreError(CONTEXT_STORE_RPC_ERROR.timeout, `context-store RPC timed out: id ${id}`),
-      ),
+    const timeoutError = new ContextStoreError(
+      queued ? CONTEXT_STORE_RPC_ERROR.unavailable : CONTEXT_STORE_RPC_ERROR.timeout,
+      queued ? `context-store request remained queued: id ${id}` : `context-store RPC timed out: id ${id}`,
     );
+    entry.reject(queued ? timeoutError : this.pendingFailureFor(entry, timeoutError));
     // Queue starvation is backpressure, not a sick worker.  In particular do
     // not increment the generation timeout strike or respawn while a request
     // has not received the started acknowledgement.
