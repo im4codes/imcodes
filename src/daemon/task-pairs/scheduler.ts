@@ -620,7 +620,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
       'blocked', 'needs_input', 'needs_auditor', 'executor_silent', 'verdict_inconsistent',
       'awaiting_audit_ignored', 'replacement_churn', 'markers_unresolved', 'all_providers_limited',
       'auditor_capacity_hold', 'no_pool_configured', 'policy_violation', 'waiting_for_capacity',
-    ].includes(flag));
+    ].includes(flag) && !(
+      (flag === 'blocked' || flag === 'needs_input') && pair.lastWaitResolution
+    ));
   }
 
   #deliverMainHeartbeat(brain: string, storedPairs: readonly StoredTaskPair[]): void {

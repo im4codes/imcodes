@@ -554,6 +554,8 @@ export interface TaskPairState {
   flagSides: Partial<Record<'blocked' | 'needs_input', TaskPairRole>>;
   /** The `note=` text of the BLOCKED/NEEDS_INPUT marker that set flagSides, so an escalation can state the real cause. */
   blockedNote?: string;
+  /** Last authoritative Brain/daemon resolution of a participant wait. */
+  lastWaitResolution?: { writer: string; note?: string; at: number };
   /** Audit submissions so far. */
   round: number;
   /** Round in which a consistent PASS was recorded, if any. */
@@ -825,12 +827,23 @@ export function markTaskPairStarted(pair: TaskPairState, now: number): void {
  * which side raised it.  Keep this separate from participant progress: a
  * Brain reply is authoritative input, not work performed by the participant.
  */
-export function resolveTaskPairBrainWait(pair: TaskPairState, now: number): void {
+export function resolveTaskPairBrainWait(
+  pair: TaskPairState,
+  now: number,
+  resolution?: { writer: string; note?: string },
+): void {
   removeFlag(pair, 'blocked');
   removeFlag(pair, 'needs_input');
   delete pair.flagSides.blocked;
   delete pair.flagSides.needs_input;
   pair.blockedNote = undefined;
+  if (resolution) {
+    pair.lastWaitResolution = {
+      writer: resolution.writer,
+      ...(resolution.note ? { note: resolution.note } : {}),
+      at: now,
+    };
+  }
   if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) markTaskPairStarted(pair, now);
 }
 
@@ -842,6 +855,7 @@ function clonePair(pair: TaskPairState): TaskPairState {
     blocking: [...pair.blocking],
     previousAuditors: [...pair.previousAuditors],
     capCounts: { ...pair.capCounts },
+    lastWaitResolution: pair.lastWaitResolution ? { ...pair.lastWaitResolution } : undefined,
     lastVerdict: pair.lastVerdict ? { ...pair.lastVerdict, counts: { ...pair.lastVerdict.counts } } : undefined,
     material: pair.material ? { ...pair.material } : undefined,
     workspace: pair.workspace ? { ...pair.workspace } : undefined,
@@ -951,7 +965,12 @@ export function applyTaskPairMarker(
   if (!verb) return { ...recorded(existing), effect: 'unrecognized' };
   const intents: TaskPairIntent[] = [];
   const role = taskPairRoleOf(existing, ctx.writer);
-  const roleAuthority = role === 'brain' || role === 'daemon';
+  // The project-authoritative Brain is allowed to resolve a participant wait
+  // even when a restored pair carries an older Brain session name.  This is
+  // intentionally narrower than daemon authority: only the configured
+  // fallback Brain identity gets this compatibility path.
+  const brainAuthority = role === 'brain' || (!!existing && ctx.writer === ctx.fallbackBrain);
+  const roleAuthority = brainAuthority || role === 'daemon';
   const attrs = marker.attrs;
   const fromStatus = existing?.status;
 
@@ -1095,6 +1114,13 @@ export function applyTaskPairMarker(
   if ((PROGRESS_VERBS.includes(verb) && !(terminal && verb === 'DISPATCH'))
     || (roleAuthority && (verb === 'QUEUE' || verb === 'REASSIGN'))) {
     clearSideFlags(pair, role, roleAuthority);
+  }
+  const brainResolutionVerb = roleAuthority && (
+    verb === 'STARTED' || verb === 'WORKING' || verb === 'DISPATCH'
+      || verb === 'QUEUE' || verb === 'REASSIGN' || verb === 'NEEDS_INPUT'
+  );
+  if (brainResolutionVerb) {
+    resolveTaskPairBrainWait(pair, ctx.now, { writer: ctx.writer, note: attrs.note });
   }
 
   // Once a pair has earned PASS, or has been closed, participant progress
@@ -1307,11 +1333,13 @@ export function applyTaskPairMarker(
     case 'BLOCKED':
     case 'NEEDS_INPUT': {
       if (terminal) return recorded(existing, false);
+      if (roleAuthority) return done('brain_resolved');
       const flag = verb === 'BLOCKED' ? 'blocked' : 'needs_input';
       const freshlyFlagged = !pair.flags.includes(flag) || pair.flagSides[flag] !== role;
       addFlag(pair, flag);
       pair.flagSides[flag] = role;
       pair.blockedNote = attrs.note?.trim() || undefined;
+      pair.lastWaitResolution = undefined;
       // Owner evidence: an executor's question left only in its own reply,
       // never sent anywhere, stalled a pair until the owner happened to
       // notice ("make sure NEEDS_INPUT/BLOCKED notes from executors reach

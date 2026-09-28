@@ -144,6 +144,34 @@ describe('task-pair marker grammar', () => {
     expect(resumed.pair?.blockedNote).toBeUndefined();
   });
 
+  it('lets Brain WORKING resolve a live participant block, records the resolution, and permits a re-raise', () => {
+    const base = withStatus('working');
+    const blocked = apply(base, EXEC, '<!-- IMCODES_TASK BLOCKED T42 note="waiting on Brain" -->');
+    expect(blocked.pair?.flags).toContain('blocked');
+
+    const resolved = apply(blocked.pair, BRAIN, '<!-- IMCODES_TASK WORKING T42 note="go ahead" -->');
+    expect(resolved.pair).toMatchObject({
+      status: 'working',
+      flags: [],
+      blockedNote: undefined,
+      lastWaitResolution: { writer: BRAIN, note: 'go ahead', at: 1_000 },
+    });
+
+    const reraised = apply(resolved.pair, EXEC, '<!-- IMCODES_TASK BLOCKED T42 note="blocked again" -->');
+    expect(reraised.pair).toMatchObject({ flags: ['blocked'], blockedNote: 'blocked again' });
+    expect(reraised.pair?.lastWaitResolution).toBeUndefined();
+  });
+
+  it('treats Brain decision markers on an unblocked pair as harmless and clears both wait flags', () => {
+    const base = withStatus('working');
+    const reassigned = apply(base, BRAIN, '<!-- IMCODES_TASK REASSIGN T42 executor=' + EXEC + ' -->');
+    expect(reassigned.pair).toMatchObject({ status: 'working', flags: [] });
+
+    const waiting = { ...base, flags: ['needs_input'] as TaskPairState['flags'], flagSides: { needs_input: 'auditor' as const }, blockedNote: 'need scope' };
+    const answered = apply(waiting, BRAIN, '<!-- IMCODES_TASK NEEDS_INPUT T42 note="scope supplied" -->');
+    expect(answered.pair).toMatchObject({ status: 'working', flags: [], blockedNote: undefined });
+  });
+
   it('parses verbs case-insensitively with bare and quoted attributes', () => {
     const scanned = marker('<!-- IMCODES_TASK rework T42 blocking=P0 p0=1 p1=2 note="null check \\"missing\\" in login.ts" -->');
     expect(scanned).toMatchObject({

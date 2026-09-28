@@ -1007,6 +1007,40 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
   });
 
+  it('stops listing a blocked pair after Brain WORKING, while a participant re-raise is actionable again', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH brain-working-resolve executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED brain-working-resolve note="needs Brain decision" -->');
+    await flush();
+    sent = [];
+
+    marker(BRAIN, '<!-- IMCODES_TASK WORKING brain-working-resolve note="resolved" -->');
+    expect(pair('brain-working-resolve')).toMatchObject({ status: 'working', flags: [] });
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED brain-working-resolve note="blocked again" -->');
+    expect(pair('brain-working-resolve')).toMatchObject({ flags: ['blocked'], blockedNote: 'blocked again' });
+    now += 10 * 60_000;
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat').length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('does not resurrect a stale blocked flag after a persisted Brain resolution', async () => {
+    getTaskPairStore().savePair(PROJECT, {
+      taskId: 'brain-stale-resolved', brain: BRAIN, status: 'working', flags: ['blocked'],
+      flagSides: { blocked: 'executor' }, blockedNote: 'old wait',
+      lastWaitResolution: { writer: BRAIN, note: 'resolved earlier', at: now - 1_000 },
+      round: 1, blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0,
+      createdAt: now - 60_000, updatedAt: now - 60_000, executor: EXEC, auditor: AUD,
+    } satisfies TaskPairState);
+    automation.publishBadges();
+    await flush();
+    expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+  });
+
   it('pauses the main heartbeat on NEEDS_INPUT and re-arms after a real user message', async () => {
     getTaskPairStore().savePair(PROJECT, {
       taskId: 'brain-blocked', brain: BRAIN, status: 'passed', flags: ['blocked'], flagSides: {}, round: 1,
