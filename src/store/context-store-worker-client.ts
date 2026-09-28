@@ -763,7 +763,9 @@ export class ContextStoreWorkerClient {
       queued ? CONTEXT_STORE_RPC_ERROR.unavailable : CONTEXT_STORE_RPC_ERROR.timeout,
       queued ? `context-store request remained queued: id ${id}` : `context-store RPC timed out: id ${id}`,
     );
-    entry.reject(dispatchedUnsafeQueued ? this.pendingFailureFor(entry, timeoutError) : timeoutError);
+    const dispatchedUnsafe = entry.dispatched
+      && contextStoreOpRetryClass(entry.op) === CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry;
+    entry.reject(dispatchedUnsafe ? this.pendingFailureFor(entry, timeoutError) : timeoutError);
     // Queue starvation is backpressure, not a sick worker.  In particular do
     // not increment the generation timeout strike or respawn while a request
     // has not received the started acknowledgement.
@@ -773,7 +775,12 @@ export class ContextStoreWorkerClient {
         // A started operation can still be progressing even though its caller
         // budget elapsed.  Defer any destructive respawn until a generous
         // liveness grace period has passed with no worker-side progress.
-        this.scheduleStuckWorkerCheck();
+        // Explicit timeout probes (queueAware=false) retain the historical
+        // immediate escalation for a dispatched request with no started ack.
+        // Queue-aware calls are backpressure and never enter this strike path;
+        // started operations receive the liveness grace period.
+        if (entry.started || (entry.dispatched && entry.queueAware)) this.scheduleStuckWorkerCheck();
+        else this.respawn();
       }
     }
   }

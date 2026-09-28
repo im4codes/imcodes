@@ -320,8 +320,9 @@ describe('context-store in-flight retry-class policy', () => {
     await client.whenReady();
 
     const read = client.run('getContextMeta', ['queued-read'], { priority: 'high', timeoutMs: 1 });
+    const assertion = expect(read).rejects.toMatchObject({ code: CONTEXT_STORE_RPC_ERROR.unavailable });
     await vi.advanceTimersByTimeAsync(30_000);
-    await expect(read).rejects.toMatchObject({ code: CONTEXT_STORE_RPC_ERROR.unavailable });
+    await assertion;
     client.dispose();
   });
 
