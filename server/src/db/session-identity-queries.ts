@@ -52,30 +52,11 @@ export async function listSessionIdentityProfiles(
   serverId?: string,
 ): Promise<SessionIdentityProfile[]> {
   const params: unknown[] = [userId];
-  const relevant = serverId
-    ? `(
-         scope = 'user'
-         OR (scope = 'project' AND EXISTS (
-           SELECT 1
-             FROM sessions AS live_project
-             JOIN servers AS owner_server ON owner_server.id = live_project.server_id
-            WHERE live_project.server_id = $2
-              AND owner_server.user_id = $1
-              AND live_project.state <> 'stopped'
-              AND live_project.project_name = session_identity_profiles.scope_key
-         ))
-         OR (scope = 'session' AND EXISTS (
-           SELECT 1
-             FROM sessions AS live_session
-             JOIN servers AS owner_server ON owner_server.id = live_session.server_id
-            WHERE live_session.server_id = $2
-              AND owner_server.user_id = $1
-              AND live_session.state <> 'stopped'
-              AND live_session.server_id || ':' || live_session.name = session_identity_profiles.scope_key
-         ))
-       )`
-    : `scope = 'user'`;
-  if (serverId) params.push(serverId);
+  // The daemon owns the authoritative live-session projection (including
+  // contextNamespace project IDs and sub-sessions). The server cannot safely
+  // reconstruct those keys from sessions alone, so serverId only selects the
+  // bounded sync mode; the daemon applies profilesForSession locally.
+  const relevant = serverId ? 'TRUE' : `scope = 'user'`;
   params.push(SESSION_IDENTITY_SYNC_MAX_PROFILES, SESSION_IDENTITY_SYNC_MAX_BYTES);
   const query = async (queryDb: Database): Promise<IdentityProfileRow[]> => queryDb.query<IdentityProfileRow>(
     `WITH candidates AS (
@@ -86,7 +67,7 @@ export async function listSessionIdentityProfiles(
          FROM session_identity_profiles
         WHERE user_id = $1 AND ${relevant}
         ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, scope_key ASC
-        LIMIT $${serverId ? 3 : 2}
+        LIMIT $2::int
      ), bounded AS (
        SELECT scope, scope_key, profile_rank,
               SUM(content_bytes) OVER (
@@ -100,8 +81,8 @@ export async function listSessionIdentityProfiles(
        FROM bounded
        JOIN session_identity_profiles AS profile
          ON profile.user_id = $1 AND profile.scope = bounded.scope AND profile.scope_key = bounded.scope_key
-      WHERE profile_rank <= $${serverId ? 3 : 2}
-        AND (bytes_so_far <= $${serverId ? 4 : 3} OR profile_rank = 1)
+      WHERE profile_rank <= $2::int
+        AND (bytes_so_far <= $3::bigint OR profile_rank = 1)
       ORDER BY profile_rank ASC`,
     params,
   );

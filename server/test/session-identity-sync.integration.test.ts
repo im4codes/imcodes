@@ -34,7 +34,7 @@ function app() {
 }
 
 describe('session identity synchronization bounds', () => {
-  it('filters to live sessions and bounds a production-shaped snapshot', async () => {
+  it('bounds a production-shaped snapshot while preserving every key form', async () => {
     const userId = randomHex(16);
     const serverId = randomHex(16);
     const token = randomHex(32);
@@ -58,12 +58,16 @@ describe('session identity synchronization bounds', () => {
       [userId, scope, scopeKey, content, sha256Hex(content), now],
     );
     await profile('user', '', 'global');
+    await profile('project', 'github-im4codes/im4codes/imcodes', 'project-id project');
     await profile('project', 'repo-live', 'live project');
     await profile('project', 'repo-stopped', 'stale project');
     await profile('session', `${serverId}:deck_live`, 'live session');
+    await profile('session', `${serverId}:deck_sub_1`, 'sub session');
     await profile('session', `${serverId}:deck_stopped`, 'stale session');
     for (let i = 0; i < SESSION_IDENTITY_SYNC_MAX_PROFILES + 40; i += 1) {
-      const name = `deck_many_${i}`;
+      // Sort these after the representative project/main/sub-session keys so
+      // the bounded snapshot proves each key form survives the cap.
+      const name = `zz_many_${i}`;
       await db.execute(
         `INSERT INTO sessions (id, server_id, name, project_name, role, agent_type, state, created_at, updated_at)
          VALUES ($1, $2, $3, $4, 'worker', 'codex-sdk', 'idle', $5, $5)`,
@@ -77,9 +81,9 @@ describe('session identity synchronization bounds', () => {
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(profiles.length).toBeLessThanOrEqual(SESSION_IDENTITY_SYNC_MAX_PROFILES);
     expect(profiles.some((item) => item.scope === 'user' && item.content === 'global')).toBe(true);
+    expect(profiles.some((item) => item.scopeKey === 'github-im4codes/im4codes/imcodes')).toBe(true);
     expect(profiles.some((item) => item.scopeKey === 'repo-live')).toBe(true);
-    expect(profiles.some((item) => item.scopeKey === 'repo-stopped')).toBe(false);
-    expect(profiles.some((item) => item.scopeKey === `${serverId}:deck_stopped`)).toBe(false);
+    expect(profiles.some((item) => item.scopeKey === `${serverId}:deck_sub_1`)).toBe(true);
     expect(profiles.reduce((bytes, item) => bytes + Buffer.byteLength(item.content), 0))
       .toBeLessThanOrEqual(SESSION_IDENTITY_SYNC_MAX_BYTES);
 
