@@ -4556,6 +4556,26 @@ describe('handleWebCommand transport queue behavior', () => {
       expect(setEffort).not.toHaveBeenCalled();
     });
 
+    it.each([
+      ['provider model/list rejects', vi.fn().mockRejectedValue(new Error('model list unavailable'))],
+      ['provider model/list returns no matching model', vi.fn().mockResolvedValue({ models: [] })],
+    ])('falls back to the shared Codex effort list when %s', async (_caseName, listModels) => {
+      const setEffort = vi.fn();
+      getSessionMock.mockReturnValue({
+        name: 'deck_sub_codex_fallback_effort', projectName: 'p', role: 'w1', agentType: 'codex-sdk',
+        runtimeType: 'transport', state: 'running', activeModel: 'gpt-model-list-unavailable', effort: 'ultra',
+      });
+      getProviderMock.mockReturnValue({ listModels });
+      getTransportRuntimeMock.mockReturnValue({ setEffort, pendingCount: 0 });
+
+      await expect(switchSessionThinkingNow('deck_sub_codex_fallback_effort', 'ultra')).resolves.toMatchObject({
+        ok: false,
+        code: 'unknown_thinking_level',
+        availableThinkingLevels: ['low', 'medium', 'high', 'xhigh', 'max'],
+      });
+      expect(setEffort).not.toHaveBeenCalled();
+    });
+
     it('rejects thinking control for agents without effort support', async () => {
       getSessionMock.mockReturnValue({ name: 'deck_sub_unsupported_effort', projectName: 'p', role: 'w1', agentType: 'cursor-headless', runtimeType: 'transport', state: 'idle' });
       await expect(switchSessionThinkingNow('deck_sub_unsupported_effort', 'high')).resolves.toMatchObject({ ok: false, code: 'thinking_unsupported' });

@@ -10081,7 +10081,9 @@ afterEach(() => {
     }));
 
     fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
-    expect(screen.getByRole('button', { name: '○ Max' })).toBeDefined();
+    expect(Array.from(document.querySelectorAll('.shortcuts-model .menu-dropdown .menu-item')).map((item) => item.textContent?.trim())).toEqual([
+      '○ Low', '○ Medium', '● High', '○ Extra High', '○ Max',
+    ]);
     expect(screen.queryByRole('button', { name: '○ Minimal' })).toBeNull();
     fireEvent.click(screen.getByRole('button', { name: '○ Max' }));
     expectSendPayload(ws, { sessionName: 'codex-effort-metadata', text: '/thinking max' });
@@ -10100,7 +10102,46 @@ afterEach(() => {
       />,
     );
     fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
-    expect(screen.getByRole('button', { name: /○ Ultra —/ })).toBeDefined();
+    expect(Array.from(document.querySelectorAll('.shortcuts-model .menu-dropdown .menu-item')).map((item) => item.textContent?.trim())).toEqual([
+      '○ Low', '○ Medium', '● High', '○ Extra High', '○ Max', '○ Ultra — thinking_ultra_hint',
+    ]);
+  });
+
+  it('renders the exact gpt-5.5 effort menu without unsupported levels', async () => {
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({
+          name: 'codex-gpt55-effort-metadata',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          activeModel: 'gpt-5.5',
+          effort: 'high',
+        })}
+        quickData={makeQuickData() as any}
+      />,
+    );
+    const request = await waitFor(() => {
+      const found = ws.send.mock.calls
+        .map((call) => call[0])
+        .find((message) => message?.type === 'transport.list_models' && message?.agentType === 'codex-sdk');
+      expect(found).toBeDefined();
+      return found;
+    });
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codex-sdk',
+      requestId: request.requestId,
+      models: [{ id: 'gpt-5.5', supportedEffortLevels: ['low', 'medium', 'high', 'xhigh'] }],
+    }));
+    fireEvent.click(screen.getByRole('button', { name: /^high$/i }));
+    expect(Array.from(document.querySelectorAll('.shortcuts-model .menu-dropdown .menu-item')).map((item) => item.textContent?.trim())).toEqual([
+      '○ Low', '○ Medium', '● High', '○ Extra High',
+    ]);
+    expect(screen.queryByRole('button', { name: '○ Minimal' })).toBeNull();
+    expect(screen.queryByRole('button', { name: '○ Max' })).toBeNull();
+    expect(screen.queryByRole('button', { name: /○ Ultra/ })).toBeNull();
   });
 
   it('uses the main-session model command for a worker-role process Codex session', () => {
