@@ -16,6 +16,7 @@ import {
   getReplicationState,
   getLatestMasterSummaryUpdatedAt,
   getLatestRecentSummaryUpdatedAtForTarget,
+  getContextMeta,
   hasProcessedProjectionsInNamespace,
   listContextEvents,
   listDirtyTargets,
@@ -25,6 +26,7 @@ import {
   queryPendingContextEvents,
   queryProcessedProjections,
   removeMemoryNoiseProjections,
+  purgeMemoryNoiseProjectionsBatch,
   recordContextEvent,
   recordMemoryHits,
   resetContextStoreForTests,
@@ -591,6 +593,36 @@ describe('context-store', () => {
     expect(removeMemoryNoiseProjections()).toBeLessThanOrEqual(1);
     expect(listProcessedProjections(namespace).map((row) => row.id)).toEqual([clean.id]);
     expect(getReplicationState(namespace)?.pendingProjectionIds).toEqual([clean.id]);
+  });
+
+  it('cleans legacy noise in bounded cursor batches instead of scanning the whole projection table', () => {
+    getContextMeta('__noise_batch_fixture__');
+    const dbPath = process.env.IMCODES_CONTEXT_DB_PATH;
+    expect(dbPath).toBeTruthy();
+    // Seed enough rows to cross several maintenance batches without routing
+    // each fixture row through the normal materialization path.
+    const sqlite = new DatabaseSync(dbPath!);
+    sqlite.exec('BEGIN');
+    const insert = sqlite.prepare(`
+      INSERT INTO context_processed_local
+        (id, namespace_key, class, source_event_ids_json, summary, content_json, created_at, updated_at, status, hit_count)
+      VALUES (?, ?, 'recent_summary', '[]', ?, '{}', ?, ?, 'active', 0)
+    `);
+    for (let index = 0; index < 300; index += 1) {
+      const now = 1000 + index;
+      insert.run(`noise-${index}`, 'personal::repo::user-1::::', '**Assistant:** [API Error: Connection error. (cause: fetch failed)]', now, now);
+    }
+    sqlite.exec('COMMIT');
+    sqlite.close();
+
+    const first = purgeMemoryNoiseProjectionsBatch(64);
+    expect(first).toBeLessThanOrEqual(64);
+    let removed = first;
+    for (let pass = 0; pass < 10 && removed < 300; pass += 1) {
+      removed += purgeMemoryNoiseProjectionsBatch(64);
+    }
+    expect(removed).toBe(300);
+    expect(removeMemoryNoiseProjections()).toBe(0);
   });
 
   it('reconciles stale staged events that were already referenced by processed projections', () => {

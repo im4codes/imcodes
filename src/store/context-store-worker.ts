@@ -36,6 +36,9 @@ const { port } = resolveWorkerRuntime();
 
 /** How often (ms) the idle checkpoint timer fires. */
 const IDLE_CHECKPOINT_INTERVAL_MS = 30_000;
+/** Yield between bounded request slices so a normal-ingest flood cannot starve
+ * high-priority recall or the worker's own timers indefinitely. */
+const MAX_REQUESTS_PER_DRAIN_SLICE = 32;
 
 // ── Build the allowlisted handler map (shared with the client cold fallback;
 // explicit, allowlist-bounded — never raw store[arbitrary]). ──
@@ -116,10 +119,20 @@ function drain(): void {
   // Process ALL high+normal first (front-of-turn recall + writes jump ahead of
   // background work), then at most ONE low item before yielding, so a newly
   // arrived high/normal preempts the rest of the low backlog.
-  for (;;) {
+  let processed = 0;
+  for (; processed < MAX_REQUESTS_PER_DRAIN_SLICE;) {
     const req = queues.high.shift() ?? queues.normal.shift();
     if (!req) break;
     execute(req);
+    processed += 1;
+  }
+  // A sustained normal/high backlog must yield to the worker event loop. This
+  // keeps timers (including health/checkpoint maintenance) and newly-arriving
+  // high-priority reads responsive instead of draining an unbounded slice.
+  if (processed >= MAX_REQUESTS_PER_DRAIN_SLICE && (queues.high.length > 0 || queues.normal.length > 0)) {
+    draining = false;
+    scheduleDrain();
+    return;
   }
   const low = queues.low.shift();
   if (low) execute(low);
@@ -133,6 +146,12 @@ function maybeCheckpoint(): void {
   // Idle = nothing draining AND no queued work (in particular no high waiter).
   if (draining || hasQueued()) return;
   try {
+    // Legacy noise cleanup is cursor-bounded and runs only while the worker is
+    // idle. It must never be part of ensureDb()'s warmup transaction: loading
+    // every historical summary there can exceed the RPC timeout and trigger a
+    // respawn storm on a large store.
+    store.reconcileMaterializedStagedEventsBatch();
+    store.purgeMemoryNoiseProjectionsBatch();
     store.checkpointWal();
   } catch {
     // Best-effort; a busy/locked checkpoint is non-fatal.

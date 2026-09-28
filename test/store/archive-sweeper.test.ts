@@ -1,21 +1,27 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { createRequire } from 'node:module';
 import { cleanupIsolatedSharedContextDb, createIsolatedSharedContextDb } from '../util/shared-context-db.js';
 import { getCounter, resetMetricsForTests } from '../../src/util/metrics.js';
 import { resetRateLimitedWarnForTests } from '../../src/util/rate-limited-warn.js';
 import {
   archiveEventsForMaterialization,
   deleteStagedEventsByIds,
+  enqueueContextJob,
   getArchivedEvent,
   getContextMeta,
   getStagedEvent,
   insertProjectionSources,
   pruneArchive,
+  pruneArchiveIfDue,
   recordContextEvent,
   resetContextStoreForTests,
+  updateContextJob,
 } from '../../src/store/context-store.js';
 
 const namespace = { scope: 'personal' as const, projectId: 'repo', userId: 'user-1' };
 const target = { namespace, kind: 'session' as const, sessionName: 'deck_repo_brain' };
+const require = createRequire(import.meta.url);
+const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 describe('archive and sweeper safety', () => {
   let tempDir: string;
@@ -54,6 +60,24 @@ describe('archive and sweeper safety', () => {
     expect(getArchivedEvent('evt-cited')?.content).toBe('cited');
     expect(getArchivedEvent('evt-uncited')).toBeUndefined();
     expect(getContextMeta('last_archive_sweep_at')).toBe(String(now));
+  });
+
+  it('prunes completed materialization bookkeeping with the archive retention sweep', () => {
+    const now = 2_000_000_000_000;
+    const old = now - 31 * 86_400_000;
+    const oldJob = enqueueContextJob(target, 'materialize_session', 'schedule', old);
+    updateContextJob(oldJob.id, 'completed', { now: old });
+    const recentJob = enqueueContextJob({ ...target, sessionName: 'recent-session' }, 'materialize_session', 'schedule', now);
+    updateContextJob(recentJob.id, 'completed', { now });
+
+    expect(pruneArchiveIfDue(30, now)).toMatchObject({ deleted: 0, skipped: false });
+    const sqlite = new DatabaseSync(process.env.IMCODES_CONTEXT_DB_PATH!);
+    try {
+      expect(sqlite.prepare('SELECT count(*) AS n FROM context_jobs WHERE id = ?').get(oldJob.id)).toEqual({ n: 0 });
+      expect(sqlite.prepare('SELECT count(*) AS n FROM context_jobs WHERE id = ?').get(recentJob.id)).toEqual({ n: 1 });
+    } finally {
+      sqlite.close();
+    }
   });
 
   it('-1 disables archive pruning and leaves the sweep sentinel untouched', () => {

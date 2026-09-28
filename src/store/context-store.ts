@@ -128,6 +128,8 @@ export const CONTEXT_META_SENTINELS = [
   'last_observation_repair_at',
   'migration_namespace_filter_columns_backfilled',
   'usage_authority_id',
+  'memory_noise_purge_rowid',
+  'staged_reconcile_rowid',
 ] as const;
 
 export function tryAlter(database: DatabaseSyncInstance, sql: string): boolean {
@@ -380,6 +382,12 @@ function ensureDb(): DatabaseSyncInstance {
     );
     CREATE INDEX IF NOT EXISTS idx_context_jobs_target_status
       ON context_jobs(target_key, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_created
+      ON context_jobs(target_key, job_type, status, created_at);
+    CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_updated
+      ON context_jobs(target_key, job_type, status, updated_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_context_jobs_status_type_updated
+      ON context_jobs(status, job_type, updated_at);
 
     CREATE TABLE IF NOT EXISTS context_processed_local (
       id TEXT PRIMARY KEY,
@@ -641,6 +649,8 @@ function ensureDb(): DatabaseSyncInstance {
       ON context_turn_usage_sync(usage_authority_id, usage_fact_id);
     CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_attempt
       ON context_turn_usage_sync(sync_status, next_attempt_at_ms, created_at_ms);
+    CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_created
+      ON context_turn_usage_sync(sync_status, created_at_ms);
 
     -- Codex account-level pay-as-you-go usage credit balance, snapshotted
     -- every time a real (non-cached) account/rateLimits/read refresh
@@ -746,7 +756,9 @@ function ensureDb(): DatabaseSyncInstance {
   }
   if (stagedReconciledForPath !== dbPath) {
     reconcileMaterializedStagedEvents(db);
-    purgeMemoryNoiseProjections(db);
+    // Keep worker warmup bounded. Remaining legacy noise is removed by the
+    // worker's idle maintenance pass using the persisted rowid cursor.
+    purgeMemoryNoiseProjectionsBatchForDb(db);
     stagedReconciledForPath = dbPath;
   }
   if (materializationRepairRanForPath !== dbPath) {
@@ -1394,14 +1406,62 @@ function removeProjectionIdsFromReplicationState(database: DatabaseSyncInstance,
   }
 }
 
-function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
-  const rows = database.prepare('SELECT id, summary FROM context_processed_local').all() as Array<{ id: string; summary: string }>;
+const MEMORY_NOISE_PURGE_BATCH_SIZE = 256;
+const MEMORY_NOISE_PURGE_CURSOR_KEY = 'memory_noise_purge_rowid';
+
+interface NoisePurgeBatchResult {
+  deleted: number;
+  done: boolean;
+  nextCursor: number;
+}
+
+/**
+ * Remove legacy request-failure projections without loading the whole summary
+ * column into memory.  This is deliberately cursor-bounded: the old startup
+ * sweep selected every summary (hundreds of MB on a long-lived daemon), so a
+ * worker respawn repeatedly spent >5s in SQLite/JS and timed out all callers.
+ */
+function purgeMemoryNoiseProjectionsBatchForDb(
+  database: DatabaseSyncInstance,
+  limit = MEMORY_NOISE_PURGE_BATCH_SIZE,
+  persistCursor = true,
+  cursorOverride?: number,
+): NoisePurgeBatchResult {
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+  const cursorRaw = persistCursor ? internalGetContextMeta(database, MEMORY_NOISE_PURGE_CURSOR_KEY) : undefined;
+  const cursor = cursorOverride ?? (cursorRaw && Number.isSafeInteger(Number(cursorRaw)) ? Number(cursorRaw) : 0);
+  const rows = database.prepare(`
+    SELECT rowid, id, summary
+    FROM context_processed_local
+    WHERE rowid > ?
+    ORDER BY rowid ASC
+    LIMIT ?
+  `).all(cursor, safeLimit) as Array<{ rowid: number; id: string; summary: string }>;
+  const nextCursor = rows.length > 0 ? Number(rows[rows.length - 1].rowid) : cursor;
+  if (persistCursor) internalSetContextMeta(database, MEMORY_NOISE_PURGE_CURSOR_KEY, String(nextCursor));
+
   const badIds = rows.filter((row) => isMemoryNoiseSummary(row.summary)).map((row) => row.id);
-  if (badIds.length === 0) return 0;
+  if (badIds.length === 0) return { deleted: 0, done: rows.length < safeLimit, nextCursor };
   const placeholders = badIds.map(() => '?').join(', ');
   database.prepare(`DELETE FROM context_processed_local WHERE id IN (${placeholders})`).run(...badIds);
   removeProjectionIdsFromReplicationState(database, badIds);
-  return badIds.length;
+  return { deleted: badIds.length, done: rows.length < safeLimit, nextCursor };
+}
+
+function purgeMemoryNoiseProjections(database: DatabaseSyncInstance): number {
+  let deleted = 0;
+  let cursor = 0;
+  for (;;) {
+    const batch = purgeMemoryNoiseProjectionsBatchForDb(database, 1000, false, cursor);
+    deleted += batch.deleted;
+    cursor = batch.nextCursor;
+    if (batch.done) return deleted;
+  }
+}
+
+/** One bounded cleanup pass for the worker's idle maintenance loop. */
+export function purgeMemoryNoiseProjectionsBatch(limit = MEMORY_NOISE_PURGE_BATCH_SIZE): number {
+  return purgeMemoryNoiseProjectionsBatchForDb(ensureDb(), limit).deleted;
 }
 
 export function removeMemoryNoiseProjections(): number {
@@ -1686,6 +1746,27 @@ export function pruneArchive(retentionDays: number, now = Date.now()): { deleted
   return { deleted: result.changes ?? 0 };
 }
 
+/**
+ * Completed materialization jobs are historical bookkeeping, not an archive
+ * of user context.  Keep them under the same retention window as the event
+ * archive so a busy installation cannot grow this table without bound.  The
+ * status/type/updated index makes the daily sweep proportional to rows that
+ * are eligible for deletion rather than the whole job table.
+ */
+export function pruneCompletedMaterializationJobs(retentionDays: number, now = Date.now()): { deleted: number } {
+  if (retentionDays === -1) return { deleted: 0 };
+  if (!Number.isFinite(retentionDays) || retentionDays < 1) return { deleted: 0 };
+  const database = ensureDb();
+  const cutoff = now - retentionDays * 86_400_000;
+  const result = database.prepare(`
+    DELETE FROM context_jobs
+    WHERE status = 'completed'
+      AND job_type IN ('materialize_session', 'materialize_project')
+      AND updated_at < ?
+  `).run(cutoff) as { changes?: number };
+  return { deleted: result.changes ?? 0 };
+}
+
 export function pruneArchiveIfDue(retentionDays: number, now = Date.now()): { deleted: number; skipped: boolean } {
   if (retentionDays === -1) return { deleted: 0, skipped: true };
   if (!Number.isFinite(retentionDays) || retentionDays < 1) {
@@ -1700,7 +1781,9 @@ export function pruneArchiveIfDue(retentionDays: number, now = Date.now()): { de
   const lastRaw = internalGetContextMeta(database, 'last_archive_sweep_at');
   const last = lastRaw ? Number(lastRaw) : Number.NaN;
   if (Number.isFinite(last) && now - last < 86_400_000) return { deleted: 0, skipped: true };
-  return { ...pruneArchive(retentionDays, now), skipped: false };
+  const archive = pruneArchive(retentionDays, now);
+  pruneCompletedMaterializationJobs(retentionDays, now);
+  return { ...archive, skipped: false };
 }
 
 // ── Compression-run telemetry ────────────────────────────────────────────────
@@ -4903,11 +4986,29 @@ function getPendingContextStats(filters: ProcessedProjectionQuery): {
   };
 }
 
-function reconcileMaterializedStagedEvents(database: DatabaseSyncInstance): void {
+const STAGED_RECONCILE_BATCH_SIZE = 256;
+const STAGED_RECONCILE_CURSOR_KEY = 'staged_reconcile_rowid';
+
+/** Reconcile at most one projection batch; the cursor keeps startup bounded. */
+function reconcileMaterializedStagedEventsBatchForDb(
+  database: DatabaseSyncInstance,
+  limit = STAGED_RECONCILE_BATCH_SIZE,
+): boolean {
   const stagedRows = database.prepare('SELECT id FROM context_staged_events').all() as Array<Record<string, unknown>>;
-  if (stagedRows.length === 0) return;
+  if (stagedRows.length === 0) return true;
   const stagedIds = new Set(stagedRows.map((row) => String(row.id)));
-  const projectionRows = database.prepare('SELECT source_event_ids_json FROM context_processed_local').all() as Array<Record<string, unknown>>;
+  const cursorRaw = internalGetContextMeta(database, STAGED_RECONCILE_CURSOR_KEY);
+  const cursor = cursorRaw && Number.isSafeInteger(Number(cursorRaw)) ? Number(cursorRaw) : 0;
+  const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+  const projectionRows = database.prepare(`
+    SELECT rowid, source_event_ids_json
+    FROM context_processed_local
+    WHERE rowid > ?
+    ORDER BY rowid ASC
+    LIMIT ?
+  `).all(cursor, safeLimit) as Array<{ rowid: number; source_event_ids_json: string }>;
+  const nextCursor = projectionRows.length > 0 ? Number(projectionRows[projectionRows.length - 1].rowid) : cursor;
+  internalSetContextMeta(database, STAGED_RECONCILE_CURSOR_KEY, String(nextCursor));
   const matchedIds: string[] = [];
   for (const row of projectionRows) {
     const sourceIds = parseJson<string[]>(row.source_event_ids_json, []);
@@ -4915,10 +5016,20 @@ function reconcileMaterializedStagedEvents(database: DatabaseSyncInstance): void
       if (stagedIds.has(sourceId)) matchedIds.push(sourceId);
     }
   }
-  if (matchedIds.length === 0) return;
+  if (matchedIds.length === 0) return projectionRows.length < safeLimit;
   const uniqueIds = Array.from(new Set(matchedIds));
   const placeholders = uniqueIds.map(() => '?').join(', ');
   database.prepare(`DELETE FROM context_staged_events WHERE id IN (${placeholders})`).run(...uniqueIds);
+  return projectionRows.length < safeLimit;
+}
+
+function reconcileMaterializedStagedEvents(database: DatabaseSyncInstance): void {
+  // Retained as a bounded startup pass; idle maintenance advances the cursor.
+  reconcileMaterializedStagedEventsBatchForDb(database);
+}
+
+export function reconcileMaterializedStagedEventsBatch(limit = STAGED_RECONCILE_BATCH_SIZE): boolean {
+  return reconcileMaterializedStagedEventsBatchForDb(ensureDb(), limit);
 }
 
 export function getLocalProcessedFreshness(namespace: ContextNamespace, now = Date.now()): ContextFreshness {
