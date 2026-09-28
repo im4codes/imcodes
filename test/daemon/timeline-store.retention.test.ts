@@ -64,6 +64,7 @@ function makeEvent(sessionId: string, seq: number, text: string) {
 describe('timeline-store async retention (T5-T6)', () => {
   const originalHome = process.env.HOME;
   const originalUserProfile = process.env.USERPROFILE;
+  const originalImcodesHome = process.env.IMCODES_HOME;
   let tempHome: string | null = null;
 
   beforeEach(() => {
@@ -72,6 +73,7 @@ describe('timeline-store async retention (T5-T6)', () => {
     tempHome = mkdtempSync(join(tmpdir(), 'imcodes-timeline-retention-'));
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
   });
 
   afterEach(() => {
@@ -80,6 +82,8 @@ describe('timeline-store async retention (T5-T6)', () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
     tempHome = null;
   });

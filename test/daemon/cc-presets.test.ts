@@ -30,6 +30,9 @@ describe('cc presets', () => {
   beforeEach(async () => {
     loggerWarn.mockClear();
     state.home = await mkdtemp(join(tmpdir(), 'imcodes-cc-presets-'));
+    vi.stubEnv('HOME', state.home);
+    vi.stubEnv('USERPROFILE', state.home);
+    vi.stubEnv('IMCODES_HOME', join(state.home, '.imcodes'));
     await mkdir(join(state.home, '.imcodes'), { recursive: true });
     await writeFile(
       join(state.home, '.imcodes', 'cc-presets.json'),
@@ -50,6 +53,7 @@ describe('cc presets', () => {
 
   afterEach(async () => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.resetModules();
     if (state.home) await rm(state.home, { recursive: true, force: true });
     state.home = '';

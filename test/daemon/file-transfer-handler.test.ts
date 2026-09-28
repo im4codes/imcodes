@@ -6,6 +6,9 @@ import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_MSG, FILE_TRANSFER_RELAY_HEADER } from '../../shared/transport/file-transfer.js';
 
 async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
+  vi.stubEnv('HOME', fakeHome);
+  vi.stubEnv('USERPROFILE', fakeHome);
+  vi.stubEnv('IMCODES_HOME', path.join(fakeHome, '.imcodes'));
   vi.resetModules();
   vi.doMock('node:os', async (importOriginal) => {
     const actual = await importOriginal<typeof import('node:os')>();
@@ -63,6 +66,7 @@ describe('file-transfer local handle hardening', () => {
     vi.doUnmock('node:os');
     vi.doUnmock('../../shared/transport/file-transfer.js');
     vi.doUnmock('../../src/util/logger.js');
+    vi.unstubAllEnvs();
     vi.resetModules();
     await rm(rootDir, { recursive: true, force: true });
   });

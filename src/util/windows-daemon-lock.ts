@@ -52,21 +52,6 @@ export function resolveImcodesHome(options: WindowsDaemonLockPathOptions = {}): 
   // it points somewhere else so isolated daemons receive their own pipe.
   const configuredUserHome = options.env ? options.env.HOME?.trim() : process.env.HOME?.trim();
   const configuredUserProfile = options.env ? options.env.USERPROFILE?.trim() : process.env.USERPROFILE?.trim();
-  // Vitest's global setup supplies IMCODES_HOME, while a number of legacy
-  // tests deliberately replace HOME for one module and expect its state under
-  // that replacement. Keep the production rule (IMCODES_HOME wins) intact,
-  // but treat a divergent test HOME as the per-test override; the setup value
-  // is stale only when its parent no longer matches HOME.
-  const runningVitest = process.env.VITEST === 'true' || process.env.VITEST_WORKER_ID !== undefined;
-  if (configuredHome && runningVitest && configuredUserHome) {
-    const configuredParent = looksLikeWindowsPath(configuredHome)
-      ? win32.dirname(configuredHome)
-      : dirname(configuredHome);
-    const sameHome = looksLikeWindowsPath(configuredHome) || looksLikeWindowsPath(configuredUserHome)
-      ? normalizeWindowsLockPath(configuredParent) === normalizeWindowsLockPath(configuredUserHome)
-      : resolve(configuredParent) === resolve(configuredUserHome);
-    if (!sameHome) return resolveLockPath(join(configuredUserHome, '.imcodes'));
-  }
   if (configuredHome) return resolveLockPath(configuredHome);
   // On POSIX, HOME is the same source as os.homedir() and test suites often
   // mock homedir() without rewriting the process environment.  Treating an

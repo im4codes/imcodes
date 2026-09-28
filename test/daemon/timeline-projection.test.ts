@@ -11,6 +11,7 @@ const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 
 const originalHome = process.env.HOME;
 const originalUserProfile = process.env.USERPROFILE;
+const originalImcodesHome = process.env.IMCODES_HOME;
 const originalDbPath = process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
 const PROJECTION_SETTLE_TIMEOUT_MS = 10_000;
 const PROJECTION_SETTLE_INTERVAL_MS = 50;
@@ -57,6 +58,8 @@ describe('timeline projection', () => {
     else process.env.HOME = originalHome;
     if (originalUserProfile === undefined) delete process.env.USERPROFILE;
     else process.env.USERPROFILE = originalUserProfile;
+    if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = originalImcodesHome;
     if (originalDbPath === undefined) delete process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH;
     else process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = originalDbPath;
     if (tempHome) rmSync(tempHome, { recursive: true, force: true });
@@ -69,6 +72,7 @@ describe('timeline projection', () => {
     dbPath = join(tempHome, '.imcodes', 'timeline-projection.sqlite');
     process.env.HOME = tempHome;
     process.env.USERPROFILE = tempHome;
+    process.env.IMCODES_HOME = join(tempHome, '.imcodes');
     process.env.IMCODES_TIMELINE_PROJECTION_DB_PATH = dbPath;
     prepareDb?.(dbPath);
     const [{ timelineProjection }, { timelineStore }] = await Promise.all([

@@ -43,6 +43,9 @@ function createIsolatedTmpDirs() {
   testRoot = mkdtempSync(join(process.env.TMPDIR ?? '/tmp', 'imcodes-setup-flow-'));
   projectDir = join(testRoot, 'project');
   setupState.home = join(testRoot, 'home');
+  vi.stubEnv('HOME', setupState.home);
+  vi.stubEnv('USERPROFILE', setupState.home);
+  vi.stubEnv('IMCODES_HOME', join(setupState.home, '.imcodes'));
   mkdirSync(projectDir, { recursive: true });
   mkdirSync(setupState.home, { recursive: true });
 }
@@ -138,6 +141,7 @@ function useIsolatedSetupEnvironment(): void {
     testRoot = '';
     projectDir = '';
     setupState.home = '';
+    vi.unstubAllEnvs();
   });
 }
 

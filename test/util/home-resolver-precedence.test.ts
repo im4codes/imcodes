@@ -49,10 +49,19 @@ describe('resolveImcodesHome precedence', () => {
     const secondHome = mkdtempSync(join(tmpdir(), 'imcodes-home-b-'));
     try {
       vi.resetModules();
+      // Keep the mocked homedir and HOME aligned so this assertion exercises
+      // IMCODES_HOME's production precedence rather than the legacy-test
+      // mocked-homedir compatibility branch.
+      mockedHome.value = firstHome;
+      process.env.HOME = firstHome;
+      process.env.USERPROFILE = firstHome;
       process.env.IMCODES_HOME = join(firstHome, '.imcodes');
       const { registerTempFile, flushTempFileStore } = await import('../../src/store/temp-file-store.js');
 
       process.env.IMCODES_HOME = join(secondHome, '.imcodes');
+      process.env.HOME = secondHome;
+      process.env.USERPROFILE = secondHome;
+      mockedHome.value = secondHome;
       await registerTempFile({
         path: join(secondHome, 'payload.txt'),
         createdAt: Date.now(),

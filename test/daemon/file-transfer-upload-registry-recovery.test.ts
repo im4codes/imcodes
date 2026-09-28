@@ -17,6 +17,9 @@ describe('upload attachment registry recovery', () => {
   beforeEach(async () => {
     vi.resetModules();
     home = await mkdtemp(path.join(tmpdir(), 'imcodes-upload-registry-'));
+    vi.stubEnv('HOME', home);
+    vi.stubEnv('USERPROFILE', home);
+    vi.stubEnv('IMCODES_HOME', path.join(home, '.imcodes'));
     uploads = path.join(home, '.imcodes', 'uploads');
     await mkdir(uploads, { recursive: true });
     const os = await vi.importActual<typeof import('node:os')>('node:os');
@@ -29,6 +32,7 @@ describe('upload attachment registry recovery', () => {
   afterEach(async () => {
     vi.doUnmock('node:os');
     vi.doUnmock('../../src/util/logger.js');
+    vi.unstubAllEnvs();
     vi.resetModules();
     await rm(home, { recursive: true, force: true });
   });

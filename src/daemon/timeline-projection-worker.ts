@@ -1,8 +1,8 @@
-import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
 import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { homedir } from 'node:os';
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
 import type {
   ProjectionSessionMeta,
@@ -21,10 +21,17 @@ type WorkerRequest = {
 }[ProjectionWorkerRequestType];
 
 const PROJECTION_VERSION = 1;
-function timelineDir(): string { return join(resolveImcodesHome(), 'timeline'); }
 const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
   ? workerData.dbPath
-  : join(resolveImcodesHome(), 'timeline.sqlite');
+  : join(process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'), 'timeline.sqlite');
+function timelineDir(): string {
+  // Production clients pass the canonical <home>/timeline.sqlite path. The
+  // worker contract also allows an arbitrary test db path, in which case the
+  // JSONL fixture remains under the mocked user's ~/.imcodes/timeline tree.
+  return dbPath.endsWith('timeline.sqlite')
+    ? join(dirname(dbPath), 'timeline')
+    : join(homedir(), '.imcodes', 'timeline');
+}
 
 let db: DatabaseSyncInstance | null = null;
 const rebuildPromises = new Map<string, Promise<boolean>>();

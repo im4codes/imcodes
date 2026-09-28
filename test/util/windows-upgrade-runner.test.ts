@@ -390,6 +390,8 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
           HOME: fakeHome,
           PATH: emptyPath,
           npm_config_registry: 'http://127.0.0.1:9',
+          IMCODES_HOME: imcodesDir,
+          IMCODES_DEFAULT_HOME: imcodesDir,
         },
       });
     } catch (e) {
