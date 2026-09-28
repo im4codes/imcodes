@@ -1048,6 +1048,36 @@ describe('SharedContextManagementPanel', () => {
     expect((await screen.findAllByText('sharedContext.management.memoryToolDisabledNoDaemon')).length).toBeGreaterThan(0);
   });
 
+  it('shows local memory as unavailable instead of rendering zero counts', async () => {
+    const sent: Array<Record<string, unknown>> = [];
+    const handlers = new Set<(message: unknown) => void>();
+    const ws = {
+      send(message: Record<string, unknown>) { sent.push(message); },
+      onMessage(handler: (message: unknown) => void) { handlers.add(handler); return () => handlers.delete(handler); },
+    };
+    render(<SharedContextManagementPanel serverId="srv-1" ws={ws as never} />);
+    await flush();
+    await act(async () => { fireEvent.click(screen.getByText('sharedContext.management.tabs.memory')); });
+    const query = [...sent].reverse().find((message) => message.type === MEMORY_WS.PERSONAL_QUERY);
+    expect(query).toBeDefined();
+    await act(async () => {
+      for (const handler of handlers) handler({
+        type: MEMORY_WS.PERSONAL_RESPONSE,
+        requestId: query?.requestId,
+        stats: {
+          totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0,
+          durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0,
+          dirtyTargetCount: 0, pendingJobCount: 0, localUnavailable: true,
+        },
+        records: [], pendingRecords: [], projects: [],
+      });
+    });
+    expect(await screen.findByText('sharedContext.management.memoryLocalStatusUnavailable')).toBeDefined();
+    const processedTab = screen.getByText('sharedContext.management.memoryTabLocalProcessed').closest('button');
+    expect(processedTab?.querySelector('span')).toBeNull();
+    expect(screen.queryByText('sharedContext.management.memoryProcessedEmptyPending')).toBeNull();
+  });
+
   it('surfaces manual memory save validation instead of silently ignoring clicks', async () => {
     listSharedProjectsMock.mockResolvedValueOnce([]);
     const sent: Array<Record<string, unknown>> = [];

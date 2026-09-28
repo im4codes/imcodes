@@ -1107,6 +1107,7 @@ function normalizeMemoryView(view: ContextMemoryView): ContextMemoryView {
       stagedEventCount: view.stats.stagedEventCount ?? 0,
       dirtyTargetCount: view.stats.dirtyTargetCount ?? 0,
       pendingJobCount: view.stats.pendingJobCount ?? 0,
+      ...(view.stats.localUnavailable ? { localUnavailable: true } : {}),
     },
     records: view.records ?? [],
     pendingRecords: view.pendingRecords ?? [],
@@ -1831,14 +1832,16 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
   ], [t]);
 
   const memoryTopTabs = useMemo(() => [
-    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemory.stats.totalRecords + (localPersonalMemory.pendingRecords?.length ?? 0) + cloudPersonalMemory.stats.totalRecords },
+    { id: 'personal' as const, label: t('sharedContext.management.memoryTabPersonal'), count: localPersonalMemoryStatus === 'ready' || cloudPersonalMemory.stats.totalRecords > 0
+      ? (localPersonalMemoryStatus === 'ready' ? localPersonalMemory.stats.totalRecords + (localPersonalMemory.pendingRecords?.length ?? 0) : 0) + cloudPersonalMemory.stats.totalRecords
+      : undefined },
     { id: 'enterprise-memory' as const, label: t('sharedContext.management.memoryTabEnterprise'), count: sharedMemory.stats.totalRecords },
-  ], [t, localPersonalMemory, cloudPersonalMemory, sharedMemory]);
+  ], [t, localPersonalMemory, localPersonalMemoryStatus, cloudPersonalMemory, sharedMemory]);
   const memoryPersonalSubTabs = useMemo(() => [
-    { id: 'unprocessed' as const, label: t('sharedContext.management.memoryTabLocalPending'), count: localPersonalMemory.pendingRecords?.length ?? 0 },
-    { id: 'processed' as const, label: t('sharedContext.management.memoryTabLocalProcessed'), count: localPersonalMemory.stats.totalRecords },
+    { id: 'unprocessed' as const, label: t('sharedContext.management.memoryTabLocalPending'), count: localPersonalMemoryStatus === 'ready' ? localPersonalMemory.pendingRecords?.length ?? 0 : undefined },
+    { id: 'processed' as const, label: t('sharedContext.management.memoryTabLocalProcessed'), count: localPersonalMemoryStatus === 'ready' ? localPersonalMemory.stats.totalRecords : undefined },
     { id: 'cloud' as const, label: t('sharedContext.management.memoryTabCloud'), count: cloudPersonalMemory.stats.totalRecords },
-  ], [t, localPersonalMemory, cloudPersonalMemory]);
+  ], [t, localPersonalMemory, localPersonalMemoryStatus, cloudPersonalMemory]);
   const memoryEnterpriseSubTabs = useMemo(() => [
     { id: 'shared-memory' as const, label: t('sharedContext.management.memoryTabSharedMemory'), count: sharedMemory.stats.totalRecords },
     { id: 'authored-context' as const, label: t('sharedContext.management.memoryTabAuthoredContext') },
@@ -2189,7 +2192,11 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
         pendingRecords: msg.pendingRecords ?? [],
         projects: msg.projects ?? [],
       }));
-      setLocalPersonalMemoryStatus(msg.errorCode ? 'error' : 'ready');
+      setLocalPersonalMemoryStatus(
+        msg.stats?.localUnavailable || msg.errorCode === MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE
+          ? 'unavailable'
+          : msg.errorCode ? 'error' : 'ready',
+      );
     });
   }, [rememberMemoryProjectIndex, ws]);
 
@@ -4849,7 +4856,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <SectionHeading
                   title={t('sharedContext.management.memoryLocalTitle')}
                   description={t('sharedContext.management.memoryProcessedDescription')}
-                  action={<span style={pillStyle}>{localPersonalMemory.records.length}</span>}
+                  action={localPersonalMemoryStatus === 'ready' ? <span style={pillStyle}>{localPersonalMemory.records.length}</span> : null}
                 />
                 {localMemoryStatusNotice ? <div style={memoryProcessedNoteStyle}>{localMemoryStatusNotice}</div> : null}
                 {!localMemoryUnavailable ? (
@@ -4948,7 +4955,7 @@ export function SharedContextManagementPanel({ enterpriseId: initialEnterpriseId
                 <SectionHeading
                   title={t('sharedContext.management.memoryPendingTitle')}
                   description={t('sharedContext.management.memoryPendingDescription')}
-                  action={<span style={pillStyle}>{localPersonalMemory.pendingRecords?.length ?? 0}</span>}
+                  action={localPersonalMemoryStatus === 'ready' ? <span style={pillStyle}>{localPersonalMemory.pendingRecords?.length ?? 0}</span> : null}
                 />
                 {localMemoryStatusNotice ? <div style={memoryProcessedNoteStyle}>{localMemoryStatusNotice}</div> : null}
                 {!localMemoryUnavailable ? (

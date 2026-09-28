@@ -739,6 +739,34 @@ describe('handleWebCommand memory context timeline', () => {
     }));
   });
 
+  it('completes delete, archive, and restore actions when the local store is healthy', async () => {
+    getProcessedProjectionByIdMock.mockReturnValue({
+      id: 'healthy-proj',
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo', userId: 'user-bob' },
+      class: 'recent_summary', sourceEventIds: ['evt-healthy'], summary: 'Healthy local memory',
+      content: {}, createdAt: 1, updatedAt: 2, status: 'active',
+    });
+    archiveMemoryMock.mockReturnValue(true);
+    restoreArchivedMemoryMock.mockReturnValue(true);
+    deleteMemoryMock.mockReturnValue(true);
+    const context = (requestId: string) => ({
+      actorId: 'user-bob', userId: 'user-bob', role: 'user', source: 'server_bridge', requestId,
+      boundProjects: [{ canonicalRepoId: 'github.com/acme/repo' }],
+    });
+    for (const [type, responseType, requestId] of [
+      [MEMORY_WS.ARCHIVE, MEMORY_WS.ARCHIVE_RESPONSE, 'healthy-archive'],
+      [MEMORY_WS.RESTORE, MEMORY_WS.RESTORE_RESPONSE, 'healthy-restore'],
+      [MEMORY_WS.DELETE, MEMORY_WS.DELETE_RESPONSE, 'healthy-delete'],
+    ] as const) {
+      handleWebCommand({ type, responseType, requestId, id: 'healthy-proj', canonicalRepoId: 'github.com/acme/repo', [MEMORY_MANAGEMENT_CONTEXT_FIELD]: context(requestId) }, serverLink as any);
+      await flushAsync();
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({ type: responseType, requestId, success: true }));
+    }
+    expect(archiveMemoryMock).toHaveBeenCalledWith('healthy-proj');
+    expect(restoreArchivedMemoryMock).toHaveBeenCalledWith('healthy-proj');
+    expect(deleteMemoryMock).toHaveBeenCalledWith('healthy-proj');
+  });
+
   it('allows explicit manual create, edit, and pin for visible project personal memory', async () => {
     getProcessedProjectionByIdMock.mockReturnValue({
       id: 'legacy-proj',
