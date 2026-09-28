@@ -765,9 +765,11 @@ export class ContextStoreWorkerClient {
       // The initial timer is only a generous queue guard. Once the worker
       // acknowledges execution, it is replaced with the normal operation
       // budget. Queue expiry never contributes a timeout strike/respawn.
-      // Very small explicit budgets are used by deterministic fault tests and
-      // represent an execution timeout, not a production queue budget.
-      const queueAware = timeoutMs >= 100;
+      // Explicit timeout-only calls (used by callers/tests that deliberately
+      // probe execution latency) retain their exact budget. Production calls
+      // either use the default budget or identify a priority lane and receive
+      // the separate queue guard.
+      const queueAware = opts.timeoutMs === undefined || opts.priority !== undefined;
       const queueTimeoutMs = timeoutMs > 0
         ? (queueAware ? Math.max(timeoutMs * 4, 30_000) : timeoutMs)
         : 0;
