@@ -297,7 +297,7 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     ? '%APPDATA%\\npm\\imcodes-launch-preflight.cmd'
     : preflightShimPath;
   const preflightLine = preflightShimExists
-    ? `call "${preflightShimTarget}" >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`
+    ? `call "${preflightShimTarget}" >> "%IMCODES_HOME%\\watchdog.log" 2>&1`
     : null;
 
   // CRITICAL: use `ping`-based sleep instead of `timeout /t N /nobreak`.
@@ -327,7 +327,7 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     'chcp 65001 >nul 2>&1',
     ...scopedEnvironmentPrefix(paths).trimEnd().split('\r\n').filter(Boolean),
     ':loop',
-    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_lock',
+    'if exist "%IMCODES_HOME%\\upgrade.lock" goto wait_lock',
     // Preflight FIRST (when the shim is installed): detects half-
     // installed node_modules / missing dist/ from a killed
     // `npm install -g imcodes@…` and reinstalls the pinned version
@@ -335,23 +335,23 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
     // at first import. Older installs that pre-date the preflight
     // shim simply skip this line — graceful degradation.
     ...(preflightLine ? [preflightLine] : []),
-    `${launchCmd} >> "%USERPROFILE%\\.imcodes\\watchdog.log" 2>&1`,
+    `${launchCmd} >> "%IMCODES_HOME%\\watchdog.log" 2>&1`,
     'ping -n 6 127.0.0.1 >nul 2>&1',
     'goto loop',
     ':wait_lock',
-    'echo [%date% %time%] Upgrade in progress, waiting for lock to clear... >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'echo [%date% %time%] Upgrade in progress, waiting for lock to clear... >> "%IMCODES_HOME%\\watchdog.log"',
     ':wait_loop',
     'ping -n 31 127.0.0.1 >nul 2>&1',
-    'if not exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto lock_cleared',
+    'if not exist "%IMCODES_HOME%\\upgrade.lock" goto lock_cleared',
     // Stale-lock probe: if the lock file mtime is >10 minutes old, the
     // upgrade script crashed before its `:done` cleanup ran — remove the
     // lock ourselves so the daemon can come back up.
-    'powershell -NoProfile -NonInteractive -Command "$f=\'%USERPROFILE%\\.imcodes\\upgrade.lock\'; if((Test-Path $f) -and ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-10))){Remove-Item -Force -ErrorAction SilentlyContinue $f}" >nul 2>&1',
-    'if exist "%USERPROFILE%\\.imcodes\\upgrade.lock" goto wait_loop',
-    'echo [%date% %time%] Upgrade lock was stale ^(>10min^) -- removed by watchdog self-heal. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'powershell -NoProfile -NonInteractive -Command "$f=\'%IMCODES_HOME%\\upgrade.lock\'; if((Test-Path $f) -and ((Get-Item $f).LastWriteTime -lt (Get-Date).AddMinutes(-10))){Remove-Item -Force -ErrorAction SilentlyContinue $f}" >nul 2>&1',
+    'if exist "%IMCODES_HOME%\\upgrade.lock" goto wait_loop',
+    'echo [%date% %time%] Upgrade lock was stale ^(>10min^) -- removed by watchdog self-heal. >> "%IMCODES_HOME%\\watchdog.log"',
     'goto loop',
     ':lock_cleared',
-    'echo [%date% %time%] Upgrade lock cleared, resuming. >> "%USERPROFILE%\\.imcodes\\watchdog.log"',
+    'echo [%date% %time%] Upgrade lock cleared, resuming. >> "%IMCODES_HOME%\\watchdog.log"',
     'goto loop',
     '',
   ].join('\r\n');

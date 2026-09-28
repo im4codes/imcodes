@@ -105,7 +105,7 @@ describe('writeWatchdogCmd', () => {
 
     // Lock file path must be in the check (now via %USERPROFILE% expansion
     // so cmd.exe handles non-ASCII usernames natively at runtime).
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\upgrade.lock');
+    expect(cmd).toContain('%IMCODES_HOME%\\upgrade.lock');
 
     // When locked, should wait and loop back (not launch daemon)
     expect(cmd).toContain('Upgrade in progress, waiting');
@@ -161,7 +161,7 @@ describe('writeWatchdogCmd', () => {
     expect(cmd).not.toContain('C:\\Users\\X\\AppData\\Roaming\\npm\\imcodes-launch-preflight');
     // Preflight output must go to the watchdog log so operators can
     // see what self-repair did.
-    expect(cmd).toContain('imcodes-launch-preflight.cmd" >> "%USERPROFILE%\\.imcodes\\watchdog.log"');
+    expect(cmd).toContain('imcodes-launch-preflight.cmd" >> "%IMCODES_HOME%\\watchdog.log"');
     // Order: preflight line MUST come before the launch line each
     // iteration, otherwise we'd attempt a launch on a broken install
     // first.
@@ -240,8 +240,8 @@ describe('writeWatchdogCmd', () => {
     };
     await writeWatchdogCmd(paths);
     const cmd = written[paths.watchdogPath];
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\upgrade.lock');
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\watchdog.log');
+    expect(cmd).toContain('%IMCODES_HOME%\\upgrade.lock');
+    expect(cmd).toContain('%IMCODES_HOME%\\watchdog.log');
   });
 
   it('falls back to node+script when shim not found', async () => {
@@ -604,7 +604,7 @@ describe('writeWatchdogCmd encoding (regression: cmd.exe BOM bug)', () => {
     // routed through %APPDATA% and %USERPROFILE%.
     expect(cmd).not.toContain('用户测试');
     expect(cmd).toContain('%APPDATA%\\npm\\imcodes.cmd');
-    expect(cmd).toContain('%USERPROFILE%\\.imcodes\\watchdog.log');
+    expect(cmd).toContain('%IMCODES_HOME%\\watchdog.log');
   });
 
   it('uses ABSOLUTE shim path when npm prefix differs from %APPDATA%\\npm (nvm/fnm/custom)', async () => {
