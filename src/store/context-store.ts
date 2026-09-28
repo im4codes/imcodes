@@ -1174,7 +1174,10 @@ function projectionContentHash(summary: string, content: unknown): string {
   return computeProjectionContentHash({ summary, content });
 }
 
-const ARCHIVE_BACKFILL_BATCH_SIZE = 1000;
+// Keep each low-lane migration slice below the interactive read budget. A
+// 1000-row synchronous transaction was enough to hold the worker for hundreds
+// of milliseconds on a large store, defeating priority scheduling.
+const ARCHIVE_BACKFILL_BATCH_SIZE = 32;
 const ARCHIVE_BACKFILL_CURSOR_KEY = 'migration_archive_backfill_cursor';
 
 type ArchiveBackfillCursor = { updatedAt: number; id: string };
@@ -4366,7 +4369,7 @@ function backfillNamespacesAndObservationsForDb(
   options: { limit?: number; now?: number } = {},
 ): ObservationRepairStats {
   const now = options.now ?? Date.now();
-  const safeLimit = Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 1000)));
+  const safeLimit = Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 64)));
   const projectionRows = database.prepare(`
     SELECT id, namespace_key, class, source_event_ids_json, summary, content_json, origin, created_at, updated_at, summary_fingerprint
     FROM context_processed_local
@@ -4420,7 +4423,7 @@ function repairObservationStoreForDb(
     SELECT id, source_event_ids_json FROM context_processed_local
     WHERE id NOT IN (SELECT DISTINCT projection_id FROM context_projection_sources WHERE projection_id IS NOT NULL)
     LIMIT ?
-  `).all(Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 1000)))) as Array<{ id: string; source_event_ids_json: string }>;
+  `).all(Math.max(1, Math.min(10_000, Math.floor(options.limit ?? 64)))) as Array<{ id: string; source_event_ids_json: string }>;
   let orphanProjectionSourcesRepaired = 0;
   for (const row of sourceRows) {
     const sourceIds = parseJson<string[]>(row.source_event_ids_json, []);
