@@ -674,6 +674,7 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock.mock.calls[0]?.[0]).toEqual(expect.any(String));
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).toEqual(expect.objectContaining({
       type: 'file.upload_fetch',
+      filename: expect.stringMatching(/^[a-f0-9]{32}\.txt$/),
       originalName: 'a<b>:c?.txt',
       sanitizedName: 'a_b_c_.txt',
       mime: 'text/plain',
@@ -684,6 +685,28 @@ describe('file-transfer upload route', () => {
     expect(sendFileTransferRequestMock.mock.calls[0]?.[2]).toBe(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS);
     expect(hasDaemonCapabilityMock).toHaveBeenCalledWith(FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY);
     expect(sendFileTransferRequestMock.mock.calls[0]?.[1]).not.toHaveProperty('content');
+  });
+
+  it('keeps a legacy extension in the request consumed by old daemons', async () => {
+    const app = makeApp();
+    const form = new FormData();
+    form.append('file', new File([Buffer.from([0x89, 0x50, 0x4e, 0x47])], '截图 2026.png', { type: 'image/png' }));
+
+    const response = await app.request('/api/server/srv-1/upload', {
+      method: 'POST', headers: { Authorization: 'Bearer test' }, body: form,
+    });
+    expect(response.status).toBe(200);
+
+    const message = sendFileTransferRequestMock.mock.calls[0]?.[1] as {
+      filename: string;
+      originalName?: string;
+      sanitizedName?: string;
+    };
+    // 4931/4861 read only filename when choosing their flat path.
+    const oldDaemonPath = `/home/test/.imcodes/uploads/${message.filename}`;
+    expect(oldDaemonPath).toMatch(/[a-f0-9]{32}\.png$/);
+    expect(message.originalName).toBe('截图 2026.png');
+    expect(message.sanitizedName).toBe('截图 2026.png');
   });
 
   it('accepts resumable browser chunks idempotently and dispatches only the assembled file', async () => {

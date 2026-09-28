@@ -460,6 +460,26 @@ describe('file-transfer local handle hardening', () => {
     await expect(stat(path.dirname(attachment.daemonPath))).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
+  it('accepts the legacy id-plus-extension filename while retaining the new id directory layout', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const done = createServerLinkMock();
+    const id = 'fedcba9876543210fedcba9876543210';
+    await transfer.handleFileUpload({
+      type: 'file.upload',
+      uploadId: 'upload-legacy-shaped',
+      filename: `${id}.png`,
+      originalName: 'image.png',
+      sanitizedName: 'image.png',
+      mime: 'image/png',
+      size: 5,
+      content: Buffer.from('hello').toString('base64'),
+    }, done.serverLink as never);
+    const attachment = (done.sent.find((entry) => (entry as { type?: string }).type === 'file.upload_done') as { attachment: { id: string; daemonPath: string } }).attachment;
+    expect(attachment.id).toBe(id);
+    expect(attachment.daemonPath).toContain(path.join(id, 'image.png'));
+    await expect(readFile(attachment.daemonPath, 'utf8')).resolves.toBe('hello');
+  });
+
   it('keeps duplicate original names in distinct id directories', async () => {
     const transfer = await loadFileTransferHandler(fakeHome);
     const first = createServerLinkMock();

@@ -10,6 +10,7 @@ import { WsBridge } from '../ws/bridge.js';
 import { randomHex } from '../security/crypto.js';
 import {
   FILE_TRANSFER_LIMITS,
+  fileTransferLegacyFilename,
   FILE_TRANSFER_DIRECTORY_CAPABILITY,
   FILE_TRANSFER_UPLOAD_ERROR_CODE,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
@@ -1226,6 +1227,7 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
   // Generate upload ID and sanitized filename
   const uploadId = randomHex(16);
   let filename: string;
+  let storageFilename: string;
   let stagedDir: string;
   let stagedPath: string;
   let stagedSize: number;
@@ -1255,15 +1257,17 @@ fileTransferRoutes.post('/:id/upload', async (c) => {
     if (!accepted.complete) {
       return c.json({ ok: true, complete: false, committedBytes: accepted.committedBytes });
     }
-    filename = accepted.filename;
+    storageFilename = accepted.filename;
+    filename = fileTransferLegacyFilename(storageFilename, uploadOriginalName);
     stagedDir = accepted.dir;
     stagedPath = accepted.filePath;
     stagedSize = accepted.committedBytes;
     stagedMime = accepted.mime;
   } else {
-    filename = randomHex(16);
+    storageFilename = randomHex(16);
+    filename = fileTransferLegacyFilename(storageFilename, file.name || 'file');
     stagedDir = await mkdtemp(path.join(tmpdir(), STAGED_UPLOAD_PREFIX));
-    stagedPath = path.join(stagedDir, filename);
+    stagedPath = path.join(stagedDir, storageFilename);
     stagedSize = await persistStagedUpload(file, stagedPath).catch(async (err) => {
       await rm(stagedDir, { recursive: true, force: true }).catch(() => {});
       throw err;

@@ -45,6 +45,30 @@ export interface PreviewMeta {
 
 // ── Phase 1 limits ────────────────────────────────────────────────────────────
 
+/** Maximum extension bytes kept in the legacy flat upload filename. */
+export const FILE_TRANSFER_LEGACY_EXTENSION_MAX_CHARS = 20;
+
+/**
+ * The flat filename understood by pre-upload-layout daemons.  Keep this
+ * protocol value alongside the new metadata fields: old daemons use it as
+ * their on-disk basename, while new daemons strip the extension and use the
+ * id as the directory name.
+ */
+export function fileTransferLegacyFilename(storageId: string, originalName: string): string {
+  const basename = originalName.split(/[\\/]/).pop() ?? '';
+  const dot = basename.lastIndexOf('.');
+  const extension = (dot > 0 ? basename.slice(dot) : '')
+    .replace(/[^a-zA-Z0-9.]/g, '')
+    .slice(0, FILE_TRANSFER_LEGACY_EXTENSION_MAX_CHARS);
+  return `${storageId}${extension}`;
+}
+
+/** Recover the stable upload id from either the new or legacy filename shape. */
+export function fileTransferStorageId(filename: string): string {
+  const match = /^([a-f0-9]{32})(?:\.[A-Za-z0-9]{1,20})?$/i.exec(filename);
+  return match?.[1] ?? filename;
+}
+
 export const FILE_TRANSFER_LIMITS = {
   /** Maximum single file size in bytes (2 GB). */
   MAX_FILE_SIZE: 2 * 1024 * 1024 * 1024,

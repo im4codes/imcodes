@@ -12,6 +12,7 @@ import { pipeline } from 'node:stream/promises';
 import logger from '../util/logger.js';
 import {
   FILE_TRANSFER_LIMITS,
+  fileTransferStorageId,
   FILE_TRANSFER_DIRECTORY_MAX_ENTRIES,
   FILE_TRANSFER_DIRECTORY_PATH,
   isFileTransferWellKnownDirectoryPath,
@@ -284,8 +285,9 @@ export function resolveUploadPath(filename: string, originalName?: string): stri
 const UPLOAD_ID_RE = /^[a-f0-9]{32}$/i;
 
 export function resolveUploadPathForName(filename: string, originalName?: string): string {
-  const filePath = originalName !== undefined && UPLOAD_ID_RE.test(filename)
-    ? path.join(UPLOAD_DIR, filename, sanitizeUploadFilename(originalName))
+  const storageId = fileTransferStorageId(filename);
+  const filePath = originalName !== undefined && UPLOAD_ID_RE.test(storageId)
+    ? path.join(UPLOAD_DIR, storageId, sanitizeUploadFilename(originalName))
     : path.join(UPLOAD_DIR, filename);
   const resolved = path.resolve(filePath);
   if (!resolved.startsWith(path.resolve(UPLOAD_DIR) + path.sep)) {
@@ -770,6 +772,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
     }
 
     const resolved = resolveUploadPathForName(filename, sanitizedName || originalName);
+    const storageId = fileTransferStorageId(filename);
     await mkdir(path.dirname(resolved), { recursive: true });
 
     const buffer = Buffer.from(content, 'base64');
@@ -783,7 +786,7 @@ export async function handleFileUpload(cmd: Record<string, unknown>, serverLink:
 
     await finalizeUploadedFile({
       uploadId,
-      filename,
+      filename: storageId,
       originalName,
       mime,
       resolved,
@@ -818,6 +821,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
     }
 
     const resolved = resolveUploadPathForName(filename, sanitizedName || originalName);
+    const storageId = fileTransferStorageId(filename);
     await mkdir(path.dirname(resolved), { recursive: true });
     if (typeof msg.size !== 'number' || msg.size < 0 || msg.size > FILE_TRANSFER_LIMITS.MAX_FILE_SIZE) {
       throw new Error(FS_GENERIC_ERROR_CODES.FILE_TOO_LARGE);
@@ -831,7 +835,7 @@ export async function handleFileUploadFetch(cmd: Record<string, unknown>, server
     });
     await finalizeUploadedFile({
       uploadId,
-      filename,
+      filename: storageId,
       originalName,
       mime,
       resolved,
