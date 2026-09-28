@@ -11646,7 +11646,8 @@ async function handleServerDelete(): Promise<void> {
 
   logger.info('server.delete received — self-destructing daemon');
 
-  const credsPath = join(homedir(), '.imcodes', 'server.json');
+  const { resolveImcodesHome } = await import('../util/windows-daemon-lock.js');
+  const credsPath = join(resolveImcodesHome(), 'server.json');
   try { await unlink(credsPath); } catch { /* already gone */ }
 
   // Uninstall system service so daemon doesn't restart

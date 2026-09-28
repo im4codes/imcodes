@@ -11,6 +11,7 @@ import { randomBytes } from 'node:crypto';
 import { readFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { MCP_ERROR_REASONS, type MCPErrorReason } from '../../shared/memory-mcp-errors.js';
 import { NODE_ROLE, type MachineExecHttpReason } from '../../shared/remote-exec.js';
 import type { ComputerUseHttpReason } from '../../shared/computer-use.js';
@@ -34,7 +35,7 @@ export interface DaemonCredential {
 /** Read the daemon's own bound credential; null when unbound/unreadable. */
 export async function loadDaemonCredential(): Promise<DaemonCredential | null> {
   try {
-    const raw = await readFile(join(homedir(), '.imcodes', 'server.json'), 'utf8');
+    const raw = await readFile(join(resolveImcodesHome(), 'server.json'), 'utf8');
     const parsed = JSON.parse(raw) as Partial<{ serverId: string; token: string; workerUrl: string }>;
     if (!parsed.serverId || !parsed.token || !parsed.workerUrl) return null;
     return { serverUrl: parsed.workerUrl, serverId: parsed.serverId, token: parsed.token };

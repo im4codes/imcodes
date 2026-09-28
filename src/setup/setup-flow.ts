@@ -53,9 +53,10 @@ import { resolveDaemonLaunchTarget, renderSystemdExecStart } from '../util/launc
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
 import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
 import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 
-const CREDS_DIR = join(homedir(), '.imcodes');
-const CREDS_PATH = join(CREDS_DIR, 'server.json');
+function credentialsDir(): string { return resolveImcodesHome(); }
+function credentialsPath(): string { return join(credentialsDir(), 'server.json'); }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -1160,7 +1161,7 @@ function bootstrapDatabase(compose: string, dir: string, secrets: SetupSecrets):
 // ── Self-binding ────────────────────────────────────────────────────────────
 
 async function selfBind(secrets: SetupSecrets): Promise<void> {
-  await mkdir(CREDS_DIR, { recursive: true });
+  await mkdir(credentialsDir(), { recursive: true });
   const creds = {
     serverId: secrets.serverId,
     token: secrets.serverToken,
@@ -1168,7 +1169,7 @@ async function selfBind(secrets: SetupSecrets): Promise<void> {
     serverName: hostname(),
     boundAt: Date.now(),
   };
-  await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
 }
 
 function installService(): void {
@@ -1184,7 +1185,7 @@ function installService(): void {
 function installSystemdService(): void {
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
   const servicePath = join(serviceDir, 'imcodes.service');
-  const logPath = join(CREDS_DIR, 'daemon.log');
+  const logPath = join(credentialsDir(), 'daemon.log');
 
   // Prefer the self-healing launcher when this install ships it. See
   // `src/util/launch-target.ts` for the why — half-finished `npm install`

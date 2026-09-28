@@ -1,15 +1,17 @@
 import pino from 'pino';
 import { join } from 'path';
-import { homedir } from 'os';
 import { mkdirSync, existsSync, openSync, statSync, renameSync, unlinkSync } from 'fs';
+import { resolveImcodesHome } from './windows-daemon-lock.js';
 
-const LOG_DIR = join(homedir(), '.imcodes', 'logs');
-const LOG_FILE = join(LOG_DIR, 'daemon.log');
+function logDir(): string { return join(resolveImcodesHome(), 'logs'); }
+function logFile(): string { return join(logDir(), 'daemon.log'); }
 const MAX_LOG_SIZE = 10 * 1024 * 1024; // 10MB
 const MAX_OLD_LOGS = 2;
 
 /** Rotate daemon.log when it exceeds MAX_LOG_SIZE. */
 function rotateLogs(): void {
+  const LOG_DIR = logDir();
+  const LOG_FILE = logFile();
   try {
     if (!existsSync(LOG_FILE)) return;
     const { size } = statSync(LOG_FILE);
@@ -48,6 +50,8 @@ function buildLogger(): pino.Logger {
   }
 
   // Daemon mode: always write to file, console only if stdout is a TTY (not a broken pipe)
+  const LOG_DIR = logDir();
+  const LOG_FILE = logFile();
   try { mkdirSync(LOG_DIR, { recursive: true }); } catch { /* ignore */ }
   rotateLogs();
 

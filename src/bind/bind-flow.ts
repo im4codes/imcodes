@@ -10,9 +10,12 @@ import { resolveDaemonLaunchTarget, renderSystemdExecStart, renderPlistProgramAr
 import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../util/systemd-linger.js';
 import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
 import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 
-const CREDS_DIR = join(homedir(), '.imcodes');
-const CREDS_PATH = join(CREDS_DIR, 'server.json');
+/** Resolve the instance state directory lazily so scoped daemons never read or
+ * write the default user's credentials when IMCODES_HOME is overridden. */
+function credentialsDir(): string { return resolveImcodesHome(); }
+function credentialsPath(): string { return join(credentialsDir(), 'server.json'); }
 const PLIST_LABEL = 'imcodes.daemon';
 const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${PLIST_LABEL}.plist`);
 const OLD_PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', 'cc.imcodes.daemon.plist');
@@ -74,8 +77,8 @@ export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { f
       }
       const { token } = await rebindRes.json() as { token: string };
       const creds: ServerCredentials = { serverId: existing.serverId, token, workerUrl, serverName, boundAt: Date.now() };
-      await mkdir(CREDS_DIR, { recursive: true });
-      await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
+      await mkdir(credentialsDir(), { recursive: true });
+      await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
       console.log(`\nRe-bound! Device "${serverName}" updated.`);
       await ensureServiceInstalled();
       restartDaemon();
@@ -108,8 +111,8 @@ export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { f
 
   // Save credentials (0600 permissions)
   const creds: ServerCredentials = { serverId, token, workerUrl, serverName, boundAt: Date.now() };
-  await mkdir(CREDS_DIR, { recursive: true });
-  await writeFile(CREDS_PATH, JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
+  await mkdir(credentialsDir(), { recursive: true });
+  await writeFile(credentialsPath(), JSON.stringify(creds, null, 2), { encoding: 'utf8', mode: 0o600 });
   logger.info({ serverId, serverName }, 'Daemon bound');
 
   await ensureServiceInstalled();
@@ -261,7 +264,7 @@ async function ensureTmux(): Promise<void> {
 }
 
 async function installLaunchAgent(): Promise<void> {
-  const logPath = join(CREDS_DIR, 'daemon.log');
+  const logPath = join(credentialsDir(), 'daemon.log');
   const launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents');
 
   // Prefer the self-healing launcher when this install ships it. See
@@ -318,7 +321,7 @@ ${renderPlistProgramArguments(target)}
 }
 
 async function installSystemdService(): Promise<void> {
-  const logPath = join(CREDS_DIR, 'daemon.log');
+  const logPath = join(credentialsDir(), 'daemon.log');
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
   const servicePath = join(serviceDir, 'imcodes.service');
 
@@ -393,7 +396,7 @@ WantedBy=default.target
 
 export async function loadCredentials(): Promise<ServerCredentials | null> {
   try {
-    const raw = await readFile(CREDS_PATH, 'utf8');
+    const raw = await readFile(credentialsPath(), 'utf8');
     return JSON.parse(raw) as ServerCredentials;
   } catch {
     return null;
