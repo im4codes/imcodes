@@ -3,6 +3,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   getProcessedProjectionStats,
+  ensureContextStoreMaintenanceIndexes,
   listMemoryProjectSummaries,
   queryProcessedProjections,
   resetContextStoreForTests,
@@ -65,6 +66,8 @@ describe('context-store panel query performance', () => {
     database.exec('COMMIT');
     database.close();
 
+    // Warm the deferred panel indexes before measuring the steady-state path.
+    ensureContextStoreMaintenanceIndexes();
     const started = performance.now();
     const stats = getProcessedProjectionStats({ scope: 'personal', userId: 'panel-user' });
     const records = queryProcessedProjections({ scope: 'personal', userId: 'panel-user', limit: 50 });

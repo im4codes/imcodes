@@ -270,7 +270,6 @@ function backfillNamespaceFilterColumnsForTable(
   limit = 256,
 ): number {
   const cursorKey = `namespace_filter_cursor_${table}`;
-  if (internalGetContextMeta(database, `${cursorKey}_done`) === '1') return 0;
   const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0) || 0;
   const rows = database.prepare(`
     SELECT rowid, ${idColumn} AS row_id, namespace_key
@@ -278,10 +277,7 @@ function backfillNamespaceFilterColumnsForTable(
     WHERE rowid > ? AND (scope IS NULL OR scope = '')
     ORDER BY rowid ASC LIMIT ?
   `).all(cursor, limit) as Array<{ rowid: number; row_id: string; namespace_key: string }>;
-  if (rows.length === 0) {
-    internalSetContextMeta(database, `${cursorKey}_done`, '1');
-    return 0;
-  }
+  if (rows.length === 0) return 0;
   const update = database.prepare(`
     UPDATE ${table}
     SET scope = ?,
@@ -298,7 +294,6 @@ function backfillNamespaceFilterColumnsForTable(
     updated += result.changes ?? 0;
   }
   internalSetContextMeta(database, cursorKey, String(rows[rows.length - 1]!.rowid));
-  if (rows.length < limit) internalSetContextMeta(database, `${cursorKey}_done`, '1');
   return updated;
 }
 
@@ -4874,7 +4869,10 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
+  const baseConditions = [...conditions];
+  const baseParams = [...params];
   conditions.push('is_noise = 0');
+  baseConditions.push('is_noise = 0');
   if (normalizedQuery) {
     conditions.push('(summary LIKE ? OR content_json LIKE ?)');
     params.push(`%${normalizedQuery}%`, `%${normalizedQuery}%`);
@@ -4886,10 +4884,13 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
       SUM(CASE WHEN class = 'recent_summary' THEN 1 ELSE 0 END) AS recent_summary_count,
       SUM(CASE WHEN class = 'durable_memory_candidate' THEN 1 ELSE 0 END) AS durable_candidate_count,
       COUNT(DISTINCT project_id) AS project_count
-    FROM context_processed_local ${where}
-  `).get(...params) as Record<string, unknown>;
-  const matchedRecords = Number(aggregate.total_records ?? 0) || 0;
-  const totalRecords = matchedRecords;
+    FROM context_processed_local WHERE ${baseConditions.join(' AND ')}
+  `).get(...baseParams) as Record<string, unknown>;
+  const matchedAggregate = normalizedQuery
+    ? database.prepare('SELECT COUNT(*) AS matched_records FROM context_processed_local ' + where).get(...params) as Record<string, unknown>
+    : aggregate;
+  const matchedRecords = Number(matchedAggregate.matched_records ?? matchedAggregate.total_records ?? 0) || 0;
+  const totalRecords = Number(aggregate.total_records ?? 0) || 0;
   const recentSummaryCount = Number(aggregate.recent_summary_count ?? 0) || 0;
   const durableCandidateCount = Number(aggregate.durable_candidate_count ?? 0) || 0;
   const projectCount = Number(aggregate.project_count ?? 0) || 0;
