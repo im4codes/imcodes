@@ -1,6 +1,6 @@
-import { copyFileSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
@@ -9,7 +9,7 @@ import { WINDOWS_UPGRADE_RUNNER_STAGED_FILES } from '../../src/util/windows-upgr
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const runnerSource = resolve(repoRoot, 'src/util/windows-upgrade-runner.mjs');
-const stagedNames = new Set(['windows-upgrade-runner.mjs', ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES]);
+const stagedPaths = new Set(['windows-upgrade-runner.mjs', ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES]);
 
 function relativeImports(filePath: string): string[] {
   const source = readFileSync(filePath, 'utf8');
@@ -26,7 +26,8 @@ describe('Windows staged upgrade runner closure', () => {
       visited.add(current);
       for (const specifier of relativeImports(current)) {
         const dependency = resolve(dirname(current), specifier);
-        expect(stagedNames.has(basename(dependency))).toBe(true);
+        const stagedPath = relative(dirname(runnerSource), dependency).split(sep).join('/');
+        expect(stagedPaths.has(stagedPath), `${specifier} must be in the staged closure`).toBe(true);
         pending.push(dependency);
       }
     }
@@ -36,11 +37,13 @@ describe('Windows staged upgrade runner closure', () => {
     const stagingDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-stage-test-'));
     try {
       for (const relativePath of ['windows-upgrade-runner.mjs', ...WINDOWS_UPGRADE_RUNNER_STAGED_FILES]) {
+        const destination = join(stagingDir, relativePath);
+        mkdirSync(dirname(destination), { recursive: true });
         copyFileSync(
           relativePath === 'windows-upgrade-runner.mjs'
             ? runnerSource
             : resolve(dirname(runnerSource), relativePath),
-          join(stagingDir, relativePath),
+          destination,
         );
       }
       const stagedRunner = join(stagingDir, 'windows-upgrade-runner.mjs');
