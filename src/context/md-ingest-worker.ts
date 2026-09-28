@@ -40,6 +40,12 @@ interface ScheduledMarkdownMemoryIngestState {
 }
 
 const scheduledRuns = new Map<string, ScheduledMarkdownMemoryIngestState>();
+// Markdown/skill files are addressed by stable section fingerprints, but
+// parsing and issuing no-op upserts for every unchanged file still monopolizes
+// the low-priority worker during startup. Keep the file stat fingerprint in
+// process so repeated startup/scheduled passes skip unchanged inputs; a
+// changed mtime or size naturally re-enters the resumable projection path.
+const mdIngestFileFingerprints = new Map<string, string>();
 const MD_INGEST_ALLOWED_SCOPES: ReadonlySet<MemoryScope> = new Set(['personal', 'project_shared']);
 
 function isMdIngestEnabled(): boolean {
@@ -91,6 +97,9 @@ export async function runMarkdownMemoryIngest(input: {
     try {
       const stat = await lstat(fullPath);
       filesChecked += 1;
+      const fileKey = `${scopeKey}:${relativePath}`;
+      const fileFingerprint = `${stat.mtimeMs}:${stat.size}:${stat.isSymbolicLink() ? 'link' : 'file'}`;
+      if (mdIngestFileFingerprints.get(fileKey) === fileFingerprint) continue;
       const content = stat.isSymbolicLink() ? new Uint8Array() : await readFile(fullPath);
       const result = parseMdIngestDocument({
         path: relativePath,
@@ -131,6 +140,7 @@ export async function runMarkdownMemoryIngest(input: {
         void ensureProjectionEmbeddingForProjection(projection);
         observationsWritten += 1;
       }
+      mdIngestFileFingerprints.set(fileKey, fileFingerprint);
     } catch (error) {
       const code = typeof error === 'object' && error && 'code' in error ? String((error as { code?: unknown }).code) : '';
       if (code === 'ENOENT') continue;
