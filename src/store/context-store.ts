@@ -103,6 +103,7 @@ let archiveBackfillScheduledForPath: string | null = null;
 // that share a long-lived worker connection.
 const PANEL_READ_CACHE_TTL_MS = 250;
 const panelReadCache = new Map<string, { expiresAt: number; value: unknown }>();
+const PROCESSED_NOISE_BACKFILL_CURSOR_KEY = 'processed_noise_backfill_rowid';
 
 function panelCacheKey(kind: string, filters: unknown): string {
   return `${kind}:${JSON.stringify(filters ?? {})}`;
@@ -265,6 +266,29 @@ function appendNamespaceFilterSql(
   }
 }
 
+/**
+ * Legacy databases gained `is_noise` with a NOT NULL DEFAULT 0, so a row that
+ * has not yet passed the resumable semantic backfill is indistinguishable from
+ * a confirmed non-noise row at the SQL level. Until the cursor reaches the end
+ * of the table, fence panel reads to the portion that has actually been
+ * classified. This prevents request-failure/noise rows from becoming visible
+ * (or inflating aggregates) during the backfill window. New databases mark the
+ * fence complete while empty; new writes compute `is_noise` synchronously and
+ * are therefore immediately visible. The fence is shared by all panel query
+ * paths so a future aggregate cannot accidentally bypass it.
+ */
+function appendProcessedNoiseVisibilitySql(
+  database: DatabaseSyncInstance,
+  conditions: string[],
+  params: (string | number)[],
+): void {
+  conditions.push('is_noise = 0');
+  if (internalGetContextMeta(database, 'processed_noise_backfill_complete') === '1') return;
+  const cursor = Number(internalGetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY) ?? 0) || 0;
+  conditions.push('rowid <= ?');
+  params.push(cursor);
+}
+
 /** Keep the SQL candidate set bounded without requiring the whole query to be
  * contiguous.  The final token-aware matcher still decides exact/trigram
  * semantics; SQL only needs to admit rows containing at least one token. */
@@ -371,6 +395,15 @@ function backfillNamespaceFilterColumnsForDb(database: DatabaseSyncInstance, lim
  * the historical row count. */
 export function backfillNamespaceFilterColumnsBatch(limit = 256): void {
   backfillNamespaceFilterColumnsForDb(ensureDb(), Math.max(1, Math.min(1000, Math.floor(limit))));
+}
+
+function initializeProcessedNoiseBackfillState(database: DatabaseSyncInstance): void {
+  if (internalGetContextMeta(database, 'processed_noise_backfill_complete') !== undefined) return;
+  // A newly-created empty table has no legacy rows to classify. Marking it
+  // complete keeps normal test/CLI writes visible immediately; existing stores
+  // retain the conservative rowid fence until idle maintenance classifies them.
+  const row = database.prepare('SELECT 1 AS present FROM context_processed_local LIMIT 1').get() as { present?: number } | undefined;
+  if (!row) internalSetContextMeta(database, 'processed_noise_backfill_complete', '1');
 }
 
 function ensureDb(): DatabaseSyncInstance {
@@ -758,6 +791,7 @@ function ensureDb(): DatabaseSyncInstance {
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN user_id TEXT`);
     tryAlter(db, `ALTER TABLE ${table} ADD COLUMN project_id TEXT`);
   }
+  initializeProcessedNoiseBackfillState(db);
   db.exec('CREATE UNIQUE INDEX IF NOT EXISTS uq_proj_fp ON context_processed_local(namespace_key, class, summary_fingerprint) WHERE summary_fingerprint IS NOT NULL');
   db.exec(`
     CREATE INDEX IF NOT EXISTS idx_context_processed_local_scope_project
@@ -857,8 +891,6 @@ export function ensureContextStoreMaintenanceIndexes(): { created: number; done:
   return { created: 1, done: index + 1 >= indexes.length };
 }
 
-const PROCESSED_NOISE_BACKFILL_CURSOR_KEY = 'processed_noise_backfill_rowid';
-
 /** Compute the noise bit once for legacy rows.  This is intentionally a small
  * cursor pass: it runs from idle maintenance and never makes ensureDb/query
  * latency proportional to the size of a historical store. */
@@ -870,11 +902,18 @@ export function backfillProcessedNoiseBatch(limit = 256): { processed: number; d
     SELECT rowid, summary FROM context_processed_local
     WHERE rowid > ? ORDER BY rowid ASC LIMIT ?
   `).all(cursor, safeLimit) as Array<{ rowid: number; summary: string }>;
-  if (rows.length === 0) return { processed: 0, done: true };
+  if (rows.length === 0) {
+    internalSetContextMeta(database, 'processed_noise_backfill_complete', '1');
+    clearPanelReadCache();
+    return { processed: 0, done: true };
+  }
   const update = database.prepare('UPDATE context_processed_local SET is_noise = ? WHERE rowid = ?');
   for (const row of rows) update.run(isMemoryNoiseSummary(row.summary) ? 1 : 0, row.rowid);
   internalSetContextMeta(database, PROCESSED_NOISE_BACKFILL_CURSOR_KEY, String(rows[rows.length - 1]!.rowid));
-  return { processed: rows.length, done: rows.length < safeLimit };
+  const done = rows.length < safeLimit;
+  if (done) internalSetContextMeta(database, 'processed_noise_backfill_complete', '1');
+  clearPanelReadCache();
+  return { processed: rows.length, done };
 }
 
 function decodeTarget(row: Record<string, unknown>, namespace: ContextNamespace): ContextTargetRef {
@@ -4888,7 +4927,7 @@ export function queryProcessedProjections(filters: ProcessedProjectionQuery = {}
   // Noise is materialized at write time; never parse summaries while opening
   // the panel.  A bounded LIKE predicate keeps management search from turning
   // into an unbounded JS scan when a text query is supplied.
-  conditions.push('is_noise = 0');
+  appendProcessedNoiseVisibilitySql(database, conditions, params);
   if (normalizedQuery) {
     appendTextSearchSql(conditions, params, normalizedQuery);
   }
@@ -4966,8 +5005,8 @@ export function getProcessedProjectionStats(filters: ProcessedProjectionQuery = 
   }
   const baseConditions = [...conditions];
   const baseParams = [...params];
-  conditions.push('is_noise = 0');
-  baseConditions.push('is_noise = 0');
+  appendProcessedNoiseVisibilitySql(database, conditions, params);
+  appendProcessedNoiseVisibilitySql(database, baseConditions, baseParams);
   if (normalizedQuery) {
     appendTextSearchSql(conditions, params, normalizedQuery);
   }
@@ -5020,7 +5059,7 @@ export function listMemoryProjectSummaries(filters: ProcessedProjectionQuery = {
     conditions.push('class = ?');
     params.push(filters.projectionClass);
   }
-  conditions.push('is_noise = 0');
+  appendProcessedNoiseVisibilitySql(database, conditions, params);
   const where = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
   const rows = database.prepare(`
     SELECT project_id,

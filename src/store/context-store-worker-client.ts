@@ -740,12 +740,20 @@ export class ContextStoreWorkerClient {
   private onTimeout(id: number): void {
     const entry = this.pending.get(id);
     if (!entry) return;
+    // `postMessage` flips dispatched before the worker emits its started ack.
+    // The request is still queue-starved for timeout/respawn accounting, but an
+    // unsafe mutation may already have been accepted by the worker. Keep safe
+    // reads retryable as unavailable; classify only dispatched unsafe mutations
+    // as indeterminate so callers cannot replay a possible append/lease.
     const queued = entry.queueAware && !entry.started;
+    const dispatchedUnsafeQueued = queued
+      && entry.dispatched
+      && contextStoreOpRetryClass(entry.op) === CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry;
     if (!queued) {
       const durationMs = entry.startedAtMs === null ? entry.timeoutMs : Math.max(0, Date.now() - entry.startedAtMs);
       this.lastSlowOperation = { op: entry.op, durationMs };
       // eslint-disable-next-line no-console
-      console.error(`[context-store] RPC timeout op=${entry.op} durationMs=${durationMs} queued=false`);
+      console.error(`[context-store] RPC timeout op=${entry.op} durationMs=${durationMs} queued=${!entry.started}`);
     }
     this.finish(id, entry);
     // A timeout is NOT proof the op did not run - the worker may still be
@@ -755,7 +763,7 @@ export class ContextStoreWorkerClient {
       queued ? CONTEXT_STORE_RPC_ERROR.unavailable : CONTEXT_STORE_RPC_ERROR.timeout,
       queued ? `context-store request remained queued: id ${id}` : `context-store RPC timed out: id ${id}`,
     );
-    entry.reject(queued ? timeoutError : this.pendingFailureFor(entry, timeoutError));
+    entry.reject(dispatchedUnsafeQueued ? this.pendingFailureFor(entry, timeoutError) : timeoutError);
     // Queue starvation is backpressure, not a sick worker.  In particular do
     // not increment the generation timeout strike or respawn while a request
     // has not received the started acknowledgement.
@@ -765,8 +773,7 @@ export class ContextStoreWorkerClient {
         // A started operation can still be progressing even though its caller
         // budget elapsed.  Defer any destructive respawn until a generous
         // liveness grace period has passed with no worker-side progress.
-        if (entry.started) this.scheduleStuckWorkerCheck();
-        else this.respawn();
+        this.scheduleStuckWorkerCheck();
       }
     }
   }

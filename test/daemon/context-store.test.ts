@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace, ContextTargetRef } from '../../shared/context-types.js';
 import {
   archiveMemory,
+  backfillProcessedNoiseBatch,
   claimContextJob,
   deleteMemory,
   clearDirtyTarget,
@@ -453,6 +454,50 @@ describe('context-store', () => {
       dirtyTargetCount: 0,
       pendingJobCount: 0,
     });
+  });
+
+  it('does not expose legacy noise rows before the semantic backfill fence completes', () => {
+    const now = Date.now();
+    writeProcessedProjection({
+      id: 'legacy-clean-row',
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: [],
+      summary: 'A useful deployment summary',
+      content: {},
+      createdAt: now - 2,
+      updatedAt: now - 2,
+    });
+    writeProcessedProjection({
+      id: 'legacy-noise-row',
+      namespace,
+      class: 'recent_summary',
+      sourceEventIds: [],
+      summary: '[API Error: Connection error. (cause: fetch failed)]',
+      content: {},
+      createdAt: now - 1,
+      updatedAt: now - 1,
+    });
+
+    // Simulate an upgraded legacy store: ALTER TABLE supplied is_noise=0 for
+    // both rows and no semantic cursor has run yet. The panel must not mistake
+    // those defaults for a confirmed non-noise classification.
+    const database = new DatabaseSync(process.env.IMCODES_CONTEXT_DB_PATH!);
+    database.prepare('UPDATE context_processed_local SET is_noise = 0').run();
+    database.prepare("DELETE FROM context_meta WHERE key IN ('processed_noise_backfill_complete', 'processed_noise_backfill_rowid')").run();
+    database.close();
+    resetContextStoreForTests();
+
+    expect(queryProcessedProjections({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([]);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: 'repo' }).totalRecords).toBe(0);
+
+    // Once the bounded cursor pass classifies the rows, only the useful row is
+    // visible and the completion sentinel removes the temporary fence.
+    expect(backfillProcessedNoiseBatch(256)).toMatchObject({ processed: 2, done: true });
+    expect(queryProcessedProjections({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([
+      expect.objectContaining({ id: 'legacy-clean-row', summary: 'A useful deployment summary' }),
+    ]);
+    expect(getProcessedProjectionStats({ scope: 'personal', projectId: 'repo' }).totalRecords).toBe(1);
   });
 
   it('queries pending staged events separately from processed memory', () => {

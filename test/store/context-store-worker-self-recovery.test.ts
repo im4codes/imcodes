@@ -283,6 +283,48 @@ describe('context-store in-flight retry-class policy', () => {
     client.dispose();
   });
 
+  it('does not misclassify a dispatched-but-not-started mutation as retryable queue pressure', async () => {
+    vi.useFakeTimers();
+    const { client, workers } = createHarness();
+    client.start();
+    workers[0].emit('message', { type: 'ready' });
+    await client.whenReady();
+
+    // A priority option makes this queue-aware. postMessage marks the request
+    // dispatched immediately, but the fake worker intentionally withholds the
+    // started acknowledgement. The mutation may already have been accepted;
+    // timing it out must therefore surface indeterminate, not unavailable.
+    const enqueue = client.run(
+      'enqueueContextJob',
+      [{ targetKey: 'target', jobType: 'materialize_session' }],
+      { priority: 'high', timeoutMs: 1 },
+    );
+    const requestId = workers[0].lastRequest().id;
+    const assertion = expect(enqueue).rejects.toMatchObject({
+      code: CONTEXT_STORE_RPC_ERROR.indeterminate,
+    });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await assertion;
+
+    // A late response cannot turn the already-rejected call into a safe retry.
+    workers[0].emit('message', { id: requestId, ok: true, result: { accepted: true } });
+    expect(client.getHealthSnapshot().lastDownReason).not.toBe(CONTEXT_STORE_WORKER_DOWN_REASON.timeoutRespawn);
+    client.dispose();
+  });
+
+  it('keeps a dispatched-but-not-started safe read retryable as unavailable', async () => {
+    vi.useFakeTimers();
+    const { client, workers } = createHarness();
+    client.start();
+    workers[0].emit('message', { type: 'ready' });
+    await client.whenReady();
+
+    const read = client.run('getContextMeta', ['queued-read'], { priority: 'high', timeoutMs: 1 });
+    await vi.advanceTimersByTimeAsync(30_000);
+    await expect(read).rejects.toMatchObject({ code: CONTEXT_STORE_RPC_ERROR.unavailable });
+    client.dispose();
+  });
+
   it('keeps a NEVER-dispatched unsafe-retry op cleanly retryable', async () => {
     vi.useFakeTimers();
     const { client, workers } = createHarness();
