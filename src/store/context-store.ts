@@ -120,6 +120,7 @@ function panelCacheGet<T>(kind: string, filters: unknown): T | undefined {
 }
 
 function panelCacheSet(kind: string, filters: unknown, value: unknown): void {
+  if (panelReadCache.size >= 128) panelReadCache.clear();
   panelReadCache.set(panelCacheKey(kind, filters), { expiresAt: Date.now() + PANEL_READ_CACHE_TTL_MS, value });
 }
 
