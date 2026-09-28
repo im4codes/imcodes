@@ -44,7 +44,6 @@ vi.mock('../../src/daemon/transport-queue-store.js', () => ({
 
 import { wireProviderToRelay } from '../../src/daemon/transport-relay.js';
 import {
-  NATIVE_COLLABORATION_REROUTE_COALESCE_MS,
   NATIVE_COLLABORATION_SCOPES,
   clearNativeCollaborationGuardForTests,
   enforceObservedNativeCollaboration,
@@ -55,10 +54,8 @@ import {
 } from '../../src/daemon/native-collaboration-guard.js';
 import type { NativeAgentFenceResolver, TransportProvider } from '../../src/agent/transport-provider.js';
 import type { ToolCallEvent } from '../../shared/agent-message.js';
-import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import {
   NATIVE_AGENT_ADMISSION_MODES,
-  NATIVE_COLLABORATION_POLICY_NOTICE_MARKER,
   NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT,
   type NativeCollaborationGate,
 } from '../../shared/native-collaboration-policy.js';
@@ -67,7 +64,6 @@ import {
   SDK_SUBAGENT_PROVIDER_KINDS,
   buildGenericRuntimeSubagentTool,
 } from '../../shared/sdk-subagent-status.js';
-import { deterministicSendMessageId } from '../../shared/send-message-id.js';
 
 const BRAIN = 'deck_cd_brain';
 const BRAIN_CHILD = 'deck_sub_worker1';
@@ -119,7 +115,6 @@ function makeProvider(capabilities: Record<string, unknown> = {}, id = 'codex-sd
 const GATED = { nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.PRE_EXECUTION_GATE };
 const policyEvents = () => emitMock.mock.calls.filter((call) => call[1] === NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT);
 const toolProjections = () => emitMock.mock.calls.filter((call) => call[1] === 'tool.call' || call[1] === 'tool.result');
-const noticeOf = (reason: string) => JSON.parse(reason.slice(reason.indexOf('{'))) as Record<string, unknown>;
 
 describe('native collaboration supervision-authority guard', () => {
   beforeEach(() => {
@@ -174,39 +169,31 @@ describe('native collaboration supervision-authority guard', () => {
     it('treats a registry that cannot answer as managed', () => {
       registryState.fail = true;
       expect(resolveNativeCollaborationScope(UNMANAGED)).toBe(NATIVE_COLLABORATION_SCOPES.UNVERIFIABLE);
-      expect(isNativeAgentFenceRequired(UNMANAGED)).toBe(true);
+      expect(isNativeAgentFenceRequired(UNMANAGED)).toBe(false);
     });
 
     it('decides the launch fence from the launch parameters of a session that has no record yet', () => {
       // A Brain descendant is a formal participant: unfenced, like any other participant.
       expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_sub_new', role: 'w1', parentSession: BRAIN })).toBe(false);
-      expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_new_brain', role: 'brain' })).toBe(true);
+      expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_new_brain', role: 'brain' })).toBe(false);
       expect(isNativeAgentFenceRequiredForLaunch({ sessionName: 'deck_sub_plain', role: 'w1', parentSession: UNMANAGED })).toBe(false);
     });
   });
 
   describe('pre-execution gate installed on capable providers', () => {
-    it('denies top-level Brain task participation with a marked reroute reason and hidden evidence', () => {
+    it('allows top-level Brain task participation and records advisory evidence', () => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       const decision = gate()(BRAIN, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: TASK_PROMPT, toolUseId: 'toolu_1' });
-      expect(decision.allow).toBe(false);
-      if (decision.allow) return;
-      expect(decision.reason.startsWith(NATIVE_COLLABORATION_POLICY_NOTICE_MARKER)).toBe(true);
-      expect(noticeOf(decision.reason)).toMatchObject({
-        outcome: 'native_agent_task_participation_denied',
-        signals: ['repository_gate', 'implementation'],
-      });
+      expect(decision).toEqual({ allow: true });
       expect(policyEvents()).toHaveLength(1);
-      expect(policyEvents()[0]![2]).toMatchObject({ scope: 'brain', participation: 'task' });
+      expect(policyEvents()[0]![2]).toMatchObject({ scope: 'brain', participation: 'task', enforcement: 'advisory', outcome: 'allowed' });
       expect(policyEvents()[0]![3]).toMatchObject({ hidden: true, source: 'daemon' });
     });
 
-    it('denies task work in a nested brain-role sub-session', () => {
+    it('allows task work in a nested brain-role sub-session', () => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       const decision = gate()(NESTED_BRAIN, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: TASK_PROMPT });
-      expect(decision.allow).toBe(false);
-      if (decision.allow) return;
-      expect(noticeOf(decision.reason)).not.toHaveProperty('requester');
+      expect(decision).toEqual({ allow: true });
     });
 
     it.each([
@@ -216,7 +203,7 @@ describe('native collaboration supervision-authority guard', () => {
     ])('allows task work (even carrying a repository gate) in %s -- a formal participant delegates without restriction', (_label, sessionId) => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       expect(gate()(sessionId, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: TASK_PROMPT })).toEqual({ allow: true });
-      expect(policyEvents()).toHaveLength(0);
+      expect(policyEvents()).toHaveLength(1);
     });
 
     it.each([
@@ -227,7 +214,7 @@ describe('native collaboration supervision-authority guard', () => {
     ])('allows %s', (_label, sessionId, requestText) => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       expect(gate()(sessionId, { provider: 'claude-code-sdk', toolName: 'Agent', requestText })).toEqual({ allow: true });
-      expect(policyEvents()).toHaveLength(0);
+      expect(policyEvents()).toHaveLength(['task work in a genuinely unmanaged session', 'an ephemeral route'].includes(_label) ? 0 : 1);
     });
 
     it('lets a formal participant delegate small bounded work with no authority/verdict/repository signal', () => {
@@ -235,7 +222,7 @@ describe('native collaboration supervision-authority guard', () => {
       const smallImplementationOnly = 'Implement a small helper that trims trailing whitespace from each line.';
       const decision = gate()(PARTICIPANT, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: smallImplementationOnly });
       expect(decision).toEqual({ allow: true });
-      expect(policyEvents()).toHaveLength(0);
+      expect(policyEvents()).toHaveLength(1);
 
       // A Brain-descendant participant (not a top-level Brain) gets the same
       // carve-out -- it is still a formal participant, not a coordinating Brain.
@@ -243,13 +230,11 @@ describe('native collaboration supervision-authority guard', () => {
         .toEqual({ allow: true });
     });
 
-    it('never extends the delegation carve-out to a Brain, even for the same small bounded work', () => {
+    it('allows a Brain to use native agents for bounded work', () => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       const smallImplementationOnly = 'Implement a small helper that trims trailing whitespace from each line.';
       const decision = gate()(BRAIN, { provider: 'claude-code-sdk', toolName: 'Agent', requestText: smallImplementationOnly });
-      expect(decision.allow).toBe(false);
-      if (decision.allow) return;
-      expect(noticeOf(decision.reason)).toMatchObject({ outcome: 'native_agent_task_participation_denied', signals: ['implementation'] });
+      expect(decision).toEqual({ allow: true });
     });
 
     it.each([
@@ -259,15 +244,13 @@ describe('native collaboration supervision-authority guard', () => {
     ])('allows a participant\'s delegation even when the request also %s -- no restriction survives for a participant', (_label, requestText) => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       expect(gate()(PARTICIPANT, { provider: 'claude-code-sdk', toolName: 'Agent', requestText })).toEqual({ allow: true });
-      expect(policyEvents()).toHaveLength(0);
+      expect(policyEvents()).toHaveLength(1);
     });
 
-    it('denies an unclassified request from a Brain, which never gets the participant carve-out', () => {
+    it('allows an unclassified request from a Brain', () => {
       const { gate } = makeProvider(GATED, 'claude-code-sdk');
       const decision = gate()(BRAIN, { provider: 'claude-code-sdk', toolName: 'Workflow', requestText: 'agent("x")' });
-      expect(decision.allow).toBe(false);
-      if (decision.allow) return;
-      expect(noticeOf(decision.reason)).toMatchObject({ outcome: 'native_agent_request_denied_unclassified' });
+      expect(decision).toEqual({ allow: true });
     });
 
     it('lets a formal participant delegate even an unclassified request -- no classifier-recognized intent required', () => {
@@ -283,7 +266,7 @@ describe('native collaboration supervision-authority guard', () => {
 
     it('answers the per-session fence resolver from the same scope', () => {
       const { fenceResolver } = makeProvider({ nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE });
-      expect(fenceResolver()(BRAIN)).toBe(true);
+      expect(fenceResolver()(BRAIN)).toBe(false);
       expect(fenceResolver()(UNMANAGED)).toBe(false);
       expect(fenceResolver()('ephemeral-compressor')).toBe(false);
       // A launch before route registration names the session itself. A
@@ -293,7 +276,7 @@ describe('native collaboration supervision-authority guard', () => {
   });
 
   describe('post-start evidence for providers without a pre-execution gate', () => {
-    it('records evidence, stops the turn and queues one notice for a task-type native agent', () => {
+    it('records advisory evidence without stopping a task-type native agent', () => {
       const { fireTool } = makeProvider({ nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE });
       const running = runtimeSubagentTool(BRAIN, 'agent-task-1', TASK_PROMPT);
       expect(String((running.input as { description?: string }).description)).not.toMatch(/implement/);
@@ -302,36 +285,23 @@ describe('native collaboration supervision-authority guard', () => {
       fireTool(BRAIN, runtimeSubagentTool(BRAIN, 'agent-task-1', TASK_PROMPT, 'completed'));
 
       const runtime = runtimes.get(BRAIN)!;
-      expect(runtime.cancel).toHaveBeenCalledOnce();
-      expect(runtime.send).toHaveBeenCalledOnce();
-      const [notice, clientMessageId, attachments, preamble, metadata] = runtime.send.mock.calls[0]!;
-      expect(String(notice).startsWith(NATIVE_COLLABORATION_POLICY_NOTICE_MARKER)).toBe(true);
-      expect(String(notice)).toContain('native_agent_task_participation_turn_stopped');
-      expect(String(notice)).toContain('send_message with task');
-      expect(clientMessageId).toBe(deterministicSendMessageId(`native-collaboration-reroute:${BRAIN}:${running.id}`));
-      expect(attachments).toBeUndefined();
-      expect(preamble).toBeUndefined();
-      // Queued, never appended into the turn that was just stopped.
-      expect(metadata).toEqual({
-        timelineCommitted: true,
-        historyCommitted: true,
-        deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
-      });
+      expect(runtime.cancel).not.toHaveBeenCalled();
+      expect(runtime.send).not.toHaveBeenCalled();
       expect(policyEvents()).toHaveLength(1);
-      expect(policyEvents()[0]![2]).toMatchObject({ enforcement: 'observed_after_start', outcome: 'turn_stopped', scope: 'brain' });
+      expect(policyEvents()[0]![2]).toMatchObject({ enforcement: 'advisory', outcome: 'allowed', scope: 'brain' });
       // The native agent itself stays visible: its tool events are still projected.
       expect(toolProjections().length).toBeGreaterThanOrEqual(2);
     });
 
-    it('never stops a participant -- it delegates without restriction, so an observed native agent is expected, not evidence of a bypassed fence', () => {
+    it('allows a participant without correction', () => {
       const { fireTool } = makeProvider({ nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE });
       fireTool(BRAIN_CHILD, runtimeSubagentTool(BRAIN_CHILD, 'agent-worker', TASK_PROMPT));
       expect(runtimes.get(BRAIN_CHILD)!.cancel).not.toHaveBeenCalled();
       expect(runtimes.get(BRAIN_CHILD)!.send).not.toHaveBeenCalled();
-      expect(policyEvents()).toHaveLength(0);
+      expect(policyEvents()).toHaveLength(1);
     });
 
-    it('never stops analysis, unmanaged sessions, or pre-execution providers', () => {
+    it('never corrects analysis, unmanaged sessions, or pre-execution providers', () => {
       makeProvider().fireTool(BRAIN, runtimeSubagentTool(BRAIN, 'agent-analysis', ANALYSIS_PROMPT));
       makeProvider().fireTool(UNMANAGED, runtimeSubagentTool(UNMANAGED, 'agent-unmanaged', TASK_PROMPT));
       makeProvider(GATED, 'claude-code-sdk').fireTool(BRAIN, runtimeSubagentTool(BRAIN, 'agent-claude', TASK_PROMPT));
@@ -340,17 +310,18 @@ describe('native collaboration supervision-authority guard', () => {
         expect(runtimes.get(name)!.cancel).not.toHaveBeenCalled();
         expect(runtimes.get(name)!.send).not.toHaveBeenCalled();
       }
-      expect(policyEvents()).toHaveLength(0);
+      expect(policyEvents()).toHaveLength(2);
     });
 
-    it('treats a native agent with no classified request as unclassified, unless it was admitted as analysis', () => {
+    it('treats a native agent with no classified request as an allowed advisory', () => {
       const { fireTool } = makeProvider();
       fireTool(BRAIN, runtimeSubagentTool(BRAIN, 'agent-admitted', ANALYSIS_PROMPT));
       fireTool(BRAIN, runtimeSubagentTool(BRAIN, 'agent-admitted', undefined, 'completed'));
       expect(runtimes.get(BRAIN)!.cancel).not.toHaveBeenCalled();
 
       fireTool(BRAIN, runtimeSubagentTool(BRAIN, 'agent-unknown', undefined));
-      expect(runtimes.get(BRAIN)!.cancel).toHaveBeenCalledOnce();
+      expect(runtimes.get(BRAIN)!.cancel).not.toHaveBeenCalled();
+      expect(runtimes.get(BRAIN)!.send).not.toHaveBeenCalled();
     });
 
     it('classifies follow-up work handed to an existing native agent', () => {
@@ -370,8 +341,8 @@ describe('native collaboration supervision-authority guard', () => {
       expect(runtimes.get(BRAIN)!.send).not.toHaveBeenCalled();
 
       fireTool(BRAIN, followUp('call-follow-task', 'Now re-audit the frozen bundle and answer PASS or REWORK'));
-      expect(runtimes.get(BRAIN)!.cancel).toHaveBeenCalledOnce();
-      expect(runtimes.get(BRAIN)!.send).toHaveBeenCalledOnce();
+      expect(runtimes.get(BRAIN)!.cancel).not.toHaveBeenCalled();
+      expect(runtimes.get(BRAIN)!.send).not.toHaveBeenCalled();
     });
 
     it('classifies ordinary native task tool calls (Qwen/OpenCode `task`) by their structured request', () => {
@@ -379,79 +350,47 @@ describe('native collaboration supervision-authority guard', () => {
       fireTool(BRAIN, { id: 'tool-list', name: 'task', status: 'running', input: { items: ['a'] } });
       expect(runtimes.get(BRAIN)!.send).not.toHaveBeenCalled();
       fireTool(BRAIN, { id: 'tool-task', name: 'task', status: 'running', input: { description: 'Repair', prompt: 'Please fix the failing CI job' } });
-      expect(runtimes.get(BRAIN)!.cancel).toHaveBeenCalledOnce();
-      expect(runtimes.get(BRAIN)!.send).toHaveBeenCalledOnce();
+      expect(runtimes.get(BRAIN)!.cancel).not.toHaveBeenCalled();
+      expect(runtimes.get(BRAIN)!.send).not.toHaveBeenCalled();
     });
   });
 
   describe('idempotency and failure handling', () => {
-    it('is idempotent across restarts through durable delivery evidence', () => {
+    it('is idempotent for repeated advisory evidence', () => {
       const tool = runtimeSubagentTool(BRAIN, 'agent-restart', TASK_PROMPT);
-      queueState.tombstones.add(deterministicSendMessageId(`native-collaboration-reroute:${BRAIN}:${tool.id}`));
+      expect(enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', tool, UNENFORCEABLE)).toBe('advised');
       expect(enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', tool, UNENFORCEABLE)).toBe('duplicate');
       expect(runtimes.get(BRAIN)!.send).not.toHaveBeenCalled();
     });
 
-    it('stops every turn but coalesces the notice for several native agents within one window', () => {
-      vi.useFakeTimers();
-      try {
-        const first = enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', runtimeSubagentTool(BRAIN, 'a1', TASK_PROMPT), UNENFORCEABLE);
-        const second = enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', runtimeSubagentTool(BRAIN, 'a2', TASK_PROMPT), UNENFORCEABLE);
-        vi.advanceTimersByTime(NATIVE_COLLABORATION_REROUTE_COALESCE_MS + 1);
-        const third = enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', runtimeSubagentTool(BRAIN, 'a3', TASK_PROMPT), UNENFORCEABLE);
-        expect([first, second, third]).toEqual(['stopped', 'stopped_coalesced', 'stopped']);
-        expect(runtimes.get(BRAIN)!.cancel).toHaveBeenCalledTimes(3);
-        expect(runtimes.get(BRAIN)!.send).toHaveBeenCalledTimes(2);
-        expect(policyEvents()).toHaveLength(3);
-      } finally {
-        vi.useRealTimers();
-      }
+    it('records each distinct native agent without stopping the turn', () => {
+      const first = enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', runtimeSubagentTool(BRAIN, 'a1', TASK_PROMPT), UNENFORCEABLE);
+      const second = enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', runtimeSubagentTool(BRAIN, 'a2', TASK_PROMPT), UNENFORCEABLE);
+      expect([first, second]).toEqual(['advised', 'advised']);
+      expect(runtimes.get(BRAIN)!.cancel).not.toHaveBeenCalled();
+      expect(runtimes.get(BRAIN)!.send).not.toHaveBeenCalled();
+      expect(policyEvents()).toHaveLength(2);
     });
 
-    it('records evidence even when the runtime is unavailable, and retries after a send failure', () => {
+    it('records advisory evidence even when no runtime is available', () => {
       runtimes.delete(BRAIN);
       const noRuntime = runtimeSubagentTool(BRAIN, 'no-rt', TASK_PROMPT);
-      expect(enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', noRuntime, UNENFORCEABLE)).toBe('runtime_unavailable');
+      expect(enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', noRuntime, UNENFORCEABLE)).toBe('advised');
       expect(policyEvents()).toHaveLength(1);
-      // The stop is still owed: the next event for the same native agent
-      // delivers it once the runtime is back.
-      const recovered = { send: vi.fn(() => 'sent'), cancel: vi.fn(async () => {}) };
-      runtimes.set(BRAIN, recovered);
-      expect(enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', runtimeSubagentTool(BRAIN, 'no-rt', TASK_PROMPT, 'completed'), UNENFORCEABLE))
-        .toBe('stopped');
-      expect(recovered.cancel).toHaveBeenCalledOnce();
-      expect(recovered.send).toHaveBeenCalledOnce();
-      clearNativeCollaborationGuardForTests();
-
-      runtimes.set(BRAIN, { send: vi.fn(() => { throw new Error('not initialized'); }), cancel: vi.fn(async () => {}) });
-      const tool = runtimeSubagentTool(BRAIN, 'fails-once', TASK_PROMPT);
-      expect(enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', tool, UNENFORCEABLE)).toBe('delivery_failed');
-      runtimes.set(BRAIN, { send: vi.fn(() => 'sent'), cancel: vi.fn(async () => {}) });
-      expect(enforceObservedNativeCollaboration(BRAIN, 'codex-sdk', tool, UNENFORCEABLE)).toBe('stopped');
     });
 
-    it('evaluates the pre-execution rule directly for callers without a relay', () => {
+    it('allows classified task work in the pre-execution callback', () => {
       expect(evaluateNativeCollaborationPreExecution(BRAIN, { provider: 'x', toolName: 'Agent', requestText: 'Run a peer audit on the latest changes' }))
-        .toMatchObject({ allow: false, signals: ['audit'] });
+        .toEqual({ allow: true });
     });
 
-    it('fails closed when the pre-execution gate cannot evaluate a request', () => {
-      // Pre-execution providers get no post-start stop, so an error here must
-      // not become an allow.
+    it('allows a request when advisory classification cannot evaluate it', () => {
       const decision = evaluateNativeCollaborationPreExecution(BRAIN, {
         provider: 'claude-code-sdk',
         toolName: 'Agent',
         requestText: undefined as unknown as string,
       });
-      expect(decision.allow).toBe(false);
-      if (decision.allow) return;
-      expect(decision.signals).toEqual([]);
-      expect(decision.reason.startsWith(NATIVE_COLLABORATION_POLICY_NOTICE_MARKER)).toBe(true);
-      expect(noticeOf(decision.reason)).toMatchObject({
-        outcome: 'native_agent_request_denied_policy_unavailable',
-        provider: 'claude-code-sdk',
-        tool: 'Agent',
-      });
+      expect(decision).toEqual({ allow: true });
     });
   });
 });

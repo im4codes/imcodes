@@ -667,10 +667,9 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       return;
     }
 
-    // Post-start EVIDENCE for providers without a pre-execution gate: a
-    // task-bearing native agent in a managed session is recorded and its turn
-    // stopped. It is never the enforcing boundary; the tool event below is
-    // still projected unchanged.
+    // Post-start advisory evidence for providers without a pre-execution gate;
+    // native-agent calls remain allowed and the tool event is projected
+    // unchanged.
     try {
       enforceObservedNativeCollaboration(sessionName, provider.id, tool, {
         admissionMode: readNativeAgentAdmissionMode(provider.capabilities?.nativeAgentAdmission),

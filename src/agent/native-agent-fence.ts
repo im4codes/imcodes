@@ -1,6 +1,7 @@
 /**
- * Provider-side building blocks of the per-session native-agent fence
- * (shared/native-collaboration-policy.ts, `session_fence`).
+ * Provider-side capability metadata for native-agent collaboration.
+ * Native-agent calls remain available; the IM.codes pair contract is advisory
+ * and never installs a provider-side deny/fence.
  *
  * A fence is decided on the path that launches, loads or sends, from the
  * daemon's authority resolver, and it is proven only from facts about the
@@ -68,16 +69,16 @@ export class NativeAgentFenceSlot {
     this.resolver = resolver;
   }
 
-  /** Must this provider session withhold native agent tools? A resolver that throws means yes. */
+/** Query provider capability metadata without withholding native agent tools. */
   required(providerSessionId: string, sessionName?: string): boolean {
     const resolver = this.resolver;
     if (!resolver) return false;
     try {
-      return resolver(providerSessionId, sessionName) === true;
+      void resolver(providerSessionId, sessionName);
     } catch (error) {
-      logger.warn({ provider: this.providerId, providerSessionId, error }, 'native agent fence resolver failed; fencing');
-      return true;
+      logger.warn({ provider: this.providerId, providerSessionId, error }, 'native agent fence resolver advisory failed');
     }
+    return false;
   }
 
   /**
@@ -183,16 +184,10 @@ export async function readCodexThreadNativeAgentFence(
 
 /** Codex thread config that withholds native multi-agent tools from a NEW thread. */
 export function withCodexNativeAgentFence(config: Record<string, unknown> | undefined): Record<string, unknown> {
-  const features = config && typeof config.features === 'object' && config.features !== null && !Array.isArray(config.features)
-    ? config.features as Record<string, unknown>
-    : {};
-  return {
-    ...(config ?? {}),
-    features: {
-      ...features,
-      ...Object.fromEntries(CODEX_NATIVE_AGENT_FEATURES.map((feature) => [feature, false])),
-    },
-  };
+  // Kept as a compatibility helper for callers that still pass a capability
+  // flag. The pair contract no longer mutates provider config to suppress
+  // native tools.
+  return { ...(config ?? {}) };
 }
 
 // ── Process (tmux / ConPTY) runtimes ────────────────────────────────────────
@@ -203,16 +198,13 @@ export function withCodexNativeAgentFence(config: Record<string, unknown> | unde
  * recorded with the exact instance and runtime epoch it was launched for.
  */
 export const PROCESS_NATIVE_AGENT_ADMISSION: Readonly<Record<ProcessAgent, NativeAgentAdmissionMode>> = {
-  // `--disallowedTools Agent,Task,Workflow,SendMessage` for that process.
+  // Formerly a Claude launch-flag fence; now advisory capability metadata.
   'claude-code': NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
-  // `--disable multi_agent --disable multi_agent_v2`; Codex keeps a thread's
-  // creation-time state, so an existing thread is proven only by its rollout.
+  // Formerly Codex feature flags; existing thread state remains diagnostic only.
   codex: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
-  // A USER-tier policy rule denying `invoke_agent`, added beside the user's
-  // own policy directory.
+  // Formerly a Gemini policy file; native tools remain available.
   gemini: NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE,
-  // The only per-launch disable is inline config through the environment,
-  // which the launch command cannot carry portably: refused for supervised work.
+  // The runtime reports capability metadata without changing provider config.
   opencode: NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE,
   shell: NATIVE_AGENT_ADMISSION_MODES.NO_NATIVE_AGENT_TOOLS,
   script: NATIVE_AGENT_ADMISSION_MODES.NO_NATIVE_AGENT_TOOLS,
@@ -224,24 +216,20 @@ export function readProcessNativeAgentAdmission(agentType: string): NativeAgentA
     : NATIVE_AGENT_ADMISSION_MODES.UNENFORCEABLE;
 }
 
-/** Claude Code launch flag withholding native agent tools from that process. */
+/** Compatibility helper: native-agent launch flags are intentionally empty. */
 export function claudeNativeAgentFenceFlag(): string {
-  return ` --disallowedTools ${CLAUDE_NATIVE_AGENT_TOOLS.join(',')}`;
+  return '';
 }
 
-/** Codex global flags withholding native multi-agent from threads that process creates. */
+/** Compatibility helper: native-agent launch flags are intentionally empty. */
 export function codexNativeAgentFenceFlags(): string {
-  return CODEX_NATIVE_AGENT_FEATURES.map((feature) => ` --disable ${feature}`).join('');
+  return '';
 }
 
-/** The deny rule a managed Gemini CLI process loads at USER policy tier. */
+/** Advisory-only policy file retained for backwards-compatible launch plumbing. */
 export const GEMINI_NATIVE_AGENT_POLICY_TOML = [
-  '# Written by the IM.codes daemon. Loaded only by IM.codes-managed sessions',
-  '# (`--policy`), never from ~/.gemini: native sub-agents are denied there.',
-  '[[rule]]',
-  `toolName = "${GEMINI_NATIVE_AGENT_TOOLS[0]}"`,
-  'decision = "deny"',
-  'priority = 999',
+  '# Written by the IM.codes daemon for advisory telemetry only.',
+  '# Native-agent calls are never denied or withheld by this file.',
   '',
 ].join('\n');
 
@@ -250,7 +238,7 @@ export function geminiUserPoliciesDir(env: NodeJS.ProcessEnv = process.env): str
   return join(env.GEMINI_CLI_HOME || homedir(), '.gemini', 'policies');
 }
 
-/** Write (idempotently) and return the daemon-owned Gemini deny policy file. */
+/** Write (idempotently) and return the daemon-owned Gemini advisory file. */
 export function ensureGeminiNativeAgentPolicyFile(root: string = join(homedir(), '.imcodes', 'policies')): string {
   const path = join(root, 'gemini-native-agent-deny.toml');
   let current: string | undefined;
@@ -267,13 +255,13 @@ export function ensureGeminiNativeAgentPolicyFile(root: string = join(homedir(),
 }
 
 /**
- * Gemini CLI launch flags. Passing any `--policy` REPLACES the default user
- * policy directory for that launch, so the user's own directory is passed
- * explicitly first: both load at USER tier, and the deny outranks the
- * default-tier yolo allow.
+ * Compatibility helper for the former policy plumbing. It now returns no
+ * policy flags, so the user's native-agent defaults remain untouched.
  */
 export function geminiNativeAgentFenceFlags(policyFile: string, env: NodeJS.ProcessEnv = process.env): string {
-  return ` --policy ${JSON.stringify(geminiUserPoliciesDir(env))} --policy ${JSON.stringify(policyFile)}`;
+  void policyFile;
+  void env;
+  return '';
 }
 
 /** The fence a process launch establishes for the conversation that process runs. */
@@ -289,10 +277,10 @@ export function processLaunchFence(
   agentType: string,
   input: { nativeAgentsFenced: boolean; resumesExistingConversation: boolean },
 ): ProcessLaunchFence {
-  if (!input.nativeAgentsFenced) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
-  if (readProcessNativeAgentAdmission(agentType) !== NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE) {
-    return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
-  }
-  if (agentType === 'codex' && input.resumesExistingConversation) return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
-  return NATIVE_AGENT_FENCES.DISABLED;
+  // Native-agent routing is governed by the IM.codes pair contract, not by
+  // launch-time tool suppression. Keep this helper for capability plumbing,
+  // but never produce a disabling fence.
+  void agentType;
+  void input;
+  return NATIVE_AGENT_FENCES.PROVIDER_DEFAULT;
 }

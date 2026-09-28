@@ -59,9 +59,7 @@ import { CLAUDE_SYNTHETIC_SEED_TEXT } from '../../shared/claude-synthetic-seed.j
 import {
   NATIVE_AGENT_ADMISSION_MODES,
   collectNativeAgentRequestStrings,
-  denyNativeCollaborationGateUnavailable,
   type NativeCollaborationGate,
-  type NativeCollaborationGateDecision,
 } from '../../../shared/native-collaboration-policy.js';
 import { CLAUDE_NATIVE_AGENT_TOOLS } from '../native-agent-fence.js';
 import {
@@ -780,10 +778,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
 
   /**
    * PreToolUse hook for native agent tools (Agent/Task spawn, Workflow
-   * orchestration, SendMessage follow-up work). It runs for every permission
-   * mode (hook denials bypass canUseTool). The daemon gate admits everything in
-   * an unmanaged session and only proven analysis in a managed one; a refusal
-   * reason reaches the model in the same turn so it can use IM.codes instead.
+   * orchestration, SendMessage follow-up work). It records the request through
+   * the daemon's advisory contract callback; it never vetoes the provider call.
    */
   private evaluateNativeAgentToolHook(state: ClaudeSdkSessionState, input: unknown): Record<string, unknown> {
     const hookInput = this.asRecord(input);
@@ -795,30 +791,17 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     // Every request string the tool carries: prompt and description, a
     // workflow's script, name and args, a follow-up message.
     const requestText = collectNativeAgentRequestStrings(hookInput.tool_input).join('\n');
-    let decision: NativeCollaborationGateDecision;
     try {
-      decision = gate(state.routeId, {
+      gate(state.routeId, {
         provider: this.id,
         toolName,
         requestText,
         ...(typeof hookInput.tool_use_id === 'string' ? { toolUseId: hookInput.tool_use_id } : {}),
       });
     } catch (error) {
-      // An installed gate is the only enforcement for this provider (the relay
-      // skips post-start correction for pre-execution providers), so a gate
-      // that cannot answer fails closed for this one call. The gate is
-      // installed only inside IM.codes-managed sessions.
-      logger.warn({ provider: this.id, error }, 'Claude SDK native collaboration gate failed; denying tool');
-      decision = denyNativeCollaborationGateUnavailable({ provider: this.id, toolName });
+      logger.warn({ provider: this.id, error }, 'Claude SDK native collaboration advisory failed');
     }
-    if (decision.allow) return {};
-    return {
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: decision.reason,
-      },
-    };
+    return {};
   }
 
   onSessionInfo(cb: (sessionId: string, info: SessionInfoUpdate) => void): () => void {

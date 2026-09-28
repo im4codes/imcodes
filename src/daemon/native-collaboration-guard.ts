@@ -9,51 +9,38 @@
  * UNVERIFIABLE and treated as managed; everything else is genuinely unmanaged
  * and keeps provider defaults.
  *
- * A formal participant (never a Brain) is unrestricted at every enforcement
- * point below: it may delegate any of its own assigned work to its own
- * native subagent and remains the accountable executor of the result either
- * way. Only a Brain (or a scope the registry could not verify) is actually
- * gated.
+ * Native-agent classification is advisory at every provider boundary. The
+ * formal pair contract governs Brain routing, while provider-native calls are
+ * never vetoed or stopped here.
  *
  * - `pre_execution_gate` providers ask `evaluateNativeCollaborationPreExecution`
- *   before a native agent tool runs; a gated Brain admits proven analysis
- *   only.
+ *   before a native agent tool runs; the callback records advisory metadata
+ *   and always admits the call.
  * - `session_fence` providers ask `isNativeAgentFenceRequired` on the path
- *   that launches, loads or sends, and withhold native agent tools for a
- *   Brain. Supervised dispatch checks the proven fence separately
- *   (src/daemon/native-agent-admission.ts).
- * - For every non-gate provider, a task-bearing native agent still OBSERVED
- *   for a Brain is evidence of an unproven fence or an unenforceable
- *   runtime: `enforceObservedNativeCollaboration` records it and stops the
- *   turn. Observation is never the enforcing boundary.
+ *   that launches, loads or sends. The resolver remains capability plumbing
+ *   but never withholds native tools.
+ * - For every provider, `enforceObservedNativeCollaboration` records optional
+ *   advisory evidence without stopping turns or queuing corrections.
  */
 import type { ToolCallEvent } from '../../shared/agent-message.js';
-import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../shared/memory-mcp-contracts.js';
 import {
-  NATIVE_AGENT_ADMISSION_MODES,
   NATIVE_COLLABORATION_ENFORCEMENT,
   NATIVE_COLLABORATION_PARTICIPATION,
   NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT,
   NATIVE_COLLABORATION_POLICY_VERSION,
-  buildNativeCollaborationRerouteNotice,
   classifyNativeCollaborationRequest,
   collectNativeAgentRequestStrings,
-  denyNativeCollaborationGateUnavailable,
-  formatNativeCollaborationPolicyNotice,
   readNativeCollaborationClassification,
-  NATIVE_COLLABORATION_REQUESTERS,
   type NativeAgentAdmissionMode,
   type NativeCollaborationEnforcement,
   type NativeCollaborationGateDecision,
   type NativeCollaborationGateRequest,
   type NativeCollaborationParticipation,
-  type NativeCollaborationRequester,
   type NativeCollaborationTaskSignal,
   type NativeCollaborationUnclassifiedReason,
 } from '../../shared/native-collaboration-policy.js';
 import { SDK_SUBAGENT_DETAIL_KIND, parseSdkSubagentDetail } from '../../shared/sdk-subagent-status.js';
 import { deterministicSendMessageId } from '../../shared/send-message-id.js';
-import { getTransportRuntime } from '../agent/session-manager.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { resolveEffectiveProjectName } from '../../shared/session-scope.js';
 import { isTerminalSupervisionTaskStatus } from '../../shared/supervision-config.js';
@@ -61,7 +48,6 @@ import { getSession, listSessions } from '../store/session-store.js';
 import { getSupervisionTaskRegistry, matchesDurableSupervisionParticipant } from './supervision-state-store.js';
 import logger from '../util/logger.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { getTransportQueueStore } from './transport-queue-store.js';
 
 /** Detail kind Codex uses for raw native collaboration function calls. */
 export const NATIVE_COLLABORATION_TOOL_DETAIL_KIND = 'nativeCollaboration' as const;
@@ -69,10 +55,7 @@ export const NATIVE_COLLABORATION_TOOL_DETAIL_KIND = 'nativeCollaboration' as co
 export type ObservedNativeCollaborationOutcome =
   | 'ignored'
   | 'duplicate'
-  | 'stopped'
-  | 'stopped_coalesced'
-  | 'runtime_unavailable'
-  | 'delivery_failed';
+  | 'advised';
 
 /**
  * Native sub-agent tools that some providers surface as ordinary tool calls
@@ -90,9 +73,6 @@ export const NATIVE_COLLABORATION_REROUTE_COALESCE_MS = 30_000;
 
 const ENFORCED_KEY_LIMIT = 2_000;
 const enforcedKeys = new Set<string>();
-const admittedAnalysisKeys = new Set<string>();
-const lastRerouteNoticeAt = new Map<string, number>();
-
 function rememberBoundedKey(keys: Set<string>, key: string): boolean {
   if (keys.has(key)) return false;
   keys.add(key);
@@ -180,41 +160,23 @@ export function isNativeCollaborationManagedSession(sessionName: string | undefi
   return resolveNativeCollaborationScope(sessionName) !== NATIVE_COLLABORATION_SCOPES.UNMANAGED;
 }
 
-/**
- * Must the runtime serving this IM.codes session withhold native agent tools?
- * Asked by `session_fence` providers and process launches on the path that
- * launches, loads or sends. A session that cannot be resolved to an IM.codes
- * session (an out-of-band broker or compressor route) keeps provider defaults;
- * a scope that cannot be verified is fenced. A formal participant (never a
- * Brain) is never fenced: it may delegate to its own native subagent freely
- * and remains the accountable executor of its own assigned work regardless.
- */
+/** Native-agent capability query retained for provider plumbing. The pair
+ * contract is advisory and never withholds provider-native tools. */
 export function isNativeAgentFenceRequired(sessionName: string | undefined): boolean {
-  if (!sessionName) return false;
-  const scope = resolveNativeCollaborationScope(sessionName);
-  return scope !== NATIVE_COLLABORATION_SCOPES.UNMANAGED && scope !== NATIVE_COLLABORATION_SCOPES.PARTICIPANT;
+  // Keep the resolver in the provider capability plumbing, but do not turn
+  // the contract into a provider-tool gate.
+  void sessionName;
+  return false;
 }
 
-/**
- * The fence decision for a PROCESS launch, whose record may not exist yet (a
- * brand-new sub-session) or may not carry the launch's role and parent: the
- * launch parameters count as authority too. Any failure fences. A Brain
- * descendant is a formal participant, so it launches unfenced; only an actual
- * Brain role always fences.
- */
+/** Native-agent capability query for a process launch; always provider-default. */
 export function isNativeAgentFenceRequiredForLaunch(input: {
   sessionName: string;
   role?: string | null;
   parentSession?: string | null;
 }): boolean {
-  try {
-    if (input.role === 'brain') return true;
-    if (descendsFromBrain(input.sessionName, input.parentSession)) return false;
-    return isNativeAgentFenceRequired(input.sessionName);
-  } catch (error) {
-    logger.warn({ error, sessionName: input.sessionName }, 'native agent launch scope unverifiable; fencing');
-    return true;
-  }
+  void input;
+  return false;
 }
 
 function emitPolicyEvidence(sessionName: string, input: {
@@ -251,23 +213,12 @@ function emitPolicyEvidence(sessionName: string, input: {
   }
 }
 
-/** The requester a refusal notice addresses for a managed scope. */
-const requesterFor = (scope: NativeCollaborationScope): NativeCollaborationRequester => (
-  scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT
-    ? NATIVE_COLLABORATION_REQUESTERS.PARTICIPANT
-    : NATIVE_COLLABORATION_REQUESTERS.BRAIN
-);
-
 /**
  * Pre-execution decision for a native agent request made inside `sessionName`.
  *
- * An unmanaged session is always allowed. A formal participant (never a
- * Brain) is always allowed too: it may hand any of its own assigned work to
- * its own native subagent and remains the accountable executor regardless of
- * what the subagent does. Inside a Brain, or a session whose scope cannot be
- * verified, ONLY a request the policy proves to be analysis runs: task work
- * and unclassified requests are both refused before execution. A gate that
- * cannot evaluate fails CLOSED.
+ * Every scope is allowed. Classification and scope remain available for
+ * advisory timeline evidence, while the pair contract (rather than this
+ * callback) governs where project work is dispatched.
  */
 export function evaluateNativeCollaborationPreExecution(
   sessionName: string,
@@ -276,35 +227,22 @@ export function evaluateNativeCollaborationPreExecution(
   try {
     const scope = resolveNativeCollaborationScope(sessionName);
     if (scope === NATIVE_COLLABORATION_SCOPES.UNMANAGED) return { allow: true };
-    if (scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT) return { allow: true };
     const classification = classifyNativeCollaborationRequest(request.requestText);
-    if (classification.participation === NATIVE_COLLABORATION_PARTICIPATION.ANALYSIS) return { allow: true };
     emitPolicyEvidence(sessionName, {
       key: request.toolUseId ?? deterministicSendMessageId(`native-collaboration-gate:${request.requestText}`),
       provider: request.provider,
       toolName: request.toolName,
       signals: classification.signals,
-      enforcement: NATIVE_COLLABORATION_ENFORCEMENT.DENIED_BEFORE_EXECUTION,
-      outcome: 'denied',
+      enforcement: NATIVE_COLLABORATION_ENFORCEMENT.ADVISORY,
+      outcome: 'allowed',
       scope,
       participation: classification.participation,
       ...(classification.unclassifiedReason ? { unclassifiedReason: classification.unclassifiedReason } : {}),
     });
-    return {
-      allow: false,
-      signals: classification.signals,
-      reason: formatNativeCollaborationPolicyNotice(buildNativeCollaborationRerouteNotice({
-        provider: request.provider,
-        toolName: request.toolName,
-        signals: classification.signals,
-        enforcement: NATIVE_COLLABORATION_ENFORCEMENT.DENIED_BEFORE_EXECUTION,
-        requester: requesterFor(scope),
-        ...(classification.unclassifiedReason ? { unclassifiedReason: classification.unclassifiedReason } : {}),
-      })),
-    };
+    return { allow: true };
   } catch (error) {
-    logger.warn({ error, sessionName, provider: request.provider, tool: request.toolName }, 'native collaboration gate failed closed');
-    return denyNativeCollaborationGateUnavailable(request);
+    logger.warn({ error, sessionName, provider: request.provider, tool: request.toolName }, 'native collaboration advisory failed');
+    return { allow: true };
   }
 }
 
@@ -384,13 +322,9 @@ export function readObservedNativeCollaborationRequest(
 }
 
 /**
- * Post-start EVIDENCE for providers without a pre-execution gate. A
- * task-bearing (or unclassified) native agent observed in a managed session
- * means the runtime's fence was not in effect or the runtime is unenforceable,
- * so the daemon records hidden durable evidence, stops the turn that started
- * the agent, and queues one policy notice the model reads on its next turn.
- * Idempotent per (session, native agent) across restarts: the notice uses a
- * deterministic delivery id and durable queue evidence.
+ * Post-start advisory evidence for providers without a pre-execution gate.
+ * Native-agent calls are allowed; this function only records one hidden
+ * timeline row per observed request in a managed scope.
  */
 export function enforceObservedNativeCollaboration(
   sessionName: string,
@@ -398,94 +332,24 @@ export function enforceObservedNativeCollaboration(
   tool: ToolCallEvent,
   options: { admissionMode: NativeAgentAdmissionMode },
 ): ObservedNativeCollaborationOutcome {
-  // A gated provider already refused task requests before execution and
-  // delivered the reason in-turn; what it let through is proven analysis.
-  if (options.admissionMode === NATIVE_AGENT_ADMISSION_MODES.PRE_EXECUTION_GATE) return 'ignored';
-  // Every tool event passes through here: recognize a native agent first (no
-  // I/O) and resolve the session's authority only for one.
+  void options;
   const request = readObservedNativeCollaborationRequest(providerId, tool);
   if (!request) return 'ignored';
   const scope = resolveNativeCollaborationScope(sessionName);
   if (scope === NATIVE_COLLABORATION_SCOPES.UNMANAGED) return 'ignored';
-  // A formal participant is never fenced any more (isNativeAgentFenceRequired)
-  // and never gated pre-execution (evaluateNativeCollaborationPreExecution),
-  // so an observed native agent here is neither unproven nor unenforceable --
-  // it is exactly what the policy now allows. Only a Brain (or a scope the
-  // registry could not verify) still gets stopped.
-  if (scope === NATIVE_COLLABORATION_SCOPES.PARTICIPANT) return 'ignored';
   const agentKey = `${sessionName}\0${request.key}`;
-  if (request.participation === NATIVE_COLLABORATION_PARTICIPATION.ANALYSIS) {
-    // Later progress/completion snapshots of this agent carry no request text;
-    // they inherit the analysis admission instead of reading as unclassified.
-    rememberBoundedKey(admittedAnalysisKeys, agentKey);
-    return 'ignored';
-  }
-  if (request.participation === NATIVE_COLLABORATION_PARTICIPATION.UNCLASSIFIED
-    && request.signals.length === 0
-    && admittedAnalysisKeys.has(agentKey)) return 'ignored';
   if (!rememberEnforcedKey(agentKey)) return 'duplicate';
-
-  const clientMessageId = deterministicSendMessageId(`native-collaboration-reroute:${sessionName}:${request.key}`);
-  try {
-    const store = getTransportQueueStore();
-    const alreadyQueued = store.hasDeliveryTombstone(sessionName, clientMessageId)
-      || store.readSnapshot(sessionName).pendingMessageEntries.some((entry) => entry.clientMessageId === clientMessageId);
-    if (alreadyQueued) return 'duplicate';
-  } catch (error) {
-    logger.warn({ error, sessionName }, 'native collaboration notice dedupe lookup failed');
-  }
-
   emitPolicyEvidence(sessionName, {
     key: request.key,
     provider: request.provider,
     toolName: request.toolName,
     signals: request.signals,
-    enforcement: NATIVE_COLLABORATION_ENFORCEMENT.OBSERVED_AFTER_START,
-    outcome: 'turn_stopped',
+    enforcement: NATIVE_COLLABORATION_ENFORCEMENT.ADVISORY,
+    outcome: 'allowed',
     scope,
     participation: request.participation,
   });
-
-  const runtime = getTransportRuntime(sessionName);
-  if (!runtime) {
-    // Evidence is recorded; the stop is still owed. Forget the key so the next
-    // event for this native agent (progress, completion) retries it.
-    enforcedKeys.delete(agentKey);
-    return 'runtime_unavailable';
-  }
-  // Stop first: the turn that started the agent must not go on consuming it.
-  void runtime.cancel().catch((error: unknown) => {
-    logger.warn({ error, sessionName, provider: request.provider }, 'native collaboration turn stop failed');
-  });
-
-  // One provider spawn can surface as several events (ordinary tool call plus
-  // runtime snapshot). The notice is the same rule, so coalesce it.
-  const now = Date.now();
-  const previousNoticeAt = lastRerouteNoticeAt.get(sessionName);
-  if (previousNoticeAt !== undefined && now - previousNoticeAt < NATIVE_COLLABORATION_REROUTE_COALESCE_MS) {
-    return 'stopped_coalesced';
-  }
-  const notice = formatNativeCollaborationPolicyNotice(buildNativeCollaborationRerouteNotice({
-    provider: request.provider,
-    toolName: request.toolName,
-    signals: request.signals,
-    enforcement: NATIVE_COLLABORATION_ENFORCEMENT.OBSERVED_AFTER_START,
-    requester: requesterFor(scope),
-  }));
-  try {
-    // Queued, never appended: the stopped turn must not receive it.
-    runtime.send(notice, clientMessageId, undefined, undefined, {
-      timelineCommitted: true,
-      historyCommitted: true,
-      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE,
-    });
-    lastRerouteNoticeAt.set(sessionName, now);
-    return 'stopped';
-  } catch (error) {
-    enforcedKeys.delete(agentKey);
-    logger.warn({ error, sessionName, provider: request.provider }, 'native collaboration notice delivery failed');
-    return 'delivery_failed';
-  }
+  return 'advised';
 }
 
 const nativeAgentToolCalls = new Set<string>();
@@ -526,7 +390,5 @@ export function isNativeCollaborationTimelineEvent(event: {
 
 export function clearNativeCollaborationGuardForTests(): void {
   enforcedKeys.clear();
-  admittedAnalysisKeys.clear();
-  lastRerouteNoticeAt.clear();
   nativeAgentToolCalls.clear();
 }

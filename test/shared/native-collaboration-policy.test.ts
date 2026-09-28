@@ -8,17 +8,26 @@ import {
   NATIVE_COLLABORATION_UNCLASSIFIED_REASONS as UNCLASSIFIED_REASON,
   buildNativeCollaborationRerouteNotice,
   classifyNativeCollaborationRequest,
-  denyNativeCollaborationGateUnavailable,
   formatNativeCollaborationPolicyNotice,
   formatNativeCollaborationSignals,
+  nativeAgentAdmissionProven,
   readNativeCollaborationClassification,
 } from '../../shared/native-collaboration-policy.js';
+import { buildTaskPairMarkerContract, TASK_PAIR_NATIVE_COLLABORATION_RULE } from '../../shared/task-pair.js';
 
 const task = NATIVE_COLLABORATION_PARTICIPATION.TASK;
 const analysis = NATIVE_COLLABORATION_PARTICIPATION.ANALYSIS;
 const unclassified = NATIVE_COLLABORATION_PARTICIPATION.UNCLASSIFIED;
 
 describe('native collaboration task-participation policy', () => {
+  it('keeps every admission mode fail-open for provider-native calls', () => {
+    expect(nativeAgentAdmissionProven('pre_execution_gate')).toBe(true);
+    expect(nativeAgentAdmissionProven('session_fence')).toBe(true);
+    expect(nativeAgentAdmissionProven('no_native_agent_tools')).toBe(true);
+    expect(nativeAgentAdmissionProven('unenforceable')).toBe(true);
+    expect(nativeAgentAdmissionProven('unknown-mode')).toBe(true);
+  });
+
   it.each([
     // Task participation: every class the Brain must route through IM.codes.
     ['Implement the retry queue in src/daemon/send-tool.ts and add tests', SIGNAL.IMPLEMENTATION],
@@ -204,53 +213,36 @@ describe('native collaboration task-participation policy', () => {
     expect(readNativeCollaborationClassification(undefined, undefined)).toBeUndefined();
   });
 
-  it('builds a reroute notice naming the exact IM.codes route', () => {
-    const denied = JSON.parse(buildNativeCollaborationRerouteNotice({
+  it('builds an advisory notice naming the exact IM.codes route', () => {
+    const advisory = JSON.parse(buildNativeCollaborationRerouteNotice({
       provider: 'claude-code-sdk',
       toolName: 'Agent',
       signals: [SIGNAL.IMPLEMENTATION],
-      enforcement: 'denied_before_execution',
+      enforcement: 'advisory',
     }));
-    expect(denied).toMatchObject({
+    expect(advisory).toMatchObject({
       policy: NATIVE_COLLABORATION_POLICY_VERSION,
-      outcome: 'native_agent_task_participation_denied',
+      outcome: 'native_agent_policy_advisory',
       signals: [SIGNAL.IMPLEMENTATION],
       requiredRoute: ['send_list_targets', 'send_message with task {objective, acceptance}'],
     });
-    expect(denied).not.toHaveProperty('nativeAgentOutput');
-
-    const observed = JSON.parse(buildNativeCollaborationRerouteNotice({
-      provider: 'codex-sdk',
-      toolName: 'spawn_agent',
-      signals: [SIGNAL.AUDIT],
-      enforcement: 'observed_after_start',
-    }));
-    expect(observed.outcome).toBe('native_agent_task_participation_turn_stopped');
-    expect(observed.turn).toMatch(/stopped the turn/);
-    expect(observed.nativeAgentOutput).toMatch(/re-dispatch the task through IM\.codes/);
-    expect(observed).not.toHaveProperty('retry');
-    expect(denied).not.toHaveProperty('retry');
+    expect(advisory.advisory).toMatch(/allowed/);
   });
 
-  it('builds the fail-closed decision of a gate that could not evaluate', () => {
-    const decision = denyNativeCollaborationGateUnavailable({ provider: 'claude-code-sdk', toolName: 'Task' });
-    expect(decision.allow).toBe(false);
-    if (decision.allow) return;
-    expect(decision.signals).toEqual([]);
-    const [marker, header, ...body] = decision.reason.split('\n');
-    expect(marker).toBe(NATIVE_COLLABORATION_POLICY_NOTICE_MARKER);
-    expect(header).toBe('Trusted IM.codes runtime policy notice (not a user request).');
-    const notice = JSON.parse(body.join('\n'));
-    expect(notice).toMatchObject({
-      policy: NATIVE_COLLABORATION_POLICY_VERSION,
-      outcome: 'native_agent_request_denied_policy_unavailable',
+  it('keeps native-agent policy advisory and single-sources the Brain routing clause', () => {
+    const advisory = JSON.parse(buildNativeCollaborationRerouteNotice({
       provider: 'claude-code-sdk',
-      tool: 'Task',
+      toolName: 'Task',
       signals: [],
-      requiredRoute: ['send_list_targets', 'send_message with task {objective, acceptance}'],
+      enforcement: 'advisory',
+    }));
+    expect(advisory).toMatchObject({
+      policy: NATIVE_COLLABORATION_POLICY_VERSION,
+      outcome: 'native_agent_policy_advisory',
+      rule: TASK_PAIR_NATIVE_COLLABORATION_RULE,
+      advisory: 'This is advisory only; the native-agent call was allowed to run.',
     });
-    expect(notice.retry).toMatch(/read-only analysis/);
-    expect(notice).not.toHaveProperty('nativeAgentOutput');
+    expect(buildTaskPairMarkerContract()).toContain(TASK_PAIR_NATIVE_COLLABORATION_RULE);
     expect(formatNativeCollaborationPolicyNotice('{"a":1}'))
       .toBe(`${NATIVE_COLLABORATION_POLICY_NOTICE_MARKER}\nTrusted IM.codes runtime policy notice (not a user request).\n{"a":1}`);
   });

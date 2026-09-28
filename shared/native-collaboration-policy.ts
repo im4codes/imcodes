@@ -3,36 +3,33 @@
  *
  * Provider-native agents (Claude `Agent`/`Workflow`/`SendMessage`, Codex
  * multi-agent, Copilot `task`/`write_agent`, ACP/runtime sub-agents) are useful
- * for ephemeral parallel reasoning and read-only analysis. Inside an IM.codes
- * MANAGED session -- any Brain (nested included), a formal participant bound
- * to a live supervision assignment, an execution clone, a Brain's child
- * sub-session, or a session carrying the sticky fence-required marker -- they
- * must never carry PROJECT TASK WORK: implementation, repair, audit or
- * re-audit, a PASS/REWORK verdict, IM.codes lifecycle authority, or a
- * Git/deploy gate. That work needs a formal IM.codes sub-session and a
- * supervision task (taskId, assignmentId, readable title, lifecycle, audit).
- * A genuinely unmanaged session keeps its provider defaults untouched.
+ * for ephemeral parallel reasoning and read-only analysis. The pair contract
+ * defines where project task work is dispatched, but this module deliberately
+ * does not block or rewrite provider-native calls. Every runtime keeps its
+ * provider defaults; classification is advisory telemetry only.
  *
- * Enforcement is at the tool layer, never prompt text. Every agent runtime
- * declares one admission mode (`NATIVE_AGENT_ADMISSION_MODES`):
+ * Admission metadata is at the tool layer, never prompt text. Every agent
+ * runtime declares one admission mode (`NATIVE_AGENT_ADMISSION_MODES`):
  *
  * - `pre_execution_gate`: the runtime asks the daemon before a native agent
- *   tool runs; a managed session admits only a request this classifier proves
- *   to be analysis. Task work AND unclassified text are refused.
- * - `session_fence`: no veto boundary, so a managed session's runtime is
- *   launched/loaded with native agent tools withheld; supervised work is
- *   dispatched only to (and from) a runtime whose fence is proven.
+ *   tool runs. The daemon records classification for observability, but does
+ *   not veto the provider-native call.
+ * - `session_fence`: the provider may report its native-agent fence state for
+ *   diagnostics; this policy does not require a fence or withhold tools.
  * - `no_native_agent_tools`: nothing to withhold.
  * - `unenforceable`: neither; such a runtime cannot send or receive supervised
  *   work at all.
  *
- * The classifier is deterministic and fails closed: a request is task work
+ * The classifier is deterministic: a request is task work
  * when it carries IM.codes authority tokens, a verdict, a repository/deploy
  * gate, an audit of a work product, or an implementation directive; it is
  * analysis ONLY when it states analysis intent and nothing else; everything in
  * between (no analysis intent, an unrecognized instruction, a request too large
- * to read whole) is `unclassified` and refused like task work.
+ * to read whole) is `unclassified`; callers may use this only for advisory
+ * telemetry.
  */
+
+import { TASK_PAIR_NATIVE_COLLABORATION_RULE } from './task-pair.js';
 
 export const NATIVE_COLLABORATION_POLICY_VERSION = 'native_collaboration_policy_v1' as const;
 
@@ -48,12 +45,11 @@ export const NATIVE_COLLABORATION_POLICY_TIMELINE_EVENT = 'native_collaboration.
  * runtime declares exactly one; there is no after-the-fact mode.
  */
 export const NATIVE_AGENT_ADMISSION_MODES = {
-  /** The runtime asks the daemon gate BEFORE any native agent tool executes and can refuse it with a reason. */
+  /** The runtime asks the daemon for non-blocking classification before a native agent tool executes. */
   PRE_EXECUTION_GATE: 'pre_execution_gate',
   /**
-   * No veto boundary, but the tools can be withheld per session: a managed
-   * session runs with them disabled, a verified unmanaged one keeps provider
-   * defaults. Supervised work needs the fence proven for the live runtime.
+   * The runtime can report a per-session fence state for diagnostics. The
+   * policy never withholds native tools based on that state.
    */
   SESSION_FENCE: 'session_fence',
   /** The agent has no provider-native agent tool. */
@@ -90,73 +86,19 @@ export const NATIVE_AGENT_FENCES = {
 export type NativeAgentFence = typeof NATIVE_AGENT_FENCES[keyof typeof NATIVE_AGENT_FENCES];
 
 /**
- * Is supervised work admissible on a runtime with this mode and fence? A gate
- * or a tool-less agent always is; a session fence only when it is disabled now
- * or will be decided (under managed authority) at the next launch; an
- * unenforceable runtime never is.
+ * Native-agent admission is no longer a gate. This helper remains as
+ * compatibility plumbing for callers that report provider capabilities, and
+ * therefore always admits a declared or unknown mode.
  */
 export function nativeAgentAdmissionProven(mode: unknown, fence?: NativeAgentFence): boolean {
-  const admission = readNativeAgentAdmissionMode(mode);
-  if (admission === NATIVE_AGENT_ADMISSION_MODES.PRE_EXECUTION_GATE
-    || admission === NATIVE_AGENT_ADMISSION_MODES.NO_NATIVE_AGENT_TOOLS) return true;
-  if (admission === NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE) {
-    return fence === NATIVE_AGENT_FENCES.DISABLED || fence === NATIVE_AGENT_FENCES.DECIDED_AT_NEXT_LAUNCH;
-  }
-  return false;
+  readNativeAgentAdmissionMode(mode);
+  void fence;
+  return true;
 }
 
-/** Why supervised work was refused for one side of a dispatch. */
-export const NATIVE_AGENT_ADMISSION_REFUSALS = {
-  /** The runtime can neither refuse native agent tools per call nor withhold them per session. */
-  UNENFORCEABLE: 'native_agent_tools_unenforceable',
-  /** A `session_fence` runtime is live with the provider's default tool set, or its fence cannot be proven. */
-  FENCE_UNPROVEN: 'native_agent_fence_unproven',
-  /** No live runtime answers for the session, so nothing can be proven. */
-  RUNTIME_UNAVAILABLE: 'native_agent_runtime_unavailable',
-  /** The admission check itself failed; it never degrades into admitting. */
-  ADMISSION_UNVERIFIABLE: 'native_agent_admission_unverifiable',
-} as const;
-export type NativeAgentAdmissionRefusal =
-  typeof NATIVE_AGENT_ADMISSION_REFUSALS[keyof typeof NATIVE_AGENT_ADMISSION_REFUSALS];
-
-/** Which party of a supervised dispatch a refusal concerns. */
-export const NATIVE_AGENT_ADMISSION_SIDES = {
-  CALLER: 'caller',
-  TARGET: 'target',
-} as const;
-export type NativeAgentAdmissionSide =
-  typeof NATIVE_AGENT_ADMISSION_SIDES[keyof typeof NATIVE_AGENT_ADMISSION_SIDES];
-
-/** How a refused side is repaired; read by the dispatching model. */
-export const NATIVE_AGENT_ADMISSION_REPAIRS = {
-  /** A fresh conversation is created with the fence (Codex fixes the fence per thread at creation). */
-  RESTART_RESET: 'session_restart_reset',
-  /** Relaunch the same conversation; the launch re-decides the fence from managed authority. */
-  RESTART_RESUME: 'session_restart_resume',
-  /** Wait for the active unfenced turn to settle; the next turn is fenced. */
-  WAIT_FOR_TURN: 'wait_for_active_turn',
-  /** Move the work to a session on an enforceable runtime. */
-  USE_ENFORCEABLE_RUNTIME: 'use_enforceable_runtime',
-} as const;
-export type NativeAgentAdmissionRepair =
-  typeof NATIVE_AGENT_ADMISSION_REPAIRS[keyof typeof NATIVE_AGENT_ADMISSION_REPAIRS];
-
 export const NATIVE_COLLABORATION_ENFORCEMENT = {
-  /** A pre-execution provider gate refused the native agent before it ran. */
-  DENIED_BEFORE_EXECUTION: 'denied_before_execution',
-  /**
-   * A task-bearing native agent was observed after start in a managed session
-   * whose runtime has no pre-execution gate (an unproven fence or an
-   * unenforceable runtime). Evidence only: the daemon records it and stops the
-   * turn. It is never the enforcing boundary.
-   */
-  OBSERVED_AFTER_START: 'observed_after_start',
-  /**
-   * The installed pre-execution gate could not evaluate the request, so it
-   * failed closed. The gate exists only inside IM.codes-managed sessions; a
-   * request nobody could classify must not slip past as Brain task work.
-   */
-  GATE_UNAVAILABLE: 'gate_unavailable',
+  /** Non-blocking classification/admission telemetry. */
+  ADVISORY: 'advisory',
 } as const;
 export type NativeCollaborationEnforcement =
   typeof NATIVE_COLLABORATION_ENFORCEMENT[keyof typeof NATIVE_COLLABORATION_ENFORCEMENT];
@@ -167,7 +109,7 @@ export const NATIVE_COLLABORATION_PARTICIPATION = {
   /**
    * Neither provably task work nor provably analysis: no analysis intent, an
    * instruction the policy does not recognize, or a request too large to read
-   * whole. A managed session denies it exactly like task work.
+   * whole. Callers may retain this distinction for advisory telemetry.
    */
   UNCLASSIFIED: 'unclassified',
 } as const;
@@ -246,9 +188,8 @@ export interface NativeCollaborationGateRequest {
   toolUseId?: string;
 }
 
-export type NativeCollaborationGateDecision =
-  | { allow: true }
-  | { allow: false; reason: string; signals: NativeCollaborationTaskSignal[] };
+/** Native-agent admission is advisory only; provider calls are never vetoed. */
+export type NativeCollaborationGateDecision = { allow: true; notice?: string };
 
 /** Pre-execution gate a provider consults; installed by the daemon transport relay. */
 export type NativeCollaborationGate = (
@@ -515,7 +456,7 @@ function directiveText(text: string): string {
  * directive elsewhere in the request. Without task signals a request is
  * analysis only when every instruction clause is recognizably analysis,
  * question or context and the whole request was read; otherwise it is
- * `unclassified`, which managed sessions deny.
+ * `unclassified`; all three outcomes remain advisory metadata.
  */
 export function classifyNativeCollaborationRequest(
   input: string | readonly (string | undefined | null)[],
@@ -572,17 +513,14 @@ export function readNativeCollaborationClassification(
 }
 
 /**
- * The correction a Brain receives when it tries to (or did) hand project task
- * work to a native agent. It is read by the model, so it names the exact
- * IM.codes route and what native agents remain allowed to do.
+ * Optional non-blocking advisory text for native-agent telemetry. It names the
+ * contract route without vetoing the provider call.
  */
 const NATIVE_COLLABORATION_NOTICE_OUTCOMES: Record<NativeCollaborationEnforcement, string> = {
-  [NATIVE_COLLABORATION_ENFORCEMENT.DENIED_BEFORE_EXECUTION]: 'native_agent_task_participation_denied',
-  [NATIVE_COLLABORATION_ENFORCEMENT.OBSERVED_AFTER_START]: 'native_agent_task_participation_turn_stopped',
-  [NATIVE_COLLABORATION_ENFORCEMENT.GATE_UNAVAILABLE]: 'native_agent_request_denied_policy_unavailable',
+  [NATIVE_COLLABORATION_ENFORCEMENT.ADVISORY]: 'native_agent_policy_advisory',
 };
 
-/** Who made a refused native agent request; each has its own IM.codes route. */
+/** Who made a native agent request; each has its own IM.codes route. */
 export const NATIVE_COLLABORATION_REQUESTERS = {
   /** A Brain delegates task work to formal sub-sessions. */
   BRAIN: 'brain',
@@ -596,47 +534,32 @@ export function buildNativeCollaborationRerouteNotice(input: {
   provider: string;
   toolName: string;
   signals: readonly NativeCollaborationTaskSignal[];
-  /** Whether the native agent was stopped before it ran (pre-execution gate). */
+  /** Advisory classification event (the provider call is always allowed). */
   enforcement: NativeCollaborationEnforcement;
   /** Who asked. Defaults to a Brain. */
   requester?: NativeCollaborationRequester;
-  /** Present when a request without task signals was refused because it is not provably analysis. */
+  /** Present when a request has no classifier-recognized task signal. */
   unclassifiedReason?: NativeCollaborationUnclassifiedReason;
 }): string {
   const participant = input.requester === NATIVE_COLLABORATION_REQUESTERS.PARTICIPANT;
-  const refusedUnclassified = input.unclassifiedReason !== undefined
-    && input.enforcement === NATIVE_COLLABORATION_ENFORCEMENT.DENIED_BEFORE_EXECUTION;
   return JSON.stringify({
     policy: NATIVE_COLLABORATION_POLICY_VERSION,
-    outcome: refusedUnclassified
-      ? 'native_agent_request_denied_unclassified'
-      : NATIVE_COLLABORATION_NOTICE_OUTCOMES[input.enforcement],
+    outcome: NATIVE_COLLABORATION_NOTICE_OUTCOMES[input.enforcement],
     provider: input.provider,
     tool: input.toolName,
     signals: [...input.signals],
     ...(input.unclassifiedReason ? { unclassifiedReason: input.unclassifiedReason } : {}),
     ...(participant ? {
       requester: NATIVE_COLLABORATION_REQUESTERS.PARTICIPANT,
-      rule: 'A formal IM.codes participant performs its assigned task work itself, in this session. Project task work (implementation, repair, audit, re-audit, PASS/REWORK, Git/deploy gates, IM.codes task authority) is never handed to a provider-native agent, and a native agent is never a task participant.',
+      rule: TASK_PAIR_NATIVE_COLLABORATION_RULE,
       requiredRoute: ['continue the assigned work in this session', 'report a structured blocker to the coordinating Brain when another executor or more capacity is needed'],
     } : {
-      rule: 'Project task work (implementation, repair, audit, re-audit, PASS/REWORK, Git/deploy gates, IM.codes task authority) must be delegated to a formal IM.codes sub-session with a supervision task. A provider-native agent is never a task participant, WAITING target, or basis for an arranged-task claim.',
+      rule: TASK_PAIR_NATIVE_COLLABORATION_RULE,
       requiredRoute: ['send_list_targets', 'send_message with task {objective, acceptance}'],
     }),
     nativeAgentsMay: 'ephemeral read-only analysis or parallel reasoning only; treat their output as non-authoritative input',
-    ...(refusedUnclassified
-      ? { retry: 'state a native agent request as explicit read-only analysis (search, read, explain, summarize, compare) with no implementation, audit, verdict or repository-gate instruction, and keep it within the classifier bound' }
-      : {}),
-    ...(input.enforcement === NATIVE_COLLABORATION_ENFORCEMENT.OBSERVED_AFTER_START
-      ? {
-          turn: 'the IM.codes daemon stopped the turn that started this native agent',
-          nativeAgentOutput: participant
-            ? 'discard it: do not rely on, wait for, or report this native agent as task progress; do the work in this session'
-            : 'discard it: do not rely on, wait for, or report this native agent as task progress; re-dispatch the task through IM.codes',
-        }
-      : {}),
-    ...(input.enforcement === NATIVE_COLLABORATION_ENFORCEMENT.GATE_UNAVAILABLE
-      ? { retry: 'the IM.codes policy gate could not classify this request; dispatch any project task work through IM.codes, or retry a clearly read-only analysis request' }
+    ...(input.enforcement === NATIVE_COLLABORATION_ENFORCEMENT.ADVISORY
+      ? { advisory: 'This is advisory only; the native-agent call was allowed to run.' }
       : {}),
   });
 }
@@ -644,20 +567,4 @@ export function buildNativeCollaborationRerouteNotice(input: {
 /** Wrap a policy notice so the model reads it as trusted runtime policy, not a user request. */
 export function formatNativeCollaborationPolicyNotice(notice: string): string {
   return `${NATIVE_COLLABORATION_POLICY_NOTICE_MARKER}\nTrusted IM.codes runtime policy notice (not a user request).\n${notice}`;
-}
-
-/** The fail-closed decision of an installed gate that could not evaluate a request. */
-export function denyNativeCollaborationGateUnavailable(
-  request: Pick<NativeCollaborationGateRequest, 'provider' | 'toolName'>,
-): NativeCollaborationGateDecision {
-  return {
-    allow: false,
-    signals: [],
-    reason: formatNativeCollaborationPolicyNotice(buildNativeCollaborationRerouteNotice({
-      provider: request.provider,
-      toolName: request.toolName,
-      signals: [],
-      enforcement: NATIVE_COLLABORATION_ENFORCEMENT.GATE_UNAVAILABLE,
-    })),
-  };
 }

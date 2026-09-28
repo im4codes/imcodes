@@ -95,6 +95,10 @@ export const TASK_PAIR_TITLE_MARKER_RULE =
   + 'it never reopens, requeues, or wakes an existing pair, including a '
   + 'cancelled or done pair. A DISPATCH with lifecycle attributes cannot '
   + 'revive a cancelled or done pair; use a new taskId instead.';
+/** Brain/provider-native boundary: routing authority lives in IM.codes pairs, not provider sub-agents. */
+export const TASK_PAIR_NATIVE_COLLABORATION_RULE =
+  'Brain must never dispatch pair/task work (implementation, repair, audit, PASS/REWORK, merges) through provider-native sub-agents. '
+  + 'Dispatch it only through IM.codes pair markers (DISPATCH/QUEUE). Native sub-agents are fine for read-only research and analysis.';
 /** Automation kind stamped on daemon-authored pair messages. */
 export const TASK_PAIR_AUTOMATION_KIND = 'task-pair' as const;
 /** Directory-name prefix of a pair's executor worktree, beside legacy `asg_…` assignment worktrees. */
@@ -1527,6 +1531,7 @@ export function buildTaskPairMarkerContract(): string {
     `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
     TASK_PAIR_TITLE_RULE,
     TASK_PAIR_TITLE_MARKER_RULE,
+    TASK_PAIR_NATIVE_COLLABORATION_RULE,
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,

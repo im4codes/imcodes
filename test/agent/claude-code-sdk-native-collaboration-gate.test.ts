@@ -49,10 +49,7 @@ const loggerMock = vi.hoisted(() => ({ info: vi.fn(), warn: vi.fn(), error: vi.f
 vi.mock('../../src/util/logger.js', () => ({ default: loggerMock }));
 
 import { ClaudeCodeSdkProvider } from '../../src/agent/providers/claude-code-sdk.js';
-import {
-  NATIVE_COLLABORATION_POLICY_NOTICE_MARKER,
-  type NativeCollaborationGate,
-} from '../../shared/native-collaboration-policy.js';
+import { type NativeCollaborationGate } from '../../shared/native-collaboration-policy.js';
 
 type HookFn = (input: unknown, toolUseId: string | undefined, options: { signal: AbortSignal }) => Promise<Record<string, unknown>>;
 
@@ -117,12 +114,8 @@ describe('Claude SDK native collaboration pre-execution gate', () => {
     ]);
   });
 
-  it('refuses Brain task participation before execution with the full request and an IM.codes reroute reason', async () => {
-    const gate = vi.fn<NativeCollaborationGate>(() => ({
-      allow: false,
-      reason: '<imcodes-native-collaboration-policy-v1>\nreroute through send_message with task',
-      signals: ['implementation'],
-    }));
+  it('allows Brain task participation while passing the full request to the advisory callback', async () => {
+    const gate = vi.fn<NativeCollaborationGate>(() => ({ allow: true }));
     const { hook } = await startProvider(gate);
     const longPrompt = `${'context '.repeat(80)}Please implement the retry queue and git push the branch.`;
 
@@ -134,13 +127,7 @@ describe('Claude SDK native collaboration pre-execution gate', () => {
       requestText: `Queue work\n${longPrompt}`,
       toolUseId: 'toolu_native_1',
     });
-    expect(output).toEqual({
-      hookSpecificOutput: {
-        hookEventName: 'PreToolUse',
-        permissionDecision: 'deny',
-        permissionDecisionReason: '<imcodes-native-collaboration-policy-v1>\nreroute through send_message with task',
-      },
-    });
+    expect(output).toEqual({});
   });
 
   it('allows analysis requests, other tools, and sessions without an IM.codes gate', async () => {
@@ -161,23 +148,13 @@ describe('Claude SDK native collaboration pre-execution gate', () => {
     await expect(noGate.hook!(hookInput('Agent', { prompt: 'Implement it' }), 'toolu_d', { signal })).resolves.toEqual({});
   });
 
-  it('fails closed when the installed gate cannot answer', async () => {
-    // The relay skips post-start correction for pre-execution providers, so an
-    // allow-on-error here would leave Brain task work with no enforcement.
+  it('allows the native call when the advisory callback cannot answer', async () => {
     const failing = await startProvider(() => { throw new Error('registry offline'); });
     const output = await failing.hook!(hookInput('Agent', { prompt: 'Implement it' }), 'toolu_e', { signal });
-    const hookOutput = (output as { hookSpecificOutput?: Record<string, unknown> }).hookSpecificOutput;
-    expect(hookOutput).toMatchObject({ hookEventName: 'PreToolUse', permissionDecision: 'deny' });
-    const reason = String(hookOutput?.permissionDecisionReason);
-    expect(reason.startsWith(NATIVE_COLLABORATION_POLICY_NOTICE_MARKER)).toBe(true);
-    expect(JSON.parse(reason.slice(reason.indexOf('{')))).toMatchObject({
-      outcome: 'native_agent_request_denied_policy_unavailable',
-      provider: 'claude-code-sdk',
-      tool: 'Agent',
-    });
+    expect(output).toEqual({});
     expect(loggerMock.warn).toHaveBeenCalledWith(
       expect.objectContaining({ provider: 'claude-code-sdk' }),
-      'Claude SDK native collaboration gate failed; denying tool',
+      'Claude SDK native collaboration advisory failed',
     );
   });
 });
