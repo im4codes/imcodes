@@ -108,7 +108,7 @@ describe('/api/session-identities', () => {
     const own = await app.request('/api/session-identities/all', { headers: { Authorization: bearer() } });
     expect(await own.json()).toMatchObject({ profiles: [{ scope: 'user', content: 'Global identity' }] });
     const other = await app.request('/api/session-identities/all', { headers: { Authorization: bearer('user-2') } });
-    expect(await other.json()).toEqual({ profiles: [] });
+    expect(await other.json()).toEqual({ profiles: [], truncated: false });
   });
 
   it('uses explicit last-write-wins semantics for update and delete', async () => {

@@ -18,6 +18,11 @@ interface IdentityProfileRow {
   source_file: string | null;
 }
 
+export interface SessionIdentityProfileSnapshot {
+  profiles: SessionIdentityProfile[];
+  truncated: boolean;
+}
+
 function mapRow(row: IdentityProfileRow): SessionIdentityProfile {
   return {
     scope: row.scope,
@@ -50,7 +55,7 @@ export async function listSessionIdentityProfiles(
   db: Database,
   userId: string,
   serverId?: string,
-): Promise<SessionIdentityProfile[]> {
+): Promise<SessionIdentityProfileSnapshot> {
   const params: unknown[] = [userId];
   // The daemon owns the authoritative live-session projection (including
   // contextNamespace project IDs and sub-sessions). The server cannot safely
@@ -58,8 +63,16 @@ export async function listSessionIdentityProfiles(
   // bounded sync mode; the daemon applies profilesForSession locally.
   const relevant = serverId ? 'TRUE' : `scope = 'user'`;
   params.push(SESSION_IDENTITY_SYNC_MAX_PROFILES, SESSION_IDENTITY_SYNC_MAX_BYTES);
-  const query = async (queryDb: Database): Promise<IdentityProfileRow[]> => queryDb.query<IdentityProfileRow>(
-    `WITH candidates AS (
+  const query = async (queryDb: Database): Promise<SessionIdentityProfileSnapshot> => {
+    const bounds = await queryDb.queryOne<{ total_profiles: number | string; total_bytes: number | string }>(
+      `SELECT COUNT(*)::int AS total_profiles,
+              COALESCE(SUM(octet_length(content)), 0)::bigint AS total_bytes
+         FROM session_identity_profiles
+        WHERE user_id = $1 AND ${relevant}`,
+      [userId],
+    );
+    const rows = await queryDb.query<IdentityProfileRow>(
+      `WITH candidates AS (
        SELECT scope, scope_key, octet_length(content) AS content_bytes,
               ROW_NUMBER() OVER (
                 ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, scope_key ASC
@@ -84,21 +97,27 @@ export async function listSessionIdentityProfiles(
       WHERE profile_rank <= $2::int
         AND (bytes_so_far <= $3::bigint OR profile_rank = 1)
       ORDER BY profile_rank ASC`,
-    params,
-  );
-  let rows: IdentityProfileRow[];
+      params,
+    );
+    return {
+      profiles: rows.map(mapRow),
+      truncated: Number(bounds?.total_profiles ?? 0) > SESSION_IDENTITY_SYNC_MAX_PROFILES
+        || Number(bounds?.total_bytes ?? 0) > SESSION_IDENTITY_SYNC_MAX_BYTES,
+    };
+  };
+  let snapshot: SessionIdentityProfileSnapshot;
   // Keep the timeout local to the pooled connection. Test doubles from the
   // route unit tests do not implement transactions, so retain their direct
   // query path while production PostgreSQL always gets the bound.
   if (typeof (db as Database & { transaction?: unknown }).transaction === 'function') {
-    rows = await db.transaction(async (tx) => {
+    snapshot = await db.transaction(async (tx) => {
       await tx.exec(`SET LOCAL statement_timeout = '${SESSION_IDENTITY_SYNC_STATEMENT_TIMEOUT_MS}ms'`);
       return query(tx);
     });
   } else {
-    rows = await query(db);
+    snapshot = await query(db);
   }
-  return rows.map(mapRow);
+  return snapshot;
 }
 
 export async function upsertSessionIdentityProfile(

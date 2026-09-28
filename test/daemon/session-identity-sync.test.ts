@@ -44,6 +44,7 @@ describe('cross-machine session identity synchronization', () => {
         profile('project', 'repo-1', 'repo rules'),
         profile('session', 'srv-9:deck_proj_cc1', 'worker rules'),
       ],
+      truncated: false,
     }));
     const applyIdentity = vi.fn(() => ({ applied: true }));
 
@@ -65,10 +66,10 @@ describe('cross-machine session identity synchronization', () => {
 
   it('joins a concurrent periodic sync instead of falsely reporting skipped before apply completes', async () => {
     let releaseSnapshot!: (value: {
-      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[];
+      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[]; truncated: boolean;
     }) => void;
     const listProfiles = vi.fn(() => new Promise<{
-      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[];
+      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[]; truncated: boolean;
     }>((resolve) => { releaseSnapshot = resolve; }));
     const applyIdentity = vi.fn(() => ({ applied: true }));
     const deps = {
@@ -80,16 +81,45 @@ describe('cross-machine session identity synchronization', () => {
     const periodic = syncSessionIdentities({}, deps);
     const explicit = syncSessionIdentities({}, deps);
     expect(listProfiles).toHaveBeenCalledTimes(1);
-    releaseSnapshot({ status: 'ok', serverId: 'srv-9', profiles: [profile('user', '', 'global')] });
+    releaseSnapshot({ status: 'ok', serverId: 'srv-9', profiles: [profile('user', '', 'global')], truncated: false });
 
     await expect(periodic).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
     await expect(explicit).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
     expect(applyIdentity).toHaveBeenCalledTimes(1);
   });
 
+  it('hydrates a live session when the bounded snapshot reports truncation', async () => {
+    const target = session({ name: 'zz_session_last' });
+    const listProfiles = vi.fn(async () => ({
+      status: 'ok' as const,
+      serverId: 'srv-9',
+      profiles: [profile('user', '', 'global')],
+      truncated: true,
+    }));
+    const getEffectiveProfiles = vi.fn(async () => ({
+      status: 'ok' as const,
+      serverId: 'srv-9',
+      profiles: [profile('user', '', 'global'), profile('session', 'srv-9:zz_session_last', 'late session')],
+    }));
+    const applyIdentity = vi.fn(() => ({ applied: true }));
+
+    const result = await syncSessionIdentities({}, {
+      listProfiles,
+      getEffectiveProfiles,
+      listLocalSessions: () => [target],
+      applyIdentity,
+    });
+
+    expect(result).toEqual({ status: 'ok', checked: 1, changed: 1 });
+    expect(getEffectiveProfiles).toHaveBeenCalledWith({ projectKey: 'repo-1', sessionName: 'zz_session_last' }, {});
+    expect(applyIdentity).toHaveBeenCalledWith(
+      'zz_session_last', expect.stringContaining('late session'), { refresh: true },
+    );
+  });
+
   it('fetches a post-write snapshot for an explicit target instead of joining a stale periodic snapshot', async () => {
     let releasePeriodic!: (value: {
-      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[];
+      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[]; truncated: boolean;
     }) => void;
     const target = session({ identityPrompt: undefined });
     const listProfiles = vi.fn()
@@ -98,6 +128,7 @@ describe('cross-machine session identity synchronization', () => {
         status: 'ok' as const,
         serverId: 'srv-9',
         profiles: [{ ...profile('session', 'srv-9:deck_proj_brain', 'Identity loaded from a selected file.'), sourceFile: '/identity.md' }],
+        truncated: false,
       });
     const applyIdentity = vi.fn(() => ({ applied: true }));
     const deps = { listProfiles, listLocalSessions: () => [target], applyIdentity };
@@ -110,7 +141,7 @@ describe('cross-machine session identity synchronization', () => {
       expect.stringContaining('Identity loaded from a selected file.'),
       { refresh: true },
     );
-    releasePeriodic({ status: 'ok', serverId: 'srv-9', profiles: [] });
+    releasePeriodic({ status: 'ok', serverId: 'srv-9', profiles: [], truncated: false });
     await periodic;
     expect(listProfiles).toHaveBeenCalledTimes(2);
   });
@@ -141,6 +172,7 @@ describe('cross-machine session identity synchronization', () => {
       status: 'ok' as const,
       serverId: 'srv-9',
       profiles: [profile('user', '', 'global'), profile('session', 'srv-9:deck_proj_brain', 'session')],
+      truncated: false,
     }));
     const applyIdentity = vi.fn(() => ({ applied: true }));
     const result = await syncSessionIdentity('deck_proj_brain', {}, {

@@ -34,6 +34,7 @@ export type IdentityListResult = {
   status: 'ok';
   serverId: string;
   profiles: SessionIdentityProfile[];
+  truncated: boolean;
 } | Failure;
 
 function failure(reason: MCPErrorReason, message: string): Failure {
@@ -184,6 +185,7 @@ export async function listSessionIdentityProfiles(
         return {
           status: 'ok',
           serverId: ep.serverId,
+          truncated: body.truncated === true,
           profiles: raw.flatMap((value) => {
             const profile = profileFrom(value);
             return profile ? [profile] : [];

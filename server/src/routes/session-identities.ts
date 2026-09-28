@@ -16,12 +16,12 @@ sessionIdentityRoutes.use('/*', requireAuth());
 /** A bounded snapshot lets one daemon synchronize only its live sessions. */
 sessionIdentityRoutes.get('/all', async (c) => {
   const serverId = c.req.query('serverId') || c.req.header('X-Server-Id') || undefined;
-  const profiles = await listSessionIdentityProfiles(
+  const snapshot = await listSessionIdentityProfiles(
     c.env.DB,
     c.get('userId' as never) as string,
     serverId,
   );
-  return c.json({ profiles });
+  return c.json(snapshot);
 });
 
 sessionIdentityRoutes.get('/', async (c) => {

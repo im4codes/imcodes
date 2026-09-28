@@ -82,9 +82,11 @@ describe('session identity synchronization bounds', () => {
     }
 
     const started = Date.now();
-    const profiles = await listSessionIdentityProfiles(db, userId, serverId);
+    const snapshot = await listSessionIdentityProfiles(db, userId, serverId);
+    const profiles = snapshot.profiles;
     expect(Date.now() - started).toBeLessThan(2_000);
     expect(profiles.length).toBeLessThanOrEqual(SESSION_IDENTITY_SYNC_MAX_PROFILES);
+    expect(snapshot.truncated).toBe(true);
     expect(profiles.some((item) => item.scope === 'user' && item.content === 'global')).toBe(true);
     expect(profiles.some((item) => item.scopeKey === 'github-im4codes/im4codes/imcodes')).toBe(true);
     expect(profiles.some((item) => item.scopeKey === 'repo-live')).toBe(true);
@@ -99,8 +101,10 @@ describe('session identity synchronization bounds', () => {
       },
     });
     expect(response.status).toBe(200);
-    expect((await response.json() as { profiles: unknown[] }).profiles.length)
+    const body = await response.json() as { profiles: unknown[]; truncated: boolean };
+    expect(body.profiles.length)
       .toBeLessThanOrEqual(SESSION_IDENTITY_SYNC_MAX_PROFILES);
+    expect(body.truncated).toBe(true);
 
     await db.execute('DELETE FROM session_identity_profiles WHERE user_id = $1', [userId]);
     await db.execute('DELETE FROM sub_sessions WHERE server_id = $1', [serverId]);

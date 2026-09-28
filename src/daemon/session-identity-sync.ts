@@ -14,6 +14,7 @@ import {
 } from './session-identity-mcp-client.js';
 
 export const SESSION_IDENTITY_SYNC_INTERVAL_MS = 60_000;
+const SESSION_IDENTITY_HYDRATION_CONCURRENCY = 4;
 
 export interface SessionIdentitySyncResult {
   status: 'ok' | 'error' | 'skipped';
@@ -56,6 +57,38 @@ function profilesForSession(
   ));
 }
 
+async function hydrateTruncatedProfiles(
+  sessions: readonly SessionRecord[],
+  snapshot: { profiles: SessionIdentityProfile[]; serverId: string },
+  options: SessionIdentityClientOptions,
+  getEffective: typeof getEffectiveSessionIdentityProfiles,
+): Promise<SessionIdentityProfile[]> {
+  const merged = new Map(snapshot.profiles.map((profile) => [
+    `${profile.scope}\0${profile.scopeKey}`,
+    profile,
+  ]));
+  let next = 0;
+  const worker = async () => {
+    while (next < sessions.length) {
+      const session = sessions[next++];
+      if (!session) continue;
+      const result = await getEffective({
+        projectKey: sessionIdentityProjectKey({
+          contextNamespace: session.contextNamespace,
+          project: session.projectName,
+        }),
+        sessionName: session.name,
+      }, options);
+      if (result.status !== 'ok') continue;
+      for (const profile of result.profiles) {
+        merged.set(`${profile.scope}\0${profile.scopeKey}`, profile);
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(SESSION_IDENTITY_HYDRATION_CONCURRENCY, sessions.length) }, worker));
+  return [...merged.values()];
+}
+
 /**
  * Fetch one user-scoped snapshot and converge every local session. This is
  * deliberately one HTTP request per daemon rather than three per session.
@@ -73,10 +106,18 @@ export async function syncSessionIdentities(
       return { status: 'error', checked: 0, changed: 0, message: snapshot.message };
     }
     const sessions = (deps.listLocalSessions ?? listSessions)().filter((session) => session.state !== 'stopped');
+    const profiles = snapshot.truncated
+      ? await hydrateTruncatedProfiles(
+        sessions,
+        snapshot,
+        options,
+        deps.getEffectiveProfiles ?? getEffectiveSessionIdentityProfiles,
+      )
+      : snapshot.profiles;
     let changed = 0;
     for (const session of sessions) {
       const prompt = renderSessionIdentityProfiles(
-        profilesForSession(snapshot.profiles, session, snapshot.serverId),
+        profilesForSession(profiles, session, snapshot.serverId),
       );
       if ((session.identityPrompt?.trim() || undefined) === prompt) continue;
       (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, prompt, { refresh: true });
@@ -114,9 +155,19 @@ export async function syncSessionIdentity(
       sessionName: session.name,
     }, options);
   if (snapshot.status !== 'ok') return { status: 'error', checked: 1, changed: 0, message: snapshot.message };
-  const profiles = deps.listProfiles
-    ? profilesForSession(snapshot.profiles, session, snapshot.serverId)
-    : snapshot.profiles;
+  const hydrated = ('truncated' in snapshot && snapshot.truncated)
+    ? await (deps.getEffectiveProfiles ?? getEffectiveSessionIdentityProfiles)({
+      projectKey: sessionIdentityProjectKey({
+        contextNamespace: session.contextNamespace,
+        project: session.projectName,
+      }),
+      sessionName: session.name,
+    }, options)
+    : snapshot;
+  if (hydrated.status !== 'ok') return { status: 'error', checked: 1, changed: 0, message: hydrated.message };
+  const profiles = deps.listProfiles && !('truncated' in snapshot && snapshot.truncated)
+    ? profilesForSession(hydrated.profiles, session, snapshot.serverId)
+    : hydrated.profiles;
   const prompt = renderSessionIdentityProfiles(
     profiles,
   );

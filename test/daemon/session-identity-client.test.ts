@@ -58,7 +58,7 @@ describe('session identity online client', () => {
       .mockRejectedValueOnce(new Error('fetch failed'))
       .mockResolvedValueOnce(jsonResponse({ profiles: [] }));
     await expect(listSessionIdentityProfiles({ endpoint, fetchImpl })).resolves.toMatchObject({
-      status: 'ok', serverId: 'srv-1', profiles: [],
+      status: 'ok', serverId: 'srv-1', profiles: [], truncated: false,
     });
     expect(fetchImpl).toHaveBeenCalledTimes(2);
   });
