@@ -2069,10 +2069,11 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
         const upgradeId = typeof cmd.upgradeId === 'string' && cmd.upgradeId.length > 0 && cmd.upgradeId.length <= 128
           ? cmd.upgradeId
           : undefined;
-        void handleDaemonUpgrade(
+      void handleDaemonUpgrade(
           normalizedTarget === DAEMON_UPGRADE_TARGET_LATEST ? undefined : normalizedTarget,
           serverLink,
           upgradeId,
+          typeof cmd.registry === 'string' ? cmd.registry : undefined,
         );
       } catch {
         logger.warn({ targetVersion: cmd.targetVersion }, 'daemon.upgrade rejected invalid targetVersion');
@@ -8191,12 +8192,12 @@ export function checkUpgradeToolchain(opts: {
 async function resolveUpgradeRegistry(): Promise<{ base: string; explicit: boolean }> {
   const { readFileSync } = await import('fs');
   const { join } = await import('path');
-  const { homedir } = await import('os');
   const { execFile } = await import('child_process');
+  const { resolveImcodesHome } = await import('../util/windows-daemon-lock.js');
 
   let configRegistry: unknown;
   try {
-    const raw = readFileSync(join(homedir(), '.imcodes', INSTALLER_CONFIG_BASENAME), 'utf8');
+    const raw = readFileSync(join(resolveImcodesHome(), INSTALLER_CONFIG_BASENAME), 'utf8');
     const parsed = JSON.parse(raw) as InstallerConfig;
     configRegistry = parsed?.npmRegistry;
   } catch { /* no install.json (or unreadable) — fall through to ambient */ }
@@ -8221,6 +8222,7 @@ async function handleDaemonUpgrade(
   targetVersion?: string,
   serverLink?: ServerLink,
   upgradeId?: string,
+  registryOverride?: string,
 ): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
@@ -8402,7 +8404,10 @@ async function handleDaemonUpgrade(
   // Resolve the registry ONCE here and reuse it for both the pre-flight probe
   // and the install command baked into the upgrade script, so they never
   // diverge (this is the fix for the prior hard-coded-official-registry probe).
-  const upgradeRegistry = await resolveUpgradeRegistry();
+  const normalizedRegistryOverride = normalizeRegistryBase(registryOverride);
+  const upgradeRegistry = normalizedRegistryOverride
+    ? { base: normalizedRegistryOverride, explicit: normalizedRegistryOverride !== INSTALLER_OFFICIAL_NPM_REGISTRY }
+    : await resolveUpgradeRegistry();
   if (!targetVersion || targetVersion === 'latest') {
     try {
       const res = await fetch(`${upgradeRegistry.base}imcodes/latest`, {
