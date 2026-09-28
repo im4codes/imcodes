@@ -1,9 +1,10 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
 import logger from '../util/logger.js';
 
-const STORE_DIR = join(homedir(), '.imcodes');
+const STORE_DIR = resolveImcodesHome();
 const STORE_PATH = join(STORE_DIR, 'temp-files.json');
 const DEBOUNCE_MS = 500;
 const CLEANUP_SWEEP_MS = 5 * 60_000;

@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Full CC hook suite setup.
  *
@@ -23,7 +24,7 @@ import path from 'path';
 import os from 'os';
 import { activeHookPort } from '../daemon/hook-server.js';
 
-const IMCODES_DIR = path.join(os.homedir(), '.imcodes');
+const IMCODES_DIR = resolveImcodesHome();
 const CC_SETTINGS_PATH = path.join(os.homedir(), '.claude', 'settings.json');
 const IS_WINDOWS = process.platform === 'win32';
 

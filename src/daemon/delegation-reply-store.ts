@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -23,7 +24,7 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'delegation-replies.sqlite');
+const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'delegation-replies.sqlite');
 
 function persistedMessageKind(result: string): AgentDelegationReplyMessageKind {
   try {

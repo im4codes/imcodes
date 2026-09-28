@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { mkdirSync, statSync } from 'node:fs';
@@ -86,7 +87,7 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 export type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'shared-agent-context.sqlite');
+const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'shared-agent-context.sqlite');
 const DEFAULT_LOCAL_PROCESSED_FRESH_MS = 6 * 60 * 60 * 1000;
 
 let db: DatabaseSyncInstance | null = null;

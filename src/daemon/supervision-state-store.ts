@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
 import { SUPERVISION_UNBOUND_REVISION } from '../../shared/supervision-mcp-tools.js';
 import { mkdirSync } from 'node:fs';
@@ -108,7 +109,7 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'supervision-state.sqlite');
+const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'supervision-state.sqlite');
 export const SUPERVISION_STATE_VERSION = 1;
 
 /**

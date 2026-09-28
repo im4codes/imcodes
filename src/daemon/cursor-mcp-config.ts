@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -10,7 +11,7 @@ import {
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 
 const DAEMON_CONFLICT_SERVER_NAME = `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`;
-const NOTICE_MARKER = join(homedir(), '.imcodes', 'cursor-mcp-notice-shown');
+const NOTICE_MARKER = join(resolveImcodesHome(), 'cursor-mcp-notice-shown');
 
 export interface CursorMcpEnsureOptions {
   configPath?: string;

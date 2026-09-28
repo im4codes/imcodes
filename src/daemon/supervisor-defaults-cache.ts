@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Daemon-side cache of the user's global supervision defaults.
  *
@@ -48,7 +49,7 @@ suppressSqliteExperimentalWarning();
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
-const DEFAULT_DB_PATH = join(homedir(), '.imcodes', 'supervisor-defaults-cache.sqlite');
+const DEFAULT_DB_PATH = join(resolveImcodesHome(), 'supervisor-defaults-cache.sqlite');
 
 function resolveDbPath(): string {
   return process.env.IMCODES_SUPERVISOR_DEFAULTS_CACHE_DB_PATH?.trim()

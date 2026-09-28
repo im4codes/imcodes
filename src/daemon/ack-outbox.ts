@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Daemon command.ack outbox — crash-safe persistence for unacknowledged acks.
  *
@@ -53,7 +54,7 @@ export interface AckOutboxSender {
   isConnected?: () => boolean;
 }
 
-const DEFAULT_DIR = join(homedir(), '.imcodes');
+const DEFAULT_DIR = resolveImcodesHome();
 const DEFAULT_FILE = join(DEFAULT_DIR, 'ack-outbox.jsonl');
 
 export class AckOutbox {

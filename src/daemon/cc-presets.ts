@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * CC Environment Presets — named sets of env vars for launching Claude Code
  * with alternative API providers (MiniMax, DeepSeek, OpenRouter, etc.).
@@ -22,7 +23,7 @@ import type { DshLlmConfig } from '../../shared/deepseek-harness.js';
 import type { PiLlmConfig } from '../../shared/pi-agent.js';
 import logger from '../util/logger.js';
 
-const PRESETS_PATH = join(homedir(), '.imcodes', 'cc-presets.json');
+const PRESETS_PATH = join(resolveImcodesHome(), 'cc-presets.json');
 
 let cachedPresets: CcPreset[] | null = null;
 

@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { execFile, type ExecFileOptions } from 'node:child_process';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -13,7 +14,7 @@ import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-n
 import { MEMORY_MCP_PROVIDER_STATUS_REASON } from '../../shared/memory-ws.js';
 
 const execFileAsync = promisify(execFile);
-const NOTICE_MARKER = join(homedir(), '.imcodes', 'qwen-mcp-notice-shown');
+const NOTICE_MARKER = join(resolveImcodesHome(), 'qwen-mcp-notice-shown');
 const DAEMON_CONFLICT_SERVER_NAME = `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`;
 
 export interface QwenMcpEnsureOptions {
@@ -161,7 +162,7 @@ async function writeNoticeOnce(markerPath: string, message: string): Promise<voi
 export async function ensureQwenMcpHasImcodesEntry(options: QwenMcpEnsureOptions = {}): Promise<QwenMcpEnsureResult> {
   const qwenBinary = options.qwenBinary ?? 'qwen';
   const run = options.execFileImpl ?? ((file, args, opts) => execFileAsync(file, args, opts) as Promise<{ stdout: string; stderr: string }>);
-  const lockPath = join(homedir(), '.imcodes', 'qwen-mcp.lock');
+  const lockPath = join(resolveImcodesHome(), 'qwen-mcp.lock');
   try {
     return await withLock(lockPath, async () => {
       const listed = await run(qwenBinary, ['mcp', 'list'], { windowsHide: true, timeout: 10_000 });

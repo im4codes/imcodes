@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createWriteStream, existsSync, mkdirSync, renameSync, statSync, unlinkSync, type WriteStream } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { homedir, loadavg } from 'node:os';
@@ -58,8 +59,8 @@ interface RecentServerSend {
 }
 
 const TRUE_RE = /^(1|true|yes|on|debug)$/i;
-const DEFAULT_LOG_DIR = join(homedir(), '.imcodes', 'logs');
-const DEFAULT_FLAG_FILE = join(homedir(), '.imcodes', 'latency-trace.enabled');
+const DEFAULT_LOG_DIR = join(resolveImcodesHome(), 'logs');
+const DEFAULT_FLAG_FILE = join(resolveImcodesHome(), 'latency-trace.enabled');
 const DEFAULT_LOG_FILE = join(DEFAULT_LOG_DIR, 'latency-trace.ndjson');
 const MAX_LOG_SIZE = 100 * 1024 * 1024;
 const MAX_OLD_LOGS = 3;

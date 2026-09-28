@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
 import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
@@ -21,10 +22,10 @@ type WorkerRequest = {
 }[ProjectionWorkerRequestType];
 
 const PROJECTION_VERSION = 1;
-const TIMELINE_DIR = join(homedir(), '.imcodes', 'timeline');
+const TIMELINE_DIR = join(resolveImcodesHome(), 'timeline');
 const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
   ? workerData.dbPath
-  : join(homedir(), '.imcodes', 'timeline.sqlite');
+  : join(resolveImcodesHome(), 'timeline.sqlite');
 
 let db: DatabaseSyncInstance | null = null;
 const rebuildPromises = new Map<string, Promise<boolean>>();

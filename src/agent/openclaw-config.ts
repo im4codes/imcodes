@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 // Manages ~/.imcodes/openclaw.json for persistent connection config
 // AND auto-reads token from ~/.openclaw/openclaw.json (OC's own config)
 
@@ -6,7 +7,7 @@ import { existsSync, readFileSync } from 'fs';
 import { join } from 'path';
 import { homedir } from 'os';
 
-const IMCODES_DIR = join(homedir(), '.imcodes');
+const IMCODES_DIR = resolveImcodesHome();
 const CONFIG_PATH = join(IMCODES_DIR, 'openclaw.json');
 const OC_CONFIG_PATH = join(homedir(), '.openclaw', 'openclaw.json');
 

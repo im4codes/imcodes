@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createRequire } from 'node:module';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
@@ -32,11 +33,7 @@ type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 /** Resolve at construction time so a test can install its isolated home after
  * this module has been imported without ever opening the production queue. */
 function defaultDbPath(): string {
-  const configured = process.env.IMCODES_HOME?.trim();
-  if (configured) return join(configured, 'transport-queue.sqlite');
-  const testHome = process.env.HOME?.trim();
-  if (testHome && testHome !== homedir()) return join(testHome, '.imcodes', 'transport-queue.sqlite');
-  return join(homedir(), '.imcodes', 'transport-queue.sqlite');
+  return join(resolveImcodesHome(), 'transport-queue.sqlite');
 }
 export const MAX_QUEUE_HANDOFF_ATTEMPTS = 3;
 const QUEUE_CANCELLATION_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;

@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Crash-safe single-record outbox for detached daemon-upgrade failures.
  *
@@ -19,7 +20,7 @@ import {
 import logger from '../util/logger.js';
 
 const UPGRADE_BLOCKED_OUTBOX_TTL_MS = 7 * 24 * 60 * 60 * 1000;
-const DEFAULT_FILE = join(homedir(), '.imcodes', 'pending-upgrade-blocked.json');
+const DEFAULT_FILE = join(resolveImcodesHome(), 'pending-upgrade-blocked.json');
 
 export interface UpgradeInstallFailedMessage {
   type: typeof DAEMON_MSG.UPGRADE_BLOCKED;

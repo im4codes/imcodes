@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Transport session JSONL history — local cache for transport-backed agent messages.
  * Each session gets a JSONL file at ~/.imcodes/transport/{sessionKey}.jsonl
@@ -16,7 +17,7 @@ import {
 import { isClaudeSyntheticSeedAssistantTextEvent } from '../shared/claude-synthetic-seed.js';
 import logger from '../util/logger.js';
 
-const TRANSPORT_DIR = join(homedir(), '.imcodes', 'transport');
+const TRANSPORT_DIR = join(resolveImcodesHome(), 'transport');
 const MAX_REPLAY_LINES = 200;
 export const TRANSPORT_HISTORY_REPLAY_BUDGET_BYTES = TIMELINE_PAYLOAD_BUDGET_BYTES.CHAT_HISTORY_TRACE_HARD_LIMIT;
 /**

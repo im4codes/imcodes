@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
@@ -11,7 +12,7 @@ interface P2pConfigStore {
 
 type P2pConfigStoreLoadIssue = 'missing_file' | 'corrupted_file' | 'validation_failed' | null;
 
-const STORE_DIR = join(homedir(), '.imcodes');
+const STORE_DIR = resolveImcodesHome();
 const STORE_PATH = join(STORE_DIR, 'p2p-config.json');
 
 let loaded = false;

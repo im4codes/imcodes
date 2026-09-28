@@ -1,3 +1,4 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 /**
  * Daemon-side file transfer handler.
  * Handles upload persistence, download resolution, and lifecycle cleanup.
@@ -78,7 +79,7 @@ export interface FileTransferSender {
 }
 
 /** Upload directory — ~/.imcodes/uploads (persists across reboots, unlike /tmp). */
-const UPLOAD_DIR = path.join(homedir(), '.imcodes', 'uploads');
+const UPLOAD_DIR = path.join(resolveImcodesHome(), 'uploads');
 
 // ── Attachment registry ─────────────────────────────────────────────────────
 
