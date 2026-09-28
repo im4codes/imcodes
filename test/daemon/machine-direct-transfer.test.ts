@@ -173,7 +173,11 @@ describe('machine direct encrypted TCP transfer', () => {
     const receiver = await startMachineDirectFetchReceiver({
       tempPath,
       request,
-      transferTimeoutMs: stallTimeoutMs + 5_000,
+      // Keep the overall budget far above the per-frame stall threshold and
+      // assert the protocol's specific stall error rather than sleeping a
+      // fixed number of wall-clock milliseconds. Fixed sleeps are flaky on
+      // loaded CI runners when timer callbacks are delayed.
+      transferTimeoutMs: stallTimeoutMs + 30_000,
       stallTimeoutMs,
     });
     expect(receiver).not.toBeNull();
@@ -198,13 +202,11 @@ describe('machine direct encrypted TCP transfer', () => {
       0n,
       Buffer.from([MACHINE_DIRECT_FRAME_TYPE.START, ...Buffer.from(JSON.stringify({ size: 1, originalName: 'stall.bin', sourceIdentity: { size: 1, mtimeMs: 1, device: 1, inode: 1 } }))]),
     ));
-    let rejected = false;
-    const completion = receiver!.completion.catch(() => { rejected = true; });
-    await new Promise((resolve) => setTimeout(resolve, stallTimeoutMs + 25));
-    expect(rejected).toBe(true);
+    const startedAt = Date.now();
+    await expect(receiver!.completion).rejects.toThrow('transfer_timeout');
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
     socket.destroy();
     receiver!.close();
-    await completion;
   });
 
   it('resumes a reverse machine-direct fetch after a connection loss without rewriting its prefix', async () => {

@@ -261,19 +261,30 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
     // file), so the runner should finish in well under a second.
     let stdout = '';
     let stderr = '';
+    const emptyPath = mkdtempSync(join(tmpdir(), 'imcodes-runner-empty-path-'));
     try {
-      stdout = execFileSync('node', [
+      stdout = execFileSync(process.execPath, [
         RUNNER_SRC,
         logFile,
         args.npmCmd,
         args.pkgSpec,
         args.targetVer,
         scriptDir,
-      ], { encoding: 'utf8', timeout: 30_000 });
+      ], {
+        encoding: 'utf8',
+        timeout: 30_000,
+        env: {
+          ...process.env,
+          PATH: emptyPath,
+          npm_config_registry: 'http://127.0.0.1:9',
+        },
+      });
     } catch (e) {
       const err = e as { stdout?: Buffer | string; stderr?: Buffer | string };
       stdout = err.stdout?.toString() ?? '';
       stderr = err.stderr?.toString() ?? '';
+    } finally {
+      try { rmSync(emptyPath, { recursive: true, force: true }); } catch { /* ignore */ }
     }
     const log = existsSync(logFile) ? readFileSync(logFile, 'utf8') : '';
     return { stdout, stderr, log };
@@ -344,8 +355,9 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
     expect(existsSync(lock)).toBe(true);
 
     let stderr = '';
+    const emptyPath = mkdtempSync(join(tmpdir(), 'imcodes-runner-empty-path-'));
     try {
-      execFileSync('node', [
+      execFileSync(process.execPath, [
         RUNNER_SRC,
         logFile,
         join(scriptDir, 'no-such-npm.cmd'),
@@ -355,7 +367,13 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
       ], {
         encoding: 'utf8',
         timeout: 30_000,
-        env: { ...process.env, USERPROFILE: fakeHome, HOME: fakeHome },
+        env: {
+          ...process.env,
+          USERPROFILE: fakeHome,
+          HOME: fakeHome,
+          PATH: emptyPath,
+          npm_config_registry: 'http://127.0.0.1:9',
+        },
       });
     } catch (e) {
       stderr = (e as { stderr?: Buffer }).stderr?.toString() ?? '';
@@ -374,6 +392,7 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
       expect(stderr).not.toMatch(/EACCES|EPERM/);
     }
 
+    try { rmSync(emptyPath, { recursive: true, force: true }); } catch { /* ignore */ }
     try { rmSync(fakeHome, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 });
