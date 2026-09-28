@@ -788,6 +788,8 @@ export function ensureContextStoreMaintenanceIndexes(): { created: number; done:
   const indexes = [
     'CREATE INDEX IF NOT EXISTS idx_context_processed_local_panel ON context_processed_local(scope, enterprise_id, workspace_id, user_id, project_id, status, is_noise, updated_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_context_processed_local_project_panel ON context_processed_local(project_id, status, is_noise, class, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_panel_owner ON context_processed_local(scope, user_id, status, is_noise, updated_at DESC)',
+    'CREATE INDEX IF NOT EXISTS idx_context_processed_local_panel_owner_project ON context_processed_local(scope, user_id, status, is_noise, project_id, class, updated_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_created ON context_jobs(target_key, job_type, status, created_at)',
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_updated ON context_jobs(target_key, job_type, status, updated_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_status_type_updated ON context_jobs(status, job_type, updated_at)',
