@@ -468,25 +468,26 @@ describe('context-store', () => {
       createdAt: now - 2,
       updatedAt: now - 2,
     });
-    writeProcessedProjection({
-      id: 'legacy-noise-row',
-      namespace,
-      class: 'recent_summary',
-      sourceEventIds: [],
-      summary: '[API Error: Connection error. (cause: fetch failed)]',
-      content: {},
-      createdAt: now - 1,
-      updatedAt: now - 1,
-    });
-
     // Simulate an upgraded legacy store: ALTER TABLE supplied is_noise=0 for
     // both rows and no semantic cursor has run yet. The panel must not mistake
     // those defaults for a confirmed non-noise classification.
     const database = new DatabaseSync(process.env.IMCODES_CONTEXT_DB_PATH!);
+    database.prepare(`
+      INSERT INTO context_processed_local
+        (id, namespace_key, scope, user_id, project_id, class,
+         source_event_ids_json, summary, content_json, created_at, updated_at,
+         status, hit_count, is_noise)
+      VALUES (?, ?, 'personal', 'user-1', 'repo', 'recent_summary', '[]', ?, '{}', ?, ?, 'active', 0, 0)
+    `).run(
+      'legacy-noise-row',
+      'personal::::user-1:repo',
+      '[API Error: Connection error. (cause: fetch failed)]',
+      now - 1,
+      now - 1,
+    );
     database.prepare('UPDATE context_processed_local SET is_noise = 0').run();
     database.prepare("DELETE FROM context_meta WHERE key IN ('processed_noise_backfill_complete', 'processed_noise_backfill_rowid')").run();
     database.close();
-    resetContextStoreForTests();
 
     expect(queryProcessedProjections({ scope: 'personal', projectId: 'repo', limit: 10 })).toEqual([]);
     expect(getProcessedProjectionStats({ scope: 'personal', projectId: 'repo' }).totalRecords).toBe(0);
