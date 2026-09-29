@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { access, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -176,8 +175,6 @@ describe('daemon direct file transfer v2 lease broker', () => {
   let lookupAttachmentByClientUploadId: ReturnType<typeof vi.fn>;
   let resolveDirectFileDownloadSource: ReturnType<typeof vi.fn>;
   let directLogger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> };
-  /** In-memory stand-in for session-identity-local-store.ts, keyed like it is (scope\0scopeKey). */
-  let identityStore: Map<string, { content: string; contentHash: string; revision: number; updatedAt: number }>;
 
   beforeEach(async () => {
     vi.resetModules();
@@ -198,7 +195,6 @@ describe('daemon direct file transfer v2 lease broker', () => {
       return { attachmentId: 'preview-handle-0001', readPath: sourcePath, filename: 'source.bin', size: 8, mime: 'application/octet-stream' };
     });
     directLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
-    identityStore = new Map();
     vi.doMock('node-datachannel', () => ({ PeerConnection: FakePeerConnection, initLogger: vi.fn(), cleanup: vi.fn() }));
     vi.doMock('../../src/daemon/file-transfer-handler.js', () => ({
       ensureUploadDirectory: vi.fn(),
@@ -254,31 +250,6 @@ describe('daemon direct file transfer v2 lease broker', () => {
       if (method === 'lookupAttachmentByClientUploadId') return handler.lookupAttachmentByClientUploadId(String(args[0] ?? '')) ?? null;
       if (method === 'resolveDirectFileDownloadSource') return await handler.resolveDirectFileDownloadSource(String(args[0] ?? ''));
       if (method === 'finalizeDirectUploadedFile') return await handler.finalizeDirectUploadedFile(args[0] as never);
-      if (method === 'identityGet') {
-        const [scope, scopeKey, knownContentHash] = args as [string, string, string | undefined];
-        const existing = identityStore.get(`${scope}\0${scopeKey}`);
-        if (!existing) return { status: 'ok' };
-        if (knownContentHash && existing.contentHash === knownContentHash) {
-          return { status: 'ok', unchanged: true, contentHash: existing.contentHash, revision: existing.revision, updatedAt: existing.updatedAt };
-        }
-        return { status: 'ok', ...existing };
-      }
-      if (method === 'identitySet') {
-        const [scope, scopeKey, content] = args as [string, string, string];
-        const key = `${scope}\0${scopeKey}`;
-        const previous = identityStore.get(key);
-        const next = {
-          content, contentHash: createHash('sha256').update(content).digest('hex'),
-          revision: (previous?.revision ?? 0) + 1, updatedAt: Date.now(),
-        };
-        identityStore.set(key, next);
-        return { status: 'ok', contentHash: next.contentHash, revision: next.revision, updatedAt: next.updatedAt };
-      }
-      if (method === 'identityDelete') {
-        const [scope, scopeKey] = args as [string, string];
-        identityStore.delete(`${scope}\0${scopeKey}`);
-        return { status: 'ok' };
-      }
       throw new Error(`unsupported_host_method:${method}`);
     });
     expect(await direct.initializeDirectFileTransfer()).toBe(true);
@@ -328,103 +299,6 @@ describe('daemon direct file transfer v2 lease broker', () => {
     expect(extraHealth.close, 'one lease must never retain a second health channel').toHaveBeenCalledOnce();
     expect(sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED)).toBeUndefined();
     await direct.shutdownDirectFileTransfers();
-  });
-
-  describe('identity over the lease (phase 2)', () => {
-    function identityBase(overrides: Record<string, unknown> = {}) {
-      return {
-        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
-        serverId, browserTabId, leaseId, leaseGeneration: 1, daemonGeneration: 1,
-        ...overrides,
-      };
-    }
-
-    it('sets then gets identity content over the bounded bootstrap channel, never opening a file operation', async () => {
-      const { direct, sent } = await readyLease();
-      const health = new FakeDataChannel('imcodes-health-0001');
-      FakePeerConnection.latest!.emitDataChannel(health);
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-1', op: 'set', scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'session rules', source: 'web',
-      })));
-      await vi.waitFor(() => expect(health.sent).toHaveLength(1));
-      const setResponse = JSON.parse(health.sent[0] as string);
-      expect(setResponse).toMatchObject({ type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE, nonce: 'id-nonce-1', status: 'ok', revision: 1 });
-      expect(typeof setResponse.contentHash).toBe('string');
-
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-2', op: 'get', scope: 'session', scopeKey: 'srv-1:deck_proj_brain',
-      })));
-      await vi.waitFor(() => expect(health.sent).toHaveLength(2));
-      const getResponse = JSON.parse(health.sent[1] as string);
-      expect(getResponse).toMatchObject({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE, nonce: 'id-nonce-2', status: 'ok',
-        content: 'session rules', contentHash: setResponse.contentHash, revision: 1,
-      });
-      // No file-transfer authority was ever granted for this lease.
-      expect(sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.AUTHORIZED)).toBeUndefined();
-      await direct.shutdownDirectFileTransfers();
-    });
-
-    it('a conditional GET with a matching knownContentHash gets "unchanged" and no content bytes', async () => {
-      const { direct } = await readyLease();
-      const health = new FakeDataChannel('imcodes-health-0001');
-      FakePeerConnection.latest!.emitDataChannel(health);
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-1', op: 'set', scope: 'project', scopeKey: 'repo-1', content: 'project rules', source: 'web',
-      })));
-      await vi.waitFor(() => expect(health.sent).toHaveLength(1));
-      const { contentHash } = JSON.parse(health.sent[0] as string);
-
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-2', op: 'get', scope: 'project', scopeKey: 'repo-1', knownContentHash: contentHash,
-      })));
-      await vi.waitFor(() => expect(health.sent).toHaveLength(2));
-      const response = JSON.parse(health.sent[1] as string);
-      expect(response).toMatchObject({ status: 'ok', unchanged: true, contentHash });
-      expect(response.content).toBeUndefined();
-      await direct.shutdownDirectFileTransfers();
-    });
-
-    it('delete then get reports no content, and a bogus scope is rejected before any host call', async () => {
-      const { direct } = await readyLease();
-      const health = new FakeDataChannel('imcodes-health-0001');
-      FakePeerConnection.latest!.emitDataChannel(health);
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-1', op: 'set', scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'x', source: 'web',
-      })));
-      await vi.waitFor(() => expect(health.sent).toHaveLength(1));
-
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-2', op: 'delete', scope: 'session', scopeKey: 'srv-1:deck_proj_brain',
-      })));
-      await vi.waitFor(() => expect(health.sent).toHaveLength(2));
-      expect(JSON.parse(health.sent[1] as string)).toMatchObject({ status: 'ok' });
-
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-3', op: 'get', scope: 'session', scopeKey: 'srv-1:deck_proj_brain',
-      })));
-      await vi.waitFor(() => expect(health.sent).toHaveLength(3));
-      const afterDelete = JSON.parse(health.sent[2] as string);
-      expect(afterDelete).toMatchObject({ status: 'ok' });
-      expect(afterDelete.contentHash).toBeUndefined();
-
-      // A malformed op/scope must retire the channel like any other protocol
-      // violation, never reach the host, and never leave the caller hanging.
-      health.emit(JSON.stringify(identityBase({
-        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
-        nonce: 'id-nonce-4', op: 'get', scope: 'user', scopeKey: '',
-      })));
-      await vi.waitFor(() => expect(health.close).toHaveBeenCalledOnce());
-      expect(health.sent).toHaveLength(3);
-      await direct.shutdownDirectFileTransfers();
-    });
   });
 
   it('answers a PREPARE with a retryable host timeout instead of hanging during daemon startup', async () => {

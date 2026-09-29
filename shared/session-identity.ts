@@ -106,6 +106,40 @@ export function isSessionIdentityScope(value: unknown): value is SessionIdentity
     && (SESSION_IDENTITY_SCOPE_LIST as readonly string[]).includes(value);
 }
 
+/**
+ * Identity-over-the-lease (phase 2) reuses the Direct File Transfer v2
+ * upload/download operations unchanged: an "upload" is a SET, a "download"
+ * is a GET, moving in-memory bytes rather than a real file. The daemon
+ * recognizes an identity-flavored operation by this handle, carried in the
+ * download's `previewHandle` (unrestricted byte-bounded string) or the
+ * upload's `filename` field (same bound, repurposed -- the real
+ * `clientUploadId` stays a plain opaque token, since IT is restricted to
+ * `[A-Za-z0-9_-]{8,128}` and cannot carry an arbitrary scope key).
+ */
+const SESSION_IDENTITY_DIRECT_HANDLE_PREFIX = 'imcodes-identity:';
+
+export function encodeSessionIdentityDirectHandle(scope: SessionIdentityScope, scopeKey: string): string {
+  return `${SESSION_IDENTITY_DIRECT_HANDLE_PREFIX}${scope}:${encodeURIComponent(scopeKey)}`;
+}
+
+export function decodeSessionIdentityDirectHandle(
+  handle: string,
+): { scope: SessionIdentityScope; scopeKey: string } | null {
+  if (!handle.startsWith(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX)) return null;
+  const rest = handle.slice(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX.length);
+  const separator = rest.indexOf(':');
+  if (separator < 0) return null;
+  const scope = rest.slice(0, separator);
+  if (!isSessionIdentityScope(scope)) return null;
+  let scopeKey: string;
+  try {
+    scopeKey = decodeURIComponent(rest.slice(separator + 1));
+  } catch {
+    return null;
+  }
+  return { scope, scopeKey };
+}
+
 export function normalizeSessionIdentityContent(value: string): string {
   return value.normalize('NFC').trim();
 }
