@@ -16,7 +16,7 @@ import { writeFile, readFile, mkdir, chmod, unlink } from 'node:fs/promises';
 import { existsSync, writeFileSync, readFileSync, mkdtempSync, rmSync, readdirSync} from 'node:fs';
 import { execSync, execFileSync } from 'node:child_process';
 import { createInterface } from 'node:readline';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { homedir, hostname, tmpdir } from 'node:os';
 import {
   dockerComposeTemplate,
@@ -54,6 +54,7 @@ import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../u
 import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
 import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
 
 function credentialsDir(): string { return resolveImcodesHome(); }
 function credentialsPath(): string { return join(credentialsDir(), 'server.json'); }
@@ -1183,8 +1184,9 @@ function installService(): void {
 }
 
 function installSystemdService(): void {
+  const service = resolvePosixDaemonServicePaths();
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
-  const servicePath = join(serviceDir, 'imcodes.service');
+  const servicePath = service.systemdUnitPath;
   const logPath = join(credentialsDir(), 'daemon.log');
 
   // Prefer the self-healing launcher when this install ships it. See
@@ -1194,7 +1196,7 @@ function installSystemdService(): void {
   const target = resolveDaemonLaunchTarget();
 
   const unit = `[Unit]
-Description=IM.codes Daemon
+Description=IM.codes Daemon${service.scoped ? ` (${service.stateHome})` : ''}
 After=network.target
 ${renderSystemdStartLimitBlock()}
 
@@ -1209,7 +1211,9 @@ TimeoutStopSec=45s
 SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
-Environment=NODE_ENV=production
+${service.scoped ? `Environment=IMCODES_HOME=${service.stateHome}
+Environment=IMCODES_DEFAULT_HOME=${dirname(service.defaultHome)}
+` : ''}Environment=NODE_ENV=production
 # See bind-flow.ts.installSystemdService for rationale on these two.
 # Mirrors the flags there so the one-click setup and the manual bind
 # install produce equivalent units.
@@ -1230,8 +1234,8 @@ WantedBy=default.target
   writeFileSync(servicePath, unit);
   try {
     execSync('systemctl --user daemon-reload', { stdio: 'ignore' });
-    execSync('systemctl --user enable imcodes', { stdio: 'ignore' });
-    execSync('systemctl --user restart imcodes', { stdio: 'ignore' });
+    execSync(`systemctl --user enable ${service.systemdUnitName}`, { stdio: 'ignore' });
+    execSync(`systemctl --user restart ${service.systemdUnitName}`, { stdio: 'ignore' });
   } catch {
     console.log('  Could not start systemd service automatically. Run: systemctl --user start imcodes');
   }
@@ -1239,7 +1243,11 @@ WantedBy=default.target
   // External recovery trigger, installed as its own timer/oneshot pair so it can
   // still act when imcodes.service itself is wedged falsely-active. Idempotent:
   // a re-run rewrites nothing and reloads nothing when the units already match.
-  installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
+  if (!service.scoped) {
+    installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
+  } else {
+    log('Scoped daemon: skipped the shared recovery timer to preserve default-service isolation.');
+  }
 
   const linger = enableSystemdUserLinger();
   if (linger.ok) {

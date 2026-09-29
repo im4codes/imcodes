@@ -96,6 +96,7 @@ import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.j
 import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
 import { daemonProcessAppearsRunning, isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
 import { resolveImcodesHome } from './util/windows-daemon-lock.js';
+import { resolvePosixDaemonServicePaths } from './util/posix-daemon-service.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
@@ -309,7 +310,7 @@ function killStaleImcodesProcesses(): void {
 function ensureServiceForeground(): void {
   const platform = process.platform;
   if (platform === 'darwin') {
-    const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+    const plist = resolvePosixDaemonServicePaths().launchAgentPath;
     if (!existsSync(plist)) return;
     const content = readFileSync(plist, 'utf8');
     if (content.includes('--foreground')) return;
@@ -323,7 +324,7 @@ function ensureServiceForeground(): void {
       console.log('Patched plist: added --foreground');
     }
   } else if (platform === 'linux') {
-    const svc = resolve(homedir(), '.config/systemd/user/imcodes.service');
+    const svc = resolvePosixDaemonServicePaths().systemdUnitPath;
     if (!existsSync(svc)) return;
     const content = readFileSync(svc, 'utf8');
     if (content.includes('--foreground')
@@ -389,7 +390,7 @@ program
     // Interactive: delegate to system service to avoid duplicate processes
     const platform = process.platform;
     if (platform === 'darwin') {
-      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      const plist = resolvePosixDaemonServicePaths().launchAgentPath;
       if (!existsSync(plist)) {
         console.error(`No service installed. Run 'imcodes service install' first, or use 'imcodes start --foreground'.`);
         process.exit(1);
@@ -398,9 +399,9 @@ program
       execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
       console.log('Daemon started via launchctl.');
     } else if (platform === 'linux') {
-      const userService = existsSync(resolve(homedir(), '.config/systemd/user/imcodes.service'));
+      const userService = existsSync(resolvePosixDaemonServicePaths().systemdUnitPath);
       if (userService) {
-        execSync('systemctl --user start imcodes', { stdio: 'inherit' });
+        execSync(`systemctl --user start ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
       } else {
         console.error(`No user service installed. Run 'imcodes bind' or 'imcodes service install' first, or use 'imcodes start --foreground'.`);
         process.exit(1);
@@ -426,15 +427,15 @@ program
     // installed service simply exits without touching sessions.json.
     const platform = process.platform;
     if (platform === 'darwin') {
-      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      const plist = resolvePosixDaemonServicePaths().launchAgentPath;
       if (existsSync(plist)) {
         execSync(`launchctl unload "${plist}"`, { stdio: 'inherit' });
         return;
       }
     } else if (platform === 'linux') {
-      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
       if (existsSync(userService)) {
-        execSync('systemctl --user stop imcodes', { stdio: 'inherit' });
+        execSync(`systemctl --user stop ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
         return;
       }
     }
@@ -510,7 +511,7 @@ program
     // Fallback: systemd (Linux only)
     if (!daemonRunning && process.platform === 'linux') {
       try {
-        const out = execSync('systemctl --user show imcodes --property=MainPID --value 2>/dev/null', { encoding: 'utf8' }).trim();
+        const out = execSync(`systemctl --user show ${resolvePosixDaemonServicePaths().systemdUnitName} --property=MainPID --value 2>/dev/null`, { encoding: 'utf8' }).trim();
         // systemd keeps reporting a non-zero MainPID while the unit is falsely
         // active with a zombie main process, so the PID alone proves nothing.
         if (out && out !== '0' && daemonProcessAppearsRunning(Number.parseInt(out, 10))) {
@@ -975,7 +976,7 @@ program
         const platform = process.platform;
 
         if (platform === 'darwin') {
-          const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+          const plist = resolvePosixDaemonServicePaths().launchAgentPath;
           if (!existsSync(plist)) {
             console.error(`Plist not found: ${plist}`);
             process.exit(1);
@@ -987,11 +988,11 @@ program
           execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
           console.log('Done.');
         } else if (platform === 'linux') {
-          const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+          const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
           const isUserService = existsSync(userService);
           console.log('Restarting via systemd...');
           if (isUserService) {
-            execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
+            execSync(`systemctl --user daemon-reload && systemctl --user restart ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
           } else {
             console.error('No user service found. Run "imcodes bind" to install.');
             process.exit(1);
@@ -1119,7 +1120,7 @@ program
     // The daemon's own watchdog loop will relaunch with the new version after exit.
     ensureServiceForeground();
     if (platform === 'darwin') {
-      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      const plist = resolvePosixDaemonServicePaths().launchAgentPath;
       if (existsSync(plist)) {
         console.log('Restarting daemon via launchctl...');
         try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
@@ -1127,10 +1128,10 @@ program
         execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
       }
     } else if (platform === 'linux') {
-      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
       if (existsSync(userService)) {
         console.log('Restarting daemon via systemd...');
-        execSync('systemctl --user daemon-reload && systemctl --user restart imcodes', { stdio: 'inherit' });
+        execSync(`systemctl --user daemon-reload && systemctl --user restart ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
       } else {
         console.log('No user service found. Skipping restart — run "imcodes bind" to install.');
       }
@@ -1155,18 +1156,18 @@ program
     ensureServiceForeground();
     const platform = process.platform;
     if (platform === 'darwin') {
-      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      const plist = resolvePosixDaemonServicePaths().launchAgentPath;
       if (!existsSync(plist)) { console.error(`Plist not found: ${plist}`); process.exit(1); }
       console.log('Restarting via launchctl...');
       execSync(`launchctl unload "${plist}"`, { stdio: 'inherit' });
       killStaleImcodesProcesses();
       execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
     } else if (platform === 'linux') {
-      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
       const isUserService = existsSync(userService);
       console.log('Restarting via systemd...');
       if (isUserService) {
-        execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
+        execSync(`systemctl --user restart ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
       } else {
         console.error('No user service found. Run "imcodes bind" to install.');
         process.exit(1);
@@ -1230,16 +1231,16 @@ program
     ensureServiceForeground();
     const platform = process.platform;
     if (platform === 'darwin') {
-      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      const plist = resolvePosixDaemonServicePaths().launchAgentPath;
       if (existsSync(plist)) {
         try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
         killStaleImcodesProcesses();
         execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
       }
     } else if (platform === 'linux') {
-      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
       if (existsSync(userService)) {
-        execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
+        execSync(`systemctl --user restart ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
       } else {
         console.log('No user service found. Run "imcodes restart" manually after installing with "imcodes bind".');
       }
@@ -1267,16 +1268,16 @@ program
     ensureServiceForeground();
     const platform = process.platform;
     if (platform === 'darwin') {
-      const plist = resolve(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
+      const plist = resolvePosixDaemonServicePaths().launchAgentPath;
       if (existsSync(plist)) {
         try { execSync(`launchctl unload "${plist}" 2>/dev/null`, { stdio: 'pipe' }); } catch { /* ok */ }
         killStaleImcodesProcesses();
         execSync(`launchctl load "${plist}"`, { stdio: 'inherit' });
       }
     } else if (platform === 'linux') {
-      const userService = resolve(homedir(), '.config/systemd/user/imcodes.service');
+      const userService = resolvePosixDaemonServicePaths().systemdUnitPath;
       if (existsSync(userService)) {
-        execSync('systemctl --user restart imcodes', { stdio: 'inherit' });
+        execSync(`systemctl --user restart ${resolvePosixDaemonServicePaths().systemdUnitName}`, { stdio: 'inherit' });
       } else {
         console.log('No user service found. Run "imcodes restart" manually after installing with "imcodes bind".');
       }

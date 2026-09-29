@@ -1,6 +1,6 @@
 import { readFile, writeFile, mkdir } from 'fs/promises';
 import { existsSync as existsSyncFs } from 'fs';
-import { join } from 'path';
+import { dirname, join } from 'path';
 import { homedir, hostname } from 'os';
 import { execSync } from 'child_process';
 import logger from '../util/logger.js';
@@ -11,14 +11,12 @@ import { enableSystemdUserLinger, formatSystemdLingerFailureMessage } from '../u
 import { renderRecoveryExecStart, renderSystemdStartLimitBlock, renderSystemdTerminalDiagnostics } from '../util/systemd-unit.js';
 import { installRecoveryUnits } from '../util/systemd-recovery-install.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
+import { resolvePosixDaemonServicePaths } from '../util/posix-daemon-service.js';
 
 /** Resolve the instance state directory lazily so scoped daemons never read or
  * write the default user's credentials when IMCODES_HOME is overridden. */
 function credentialsDir(): string { return resolveImcodesHome(); }
 function credentialsPath(): string { return join(credentialsDir(), 'server.json'); }
-const PLIST_LABEL = 'imcodes.daemon';
-const PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', `${PLIST_LABEL}.plist`);
-const OLD_PLIST_PATH = join(homedir(), 'Library', 'LaunchAgents', 'cc.imcodes.daemon.plist');
 
 interface ServerCredentials {
   serverId: string;
@@ -123,13 +121,14 @@ export async function bindFlow(bindUrl: string, deviceName?: string, _opts?: { f
 
 function restartDaemon(): void {
   try {
+    const service = resolvePosixDaemonServicePaths();
     if (process.platform === 'darwin') {
-      const plist = join(homedir(), 'Library', 'LaunchAgents', `${PLIST_LABEL}.plist`);
+      const plist = service.launchAgentPath;
       execSync(`launchctl unload "${plist}" 2>/dev/null; launchctl load -w "${plist}"`, { stdio: 'ignore' });
     } else if (process.platform === 'linux') {
-      const userService = join(homedir(), '.config/systemd/user/imcodes.service');
+      const userService = service.systemdUnitPath;
       if (existsSyncFs(userService)) {
-        execSync('systemctl --user restart imcodes', { stdio: 'ignore' });
+        execSync(`systemctl --user restart ${service.systemdUnitName}`, { stdio: 'ignore' });
       } else {
         throw new Error('No user service found');
       }
@@ -276,6 +275,7 @@ async function ensureTmux(): Promise<void> {
 }
 
 async function installLaunchAgent(): Promise<void> {
+  const service = resolvePosixDaemonServicePaths();
   const logPath = join(credentialsDir(), 'daemon.log');
   const launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents');
 
@@ -288,7 +288,7 @@ async function installLaunchAgent(): Promise<void> {
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>${PLIST_LABEL}</string>
+  <string>${service.launchAgentLabel}</string>
   <key>ProgramArguments</key>
   <array>
 ${renderPlistProgramArguments(target)}
@@ -299,6 +299,11 @@ ${renderPlistProgramArguments(target)}
     <string>${process.env.PATH ?? '/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin'}</string>
     <key>HOME</key>
     <string>${homedir()}</string>
+${service.scoped ? `    <key>IMCODES_HOME</key>
+    <string>${service.stateHome}</string>
+    <key>IMCODES_DEFAULT_HOME</key>
+    <string>${dirname(service.defaultHome)}</string>
+` : ''}
     <!-- See bind-flow.ts.installSystemdService for rationale on these flags
          (V8 lazy-GC + heap-limit OOM cascade observed on production daemons). -->
     <key>NODE_OPTIONS</key>
@@ -316,33 +321,34 @@ ${renderPlistProgramArguments(target)}
 </plist>`;
 
   await mkdir(launchAgentsDir, { recursive: true });
-  await writeFile(PLIST_PATH, plist, 'utf8');
+  await writeFile(service.launchAgentPath, plist, 'utf8');
 
   // Migrate: unload and remove old cc.imcodes.daemon plist if present
   const { existsSync, unlinkSync } = await import('fs');
-  if (existsSync(OLD_PLIST_PATH)) {
-    try { execSync(`launchctl unload "${OLD_PLIST_PATH}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
-    try { unlinkSync(OLD_PLIST_PATH); } catch { /* ok */ }
+  if (!service.scoped && existsSync(service.legacyLaunchAgentPath)) {
+    try { execSync(`launchctl unload "${service.legacyLaunchAgentPath}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
+    try { unlinkSync(service.legacyLaunchAgentPath); } catch { /* ok */ }
     console.log('Removed old cc.imcodes.daemon.plist');
   }
 
   // Unload existing (ignore error), then load fresh
-  try { execSync(`launchctl unload "${PLIST_PATH}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
-  execSync(`launchctl load -w "${PLIST_PATH}"`);
-  console.log(`Launch agent loaded: ${PLIST_PATH}`);
+  try { execSync(`launchctl unload "${service.launchAgentPath}" 2>/dev/null`, { stdio: 'ignore' }); } catch { /* ok */ }
+  execSync(`launchctl load -w "${service.launchAgentPath}"`);
+  console.log(`Launch agent loaded: ${service.launchAgentPath}`);
 }
 
 async function installSystemdService(): Promise<void> {
+  const service = resolvePosixDaemonServicePaths();
   const logPath = join(credentialsDir(), 'daemon.log');
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
-  const servicePath = join(serviceDir, 'imcodes.service');
+  const servicePath = service.systemdUnitPath;
 
   // Prefer the self-healing launcher when this install ships it. See
   // `src/util/launch-target.ts` for rationale.
   const target = resolveDaemonLaunchTarget();
 
   const unit = `[Unit]
-Description=IM.codes Daemon
+Description=IM.codes Daemon${service.scoped ? ` (${service.stateHome})` : ''}
 After=network.target
 ${renderSystemdStartLimitBlock()}
 
@@ -356,6 +362,9 @@ TimeoutStopSec=45s
 SendSIGKILL=yes
 Environment=PATH=${process.env.PATH ?? '/usr/local/bin:/usr/bin:/bin'}
 Environment=HOME=${homedir()}
+${service.scoped ? `Environment=IMCODES_HOME=${service.stateHome}
+Environment=IMCODES_DEFAULT_HOME=${dirname(service.defaultHome)}
+` : ''}
 # --expose-gc lets the daemon's startGcPoller proactively trigger major
 # GC, keeping RSS bounded near the live working set. Without this flag,
 # V8 lazy major GC lets old-gen garbage accumulate to many GB before
@@ -387,13 +396,17 @@ WantedBy=default.target
   await writeFile(servicePath, unit, 'utf8');
 
   execSync('systemctl --user daemon-reload', { stdio: 'inherit' });
-  execSync('systemctl --user enable --now imcodes', { stdio: 'inherit' });
+  execSync(`systemctl --user enable --now ${service.systemdUnitName}`, { stdio: 'inherit' });
 
   // External recovery trigger. Installed as its own timer/oneshot pair so it can
   // still act when imcodes.service itself is wedged falsely-active.
-  const recovery = installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
-  if (recovery.serviceWritten || recovery.timerWritten) {
-    console.log('Installed daemon recovery timer (imcodes-recovery.timer).');
+  if (!service.scoped) {
+    const recovery = installRecoveryUnits(renderRecoveryExecStart(process.execPath, process.argv[1]));
+    if (recovery.serviceWritten || recovery.timerWritten) {
+      console.log('Installed daemon recovery timer (imcodes-recovery.timer).');
+    }
+  } else {
+    console.log('Scoped daemon: skipped the shared recovery timer to preserve default-service isolation.');
   }
 
   const linger = enableSystemdUserLinger();

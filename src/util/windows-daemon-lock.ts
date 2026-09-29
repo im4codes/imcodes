@@ -1,4 +1,5 @@
 import { homedir, userInfo } from 'node:os';
+import { createHash } from 'node:crypto';
 import { dirname, join, resolve, win32 } from 'node:path';
 import { normalizeWindowsTaskHome, windowsHomeHash } from './windows-daemon-watchdog.mjs';
 
@@ -101,8 +102,46 @@ export function resolveImcodesHome(options: WindowsDaemonLockPathOptions = {}): 
   return resolveLockPath(join(realProfileHome, '.imcodes'));
 }
 
+/** Resolve the default state directory on POSIX and Windows alike.  Scoped
+ * launchers set IMCODES_DEFAULT_HOME to the profile/home parent, matching the
+ * Windows launcher contract; the state directory is always its `.imcodes`
+ * child. */
+export function resolveDefaultImcodesHome(env: NodeJS.ProcessEnv = process.env): string {
+  const configured = env.IMCODES_DEFAULT_HOME?.trim();
+  if (configured) {
+    const normalized = resolveLockPath(configured);
+    return normalized.endsWith(`${pathSeparator(normalized)}.imcodes`)
+      ? normalized
+      : resolveLockPath(join(normalized, '.imcodes'));
+  }
+  return resolveLockPath(join(resolveRealProfileHome(env), '.imcodes'));
+}
+
+/** True when the daemon state home is isolated from the account's default. */
+export function isScopedImcodesHome(
+  homePath = resolveImcodesHome(),
+  env: NodeJS.ProcessEnv = process.env,
+): boolean {
+  return canonicalHomeIdentity(homePath) !== canonicalHomeIdentity(resolveDefaultImcodesHome(env));
+}
+
+/** Stable short identity used for per-home POSIX service names. */
+export function imcodesHomeHash(homePath = resolveImcodesHome()): string {
+  return createHash('sha256').update(canonicalHomeIdentity(homePath), 'utf8').digest('hex').slice(0, 12);
+}
+
 function looksLikeWindowsPath(path: string): boolean {
   return /^[A-Za-z]:[\\/]/.test(path) || path.includes('\\');
+}
+
+function pathSeparator(path: string): string {
+  return looksLikeWindowsPath(path) ? '\\' : '/';
+}
+
+function canonicalHomeIdentity(path: string): string {
+  return looksLikeWindowsPath(path)
+    ? normalizeWindowsLockPath(path)
+    : resolve(path).replace(/[\\]+$/, '');
 }
 
 function resolveLockPath(path: string): string {
