@@ -2,7 +2,8 @@ import { describe, expect, it } from 'vitest';
 import { TaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { MainCheckoutGuard } from '../../../src/daemon/task-pairs/main-checkout-guard.js';
 import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
-import { scanTaskPairMarkers } from '../../../shared/task-pair.js';
+import { TASK_PAIR_TIMELINE_EVENT, scanTaskPairMarkers } from '../../../shared/task-pair.js';
+import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 describe('pair resource claims', () => {
   it('conflicts across projects, expires and releases', () => {
     const store = new TaskPairStore(':memory:');
@@ -20,9 +21,16 @@ describe('pair resource claims', () => {
     store.tryClaimResource({ project: 'claims', taskId: 't1', owner: 'e1', resource: 'machine:211', mode: 'exclusive', ttlMs: 600000, now: 100 });
     const marker = scanTaskPairMarkers('<!-- IMCODES_TASK CLAIM t2 resource="machine:211" mode=exclusive ttl=600 -->').markers[0]!;
     service.applyMarker({ project: 'claims', writer: 'brain', marker: scanTaskPairMarkers('<!-- IMCODES_TASK DISPATCH t2 executor=e2 auditor=a2 -->').markers[0]!, source: 'marker', eventId: 'dispatch-t2', now: 101 });
+    const timeline: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.payload && typeof event.payload === 'object') timeline.push(event.payload as Record<string, unknown>);
+    });
     const transition = service.applyMarker({ project: 'claims', writer: 'brain', marker, source: 'marker', eventId: 'claim-t2', now: 200 });
     expect(transition.effect).toBe('resource_conflict');
     expect(transition.resourceConflict).toMatchObject({ project: 'claims', taskId: 't1', owner: 'e1', resource: 'machine:211', expiresAt: 600100 });
+    expect(timeline.some((payload) => (payload.resourceConflict as Record<string, unknown> | undefined)?.owner === 'e1')).toBe(true);
+    expect(timeline.find((payload) => payload.effect === 'resource_conflict')?.resourceConflict).toMatchObject({ taskId: 't1', owner: 'e1', expiresAt: 600100 });
+    off();
     await service.dispose();
     setTaskPairStoreForTests(undefined);
   });

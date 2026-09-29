@@ -1180,6 +1180,7 @@ export class TaskPairService {
       ...(transition.fromStatus ? { fromStatus: transition.fromStatus } : {}),
       ...(transition.toStatus ?? pair?.status ? { toStatus: transition.toStatus ?? pair?.status } : {}),
       unusual: transition.unusual,
+      ...(transition.resourceConflict ? { resourceConflict: transition.resourceConflict } : {}),
       ...(transition.verdict ? { severityCounts: transition.verdict.counts, verdictJudgement: transition.verdict.judgement } : {}),
     }, pair, input.eventId);
   }
