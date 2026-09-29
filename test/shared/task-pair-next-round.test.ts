@@ -114,6 +114,18 @@ describe('NEXT_ROUND: opening the next delivery round after PASS', () => {
     expect(again.pair?.material?.base).toBe(HEAD1);
   });
 
+  it('Brain\'s NEXT_ROUND resolves a participant wait still set on the passed pair, but a rejected one clears nothing', () => {
+    const waiting = { ...passedPair(), flags: ['blocked' as const], flagSides: { blocked: 'executor' as const }, blockedNote: 'need creds' };
+    const opened = apply(waiting, BRAIN, '<!-- IMCODES_TASK NEXT_ROUND T1 note="go" -->').pair!;
+    expect(opened.flags).not.toContain('blocked');
+    expect(opened.flagSides.blocked).toBeUndefined();
+    expect(opened.blockedNote).toBeUndefined();
+    expect(opened.lastWaitResolution).toMatchObject({ writer: BRAIN, note: 'go' });
+    const rejected = apply(waiting, EXEC, '<!-- IMCODES_TASK NEXT_ROUND T1 -->');
+    expect(rejected.pair?.flags ?? waiting.flags).toContain('blocked');
+    expect(rejected.pair?.flagSides.blocked ?? waiting.flagSides.blocked).toBe('executor');
+  });
+
   it('a third round: each NEXT_ROUND advances the delivery round by one', () => {
     let pair = apply(passedPair(), BRAIN, '<!-- IMCODES_TASK NEXT_ROUND T1 -->').pair!;
     pair = apply(pair, EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT T1 worktree=/ws/T1 head=${HEAD2} -->`).pair!;

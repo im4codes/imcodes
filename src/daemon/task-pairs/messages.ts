@@ -145,7 +145,7 @@ export function buildParticipantRecoveryMessage(
     : `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace?.path ?? '<task-directory>'} -->`;
   return [
     header(pair),
-    `Participant recovery state (role=${role}, status=${pair.status}, round=${pair.round}).`,
+    `Participant recovery state (role=${role}, status=${pair.status}, round=${pair.round}${taskPairDeliveryRound(pair) > 1 ? `, delivery round=${taskPairDeliveryRound(pair)}` : ''}).`,
     location,
     incomplete.length > 0 ? `Unfinished checklist items: ${incomplete.join(' | ')}` : 'Unfinished checklist items: none recorded.',
     next,

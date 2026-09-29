@@ -1594,6 +1594,11 @@ export function applyTaskPairMarker(
       const commit = named ?? previousHead;
       const deliveryRound = taskPairDeliveryRound(pair) + 1;
       const note = attrs.note?.trim() || undefined;
+      // Brain's explicit lifecycle control resolves any participant wait
+      // (blocked / needs_input) still set on the passed pair, like its other
+      // controls do; only after the checks above, so a rejected marker
+      // never clears anything.
+      resolveTaskPairBrainWait(pair, ctx.now, { writer: ctx.writer, note });
       pair.deliveryRound = deliveryRound;
       pair.roundBase = commit
         ? {
