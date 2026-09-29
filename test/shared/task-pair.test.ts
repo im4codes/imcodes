@@ -4,6 +4,7 @@ import {
   TASK_PAIR_AUDITOR_PROPOSAL_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
+  TASK_PAIR_EXECUTION_DISCIPLINE_RULE,
   TASK_PAIR_INTEGRATION_RULE,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
@@ -242,6 +243,15 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('Routine progress, REWORK rounds');
     expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
     expect(body).toContain('conditional non-convergence report');
+  });
+
+  it('ships a contract with execution discipline: own workspace, state-change reporting, frozen evidence head, safe shared machines', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain(TASK_PAIR_EXECUTION_DISCIPLINE_RULE);
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('never in the project main checkout');
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('never relay another pair');
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('freeze the head');
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('only remove paths you created by exact name');
   });
 
   it('ships a contract where Brain sets direction and the pair gathers evidence, decides when clear and escalates otherwise', () => {
