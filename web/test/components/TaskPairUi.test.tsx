@@ -45,6 +45,15 @@ describe('TaskPairEventChip', () => {
     expect(chip.textContent).not.toContain('taskPair.verdict_held');
   });
 
+  it('labels a NEXT_ROUND event with its own verb and the resulting working status', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-next" payload={{
+      taskId: 'T9', title: 'Staged', writer: 'deck_proj_brain', verb: 'NEXT_ROUND', toStatus: 'working', deliveryRound: 2, unusual: false,
+    }} />);
+    const chip = container.querySelector('.task-pair-chip')!;
+    expect(chip.textContent).toContain('taskPair.verb.next_round');
+    expect(chip.textContent).toContain('taskPair.status.working');
+  });
+
   it('renders title before the muted id and opens labelled sessions', () => {
     const navigate = vi.fn();
     const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
@@ -260,6 +269,33 @@ describe('TaskPairStatusPanel', () => {
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: { tasks: [{ taskId: 'new-scope', title: 'New scope', pair: { status: 'working' } }], assignments: [], authoritative: true } }));
     expect(await waitFor(() => screen.getByText('New scope'))).toBeTruthy();
   });
+  it('shows "round N in progress" for a working pair in a later delivery round instead of a passed/plain working label', () => {
+    const at = Date.now();
+    const events = [
+      { eventId: 'nr-1', type: 'task_pair.event', ts: at - 2000, payload: { taskId: 'nr', title: 'Staged task', toStatus: 'passed', round: 1, blocking: ['P0'] } },
+      { eventId: 'nr-2', type: 'task_pair.event', ts: at - 1000, payload: { taskId: 'nr', title: 'Staged task', toStatus: 'working', round: 1, deliveryRound: 2, blocking: ['P0'] } },
+    ] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="next-round" />);
+    const row = container.querySelector('[data-status="working"]')!;
+    expect(row).toBeTruthy();
+    expect(row.textContent).toContain('taskPair.panel_round_in_progress:{"round":2}');
+    expect(row.textContent).not.toContain('taskPair.status.passed');
+    expect(row.textContent).not.toContain('taskPair.status.working');
+    expect(container.querySelector('[data-status="passed"]')).toBeNull();
+    // The audit-round chip names both numbers so the two rounds are never confused.
+    expect(row.textContent).toContain('taskPair.panel_round_of:{"delivery":2,"audit":1}');
+  });
+
+  it('keeps the ordinary first-round rendering: plain working label and the audit-round chip only', () => {
+    const events = [{ eventId: 'r1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'r1', title: 'One round', toStatus: 'working', round: 2, blocking: ['P0'] } }] as never;
+    const { container } = render(<TaskPairStatusPanel events={events} serverId="first-round" />);
+    const row = container.querySelector('[data-status="working"]')!;
+    expect(row.textContent).toContain('taskPair.status.working');
+    expect(row.textContent).toContain('taskPair.panel_round:{"round":2}');
+    expect(row.textContent).not.toContain('panel_round_in_progress');
+    expect(row.textContent).not.toContain('panel_round_of');
+  });
+
   it('defaults collapsed on mobile but expanded on desktop, with independent layout keys', () => {
     const events = [{ eventId: 'layout-default', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-default', title: 'Layout default', toStatus: 'working' } }] as never;
     const original = window.matchMedia;

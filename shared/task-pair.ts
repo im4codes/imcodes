@@ -38,6 +38,8 @@ export const TASK_PAIR_BRAIN_CONTRACT_ID = 'task_pair_brain_v1' as const;
 export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; a single-box "- [ ]" item has no audit box; number items 1..N in brief order. The executor ticks each implemented box as soon as that item is done and all delivered items before READY_FOR_AUDIT; the auditor ticks each audited box when verified and all verified items before PASS; on REWORK the auditor unticks failed items and names their numbers. Tick only work really done or verified. Use pair_task_get/update/check or the CHECK marker to update the whole brief.';
 export const TASK_PAIR_RESOURCE_CLAIM_RULE = 'Before using a shared machine, directory, port range, or named test stack, claim it with pair_resource_claim or `<!-- IMCODES_TASK CLAIM <taskId> resource=... mode=exclusive|shared ttl=... -->`; renew before the TTL expires. Claims are user-scoped, conflict-checked, persisted across daemon restarts, and released on DONE/CANCEL. Never touch an unclaimed shared resource.';
 export const TASK_PAIR_CHECK_VERB = 'CHECK' as const;
+/** Brain-only: opens the next delivery round on a passed (not yet done) pair. */
+export const TASK_PAIR_NEXT_ROUND_VERB = 'NEXT_ROUND' as const;
 export const TASK_PAIR_CHECKLIST_AUTO_TICK_VERB = 'CHECKLIST_AUTO_TICK' as const;
 export const TASK_PAIR_CHECKLIST_BOXES = ['implemented', 'audited'] as const;
 export type TaskPairChecklistBox = typeof TASK_PAIR_CHECKLIST_BOXES[number];
@@ -303,6 +305,31 @@ export const TASK_PAIR_MERGE_VERIFICATION_RULE: string =
   + 'the end-to-end tests that drive it. Batch small verified merges.';
 
 /**
+ * Multi-round deliveries (2026-09-30): a task delivered in stages (spinner,
+ * then console sync, then watchdog attribution) used to continue on an
+ * already-passed pair, where every later READY_FOR_AUDIT/PASS was recorded
+ * as unusual and the panel kept saying "passed".
+ */
+export const TASK_PAIR_NEXT_ROUND_RULE: string =
+  'Multi-round delivery: split a task into rounds when each round is a '
+  + 'separately auditable, mergeable deliverable (the first PASS can be '
+  + 'integrated before the next round starts). Only Brain opens the next '
+  + 'round, on a PASSED pair that is not yet DONE: NEXT_ROUND <taskId> '
+  + '[base=<commit>] [note="what round N delivers"]. The pair returns to '
+  + 'working with the same workspace, executor and auditor; the delivery '
+  + 'round number goes up. base defaults to the previous round\'s PASSed '
+  + 'head; name base=<commit> (typically the dev tip that already contains '
+  + 'the merged previous round) when the executor must build on something '
+  + 'else. The executor commits on top of that base, then writes '
+  + 'READY_FOR_AUDIT for the new round (a base= that differs from the round '
+  + 'base is rejected, and a head that does not descend from it is sent '
+  + 'back); the auditor\'s PASS/REWORK then applies to that round only. '
+  + 'Do not DONE a pair you still intend to continue: a DONE or CANCELled '
+  + 'pair cannot open another round (use a new taskId), and nobody but '
+  + 'Brain may write NEXT_ROUND. Update the brief (pair_task_update) with '
+  + 'the new round\'s items before or with NEXT_ROUND.';
+
+/**
  * From the 2-hourly stall review: most READYs bounced within minutes for
  * missing evidence, and pairs stopped to ask Brain about harness problems
  * they could fix themselves.
@@ -448,7 +475,7 @@ export const TASK_PAIR_INFER_TASK_ID = '-' as const;
 
 export const TASK_PAIR_VERBS = [
   'DISPATCH', 'QUEUE', 'STARTED', 'WORKING', 'READY_FOR_AUDIT', 'PASS', 'REWORK',
-  'DONE', 'BLOCKED', 'NEEDS_INPUT', 'REASSIGN', 'CANCEL', 'CLAIM', TASK_PAIR_CHECK_VERB,
+  'DONE', 'BLOCKED', 'NEEDS_INPUT', 'REASSIGN', 'CANCEL', 'CLAIM', TASK_PAIR_CHECK_VERB, TASK_PAIR_NEXT_ROUND_VERB,
 ] as const;
 export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 
@@ -488,6 +515,18 @@ export const TASK_PAIR_BRAIN_REMINDER_SECOND_MS = 10 * 60_000;
 export const TASK_PAIR_BRAIN_REMINDER_REPEAT_MS = 15 * 60_000;
 /** Hard minimum between any two aggregate Brain heartbeat/reminder messages. */
 export const TASK_PAIR_BRAIN_MIN_GAP_MS = 10 * 60_000;
+
+/** Base commit of a delivery round after NEXT_ROUND. */
+export interface TaskPairRoundBase {
+  commit: string;
+  /** `passed_head`: the previous round's PASSed head; `brain`: a commit Brain named (typically the dev tip that contains the merged previous round). */
+  source: 'passed_head' | 'brain';
+  deliveryRound: number;
+  /** The previous round's PASSed head when known, kept even when Brain names another base. */
+  previousHead?: string;
+  note?: string;
+  at: number;
+}
 
 export const TASK_PAIR_ROLES = ['brain', 'executor', 'auditor', 'other', 'daemon'] as const;
 export type TaskPairRole = typeof TASK_PAIR_ROLES[number];
@@ -719,6 +758,15 @@ export interface TaskPairState {
   round: number;
   /** Round in which a consistent PASS was recorded, if any. */
   passRound?: number;
+  /**
+   * Delivery round (1-based; missing means 1): one deliverable cycle of the
+   * same pair, advanced only by Brain's NEXT_ROUND on a passed pair. Distinct
+   * from `round`, which counts audit submissions and keeps its own caps and
+   * convergence cadence across delivery rounds.
+   */
+  deliveryRound?: number;
+  /** What this delivery round builds on; READY_FOR_AUDIT material is checked against it. */
+  roundBase?: TaskPairRoundBase;
   blocking: AuditSeverity[];
   /**
    * Where `blocking` came from: `explicit` when a human/marker named it
@@ -848,6 +896,19 @@ export interface TaskPairOutput {
 /** READY_FOR_AUDIT attributes that name the audit material. */
 export const TASK_PAIR_MATERIAL_ATTRS = ['worktree', 'head', 'base', 'path', 'intentionalNote'] as const;
 
+/** Two commit ids name the same commit when one is a (>=7 hex) prefix of the other. */
+export function sameTaskPairCommit(a: string, b: string): boolean {
+  const left = a.trim().toLowerCase();
+  const right = b.trim().toLowerCase();
+  if (!/^[0-9a-f]{7,64}$/.test(left) || !/^[0-9a-f]{7,64}$/.test(right)) return left === right;
+  return left.startsWith(right) || right.startsWith(left);
+}
+
+/** Delivery round of a pair (1 until Brain opens another with NEXT_ROUND). */
+export function taskPairDeliveryRound(pair: Pick<TaskPairState, 'deliveryRound'>): number {
+  return pair.deliveryRound && pair.deliveryRound > 1 ? pair.deliveryRound : 1;
+}
+
 function materialFromAttrs(attrs: Record<string, string>, now: number): TaskPairMaterial | undefined {
   const material: TaskPairMaterial = { at: now };
   for (const key of TASK_PAIR_MATERIAL_ATTRS) if (attrs[key]) material[key] = attrs[key];
@@ -872,6 +933,8 @@ export type TaskPairIntent =
   | { kind: 'rework_notice'; to: string; counts: TaskPairSeverityCounts }
   /** Brain explicitly invalidated a prior PASS and reopened this pair. */
   | { kind: 'brain_reopen_notice'; reason?: string }
+  /** Brain opened the next delivery round on a passed pair. */
+  | { kind: 'next_round_notice'; note?: string }
   | { kind: 'auditor_proposal_nudge'; to: string }
   | { kind: 'convergence_checkpoint_nudge'; to: string }
   /** An audit round opened: tell the auditor where the material is. */
@@ -1049,6 +1112,7 @@ function clonePair(pair: TaskPairState): TaskPairState {
     material: pair.material ? { ...pair.material } : undefined,
     workspace: pair.workspace ? { ...pair.workspace } : undefined,
     output: pair.output ? { ...pair.output } : undefined,
+    roundBase: pair.roundBase ? { ...pair.roundBase } : undefined,
   };
 }
 
@@ -1456,9 +1520,18 @@ export function applyTaskPairMarker(
     case 'READY_FOR_AUDIT': {
       if (!hasAudit(pair)) return recorded(existing);
       const material = materialFromAttrs(attrs, ctx.now);
-      if (material) pair.material = material;
+      // A delivery round opened by NEXT_ROUND is built on roundBase: the
+      // material's base must be that commit (omit base= and the daemon fills
+      // it in). Checked before any material/round mutation, like the other
+      // rejections. Whether head actually descends from it needs git and is
+      // verified by the daemon when it relays the audit request.
+      const roundBase = pair.roundBase?.commit;
+      if (roundBase && material?.base && !sameTaskPairCommit(material.base, roundBase)) {
+        return reject(`Delivery round ${taskPairDeliveryRound(pair)} of ${marker.taskId} is based on ${roundBase}; READY_FOR_AUDIT base=${material.base} does not match. Omit base= or name ${roundBase}, rebase your work onto it, commit, and resend.`);
+      }
+      if (material) pair.material = roundBase && !material.base ? { ...material, base: roundBase } : material;
       else if (pair.workspace?.path) {
-        pair.material = { path: pair.workspace.path, ...(pair.workspace.lastHead ? { head: pair.workspace.lastHead } : {}), at: ctx.now };
+        pair.material = { path: pair.workspace.path, ...(pair.workspace.lastHead ? { head: pair.workspace.lastHead } : {}), ...(roundBase ? { base: roundBase } : {}), at: ctx.now };
       }
       if (pair.status === 'in_audit') {
         // A resubmission inside the round with new material is relayed again.
@@ -1502,6 +1575,42 @@ export function applyTaskPairMarker(
       applyVerdict(pair, verb, verdict, ctx.writer, intents, ctx);
       if (role === 'brain') resetCapFlagsOnBrainAction(pair);
       return done(isAppliedVerdict(verdict.judgement) ? 'verdict' : 'verdict_held', { verdict });
+    }
+    case 'NEXT_ROUND': {
+      if (!brainAuthority) {
+        return reject(`Only Brain may open the next round of ${marker.taskId}; your marker was recorded but not applied.`);
+      }
+      if (terminal) {
+        return reject(`Task ${marker.taskId} is ${pair.status}; a closed pair cannot start another round. Use a new taskId.`);
+      }
+      if (pair.status !== 'passed') {
+        return reject(`NEXT_ROUND applies only to a passed pair (${marker.taskId} is ${pair.status}); the current round is still open.`);
+      }
+      const named = attrs.base?.trim();
+      if (named && !/^[0-9a-f]{7,64}$/i.test(named)) {
+        return reject(`NEXT_ROUND base= must be a commit id (7-64 hex characters), got "${named}".`);
+      }
+      const previousHead = pair.material?.head ?? pair.workspace?.lastHead;
+      const commit = named ?? previousHead;
+      const deliveryRound = taskPairDeliveryRound(pair) + 1;
+      const note = attrs.note?.trim() || undefined;
+      pair.deliveryRound = deliveryRound;
+      pair.roundBase = commit
+        ? {
+            commit, source: named ? 'brain' : 'passed_head', deliveryRound, at: ctx.now,
+            ...(previousHead ? { previousHead } : {}), ...(note ? { note } : {}),
+          }
+        : undefined;
+      pair.status = 'working';
+      // The previous round's verdict and material do not carry over: the new
+      // round needs its own READY_FOR_AUDIT and PASS.
+      pair.material = undefined;
+      pair.passRound = undefined;
+      pair.lastVerdict = undefined;
+      resetCaps(pair);
+      removeFlag(pair, 'executor_silent');
+      intents.push({ kind: 'next_round_notice', ...(note ? { note } : {}) });
+      return done('next_round');
     }
     case 'DONE': {
       const force = role === 'brain' && isTrue(attrs.force);
@@ -1717,6 +1826,8 @@ export interface TaskPairEventPayload {
   queuePosition?: number;
   urgent?: boolean;
   round?: number;
+  /** Delivery round, present only from the second one (NEXT_ROUND) on. */
+  deliveryRound?: number;
   flags?: TaskPairFlag[];
   blocking?: AuditSeverity[];
   severityCounts?: TaskPairSeverityCounts;
@@ -1742,9 +1853,10 @@ export function buildTaskPairMarkerContract(): string {
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
-    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CLAIM, CHECK. CLAIM <taskId> resource=... mode=exclusive|shared ttl=... [renew=true] claims a shared external resource. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited, Brain either. taskId "-" means your single open task.',
+    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CLAIM, CHECK, NEXT_ROUND. CLAIM <taskId> resource=... mode=exclusive|shared ttl=... [renew=true] claims a shared external resource. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited, Brain either. taskId "-" means your single open task.',
     'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. In a git workspace, commit locally before READY and name that commit as head= so the audit reads a fixed revision; REWORK fixes are new local commits. Only after the assigned auditor applies PASS in a material-backed audit round may the executor report the worktree path and HEAD to Brain (never push any branch) and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with DONE (accept) or CANCEL; further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
     TASK_PAIR_INTEGRATION_RULE,
+    TASK_PAIR_NEXT_ROUND_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
     `Auditor: the material is the executor's workspace (a worktree at the named head, or the named task-directory path; read it directly) plus their reported validation; judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}. Reply to the executor with every finding tagged [P0]..[P4]. ${TASK_PAIR_AUDITOR_PROPOSAL_RULE} Then write PASS or REWORK with the blocking set and a count per level, e.g. REWORK <taskId> blocking=P0 p0=1 p1=2. REWORK needs at least one finding at a blocking level; PASS has none. If a genuinely undecidable scope, approach, ownership, unreachable target, or environment issue remains, escalate to Brain with options and a recommendation instead of looping. PASS/REWORK applies only while status is in_audit and material is present; otherwise it is recorded as unusual and cannot advance the pair. After a real PASS, only the executor may DONE. CANCEL and role-changing verbs are Brain/daemon-only; invalid participant markers are recorded as unusual with a bounded notice. Re-audits check only the prior blocking classes plus regressions. If the material cannot be reached (executor limited/offline, workspace unreadable), write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK.`,

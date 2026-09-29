@@ -4383,6 +4383,7 @@
       "needs_input": "入力が必要",
       "reassign": "再割り当て",
       "cancel": "キャンセル",
+      "next_round": "次のラウンドを開始",
       "send": "資料送付",
       "import": "インポート",
       "other": "記録"
@@ -4448,6 +4449,8 @@
     "panel_duration_separator": "",
     "panel_elapsed": "経過 {{duration}}",
     "panel_round": "第{{round}}ラウンド",
+    "panel_round_in_progress": "第{{round}}ラウンド進行中",
+    "panel_round_of": "第{{delivery}}ラウンド · 監査{{audit}}",
     "panel_group_working": "実行中",
     "panel_group_audit": "監査中",
     "panel_group_rework": "修正",

@@ -15,7 +15,7 @@
  */
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import type { TaskPairState } from '../../../shared/task-pair.js';
+import { sameTaskPairCommit, type TaskPairState } from '../../../shared/task-pair.js';
 
 const GIT_HEAD_TIMEOUT_MS = 5_000;
 
@@ -35,6 +35,8 @@ export interface ResolvedTaskPairMaterial {
 
 export interface TaskPairMaterialDeps {
   gitHead?: (worktree: string) => Promise<string | undefined>;
+  /** True when `ancestor` is reachable from `descendant`, false when it is not, undefined when git cannot tell (unknown commit, no repo, timeout). */
+  gitIsAncestor?: (worktree: string, ancestor: string, descendant: string) => Promise<boolean | undefined>;
 }
 
 function defaultGitHead(worktree: string): Promise<string | undefined> {
@@ -44,6 +46,18 @@ function defaultGitHead(worktree: string): Promise<string | undefined> {
     execFile('git', ['-C', worktree, 'rev-parse', 'HEAD'], { timeout: GIT_HEAD_TIMEOUT_MS, windowsHide: true }, (error, stdout) => {
       const head = String(stdout ?? '').trim();
       resolve(!error && /^[0-9a-f]{7,64}$/i.test(head) ? head : undefined);
+    });
+  });
+}
+
+function defaultGitIsAncestor(worktree: string, ancestor: string, descendant: string): Promise<boolean | undefined> {
+  if (!existsSync(worktree)) return Promise.resolve(undefined);
+  return new Promise((resolve) => {
+    execFile('git', ['-C', worktree, 'merge-base', '--is-ancestor', ancestor, descendant], { timeout: GIT_HEAD_TIMEOUT_MS, windowsHide: true }, (error) => {
+      if (!error) return resolve(true);
+      // Exit 1 is git's definite "not an ancestor"; anything else (128 for an
+      // unknown object, a timeout, a missing git) is "cannot tell".
+      resolve((error as unknown as { code?: number | string }).code === 1 ? false : undefined);
     });
   });
 }
@@ -73,4 +87,34 @@ export async function resolveTaskPairMaterial(pair: TaskPairState, deps: TaskPai
     ...(named?.intentionalNote ? { intentionalNote: named.intentionalNote } : {}),
     source: named?.worktree || named?.head ? 'executor' : workspace ? 'workspace' : 'pending',
   };
+}
+
+export type TaskPairRoundBaseCheck =
+  | { status: 'none' }
+  | { status: 'ok'; base: string; head: string }
+  /** head is the round base itself: no new commit was made in this round. */
+  | { status: 'same_as_base'; base: string; head: string }
+  | { status: 'not_ancestor'; base: string; head: string }
+  | { status: 'unverifiable'; base: string; head?: string };
+
+/**
+ * A delivery round opened by NEXT_ROUND is built on `pair.roundBase`: the
+ * material's head must descend from it. The state machine already checked the
+ * named base= text; only git can check ancestry. Only a definite "not an
+ * ancestor" blocks the audit request -- an unknown commit (for example a base
+ * that exists on the daemon's dev checkout but not yet in this worktree) is
+ * reported to the auditor as unverified instead of stalling the pair.
+ */
+export async function verifyTaskPairRoundBase(
+  pair: TaskPairState,
+  material: ResolvedTaskPairMaterial,
+  deps: TaskPairMaterialDeps = testDeps ?? {},
+): Promise<TaskPairRoundBaseCheck> {
+  const base = pair.roundBase?.commit;
+  if (!base) return { status: 'none' };
+  if (!material.worktree || !material.head) return { status: 'unverifiable', base, ...(material.head ? { head: material.head } : {}) };
+  if (sameTaskPairCommit(material.head, base)) return { status: 'same_as_base', base, head: material.head };
+  const descends = await (deps.gitIsAncestor ?? defaultGitIsAncestor)(material.worktree, base, material.head);
+  if (descends === undefined) return { status: 'unverifiable', base, head: material.head };
+  return descends ? { status: 'ok', base, head: material.head } : { status: 'not_ancestor', base, head: material.head };
 }

@@ -281,6 +281,70 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     expect(getTaskPairStore().isParticipantOfOpenPair(AUD)).toBe(false);
   });
 
+  it('delivers in rounds: PASS, Brain NEXT_ROUND x2, each round audited and PASSed by markers, then DONE (only the two deliberate negative markers are unusual)', async () => {
+    const dispatchMessage = vi.fn().mockResolvedValue('queued');
+    const created = await dispatchSendMessage(caller(BRAIN), {
+      target: EXEC,
+      message: 'Deliver the staged change: spinner, console sync, watchdog.',
+      idempotencyKey: 'pairs-e2e-rounds',
+      task: { objective: 'Deliver the staged change' },
+    }, { listSessions: () => live.sessions as unknown as SessionRecord[], dispatchMessage });
+    if (created.status !== 'accepted' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
+    const taskId = created.taskId;
+    await settle();
+
+    const HEAD1 = '1'.repeat(40);
+    const HEAD2 = '2'.repeat(40);
+    const HEAD3 = '3'.repeat(40);
+    const DEV_TIP = '9'.repeat(40);
+
+    // Round 1 ends in PASS, and Brain merges it (the pair stays passed, not done).
+    await say(EXEC, `Spinner done.\n<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/workspace head=${HEAD1} -->`);
+    await say(AUD, `<!-- IMCODES_TASK PASS ${taskId} blocking=P0 p0=0 -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'passed', round: 1 });
+
+    // Baseline: without NEXT_ROUND a further READY is only recorded as unusual.
+    await say(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/workspace head=${HEAD2} -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'passed', round: 1 });
+    expect(getTaskPairStore().listEvents(PROJECT, taskId).some((event) => event.verb === 'READY_FOR_AUDIT' && event.unusual)).toBe(true);
+
+    // Round 2: Brain opens it on the merged dev tip.
+    await say(BRAIN, `Round 1 is in dev.\n<!-- IMCODES_TASK NEXT_ROUND ${taskId} base=${DEV_TIP} note="console sync" -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'working', deliveryRound: 2, executor: EXEC, auditor: AUD });
+    expect(getTaskPairStore().isParticipantOfOpenPair(EXEC)).toBe(true);
+    await say(EXEC, `Console sync done.\n<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/workspace head=${HEAD2} -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'in_audit', round: 2, deliveryRound: 2 });
+    expect(pairOf(taskId)?.material).toMatchObject({ head: HEAD2, base: DEV_TIP });
+    await say(AUD, `<!-- IMCODES_TASK PASS ${taskId} blocking=P0 p0=0 -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'passed', round: 2, deliveryRound: 2 });
+
+    // Round 3 (default base: round 2's PASSed head), with a REWORK inside it.
+    await say(BRAIN, `<!-- IMCODES_TASK NEXT_ROUND ${taskId} note="watchdog" -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'working', deliveryRound: 3 });
+    expect(pairOf(taskId)?.roundBase).toMatchObject({ commit: HEAD2, source: 'passed_head' });
+    await say(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/workspace head=${HEAD3} -->`);
+    await say(AUD, `[P0] missing attribution.\n<!-- IMCODES_TASK REWORK ${taskId} blocking=P0 p0=1 -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'rework', deliveryRound: 3 });
+    await say(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/workspace head=${'4'.repeat(40)} -->`);
+    await say(AUD, `<!-- IMCODES_TASK PASS ${taskId} blocking=P0 p0=0 -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'passed', deliveryRound: 3 });
+
+    // The panel event stream carries the delivery round from the second round on.
+    const rounds = pairEvents
+      .filter((event) => event.session === BRAIN && event.payload.taskId === taskId && event.payload.toStatus === 'working' && event.payload.verb === 'NEXT_ROUND')
+      .map((event) => event.payload.deliveryRound);
+    expect(rounds).toEqual([2, 3]);
+
+    await say(EXEC, `Committed locally.\n<!-- IMCODES_TASK DONE ${taskId} -->`);
+    expect(pairOf(taskId)?.status).toBe('done');
+    // A DONE pair cannot start another round.
+    await say(BRAIN, `<!-- IMCODES_TASK NEXT_ROUND ${taskId} -->`);
+    expect(pairOf(taskId)).toMatchObject({ status: 'done', deliveryRound: 3 });
+    // No unusual event other than the deliberate baseline READY and the closed-pair NEXT_ROUND.
+    const unusual = getTaskPairStore().listEvents(PROJECT, taskId).filter((event) => event.unusual).map((event) => `${event.verb}:${event.fromStatus}`);
+    expect([...unusual].sort()).toEqual(['NEXT_ROUND:done', 'READY_FOR_AUDIT:passed']);
+  });
+
   it('holds a REWORK that carries no blocking finding and asks the auditor to correct it', async () => {
     const dispatchMessage = vi.fn().mockResolvedValue('queued');
     const created = await dispatchSendMessage(caller(BRAIN), {

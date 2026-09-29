@@ -4384,6 +4384,7 @@
       "needs_input": "necesita datos",
       "reassign": "reasignada",
       "cancel": "cancelada",
+      "next_round": "siguiente ronda abierta",
       "send": "materiales enviados",
       "import": "importada",
       "other": "registrada"
@@ -4449,6 +4450,8 @@
     "panel_duration_separator": " ",
     "panel_elapsed": "Transcurrido {{duration}}",
     "panel_round": "Ronda {{round}}",
+    "panel_round_in_progress": "Ronda {{round}} en curso",
+    "panel_round_of": "Ronda {{delivery}} · auditoría {{audit}}",
     "panel_group_working": "En ejecución",
     "panel_group_audit": "En auditoría",
     "panel_group_rework": "Rehacer",

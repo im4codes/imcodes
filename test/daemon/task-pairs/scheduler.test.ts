@@ -1214,6 +1214,79 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(1);
   });
 
+  describe('NEXT_ROUND: what changes for the logic that depends on the passed state', () => {
+    async function passRoundOne(taskId: string) {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/ws/${taskId} head=${'1'.repeat(40)} -->`);
+      await flush();
+      marker(AUD, `<!-- IMCODES_TASK PASS ${taskId} blocking=P0 -->`);
+      await flush();
+      expect(pair(taskId).status).toBe('passed');
+    }
+
+    it('Brain heartbeat: a passed pair is an actionable Brain wait, a working round is not', async () => {
+      await passRoundOne('NR1');
+      automation.publishBadges();
+      expect(getSupervisionHeartbeatProjection(BRAIN)).toMatchObject({ state: 'armed', kind: 'pair' });
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR1 -->');
+      await flush();
+      expect(pair('NR1').status).toBe('working');
+      automation.publishBadges();
+      expect(getSupervisionHeartbeatProjection(BRAIN)?.state ?? 'off').toBe('off');
+      // No "audit passed; commit and DONE" reminder reaches Brain for the new round.
+      now += 30 * 60_000;
+      automation.publishBadges();
+      await flush();
+      expect(sentTo(BRAIN, 'brain-heartbeat')).toHaveLength(0);
+    });
+
+    it('participant heartbeat: the new round is nudged as ordinary work, not with the passed "commit and DONE" text', async () => {
+      await passRoundOne('NR2');
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR2 -->');
+      await flush();
+      sent = [];
+      await tick(2);
+      const nudges = sentTo(EXEC, 'nudge-executor');
+      expect(nudges.length).toBeGreaterThan(0);
+      expect(nudges[0]!.text).toContain('Continue the task');
+      expect(nudges[0]!.text).not.toContain('PASS received');
+    });
+
+    it('concurrency slot: the pair holds its slot through passed -> next round -> DONE, and the queue only drains when it ends', async () => {
+      candidates = [SPARE, SPARE2];
+      marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
+      await passRoundOne('NR3');
+      marker(BRAIN, '<!-- IMCODES_TASK QUEUE NRQ title="Waiting" -->\nbrief\n<!-- IMCODES_TASK_END NRQ -->');
+      await flush();
+      await tick(1);
+      expect(pair('NRQ').status).toBe('queued');
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR3 -->');
+      await flush();
+      await tick(1);
+      expect(pair('NR3').status).toBe('working');
+      expect(pair('NRQ').status).toBe('queued');
+      marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT NR3 worktree=/ws/NR3 head=${'2'.repeat(40)} -->`);
+      await flush();
+      marker(AUD, '<!-- IMCODES_TASK PASS NR3 blocking=P0 -->');
+      await flush();
+      expect(pair('NR3').status).toBe('passed');
+      marker(EXEC, '<!-- IMCODES_TASK DONE NR3 -->');
+      await flush();
+      expect(pair('NR3').status).toBe('done');
+      await tick(1);
+      expect(pair('NRQ').status).not.toBe('queued');
+    });
+
+    it('the next round stays the same single pair with the same participants (no duplicate pair)', async () => {
+      await passRoundOne('NR4');
+      marker(BRAIN, '<!-- IMCODES_TASK NEXT_ROUND NR4 -->');
+      await flush();
+      expect(getTaskPairStore().listActivePairs(PROJECT).filter((entry) => entry.state.taskId === 'NR4')).toHaveLength(1);
+      expect(pair('NR4')).toMatchObject({ deliveryRound: 2, executor: EXEC, auditor: AUD });
+    });
+  });
+
   it('clears the Brain projection when the last open pair ends', () => {
     getTaskPairStore().savePair(PROJECT, {
       taskId: 'brain-clear', brain: BRAIN, status: 'passed', flags: [], flagSides: {}, round: 1,

@@ -22,12 +22,13 @@ import {
   TASK_PAIR_WORKS_DIR,
   TASK_PAIR_WORKSPACE_RULES,
   formatTaskPairSeverityCounts,
+  taskPairDeliveryRound,
   type TaskPairFlag,
   type TaskPairSeverityCounts,
   type TaskPairState,
   type TaskPairVerdictJudgement,
 } from '../../../shared/task-pair.js';
-import type { ResolvedTaskPairMaterial } from './material.js';
+import type { ResolvedTaskPairMaterial, TaskPairRoundBaseCheck } from './material.js';
 import { parseTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 
 /**
@@ -171,6 +172,50 @@ export function buildBrainReopenNoticeMessage(pair: TaskPairState, reason?: stri
     ...(reason ? [`Reason: ${reason}`] : []),
     `Executor: ${pair.executor ?? '-'}, auditor: ${pair.auditor ?? '-'}. A fresh READY_FOR_AUDIT with a new head is required before the next PASS.`,
     contracts(pair.blocking),
+  ].join('\n');
+}
+
+/** What Brain's NEXT_ROUND tells both participants: same pair, new delivery round, what it builds on. */
+export function buildNextRoundNoticeMessage(pair: TaskPairState, note?: string): string {
+  const round = taskPairDeliveryRound(pair);
+  const base = pair.roundBase;
+  return [
+    header(pair),
+    `Brain opened delivery round ${round} of this pair after the previous round's PASS. The pair is ${pair.status} again with the same workspace, executor ${pair.executor ?? '-'} and auditor ${pair.auditor ?? '-'}.`,
+    ...(note ? [`Round ${round}: ${note}`] : []),
+    base
+      ? `Base for round ${round}: ${base.commit} (${base.source === 'brain' ? 'named by Brain' : "the previous round's PASSed head"}). Build on top of that commit; if it is not in your worktree yet, fetch it first.`
+      : `No base commit is recorded for round ${round}; continue in the pair workspace.`,
+    `Executor: do the round's work, commit locally, send your validation to the auditor, then write ${readyMarker(pair)} (a base= other than the round base is rejected; omit it and the daemon fills it in). Do not write DONE for the previous round's head.`,
+    `Auditor: wait for the executor's READY_FOR_AUDIT for round ${round}; PASS/REWORK applies to that round's material only.`,
+    contracts(pair.blocking),
+  ].join('\n');
+}
+
+/** The auditor-facing line about the round base, or undefined for an ordinary first round. */
+export function buildRoundBaseAuditLine(pair: TaskPairState, check: TaskPairRoundBaseCheck): string | undefined {
+  if (check.status === 'none') return undefined;
+  const round = taskPairDeliveryRound(pair);
+  switch (check.status) {
+    case 'ok': return `Delivery round ${round}: head ${check.head} descends from the round base ${check.base} (verified by the daemon).`;
+    case 'same_as_base': return `Delivery round ${round}: head ${check.head} IS the round base ${check.base}: the executor made no new commit in this round. Judge whether that is intended.`;
+    case 'unverifiable': return `Delivery round ${round}: the round base ${check.base} could not be verified against the head${check.head ? ` ${check.head}` : ''} (commit not present in the worktree, or no git). Check the ancestry yourself.`;
+    default: return undefined;
+  }
+}
+
+export function buildRoundBaseMismatchExecutorMessage(pair: TaskPairState, head: string, base: string): string {
+  return [
+    header(pair),
+    `READY_FOR_AUDIT for delivery round ${taskPairDeliveryRound(pair)} was not relayed: head ${head} does not descend from the round base ${base}.`,
+    `Rebase or merge your work onto ${base} (or ask Brain for NEXT_ROUND base=<commit> if the base is wrong), commit, and resend ${readyMarker(pair)} with the new head.`,
+  ].join('\n');
+}
+
+export function buildRoundBaseMismatchAuditorMessage(pair: TaskPairState, head: string, base: string): string {
+  return [
+    header(pair),
+    `Delivery round ${taskPairDeliveryRound(pair)} material is not ready: head ${head} does not descend from the round base ${base}. The executor was asked to rebase and resend; wait for the resent audit request.`,
   ].join('\n');
 }
 

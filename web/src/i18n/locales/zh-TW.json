@@ -4384,6 +4384,7 @@
       "needs_input": "需要輸入",
       "reassign": "已改派",
       "cancel": "已取消",
+      "next_round": "開啟下一輪",
       "send": "已傳送資料",
       "import": "已匯入",
       "other": "已記錄"
@@ -4449,6 +4450,8 @@
     "panel_duration_separator": "",
     "panel_elapsed": "已執行 {{duration}}",
     "panel_round": "第{{round}}輪",
+    "panel_round_in_progress": "第{{round}}輪進行中",
+    "panel_round_of": "第{{delivery}}輪 · 審計{{audit}}",
     "panel_group_working": "執行中",
     "panel_group_audit": "審計中",
     "panel_group_rework": "返工",

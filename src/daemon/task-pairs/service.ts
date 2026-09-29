@@ -46,7 +46,7 @@ import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared
 import { getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
-import { resolveTaskPairMaterial } from './material.js';
+import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
 import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
@@ -70,6 +70,10 @@ import {
   buildUntitledTaskTitleRequest,
   buildAuditorProposalNudgeMessage,
   buildConvergenceCheckpointMessage,
+  buildNextRoundNoticeMessage,
+  buildRoundBaseAuditLine,
+  buildRoundBaseMismatchAuditorMessage,
+  buildRoundBaseMismatchExecutorMessage,
 } from './messages.js';
 
 /** Intents that need the pool, the heartbeat or the queue (see scheduler.ts). */
@@ -1229,6 +1233,20 @@ export class TaskPairService {
       next.brainReminderLastAt = undefined;
     }
     next.bothIdleNudgedAt = undefined;
+    // A new delivery round starts both sides with a clean slate: the pair
+    // sat idle in `passed`, and neither that nor the previous round's silence
+    // may count against the new round.
+    if (transition.effect === 'next_round') {
+      next.silenceExecutor = 0;
+      next.silenceAuditor = 0;
+      next.progressExecutorAt = now;
+      next.progressAuditorAt = now;
+      next.activityExecutorAt = now;
+      next.activityAuditorAt = now;
+      next.executorEscalationAt = undefined;
+      next.executorEscalationReminderCount = 0;
+      next.executorEscalationLastAt = undefined;
+    }
     // A new auditor starts with a clean slate.
     if (transition.effect === 'reassigned_auditor') {
       next.silenceAuditor = 0;
@@ -1307,6 +1325,14 @@ export class TaskPairService {
             )));
             break;
           }
+          case 'next_round_notice': {
+            const recipients = [pair.executor, pair.auditor]
+              .filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR);
+            await Promise.all([...new Set(recipients)].map((target) => sendTaskPairMessage(
+              target, pair.taskId, 'next-round', buildNextRoundNoticeMessage(pair, intent.note),
+            )));
+            break;
+          }
           case 'auditor_proposal_nudge':
             await sendTaskPairMessage(intent.to, pair.taskId, 'auditor-proposal-nudge', buildAuditorProposalNudgeMessage(pair));
             break;
@@ -1322,8 +1348,16 @@ export class TaskPairService {
               if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'material-pending', `Material is pending for ${pair.taskId}; resend READY_FOR_AUDIT with worktree=<absolute path> head=<commit> (or path=<task directory>).`);
               await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', `Material pending for ${pair.taskId}; the executor must resend READY_FOR_AUDIT with an explicit workspace path and head.`);
             } else {
-              await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material));
-              queueAuditRebaseWarning(project, pair, material);
+              const roundBase = await verifyTaskPairRoundBase(pair, material);
+              if (roundBase.status === 'not_ancestor') {
+                // The state machine cannot run git; a head that does not build
+                // on this round's base is sent back instead of audited.
+                if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'material-base-mismatch', buildRoundBaseMismatchExecutorMessage(pair, roundBase.head, roundBase.base));
+                await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildRoundBaseMismatchAuditorMessage(pair, roundBase.head, roundBase.base));
+              } else {
+                await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material, buildRoundBaseAuditLine(pair, roundBase)));
+                queueAuditRebaseWarning(project, pair, material);
+              }
             }
             break;
           }
@@ -1696,7 +1730,7 @@ export class TaskPairService {
  * participant (executor, auditor, Brain), with the pair's current roles.
  */
 export function emitTaskPairTimelineEvent(
-  base: Omit<TaskPairEventPayload, 'title' | 'executor' | 'auditor' | 'round' | 'flags' | 'blocking' | 'executorPool' | 'auditorPool'>,
+  base: Omit<TaskPairEventPayload, 'title' | 'executor' | 'auditor' | 'round' | 'deliveryRound' | 'flags' | 'blocking' | 'executorPool' | 'auditorPool'>,
   pair: TaskPairState | undefined,
   eventId: string,
 ): void {
@@ -1707,6 +1741,7 @@ export function emitTaskPairTimelineEvent(
       ...(pair.executor ? { executor: pair.executor } : {}),
       ...(pair.auditor ? { auditor: pair.auditor } : {}),
       round: pair.round,
+      ...(pair.deliveryRound && pair.deliveryRound > 1 ? { deliveryRound: pair.deliveryRound } : {}),
       flags: pair.flags,
       blocking: pair.blocking,
       ...(pair.executorPool ? { executorPool: pair.executorPool } : {}),

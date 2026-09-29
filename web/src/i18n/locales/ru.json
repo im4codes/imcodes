@@ -4383,6 +4383,7 @@
       "needs_input": "нужен ввод",
       "reassign": "переназначена",
       "cancel": "отменена",
+      "next_round": "открыт следующий раунд",
       "send": "материалы отправлены",
       "import": "импортирована",
       "other": "записано"
@@ -4448,6 +4449,8 @@
     "panel_duration_separator": " ",
     "panel_elapsed": "Прошло {{duration}}",
     "panel_round": "Раунд {{round}}",
+    "panel_round_in_progress": "Раунд {{round}} выполняется",
+    "panel_round_of": "Раунд {{delivery}} · аудит {{audit}}",
     "panel_group_working": "В работе",
     "panel_group_audit": "Аудит",
     "panel_group_rework": "Доработка",

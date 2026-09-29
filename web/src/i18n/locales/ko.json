@@ -4383,6 +4383,7 @@
       "needs_input": "입력 필요",
       "reassign": "재배정",
       "cancel": "취소",
+      "next_round": "다음 라운드 시작",
       "send": "자료 전송",
       "import": "가져옴",
       "other": "기록됨"
@@ -4448,6 +4449,8 @@
     "panel_duration_separator": "",
     "panel_elapsed": "경과 {{duration}}",
     "panel_round": "{{round}}라운드",
+    "panel_round_in_progress": "{{round}}라운드 진행 중",
+    "panel_round_of": "{{delivery}}라운드 · 감사 {{audit}}",
     "panel_group_working": "실행 중",
     "panel_group_audit": "감사 중",
     "panel_group_rework": "재작업",
