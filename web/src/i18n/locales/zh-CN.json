@@ -572,7 +572,8 @@
     "execution_clone_launch_failed": "执行克隆启动失败：{{error}}",
     "execution_clone_launch_unknown_error": "未知错误",
     "execution_clone_launch_timeout": "执行克隆启动超时",
-    "execution_clone_launch_offline": "连接已断开，执行克隆未发送"
+    "execution_clone_launch_offline": "连接已断开，执行克隆未发送",
+    "messageQueuedLabel": "已排队"
   },
   "session": {
     "restart": "↺ 重启",

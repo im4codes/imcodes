@@ -1391,7 +1391,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
   });
 
-  it('uses HTTP-backfilled command.ack to mark daemon receipt while keeping the optimistic send pending', async () => {
+  it('uses HTTP-backfilled command.ack to mark daemon receipt and end the optimistic send spinner', async () => {
     const sessionName = `deck_http_backfill_ack_${Date.now()}`;
     const serverId = `srv-http-ack-${Date.now()}`;
 
@@ -1443,7 +1443,7 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     });
 
     await waitFor(() => {
-      expect(screen.getByTestId('probe').textContent).toContain('pending:true');
+      expect(screen.getByTestId('probe').textContent).toContain('pending:false');
       expect(screen.getByTestId('probe').textContent).toContain('acked:true');
     });
   });

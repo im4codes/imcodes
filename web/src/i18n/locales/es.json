@@ -572,7 +572,8 @@
     "execution_clone_launch_failed": "Error al iniciar los clones de ejecución: {{error}}",
     "execution_clone_launch_unknown_error": "Error desconocido",
     "execution_clone_launch_timeout": "Se agotó el tiempo para iniciar los clones de ejecución",
-    "execution_clone_launch_offline": "Los clones de ejecución no se enviaron porque la conexión está desconectada"
+    "execution_clone_launch_offline": "Los clones de ejecución no se enviaron porque la conexión está desconectada",
+    "messageQueuedLabel": "En cola"
   },
   "session": {
     "restart": "↺ Reiniciar",

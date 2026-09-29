@@ -572,7 +572,8 @@
     "execution_clone_launch_failed": "執行複製會話啟動失敗：{{error}}",
     "execution_clone_launch_unknown_error": "未知錯誤",
     "execution_clone_launch_timeout": "執行複製會話啟動逾時",
-    "execution_clone_launch_offline": "連線已中斷，執行複製會話未送出"
+    "execution_clone_launch_offline": "連線已中斷，執行複製會話未送出",
+    "messageQueuedLabel": "已排隊"
   },
   "session": {
     "restart": "↺ 重新啟動",

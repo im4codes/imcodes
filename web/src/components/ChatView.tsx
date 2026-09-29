@@ -1569,6 +1569,7 @@ function eventRevision(event: TimelineEvent): string {
     event.seq,
     event.payload.streaming === true ? 'streaming' : '',
     event.payload.pending === true ? 'pending' : '',
+    event.payload.queued === true ? 'queued' : '',
     event.payload.failed === true ? 'failed' : '',
     state,
     text,
@@ -5389,6 +5390,7 @@ const ChatEvent = memo(function ChatEvent({
       }
       const isPending = !!event.payload.pending;
       const isFailed = !!event.payload.failed;
+      const isQueued = event.payload.queued === true && !isFailed && !isPending;
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
       const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
@@ -5423,6 +5425,13 @@ const ChatEvent = memo(function ChatEvent({
               aria-label={t('chat.sendingLabel', 'Sending')}
               title={t('chat.sendingLabel', 'Sending')}
             />
+          )}
+          {isQueued && (
+            <span
+              class="chat-user-status chat-user-status-queued"
+              aria-label={t('chat.messageQueuedLabel', 'Queued')}
+              title={t('chat.messageQueuedLabel', 'Queued')}
+            >{t('chat.messageQueuedLabel', 'Queued')}</span>
           )}
           {isFailed && (
             <div class="chat-user-status chat-user-status-failed">

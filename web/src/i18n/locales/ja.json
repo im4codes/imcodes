@@ -572,7 +572,8 @@
     "execution_clone_launch_failed": "実行クローンの起動に失敗しました：{{error}}",
     "execution_clone_launch_unknown_error": "不明なエラー",
     "execution_clone_launch_timeout": "実行クローンの起動がタイムアウトしました",
-    "execution_clone_launch_offline": "接続がオフラインのため実行クローンは送信されませんでした"
+    "execution_clone_launch_offline": "接続がオフラインのため実行クローンは送信されませんでした",
+    "messageQueuedLabel": "キュー済み"
   },
   "session": {
     "restart": "↺ 再起動",

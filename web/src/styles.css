@@ -5161,6 +5161,7 @@ html.native-ios-mac .chat-dl-btn {
 .chat-user.chat-failed { background: #3a1a1a; color: #fca5a5; border: 1px solid #7f1d1d; }
 .chat-user-status { display: inline-flex; align-items: center; gap: 6px; margin-top: 4px; font-size: 11px; line-height: 1; }
 .chat-user-status-pending { width: 11px; height: 11px; border: 1.5px solid #60a5fa80; border-top-color: #60a5fa; border-radius: 50%; animation: chat-spinner-rotate 0.8s linear infinite; vertical-align: -1px; margin-top: 4px; margin-left: 2px; }
+.chat-user-status-queued { color: #93c5fd; font-size: 10px; opacity: 0.9; }
 @keyframes chat-spinner-rotate { to { transform: rotate(360deg); } }
 .chat-user-status-failed { gap: 8px; }
 .chat-user-status-icon { display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px; border-radius: 50%; background: #dc2626; color: #fff; font-size: 10px; font-weight: 700; font-family: ui-sans-serif, system-ui, sans-serif; line-height: 1; cursor: help; }

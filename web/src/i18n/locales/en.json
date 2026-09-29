@@ -572,7 +572,8 @@
     "execution_clone_launch_failed": "Execution clones failed: {{error}}",
     "execution_clone_launch_unknown_error": "Unknown error",
     "execution_clone_launch_timeout": "Execution clone launch timed out",
-    "execution_clone_launch_offline": "Execution clones were not sent because the connection is offline"
+    "execution_clone_launch_offline": "Execution clones were not sent because the connection is offline",
+    "messageQueuedLabel": "Queued"
   },
   "session": {
     "restart": "↺ Restart",

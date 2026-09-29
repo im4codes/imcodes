@@ -572,7 +572,8 @@
     "execution_clone_launch_failed": "Не удалось запустить клоны выполнения: {{error}}",
     "execution_clone_launch_unknown_error": "Неизвестная ошибка",
     "execution_clone_launch_timeout": "Время ожидания запуска клонов выполнения истекло",
-    "execution_clone_launch_offline": "Клоны выполнения не отправлены: соединение отсутствует"
+    "execution_clone_launch_offline": "Клоны выполнения не отправлены: соединение отсутствует",
+    "messageQueuedLabel": "В очереди"
   },
   "session": {
     "restart": "↺ Перезапустить",

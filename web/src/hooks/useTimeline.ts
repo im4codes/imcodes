@@ -1563,7 +1563,11 @@ function isHistoryCursorEligibleEvent(ev: TimelineEvent): boolean {
   // Pending optimistic bubbles carry `ts = Date.now()` from the client clock —
   // exclude them so a skewed client clock can't accidentally filter out
   // legitimately-missed server events.
-  if (ev.type === 'user.message' && (ev as { payload?: { pending?: boolean } }).payload?.pending) return false;
+  // A local optimistic bubble stays in the timeline after the daemon receipt
+  // (pending cleared) until its echo arrives, so it is excluded whether or not
+  // it is still pending.
+  if (ev.type === 'user.message'
+    && ((ev as { payload?: { pending?: boolean } }).payload?.pending || isLocalOptimisticUserMessage(ev))) return false;
   return true;
 }
 
@@ -2962,6 +2966,7 @@ export function useTimeline(
         const hasConfirmedEcho = base.some((e) =>
           e.type === 'user.message'
           && e.eventId !== eventId
+          && !isLocalOptimisticUserMessage(e)
           && !e.payload.pending
           && !e.payload.failed
           && String(e.payload.text ?? '').trim() === text,
@@ -2979,6 +2984,7 @@ export function useTimeline(
         pending: false,
         failed: true,
       };
+      delete payload.queued;
       if (error) payload.failureReason = error;
       const updated = [...base];
       updated[idx] = { ...existing, payload };
@@ -3145,24 +3151,44 @@ export function useTimeline(
     });
   }, [clearAutoRetryState, clearOptimisticTimer]);
 
-  const reconcileQueuedOptimisticEntries = useCallback((queuedEntries: Array<{ clientMessageId?: string }>) => {
+  // A message the queue now lists is shown in one place only:
+  //  - a FIFO send retires its local bubble; its card in the composer queue
+  //    strip (edit / undo / append) is its "queued" display until delivery;
+  //  - an Append send has no strip card and is never retired, so its own bubble
+  //    carries a small "Queued" marker while its id is listed (cleared on
+  //    delivery, failure, or when the real echo replaces the bubble).
+  // `markAppendQueued: false` is for the delivery path, where the id is being
+  // removed from the queue rather than reported as still queued.
+  const reconcileQueuedOptimisticEntries = useCallback((
+    queuedEntries: Array<{ clientMessageId?: string }>,
+    options?: { markAppendQueued?: boolean },
+  ) => {
     if (queuedEntries.length === 0) return;
     const queuedIds = new Set(queuedEntries.map((entry) => entry.clientMessageId).filter(Boolean));
     if (queuedIds.size === 0) return;
+    const markAppendQueued = options?.markAppendQueued !== false;
     setEvents((prev) => {
       const base = getSharedTimelineBase(cacheKeyRef.current, prev, MAX_MEMORY_EVENTS);
       let changed = false;
-      const next = base.filter((event) => {
-        if (!isLocalOptimisticUserMessage(event)) return true;
-        if (isOptimisticAppendUserMessage(event)) return true;
+      const next: TimelineEvent[] = [];
+      for (const event of base) {
+        if (!isLocalOptimisticUserMessage(event)) { next.push(event); continue; }
         const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : '';
-        if (!commandId || !queuedIds.has(commandId)) return true;
+        if (!commandId || !queuedIds.has(commandId)) { next.push(event); continue; }
+        if (isOptimisticAppendUserMessage(event)) {
+          if (!markAppendQueued || event.payload.failed === true || event.payload.queued === true) {
+            next.push(event);
+            continue;
+          }
+          changed = true;
+          next.push({ ...event, payload: { ...event.payload, queued: true } });
+          continue;
+        }
         optimisticIdsByCommandRef.current.delete(commandId);
         rememberSettledCommandId(commandId);
         clearOptimisticTimer(commandId);
         changed = true;
-        return false;
-      });
+      }
       if (!changed) return base;
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, next);
       return next;
@@ -3182,7 +3208,18 @@ export function useTimeline(
     reconcileQueuedOptimisticEntries(queuedEntries);
   }, [reconcileQueuedOptimisticEntries, sessionId]);
 
-  const markOptimisticAccepted = useCallback((commandId: string, options?: { clearPending?: boolean }) => {
+  const markOptimisticAccepted = useCallback((commandId: string, options?: {
+    clearPending?: boolean;
+    /**
+     * The daemon has only RECEIVED the command (`command.ack accepted`): stop
+     * the blocking spinner, but keep the command open (not settled) so a later
+     * queue failure / error still flips the bubble to a retryable failure and
+     * the eventual echo still reconciles it. Delegation commands keep their
+     * historical terminal-at-ack behaviour.
+     */
+    receiptOnly?: boolean;
+    queued?: boolean;
+  }) => {
     if (!commandId) return;
     // N-R2 fix (audit 0419d1ac-1f4 / O2 选项 D) — `accepted` is a daemon-
     // receipt ack ("I got your command"), NOT a terminal outcome. Two
@@ -3221,13 +3258,17 @@ export function useTimeline(
         failed: false,
         acked: true,
       };
+      if (options?.queued === true) payload.queued = true;
+      else if (options?.queued === false) delete payload.queued;
       delete payload.failureReason;
       const updated = [...base];
       updated[idx] = { ...existing, payload };
       if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
       return updated;
     });
-    if (clearPending) rememberSettledCommandId(commandId);
+    if (clearPending && (isDelegationOptimisticCommand(commandId) || options?.receiptOnly !== true)) {
+      rememberSettledCommandId(commandId);
+    }
   }, [clearAutoRetryState, clearOptimisticTimer, isDelegationOptimisticCommand, rememberSettledCommandId]);
 
   const settleOptimisticByCommandAck = useCallback((commandId: string, status: string, error?: unknown, options?: { delegated?: boolean }) => {
@@ -3236,7 +3277,12 @@ export function useTimeline(
       markOptimisticFailed(commandId, localizedDelegationAckError(error) ?? (typeof error === 'string' ? error : status));
       return;
     }
-    markOptimisticAccepted(commandId, { clearPending: options?.delegated === true });
+    // A successful receipt means the daemon durably accepted the command (the
+    // core-lane worker acks within milliseconds, independent of the busy main
+    // thread or the agent's queue), NOT that the provider has delivered it.
+    // End the blocking spinner now; the command stays open so a later queue
+    // failure or error ack can still turn the bubble into a retryable failure.
+    markOptimisticAccepted(commandId, { clearPending: true, receiptOnly: options?.delegated !== true });
   }, [markOptimisticAccepted, markOptimisticFailed]);
 
   const settleOptimisticByCommandAckEvent = useCallback((event: TimelineEvent) => {
@@ -3264,8 +3310,8 @@ export function useTimeline(
       return;
     }
     if (event.type === 'transport.queue.delivery') {
-      markOptimisticAccepted(event.clientMessageId, { clearPending: true });
-      reconcileQueuedOptimisticEntries([{ clientMessageId: event.clientMessageId }]);
+      markOptimisticAccepted(event.clientMessageId, { clearPending: true, queued: false });
+      reconcileQueuedOptimisticEntries([{ clientMessageId: event.clientMessageId }], { markAppendQueued: false });
     }
   }, [markOptimisticAccepted, markOptimisticFailed, reconcileQueuedOptimisticEntries, sessionId, settleOptimisticByCommandAck]);
 
@@ -3318,6 +3364,7 @@ export function useTimeline(
         };
         delete updated[idx]!.payload.failureReason;
         delete updated[idx]!.payload.acked;
+        delete updated[idx]!.payload.queued;
         if (cacheKeyRef.current) setCachedEvents(cacheKeyRef.current, updated);
         return updated;
       }
@@ -4689,7 +4736,7 @@ export function useTimeline(
             const optimisticTextIdx = base.findIndex(
               (e) =>
                 e.type === 'user.message'
-                && (e.payload.pending || e.payload.failed)
+                && (e.payload.pending || e.payload.failed || isLocalOptimisticUserMessage(e))
                 && normalizeForEcho(String(e.payload.text ?? '')) === normalizedText,
             );
             if (optimisticTextIdx >= 0) {
@@ -4714,7 +4761,7 @@ export function useTimeline(
             }
             const withoutPending = base.filter(
               (e) => {
-                if (e.type !== 'user.message' || (!e.payload.pending && !e.payload.failed)) return true;
+                if (e.type !== 'user.message' || (!e.payload.pending && !e.payload.failed && !isLocalOptimisticUserMessage(e))) return true;
                 const candidateCommandId = typeof e.payload.commandId === 'string'
                   ? e.payload.commandId
                   : '';
@@ -4730,6 +4777,7 @@ export function useTimeline(
               (e) =>
                 e.type === 'user.message' &&
                 e.payload.allowDuplicate !== true &&
+                !isLocalOptimisticUserMessage(e) &&
                 !e.payload.pending &&
                 !e.payload.failed &&
                 Math.abs(e.ts - event.ts) < USER_MSG_DEDUP_WINDOW_MS &&
