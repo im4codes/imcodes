@@ -35,10 +35,13 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // schemas no longer exist on the wire at all, not merely withheld from the
 // active list). The ceiling moves deliberately with roughly the same ~700
 // bytes of reviewable headroom as before.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 43_100;
-// Raw = authored + the MCP SDK framing, currently 6,016 bytes across 62 tools.
-// Keep a bounded allowance above the measured 48,423-byte wire payload.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 49_100;
+// The pair-resource-claim contract brings the measured authored surface to
+// 43,126 bytes; retain a small bounded review headroom.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 43_200;
+// Raw = authored + the MCP SDK framing. The pair-resource-claim tool adds one
+// intentionally discoverable contract; the current measured 49,234-byte wire
+// payload keeps the same bounded headroom below.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 49_300;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,
