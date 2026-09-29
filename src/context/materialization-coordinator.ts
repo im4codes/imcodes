@@ -16,6 +16,7 @@ import { isMemoryNoiseSummary, isMemoryNoiseTurn } from '../../shared/memory-noi
 import type {
   IngestContextEventResult,
   LatestRecentSummarySession,
+  ListProcessedProjectionsOptions,
   MaterializationCommitInput,
   MaterializationCommitResult,
   PinnedNote,
@@ -336,9 +337,11 @@ export class MaterializationCoordinator {
     // Recent summaries are delta-only. Do not feed the previous recent summary
     // back into the compressor, or every small batch snowballs into another
     // full handoff and burns tokens when synced into sub-sessions.
-    const previousProjections = (await client.run<ProcessedContextProjection[]>(
-      'listProcessedProjections', [target.namespace, 'recent_summary'],
-    )).filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup');
+    // Only existence matters: ask for one non-archived row instead of pulling
+    // (and structured-cloning) every recent summary of the namespace.
+    const previousProjections = await client.run<ProcessedContextProjection[]>(
+      'listProcessedProjections', [target.namespace, 'recent_summary', { excludeArchived: true, limit: 1 } satisfies ListProcessedProjectionsOptions],
+    );
     const hadPreviousSummary = previousProjections.length > 0;
 
     // Compress with SDK (primary → backup). When all SDK attempts fail the
@@ -995,15 +998,13 @@ async function findNamespaceForSessionSummaries(sessionName: string): Promise<Co
 }
 
 async function findLatestMasterSummary(sessionName: string, namespace: ContextNamespace): Promise<ProcessedContextProjection | undefined> {
-  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'master_summary']))
-    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
-    .find((projection) => projection.content.sessionName === sessionName);
+  const options: ListProcessedProjectionsOptions = { sessionName, excludeArchived: true, limit: 1 };
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'master_summary', options]))[0];
 }
 
 async function queryBatchSummariesForMaster(sessionName: string, namespace: ContextNamespace, since = 0): Promise<ProcessedContextProjection[]> {
-  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary']))
-    .filter((projection) => projection.status !== 'archived' && projection.status !== 'archived_dedup')
-    .filter((projection) => projection.content.sessionName === sessionName && projection.updatedAt > since)
+  const options: ListProcessedProjectionsOptions = { sessionName, updatedAfter: since, excludeArchived: true };
+  return (await getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary', options]))
     .sort((a, b) => a.updatedAt - b.updatedAt);
 }
 

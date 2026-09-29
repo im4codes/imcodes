@@ -360,4 +360,54 @@ describe('context-store worker client lifecycle repair', () => {
     client.dispose();
     vi.useRealTimers();
   });
+
+  describe('worker diagnostics', () => {
+    it('logs a bounded slow_op line from the worker without any request content', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { client, workers } = createHarness();
+      client.start();
+      workers[0].emit('message', { type: 'ready' });
+      await client.whenReady();
+      workers[0].emit('message', { type: 'slow_op', kind: 'op', op: 'ingestContextEvent', durationMs: 640, rssBytes: 123456, queued: 3 });
+      expect(warn).toHaveBeenCalledWith(expect.stringContaining('worker slow op=ingestContextEvent durationMs=640 queuedAfter=3 rssBytes=123456'));
+      expect(client.getHealthSnapshot().lastSlowOperation).toEqual({ op: 'ingestContextEvent', durationMs: 640 });
+      // flood: the log is rate-limited per window
+      warn.mockClear();
+      for (let i = 0; i < 200; i += 1) workers[0].emit('message', { type: 'slow_op', kind: 'maintenance', op: 'backfillProcessedNoiseBatch', durationMs: 900, rssBytes: 1, queued: 0 });
+      expect(warn.mock.calls.length).toBeLessThanOrEqual(20);
+      client.dispose();
+      warn.mockRestore();
+    });
+
+    it('records what was in flight, how many were queued, and the exit signal when a worker is lost', async () => {
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const { client, workers } = createHarness();
+      client.start();
+      workers[0].emit('message', { type: 'ready' });
+      await client.whenReady();
+      (workers[0] as unknown as { exitSignal: string | null; pid: number }).pid = 4242;
+      const inflight = client.run('ingestContextEvent', [{ secret: 'SHOULD-NOT-LEAK' }, true]);
+      const queued = client.run('getContextMeta', ['SHOULD-NOT-LEAK-EITHER']);
+      const inflightAssertion = expect(inflight).rejects.toBeDefined();
+      const queuedAssertion = expect(queued).rejects.toBeDefined();
+      const id = (workers[0].postMessage.mock.calls[0]![0] as { id: number }).id;
+      workers[0].emit('message', { type: 'started', id, op: 'ingestContextEvent', startedAtMs: Date.now() - 250 });
+      (workers[0] as unknown as { exitSignal: string | null }).exitSignal = 'SIGKILL';
+      workers[0].emit('exit', 137);
+      await inflightAssertion;
+      await queuedAssertion;
+      const line = warn.mock.calls.map((c) => String(c[0])).find((m) => m.includes('worker lost'));
+      expect(line).toBeDefined();
+      expect(line).toContain('reason=worker_exit');
+      expect(line).toContain('pid=4242');
+      expect(line).toContain('exitCode=137');
+      expect(line).toContain('exitSignal=SIGKILL');
+      expect(line).toMatch(/inFlight=\[ingestContextEvent@\d+ms\]/);
+      expect(line).toContain('notStarted=1');
+      expect(line).toContain('indeterminateMutations=1');
+      expect(line).not.toContain('SHOULD-NOT-LEAK');
+      client.dispose();
+      warn.mockRestore();
+    });
+  });
 });

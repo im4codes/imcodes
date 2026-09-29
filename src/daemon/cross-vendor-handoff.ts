@@ -3,6 +3,7 @@ import { timelineStore } from './timeline-store.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import type { ContextNamespace, ProcessedContextProjection } from '../../shared/context-types.js';
+import type { ListProcessedProjectionsOptions } from '../store/context-store.js';
 import {
   CROSS_VENDOR_HANDOFF_DEFAULTS,
   CROSS_VENDOR_HANDOFF_HEADINGS,
@@ -38,17 +39,22 @@ function renderTools(events: TimelineEvent[], config: CrossVendorHandoffConfig):
   return events.filter((event) => event.type === 'tool.call' || event.type === 'tool.result').slice(-20).map((event) => safeToolLine(event, config.includeToolPreviews)).join('\n');
 }
 
+const MEMORY_LINE_LIMIT = 8;
+
 async function readMemory(namespace?: ContextNamespace): Promise<string> {
   if (!namespace) return '';
   try {
+    // Only the newest MEMORY_LINE_LIMIT survive the merge below, so never pull
+    // a whole (potentially tens-of-thousands-row) class from the store.
+    const options: ListProcessedProjectionsOptions = { excludeArchived: true, limit: MEMORY_LINE_LIMIT };
     const [recent, durable] = await Promise.all([
-      getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary']),
-      getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'durable_memory_candidate']),
+      getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'recent_summary', options]),
+      getContextStoreClient().run<ProcessedContextProjection[]>('listProcessedProjections', [namespace, 'durable_memory_candidate', options]),
     ]);
     return [...durable, ...recent]
       .filter((item) => item.status !== 'archived' && item.status !== 'archived_dedup')
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .slice(0, 8)
+      .slice(0, MEMORY_LINE_LIMIT)
       .map((item) => `- ${redactSensitiveText(item.summary.replace(/\s+/g, ' ').trim())}`)
       .join('\n');
   } catch {

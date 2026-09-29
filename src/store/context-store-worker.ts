@@ -21,10 +21,13 @@
  * shared allowlist; their worker orchestration handlers land in Phases 2/3.
  * Until then a call to one resolves to a stable `unsupported_operation` error.
  */
+import { performance } from 'node:perf_hooks';
 import { resolveWorkerRuntime } from '../util/worker-runtime-port.js';
 import * as store from './context-store.js';
 import {
   CONTEXT_STORE_RPC_ERROR,
+  CONTEXT_STORE_WORKER_DIAGNOSTIC_TYPE,
+  CONTEXT_STORE_WORKER_SLOW_OP_MS,
   isContextStoreRpcOp,
   type ContextStoreRpcRequest,
   type ContextStoreRpcResponse,
@@ -34,8 +37,19 @@ import { buildContextStoreOpHandlers } from './context-store-op-handlers.js';
 
 const { port } = resolveWorkerRuntime();
 
-/** How often (ms) the idle checkpoint timer fires. */
+/** How often (ms) the idle WAL checkpoint timer fires. */
 const IDLE_CHECKPOINT_INTERVAL_MS = 30_000;
+/** How often (ms) one bounded maintenance slice is considered. Each tick runs
+ * ONE step (never the whole batch), so the worker returns to its event loop
+ * between steps and a queued ingest/enqueue waits at most one step. */
+const MAINTENANCE_TICK_MS = 1_000;
+/** While requests keep the worker busy, idle gating alone would starve the
+ * cursor backfills forever (the stalled noise backfill). A bounded step is
+ * therefore forced at least this often even under load. */
+const MAINTENANCE_FORCE_INTERVAL_MS = 10_000;
+/** A forced checkpoint under sustained load, so the WAL cannot grow unbounded
+ * while the idle gate is never open. */
+const CHECKPOINT_FORCE_INTERVAL_MS = 120_000;
 /** Yield between bounded request slices so a normal-ingest flood cannot starve
  * high-priority recall or the worker's own timers indefinitely. */
 const MAX_REQUESTS_PER_DRAIN_SLICE = 32;
@@ -80,6 +94,24 @@ function reply(res: ContextStoreRpcResponse): void {
   port!.postMessage(res);
 }
 
+function reportSlow(kind: 'op' | 'maintenance', name: string, durationMs: number): void {
+  if (durationMs < CONTEXT_STORE_WORKER_SLOW_OP_MS) return;
+  // Op/step NAME only: arguments and row contents never leave the worker in
+  // diagnostics. rss lets an operator tell a memory-bound stall from a scan.
+  try {
+    port!.postMessage({
+      type: CONTEXT_STORE_WORKER_DIAGNOSTIC_TYPE.slowOp,
+      kind,
+      op: name,
+      durationMs: Math.round(durationMs),
+      rssBytes: process.memoryUsage().rss,
+      queued: queues.high.length + queues.normal.length + queues.low.length,
+    });
+  } catch {
+    /* diagnostics are best-effort */
+  }
+}
+
 function execute(req: ContextStoreRpcRequest): void {
   const { id, op, args } = req;
   // A queued request is not a hung request.  Acknowledging execution before
@@ -97,18 +129,21 @@ function execute(req: ContextStoreRpcRequest): void {
     reply({ id, ok: false, error: { code: CONTEXT_STORE_RPC_ERROR.unsupportedOperation, message: `op not available: ${op}` } });
     return;
   }
+  const startedAt = performance.now();
   try {
     const result = handler(Array.isArray(args) ? args : []);
     if (result != null && typeof (result as { then?: unknown }).then === 'function') {
       // Async handler (e.g. L3 semantic rerank): reply when it settles.
       void (result as Promise<unknown>).then(
-        (value) => reply({ id, ok: true, result: value }),
-        (err) => reply({ id, ok: false, error: toRpcError(err, CONTEXT_STORE_RPC_ERROR.opFailed) }),
+        (value) => { reportSlow('op', op, performance.now() - startedAt); reply({ id, ok: true, result: value }); },
+        (err) => { reportSlow('op', op, performance.now() - startedAt); reply({ id, ok: false, error: toRpcError(err, CONTEXT_STORE_RPC_ERROR.opFailed) }); },
       );
     } else {
+      reportSlow('op', op, performance.now() - startedAt);
       reply({ id, ok: true, result });
     }
   } catch (err) {
+    reportSlow('op', op, performance.now() - startedAt);
     reply({ id, ok: false, error: toRpcError(err, CONTEXT_STORE_RPC_ERROR.opFailed) });
   }
 }
@@ -145,27 +180,74 @@ function drain(): void {
   if (hasQueued()) scheduleDrain();
 }
 
-// ── Idle WAL checkpoint ──────────────────────────────────────────────────────
-function maybeCheckpoint(): void {
-  // Idle = nothing draining AND no queued work (in particular no high waiter).
-  if (draining || hasQueued()) return;
+// ── Maintenance (cursor backfills, index builds) and WAL checkpoint ─────────
+// Legacy noise cleanup is cursor-bounded and must never be part of ensureDb()'s
+// warmup transaction: loading every historical summary there can exceed the RPC
+// timeout and trigger a respawn storm on a large store. It used to run as one
+// five-batch + checkpoint burst inside a single event-loop turn every 30 s and
+// only when the queue happened to be empty at that instant, i.e. never under
+// load. It is now one bounded step per tick, rotating, and forced periodically.
+interface MaintenanceStep {
+  name: string;
+  run: () => void;
+  /** Heavy steps (index builds) only run when nothing is queued. */
+  idleOnly: boolean;
+}
+const maintenanceSteps: MaintenanceStep[] = [
+  { name: 'ensureContextStoreMaintenanceIndexes', run: () => { store.ensureContextStoreMaintenanceIndexes(); }, idleOnly: true },
+  { name: 'backfillNamespaceFilterColumnsBatch', run: () => store.backfillNamespaceFilterColumnsBatch(), idleOnly: false },
+  { name: 'backfillProcessedNoiseBatch', run: () => { store.backfillProcessedNoiseBatch(); }, idleOnly: false },
+  { name: 'reconcileMaterializedStagedEventsBatch', run: () => { store.reconcileMaterializedStagedEventsBatch(); }, idleOnly: false },
+  { name: 'purgeMemoryNoiseProjectionsBatch', run: () => { store.purgeMemoryNoiseProjectionsBatch(); }, idleOnly: false },
+];
+let maintenanceCursor = 0;
+let lastMaintenanceAt = 0;
+let lastCheckpointAt = Date.now();
+
+function isWorkerBusy(): boolean {
+  return draining || hasQueued();
+}
+
+function maintenanceTick(): void {
+  const now = Date.now();
+  const busy = isWorkerBusy();
+  if (busy && now - lastMaintenanceAt < MAINTENANCE_FORCE_INTERVAL_MS) return;
+  // Pick the next step; a heavy step is skipped (not forced) while busy.
+  let step: MaintenanceStep | undefined;
+  for (let i = 0; i < maintenanceSteps.length; i += 1) {
+    const candidate = maintenanceSteps[(maintenanceCursor + i) % maintenanceSteps.length]!;
+    if (busy && candidate.idleOnly) continue;
+    step = candidate;
+    maintenanceCursor = (maintenanceCursor + i + 1) % maintenanceSteps.length;
+    break;
+  }
+  if (!step) return;
+  lastMaintenanceAt = now;
+  const startedAt = performance.now();
   try {
-    // Legacy noise cleanup is cursor-bounded and runs only while the worker is
-    // idle. It must never be part of ensureDb()'s warmup transaction: loading
-    // every historical summary there can exceed the RPC timeout and trigger a
-    // respawn storm on a large store.
-    store.ensureContextStoreMaintenanceIndexes();
-    store.backfillNamespaceFilterColumnsBatch();
-    store.backfillProcessedNoiseBatch();
-    store.reconcileMaterializedStagedEventsBatch();
-    store.purgeMemoryNoiseProjectionsBatch();
+    step.run();
+  } catch {
+    // Best-effort; a busy/locked step is retried on a later tick.
+  }
+  reportSlow('maintenance', step.name, performance.now() - startedAt);
+}
+
+function maybeCheckpoint(): void {
+  const now = Date.now();
+  if (isWorkerBusy() && now - lastCheckpointAt < CHECKPOINT_FORCE_INTERVAL_MS) return;
+  lastCheckpointAt = now;
+  const startedAt = performance.now();
+  try {
     store.checkpointWal();
   } catch {
     // Best-effort; a busy/locked checkpoint is non-fatal.
   }
+  reportSlow('maintenance', 'checkpointWal', performance.now() - startedAt);
 }
+const maintenanceTimer = setInterval(maintenanceTick, MAINTENANCE_TICK_MS);
 const checkpointTimer = setInterval(maybeCheckpoint, IDLE_CHECKPOINT_INTERVAL_MS);
-// Don't keep the worker event loop alive just for the checkpoint timer.
+// Don't keep the worker event loop alive just for the maintenance timers.
+if (typeof maintenanceTimer.unref === 'function') maintenanceTimer.unref();
 if (typeof checkpointTimer.unref === 'function') checkpointTimer.unref();
 
 // ── Message intake ───────────────────────────────────────────────────────────

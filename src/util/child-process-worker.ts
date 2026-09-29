@@ -4,6 +4,9 @@ import { fileURLToPath } from 'node:url';
 /** Worker-like facade backed by a dedicated Node OS process and IPC channel. */
 export interface ChildProcessWorkerHandle {
   readonly pid: number | undefined;
+  /** Terminating signal name once the process has exited by signal (e.g. an OOM
+   *  SIGKILL); null when it exited by code or is still running. */
+  readonly exitSignal: string | null;
   unref(): void;
   on(event: 'message', listener: (message: any) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
@@ -17,7 +20,13 @@ export interface ChildProcessWorkerHandle {
 }
 
 class ForkedWorkerHandle implements ChildProcessWorkerHandle {
-  constructor(private readonly child: ChildProcess) {}
+  private signal: string | null = null;
+
+  constructor(private readonly child: ChildProcess) {
+    child.on('exit', (_code, signal) => { this.signal = signal ?? null; });
+  }
+
+  get exitSignal(): string | null { return this.signal; }
 
   get pid(): number | undefined { return this.child.pid; }
 

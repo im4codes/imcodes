@@ -25,10 +25,12 @@ import {
   CONTEXT_STORE_RPC_TIMEOUT_MS,
   CONTEXT_STORE_SLOW_OP_LOG_MS,
   CONTEXT_STORE_STUCK_WORKER_GRACE_MS,
+  CONTEXT_STORE_WORKER_DIAGNOSTIC_TYPE,
   CONTEXT_STORE_WORKER_DOWN_REASON,
   CONTEXT_STORE_WORKER_HEALTH,
   contextStoreOpRetryClass,
   defaultPriorityForOp,
+  isContextStoreRpcOp,
   isFireAndForgetOp,
   type ContextStoreFireAndForgetOp,
   type ContextStoreWorkerDownReason,
@@ -95,6 +97,9 @@ export interface ContextStoreHealthSnapshot {
 }
 
 interface ContextStoreWorkerHandle {
+  /** Optional so an injected test double may omit them; production has them. */
+  readonly pid?: number;
+  readonly exitSignal?: string | null;
   unref(): void;
   on(event: 'message', listener: (msg: unknown) => void): this;
   on(event: 'error', listener: (err: Error) => void): this;
@@ -113,6 +118,9 @@ export interface CallOptions {
   timeoutMs?: number;
 }
 
+const SLOW_LOG_WINDOW_MS = 60_000;
+const SLOW_LOG_MAX_PER_WINDOW = 20;
+const LOSS_LOG_MAX_OPS = 5;
 const { maxAwaitedPending, maxFireAndForgetPending } = CONTEXT_STORE_RPC_BACKPRESSURE;
 const {
   consecutiveTimeoutsBeforeRespawn,
@@ -132,6 +140,12 @@ export class ContextStoreWorkerClient {
   private fireAndForgetCount = 0;
   private lastSlowOperation: { op: ContextStoreRpcOp; durationMs: number } | null = null;
   private lastWorkerProgressAt = Date.now();
+  /** Most recent worker-reported RSS (from `slow_op` diagnostics). */
+  private lastWorkerRssBytes: number | null = null;
+  /** Exit facts of the current generation, captured for the loss diagnostic. */
+  private lastExit: { code: number | null; signal: string | null } = { code: null, signal: null };
+  private slowLogWindowStart = 0;
+  private slowLogCount = 0;
   private stuckWorkerCheckTimer: NodeJS.Timeout | null = null;
   private warmReady = false;
   private readyPromise: Promise<void> | null = null;
@@ -409,6 +423,7 @@ export class ContextStoreWorkerClient {
       this.confirmRetirement(generation);
     });
     worker.on('exit', (code) => {
+      this.lastExit = { code: typeof code === 'number' ? code : null, signal: worker.exitSignal ?? null };
       // Any exit from the current generation makes the worker unavailable, even
       // code 0 with no pending requests: otherwise a pre-ready clean exit leaves
       // whenReady() unresolved forever.
@@ -502,6 +517,10 @@ export class ContextStoreWorkerClient {
           { reason: CONTEXT_STORE_WORKER_DOWN_REASON.workerError },
         );
       }
+      return;
+    }
+    if ((msg as { type?: unknown }).type === CONTEXT_STORE_WORKER_DIAGNOSTIC_TYPE.slowOp) {
+      this.onWorkerSlowOp(msg as { kind?: unknown; op?: unknown; durationMs?: unknown; rssBytes?: unknown; queued?: unknown });
       return;
     }
     if ((msg as { type?: unknown }).type === 'ready') {
@@ -602,6 +621,7 @@ export class ContextStoreWorkerClient {
     }
     if (reason !== CONTEXT_STORE_WORKER_DOWN_REASON.dispose) this.lastDownReason = reason;
     const dead = this.worker;
+    if (dead && reason !== CONTEXT_STORE_WORKER_DOWN_REASON.dispose) this.logWorkerLoss(reason, dead);
     this.worker = null;
     this.warmReady = false;
     this.settleReady();
@@ -619,6 +639,57 @@ export class ContextStoreWorkerClient {
     this.fireAndForgetCount = 0;
     this.scheduleRebuild();
     this.notifyHealth();
+  }
+
+  /** Bounded `slow_op` log from the worker's own per-op timing. Op/step names
+   *  and numbers only - never arguments or row contents. Rate-limited so a
+   *  pathological loop cannot flood daemon.log. */
+  private onWorkerSlowOp(msg: { kind?: unknown; op?: unknown; durationMs?: unknown; rssBytes?: unknown; queued?: unknown }): void {
+    const op = typeof msg.op === 'string' ? msg.op.slice(0, 80) : 'unknown';
+    const durationMs = typeof msg.durationMs === 'number' ? msg.durationMs : 0;
+    if (typeof msg.rssBytes === 'number') this.lastWorkerRssBytes = msg.rssBytes;
+    this.lastWorkerProgressAt = Date.now();
+    if (isContextStoreRpcOp(op)) this.lastSlowOperation = { op, durationMs };
+    const now = Date.now();
+    if (now - this.slowLogWindowStart > SLOW_LOG_WINDOW_MS) {
+      this.slowLogWindowStart = now;
+      this.slowLogCount = 0;
+    }
+    if (this.slowLogCount >= SLOW_LOG_MAX_PER_WINDOW) return;
+    this.slowLogCount += 1;
+    const kind = msg.kind === 'maintenance' ? 'maintenance' : 'op';
+    const queued = typeof msg.queued === 'number' ? msg.queued : 0;
+    const rss = this.lastWorkerRssBytes ?? 0;
+    // eslint-disable-next-line no-console
+    console.warn(`[context-store] worker slow ${kind}=${op} durationMs=${durationMs} queuedAfter=${queued} rssBytes=${rss}`);
+  }
+
+  /** One structured line when a generation is lost (timeout respawn, crash,
+   *  exit, warmup failure): what was running, what was waiting, how it died.
+   *  This is the missing half of "worker respawned after repeated timeouts",
+   *  which previously said nothing about the op that wedged it. */
+  private logWorkerLoss(reason: ContextStoreWorkerDownReason, dead: ContextStoreWorkerHandle): void {
+    const now = Date.now();
+    const inFlight: string[] = [];
+    let queued = 0;
+    let indeterminate = 0;
+    for (const entry of this.pending.values()) {
+      if (entry.started) {
+        if (inFlight.length < LOSS_LOG_MAX_OPS) inFlight.push(`${entry.op}@${entry.startedAtMs === null ? 0 : Math.max(0, now - entry.startedAtMs)}ms`);
+      } else {
+        queued += 1;
+      }
+      if (entry.dispatched && contextStoreOpRetryClass(entry.op) === CONTEXT_STORE_OP_RETRY_CLASS.unsafeRetry) indeterminate += 1;
+    }
+    const slow = this.lastSlowOperation;
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[context-store] worker lost reason=${reason} generation=${this.workerGeneration} pid=${dead.pid ?? 'unknown'}`
+      + ` exitCode=${this.lastExit.code ?? 'none'} exitSignal=${dead.exitSignal ?? this.lastExit.signal ?? 'none'}`
+      + ` inFlight=[${inFlight.join(',')}] notStarted=${queued} indeterminateMutations=${indeterminate}`
+      + ` lastSlowOp=${slow ? `${slow.op}@${slow.durationMs}ms` : 'none'}`
+      + ` lastProgressAgeMs=${Math.max(0, now - this.lastWorkerProgressAt)} rssBytes=${this.lastWorkerRssBytes ?? 'unknown'}`,
+    );
   }
 
   /** Failure handed to a pending RPC when its generation dies.

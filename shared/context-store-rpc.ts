@@ -213,7 +213,9 @@ export function isFireAndForgetOp(op: string): boolean {
 export const CONTEXT_STORE_LOW_PRIORITY_OPS = [
   // Background startup/replication/materialization work. Interactive panel
   // reads explicitly use the high lane and therefore preempt these requests.
-  'ingestContextEvent',
+  // `ingestContextEvent` is deliberately NOT here: it is the per-event durable
+  // write, and one-per-drain-slice on the low lane let a normal-lane burst
+  // queue live ingests until the client reported "remained queued".
   'commitMaterialization',
   'selectTurnUsageSyncBatch',
   'recordTurnUsageSyncResults',
@@ -227,6 +229,10 @@ export const CONTEXT_STORE_LOW_PRIORITY_OPS = [
   'backfillTurnUsageSyncMetadata',
   'backfillNamespacesAndObservations',
   'repairObservationStore',
+  // The 15 s master-summary sweep: a housekeeping scan that must never sit in
+  // front of a live ingest/enqueue.
+  'listLatestRecentSummarySessions',
+  'getLatestMasterSummaryUpdatedAt',
 ] as const;
 const LOW_PRIORITY_SET: ReadonlySet<string> = new Set(
   CONTEXT_STORE_LOW_PRIORITY_OPS,
@@ -243,6 +249,17 @@ export function defaultPriorityForOp(op: ContextStoreRpcOp): ContextStoreRpcPrio
  * separate from the RPC timeout: it records slow progress without treating a
  * queued or long-but-healthy operation as a worker failure. */
 export const CONTEXT_STORE_SLOW_OP_LOG_MS = 1_000;
+
+/** Worker-side per-op execution time above which the worker itself reports a
+ * `slow_op` diagnostic to the client. Lower than the client's 1 s response-side
+ * threshold and, unlike it, reported even when the op never gets a response
+ * before the worker is lost. */
+export const CONTEXT_STORE_WORKER_SLOW_OP_MS = 500;
+
+/** Worker → client diagnostic message types (not RPC responses). */
+export const CONTEXT_STORE_WORKER_DIAGNOSTIC_TYPE = {
+  slowOp: 'slow_op',
+} as const;
 
 /** Grace period after an execution timeout before considering a worker stuck.
  * A started RPC may still be making forward progress and must not trigger a

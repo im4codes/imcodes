@@ -864,6 +864,14 @@ function ensureDb(): DatabaseSyncInstance {
   return db;
 }
 
+/** Expressions the summary-lookup indexes are built on. The lookup queries MUST
+ * spell them identically or SQLite cannot use the index. */
+const SESSION_NAME_EXPR = "json_extract(content_json, '$.sessionName')";
+const TARGET_KIND_EXPR = "json_extract(content_json, '$.targetKind')";
+const PROCESSED_SESSION_SUMMARY_INDEX = 'idx_context_processed_local_session_summary';
+const PROCESSED_TARGET_KIND_SUMMARY_INDEX = 'idx_context_processed_local_target_kind_summary';
+const NOT_ARCHIVED_SQL = "status NOT IN ('archived', 'archived_dedup')";
+
 /**
  * Build optional maintenance indexes outside the synchronous warmup path.
  * The worker invokes this only from its idle maintenance tick, after it has
@@ -881,6 +889,12 @@ export function ensureContextStoreMaintenanceIndexes(): { created: number; done:
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_target_type_status_updated ON context_jobs(target_key, job_type, status, updated_at DESC)',
     'CREATE INDEX IF NOT EXISTS idx_context_jobs_status_type_updated ON context_jobs(status, job_type, updated_at)',
     'CREATE INDEX IF NOT EXISTS idx_turn_usage_sync_status_created ON context_turn_usage_sync(sync_status, created_at_ms)',
+    // Per-target latest-summary lookups (run on every live event) and the 15 s
+    // master-summary sweep resolve through these expression indexes instead of
+    // json-parsing every summary row of a namespace. `class` leads so the
+    // un-namespaced GROUP BY sweep reads one contiguous, already-ordered range.
+    `CREATE INDEX IF NOT EXISTS ${PROCESSED_SESSION_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${SESSION_NAME_EXPR}, updated_at DESC, status)`,
+    `CREATE INDEX IF NOT EXISTS ${PROCESSED_TARGET_KIND_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${TARGET_KIND_EXPR}, updated_at DESC, status)`,
   ];
   const cursorKey = 'maintenance_indexes_cursor';
   const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0);
@@ -4700,9 +4714,52 @@ export function countProjectionsMissingEmbedding(): number {
   return row?.n ?? 0;
 }
 
-export function listProcessedProjections(namespace: ContextNamespace, projectionClass?: ProcessedContextClass): ProcessedContextProjection[] {
+/** Narrowing options for {@link listProcessedProjections}. Every field is
+ * pushed into SQL so a large namespace is never materialised just to be
+ * filtered in JS (a 27k-row namespace cost ~600 ms + a huge structured clone
+ * per call). Omit the options object for the legacy "everything" behaviour. */
+export interface ListProcessedProjectionsOptions {
+  /** Only projections whose content.sessionName equals this. */
+  sessionName?: string;
+  /** Only projections updated strictly after this unix-ms. */
+  updatedAfter?: number;
+  /** Stop after this many (post noise-filter) projections. */
+  limit?: number;
+  /** Skip archived / archived_dedup rows. */
+  excludeArchived?: boolean;
+}
+
+export function listProcessedProjections(
+  namespace: ContextNamespace,
+  projectionClass?: ProcessedContextClass,
+  options?: ListProcessedProjectionsOptions,
+): ProcessedContextProjection[] {
   const database = ensureDb();
   const namespaceKey = serializeContextNamespace(namespace);
+  if (options && projectionClass) {
+    const clauses = ['namespace_key = ?', 'class = ?'];
+    const params: Array<string | number> = [namespaceKey, projectionClass];
+    if (typeof options.sessionName === 'string') {
+      clauses.push(`${SESSION_NAME_EXPR} = ?`);
+      params.push(options.sessionName);
+    }
+    if (typeof options.updatedAfter === 'number' && Number.isFinite(options.updatedAfter)) {
+      clauses.push('updated_at > ?');
+      params.push(options.updatedAfter);
+    }
+    if (options.excludeArchived) clauses.push(NOT_ARCHIVED_SQL);
+    const limit = typeof options.limit === 'number' && options.limit > 0 ? Math.floor(options.limit) : Infinity;
+    const out: ProcessedContextProjection[] = [];
+    for (const row of database.prepare(
+      `SELECT * FROM context_processed_local WHERE ${clauses.join(' AND ')} ORDER BY updated_at DESC`,
+    ).iterate(...params) as Iterable<Record<string, unknown>>) {
+      const projection = processedProjectionFromRow(row, namespace);
+      if (isMemoryNoiseSummary(projection.summary)) continue;
+      out.push(projection);
+      if (out.length >= limit) break;
+    }
+    return out;
+  }
   const rows = projectionClass
     ? database.prepare('SELECT * FROM context_processed_local WHERE namespace_key = ? AND class = ? ORDER BY updated_at DESC').all(namespaceKey, projectionClass)
     : database.prepare('SELECT * FROM context_processed_local WHERE namespace_key = ? ORDER BY updated_at DESC').all(namespaceKey);
@@ -4726,13 +4783,15 @@ export function listProcessedProjections(namespace: ContextNamespace, projection
 export function hasProcessedProjectionsInNamespace(namespace: ContextNamespace): boolean {
   const database = ensureDb();
   const namespaceKey = serializeContextNamespace(namespace);
-  const rows = database.prepare(`
+  // Early exit on the first non-noise row instead of loading every summary.
+  for (const row of database.prepare(`
     SELECT summary
       FROM context_processed_local
      WHERE namespace_key = ?
-     ORDER BY updated_at DESC
-  `).all(namespaceKey) as Array<{ summary?: string }>;
-  return rows.some((row) => !isMemoryNoiseSummary(row.summary));
+  `).iterate(namespaceKey) as Iterable<{ summary?: string }>) {
+    if (!isMemoryNoiseSummary(row.summary)) return true;
+  }
+  return false;
 }
 
 export function listProcessedProjectionsByIds(namespace: ContextNamespace, projectionIds: readonly string[]): ProcessedContextProjection[] {
@@ -4759,40 +4818,44 @@ export function listProcessedProjectionsByIds(namespace: ContextNamespace, proje
   });
 }
 
-export function getLatestRecentSummaryUpdatedAtForTarget(target: ContextTargetRef): number | undefined {
+/** Newest non-noise, non-archived summary timestamp of one class for a
+ * (namespace, target-column expression) pair. Walks the index in
+ * `updated_at DESC` order and stops at the first usable row, so the cost is
+ * O(rows skipped), never O(namespace). */
+function latestNonNoiseUpdatedAt(
+  namespaceKey: string,
+  projectionClass: 'recent_summary' | 'master_summary',
+  extraClauses: readonly string[],
+  extraParams: readonly string[],
+): number | undefined {
   const database = ensureDb();
-  const namespaceKey = serializeContextNamespace(target.namespace);
-  let rows: Array<Record<string, unknown>>;
-  if (target.kind === 'project') {
-    rows = database.prepare(`
-        SELECT updated_at, summary
-          FROM context_processed_local
-         WHERE namespace_key = ?
-           AND class = 'recent_summary'
-           AND status NOT IN ('archived', 'archived_dedup')
-           AND json_extract(content_json, '$.targetKind') = 'project'
-         ORDER BY updated_at DESC
-      `).all(namespaceKey) as Array<Record<string, unknown>>;
-  } else {
-    const sessionName = target.sessionName;
-    if (!sessionName) return undefined;
-    rows = database.prepare(`
-        SELECT updated_at, summary
-          FROM context_processed_local
-         WHERE namespace_key = ?
-           AND class = 'recent_summary'
-           AND status NOT IN ('archived', 'archived_dedup')
-           AND json_extract(content_json, '$.targetKind') = 'session'
-           AND json_extract(content_json, '$.sessionName') = ?
-         ORDER BY updated_at DESC
-      `).all(namespaceKey, sessionName) as Array<Record<string, unknown>>;
-  }
-  for (const row of rows as Array<{ updated_at: unknown; summary: unknown }>) {
+  const clauses = ['namespace_key = ?', 'class = ?', NOT_ARCHIVED_SQL, ...extraClauses];
+  for (const row of database.prepare(`
+    SELECT updated_at, summary
+      FROM context_processed_local
+     WHERE ${clauses.join(' AND ')}
+     ORDER BY updated_at DESC
+  `).iterate(namespaceKey, projectionClass, ...extraParams) as Iterable<{ updated_at: unknown; summary: unknown }>) {
     if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
     const updatedAt = Number(row.updated_at);
     if (Number.isFinite(updatedAt)) return updatedAt;
   }
   return undefined;
+}
+
+export function getLatestRecentSummaryUpdatedAtForTarget(target: ContextTargetRef): number | undefined {
+  const namespaceKey = serializeContextNamespace(target.namespace);
+  if (target.kind === 'project') {
+    return latestNonNoiseUpdatedAt(namespaceKey, 'recent_summary', [`${TARGET_KIND_EXPR} = 'project'`], []);
+  }
+  const sessionName = target.sessionName;
+  if (!sessionName) return undefined;
+  return latestNonNoiseUpdatedAt(
+    namespaceKey,
+    'recent_summary',
+    [`${TARGET_KIND_EXPR} = 'session'`, `${SESSION_NAME_EXPR} = ?`],
+    [sessionName],
+  );
 }
 
 export interface LatestRecentSummarySession {
@@ -4805,56 +4868,71 @@ export function listLatestRecentSummarySessions(limit = 1000): LatestRecentSumma
   const safeLimit = Math.max(0, Math.min(5000, Math.floor(limit)));
   if (safeLimit === 0) return [];
   const database = ensureDb();
-  const rows = database.prepare(`
+  // One covering-index GROUP BY yields the newest row per (namespace, session);
+  // the noise check then touches only that one candidate row per session, with
+  // a per-session early-exit fallback when the newest row is noise. This
+  // replaces a full-class scan + json parse of every summary every 15 s.
+  const groupStmt = database.prepare(`
     SELECT namespace_key,
-           summary,
-           json_extract(content_json, '$.sessionName') AS session_name,
-           updated_at
+           ${SESSION_NAME_EXPR} AS session_name,
+           MAX(updated_at) AS newest
       FROM context_processed_local
      WHERE class = 'recent_summary'
-       AND status NOT IN ('archived', 'archived_dedup')
-       AND json_extract(content_json, '$.sessionName') IS NOT NULL
-     ORDER BY updated_at DESC
-  `).all() as Array<Record<string, unknown>>;
-  const result: LatestRecentSummarySession[] = [];
-  const seen = new Set<string>();
-  for (const row of rows) {
-    if (isMemoryNoiseSummary(typeof row.summary === 'string' ? row.summary : undefined)) continue;
-    const sessionName = typeof row.session_name === 'string' ? row.session_name : undefined;
-    const updatedAt = Number(row.updated_at);
-    if (!sessionName || !Number.isFinite(updatedAt)) continue;
-    const namespaceKey = String(row.namespace_key);
-    const key = `${namespaceKey}\0${sessionName}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    result.push({
-      sessionName,
-      namespace: parseNamespaceKey(namespaceKey),
-      updatedAt,
-    });
-    if (result.length >= safeLimit) break;
+       AND ${NOT_ARCHIVED_SQL}
+       AND ${SESSION_NAME_EXPR} IS NOT NULL
+     GROUP BY namespace_key, session_name
+     ORDER BY newest DESC
+     LIMIT ? OFFSET ?
+  `);
+  const newestRowsStmt = database.prepare(`
+    SELECT summary
+      FROM context_processed_local
+     WHERE namespace_key = ?
+       AND class = 'recent_summary'
+       AND ${SESSION_NAME_EXPR} = ?
+       AND updated_at = ?
+       AND ${NOT_ARCHIVED_SQL}
+  `);
+  let result: LatestRecentSummarySession[] = [];
+  const pageSize = Math.min(safeLimit, 500);
+  paging: for (let offset = 0; ; offset += pageSize) {
+    const candidates = groupStmt.all(pageSize, offset) as Array<Record<string, unknown>>;
+    for (const row of candidates) {
+      if (typeof row.session_name !== 'string') continue;
+      const namespaceKey = String(row.namespace_key);
+      const newest = Number(row.newest);
+      if (!Number.isFinite(newest)) continue;
+      // Candidates arrive newest-first by RAW timestamp, and a noise fallback
+      // can only LOWER a session's timestamp - so once the result is full and
+      // the next candidate's raw newest is already below the current cut-off,
+      // no remaining candidate can enter the top `safeLimit`.
+      if (result.length >= safeLimit && newest < result[safeLimit - 1]!.updatedAt) break paging;
+      let updatedAt: number | undefined = newest;
+      const newestRows = newestRowsStmt.all(namespaceKey, row.session_name, newest) as Array<{ summary?: unknown }>;
+      if (newestRows.every((r) => isMemoryNoiseSummary(typeof r.summary === 'string' ? r.summary : undefined))) {
+        updatedAt = latestNonNoiseUpdatedAt(namespaceKey, 'recent_summary', [`${SESSION_NAME_EXPR} = ?`], [row.session_name]);
+      }
+      if (updatedAt === undefined) continue;
+      result.push({ sessionName: row.session_name, namespace: parseNamespaceKey(namespaceKey), updatedAt });
+      if (result.length > safeLimit) {
+        result.sort((x, y) => y.updatedAt - x.updatedAt);
+        result = result.slice(0, safeLimit);
+      } else if (result.length === safeLimit) {
+        result.sort((x, y) => y.updatedAt - x.updatedAt);
+      }
+    }
+    if (candidates.length < pageSize) break;
   }
-  return result;
+  return result.sort((a, b) => b.updatedAt - a.updatedAt);
 }
 
 export function getLatestMasterSummaryUpdatedAt(sessionName: string, namespace: ContextNamespace): number | undefined {
-  const database = ensureDb();
-  const namespaceKey = serializeContextNamespace(namespace);
-  const rows = database.prepare(`
-    SELECT updated_at, summary
-      FROM context_processed_local
-     WHERE namespace_key = ?
-       AND class = 'master_summary'
-       AND status NOT IN ('archived', 'archived_dedup')
-       AND json_extract(content_json, '$.sessionName') = ?
-     ORDER BY updated_at DESC
-  `).all(namespaceKey, sessionName) as Array<{ updated_at?: number; summary?: string }>;
-  for (const row of rows) {
-    if (isMemoryNoiseSummary(row.summary)) continue;
-    const updatedAt = Number(row.updated_at);
-    if (Number.isFinite(updatedAt)) return updatedAt;
-  }
-  return undefined;
+  return latestNonNoiseUpdatedAt(
+    serializeContextNamespace(namespace),
+    'master_summary',
+    [`${SESSION_NAME_EXPR} = ?`],
+    [sessionName],
+  );
 }
 
 /** Returns a map of namespace_key → projection IDs for all local projections. */
