@@ -34,6 +34,7 @@ import { AGENT_DELEGATION_REPLY_ERRORS, buildAgentDelegationSenderLine } from '.
 import {
   createMemoryMcpServerFromEnv,
   createMemoryMcpServer,
+  createResourceOwnerHookWithEpochRefresh,
   mergeDefaultToolDeps,
   postHookSend,
 } from '../../src/daemon/memory-mcp-server.js';
@@ -45,6 +46,10 @@ import {
 } from '../../shared/session-resource-lifecycle.js';
 import { MEMORY_MCP_DAEMON_RPC_PATH } from '../../shared/memory-mcp-daemon-rpc.js';
 import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from '../../src/daemon/memory-mcp-error-codes.js';
+import {
+  SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+  SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
+} from '../../shared/shared-machine-authority.js';
 import { deterministicSendMessageId, createSendDispatchId } from '../../shared/send-message-id.js';
 import {
   getTransportQueueStore,
@@ -144,6 +149,7 @@ async function writeSessionStore(home: string, options: { includeLatePeer?: bool
 async function writeWorkerSessionIdentity(
   home: string,
   identity: { sessionInstanceId: string; runtimeEpoch: string },
+  state: 'idle' | 'stopped' = 'idle',
 ): Promise<void> {
   const imcodesDir = join(home, '.imcodes');
   await mkdir(imcodesDir, { recursive: true });
@@ -156,7 +162,7 @@ async function writeWorkerSessionIdentity(
         role: 'w1',
         agentType: 'codex-sdk',
         projectDir: join(home, 'proj'),
-        state: 'idle',
+        state,
         restarts: 0,
         restartTimestamps: [],
         createdAt: now,
@@ -1728,6 +1734,155 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       expect(requests).toEqual([
         expect.objectContaining({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' }),
       ]);
+    } finally {
+      process.env.HOME = previousHome;
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('self-heals shared machine authority after an ordinary session restart', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-machine-authority-heal-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const requests: Array<Record<string, unknown>> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        void (async () => {
+          const body = JSON.parse(raw) as Record<string, unknown>;
+          requests.push(body);
+          if (body.runtimeEpoch === 'epoch-old') {
+            await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-new' });
+            res.writeHead(409, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: false, error: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR }));
+            return;
+          }
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, authority: 'authority-after-restart' }));
+        })();
+      });
+    });
+    try {
+      await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
+      await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+      const address = hookServer.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+      const owner = { sessionName: 'deck_sub_worker', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' };
+      const postHook = createResourceOwnerHookWithEpochRefresh({
+        resourceOwner: owner,
+        callerSessionName: caller.sessionName!,
+        requireHookPort: async () => address.port,
+        hookPath: SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+        timeoutMs: 2_000,
+        staleRuntimeError: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
+        rejectStopped: true,
+      });
+      await expect(postHook()).resolves.toMatchObject({ authority: 'authority-after-restart' });
+      await expect(postHook()).resolves.toMatchObject({ authority: 'authority-after-restart' });
+      expect(requests).toEqual([
+        expect.objectContaining({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' }),
+        expect.objectContaining({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-new' }),
+        expect.objectContaining({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-new' }),
+      ]);
+    } finally {
+      process.env.HOME = previousHome;
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('does not adopt a replacement session when machine authority sees stale runtime', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-machine-authority-reuse-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const requests: Array<Record<string, unknown>> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        void (async () => {
+          requests.push(JSON.parse(raw) as Record<string, unknown>);
+          await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-2', runtimeEpoch: 'epoch-new' });
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR }));
+        })();
+      });
+    });
+    try {
+      await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
+      await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+      const address = hookServer.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+      const postHook = createResourceOwnerHookWithEpochRefresh({
+        resourceOwner: { sessionName: 'deck_sub_worker', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' },
+        callerSessionName: caller.sessionName!,
+        requireHookPort: async () => address.port,
+        hookPath: SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+        timeoutMs: 2_000,
+        staleRuntimeError: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
+        rejectStopped: true,
+      });
+      await expect(postHook())
+        .rejects.toThrow(SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR);
+      expect(requests).toHaveLength(1);
+    } finally {
+      process.env.HOME = previousHome;
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('does not retry machine authority for a stopped exact session', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-machine-authority-stopped-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const requests: Array<Record<string, unknown>> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        void (async () => {
+          requests.push(JSON.parse(raw) as Record<string, unknown>);
+          await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-new' }, 'stopped');
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR }));
+        })();
+      });
+    });
+    try {
+      await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
+      await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+      const address = hookServer.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+      const postHook = createResourceOwnerHookWithEpochRefresh({
+        resourceOwner: { sessionName: 'deck_sub_worker', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' },
+        callerSessionName: caller.sessionName!,
+        requireHookPort: async () => address.port,
+        hookPath: SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+        timeoutMs: 2_000,
+        staleRuntimeError: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
+        rejectStopped: true,
+      });
+      await expect(postHook())
+        .rejects.toThrow(SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR);
+      expect(requests).toHaveLength(1);
     } finally {
       process.env.HOME = previousHome;
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

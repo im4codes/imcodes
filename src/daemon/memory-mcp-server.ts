@@ -23,7 +23,10 @@ import { registerMessagePinMcpTools, type MessagePinMcpToolDeps } from './messag
 import { registerSupervisionMcpTools, type SupervisionMcpToolDeps } from './supervision-mcp-tools.js';
 import { createSupervisionMcpToolDeps } from './supervision-registry-port.js';
 import { createDaemonMachineToolDeps } from './machine-mcp-deps.js';
-import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
+import {
+  SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+  SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
+} from '../../shared/shared-machine-authority.js';
 import { getSession, loadStore, type SessionRecord } from '../store/session-store.js';
 import { DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR } from './memory-mcp-error-codes.js';
 import { isDaemonCapabilityAdvertised } from './server-link.js';
@@ -501,6 +504,56 @@ export async function postHookSend(
   });
 }
 
+/**
+ * Post a resource-owner-bound hook request, refreshing only a bumped epoch for
+ * the exact session instance that owns this stdio child.  The child captures
+ * its owner from env at spawn, while an ordinary session restart can bump the
+ * epoch without replacing the child.  A stale response is therefore safe to
+ * retry only after the on-disk record proves the same instance is still the
+ * named session; never adopt a replacement that reuses the name.
+ */
+export function createResourceOwnerHookWithEpochRefresh(options: {
+  resourceOwner: SessionResourceOwner;
+  callerSessionName: string;
+  hookPath: string;
+  timeoutMs?: number;
+  body?: Record<string, unknown>;
+  staleRuntimeError: string;
+  rejectStopped?: boolean;
+  requireHookPort: (operation: string) => Promise<number>;
+}): ((body?: Record<string, unknown>) => Promise<Record<string, unknown>>) {
+  let runtimeEpoch = options.resourceOwner.runtimeEpoch;
+  return async (body = {}) => {
+    const sendOnce = () => options.requireHookPort(options.hookPath).then((port) => postHookSend(
+      port,
+      {
+        ...body,
+        sessionInstanceId: options.resourceOwner.sessionInstanceId,
+        runtimeEpoch,
+      },
+      options.hookPath,
+      options.callerSessionName,
+      options.timeoutMs,
+    ));
+
+    try {
+      return await sendOnce();
+    } catch (err) {
+      if (!(err instanceof Error) || err.message !== options.staleRuntimeError) throw err;
+      await loadStore();
+      const fresh = getSession(options.callerSessionName);
+      if (!fresh
+        || (options.rejectStopped && fresh.state === 'stopped')
+        || fresh.sessionInstanceId !== options.resourceOwner.sessionInstanceId
+        || !fresh.runtimeEpoch) {
+        throw err;
+      }
+      runtimeEpoch = fresh.runtimeEpoch;
+      return sendOnce();
+    }
+  };
+}
+
 export class HookRateLimitError extends Error {
   readonly name = 'HookRateLimitError';
   readonly statusCode = 429;
@@ -549,6 +602,17 @@ export function mergeDefaultToolDeps(
   const usesDefaultCapabilityService = !toolDeps.capabilityService && Boolean(caller.serverId);
   const resolveCapabilityIdentity = toolDeps.resolveCapabilityIdentity
     ?? (usesDefaultCapabilityService ? resolveDaemonCapabilityIdentity : undefined);
+  const postSharedMachineAuthorityHook = resourceOwner && caller.sessionName
+    ? createResourceOwnerHookWithEpochRefresh({
+      resourceOwner,
+      callerSessionName: caller.sessionName,
+      requireHookPort,
+      hookPath: SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+      timeoutMs: 2_000,
+      staleRuntimeError: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
+      rejectStopped: true,
+    })
+    : null;
   return {
     ...toolDeps,
     invokeDaemonMemoryTool: toolDeps.invokeDaemonMemoryTool
@@ -567,29 +631,16 @@ export function mergeDefaultToolDeps(
             // session currently owns the name, which would let an orphaned
             // child from a deleted session impersonate an unrelated session
             // that later reused that name.
-            let currentRuntimeEpoch = resourceOwner.runtimeEpoch;
-            const sendOnce = (name: MemoryMcpDaemonToolName, input: unknown, runtimeEpoch: string) =>
-              requireHookPort(MEMORY_MCP_DAEMON_RPC_PATH).then((port) => postHookSend(port, {
-                sessionInstanceId: resourceOwner.sessionInstanceId,
-                runtimeEpoch,
-                serverId: caller.serverId,
-                tool: name,
-                input,
-              }, MEMORY_MCP_DAEMON_RPC_PATH, caller.sessionName!, MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS));
+            const postResourceOwnerHook = createResourceOwnerHookWithEpochRefresh({
+                resourceOwner,
+                callerSessionName: caller.sessionName!,
+                requireHookPort,
+                hookPath: MEMORY_MCP_DAEMON_RPC_PATH,
+                timeoutMs: MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS,
+                staleRuntimeError: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR,
+              });
             return async (name: MemoryMcpDaemonToolName, input?: unknown) => {
-              let response: Record<string, unknown>;
-              try {
-                response = await sendOnce(name, input, currentRuntimeEpoch);
-              } catch (err) {
-                if (!(err instanceof Error) || err.message !== DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR) throw err;
-                await loadStore();
-                const fresh = getSession(caller.sessionName!);
-                if (!fresh || fresh.sessionInstanceId !== resourceOwner.sessionInstanceId || !fresh.runtimeEpoch) {
-                  throw err;
-                }
-                currentRuntimeEpoch = fresh.runtimeEpoch;
-                response = await sendOnce(name, input, currentRuntimeEpoch);
-              }
+              const response = await postResourceOwnerHook({ serverId: caller.serverId, tool: name, input });
               const result = response.result;
               if (!result || typeof result !== 'object' || Array.isArray(result)) {
                 throw new Error('daemon_memory_worker_invalid_response');
@@ -695,11 +746,7 @@ export function mergeDefaultToolDeps(
       resourceOwner,
       loadSharedMachineAuthority: resourceOwner && caller.sessionName
         ? async () => {
-            const port = await requireHookPort(SHARED_MACHINE_AUTHORITY_HOOK_PATH);
-            const response = await postHookSend(port, {
-              sessionInstanceId: resourceOwner.sessionInstanceId,
-              runtimeEpoch: resourceOwner.runtimeEpoch,
-            }, SHARED_MACHINE_AUTHORITY_HOOK_PATH, caller.sessionName!, 2_000);
+            const response = await postSharedMachineAuthorityHook!();
             if (response.authority == null) return null;
             if (typeof response.authority !== 'string' || !response.authority) {
               throw new Error('shared_machine_authority_invalid_response');

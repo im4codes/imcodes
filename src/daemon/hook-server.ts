@@ -74,7 +74,10 @@ import {
 } from '../../shared/memory-mcp-daemon-rpc.js';
 import { normalizeDaemonLocalMemoryNamespace, LEGACY_DAEMON_LOCAL_USER_ID } from '../../shared/memory-namespace.js';
 import type { McpRuntimeCaller } from './memory-mcp-caller.js';
-import { SHARED_MACHINE_AUTHORITY_HOOK_PATH } from '../../shared/shared-machine-authority.js';
+import {
+  SHARED_MACHINE_AUTHORITY_HOOK_PATH,
+  SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR,
+} from '../../shared/shared-machine-authority.js';
 import { readProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
 
 export { DEFAULT_HOOK_PORT };
@@ -1067,7 +1070,7 @@ export async function startHookServer(
           || body.sessionInstanceId !== session.sessionInstanceId
           || body.runtimeEpoch !== session.runtimeEpoch) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'shared_machine_authority_stale_runtime' }));
+          res.end(JSON.stringify({ ok: false, error: SHARED_MACHINE_AUTHORITY_STALE_RUNTIME_ERROR }));
           return;
         }
         const { getTransportRuntime } = await import('../agent/session-manager.js');
