@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import logger from '../util/logger.js';
 import { recordDaemonEventLoopStall } from '../util/daemon-status.js';
 
@@ -8,6 +9,14 @@ export const EVENT_LOOP_WATCHDOG_IDLE_PHASE = 'daemon-main-loop';
 let timer: ReturnType<typeof setInterval> | undefined;
 let expectedAt = 0;
 let phase = EVENT_LOOP_WATCHDOG_IDLE_PHASE;
+
+/**
+ * Over-threshold scoped blocks already reported under their own phase. The
+ * interval callback only runs AFTER the blocking work returns, so it subtracts
+ * these from its drift instead of blaming the same milliseconds on whatever
+ * phase happens to be current by then.
+ */
+let attributedScopedStalls: Array<{ durationMs: number }> = [];
 
 /**
  * Low-level setter. Prefer {@link withEventLoopWatchdogPhase}: a phase set here
@@ -24,16 +33,27 @@ export function getEventLoopWatchdogPhase(): string {
 
 /**
  * Labels only the synchronous work inside `fn`, then restores the previous
- * phase. A stall is therefore attributed to a named phase only when it was
- * actually running; work outside any scope reports as the idle phase.
+ * phase. The stall detector is a timer, so it cannot observe the phase while
+ * `fn` blocks the loop -- it fires afterwards. A scope that itself runs longer
+ * than the stall threshold therefore reports its stall directly, under its own
+ * name, and the following tick discounts those milliseconds; a stall that no
+ * scope explains still reports as the idle phase.
  */
 export function withEventLoopWatchdogPhase<T>(name: string, fn: () => T): T {
   const previous = phase;
   setEventLoopWatchdogPhase(name);
+  const startedAt = performance.now();
   try {
     return fn();
   } finally {
+    const durationMs = performance.now() - startedAt;
     phase = previous;
+    if (timer && durationMs > WATCHDOG_THRESHOLD_MS) {
+      const stallMs = Math.round(durationMs);
+      attributedScopedStalls.push({ durationMs });
+      recordDaemonEventLoopStall({ stallMs, phase: name });
+      logger.warn({ driftMs: stallMs, phase: name }, 'daemon event loop stall detected');
+    }
   }
 }
 
@@ -41,10 +61,15 @@ export function withEventLoopWatchdogPhase<T>(name: string, fn: () => T): T {
 export function startEventLoopWatchdog(): void {
   if (timer) return;
   expectedAt = Date.now() + WATCHDOG_INTERVAL_MS;
+  attributedScopedStalls = [];
   timer = setInterval(() => {
     const now = Date.now();
-    const driftMs = now - expectedAt;
+    const rawDriftMs = now - expectedAt;
     expectedAt = now + WATCHDOG_INTERVAL_MS;
+    // Every scoped block reported since the previous tick is part of this drift.
+    const attributedMs = attributedScopedStalls.reduce((sum, stall) => sum + stall.durationMs, 0);
+    attributedScopedStalls = [];
+    const driftMs = rawDriftMs - attributedMs;
     if (driftMs <= WATCHDOG_THRESHOLD_MS) return;
     recordDaemonEventLoopStall({ stallMs: driftMs, phase });
     logger.warn({ driftMs, phase }, 'daemon event loop stall detected');
@@ -56,4 +81,5 @@ export function stopEventLoopWatchdog(): void {
   if (!timer) return;
   clearInterval(timer);
   timer = undefined;
+  attributedScopedStalls = [];
 }

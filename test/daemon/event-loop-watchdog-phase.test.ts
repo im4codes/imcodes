@@ -13,14 +13,19 @@ import {
   withEventLoopWatchdogPhase,
 } from '../../src/daemon/event-loop-watchdog.js';
 
+/** Blocks the event loop for real: the watchdog's timer can only run afterwards. */
+function busyWait(ms: number): void {
+  const until = performance.now() + ms;
+  while (performance.now() < until) { /* spin */ }
+}
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
 beforeEach(() => {
-  vi.useFakeTimers();
   recordStall.mockReset();
   setEventLoopWatchdogPhase(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
 });
 afterEach(() => {
   stopEventLoopWatchdog();
-  vi.useRealTimers();
 });
 
 describe('event-loop watchdog phase attribution (tsk_cd_send_spinner_console_sync)', () => {
@@ -35,25 +40,39 @@ describe('event-loop watchdog phase attribution (tsk_cd_send_spinner_console_syn
     expect(getEventLoopWatchdogPhase()).toBe(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
   });
 
-  it('blames a stall on a named phase only when that phase was actually running', () => {
+  // The stall timer fires AFTER the blocking work returns, i.e. after the scope
+  // restored the phase. These use real timers and a real busy-wait for that reason.
+  it('names the scope for a stall that was really caused inside it -- and counts it once', async () => {
     startEventLoopWatchdog();
-    // A console pass ran and finished long ago ...
-    withEventLoopWatchdogPhase('supervision-console.synchronize-durable-events', () => undefined);
-    // ... then something unlabelled blocks the loop for 400 ms. Before the fix the
-    // sticky label made this a "synchronize-durable-events" stall.
-    vi.setSystemTime(Date.now() + 400);
-    vi.advanceTimersByTime(100);
-    expect(recordStall).toHaveBeenCalledTimes(1);
-    expect(recordStall.mock.calls[0]![0]).toMatchObject({ phase: EVENT_LOOP_WATCHDOG_IDLE_PHASE });
-    expect(recordStall.mock.calls[0]![0].stallMs).toBeGreaterThan(75);
+    await sleep(120);
+    recordStall.mockReset();
+    withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => busyWait(220));
+    await sleep(350);
+    const named = recordStall.mock.calls.map(([arg]) => arg as { phase: string; stallMs: number });
+    expect(named.filter((stall) => stall.phase === 'supervision-console.build-snapshot')).toHaveLength(1);
+    expect(named.find((stall) => stall.phase === 'supervision-console.build-snapshot')!.stallMs).toBeGreaterThanOrEqual(200);
+    // The tick that finally ran must not blame the same milliseconds on the idle phase.
+    expect(named.filter((stall) => stall.phase === EVENT_LOOP_WATCHDOG_IDLE_PHASE)).toHaveLength(0);
   });
 
-  it('still names the phase for a stall that happens INSIDE a scoped phase', () => {
+  it('does not blame an earlier finished scope for an unrelated stall', async () => {
     startEventLoopWatchdog();
-    withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => {
-      vi.setSystemTime(Date.now() + 400);
-      vi.advanceTimersByTime(100);
-    });
-    expect(recordStall.mock.calls[0]![0]).toMatchObject({ phase: 'supervision-console.build-snapshot' });
+    await sleep(120);
+    withEventLoopWatchdogPhase('supervision-console.synchronize-durable-events', () => undefined);
+    recordStall.mockReset();
+    busyWait(220); // unlabelled work
+    await sleep(350);
+    const stalls = recordStall.mock.calls.map(([arg]) => arg as { phase: string });
+    expect(stalls.length).toBeGreaterThanOrEqual(1);
+    expect(stalls.every((stall) => stall.phase === EVENT_LOOP_WATCHDOG_IDLE_PHASE)).toBe(true);
+  });
+
+  it('a short scope reports nothing and leaves the tick to judge', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    recordStall.mockReset();
+    withEventLoopWatchdogPhase('short', () => busyWait(20));
+    await sleep(250);
+    expect(recordStall).not.toHaveBeenCalled();
   });
 });

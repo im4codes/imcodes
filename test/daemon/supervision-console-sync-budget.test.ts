@@ -12,6 +12,12 @@
  */
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+
+const recordStall = vi.hoisted(() => vi.fn());
+vi.mock('../../src/util/daemon-status.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/util/daemon-status.js')>()),
+  recordDaemonEventLoopStall: (arg: unknown) => recordStall(arg),
+}));
 import {
   SUPERVISION_INLINE_SYNC_MAX_EVENTS,
   SUPERVISION_SYNC_SLICE_BUDGET_MS,
@@ -23,6 +29,11 @@ import {
 } from '../../src/daemon/supervision-store-migrations.js';
 import type { SupervisionTaskConsoleDelta } from '../../shared/supervision-task-console.js';
 import { TaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
+import {
+  EVENT_LOOP_WATCHDOG_IDLE_PHASE,
+  startEventLoopWatchdog,
+  stopEventLoopWatchdog,
+} from '../../src/daemon/event-loop-watchdog.js';
 
 const SCOPE = { projectName: 'codedeck', coordinatorSessionName: 'deck_cd_brain' };
 const EPOCH = 'epoch-budget';
@@ -390,5 +401,55 @@ describe('inline vs yielded threshold', () => {
     expect(p.needsYieldedDurableReplay(SCOPE)).toBe(false);
     insertEvent('t1', null, 99);
     expect(p.needsYieldedDurableReplay(SCOPE)).toBe(true);
+  });
+});
+
+describe('a real console stall is attributed to its console phase (watchdog)', () => {
+  const busyWait = (ms: number) => { const until = performance.now() + ms; while (performance.now() < until) { /* block the loop */ } };
+  const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+  const phases = () => recordStall.mock.calls.map(([arg]) => (arg as { phase: string }).phase);
+
+  beforeEach(async () => {
+    recordStall.mockReset();
+    startEventLoopWatchdog();
+    await sleep(120);
+    recordStall.mockReset();
+  });
+  afterEach(() => { stopEventLoopWatchdog(); });
+
+  // The slow part is the live-session lookup the projection calls for every
+  // assignment row it builds -- the same call a busy real daemon makes slowly.
+  const slowPresentation = (_name: string, at: number) => {
+    busyWait(200);
+    return { state: 'idle' as const, source: 'runtime' as const, observedAt: at };
+  };
+
+  it('a slow snapshot build is reported under supervision-console.build-snapshot, once, never as idle', async () => {
+    insertTask('t1');
+    insertAssignment('a1', 't1', 'implementing', 'primary');
+    const p = makeProducer({ resolveSessionPresentation: slowPresentation });
+    p.buildSnapshot(SCOPE, 'sub-slow');
+    await sleep(350);
+    expect(phases().filter((phase) => phase === 'supervision-console.build-snapshot')).toHaveLength(1);
+    expect(phases()).not.toContain(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
+  });
+
+  it('a slow durable-tail slice is reported under supervision-console.synchronize-durable-events-async', async () => {
+    insertTask('t1');
+    insertAssignment('a1', 't1', 'implementing', 'primary');
+    const p = makeProducer({ resolveSessionPresentation: slowPresentation });
+    p.ensureProjectionBaseline(SCOPE);
+    insertEvent('t1', 'a1');
+    await p.synchronizeDurableEventsAsync(SCOPE, { deliver: false });
+    await sleep(350);
+    expect(phases().filter((phase) => phase === 'supervision-console.synchronize-durable-events-async')).toHaveLength(1);
+    expect(phases()).not.toContain(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
+  });
+
+  it('an unlabelled stall in the same process still reads as the idle phase', async () => {
+    busyWait(200);
+    await sleep(350);
+    expect(phases()).toContain(EVENT_LOOP_WATCHDOG_IDLE_PHASE);
+    expect(phases().every((phase) => phase === EVENT_LOOP_WATCHDOG_IDLE_PHASE)).toBe(true);
   });
 });
