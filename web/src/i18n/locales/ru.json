@@ -1016,7 +1016,22 @@
     "delete_tmux_note": "Сессии tmux не будут закрыты",
     "delete_tmux_suffix": ", но daemon больше не будет запускаться автоматически.",
     "delete_confirm_prompt": "Введите имя сервера для подтверждения удаления:",
-    "delete_confirm": "Подтвердить удаление"
+    "delete_confirm": "Подтвердить удаление",
+    "daemon_upgrade_available": "Доступно обновление daemon",
+    "daemon_status": "Состояние daemon",
+    "daemon_current_version": "Текущая версия",
+    "daemon_latest_version": "Последняя версия",
+    "daemon_upgrade_button": "Обновить daemon",
+    "daemon_upgrade_confirm_title": "Обновить daemon?",
+    "daemon_upgrade_confirm_warning": "Активные задачи будут прерваны, а соединение отключится на несколько секунд во время перезапуска daemon.",
+    "daemon_upgrade_confirm_busy": "В {{count}} сессии(ях) есть активная работа.",
+    "daemon_upgrade_confirm_multiple": "Будет запрошено обновление {{count}} daemon.",
+    "daemon_upgrade_confirm": "Обновить",
+    "daemon_upgrade_in_progress": "Обновление…",
+    "daemon_upgrade_reconnecting": "Обновление отправлено; переподключение…",
+    "daemon_upgrade_blocked": "Обновление заблокировано",
+    "daemon_busy_sessions": "Активных сессий: {{count}}",
+    "daemon_offline": "Daemon отключён"
   },
   "quick_input": {
     "title": "Быстрый ввод",

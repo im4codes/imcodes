@@ -1016,7 +1016,22 @@
     "delete_tmux_note": "Las sesiones de tmux no se cerrarán",
     "delete_tmux_suffix": ", pero el daemon ya no se iniciará automáticamente.",
     "delete_confirm_prompt": "Escribe el nombre del servidor para confirmar la eliminación:",
-    "delete_confirm": "Confirmar eliminación"
+    "delete_confirm": "Confirmar eliminación",
+    "daemon_upgrade_available": "Actualización del daemon disponible",
+    "daemon_status": "Estado del daemon",
+    "daemon_current_version": "Versión actual",
+    "daemon_latest_version": "Última versión",
+    "daemon_upgrade_button": "Actualizar daemon",
+    "daemon_upgrade_confirm_title": "¿Actualizar el daemon?",
+    "daemon_upgrade_confirm_warning": "Las tareas activas se interrumpirán y la conexión se perderá unos segundos mientras el daemon se reinicia.",
+    "daemon_upgrade_confirm_busy": "{{count}} sesión(es) tienen trabajo activo.",
+    "daemon_upgrade_confirm_multiple": "Se solicitará la actualización de {{count}} daemons.",
+    "daemon_upgrade_confirm": "Actualizar",
+    "daemon_upgrade_in_progress": "Actualizando…",
+    "daemon_upgrade_reconnecting": "Actualización enviada; reconectando…",
+    "daemon_upgrade_blocked": "Actualización bloqueada",
+    "daemon_busy_sessions": "{{count}} sesión(es) activas",
+    "daemon_offline": "Daemon desconectado"
   },
   "quick_input": {
     "title": "Entrada rápida",

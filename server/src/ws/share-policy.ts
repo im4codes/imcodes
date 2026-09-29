@@ -1005,7 +1005,7 @@ function redactDaemonStatsForParticipant(
   // of forwarding arbitrary daemon fields so a future token/secret field can
   // never become visible merely because daemon.stats was expanded upstream.
   const redacted: Record<string, unknown> = { type: 'daemon.stats' };
-  for (const key of ['daemonVersion', 'cpu', 'memUsed', 'memTotal', 'load1', 'load5', 'load15', 'uptime']) {
+  for (const key of ['daemonVersion', 'latestDaemonVersion', 'cpu', 'memUsed', 'memTotal', 'load1', 'load5', 'load15', 'uptime']) {
     const value = msg[key];
     if (typeof value === 'number' || typeof value === 'string' || value === null) {
       redacted[key] = value;

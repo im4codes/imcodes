@@ -85,3 +85,13 @@ describe('controlled upgrade rollback envelope', () => {
     })).toEqual({ ok: false });
   });
 });
+
+describe('resolveDaemonUpgradeSource', () => {
+  it('treats a missing or unknown source (older servers) as auto so the opt-out still holds', async () => {
+    const { resolveDaemonUpgradeSource, DAEMON_UPGRADE_SOURCE } = await import('../../shared/daemon-upgrade.js');
+    expect(resolveDaemonUpgradeSource(undefined)).toBe(DAEMON_UPGRADE_SOURCE.AUTO);
+    expect(resolveDaemonUpgradeSource('bogus')).toBe(DAEMON_UPGRADE_SOURCE.AUTO);
+    expect(resolveDaemonUpgradeSource(DAEMON_UPGRADE_SOURCE.MANUAL)).toBe(DAEMON_UPGRADE_SOURCE.MANUAL);
+    expect(resolveDaemonUpgradeSource(DAEMON_UPGRADE_SOURCE.REPLAY)).toBe(DAEMON_UPGRADE_SOURCE.REPLAY);
+  });
+});

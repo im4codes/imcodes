@@ -164,6 +164,7 @@ import {
 import { clearMessagePinsCache } from './hooks/useMessagePins.js';
 import type { ChatLocalWebPreviewOpenHandler } from './components/ChatLoopbackLink.js';
 import { formatDaemonVersionShort } from './util/format-version.js';
+import { DaemonStatusCard, DaemonUpgradeConfirmDialog, type DaemonUpgradeRequestState } from './components/DaemonStatusCard.js';
 import { nextDaemonUpgradingState, daemonUpgradingLabel, type DaemonUpgradingState } from './util/daemon-upgrade-status.js';
 import {
   daemonUpgradeBlockedToastKey,
@@ -497,6 +498,7 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   daemonVersion?: string | null;
+  latestDaemonVersion?: string | null;
   createdAt: number;
 }
 
@@ -660,6 +662,8 @@ export function App() {
       return null;
     }
   });
+  const [daemonUpgradeRequests, setDaemonUpgradeRequests] = useState<Record<string, DaemonUpgradeRequestState>>({});
+  const [daemonUpgradeConfirmTarget, setDaemonUpgradeConfirmTarget] = useState<ServerInfo | 'all' | null>(null);
   const supervisionCacheUserRef = useRef<string | null>(auth?.userId ?? null);
   useEffect(() => {
     const previousUserId = supervisionCacheUserRef.current;
@@ -1485,26 +1489,52 @@ export function App() {
   }, [selectedServerId]);
 
   const handleUpgradeDaemon = useCallback(async (server: ServerInfo) => {
+    setDaemonUpgradeConfirmTarget(server);
+  }, []);
+
+  const performDaemonUpgrade = useCallback(async (server: ServerInfo) => {
+    setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'requesting' } }));
     try {
       await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
-      alert(trans('server.upgrade_sent', { name: server.name }));
+      setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'sent' } }));
     } catch {
-      alert(trans('server.upgrade_failed'));
+      setDaemonUpgradeRequests((previous) => ({ ...previous, [server.id]: { phase: 'failed', message: trans('server.upgrade_failed') } }));
     }
   }, [trans]);
 
   const handleUpgradeAll = useCallback(async () => {
-    const results: string[] = [];
-    for (const server of servers) {
-      try {
+    setDaemonUpgradeConfirmTarget('all');
+  }, []);
+
+  const confirmDaemonUpgrade = useCallback(async () => {
+    const target = daemonUpgradeConfirmTarget;
+    setDaemonUpgradeConfirmTarget(null);
+    if (!target) return;
+    if (target === 'all') {
+      setDaemonUpgradeRequests((previous) => {
+        const next = { ...previous };
+        servers.forEach((server) => { next[server.id] = { phase: 'requesting' }; });
+        return next;
+      });
+      const results = await Promise.allSettled(servers.map(async (server) => {
         await apiFetch(`/api/server/${server.id}/upgrade`, { method: 'POST' });
-        results.push(`✓ ${server.name}`);
-      } catch {
-        results.push(`✗ ${server.name}`);
-      }
+        return server.id;
+      }));
+      setDaemonUpgradeRequests((previous) => {
+        const next = { ...previous };
+        results.forEach((result, index) => {
+          const id = servers[index]?.id;
+          if (!id) return;
+          next[id] = result.status === 'rejected'
+            ? { phase: 'failed', message: trans('server.upgrade_failed') }
+            : { phase: 'sent' };
+        });
+        return next;
+      });
+      return;
     }
-    alert(results.join('\n'));
-  }, [servers]);
+    await performDaemonUpgrade(target);
+  }, [daemonUpgradeConfirmTarget, performDaemonUpgrade, servers, trans]);
 
   const handleDeleteServer = useCallback(async (server: ServerInfo) => {
     try {
@@ -2959,7 +2989,7 @@ export function App() {
     }
     setShowDiscussionDialog(false);
   }, [pushDiscussionFailureToast]);
-  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean } | null>(null);
+  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; latestDaemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean } | null>(null);
 
   useEffect(() => {
     if (!auth || !selectedServerId || sharedHashRestorePending) return;
@@ -4435,6 +4465,12 @@ export function App() {
         }
       }
       if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
+        if (selectedServerId) {
+          setDaemonUpgradeRequests((previous) => ({
+            ...previous,
+            [selectedServerId]: { phase: 'failed', blockedReason: msg.reason },
+          }));
+        }
         const now = Date.now();
         if (shouldShowDaemonUpgradeBlockedToast(lastUpgradeBlockedToastRef.current, msg.reason, now)) {
           lastUpgradeBlockedToastRef.current = { reason: msg.reason, shownAt: now };
@@ -4480,6 +4516,13 @@ export function App() {
         // (The upgrading badge is cleared by the reducer block above, which also
         // handles ONLINE/RECONNECTED.)
         setDaemonOnline(true);
+        if (selectedServerId) {
+          setDaemonUpgradeRequests((previous) => {
+            const current = previous[selectedServerId];
+            if (!current || (current.phase !== 'requesting' && current.phase !== 'sent')) return previous;
+            return { ...previous, [selectedServerId]: { phase: 'idle' } };
+          });
+        }
         setServers((prev) => markServerDaemonActivity(prev, selectedServerId));
       }
       if (msg.type === MSG_DAEMON_OFFLINE) {
@@ -4647,7 +4690,7 @@ export function App() {
     });
     const unsubStats = ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
-        setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime, mainEventLoopLagMs: msg.mainEventLoopLagMs, mainEventLoopBlockedMs: msg.mainEventLoopBlockedMs, mainEventLoopBusy: msg.mainEventLoopBusy });
+        setDaemonStats({ daemonVersion: msg.daemonVersion, latestDaemonVersion: msg.latestDaemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime, mainEventLoopLagMs: msg.mainEventLoopLagMs, mainEventLoopBlockedMs: msg.mainEventLoopBlockedMs, mainEventLoopBusy: msg.mainEventLoopBusy });
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
@@ -5997,6 +6040,11 @@ export function App() {
     ? servers.find((server) => server.id === selectedServerId) ?? null
     : null;
   const daemonVersionForDisplay = daemonStats?.daemonVersion ?? selectedServerInfo?.daemonVersion ?? null;
+  const latestDaemonVersionForDisplay = daemonStats?.latestDaemonVersion ?? selectedServerInfo?.latestDaemonVersion ?? null;
+  const daemonUpgradeRequest = selectedServerId
+    ? daemonUpgradeRequests[selectedServerId] ?? { phase: 'idle' as const }
+    : { phase: 'idle' as const };
+  const busyDaemonSessionCount = sessions.filter((session) => session.state === 'running' || session.state === 'queued').length;
   const daemonBadgeState = getDaemonBadgeState(connected, connecting, daemonOnline, selectedServerInfo);
 
   useEffect(() => {
@@ -6326,8 +6374,17 @@ export function App() {
           )}
         </div>
         <div style={{ flex: 1 }} />
-        {connected && (daemonStats || daemonVersionForDisplay) && (
+        {selectedServerInfo && (connected || daemonStats || daemonVersionForDisplay) && (
           <div class="sidebar-stats">
+            <DaemonStatusCard
+              currentVersion={daemonVersionForDisplay}
+              latestVersion={latestDaemonVersionForDisplay}
+              online={connected && daemonOnline}
+              busySessions={busyDaemonSessionCount}
+              upgrading={Boolean(daemonUpgrading)}
+              requestState={daemonUpgradeRequest}
+              onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
+            />
             {daemonVersionForDisplay && (
               <div class="sidebar-stats-row">
                 {/* Tooltip surfaces the full version (incl. dev counter) for support. */}
@@ -7125,8 +7182,18 @@ export function App() {
             </div>
             {/* Footer */}
             <div class="mobile-sidebar-footer">
-              {selectedServerId && connected && (daemonStats || daemonVersionForDisplay) && (
+              {selectedServerId && selectedServerInfo && (connected || daemonStats || daemonVersionForDisplay) && (
                 <div class="mobile-sidebar-daemon-status">
+                  <DaemonStatusCard
+                    currentVersion={daemonVersionForDisplay}
+                    latestVersion={latestDaemonVersionForDisplay}
+                    online={connected && daemonOnline}
+                    busySessions={busyDaemonSessionCount}
+                    upgrading={Boolean(daemonUpgrading)}
+                    requestState={daemonUpgradeRequest}
+                    onUpgrade={() => handleUpgradeDaemon(selectedServerInfo)}
+                    compact
+                  />
                   <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
                     {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}{daemonStats.mainEventLoopBusy ? ` · Busy ${Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms` : ''}</span>}
@@ -7733,6 +7800,15 @@ export function App() {
           onUpgradeAll={servers.length > 1 ? handleUpgradeAll : undefined}
           onDelete={() => setDeleteTarget(serverCtxMenu.server)}
           onClose={() => setServerCtxMenu(null)}
+        />
+      )}
+
+      {daemonUpgradeConfirmTarget && (
+        <DaemonUpgradeConfirmDialog
+          busySessions={busyDaemonSessionCount}
+          targetCount={daemonUpgradeConfirmTarget === 'all' ? servers.length : 1}
+          onCancel={() => setDaemonUpgradeConfirmTarget(null)}
+          onConfirm={() => void confirmDaemonUpgrade()}
         />
       )}
 

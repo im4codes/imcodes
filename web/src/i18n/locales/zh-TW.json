@@ -1016,7 +1016,22 @@
     "delete_tmux_note": "tmux sessions 不會被關閉",
     "delete_tmux_suffix": "，但 Daemon 將不再自動啟動。",
     "delete_confirm_prompt": "請輸入伺服器名稱以確認刪除：",
-    "delete_confirm": "確認刪除"
+    "delete_confirm": "確認刪除",
+    "daemon_upgrade_available": "Daemon 有可用升級",
+    "daemon_status": "Daemon 狀態",
+    "daemon_current_version": "目前版本",
+    "daemon_latest_version": "最新版本",
+    "daemon_upgrade_button": "升級 Daemon",
+    "daemon_upgrade_confirm_title": "升級 Daemon？",
+    "daemon_upgrade_confirm_warning": "執行中的工作會中斷，Daemon 重啟期間連線會中斷幾秒。",
+    "daemon_upgrade_confirm_busy": "目前有 {{count}} 個工作階段正在執行。",
+    "daemon_upgrade_confirm_multiple": "將為 {{count}} 個 Daemon 請求升級。",
+    "daemon_upgrade_confirm": "升級",
+    "daemon_upgrade_in_progress": "升級中…",
+    "daemon_upgrade_reconnecting": "已送出升級請求，正在重新連線…",
+    "daemon_upgrade_blocked": "升級遭阻止",
+    "daemon_busy_sessions": "{{count}} 個工作階段正在執行",
+    "daemon_offline": "Daemon 離線"
   },
   "quick_input": {
     "title": "快速輸入",

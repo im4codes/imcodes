@@ -228,8 +228,11 @@ import {
 } from '../../shared/codebuddy.js';
 import {
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_SOURCE,
   DAEMON_UPGRADE_TARGET_LATEST,
   normalizeDaemonUpgradeTargetVersion,
+  resolveDaemonUpgradeSource,
+  type DaemonUpgradeSource,
 } from '../../shared/daemon-upgrade.js';
 import { CC_PRESET_MSG, CUSTOM_PROVIDER_SDK_AGENT_TYPES, normalizeCcPresetName, type CcPreset } from '../../shared/cc-presets.js';
 import {
@@ -2086,11 +2089,13 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
         const upgradeId = typeof cmd.upgradeId === 'string' && cmd.upgradeId.length > 0 && cmd.upgradeId.length <= 128
           ? cmd.upgradeId
           : undefined;
+        const source = resolveDaemonUpgradeSource(cmd.source);
       void handleDaemonUpgrade(
           normalizedTarget === DAEMON_UPGRADE_TARGET_LATEST ? undefined : normalizedTarget,
           serverLink,
           upgradeId,
           typeof cmd.registry === 'string' ? cmd.registry : undefined,
+          source,
         );
       } catch {
         logger.warn({ targetVersion: cmd.targetVersion }, 'daemon.upgrade rejected invalid targetVersion');
@@ -8264,21 +8269,20 @@ async function handleDaemonUpgrade(
   serverLink?: ServerLink,
   upgradeId?: string,
   registryOverride?: string,
+  source: DaemonUpgradeSource = DAEMON_UPGRADE_SOURCE.MANUAL,
 ): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
-  // ── Opt-out: forcibly disable the daemon's self-upgrade ───────────────────
-  // Set `daemon.autoUpgrade: false` in ~/.imcodes/config.yaml (or the env
-  // IMCODES_DISABLE_AUTO_UPGRADE=1) to stop the daemon from replacing itself —
-  // e.g. when running a local source build you don't want clobbered by the
-  // published npm release. The manual `imcodes upgrade` CLI is unaffected.
+  // ── Opt-out: server-driven automatic upgrades are disabled by default. ────
+  // Explicitly confirmed manual upgrades and replay of an existing manual
+  // lifecycle remain allowed; only legacy source:auto is gated here.
   const envDisabled = process.env.IMCODES_DISABLE_AUTO_UPGRADE === '1'
     || process.env.IMCODES_DISABLE_AUTO_UPGRADE === 'true';
   // Read the already-cached config synchronously — no await before the
   // active-turn / cooldown checks below (an extra async hop would delay them
   // past their awaiters). Null (config not yet loaded) is treated as enabled.
   const configDisabled = getLoadedConfig()?.daemon?.autoUpgrade === false;
-  if (envDisabled || configDisabled) {
+  if (source === DAEMON_UPGRADE_SOURCE.AUTO && (envDisabled || configDisabled)) {
     logger.info(
       { targetVersion, reason: envDisabled ? 'env' : 'config' },
       'daemon.upgrade: auto-upgrade disabled — skipping',

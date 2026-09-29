@@ -1016,7 +1016,22 @@
     "delete_tmux_note": "tmuxセッションは閉じられません",
     "delete_tmux_suffix": "が、Daemonは自動起動しなくなります。",
     "delete_confirm_prompt": "削除を確認するにはサーバー名を入力してください：",
-    "delete_confirm": "削除を確認"
+    "delete_confirm": "削除を確認",
+    "daemon_upgrade_available": "daemon の更新があります",
+    "daemon_status": "daemon の状態",
+    "daemon_current_version": "現在のバージョン",
+    "daemon_latest_version": "最新バージョン",
+    "daemon_upgrade_button": "daemon を更新",
+    "daemon_upgrade_confirm_title": "daemon を更新しますか？",
+    "daemon_upgrade_confirm_warning": "実行中のタスクは中断され、daemon の再起動中は数秒間接続が切れます。",
+    "daemon_upgrade_confirm_busy": "{{count}} 件のセッションで作業中です。",
+    "daemon_upgrade_confirm_multiple": "{{count}} 個の daemon に更新を要求します。",
+    "daemon_upgrade_confirm": "更新",
+    "daemon_upgrade_in_progress": "更新中…",
+    "daemon_upgrade_reconnecting": "更新を送信しました。再接続中…",
+    "daemon_upgrade_blocked": "更新がブロックされました",
+    "daemon_busy_sessions": "実行中のセッション {{count}} 件",
+    "daemon_offline": "daemon はオフラインです"
   },
   "quick_input": {
     "title": "クイック入力",

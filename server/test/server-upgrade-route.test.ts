@@ -105,7 +105,30 @@ describe('server routes', () => {
         status: 'online',
         lastHeartbeatAt: 123,
         daemonVersion: '2026.5.2047-dev.2025',
+        latestDaemonVersion: null,
         createdAt: 99,
+      }],
+    });
+  });
+
+  it('GET /api/server exposes the configured latest daemon version', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    mockGetFullServersByUserId.mockResolvedValue([{
+      id: 'srv-1',
+      name: 'Alpha',
+      daemon_version: '2026.4.904-dev.876',
+    }]);
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server');
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      servers: [{
+        id: 'srv-1',
+        name: 'Alpha',
+        daemonVersion: '2026.4.904-dev.876',
+        latestDaemonVersion: '2026.4.905-dev.877',
       }],
     });
   });

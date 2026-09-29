@@ -3390,6 +3390,21 @@ html.native-ios-mac .chat-dl-btn {
    breakpoint, so width alone cannot decide whether the mobile shell exists. */
 .mobile-server-bar { display: none; align-items: center; justify-content: space-between; gap: 8px; padding: 7px 9px; background: linear-gradient(180deg, #0d1422 0%, #09111d 100%); border-bottom: 1px solid rgba(34,211,238,0.18); box-shadow: inset 0 1px 0 rgba(255,255,255,0.04), 0 4px 16px rgba(0,0,0,0.24); flex-shrink: 0; position: relative; z-index: var(--mobile-server-bar-z); }
 .mobile-server-bar::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 1px; background: linear-gradient(90deg, transparent, rgba(34,211,238,0.72), rgba(52,211,153,0.55), transparent); pointer-events: none; }
+
+.daemon-status-card { position: relative; display: flex; align-items: flex-start; gap: 6px; min-width: 0; }
+.daemon-upgrade-icon { border: 1px solid rgba(251, 191, 36, 0.65); border-radius: 999px; background: rgba(120, 53, 15, 0.45); color: #fde68a; width: 24px; height: 24px; padding: 0; cursor: pointer; line-height: 1; font-size: 16px; animation: daemon-upgrade-pulse 1.2s ease-in-out infinite; }
+.daemon-upgrade-icon:focus-visible { outline: 2px solid #fbbf24; outline-offset: 2px; }
+.daemon-status-card-content { min-width: 210px; max-width: min(280px, calc(100vw - 24px)); padding: 9px 10px; border: 1px solid rgba(251, 191, 36, 0.45); border-radius: 8px; background: #111827; box-shadow: 0 8px 22px rgba(0,0,0,0.35); color: #cbd5e1; font-size: 11px; }
+.daemon-status-card-title { color: #f8fafc; font-weight: 650; margin-bottom: 6px; }
+.daemon-status-card-row { display: flex; justify-content: space-between; gap: 10px; margin-top: 3px; }
+.daemon-status-card-row code { color: #fde68a; }
+.daemon-status-card-warning { margin-top: 7px; color: #fbbf24; line-height: 1.35; }
+.daemon-status-card-state { margin-top: 7px; color: #93c5fd; line-height: 1.35; }
+.daemon-upgrade-button { width: 100%; margin-top: 9px; font-size: 11px; padding: 5px 8px; }
+@keyframes daemon-upgrade-pulse { 0%, 100% { opacity: 1; transform: scale(1); } 50% { opacity: .45; transform: scale(.9); } }
+@media (prefers-reduced-motion: reduce) { .daemon-upgrade-icon { animation: none; } }
+.mobile-sidebar-daemon-status .daemon-status-card { flex: 0 0 auto; }
+.mobile-sidebar-daemon-status .daemon-status-card-content { position: absolute; right: 0; bottom: 30px; z-index: 10; }
 .mobile-sidebar-toggle { display: none; width: 36px; height: 36px; background: rgba(15,23,42,0.55); border: 1px solid rgba(125,211,252,0.16); border-radius: 10px; color: #94a3b8; font-size: 18px; cursor: pointer; padding: 0; line-height: 1; flex-shrink: 0; }
 .mobile-sidebar-toggle:active { color: var(--chrome-accent); border-color: rgba(34,211,238,0.5); background: rgba(8,145,178,0.16); }
 .mobile-dashboard-menu-button { position: sticky; top: max(12px, var(--sat, 0px)); z-index: 2; width: 40px; height: 40px; margin: 12px 0 -52px 12px; padding: 0; border: 1px solid rgba(125,211,252,0.22); border-radius: 10px; background: rgba(15,23,42,0.9); color: #cbd5e1; font-size: 20px; line-height: 1; cursor: pointer; box-shadow: 0 6px 18px rgba(0,0,0,0.3); }
@@ -8794,6 +8809,8 @@ html.native-ios-mac .chat-dl-btn {
 
 /* Server icon bar — narrow fixed-width vertical strip (Discord/Slack style) */
 .server-icon-bar { display: flex; flex-direction: column; align-items: center; width: 48px; min-width: 48px; background: repeating-linear-gradient(180deg, transparent 0 22px, rgba(125,211,252,0.026) 22px 23px), linear-gradient(180deg, #0b1220 0%, #070b13 100%); border-right: 1px solid rgba(34,211,238,0.18); padding: 8px 0; gap: 4px; overflow-y: auto; scrollbar-width: none; flex-shrink: 0; box-shadow: inset -1px 0 0 rgba(255,255,255,0.035), 8px 0 24px rgba(0,0,0,0.22); }
+.server-icon-upgrade { position: absolute; right: 1px; top: 1px; color: #fde68a; font-size: 12px; animation: daemon-upgrade-pulse 1.2s ease-in-out infinite; }
+@media (prefers-reduced-motion: reduce) { .server-icon-upgrade { animation: none; } }
 .server-icon-bar::-webkit-scrollbar { display: none; }
 .server-icon { position: relative; width: 38px; height: 34px; border-radius: 11px; background: linear-gradient(180deg, rgba(30,41,59,0.84), rgba(15,23,42,0.86)); border: 1px solid rgba(125,211,252,0.16); color: #94a3b8; font-size: 15px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: background 0.15s, border-color 0.15s, color 0.15s, border-radius 0.15s, box-shadow 0.15s, transform 0.15s; padding: 0; flex-shrink: 0; box-shadow: inset 0 1px 0 rgba(255,255,255,0.04); overflow: visible; }
 .server-icon::before { content: ''; position: absolute; inset: 0; background: linear-gradient(135deg, rgba(255,255,255,0.10), transparent 42%); opacity: 0.35; pointer-events: none; }

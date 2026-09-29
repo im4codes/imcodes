@@ -495,7 +495,7 @@ describe('WsBridge share-scoped sockets', () => {
     }));
     await flushAsync();
     expect(participant.sentJson.find((msg) => msg.type === 'daemon.stats')).toEqual({
-      type: 'daemon.stats', daemonVersion: '1.2.3', cpu: 1, memUsed: 2, memTotal: 3,
+      type: 'daemon.stats', daemonVersion: '1.2.3', latestDaemonVersion: null, cpu: 1, memUsed: 2, memTotal: 3,
       load1: 4, load5: 5, load15: 6, uptime: 7,
     });
     expect(shared.sentJson.some((msg) => msg.type === 'daemon.stats')).toBe(false);

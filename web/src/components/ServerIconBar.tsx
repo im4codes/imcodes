@@ -2,6 +2,7 @@ import { useTranslation } from 'react-i18next';
 import { isServerOnline } from '../server-selection.js';
 import type { SharedStateSummary } from '../tab-sharing-ui.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
+import { isDaemonUpgradeAvailable } from '@shared/daemon-upgrade.js';
 
 interface ServerInfo {
   id: string;
@@ -9,6 +10,7 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   daemonVersion?: string | null;
+  latestDaemonVersion?: string | null;
   createdAt: number;
 }
 
@@ -62,6 +64,9 @@ export function ServerIconBar({ servers, activeServerId, onSelectServer, onServe
           >
             <span class="server-icon-letter">{getInitial(server.name)}</span>
             <SharedStateIndicator state={sharedState} iconOnly variant="shared-out" />
+            {isDaemonUpgradeAvailable(server.daemonVersion, server.latestDaemonVersion) && (
+              <span class="server-icon-upgrade" aria-label={t('server.daemon_upgrade_available')} title={t('server.daemon_upgrade_available')}>↥</span>
+            )}
             <span
               class="server-icon-dot"
               style={{ background: isOnline ? '#4ade80' : '#475569' }}

@@ -1,6 +1,46 @@
 import { DAEMON_MSG } from './daemon-events.js';
+import { compareImcodesVersions, getReleaseChannel } from './imcodes-version.js';
 
 export const DAEMON_UPGRADE_TARGET_LATEST = 'latest';
+
+/** Origin of a daemon upgrade command. Auto is retained only for legacy
+ * controlled-node recovery; full daemons never receive it on reconnect. */
+export const DAEMON_UPGRADE_SOURCE = {
+  AUTO: 'auto',
+  MANUAL: 'manual',
+  REPLAY: 'replay',
+} as const;
+
+export type DaemonUpgradeSource = typeof DAEMON_UPGRADE_SOURCE[keyof typeof DAEMON_UPGRADE_SOURCE];
+
+/**
+ * Wire source of a received daemon.upgrade command. Servers older than the
+ * manual-upgrade change send no source and only ever pushed automatic
+ * upgrades, so a missing or unknown source is treated as auto: the daemon's
+ * autoUpgrade:false / IMCODES_DISABLE_AUTO_UPGRADE opt-out must still hold
+ * against them.
+ */
+export function resolveDaemonUpgradeSource(raw: unknown): DaemonUpgradeSource {
+  return raw === DAEMON_UPGRADE_SOURCE.MANUAL || raw === DAEMON_UPGRADE_SOURCE.REPLAY || raw === DAEMON_UPGRADE_SOURCE.AUTO
+    ? raw
+    : DAEMON_UPGRADE_SOURCE.AUTO;
+}
+
+/**
+ * Returns true when the daemon should show the operator an upgrade action.
+ * Release-channel mismatches are actionable even when semver ordering says the
+ * stable build is newer than the server's dev build: the server still
+ * converges daemons to its own channel when the operator confirms.
+ */
+export function isDaemonUpgradeAvailable(
+  current: string | null | undefined,
+  latest: string | null | undefined,
+): boolean {
+  if (!current || !latest || current === latest) return false;
+  if (getReleaseChannel(current) !== getReleaseChannel(latest)) return true;
+  const compared = compareImcodesVersions(current, latest);
+  return compared === null ? false : compared < 0;
+}
 
 export const DAEMON_UPGRADE_BLOCK_REASON = {
   ALREADY_IN_PROGRESS: 'already_in_progress',

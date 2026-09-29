@@ -366,7 +366,8 @@ import {
   P2P_BRIDGE_PENDING_REQUESTS_PER_SOCKET,
   P2P_CAPABILITY_FRESHNESS_TTL_MS,
 } from '../../../shared/p2p-workflow-constants.js';
-import { DaemonUpgradeCoordinator, type DaemonUpgradeSource, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import { DaemonUpgradeCoordinator, type RequestDaemonUpgradeResult } from './daemon-upgrade-coordinator.js';
+import type { DaemonUpgradeSource } from '../../../shared/daemon-upgrade.js';
 import {
   SHARE_REASONS,
   buildSharedActorEnvelope,
@@ -468,9 +469,6 @@ import type { QueueSnapshot } from '../../../shared/transport-queue-types.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
-const DAEMON_UPGRADE_BLOCKED_RETRY_MS = 60_000;
-const DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS = 5_000;
-const DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS = 15 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX = 1_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS = 60_000;
@@ -484,16 +482,6 @@ export function __setLegacyUpgradePublisherSignerResolverForTests(
   resolveLegacyUpgradePublisherSigner = resolver;
   return () => { resolveLegacyUpgradePublisherSigner = previous; };
 }
-const DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS = new Set([
-  DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
-  'p2p_active',
-  'auto_deliver_active',
-  'master_compaction_active',
-  'compression_active',
-  'transport_busy',
-  'session_busy',
-]);
-
 const SUBSESSION_QUEUE_RELAY_FIELDS = [
   'queueEpoch',
   'queueAuthorityId',
@@ -5514,59 +5502,11 @@ export class WsBridge {
         this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
         this.flushPendingDaemonUpgrade(ws);
 
-        // Auto-upgrade: on reconnect, retry up to 3 times, but never schedule
-        // more than one upgrade command per 15 minutes while the daemon remains
-        // on a mismatched version. This protects npm global install from
-        // reconnect storms and registry propagation windows.
-        // Always target the server's exact version so dev↔stable mismatches converge to
-        // the same channel in both directions.
-        const serverVersion = process.env.APP_VERSION;
-        const shouldUpgrade = Boolean(
-          serverVersion
-          && serverVersion !== '0.0.0'
-          && this.daemonVersion
-          && this.daemonVersion !== serverVersion,
-        );
-        if (shouldUpgrade) {
-          const result = this.requestDaemonUpgrade({
-            targetVersion: serverVersion,
-            source: 'auto',
-            isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
-          });
-          if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
-            logger.info({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              upgradeId: result.upgradeId,
-            }, 'Version mismatch — scheduling daemon.upgrade');
-          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SUPPRESSED) {
-            logger.info({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              nextAttemptAt: result.nextAttemptAt,
-            }, 'Version mismatch — auto daemon.upgrade suppressed by 15-minute interval');
-          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF) {
-            logger.warn({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              reason: result.reason,
-            }, 'Version mismatch — auto daemon.upgrade in backoff');
-          } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_PUBLICATION) {
-            logger.info({
-              serverId: this.serverId,
-              daemonVersion: this.daemonVersion,
-              serverVersion,
-              nextAttemptAt: result.nextAttemptAt,
-              reason: result.reason,
-            }, 'Version mismatch — waiting for daemon upgrade target to appear on npm');
-          }
-        } else {
-          // Version matches or auto-upgrade does not apply — reset retry state.
-          this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
-        }
+        // Version mismatches are advisory only. The browser receives the
+        // current daemonVersion alongside the server's latest version and the
+        // operator explicitly confirms before a manual upgrade is requested.
+        // Never restart a user's daemon merely because it reconnected.
+        this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
 
         // Replay queued messages, skipping terminal.subscribe/unsubscribe — refs replay below is authoritative
         for (const queued of this.queue) {
@@ -8477,6 +8417,7 @@ export class WsBridge {
       this.broadcastToBrowsers(JSON.stringify({
         type: 'daemon.stats',
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
+        latestDaemonVersion: process.env.APP_VERSION ?? null,
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,
         load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime,
         // The bridge rebuilds daemon.stats from an explicit allowlist. Keep
@@ -9929,78 +9870,29 @@ export class WsBridge {
       }
     }
 
-    // A rolled-back one-shot is reported by the recovered controlled node.
-    // It names the failed target, so it is safe to fence that exact server
-    // release rather than restarting the same destructive loop every minute.
-    const controlledTerminalFailure = this.daemonNodeRole === NODE_ROLE.CONTROLLED
-      && msg.reason === DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED
-      && failedTargetVersion === serverVersion;
-    const retryDelayMs = controlledTerminalFailure
-      ? null
-      : this.daemonNodeRole === NODE_ROLE.CONTROLLED
-        ? DAEMON_UPGRADE_BLOCKED_RETRY_MS
-        : this.daemonUpgradeBlockedRetryDelayMs(msg);
-    if (retryDelayMs == null) {
-      const replayBeforeSync = this.upgradeBlockedSyncRequiredGeneration === this.daemonGeneration
-        && this.upgradeBlockedSyncCompleteGeneration !== this.daemonGeneration;
-      const supersededByManual = msg.reason === DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED
-        && failedTargetVersion != null
-        && (
-          this.daemonUpgradeCoordinator.isTerminalFailureSupersededByManual(
-            failedTargetVersion,
-            failureUpgradeId,
-          )
-          || (
-            failureUpgradeId == null
-            && replayBeforeSync
-            && this.daemonUpgradeCoordinator.hasManualLifecycleForTarget(failedTargetVersion)
-          )
-        );
-      if (supersededByManual) {
-        this.sendDaemonUpgradeBlockedAck(
-          ws,
-          failureId,
-          DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.SUPERSEDED,
-        );
-        return false;
-      }
-      this.daemonUpgradeCoordinator.blockTargetAfterTerminalFailure(serverVersion);
-      const duplicate = failureId ? this.hasSeenUpgradeBlockedFailure(failureId) : false;
-      if (failureId) {
-        this.rememberUpgradeBlockedFailure(failureId);
-        this.sendDaemonUpgradeBlockedAck(
-          ws,
-          failureId,
-          DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
-        );
-      }
-      logger.info({
-        serverId: this.serverId,
-        daemonVersion: this.daemonVersion,
-        serverVersion,
-        reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
-      }, 'daemon.upgrade blocked by non-retryable reason');
-      return !duplicate;
+    // A blocked upgrade is now an operator-visible terminal state. The old
+    // bridge retried transient blockers automatically, which could restart a
+    // daemon repeatedly while a user was still working. Keep the blocker
+    // envelope/ack path so the UI can show the existing toast and card state;
+    // the user can explicitly confirm another POST when ready.
+    const duplicate = failureId ? this.hasSeenUpgradeBlockedFailure(failureId) : false;
+    if (failureId) {
+      this.rememberUpgradeBlockedFailure(failureId);
+      this.sendDaemonUpgradeBlockedAck(
+        ws,
+        failureId,
+        DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.ACCEPTED,
+      );
     }
-
-    const result = this.daemonUpgradeCoordinator.retryAutoAfterBlocked({
-      retryDelayMs,
-      skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,
-      isDaemonReady: () => this.isDaemonReadyForUpgrade(),
-      isStillCurrent: () => this.daemonWs === ws && this.authenticated && this.daemonVersion !== serverVersion,
-      send: (message) => this.sendDirectToDaemon(message),
-    });
-    if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
-      logger.info({
-        serverId: this.serverId,
-        daemonVersion: this.daemonVersion,
-        serverVersion,
-        reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
-        nextAttemptAt: result.nextAttemptAt,
-        upgradeId: result.upgradeId,
-      }, 'daemon.upgrade blocked by transient daemon state — retry scheduled');
-    }
-    return true;
+    logger.info({
+      serverId: this.serverId,
+      daemonVersion: this.daemonVersion,
+      serverVersion,
+      reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
+      failedTargetVersion,
+      failureUpgradeId,
+    }, 'daemon.upgrade blocked; waiting for explicit manual retry');
+    return !duplicate;
   }
 
   private sendDaemonUpgradeBlockedAck(
@@ -10038,22 +9930,6 @@ export class WsBridge {
       if (!oldest) break;
       this.seenUpgradeBlockedFailures.delete(oldest);
     }
-  }
-
-  private daemonUpgradeBlockedRetryDelayMs(msg: Record<string, unknown>): number | null {
-    const reason = typeof msg.reason === 'string' ? msg.reason : 'unknown';
-    if (reason === 'cooldown_active') {
-      const cooldownRemainingMs = typeof msg.cooldownRemainingMs === 'number' && Number.isFinite(msg.cooldownRemainingMs)
-        ? msg.cooldownRemainingMs
-        : null;
-      if (cooldownRemainingMs == null || cooldownRemainingMs <= 0) return DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS;
-      return Math.min(
-        DAEMON_UPGRADE_BLOCKED_MAX_RETRY_MS,
-        Math.max(DAEMON_UPGRADE_BLOCKED_MIN_RETRY_MS, Math.ceil(cooldownRemainingMs)),
-      );
-    }
-    if (!DAEMON_UPGRADE_TRANSIENT_BLOCK_REASONS.has(reason)) return null;
-    return DAEMON_UPGRADE_BLOCKED_RETRY_MS;
   }
 
   requestDaemonUpgrade(input: {

@@ -366,6 +366,7 @@ serverRoutes.get('/', requireAuth(), async (c) => {
     status: s.status,
     lastHeartbeatAt: s.last_heartbeat_at,
     daemonVersion: s.daemon_version,
+    latestDaemonVersion: process.env.APP_VERSION ?? null,
     createdAt: s.created_at,
   }));
 

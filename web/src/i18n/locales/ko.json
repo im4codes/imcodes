@@ -1016,7 +1016,22 @@
     "delete_tmux_note": "tmux 세션은 닫히지 않습니다",
     "delete_tmux_suffix": ", 하지만 Daemon은 더 이상 자동으로 시작되지 않습니다.",
     "delete_confirm_prompt": "삭제를 확인하려면 서버 이름을 입력하세요:",
-    "delete_confirm": "삭제 확인"
+    "delete_confirm": "삭제 확인",
+    "daemon_upgrade_available": "데몬 업데이트 가능",
+    "daemon_status": "데몬 상태",
+    "daemon_current_version": "현재 버전",
+    "daemon_latest_version": "최신 버전",
+    "daemon_upgrade_button": "데몬 업데이트",
+    "daemon_upgrade_confirm_title": "데몬을 업데이트할까요?",
+    "daemon_upgrade_confirm_warning": "실행 중인 작업이 중단되고 데몬 재시작 중 몇 초 동안 연결이 끊깁니다.",
+    "daemon_upgrade_confirm_busy": "{{count}}개 세션에서 작업이 실행 중입니다.",
+    "daemon_upgrade_confirm_multiple": "{{count}}개 데몬에 업데이트를 요청합니다.",
+    "daemon_upgrade_confirm": "업데이트",
+    "daemon_upgrade_in_progress": "업데이트 중…",
+    "daemon_upgrade_reconnecting": "업데이트를 보냈습니다. 다시 연결하는 중…",
+    "daemon_upgrade_blocked": "업데이트 차단됨",
+    "daemon_busy_sessions": "활성 세션 {{count}}개",
+    "daemon_offline": "데몬 오프라인"
   },
   "quick_input": {
     "title": "빠른 입력",

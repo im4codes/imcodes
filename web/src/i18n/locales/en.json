@@ -1016,7 +1016,22 @@
     "delete_tmux_note": "tmux sessions will not be closed",
     "delete_tmux_suffix": ", but the daemon will no longer auto-start.",
     "delete_confirm_prompt": "Type the server name to confirm deletion:",
-    "delete_confirm": "Confirm Delete"
+    "delete_confirm": "Confirm Delete",
+    "daemon_upgrade_available": "Daemon upgrade available",
+    "daemon_status": "Daemon status",
+    "daemon_current_version": "Current version",
+    "daemon_latest_version": "Latest version",
+    "daemon_upgrade_button": "Upgrade daemon",
+    "daemon_upgrade_confirm_title": "Upgrade daemon?",
+    "daemon_upgrade_confirm_warning": "Running tasks will be interrupted and the connection will drop for a few seconds while the daemon restarts.",
+    "daemon_upgrade_confirm_busy": "{{count}} session(s) currently have active work.",
+    "daemon_upgrade_confirm_multiple": "This will request upgrades for {{count}} daemons.",
+    "daemon_upgrade_confirm": "Upgrade",
+    "daemon_upgrade_in_progress": "Upgrading…",
+    "daemon_upgrade_reconnecting": "Upgrade sent; reconnecting…",
+    "daemon_upgrade_blocked": "Upgrade blocked",
+    "daemon_busy_sessions": "{{count}} active session(s)",
+    "daemon_offline": "Daemon offline"
   },
   "quick_input": {
     "title": "Quick input",

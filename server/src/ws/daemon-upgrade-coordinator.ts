@@ -2,8 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_SOURCE,
   normalizeDaemonUpgradeTargetVersion,
   shouldSendDaemonUpgradeTargetVersion,
+  type DaemonUpgradeSource,
   type DaemonUpgradeDeliveryStatus,
 } from '../../../shared/daemon-upgrade.js';
 import {
@@ -11,16 +13,9 @@ import {
   type DaemonUpgradePublicationGate,
 } from './daemon-upgrade-publication-gate.js';
 
-const AUTO_UPGRADE_SEND_DELAY_MS = 5_000;
-const AUTO_UPGRADE_MIN_INTERVAL_MS = 15 * 60 * 1000;
-const AUTO_UPGRADE_MAX_ATTEMPTS = 3;
-
-export type DaemonUpgradeSource = 'auto' | 'manual' | 'replay';
-
 type UpgradeLifecycleState =
   | 'pending_offline'
   | 'pending_publication'
-  | 'scheduled'
   | 'sent'
   | 'terminal_blocked'
   | 'superseded';
@@ -30,7 +25,6 @@ interface UpgradeState {
   targetVersion: string;
   source: DaemonUpgradeSource;
   status: UpgradeLifecycleState;
-  attempt: number;
   createdAt: number;
   updatedAt: number;
   lastSentAt: number | null;
@@ -59,13 +53,8 @@ export interface RequestDaemonUpgradeResult {
   reason?: string;
 }
 
-export interface RetryAutoDaemonUpgradeAfterBlockedInput extends Omit<RequestDaemonUpgradeInput, 'targetVersion' | 'source'> {
-  retryDelayMs: number;
-}
-
 export class DaemonUpgradeCoordinator {
   private current: UpgradeState | null = null;
-  private lastAutoSentAt: number | null = null;
 
   constructor(private readonly publicationGate: DaemonUpgradePublicationGate = daemonUpgradePublicationGate) {}
 
@@ -84,9 +73,7 @@ export class DaemonUpgradeCoordinator {
     const now = input.now ?? Date.now();
     let current = this.current?.targetVersion === targetVersion ? this.current : null;
     if (this.current && this.current.targetVersion !== targetVersion) {
-      const terminalTargetChanged = this.current.status === 'terminal_blocked';
       this.supersedeCurrent(now);
-      if (terminalTargetChanged) this.lastAutoSentAt = null;
     }
 
     if (current?.status === 'terminal_blocked') {
@@ -128,36 +115,14 @@ export class DaemonUpgradeCoordinator {
     } else if (
       current
       && current.status !== 'superseded'
-      && (current.status !== 'pending_offline' || !effectiveInput.isDaemonReady())
+      && !(current.status === 'pending_offline' && !effectiveInput.isDaemonReady())
     ) {
-      if (effectiveInput.source === 'auto') {
-        const nextAutoAt = this.nextAutoAttemptAt(now);
-        if (nextAutoAt > now) {
-          return {
-            ok: true,
-            upgradeId: current.upgradeId,
-            targetVersion,
-            deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SUPPRESSED,
-            nextAttemptAt: new Date(nextAutoAt).toISOString(),
-          };
-        }
-        if (current.attempt >= AUTO_UPGRADE_MAX_ATTEMPTS) {
-          return {
-            ok: true,
-            upgradeId: current.upgradeId,
-            targetVersion,
-            deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF,
-            reason: 'max_attempts_reached',
-          };
-        }
-      } else {
-        return {
-          ok: true,
-          upgradeId: current.upgradeId,
-          targetVersion,
-          deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS,
-        };
-      }
+      return {
+        ok: true,
+        upgradeId: current.upgradeId,
+        targetVersion,
+        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS,
+      };
     }
 
     const state = current ?? {
@@ -165,7 +130,6 @@ export class DaemonUpgradeCoordinator {
       targetVersion,
       source: effectiveInput.source,
       status: 'pending_offline' as UpgradeLifecycleState,
-      attempt: 0,
       createdAt: now,
       updatedAt: now,
       lastSentAt: null,
@@ -185,12 +149,6 @@ export class DaemonUpgradeCoordinator {
         targetVersion,
         deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
       };
-    }
-
-    if (effectiveInput.source === 'auto') {
-      const publication = this.ensureTargetPublished(state, effectiveInput, now);
-      if (publication) return publication;
-      return this.scheduleAutoSend(state, effectiveInput, now);
     }
 
     const publication = this.ensureTargetPublished(state, effectiveInput, now);
@@ -219,39 +177,12 @@ export class DaemonUpgradeCoordinator {
     const now = Date.now();
     const publication = this.ensureTargetPublished(state, requestInput, now);
     if (publication) return publication;
-    if (state.source === 'auto') {
-      return this.scheduleAutoSend(state, requestInput, now);
-    }
     this.sendNow(state, requestInput, now);
     return {
       ok: true,
       upgradeId: state.upgradeId,
       targetVersion: state.targetVersion,
       deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
-    };
-  }
-
-  retryAutoAfterBlocked(input: RetryAutoDaemonUpgradeAfterBlockedInput): RequestDaemonUpgradeResult | null {
-    const state = this.current;
-    if (!state || state.source !== 'auto' || state.status !== 'sent') return null;
-
-    const retryDelayMs = Math.max(0, Math.floor(input.retryDelayMs));
-    const now = input.now ?? Date.now();
-    if (state.timer) clearTimeout(state.timer);
-    state.status = 'scheduled';
-    state.updatedAt = now;
-    state.timer = setTimeout(() => {
-      state.timer = null;
-      if (this.current !== state || !input.isDaemonReady() || input.isStillCurrent?.() === false) return;
-      this.sendNow(state, { ...input, targetVersion: state.targetVersion, source: 'auto' }, Date.now());
-    }, retryDelayMs);
-
-    return {
-      ok: true,
-      upgradeId: state.upgradeId,
-      targetVersion: state.targetVersion,
-      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
-      nextAttemptAt: new Date(now + retryDelayMs).toISOString(),
     };
   }
 
@@ -267,11 +198,9 @@ export class DaemonUpgradeCoordinator {
     if (state.timer) clearTimeout(state.timer);
     state.timer = null;
     state.status = 'pending_offline';
-    state.attempt = 0;
     state.updatedAt = now;
     state.publicationResumeInput = null;
     state.publicationCallbackRegistered = false;
-    if (state.source === 'auto') this.lastAutoSentAt = null;
     return true;
   }
 
@@ -294,9 +223,8 @@ export class DaemonUpgradeCoordinator {
     const state = this.current ?? {
       upgradeId: randomUUID(),
       targetVersion: normalized,
-      source: 'auto' as DaemonUpgradeSource,
+      source: DAEMON_UPGRADE_SOURCE.REPLAY,
       status: 'terminal_blocked' as UpgradeLifecycleState,
-      attempt: 0,
       createdAt: now,
       updatedAt: now,
       lastSentAt: null,
@@ -372,44 +300,6 @@ export class DaemonUpgradeCoordinator {
     }
   }
 
-  private scheduleAutoSend(state: UpgradeState, input: RequestDaemonUpgradeInput, now: number): RequestDaemonUpgradeResult {
-    const nextAutoAt = this.nextAutoAttemptAt(now);
-    if (nextAutoAt > now) {
-      return {
-        ok: true,
-        upgradeId: state.upgradeId,
-        targetVersion: state.targetVersion,
-        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SUPPRESSED,
-        nextAttemptAt: new Date(nextAutoAt).toISOString(),
-      };
-    }
-    if (state.attempt >= AUTO_UPGRADE_MAX_ATTEMPTS) {
-      return {
-        ok: true,
-        upgradeId: state.upgradeId,
-        targetVersion: state.targetVersion,
-        deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF,
-        reason: 'max_attempts_reached',
-      };
-    }
-    if (state.timer) clearTimeout(state.timer);
-    state.status = 'scheduled';
-    state.attempt += 1;
-    state.updatedAt = now;
-    this.lastAutoSentAt = now;
-    state.timer = setTimeout(() => {
-      state.timer = null;
-      if (this.current !== state || !input.isDaemonReady() || input.isStillCurrent?.() === false) return;
-      this.sendNow(state, input, Date.now());
-    }, AUTO_UPGRADE_SEND_DELAY_MS);
-    return {
-      ok: true,
-      upgradeId: state.upgradeId,
-      targetVersion: state.targetVersion,
-      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
-    };
-  }
-
   private ensureTargetPublished(
     state: UpgradeState,
     input: RequestDaemonUpgradeInput,
@@ -454,10 +344,6 @@ export class DaemonUpgradeCoordinator {
     if (this.current !== state || state.status !== 'pending_publication') return;
     if (!input.isDaemonReady() || input.isStillCurrent?.() === false) return;
     const now = Date.now();
-    if (state.source === 'auto') {
-      this.scheduleAutoSend(state, input, now);
-      return;
-    }
     this.sendNow(state, input, now);
   }
 
@@ -472,12 +358,9 @@ export class DaemonUpgradeCoordinator {
     return {
       type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
       upgradeId: state.upgradeId,
+      source: state.source,
       ...(shouldSendDaemonUpgradeTargetVersion(state.targetVersion) ? { targetVersion: state.targetVersion } : {}),
     };
-  }
-
-  private nextAutoAttemptAt(now: number): number {
-    return this.lastAutoSentAt == null ? now : this.lastAutoSentAt + AUTO_UPGRADE_MIN_INTERVAL_MS;
   }
 
   private supersedeCurrent(now: number): void {
@@ -491,6 +374,5 @@ export class DaemonUpgradeCoordinator {
   private clearCurrent(): void {
     if (this.current?.timer) clearTimeout(this.current.timer);
     this.current = null;
-    this.lastAutoSentAt = null;
   }
 }

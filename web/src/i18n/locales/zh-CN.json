@@ -1016,7 +1016,22 @@
     "delete_tmux_note": "tmux 会话不会被关闭",
     "delete_tmux_suffix": "，但 daemon 将不再自动启动。",
     "delete_confirm_prompt": "输入 server 名称确认删除：",
-    "delete_confirm": "确认删除"
+    "delete_confirm": "确认删除",
+    "daemon_upgrade_available": "Daemon 有可用升级",
+    "daemon_status": "Daemon 状态",
+    "daemon_current_version": "当前版本",
+    "daemon_latest_version": "最新版本",
+    "daemon_upgrade_button": "升级 Daemon",
+    "daemon_upgrade_confirm_title": "升级 Daemon？",
+    "daemon_upgrade_confirm_warning": "执行中的任务会被中断，Daemon 重启期间连接会断开几秒。",
+    "daemon_upgrade_confirm_busy": "当前有 {{count}} 个会话正在执行任务。",
+    "daemon_upgrade_confirm_multiple": "将为 {{count}} 个 Daemon 请求升级。",
+    "daemon_upgrade_confirm": "升级",
+    "daemon_upgrade_in_progress": "升级中…",
+    "daemon_upgrade_reconnecting": "已发送升级请求，正在重连…",
+    "daemon_upgrade_blocked": "升级被阻止",
+    "daemon_busy_sessions": "{{count}} 个会话正在执行",
+    "daemon_offline": "Daemon 离线"
   },
   "quick_input": {
     "title": "快捷输入",
