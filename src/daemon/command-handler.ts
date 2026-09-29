@@ -25,10 +25,11 @@ import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
 import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
-import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
+import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
+import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { bindProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
@@ -80,6 +81,7 @@ import {
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
+import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
@@ -5954,6 +5956,25 @@ async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink)
   if (transportRuntime) {
     if (data === '\x1b') {
       cancelTransportTurnNow(sessionName, undefined, undefined);
+    }
+    return;
+  }
+
+  // node-pty writes are synchronous once the ConPTY module is loaded.  Do not
+  // queue browser keystrokes behind the process-send mutex on Windows: that
+  // mutex is also held while agent commands perform network/filesystem work,
+  // which made a shell echo wait hundreds of milliseconds under load.  The WS
+  // dispatcher already invokes messages in arrival order and node-pty preserves
+  // write ordering, so the fast path keeps input ordering without coupling it
+  // to the long-running process command lane.
+  if (!terminalInputNeedsSessionMutex(BACKEND)) {
+    const stageStartedAt = Date.now();
+    terminalStageTrace('browser_input_received', sessionName, stageStartedAt);
+    try {
+      await sendRawInput(sessionName, data);
+      terminalStageTrace('sendRawInput_complete', sessionName, stageStartedAt);
+    } catch (err) {
+      logger.error({ sessionName, err }, 'session.input failed');
     }
     return;
   }

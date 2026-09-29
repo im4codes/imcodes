@@ -14,6 +14,7 @@ import { dirname, join } from 'path';
 import { promisify } from 'node:util';
 
 import logger from '../util/logger.js';
+import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 
@@ -191,6 +192,7 @@ export async function conptyNewSession(
   };
 
   pty.onData((data: string) => {
+    terminalStageTrace('conpty_read', name);
     feedRingBuffer(session, data);
     // Keep recent raw output for snapshot (capturePaneVisible)
     session.screenBuffer += data;

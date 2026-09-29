@@ -101,7 +101,7 @@ function atomicWriteJson(path: string, value: unknown): void {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    const file = openSync(temporary, 'r');
+    const file = openSync(temporary, 'r+');
     try { fsyncDescriptorSync(file); } finally { closeSync(file); }
     renameSync(temporary, path);
     fsyncDirectorySync(dirname(path));
@@ -706,7 +706,7 @@ export function publishManagedSkillVersion(input: PublishManagedSkillInput, home
     ownsFinalPath = true;
     renameSync(temporaryManifestPath, finalManifestPath);
     ownsFinalManifestPath = true;
-    const manifestFile = openSync(finalManifestPath, 'r');
+    const manifestFile = openSync(finalManifestPath, 'r+');
     try { fsyncDescriptorSync(manifestFile); } finally { closeSync(manifestFile); }
     fsyncDirectorySync(registryRoot);
     return publishIndex(readManagedSkillIndexStrict(homeDir), manifest);

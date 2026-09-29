@@ -51,6 +51,7 @@ function producer(over: Partial<{
     source: 'runtime' | 'supervision' | 'registry';
     observedAt: number;
   } | undefined;
+  snapshotCacheTtlMs: number;
 }> = {}) {
   return new SupervisionConsoleProducer(asDb(), {
     projectionEpoch: over.epoch ?? EPOCH,
@@ -58,6 +59,7 @@ function producer(over: Partial<{
     onBoundary: over.onBoundary,
     broadcast: over.broadcast === false ? undefined : (frame) => { sent.push(frame); },
     resolveSessionPresentation: over.resolveSessionPresentation,
+    snapshotCacheTtlMs: over.snapshotCacheTtlMs ?? 0,
   });
 }
 
@@ -170,6 +172,27 @@ describe('crash boundary matrix', () => {
 });
 
 describe('bounded projection cost on a large backlog', () => {
+  it('coalesces repeated snapshots when the bounded cache is enabled', () => {
+    seedTask('implementing');
+    let calls = 0;
+    const p = producer({
+      snapshotCacheTtlMs: 1_000,
+      resolveSessionPresentation: (_sessionName, observedAt) => {
+        calls += 1;
+        return { state: 'idle', source: 'runtime', observedAt };
+      },
+    });
+    const first = p.buildSnapshot(SCOPE, 'sub-cache-a');
+    expect(first.subscriptionId).toBe('sub-cache-a');
+    expect(calls).toBe(1);
+    const second = p.buildSnapshot(SCOPE, 'sub-cache-b');
+    expect(second.subscriptionId).toBe('sub-cache-b');
+    expect(calls).toBe(1);
+    p.invalidateSnapshot(SCOPE);
+    p.buildSnapshot(SCOPE, 'sub-cache-c');
+    expect(calls).toBe(2);
+  });
+
   it('projects assignments once per replay/snapshot pass, not once per event', () => {
     seedTask('implementing');
     const ASSIGNMENTS = 40;

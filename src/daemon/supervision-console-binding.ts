@@ -38,6 +38,8 @@ export interface SupervisionConsoleBindingDeps {
   onError?: (error: unknown) => void;
   onActiveSubscriptionCountChanged?: (count: number) => void;
   resolveSessionPresentation?: SupervisionProducerOptions['resolveSessionPresentation'];
+  /** Keep the authenticated WS callback free of synchronous snapshot work. */
+  deferSnapshots?: boolean;
 }
 
 export interface SupervisionConsoleBinding {
@@ -105,6 +107,7 @@ export function createSupervisionConsoleBinding(
     now: deps.now,
     onError: deps.onError,
     onActiveSubscriptionCountChanged: deps.onActiveSubscriptionCountChanged,
+    deferSnapshots: deps.deferSnapshots,
   });
 
   deps.serverLink.onMessage((message) => { sessions?.handleFrame(message); });

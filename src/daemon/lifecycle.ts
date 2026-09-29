@@ -1506,6 +1506,10 @@ export async function startup(): Promise<DaemonContext> {
     supervisionConsole = createProductionSupervisionConsoleBinding({
       serverLink,
       registry: getSupervisionTaskRegistry(),
+      // Snapshot projection can enumerate hundreds of assignments and owner
+      // state. Keep the authenticated WS callback responsive in the daemon;
+      // unit/integration bindings retain synchronous delivery by default.
+      deferSnapshots: true,
       // Only the coordinator that owns a project scope may subscribe to it.
       authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
       resolveSessionPresentation: (sessionName, durableObservedAt) => {

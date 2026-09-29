@@ -32,6 +32,7 @@ import {
   registerPane,
 } from './wezterm.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
+import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 
 const execFile = promisify(execFileCb);
 
@@ -919,6 +920,7 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   if (BACKEND === 'conpty') {
     const c = await conpty();
     c.conptySendText(session, data);
+    terminalStageTrace('conpty_write', session);
     return;
   }
 

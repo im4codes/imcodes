@@ -980,7 +980,10 @@ function atomicWriteJson(path: string, value: unknown): void {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, serialized, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    const file = openSync(temporary, 'r');
+    // Windows can reject fsync on a read-only descriptor with EPERM.  The
+    // temporary file is ours and was opened writable, so retain that access
+    // mode for the durability fence.
+    const file = openSync(temporary, 'r+');
     try { fsyncDescriptorSync(file); } finally { closeSync(file); }
     renameSync(temporary, path);
     // Directory fsync makes the rename itself durable across power loss. It is

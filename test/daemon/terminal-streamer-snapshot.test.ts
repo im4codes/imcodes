@@ -107,6 +107,24 @@ describe('TerminalStreamer — snapshot behavior', () => {
     expect(snapshotCalls).toHaveLength(0);
   });
 
+  it('resets browser stream state before a restarted pane is reattached', async () => {
+    const control: Array<Record<string, unknown>> = [];
+    streamer.subscribe({
+      sessionName: 'rebind-session',
+      send: () => {},
+      sendControl: (message) => control.push(message),
+    });
+    await flush();
+
+    await streamer.rebindSession('rebind-session');
+
+    expect(control).toContainEqual({
+      type: 'terminal.stream_reset',
+      session: 'rebind-session',
+      reason: 'rebind',
+    });
+  });
+
   it('clamps a nonsense pane height instead of building an unbounded frame', async () => {
     // `rows` feeds `while (lines.length < rows) lines.push('')` here AND in the
     // browser. Unclamped, one bad size allocates until the process (or the tab)

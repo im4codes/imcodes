@@ -30,6 +30,8 @@ export interface SupervisionConsoleSessionDeps {
   onError?: (error: unknown) => void;
   /** Drives production-only polling while at least one authorized view is open. */
   onActiveSubscriptionCountChanged?: (count: number) => void;
+  /** Production sends snapshots after yielding so WS callbacks stay short. */
+  deferSnapshots?: boolean;
 }
 
 interface ActiveSubscription {
@@ -337,6 +339,25 @@ export class SupervisionConsoleSessionRegistry {
   }
 
   #sendSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): boolean {
+    if (this.#deps.deferSnapshots) {
+      void this.#deps.producer.buildSnapshotAsync(scope, subscriptionId)
+        .then((snapshot) => {
+          if (this.#subscriptions.get(scopeKey(scope))?.subscriptionId !== subscriptionId) return;
+          this.#deps.send(snapshot);
+        })
+        .catch((error) => {
+          this.#deps.onError?.(error);
+          if (this.#subscriptions.get(scopeKey(scope))?.subscriptionId !== subscriptionId) return;
+          this.#deps.send({
+            type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE,
+            subscriptionId,
+            scope,
+            reason: SUPERVISION_CONSOLE_UNAVAILABLE_REASONS.PROJECTION_UNAVAILABLE,
+            retryable: true,
+          });
+        });
+      return true;
+    }
     this.#deps.send(this.#deps.producer.buildSnapshot(scope, subscriptionId));
     return true;
   }

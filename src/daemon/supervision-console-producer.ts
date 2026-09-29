@@ -86,6 +86,8 @@ export interface SupervisionProducerOptions {
     source: SupervisionConsoleSessionStateSource;
     observedAt: number;
   } | undefined;
+  /** Cache identical subscribe snapshots for this bounded interval. */
+  snapshotCacheTtlMs?: number;
 }
 
 export interface SupervisionOutboxRow {
@@ -137,6 +139,16 @@ export class SupervisionConsoleProducer {
   readonly #onBoundary: (boundary: SupervisionCrashBoundary) => void;
   readonly #broadcast?: (frame: SupervisionTaskConsoleDelta) => void;
   readonly #resolveSessionPresentation?: SupervisionProducerOptions['resolveSessionPresentation'];
+  readonly #snapshotCacheTtlMs: number;
+  readonly #snapshotCache = new Map<string, {
+    builtAt: number;
+    dataVersion: number;
+    projectionVersion: number;
+    lastDurableEventId: number | null;
+    projectionEpoch: string;
+    snapshot: Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>;
+  }>();
+  readonly #snapshotBuildInFlight = new Map<string, Promise<Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>>>();
   /**
    * Assignment rows memoized for one synchronous projection pass. A replay of
    * N durable events used to re-project every assignment (and each owner's
@@ -155,6 +167,37 @@ export class SupervisionConsoleProducer {
     this.#onBoundary = options.onBoundary ?? (() => {});
     this.#broadcast = options.broadcast;
     this.#resolveSessionPresentation = options.resolveSessionPresentation;
+    this.#snapshotCacheTtlMs = Math.max(0, options.snapshotCacheTtlMs ?? 1_000);
+  }
+
+  #snapshotKey(scope: SupervisionTaskConsoleScope): string {
+    return JSON.stringify([scope.projectName, scope.coordinatorSessionName]);
+  }
+
+  #readDataVersion(): number {
+    const row = this.#db.prepare('PRAGMA data_version').get() as { data_version?: unknown } | undefined;
+    return typeof row?.data_version === 'number' ? row.data_version : 0;
+  }
+
+  /** Invalidate after durable task/assignment changes. */
+  invalidateSnapshot(scope: SupervisionTaskConsoleScope): void {
+    this.#snapshotCache.delete(this.#snapshotKey(scope));
+  }
+
+  /** Build outside the inbound WS callback and coalesce concurrent requests. */
+  async buildSnapshotAsync(scope: SupervisionTaskConsoleScope, subscriptionId: string): Promise<SupervisionTaskConsoleSnapshot> {
+    const key = this.#snapshotKey(scope);
+    let work = this.#snapshotBuildInFlight.get(key);
+    if (!work) {
+      work = new Promise<Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>>((resolve) => {
+        setImmediate(() => resolve(this.#buildSnapshotCached(scope)));
+      }).finally(() => {
+        if (this.#snapshotBuildInFlight.get(key) === work) this.#snapshotBuildInFlight.delete(key);
+      });
+      this.#snapshotBuildInFlight.set(key, work);
+    }
+    const snapshot = await work;
+    return { ...snapshot, subscriptionId };
   }
 
   #visibleTaskIds(projectName: string): Set<string> {
@@ -338,6 +381,7 @@ export class SupervisionConsoleProducer {
         afterEventId = events[events.length - 1]!.id;
         if (events.length < SUPERVISION_PROJECTION_CHUNK_SIZE) break;
       }
+      if (committedCount > 0) this.invalidateSnapshot(scope);
       return committedCount;
     }));
   }
@@ -375,6 +419,7 @@ export class SupervisionConsoleProducer {
         afterEventId = events[events.length - 1]!.id;
         if (events.length < SUPERVISION_PROJECTION_CHUNK_SIZE) break;
       }
+      if (committedCount > 0) this.invalidateSnapshot(scope);
       return committedCount;
     }).finally(() => {
       if (this.#asyncReplayInFlight.get(replayKey) === work) this.#asyncReplayInFlight.delete(replayKey);
@@ -452,6 +497,7 @@ export class SupervisionConsoleProducer {
     // Past this line the state is durable. A crash here loses no data: the
     // frame is still `pending` and restart redelivers it.
     this.#onBoundary('after_commit_before_broadcast');
+    this.invalidateSnapshot(input.scope);
     this.#deliver(committed.frame, committed.projectionVersion, input.scope);
     return { eventId: committed.eventId, projectionVersion: committed.projectionVersion };
   }
@@ -794,11 +840,40 @@ export class SupervisionConsoleProducer {
   buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
     setEventLoopWatchdogPhase('supervision-console.build-snapshot');
     return traceSync('supervision-console.build-snapshot', { projectName: scope.projectName },
-      () => this.#withAssignmentPass(() => this.#buildSnapshot(scope, subscriptionId)));
+      () => ({ ...this.#buildSnapshotCached(scope), subscriptionId }));
   }
 
-  #buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
+  #buildSnapshotCached(scope: SupervisionTaskConsoleScope): Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> {
+    const key = this.#snapshotKey(scope);
     const cursor = this.restoreCursor(scope);
+    const now = Date.now();
+    const dataVersion = this.#readDataVersion();
+    const cached = this.#snapshotCache.get(key);
+    if (cached
+      && this.#snapshotCacheTtlMs > 0
+      && now - cached.builtAt < this.#snapshotCacheTtlMs
+      && cached.dataVersion === dataVersion
+      && cached.projectionVersion === cursor.projectionVersion
+      && cached.lastDurableEventId === cursor.lastDurableEventId
+      && cached.projectionEpoch === cursor.projectionEpoch) {
+      return cached.snapshot;
+    }
+    const snapshot = this.#withAssignmentPass(() => this.#buildSnapshotParts(scope, cursor));
+    this.#snapshotCache.set(key, {
+      builtAt: now,
+      dataVersion,
+      projectionVersion: cursor.projectionVersion,
+      lastDurableEventId: cursor.lastDurableEventId,
+      projectionEpoch: cursor.projectionEpoch,
+      snapshot,
+    });
+    return snapshot;
+  }
+
+  #buildSnapshotParts(
+    scope: SupervisionTaskConsoleScope,
+    cursor: ReturnType<SupervisionConsoleProducer['restoreCursor']>,
+  ): Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> {
     const pairRows = isPairsEngineProject(scope.projectName) ? this.readPairRows(scope.projectName) : undefined;
     const tasks = pairRows?.tasks ?? [...this.#visibleTaskIds(scope.projectName)]
       .map((taskId) => this.readTaskRow(taskId, scope.projectName))
@@ -806,7 +881,6 @@ export class SupervisionConsoleProducer {
     return {
       type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
       scope,
-      subscriptionId,
       schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
       statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
       projectionVersion: cursor.projectionVersion,

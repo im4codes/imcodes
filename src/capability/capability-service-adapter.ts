@@ -641,7 +641,7 @@ export class DaemonCapabilityServiceAdapter implements SharedCapabilityService {
       writeFileSync(temporary, serialized, {
         encoding: 'utf8', mode: 0o600, flag: 'wx',
       });
-      const file = openSync(temporary, 'r');
+      const file = openSync(temporary, 'r+');
       try { fsyncDescriptorSync(file); } finally { closeSync(file); }
       renameSync(temporary, path);
       fsyncDirectorySync(dirname(path));

@@ -24,6 +24,7 @@ import { isWatching } from './jsonl-watcher.js';
 import { isWatching as isCodexWatching } from './codex-watcher.js';
 import { isWatching as isGeminiWatching } from './gemini-watcher.js';
 import logger from '../util/logger.js';
+import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { timelineEmitter } from './timeline-emitter.js';
 import { emitSessionInlineError } from './session-error.js';
 import type { TerminalDiff, TerminalHistory } from '../shared/transport/terminal.js';
@@ -77,6 +78,11 @@ function stripAnsiForBlankCheck(value: string): string {
 
 function isBlankTerminalSnapshot(value: string): boolean {
   return stripAnsiForBlankCheck(value).trim().length === 0;
+}
+
+/** A live ConPTY can be idle with no snapshot/raw bytes yet; do not restart it. */
+export function shouldReportBootstrapStall(backend: string, paneAlive: boolean): boolean {
+  return backend !== 'conpty' || !paneAlive;
 }
 
 /**
@@ -451,6 +457,18 @@ export class TerminalStreamer {
           if (probe === 'sent') return;
           if (!this.subscribers.get(sessionName)?.has(subscriber)) return;
           if ((this.lastStreamRawAt.get(sessionName) ?? 0) >= bootstrapWatchStartedAt) return;
+          // ConPTY has no tmux capture-pane readiness signal.  An idle but
+          // healthy cmd.exe can legitimately have a blank screen buffer while
+          // its PTY is alive; treating that as a dead pane caused the
+          // blank_snapshot_no_raw restart loop observed on Windows.  The raw
+          // stream is already attached, so a live ConPTY is sufficient proof
+          // that bootstrap succeeded.
+          if (BACKEND === 'conpty') {
+            try {
+              const { conptyIsPaneAlive } = await import('../agent/conpty.js');
+              if (!shouldReportBootstrapStall(BACKEND, conptyIsPaneAlive(sessionName))) return;
+            } catch { /* fall through to the existing recovery signal */ }
+          }
           subscriber.onBootstrapStalled?.(probe === 'failed' ? 'snapshot_failed' : 'blank_snapshot_no_raw');
         })();
       }, BLANK_BOOTSTRAP_STALL_MS);
@@ -704,6 +722,37 @@ export class TerminalStreamer {
     // Transport sessions don't have a pane to rebind — skip rather than
     // trigger the "paneId not available" error on every relaunch.
     if (isTransportSessionName(sessionName)) return;
+    // A restarted pane has a new raw stream and cursor state. Tell every
+    // browser to discard the old xterm buffer before the replacement snapshot
+    // and raw replay arrive; otherwise post-restart bytes can be attached to a
+    // stale stream and the readiness sentinel is never observed.
+    for (const [subscriber] of subs) {
+      try {
+        subscriber.sendControl?.({
+          type: TERMINAL_CONTROL.STREAM_RESET,
+          session: sessionName,
+          reason: 'rebind',
+        });
+      } catch { /* best effort; the normal send path handles a dead subscriber */ }
+    }
+    // Drop parser/cursor state from the old pane before attaching the new raw
+    // stream. Otherwise stale timestamps and partial ANSI lines can suppress
+    // the bootstrap guard or splice the new prompt into old terminal text.
+    resetParser(sessionName);
+    this.lastStreamRawAt.delete(sessionName);
+    this.lastRawAt.delete(sessionName);
+    this.idleState.delete(sessionName);
+    this.clearSnapshotCoalescing(sessionName);
+    for (const state of subs.values()) {
+      // requestSnapshot below sends the replacement snapshot immediately. Do
+      // not leave the subscriber in snapshotPending here: unlike the initial
+      // bootstrap path, rebind does not run bootstrapSubscriber to release
+      // that gate, and subsequent raw bytes would remain buffered forever.
+      state.snapshotPending = false;
+      state.rawBuffer = [];
+      state.rawBufferBytes = 0;
+      state.firstPaintAbandoned = false;
+    }
     await this.stopPipe(sessionName);
     await this.startPipe(sessionName, 0);
     // Re-snapshot all subscribers
@@ -957,6 +1006,7 @@ export class TerminalStreamer {
   // ── Raw data handling ───────────────────────────────────────────────────────
 
   private onRawData(sessionName: string, data: Buffer): void {
+    terminalStageTrace('frame_dispatch', sessionName);
     const hasStructuredWatcher = isWatching(sessionName) || isCodexWatching(sessionName) || isGeminiWatching(sessionName);
 
     // Unconditional stream-activity stamp for the bootstrap re-probe guard. Must

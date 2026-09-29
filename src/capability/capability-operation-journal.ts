@@ -103,7 +103,7 @@ function atomicWrite(path: string, value: JournalState): void {
   const temporary = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
     writeFileSync(temporary, `${JSON.stringify(value)}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
-    const file = openSync(temporary, 'r');
+    const file = openSync(temporary, 'r+');
     try { fsyncDescriptorSync(file); } finally { closeSync(file); }
     renameSync(temporary, path);
     fsyncDirectorySync(dirname(path));
