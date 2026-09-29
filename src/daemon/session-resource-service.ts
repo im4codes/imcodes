@@ -62,10 +62,32 @@ export function resourceOwnerEnv(owner: SessionResourceOwner | null): Record<str
   } : {};
 }
 
+async function resolveTmuxServerId(name: string): Promise<string | undefined> {
+  if (process.platform === 'win32') return undefined;
+  try {
+    const [pid, started] = await Promise.all([
+      execFile('tmux', ['display-message', '-p', '-t', name, '#{pid}'], { timeout: 2_000 }),
+      execFile('tmux', ['display-message', '-p', '-t', name, '#{start_time}'], { timeout: 2_000 }),
+    ]);
+    const serverPid = pid.stdout.trim();
+    const serverStart = started.stdout.trim();
+    return serverPid && serverStart ? `${serverPid}:${serverStart}` : undefined;
+  } catch {
+    // Marker capture is additive; registry liveness remains fail-closed when
+    // tmux is unavailable or a non-tmux backend owns this session.
+    return undefined;
+  }
+}
+
 export async function registerTmuxSessionResource(record: SessionRecord): Promise<void> {
   const owner = sessionResourceOwner(record);
   if (!owner) throw new Error('session_resource_owner_missing');
   if (!record.paneId) throw new Error('session_resource_tmux_identity_unavailable');
+  // Capture the tmux server lifetime alongside `%N`. Pane ids are reused by
+  // a fresh server, so the registry must be able to distinguish a recycled
+  // pane from the old owner during restore. If the bounded probe is
+  // unavailable, keep the legacy pane-only handle and fail closed as before.
+  const serverId = await resolveTmuxServerId(record.name);
   await registry.register({
     resourceId: `tmux:${record.name}`,
     kind: SESSION_RESOURCE_KIND.TMUX,
@@ -74,6 +96,7 @@ export async function registerTmuxSessionResource(record: SessionRecord): Promis
       type: SESSION_RESOURCE_HANDLE_TYPE.TMUX,
       name: record.name,
       paneId: record.paneId,
+      ...(serverId ? { serverId } : {}),
     },
   });
 }

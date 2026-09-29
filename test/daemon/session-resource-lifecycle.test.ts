@@ -22,7 +22,7 @@ afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-type TmuxIdentity = { paneId: string; sessionInstanceId: string; runtimeEpoch: string } | null | undefined;
+type TmuxIdentity = { paneId: string; sessionInstanceId: string; runtimeEpoch: string; serverId?: string } | null | undefined;
 
 // Never probe the host's real tmux: whether `tmux` is installed or a server is
 // running differs between CI runners. Default to "liveness unknown" (null),
@@ -225,6 +225,42 @@ describe('session resource lifecycle', () => {
       resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: successor,
       handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%0' },
     })).resolves.toMatchObject({ owner: successor });
+  });
+
+  it('accepts a recycled pane after the tmux server restarts, but rejects a foreign owner', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'imcodes-resource-ledger-'));
+    roots.push(directory);
+    const cleanup = vi.fn<SessionResourceCleanup>(async () => {});
+    // The old and new daemon records can carry different instance ids while
+    // restore is still observing the old owner metadata. The old tmux server
+    // and the new server both allocate `%0`.
+    let liveIdentity = {
+      paneId: '%0', sessionInstanceId: 'instance-old', runtimeEpoch: 'epoch-a', serverId: 'server-b',
+    };
+    const registry = new SessionResourceRegistry({
+      directory,
+      cleanup,
+      resolveTmuxIdentity: async () => liveIdentity,
+    });
+    const prior = { ...owner('instance-old'), runtimeEpoch: 'epoch-a' };
+    const successor = { ...owner('instance-new'), runtimeEpoch: 'epoch-b' };
+    await registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: prior,
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%0', serverId: 'server-a' },
+    });
+
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: successor,
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%0', serverId: 'server-b' },
+    })).resolves.toMatchObject({ owner: successor, handle: { paneId: '%0', serverId: 'server-b' } });
+
+    liveIdentity = {
+      paneId: '%0', sessionInstanceId: 'foreign-instance', runtimeEpoch: 'foreign-epoch', serverId: 'server-b',
+    };
+    await expect(registry.register({
+      resourceId: 'tmux:deck_alpha_w1', kind: 'tmux', owner: owner('foreign-instance'),
+      handle: { type: 'tmux', name: 'deck_alpha_w1', paneId: '%0', serverId: 'server-b' },
+    })).rejects.toThrow('session_resource_owner_conflict');
   });
 
   it('fails closed and releases the registry lock when live tmux identity lookup is unavailable', async () => {

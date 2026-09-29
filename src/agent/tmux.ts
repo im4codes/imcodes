@@ -683,6 +683,8 @@ export interface TmuxSessionResourceIdentity {
   paneId: string;
   sessionInstanceId: string;
   runtimeEpoch: string;
+  /** Stable only for the lifetime of one tmux server process. */
+  serverId?: string;
 }
 
 /**
@@ -709,10 +711,18 @@ export async function getTmuxSessionResourceIdentity(
     // format tokens. Read the pane id and the session environment separately;
     // using #{VAR} silently returns an empty string and made every relaunch
     // look like an unknown live owner (the original black-shell regression).
-    const { stdout: paneStdout } = await execFile('tmux', ['display-message', '-p', '-t', session, '#{pane_id}'], {
-      timeout: timeoutMs,
-      maxBuffer: 4 * 1024,
-    });
+    const readFormat = async (format: string): Promise<string> => {
+      const { stdout } = await execFile('tmux', ['display-message', '-p', '-t', session, format], {
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024,
+      });
+      return stdout.trim();
+    };
+    const [paneId, serverPid, serverStart] = await Promise.all([
+      readFormat('#{pane_id}'),
+      readFormat('#{pid}'),
+      readFormat('#{start_time}'),
+    ]);
     const readEnv = async (name: string): Promise<string> => {
       const { stdout } = await execFile('tmux', ['show-environment', '-t', session, name], {
         timeout: timeoutMs,
@@ -724,12 +734,12 @@ export async function getTmuxSessionResourceIdentity(
       readEnv(SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID),
       readEnv(SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH),
     ]);
-    const paneId = paneStdout.trim();
     const parseEnv = (line: string, name: string): string => line.startsWith(`${name}=`) ? line.slice(name.length + 1) : '';
     const sessionInstanceId = parseEnv(instanceLine, SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID);
     const runtimeEpoch = parseEnv(epochLine, SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH);
+    const serverId = serverPid && serverStart ? `${serverPid}:${serverStart}` : undefined;
     return paneId && sessionInstanceId && runtimeEpoch
-      ? { paneId, sessionInstanceId, runtimeEpoch }
+      ? { paneId, sessionInstanceId, runtimeEpoch, ...(serverId ? { serverId } : {}) }
       : null;
   } catch (error) {
     const output = `${(error as { stderr?: unknown }).stderr ?? ''} ${(error as Error).message ?? ''}`.toLowerCase();

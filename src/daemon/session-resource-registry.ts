@@ -27,7 +27,7 @@ export type SessionResourceOwner = SessionResourceOwnerIdentity;
 
 export type SessionResourceHandle =
   | { type: typeof SESSION_RESOURCE_HANDLE_TYPE.PID; pid: number; processStart?: string; killTree?: boolean }
-  | { type: typeof SESSION_RESOURCE_HANDLE_TYPE.TMUX; name: string; paneId?: string }
+  | { type: typeof SESSION_RESOURCE_HANDLE_TYPE.TMUX; name: string; paneId?: string; serverId?: string }
   | { type: typeof SESSION_RESOURCE_HANDLE_TYPE.PODMAN; containerId: string };
 
 export interface SessionResourceRegistration {
@@ -60,6 +60,8 @@ export interface SessionResourceRegistryOptions {
     paneId: string;
     sessionInstanceId: string;
     runtimeEpoch: string;
+    /** tmux server lifetime marker; pane ids are only unique within a server. */
+    serverId?: string;
   } | null | undefined>;
   /** Proves whether a concrete pane handle is still the live owner. `null`
    * means the probe was inconclusive and must fail closed. */
@@ -120,7 +122,9 @@ function validHandle(value: unknown): value is SessionResourceHandle {
       && (handle.killTree === undefined || typeof handle.killTree === 'boolean');
   }
   if (handle.type === SESSION_RESOURCE_HANDLE_TYPE.TMUX) {
-    return boundedString(handle.name) && (handle.paneId === undefined || boundedString(handle.paneId));
+    return boundedString(handle.name)
+      && (handle.paneId === undefined || boundedString(handle.paneId))
+      && (handle.serverId === undefined || boundedString(handle.serverId));
   }
   if (handle.type === SESSION_RESOURCE_HANDLE_TYPE.PODMAN) {
     return typeof handle.containerId === 'string' && PODMAN_ID.test(handle.containerId);
@@ -222,6 +226,7 @@ async function resolveLiveTmuxIdentity(name: string): Promise<{
   paneId: string;
   sessionInstanceId: string;
   runtimeEpoch: string;
+  serverId?: string;
 } | null | undefined> {
   try {
     const { getTmuxSessionResourceIdentity } = await import('../agent/tmux.js');
@@ -515,6 +520,22 @@ export class SessionResourceRegistry {
             && liveIdentity.paneId === registration.handle.paneId
             && liveIdentity.sessionInstanceId === registration.owner.sessionInstanceId
             && liveIdentity.runtimeEpoch === registration.owner.runtimeEpoch);
+          // `%N` pane ids are allocated by the tmux server, not globally. A
+          // restarted server can therefore reuse `%0` while the session
+          // instance survives with a fresh runtime epoch.  If the persisted
+          // handle and the live successor carry different server-lifetime
+          // markers, the old handle cannot be the live pane even when a
+          // name/pane probe says it is. Keep the owner instance check so a
+          // foreign session cannot steal a recycled pane.
+          if (!replacesStaleTmuxOwner && liveIdentity && previous.handle.serverId
+            && registration.handle.serverId && liveIdentity.serverId
+            && previous.handle.serverId !== liveIdentity.serverId
+            && registration.handle.serverId === liveIdentity.serverId
+            && liveIdentity.paneId === registration.handle.paneId
+            && (liveIdentity.sessionInstanceId === previous.owner.sessionInstanceId
+              || liveIdentity.sessionInstanceId === registration.owner.sessionInstanceId)) {
+            replacesStaleTmuxOwner = true;
+          }
           // A remain-on-exit pane keeps its name and pane id while its old
           // owner tuple remains visible. Prove that concrete old handle is
           // dead before allowing the successor; a foreign live pane returns
