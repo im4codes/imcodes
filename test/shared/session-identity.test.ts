@@ -17,9 +17,12 @@ import {
   sessionIdentityContentLength,
   sessionIdentityMaxChars,
   sessionIdentityScopeKeyError,
+  encodeSessionIdentityDirectHandle,
+  decodeSessionIdentityDirectHandle,
   type SessionIdentityProfile,
 } from '../../shared/session-identity.js';
 import { MEMORY_MCP_TOOL_CONTRACTS, MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
+import { sanitizeUploadFilename } from '../../shared/upload-filename.js';
 
 function profile(scope: SessionIdentityProfile['scope'], content: string): SessionIdentityProfile {
   return {
@@ -194,5 +197,35 @@ describe('session identity scope keys', () => {
 
   it('keys a session identity by server and session name', () => {
     expect(sessionIdentitySessionKey('srv-1', 'deck_proj_brain')).toBe('srv-1:deck_proj_brain');
+  });
+});
+
+describe('identity-over-lease handle (phase 2)', () => {
+  it('round-trips scope and scope key for both project and session scope', () => {
+    expect(decodeSessionIdentityDirectHandle(encodeSessionIdentityDirectHandle('project', 'repo-1')))
+      .toEqual({ scope: 'project', scopeKey: 'repo-1' });
+    expect(decodeSessionIdentityDirectHandle(encodeSessionIdentityDirectHandle('session', 'srv-1:deck_proj_brain')))
+      .toEqual({ scope: 'session', scopeKey: 'srv-1:deck_proj_brain' });
+  });
+
+  it('round-trips a scope key containing the delimiter character itself, unicode, and an underscore', () => {
+    for (const scopeKey of ['a_b_c', 'has:colons:too', '项目/仓库', 'trailing_']) {
+      expect(decodeSessionIdentityDirectHandle(encodeSessionIdentityDirectHandle('project', scopeKey)))
+        .toEqual({ scope: 'project', scopeKey });
+    }
+  });
+
+  it('is unaffected by sanitizeUploadFilename -- the upload wire path runs the handle through it as a real filename', () => {
+    const handle = encodeSessionIdentityDirectHandle('session', 'srv-1:deck_proj_brain');
+    expect(sanitizeUploadFilename(handle)).toBe(handle);
+    expect(decodeSessionIdentityDirectHandle(sanitizeUploadFilename(handle))).toEqual({
+      scope: 'session', scopeKey: 'srv-1:deck_proj_brain',
+    });
+  });
+
+  it('rejects a handle with no recognized prefix, an unknown scope, or a malformed percent-encoding', () => {
+    expect(decodeSessionIdentityDirectHandle('not-an-identity-handle')).toBeNull();
+    expect(decodeSessionIdentityDirectHandle('imcodes-identity_user_')).toBeNull();
+    expect(decodeSessionIdentityDirectHandle('imcodes-identity_project_%')).toBeNull();
   });
 });

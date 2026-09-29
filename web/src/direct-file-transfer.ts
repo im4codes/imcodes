@@ -2964,13 +2964,65 @@ export async function setSessionIdentityDirect(
  * One bounded attempt only (see `setSessionIdentityDirect`'s sibling note):
  * the caller falls back to the WS-relayed HTTP path on any rejection.
  */
+/**
+ * A minimal in-memory `FileSystemWritableFileStreamLike` (the same shape
+ * `createNativeBlobDownloadSink`'s writer implements), decoded directly via
+ * `TextDecoder` rather than through a `Blob` -- identity content is
+ * decoded text, not a downloadable file, and `Blob.text()`/`arrayBuffer()`
+ * are not universally available (notably: not in this project's jsdom test
+ * environment), so this avoids depending on them for something that was
+ * never going to be saved to disk anyway.
+ */
+function createInMemoryTextSink(): { destination: DirectPreviewDownloadDestination; takeContent(): string } {
+  let committed = new Uint8Array(0);
+  return {
+    destination: {
+      handle: {
+        async createWritable() {
+          let working = new Uint8Array(0);
+          let position = 0;
+          let settled = false;
+          return {
+            async write(data) {
+              if (settled) throw new Error('download_writer_closed');
+              const bytes = data instanceof ArrayBuffer
+                ? new Uint8Array(data)
+                : new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+              const required = position + bytes.byteLength;
+              if (required > working.byteLength) {
+                const expanded = new Uint8Array(required);
+                expanded.set(working);
+                working = expanded;
+              }
+              working.set(bytes, position);
+              position = required;
+            },
+            async close() {
+              if (settled) throw new Error('download_writer_closed');
+              settled = true;
+              committed = working;
+            },
+            async abort() {
+              settled = true;
+              working = new Uint8Array(0);
+            },
+          };
+        },
+      },
+    },
+    takeContent() {
+      return new TextDecoder('utf-8').decode(committed);
+    },
+  };
+}
+
 export async function getSessionIdentityDirect(
   ws: WsClient, serverId: string, scope: 'project' | 'session', scopeKey: string,
 ): Promise<SessionIdentityDirectResult> {
   if (!supportsPreviewDownload(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   const { lease, release } = acquireLease(ws, serverId);
   try {
-    const sink = createNativeBlobDownloadSink();
+    const sink = createInMemoryTextSink();
     const operationId = crypto.randomUUID();
     await retryDirect<OperationSuccess>(lease, async () => ({
       kind: 'download',
@@ -2978,8 +3030,14 @@ export async function getSessionIdentityDirect(
       operationId,
       writer: await createPreviewWriter(sink.destination, 0),
     }), undefined);
-    const blob = sink.takeCompletedBlob();
-    return { content: await blob.text() };
+    // retryDirect alone does not record this -- downloadPreviewWithDirectFallback
+    // (the higher-level caller we're bypassing) is what normally does, so this
+    // path records it itself.
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, {
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      route: await selectedPeerRoute(lease.peer),
+    });
+    return { content: sink.takeContent() };
   } finally {
     release();
   }

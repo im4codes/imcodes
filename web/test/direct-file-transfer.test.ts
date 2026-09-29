@@ -3935,6 +3935,58 @@ describe('direct file transfer v2 browser broker', () => {
     ).toBe(leaseInitsAfterProbe);
   });
 
+  describe('session identity over the lease (phase 2: chunked reuse)', () => {
+    // jsdom's Blob (File extends Blob) does not implement arrayBuffer() --
+    // real browsers do; this polyfill (via the FileReader jsdom DOES fully
+    // implement) exists only so setSessionIdentityDirect (which constructs
+    // a real Blob-backed File) can be exercised here.
+    const originalArrayBuffer = Blob.prototype.arrayBuffer;
+    beforeEach(() => {
+      if (!originalArrayBuffer) {
+        Blob.prototype.arrayBuffer = function arrayBufferPolyfill(this: Blob) {
+          return new Promise<ArrayBuffer>((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload = () => resolve(reader.result as ArrayBuffer);
+            reader.onerror = () => reject(reader.error);
+            reader.readAsArrayBuffer(this);
+          });
+        };
+      }
+    });
+    afterEach(() => {
+      if (!originalArrayBuffer) delete (Blob.prototype as { arrayBuffer?: unknown }).arrayBuffer;
+    });
 
+    it('SET sends an upload OPERATION_INIT whose filename carries the identity handle, and parses the daemon reply', async () => {
+      const { setSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
+      const { ws, sent } = createWs(directCapabilities);
+
+      const result = await setSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain', 'session rules content');
+
+      expect(result).toMatchObject({ contentHash: expect.any(String), revision: expect.any(Number), updatedAt: expect.any(Number) });
+      const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
+      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, filename: 'imcodes-identity_session_srv-1%3Adeck_proj_brain' });
+    });
+
+    it('GET sends a download OPERATION_INIT whose previewHandle carries the identity handle, and decodes the received bytes', async () => {
+      const { getSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
+      const { ws, sent } = createWs(directCapabilities);
+
+      const result = await getSessionIdentityDirect(ws, 'server-1', 'project', 'repo-1');
+
+      expect(result.content.length).toBeGreaterThan(0);
+      const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
+      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD, previewHandle: 'imcodes-identity_project_repo-1' });
+    });
+
+    it('rejects when the daemon has not advertised the required capabilities, without ever attempting a lease', async () => {
+      const { setSessionIdentityDirect, getSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
+      const { ws, sent } = createWs([]);
+
+      await expect(setSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain', 'x')).rejects.toThrow();
+      await expect(getSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain')).rejects.toThrow();
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(0);
+    });
+  });
 
 });

@@ -115,22 +115,36 @@ export function isSessionIdentityScope(value: unknown): value is SessionIdentity
  * upload's `filename` field (same bound, repurposed -- the real
  * `clientUploadId` stays a plain opaque token, since IT is restricted to
  * `[A-Za-z0-9_-]{8,128}` and cannot carry an arbitrary scope key).
+ *
+ * Deliberately colon-free: `filename` passes through
+ * `sanitizeUploadFilename` (shared/upload-filename.ts) before an
+ * OPERATION_INIT is ever sent, which strips `:` (and other
+ * filesystem-unsafe characters) as if this were a real file name. `_` is
+ * not in that stripped set, and `encodeURIComponent` never produces one
+ * either, so it is a safe, unambiguous delimiter here.
+ *
+ * PROJECT/SESSION only, never USER: USER scope stays server-authoritative
+ * (phase 1) and is never reachable over the lease. `decode` rejects a
+ * `user` handle explicitly rather than relying on every caller to check --
+ * a browser (malicious or merely buggy) could otherwise ask the daemon to
+ * read/write the local USER-scope profile through this path.
  */
-const SESSION_IDENTITY_DIRECT_HANDLE_PREFIX = 'imcodes-identity:';
+const SESSION_IDENTITY_DIRECT_HANDLE_PREFIX = 'imcodes-identity_';
+const SESSION_IDENTITY_DIRECT_SCOPES = new Set<string>([SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_SCOPES.SESSION]);
 
-export function encodeSessionIdentityDirectHandle(scope: SessionIdentityScope, scopeKey: string): string {
-  return `${SESSION_IDENTITY_DIRECT_HANDLE_PREFIX}${scope}:${encodeURIComponent(scopeKey)}`;
+export function encodeSessionIdentityDirectHandle(scope: 'project' | 'session', scopeKey: string): string {
+  return `${SESSION_IDENTITY_DIRECT_HANDLE_PREFIX}${scope}_${encodeURIComponent(scopeKey)}`;
 }
 
 export function decodeSessionIdentityDirectHandle(
   handle: string,
-): { scope: SessionIdentityScope; scopeKey: string } | null {
+): { scope: 'project' | 'session'; scopeKey: string } | null {
   if (!handle.startsWith(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX)) return null;
   const rest = handle.slice(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX.length);
-  const separator = rest.indexOf(':');
+  const separator = rest.indexOf('_');
   if (separator < 0) return null;
-  const scope = rest.slice(0, separator);
-  if (!isSessionIdentityScope(scope)) return null;
+  const scope = rest.slice(0, separator) as 'project' | 'session';
+  if (!SESSION_IDENTITY_DIRECT_SCOPES.has(scope)) return null;
   let scopeKey: string;
   try {
     scopeKey = decodeURIComponent(rest.slice(separator + 1));
