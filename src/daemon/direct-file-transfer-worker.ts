@@ -1103,15 +1103,16 @@ function routeMetricClass(lease: DirectLease): 'direct' | 'relay' | 'unknown' {
 }
 
 async function closeTransferResources(transfer: ActiveDirectTransfer, removePart: boolean): Promise<void> {
-  if (transfer.idleTimer) clearTimeout(transfer.idleTimer);
-  transfer.idleTimer = null;
-  await transfer.writeChain.catch(() => {});
-  if (transfer.uploadFileHandle) await transfer.uploadFileHandle.close().catch(() => {});
-  if (transfer.downloadFileHandle) await transfer.downloadFileHandle.close().catch(() => {});
-  transfer.uploadFileHandle = null;
-  transfer.downloadFileHandle = null;
-  closeOrRetireNative(transfer.channel);
-  if (removePart) {
+  try {
+    if (transfer.idleTimer) clearTimeout(transfer.idleTimer);
+    transfer.idleTimer = null;
+    await transfer.writeChain.catch(() => {});
+    if (transfer.uploadFileHandle) await transfer.uploadFileHandle.close().catch(() => {});
+    if (transfer.downloadFileHandle) await transfer.downloadFileHandle.close().catch(() => {});
+    transfer.uploadFileHandle = null;
+    transfer.downloadFileHandle = null;
+    closeOrRetireNative(transfer.channel);
+    if (removePart) {
     // `removePart` marks a terminal outcome — explicit cancel, expiry, or a
     // final integrity failure — so the resume state goes with the bytes. A
     // transient channel/ICE failure passes false and deliberately keeps both,
@@ -1129,12 +1130,17 @@ async function closeTransferResources(transfer: ActiveDirectTransfer, removePart
       // record behind until the next boot is needless litter.
       await unlink(commitIntentPathFor(transfer.finalPath)).catch(() => {});
     }
-  }
-  activeAttempts.delete(transfer.authority.attemptId);
-  transfer.lease.activeAttempts.delete(transfer.authority.attemptId);
-  if (transfer.uploadClaim) {
-    await releaseClientUploadClaim(transfer.authority.operationId, transfer.uploadClaim)
-      .catch(() => undefined);
+    }
+    activeAttempts.delete(transfer.authority.attemptId);
+    transfer.lease.activeAttempts.delete(transfer.authority.attemptId);
+  } finally {
+    // Claim release is the final safety invariant.  Cleanup/finalization can
+    // throw (including child shutdown races); never strand a clientUploadId.
+    if (transfer.uploadClaim) {
+      const claim = transfer.uploadClaim;
+      transfer.uploadClaim = null;
+      await releaseClientUploadClaim(transfer.authority.operationId, claim).catch(() => undefined);
+    }
   }
   resetLeaseIdleTimer(transfer.lease);
   // A warm/renewed lease must not pin retired native wrappers forever. Once
