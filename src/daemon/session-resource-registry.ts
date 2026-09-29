@@ -14,6 +14,7 @@ import {
   type SessionResourceOwnerIdentity,
 } from '../../shared/session-resource-lifecycle.js';
 import { MCP_LIFECYCLE_EVENT, appendMcpLifecycleEvent, mcpLifecycleLogPath } from './mcp-lifecycle-log.js';
+import { readProcessStart } from '../util/process-start.js';
 
 const execFile = promisify(execFileCallback);
 const RECORD_VERSION = 1;
@@ -202,24 +203,6 @@ export type ProviderHostedRelease = typeof PROVIDER_HOSTED_RELEASE[keyof typeof 
 
 function recordFileName(resourceId: string): string {
   return `${createHash('sha256').update(resourceId).digest('hex')}.json`;
-}
-
-async function readProcessStart(pid: number): Promise<string | undefined> {
-  try {
-    if (process.platform === 'win32') {
-      const { stdout } = await execFile('powershell.exe', [
-        '-NoProfile', '-NonInteractive', '-Command',
-        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`,
-      ], { timeout: 2_000, windowsHide: true });
-      const value = stdout.trim();
-      return /^\d+$/.test(value) ? value : undefined;
-    }
-    const { stdout } = await execFile('ps', ['-o', 'lstart=', '-p', String(pid)], { timeout: 2_000 });
-    const value = stdout.trim();
-    return value || undefined;
-  } catch {
-    return undefined;
-  }
 }
 
 async function resolveLiveTmuxIdentity(name: string): Promise<{

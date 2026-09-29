@@ -11,6 +11,7 @@ import { constants as fsConstants, watch, type FSWatcher } from 'node:fs';
 import { homedir } from 'node:os';
 import { extname, join, resolve, sep } from 'node:path';
 import { getCodexHome, recentCodexSessionDirs, findCodexRolloutPathByUuid } from '../../util/codex-rollout-path.js';
+import { codexRolloutIndex } from '../../util/codex-rollout-index.js';
 import { TextDecoder } from 'node:util';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import readline, { type Interface as ReadlineInterface } from 'node:readline';
@@ -711,25 +712,10 @@ async function discoverCodexChildSubagentRolloutSnapshots(
   const codexHome = getCodexHome(env);
   const snapshots: CodexChildSubagentRolloutSnapshot[] = [];
   const minMtimeWithSkew = minMtimeMs - CODEX_CHILD_SUBAGENT_ROLLOUT_CLOCK_SKEW_MS;
-  for (const dir of recentCodexSessionDirs(codexHome)) {
-    let entries: string[];
-    try {
-      entries = await readdir(dir);
-    } catch {
-      continue;
-    }
-    for (const name of entries) {
-      if (!name.startsWith('rollout-') || !name.endsWith('.jsonl')) continue;
-      const rolloutPath = join(dir, name);
-      try {
-        const info = await stat(rolloutPath);
-        if (info.mtimeMs < minMtimeWithSkew) continue;
-      } catch {
-        continue;
-      }
-      const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
-      if (snapshot) snapshots.push(snapshot);
-    }
+  const rolloutPaths = await codexRolloutIndex.listSince(codexHome, recentCodexSessionDirs(codexHome), minMtimeWithSkew);
+  for (const rolloutPath of rolloutPaths) {
+    const snapshot = await readCodexChildSubagentRolloutSnapshot(rolloutPath);
+    if (snapshot) snapshots.push(snapshot);
   }
   return snapshots;
 }

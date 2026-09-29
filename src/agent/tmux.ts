@@ -217,8 +217,46 @@ async function ensureTmuxServer(): Promise<void> {
   }
 }
 
+/**
+ * Identical read-only queries issued while one is already running share its
+ * spawn (many windows poll the same `list-sessions` / `display-message` in the
+ * same tick). A read joins only while no non-read command has started or
+ * finished since the in-flight one began, so read-after-write callers (send
+ * keys, then capture the pane) never receive a snapshot taken before their
+ * own write.
+ */
+let tmuxMutationGeneration = 0;
+const tmuxReadsInFlight = new Map<string, { generation: number; promise: Promise<string> }>();
+
+function isCoalescableTmuxRead(args: readonly string[]): boolean {
+  const command = args[0];
+  if (command === 'display-message' || command === 'capture-pane') return args.includes('-p');
+  return command === 'list-sessions' || command === 'list-panes';
+}
+
 /** Run a tmux command with array args (no shell — safe from injection). */
 async function tmuxRun(...args: string[]): Promise<string> {
+  if (!isCoalescableTmuxRead(args)) {
+    tmuxMutationGeneration += 1;
+    try {
+      return await tmuxRunSpawn(args);
+    } finally {
+      tmuxMutationGeneration += 1;
+    }
+  }
+  const key = args.join('\0');
+  const shared = tmuxReadsInFlight.get(key);
+  if (shared && shared.generation === tmuxMutationGeneration) return shared.promise;
+  const entry = { generation: tmuxMutationGeneration, promise: tmuxRunSpawn(args) };
+  tmuxReadsInFlight.set(key, entry);
+  try {
+    return await entry.promise;
+  } finally {
+    if (tmuxReadsInFlight.get(key) === entry) tmuxReadsInFlight.delete(key);
+  }
+}
+
+async function tmuxRunSpawn(args: string[]): Promise<string> {
   let lastError: unknown;
   const attempts = 3;
   for (let attempt = 0; attempt < attempts; attempt++) {
