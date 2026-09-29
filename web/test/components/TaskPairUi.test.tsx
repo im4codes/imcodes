@@ -109,11 +109,17 @@ describe('TaskPairEventChip workspace events', () => {
   });
 });
 describe('TaskPairStatusPanel', () => {
+  let originalMaxTouchPoints: PropertyDescriptor | undefined;
   beforeEach(() => {
     window.localStorage.clear();
     delete (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot;
+    originalMaxTouchPoints = Object.getOwnPropertyDescriptor(window.navigator, 'maxTouchPoints');
   });
-  afterEach(() => cleanup());
+  afterEach(() => {
+    if (originalMaxTouchPoints) Object.defineProperty(window.navigator, 'maxTouchPoints', originalMaxTouchPoints);
+    else delete (window.navigator as Navigator & { maxTouchPoints?: number }).maxTouchPoints;
+    cleanup();
+  });
   it('keeps the title as the headline and expands the full brief with two checklist columns', () => {
     (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = {
       tasks: [{ taskId: 'brief-task', title: 'Readable title', brief: '# Goal\n\nDetails **matter**.\n\n- [x][ ] Implement it', pair: { status: 'working', updatedAt: 1 } }],
@@ -295,6 +301,7 @@ describe('TaskPairStatusPanel', () => {
   it('uses the mobile compact strip as the only expand control and keeps collapse visible when expanded', () => {
     const events = [{ eventId: 'mobile-compact', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'mobile-compact', title: 'Mobile task', toStatus: 'working' } }] as never;
     const original = window.matchMedia;
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
     const { container } = render(<TaskPairStatusPanel events={events} serverId="mobile-compact" />);
     const compact = container.querySelector('.task-pair-status-compact') as HTMLElement | null;
@@ -322,6 +329,7 @@ describe('TaskPairStatusPanel', () => {
 
   it('portals the collapsed mobile status into the pinned-message header row', async () => {
     const original = window.matchMedia;
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '(max-width: 720px)', addEventListener: () => {}, removeEventListener: () => {} }) });
     const titlebar = document.createElement('div');
     const pin = document.createElement('button');
@@ -342,6 +350,7 @@ describe('TaskPairStatusPanel', () => {
 
   it('keeps the mobile status in the equivalent header row when no pinned message exists', async () => {
     const original = window.matchMedia;
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '(max-width: 720px)', addEventListener: () => {}, removeEventListener: () => {} }) });
     const titlebar = document.createElement('div');
     document.body.append(titlebar);
@@ -374,6 +383,7 @@ describe('TaskPairStatusPanel', () => {
     fireEvent.click(screen.getByRole('button', { name: /taskPair\.panel_collapse/ }));
     expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
     unmount();
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
     render(<TaskPairStatusPanel events={events} serverId="close" />);
     const compact = document.querySelector('.task-pair-status-compact') as HTMLElement;
