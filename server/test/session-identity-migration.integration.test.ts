@@ -88,7 +88,7 @@ async function cleanup(userId: string, serverId: string) {
 }
 
 describe('session identity migration off the server (real PostgreSQL, zero data loss)', () => {
-  it('clears a row only after the daemon confirms it persisted the exact hash', async () => {
+  it('records metadata on confirm but keeps a shared PROJECT row for the other daemons', async () => {
     const { userId, serverId, token } = await seedUserAndDaemon();
     try {
       const content = 'x'.repeat(250_000); // production-shaped: a large existing PROJECT row
@@ -122,10 +122,66 @@ describe('session identity migration off the server (real PostgreSQL, zero data 
         type: SESSION_IDENTITY_WS.MIGRATE_CONFIRM,
         confirmed: [{ scope: 'project', scopeKey: 'repo-1', contentHash: written.contentHash }],
       }));
-      await waitForContent(userId, 'project', 'repo-1', (value) => value === null);
-
+      await vi.waitFor(async () => {
+        const metadata = await getSessionIdentityMetadata(db, userId, 'project', 'repo-1');
+        if (!metadata) throw new Error('metadata not written yet');
+      }, { timeout: 5_000, interval: 20 });
       const metadata = await getSessionIdentityMetadata(db, userId, 'project', 'repo-1');
       expect(metadata).toMatchObject({ contentHash: written.contentHash });
+
+      // A PROJECT key is shared by every daemon of the user running that
+      // project: one daemon's confirm must not strand another daemon.
+      const afterConfirm = await db.queryOne<{ content: string | null }>(
+        'SELECT content FROM session_identity_profiles WHERE user_id = $1 AND scope = $2 AND scope_key = $3',
+        [userId, 'project', 'repo-1'],
+      );
+      expect(afterConfirm?.content).toBe(content);
+      const secondServerId = randomHex(16);
+      const secondToken = randomHex(32);
+      await createServer(db, secondServerId, userId, 'identity-migration-server-2', sha256Hex(secondToken));
+      try {
+        const second = await connectDaemon(secondServerId, secondToken);
+        second.emit('message', JSON.stringify({
+          type: SESSION_IDENTITY_WS.MIGRATE_REQUEST, requestId: 'mig-1b',
+          candidates: [{ scope: 'project', scopeKey: 'repo-1' }],
+        }));
+        await waitForSent(second, (m) => m.type === SESSION_IDENTITY_WS.MIGRATE_RESPONSE);
+        const secondResponse = second.sent.find((m) => m.type === SESSION_IDENTITY_WS.MIGRATE_RESPONSE && m.requestId === 'mig-1b');
+        expect((secondResponse?.rows as Array<{ content: string }>)[0]?.content).toBe(content);
+      } finally {
+        await db.execute('DELETE FROM servers WHERE id = $1', [secondServerId]);
+      }
+    } finally {
+      await cleanup(userId, serverId);
+    }
+  });
+
+  it('clears a SESSION row only after its daemon confirms it persisted the exact hash', async () => {
+    const { userId, serverId, token } = await seedUserAndDaemon();
+    try {
+      const content = 's'.repeat(200_000);
+      const scopeKey = `${serverId}:deck_owner`;
+      const written = await upsertSessionIdentityProfile(db, {
+        userId, scope: 'session', scopeKey, content, contentHash: sha256Hex(content), source: 'web',
+      });
+      if (written === 'revision_conflict') throw new Error('unexpected conflict');
+      const daemon = await connectDaemon(serverId, token);
+      daemon.emit('message', JSON.stringify({
+        type: SESSION_IDENTITY_WS.MIGRATE_REQUEST, requestId: 'mig-s',
+        candidates: [{ scope: 'session', scopeKey }],
+      }));
+      await waitForSent(daemon, (m) => m.type === SESSION_IDENTITY_WS.MIGRATE_RESPONSE);
+      const before = await db.queryOne<{ content: string | null }>(
+        'SELECT content FROM session_identity_profiles WHERE user_id = $1 AND scope = $2 AND scope_key = $3',
+        [userId, 'session', scopeKey],
+      );
+      expect(before?.content).toBe(content);
+      daemon.emit('message', JSON.stringify({
+        type: SESSION_IDENTITY_WS.MIGRATE_CONFIRM,
+        confirmed: [{ scope: 'session', scopeKey, contentHash: written.contentHash }],
+      }));
+      await waitForContent(userId, 'session', scopeKey, (value) => value === null);
+      expect(await getSessionIdentityMetadata(db, userId, 'session', scopeKey)).toMatchObject({ contentHash: written.contentHash });
     } finally {
       await cleanup(userId, serverId);
     }
@@ -202,7 +258,14 @@ describe('session identity migration off the server (real PostgreSQL, zero data 
         type: SESSION_IDENTITY_WS.MIGRATE_CONFIRM,
         confirmed: [{ scope: 'project', scopeKey: 'repo-2', contentHash: projectProfile.contentHash }],
       }));
-      await waitForContent(userId, 'project', 'repo-2', (value) => value === null);
+      await vi.waitFor(async () => {
+        if (!await getSessionIdentityMetadata(db, userId, 'project', 'repo-2')) throw new Error('metadata not written yet');
+      }, { timeout: 5_000, interval: 20 });
+      const projectRow = await db.queryOne<{ content: string | null }>(
+        'SELECT content FROM session_identity_profiles WHERE user_id = $1 AND scope = $2 AND scope_key = $3',
+        [userId, 'project', 'repo-2'],
+      );
+      expect(projectRow?.content).toBe(projectContent);
 
       const userRow = await db.queryOne<{ content: string | null }>(
         'SELECT content FROM session_identity_profiles WHERE user_id = $1 AND scope = $2 AND scope_key = $3',

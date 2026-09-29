@@ -11666,10 +11666,17 @@ export class WsBridge {
           source: current.source,
           sourceFile: current.sourceFile,
         });
-        await this.db.execute(
-          `UPDATE session_identity_profiles SET content = NULL WHERE user_id = $1 AND scope = $2 AND scope_key = $3 AND content_hash = $4`,
-          [userId, scope, scopeKey, contentHash],
-        );
+        // Only a SESSION key names one daemon (it embeds the serverId). A
+        // PROJECT key is shared by every daemon of the user that runs that
+        // project, so clearing it on the first confirm would strand the
+        // others: keep the server copy for PROJECT rows so each daemon can
+        // still migrate its own copy.
+        if (scope === 'session') {
+          await this.db.execute(
+            `UPDATE session_identity_profiles SET content = NULL WHERE user_id = $1 AND scope = $2 AND scope_key = $3 AND content_hash = $4`,
+            [userId, scope, scopeKey, contentHash],
+          );
+        }
       } catch (error) {
         logger.warn({ err: error, serverId: this.serverId, scope, scopeKey }, 'session identity migrate confirm failed');
       }
