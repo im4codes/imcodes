@@ -18,7 +18,7 @@ import {
   setSupervisionHeartbeatProjection,
 } from '../supervision-heartbeat-projection.js';
 import logger from '../../util/logger.js';
-import { getSession, type SessionRecord } from '../../store/session-store.js';
+import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
 import { restartSession } from '../../agent/session-manager.js';
 import {
   TASK_PAIR_BOTH_IDLE_NUDGE_MS,
@@ -44,6 +44,7 @@ import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './
 import { isPairsEngineProject, projectBrainSession, resolveTaskPairMaxConcurrency } from './engine.js';
 import { sendTaskPairMessage } from './delivery.js';
 import { hasRecentTaskPairProviderError } from './provider-errors.js';
+import { mainCheckoutGuard } from './main-checkout-guard.js';
 import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from './service.js';
 import {
   roleEligibleProvisionConfig,
@@ -134,6 +135,8 @@ export interface TaskPairSchedulerDeps {
   poolOf?: (brain: string, sessionName: string) => 'primary' | 'economy' | undefined;
   /** Injectable participant relaunch for deterministic health/recovery tests. */
   restartParticipant?: (record: SessionRecord) => Promise<boolean>;
+  mainCheckoutRoots?: () => Array<{ project: string; root: string }>;
+  brainMainCheckoutActive?: (project: string) => boolean;
 }
 
 export function resolveTaskPairHeartbeatMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -603,6 +606,22 @@ export class TaskPairAutomation implements TaskPairScheduler {
   async tick(): Promise<void> {
     const now = this.#now();
     const store = getTaskPairStore();
+    const activeForGuard = store.listActivePairs().filter((pair) => isPairsEngineProject(pair.project));
+    const derivedRoots = [...new Set(activeForGuard.map((pair) => pair.project))].map((project) => {
+      const sessions = listSessions();
+      const session = sessions.find((candidate) => candidate.projectName === project && candidate.role === 'brain') ?? sessions.find((candidate) => candidate.projectName === project);
+      return session?.projectDir ? { project, root: session.projectDir } : undefined;
+    }).filter((target): target is { project: string; root: string } => !!target);
+    for (const target of this.#deps.mainCheckoutRoots?.() ?? derivedRoots) {
+      const brainActive = this.#deps.brainMainCheckoutActive?.(target.project)
+        ?? activeForGuard.some((pair) => pair.project === target.project && (pair.liveness.brainLastActivityAt ?? 0) >= now - 30_000);
+      const notice = await mainCheckoutGuard.inspect(target.project, target.root, { brainActive });
+      if (notice) {
+        const pairs = activeForGuard.filter((pair) => pair.project === target.project);
+        const detail = (notice.credentialPaths.length ? 'Credential-like paths have priority: ' + notice.credentialPaths.join(', ') + '. ' : '') + 'Main checkout changed outside the pair workspace: ' + notice.paths.join(', ') + '. Do not auto-delete; move work to the pair workspace.';
+        for (const recipient of new Set(pairs.flatMap((pair) => [pair.state.brain, pair.state.executor, pair.state.auditor].filter((name): name is string => !!name && name !== TASK_PAIR_NO_AUDITOR)))) void sendTaskPairMessage(recipient, '__main-checkout__', 'main-checkout-guard', detail);
+      }
+    }
     // A project switched back to `pairs` while the daemon runs gets its
     // in-flight legacy tasks on the next tick, not only at the next start.
     try {

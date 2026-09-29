@@ -1,9 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
+import { mainCheckoutGuard } from '../../../src/daemon/task-pairs/main-checkout-guard.js';
 import { TaskPairAutomation, isTaskPairBrainReminderDue, isTaskPairBrainReminderGapSatisfied, resolveTaskPairBrainReminderInterval } from '../../../src/daemon/task-pairs/scheduler.js';
 import { isSessionWorking } from '../../../src/daemon/session-working.js';
 import { listTaskPairCandidates } from '../../../src/daemon/task-pairs/pool.js';
@@ -161,6 +162,21 @@ describe('task-pair heartbeat, replacement and queue', () => {
     for (const name of [BRAIN, EXEC, AUD, SPARE, SPARE2]) removeSession(name);
     if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+  });
+
+  it('guards the production main checkout once, prioritizes credentials, and ignores Brain activity', async () => {
+    marker(BRAIN, '<!-- IMCODES_TASK DISPATCH GUARD executor=' + EXEC + ' auditor=' + AUD + ' -->');
+    await flush();
+    sent = [];
+    mainCheckoutGuard.reset(PROJECT, '/tmp/' + PROJECT);
+    automation = new TaskPairAutomation({ now: () => now, isBusy: () => false, importLegacy: () => undefined, mainCheckoutRoots: () => [{ project: PROJECT, root: '/tmp/' + PROJECT }], brainMainCheckoutActive: () => false });
+    taskPairService.setScheduler(automation);
+    const inspect = vi.spyOn(mainCheckoutGuard, 'inspect').mockResolvedValue({ project: PROJECT, root: '/tmp/' + PROJECT, paths: ['.env.token', 'src/main.ts'], credentialPaths: ['.env.token'] });
+    await automation.tick();
+    expect(sentTo(BRAIN, 'main-checkout-guard')).toHaveLength(1);
+    expect(sentTo(EXEC, 'main-checkout-guard')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'main-checkout-guard')[0]!.text).toContain('.env.token');
+    inspect.mockRestore();
   });
 
   it('nudges an idle executor, then escalates once and stops nudging', async () => {

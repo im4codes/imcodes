@@ -38,6 +38,7 @@ import {
   type TaskPairIntent,
   type TaskPairMarker,
   type TaskPairState,
+  type TaskPairResourceMode,
   type TaskPairTransition,
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
@@ -363,6 +364,14 @@ export class TaskPairService {
   }
 
   /** Number of background operations still in flight (diagnostics/tests). */
+  claimResource(input: { project: string; taskId: string; owner: string; resource: string; mode: TaskPairResourceMode; ttlMs: number; now?: number }): any {
+    const store = getTaskPairStore(); const pair = store.getPair(input.project, input.taskId);
+    if (!pair || ![pair.state.brain, pair.state.executor, pair.state.auditor].includes(input.owner)) return { ok: false, conflict: undefined };
+    const result = store.tryClaimResource(input); if (!result.ok) return result;
+    const next = { ...pair.state, resourceClaims: store.listResourceClaimsForPair(input.project, input.taskId, input.now), updatedAt: input.now ?? Date.now() };
+    store.savePair(input.project, next); return { ok: true, claim: result.claim, pair: next };
+  }
+
   get pendingCount(): number {
     return this.#pending.size;
   }
@@ -503,6 +512,16 @@ export class TaskPairService {
     if (store.hasEvent(input.eventId)) return { effect: 'replayed', unusual: false, intents: [] };
     const taskId = this.resolveTaskId(input.project, input.writer, input.marker.taskId, input.marker.knownVerb);
     const existing = taskId && taskId !== TASK_PAIR_INFER_TASK_ID ? store.getPair(input.project, taskId) : undefined;
+    if (input.marker.knownVerb === 'CLAIM' && existing) {
+      const resource = input.marker.attrs.resource?.trim();
+      const mode = input.marker.attrs.mode === 'shared' || input.marker.attrs.mode === 'exclusive' ? input.marker.attrs.mode : undefined;
+      const raw = Number(input.marker.attrs.ttl ?? 1800000); const ttlMs = Number.isFinite(raw) ? Math.max(60000, Math.min(86400000, raw < 1000 ? raw * 1000 : raw)) : 1800000;
+      const claimed = resource && mode ? this.claimResource({ project: input.project, taskId: existing.state.taskId, owner: input.writer, resource, mode, ttlMs, now }) : { ok: false };
+      const effect = claimed.ok ? 'resource_claimed' : 'resource_conflict';
+      store.recordEvent({ id: input.eventId, project: input.project, taskId: existing.state.taskId, writer: input.writer, role: taskPairRoleOf(existing.state, input.writer), verb: 'CLAIM', attrs: input.marker.attrs, effect, unusual: !claimed.ok, source: input.source, fromStatus: existing.state.status, toStatus: existing.state.status, at: now });
+      const transition = { pair: claimed.ok ? claimed.pair : existing.state, fromStatus: existing.state.status, toStatus: existing.state.status, effect, unusual: !claimed.ok, intents: [] } as TaskPairTransition;
+      this.#emitEvent(input, existing.state.taskId, taskPairRoleOf(existing.state, input.writer), transition, transition.pair); return transition;
+    }
     // A marker can be observed twice (the assistant reply and a relay copy).
     // Treat an identical participant verdict/material marker in the same round
     // as one occurrence, while allowing a later round or a different head to
@@ -658,6 +677,12 @@ export class TaskPairService {
     // starts its retention and a deliverable named on DONE is kept.
     if (stored && transition.toStatus && isTerminalTaskPairStatus(transition.toStatus)
       && (!transition.fromStatus || !isTerminalTaskPairStatus(transition.fromStatus))) {
+      const released = store.releaseResourceClaims(input.project, stored.state.taskId, now);
+      if (released.length) {
+        const cleanup = { releasedAt: now, resources: released.map((claim) => claim.resource), checklist: released.map((claim) => 'Confirm cleanup of ' + claim.resource + '; do not delete resources owned by another pair.') };
+        stored = store.savePair(input.project, { ...stored.state, resourceClaims: [], resourceCleanup: cleanup, updatedAt: now }); transition.pair = stored.state;
+        this.#track(sendTaskPairMessage(stored.state.executor ?? stored.state.brain, stored.state.taskId, 'resource-cleanup', 'Claims released for ' + stored.state.taskId + '. Cleanup checklist: ' + cleanup.checklist.join(' | ')));
+      }
       this.#track(this.endWorkspace(input.project, stored.state.taskId, now));
     }
     if (stored && transition.toStatus === 'passed' && transition.fromStatus !== 'passed') {

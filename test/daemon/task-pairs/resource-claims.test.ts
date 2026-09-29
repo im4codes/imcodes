@@ -15,6 +15,12 @@ describe('pair resource claims', () => {
     expect((await guard.inspect('p', '/repo', { exec }))?.credentialPaths).toEqual(['.env.local']);
     expect(await guard.inspect('p', '/repo', { exec })).toBeUndefined();
   });
+  it('self-checks a pair participant editing the main checkout', async () => {
+    const guard = new MainCheckoutGuard();
+    const notice = await guard.inspect('p', '/main', { writerSession: 'executor-1', pairParticipants: ['executor-1'], brainSession: 'brain-1', exec: async () => ' M src/owned.ts\0' });
+    expect(notice?.paths).toEqual(['src/owned.ts']);
+    expect(await guard.inspect('p', '/brain', { writerSession: 'brain-1', pairParticipants: ['executor-1'], brainSession: 'brain-1', exec: async () => ' M src/brain.ts\0' })).toBeUndefined();
+  });
   it('ignores Brain activity and non-git failures', async () => {
     const guard = new MainCheckoutGuard();
     expect(await guard.inspect('p', '/repo', { brainActive: true, exec: async () => ' M file.ts\0' })).toBeUndefined();
