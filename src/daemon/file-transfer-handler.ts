@@ -136,6 +136,11 @@ const clientUploadClaims = new Map<string, {
   release: () => void;
 }>();
 
+// A direct sender can disappear after claiming an id (for example when its
+// worker crashes).  Relay retries must never wait forever for that claim to be
+// released; callers get a terminal error and may reconcile/retry later.
+export const CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS = 60_000;
+
 /**
  * Serialize direct transfer and relay fallback attempts that share the same
  * browser-generated identity. This closes the ambiguous-completion window:
@@ -469,7 +474,16 @@ async function acquireRelayUploadTurn(clientUploadId: string): Promise<
       return { attachment: committed };
     }
     const released = waitForClientUploadClaim(clientUploadId);
-    if (released) await released;
+    if (released) {
+      let timeout: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([
+        released,
+        new Promise<never>((_, reject) => {
+          timeout = setTimeout(() => reject(new Error('client_upload_claim_timeout')), CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS);
+          timeout.unref?.();
+        }),
+      ]).finally(() => { if (timeout) clearTimeout(timeout); });
+    }
   }
 }
 
