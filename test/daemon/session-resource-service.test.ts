@@ -44,7 +44,7 @@ function mcpRecord(resourceId: string): SessionResourceRecord {
 function dependencies(record: SessionResourceRecord, exactProcessCurrent: boolean | null) {
   return {
     listResources: vi.fn().mockResolvedValue([record]),
-    sampleCpuMillis: vi.fn().mockResolvedValue(null),
+    sampleCpuMillisBatch: vi.fn().mockResolvedValue(new Map<number, number>()),
     pidHandleIsCurrent: vi.fn().mockResolvedValue(exactProcessCurrent),
     releaseResource: vi.fn().mockResolvedValue({ released: 1, failed: 0 }),
   };
@@ -92,9 +92,9 @@ describe('memory MCP watchdog process identity', () => {
     const reportSustainedCpu = vi.fn();
     const deps = {
       ...dependencies(record, true),
-      sampleCpuMillis: vi.fn().mockImplementation(async () => {
+      sampleCpuMillisBatch: vi.fn().mockImplementation(async (pids: readonly number[]) => {
         cpuMs += 1_000;
-        return cpuMs;
+        return new Map(pids.map((pid) => [pid, cpuMs]));
       }),
       reportSustainedCpu,
     };
@@ -114,9 +114,9 @@ describe('memory MCP watchdog process identity', () => {
     let cpuMs = 0;
     const deps = {
       ...dependencies(record, true),
-      sampleCpuMillis: vi.fn().mockImplementation(async () => {
+      sampleCpuMillisBatch: vi.fn().mockImplementation(async (pids: readonly number[]) => {
         cpuMs += 1_000;
-        return cpuMs;
+        return new Map(pids.map((pid) => [pid, cpuMs]));
       }),
       reportSustainedCpu: vi.fn(),
     };
@@ -134,28 +134,51 @@ describe('memory MCP watchdog process identity', () => {
     expect(deps.reportSustainedCpu).not.toHaveBeenCalled();
   });
 
-  it('samples a large MCP population in bounded parallel batches', async () => {
-    const records = Array.from({ length: 16 }, (_, index) => mcpRecord(`mcp:batch-${index}`));
-    let inFlight = 0;
-    let maxInFlight = 0;
+  it('samples every MCP pid of a tick with ONE batched call, however many records there are', async () => {
+    const records = Array.from({ length: 16 }, (_, index) => ({ ...mcpRecord(`mcp:batch-${index}`), handle: { type: 'pid' as const, pid: 1_000 + index, processStart: 'registered-start' } }));
     const deps = {
       listResources: vi.fn().mockResolvedValue(records),
-      sampleCpuMillis: vi.fn().mockImplementation(async () => {
-        inFlight += 1;
-        maxInFlight = Math.max(maxInFlight, inFlight);
-        await new Promise((resolve) => setTimeout(resolve, 5));
-        inFlight -= 1;
-        return 0;
-      }),
+      sampleCpuMillisBatch: vi.fn().mockResolvedValue(new Map(records.map((record) => [record.handle.pid, 0]))),
       pidHandleIsCurrent: vi.fn(),
       releaseResource: vi.fn(),
     };
 
     await sweepMemoryMcpCpu(10_000, deps);
 
-    expect(maxInFlight).toBeGreaterThan(1);
-    expect(maxInFlight).toBeLessThanOrEqual(8);
-    expect(deps.sampleCpuMillis).toHaveBeenCalledTimes(records.length);
+    expect(deps.sampleCpuMillisBatch).toHaveBeenCalledTimes(1);
+    expect(deps.sampleCpuMillisBatch.mock.calls[0][0]).toEqual(records.map((record) => record.handle.pid));
+    expect(deps.pidHandleIsCurrent).not.toHaveBeenCalled();
+  });
+
+  it('never samples the daemon itself and treats a pid missing from the batch exactly like a failed per-pid sample', async () => {
+    const live = { ...mcpRecord('mcp:live'), handle: { type: 'pid' as const, pid: 2_001, processStart: 'live-start' } };
+    const self = { ...mcpRecord('mcp:self'), handle: { type: 'pid' as const, pid: process.pid, processStart: 'self-start' } };
+    const gone = { ...mcpRecord('mcp:gone'), handle: { type: 'pid' as const, pid: 2_002, processStart: 'gone-start' } };
+    const deps = {
+      listResources: vi.fn().mockResolvedValue([live, self, gone]),
+      sampleCpuMillisBatch: vi.fn().mockResolvedValue(new Map([[2_001, 5_000]])),
+      pidHandleIsCurrent: vi.fn().mockImplementation(async (handle: { pid: number }) => (handle.pid === 2_002 ? false : true)),
+      releaseResource: vi.fn().mockResolvedValue({ released: 1, failed: 0 }),
+    };
+
+    await sweepMemoryMcpCpu(10_000, deps);
+
+    expect(deps.sampleCpuMillisBatch.mock.calls[0][0]).toEqual([2_001, 2_002]);
+    expect(deps.pidHandleIsCurrent).toHaveBeenCalledOnce();
+    expect(deps.pidHandleIsCurrent).toHaveBeenCalledWith(gone.handle);
+    expect(deps.releaseResource).toHaveBeenCalledOnce();
+    expect(deps.releaseResource).toHaveBeenCalledWith('mcp:gone', owner, SESSION_RESOURCE_RELEASE_REASON.PROCESS_MISSING);
+  });
+
+  it('does not ask for a batch when there is no MCP pid record at all', async () => {
+    const deps = {
+      listResources: vi.fn().mockResolvedValue([]),
+      sampleCpuMillisBatch: vi.fn().mockResolvedValue(new Map()),
+      pidHandleIsCurrent: vi.fn(),
+      releaseResource: vi.fn(),
+    };
+    await sweepMemoryMcpCpu(10_000, deps);
+    expect(deps.sampleCpuMillisBatch).not.toHaveBeenCalled();
   });
 });
 

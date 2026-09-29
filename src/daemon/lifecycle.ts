@@ -5,7 +5,7 @@ import { getTaskPairStore } from './task-pairs/store.js';
 import { isSessionWorking } from './session-working.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
-import { sessionExists, isPaneAlive, BACKEND, killSession } from '../agent/tmux.js';
+import { sessionExists, isPaneAlive, BACKEND, killSession, createTmuxHealthProbe, type TmuxHealthProbe } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
@@ -2142,7 +2142,7 @@ function completeExecutionCloneOnPaneDeath(s: SessionRecord): void {
 
 /** Per-session health check. Exported so the execution-clone respawn-skip and
  *  the sweep can be asserted deterministically without the 30s tick (task 3.9). */
-export async function checkSessionHealth(s: SessionRecord): Promise<void> {
+export async function checkSessionHealth(s: SessionRecord, probe: TmuxHealthProbe = { exists: sessionExists, paneAlive: isPaneAlive }): Promise<void> {
   if (s.state === 'stopped' || s.state === 'error') return;
   // Execution clones are ephemeral: NEVER auto-respawn (this is the real
   // destroy-safety mechanism — teardown is not atomic). On pane death, mark for
@@ -2150,8 +2150,8 @@ export async function checkSessionHealth(s: SessionRecord): Promise<void> {
   if (isExecutionClone(s)) {
     if (s.runtimeType === 'transport' || isTransportAgent(s.agentType)) return; // no pane; bounded by hard-timeout / orchestrator / restart sweep
     try {
-      const exists = await sessionExists(s.name);
-      if (!exists || !(await isPaneAlive(s.name))) completeExecutionCloneOnPaneDeath(s);
+      const exists = await probe.exists(s.name);
+      if (!exists || !(await probe.paneAlive(s.name))) completeExecutionCloneOnPaneDeath(s);
     } catch { /* ignore */ }
     return;
   }
@@ -2163,11 +2163,11 @@ export async function checkSessionHealth(s: SessionRecord): Promise<void> {
   // Sub-sessions: auto-restart dead panes, mark stopped if tmux session gone entirely
   if (s.name.startsWith('deck_sub_')) {
     try {
-      const exists = await sessionExists(s.name);
+      const exists = await probe.exists(s.name);
       if (!exists) {
         logger.info({ session: s.name }, 'Sub-session gone, marking stopped');
         upsertSession({ ...s, state: 'stopped', updatedAt: Date.now() });
-      } else if (!(await isPaneAlive(s.name))) {
+      } else if (!(await probe.paneAlive(s.name))) {
         logger.warn({ session: s.name }, 'Sub-session pane dead, respawning');
         await respawnSession(s);
       }
@@ -2175,11 +2175,11 @@ export async function checkSessionHealth(s: SessionRecord): Promise<void> {
     return;
   }
   try {
-    const exists = await sessionExists(s.name);
+    const exists = await probe.exists(s.name);
     if (!exists) {
       logger.warn({ session: s.name }, 'Session missing, attempting restart');
       await restartSession(s);
-    } else if (!(await isPaneAlive(s.name))) {
+    } else if (!(await probe.paneAlive(s.name))) {
       logger.warn({ session: s.name }, 'Pane dead, respawning');
       await respawnSession(s);
     }
@@ -2217,8 +2217,9 @@ export async function runExecutionCloneSweep(now: number): Promise<void> {
 function startHealthPoller(): void {
   healthTimer = setInterval(async () => {
     const sessions = listSessions();
+    const tmuxProbe = createTmuxHealthProbe();
     for (const s of sessions) {
-      await checkSessionHealth(s);
+      await checkSessionHealth(s, tmuxProbe);
       let memoryCompressionRecovered = false;
       try {
         memoryCompressionRecovered = await recoverMemoryCompressionStalledSession(s.name);

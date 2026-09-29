@@ -595,6 +595,73 @@ export async function isPaneAlive(name: string): Promise<boolean> {
   }
 }
 
+/** Existence and pane liveness for a periodic sweep over many sessions. */
+export interface TmuxHealthProbe {
+  exists(name: string): Promise<boolean>;
+  paneAlive(name: string): Promise<boolean>;
+}
+
+/** Per session name: the `pane_dead` values of its current window's panes (what `list-panes -t <name>` reports). */
+async function listSessionPaneHealth(): Promise<Map<string, string[]> | null> {
+  let raw: string;
+  try {
+    raw = await tmuxRun('list-panes', '-a', '-F', '#{window_active} #{pane_dead} #{session_name}');
+  } catch (e: any) {
+    const err = String(e?.stderr || e?.message || '');
+    if (err.includes('no sessions') || isRecoverableTmuxServerError(e)) return new Map();
+    return null;
+  }
+  const sessions = new Map<string, string[]>();
+  for (const line of raw.split('\n')) {
+    const match = /^(\d+) (\d+) (.+)$/.exec(line);
+    if (!match) continue;
+    const panes = sessions.get(match[3]) ?? [];
+    if (match[1] === '1') panes.push(match[2]);
+    sessions.set(match[3], panes);
+  }
+  return sessions;
+}
+
+/**
+ * One `list-panes -a` per sweep tick answers "does it exist" and "is its pane
+ * alive" for every session, instead of a `list-sessions` plus a `list-panes`
+ * spawn per session.
+ *
+ * Only positive answers come from the snapshot. A session the snapshot does
+ * not show, or a pane it shows dead, is re-verified with the live per-session
+ * query before the caller acts (restart / respawn), so a snapshot that went
+ * stale during a long tick can never trigger a spurious relaunch. A snapshot
+ * older than `maxAgeMs` is refetched; a failed snapshot falls back to the
+ * per-session queries, i.e. the previous behaviour.
+ */
+export function createTmuxHealthProbe(maxAgeMs = 1_000): TmuxHealthProbe {
+  let snapshot: { at: number; sessions: Map<string, string[]> } | null = null;
+  let inflight: Promise<Map<string, string[]> | null> | null = null;
+  const current = async (): Promise<Map<string, string[]> | null> => {
+    if (snapshot && Date.now() - snapshot.at <= maxAgeMs) return snapshot.sessions;
+    if (!inflight) {
+      inflight = listSessionPaneHealth().then((sessions) => {
+        snapshot = sessions ? { at: Date.now(), sessions } : null;
+        return sessions;
+      }).finally(() => { inflight = null; });
+    }
+    return inflight;
+  };
+  return {
+    async exists(name) {
+      if (BACKEND !== 'tmux') return sessionExists(name);
+      if ((await current())?.has(name)) return true;
+      return sessionExists(name);
+    },
+    async paneAlive(name) {
+      if (BACKEND !== 'tmux') return isPaneAlive(name);
+      const panes = (await current())?.get(name);
+      if (panes && panes.join('\n') === '0') return true;
+      return isPaneAlive(name);
+    },
+  };
+}
+
 /**
  * Check whether a concrete pane *target* (e.g. a tmux "%5" pane id) currently
  * resolves to a live pane.

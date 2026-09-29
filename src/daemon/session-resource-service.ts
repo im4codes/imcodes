@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { promisify } from 'node:util';
+import { readProcessCpuMillis } from '../util/process-start.js';
 import type { SessionRecord } from '../store/session-store.js';
 import {
   SESSION_RESOURCE_DEFAULTS,
@@ -243,29 +244,14 @@ export async function sweepOrphanedSessionResources(records: readonly SessionRec
   });
 }
 
-async function sampleProcessCpuMillis(pid: number): Promise<number | null> {
-  try {
-    if (process.platform === 'win32') {
-      const { stdout } = await execFile('powershell.exe', [
-        '-NoProfile', '-NonInteractive', '-Command',
-        `(Get-Process -Id ${pid} -ErrorAction Stop).TotalProcessorTime.TotalMilliseconds`,
-      ], { timeout: 2_000, windowsHide: true });
-      const value = Number(stdout.trim());
-      return Number.isFinite(value) && value >= 0 ? value : null;
-    }
-    const { stdout } = await execFile('ps', ['-o', 'time=', '-p', String(pid)], { timeout: 2_000 });
-    const match = /^(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+(?:\.\d+)?)$/.exec(stdout.trim());
-    if (!match) return null;
-    return ((((Number(match[1] ?? 0) * 24) + Number(match[2] ?? 0)) * 60
-      + Number(match[3])) * 60 + Number(match[4])) * 1_000;
-  } catch {
-    return null;
-  }
-}
+type PidResourceRecord = SessionResourceRecord & {
+  handle: Extract<SessionResourceRecord['handle'], { type: typeof SESSION_RESOURCE_HANDLE_TYPE.PID }>;
+};
 
 interface MemoryMcpWatchdogDependencies {
   listResources: () => Promise<SessionResourceRecord[]>;
-  sampleCpuMillis: (pid: number) => Promise<number | null>;
+  /** One batched read for every MCP pid of a tick; a pid that is gone or unreadable is absent from the map. */
+  sampleCpuMillisBatch: (pids: readonly number[]) => Promise<ReadonlyMap<number, number>>;
   pidHandleIsCurrent: typeof sessionResourcePidHandleIsCurrent;
   releaseResource: typeof releaseSessionResource;
   reportSustainedCpu?: (record: SessionResourceRecord, cpuRatio: number) => void;
@@ -273,7 +259,7 @@ interface MemoryMcpWatchdogDependencies {
 
 const memoryMcpWatchdogDependencies: MemoryMcpWatchdogDependencies = {
   listResources: () => registry.list(),
-  sampleCpuMillis: sampleProcessCpuMillis,
+  sampleCpuMillisBatch: readProcessCpuMillis,
   pidHandleIsCurrent: sessionResourcePidHandleIsCurrent,
   releaseResource: releaseSessionResource,
   reportSustainedCpu: (record, cpuRatio) => {
@@ -289,11 +275,11 @@ export async function sweepMemoryMcpCpu(
 ): Promise<void> {
   const records = await dependencies.listResources();
   const liveIds = new Set<string>();
-  const sampleRecord = async (record: SessionResourceRecord): Promise<void> => {
+  const sampleRecord = async (record: SessionResourceRecord, sampledCpuMs: number | undefined): Promise<void> => {
     if (record.kind !== SESSION_RESOURCE_KIND.MCP || record.handle.type !== SESSION_RESOURCE_HANDLE_TYPE.PID) return;
     liveIds.add(record.resourceId);
     if (record.handle.pid === process.pid) return;
-    const cpuMs = await dependencies.sampleCpuMillis(record.handle.pid);
+    const cpuMs = sampledCpuMs ?? null;
     if (cpuMs === null) {
       mcpCpuSamples.delete(record.resourceId);
       // CPU sampling can fail transiently (ps timeout/format/permission). It is
@@ -352,18 +338,19 @@ export async function sweepMemoryMcpCpu(
       }
     }
   };
-  const candidates = records.filter((record): record is SessionResourceRecord =>
+  const candidates = records.filter((record): record is PidResourceRecord =>
     record.kind === SESSION_RESOURCE_KIND.MCP
       && record.handle.type === SESSION_RESOURCE_HANDLE_TYPE.PID,
   );
-  // Sampling each process starts an independent `ps`/PowerShell child. Run a
-  // bounded batch in parallel instead of serially waiting for every process;
-  // a large MCP population must not turn one watchdog tick into a long queue
-  // of main-thread callbacks. The batch boundary also caps child-process
-  // pressure and yields between groups.
+  // Every pid of the tick is sampled by ONE batched read (a /proc read each on
+  // Linux, otherwise a single `ps`/PowerShell spawn) instead of one child
+  // process per MCP. What each record then does with its sample (identity
+  // recheck, release) still runs in bounded parallel groups.
+  const sampledPids = candidates.map((record) => record.handle.pid).filter((pid) => pid !== process.pid);
+  const sampled = sampledPids.length > 0 ? await dependencies.sampleCpuMillisBatch(sampledPids) : new Map<number, number>();
   for (let offset = 0; offset < candidates.length; offset += MCP_CPU_SAMPLE_CONCURRENCY) {
     const batch = candidates.slice(offset, offset + MCP_CPU_SAMPLE_CONCURRENCY);
-    await Promise.all(batch.map((record) => sampleRecord(record)));
+    await Promise.all(batch.map((record) => sampleRecord(record, sampled.get(record.handle.pid))));
   }
   for (const resourceId of mcpCpuSamples.keys()) {
     if (!liveIds.has(resourceId)) mcpCpuSamples.delete(resourceId);

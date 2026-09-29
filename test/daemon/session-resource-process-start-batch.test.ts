@@ -26,6 +26,9 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 const { spawn } = await import('node:child_process');
 const { SessionResourceRegistry } = await import('../../src/daemon/session-resource-registry.js');
+const { sweepMemoryMcpCpu } = await import('../../src/daemon/session-resource-service.js');
+const { readProcessCpuMillis } = await import('../../src/util/process-start.js');
+const execFileAsync = promisify((await import('node:child_process')).execFile);
 
 const owner = { sessionName: 'deck_e2e_procstart_w1', sessionInstanceId: 'instance-a', runtimeEpoch: 'epoch-a' };
 const roots: string[] = [];
@@ -96,5 +99,39 @@ describe.skipIf(process.platform === 'win32')('orphan sweep process-identity che
     const afterFirst = spawned.ps.filter((args) => args.at(-1) === String(process.pid)).length;
     for (let i = 0; i < 5; i += 1) await registry.touch(`mcp:${pids[0]}`);
     expect(spawned.ps.filter((args) => args.at(-1) === String(process.pid)).length).toBe(afterFirst);
+  });
+});
+
+describe.skipIf(process.platform === 'win32')('memory MCP CPU watchdog spawns', () => {
+  it('samples a tick of MCP pids with at most ONE ps (none on Linux), where the old sampler forked one ps per pid', async () => {
+    const pids: number[] = [];
+    for (let i = 0; i < 12; i += 1) {
+      const child = spawn('sleep', ['60'], { stdio: 'ignore' });
+      children.push(child);
+      pids.push(child.pid!);
+    }
+    const records = pids.map((pid) => ({
+      version: 1 as const, resourceId: `mcp:cpu-${pid}`, kind: 'mcp' as const, owner,
+      handle: { type: 'pid' as const, pid, processStart: 'x' }, createdAt: 1, lastUsedAt: 1,
+    }));
+
+    // Baseline: the previous per-pid sampler, replayed against the same fixture.
+    spawned.ps.length = 0;
+    for (const pid of pids) await execFileAsync('ps', ['-o', 'time=', '-p', String(pid)], { timeout: 2_000 });
+    const legacySpawns = spawned.ps.filter((args) => args.includes('time=')).length;
+    expect(legacySpawns).toBe(12);
+
+    spawned.ps.length = 0;
+    const releaseResource = vi.fn();
+    await sweepMemoryMcpCpu(1_000, {
+      listResources: async () => records,
+      sampleCpuMillisBatch: readProcessCpuMillis,
+      pidHandleIsCurrent: vi.fn(async () => true),
+      releaseResource: releaseResource as never,
+    });
+    const batchedSpawns = spawned.ps.length;
+    expect(batchedSpawns).toBeLessThanOrEqual(1);
+    expect(releaseResource).not.toHaveBeenCalled();
+    expect(legacySpawns / Math.max(1, batchedSpawns)).toBeGreaterThanOrEqual(12);
   });
 });

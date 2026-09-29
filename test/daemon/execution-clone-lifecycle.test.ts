@@ -302,3 +302,55 @@ describe('checkSessionHealth + runExecutionCloneSweep — recoverable creator su
     expect(destroyingWrite).toBe(false);
   });
 });
+
+// ── health-poll probe: one list-panes per tick instead of two queries per session ──
+
+describe('checkSessionHealth — shared tmux health probe', () => {
+  const probeReporting = (exists: boolean, paneAlive: boolean) => ({
+    exists: vi.fn(async (_name: string) => exists),
+    paneAlive: vi.fn(async (_name: string) => paneAlive),
+  });
+
+  it('a sub-session whose pane the probe reports dead is respawned, without a per-session tmux query', async () => {
+    const sub = baseRecord({ name: 'deck_sub_probe1', agentType: 'shell', state: 'running' });
+    mocks.sessions.set(sub.name, sub);
+    const probe = probeReporting(true, false);
+
+    await checkSessionHealth(sub, probe);
+
+    expect(probe.exists).toHaveBeenCalledWith('deck_sub_probe1');
+    expect(probe.paneAlive).toHaveBeenCalledWith('deck_sub_probe1');
+    expect(mocks.respawnSession).toHaveBeenCalledOnce();
+    expect(mocks.sessionExists).not.toHaveBeenCalled();
+    expect(mocks.isPaneAlive).not.toHaveBeenCalled();
+  });
+
+  it('a main session the probe reports missing is restarted; a healthy one triggers nothing', async () => {
+    const main = baseRecord({ name: 'deck_proj_w7', agentType: 'shell', state: 'running' });
+    await checkSessionHealth(main, probeReporting(false, false));
+    expect(mocks.restartSession).toHaveBeenCalledOnce();
+
+    mocks.restartSession.mockClear();
+    const healthy = probeReporting(true, true);
+    await checkSessionHealth(main, healthy);
+    expect(mocks.restartSession).not.toHaveBeenCalled();
+    expect(mocks.respawnSession).not.toHaveBeenCalled();
+    expect(healthy.paneAlive).toHaveBeenCalledOnce();
+  });
+
+  it('an execution clone uses the probe too, and the default (no probe) still asks tmux per session', async () => {
+    const clone = baseRecord({
+      name: 'deck_sub_clone2', agentType: 'shell', state: 'running',
+      executionCloneMetadata: cloneMeta({ cleanupState: 'active' }),
+    });
+    mocks.sessions.set(clone.name, clone);
+    const probe = probeReporting(true, false);
+    await checkSessionHealth(clone, probe);
+    expect(probe.paneAlive).toHaveBeenCalledWith('deck_sub_clone2');
+    expect(mocks.isPaneAlive).not.toHaveBeenCalled();
+
+    await checkSessionHealth(baseRecord({ name: 'deck_proj_w8', agentType: 'shell', state: 'running' }));
+    expect(mocks.sessionExists).toHaveBeenCalledWith('deck_proj_w8');
+    expect(mocks.isPaneAlive).toHaveBeenCalledWith('deck_proj_w8');
+  });
+});
