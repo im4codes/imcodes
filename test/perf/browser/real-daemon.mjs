@@ -13,6 +13,9 @@ const token = process.env.IMC_PERF_DAEMON_TOKEN ?? 'imc-shell-real-daemon-token'
 const workerUrl = process.env.IMC_PERF_WORKER_URL ?? 'http://server:19138';
 const sessionName = process.env.IMC_PERF_SHELL_SESSION ?? 'deck_shell_perf_brain';
 const poolSessionName = process.env.IMC_PERF_POOL_SESSION ?? 'deck_pool_roles_brain';
+// Chat session backed by test/perf/browser/fake-qwen.mjs (installed as `qwen`):
+// gives the real daemon a genuine accept -> echo -> answer path for send-latency.
+const latencySessionName = process.env.IMC_PERF_LATENCY_SESSION ?? 'deck_latency_qwen_brain';
 // Keep the isolated project outside the daemon's test-session guard patterns;
 // otherwise worker-session sync intentionally deletes the harness row.
 const projectDir = '/tmp/imc-shell-browser-project';
@@ -58,6 +61,12 @@ await writeFile(`${imcodesHome}/sessions.json`, JSON.stringify({
       sessionInstanceId: randomUUID(), runtimeEpoch: randomUUID(), requestedModel: 'gpt-6-luna', activeModel: 'gpt-6-luna',
       providerSessionId: `pool-${poolSessionName}`, userCreated: true,
     },
+    [latencySessionName]: {
+      name: latencySessionName, projectName: 'shell-perf', role: 'brain', agentType: 'qwen', runtimeType: 'transport',
+      projectDir, state: 'idle', restarts: 0, restartTimestamps: [], createdAt: now, updatedAt: now,
+      sessionInstanceId: randomUUID(), runtimeEpoch: randomUUID(), requestedModel: 'perf-model', activeModel: 'perf-model',
+      providerSessionId: `latency-${latencySessionName}`, userCreated: true,
+    },
   },
 }, null, 2));
 
@@ -85,6 +94,9 @@ await db.query(`INSERT INTO sessions (id, server_id, name, project_name, project
 await db.query(`INSERT INTO sessions (id, server_id, name, project_name, project_dir, role, agent_type, state, created_at, updated_at)
   VALUES ($1, $2, $3, 'shell-perf', $4, 'brain', 'codex-sdk', 'idle', $5, $5)
   ON CONFLICT (id) DO UPDATE SET state='idle', updated_at=EXCLUDED.updated_at`, [`pool-session-${poolSessionName}`, serverId, poolSessionName, projectDir, now]);
+await db.query(`INSERT INTO sessions (id, server_id, name, project_name, project_dir, role, agent_type, state, created_at, updated_at)
+  VALUES ($1, $2, $3, 'shell-perf', $4, 'brain', 'qwen', 'idle', $5, $5)
+  ON CONFLICT (id) DO UPDATE SET state='idle', updated_at=EXCLUDED.updated_at`, [`latency-session-${latencySessionName}`, serverId, latencySessionName, projectDir, now]);
 await db.end();
 
 // The shell harness must create an interactive PTY.  Without `-i`, bash

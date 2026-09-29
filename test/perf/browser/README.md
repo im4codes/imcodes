@@ -112,3 +112,31 @@ daemon. It does not send terminal input or create sessions; those go through
 the normal web/server-link/ConPTY path. Set `IMC_PERF_SHELL_PLATFORM=windows`
 so command fixtures use `cmd.exe`. Keep the daemon HOME, lock pipe, server
 ID/token and ports isolated from the installed controlled node.
+
+## Send-spinner latency and console-sync cost (tsk_cd_send_spinner_console_sync)
+
+Two test-only measurements, each run once per revision with the SAME harness
+files so the tables compare like with like.
+
+**Click Send -> the spinner ends (real daemon, real browser).** Uses the `shell`
+profile's real daemon and its gated main-thread block hook as a controlled
+stall (the owner's "send spins for ~10 s"):
+
+```bash
+test/perf/browser/run-send-latency.sh <checkout> <label>   # once per revision
+node test/perf/browser/send-latency-compare.mjs <base>/send-latency.json <fixed>/send-latency.json
+```
+
+`IMC_PERF_BLOCK_MS` (default 8000) is applied to both the daemon hook and the
+spec; the hook is one-shot per daemon lifetime, so several messages are sent
+inside that single window. The spec clicks Send in-page so the click and the spinner observer share
+one clock, and also records the time of the daemon's `command.ack accepted`.
+
+**Console sync main-thread cost at production scale.** `test/perf/console-sync-bench.mts`
+builds a synthetic registry + pair store the size of a real owner machine,
+drives the real session registry with the production triggers (pair-activity
+resyncs and registry commits) and samples event-loop lag on the same thread:
+
+```bash
+BENCH_ROOT=<tree with node_modules> BENCH_SECONDS=60 npx tsx test/perf/console-sync-bench.mts
+```

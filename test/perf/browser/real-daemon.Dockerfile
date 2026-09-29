@@ -18,4 +18,7 @@ COPY scripts/ ./scripts/
 RUN npm run build
 
 COPY test/perf/browser/real-daemon.mjs ./test/perf/browser/real-daemon.mjs
+# Test-only `qwen` stand-in (see fake-qwen.mjs): a genuine echo path for send-latency.
+COPY test/perf/browser/fake-qwen.mjs /usr/local/bin/qwen
+RUN chmod +x /usr/local/bin/qwen
 CMD ["node", "/repo/test/perf/browser/real-daemon.mjs"]

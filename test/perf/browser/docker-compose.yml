@@ -335,6 +335,40 @@ services:
     shm_size: 1g
     pids_limit: 256
 
+  # "Click Send -> spinner ends" on the real daemon (profile `shell`), with a
+  # controlled daemon main-thread block. See send-latency.spec.mjs / run-send-latency.sh.
+  latency-harness:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - type: bind
+        source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
+        target: /repo/perf-results
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_LATENCY_SESSION: deck_latency_qwen_brain
+      IMC_PERF_SHELL_CONTROL_URL: http://shell-daemon:19139
+      IMC_PERF_REVISION: ${IMC_PERF_REVISION:-unknown}
+      IMC_PERF_BLOCK_MS: ${IMC_PERF_BLOCK_MS:-8000}
+      IMC_PERF_IDLE_TRIALS: ${IMC_PERF_IDLE_TRIALS:-12}
+      IMC_PERF_BLOCK_SENDS: ${IMC_PERF_BLOCK_SENDS:-5}
+      IMC_PERF_LATENCY_OUT: /repo/perf-results/send-latency.json
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/send-latency.spec.mjs"]
+    depends_on:
+      shell-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
 volumes:
   perf_home:
   perf_results:
