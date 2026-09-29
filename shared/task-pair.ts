@@ -244,7 +244,11 @@ export const TASK_PAIR_EXECUTION_DISCIPLINE_RULE: string =
   + 'the home directory ($HOME, $home, ~, %USERPROFILE%): they use explicit '
   + 'scoped absolute paths, abort if a write target resolves into a default '
   + 'daemon home, and compare the default-state hashes after every setup '
-  + 'step, stopping at the first mismatch.';
+  + 'step, stopping at the first mismatch. The same holds for the agent '
+  + 'CLIs a test daemon launches: pin every agent binary by absolute path and '
+  + 'every agent home (CODEX_HOME, the Claude config dir and the like) to a '
+  + 'scoped directory, and abort if any of them resolves through the system '
+  + 'PATH or into the real user home.';
 
 /**
  * Generic pair start-up rules for every IM.codes project, derived from where

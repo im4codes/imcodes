@@ -279,6 +279,8 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('safety fixes merged after it');
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('never expand');
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('after every setup step');
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('pin every agent binary by absolute path');
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('resolves through the system PATH or into the real user home');
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('list every call site');
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('must NOT trigger');
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('version skew');
