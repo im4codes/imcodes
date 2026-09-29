@@ -36,6 +36,7 @@ export const TASK_PAIR_ENGINE_HOOK_PATH = '/task-pairs/engine' as const;
  */
 export const TASK_PAIR_BRAIN_CONTRACT_ID = 'task_pair_brain_v1' as const;
 export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; a single-box "- [ ]" item has no audit box; number items 1..N in brief order. The executor ticks each implemented box as soon as that item is done and all delivered items before READY_FOR_AUDIT; the auditor ticks each audited box when verified and all verified items before PASS; on REWORK the auditor unticks failed items and names their numbers. Tick only work really done or verified. Use pair_task_get/update/check or the CHECK marker to update the whole brief.';
+export const TASK_PAIR_RESOURCE_CLAIM_RULE = 'Before using a shared machine, directory, port range, or named test stack, claim it with pair_resource_claim or `<!-- IMCODES_TASK CLAIM <taskId> resource=... mode=exclusive|shared ttl=... -->`; renew before the TTL expires. Claims are user-scoped, conflict-checked, persisted across daemon restarts, and released on DONE/CANCEL. Never touch an unclaimed shared resource.';
 export const TASK_PAIR_CHECK_VERB = 'CHECK' as const;
 export const TASK_PAIR_CHECKLIST_AUTO_TICK_VERB = 'CHECKLIST_AUTO_TICK' as const;
 export const TASK_PAIR_CHECKLIST_BOXES = ['implemented', 'audited'] as const;
@@ -424,7 +425,7 @@ export const TASK_PAIR_INFER_TASK_ID = '-' as const;
 
 export const TASK_PAIR_VERBS = [
   'DISPATCH', 'QUEUE', 'STARTED', 'WORKING', 'READY_FOR_AUDIT', 'PASS', 'REWORK',
-  'DONE', 'BLOCKED', 'NEEDS_INPUT', 'REASSIGN', 'CANCEL', TASK_PAIR_CHECK_VERB,
+  'DONE', 'BLOCKED', 'NEEDS_INPUT', 'REASSIGN', 'CANCEL', 'CLAIM', TASK_PAIR_CHECK_VERB,
 ] as const;
 export type TaskPairVerb = typeof TASK_PAIR_VERBS[number];
 
@@ -758,6 +759,22 @@ export interface TaskPairState {
   startedAt?: number;
   createdAt: number;
   updatedAt: number;
+  resourceClaims?: TaskPairResourceClaim[];
+  resourceCleanup?: { releasedAt: number; resources: string[]; checklist: string[] };
+}
+
+export const TASK_PAIR_RESOURCE_MODES = ['exclusive', 'shared'] as const;
+export type TaskPairResourceMode = typeof TASK_PAIR_RESOURCE_MODES[number];
+export interface TaskPairResourceClaim {
+  claimId: string;
+  resource: string;
+  mode: TaskPairResourceMode;
+  owner: string;
+  taskId: string;
+  project: string;
+  claimedAt: number;
+  renewedAt: number;
+  expiresAt: number;
 }
 
 export interface TaskPairMaterial {
@@ -1690,7 +1707,7 @@ export function buildTaskPairMarkerContract(): string {
     'Supervised tasks are executor+auditor pairs driven by one-line markers you write on their own line in your reply (never inside code fences):',
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
-    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CHECK. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited, Brain either. taskId "-" means your single open task.',
+    'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CLAIM, CHECK. CLAIM <taskId> resource=... mode=exclusive|shared ttl=... [renew=true] claims a shared external resource. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited, Brain either. taskId "-" means your single open task.',
     'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. Only after the assigned auditor applies PASS in a material-backed audit round may the executor commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with DONE (accept) or CANCEL; further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
     TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_WORKSPACE_RULES,
@@ -1711,5 +1728,6 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,
+    TASK_PAIR_RESOURCE_CLAIM_RULE,
   ].join('\n');
 }

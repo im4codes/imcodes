@@ -18,6 +18,8 @@ import {
   type TaskPairRole,
   type TaskPairState,
   type TaskPairStatus,
+  type TaskPairResourceClaim,
+  type TaskPairResourceMode,
 } from '../../../shared/task-pair.js';
 import { assertNotRealImcodesPathInTests } from '../../util/test-home-guard.js';
 
@@ -187,7 +189,49 @@ export class TaskPairStore {
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS task_pair_resource_claims (
+        claim_id TEXT PRIMARY KEY,
+        project TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        owner TEXT NOT NULL,
+        resource TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        claimed_at INTEGER NOT NULL,
+        renewed_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        released_at INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS task_pair_resource_active_idx ON task_pair_resource_claims (resource, expires_at, released_at);
     `);
+  }
+
+  listActiveResourceClaims(now = Date.now()): TaskPairResourceClaim[] {
+    this.#db.prepare('DELETE FROM task_pair_resource_claims WHERE released_at IS NOT NULL OR expires_at <= ?').run(now);
+    const rows = this.#db.prepare('SELECT * FROM task_pair_resource_claims WHERE released_at IS NULL AND expires_at > ? ORDER BY claimed_at').all(now) as Array<Record<string, unknown>>;
+    return rows.map(resourceClaimFromRow);
+  }
+
+  listResourceClaimsForPair(project: string, taskId: string, now = Date.now()): TaskPairResourceClaim[] {
+    return this.listActiveResourceClaims(now).filter((claim) => claim.project === project && claim.taskId === taskId);
+  }
+
+  tryClaimResource(input: { project: string; taskId: string; owner: string; resource: string; mode: TaskPairResourceMode; ttlMs: number; now?: number; renew?: boolean }): { ok: true; claim: TaskPairResourceClaim } | { ok: false; conflict: TaskPairResourceClaim } {
+    const now = input.now ?? Date.now();
+    const resource = input.resource.trim();
+    const existing = this.listActiveResourceClaims(now).find((claim) => claim.resource === resource && claim.project !== input.project || claim.resource === resource && claim.taskId !== input.taskId);
+    if (existing && (existing.mode === 'exclusive' || input.mode === 'exclusive')) return { ok: false, conflict: existing };
+    const same = this.listActiveResourceClaims(now).find((claim) => claim.resource === resource && claim.project === input.project && claim.taskId === input.taskId && claim.owner === input.owner);
+    const claim: TaskPairResourceClaim = same
+      ? { ...same, renewedAt: now, expiresAt: now + input.ttlMs }
+      : { claimId: `${input.project}:${input.taskId}:${resource}:${input.owner}`, project: input.project, taskId: input.taskId, owner: input.owner, resource, mode: input.mode, claimedAt: now, renewedAt: now, expiresAt: now + input.ttlMs };
+    this.#db.prepare(`INSERT INTO task_pair_resource_claims (claim_id, project, task_id, owner, resource, mode, claimed_at, renewed_at, expires_at, released_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) ON CONFLICT(claim_id) DO UPDATE SET renewed_at=excluded.renewed_at, expires_at=excluded.expires_at, released_at=NULL`).run(claim.claimId, claim.project, claim.taskId, claim.owner, claim.resource, claim.mode, claim.claimedAt, claim.renewedAt, claim.expiresAt);
+    return { ok: true, claim };
+  }
+
+  releaseResourceClaims(project: string, taskId: string, now = Date.now()): TaskPairResourceClaim[] {
+    const claims = this.listResourceClaimsForPair(project, taskId, now);
+    this.#db.prepare('UPDATE task_pair_resource_claims SET released_at = ? WHERE project = ? AND task_id = ? AND released_at IS NULL').run(now, project, taskId);
+    return claims;
   }
 
   close(): void {
@@ -431,6 +475,14 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     liveness,
     queueOrder: Number(row.queue_order),
     ...(row.legacy_task_id ? { legacyTaskId: String(row.legacy_task_id) } : {}),
+  };
+}
+
+function resourceClaimFromRow(row: Record<string, unknown>): TaskPairResourceClaim {
+  return {
+    claimId: String(row.claim_id), project: String(row.project), taskId: String(row.task_id), owner: String(row.owner),
+    resource: String(row.resource), mode: String(row.mode) as TaskPairResourceMode,
+    claimedAt: Number(row.claimed_at), renewedAt: Number(row.renewed_at), expiresAt: Number(row.expires_at),
   };
 }
 

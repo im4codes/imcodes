@@ -125,6 +125,7 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_TASK_GET: 'pair_task_get',
   PAIR_TASK_UPDATE: 'pair_task_update',
   PAIR_TASK_CHECK: 'pair_task_check',
+  PAIR_RESOURCE_CLAIM: 'pair_resource_claim',
   SEND_STOP: 'send_stop',
   DESTROY_EXECUTION_CLONE: 'destroy_execution_clone',
   CRON_CREATE_SELF: 'cron_create_self',
@@ -182,6 +183,7 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
+  MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
   MEMORY_MCP_TOOL_NAMES.SEND_STOP,
   MEMORY_MCP_TOOL_NAMES.DESTROY_EXECUTION_CLONE,
   MEMORY_MCP_TOOL_NAMES.CRON_CREATE_SELF,
@@ -888,6 +890,12 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
     description: 'Update pair checklist.',
     inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), items: { type: 'array', items: { type: 'integer', minimum: 1 } }, box: { type: 'string', enum: ['implemented', 'audited'] }, checked: { type: 'boolean' } }, ['items', 'box', 'checked']),
+    outputSchema: statusSchema,
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM,
+    description: 'Claim or renew a shared external pair resource.',
+    inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), resource: stringSchema('Canonical external resource.'), mode: { type: 'string', enum: ['exclusive', 'shared'] }, ttlMs: { type: 'integer', minimum: 60000, maximum: 86400000 }, renew: { type: 'boolean' } }, ['resource', 'mode']),
     outputSchema: statusSchema,
   },
 

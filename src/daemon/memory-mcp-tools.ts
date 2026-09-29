@@ -1550,7 +1550,7 @@ function pairChecklistTarget(caller: McpRuntimeCaller, sessions: readonly Sessio
 function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
-  return { taskId: pair.state.taskId, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, ...taskPairChecklistCounts(markdown) };
+  return { taskId: pair.state.taskId, title: pair.state.title ?? null, markdown, status: pair.state.status, executor: pair.state.executor, auditor: pair.state.auditor, brain: pair.state.brain, round: pair.state.round, flags: pair.state.flags, blocking: pair.state.blocking, previousAuditors: pair.state.previousAuditors, capCounts: pair.state.capCounts, workspaceKind: pair.state.workspaceKind, lastVerdict: pair.state.lastVerdict, createdAt: pair.state.createdAt, updatedAt: pair.state.updatedAt, workspace: pair.state.workspace, material: pair.state.material, output: pair.state.output, resourceClaims: pair.state.resourceClaims ?? [], resourceCleanup: pair.state.resourceCleanup ?? null, ...taskPairChecklistCounts(markdown) };
 }
 
 function savePairBrief(pair: NonNullable<ReturnType<typeof pairChecklistTarget>>, markdown: string, writer: string) {
@@ -1910,6 +1910,18 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: async (input) => {
+      const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
+      const resource = typeof args.resource === 'string' ? args.resource.trim() : '';
+      const mode = args.mode === 'shared' || args.mode === 'exclusive' ? args.mode : undefined;
+      const ttlMs = typeof args.ttlMs === 'number' && Number.isInteger(args.ttlMs) ? args.ttlMs : 1800000;
+      if (!resource || !mode || ttlMs < 60000 || ttlMs > 86400000) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'resource, mode and ttlMs (1m..24h) are required');
+      const pair = pairChecklistTarget(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
+      if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      const result = taskPairService.claimResource({ project: pair.project, taskId: pair.state.taskId, owner: caller.sessionName ?? 'unknown', resource, mode, ttlMs });
+      if (!result.ok) return { status: 'error', reason: 'resource_conflict', message: 'resource is already held', conflict: result.conflict };
+      return { status: 'ok', claimed: true, claim: result.claim, claims: result.pair.resourceClaims ?? [] };
     },
     [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: async (input) => {
       const gate = memoryGate(deps, MEMORY_FEATURE_FLAGS_BY_NAME.quickSearch, MEMORY_MCP_DISABLED_FLAGS.QUICK_SEARCH, { items: [] });
@@ -3848,6 +3860,7 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: z.object({ taskId: z.string().optional().describe('Pair task id.') }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: z.object({ taskId: z.string().optional().describe('Pair task id.'), markdown: z.string().optional().describe('Complete Markdown brief.'), title: z.string().min(1).optional().describe('Short specific title in the owner UI language; Brain only.') }).refine((value) => value.markdown !== undefined || value.title !== undefined, { message: 'markdown or title is required' }),
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: z.object({ taskId: z.string().optional().describe('Pair task id.'), items: z.array(z.number().int().positive()).describe('1-based checklist item numbers.'), box: z.enum(['implemented', 'audited']).describe('Box to update.'), checked: z.boolean().describe('New state.') }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_RESOURCE_CLAIM]: z.object({ taskId: z.string().optional(), resource: z.string().min(1).max(500), mode: z.enum(['exclusive', 'shared']), ttlMs: z.number().int().min(60000).max(86400000).optional(), renew: z.boolean().optional() }),
   [MEMORY_MCP_TOOL_NAMES.SEARCH_MEMORY]: z.object({
     query: z.string().describe('Text query; hits include sourceLookup for expansion.'),
     limit: z.number().int().min(1).max(100).optional().describe('Maximum hits.'),
