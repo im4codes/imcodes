@@ -286,8 +286,12 @@ export const TASK_PAIR_BOUNDARY_AUDIT_RULE: string =
   + 'server or daemon on the other side (missing or unknown fields must keep '
   + 'the safe old behaviour). For data migrations, check keys shared by '
   + 'several owners (two daemons, two users of one project) so the first '
-  + 'owner\'s step cannot strand the others. A missed boundary that breaks '
-  + 'existing behaviour is a P0.';
+  + 'owner\'s step cannot strand the others. When a producer changes what a '
+  + 'message carries (fields dropped, partial frames), list every consumer '
+  + 'and show it keeps the last good values. For code that runs per event, '
+  + 'per streamed chunk or per heartbeat, state its per-call cost at '
+  + 'production-shaped data size with a measurement. A missed boundary that '
+  + 'breaks existing behaviour is a P0.';
 
 export const TASK_PAIR_MERGE_VERIFICATION_RULE: string =
   'Merge verification (Brain): read the diff for removed lines of recently '

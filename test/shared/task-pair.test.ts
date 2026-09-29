@@ -283,6 +283,8 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('must NOT trigger');
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('version skew');
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('shared by several owners');
+    expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('list every consumer');
+    expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('per-call cost');
   });
 
   it('ships READY self-check and harness self-sufficiency rules', () => {
