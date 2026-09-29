@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
+import { createHash } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { access, mkdtemp, readdir, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
@@ -19,6 +20,7 @@ import {
   DIRECT_FILE_TRANSFER_TERMINAL_STATE,
   validateDirectFileTransferDaemonMessage,
 } from '../../shared/direct-file-transfer.js';
+import { decodeSessionIdentityDirectHandle, encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 
 class FakeDataChannel {
   private messageHandler: ((message: string | Buffer | ArrayBuffer) => void) | null = null;
@@ -175,6 +177,8 @@ describe('daemon direct file transfer v2 lease broker', () => {
   let lookupAttachmentByClientUploadId: ReturnType<typeof vi.fn>;
   let resolveDirectFileDownloadSource: ReturnType<typeof vi.fn>;
   let directLogger: { info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn>; debug: ReturnType<typeof vi.fn> };
+  /** In-memory stand-in for session-identity-local-store.ts, keyed like it is (scope\0scopeKey). */
+  let identityStore: Map<string, { content: string; contentHash: string; revision: number; updatedAt: number }>;
 
   beforeEach(async () => {
     vi.resetModules();
@@ -195,6 +199,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       return { attachmentId: 'preview-handle-0001', readPath: sourcePath, filename: 'source.bin', size: 8, mime: 'application/octet-stream' };
     });
     directLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() };
+    identityStore = new Map();
     vi.doMock('node-datachannel', () => ({ PeerConnection: FakePeerConnection, initLogger: vi.fn(), cleanup: vi.fn() }));
     vi.doMock('../../src/daemon/file-transfer-handler.js', () => ({
       ensureUploadDirectory: vi.fn(),
@@ -250,6 +255,24 @@ describe('daemon direct file transfer v2 lease broker', () => {
       if (method === 'lookupAttachmentByClientUploadId') return handler.lookupAttachmentByClientUploadId(String(args[0] ?? '')) ?? null;
       if (method === 'resolveDirectFileDownloadSource') return await handler.resolveDirectFileDownloadSource(String(args[0] ?? ''));
       if (method === 'finalizeDirectUploadedFile') return await handler.finalizeDirectUploadedFile(args[0] as never);
+      if (method === 'resolveIdentityDownloadSource') {
+        const decoded = decodeSessionIdentityDirectHandle(String(args[0] ?? ''));
+        if (!decoded) throw new Error('not_found');
+        const existing = identityStore.get(`${decoded.scope}\0${decoded.scopeKey}`);
+        if (!existing) throw new Error('not_found');
+        return { content: existing.content, filename: 'identity', size: Buffer.byteLength(existing.content, 'utf8') };
+      }
+      if (method === 'finalizeIdentityUpload') {
+        const params = args[0] as { scope: string; scopeKey: string; content: string };
+        const key = `${params.scope}\0${params.scopeKey}`;
+        const previous = identityStore.get(key);
+        const next = {
+          content: params.content, contentHash: createHash('sha256').update(params.content).digest('hex'),
+          revision: (previous?.revision ?? 0) + 1, updatedAt: Date.now(),
+        };
+        identityStore.set(key, next);
+        return { contentHash: next.contentHash, revision: next.revision, updatedAt: next.updatedAt };
+      }
       throw new Error(`unsupported_host_method:${method}`);
     });
     expect(await direct.initializeDirectFileTransfer()).toBe(true);
@@ -1555,6 +1578,148 @@ describe('daemon direct file transfer v2 lease broker', () => {
     expect(FakePeerConnection.instances).toHaveLength(1);
     expect(resolveDirectFileDownloadSource).toHaveBeenCalledOnce();
     await direct.shutdownDirectFileTransfers();
+  });
+
+  describe('identity over the lease (phase 2: chunked reuse)', () => {
+    it('sets then gets identity content through the real upload/download operation machinery', async () => {
+      const { direct, sent, sender } = await readyLease();
+      const content = 'session rules content';
+      const contentBytes = Buffer.byteLength(content, 'utf8');
+      const handle = encodeSessionIdentityDirectHandle('session', 'srv-1:deck_proj_brain');
+
+      const uploadAuthority = uploadPrepare({ filename: handle, size: contentBytes });
+      await direct.handleDirectFileTransferCommand(uploadAuthority, sender);
+      const uploadChannel = new FakeDataChannel(uploadAuthority.channelLabel as string);
+      FakePeerConnection.latest!.emitDataChannel(uploadChannel);
+      uploadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...binding(),
+        authority: uploadAuthority.authority,
+      }));
+      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      uploadChannel.emit(Buffer.from(content, 'utf8'));
+      uploadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...binding(),
+        totalBytes: contentBytes,
+      }));
+      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)));
+      const committed = JSON.parse(uploadChannel.sent.find(
+        (value) => typeof value === 'string' && value.includes(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED),
+      ) as string);
+      // Synthetic, internal-only attachment: never registered as a real
+      // downloadable attachment, and finalizeDirectUploadedFile (the real
+      // file-attachment registry) is never called for identity content.
+      expect(committed.attachment).toMatchObject({ downloadable: false, size: contentBytes });
+      expect(committed.attachment.id).toMatch(/^[a-f0-9]{64}$/);
+      expect(finalizeDirectUploadedFile).not.toHaveBeenCalled();
+      expect(identityStore.get('session\0srv-1:deck_proj_brain')).toMatchObject({ content, revision: 1 });
+
+      const downloadAuthority = downloadPrepare({ previewHandle: handle });
+      await direct.handleDirectFileTransferCommand(downloadAuthority, sender);
+      const downloadChannel = new FakeDataChannel(downloadAuthority.channelLabel as string);
+      FakePeerConnection.latest!.emitDataChannel(downloadChannel);
+      const downloadBinding = binding({
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+        operationId: downloadAuthority.operationId,
+        attemptId: downloadAuthority.attemptId,
+        requestId: downloadAuthority.requestId,
+      });
+      downloadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...downloadBinding,
+        authority: downloadAuthority.authority,
+      }));
+      await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      const accepted = JSON.parse(downloadChannel.sent.find(
+        (value) => typeof value === 'string' && value.includes(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED),
+      ) as string);
+      expect(accepted.size).toBe(contentBytes);
+      downloadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...downloadBinding,
+        creditBytes: contentBytes,
+      }));
+      await vi.waitFor(() => expect(downloadChannel.sent.some((value) => value instanceof Uint8Array)).toBe(true));
+      // The bytes sent must decode back to the exact original content.
+      const receivedBytes = Buffer.concat(downloadChannel.sent.filter(
+        (value): value is Uint8Array => value instanceof Uint8Array,
+      ).map((value) => Buffer.from(value)));
+      expect(receivedBytes.toString('utf8')).toBe(content);
+      await vi.waitFor(() => expect(downloadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.FINISH)));
+      downloadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...downloadBinding,
+        totalBytes: contentBytes,
+      }));
+      await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+        operationId: downloadAuthority.operationId,
+        state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+      })));
+      expect(resolveDirectFileDownloadSource).not.toHaveBeenCalled();
+      await direct.shutdownDirectFileTransfers();
+    });
+
+    it('rejects a checksum mismatch and never calls the identity finalize host method', async () => {
+      const { direct, sender } = await readyLease();
+      const content = 'tampered content check';
+      const contentBytes = Buffer.byteLength(content, 'utf8');
+      const handle = encodeSessionIdentityDirectHandle('project', 'repo-1');
+      const uploadAuthority = uploadPrepare({ filename: handle, size: contentBytes, sha256: 'a'.repeat(64) });
+      await direct.handleDirectFileTransferCommand(uploadAuthority, sender);
+      const uploadChannel = new FakeDataChannel(uploadAuthority.channelLabel as string);
+      FakePeerConnection.latest!.emitDataChannel(uploadChannel);
+      uploadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...binding(),
+        authority: uploadAuthority.authority,
+      }));
+      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+      uploadChannel.emit(Buffer.from(content, 'utf8'));
+      uploadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...binding(),
+        totalBytes: contentBytes,
+      }));
+      await vi.waitFor(() => expect(uploadChannel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_ERROR.CHECKSUM_MISMATCH)));
+      expect(identityStore.size).toBe(0);
+      await direct.shutdownDirectFileTransfers();
+    });
+
+    it('reports not-found for a download handle the identity store never had', async () => {
+      const { direct, sent, sender } = await readyLease();
+      const handle = encodeSessionIdentityDirectHandle('project', 'never-written');
+      const downloadAuthority = downloadPrepare({ previewHandle: handle });
+      await direct.handleDirectFileTransferCommand(downloadAuthority, sender);
+      const downloadChannel = new FakeDataChannel(downloadAuthority.channelLabel as string);
+      FakePeerConnection.latest!.emitDataChannel(downloadChannel);
+      const downloadBinding = binding({
+        direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+        operationId: downloadAuthority.operationId,
+        attemptId: downloadAuthority.attemptId,
+        requestId: downloadAuthority.requestId,
+      });
+      downloadChannel.emit(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        ...downloadBinding,
+        authority: downloadAuthority.authority,
+      }));
+      await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+        type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+        error: DIRECT_FILE_TRANSFER_ERROR.PREVIEW_HANDLE_INVALID,
+        retryable: false,
+      })));
+      await direct.shutdownDirectFileTransfers();
+    });
   });
 
   it('returns an existing upload result for a duplicate stable operation id without committing again', async () => {

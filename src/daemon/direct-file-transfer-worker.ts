@@ -51,6 +51,7 @@ import {
   DIRECT_FILE_TRANSFER_WORKER_PROTOCOL_VERSION,
   validateDirectFileTransferWorkerEnvelope,
 } from '../../shared/direct-file-transfer.js';
+import { decodeSessionIdentityDirectHandle, type SessionIdentityScope } from '../../shared/session-identity.js';
 
 /**
  * The worker's stand-in for a main-thread transport.
@@ -240,6 +241,23 @@ async function finalizeDirectUploadedFile(params: Record<string, unknown>): Prom
   ) as AttachmentRef;
 }
 
+interface IdentityDownloadSource { content: string; filename: string; size: number }
+interface IdentityUploadFinalizeResult { contentHash: string; revision: number; updatedAt: number }
+
+async function resolveIdentityDownloadSource(previewHandle: string): Promise<IdentityDownloadSource> {
+  return await callHost(
+    DIRECT_FILE_TRANSFER_HOST_METHOD.RESOLVE_IDENTITY_DOWNLOAD_SOURCE, [previewHandle],
+  ) as IdentityDownloadSource;
+}
+
+async function finalizeIdentityUpload(params: {
+  scope: SessionIdentityScope; scopeKey: string; content: string; source: 'web' | 'mcp'; sourceFile?: string;
+}): Promise<IdentityUploadFinalizeResult> {
+  return await callHost(
+    DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_IDENTITY_UPLOAD, [params],
+  ) as IdentityUploadFinalizeResult;
+}
+
 const senderCache = new Map<string, WorkerControlSender>();
 
 /** One stable shim per sender id, so lease rebinding keeps object identity. */
@@ -328,6 +346,17 @@ interface ActiveDirectTransfer {
   sourceFinished: boolean;
   settled: boolean;
   idleTimer: ReturnType<typeof setTimeout> | null;
+  /**
+   * Identity-over-lease (phase 2): an in-memory stand-in for
+   * uploadFileHandle/downloadFileHandle/downloadSource, set instead of (never
+   * alongside) those when `authority.filename`/`authority.previewHandle`
+   * decodes as an identity handle. `uploadBuffer` is pre-allocated to
+   * `authority.size` and filled by offset; `downloadBuffer` is the full
+   * content read once at start. No temp file is ever created for either.
+   */
+  uploadBuffer: Buffer | null;
+  downloadBuffer: Buffer | null;
+  identityUpload: { scope: SessionIdentityScope; scopeKey: string; source: 'web' | 'mcp'; sourceFile?: string } | null;
 }
 
 interface LedgerRecord {
@@ -1467,9 +1496,123 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
   channel.onError(retire);
 }
 
+/**
+ * Identity-over-lease (phase 2) upload. No resume, no claim registry, no
+ * temp file, no attachment: content is small (SESSION_IDENTITY_*_MAX_CHARS,
+ * at most ~1.2MB), so a failed attempt just restarts from zero rather than
+ * carrying the general file-upload resume/claim machinery those bounds
+ * don't need. The handle is decoded from `filename` (an identity upload's
+ * real "file" is a scope/scopeKey pair, not a name); `clientUploadId` stays
+ * a plain opaque token because it is restricted to `[A-Za-z0-9_-]{8,128}`
+ * and cannot carry an arbitrary scope key.
+ */
+async function startIdentityUpload(transfer: ActiveDirectTransfer): Promise<void> {
+  const authority = transfer.authority;
+  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) return;
+  const decoded = decodeSessionIdentityDirectHandle(authority.filename);
+  if (!decoded || !Number.isSafeInteger(authority.size) || authority.size < 0) {
+    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST, false);
+    return;
+  }
+  transfer.uploadBuffer = Buffer.allocUnsafe(authority.size);
+  transfer.identityUpload = { scope: decoded.scope, scopeKey: decoded.scopeKey, source: 'web' };
+  transfer.started = true;
+  resetTransferIdleTimer(transfer);
+  transfer.channel?.sendMessage(JSON.stringify({
+    type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...makeDataBinding(authority),
+    direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+  }));
+}
+
+function enqueueIdentityUploadChunk(transfer: ActiveDirectTransfer, bytes: Uint8Array): void {
+  const authority = transfer.authority;
+  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) return;
+  if (!transfer.uploadBuffer || transfer.received + bytes.byteLength > authority.size) {
+    void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
+    return;
+  }
+  Buffer.from(bytes).copy(transfer.uploadBuffer, transfer.received);
+  transfer.hash.update(bytes);
+  transfer.received += bytes.byteLength;
+  resetTransferIdleTimer(transfer);
+  reportUploadCommit(transfer);
+}
+
+async function finishIdentityUpload(transfer: ActiveDirectTransfer, totalBytes: number, sha256?: string): Promise<void> {
+  const authority = transfer.authority;
+  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) return;
+  if (transfer.settled) return;
+  if (!transfer.started || !transfer.uploadBuffer || !transfer.identityUpload
+    || totalBytes !== transfer.received || transfer.received !== authority.size) {
+    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
+    return;
+  }
+  const digest = transfer.hash.digest('hex');
+  if ((sha256 ?? authority.sha256) && digest !== (sha256 ?? authority.sha256)) {
+    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.CHECKSUM_MISMATCH, false);
+    return;
+  }
+  const content = transfer.uploadBuffer.toString('utf8');
+  const identity = transfer.identityUpload;
+  let result: { contentHash: string; revision: number; updatedAt: number };
+  try {
+    result = await finalizeIdentityUpload({ scope: identity.scope, scopeKey: identity.scopeKey, content, source: identity.source });
+  } catch (error) {
+    await failTransfer(
+      transfer,
+      isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
+      true,
+      errorDetail(error),
+    );
+    return;
+  }
+  transfer.settled = true;
+  directFileMetric('direct_success', {
+    direction: authority.direction, attempt: authority.attempt, bytes: transfer.received, route: routeMetricClass(transfer.lease),
+  });
+  // Reuses the file-upload wire shape (UPLOAD_COMMITTED requires an
+  // AttachmentRef, TERMINAL's is optional but sent for the same resilience
+  // reason existing uploads send both) rather than adding a second identity-
+  // only message: there is no real attachment, so this is a synthetic,
+  // internal-only stand-in the browser's identity code reads back and
+  // discards, never registered anywhere as a downloadable attachment
+  // (downloadable: false; daemonPath is an inert sentinel, never
+  // dereferenced). `id` carries contentHash (already a valid transfer-id
+  // shape) and `originalName` carries the new revision -- there is nowhere
+  // else in AttachmentRef's shape for that specific number to go.
+  const syntheticAttachment: AttachmentRef = {
+    id: result.contentHash,
+    source: 'upload',
+    serverId: authority.serverId,
+    daemonPath: '-',
+    originalName: String(result.revision),
+    size: totalBytes,
+    createdAt: new Date(result.updatedAt).toISOString(),
+    downloadable: false,
+  };
+  putLedger(authority, DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED, DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED, syntheticAttachment);
+  transfer.channel?.sendMessage(JSON.stringify({
+    type: DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...makeDataBinding(authority),
+    attachment: syntheticAttachment,
+  }));
+  sendControl(transfer.lease, {
+    type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...makeDataBinding(authority),
+    state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+    attachment: syntheticAttachment,
+  });
+  await closeTransferResources(transfer, false);
+}
+
 async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset = 0): Promise<void> {
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD || transfer.started) return;
+  if (decodeSessionIdentityDirectHandle(authority.filename)) return startIdentityUpload(transfer);
   const existing = await lookupAttachmentByClientUploadId(authority.clientUploadId);
   if (existing) {
     transfer.started = true;
@@ -1625,9 +1768,44 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
   }));
 }
 
+/** Identity-over-lease (phase 2) download: mirrors startDownload with an in-memory buffer as the source, no real file. */
+async function startIdentityDownload(transfer: ActiveDirectTransfer, requestedResumeOffset: number): Promise<void> {
+  const authority = transfer.authority;
+  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) return;
+  let source: { content: string; filename: string; size: number };
+  try {
+    source = await resolveIdentityDownloadSource(authority.previewHandle);
+  } catch (error) {
+    const detail = errorDetail(error);
+    await failTransfer(
+      transfer,
+      detail === 'not_found' ? DIRECT_FILE_TRANSFER_ERROR.PREVIEW_HANDLE_INVALID : DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED,
+      false,
+    );
+    return;
+  }
+  if (!Number.isSafeInteger(requestedResumeOffset) || requestedResumeOffset < 0 || requestedResumeOffset > source.size) {
+    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
+    return;
+  }
+  transfer.downloadBuffer = Buffer.from(source.content, 'utf8');
+  transfer.received = requestedResumeOffset;
+  transfer.started = true;
+  resetTransferIdleTimer(transfer);
+  transfer.channel?.sendMessage(JSON.stringify({
+    type: DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...makeDataBinding(authority),
+    direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+    filename: source.filename,
+    size: source.size,
+  }));
+}
+
 async function startDownload(transfer: ActiveDirectTransfer, requestedResumeOffset = 0): Promise<void> {
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD || transfer.started) return;
+  if (decodeSessionIdentityDirectHandle(authority.previewHandle)) return startIdentityDownload(transfer, requestedResumeOffset);
   let source: DirectFileDownloadSource;
   try {
     source = await resolveDirectFileDownloadSource(authority.previewHandle);
@@ -1705,7 +1883,9 @@ function reportUploadCommit(transfer: ActiveDirectTransfer): void {
 }
 
 function enqueueUploadChunk(transfer: ActiveDirectTransfer, bytes: Uint8Array): void {
-  if (!transfer.started || transfer.settled || !transfer.uploadFileHandle) return;
+  if (!transfer.started || transfer.settled) return;
+  if (transfer.uploadBuffer) { enqueueIdentityUploadChunk(transfer, bytes); return; }
+  if (!transfer.uploadFileHandle) return;
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD
     || transfer.received + transfer.pendingBytes + bytes.byteLength > authority.size) {
@@ -1735,6 +1915,7 @@ function enqueueUploadChunk(transfer: ActiveDirectTransfer, bytes: Uint8Array): 
 async function finishUpload(transfer: ActiveDirectTransfer, totalBytes: number, sha256?: string): Promise<void> {
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) return;
+  if (transfer.uploadBuffer) return finishIdentityUpload(transfer, totalBytes, sha256);
   await transfer.writeChain;
   if (transfer.settled) return;
   if (!transfer.started || !transfer.uploadFileHandle || !transfer.partPath || !transfer.finalPath || !transfer.finalFilename
@@ -1811,28 +1992,36 @@ async function waitForChannelBuffer(channel: DataChannel): Promise<void> {
 }
 
 async function pumpDownload(transfer: ActiveDirectTransfer): Promise<void> {
-  if (transfer.downloadPumping || transfer.settled || !transfer.started || !transfer.channel || !transfer.downloadSource || !transfer.downloadFileHandle) return;
+  const totalSize = transfer.downloadBuffer ? transfer.downloadBuffer.byteLength : transfer.downloadSource?.size;
+  if (transfer.downloadPumping || transfer.settled || !transfer.started || !transfer.channel || totalSize === undefined
+    || (!transfer.downloadFileHandle && !transfer.downloadBuffer)) return;
   transfer.downloadPumping = true;
   try {
-    while (!transfer.settled && transfer.downloadCredit > 0 && transfer.received < transfer.downloadSource.size) {
+    while (!transfer.settled && transfer.downloadCredit > 0 && transfer.received < totalSize) {
       await waitForChannelBuffer(transfer.channel);
       if (transfer.settled
         || !isCurrentLeaseCallback(transfer.lease, transfer.lease.callbackGeneration)) return;
       const count = Math.min(
         DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES,
         transfer.downloadCredit,
-        transfer.downloadSource.size - transfer.received,
+        totalSize - transfer.received,
       );
-      const buffer = Buffer.allocUnsafe(count);
-      const result = await transfer.downloadFileHandle.read(buffer, 0, count, transfer.received);
-      if (result.bytesRead <= 0) throw new Error('source_short_read');
-      const chunk = buffer.subarray(0, result.bytesRead);
+      let chunk: Uint8Array;
+      if (transfer.downloadBuffer) {
+        chunk = transfer.downloadBuffer.subarray(transfer.received, transfer.received + count);
+        if (chunk.byteLength <= 0) throw new Error('source_short_read');
+      } else {
+        const buffer = Buffer.allocUnsafe(count);
+        const result = await transfer.downloadFileHandle!.read(buffer, 0, count, transfer.received);
+        if (result.bytesRead <= 0) throw new Error('source_short_read');
+        chunk = buffer.subarray(0, result.bytesRead);
+      }
       transfer.channel.sendMessageBinary(new Uint8Array(chunk));
-      transfer.downloadCredit -= result.bytesRead;
-      transfer.received += result.bytesRead;
+      transfer.downloadCredit -= chunk.byteLength;
+      transfer.received += chunk.byteLength;
       resetTransferIdleTimer(transfer);
     }
-    if (!transfer.settled && transfer.downloadSource && transfer.received === transfer.downloadSource.size && !transfer.sourceFinished) {
+    if (!transfer.settled && transfer.received === totalSize && !transfer.sourceFinished) {
       transfer.sourceFinished = true;
       await transfer.downloadFileHandle?.close().catch(() => {});
       transfer.downloadFileHandle = null;
@@ -1853,8 +2042,9 @@ async function pumpDownload(transfer: ActiveDirectTransfer): Promise<void> {
 }
 
 async function completeDownload(transfer: ActiveDirectTransfer, totalBytes: number): Promise<void> {
+  const totalSize = transfer.downloadBuffer ? transfer.downloadBuffer.byteLength : transfer.downloadSource?.size;
   if (transfer.authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD || !transfer.sourceFinished
-    || !transfer.downloadSource || totalBytes !== transfer.received || totalBytes !== transfer.downloadSource.size) {
+    || totalSize === undefined || totalBytes !== transfer.received || totalBytes !== totalSize) {
     await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.SIZE_MISMATCH, false);
     return;
   }
@@ -2219,6 +2409,9 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Wo
     sourceFinished: false,
     settled: false,
     idleTimer: null,
+    uploadBuffer: null,
+    downloadBuffer: null,
+    identityUpload: null,
   };
   if (authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && !transfer.uploadClaim) {
     // Another attempt for this same clientUploadId still owns the claim — and

@@ -1519,11 +1519,24 @@ describe('direct file transfer worker boundary', () => {
       'DirectFileDownloadSource', 'createDirectUploadFilename', 'ensureUploadDirectory', 'resolveUploadPath',
     ].sort());
 
+    // Same property for identity authority (session-identity-local-store.ts):
+    // the worker must never import it directly either, only reach it via the
+    // RESOLVE_IDENTITY_DOWNLOAD_SOURCE/FINALIZE_IDENTITY_UPLOAD host calls
+    // below.
+    const identityImported = /from\s*'\.\/session-identity-local-store\.js'/.exec(source);
+    expect(identityImported, 'the worker must not import identity storage authority directly').toBeFalsy();
+
     // And the host side does hold them, so they were not simply dropped.
-    const handler = await import('../../src/daemon/file-transfer-handler.js');
+    // File-upload/download authority lives in file-transfer-handler.ts;
+    // identity authority's own resolve/finalize wrappers live directly in
+    // direct-file-transfer.ts (the host module itself), since identity
+    // storage is not a file-transfer concern file-transfer-handler.ts should
+    // know about.
+    const handler = await import('../../src/daemon/file-transfer-handler.js') as unknown as Record<string, unknown>;
+    const identityHost = await import('../../src/daemon/direct-file-transfer.js') as unknown as Record<string, unknown>;
     for (const authority of Object.values(DIRECT_FILE_TRANSFER_HOST_METHOD)) {
-      expect(typeof (handler as unknown as Record<string, unknown>)[authority],
-        `${authority} is host-owned`).toBe('function');
+      const owner = authority in handler ? handler : identityHost;
+      expect(typeof owner[authority], `${authority} is host-owned`).toBe('function');
     }
   });
 

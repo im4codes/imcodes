@@ -47,6 +47,7 @@ import {
   resolveDirectFileDownloadSource,
   tryClaimClientUpload,
 } from './file-transfer-handler.js';
+import { decodeSessionIdentityDirectHandle, type SessionIdentityScope } from '../../shared/session-identity.js';
 
 export { toNodeDataChannelIceServers } from './direct-file-transfer-worker.js';
 
@@ -161,6 +162,47 @@ const finalizeDirectUploadedFileOnDemand: FinalizeDirectUploadedFile = async (pa
 };
 
 let finalizeUploadedFileOnHost: FinalizeDirectUploadedFile = finalizeDirectUploadedFileOnDemand;
+
+/**
+ * Identity-over-lease resolve/finalize (phase 2). Content stays a plain
+ * UTF-8 string across the worker<->host boundary on both sides -- never a
+ * Buffer/TypedArray -- so it round-trips identically regardless of the
+ * child transport's exact serialization. Lazily imports
+ * session-identity-local-store.js for the same reason
+ * finalizeDirectUploadedFileOnDemand lazily imports file-transfer-handler.js
+ * above: keep this module's eager import surface unchanged for the many
+ * existing tests that mock it narrowly.
+ */
+export interface IdentityUploadFinalizeParams {
+  scope: SessionIdentityScope;
+  scopeKey: string;
+  content: string;
+  source: 'web' | 'mcp';
+  sourceFile?: string;
+}
+
+export interface IdentityDownloadSource {
+  content: string;
+  filename: string;
+  size: number;
+}
+
+export async function resolveIdentityDownloadSource(previewHandle: string): Promise<IdentityDownloadSource> {
+  const decoded = decodeSessionIdentityDirectHandle(previewHandle);
+  if (!decoded) throw new Error('not_found');
+  const { getLocalSessionIdentityProfile } = await import('./session-identity-local-store.js');
+  const profile = await getLocalSessionIdentityProfile(decoded.scope, decoded.scopeKey);
+  if (!profile) throw new Error('not_found');
+  return { content: profile.content, filename: 'identity', size: Buffer.byteLength(profile.content, 'utf8') };
+}
+
+export async function finalizeIdentityUpload(
+  params: IdentityUploadFinalizeParams,
+): Promise<{ contentHash: string; revision: number; updatedAt: number }> {
+  const { putLocalSessionIdentityProfile } = await import('./session-identity-local-store.js');
+  const profile = await putLocalSessionIdentityProfile(params);
+  return { contentHash: profile.contentHash, revision: profile.revision, updatedAt: profile.updatedAt };
+}
 
 /**
  * Test seam for the worker factory.
@@ -514,6 +556,10 @@ async function invokeHostMethod(generation: number, method: string, args: unknow
       return await finalizeUploadedFileOnHost(
         args[0] as Parameters<FinalizeDirectUploadedFile>[0],
       );
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.RESOLVE_IDENTITY_DOWNLOAD_SOURCE:
+      return await resolveIdentityDownloadSource(String(args[0] ?? ''));
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_IDENTITY_UPLOAD:
+      return await finalizeIdentityUpload(args[0] as IdentityUploadFinalizeParams);
     default:
       // Unreachable: the validator allowlists the method before we get here.
       throw new Error(`unsupported_host_method:${method}`);
