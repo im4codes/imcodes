@@ -307,6 +307,11 @@ export function restartWindowsDaemon(currentPid?: number): boolean {
   return false;
 }
 
+/** PowerShell `-like` pattern for daemon node.exe command lines. `-like` treats
+ *  backslash literally (only `` ` `` escapes), so this must contain SINGLE
+ *  backslashes: a doubled `\\` pattern never matches a real Windows path. */
+export const DAEMON_PROCESS_LIKE_PATTERN = '*node_modules\\imcodes\\dist*';
+
 /** Forcefully kill any node.exe process that is listening on the imcodes
  *  daemon's home-scoped named pipe (the default is
  *  `windowsDaemonLockPipeName()`).  This handles the
@@ -351,7 +356,7 @@ export function killOrphanDaemonProcesses(): boolean {
       scriptPath,
       `# instance-lock-pipe: ${lockPipeName}\r\n` +
         "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | " +
-        "Where-Object { $_.CommandLine -like '*node_modules\\\\imcodes\\\\dist*' } | " +
+        `Where-Object { $_.CommandLine -like '${DAEMON_PROCESS_LIKE_PATTERN}' } | ` +
         "ForEach-Object { \"$($_.ProcessId)`t$($_.CommandLine)\" }\r\n",
     );
     const out = execSync(
