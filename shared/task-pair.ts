@@ -771,6 +771,8 @@ export interface TaskPairWorkspace {
   lastHeadAt?: number;
   /** Last rewritten head for which the daemon emitted the advisory. */
   lastRebaseNoticeHead?: string;
+  /** Previous head retained as the comparison side for that rewrite. */
+  lastRebasePreviousHead?: string;
   createdAt: number;
   /**
    * `ended` from DONE/CANCEL until the retention elapses; then `removed`, or

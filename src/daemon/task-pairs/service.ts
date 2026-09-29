@@ -223,6 +223,31 @@ function queueRebaseWarning(
   })().catch((error) => logger.warn({ err: error, taskId }, 'task-pair: rebase advisory failed'));
 }
 
+/** Audit requests are sent first; this only catches a rewrite observed between refreshes. */
+function queueAuditRebaseWarning(project: string, pair: TaskPairState, material: Awaited<ReturnType<typeof resolveTaskPairMaterial>>): void {
+  void (async () => {
+    const workspace = getTaskPairStore().getPair(project, pair.taskId)?.state.workspace;
+    if (!workspace || workspace.kind !== 'worktree' || !material.head) return;
+    if (workspace.lastRebaseNoticeHead === material.head) return;
+    const previousHead = workspace.lastHead;
+    if (!previousHead || previousHead === material.head || !(await isRewrittenHead(workspace.path, previousHead, material.head))) return;
+    const latest = getTaskPairStore().getPair(project, pair.taskId);
+    if (!latest?.state.workspace || latest.state.workspace.lastRebaseNoticeHead === material.head) return;
+    getTaskPairStore().savePair(project, {
+      ...latest.state,
+      workspace: {
+        ...latest.state.workspace,
+        lastHead: material.head,
+        lastHeadAt: Date.now(),
+        lastRebaseNoticeHead: material.head,
+        lastRebasePreviousHead: previousHead,
+      },
+      updatedAt: Date.now(),
+    });
+    queueRebaseWarning(latest.state, pair.taskId, material, previousHead);
+  })().catch((error) => logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: audit rebase advisory failed'));
+}
+
 export class TaskPairService {
   static readonly TITLE_REQUEST_RETRY_MS = 5 * 60_000;
   #titleRequestFlushes = new Map<string, Promise<void>>();
@@ -1039,15 +1064,12 @@ export class TaskPairService {
             break;
           case 'audit_request': {
             const material = await resolveTaskPairMaterial(pair);
-            const warning = formatPossibleSilentRevertWarning(await inspectPossibleSilentRevert(material));
             if (material.source === 'pending' || (!material.worktree && !material.path)) {
               if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'material-pending', `Material is pending for ${pair.taskId}; resend READY_FOR_AUDIT with worktree=<absolute path> head=<commit> (or path=<task directory>).`);
               await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', `Material pending for ${pair.taskId}; the executor must resend READY_FOR_AUDIT with an explicit workspace path and head.`);
             } else {
-              await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material, warning));
-              if (warning) {
-                await sendTaskPairMessage(pair.brain, pair.taskId, 'rebase-revert-warning', warning);
-              }
+              await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material));
+              queueAuditRebaseWarning(project, pair, material);
             }
             break;
           }

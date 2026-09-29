@@ -20,7 +20,7 @@ async function commit(dir: string, subject: string) { await run(dir, 'add', '.')
 const material = (worktree: string, base: string, head: string) => ({ worktree, base, head, source: 'executor' as const });
 
 describe('possible silent rebase revert guard', () => {
-  it('warns when a recent foreign fix is deleted by the submitted head', async () => {
+  it('does not warn for an ordinary deletion on a normal READY submission', async () => {
     const dir = await repo();
     try {
       await writeFile(join(dir, 'app.txt'), 'before\n');
@@ -29,9 +29,7 @@ describe('possible silent rebase revert guard', () => {
       const foreign = await commit(dir, 'foreign fix: preserve state');
       await writeFile(join(dir, 'app.txt'), 'before\n');
       const head = await commit(dir, 'stale resolution');
-      const warning = formatPossibleSilentRevertWarning(await inspectPossibleSilentRevert(material(dir, foreign, head)));
-      expect(warning).toContain('Possible silent rebase revert warning');
-      expect(warning).toContain('foreign fix: preserve state');
+      expect(await inspectPossibleSilentRevert(material(dir, foreign, head))).toBeUndefined();
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 
@@ -69,7 +67,9 @@ describe('possible silent rebase revert guard', () => {
       await writeFile(join(dir, 'app.txt'), 'before\nrewritten change\n');
       const rewritten = await commit(dir, 'rebased stale resolution');
       expect(await isRewrittenHead(dir, oldHead, rewritten)).toBe(true);
-      const warning = formatPossibleSilentRevertWarning(await inspectPossibleSilentRevert(material(dir, oldHead, rewritten)));
+      const warning = formatPossibleSilentRevertWarning(await inspectPossibleSilentRevert({
+        ...material(dir, oldHead, rewritten), ownershipBase: initial, ownershipHead: oldHead,
+      }));
       expect(warning).toContain('foreign fix: preserve state');
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
@@ -104,6 +104,25 @@ describe('possible silent rebase revert guard', () => {
       const head = await commit(dir, 'whitespace only');
       expect(await inspectPossibleSilentRevert({ path: dir, source: 'executor' })).toBeUndefined();
       expect(await inspectPossibleSilentRevert(material(dir, base, head))).toBeUndefined();
+    } finally { await rm(dir, { recursive: true, force: true }); }
+  });
+
+  it('fails open within one total budget on a many-file rewrite', async () => {
+    const dir = await repo();
+    try {
+      await writeFile(join(dir, 'seed.txt'), 'seed\n');
+      const initial = await commit(dir, 'initial');
+      for (let index = 0; index < 50; index++) await writeFile(join(dir, `file-${index}.txt`), `foreign line ${index}\n`);
+      const oldHead = await commit(dir, 'foreign integration batch');
+      await run(dir, 'branch', '-f', 'dev', oldHead);
+      await run(dir, 'reset', '-q', '--hard', initial);
+      for (let index = 0; index < 50; index++) await writeFile(join(dir, `file-${index}.txt`), 'rewritten\n');
+      const rewritten = await commit(dir, 'rebased batch rewrite');
+      const started = Date.now();
+      await inspectPossibleSilentRevert({
+        ...material(dir, oldHead, rewritten), ownershipBase: initial, ownershipHead: oldHead,
+      });
+      expect(Date.now() - started).toBeLessThan(5_500);
     } finally { await rm(dir, { recursive: true, force: true }); }
   });
 });
