@@ -15,10 +15,11 @@
 import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../../shared/agent-skills.js';
 import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../../shared/agent-mcp.js';
 import { DaemonRequestTracker } from './daemon-request-tracker.js';
+import { CommandAckOriginRouter } from './command-ack-origin-router.js';
 import WebSocket, { type RawData } from 'ws';
 import { CLOCK_SYNC_FIELD } from '../../../shared/clock-sync.js';
 import { performance } from 'node:perf_hooks';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import type { Database } from '../db/client.js';
 import type { Env } from '../env.js';
 import { MemoryRateLimiter } from './rate-limiter.js';
@@ -226,6 +227,15 @@ import {
   isMemoryManagementRequestType,
   isMemoryManagementResponseType,
 } from '../../../shared/memory-ws.js';
+import { SESSION_IDENTITY_WS, SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS } from '../../../shared/session-identity-ws.js';
+import {
+  getSessionIdentityProfile as getServerSessionIdentityProfile,
+  upsertSessionIdentityProfile as upsertServerSessionIdentityProfile,
+  deleteSessionIdentityProfile as deleteServerSessionIdentityProfile,
+  upsertSessionIdentityMetadata,
+  deleteSessionIdentityMetadata,
+} from '../db/session-identity-queries.js';
+import { normalizeSessionIdentityContent, sessionIdentityContentLength } from '../../../shared/session-identity.js';
 import {
   MEMORY_MANAGEMENT_CONTEXT_FIELD,
   type AuthenticatedMemoryManagementContext,
@@ -266,6 +276,7 @@ import {
   ACK_TIMEOUT_RETRY_LIMIT,
   ACK_DEDUP_TTL_MS,
   INFLIGHT_GC_TTL_MS,
+  COMMAND_ACK_ORIGIN_TTL_MS,
   type AckFailureReason,
 } from '../../../shared/ack-protocol.js';
 import {
@@ -2214,6 +2225,12 @@ export class WsBridge {
    * any peer-audit response without a matching route is dropped, never
    * broadcast.
    */
+  /**
+   * commandId -> originating browser socket for command.ack delivery to a
+   * sender that isn't subscribed to the session. See CommandAckOriginRouter.
+   */
+  private readonly commandAckOrigins = new CommandAckOriginRouter(COMMAND_ACK_ORIGIN_TTL_MS);
+
   private readonly peerAuditRouter: PeerAuditUnicastRouter = new PeerAuditUnicastRouter(
     undefined,
     0,
@@ -2429,6 +2446,13 @@ export class WsBridge {
    * openspec/changes/memory-source-server-routing.
    */
   private readonly memorySourcesRequests = new DaemonRequestTracker();
+
+  /**
+   * requestId -> awaiting HTTP route caller, for PROJECT/SESSION identity
+   * get/set/delete forwarded to the daemon (the daemon is the sole content
+   * owner for those scopes; this is the only way to reach it, never HTTP).
+   */
+  private readonly sessionIdentityRequests = new DaemonRequestTracker();
 
   /**
    * `/api/agent-skills` and `/api/agent-mcp` callers awaiting the daemon's
@@ -5452,6 +5476,26 @@ export class WsBridge {
             finishLocalAuth();
             return;
           }
+          // USER-scope identity content lives on the server; push it now
+          // instead of the daemon polling for it (owner rule,
+          // tsk_cd_identity_daemon_storage). Unconditional: this event is
+          // rare (one per connect) and the content is capped at 100k chars,
+          // so no need for hash comparison here -- a reconnecting daemon
+          // with a stale copy gets the current one either way.
+          try {
+            const userProfile = await getServerSessionIdentityProfile(db, server.user_id, 'user', '');
+            if (!isCurrentAuthConnection()) {
+              finishLocalAuth();
+              return;
+            }
+            if (userProfile && userProfile.content) this.sendSessionIdentityUserPush(userProfile);
+          } catch (err) {
+            logger.warn({ err, serverId: this.serverId }, 'failed to push user identity on daemon auth');
+          }
+          if (!isCurrentAuthConnection()) {
+            finishLocalAuth();
+            return;
+          }
         }
         if (this.daemonNodeRole === NODE_ROLE.FULL) {
           try {
@@ -6740,6 +6784,16 @@ export class WsBridge {
       }
 
       if (TIMELINE_REQUEST_TYPES.has(browserMessageType) && this.registerTimelineHistoryAlias(msg)) return;
+      // Generic commandId-bearing commands (session.identity.refresh,
+      // session.edit_queued_message, transport-queue append, timeline
+      // message delete, ...) aren't tracked by a more specific mechanism
+      // (inflightCommands / peerAuditRouter above) -- record the origin so
+      // their eventual command.ack can reach this socket even if it never
+      // subscribes to the session.
+      if (typeof msg.commandId === 'string') {
+        this.commandAckOrigins.record(msg.commandId, ws);
+        this.startAckHousekeepingIfNeeded();
+      }
       this.sendToDaemon(raw);
     });
 
@@ -7909,6 +7963,29 @@ export class WsBridge {
       return;
     }
 
+    // ── PROJECT/SESSION identity: daemon is the sole content owner ────────
+    if (type === SESSION_IDENTITY_WS.LOCAL_RESPONSE) {
+      const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+      if (requestId) this.resolveSessionIdentityLocal(requestId, msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.MIGRATE_REQUEST) {
+      void this.handleSessionIdentityMigrateRequest(msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.MIGRATE_CONFIRM) {
+      void this.handleSessionIdentityMigrateConfirm(msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.LOCAL_REPORT) {
+      void this.handleSessionIdentityLocalReport(msg);
+      return;
+    }
+    if (type === SESSION_IDENTITY_WS.USER_REPORT) {
+      void this.handleSessionIdentityUserReport(msg);
+      return;
+    }
+
     // Agent-configuration replies go to the waiting owner-only route only,
     // never to browsers.
     if (type === AGENT_SKILLS_MSG.LIST_RESPONSE || type === AGENT_SKILLS_MSG.RUN_RESPONSE
@@ -8029,10 +8106,14 @@ export class WsBridge {
       }
       // Control-plane: bypass the PTY queue. command.ack drives the UI
       // optimistic-bubble state — must never head-of-line block.
+      // The originating socket (if recorded and not itself a subscriber)
+      // gets this too, so a command sent from a page not subscribed to the
+      // session still receives its own ack instead of timing out.
+      const originSocket = commandId ? this.commandAckOrigins.take(commandId) : null;
       this.sendJsonToSessionSubscribers(sessionName, JSON.stringify({
         ...msg,
         activeDispatchId: this.activeDispatchIds.get(sessionName) ?? null,
-      }));
+      }), originSocket ?? undefined);
       return;
     }
 
@@ -8693,7 +8774,7 @@ export class WsBridge {
    *    subscriptions to); we dedup per-WS so the same JSON is never sent
    *    twice.
    */
-  private sendJsonToSessionSubscribers(sessionName: string, json: string): number {
+  private sendJsonToSessionSubscribers(sessionName: string, json: string, extraRecipient?: WebSocket): number {
     const sent = new Set<WebSocket>();
     for (const [ws, sessions] of this.browserSubscriptions) {
       if (!sessions.has(sessionName)) continue;
@@ -8712,6 +8793,16 @@ export class WsBridge {
       if (!outgoing) continue;
       sent.add(ws);
       safeSend(ws, outgoing);
+    }
+    // Additive unicast to the socket that sent the originating command, when
+    // it isn't already among the subscribers above (see CommandAckOriginRouter).
+    if (extraRecipient && !sent.has(extraRecipient)) {
+      const msg = this.tryParseJsonRecord(json);
+      const outgoing = this.filterShareOutgoingJson(extraRecipient, msg, json);
+      if (outgoing) {
+        sent.add(extraRecipient);
+        safeSend(extraRecipient, outgoing);
+      }
     }
     return sent.size;
   }
@@ -9236,6 +9327,7 @@ export class WsBridge {
       this.pendingRepoRequests.delete(requestId);
     }
     this.peerAuditRouter.dropSocket(ws);
+    this.commandAckOrigins.dropSocket(ws);
     this.directFileTransferRouter.dropSocket(ws);
     this.remoteDesktopRouter.dropSocket(ws);
     // Clean up pending timeline requests for this socket
@@ -9774,7 +9866,9 @@ export class WsBridge {
     for (const [id, ts] of this.seenCommandAcks) {
       if (now - ts > ACK_DEDUP_TTL_MS) this.seenCommandAcks.delete(id);
     }
-    if (this.inflightCommands.size === 0 && this.seenCommandAcks.size === 0 && this.ackHousekeepingTimer) {
+    this.commandAckOrigins.sweep(now);
+    if (this.inflightCommands.size === 0 && this.seenCommandAcks.size === 0
+      && this.commandAckOrigins.size() === 0 && this.ackHousekeepingTimer) {
       clearInterval(this.ackHousekeepingTimer);
       this.ackHousekeepingTimer = null;
     }
@@ -11374,6 +11468,212 @@ export class WsBridge {
   private rejectAllPendingMemorySourcesRequests(reason: string): void {
     this.memorySourcesRequests.rejectAll(reason);
     this.machineConfigRequests.rejectAll(reason);
+    this.sessionIdentityRequests.rejectAll(reason);
+  }
+
+  // ── PROJECT/SESSION identity: daemon is the sole content owner ─────────
+  //
+  // The server never stores PROJECT/SESSION identity content (owner rule,
+  // tsk_cd_identity_daemon_storage). A get/set/delete for those scopes is a
+  // unicast RPC over the daemon WS, gated by requestId, exactly like
+  // sendMemorySourcesRequest above -- never HTTP daemon<->server in either
+  // direction, so a flaky proxy link can never make a save/apply time out.
+
+  /** Rejects with 'daemon_offline' or 'timeout'; never HTTP. */
+  sendSessionIdentityLocalRequest(
+    requestId: string,
+    payload: { op: 'get' | 'set' | 'delete'; scope: 'project' | 'session'; scopeKey: string; content?: string; source?: 'web' | 'mcp'; sourceFile?: string },
+    timeoutMs: number = SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS,
+  ): Promise<Record<string, unknown>> {
+    if (!this.isDaemonConnected()) {
+      return Promise.reject(new Error('daemon_offline'));
+    }
+    return this.sessionIdentityRequests.request(requestId, timeoutMs, () => {
+      this.daemonWs!.send(JSON.stringify({
+        type: SESSION_IDENTITY_WS.LOCAL_REQUEST,
+        requestId,
+        ...payload,
+      }));
+    });
+  }
+
+  private resolveSessionIdentityLocal(requestId: string, msg: Record<string, unknown>): boolean {
+    return this.sessionIdentityRequests.resolve(requestId, msg);
+  }
+
+  /** USER-scope content lives on the server; push it to this daemon over WS (never HTTP-polled). */
+  private sendSessionIdentityUserPush(profile: { content: string; contentHash: string; revision: number; updatedAt: number }): void {
+    this.sendToDaemon(JSON.stringify({
+      type: SESSION_IDENTITY_WS.PUSH,
+      scope: 'user',
+      content: profile.content,
+      contentHash: profile.contentHash,
+      revision: profile.revision,
+      updatedAt: profile.updatedAt,
+    }));
+  }
+
+  /**
+   * Deliver USER-scope content (or its removal) to every online daemon of an
+   * account, over each one's own WS -- never a daemon-initiated HTTP poll
+   * (owner rule, tsk_cd_identity_daemon_storage). Static + account-scoped
+   * (not tied to one bridge instance) so an HTTP route with no daemon
+   * connection of its own can call it after a USER-scope save/delete.
+   * Mirrors pushUserMemoryFeatureConfigToOnlineDaemons. A daemon offline
+   * right now gets the current content on its next connect instead (see
+   * handleDaemonConnection).
+   */
+  static async pushSessionIdentityUserToOnlineDaemonsForUser(
+    userId: string,
+    profile: { content: string; contentHash: string; revision: number; updatedAt: number },
+    excludeServerId?: string,
+  ): Promise<void> {
+    await WsBridge.broadcastSessionIdentityUserPush(userId, (bridge) => bridge.sendSessionIdentityUserPush(profile), excludeServerId);
+  }
+
+  static async pushSessionIdentityUserDeleteToOnlineDaemonsForUser(userId: string, excludeServerId?: string): Promise<void> {
+    await WsBridge.broadcastSessionIdentityUserPush(userId, (bridge) => bridge.sendToDaemon(JSON.stringify({
+      type: SESSION_IDENTITY_WS.PUSH, scope: 'user', deleted: true,
+    })), excludeServerId);
+  }
+
+  private static async broadcastSessionIdentityUserPush(
+    userId: string,
+    send: (bridge: WsBridge) => void,
+    excludeServerId?: string,
+  ): Promise<void> {
+    const entries = [...WsBridge.instances.values()];
+    await Promise.all(entries.map(async (bridge) => {
+      if (bridge.serverId === excludeServerId) return;
+      if (!bridge.authenticated || !bridge.daemonWs || !bridge.db) return;
+      if (bridge.daemonOwnerUserId !== userId) return;
+      try {
+        send(bridge);
+      } catch (error) {
+        logger.warn({ err: error, serverId: bridge.serverId }, 'failed to push user identity to daemon');
+      }
+    }));
+  }
+
+  /**
+   * Daemon -> server, fire-and-forget: an MCP-driven local write/delete of a
+   * PROJECT/SESSION profile. Keep the server's metadata row (hash/length/
+   * revision only, never content) in step.
+   */
+  private async handleSessionIdentityLocalReport(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    if (!userId || !this.db) return;
+    const scope = msg.scope === 'project' || msg.scope === 'session' ? msg.scope : undefined;
+    const scopeKey = typeof msg.scopeKey === 'string' ? msg.scopeKey : undefined;
+    if (!scope || !scopeKey) return;
+    try {
+      if (msg.deleted === true) {
+        await deleteSessionIdentityMetadata(this.db, userId, scope, scopeKey);
+        return;
+      }
+      const contentHash = typeof msg.contentHash === 'string' ? msg.contentHash : undefined;
+      const contentLength = typeof msg.contentLength === 'number' ? msg.contentLength : undefined;
+      if (!contentHash || contentLength === undefined) return;
+      await upsertSessionIdentityMetadata(this.db, {
+        userId, scope, scopeKey, contentHash, contentLength,
+        source: msg.source === 'web' ? 'web' : 'mcp',
+        sourceFile: typeof msg.sourceFile === 'string' ? msg.sourceFile : undefined,
+      });
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId, scope, scopeKey }, 'session identity local report failed');
+    }
+  }
+
+  /**
+   * Daemon -> server, fire-and-forget: an MCP-driven write/delete of the
+   * USER-scope profile. This scope's content still lives on the server, so
+   * this carries the full content and gets persisted, then re-pushed to the
+   * account's other online daemons.
+   */
+  private async handleSessionIdentityUserReport(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    if (!userId || !this.db) return;
+    try {
+      if (msg.deleted === true) {
+        await deleteServerSessionIdentityProfile(this.db, userId, 'user', '');
+        await WsBridge.pushSessionIdentityUserDeleteToOnlineDaemonsForUser(userId, this.serverId);
+        return;
+      }
+      if (typeof msg.content !== 'string') return;
+      const content = normalizeSessionIdentityContent(msg.content);
+      const contentHash = createHash('sha256').update(content, 'utf8').digest('hex');
+      const result = await upsertServerSessionIdentityProfile(this.db, {
+        userId, scope: 'user', scopeKey: '', content, contentHash,
+        source: msg.source === 'web' ? 'web' : 'mcp',
+        sourceFile: typeof msg.sourceFile === 'string' ? msg.sourceFile : undefined,
+      });
+      if (result === 'revision_conflict') return;
+      await WsBridge.pushSessionIdentityUserToOnlineDaemonsForUser(userId, result, this.serverId);
+    } catch (error) {
+      logger.warn({ err: error, serverId: this.serverId }, 'session identity user report failed');
+    }
+  }
+
+  /**
+   * Daemon -> server: on (re)connect, the daemon asks for any content the
+   * server still holds for the PROJECT/SESSION scope keys it recognizes as
+   * its own (its live sessions' project/session keys) -- the one-time,
+   * daemon-initiated migration off server storage. Zero data loss: the
+   * server clears a row's content only once MIGRATE_CONFIRM proves the
+   * daemon persisted and hash-verified it (see handleSessionIdentityMigrateConfirm).
+   */
+  private async handleSessionIdentityMigrateRequest(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : undefined;
+    if (!userId || !this.db || !requestId) return;
+    const candidates = Array.isArray(msg.candidates) ? msg.candidates : [];
+    const rows: Array<{ scope: string; scopeKey: string; content: string; contentHash: string; revision: number; updatedAt: number }> = [];
+    for (const candidate of candidates) {
+      if (!candidate || typeof candidate !== 'object') continue;
+      const scope = (candidate as Record<string, unknown>).scope;
+      const scopeKey = (candidate as Record<string, unknown>).scopeKey;
+      if ((scope !== 'project' && scope !== 'session') || typeof scopeKey !== 'string' || !scopeKey) continue;
+      const profile = await getServerSessionIdentityProfile(this.db, userId, scope, scopeKey).catch(() => null);
+      if (profile && profile.content) {
+        rows.push({
+          scope, scopeKey: profile.scopeKey, content: profile.content, contentHash: profile.contentHash,
+          revision: profile.revision, updatedAt: profile.updatedAt,
+        });
+      }
+    }
+    this.sendToDaemon(JSON.stringify({ type: SESSION_IDENTITY_WS.MIGRATE_RESPONSE, requestId, rows }));
+  }
+
+  private async handleSessionIdentityMigrateConfirm(msg: Record<string, unknown>): Promise<void> {
+    const userId = this.daemonOwnerUserId;
+    if (!userId || !this.db) return;
+    const confirmed = Array.isArray(msg.confirmed) ? msg.confirmed : [];
+    for (const entry of confirmed) {
+      if (!entry || typeof entry !== 'object') continue;
+      const scope = (entry as Record<string, unknown>).scope;
+      const scopeKey = (entry as Record<string, unknown>).scopeKey;
+      const contentHash = (entry as Record<string, unknown>).contentHash;
+      if ((scope !== 'project' && scope !== 'session') || typeof scopeKey !== 'string' || typeof contentHash !== 'string') continue;
+      try {
+        const current = await getServerSessionIdentityProfile(this.db, userId, scope, scopeKey);
+        // Only clear when the daemon's confirmed hash still matches what the
+        // server has -- a concurrent edit after the migrate snapshot was
+        // read must never be silently discarded.
+        if (!current || current.contentHash !== contentHash) continue;
+        await upsertSessionIdentityMetadata(this.db, {
+          userId, scope, scopeKey, contentHash,
+          contentLength: sessionIdentityContentLength(current.content),
+          source: current.source,
+          sourceFile: current.sourceFile,
+        });
+        await this.db.execute(
+          `UPDATE session_identity_profiles SET content = NULL WHERE user_id = $1 AND scope = $2 AND scope_key = $3 AND content_hash = $4`,
+          [userId, scope, scopeKey, contentHash],
+        );
+      } catch (error) {
+        logger.warn({ err: error, serverId: this.serverId, scope, scopeKey }, 'session identity migrate confirm failed');
+      }
+    }
   }
 
   private resolvePreviewStart(msg: PreviewResponseStartMessage): void {

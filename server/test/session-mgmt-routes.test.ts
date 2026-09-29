@@ -26,6 +26,24 @@ const sendToDaemonMock = vi.fn();
 const countSharePendingCommandsForUserMock = vi.fn(() => 0);
 const getActiveDispatchIdForSessionMock = vi.fn(() => 'dispatch-1');
 const resolveSessionIdentityProjectKeyMock = vi.fn<(sessionName: string) => string | null>(() => null);
+/**
+ * PROJECT/SESSION identity now routes to the daemon over WS instead of the
+ * content table (tsk_cd_identity_daemon_storage); these two mocks stand in
+ * for WsBridge.isDaemonConnected()/sendSessionIdentityLocalRequest() for the
+ * identity tests below. Defaults to "connected, echoes the write back" so
+ * every OTHER test in this file (which never touches identity) is unaffected.
+ */
+const isDaemonConnectedMock = vi.fn(() => true);
+const sendSessionIdentityLocalRequestMock = vi.fn(async (
+  _requestId: string,
+  payload: { op: 'get' | 'set' | 'delete'; scope: string; scopeKey: string; content?: string },
+) => {
+  if (payload.op === 'set') {
+    return { status: 'ok', contentHash: 'daemon-hash', revision: 1, updatedAt: 1 };
+  }
+  if (payload.op === 'delete') return { status: 'ok' };
+  return { status: 'ok' };
+});
 const mockDb = { queryOne: mockDbQueryOne, query: mockDbQuery, execute: mockDbExecute };
 
 vi.mock('../src/security/authorization.js', () => ({
@@ -65,6 +83,8 @@ vi.mock('../src/ws/bridge.js', () => ({
       countSharePendingCommandsForUser: countSharePendingCommandsForUserMock,
       getActiveDispatchIdForSession: getActiveDispatchIdForSessionMock,
       resolveSessionIdentityProjectKey: resolveSessionIdentityProjectKeyMock,
+      isDaemonConnected: isDaemonConnectedMock,
+      sendSessionIdentityLocalRequest: sendSessionIdentityLocalRequestMock,
     }),
   },
 }));
@@ -1266,11 +1286,9 @@ describe('session-mgmt persistence routes', () => {
         },
       },
     });
-    const profileRow = {
-      scope: 'project', scope_key: 'repo-stable-id', content: 'Owner identity',
-      content_hash: 'owner-hash', revision: 4, updated_at: 10, source: 'web', source_file: null,
-    };
-    mockDbQueryOne.mockResolvedValue(profileRow);
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', content: 'Owner identity', contentHash: 'owner-hash', revision: 4, updatedAt: 10,
+    });
     const app = await buildApp();
 
     const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=repo-stable-id');
@@ -1278,11 +1296,17 @@ describe('session-mgmt persistence routes', () => {
     await expect(read.json()).resolves.toEqual({
       profile: expect.objectContaining({ scope: 'project', scopeKey: 'repo-stable-id', content: 'Owner identity' }),
     });
-    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
-      'owner-user', 'project', 'repo-stable-id',
-    ]);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'get', scope: 'project', scopeKey: 'repo-stable-id' },
+      expect.any(Number),
+    );
 
-    mockDbQueryOne.mockResolvedValueOnce({ ...profileRow, content: 'Participant overwrite', revision: 5 });
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({ status: 'ok', contentHash: 'overwrite-hash', revision: 1, updatedAt: 20 });
+    mockDbQueryOne.mockResolvedValueOnce({
+      scope: 'project', scope_key: 'repo-stable-id', content_hash: 'overwrite-hash', content_length: 20,
+      revision: 5, updated_at: 20, source: 'web', source_file: null,
+    });
     const write = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -1292,16 +1316,27 @@ describe('session-mgmt persistence routes', () => {
     await expect(write.json()).resolves.toEqual({
       profile: expect.objectContaining({ content: 'Participant overwrite', revision: 5 }),
     });
-    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('INSERT INTO session_identity_profiles'),
-      expect.arrayContaining(['owner-user', 'project', 'repo-stable-id', 'Participant overwrite']));
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      expect.objectContaining({ op: 'set', scope: 'project', scopeKey: 'repo-stable-id', content: 'Participant overwrite' }),
+      expect.any(Number),
+    );
+    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('INSERT INTO session_identity_metadata'),
+      expect.arrayContaining(['owner-user', 'project', 'repo-stable-id', 'overwrite-hash']));
 
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({ status: 'ok' });
     const clear = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=repo-stable-id', {
       method: 'DELETE',
     });
     expect(clear.status).toBe(200);
     await expect(clear.json()).resolves.toEqual({ deleted: true });
-    expect(mockDbExecute).toHaveBeenLastCalledWith(expect.stringContaining('DELETE FROM session_identity_profiles'), [
-      'owner-user', 'project', 'repo-stable-id', null,
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'delete', scope: 'project', scopeKey: 'repo-stable-id' },
+      expect.any(Number),
+    );
+    expect(mockDbExecute).toHaveBeenLastCalledWith(expect.stringContaining('DELETE FROM session_identity_metadata'), [
+      'owner-user', 'project', 'repo-stable-id',
     ]);
   });
 
@@ -1315,26 +1350,35 @@ describe('session-mgmt persistence routes', () => {
     resolveSessionIdentityProjectKeyMock.mockImplementation((name) => (
       name === 'deck_proj_brain' ? 'github-org/repo' : null
     ));
-    mockDbQueryOne.mockResolvedValue({
-      scope: 'project', scope_key: 'github-org/repo', content: 'Owner project identity',
-      content_hash: 'h', revision: 1, updated_at: 10, source: 'web', source_file: null,
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', content: 'Owner project identity', contentHash: 'h', revision: 1, updatedAt: 10,
     });
     const app = await buildApp();
 
     const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=project&scopeKey=proj');
     expect(read.status).toBe(200);
-    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
-      'owner-user', 'project', 'github-org/repo',
-    ]);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'get', scope: 'project', scopeKey: 'github-org/repo' },
+      expect.any(Number),
+    );
 
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({ status: 'ok', contentHash: 'edited-hash', revision: 2, updatedAt: 30 });
+    mockDbQueryOne.mockResolvedValueOnce({
+      scope: 'project', scope_key: 'github-org/repo', content_hash: 'edited-hash', content_length: 21,
+      revision: 2, updated_at: 30, source: 'web', source_file: null,
+    });
     const write = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ scope: 'project', scopeKey: 'proj', content: 'Edited by participant' }),
     });
     expect(write.status).toBe(200);
-    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('INSERT INTO session_identity_profiles'),
-      expect.arrayContaining(['owner-user', 'project', 'github-org/repo', 'Edited by participant']));
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      expect.objectContaining({ op: 'set', scope: 'project', scopeKey: 'github-org/repo', content: 'Edited by participant' }),
+      expect.any(Number),
+    );
     resolveSessionIdentityProjectKeyMock.mockReset();
     resolveSessionIdentityProjectKeyMock.mockImplementation(() => null);
   });
@@ -1343,14 +1387,16 @@ describe('session-mgmt persistence routes', () => {
     mockResolveHttpShareAccessForCoveredSession.mockResolvedValue({
       actor: { kind: 'share', effectiveActorRole: 'participant' },
     });
-    mockDbQueryOne.mockResolvedValue(null);
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({ status: 'ok' });
     const app = await buildApp();
 
     const read = await app.request('/api/server/srv-1/sessions/deck_proj_brain/identity?scope=session&scopeKey=srv-1:deck_other_brain');
     expect(read.status).toBe(200);
-    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
-      'owner-user', 'session', 'srv-1:deck_proj_brain',
-    ]);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'get', scope: 'session', scopeKey: 'srv-1:deck_proj_brain' },
+      expect.any(Number),
+    );
   });
 
   it('serves the machine owner\'s identity to a whole-server participant before any session exists', async () => {
@@ -1359,9 +1405,8 @@ describe('session-mgmt persistence routes', () => {
       actor: { kind: 'share', effectiveActorRole: 'participant' },
       shareProvenance: 'server',
     });
-    mockDbQueryOne.mockResolvedValue({
-      scope: 'project', scope_key: 'proj', content: 'Owner project identity',
-      content_hash: 'h', revision: 1, updated_at: 10, source: 'web', source_file: null,
+    sendSessionIdentityLocalRequestMock.mockResolvedValueOnce({
+      status: 'ok', content: 'Owner project identity', contentHash: 'h', revision: 1, updatedAt: 10,
     });
     const app = await buildApp();
 
@@ -1370,9 +1415,11 @@ describe('session-mgmt persistence routes', () => {
     await expect(read.json()).resolves.toEqual({
       profile: expect.objectContaining({ scope: 'project', content: 'Owner project identity' }),
     });
-    expect(mockDbQueryOne).toHaveBeenLastCalledWith(expect.stringContaining('FROM session_identity_profiles'), [
-      'owner-user', 'project', 'proj',
-    ]);
+    expect(sendSessionIdentityLocalRequestMock).toHaveBeenLastCalledWith(
+      expect.stringContaining('identity-'),
+      { op: 'get', scope: 'project', scopeKey: 'proj' },
+      expect.any(Number),
+    );
   });
 
   it('refuses the server-level identity route to session-scoped participants and viewers', async () => {

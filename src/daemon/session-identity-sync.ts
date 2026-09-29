@@ -7,14 +7,20 @@ import {
   sessionIdentitySessionKey,
   type SessionIdentityProfile,
 } from '../../shared/session-identity.js';
-import {
-  getEffectiveSessionIdentityProfiles,
-  listSessionIdentityProfiles,
-  type SessionIdentityClientOptions,
-} from './session-identity-mcp-client.js';
+import { listLocalSessionIdentityProfiles } from './session-identity-local-store.js';
+import { loadCredentials } from '../bind/bind-flow.js';
 
+/**
+ * Periodic LOCAL reconciliation only -- a safety net that recomputes every
+ * live session's rendered identity prompt from the daemon's own local cache
+ * and applies it if it drifted. No network call of any kind: PROJECT/SESSION
+ * content lives on this daemon already (session-identity-local-store.ts),
+ * and USER-scope content arrives by server push (see WsBridge's
+ * SESSION_IDENTITY_WS.PUSH handling), never a poll. Owner rule,
+ * tsk_cd_identity_daemon_storage: the daemon must never call the server over
+ * HTTP for identity.
+ */
 export const SESSION_IDENTITY_SYNC_INTERVAL_MS = 60_000;
-const SESSION_IDENTITY_HYDRATION_CONCURRENCY = 4;
 
 export interface SessionIdentitySyncResult {
   status: 'ok' | 'error' | 'skipped';
@@ -24,10 +30,19 @@ export interface SessionIdentitySyncResult {
 }
 
 export interface SessionIdentitySyncDeps {
-  listProfiles?: typeof listSessionIdentityProfiles;
-  getEffectiveProfiles?: typeof getEffectiveSessionIdentityProfiles;
+  listLocalProfiles?: typeof listLocalSessionIdentityProfiles;
   listLocalSessions?: typeof listSessions;
   applyIdentity?: typeof applyEffectiveSessionIdentity;
+  /** This daemon's own bound serverId (for the SESSION-scope key). */
+  boundServerId?: () => Promise<string | undefined>;
+}
+
+async function defaultBoundServerId(): Promise<string | undefined> {
+  try {
+    return (await loadCredentials())?.serverId;
+  } catch {
+    return undefined;
+  }
 }
 
 export interface SessionIdentityRefreshAck {
@@ -57,74 +72,20 @@ function profilesForSession(
   ));
 }
 
-async function hydrateTruncatedProfiles(
-  sessions: readonly SessionRecord[],
-  snapshot: { profiles: SessionIdentityProfile[]; serverId: string },
-  options: SessionIdentityClientOptions,
-  getEffective: typeof getEffectiveSessionIdentityProfiles,
-): Promise<{ profiles: SessionIdentityProfile[]; error?: string }> {
-  const merged = new Map(snapshot.profiles.map((profile) => [
-    `${profile.scope}\0${profile.scopeKey}`,
-    profile,
-  ]));
-  let next = 0;
-  let firstError: string | undefined;
-  const worker = async () => {
-    while (next < sessions.length) {
-      const session = sessions[next++];
-      if (!session) continue;
-      const result = await getEffective({
-        projectKey: sessionIdentityProjectKey({
-          contextNamespace: session.contextNamespace,
-          project: session.projectName,
-        }),
-        sessionName: session.name,
-      }, options);
-      if (result.status !== 'ok') {
-        firstError ??= result.message;
-        continue;
-      }
-      for (const profile of result.profiles) {
-        merged.set(`${profile.scope}\0${profile.scopeKey}`, profile);
-      }
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(SESSION_IDENTITY_HYDRATION_CONCURRENCY, sessions.length) }, worker));
-  return { profiles: [...merged.values()], ...(firstError ? { error: firstError } : {}) };
-}
-
-/**
- * Fetch one user-scoped snapshot and converge every local session. This is
- * deliberately one HTTP request per daemon rather than three per session.
- */
+/** Recompute every live session's identity prompt from the local cache and apply on drift. */
 export async function syncSessionIdentities(
-  options: SessionIdentityClientOptions = {},
   deps: SessionIdentitySyncDeps = {},
 ): Promise<SessionIdentitySyncResult> {
   // An explicit UI/MCP refresh must join an already-running periodic sync,
   // rather than report a false success before that sync has applied anything.
   if (syncInFlight) return syncInFlight;
   syncInFlight = (async () => {
-    const snapshot = await (deps.listProfiles ?? listSessionIdentityProfiles)(options);
-    if (snapshot.status !== 'ok') {
-      return { status: 'error', checked: 0, changed: 0, message: snapshot.message };
-    }
+    const profiles = await (deps.listLocalProfiles ?? listLocalSessionIdentityProfiles)();
     const sessions = (deps.listLocalSessions ?? listSessions)().filter((session) => session.state !== 'stopped');
-    const hydrated = snapshot.truncated
-      ? await hydrateTruncatedProfiles(
-        sessions,
-        snapshot,
-        options,
-        deps.getEffectiveProfiles ?? getEffectiveSessionIdentityProfiles,
-      )
-      : { profiles: snapshot.profiles };
-    if (hydrated.error) return { status: 'error', checked: sessions.length, changed: 0, message: hydrated.error };
-    const profiles = hydrated.profiles;
+    const serverId = (await (deps.boundServerId ?? defaultBoundServerId)()) ?? '';
     let changed = 0;
     for (const session of sessions) {
-      const prompt = renderSessionIdentityProfiles(
-        profilesForSession(profiles, session, snapshot.serverId),
-      );
+      const prompt = renderSessionIdentityProfiles(profilesForSession(profiles, session, serverId));
       if ((session.identityPrompt?.trim() || undefined) === prompt) continue;
       (deps.applyIdentity ?? applyEffectiveSessionIdentity)(session.name, prompt, { refresh: true });
       changed += 1;
@@ -138,45 +99,17 @@ export async function syncSessionIdentities(
   }
 }
 
-/**
- * Refresh one exact session from a snapshot fetched after the user's write.
- * Do not join the periodic all-session request: that request may already hold
- * a pre-write snapshot and would acknowledge the save without applying it.
- */
+/** Refresh one exact session from the local cache. */
 export async function syncSessionIdentity(
   sessionName: string,
-  options: SessionIdentityClientOptions = {},
   deps: SessionIdentitySyncDeps = {},
 ): Promise<SessionIdentitySyncResult> {
   const session = (deps.listLocalSessions ?? listSessions)()
     .find((candidate) => candidate.name === sessionName && candidate.state !== 'stopped');
   if (!session) return { status: 'error', checked: 0, changed: 0, message: 'session identity target is unavailable' };
-  const snapshot = deps.listProfiles
-    ? await deps.listProfiles(options)
-    : await (deps.getEffectiveProfiles ?? getEffectiveSessionIdentityProfiles)({
-      projectKey: sessionIdentityProjectKey({
-        contextNamespace: session.contextNamespace,
-        project: session.projectName,
-      }),
-      sessionName: session.name,
-    }, options);
-  if (snapshot.status !== 'ok') return { status: 'error', checked: 1, changed: 0, message: snapshot.message };
-  const hydrated = ('truncated' in snapshot && snapshot.truncated)
-    ? await (deps.getEffectiveProfiles ?? getEffectiveSessionIdentityProfiles)({
-      projectKey: sessionIdentityProjectKey({
-        contextNamespace: session.contextNamespace,
-        project: session.projectName,
-      }),
-      sessionName: session.name,
-    }, options)
-    : snapshot;
-  if (hydrated.status !== 'ok') return { status: 'error', checked: 1, changed: 0, message: hydrated.message };
-  const profiles = deps.listProfiles && !('truncated' in snapshot && snapshot.truncated)
-    ? profilesForSession(hydrated.profiles, session, snapshot.serverId)
-    : hydrated.profiles;
-  const prompt = renderSessionIdentityProfiles(
-    profiles,
-  );
+  const profiles = await (deps.listLocalProfiles ?? listLocalSessionIdentityProfiles)();
+  const serverId = (await (deps.boundServerId ?? defaultBoundServerId)()) ?? '';
+  const prompt = renderSessionIdentityProfiles(profilesForSession(profiles, session, serverId));
   if ((session.identityPrompt?.trim() || undefined) === prompt) {
     return { status: 'ok', checked: 1, changed: 0 };
   }
@@ -216,15 +149,14 @@ export async function syncSessionIdentitiesForCommand(
 }
 
 export function startSessionIdentitySync(
-  options: SessionIdentityClientOptions = {},
   onError: (message: string) => void = () => undefined,
 ): void {
   if (syncTimer) return;
-  void syncSessionIdentities(options).then((result) => {
+  void syncSessionIdentities().then((result) => {
     if (result.status === 'error' && result.message) onError(result.message);
   });
   syncTimer = setInterval(() => {
-    void syncSessionIdentities(options).then((result) => {
+    void syncSessionIdentities().then((result) => {
       if (result.status === 'error' && result.message) onError(result.message);
     });
   }, SESSION_IDENTITY_SYNC_INTERVAL_MS);

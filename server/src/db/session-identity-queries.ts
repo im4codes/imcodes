@@ -10,7 +10,12 @@ import {
 interface IdentityProfileRow {
   scope: SessionIdentityScope;
   scope_key: string;
-  content: string;
+  /**
+   * NULL once a PROJECT/SESSION row's content has been migrated to (and
+   * hash-confirmed by) its owning daemon -- see WsBridge's
+   * handleSessionIdentityMigrateConfirm. USER-scope rows are never null.
+   */
+  content: string | null;
   content_hash: string;
   revision: number;
   updated_at: number;
@@ -23,11 +28,110 @@ export interface SessionIdentityProfileSnapshot {
   truncated: boolean;
 }
 
+interface IdentityMetadataRow {
+  scope: SessionIdentityScope;
+  scope_key: string;
+  content_hash: string;
+  content_length: number;
+  revision: number;
+  updated_at: number;
+  source: 'web' | 'mcp';
+  source_file: string | null;
+}
+
+function mapMetadataRow(row: IdentityMetadataRow): SessionIdentityProfile {
+  return {
+    scope: row.scope,
+    scopeKey: row.scope_key,
+    content: '',
+    contentHash: row.content_hash,
+    revision: Number(row.revision),
+    updatedAt: Number(row.updated_at),
+    source: row.source,
+    ...(row.source_file ? { sourceFile: row.source_file } : {}),
+  };
+}
+
+export async function getSessionIdentityMetadata(
+  db: Database,
+  userId: string,
+  scope: SessionIdentityScope,
+  scopeKey: string,
+): Promise<SessionIdentityProfile | null> {
+  const row = await db.queryOne<IdentityMetadataRow>(
+    `SELECT scope, scope_key, content_hash, content_length, revision, updated_at, source, source_file
+       FROM session_identity_metadata
+      WHERE user_id = $1 AND scope = $2 AND scope_key = $3`,
+    [userId, scope, scopeKey],
+  );
+  return row ? mapMetadataRow(row) : null;
+}
+
+export async function upsertSessionIdentityMetadata(
+  db: Database,
+  input: {
+    userId: string;
+    scope: SessionIdentityScope;
+    scopeKey: string;
+    contentHash: string;
+    contentLength: number;
+    source: 'web' | 'mcp';
+    sourceFile?: string;
+  },
+): Promise<SessionIdentityProfile> {
+  const now = Date.now();
+  const row = await db.queryOne<IdentityMetadataRow>(
+    `INSERT INTO session_identity_metadata
+       (user_id, scope, scope_key, content_hash, content_length, source, revision, updated_at, source_file)
+     VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8)
+     ON CONFLICT (user_id, scope, scope_key) DO UPDATE SET
+       content_hash = excluded.content_hash,
+       content_length = excluded.content_length,
+       source = excluded.source,
+       source_file = excluded.source_file,
+       revision = session_identity_metadata.revision + 1,
+       updated_at = excluded.updated_at
+     RETURNING scope, scope_key, content_hash, content_length, revision, updated_at, source, source_file`,
+    [input.userId, input.scope, input.scopeKey, input.contentHash, input.contentLength, input.source, now, input.sourceFile ?? null],
+  );
+  if (!row) throw new Error('identity metadata write failed');
+  return mapMetadataRow(row);
+}
+
+export async function deleteSessionIdentityMetadata(
+  db: Database,
+  userId: string,
+  scope: SessionIdentityScope,
+  scopeKey: string,
+): Promise<boolean> {
+  const result = await db.execute(
+    `DELETE FROM session_identity_metadata WHERE user_id = $1 AND scope = $2 AND scope_key = $3`,
+    [userId, scope, scopeKey],
+  );
+  return result.changes > 0;
+}
+
+export async function listSessionIdentityMetadata(
+  db: Database,
+  userId: string,
+): Promise<SessionIdentityProfileSnapshot> {
+  const rows = await db.query<IdentityMetadataRow>(
+    `SELECT scope, scope_key, content_hash, content_length, revision, updated_at, source, source_file
+       FROM session_identity_metadata
+      WHERE user_id = $1
+      ORDER BY CASE scope WHEN 'user' THEN 0 WHEN 'project' THEN 1 ELSE 2 END, scope_key ASC`,
+    [userId],
+  );
+  return { profiles: rows.map(mapMetadataRow), truncated: false };
+}
+
 function mapRow(row: IdentityProfileRow): SessionIdentityProfile {
   return {
     scope: row.scope,
     scopeKey: row.scope_key,
-    content: row.content,
+    // NULL (a migrated PROJECT/SESSION row) reads as "no content here" --
+    // callers that need PROJECT/SESSION content now read it from the daemon.
+    content: row.content ?? '',
     contentHash: row.content_hash,
     revision: Number(row.revision),
     updatedAt: Number(row.updated_at),

@@ -1,91 +1,92 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { join } from 'node:path';
+import { rm } from 'node:fs/promises';
 import {
   clearSessionIdentityProfile,
   getEffectiveSessionIdentityProfiles,
+  getSessionIdentityProfile,
   listSessionIdentityProfiles,
   setSessionIdentityProfile,
 } from '../../src/daemon/session-identity-mcp-client.js';
 
+const home = join(process.cwd(), '.tmp-identity-client');
 const endpoint = { workerUrl: 'https://im.example.test/', serverId: 'srv-1', token: 'secret-token' };
 
-function jsonResponse(body: unknown, status = 200): Response {
-  return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
-}
+afterEach(async () => {
+  vi.unstubAllEnvs();
+  await rm(home, { recursive: true, force: true });
+});
 
-describe('session identity online client', () => {
-  it('loads one user-scoped snapshot for cross-machine daemon convergence', async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse({ profiles: [{
-      scope: 'user', scopeKey: '', content: 'global identity', contentHash: 'hash', revision: 2, updatedAt: 3, source: 'mcp',
-    }] }));
-    const result = await listSessionIdentityProfiles({ endpoint, fetchImpl });
-    expect(result).toMatchObject({ status: 'ok', serverId: 'srv-1', profiles: [{ content: 'global identity' }] });
-    expect(fetchImpl).toHaveBeenCalledWith('https://im.example.test/api/session-identities/all?serverId=srv-1', expect.objectContaining({
-      headers: { Authorization: 'Bearer secret-token', 'X-Server-Id': 'srv-1' },
-    }));
-  });
-
-  it('ignores legacy optimistic revisions and sends a last-write-wins update', async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse({ profile: {
-      scope: 'session', scopeKey: 'srv-1:deck_proj_cc1', content: 'identity',
-      contentHash: 'hash', revision: 5, updatedAt: 1, source: 'mcp',
-    } }));
-    const result = await setSessionIdentityProfile({
-      scope: 'session',
-      scopeKey: 'srv-1:deck_proj_cc1',
-      content: 'identity',
-      expectedRevision: 4,
+/**
+ * Owner rule (tsk_cd_identity_daemon_storage): the daemon must never call the
+ * server over HTTP for identity -- get/set/clear/list/effective all read and
+ * write session-identity-local-store.ts directly. Every test below passes a
+ * `fetchImpl` spy and asserts it is NEVER called, which is the causal proof:
+ * on the pre-fix code this same call would have made 1-3 real fetch() calls.
+ */
+describe('session identity local-first client (never HTTP)', () => {
+  it('sets and reads back a profile purely from local disk, never calling fetch', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const fetchImpl = vi.fn();
+    const written = await setSessionIdentityProfile({
+      scope: 'project', scopeKey: 'repo-1', content: 'project identity',
     }, { endpoint, fetchImpl });
-    expect(result).toMatchObject({ status: 'ok', profile: { revision: 5 } });
-    const [url, init] = fetchImpl.mock.calls[0]!;
-    expect(String(url)).toContain('scope=session');
-    expect(String(url)).toContain('scopeKey=srv-1%3Adeck_proj_cc1');
-    expect(JSON.parse(String(init.body))).toEqual({
-      scope: 'session', scopeKey: 'srv-1:deck_proj_cc1', content: 'identity',
-    });
+    expect(written).toMatchObject({ status: 'ok', profile: { content: 'project identity', revision: 1 } });
+    const read = await getSessionIdentityProfile('project', 'repo-1', { endpoint, fetchImpl });
+    expect(read).toMatchObject({ status: 'ok', profile: { content: 'project identity' } });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('ignores the legacy expected revision when clearing one scope', async () => {
-    const fetchImpl = vi.fn(async () => jsonResponse({ deleted: true }));
+  it('lists every locally-stored profile across scopes, never calling fetch', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const fetchImpl = vi.fn();
+    await setSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'global identity' }, { endpoint, fetchImpl });
+    await setSessionIdentityProfile({ scope: 'session', scopeKey: 'srv-1:deck_proj_cc1', content: 'session identity' }, { endpoint, fetchImpl });
+    const result = await listSessionIdentityProfiles({ endpoint, fetchImpl });
+    expect(result).toMatchObject({
+      status: 'ok', serverId: 'srv-1', truncated: false,
+      profiles: expect.arrayContaining([
+        expect.objectContaining({ scope: 'user', content: 'global identity' }),
+        expect.objectContaining({ scope: 'session', content: 'session identity' }),
+      ]),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('clears a locally-stored profile, never calling fetch', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const fetchImpl = vi.fn();
+    await setSessionIdentityProfile({ scope: 'project', scopeKey: 'repo-1', content: 'x' }, { endpoint, fetchImpl });
     await expect(clearSessionIdentityProfile('project', 'repo-1', 7, { endpoint, fetchImpl }))
       .resolves.toEqual({ status: 'ok', deleted: true });
-    const [url, init] = fetchImpl.mock.calls[0]!;
-    expect(String(url)).not.toContain('expectedRevision');
-    expect(init.method).toBe('DELETE');
+    await expect(getSessionIdentityProfile('project', 'repo-1', { endpoint, fetchImpl }))
+      .resolves.toEqual({ status: 'ok', profile: null });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 
-  it('retries a transient fetch failure and converges without reporting stale', async () => {
-    const fetchImpl = vi.fn()
-      .mockRejectedValueOnce(new Error('fetch failed'))
-      .mockResolvedValueOnce(jsonResponse({ profiles: [] }));
-    await expect(listSessionIdentityProfiles({ endpoint, fetchImpl })).resolves.toMatchObject({
-      status: 'ok', serverId: 'srv-1', profiles: [], truncated: false,
-    });
-    expect(fetchImpl).toHaveBeenCalledTimes(2);
-  });
-
-  it('returns a bounded, explicit stale error after repeated aborts', async () => {
-    const fetchImpl = vi.fn(async () => { throw new Error('This operation was aborted'); });
-    const result = await listSessionIdentityProfiles({ endpoint, fetchImpl, timeoutMs: 1 });
-    expect(result).toMatchObject({ status: 'error', reason: 'internal_error' });
-    expect(result.message).toContain('failed after retries');
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
-  });
-
-  it('refreshes one session with only its effective three scope reads', async () => {
-    const fetchImpl = vi.fn(async (url: string | URL) => {
-      const value = String(url);
-      const scope = new URL(value).searchParams.get('scope');
-      return jsonResponse({ profile: scope === 'user' ? {
-        scope: 'user', scopeKey: '', content: 'global', contentHash: 'h1', revision: 1, updatedAt: 1, source: 'mcp',
-      } : scope === 'session' ? {
-        scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'session', contentHash: 'h2', revision: 1, updatedAt: 1, source: 'mcp',
-      } : null });
-    });
+  it('refreshes one session from only its three local scope reads, never calling fetch', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const fetchImpl = vi.fn();
+    await setSessionIdentityProfile({ scope: 'user', scopeKey: '', content: 'global' }, { endpoint, fetchImpl });
+    await setSessionIdentityProfile({ scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'session' }, { endpoint, fetchImpl });
     const result = await getEffectiveSessionIdentityProfiles({
       projectKey: 'repo-1', sessionName: 'deck_proj_brain',
     }, { endpoint, fetchImpl });
-    expect(result).toMatchObject({ status: 'ok', serverId: 'srv-1', profiles: expect.any(Array) });
-    expect(fetchImpl).toHaveBeenCalledTimes(3);
-    expect(fetchImpl.mock.calls.every(([url]) => !String(url).endsWith('/all'))).toBe(true);
+    expect(result).toMatchObject({
+      status: 'ok', serverId: 'srv-1',
+      profiles: expect.arrayContaining([
+        expect.objectContaining({ scope: 'user', content: 'global' }),
+        expect.objectContaining({ scope: 'session', content: 'session' }),
+      ]),
+    });
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('a missing local profile reads back null instead of erroring, never calling fetch', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    const fetchImpl = vi.fn();
+    await expect(getSessionIdentityProfile('project', 'never-written', { endpoint, fetchImpl }))
+      .resolves.toEqual({ status: 'ok', profile: null });
+    expect(fetchImpl).not.toHaveBeenCalled();
   });
 });

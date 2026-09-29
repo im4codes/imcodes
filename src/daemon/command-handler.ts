@@ -134,6 +134,12 @@ import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-
 import { supervisionAutomation } from './supervision-automation.js';
 import { refreshSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
 import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
+import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
+import {
+  handleSessionIdentityLocalRequest,
+  handleSessionIdentityMigrateResponse,
+  handleSessionIdentityPush,
+} from './session-identity-server-sync.js';
 import {
   normalizeSessionIdentityContent,
   sessionIdentityContentError,
@@ -1869,6 +1875,15 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       }).catch((err) => {
         logger.warn({ err }, 'legacy session identity refresh failed');
       });
+      break;
+    case SESSION_IDENTITY_WS.LOCAL_REQUEST:
+      void handleSessionIdentityLocalRequest(cmd, serverLink);
+      break;
+    case SESSION_IDENTITY_WS.PUSH:
+      void handleSessionIdentityPush(cmd);
+      break;
+    case SESSION_IDENTITY_WS.MIGRATE_RESPONSE:
+      void handleSessionIdentityMigrateResponse(cmd, serverLink);
       break;
     case 'session.send':
       dispatchSessionSend(cmd, serverLink);

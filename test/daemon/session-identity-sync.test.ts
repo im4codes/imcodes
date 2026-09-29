@@ -27,8 +27,16 @@ function profile(scope: SessionIdentityProfile['scope'], scopeKey: string, conte
   return { scope, scopeKey, content, contentHash: content, revision: 1, updatedAt: 1, source: 'mcp' };
 }
 
-describe('cross-machine session identity synchronization', () => {
-  it('uses one online snapshot and refreshes only sessions whose effective identity changed', async () => {
+/**
+ * Owner rule (tsk_cd_identity_daemon_storage): the 60s reconciliation loop
+ * now reads only the daemon's own local cache -- no network call of any
+ * kind. Every test below passes a `boundServerId` spy purely to compute the
+ * SESSION-scope key deterministically; it is never a network operation
+ * (session-identity-local-store.js's listLocalSessionIdentityProfiles is the
+ * only "fetch", and it is a local-disk read).
+ */
+describe('local-only session identity reconciliation', () => {
+  it('reads one local snapshot and refreshes only sessions whose effective identity changed', async () => {
     const unchangedPrompt = renderSessionIdentityProfiles([profile('user', '', 'global')]);
     const sessions = [
       session({ name: 'deck_proj_brain', identityPrompt: unchangedPrompt }),
@@ -36,26 +44,22 @@ describe('cross-machine session identity synchronization', () => {
       session({ name: 'deck_other_brain', projectName: 'other', identityPrompt: unchangedPrompt, contextNamespace: { scope: 'user_private', userId: 'u1', projectId: 'repo-2' } }),
       session({ name: 'deck_stopped', state: 'stopped' }),
     ];
-    const listProfiles = vi.fn(async () => ({
-      status: 'ok' as const,
-      serverId: 'srv-9',
-      profiles: [
-        profile('user', '', 'global'),
-        profile('project', 'repo-1', 'repo rules'),
-        profile('session', 'srv-9:deck_proj_cc1', 'worker rules'),
-      ],
-      truncated: false,
-    }));
+    const listLocalProfiles = vi.fn(async () => [
+      profile('user', '', 'global'),
+      profile('project', 'repo-1', 'repo rules'),
+      profile('session', 'srv-9:deck_proj_cc1', 'worker rules'),
+    ]);
     const applyIdentity = vi.fn(() => ({ applied: true }));
 
-    const result = await syncSessionIdentities({}, {
-      listProfiles,
+    const result = await syncSessionIdentities({
+      listLocalProfiles,
       listLocalSessions: () => sessions,
       applyIdentity,
+      boundServerId: async () => 'srv-9',
     });
 
     expect(result).toEqual({ status: 'ok', checked: 3, changed: 2 });
-    expect(listProfiles).toHaveBeenCalledTimes(1);
+    expect(listLocalProfiles).toHaveBeenCalledTimes(1);
     expect(applyIdentity).toHaveBeenCalledWith(
       'deck_proj_cc1',
       expect.stringMatching(/<user>[\s\S]*<project>[\s\S]*<session>/),
@@ -65,97 +69,42 @@ describe('cross-machine session identity synchronization', () => {
   });
 
   it('joins a concurrent periodic sync instead of falsely reporting skipped before apply completes', async () => {
-    let releaseSnapshot!: (value: {
-      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[]; truncated: boolean;
-    }) => void;
-    const listProfiles = vi.fn(() => new Promise<{
-      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[]; truncated: boolean;
-    }>((resolve) => { releaseSnapshot = resolve; }));
+    let releaseSnapshot!: (value: SessionIdentityProfile[]) => void;
+    const listLocalProfiles = vi.fn(() => new Promise<SessionIdentityProfile[]>((resolve) => { releaseSnapshot = resolve; }));
     const applyIdentity = vi.fn(() => ({ applied: true }));
     const deps = {
-      listProfiles,
+      listLocalProfiles,
       listLocalSessions: () => [session({ identityPrompt: undefined })],
       applyIdentity,
+      boundServerId: async () => 'srv-9',
     };
 
-    const periodic = syncSessionIdentities({}, deps);
-    const explicit = syncSessionIdentities({}, deps);
-    expect(listProfiles).toHaveBeenCalledTimes(1);
-    releaseSnapshot({ status: 'ok', serverId: 'srv-9', profiles: [profile('user', '', 'global')], truncated: false });
+    const periodic = syncSessionIdentities(deps);
+    const explicit = syncSessionIdentities(deps);
+    expect(listLocalProfiles).toHaveBeenCalledTimes(1);
+    releaseSnapshot([profile('user', '', 'global')]);
 
     await expect(periodic).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
     await expect(explicit).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
     expect(applyIdentity).toHaveBeenCalledTimes(1);
   });
 
-  it('hydrates a live session when the bounded snapshot reports truncation', async () => {
-    const target = session({ name: 'zz_session_last' });
-    const listProfiles = vi.fn(async () => ({
-      status: 'ok' as const,
-      serverId: 'srv-9',
-      profiles: [profile('user', '', 'global')],
-      truncated: true,
-    }));
-    const getEffectiveProfiles = vi.fn(async () => ({
-      status: 'ok' as const,
-      serverId: 'srv-9',
-      profiles: [profile('user', '', 'global'), profile('session', 'srv-9:zz_session_last', 'late session')],
-    }));
-    const applyIdentity = vi.fn(() => ({ applied: true }));
-
-    const result = await syncSessionIdentities({}, {
-      listProfiles,
-      getEffectiveProfiles,
-      listLocalSessions: () => [target],
-      applyIdentity,
+  it('never calls out to the network -- listLocalProfiles is the only data source', async () => {
+    const listLocalProfiles = vi.fn(async () => [profile('user', '', 'global')]);
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockImplementation(() => {
+      throw new Error('fetch must never be called by the local sync loop');
     });
-
-    expect(result).toEqual({ status: 'ok', checked: 1, changed: 1 });
-    expect(getEffectiveProfiles).toHaveBeenCalledWith({ projectKey: 'repo-1', sessionName: 'zz_session_last' }, {});
-    expect(applyIdentity).toHaveBeenCalledWith(
-      'zz_session_last', expect.stringContaining('late session'), { refresh: true },
-    );
-  });
-
-  it('reports a scoped hydration failure instead of applying a silently truncated identity', async () => {
-    const applyIdentity = vi.fn(() => ({ applied: true }));
-    const result = await syncSessionIdentities({}, {
-      listProfiles: async () => ({ status: 'ok' as const, serverId: 'srv-9', profiles: [], truncated: true }),
-      getEffectiveProfiles: async () => ({ status: 'error' as const, reason: 'internal_error', message: 'scoped read failed' }),
-      listLocalSessions: () => [session({ name: 'zz_session_last' })],
-      applyIdentity,
-    });
-    expect(result).toEqual({ status: 'error', checked: 1, changed: 0, message: 'scoped read failed' });
-    expect(applyIdentity).not.toHaveBeenCalled();
-  });
-
-  it('fetches a post-write snapshot for an explicit target instead of joining a stale periodic snapshot', async () => {
-    let releasePeriodic!: (value: {
-      status: 'ok'; serverId: string; profiles: SessionIdentityProfile[]; truncated: boolean;
-    }) => void;
-    const target = session({ identityPrompt: undefined });
-    const listProfiles = vi.fn()
-      .mockImplementationOnce(() => new Promise((resolve) => { releasePeriodic = resolve; }))
-      .mockResolvedValueOnce({
-        status: 'ok' as const,
-        serverId: 'srv-9',
-        profiles: [{ ...profile('session', 'srv-9:deck_proj_brain', 'Identity loaded from a selected file.'), sourceFile: '/identity.md' }],
-        truncated: false,
+    try {
+      await syncSessionIdentities({
+        listLocalProfiles,
+        listLocalSessions: () => [session({ identityPrompt: undefined })],
+        applyIdentity: () => ({ applied: true }),
+        boundServerId: async () => 'srv-9',
       });
-    const applyIdentity = vi.fn(() => ({ applied: true }));
-    const deps = { listProfiles, listLocalSessions: () => [target], applyIdentity };
-
-    const periodic = syncSessionIdentities({}, deps);
-    const explicit = syncSessionIdentity(target.name, {}, deps);
-    await expect(explicit).resolves.toEqual({ status: 'ok', checked: 1, changed: 1 });
-    expect(applyIdentity).toHaveBeenCalledWith(
-      target.name,
-      expect.stringContaining('Identity loaded from a selected file.'),
-      { refresh: true },
-    );
-    releasePeriodic({ status: 'ok', serverId: 'srv-9', profiles: [], truncated: false });
-    await periodic;
-    expect(listProfiles).toHaveBeenCalledTimes(2);
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
   });
 
   it('builds the explicit refresh ack only after convergence and carries failures', async () => {
@@ -179,23 +128,30 @@ describe('cross-machine session identity synchronization', () => {
     });
   });
 
-  it('uses the effective scoped reads for an explicit refresh', async () => {
-    const getEffectiveProfiles = vi.fn(async () => ({
-      status: 'ok' as const,
-      serverId: 'srv-9',
-      profiles: [profile('user', '', 'global'), profile('session', 'srv-9:deck_proj_brain', 'session')],
-      truncated: false,
-    }));
+  it('uses the local scoped reads for an explicit refresh of one session', async () => {
+    const listLocalProfiles = vi.fn(async () => [
+      profile('user', '', 'global'), profile('session', 'srv-9:deck_proj_brain', 'session'),
+    ]);
     const applyIdentity = vi.fn(() => ({ applied: true }));
-    const result = await syncSessionIdentity('deck_proj_brain', {}, {
-      getEffectiveProfiles,
+    const result = await syncSessionIdentity('deck_proj_brain', {
+      listLocalProfiles,
       listLocalSessions: () => [session({})],
       applyIdentity,
+      boundServerId: async () => 'srv-9',
     });
     expect(result).toEqual({ status: 'ok', checked: 1, changed: 1 });
-    expect(getEffectiveProfiles).toHaveBeenCalledWith({ projectKey: 'repo-1', sessionName: 'deck_proj_brain' }, {});
     expect(applyIdentity).toHaveBeenCalledWith(
       'deck_proj_brain', expect.stringContaining('session'), { refresh: true },
     );
+  });
+
+  it('reports the target unavailable instead of applying a stopped/missing session', async () => {
+    const result = await syncSessionIdentity('missing_session', {
+      listLocalProfiles: async () => [],
+      listLocalSessions: () => [session({ name: 'deck_stopped', state: 'stopped' })],
+      applyIdentity: () => ({ applied: true }),
+      boundServerId: async () => 'srv-9',
+    });
+    expect(result).toEqual({ status: 'error', checked: 0, changed: 0, message: 'session identity target is unavailable' });
   });
 });

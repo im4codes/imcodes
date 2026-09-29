@@ -117,6 +117,8 @@ import {
 } from './cgroup-validation-probes.js';
 import { runOrderedDaemonShutdown } from './ordered-shutdown.js';
 import { startSessionIdentitySync, stopSessionIdentitySync } from './session-identity-sync.js';
+import { setSessionIdentityReportSender } from './session-identity-local-store.js';
+import { requestSessionIdentityMigration } from './session-identity-server-sync.js';
 
 export { acquireInstanceLock, releaseInstanceLock } from './instance-lock.js';
 
@@ -1605,11 +1607,17 @@ export async function startup(): Promise<DaemonContext> {
   startCodexQuotaPoller(serverLink);
   startContextReplicationPoller(workerUrl, serverId, token);
   startUsageSyncWorker(workerUrl, serverId, token);
-  if (creds) {
-    startSessionIdentitySync({ endpoint: { workerUrl: creds.workerUrl, serverId: creds.serverId, token: creds.token } }, (message) => {
-      logger.warn({ reason: message }, 'session identity synchronization failed');
-    });
+  // PROJECT/SESSION/USER identity writes report themselves to the server
+  // over this same WS connection (never HTTP -- owner rule,
+  // tsk_cd_identity_daemon_storage). Set once here; session-identity-local-store.ts
+  // calls it on every local write.
+  if (serverLink) {
+    setSessionIdentityReportSender((report) => serverLink!.send(report));
+    void requestSessionIdentityMigration(serverLink);
   }
+  startSessionIdentitySync((message) => {
+    logger.warn({ reason: message }, 'session identity synchronization failed');
+  });
   startContextMaterializationPoller(liveContextIngestion);
   startGcPoller();
   startEventLoopDelayMonitor();
