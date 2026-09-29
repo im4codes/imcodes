@@ -18,6 +18,21 @@ import {
   type FileBrowserPreviewRequest,
   type FileBrowserPreviewUpdate,
 } from './components/file-browser-lazy.js';
+import {
+  DAEMON_LIVENESS_MSG,
+  DAEMON_STATS_MSG,
+  isDaemonMainLoopBusy,
+  mergeDaemonLiveness,
+  mergeDaemonStats,
+  type DaemonStatsView,
+} from '@shared/daemon-stats.js';
+import {
+  cpuSeverity,
+  formatCpuPercent,
+  formatMemoryCompact,
+  formatStatNumber,
+  formatUptime as formatDaemonUptime,
+} from './util/daemon-stats-format.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { sessionIdentityProjectKey } from '@shared/session-identity.js';
 import { AUTH_IDENTITY_ERRORS } from '@shared/auth-identity.js';
@@ -2989,7 +3004,7 @@ export function App() {
     }
     setShowDiscussionDialog(false);
   }, [pushDiscussionFailureToast]);
-  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; latestDaemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean } | null>(null);
+  const [daemonStats, setDaemonStats] = useState<DaemonStatsView | null>(null);
 
   useEffect(() => {
     if (!auth || !selectedServerId || sharedHashRestorePending) return;
@@ -4703,8 +4718,13 @@ export function App() {
       setServers((prev) => touchServerHeartbeat(prev, selectedServerId));
     });
     const unsubStats = ws.onMessage((msg) => {
-      if (msg.type === 'daemon.stats') {
-        setDaemonStats({ daemonVersion: msg.daemonVersion, latestDaemonVersion: msg.latestDaemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime, mainEventLoopLagMs: msg.mainEventLoopLagMs, mainEventLoopBlockedMs: msg.mainEventLoopBlockedMs, mainEventLoopBusy: msg.mainEventLoopBusy });
+      // A liveness frame (link-worker heartbeat) proves the daemon is alive just
+      // like a stats frame, but carries no system numbers: both fold into the
+      // last snapshot instead of replacing it, so nothing ever blanks or turns NaN.
+      if (msg.type === DAEMON_STATS_MSG || msg.type === DAEMON_LIVENESS_MSG) {
+        setDaemonStats((prev) => (msg.type === DAEMON_STATS_MSG
+          ? mergeDaemonStats(prev, msg as unknown as Record<string, unknown>)
+          : mergeDaemonLiveness(prev, msg as unknown as Record<string, unknown>)));
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
@@ -6415,26 +6435,26 @@ export function App() {
             )}
             {daemonStats && (
               <div class="sidebar-stats-row">
-                <span style={{ color: daemonStats.cpu > 80 ? '#f87171' : daemonStats.cpu > 50 ? '#fbbf24' : '#4ade80' }}>
-                  CPU {daemonStats.cpu}%
+                <span style={{ color: { danger: '#f87171', warn: '#fbbf24', ok: '#4ade80' }[cpuSeverity(daemonStats.cpu) ?? 'ok'] }}>
+                  CPU {formatCpuPercent(daemonStats.cpu)}
                 </span>
                 <span style={{ color: '#a78bfa' }}>
-                  Load {daemonStats.load1}
+                  Load {formatStatNumber(daemonStats.load1)}
                 </span>
               </div>
             )}
             {daemonStats && (
               <div class="sidebar-stats-row">
                 <span style={{ color: '#60a5fa' }}>
-                  Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
+                  Mem {formatMemoryCompact(daemonStats.memUsed)}/{formatMemoryCompact(daemonStats.memTotal)}
                 </span>
-                {daemonStats.mainEventLoopBusy && (
+                {isDaemonMainLoopBusy(daemonStats) && (
                   <span style={{ color: '#fb923c' }} title="Main daemon event loop is busy">
                     Busy {Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms
                   </span>
                 )}
                 <span style={{ color: '#94a3b8' }}>
-                  {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
+                  {formatDaemonUptime(daemonStats.uptime)}
                 </span>
               </div>
             )}
@@ -7210,7 +7230,7 @@ export function App() {
                   />
                   <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
-                    {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}{daemonStats.mainEventLoopBusy ? ` · Busy ${Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms` : ''}</span>}
+                    {daemonStats && <span>CPU {formatCpuPercent(daemonStats.cpu)} · Load {formatStatNumber(daemonStats.load1)}{isDaemonMainLoopBusy(daemonStats) ? ` · Busy ${Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms` : ''}</span>}
                   </span>
                   {daemonUpgrading && (
                     <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>

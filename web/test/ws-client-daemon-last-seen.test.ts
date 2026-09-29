@@ -145,6 +145,20 @@ describe('WsClient daemonLastSeenAt freshness whitelist (N4)', () => {
     expect(client.isDaemonCapabilityStale(queryAt)).toBe(false);
   });
 
+  it('daemon.liveness (link-worker heartbeat) keeps the connection fresh too', async () => {
+    // With the core-lane worker on, the heartbeat -- not a full stats frame --
+    // may be the only thing arriving while the main thread is busy.
+    const { client, ws } = await connect();
+    const baseTime = 1_000_000_000_000;
+    vi.spyOn(Date, 'now').mockReturnValue(baseTime);
+    seedHello(ws);
+
+    vi.spyOn(Date, 'now').mockReturnValue(baseTime + P2P_CAPABILITY_FRESHNESS_TTL_MS - 1_000);
+    sendDaemonMsg(ws, 'daemon.liveness', { mainEventLoopBusy: true, mainEventLoopBlockedMs: 30_000 });
+
+    expect(client.isDaemonCapabilityStale(baseTime + P2P_CAPABILITY_FRESHNESS_TTL_MS + 5_000)).toBe(false);
+  });
+
   it('repo.checkout_branch_response keeps the daemon connection fresh', async () => {
     const { client, ws } = await connect();
     const baseTime = 1_000_000_000_000;

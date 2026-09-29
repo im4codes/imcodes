@@ -39,6 +39,7 @@ import {
   SUPERVISION_MODE_PROJECTION_KEY,
 } from '../../../shared/supervision-config.js';
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
+import { DAEMON_STATS_MSG, DAEMON_STATS_NUMERIC_KEYS } from '../../../shared/daemon-stats.js';
 import { isDirectConnectivityRuntimeStatus } from '../../../shared/direct-file-transfer.js';
 import type { ProviderQuotaMeta, ProviderQuotaWindow } from '../../../shared/provider-quota.js';
 
@@ -315,7 +316,7 @@ type DaemonMessagePolicy = {
 };
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessagePolicy>([
-  ['daemon.stats', {
+  [DAEMON_STATS_MSG, {
     target: serverFieldTarget,
     redact: redactDaemonStatsForParticipant,
     // Stats contain no session transcript and are rebuilt from a strict
@@ -1029,13 +1030,16 @@ function redactDaemonStatsForParticipant(
   // The status strip needs only operational health. Rebuild the frame instead
   // of forwarding arbitrary daemon fields so a future token/secret field can
   // never become visible merely because daemon.stats was expanded upstream.
-  const redacted: Record<string, unknown> = { type: 'daemon.stats' };
-  for (const key of ['daemonVersion', 'latestDaemonVersion', 'cpu', 'memUsed', 'memTotal', 'load1', 'load5', 'load15', 'uptime']) {
+  const redacted: Record<string, unknown> = { type: DAEMON_STATS_MSG };
+  for (const key of ['daemonVersion', 'latestDaemonVersion', ...DAEMON_STATS_NUMERIC_KEYS]) {
     const value = msg[key];
     if (typeof value === 'number' || typeof value === 'string' || value === null) {
       redacted[key] = value;
     }
   }
+  // A frame with no system numbers says nothing a status strip can show, and a
+  // viewer that takes it at face value blanks what it already had.
+  if (!DAEMON_STATS_NUMERIC_KEYS.some((key) => typeof redacted[key] === 'number')) return null;
 
   // A session share gets the status bar without server diagnostics. A server
   // participant is owner-equivalent for operational status and receives only

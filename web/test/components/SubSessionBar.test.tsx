@@ -1532,6 +1532,64 @@ describe('SubSessionBar', () => {
     );
   }
 
+  describe('daemon status frames fold into the last snapshot', () => {
+    const livenessFrame = {
+      type: 'daemon.liveness',
+      daemonVersion: '2026.5.2161-dev.7',
+      mainEventLoopLagMs: 4,
+      mainEventLoopBlockedMs: 30_000,
+      mainEventLoopBusy: true,
+    };
+
+    function openDetails(view: ReturnType<typeof renderBarWithStats>) {
+      fireEvent.click(view.getByLabelText('Show daemon details'));
+      return view.getByRole('dialog');
+    }
+
+    it.each([['collapsed', true], ['expanded', false]] as const)(
+      'keeps CPU, memory, load and uptime when liveness-only and number-less frames arrive (%s bar and detail card)',
+      async (_label, collapsed) => {
+        const statsWs = makeStatsWs();
+        const view = renderBarWithStats(collapsed, statsWs);
+        await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+        act(() => { statsWs.emit(daemonStatsMessage); });
+        const before = view.container.querySelector('.daemon-stats-inline')!.textContent;
+
+        // The frame the link worker's heartbeat becomes, and what an older
+        // server used to send in its place: stats with every number missing.
+        act(() => { statsWs.emit(livenessFrame); });
+        act(() => { statsWs.emit({ type: 'daemon.stats', daemonVersion: '2026.5.2161-dev.7' }); });
+        act(() => { statsWs.emit({ ...daemonStatsMessage, cpu: undefined, memUsed: Number.NaN, load1: null, uptime: 'soon' }); });
+
+        expect(view.container.querySelector('.daemon-stats-inline')!.textContent).toBe(before);
+        const dialog = openDetails(view);
+        const cards = dialog.querySelector('.daemon-details-grid')!.textContent!;
+        expect(cards).toContain('2%');
+        expect(cards).toContain('9.9 / 41.2 GB');
+        expect(cards).toContain('0.8 / 0.7 / 0.6');
+        expect(cards).toContain('1h');
+        expect(view.container.textContent).not.toContain('NaN');
+        expect(dialog.textContent).not.toContain('NaN');
+      },
+    );
+
+    it('shows a placeholder, never NaN, while no full stats frame has arrived yet', async () => {
+      const statsWs = makeStatsWs();
+      const view = renderBarWithStats(false, statsWs);
+      await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+
+      act(() => { statsWs.emit(livenessFrame); });
+      const strip = view.container.querySelector('.daemon-stats-inline')!;
+      expect(strip.textContent).toContain('CPU —');
+      expect(strip.textContent).not.toContain('NaN');
+
+      const dialog = openDetails(view);
+      const cards = dialog.querySelector('.daemon-details-grid')!.textContent!;
+      expect(cards).not.toContain('NaN');
+      expect(cards).toContain('—');
+    });
+  });
+
   it.each([['collapsed', true], ['expanded', false]] as const)(
     'surfaces a short-ref persistence failure in the %s status bar',
     async (_label, collapsed) => {

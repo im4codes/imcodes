@@ -223,6 +223,13 @@ import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
 import { isCoreLaneStatus } from '../../../shared/core-lane-status.js';
 import {
+  DAEMON_LIVENESS_MSG,
+  DAEMON_STATS_MSG,
+  hasDaemonLiveness,
+  hasAnyDaemonSystemStats,
+  pickDaemonLiveness,
+} from '../../../shared/daemon-stats.js';
+import {
   MEMORY_WS,
   isMemoryManagementRequestType,
   isMemoryManagementResponseType,
@@ -8475,10 +8482,23 @@ export class WsBridge {
     }
 
     // ── Daemon stats: extract from heartbeat or standalone, broadcast to browsers ─
-    if (type === 'daemon.stats' || (type === 'heartbeat' && (msg.cpu !== undefined || msg.mainEventLoopBlockedMs !== undefined))) {
+    // A heartbeat from the core-lane link worker carries only event-loop
+    // liveness. Rebuilding it as a full daemon.stats put undefined into every
+    // number, and viewers that replace their last stats rendered NaN/unknown
+    // until the next full frame. It goes out as its own frame instead.
+    if (type === 'heartbeat' && !hasAnyDaemonSystemStats(msg) && hasDaemonLiveness(msg)) {
       if (typeof msg.daemonVersion === 'string') this.daemonVersion = msg.daemonVersion;
       this.broadcastToBrowsers(JSON.stringify({
-        type: 'daemon.stats',
+        type: DAEMON_LIVENESS_MSG,
+        daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
+        ...pickDaemonLiveness(msg),
+      }));
+      return;
+    }
+    if (type === DAEMON_STATS_MSG || (type === 'heartbeat' && hasAnyDaemonSystemStats(msg))) {
+      if (typeof msg.daemonVersion === 'string') this.daemonVersion = msg.daemonVersion;
+      this.broadcastToBrowsers(JSON.stringify({
+        type: DAEMON_STATS_MSG,
         daemonVersion: typeof msg.daemonVersion === 'string' ? msg.daemonVersion : this.daemonVersion,
         latestDaemonVersion: process.env.APP_VERSION ?? null,
         cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal,

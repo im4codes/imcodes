@@ -2758,6 +2758,79 @@ describe('App shell', () => {
     }
   }, 20_000);
 
+  it('keeps the daemon numbers when liveness-only and number-less frames arrive, and shows the busy hint from liveness', async () => {
+    const originalUserAgent = navigator.userAgent;
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(navigator, 'userAgent', { configurable: true, value: 'Android' });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 800 });
+
+    try {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+      const { App } = await importApp();
+      const view = render(<App />);
+      const ws = await getActiveWsClient();
+      const footerStatus = async () => {
+        if (!view.container.querySelector('.mobile-sidebar-overlay.open')) {
+          fireEvent.click(view.container.querySelector('.mobile-sidebar-toggle')!);
+        }
+        return waitFor(() => {
+          const node = view.container.querySelector('.mobile-sidebar-overlay.open .mobile-sidebar-daemon-status');
+          expect(node).toBeTruthy();
+          return node!;
+        });
+      };
+
+      await act(async () => {
+        ws.emit({ type: 'session.event', event: 'connected', session: '', state: 'connected' });
+        // Liveness before any full stats: placeholders, never NaN.
+        ws.emit({ type: 'daemon.liveness', daemonVersion: '2026.9.4508-dev', mainEventLoopLagMs: 3, mainEventLoopBlockedMs: 40, mainEventLoopBusy: false });
+      });
+      const early = (await footerStatus()).textContent ?? '';
+      expect(early).toContain('CPU — · Load —');
+      expect(early).not.toContain('NaN');
+
+      await act(async () => {
+        ws.emit({
+          type: 'daemon.stats',
+          daemonVersion: '2026.9.4508-dev',
+          cpu: 28, memUsed: 1, memTotal: 2, load1: 2.78, load5: 0, load15: 0, uptime: 10,
+        });
+      });
+      await waitFor(async () => expect((await footerStatus()).textContent).toContain('CPU 28% · Load 2.78'));
+
+      // The link worker reports the main thread stuck: the hint appears, the
+      // numbers stay.
+      await act(async () => {
+        ws.emit({ type: 'daemon.liveness', daemonVersion: '2026.9.4508-dev', mainEventLoopLagMs: 5, mainEventLoopBlockedMs: 30_000, mainEventLoopBusy: true });
+      });
+      await waitFor(async () => expect((await footerStatus()).textContent).toContain('CPU 28% · Load 2.78 · Busy 30000ms'));
+
+      // What an older server sent for the same heartbeat: stats with no numbers.
+      await act(async () => {
+        ws.emit({ type: 'daemon.stats', daemonVersion: '2026.9.4508-dev' });
+      });
+      const after = (await footerStatus()).textContent ?? '';
+      expect(after).toContain('CPU 28% · Load 2.78 · Busy 30000ms');
+      expect(after).not.toContain('NaN');
+
+      // Recovery is reported by the next liveness frame.
+      await act(async () => {
+        ws.emit({ type: 'daemon.liveness', daemonVersion: '2026.9.4508-dev', mainEventLoopLagMs: 2, mainEventLoopBlockedMs: 10, mainEventLoopBusy: false });
+      });
+      await waitFor(async () => {
+        const text = (await footerStatus()).textContent ?? '';
+        expect(text).toContain('CPU 28% · Load 2.78');
+        expect(text).not.toContain('Busy');
+      });
+    } finally {
+      Object.defineProperty(navigator, 'userAgent', { configurable: true, value: originalUserAgent });
+      Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+    }
+  }, 20_000);
+
   it('keeps the mobile server menu available on wide-viewport Android browsers', async () => {
     const originalUserAgent = navigator.userAgent;
     const originalInnerWidth = window.innerWidth;

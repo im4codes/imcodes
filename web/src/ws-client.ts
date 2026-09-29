@@ -7,6 +7,7 @@ import type { TransportPendingMessageEntry } from './transport-queue.js';
 import { apiFetch, ApiError } from './api.js';
 import type { TimelineEvent } from '../../src/shared/timeline/types.js';
 import { markPerfFrame } from './perf-render-debug.js';
+import { DAEMON_LIVENESS_MSG, DAEMON_STATS_MSG } from '@shared/daemon-stats.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { DAEMON_UPGRADE_BLOCK_REASON } from '@shared/daemon-upgrade.js';
@@ -251,7 +252,8 @@ export type ServerMessage =
   | { type: 'discussion.done'; discussionId: string; filePath: string; conclusion: string }
   | { type: 'discussion.error'; discussionId?: string; requestId?: string; error: string }
   | { type: 'discussion.list'; discussions: Array<{ id: string; requestId?: string; topic: string; state: string; currentRound: number; maxRounds: number; completedHops?: number; totalHops?: number; currentSpeaker?: string; conclusion?: string; filePath?: string }> }
-  | { type: 'daemon.stats'; daemonVersion?: string | null; latestDaemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth; directConnectivity?: import('@shared/direct-file-transfer.js').DirectConnectivityRuntimeStatus; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
+  | { type: typeof DAEMON_LIVENESS_MSG; daemonVersion?: string | null; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
+  | { type: typeof DAEMON_STATS_MSG; daemonVersion?: string | null; latestDaemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; embedding?: EmbeddingStatus; disks?: DiskUsage[]; shortRefHealth?: MemoryShortRefHealth; directConnectivity?: import('@shared/direct-file-transfer.js').DirectConnectivityRuntimeStatus; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean }
   | FsLsResponse
   | FsReadResponse
   | FsGitStatusResponse
@@ -1586,7 +1588,9 @@ export class WsClient {
     P2P_WORKFLOW_MSG.STATUS_RESPONSE,
     P2P_WORKFLOW_MSG.LIST_DISCUSSIONS_RESPONSE,
     P2P_WORKFLOW_MSG.READ_DISCUSSION_RESPONSE,
-    'daemon.stats',
+    DAEMON_STATS_MSG,
+    // Link-worker liveness: the daemon's own process produced it moments ago.
+    DAEMON_LIVENESS_MSG,
     TIMELINE_MESSAGES.EVENT,
     TIMELINE_MESSAGES.REPLAY,
     TIMELINE_MESSAGES.HISTORY,

@@ -2,6 +2,24 @@
  * SubSessionBar — bottom panel showing sub-session preview cards.
  * Cards show live chat/terminal previews. Single or double row layout.
  */
+import {
+  DAEMON_LIVENESS_MSG,
+  DAEMON_STATS_MSG,
+  isFiniteStat,
+  mergeDaemonLiveness,
+  mergeDaemonStats,
+  type DaemonStatsView,
+} from '@shared/daemon-stats.js';
+import {
+  DAEMON_STAT_PLACEHOLDER,
+  cpuSeverity,
+  formatCpuPercent,
+  formatLoadTriple,
+  formatMemoryCompact,
+  formatMemoryPair,
+  formatStatNumber,
+  formatUptime,
+} from '../util/daemon-stats-format.js';
 import { useState, useEffect, useMemo, useRef, useCallback } from 'preact/hooks';
 import type { JSX } from 'preact';
 import { createPortal, memo } from 'preact/compat';
@@ -77,15 +95,12 @@ import {
   subscribeDirectFileConnectionStatus,
 } from '../direct-file-transfer.js';
 
-interface DaemonStats {
-  daemonVersion?: string | null;
-  cpu: number;
-  memUsed: number;
-  memTotal: number;
-  load1: number;
-  load5: number;
-  load15: number;
-  uptime: number;
+function cpuClass(cpu: number | null | undefined): string {
+  const severity = cpuSeverity(cpu);
+  return severity === 'danger' ? ' danger' : severity === 'warn' ? ' warn' : '';
+}
+
+interface DaemonStats extends DaemonStatsView {
   embedding?: EmbeddingStatus | null;
   disks?: DiskUsage[] | null;
   shortRefHealth?: MemoryShortRefHealth | null;
@@ -233,20 +248,6 @@ function loadQuickClosedIds(key: string): string[] {
   const stored = load<unknown>(key, []);
   if (!Array.isArray(stored)) return [];
   return [...new Set(stored.filter((value): value is string => typeof value === 'string' && value.trim().length > 0))];
-}
-
-function formatUptime(seconds: number): string {
-  const d = Math.floor(seconds / 86400);
-  const h = Math.floor((seconds % 86400) / 3600);
-  return d > 0 ? `${d}d ${h}h` : `${h}h`;
-}
-
-function formatMemoryPair(usedBytes: number, totalBytes: number): string {
-  const totalGb = totalBytes / (1024 ** 3);
-  if (totalGb >= 1) {
-    return `${(usedBytes / (1024 ** 3)).toFixed(1)} / ${totalGb.toFixed(1)} GB`;
-  }
-  return `${(usedBytes / (1024 ** 2)).toFixed(0)} / ${(totalBytes / (1024 ** 2)).toFixed(0)} MB`;
 }
 
 /** Format a used/total byte pair in a shared GB or TB unit — never smaller
@@ -627,7 +628,7 @@ function DaemonStatsModal({
         <div class="daemon-details-grid">
           <div class="daemon-details-card daemon-details-card-cpu">
             <span>{t('subsessionBar.daemon_details_cpu')}</span>
-            <strong>{stats.cpu}%</strong>
+            <strong>{formatCpuPercent(stats.cpu)}</strong>
           </div>
           <div class="daemon-details-card daemon-details-card-memory">
             <span>{t('subsessionBar.daemon_details_memory')}</span>
@@ -635,7 +636,7 @@ function DaemonStatsModal({
           </div>
           <div class="daemon-details-card daemon-details-card-load">
             <span>{t('subsessionBar.daemon_details_load')}</span>
-            <strong>{stats.load1} / {stats.load5} / {stats.load15}</strong>
+            <strong>{formatLoadTriple(stats.load1, stats.load5, stats.load15)}</strong>
           </div>
           <div class="daemon-details-card daemon-details-card-uptime">
             <span>{t('subsessionBar.daemon_details_uptime')}</span>
@@ -1305,26 +1306,12 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   useEffect(() => {
     if (!ws) return;
     return ws.onMessage((msg) => {
-      if (msg.type === 'daemon.stats') {
-        setStats({
-          daemonVersion: msg.daemonVersion,
-          cpu: msg.cpu,
-          memUsed: msg.memUsed,
-          memTotal: msg.memTotal,
-          load1: msg.load1,
-          load5: msg.load5,
-          load15: msg.load15,
-          uptime: msg.uptime,
-          // Older daemons don't ship `embedding`; preserve null so the
-          // icon falls through to its "unknown" rendering instead of
-          // showing a misleading "ready".
-          embedding: msg.embedding ?? null,
-          // Older daemons don't ship `disks`; null means "no data" so the
-          // desktop strip simply hides the readout (and mobile never shows it).
-          disks: msg.disks ?? null,
-          shortRefHealth: msg.shortRefHealth ?? null,
-          directConnectivity: msg.directConnectivity ?? null,
-        });
+      // Frames fold into the last snapshot (see mergeDaemonStats): a partial or
+      // liveness-only frame must never blank the card or turn a number into NaN.
+      if (msg.type === DAEMON_STATS_MSG) {
+        setStats((prev) => mergeDaemonStats<DaemonStats>(prev, msg as unknown as Record<string, unknown>));
+      } else if (msg.type === DAEMON_LIVENESS_MSG) {
+        setStats((prev) => mergeDaemonLiveness<DaemonStats>(prev, msg as unknown as Record<string, unknown>));
       }
     });
   }, [ws]);
@@ -1606,7 +1593,7 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
               <button
                 type="button"
                 class="daemon-stats-inline daemon-stats-inline-tech daemon-stats-trigger"
-                title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+                title={`${stats.daemonVersion ? `Daemon ${stats.daemonVersion} | ` : ''}Load: ${formatLoadTriple(stats.load1, stats.load5, stats.load15)} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
                 onClick={() => setShowDaemonDetails(true)}
                 aria-haspopup="dialog"
                 aria-label={t('subsessionBar.daemon_details_open')}
@@ -1626,16 +1613,16 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                     <span class="daemon-stat-sep"> · </span>
                   </>
                 )}
-                <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}>
-                  CPU {stats.cpu}%
+                <span class={`daemon-stat-cpu${cpuClass(stats.cpu)}`}>
+                  CPU {formatCpuPercent(stats.cpu)}
                 </span>
                 <span class="daemon-stat-sep"> · </span>
                 <span class="daemon-stat-mem">
-                  Mem {(() => { const gb = stats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(stats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}
+                  Mem {formatMemoryCompact(stats.memUsed)}
                 </span>
                 <span class="daemon-stat-sep"> · </span>
                 <span class="daemon-stat-load">
-                  Load {stats.load1}
+                  Load {formatStatNumber(stats.load1)}
                 </span>
                 {desktopLayoutCapable && stats.disks && stats.disks.length > 0 && (
                   <>
@@ -1683,18 +1670,19 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
         )}
         {/* Collapsed toolbar: compact stats strip. */}
         {collapsed && stats && (() => {
-          const totalGb = stats.memTotal / (1024 ** 3);
+          const totalGb = (stats.memTotal ?? 0) / (1024 ** 3);
           const useG = totalGb >= 1;
           const div = useG ? 1024 ** 3 : 1024 ** 2;
           const unit = useG ? 'G' : 'M';
-          const memUsed = (stats.memUsed / div).toFixed(1);
-          const memTotal = useG ? totalGb.toFixed(1) : (stats.memTotal / div).toFixed(0);
+          const memKnown = isFiniteStat(stats.memUsed) && isFiniteStat(stats.memTotal);
+          const memUsed = memKnown ? ((stats.memUsed ?? 0) / div).toFixed(1) : DAEMON_STAT_PLACEHOLDER;
+          const memTotal = memKnown ? (useG ? totalGb.toFixed(1) : ((stats.memTotal ?? 0) / div).toFixed(0)) : DAEMON_STAT_PLACEHOLDER;
           const ei = { fontSize: '0.65em', verticalAlign: 'middle' } as const;
           return (
             <button
               type="button"
               class={`daemon-stats-inline daemon-stats-inline-tech daemon-stats-compact daemon-stats-trigger${desktopLayoutCapable ? '' : ' daemon-stats-mobile'}`}
-              title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${stats.cpu}% | Mem ${memUsed}/${memTotal}${unit} | Load: ${stats.load1} / ${stats.load5} / ${stats.load15} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
+              title={`${stats.daemonVersion ? `v${stats.daemonVersion} | ` : ''}CPU ${formatCpuPercent(stats.cpu)} | Mem ${memUsed}/${memTotal}${memKnown ? unit : ''} | Load: ${formatLoadTriple(stats.load1, stats.load5, stats.load15)} | Uptime: ${formatUptime(stats.uptime)}${desktopLayoutCapable ? ` | ${localClockText}` : ''}`}
               onClick={() => setShowDaemonDetails(true)}
               aria-haspopup="dialog"
               aria-label={t('subsessionBar.daemon_details_open')}
@@ -1708,11 +1696,11 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
                   {formatDaemonVersionMobile(stats.daemonVersion)}
                 </span>
               ))}
-              <span class={`daemon-stat-cpu${stats.cpu > 80 ? ' danger' : stats.cpu > 50 ? ' warn' : ''}`}><span style={ei}>⚙️</span>{stats.cpu}%</span>
+              <span class={`daemon-stat-cpu${cpuClass(stats.cpu)}`}><span style={ei}>⚙️</span>{isFiniteStat(stats.cpu) ? `${stats.cpu}%` : DAEMON_STAT_PLACEHOLDER}</span>
               {' '}
-              <span class="daemon-stat-mem"><span style={ei}>🧠</span>{memUsed}/{memTotal}{unit}</span>
+              <span class="daemon-stat-mem"><span style={ei}>🧠</span>{memUsed}/{memTotal}{memKnown ? unit : ''}</span>
               {' '}
-              <span class="daemon-stat-load">≡{Number(stats.load1).toFixed(1)}</span>
+              <span class="daemon-stat-load">≡{formatStatNumber(stats.load1, 1)}</span>
               {' '}
               {desktopLayoutCapable && stats.disks && stats.disks.length > 0 && (
                 <>{renderDiskStats(stats.disks)}{' '}</>
