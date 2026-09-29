@@ -7,6 +7,7 @@ import { describe, it, expect } from 'vitest';
 import { readdir } from 'node:fs/promises';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { isMigrationFile } from '../src/db/migrate.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const MIGRATIONS_DIR = join(__dirname, '../src/db/migrations');
@@ -22,6 +23,13 @@ function sortMigrations(files: string[]): string[] {
 }
 
 describe('migration sort', () => {
+  it('ignores archive metadata and non-canonical names', () => {
+    expect(isMigrationFile('001_init.sql')).toBe(true);
+    expect(isMigrationFile('099_feature-name.sql')).toBe(true);
+    expect(isMigrationFile('._001_init.sql')).toBe(false);
+    expect(isMigrationFile('001_init.SQL')).toBe(false);
+    expect(isMigrationFile('migration.sql')).toBe(false);
+  });
   it('sorts 3-digit prefixed files in numeric order', () => {
     const files = ['010_foo.sql', '002_bar.sql', '001_init.sql', '035_baz.sql'];
     expect(sortMigrations(files)).toEqual([
