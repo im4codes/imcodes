@@ -120,6 +120,16 @@ export function buildReworkNoticeMessage(pair: TaskPairState, counts: TaskPairSe
   ].join('\n');
 }
 
+export function buildBrainReopenNoticeMessage(pair: TaskPairState, reason?: string): string {
+  return [
+    header(pair),
+    `Brain reopened this pair and invalidated its previous PASS for the current head. The pair is now ${pair.status}; do not write DONE for the old passed head.`,
+    ...(reason ? [`Reason: ${reason}`] : []),
+    `Executor: ${pair.executor ?? '-'}, auditor: ${pair.auditor ?? '-'}. A fresh READY_FOR_AUDIT with a new head is required before the next PASS.`,
+    contracts(pair.blocking),
+  ].join('\n');
+}
+
 export function buildAuditorProposalNudgeMessage(pair: TaskPairState): string {
   return [
     header(pair),

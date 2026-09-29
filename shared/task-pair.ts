@@ -800,6 +800,8 @@ export type TaskPairIntent =
   | { kind: 'correction'; to: string; judgement: TaskPairVerdictJudgement }
   | { kind: 'done_reminder'; to: string }
   | { kind: 'rework_notice'; to: string; counts: TaskPairSeverityCounts }
+  /** Brain explicitly invalidated a prior PASS and reopened this pair. */
+  | { kind: 'brain_reopen_notice'; reason?: string }
   | { kind: 'auditor_proposal_nudge'; to: string }
   | { kind: 'convergence_checkpoint_nudge'; to: string }
   /** An audit round opened: tell the auditor where the material is. */
@@ -1249,7 +1251,7 @@ export function applyTaskPairMarker(
   const guardedAfterPass = pair.status === 'passed' && (
     verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT'
       || verb === 'PASS' || verb === 'REWORK' || verb === TASK_PAIR_CHECK_VERB
-  );
+  ) && !(role === 'brain' && (verb === 'STARTED' || verb === 'WORKING' || verb === 'REWORK'));
   const guardedAfterClose = terminal && (
     verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT'
       || verb === 'PASS' || verb === 'REWORK' || verb === TASK_PAIR_CHECK_VERB
@@ -1264,6 +1266,21 @@ export function applyTaskPairMarker(
     intents.push({ kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId, text });
     return done('recorded', { unusual: true });
   };
+
+  // A merge review may reject an already-audited result after PASS. Brain's
+  // explicit WORKING/STARTED/REWORK is the only non-terminal control that may
+  // reopen that pair: invalidate the passed material/head first, then require
+  // a fresh READY_FOR_AUDIT before another PASS can apply.
+  if (pair.status === 'passed' && role === 'brain'
+    && (verb === 'STARTED' || verb === 'WORKING' || verb === 'REWORK')) {
+    pair.status = verb === 'REWORK' ? 'rework' : 'working';
+    pair.material = undefined;
+    pair.passRound = undefined;
+    pair.lastVerdict = undefined;
+    resetCaps(pair);
+    intents.push({ kind: 'brain_reopen_notice', reason: attrs.note?.trim() || undefined });
+    return done('reopened');
+  }
 
   if (verb === TASK_PAIR_CHECK_VERB) {
     const check = parseTaskPairChecklistCheck(attrs);

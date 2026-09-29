@@ -63,6 +63,7 @@ import {
   buildNoAuditorDoneNotice,
   buildPassDoneNoticeMessage,
   buildReworkNoticeMessage,
+  buildBrainReopenNoticeMessage,
   buildUntitledTaskTitleRequest,
   buildAuditorProposalNudgeMessage,
   buildConvergenceCheckpointMessage,
@@ -984,6 +985,14 @@ export class TaskPairService {
           case 'rework_notice':
             await sendTaskPairMessage(intent.to, pair.taskId, 'rework', buildReworkNoticeMessage(pair, intent.counts));
             break;
+          case 'brain_reopen_notice': {
+            const recipients = [pair.executor, pair.auditor]
+              .filter((target): target is string => !!target && target !== TASK_PAIR_NO_AUDITOR);
+            await Promise.all([...new Set(recipients)].map((target) => sendTaskPairMessage(
+              target, pair.taskId, 'brain-reopen', buildBrainReopenNoticeMessage(pair, intent.reason),
+            )));
+            break;
+          }
           case 'auditor_proposal_nudge':
             await sendTaskPairMessage(intent.to, pair.taskId, 'auditor-proposal-nudge', buildAuditorProposalNudgeMessage(pair));
             break;

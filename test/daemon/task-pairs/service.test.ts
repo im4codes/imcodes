@@ -205,6 +205,54 @@ describe('task-pair marker ingestion', () => {
     expect(pair('brain-awaiting')).toMatchObject({ flags: ['blocked'], blockedNote: 'new wait' });
   });
 
+  it('Brain WORKING reopens a passed pair, invalidates the head, and rejects old-head DONE', async () => {
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'brain-reopen', attrs: { executor: EXEC, auditor: AUD } }, source: 'marker', eventId: 'reopen-dispatch' });
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'brain-reopen', attrs: { worktree: '/tmp/reopen', head: 'head-1', base: 'base-1' } }, source: 'marker', eventId: 'reopen-ready-1' });
+    service.applyMarker({ project: PROJECT, writer: AUD, marker: { verb: 'PASS', knownVerb: 'PASS', taskId: 'brain-reopen', attrs: { blocking: 'P0' } }, source: 'marker', eventId: 'reopen-pass-1' });
+    expect(pair('brain-reopen')).toMatchObject({ status: 'passed', passRound: 1, material: { head: 'head-1' } });
+
+    const reopened = service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: 'brain-reopen', attrs: { note: 'merge review rejected this head' } },
+      source: 'marker', eventId: 'reopen-working',
+    });
+    expect(reopened).toMatchObject({ effect: 'reopened', fromStatus: 'passed', toStatus: 'working' });
+    expect(pair('brain-reopen')).toMatchObject({ status: 'working' });
+    expect(pair('brain-reopen')?.passRound).toBeUndefined();
+    expect(pair('brain-reopen')?.material).toBeUndefined();
+    expect(pair('brain-reopen')?.lastVerdict).toBeUndefined();
+    const reopenTargets = sent.filter((entry) => entry.id.includes(':brain-reopen:')).map((entry) => entry.target);
+    expect(reopenTargets).toContain(EXEC);
+    expect(reopenTargets).toContain(AUD);
+    expect(getTaskPairStore().listEvents(PROJECT, 'brain-reopen').some((event) => (
+      event.effect === 'reopened' && event.attrs.note === 'merge review rejected this head'
+    ))).toBe(true);
+
+    const oldDone = service.applyMarker({ project: PROJECT, writer: EXEC, marker: { verb: 'DONE', knownVerb: 'DONE', taskId: 'brain-reopen', attrs: {} }, source: 'marker', eventId: 'reopen-old-done' });
+    expect(oldDone.effect).toBe('recorded');
+    expect(oldDone.unusual).toBe(true);
+    expect(pair('brain-reopen')?.status).toBe('working');
+
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'brain-reopen', attrs: { worktree: '/tmp/reopen', head: 'head-2', base: 'base-1' } }, source: 'marker', eventId: 'reopen-ready-2' });
+    service.applyMarker({ project: PROJECT, writer: AUD, marker: { verb: 'PASS', knownVerb: 'PASS', taskId: 'brain-reopen', attrs: { blocking: 'P0' } }, source: 'marker', eventId: 'reopen-pass-2' });
+    expect(pair('brain-reopen')).toMatchObject({ status: 'passed', passRound: 2, material: { head: 'head-2' } });
+    await flush();
+  });
+
+  it('only Brain can reopen a passed pair; Brain REWORK reopens without material', () => {
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'brain-rework-reopen', attrs: { executor: EXEC, auditor: AUD } }, source: 'marker', eventId: 'rework-reopen-dispatch' });
+    service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'brain-rework-reopen', attrs: { worktree: '/tmp/reopen', head: 'head-1', base: 'base-1' } }, source: 'marker', eventId: 'rework-reopen-ready' });
+    service.applyMarker({ project: PROJECT, writer: AUD, marker: { verb: 'PASS', knownVerb: 'PASS', taskId: 'brain-rework-reopen', attrs: { blocking: 'P0' } }, source: 'marker', eventId: 'rework-reopen-pass' });
+    const participant = service.applyMarker({ project: PROJECT, writer: EXEC, marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: 'brain-rework-reopen', attrs: {} }, source: 'marker', eventId: 'rework-reopen-participant' });
+    expect(participant.effect).toBe('recorded');
+    expect(pair('brain-rework-reopen')?.status).toBe('passed');
+    const reopened = service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'REWORK', knownVerb: 'REWORK', taskId: 'brain-rework-reopen', attrs: { note: 'rework required after merge review', blocking: 'P0', p0: '1' } }, source: 'marker', eventId: 'rework-reopen-brain' });
+    expect(reopened).toMatchObject({ effect: 'reopened', toStatus: 'rework' });
+    expect(pair('brain-rework-reopen')?.status).toBe('rework');
+    expect(pair('brain-rework-reopen')?.material).toBeUndefined();
+    expect(pair('brain-rework-reopen')?.passRound).toBeUndefined();
+  });
+
   it('keeps DISPATCH deduplication independent per executor target', () => {
     for (const [taskId, target] of [['D1', EXEC], ['D2', PROC]] as const) {
       service.applyMarker({ project: PROJECT, writer: BRAIN, marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId, attrs: { executor: target, auditor: AUD } }, source: 'marker', now: Date.now(), eventId: `dedup-${taskId}` });
