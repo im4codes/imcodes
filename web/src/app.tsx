@@ -3782,6 +3782,17 @@ export function App() {
 
     const ws = new WsClient(auth.baseUrl, selectedServerId, { shareTarget: selectedShareTarget });
     wsRef.current = ws;
+    // Test-only, opt-in via an explicit query param: lets the identity-over-lease
+    // real-machine harness (test/perf/browser/identity-p2p.spec.mjs) call
+    // getSessionIdentityDirect/setSessionIdentityDirect directly against the
+    // app's own live connection, instead of driving the settings UI blindly.
+    // Never set unless a caller explicitly opts in via the URL.
+    if (new URLSearchParams(window.location.search).get('identityTestHooks') === '1') {
+      (window as unknown as { __identityTestWs__?: WsClient }).__identityTestWs__ = ws;
+      void import('./direct-file-transfer.js').then((mod) => {
+        (window as unknown as { __identityTestDirectFileTransfer__?: unknown }).__identityTestDirectFileTransfer__ = mod;
+      });
+    }
 
     const unsub = ws.onMessage((msg) => {
       if (msg.type === 'session.event') {

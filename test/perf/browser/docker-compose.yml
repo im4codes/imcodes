@@ -38,6 +38,21 @@ services:
       HOME: /tmp/imc-perf-home
       IMCODES_HOME: /tmp/imc-perf-home/.imcodes
       IMCODES_PERF_DEBUG: "1"
+      # Unset (default) in every profile except identity: readTurnServiceConfig
+      # (server/src/ws/turn-credentials.ts) requires TURN_ENABLED=true, so this
+      # is a pure no-op everywhere else. TURN_HOST is the docker-network
+      # service name -- resolved by Docker's own DNS from inside the harness
+      # container, never a real public host. TURN_EXTERNAL_IP is validated
+      # (must be a syntactically valid IPv4) but never placed in the ICE
+      # server URL actually sent to clients, so a same-network coturn with no
+      # NAT to traverse does not need its own real external IP here.
+      TURN_ENABLED: ${TURN_ENABLED:-}
+      TURN_HOST: ${TURN_HOST:-}
+      TURN_PORT: ${TURN_PORT:-}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
+      TURN_RELAY_MIN_PORT: ${TURN_RELAY_MIN_PORT:-}
+      TURN_RELAY_MAX_PORT: ${TURN_RELAY_MAX_PORT:-}
     depends_on:
       postgres:
         condition: service_healthy
@@ -205,9 +220,90 @@ services:
     shm_size: 1g
     pids_limit: 256
 
+  # Real WebRTC identity-over-lease scenario (tsk_cd_identity_p2p_phase2).
+  # Kept behind the identity profile for the same reason shell is: isolated,
+  # opt-in, and never part of the default timeline-perf run.
+  coturn:
+    profiles: ["identity"]
+    image: coturn/coturn:4.15.0-alpine
+    command:
+      - "-n"
+      - "--listening-ip=0.0.0.0"
+      - "--listening-port=3479"
+      - "--realm=imcodes-identity-perf"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SHARED_SECRET:-0000000000000000000000000000000000000000000000000000000000000000}"
+      - "--no-cli"
+      - "--min-port=65436"
+      - "--max-port=65535"
+    ports:
+      - "3479:3479/udp"
+      - "3479:3479/tcp"
+      - "65436-65535:65436-65535/udp"
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 64
+
+  identity-daemon:
+    profiles: ["identity"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/identity-daemon.Dockerfile
+    working_dir: /repo
+    volumes:
+      - identity_perf_home:/tmp/imc-identity-home
+    environment:
+      HOME: /tmp/imc-identity-home
+      IMCODES_HOME: /tmp/imc-identity-home/.imcodes
+      IMC_PERF_WORKER_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_identity_real_server
+      IMC_PERF_DAEMON_TOKEN: imc-identity-real-daemon-token
+      IMC_PERF_API_KEY: imc_identity_perf_browser_key
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_IDENTITY_CONTROL_PORT:-19140}:19139"]
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 256
+
+  identity-harness:
+    profiles: ["identity"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - identity_perf_results:/repo/perf-results
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_identity_real_server
+      IMC_PERF_API_KEY: imc_identity_perf_browser_key
+      IMC_PERF_IDENTITY_SESSION: deck_identity_perf_brain
+      IMC_PERF_IDENTITY_PROJECT_ID: identity-perf-org/identity-perf-repo
+      IMC_PERF_IDENTITY_CONTROL_URL: http://identity-daemon:19139
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/identity-p2p.spec.mjs"]
+    depends_on:
+      identity-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+      web:
+        condition: service_healthy
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
 volumes:
   perf_home:
   perf_results:
   shell_perf_home:
   shell_perf_results:
   perf_uploads:
+  identity_perf_home:
+  identity_perf_results:
