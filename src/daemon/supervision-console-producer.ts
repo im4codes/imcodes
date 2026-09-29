@@ -55,10 +55,25 @@ import {
 import type { SupervisionMigrationDb } from './supervision-store-migrations.js';
 import { yieldToEventLoop } from './event-loop-yield.js';
 import { traceAsync, traceSync } from './latency-tracer.js';
-import { setEventLoopWatchdogPhase } from './event-loop-watchdog.js';
+import { withEventLoopWatchdogPhase } from './event-loop-watchdog.js';
 
-/** Keep one SQLite transaction small enough that the daemon heartbeat can run. */
+/** Upper bound on events read per slice; the time budget below usually stops a slice sooner. */
 export const SUPERVISION_PROJECTION_CHUNK_SIZE = 32;
+
+/**
+ * Wall-clock budget for ONE synchronous console-sync slice (projection commit
+ * plus frame delivery). Between slices the loop yields to the event loop, so a
+ * send acknowledgement, heartbeat or control frame never waits longer than one
+ * slice behind console projection work.
+ */
+export const SUPERVISION_SYNC_SLICE_BUDGET_MS = 15;
+/** Share of the slice budget spent projecting; the rest is left for delivery. */
+const SUPERVISION_SYNC_PROJECTION_SHARE = 0.6;
+/**
+ * A backlog up to this many events is projected inline (a few milliseconds);
+ * anything larger is drained in yielded, time-budgeted slices.
+ */
+export const SUPERVISION_INLINE_SYNC_MAX_EVENTS = 6;
 
 /** Named points a test can throw from to simulate a real crash. */
 export const SUPERVISION_CRASH_BOUNDARIES = [
@@ -88,6 +103,14 @@ export interface SupervisionProducerOptions {
   } | undefined;
   /** Cache identical subscribe snapshots for this bounded interval. */
   snapshotCacheTtlMs?: number;
+  /** Monotonic millisecond clock for slice budgets (default `performance.now`). */
+  monotonicNowMs?: () => number;
+  /** Per-slice wall-clock budget override (default {@link SUPERVISION_SYNC_SLICE_BUDGET_MS}). */
+  syncSliceBudgetMs?: number;
+  /** Yield between slices (default `setImmediate`). */
+  yieldToEventLoop?: () => Promise<void>;
+  /** Inline-vs-yielded backlog threshold override. */
+  inlineSyncMaxEvents?: number;
 }
 
 export interface SupervisionOutboxRow {
@@ -117,6 +140,17 @@ interface DurableRegistryEventRow {
   taskId: string;
   assignmentId?: string;
 }
+
+/** Assignment states that no longer occupy a pool slot (shared by the full and O(delta) pool paths). */
+const POOL_INACTIVE_ASSIGNMENT_STATUSES = ['finalized', 'pushed', 'blocked', 'cancelled'] as const;
+
+const ASSIGNMENT_ROW_SELECT = `SELECT a.assignment_id, a.task_id, a.role, a.status, a.session_name, a.agent_type, a.provider_family,
+              a.pool_kind, a.validation_state, a.observed_model, a.observed_provider, a.heartbeat_at,
+              a.audit_attempt_id, a.audit_revision, a.verdict, a.blocker, a.next_action,
+              a.recovery_state, a.recovery_reason, a.last_durable_event_id, a.updated_at,
+              a.lease_id, a.payload_json
+       FROM supervision_task_assignments a
+       INNER JOIN supervision_tasks t ON t.task_id = a.task_id`;
 
 function readValidationState(value: unknown): SupervisionConsoleValidationState {
   return typeof value === 'string'
@@ -157,8 +191,21 @@ export class SupervisionConsoleProducer {
    * Nothing writes assignments inside a pass, so one read per pass is exact.
    */
   #passAssignmentRows: Map<string, SupervisionTaskConsoleAssignmentRow[]> | null = null;
+  /**
+   * Per-pass memo for the O(delta) frame path: one assignment row / task
+   * visibility / pool summary is derived at most once per pass, exactly like
+   * `#passAssignmentRows` does for the full projection.
+   */
+  #passAssignmentById: Map<string, SupervisionTaskConsoleAssignmentRow | null> | null = null;
+  #passTaskVisible: Map<string, boolean> | null = null;
+  #passPools: Map<string, SupervisionTaskConsolePoolRow[]> | null = null;
+  #passNow = 0;
   /** Prevent timer/resubscribe storms from running duplicate large replays. */
   readonly #asyncReplayInFlight = new Map<string, Promise<number>>();
+  readonly #monotonicNowMs: () => number;
+  readonly #syncSliceBudgetMs: number;
+  readonly #yield: () => Promise<void>;
+  readonly #inlineSyncMaxEvents: number;
 
   constructor(db: SupervisionMigrationDb, options: SupervisionProducerOptions) {
     this.#db = db;
@@ -168,6 +215,10 @@ export class SupervisionConsoleProducer {
     this.#broadcast = options.broadcast;
     this.#resolveSessionPresentation = options.resolveSessionPresentation;
     this.#snapshotCacheTtlMs = Math.max(0, options.snapshotCacheTtlMs ?? 1_000);
+    this.#monotonicNowMs = options.monotonicNowMs ?? (() => performance.now());
+    this.#syncSliceBudgetMs = Math.max(1, options.syncSliceBudgetMs ?? SUPERVISION_SYNC_SLICE_BUDGET_MS);
+    this.#yield = options.yieldToEventLoop ?? yieldToEventLoop;
+    this.#inlineSyncMaxEvents = Math.max(1, options.inlineSyncMaxEvents ?? SUPERVISION_INLINE_SYNC_MAX_EVENTS);
   }
 
   #snapshotKey(scope: SupervisionTaskConsoleScope): string {
@@ -190,7 +241,7 @@ export class SupervisionConsoleProducer {
     let work = this.#snapshotBuildInFlight.get(key);
     if (!work) {
       work = new Promise<Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>>((resolve) => {
-        setImmediate(() => resolve(this.#buildSnapshotCached(scope)));
+        setImmediate(() => resolve(withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => this.#buildSnapshotCached(scope))));
       }).finally(() => {
         if (this.#snapshotBuildInFlight.get(key) === work) this.#snapshotBuildInFlight.delete(key);
       });
@@ -200,21 +251,38 @@ export class SupervisionConsoleProducer {
     return { ...snapshot, subscriptionId };
   }
 
+  static #isRetentionVisible(payloadJson: unknown): boolean {
+    let retention: { archivedAt?: number } = {};
+    try {
+      const parsed = JSON.parse(String(payloadJson ?? '{}')) as unknown;
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        retention = parsed as { archivedAt?: number };
+      }
+    } catch { /* malformed legacy payload has no trustworthy archive marker */ }
+    return isSupervisionTaskVisibleByDefault(retention);
+  }
+
   #visibleTaskIds(projectName: string): Set<string> {
     const rows = this.#db.prepare(
       'SELECT task_id, payload_json FROM supervision_tasks WHERE project_name = ? ORDER BY task_id ASC',
     ).all(projectName) as Array<{ task_id?: unknown; payload_json?: unknown }>;
     const visible = new Set<string>();
     for (const row of rows) {
-      let retention: { archivedAt?: number } = {};
-      try {
-        const parsed = JSON.parse(String(row.payload_json ?? '{}')) as unknown;
-        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          retention = parsed as { archivedAt?: number };
-        }
-      } catch { /* malformed legacy payload has no trustworthy archive marker */ }
-      if (isSupervisionTaskVisibleByDefault(retention)) visible.add(String(row.task_id));
+      if (SupervisionConsoleProducer.#isRetentionVisible(row.payload_json)) visible.add(String(row.task_id));
     }
+    return visible;
+  }
+
+  /** Same rule as {@link #visibleTaskIds}, for one task (memoized per pass). */
+  #isTaskVisible(projectName: string, taskId: string): boolean {
+    const key = `${projectName}\0${taskId}`;
+    const memo = this.#passTaskVisible?.get(key);
+    if (memo !== undefined) return memo;
+    const row = this.#db.prepare(
+      'SELECT payload_json FROM supervision_tasks WHERE task_id = ? AND project_name = ?',
+    ).get(taskId, projectName) as { payload_json?: unknown } | undefined;
+    const visible = row ? SupervisionConsoleProducer.#isRetentionVisible(row.payload_json) : false;
+    this.#passTaskVisible?.set(key, visible);
     return visible;
   }
 
@@ -292,10 +360,15 @@ export class SupervisionConsoleProducer {
     afterEventId: number | null,
     limit: number = SUPERVISION_PROJECTION_CHUNK_SIZE,
   ): DurableRegistryEventRow[] {
+    // CROSS JOIN pins the event table as the OUTER loop, so SQLite seeks the
+    // rowid range `e.id > ?` and probes the task by primary key. Left as an
+    // INNER JOIN the planner starts from the project's tasks, walks every event
+    // of the project and sorts them in a temp b-tree: ~5 ms even when fully
+    // caught up on a real registry (75k events), vs ~0.04 ms.
     const rows = this.#db.prepare(
       `SELECT e.id, e.task_id, e.assignment_id
        FROM supervision_task_events e
-       INNER JOIN supervision_tasks t ON t.task_id = e.task_id
+       CROSS JOIN supervision_tasks t ON t.task_id = e.task_id
        WHERE t.project_name = ? AND e.id > ?
        ORDER BY e.id ASC
        LIMIT ?`,
@@ -324,8 +397,7 @@ export class SupervisionConsoleProducer {
       eventId: event.id,
     } as SupervisionTaskConsoleDelta;
     if (event.assignmentId) {
-      const assignment = this.readAssignmentRows(scope.projectName)
-        .find((row) => row.assignmentId === event.assignmentId);
+      const assignment = this.#readAssignmentRowById(scope.projectName, event.assignmentId);
       if (assignment) {
         base.op = 'assignment_upsert';
         base.assignment = assignment;
@@ -335,12 +407,12 @@ export class SupervisionConsoleProducer {
         base.task = this.readTaskRow(event.taskId, scope.projectName, event.id);
         // Pool occupancy changes on assignment transitions. Shipping the
         // current pool rows with the same durable event keeps both views atomic.
-        base.pools = this.readPools(scope.projectName);
+        base.pools = this.#readPoolsForDelta(scope.projectName);
         return base;
       }
       base.op = 'assignment_remove';
       base.removedId = event.assignmentId;
-      base.pools = this.readPools(scope.projectName);
+      base.pools = this.#readPoolsForDelta(scope.projectName);
       return base;
     }
     const task = this.readTaskRow(event.taskId, scope.projectName, event.id);
@@ -364,8 +436,7 @@ export class SupervisionConsoleProducer {
     scope: SupervisionTaskConsoleScope,
     options: { deliver?: boolean } = {},
   ): number {
-    setEventLoopWatchdogPhase('supervision-console.synchronize-durable-events');
-    return traceSync('supervision-console.synchronize-durable-events', { projectName: scope.projectName }, () => this.#withAssignmentPass(() => {
+    return withEventLoopWatchdogPhase('supervision-console.synchronize-durable-events', () => traceSync('supervision-console.synchronize-durable-events', { projectName: scope.projectName }, () => this.#withAssignmentPass(() => {
       this.ensureProjectionBaseline(scope);
       const cursor = this.restoreCursor(scope);
       let committedCount = 0;
@@ -383,81 +454,124 @@ export class SupervisionConsoleProducer {
       }
       if (committedCount > 0) this.invalidateSnapshot(scope);
       return committedCount;
-    }));
+    })));
   }
 
   /**
-   * Large catch-up path used by the socket subscription handler. It commits
-   * bounded chunks and yields between them; unlike the historical synchronous
-   * implementation, a 1,000-event backlog cannot monopolize the main thread.
+   * Large catch-up path used by the socket subscription handler and the live
+   * refresh. It commits time-budgeted slices (see
+   * {@link SUPERVISION_SYNC_SLICE_BUDGET_MS}) and yields between them; unlike
+   * the historical synchronous implementation, neither a 1,000-event backlog
+   * nor a busy registry can monopolize the main thread. The cursor is re-read
+   * from SQLite before every slice, so a concurrent inline pass or a restart
+   * can never make a slice project an event twice or skip one.
    */
   async synchronizeDurableEventsAsync(
     scope: SupervisionTaskConsoleScope,
     options: { deliver?: boolean } = {},
   ): Promise<number> {
     const replayKey = JSON.stringify([scope.projectName, scope.coordinatorSessionName]);
+    // A refresh that arrives while a drain is yielded joins it: the drain only
+    // yields when the tail is NOT yet empty and re-reads the persisted cursor
+    // after every yield, so the new commit is picked up by its next slice.
     const pending = this.#asyncReplayInFlight.get(replayKey);
     if (pending) return pending;
-    setEventLoopWatchdogPhase('supervision-console.synchronize-durable-events-async');
     let work: Promise<number>;
-    work = traceAsync('supervision-console.synchronize-durable-events-async', { projectName: scope.projectName }, () => this.#withAssignmentPassAsync(async () => {
-      this.ensureProjectionBaseline(scope);
-      const cursor = this.restoreCursor(scope);
-      let committedCount = 0;
-      let afterEventId = cursor.lastDurableEventId;
-      let firstPage = true;
-      while (true) {
-        if (!firstPage) await yieldToEventLoop();
-        firstPage = false;
-        const events = this.#readDurableRegistryEvents(scope, afterEventId);
-        if (events.length === 0) break;
-        const committed = this.#commitDurableEventChunk(scope, events);
-        committedCount += committed.length;
-        if (options.deliver !== false) {
-          for (const item of committed) this.#deliver(item.frame, item.projectionVersion, scope);
-        }
-        afterEventId = events[events.length - 1]!.id;
-        if (events.length < SUPERVISION_PROJECTION_CHUNK_SIZE) break;
-      }
-      if (committedCount > 0) this.invalidateSnapshot(scope);
-      return committedCount;
-    }).finally(() => {
-      if (this.#asyncReplayInFlight.get(replayKey) === work) this.#asyncReplayInFlight.delete(replayKey);
-    }));
+    work = traceAsync('supervision-console.synchronize-durable-events-async', { projectName: scope.projectName }, () => this.#drainDurableEventsSliced(scope, options))
+      .finally(() => {
+        if (this.#asyncReplayInFlight.get(replayKey) === work) this.#asyncReplayInFlight.delete(replayKey);
+      });
     this.#asyncReplayInFlight.set(replayKey, work);
     return work;
   }
 
-  /** Avoid starting the async path for the small projections used by ordinary subscriptions/tests. */
+  async #drainDurableEventsSliced(
+    scope: SupervisionTaskConsoleScope,
+    options: { deliver?: boolean },
+  ): Promise<number> {
+    let committedCount = 0;
+    while (true) {
+      const slice = withEventLoopWatchdogPhase(
+        'supervision-console.synchronize-durable-events-async',
+        () => this.#withAssignmentPass(() => this.#projectDurableSlice(scope, options)),
+      );
+      committedCount += slice.committed;
+      if (slice.drained) break;
+      await this.#yield();
+    }
+    if (committedCount > 0) this.invalidateSnapshot(scope);
+    return committedCount;
+  }
+
+  /**
+   * Project one time-budgeted slice of the durable tail. The cursor is read
+   * from SQLite here, never carried across an await, so this stays exact when
+   * an inline pass or a restart interleaves between slices.
+   */
+  #projectDurableSlice(
+    scope: SupervisionTaskConsoleScope,
+    options: { deliver?: boolean },
+  ): { committed: number; drained: boolean } {
+    const startedAt = this.#monotonicNowMs();
+    this.ensureProjectionBaseline(scope);
+    const cursor = this.restoreCursor(scope);
+    const events = this.#readDurableRegistryEvents(scope, cursor.lastDurableEventId);
+    if (events.length === 0) return { committed: 0, drained: true };
+    const projectionDeadline = startedAt + this.#syncSliceBudgetMs * SUPERVISION_SYNC_PROJECTION_SHARE;
+    const committed = this.#commitDurableEventChunk(scope, events, projectionDeadline);
+    if (options.deliver !== false) {
+      for (const item of committed) this.#deliver(item.frame, item.projectionVersion, scope);
+    }
+    const drained = committed.length === events.length && events.length < SUPERVISION_PROJECTION_CHUNK_SIZE;
+    return { committed: committed.length, drained };
+  }
+
+  /**
+   * True when the tail holds more than a few events, i.e. projecting it inline
+   * could exceed one slice budget and must be drained in yielded slices. Small
+   * tails (the steady state: one or two events per registry commit) stay inline.
+   */
   needsYieldedDurableReplay(scope: SupervisionTaskConsoleScope): boolean {
     this.ensureProjectionBaseline(scope);
     const cursor = this.restoreCursor(scope);
     const rows = this.#db.prepare(
       `SELECT 1 AS found
        FROM supervision_task_events e
-       INNER JOIN supervision_tasks t ON t.task_id = e.task_id
+       CROSS JOIN supervision_tasks t ON t.task_id = e.task_id
        WHERE t.project_name = ? AND e.id > ?
        LIMIT ?`,
-    ).all(scope.projectName, cursor.lastDurableEventId ?? 0, SUPERVISION_PROJECTION_CHUNK_SIZE + 1) as Array<{ found?: number }>;
-    return rows.length > SUPERVISION_PROJECTION_CHUNK_SIZE;
+    ).all(scope.projectName, cursor.lastDurableEventId ?? 0, this.#inlineSyncMaxEvents + 1) as Array<{ found?: number }>;
+    return rows.length > this.#inlineSyncMaxEvents;
   }
 
+  /**
+   * Commit events in order inside one transaction. With a `deadline` (monotonic
+   * ms) the commit stops after the event that crossed it -- always at least
+   * one, so a slow event can never stall progress -- and the caller continues
+   * from the persisted cursor in its next slice.
+   */
   #commitDurableEventChunk(
     scope: SupervisionTaskConsoleScope,
     events: DurableRegistryEventRow[],
+    deadline?: number,
   ): Array<{ frame: SupervisionTaskConsoleDelta; projectionVersion: number }> {
-    return this.#transaction(() => events.map((event) => {
-      const projectionVersion = this.#nextProjectionVersion(scope, event.id);
-      const frame = this.#buildDurableDelta(scope, event, projectionVersion);
-      this.#db.prepare(
-        `INSERT INTO supervision_outbox
-          (project_name, coordinator_session_name, event_id, projection_version, projection_epoch,
-           frame_json, delivery_state, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-      ).run(scope.projectName, scope.coordinatorSessionName, event.id, projectionVersion,
-        this.#epoch, JSON.stringify(frame), this.#now(), this.#now());
-      return { frame, projectionVersion };
-    }));
+    return this.#transaction(() => {
+      const out: Array<{ frame: SupervisionTaskConsoleDelta; projectionVersion: number }> = [];
+      for (const event of events) {
+        const projectionVersion = this.#nextProjectionVersion(scope, event.id);
+        const frame = this.#buildDurableDelta(scope, event, projectionVersion);
+        this.#db.prepare(
+          `INSERT INTO supervision_outbox
+            (project_name, coordinator_session_name, event_id, projection_version, projection_epoch,
+             frame_json, delivery_state, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
+        ).run(scope.projectName, scope.coordinatorSessionName, event.id, projectionVersion,
+          this.#epoch, JSON.stringify(frame), this.#now(), this.#now());
+        out.push({ frame, projectionVersion });
+        if (deadline !== undefined && this.#monotonicNowMs() >= deadline) break;
+      }
+      return out;
+    });
   }
 
   /**
@@ -569,20 +683,17 @@ export class SupervisionConsoleProducer {
   #withAssignmentPass<T>(fn: () => T): T {
     if (this.#passAssignmentRows) return fn();
     this.#passAssignmentRows = new Map();
+    this.#passAssignmentById = new Map();
+    this.#passTaskVisible = new Map();
+    this.#passPools = new Map();
+    this.#passNow = Date.now();
     try {
       return fn();
     } finally {
       this.#passAssignmentRows = null;
-    }
-  }
-
-  async #withAssignmentPassAsync<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.#passAssignmentRows) return fn();
-    this.#passAssignmentRows = new Map();
-    try {
-      return await fn();
-    } finally {
-      this.#passAssignmentRows = null;
+      this.#passAssignmentById = null;
+      this.#passTaskVisible = null;
+      this.#passPools = null;
     }
   }
 
@@ -598,73 +709,90 @@ export class SupervisionConsoleProducer {
   #projectAssignmentRows(projectName: string): SupervisionTaskConsoleAssignmentRow[] {
     const visibleTaskIds = this.#visibleTaskIds(projectName);
     const rows = this.#db.prepare(
-      `SELECT a.assignment_id, a.task_id, a.role, a.status, a.session_name, a.agent_type, a.provider_family,
-              a.pool_kind, a.validation_state, a.observed_model, a.observed_provider, a.heartbeat_at,
-              a.audit_attempt_id, a.audit_revision, a.verdict, a.blocker, a.next_action,
-              a.recovery_state, a.recovery_reason, a.last_durable_event_id, a.updated_at,
-              a.lease_id, a.payload_json
-       FROM supervision_task_assignments a
-       INNER JOIN supervision_tasks t ON t.task_id = a.task_id
-       WHERE t.project_name = ? ORDER BY a.assignment_id ASC`,
+      `${ASSIGNMENT_ROW_SELECT} WHERE t.project_name = ? ORDER BY a.assignment_id ASC`,
     ).all(projectName) as Array<Record<string, unknown>>;
     const out: SupervisionTaskConsoleAssignmentRow[] = [];
     // One clock for the whole pass so rows in a snapshot cannot disagree.
     const now = Date.now();
     for (const row of rows) {
       if (!visibleTaskIds.has(String(row.task_id))) continue;
-      const status = String(row.status ?? '');
-      // Same fail-closed rule as tasks: never project an unknown status.
-      if (!isSupervisionTaskLifecycleStatus(status)) continue;
-      const verdict = row.verdict === 'PASS' || row.verdict === 'REWORK' ? row.verdict : undefined;
-      const ownerSessionName = row.session_name ? String(row.session_name) : undefined;
-      const durableObservedAt = Number(row.updated_at ?? 0);
-      let required: boolean | undefined;
-      try {
-        const payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>;
-        if (typeof payload.required === 'boolean') required = payload.required;
-      } catch { /* malformed legacy payload keeps the conservative browser fallback */ }
-      const presentation = ownerSessionName
-        ? this.#resolveSessionPresentation?.(ownerSessionName, durableObservedAt)
-        : undefined;
-      const leaseActive = typeof row.lease_id === 'string' && row.lease_id.trim().length > 0;
-      const heartbeatAt = row.heartbeat_at === null || row.heartbeat_at === undefined
-        ? undefined : Number(row.heartbeat_at);
-      out.push({
-        assignmentId: String(row.assignment_id),
-        taskId: String(row.task_id),
-        status,
-        phase: supervisionConsoleStatusGroup(status),
-        auditRevision: row.audit_revision ? String(row.audit_revision) : undefined,
-        role: row.role ? String(row.role) : undefined,
-        required,
-        leaseActive,
-        // Derived once, server-side, so the browser renders a fact instead of
-        // guessing liveness from a raw timestamp it is forbidden to read.
-        executionHealth: supervisionConsoleExecutionHealth({ leaseActive, heartbeatAt, now }),
-        awaitingExternalCi: status === 'retrying_external_ci',
-        ownerSessionName,
-        ownerSessionLabel: presentation?.label,
-        ownerAgentType: row.agent_type ? String(row.agent_type) : undefined,
-        observedModel: row.observed_model ? String(row.observed_model) : undefined,
-        observedProvider: row.observed_provider ? String(row.observed_provider)
-          : (row.provider_family ? String(row.provider_family) : undefined),
-        sessionState: presentation?.state ?? 'unknown',
-        sessionStateSource: presentation?.source ?? 'registry',
-        sessionStateObservedAt: presentation?.observedAt ?? durableObservedAt,
-        poolKind: readPoolKind(row.pool_kind),
-        validationState: readValidationState(row.validation_state),
-        auditAttemptId: row.audit_attempt_id ? String(row.audit_attempt_id) : undefined,
-        auditVerdict: verdict,
-        blocker: row.blocker ? String(row.blocker) : undefined,
-        nextAction: row.next_action ? String(row.next_action) : undefined,
-        recoveryState: row.recovery_state ? String(row.recovery_state) : undefined,
-        recoveryReason: row.recovery_reason ? String(row.recovery_reason) : undefined,
-        heartbeatAt,
-        updatedAt: Number(row.updated_at ?? 0),
-        lastEventId: Number(row.last_durable_event_id ?? 0),
-      });
+      const projected = this.#projectAssignmentRow(row, now);
+      if (projected) out.push(projected);
     }
     return out;
+  }
+
+  /**
+   * One assignment row, projected exactly as the full pass would: same
+   * visibility rule, same fail-closed status check, same fields. Used by the
+   * durable-event path so a delta costs O(1) instead of O(every assignment).
+   */
+  #readAssignmentRowById(projectName: string, assignmentId: string): SupervisionTaskConsoleAssignmentRow | undefined {
+    const key = `${projectName}\0${assignmentId}`;
+    const memo = this.#passAssignmentById;
+    if (memo?.has(key)) return memo.get(key) ?? undefined;
+    const row = this.#db.prepare(
+      `${ASSIGNMENT_ROW_SELECT} WHERE t.project_name = ? AND a.assignment_id = ?`,
+    ).get(projectName, assignmentId) as Record<string, unknown> | undefined;
+    const projected = row && this.#isTaskVisible(projectName, String(row.task_id))
+      ? this.#projectAssignmentRow(row, this.#passNow || Date.now())
+      : undefined;
+    memo?.set(key, projected ?? null);
+    return projected;
+  }
+
+  #projectAssignmentRow(row: Record<string, unknown>, now: number): SupervisionTaskConsoleAssignmentRow | undefined {
+    const status = String(row.status ?? '');
+    // Same fail-closed rule as tasks: never project an unknown status.
+    if (!isSupervisionTaskLifecycleStatus(status)) return undefined;
+    const verdict = row.verdict === 'PASS' || row.verdict === 'REWORK' ? row.verdict : undefined;
+    const ownerSessionName = row.session_name ? String(row.session_name) : undefined;
+    const durableObservedAt = Number(row.updated_at ?? 0);
+    let required: boolean | undefined;
+    try {
+      const payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>;
+      if (typeof payload.required === 'boolean') required = payload.required;
+    } catch { /* malformed legacy payload keeps the conservative browser fallback */ }
+    const presentation = ownerSessionName
+      ? this.#resolveSessionPresentation?.(ownerSessionName, durableObservedAt)
+      : undefined;
+    const leaseActive = typeof row.lease_id === 'string' && row.lease_id.trim().length > 0;
+    const heartbeatAt = row.heartbeat_at === null || row.heartbeat_at === undefined
+      ? undefined : Number(row.heartbeat_at);
+    return {
+      assignmentId: String(row.assignment_id),
+      taskId: String(row.task_id),
+      status,
+      phase: supervisionConsoleStatusGroup(status),
+      auditRevision: row.audit_revision ? String(row.audit_revision) : undefined,
+      role: row.role ? String(row.role) : undefined,
+      required,
+      leaseActive,
+      // Derived once, server-side, so the browser renders a fact instead of
+      // guessing liveness from a raw timestamp it is forbidden to read.
+      executionHealth: supervisionConsoleExecutionHealth({ leaseActive, heartbeatAt, now }),
+      awaitingExternalCi: status === 'retrying_external_ci',
+      ownerSessionName,
+      ownerSessionLabel: presentation?.label,
+      ownerAgentType: row.agent_type ? String(row.agent_type) : undefined,
+      observedModel: row.observed_model ? String(row.observed_model) : undefined,
+      observedProvider: row.observed_provider ? String(row.observed_provider)
+        : (row.provider_family ? String(row.provider_family) : undefined),
+      sessionState: presentation?.state ?? 'unknown',
+      sessionStateSource: presentation?.source ?? 'registry',
+      sessionStateObservedAt: presentation?.observedAt ?? durableObservedAt,
+      poolKind: readPoolKind(row.pool_kind),
+      validationState: readValidationState(row.validation_state),
+      auditAttemptId: row.audit_attempt_id ? String(row.audit_attempt_id) : undefined,
+      auditVerdict: verdict,
+      blocker: row.blocker ? String(row.blocker) : undefined,
+      nextAction: row.next_action ? String(row.next_action) : undefined,
+      recoveryState: row.recovery_state ? String(row.recovery_state) : undefined,
+      recoveryReason: row.recovery_reason ? String(row.recovery_reason) : undefined,
+      heartbeatAt,
+      updatedAt: Number(row.updated_at ?? 0),
+      lastEventId: Number(row.last_durable_event_id ?? 0),
+    };
   }
 
   /**
@@ -676,9 +804,45 @@ export class SupervisionConsoleProducer {
     const byKind = new Map<string, number>();
     for (const assignment of this.readAssignmentRows(projectName)) {
       if (!assignment.poolKind
-        || ['finalized', 'pushed', 'blocked', 'cancelled'].includes(assignment.status)) continue;
+        || (POOL_INACTIVE_ASSIGNMENT_STATUSES as readonly string[]).includes(assignment.status)) continue;
       byKind.set(assignment.poolKind, (byKind.get(assignment.poolKind) ?? 0) + 1);
     }
+    return SupervisionConsoleProducer.#poolRows(byKind);
+  }
+
+  /**
+   * Same result as {@link readPools} without projecting every assignment: only
+   * the rows that can occupy a pool slot are read, and each goes through the
+   * same visibility / status / pool-kind rules. The equivalence is asserted by
+   * a test against the full projection.
+   */
+  readPoolsIncremental(projectName: string): SupervisionTaskConsolePoolRow[] {
+    const inactive = POOL_INACTIVE_ASSIGNMENT_STATUSES.map(() => '?').join(', ');
+    const rows = this.#db.prepare(
+      `SELECT a.task_id, a.status, a.pool_kind
+       FROM supervision_task_assignments a
+       INNER JOIN supervision_tasks t ON t.task_id = a.task_id
+       WHERE t.project_name = ? AND a.pool_kind IS NOT NULL AND a.status NOT IN (${inactive})`,
+    ).all(projectName, ...POOL_INACTIVE_ASSIGNMENT_STATUSES) as Array<Record<string, unknown>>;
+    const byKind = new Map<string, number>();
+    for (const row of rows) {
+      if (!isSupervisionTaskLifecycleStatus(String(row.status ?? ''))) continue;
+      const kind = readPoolKind(row.pool_kind);
+      if (!kind || !this.#isTaskVisible(projectName, String(row.task_id))) continue;
+      byKind.set(kind, (byKind.get(kind) ?? 0) + 1);
+    }
+    return SupervisionConsoleProducer.#poolRows(byKind);
+  }
+
+  #readPoolsForDelta(projectName: string): SupervisionTaskConsolePoolRow[] {
+    const cached = this.#passPools?.get(projectName);
+    if (cached) return cached;
+    const pools = this.readPoolsIncremental(projectName);
+    this.#passPools?.set(projectName, pools);
+    return pools;
+  }
+
+  static #poolRows(byKind: ReadonlyMap<string, number>): SupervisionTaskConsolePoolRow[] {
     return SUPERVISION_EXECUTION_POOL_KINDS.map((kind) => ({
       poolId: kind,
       label: kind,
@@ -838,9 +1002,11 @@ export class SupervisionConsoleProducer {
   }
 
   buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
-    setEventLoopWatchdogPhase('supervision-console.build-snapshot');
-    return traceSync('supervision-console.build-snapshot', { projectName: scope.projectName },
-      () => ({ ...this.#buildSnapshotCached(scope), subscriptionId }));
+    return withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => traceSync(
+      'supervision-console.build-snapshot',
+      { projectName: scope.projectName },
+      () => ({ ...this.#buildSnapshotCached(scope), subscriptionId }),
+    ));
   }
 
   #buildSnapshotCached(scope: SupervisionTaskConsoleScope): Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> {
@@ -889,7 +1055,11 @@ export class SupervisionConsoleProducer {
       generatedAt: this.#now(),
       tasks,
       assignments: pairRows?.assignments ?? this.readAssignmentRows(scope.projectName),
-      pools: this.readPools(scope.projectName),
+      // A pairs project has no legacy assignment rows to project for the
+      // snapshot, but its pool occupancy still comes from the registry: count
+      // it directly instead of projecting every historical assignment (~24 ms
+      // on a real registry) just to derive two integers.
+      pools: pairRows ? this.readPoolsIncremental(scope.projectName) : this.readPools(scope.projectName),
     };
   }
 

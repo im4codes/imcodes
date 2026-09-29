@@ -97,6 +97,32 @@ describe('subscribe', () => {
     expect(sent[0]).toMatchObject({ type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, subscriptionId: 'storm-11' });
   });
 
+  it('projects a steady-state registry commit inline and a real backlog through the sliced drain (live refresh)', async () => {
+    registry.handleFrame(subscribe());
+    sent.length = 0;
+    const inline = vi.spyOn(producer, 'synchronizeDurableEvents');
+    const sliced = vi.spyOn(producer, 'synchronizeDurableEventsAsync');
+    // One commit: a couple of milliseconds, stays inline.
+    db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+      VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', 500)`).run();
+    registry.refreshActiveSubscriptions();
+    expect(inline).toHaveBeenCalledTimes(1);
+    expect(sliced).not.toHaveBeenCalled();
+    // A backlog (registry writer far ahead of the console): drained in yielded slices,
+    // never one long synchronous pass on the event-loop turn that took the commit.
+    for (let i = 0; i < 40; i += 1) {
+      db.prepare(`INSERT INTO supervision_task_events (task_id, assignment_id, event_type, status, payload_json, created_at)
+        VALUES ('tsk_a', NULL, 'implementing', 'implementing', '{}', ?)`).run(600 + i);
+    }
+    inline.mockClear();
+    const before = sent.length;
+    registry.refreshActiveSubscriptions();
+    expect(inline).not.toHaveBeenCalled();
+    expect(sliced).toHaveBeenCalledTimes(1);
+    await new Promise<void>((resolve) => setTimeout(resolve, 30));
+    expect(sent.length - before).toBe(40);
+  });
+
   it('deduplicates an identical subscribe retry on the same connection', () => {
     const synchronize = vi.spyOn(producer, 'synchronizeDurableEvents');
     expect(registry.handleFrame(subscribe())).toBe(true);
