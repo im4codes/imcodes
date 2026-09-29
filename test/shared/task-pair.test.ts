@@ -273,6 +273,10 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('never relay another pair');
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('freeze the head');
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('only remove paths you created by exact name');
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('write the evidence summary');
+    expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('safety fixes merged after it');
+    expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('list every call site');
+    expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('must NOT trigger');
   });
 
   it('ships READY self-check and harness self-sufficiency rules', () => {

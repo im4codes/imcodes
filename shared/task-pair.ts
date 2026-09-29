@@ -232,7 +232,12 @@ export const TASK_PAIR_EXECUTION_DISCIPLINE_RULE: string =
   + 'removed none of the recently merged code before collecting evidence. '
   + 'On shared test machines, only start detached processes (never tied to '
   + 'an SSH session), only remove paths you created by exact name, and never '
-  + 'touch the machine default daemon, its tasks or its files.';
+  + 'touch the machine default daemon, its tasks or its files. Before '
+  + 'removing test resources, write the evidence summary (paths, hashes, key '
+  + 'numbers) into the pair workspace; tear down the images and build caches '
+  + 'you created and check free disk before large runs. When Brain freezes a '
+  + 'head, it names the safety fixes merged after it and the steps they make '
+  + 'unsafe on the frozen build.';
 
 /**
  * Generic pair start-up rules for every IM.codes project, derived from where
@@ -269,7 +274,10 @@ export const TASK_PAIR_BOUNDARY_AUDIT_RULE: string =
   + 'timeouts, formats, keys, defaults, paths or filters, also test the '
   + 'extremes the brief may have missed (large and slow inputs, every '
   + 'identifier variant, missing or stale state, the default install, '
-  + 'restart). A missed boundary that breaks existing behaviour is a P0.';
+  + 'restart). When a change edits or replaces a shared function, list every '
+  + 'call site and state its behaviour change; for heuristics, warnings and '
+  + 'alerts, require a normal-use case that must NOT trigger and a time or '
+  + 'cost bound. A missed boundary that breaks existing behaviour is a P0.';
 
 export const TASK_PAIR_MERGE_VERIFICATION_RULE: string =
   'Merge verification (Brain): read the diff for removed lines of recently '
