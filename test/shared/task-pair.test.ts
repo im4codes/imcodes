@@ -244,13 +244,14 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('conditional non-convergence report');
   });
 
-  it('ships a contract telling Brain to analyze before dispatching, with large analysis as a report-first task', () => {
+  it('ships a contract where Brain sets direction and the pair gathers evidence, decides when clear and escalates otherwise', () => {
     const body = buildTaskPairMarkerContract();
     expect(body).toContain(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE);
-    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('what is PROVEN and what is only SUSPECTED');
-    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('analysis-only task');
-    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('does not implement');
-    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('then dispatches the execution task');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('Brain does only a QUICK analysis');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('gives the pair a DIRECTION');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('decide for themselves whenever the evidence makes the decision clear');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('report the findings with options and a recommendation to Brain for a new direction');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('analyze further itself, change the direction, or let the pair execute');
     // The rule comes before the pairing policy it governs.
     expect(body.indexOf(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE)).toBeLessThan(body.indexOf('Automatic pairing policy'));
   });

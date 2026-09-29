@@ -197,22 +197,23 @@ export const TASK_PAIR_BRAIN_REPORTING_RULE: string =
   + 'at REWORK rounds 2, 4, 6… when the pair is not clearly converging.';
 
 /**
- * Brain analyzes before it dispatches. Cheap analysis is done inline; large
- * analysis is its own report-only task, and execution is dispatched only after
- * Brain decides from that report.
+ * Division of labour: Brain (usually the stronger model) does quick analysis,
+ * sets direction and makes decisions; the pair does the legwork and the
+ * verification, decides within that direction, and escalates when it can't.
  */
 export const TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE: string =
-  'Analyze before dispatch (Brain): when a quick basic analysis is possible, '
-  + 'do it yourself before any DISPATCH: reproduce or read the actual failure, '
-  + 'locate the responsible code path, and check the leading hypothesis with '
-  + 'a cheap test. Write in the brief what is PROVEN and what is only '
-  + 'SUSPECTED; never hand a pair raw symptoms or an unverified guess as the '
-  + 'cause. When the analysis itself is large (scanning a lot of code or logs, '
-  + 'a real-machine reproduction), first DISPATCH an analysis-only task that '
-  + 'investigates and reports back to Brain with the root cause and evidence, '
-  + 'options and a recommendation, and does not implement. Brain decides from '
-  + 'that report, then dispatches the execution task with the proven analysis '
-  + 'in its brief.';
+  'Direction before dispatch: Brain (usually the stronger model) owns '
+  + 'analysis and decisions; the pair does the legwork and the verification. '
+  + 'Before a DISPATCH, Brain does only a QUICK analysis (read the actual '
+  + 'failure, locate the likely code path, test a cheap hypothesis) and gives '
+  + 'the pair a DIRECTION: what is proven, what is suspected, and what to find '
+  + 'out. Executor and auditor gather the evidence along that direction and '
+  + 'decide for themselves whenever the evidence makes the decision clear. '
+  + 'When it does not, or the evidence points away from the direction, they '
+  + 'report the findings with options and a recommendation to Brain for a '
+  + 'new direction instead of guessing or looping. Brain decides each next '
+  + 'step from task difficulty and pair feedback: analyze further itself, '
+  + 'change the direction, or let the pair execute.';
 
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
