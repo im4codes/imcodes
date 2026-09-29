@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtemp, readFile, readdir, rm, stat, unlink, writeFile } from 'node:fs/promises';
 import { homedir, networkInterfaces, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -507,6 +507,48 @@ describe('machine direct encrypted TCP transfer', () => {
     await unlink(`${response.attachment.daemonPath}.meta.json`).catch(() => {});
     sender!.close();
   });
+
+  it.runIf(process.env.IMC_BIG_TRANSFER === '1')('real-socket 15KiB and 500MiB repeat sends preserve bytes', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-direct-big-'));
+    cleanup.push(dir);
+    for (const size of [15 * 1024, 500 * 1024 * 1024]) {
+      const sourcePath = join(dir, `source-${size}.bin`);
+      await writeFile(sourcePath, Buffer.alloc(size, 0x5a));
+      const base: Omit<MachineDirectUploadRequest, 'candidates'> = {
+        type: MACHINE_DIRECT_FILE_TRANSFER_MSG.REQUEST,
+        requestId: randomBytes(24).toString('base64url'),
+        clientUploadId: randomBytes(24).toString('base64url'),
+        capability: randomBytes(32).toString('base64url'),
+        originalName: `source-${size}.bin`,
+        size,
+        expiresAt: Date.now() + 10 * 60_000,
+      };
+      resumeArtifacts.add(base.clientUploadId);
+      const sender = await startMachineDirectSender({ sourcePath, request: base });
+      expect(sender).not.toBeNull();
+      const first = await receiveMachineDirectUpload({ ...base, candidates: sender!.candidates });
+      await expect(sender!.completion).resolves.toBeUndefined();
+      expect(first.type).toBe(MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE);
+      if (first.type !== MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE) throw new Error(first.error);
+
+      // A completed upload must release its claim and make an idempotent repeat
+      // immediately return the existing attachment rather than waiting forever.
+      const second = await receiveMachineDirectUpload({
+        ...base,
+        requestId: randomBytes(24).toString('base64url'),
+        candidates: [],
+      });
+      expect(second).toMatchObject({
+        type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+        attachment: { daemonPath: first.attachment.daemonPath, size },
+      });
+      const digest = createHash('sha256').update(await readFile(first.attachment.daemonPath)).digest('hex');
+      expect(digest).toBe(createHash('sha256').update(Buffer.alloc(size, 0x5a)).digest('hex'));
+      await unlink(first.attachment.daemonPath).catch(() => {});
+      await unlink(`${first.attachment.daemonPath}.meta.json`).catch(() => {});
+      sender!.close();
+    }
+  }, 180_000);
 
   it('fails closed when the upload source changes after its resume identity was bound', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-direct-source-change-'));
