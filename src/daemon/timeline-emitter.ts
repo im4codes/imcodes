@@ -268,7 +268,7 @@ export class TimelineEmitter {
     }
 
     if (type === 'assistant.text' && typeof payload.text === 'string' && opts?.hidden !== true) {
-      recordAssistantFileReadGrants(sessionId, payload.text);
+      recordAssistantFileReadGrants(sessionId, payload.text, { streaming: payload.streaming === true });
     }
 
     const seq = (this.seqMap.get(sessionId) ?? 0) + 1;

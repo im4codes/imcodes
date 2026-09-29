@@ -43,7 +43,7 @@ import {
   type TaskPairTransition,
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
-import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
+import { getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import { resolveTaskPairMaterial } from './material.js';
@@ -1099,10 +1099,21 @@ export class TaskPairService {
 
   /** Record non-marker activity for every open pair the participant owns. */
   recordActivity(writer: string, now: number): void {
+    // Runs for every tool event, user message and streamed delta of every
+    // session: pairsForSession is an in-memory lookup and #stampActivity only
+    // hits SQLite when something beyond an activity timestamp changed or the
+    // pair was last written more than an interval ago.
     const pairs = getTaskPairStore().pairsForSession(writer)
       .filter((pair) => TASK_PAIR_OPEN_STATUSES.includes(pair.state.status));
-    for (const pair of pairs) this.#stampActivity(pair, writer, now);
-    if (pairs.some((pair) => pair.state.brain === writer)) this.#scheduler?.publishBadges?.();
+    let brainStateChanged = false;
+    for (const pair of pairs) {
+      const material = this.#stampActivity(pair, writer, now);
+      if (material && pair.state.brain === writer) brainStateChanged = true;
+    }
+    // Badges follow pair/reminder state, not the activity clock: a Brain
+    // reply that clears a reminder is a material change, a bare timestamp
+    // refresh is not.
+    if (brainStateChanged) this.#scheduler?.publishBadges?.();
   }
 
   #stampProgress(pair: StoredTaskPair, writer: string, now: number): void {
@@ -1138,7 +1149,8 @@ export class TaskPairService {
     getTaskPairStore().savePair(pair.project, nextState, { liveness });
   }
 
-  #stampActivity(pair: StoredTaskPair, writer: string, now: number): void {
+  /** Returns true when the stamp changed more than an activity timestamp. */
+  #stampActivity(pair: StoredTaskPair, writer: string, now: number): boolean {
     const liveness = { ...pair.liveness };
     liveness.lastMaterialAt = now;
     // Any real Brain reply resolves the current wait immediately.  A later
@@ -1166,10 +1178,16 @@ export class TaskPairService {
       liveness.silenceAuditor = 0;
       liveness.bothIdleNudgedAt = undefined;
     }
-    const nextState = pair.state.executor === writer && pair.state.flags.includes('executor_silent')
-      ? { ...pair.state, flags: pair.state.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }
-      : pair.state;
-    getTaskPairStore().savePair(pair.project, nextState, { liveness });
+    // Clearing executor_silent is a state change: persist it immediately.
+    // Plain activity timestamps go through the throttled stamp path.
+    if (pair.state.executor === writer && pair.state.flags.includes('executor_silent')) {
+      const nextState = { ...pair.state, flags: pair.state.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now };
+      getTaskPairStore().savePair(pair.project, nextState, { liveness });
+      return true;
+    }
+    const material = livenessChangedBeyondActivityTimestamps(pair.liveness, liveness);
+    getTaskPairStore().saveLivenessActivityStamp(pair.project, pair.state.taskId, liveness);
+    return material;
   }
 
   #livenessAfterMarker(

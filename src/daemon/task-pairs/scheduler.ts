@@ -192,6 +192,17 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #badgeSessions = new Set<string>();
   /** Main Brain heartbeat state is separate from participant pair badges. */
   #mainHeartbeatPaused = new Set<string>();
+  /** Per-project engine answers reused for a moment by the per-event path (isPairsEngineProject scans the sessions). */
+  readonly #pairsProjectMemo = new Map<string, { value: boolean; at: number }>();
+
+  #isPairsProject(project: string): boolean {
+    const now = Date.now();
+    const memo = this.#pairsProjectMemo.get(project);
+    if (memo && now - memo.at < 1_000) return memo.value;
+    const value = isPairsEngineProject(project);
+    this.#pairsProjectMemo.set(project, { value, at: now });
+    return value;
+  }
   #mainHeartbeatPauseCleared = new Set<string>();
   #mainHeartbeatDelivered = new Map<string, string>();
   #mainHeartbeatPending = new Set<string>();
@@ -284,7 +295,12 @@ export class TaskPairAutomation implements TaskPairScheduler {
    * projection without reviving the retired legacy supervision engine.
    */
   observeTimelineEvent(event: { sessionId: string; type: string; payload: Record<string, unknown> }): void {
-    const activePairs = getTaskPairStore().listActivePairs().filter((stored) => isPairsEngineProject(stored.project));
+    // Called for every timeline event of every session (streamed deltas
+    // included): only the pairs this session takes part in are looked at, from
+    // the store's in-memory index, so an unrelated session costs one Map lookup.
+    const related = getTaskPairStore().pairsForSession(event.sessionId);
+    if (related.length === 0) return;
+    const activePairs = related.filter((stored) => this.#isPairsProject(stored.project));
     const pairs = activePairs.filter((stored) => (
       stored.state.brain === event.sessionId
     ));
@@ -301,7 +317,9 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const at = this.#now();
       for (const stored of pairs) {
         const next = { ...stored.liveness, brainLastActivityAt: at, brainWaitKey: undefined, brainWaitStartedAt: undefined, brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: at, brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined };
-        getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, next);
+        // Once the reminder is resolved, every further reply only moves the
+        // activity clock: keep it in memory and rewrite SQLite once per interval.
+        getTaskPairStore().saveLivenessActivityStamp(stored.project, stored.state.taskId, next);
       }
     }
     if (event.type === 'agent.status') {

@@ -338,6 +338,8 @@ function implementationActivityFingerprint(input: {
 const HOUSEKEEPING_FAILURE_BACKOFF_START_MS = 5 * 60_000;
 const HOUSEKEEPING_FAILURE_BACKOFF_MAX_MS = 60 * 60_000;
 const AUDIT_TARGET_MAX_RECOVERY_CONTINUES = 2;
+/** Streamed assistant/analysis deltas refresh implementation liveness at most this often per session. */
+const IMPLEMENTATION_ACTIVITY_STREAM_THROTTLE_MS = 2_000;
 /**
  * Provider/runtime projections are not guaranteed to publish the final
  * assistant row before the adjacent `idle` edge. Give that row a short,
@@ -1127,6 +1129,7 @@ class SupervisionAutomation {
   /** Canonical persisted snapshot last applied in this daemon lifetime. */
   private appliedSnapshotFingerprints = new Map<string, string>();
   private eventSequence = 0;
+  private readonly implementationActivityStreamStamp = new Map<string, { at: number; epoch: number }>();
   /** Test-only compatibility seam for the retired daemon-owned audit driver. */
   private automaticPeerAuditCompatibilityForTests = false;
   private assignmentHeartbeatProjectionSessions = new Set<string>();
@@ -3793,6 +3796,26 @@ class SupervisionAutomation {
   private recordAuthoritativeImplementationActivity(event: TimelineEvent): void {
     const signal = implementationActivitySignal(event);
     if (!signal) return;
+    const registry = getSupervisionTaskRegistry();
+    // Runs for every streamed assistant delta and tool event of every session,
+    // synchronously on the emit stack: a session that owns no live implementer
+    // assignment (a Brain, an idle worker) must cost a Map lookup, never a
+    // task/assignment hydration.
+    if (!registry.hasActiveImplementerAssignment(event.sessionId)) return;
+    // Streaming deltas only refresh liveness, and thresholds are minutes: one
+    // pass per session per window is enough. The window restarts whenever the
+    // set of live implementer assignments changes, so a newly delegated
+    // assignment is auto-started by the very next event, not after the window.
+    const streamingDelta = event.payload.streaming === true
+      && (signal === 'provider_assistant_output' || signal === 'provider_analysis_output');
+    const membershipEpoch = registry.implementerMembershipEpoch;
+    if (streamingDelta) {
+      const last = this.implementationActivityStreamStamp.get(event.sessionId);
+      const elapsed = last ? Date.now() - last.at : Number.POSITIVE_INFINITY;
+      // A clock that moved backwards never holds events back.
+      if (last && last.epoch === membershipEpoch
+        && elapsed >= 0 && elapsed < IMPLEMENTATION_ACTIVITY_STREAM_THROTTLE_MS) return;
+    }
     const session = getSession(event.sessionId);
     const liveIdentity = session ? liveSupervisionIdentity(session) : undefined;
     const projectName = session?.projectName?.trim();
@@ -3825,11 +3848,14 @@ class SupervisionAutomation {
     // lets later deltas refresh liveness without trusting provider payload time.
     const observedAt = Math.max(Math.min(event.ts, receivedAt), providerOutputAt);
 
-    const registry = getSupervisionTaskRegistry();
-    const listOwnedTasks = () => registry.list({
+    if (streamingDelta) {
+      this.implementationActivityStreamStamp.set(event.sessionId, { at: Date.now(), epoch: membershipEpoch });
+    }
+    // Only rows the projection can act on (live implementer assignments of
+    // non-terminal tasks): the indexed narrow query, not list(includeArchived).
+    const listOwnedTasks = () => registry.listTasksWithActiveImplementerAssignments({
       projectName,
-      ownerSessionName: event.sessionId,
-      includeArchived: true,
+      sessionName: event.sessionId,
     });
     let ownedTasks = listOwnedTasks();
     // First authoritative activity of a formal participant starts its delegated

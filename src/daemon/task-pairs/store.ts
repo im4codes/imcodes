@@ -140,9 +140,55 @@ function emptyLiveness(now: number): TaskPairLiveness {
 
 export type TaskPairChangeListener = (project: string, taskId: string) => void;
 
+/**
+ * Liveness fields that only record "something happened at time T". A liveness
+ * update that changes nothing else is an activity stamp: it is kept in memory
+ * on every event and written to SQLite at most once per interval.
+ */
+const LIVENESS_ACTIVITY_TIMESTAMP_KEYS: ReadonlySet<string> = new Set([
+  'lastMaterialAt', 'activityExecutorAt', 'activityAuditorAt', 'progressExecutorAt', 'progressAuditorAt',
+  'brainLastActivityAt', 'brainReminderResolvedAt',
+]);
+
+/** Default minimum spacing of SQLite writes for a pure activity stamp of one pair. */
+export const TASK_PAIR_LIVENESS_ACTIVITY_WRITE_INTERVAL_MS = 5_000;
+
+/** True when `next` differs from `prev` in anything other than an activity timestamp. */
+export function livenessChangedBeyondActivityTimestamps(prev: TaskPairLiveness, next: TaskPairLiveness): boolean {
+  const before = prev as unknown as Record<string, unknown>;
+  const after = next as unknown as Record<string, unknown>;
+  for (const key of new Set([...Object.keys(before), ...Object.keys(after)])) {
+    if (LIVENESS_ACTIVITY_TIMESTAMP_KEYS.has(key)) continue;
+    const a = before[key];
+    const b = after[key];
+    if (a === b) continue;
+    if (JSON.stringify(a) !== JSON.stringify(b)) return true;
+  }
+  return false;
+}
+
+interface ActivePairIndex {
+  byKey: Map<string, StoredTaskPair>;
+  bySession: Map<string, StoredTaskPair[]>;
+}
+
+function pairKey(project: string, taskId: string): string {
+  return `${project}\u0000${taskId}`;
+}
+
 export class TaskPairStore {
   readonly #db: DatabaseSyncInstance;
   readonly #listeners = new Set<TaskPairChangeListener>();
+  /**
+   * The non-terminal pairs by session, kept in memory so the per-timeline-event
+   * paths (which run for every streamed delta and tool event of every session)
+   * never query SQLite or parse JSON. Every write path of this class either
+   * invalidates it (savePair, prune) or patches the cached liveness in place
+   * (saveLiveness), so it cannot outlive the row it mirrors.
+   */
+  #activeIndex: ActivePairIndex | undefined;
+  readonly #livenessDbWriteAt = new Map<string, number>();
+  readonly #projectSettingsCache = new Map<string, TaskPairProjectSettings>();
 
   /** Every pair write notifies listeners (badges, task console); a throwing listener is ignored. */
   onPairSaved(listener: TaskPairChangeListener): () => void {
@@ -211,6 +257,8 @@ export class TaskPairStore {
   }
 
   close(): void {
+    this.#activeIndex = undefined;
+    this.#livenessDbWriteAt.clear();
     this.#db.close();
   }
 
@@ -300,9 +348,25 @@ export class TaskPairStore {
 
   /** Non-terminal pairs in which a session takes part. */
   pairsForSession(sessionName: string): StoredTaskPair[] {
-    return this.listActivePairs().filter((pair) => (
-      pair.state.executor === sessionName || pair.state.auditor === sessionName || pair.state.brain === sessionName
-    ));
+    // Served from memory. The returned pairs are shared with the cache: read
+    // them, never mutate them (copy `liveness` before changing it).
+    return [...(this.#ensureActiveIndex().bySession.get(sessionName) ?? [])];
+  }
+
+  #ensureActiveIndex(): ActivePairIndex {
+    if (this.#activeIndex) return this.#activeIndex;
+    const byKey = new Map<string, StoredTaskPair>();
+    const bySession = new Map<string, StoredTaskPair[]>();
+    for (const pair of this.listActivePairs()) {
+      byKey.set(pairKey(pair.project, pair.state.taskId), pair);
+      for (const session of new Set([pair.state.executor, pair.state.auditor, pair.state.brain])) {
+        if (!session) continue;
+        const bucket = bySession.get(session);
+        if (bucket) bucket.push(pair); else bySession.set(session, [pair]);
+      }
+    }
+    this.#activeIndex = { byKey, bySession };
+    return this.#activeIndex;
   }
 
   /** True when a session is reserved by an actively started pair. Queued
@@ -332,6 +396,8 @@ export class TaskPairStore {
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
       queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
     );
+    this.#activeIndex = undefined;
+    this.#livenessDbWriteAt.delete(pairKey(project, state.taskId));
     for (const listener of this.#listeners) {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
@@ -341,6 +407,38 @@ export class TaskPairStore {
   saveLiveness(project: string, taskId: string, liveness: TaskPairLiveness): void {
     this.#db.prepare('UPDATE task_pairs SET liveness_json = ? WHERE project = ? AND task_id = ?')
       .run(JSON.stringify(liveness), project, taskId);
+    const key = pairKey(project, taskId);
+    this.#livenessDbWriteAt.set(key, Date.now());
+    const cached = this.#activeIndex?.byKey.get(key);
+    if (cached) cached.liveness = liveness;
+  }
+
+  /**
+   * Record an activity stamp for a pair on the per-event path. The in-memory
+   * pair always takes `liveness`, so every reader of pairsForSession sees it;
+   * SQLite is rewritten only when something beyond an activity timestamp
+   * changed (a reminder cleared, a flag reset...) or the last write of this
+   * pair is older than `minIntervalMs`. A crash can lose at most one interval
+   * of activity timestamps, far below any heartbeat threshold.
+   */
+  saveLivenessActivityStamp(
+    project: string,
+    taskId: string,
+    liveness: TaskPairLiveness,
+    minIntervalMs = TASK_PAIR_LIVENESS_ACTIVITY_WRITE_INTERVAL_MS,
+  ): boolean {
+    const key = pairKey(project, taskId);
+    const cached = this.#ensureActiveIndex().byKey.get(key);
+    const previous = cached?.liveness ?? this.getPair(project, taskId)?.liveness;
+    const material = !previous || livenessChangedBeyondActivityTimestamps(previous, liveness);
+    const now = Date.now();
+    const last = this.#livenessDbWriteAt.get(key);
+    if (!material && last !== undefined && now - last < minIntervalMs) {
+      if (cached) cached.liveness = liveness;
+      return false;
+    }
+    this.saveLiveness(project, taskId, liveness);
+    return true;
   }
 
   #nextQueueOrder(): number {
@@ -397,10 +495,16 @@ export class TaskPairStore {
   }
 
   getProjectSettings(project: string): TaskPairProjectSettings {
+    // Consulted by every engine check (isPairsEngineProject), including the
+    // per-event paths: setProjectEngine is the only writer, so it is cached.
+    const cached = this.#projectSettingsCache.get(project);
+    if (cached) return { ...cached };
     const row = this.#db.prepare('SELECT engine FROM task_pair_project_settings WHERE project = ?').get(project) as
       { engine: string | null } | undefined;
     const engine = row?.engine === 'pairs' || row?.engine === 'legacy' ? row.engine : undefined;
-    return { ...(engine ? { engine } : {}) };
+    const settings: TaskPairProjectSettings = { ...(engine ? { engine } : {}) };
+    this.#projectSettingsCache.set(project, settings);
+    return { ...settings };
   }
 
   setProjectEngine(project: string, engine: TaskPairEngine, now = Date.now()): void {
@@ -408,6 +512,7 @@ export class TaskPairStore {
       INSERT INTO task_pair_project_settings (project, engine, allowlist_json, updated_at) VALUES (?, ?, NULL, ?)
       ON CONFLICT (project) DO UPDATE SET engine = excluded.engine, updated_at = excluded.updated_at
     `).run(project, engine, now);
+    this.#projectSettingsCache.delete(project);
   }
 
   getMeta(key: string): string | undefined {
@@ -425,6 +530,7 @@ export class TaskPairStore {
     this.#db.prepare(`DELETE FROM task_pairs WHERE status IN (${terminal}) AND updated_at < ?`)
       .run(...TASK_PAIR_TERMINAL_STATUSES, now - TERMINAL_PAIR_RETENTION_MS);
     this.#db.prepare('DELETE FROM task_pair_events WHERE at < ?').run(now - EVENT_RETENTION_MS);
+    this.#activeIndex = undefined;
   }
 }
 

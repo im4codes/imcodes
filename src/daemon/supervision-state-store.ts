@@ -32,6 +32,7 @@ import {
 } from '../../shared/supervision-assignment-start.js';
 
 import {
+  SUPERVISION_TASK_LIFECYCLE_STATUSES,
   canTransitionSupervisionTaskStatus,
   isTerminalSupervisionTaskStatus,
   isSupervisionTaskVisibleByDefault,
@@ -1941,12 +1942,26 @@ export type SupervisionTaskIntentInput = {
 /** Intents whose effect is an attestation about exact revision bytes. */
 export const SUPERVISION_REVISION_AUTHORITATIVE_INTENTS: readonly string[] = Object.freeze(['record_validation', 'finish']);
 
+/** Backstop only: membership changes invalidate the implementer gate immediately. */
+const SUPERVISION_IMPLEMENTER_GATE_TTL_MS = 60_000;
+const SUPERVISION_TERMINAL_TASK_STATUSES = SUPERVISION_TASK_LIFECYCLE_STATUSES
+  .filter((status) => isTerminalSupervisionTaskStatus(status));
+
 export class SupervisionTaskRegistry {
   readonly #db: DatabaseSyncInstance;
   readonly #ownsDb: boolean;
   readonly #resolveLiveParticipants?: SupervisionStateStoreOptions['resolveLiveParticipants'];
   readonly #durableEventListeners = new Set<SupervisionDurableEventListener>();
   #closed = false;
+  /**
+   * In-memory answer to "does this session currently own a live implementer
+   * assignment?", consulted on every timeline event. Recomputed from an indexed
+   * point query only after #writeAssignment changes an assignment's role,
+   * status or owning session (which bumps the epoch); the TTL is a backstop so a
+   * missed invalidation can never pin a stale answer.
+   */
+  #implementerMembershipEpoch = 0;
+  readonly #activeImplementerGate = new Map<string, { value: boolean; epoch: number; at: number }>();
 
   constructor(options: SupervisionStateStoreOptions = {}) {
     this.#resolveLiveParticipants = options.resolveLiveParticipants;
@@ -2006,6 +2021,7 @@ export class SupervisionTaskRegistry {
       );
       CREATE INDEX IF NOT EXISTS supervision_task_assignments_task_idx ON supervision_task_assignments(task_id, role, status);
       CREATE INDEX IF NOT EXISTS supervision_task_assignments_identity_idx ON supervision_task_assignments(session_name, session_instance_id, runtime_epoch);
+      CREATE INDEX IF NOT EXISTS supervision_task_assignments_owner_active_idx ON supervision_task_assignments(session_name, role, status);
       CREATE INDEX IF NOT EXISTS supervision_task_assignments_pool_active_idx
         ON supervision_task_assignments(json_extract(payload_json, '$.executionBinding.pool'), status, task_id)
         WHERE lease_id <> '';
@@ -2419,9 +2435,8 @@ export class SupervisionTaskRegistry {
   }
 
   #writeAssignment(input: PersistedSupervisionTaskAssignment, eventType: import('../../shared/supervision-config.js').SupervisionTaskRegistryEventType, payload?: Record<string, unknown>): void {
-    const record = bindValidationToRevision(
-      this.getAssignment(input.assignmentId)?.auditRevision, input.auditRevision, input,
-    );
+    const prior = this.getAssignment(input.assignmentId);
+    const record = bindValidationToRevision(prior?.auditRevision, input.auditRevision, input);
     const identity = record.identity;
     this.#db.prepare(`
       INSERT INTO supervision_task_assignments (assignment_id, task_id, role, status, session_name, session_instance_id, runtime_epoch, agent_type, provider_family, lease_id, generation, validation_state, audit_attempt_id, audit_revision, verdict, blocker, payload_json, created_at, updated_at)
@@ -2433,6 +2448,10 @@ export class SupervisionTaskRegistry {
         audit_revision=excluded.audit_revision, verdict=excluded.verdict, blocker=excluded.blocker,
         payload_json=excluded.payload_json, updated_at=excluded.updated_at
     `).run(record.assignmentId, record.taskId, record.role, record.status, identity.sessionName, identity.sessionInstanceId, identity.runtimeEpoch, identity.agentType, identity.providerFamily, record.leaseId, record.generation, record.validationState ?? null, record.auditAttemptId ?? null, record.auditRevision ?? null, record.verdict ?? null, record.blocker ?? null, JSON.stringify(record), record.createdAt, record.updatedAt);
+    if (!prior || prior.role !== record.role || prior.status !== record.status
+      || prior.identity.sessionName !== identity.sessionName) {
+      this.#implementerMembershipEpoch += 1;
+    }
     this.#appendEvent(record.taskId, record.assignmentId, eventType, record.status, payload, record.updatedAt);
     if (['implementation_finished', 'committed', 'pushed', 'recovered', 'finalized', 'cancelled'].includes(eventType)) {
       const projectName = this.getTaskRecord(record.taskId)?.projectName;
@@ -2720,6 +2739,66 @@ export class SupervisionTaskRegistry {
       })
       .slice(0, limit ?? Number.MAX_SAFE_INTEGER);
     return this.#hydrateTaskSnapshots(visible);
+  }
+
+  /** Bumped whenever an assignment's role, status or owning session changes. */
+  get implementerMembershipEpoch(): number {
+    return this.#implementerMembershipEpoch;
+  }
+
+  /**
+   * True when `sessionName` currently owns an implementer assignment that is
+   * `delegated` or `implementing`: the only rows the per-event activity
+   * projection can act on. Answered from memory except for one indexed point
+   * query after the membership changed, so the (very hot) timeline-event path
+   * of a session that owns no such work costs a Map lookup instead of a full
+   * task/assignment hydration.
+   */
+  hasActiveImplementerAssignment(sessionName: string): boolean {
+    if (this.#closed || !sessionName) return false;
+    const now = Date.now();
+    const cached = this.#activeImplementerGate.get(sessionName);
+    if (cached && cached.epoch === this.#implementerMembershipEpoch
+      && now - cached.at < SUPERVISION_IMPLEMENTER_GATE_TTL_MS) {
+      return cached.value;
+    }
+    const epoch = this.#implementerMembershipEpoch;
+    const row = this.#db.prepare(
+      `SELECT 1 AS present FROM supervision_task_assignments
+       WHERE session_name = ? AND role = 'implementer' AND status IN ('delegated', 'implementing') LIMIT 1`,
+    ).get(sessionName) as { present?: unknown } | undefined;
+    const value = row !== undefined;
+    this.#activeImplementerGate.set(sessionName, { value, epoch, at: now });
+    return value;
+  }
+
+  /**
+   * The non-terminal tasks in `projectName` in which `sessionName` owns a
+   * `delegated`/`implementing` implementer assignment, hydrated exactly like
+   * list(). This is list({ projectName, ownerSessionName, includeArchived })
+   * restricted to the rows the activity projection can act on, so a session
+   * that owns hundreds of finished tasks does not pay for them on every event.
+   *
+   * Terminal tasks (pushed/finalized/blocked/cancelled) are excluded on
+   * purpose: recordImplementationRuntimeActivity refuses them outright
+   * (`invalid_transition`), so they can never need activity accounting.
+   */
+  listTasksWithActiveImplementerAssignments(input: {
+    projectName: string;
+    sessionName: string;
+  }): SupervisionTaskSnapshot[] {
+    if (this.#closed) return [];
+    const records = (this.#db.prepare(
+      `SELECT DISTINCT t.task_id AS taskId, t.payload_json AS payloadJson
+       FROM supervision_tasks t JOIN supervision_task_assignments a ON a.task_id = t.task_id
+       WHERE t.project_name = ? AND a.session_name = ? AND a.role = 'implementer'
+         AND a.status IN ('delegated', 'implementing')
+         AND t.status NOT IN (${SUPERVISION_TERMINAL_TASK_STATUSES.map(() => '?').join(', ')})
+       ORDER BY t.task_id ASC`,
+    ).all(input.projectName, input.sessionName, ...SUPERVISION_TERMINAL_TASK_STATUSES) as Array<Record<string, unknown>>)
+      .map(parseTaskRow)
+      .filter((record): record is PersistedSupervisionTaskRecord => record !== undefined);
+    return this.#hydrateTaskSnapshots(records);
   }
 
   /** Count active leased owners in one project/pool without hydrating history. */
@@ -12260,6 +12339,7 @@ export class SupervisionTaskRegistry {
 
   clear(): void {
     if (this.#closed) return;
+    this.#implementerMembershipEpoch += 1;
     this.#db.exec('DELETE FROM supervision_worktree_gc_state; DELETE FROM supervision_task_completion_evidence; DELETE FROM supervision_audit_receipts; DELETE FROM supervision_audit_attestations; DELETE FROM supervision_task_events; DELETE FROM supervision_task_file_events; DELETE FROM supervision_task_file_claims; DELETE FROM supervision_task_idempotency; DELETE FROM supervision_task_assignments; DELETE FROM supervision_tasks;');
   }
 }

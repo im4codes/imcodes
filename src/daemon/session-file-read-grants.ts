@@ -11,6 +11,14 @@ const grantsBySession = new Map<string, Set<string>>();
 const loadedSessions = new Set<string>();
 const loadInflight = new Map<string, Promise<void>>();
 
+// A streamed assistant.text delta carries the CUMULATIVE text and is emitted up
+// to ~25 times a second; re-scanning the whole growing text for every delta is
+// O(n^2) main-thread work (7 s of a 17 s busy window in a 120 s daemon
+// profile). Streamed deltas are therefore scanned at most once per interval
+// per session; the final (non-streaming) text always is, so no grant is lost.
+export const FILE_READ_GRANT_STREAM_SCAN_INTERVAL_MS = 1_000;
+const streamScanAt = new Map<string, number>();
+
 // ChatMarkdown turns file_output_v1 Markdown destinations, inline-code local
 // paths, and standalone path lines into file-preview actions. Keep daemon
 // authorization aligned with that trusted presentation contract: an
@@ -31,7 +39,17 @@ export function extractAssistantFileReadGrants(text: string): string[] {
   return [...paths];
 }
 
-export function recordAssistantFileReadGrants(sessionName: string, text: string): void {
+export function recordAssistantFileReadGrants(
+  sessionName: string,
+  text: string,
+  opts?: { streaming?: boolean },
+): void {
+  if (opts?.streaming === true) {
+    const now = Date.now();
+    const last = streamScanAt.get(sessionName);
+    if (last !== undefined && now >= last && now - last < FILE_READ_GRANT_STREAM_SCAN_INTERVAL_MS) return;
+    streamScanAt.set(sessionName, now);
+  }
   const extracted = extractAssistantFileReadGrants(text);
   if (extracted.length === 0) return;
   let grants = grantsBySession.get(sessionName);
@@ -78,6 +96,7 @@ export async function hasAssistantFileReadGrant(
 
 export function __resetSessionFileReadGrantsForTests(): void {
   grantsBySession.clear();
+  streamScanAt.clear();
   loadedSessions.clear();
   loadInflight.clear();
 }
