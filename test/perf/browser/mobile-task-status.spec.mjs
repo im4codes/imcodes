@@ -155,7 +155,10 @@ export async function runMobileTaskStatusScenario() {
     ...[
       { label: 'android-412', width: 412, height: 915, mobile: true, hasTouch: true, pinned: true, userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/128 Mobile Safari/537.36' },
       { label: 'ipad-desktop-1024', width: 1024, height: 768, mobile: true, hasTouch: true, isMobileContext: false, pinned: true, userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15' },
-      { label: 'desktop-site-phone-390', width: 390, height: 844, mobile: true, hasTouch: false, isMobileContext: false, pinned: false, userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128 Safari/537.36' },
+      // Desktop-site mode on a phone commonly exposes a wide (~1024px) CSS
+      // viewport while retaining a touch surface; the width-only base path
+      // misclassifies it as desktop.
+      { label: 'desktop-site-phone-1024', width: 1024, height: 768, mobile: true, hasTouch: true, isMobileContext: false, pinned: false, userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128 Safari/537.36' },
     ],
     ...[1280, 1024, 800].flatMap((width) => [true, false].map((pinned) => ({
       label: `desktop-${width}-${pinned ? 'pinned' : 'no-pinned'}`, width, height: 900, mobile: false, pinned,
