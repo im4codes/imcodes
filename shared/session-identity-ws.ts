@@ -45,6 +45,24 @@ export const SESSION_IDENTITY_WS = {
    * persists it and re-pushes to the user's other online daemons.
    */
   USER_REPORT: 'session_identity.user_report',
+  /**
+   * Browser -> server -> browser, phase 2 (identity-over-lease): a tiny,
+   * server-only control call, never touching the daemon. Resolves the
+   * canonical PROJECT/SESSION scope key (server-side
+   * resolveSessionIdentityProjectKey, mirroring the HTTP route's
+   * canonicalScopeKey callback) and the CURRENT hash/revision from the
+   * server's own session_identity_metadata row -- kept in sync on every
+   * SET regardless of source (web or MCP), so this needs no daemon round
+   * trip. The browser skips a content fetch entirely when its cache
+   * already has this hash (owner rule: "server 的 hash 与缓存一致时不传输").
+   *
+   * Owner-only: the identity-over-lease P2P path is not attempted by a
+   * share participant. `ok: false` (not the daemon owner, or nothing
+   * resolved) tells the caller to fall back to the existing HTTP relay
+   * path, which already has full share-coverage access control.
+   */
+  RESOLVE_QUERY: 'session_identity.resolve_query',
+  RESOLVE_RESPONSE: 'session_identity.resolve_response',
 } as const;
 
 export type SessionIdentityWsType = typeof SESSION_IDENTITY_WS[keyof typeof SESSION_IDENTITY_WS];
@@ -144,4 +162,21 @@ export interface SessionIdentityUserReport {
   content?: string;
   source?: 'web' | 'mcp';
   sourceFile?: string;
+}
+
+export interface SessionIdentityResolveQuery {
+  type: typeof SESSION_IDENTITY_WS.RESOLVE_QUERY;
+  requestId: string;
+  scope: 'project' | 'session';
+  sessionName: string;
+}
+
+export interface SessionIdentityResolveResponse {
+  type: typeof SESSION_IDENTITY_WS.RESOLVE_RESPONSE;
+  requestId: string;
+  ok: boolean;
+  scopeKey?: string;
+  contentHash?: string;
+  revision?: number;
+  updatedAt?: number;
 }

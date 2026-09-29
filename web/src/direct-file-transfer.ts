@@ -40,6 +40,7 @@ import {
   type DirectFileTransferServerMessage,
 } from '@shared/direct-file-transfer.js';
 import { sanitizeUploadFilename } from '@shared/upload-filename.js';
+import { encodeSessionIdentityDirectHandle } from '@shared/session-identity.js';
 import {
   PendingWebRtcCandidates,
   readWebRtcCandidateType,
@@ -2916,6 +2917,66 @@ export async function downloadPreviewWithDirectFallback(options: {
       suggestedName: options.suggestedName,
       onSaveReady: options.onSaveReady,
     });
+  }
+}
+
+export interface SessionIdentityDirectResult {
+  content: string;
+}
+
+/**
+ * Session identity SET over the direct v2 lease (phase 2): reuses
+ * `uploadFileDirect` completely unchanged -- content is a Blob-backed `File`
+ * (pure in-memory, never touches disk), and its name carries the identity
+ * handle the daemon decodes (see `encodeSessionIdentityDirectHandle`). The
+ * daemon's reply is a synthetic AttachmentRef (see finishIdentityUpload in
+ * the worker); `id` is the new contentHash and `originalName` is the new
+ * revision -- both read back here and never surfaced to the caller as a
+ * real attachment.
+ */
+export async function setSessionIdentityDirect(
+  ws: WsClient, serverId: string, scope: 'project' | 'session', scopeKey: string, content: string,
+): Promise<{ contentHash: string; revision: number; updatedAt: number }> {
+  const handle = encodeSessionIdentityDirectHandle(scope, scopeKey);
+  const file = new File([content], handle, { type: 'text/plain' });
+  const clientUploadId = crypto.randomUUID().replace(/-/g, '');
+  const result = await uploadFileDirect(ws, file, clientUploadId, undefined, undefined, undefined, undefined, serverId);
+  const revision = Number(result.attachment.originalName);
+  const updatedAt = Date.parse(result.attachment.createdAt);
+  return {
+    contentHash: result.attachment.id,
+    revision: Number.isFinite(revision) && revision > 0 ? revision : 1,
+    updatedAt: Number.isFinite(updatedAt) ? updatedAt : Date.now(),
+  };
+}
+
+/**
+ * Session identity GET over the direct v2 lease (phase 2): reuses the same
+ * download operation machinery `downloadPreviewWithDirectFallback` uses,
+ * with the in-memory blob sink (`createNativeBlobDownloadSink`, already
+ * used for mobile WebViews without File System Access) as the destination
+ * instead of a real file -- content never touches disk on this end either.
+ * One bounded attempt only (see `setSessionIdentityDirect`'s sibling note):
+ * the caller falls back to the WS-relayed HTTP path on any rejection.
+ */
+export async function getSessionIdentityDirect(
+  ws: WsClient, serverId: string, scope: 'project' | 'session', scopeKey: string,
+): Promise<SessionIdentityDirectResult> {
+  if (!supportsPreviewDownload(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
+  const { lease, release } = acquireLease(ws, serverId);
+  try {
+    const sink = createNativeBlobDownloadSink();
+    const operationId = crypto.randomUUID();
+    await retryDirect<OperationSuccess>(lease, async () => ({
+      kind: 'download',
+      previewHandle: encodeSessionIdentityDirectHandle(scope, scopeKey),
+      operationId,
+      writer: await createPreviewWriter(sink.destination, 0),
+    }), undefined);
+    const blob = sink.takeCompletedBlob();
+    return { content: await blob.text() };
+  } finally {
+    release();
   }
 }
 

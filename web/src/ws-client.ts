@@ -51,6 +51,7 @@ import {
 import type { TimelineSeqGap, TimelineSubscriptionMode } from '@shared/timeline-protocol.js';
 import { CC_PRESET_MSG, type CcPreset, type CcPresetModelInfo } from '@shared/cc-presets.js';
 import { MEMORY_WS, type MemoryMcpStatusResponseMessage } from '@shared/memory-ws.js';
+import type { SessionIdentityResolveResponse } from '@shared/session-identity-ws.js';
 import type {
   MemoryFeatureAdminRecord,
   MemoryFeatureSetResponse,
@@ -315,6 +316,7 @@ export type ServerMessage =
   | { type: typeof MEMORY_WS.PIN_RESPONSE; requestId?: string; success: boolean; id?: string; error?: string; errorCode?: MemoryManagementErrorCode }
   | { type: typeof MEMORY_WS.DELETE_RESPONSE; requestId?: string; success: boolean; error?: string; errorCode?: MemoryManagementErrorCode }
   | ({ type: typeof MEMORY_WS.PROJECT_RESOLVE_RESPONSE } & MemoryProjectResolveResponsePayload)
+  | SessionIdentityResolveResponse
   | { type: typeof MEMORY_WS.FEATURES_RESPONSE; requestId?: string; records: MemoryFeatureAdminRecord[] }
   | ({ type: typeof MEMORY_WS.FEATURES_SET_RESPONSE } & MemoryFeatureSetResponse)
   | { type: typeof MEMORY_WS.PREF_RESPONSE; requestId?: string; records: MemoryPreferenceAdminRecord[]; featureEnabled?: boolean; localUnavailable?: boolean; error?: string; errorCode?: MemoryManagementErrorCode }

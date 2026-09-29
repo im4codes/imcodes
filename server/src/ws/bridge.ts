@@ -234,7 +234,9 @@ import {
   deleteSessionIdentityProfile as deleteServerSessionIdentityProfile,
   upsertSessionIdentityMetadata,
   deleteSessionIdentityMetadata,
+  getSessionIdentityMetadata,
 } from '../db/session-identity-queries.js';
+import { sessionIdentitySessionKey } from '../../../shared/session-identity.js';
 import { normalizeSessionIdentityContent, sessionIdentityContentLength } from '../../../shared/session-identity.js';
 import {
   MEMORY_MANAGEMENT_CONTEXT_FIELD,
@@ -4972,6 +4974,44 @@ export class WsBridge {
     }));
   }
 
+  /**
+   * Identity-over-lease (phase 2): pure server-side, never touches the
+   * daemon. Owner-only -- a share participant gets `ok: false` and falls
+   * back to the existing HTTP relay path, which already carries full
+   * share-coverage access control this WS shortcut deliberately does not
+   * reimplement.
+   */
+  private async handleSessionIdentityResolveQuery(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
+    const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
+    if (!requestId) return;
+    const scope = msg.scope === 'project' || msg.scope === 'session' ? msg.scope : null;
+    const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : '';
+    const userId = this.browserUserIds.get(ws)?.trim();
+    if (!scope || !sessionName || !userId || !this.daemonOwnerUserId || userId !== this.daemonOwnerUserId) {
+      safeSend(ws, JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE, requestId, ok: false }));
+      return;
+    }
+    const scopeKey = scope === 'session'
+      ? sessionIdentitySessionKey(this.serverId, sessionName)
+      : this.resolveSessionIdentityProjectKey(sessionName);
+    if (!scopeKey || !this.db) {
+      safeSend(ws, JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE, requestId, ok: false }));
+      return;
+    }
+    try {
+      const metadata = await getSessionIdentityMetadata(this.db, userId, scope, scopeKey);
+      safeSend(ws, JSON.stringify({
+        type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE,
+        requestId,
+        ok: true,
+        scopeKey,
+        ...(metadata ? { contentHash: metadata.contentHash, revision: metadata.revision, updatedAt: metadata.updatedAt } : {}),
+      }));
+    } catch {
+      safeSend(ws, JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE, requestId, ok: false }));
+    }
+  }
+
   private async handleMemoryFeaturesQuery(ws: WebSocket, msg: Record<string, unknown>): Promise<boolean> {
     if (msg.type !== MEMORY_WS.FEATURES_QUERY) return false;
     const requestId = this.registerMemoryManagementRequest(ws, msg);
@@ -6500,6 +6540,10 @@ export class WsBridge {
         return;
       }
 
+      if (msg.type === SESSION_IDENTITY_WS.RESOLVE_QUERY) {
+        await this.handleSessionIdentityResolveQuery(ws, msg);
+        return;
+      }
       if (msg.type === MEMORY_WS.FEATURES_QUERY) {
         await this.handleMemoryFeaturesQuery(ws, msg);
         return;

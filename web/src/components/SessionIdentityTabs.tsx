@@ -12,10 +12,10 @@ import {
   type SessionIdentityScope,
 } from '@shared/session-identity.js';
 import {
-  clearSessionIdentityProfile,
-  fetchSessionIdentityProfile,
-  saveSessionIdentityProfile,
-} from '../api.js';
+  clearSessionIdentityProfileDirectFirst,
+  fetchSessionIdentityProfileDirectFirst,
+  saveSessionIdentityProfileDirectFirst,
+} from '../session-identity-direct.js';
 import type { WsClient } from '../ws-client.js';
 import {
   requestSessionIdentityRefresh,
@@ -70,7 +70,7 @@ export function SessionIdentityTabs({
           initial: '', revision: 0, sourceFile: '', loaded: true,
         }] as const;
       }
-      const profile = await fetchSessionIdentityProfile(scope, key, accessContext);
+      const profile = await fetchSessionIdentityProfileDirectFirst(scope, key, accessContext, ws);
       return [scope, {
         content: profile?.content ?? '', initial: profile?.content ?? '', revision: profile?.revision ?? 0,
         sourceFile: profile?.sourceFile ?? '', loaded: true,
@@ -83,7 +83,7 @@ export function SessionIdentityTabs({
       if (live) setError(reason instanceof Error ? reason.message : String(reason));
     });
     return () => { live = false; };
-  }, [accessContext, scopeKey, sessionName]);
+  }, [accessContext, scopeKey, sessionName, ws]);
 
   const draft = drafts[activeScope];
   const validationError = draft.content.trim() ? sessionIdentityContentError(draft.content, activeScope) : null;
@@ -105,14 +105,14 @@ export function SessionIdentityTabs({
       let profile: SessionIdentityProfile | null = null;
       const contentChanged = content !== draft.initial;
       if (content && contentChanged) {
-        profile = await saveSessionIdentityProfile({
+        profile = await saveSessionIdentityProfileDirectFirst({
           scope: activeScope,
           scopeKey: scopeKey[activeScope],
           content,
           ...(draft.sourceFile ? { sourceFile: draft.sourceFile } : {}),
-        }, accessContext);
+        }, accessContext, ws);
       } else if (!content && contentChanged && draft.revision > 0) {
-        await clearSessionIdentityProfile(activeScope, scopeKey[activeScope], accessContext);
+        await clearSessionIdentityProfileDirectFirst(activeScope, scopeKey[activeScope], accessContext);
       }
       if (contentChanged) {
         setDrafts((current) => ({
