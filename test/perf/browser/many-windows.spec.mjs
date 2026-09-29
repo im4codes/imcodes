@@ -1,6 +1,7 @@
 import { createRequire } from 'node:module';
 import crypto from 'node:crypto';
 import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.ts';
+import { planSubWindows, seedVisibility } from './sub-window-plan.mjs';
 
 const require = createRequire(new URL('../../../web/package.json', import.meta.url));
 const { chromium } = require('@playwright/test');
@@ -468,9 +469,14 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
       new Promise((_, reject) => setTimeout(() => reject(new Error('main-page-open-timeout')), openTimeoutMs)),
     ]);
     pageBySession.set(main.id, page);
-    const totalSubWindows = Math.max(0, Number(process.env.IMC_PERF_SUB_WINDOWS ?? (workload.sessions.length - 1)));
+    // The spec only SEEDS (and the fake daemon only serves) `sessions - 1` sub
+    // sessions; see sub-window-plan.mjs for why a run may not wait for more.
+    const seededMinimized = process.env.IMC_PERF_SEED_MINIMIZED !== '0';
+    const subPlan = planSubWindows({ sessions: workload.sessions.length, subWindowsEnv: process.env.IMC_PERF_SUB_WINDOWS, seedMinimized: seededMinimized });
+    const totalSubWindows = subPlan.total;
     const seededHidden = process.env.IMC_PERF_SEED_MINIMIZED !== '0' && process.env.IMC_PERF_LAYOUT !== 'tabs' && process.env.IMC_PERF_VARIANT !== 'all-hidden';
-    const targetWindows = Math.max(1, seededHidden ? totalSubWindows - Math.min(10, totalSubWindows) : totalSubWindows);
+    // Exactly the visible windows the seed installed (0 is a valid target).
+    const targetWindows = seededHidden ? subPlan.target : totalSubWindows;
     const started = Date.now();
     let seen = 0;
     const boundedStep = (promise, label, timeoutMs = 2_000) => Promise.race([
@@ -576,7 +582,8 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
       await boundedStep(quick.click({ timeout: 1_500 }), 'quick restore', 2_500).catch(() => {});
       await pageWait(1_000);
       hiddenModeDiagnostics.modeAfterRestore = { ...(page.__perfWs?.sessionModes ?? {}) };
-    } else {
+    } else if (totalSubWindows > 0) {
+      // Nothing to close/restore when the run has no sub-windows at all.
       correctness.toggled = false;
       correctness.failures.push('single-page quick close/restore control missing');
     }
@@ -584,10 +591,26 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     if (hiddenTarget && restoredModes.filter((mode) => mode === 'full').length < seen) {
       correctness.failures.push(`restored subscription modes ${restoredModes.filter((mode) => mode === 'full').length}/${seen}`);
     }
-    const body = await Promise.race([readBodyText(page, 3_000), pageWait(3_000).then(() => null)]);
-    if (!body?.includes('Final answer for') && !hiddenTarget) {
+    // The fake daemon emits each session's final text on a fixed tick (every
+    // 250 stream ticks, 10 s at the default 25 Hz), so a run with few or no
+    // windows to open reaches this point BEFORE the first final. Wait for it
+    // (bounded) instead of sampling once. Whether the app then shows the chat
+    // (final text in the DOM) or its terminal view for a not-yet-typed session
+    // is a startup race, so delivery of the final frame to the browser
+    // (the harness's own WebSocket accounting) is accepted as well.
+    let body = null;
+    const finalReceived = () => Boolean(page.__perfWs?.finalSessions?.[main.name]);
+    if (!hiddenTarget) {
+      for (const started = Date.now(); Date.now() - started < 25_000;) {
+        body = await Promise.race([readBodyText(page, 3_000), pageWait(3_000).then(() => null)]);
+        if (body?.includes('Final answer for') || finalReceived()) break;
+        await pageWait(500);
+      }
+    } else body = await Promise.race([readBodyText(page, 3_000), pageWait(3_000).then(() => null)]);
+    if (!body?.includes('Final answer for') && !finalReceived() && !hiddenTarget) {
       correctness.hiddenFinal = false;
       correctness.failures.push('single-page missing authoritative final');
+      stallDiagnostics.push({ sessionId: main.name, phase: 'missing-final', bodyLength: body?.length ?? null, bodyTail: (body ?? '').slice(-1_200), readiness: main.__diagnostics?.readiness ?? null });
     }
     // Keep the primary one-page scenario alive for the requested measurement
     // duration instead of ending immediately after mount/restore. When
@@ -690,22 +713,25 @@ export async function runHarness() {
     // browser WS-ticket endpoint. This deterministic token is test-only.
     { name: 'rcc_csrf', value: 'imc-perf-csrf-token', url: BASE_URL },
   ]);
-  await context.addInitScript(({ apiKey, baseUrl }) => {
+  await context.addInitScript(({ apiKey, baseUrl, chatSessions }) => {
     localStorage.setItem('rcc_api_key', apiKey);
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'imc_perf_user', baseUrl }));
     localStorage.setItem('rcc_server', 'imc_perf_harness_server');
-  }, { apiKey: API_KEY, baseUrl: BASE_URL });
+    // The fake sessions are not typed as transport sessions until the session
+    // list arrives, and a process session opens in its terminal view by default
+    // (no chat timeline subscription, no chat text). Which one a run got was a
+    // startup race; the scenarios measure the chat, so pin it.
+    localStorage.setItem('rcc_viewModes', JSON.stringify(Object.fromEntries(chatSessions.map((name) => [name, 'chat']))));
+  }, { apiKey: API_KEY, baseUrl: BASE_URL, chatSessions: workload.sessions.map((session) => session.name) });
   if (process.env.IMC_PERF_LAYOUT !== 'tabs') {
-    const subIds = Array.from({ length: Math.max(0, requestedSessions - 1) }, (_, index) => `perfsub${index.toString(36)}`);
-    await context.addInitScript(({ main, subIds, serverId, seedMinimized }) => {
-      // Seed the app's own persisted quick-closed set so the primary scenario
-      // starts with nine visible SDK panes and ten minimized summary panes.
-      // The subsequent close/restore actions still exercise the real UI.
-      const hidden = seedMinimized ? subIds.slice(Math.max(0, subIds.length - 10)) : [];
-      const visible = seedMinimized ? subIds.slice(0, Math.max(0, subIds.length - hidden.length)) : subIds;
+    // Seed the app's own persisted open + quick-closed sets so the primary
+    // scenario starts with nine visible SDK panes and ten minimized summary
+    // panes. The subsequent close/restore actions still exercise the real UI.
+    const seeded = seedVisibility(requestedSessions, process.env.IMC_PERF_SEED_MINIMIZED !== '0');
+    await context.addInitScript(({ main, visible, hidden, serverId }) => {
       localStorage.setItem(`rcc_open_subs_${main}`, JSON.stringify(visible));
       if (hidden.length) localStorage.setItem(`rcc_subcard_quick_closed_v1:${encodeURIComponent(serverId)}:${encodeURIComponent(main)}`, JSON.stringify(hidden));
-    }, { main: workload.sessions[0]?.name, subIds, serverId: SERVER_ID, seedMinimized: process.env.IMC_PERF_SEED_MINIMIZED !== '0' });
+    }, { main: workload.sessions[0]?.name, visible: seeded.visible, hidden: seeded.hidden, serverId: SERVER_ID });
   }
   const pages = [];
   const pageBySession = new Map();
