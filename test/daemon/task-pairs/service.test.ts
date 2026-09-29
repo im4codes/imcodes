@@ -361,6 +361,28 @@ describe('task-pair marker ingestion', () => {
     expect(getTaskPairStore().listEvents(PROJECT, 'verdict-dedup').filter((event) => event.verb === 'REWORK')).toHaveLength(1);
   });
 
+  it('does not deduplicate an identical READY that follows a REWORK in the same window', () => {
+    service.setScheduler({ onIntent: () => undefined });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-after-rework', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', eventId: 'rar-dispatch',
+    });
+    const ready = (eventId: string, now: number) => service.applyMarker({
+      project: PROJECT, writer: EXEC,
+      marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'ready-after-rework', attrs: { path: '/workspace' } },
+      source: 'marker', now, eventId,
+    });
+    ready('rar-ready-1', 1_000);
+    service.applyMarker({
+      project: PROJECT, writer: AUD,
+      marker: { verb: 'REWORK', knownVerb: 'REWORK', taskId: 'ready-after-rework', attrs: { blocking: 'P0', p0: '1' } },
+      source: 'marker', now: 1_500, eventId: 'rar-rework',
+    });
+    ready('rar-ready-2', 2_000);
+    expect(getTaskPairStore().getPair(PROJECT, 'ready-after-rework')?.state).toMatchObject({ status: 'in_audit', round: 2 });
+  });
+
   it('nudges the executor once when READY lacks an auditor validation report', async () => {
     service.setScheduler({ onIntent: () => undefined });
     service.applyMarker({

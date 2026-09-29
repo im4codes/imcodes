@@ -149,6 +149,10 @@ function isDuplicateVerdictMarker(
     if (event.writer !== input.writer || event.verb !== verb) return false;
     if (now - event.at < 0 || now - event.at > TASK_PAIR_MARKER_DEDUP_WINDOW_MS) return false;
     if ((event.attrs.__round ?? '') !== round || (event.attrs.__head ?? '') !== head) return false;
+    // Only a copy of the marker that produced the CURRENT state is a
+    // duplicate: after an intervening transition (READY -> REWORK -> READY)
+    // an identical-looking marker is a new, legitimate round.
+    if (event.toStatus && event.toStatus !== existing.state.status) return false;
     return stableMarkerAttrs(event.attrs) === attrs;
   });
 }
