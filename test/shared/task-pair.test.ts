@@ -7,6 +7,7 @@ import {
   TASK_PAIR_EXECUTION_DISCIPLINE_RULE,
   TASK_PAIR_READY_SELF_CHECK_RULE,
   TASK_PAIR_SELF_SUFFICIENCY_RULE,
+  TASK_PAIR_SCOPE_DECISION_RULE,
   TASK_PAIR_BRIEF_STRUCTURE_RULE,
   TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
   TASK_PAIR_BOUNDARY_AUDIT_RULE,
@@ -292,6 +293,11 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_SELF_SUFFICIENCY_RULE).toContain('the exact command, the exact error');
     expect(TASK_PAIR_SELF_SUFFICIENCY_RULE).toContain('switch to an available alternative');
     expect(body.indexOf(TASK_PAIR_SELF_SUFFICIENCY_RULE)).toBeLessThan(body.indexOf('Automatic pairing policy'));
+    expect(body).toContain(TASK_PAIR_SCOPE_DECISION_RULE);
+    expect(TASK_PAIR_SCOPE_DECISION_RULE).toContain('pair_task_update');
+    expect(body).toContain('commit locally before READY and name that commit as head=');
+    expect(body).not.toContain('Only after the assigned auditor applies PASS in a material-backed audit round may the executor commit');
+    expect(TASK_PAIR_INTEGRATION_RULE).toContain('"evidence:"');
   });
 
   it('ships a contract where Brain sets direction and the pair gathers evidence, decides when clear and escalates otherwise', () => {

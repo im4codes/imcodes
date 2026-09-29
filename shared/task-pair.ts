@@ -321,6 +321,17 @@ export const TASK_PAIR_SELF_SUFFICIENCY_RULE: string =
   + '(an unpublished port, a temporary firewall rule on a test machine) '
   + 'instead of dropping the row.';
 
+/**
+ * Brain-side rule (2026-09-29 22:00 review): a scope decision given only by
+ * message is lost when an auditor is replaced; the replacement audits the
+ * original brief and reopens settled rows (core_lane: six voided P0s).
+ */
+export const TASK_PAIR_SCOPE_DECISION_RULE: string =
+  'When Brain narrows, re-scopes or classifies acceptance (N/A, accepted '
+  + 'elsewhere), it writes the decision into the pair brief itself '
+  + '(pair_task_update), so any current or future auditor audits the same '
+  + 'scope; a decision sent only by message does not bind a replaced auditor.';
+
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
   'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';
@@ -380,9 +391,12 @@ export const TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE: string =
  * integrates.
  */
 export const TASK_PAIR_INTEGRATION_RULE: string =
-  'After PASS: commit locally in your pair worktree (never push any branch), then report the worktree path and HEAD '
+  'After PASS: make sure the PASSed head is committed locally in your pair worktree (never push any branch), then report the worktree path and HEAD '
   + 'to Brain in your reply (the daemon also tells Brain, but say it '
-  + 'yourself too). Brain cherry-picks the commit into dev and pushes dev.';
+  + 'yourself too). Brain cherry-picks the commit into dev and pushes dev. '
+  + 'Keep evidence, logs and scratch files out of the product commits Brain '
+  + 'merges: leave them untracked in the workspace or put them in a separate '
+  + 'commit whose subject starts with "evidence:".';
 
 /**
  * Stated in the Brain contract for a project not enabled for pairs (owner
@@ -1712,7 +1726,7 @@ export function buildTaskPairMarkerContract(): string {
     `<!-- ${TASK_PAIR_MARKER_TAG} <VERB> <taskId> [key=value | key="quoted value"] -->`,
     `A marker must be in your FINAL reply of the turn: only the last text segment is scanned, so one written before an earlier tool call in the same turn is silently lost. If you need to call a tool first, finish acting, then write the marker(s) in your closing reply. A long brief goes between QUEUE <taskId> ... and its <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> line, not scattered across earlier turn text.`,
     'Verbs: DISPATCH, QUEUE, STARTED, WORKING, READY_FOR_AUDIT, PASS, REWORK, DONE, BLOCKED, NEEDS_INPUT, REASSIGN, CANCEL, CLAIM, CHECK. CLAIM <taskId> resource=... mode=exclusive|shared ttl=... [renew=true] claims a shared external resource. CHECK <taskId> box=implemented|audited items=1,2,5|all [checked=false] updates numbered brief boxes; executor may update implemented, auditor audited, Brain either. taskId "-" means your single open task.',
-    'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. Only after the assigned auditor applies PASS in a material-backed audit round may the executor commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with DONE (accept) or CANCEL; further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
+    'Executor: write STARTED when you begin and work in the pair\'s workspace (below). When done, send the auditor your validation (full suites for code) with send_message and write READY_FOR_AUDIT naming material; the daemon relays it to the auditor. In a git workspace, commit locally before READY and name that commit as head= so the audit reads a fixed revision; REWORK fixes are new local commits. Only after the assigned auditor applies PASS in a material-backed audit round may the executor report the worktree path and HEAD to Brain (never push any branch) and write DONE (with output= when the result must be kept). DONE before PASS is recorded as unusual and cannot close or advance the pair. Write BLOCKED or NEEDS_INPUT with note="..." when stuck. auditor=none is a real choice, not a lesser one: no audit window is assigned and nothing auto-picks one for you. Do proportionate self-validation instead (full suites for code), commit locally in the worktree (never push any branch), then write DONE straight to Brain with no PASS required; this reports completion but leaves the pair open awaiting Brain\'s decision. The closing reply is relayed to Brain and must state what changed, the worktree path and HEAD or file paths, and your validation result before the DONE marker. Brain ends it with DONE (accept) or CANCEL; further Brain work returns it to working. Brain merges commits into dev and pushes dev.',
     TASK_PAIR_INTEGRATION_RULE,
     TASK_PAIR_WORKSPACE_RULES,
     'Pairs have no assignmentId, auditAttemptId, auditRevision, immutable bundle, scopeFiles or control-plane binding: never wait for, ask for or block on them.',
@@ -1727,6 +1741,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_EXECUTION_DISCIPLINE_RULE,
     TASK_PAIR_READY_SELF_CHECK_RULE,
     TASK_PAIR_SELF_SUFFICIENCY_RULE,
+    TASK_PAIR_SCOPE_DECISION_RULE,
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. An empty or unconfigured pool asks the user which models to use; never invent a default. Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
     `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. Include title="<short specific title>" in the owner's UI language, for example DISPATCH tsk_demo title="Fix login retry" executor=<session> auditor=<session>. DISPATCH <taskId> title="..." executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
