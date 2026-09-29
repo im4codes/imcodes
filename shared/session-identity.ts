@@ -116,12 +116,20 @@ export function isSessionIdentityScope(value: unknown): value is SessionIdentity
  * `clientUploadId` stays a plain opaque token, since IT is restricted to
  * `[A-Za-z0-9_-]{8,128}` and cannot carry an arbitrary scope key).
  *
- * Deliberately colon-free: `filename` passes through
- * `sanitizeUploadFilename` (shared/upload-filename.ts) before an
- * OPERATION_INIT is ever sent, which strips `:` (and other
- * filesystem-unsafe characters) as if this were a real file name. `_` is
- * not in that stripped set, and `encodeURIComponent` never produces one
- * either, so it is a safe, unambiguous delimiter here.
+ * The scope key is hex-encoded, not `encodeURIComponent`-encoded: the SET
+ * path's `filename` passes through `sanitizeUploadFilename`
+ * (shared/upload-filename.ts) before an OPERATION_INIT is ever sent, as if
+ * this were a real file name. That sanitizer doesn't just strip characters
+ * like `:` -- it also COLLAPSES runs of 2+ underscores into one, strips a
+ * leading `.`/`-`, and strips a trailing `.`/space. `encodeURIComponent`
+ * leaves `_`, `.`, and `-` unescaped (they're in its unreserved set), so an
+ * entirely ordinary scope key containing one of those (a project id like
+ * "my_app__staging", or one starting/ending with `.`/`-`) silently decoded
+ * to the WRONG key after round-tripping through the sanitizer -- a real,
+ * reproduced bug, not a hypothetical one. Hex output is only `0-9a-f`,
+ * which can never trigger any of those three rules, so it survives
+ * unchanged. `-` remains a safe, unambiguous delimiter: it never appears in
+ * hex output either.
  *
  * PROJECT/SESSION only, never USER: USER scope stays server-authoritative
  * (phase 1) and is never reachable over the lease. `decode` rejects a
@@ -129,11 +137,12 @@ export function isSessionIdentityScope(value: unknown): value is SessionIdentity
  * a browser (malicious or merely buggy) could otherwise ask the daemon to
  * read/write the local USER-scope profile through this path.
  */
-const SESSION_IDENTITY_DIRECT_HANDLE_PREFIX = 'imcodes-identity_';
+const SESSION_IDENTITY_DIRECT_HANDLE_PREFIX = 'imcodes-identity-';
 const SESSION_IDENTITY_DIRECT_SCOPES = new Set<string>([SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_SCOPES.SESSION]);
 
 export function encodeSessionIdentityDirectHandle(scope: 'project' | 'session', scopeKey: string): string {
-  return `${SESSION_IDENTITY_DIRECT_HANDLE_PREFIX}${scope}_${encodeURIComponent(scopeKey)}`;
+  const hex = Buffer.from(scopeKey, 'utf8').toString('hex');
+  return `${SESSION_IDENTITY_DIRECT_HANDLE_PREFIX}${scope}-${hex}`;
 }
 
 export function decodeSessionIdentityDirectHandle(
@@ -141,17 +150,13 @@ export function decodeSessionIdentityDirectHandle(
 ): { scope: 'project' | 'session'; scopeKey: string } | null {
   if (!handle.startsWith(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX)) return null;
   const rest = handle.slice(SESSION_IDENTITY_DIRECT_HANDLE_PREFIX.length);
-  const separator = rest.indexOf('_');
+  const separator = rest.indexOf('-');
   if (separator < 0) return null;
   const scope = rest.slice(0, separator) as 'project' | 'session';
   if (!SESSION_IDENTITY_DIRECT_SCOPES.has(scope)) return null;
-  let scopeKey: string;
-  try {
-    scopeKey = decodeURIComponent(rest.slice(separator + 1));
-  } catch {
-    return null;
-  }
-  return { scope, scopeKey };
+  const hex = rest.slice(separator + 1);
+  if (!/^[0-9a-f]*$/u.test(hex) || hex.length % 2 !== 0) return null;
+  return { scope, scopeKey: Buffer.from(hex, 'hex').toString('utf8') };
 }
 
 export function normalizeSessionIdentityContent(value: string): string {

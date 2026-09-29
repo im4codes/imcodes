@@ -55,6 +55,35 @@ function withDirectAttemptBudget<T>(attempt: Promise<T>): Promise<T> {
   });
 }
 
+/**
+ * Per-serverId "don't bother" memory: a daemon whose native transport is
+ * missing entirely already gets skipped instantly (its capabilities are
+ * never advertised, so `supportsSessionIdentityDirect` fails closed below,
+ * zero microtask ticks, no budget wait) -- but a daemon whose capabilities
+ * ARE advertised yet whose network path genuinely can't complete (a forced-
+ * relay policy, a restrictive firewall) pays the full DIRECT_ATTEMPT_BUDGET_MS
+ * wait on every single call otherwise. Remember that a call against this
+ * serverId just failed and skip straight to the HTTP fallback for a short
+ * window, instead of re-paying that wait on every identity operation until
+ * conditions change. Cleared the moment a direct attempt against this
+ * serverId succeeds, so recovery is picked up on the very next call.
+ */
+const DIRECT_UNAVAILABLE_WINDOW_MS = 5 * 60 * 1000;
+const directUnavailableUntil = new Map<string, number>();
+
+function isDirectRecentlyUnavailable(serverId: string): boolean {
+  const until = directUnavailableUntil.get(serverId);
+  return until !== undefined && until > Date.now();
+}
+
+function markDirectAvailable(serverId: string): void {
+  directUnavailableUntil.delete(serverId);
+}
+
+function markDirectUnavailable(serverId: string): void {
+  directUnavailableUntil.set(serverId, Date.now() + DIRECT_UNAVAILABLE_WINDOW_MS);
+}
+
 /** Content-addressed cache: skips a bytes fetch when the server's current hash already matches. */
 const identityCache = new Map<string, { contentHash: string; content: string }>();
 
@@ -131,7 +160,9 @@ async function resolveIdentityDirect(
 export function fetchSessionIdentityProfileDirectFirst(
   scope: SessionIdentityScope, scopeKey: string, context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile | null> {
-  if (!ws || !isDirectScope(scope) || !supportsSessionIdentityDirect(ws)) return fetchSessionIdentityProfile(scope, scopeKey, context);
+  if (!ws || !isDirectScope(scope) || !supportsSessionIdentityDirect(ws) || isDirectRecentlyUnavailable(context.serverId)) {
+    return fetchSessionIdentityProfile(scope, scopeKey, context);
+  }
   const attempt = (async () => {
     const resolved = await resolveIdentityDirect(ws, scope, context);
     if (!resolved) return null;
@@ -154,7 +185,10 @@ export function fetchSessionIdentityProfileDirectFirst(
       revision: resolved.revision ?? 0, updatedAt: resolved.updatedAt ?? 0,
     });
   })();
-  return withDirectAttemptBudget(attempt).catch(() => fetchSessionIdentityProfile(scope, scopeKey, context));
+  return withDirectAttemptBudget(attempt).then(
+    (value) => { markDirectAvailable(context.serverId); return value; },
+    () => { markDirectUnavailable(context.serverId); return fetchSessionIdentityProfile(scope, scopeKey, context); },
+  );
 }
 
 /** See fetchSessionIdentityProfileDirectFirst's doc comment on why this is a plain function. */
@@ -162,7 +196,9 @@ export function saveSessionIdentityProfileDirectFirst(
   input: { scope: SessionIdentityScope; scopeKey: string; content: string; sourceFile?: string },
   context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile> {
-  if (!ws || !isDirectScope(input.scope) || !supportsSessionIdentityDirect(ws)) return saveSessionIdentityProfile(input, context);
+  if (!ws || !isDirectScope(input.scope) || !supportsSessionIdentityDirect(ws) || isDirectRecentlyUnavailable(context.serverId)) {
+    return saveSessionIdentityProfile(input, context);
+  }
   const attempt = (async () => {
     const resolved = await resolveIdentityDirect(ws, input.scope as 'project' | 'session', context);
     // A brand-new (never-saved) key still resolves to a scopeKey with no
@@ -172,7 +208,10 @@ export function saveSessionIdentityProfileDirectFirst(
     identityCache.set(cacheKey(context.serverId, input.scope, resolved.scopeKey), { contentHash: direct.contentHash, content: input.content });
     return toProfile(input.scope, resolved.scopeKey, { content: input.content, ...direct });
   })();
-  return withDirectAttemptBudget(attempt).catch(() => saveSessionIdentityProfile(input, context));
+  return withDirectAttemptBudget(attempt).then(
+    (value) => { markDirectAvailable(context.serverId); return value; },
+    () => { markDirectUnavailable(context.serverId); return saveSessionIdentityProfile(input, context); },
+  );
 }
 
 /** Always the HTTP relay path -- see the module doc comment. */

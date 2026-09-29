@@ -223,9 +223,26 @@ describe('identity-over-lease handle (phase 2)', () => {
     });
   });
 
-  it('rejects a handle with no recognized prefix, an unknown scope, or a malformed percent-encoding', () => {
+  it('survives sanitizeUploadFilename for scope keys that would corrupt an encodeURIComponent-based handle', () => {
+    // encodeURIComponent leaves `_`, `.`, `-` unescaped (its unreserved set).
+    // sanitizeUploadFilename collapses runs of 2+ underscores, strips a
+    // leading `.`/`-`, and strips a trailing `.`/space -- an entirely
+    // ordinary scope key (a project id with a double underscore, or one
+    // starting/ending with `.`/`-`) would silently decode to the WRONG key
+    // after round-tripping through it under the old scheme. Hex output is
+    // only 0-9a-f, which can never trigger any of those three rules.
+    for (const scopeKey of ['my_app__staging', '.dotfile-project', '-leading-dash', 'trailing.period.']) {
+      const handle = encodeSessionIdentityDirectHandle('project', scopeKey);
+      const sanitized = sanitizeUploadFilename(handle);
+      expect(sanitized).toBe(handle);
+      expect(decodeSessionIdentityDirectHandle(sanitized)).toEqual({ scope: 'project', scopeKey });
+    }
+  });
+
+  it('rejects a handle with no recognized prefix, an unknown scope, or malformed hex', () => {
     expect(decodeSessionIdentityDirectHandle('not-an-identity-handle')).toBeNull();
-    expect(decodeSessionIdentityDirectHandle('imcodes-identity_user_')).toBeNull();
-    expect(decodeSessionIdentityDirectHandle('imcodes-identity_project_%')).toBeNull();
+    expect(decodeSessionIdentityDirectHandle('imcodes-identity-user-')).toBeNull();
+    expect(decodeSessionIdentityDirectHandle('imcodes-identity-project-zz')).toBeNull(); // not hex
+    expect(decodeSessionIdentityDirectHandle('imcodes-identity-project-abc')).toBeNull(); // odd length
   });
 });

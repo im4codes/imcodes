@@ -3965,7 +3965,7 @@ describe('direct file transfer v2 browser broker', () => {
 
       expect(result).toMatchObject({ contentHash: expect.any(String), revision: expect.any(Number), updatedAt: expect.any(Number) });
       const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
-      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, filename: 'imcodes-identity_session_srv-1%3Adeck_proj_brain' });
+      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, filename: 'imcodes-identity-session-7372762d313a6465636b5f70726f6a5f627261696e' });
     });
 
     it('GET sends a download OPERATION_INIT whose previewHandle carries the identity handle, and decodes the received bytes', async () => {
@@ -3976,7 +3976,7 @@ describe('direct file transfer v2 browser broker', () => {
 
       expect(result.content.length).toBeGreaterThan(0);
       const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
-      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD, previewHandle: 'imcodes-identity_project_repo-1' });
+      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD, previewHandle: 'imcodes-identity-project-7265706f2d31' });
     });
 
     it('rejects when the daemon has not advertised the required capabilities, without ever attempting a lease', async () => {
