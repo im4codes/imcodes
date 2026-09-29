@@ -128,10 +128,26 @@ export async function runDaemonStatsCardScenario() {
         return socket;
       },
     });
+    // The harness is served over plain HTTP, where crypto.randomUUID does not
+    // exist. A handler that throws on it stops the ws-client dispatch loop, so
+    // later listeners (the status readouts) would never see a frame.
+    if (typeof crypto.randomUUID !== 'function') {
+      crypto.randomUUID = () => {
+        const bytes = new Uint8Array(16);
+        crypto.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+        const hex = [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+        return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+      };
+    }
     localStorage.setItem('rcc_api_key', apiKey);
     localStorage.setItem('rcc_server', serverId);
   }, { apiKey: API_KEY, serverId: SERVER_ID });
   const page = await context.newPage();
+  const pageErrors = [];
+  page.on('pageerror', (error) => { if (pageErrors.length < 30) pageErrors.push(String(error?.message ?? error)); });
+  page.on('console', (message) => { if (message.type() === 'error' && pageErrors.length < 30) pageErrors.push(`console: ${message.text().slice(0, 300)}`); });
 
   await waitForDaemonReady();
   await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(SESSION)}`, { waitUntil: 'domcontentloaded' });
@@ -178,6 +194,7 @@ export async function runDaemonStatsCardScenario() {
   const mobile = await page.evaluate(readVisibleStats);
   const mobileProblems = problemsIn(mobile, haveFullStats);
   await page.screenshot({ path: `${OUT_DIR}/daemon-stats-mobile.png` });
+  const bodyTail = await page.evaluate(() => document.body.innerText.slice(-600)).catch(() => '');
   await browser.close();
 
   const result = {
@@ -192,6 +209,8 @@ export async function runDaemonStatsCardScenario() {
     livenessFrameSample: liveness[0]?.payload ?? null,
     lastVisible: samples.at(-1),
     mobile,
+    pageErrors,
+    bodyTail,
     problemCount: problems.length + mobileProblems.length,
     problems: problems.slice(0, 20),
     mobileProblems,
