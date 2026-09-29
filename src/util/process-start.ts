@@ -85,7 +85,7 @@ export class ProcessStartReader {
     let stdout = '';
     try {
       if (this.deps.platform === 'win32') {
-        const script = `Get-Process -Id ${list} -ErrorAction SilentlyContinue | ForEach-Object { try { "$($_.Id) $($_.StartTime.ToUniversalTime().Ticks)" } catch {} }`;
+        const script = `Get-Process -Id ${list} -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Id.ToString() + ' ' + $_.StartTime.ToUniversalTime().Ticks.ToString() } catch {} }`;
         ({ stdout } = await this.deps.execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], {
           timeout: PROCESS_START_BATCH.TIMEOUT_MS,
           windowsHide: true,

@@ -114,6 +114,7 @@ describe('ProcessStartReader', () => {
     expect(calls[0].command).toBe('powershell.exe');
     expect(calls[0].args.at(-1)).toContain('Get-Process -Id 61,62,63 ');
     expect(calls[0].args.at(-1)).toContain('.StartTime.ToUniversalTime().Ticks');
+    expect(calls[0].args.at(-1)).not.toContain('"');
   });
 });
 
