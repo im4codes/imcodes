@@ -234,6 +234,51 @@ export const TASK_PAIR_EXECUTION_DISCIPLINE_RULE: string =
   + 'an SSH session), only remove paths you created by exact name, and never '
   + 'touch the machine default daemon, its tasks or its files.';
 
+/**
+ * Generic pair start-up rules for every IM.codes project, derived from where
+ * pairs actually stall: unstated boundaries, late discovery of missing
+ * environments, unbounded acceptance and redundant merge verification.
+ */
+export const TASK_PAIR_BRIEF_STRUCTURE_RULE: string =
+  'Brief structure (Brain): every DISPATCH brief states, in this order: Goal '
+  + '(the user-visible outcome, quoting the request); Proven (facts already '
+  + 'verified, with evidence); Suspected (hypotheses to confirm or refute); '
+  + 'Direction; Acceptance (numbered, checkable items); Boundary checks '
+  + '(extremes the change must not break: sizes and scale limits, every key '
+  + 'or identifier form, defaults and fallbacks, concurrency, restart and '
+  + 'upgrade, isolation from real user data); Evidence method and '
+  + 'environment (how and where each acceptance item is proven, and which '
+  + 'machines, accounts or credentials it needs); Out of scope. Acceptance is '
+  + 'risk-tiered by default: full coverage for paths the change touches '
+  + 'directly, a smoke check for paths it only rides on, unless the owner '
+  + 'asks for more.';
+
+export const TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE: string =
+  'Preflight first (executor): before implementing, check that everything '
+  + 'the acceptance needs is actually available: machines reachable, '
+  + 'accounts and credentials usable, services and test data present, and '
+  + 'any shared machine free. Report every gap immediately as NEEDS_INPUT '
+  + 'with options (an alternative machine, a test double, a narrower row) '
+  + 'instead of discovering it hours later. Reuse existing shared test '
+  + 'tooling before building a new harness, and prefer scripted checks '
+  + 'against real services over hand-driven UI.';
+
+export const TASK_PAIR_BOUNDARY_AUDIT_RULE: string =
+  'Boundary audit (auditor): before PASS, check every Boundary checks item in '
+  + 'the brief and state the evidence for each. For any change to limits, '
+  + 'timeouts, formats, keys, defaults, paths or filters, also test the '
+  + 'extremes the brief may have missed (large and slow inputs, every '
+  + 'identifier variant, missing or stale state, the default install, '
+  + 'restart). A missed boundary that breaks existing behaviour is a P0.';
+
+export const TASK_PAIR_MERGE_VERIFICATION_RULE: string =
+  'Merge verification (Brain): read the diff for removed lines of recently '
+  + 'merged work and for boundary regressions before merging. When the '
+  + 'executor reported complete full-suite results for the exact head on a '
+  + 'base equal to the current integration tip, rerun only type checks and '
+  + 'the suites the change touches; otherwise rerun the full suites. Batch '
+  + 'small verified merges.';
+
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
   'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';
@@ -1582,6 +1627,10 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
+    TASK_PAIR_BRIEF_STRUCTURE_RULE,
+    TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
+    TASK_PAIR_BOUNDARY_AUDIT_RULE,
+    TASK_PAIR_MERGE_VERIFICATION_RULE,
     TASK_PAIR_EXECUTION_DISCIPLINE_RULE,
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. An empty or unconfigured pool asks the user which models to use; never invent a default. Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
     `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. Include title="<short specific title>" in the owner's UI language, for example DISPATCH tsk_demo title="Fix login retry" executor=<session> auditor=<session>. DISPATCH <taskId> title="..." executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,

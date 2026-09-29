@@ -5,6 +5,10 @@ import {
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
   TASK_PAIR_EXECUTION_DISCIPLINE_RULE,
+  TASK_PAIR_BRIEF_STRUCTURE_RULE,
+  TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
+  TASK_PAIR_BOUNDARY_AUDIT_RULE,
+  TASK_PAIR_MERGE_VERIFICATION_RULE,
   TASK_PAIR_INTEGRATION_RULE,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
@@ -243,6 +247,21 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('Routine progress, REWORK rounds');
     expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
     expect(body).toContain('conditional non-convergence report');
+  });
+
+  it('ships generic pair start-up rules: brief structure, preflight, boundary audit, lean merge verification', () => {
+    const body = buildTaskPairMarkerContract();
+    for (const rule of [TASK_PAIR_BRIEF_STRUCTURE_RULE, TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE, TASK_PAIR_BOUNDARY_AUDIT_RULE, TASK_PAIR_MERGE_VERIFICATION_RULE]) {
+      expect(body).toContain(rule);
+    }
+    expect(TASK_PAIR_BRIEF_STRUCTURE_RULE).toContain('Boundary checks');
+    expect(TASK_PAIR_BRIEF_STRUCTURE_RULE).toContain('risk-tiered by default');
+    expect(TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE).toContain('before implementing');
+    expect(TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE).toContain('NEEDS_INPUT');
+    expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('before PASS');
+    expect(TASK_PAIR_MERGE_VERIFICATION_RULE).toContain('removed lines');
+    // Brain-side rules precede the pairing policy they govern.
+    expect(body.indexOf(TASK_PAIR_BRIEF_STRUCTURE_RULE)).toBeLessThan(body.indexOf('Automatic pairing policy'));
   });
 
   it('ships a contract with execution discipline: own workspace, state-change reporting, frozen evidence head, safe shared machines', () => {
