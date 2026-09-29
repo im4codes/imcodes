@@ -237,7 +237,11 @@ export const TASK_PAIR_EXECUTION_DISCIPLINE_RULE: string =
   + 'numbers) into the pair workspace; tear down the images and build caches '
   + 'you created and check free disk before large runs. When Brain freezes a '
   + 'head, it names the safety fixes merged after it and the steps they make '
-  + 'unsafe on the frozen build.';
+  + 'unsafe on the frozen build. Test scripts on real machines never expand '
+  + 'the home directory ($HOME, $home, ~, %USERPROFILE%): they use explicit '
+  + 'scoped absolute paths, abort if a write target resolves into a default '
+  + 'daemon home, and compare the default-state hashes after every setup '
+  + 'step, stopping at the first mismatch.';
 
 /**
  * Generic pair start-up rules for every IM.codes project, derived from where
