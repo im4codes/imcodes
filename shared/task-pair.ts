@@ -324,6 +324,8 @@ export const TASK_PAIR_NEXT_ROUND_RULE: string =
   + 'READY_FOR_AUDIT for the new round (a base= that differs from the round '
   + 'base is rejected, and a head that does not descend from it is sent '
   + 'back); the auditor\'s PASS/REWORK then applies to that round only. '
+  + 'An executor whose brief names further rounds reports the PASSed head to '
+  + 'Brain and waits for NEXT_ROUND instead of writing DONE. '
   + 'Do not DONE a pair you still intend to continue: a DONE or CANCELled '
   + 'pair cannot open another round (use a new taskId), and nobody but '
   + 'Brain may write NEXT_ROUND. Update the brief (pair_task_update) with '

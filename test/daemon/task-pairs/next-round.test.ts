@@ -111,6 +111,7 @@ describe('NEXT_ROUND through marker ingestion', () => {
   it('runs passed -> NEXT_ROUND -> working -> READY -> PASS -> DONE, telling both sides and re-notifying Brain of the second PASS', async () => {
     await passRoundOne();
     expect(sentTo(BRAIN, 'brain-line-pass-done')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'brain-line-pass-done')[0]!.text).toContain('NEXT_ROUND T1');
 
     const events: Array<Record<string, unknown>> = [];
     const off = timelineEmitter.on((event) => {

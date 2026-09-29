@@ -666,5 +666,6 @@ export function buildPassDoneNoticeMessage(pair: TaskPairState): string {
     ...(pair.workspace?.path ? [`Worktree: ${pair.workspace.path}.${pair.workspace.lastHead ? ` Head: ${pair.workspace.lastHead}.` : ''}`] : []),
     ...(where ? [where] : []),
     'Brain merges the reported commit into dev and pushes dev; the executor never pushes any branch.',
+    ...(pair.status === 'passed' ? [`More rounds planned? Write ${marker('NEXT_ROUND', pair.taskId, '[base=<commit>] [note="..."]')} on this pair instead of letting it be DONE: it returns to working with the same workspace and participants. A DONE pair cannot open another round.`] : []),
   ].join('\n');
 }
