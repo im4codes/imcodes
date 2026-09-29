@@ -118,6 +118,14 @@ describe('daemon user notice contract', () => {
     }
   });
 
+  it('tells the user a permanently unbound session must be relaunched, with no free-form params', () => {
+    const payload = createDaemonUserNoticePayload(DAEMON_USER_NOTICE_CODE.TRANSPORT_RESTORE_UNBOUND, { detail: '/Users/private/path' });
+    expect(payload.noticeCode).toBe('transport_restore_unbound');
+    expect(payload.noticeParams).toEqual({}); // nothing user-controlled ever reaches the translation
+    expect(payload.text).toContain('relaunch the session');
+    expect(payload.text).toContain('stays queued');
+  });
+
   it('attaches metadata without changing an existing information or warning rendering', () => {
     expect(attachDaemonUserNotice(
       DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED,

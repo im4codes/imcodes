@@ -277,6 +277,7 @@
       "transport_recovery_stopped": "⚠️ La recuperación se detuvo tras {{limit}} reinicios automáticos en {{minutes}} minutos.",
       "transport_recovering": "⏳ El proveedor se está recuperando; {{count}} mensaje(s) en cola se reenviarán automáticamente.",
       "transport_auto_restart_failed": "⚠️ Falló el reinicio automático del proveedor. Reinicia la sesión manualmente.",
+      "transport_restore_unbound": "⚠️ Esta sesión no se puede restaurar automáticamente (no hay una conversación duradera del proveedor que reanudar). Tu mensaje sigue en cola; reinicia la sesión para entregarlo.",
       "queued_messages_expired": "⚠️ {{count}} mensaje(s) en cola caducaron tras {{minutes}} minutos. Vuelve a enviarlos.",
       "stale_delegation_messages_expired": "⚠️ Se descartaron {{count}} mensaje(s) de delegación obsoletos: {{detail}}. Vuelve a enviar las tareas afectadas.",
       "queued_messages_failed": "⚠️ {{count}} mensaje(s) en cola siguen sin entregarse tras reconectar. Vuelve a enviarlos.",

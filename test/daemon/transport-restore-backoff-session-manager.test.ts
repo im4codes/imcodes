@@ -6,6 +6,7 @@ const mocks = vi.hoisted(() => ({
   listFails: false,
   warns: [] as Array<{ obj: Record<string, unknown>; msg: string }>,
   infos: [] as string[],
+  emits: [] as Array<{ session: string; type: string; payload: Record<string, unknown> }>,
 }));
 
 // cursor-headless cannot list sessions (the real provider has no listSessions);
@@ -47,7 +48,7 @@ vi.mock('../../src/util/logger.js', () => ({
   },
 }));
 vi.mock('../../src/daemon/timeline-emitter.js', () => ({
-  timelineEmitter: { emit: vi.fn(), on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })), forgetSession: vi.fn() },
+  timelineEmitter: { emit: vi.fn((session: string, type: string, payload: Record<string, unknown>) => { mocks.emits.push({ session, type, payload }); }), on: vi.fn(() => () => {}), epoch: 0, replay: vi.fn(() => ({ events: [], truncated: false })), forgetSession: vi.fn() },
 }));
 vi.mock('../../src/agent/tmux.js', () => ({
   listSessions: vi.fn().mockResolvedValue([]), newSession: vi.fn(), killSession: vi.fn().mockResolvedValue(undefined),
@@ -74,6 +75,8 @@ vi.mock('../../src/agent/brain-dispatcher.js', () => ({ BrainDispatcher: vi.fn()
 import { connectProvider, disconnectAll } from '../../src/agent/provider-registry.js';
 import { ensureTransportRuntimeAvailable, ensureTransportRuntimeForPendingResend } from '../../src/agent/session-manager.js';
 import { TRANSPORT_RESTORE_BACKOFF_STEPS_MS, resetTransportRestoreBackoffForTests, transportRestoreBackoffSize } from '../../src/agent/transport-restore-backoff.js';
+import { clearAllResend, enqueueResend, getResendCount } from '../../src/daemon/transport-resend-queue.js';
+import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 
 const RESTORE_LOG = 'Restoring transport session runtimes';
 const UNBOUND_WARN = 'Transport restore requires a durable provider id but the provider cannot list sessions';
@@ -98,6 +101,8 @@ beforeEach(() => {
   mocks.infos.length = 0;
   mocks.listCalls = 0;
   mocks.listFails = false;
+  mocks.emits.length = 0;
+  clearAllResend();
   resetTransportRestoreBackoffForTests();
 });
 afterEach(async () => {
@@ -241,5 +246,112 @@ describe('providers that never reach the permanent branch', () => {
     const { usesProviderResumeId } = await import('../../src/agent/transport-resume-opts.js');
     expect(['qwen', 'openclaw', 'codex-sdk', 'claude-code-sdk'].map((id) => usesProviderResumeId(id))).toEqual([false, false, false, false]);
     expect(usesProviderResumeId('cursor-headless')).toBe(true);
+  });
+});
+
+// ---- user-visible notice for a send to a permanently unbound session ----------------------------
+const SEND = { bypassBackoff: true, notifyIfPermanentlyUnbound: true } as const;
+const notices = () => mocks.emits.filter((e) => e.type === 'assistant.text' && e.payload.noticeCode === DAEMON_USER_NOTICE_CODE.TRANSPORT_RESTORE_UNBOUND);
+function queueUserMessage(name: string, id: string): void {
+  expect(enqueueResend(name, { text: `hello ${id}`, commandId: id, clientMessageId: id, queuedAt: Date.now() }).accepted).toBe(true);
+}
+
+describe('unbound-send notice (send path of a permanently unbound session)', () => {
+  it('a send tells the user once, with a shared notice code, and the message stays queued', async () => {
+    seedSession('deck_sub_notice1');
+    queueUserMessage('deck_sub_notice1', 'msg-1');
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice1', SEND);
+    expect(notices()).toHaveLength(1);
+    const [notice] = notices();
+    expect(notice!.session).toBe('deck_sub_notice1');
+    expect(notice!.payload).toMatchObject({ noticeCode: 'transport_restore_unbound', streaming: false, memoryExcluded: true });
+    expect(String(notice!.payload.text)).toContain('relaunch');
+    expect(getResendCount('deck_sub_notice1')).toBe(1); // still queued, a relaunch can deliver it
+  });
+
+  it('a burst of sends inside one backoff step notices exactly once', async () => {
+    seedSession('deck_sub_notice2');
+    for (let i = 0; i < 6; i += 1) queueUserMessage('deck_sub_notice2', `burst-${i}`);
+    await Promise.all(Array.from({ length: 6 }, () => ensureTransportRuntimeForPendingResend('deck_sub_notice2', SEND)));
+    for (let i = 0; i < 4; i += 1) {
+      advance(500);
+      await ensureTransportRuntimeForPendingResend('deck_sub_notice2', SEND);
+    }
+    expect(notices()).toHaveLength(1);
+    expect(getResendCount('deck_sub_notice2')).toBe(6);
+  });
+
+  it('notices again only when the backoff advances to a new step (5s, then 60s, then 300s), never per message', async () => {
+    seedSession('deck_sub_notice3');
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice3', SEND); // step 1
+    expect(notices()).toHaveLength(1);
+    advance(1_000);
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice3', SEND); // same step: bypass attempt inside window
+    expect(notices()).toHaveLength(1);
+    // The 5 s sweep (not a user send) reaches the window end and advances the schedule to step 2 ...
+    advance(TRANSPORT_RESTORE_BACKOFF_STEPS_MS[0]);
+    await ensureTransportRuntimeAvailable('deck_sub_notice3');
+    expect(notices()).toHaveLength(1); // ... which alone never notices,
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice3', SEND); // but the next send does, once
+    expect(notices()).toHaveLength(2);
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice3', SEND);
+    expect(notices()).toHaveLength(2);
+    advance(TRANSPORT_RESTORE_BACKOFF_STEPS_MS[1]);
+    await ensureTransportRuntimeAvailable('deck_sub_notice3'); // step 3
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice3', SEND);
+    expect(notices()).toHaveLength(3);
+  });
+
+  it('background callers (sweep, cron, supervision) never notice: only a send that asks for it does', async () => {
+    seedSession('deck_sub_notice4');
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice4'); // as the durable sweep calls it
+    await ensureTransportRuntimeAvailable('deck_sub_notice4');
+    expect(notices()).toHaveLength(0);
+  });
+
+  it('a transient failure (provider that CAN list sessions, listSessions throws) produces no notice', async () => {
+    seedSession('deck_sub_notice5', { agentType: 'copilot-sdk', providerId: 'copilot-sdk', projectDir: '/tmp/copilot-work' });
+    mocks.listFails = true;
+    queueUserMessage('deck_sub_notice5', 'transient-1');
+    for (let i = 0; i < 3; i += 1) await ensureTransportRuntimeForPendingResend('deck_sub_notice5', SEND);
+    expect(notices()).toHaveLength(0);
+    expect(getResendCount('deck_sub_notice5')).toBe(1);
+  });
+
+  it('the other permanent reason (directory-scoped provider without a project dir) notices too', async () => {
+    seedSession('deck_sub_notice6', { agentType: 'copilot-sdk', providerId: 'copilot-sdk', projectDir: '' });
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice6', SEND);
+    expect(notices()).toHaveLength(1);
+  });
+
+  it('a session deleted while its message is queued produces no notice and does not throw', async () => {
+    seedSession('deck_sub_notice7');
+    queueUserMessage('deck_sub_notice7', 'gone-1');
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice7', SEND);
+    expect(notices()).toHaveLength(1);
+    mocks.store.delete('deck_sub_notice7');
+    advance(10_000);
+    await expect(ensureTransportRuntimeForPendingResend('deck_sub_notice7', SEND)).resolves.toBeUndefined();
+    expect(notices()).toHaveLength(1);
+  });
+
+  it('after a daemon restart (empty in-memory state) the first send notices once again, and only once', async () => {
+    seedSession('deck_sub_notice8');
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice8', SEND);
+    expect(notices()).toHaveLength(1);
+    resetTransportRestoreBackoffForTests(); // daemon restart
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice8', SEND);
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice8', SEND);
+    expect(notices()).toHaveLength(2);
+  });
+
+  it('a relaunch (record change) resets the notice: no further notice for the relaunched, restorable state', async () => {
+    seedSession('deck_sub_notice9');
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice9', SEND);
+    expect(notices()).toHaveLength(1);
+    // The relaunch binds the provider conversation: the record changes, so the recorded failure no longer applies.
+    seedSession('deck_sub_notice9', { providerResumeId: 'bound-resume-id', runtimeEpoch: 'epoch-2' });
+    await ensureTransportRuntimeForPendingResend('deck_sub_notice9', SEND);
+    expect(notices()).toHaveLength(1);
   });
 });

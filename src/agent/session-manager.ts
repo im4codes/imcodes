@@ -23,6 +23,7 @@ import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { canonicalizeTransportCwd, normalizeTransportCwd } from './transport-paths.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
 import {
+  claimTransportRestoreNotice,
   clearTransportRestoreBackoff,
   isTransportRestoreBackedOff,
   noteTransportRestoreUnbound,
@@ -83,7 +84,7 @@ import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
-import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { attachDaemonUserNotice, createDaemonUserNoticePayload, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { SESSION_STATE_DECISION_REASON_SERVER_LINK_RESYNC, buildCodexLifecycleTerminalMetadata, isWorkingSessionState, type ActivityGenerationLike } from '../../shared/session-activity-types.js';
 import {
   SDK_SUBAGENT_DETAIL_KIND,
@@ -3907,13 +3908,33 @@ export async function ensureTransportRuntimeAvailable(
  */
 export async function ensureTransportRuntimeForPendingResend(
   sessionName: string,
-  options: { bypassBackoff?: boolean } = {},
+  options: {
+    bypassBackoff?: boolean;
+    /**
+     * A user message was just queued for this session: if the restore proves the
+     * session can never be restored (permanent-by-construction), say so once per
+     * backoff step. The message itself stays queued.
+     */
+    notifyIfPermanentlyUnbound?: boolean;
+  } = {},
 ): Promise<void> {
   try {
-    await ensureTransportRuntimeAvailable(sessionName, options);
+    const runtime = await ensureTransportRuntimeAvailable(sessionName, { bypassBackoff: options.bypassBackoff });
+    if (!runtime && options.notifyIfPermanentlyUnbound) emitTransportRestoreUnboundNotice(sessionName);
   } catch (err) {
     logger.error({ err, sessionName }, 'ensureTransportRuntimeForPendingResend failed');
   }
+}
+
+function emitTransportRestoreUnboundNotice(sessionName: string): void {
+  const record = getSession(sessionName);
+  if (!record) return;
+  if (!claimTransportRestoreNotice(sessionName, transportRestoreFingerprint(record))) return;
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...createDaemonUserNoticePayload(DAEMON_USER_NOTICE_CODE.TRANSPORT_RESTORE_UNBOUND),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
 }
 
 export async function launchSession(opts: LaunchOpts): Promise<void> {

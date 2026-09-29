@@ -277,6 +277,7 @@
       "transport_recovery_stopped": "⚠️ Transport recovery stopped after {{limit}} automatic restart attempts in {{minutes}} minutes.",
       "transport_recovering": "⏳ The provider is recovering; {{count}} queued message(s) will be resent automatically.",
       "transport_auto_restart_failed": "⚠️ Automatic provider restart failed. Restart the session manually to recover.",
+      "transport_restore_unbound": "⚠️ This session can't be restored automatically (there is no durable provider conversation to resume). Your message stays queued; relaunch the session to deliver it.",
       "queued_messages_expired": "⚠️ {{count}} queued message(s) expired after {{minutes}} minutes. Send them again.",
       "stale_delegation_messages_expired": "⚠️ {{count}} stale delegation message(s) were discarded: {{detail}}. Send the affected tasks again.",
       "queued_messages_failed": "⚠️ {{count}} queued message(s) still could not be delivered after reconnecting. Send them again.",

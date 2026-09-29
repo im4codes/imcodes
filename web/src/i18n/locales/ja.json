@@ -277,6 +277,7 @@
       "transport_recovery_stopped": "⚠️ {{minutes}} 分間に {{limit}} 回自動再起動したため、転送の復旧を停止しました。",
       "transport_recovering": "⏳ プロバイダーを復旧中です。キュー内の {{count}} 件を自動再送します。",
       "transport_auto_restart_failed": "⚠️ プロバイダーの自動再起動に失敗しました。手動でセッションを再起動してください。",
+      "transport_restore_unbound": "⚠️ このセッションは自動復元できません（再開できる永続的なプロバイダー会話がありません）。メッセージはキューに残っています。セッションを再起動すると配信されます。",
       "queued_messages_expired": "⚠️ キュー内の {{count}} 件が {{minutes}} 分後に期限切れになりました。再送してください。",
       "stale_delegation_messages_expired": "⚠️ 期限切れの委任メッセージ {{count}} 件を破棄しました：{{detail}}。該当するタスクを再送してください。",
       "queued_messages_failed": "⚠️ 再接続後も {{count}} 件を配信できませんでした。再送してください。",

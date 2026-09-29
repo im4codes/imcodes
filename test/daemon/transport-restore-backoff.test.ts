@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from 'vitest';
 import {
   TRANSPORT_RESTORE_BACKOFF_STEPS_MS,
+  claimTransportRestoreNotice,
   clearTransportRestoreBackoff,
   clearTransportRestoreBackoffForProvider,
   isTransportRestoreBackedOff,
@@ -95,6 +96,30 @@ describe('transport restore backoff state', () => {
     expect(isTransportRestoreBackedOff('s8', 'fp', 1_000)).toBe(true);
     pruneTransportRestoreBackoff(() => false);
     expect(transportRestoreBackoffSize()).toBe(0);
+  });
+});
+
+describe('once-per-step notice claim', () => {
+  it('claims at most once per backoff step, per record state, and never without a recorded failure', () => {
+    expect(claimTransportRestoreNotice('s', 'fp')).toBe(false); // nothing recorded (restorable / transient / relaunched)
+    noteTransportRestoreUnbound('s', 'p', 'fp', REASON, 0);
+    expect(claimTransportRestoreNotice('s', 'other-fp')).toBe(false); // record changed since the attempt
+    expect(claimTransportRestoreNotice('s', 'fp')).toBe(true); // step 1
+    expect(claimTransportRestoreNotice('s', 'fp')).toBe(false);
+    noteTransportRestoreUnbound('s', 'p', 'fp', REASON, 2_000); // a bypassing send inside the window
+    expect(claimTransportRestoreNotice('s', 'fp')).toBe(false); // still step 1: already announced
+    noteTransportRestoreUnbound('s', 'p', 'fp', REASON, 5_000); // window over: step 2
+    expect(claimTransportRestoreNotice('s', 'fp')).toBe(true);
+    expect(claimTransportRestoreNotice('s', 'fp')).toBe(false);
+  });
+
+  it('a changed fingerprint or a cleared session forgets what was announced', () => {
+    noteTransportRestoreUnbound('s', 'p', 'fp1', REASON, 0);
+    expect(claimTransportRestoreNotice('s', 'fp1')).toBe(true);
+    noteTransportRestoreUnbound('s', 'p', 'fp2', REASON, 1); // different record state => fresh entry at step 1
+    expect(claimTransportRestoreNotice('s', 'fp2')).toBe(true);
+    clearTransportRestoreBackoff('s');
+    expect(claimTransportRestoreNotice('s', 'fp2')).toBe(false);
   });
 });
 

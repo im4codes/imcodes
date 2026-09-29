@@ -38,6 +38,7 @@ export const DAEMON_USER_NOTICE_CODE = {
   TRANSPORT_RECOVERY_STOPPED: 'transport_recovery_stopped',
   TRANSPORT_RECOVERING: 'transport_recovering',
   TRANSPORT_AUTO_RESTART_FAILED: 'transport_auto_restart_failed',
+  TRANSPORT_RESTORE_UNBOUND: 'transport_restore_unbound',
   QUEUED_MESSAGES_EXPIRED: 'queued_messages_expired',
   STALE_DELEGATION_MESSAGES_EXPIRED: 'stale_delegation_messages_expired',
   QUEUED_MESSAGES_FAILED: 'queued_messages_failed',
@@ -219,6 +220,8 @@ export function formatDaemonUserNoticeEnglish(
       return `The provider is recovering; ${numberParam(params, 'count')} queued message(s) will be resent automatically.`;
     case DAEMON_USER_NOTICE_CODE.TRANSPORT_AUTO_RESTART_FAILED:
       return 'Automatic provider restart failed. Restart the session manually to recover.';
+    case DAEMON_USER_NOTICE_CODE.TRANSPORT_RESTORE_UNBOUND:
+      return "This session can't be restored automatically (there is no durable provider conversation to resume). Your message stays queued; relaunch the session to deliver it.";
     case DAEMON_USER_NOTICE_CODE.QUEUED_MESSAGES_EXPIRED:
       return `${numberParam(params, 'count')} queued message(s) expired after ${numberParam(params, 'minutes')} minutes. Send them again.`;
     case DAEMON_USER_NOTICE_CODE.STALE_DELEGATION_MESSAGES_EXPIRED:

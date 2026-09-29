@@ -26,6 +26,8 @@ interface BackoffEntry {
   attempts: number;
   until: number;
   reason: TransportRestoreUnboundReason;
+  /** Highest step already announced to the user, so a burst of sends notices once per step. */
+  noticedStep: number;
 }
 
 const entries = new Map<string, BackoffEntry>();
@@ -92,8 +94,22 @@ export function noteTransportRestoreUnbound(
   }
   const attempts = existing && existing.fingerprint === fingerprint ? existing.attempts + 1 : 1;
   const step = TRANSPORT_RESTORE_BACKOFF_STEPS_MS[Math.min(attempts, TRANSPORT_RESTORE_BACKOFF_STEPS_MS.length) - 1]!;
-  entries.set(sessionName, { providerId, fingerprint, attempts, until: now + step, reason });
+  const carriedNotice = existing && existing.fingerprint === fingerprint ? existing.noticedStep : 0;
+  entries.set(sessionName, { providerId, fingerprint, attempts, until: now + step, reason, noticedStep: carriedNotice });
   return { logNow: true, attempts, retryInMs: step };
+}
+
+/**
+ * True at most once per backoff step, and only while a permanent failure for
+ * THIS record state is recorded: the caller then tells the user once that the
+ * session cannot be restored. Absent entry (restorable session, transient
+ * failure, relaunched/changed record, deleted session) => false.
+ */
+export function claimTransportRestoreNotice(sessionName: string, fingerprint: string): boolean {
+  const entry = entries.get(sessionName);
+  if (!entry || entry.fingerprint !== fingerprint || entry.noticedStep >= entry.attempts) return false;
+  entry.noticedStep = entry.attempts;
+  return true;
 }
 
 export function clearTransportRestoreBackoff(sessionName: string): void {

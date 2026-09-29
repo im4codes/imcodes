@@ -277,6 +277,7 @@
       "transport_recovery_stopped": "⚠️ {{minutes}}분 동안 {{limit}}회 자동 재시작한 뒤 전송 복구를 중지했습니다.",
       "transport_recovering": "⏳ 공급자를 복구 중입니다. 대기 메시지 {{count}}개를 자동 재전송합니다.",
       "transport_auto_restart_failed": "⚠️ 공급자 자동 재시작에 실패했습니다. 세션을 수동으로 재시작하세요.",
+      "transport_restore_unbound": "⚠️ 이 세션은 자동으로 복원할 수 없습니다(이어서 진행할 영구 공급자 대화가 없습니다). 메시지는 대기열에 남아 있으며, 세션을 다시 시작하면 전달됩니다.",
       "queued_messages_expired": "⚠️ 대기 메시지 {{count}}개가 {{minutes}}분 후 만료되었습니다. 다시 보내세요.",
       "stale_delegation_messages_expired": "⚠️ 오래된 위임 메시지 {{count}}개가 삭제되었습니다: {{detail}}. 영향을 받은 작업을 다시 보내세요.",
       "queued_messages_failed": "⚠️ 재연결 후에도 대기 메시지 {{count}}개를 전달하지 못했습니다. 다시 보내세요.",

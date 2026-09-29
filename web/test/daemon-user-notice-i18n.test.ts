@@ -64,6 +64,22 @@ describe('daemon user notice web localization', () => {
     }
   });
 
+  it.each(LOCALES)('renders the unbound-send relaunch notice in %s, translated and without placeholders', (locale) => {
+    const resource = JSON.parse(readFileSync(
+      resolve(WEB_ROOT, `src/i18n/locales/${locale}.json`),
+      'utf8',
+    )) as Record<string, unknown>;
+    const localized = localizeDaemonUserNoticeEvent(
+      noticeEvent(DAEMON_USER_NOTICE_CODE.TRANSPORT_RESTORE_UNBOUND),
+      resourceTranslator(resource),
+    );
+    const text = String(localized.payload.text);
+    expect(text).not.toBe('English fallback');
+    expect(text).not.toContain('{{');
+    expect(text).not.toBe(DAEMON_USER_NOTICE_I18N_KEYS[DAEMON_USER_NOTICE_CODE.TRANSPORT_RESTORE_UNBOUND]);
+    if (locale === 'en') expect(text).toContain('relaunch the session');
+  });
+
   it.each(LOCALES)('keeps every dynamic supervision diagnostic visible in %s', (locale) => {
     const resource = JSON.parse(readFileSync(
       resolve(WEB_ROOT, `src/i18n/locales/${locale}.json`),

@@ -324,7 +324,7 @@ describe('peer-audit dedicated dispatch', () => {
       clientMessageId: 'send_message_12345678',
       deliveryMode: 'append',
     }));
-    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123', { bypassBackoff: true });
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123', { bypassBackoff: true, notifyIfPermanentlyUnbound: true });
   });
 
   it('falls back to the durable runtime FIFO when native append is unsupported', async () => {
@@ -356,7 +356,7 @@ describe('peer-audit dedicated dispatch', () => {
     }));
     const queuedEntry = enqueueResendMock.mock.calls[0]?.[1] as Record<string, unknown>;
     expect(queuedEntry.commandId).toBe(queuedEntry.clientMessageId);
-    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123', { bypassBackoff: true });
+    expect(ensureTransportRuntimeForPendingResendMock).toHaveBeenCalledWith('deck_sub_audit123', { bypassBackoff: true, notifyIfPermanentlyUnbound: true });
     expect(sendMock).not.toHaveBeenCalled();
     expect(processSendMock).not.toHaveBeenCalled();
   });

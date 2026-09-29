@@ -277,6 +277,7 @@
       "transport_recovery_stopped": "⚠️ 传输恢复在 {{minutes}} 分钟内自动重启 {{limit}} 次后停止。",
       "transport_recovering": "⏳ 提供商正在恢复；{{count}} 条排队消息将在恢复后自动重发。",
       "transport_auto_restart_failed": "⚠️ 提供商自动重启失败。请手动重启会话。",
+      "transport_restore_unbound": "⚠️ 此会话无法自动恢复（没有可恢复的持久提供商对话）。你的消息仍在队列中，请重新启动该会话以送达。",
       "queued_messages_expired": "⚠️ {{count}} 条排队消息超过 {{minutes}} 分钟未送达。请重新发送。",
       "stale_delegation_messages_expired": "⚠️ {{count}} 条过期的代理消息已丢弃：{{detail}}。请重新发送相关任务。",
       "queued_messages_failed": "⚠️ 重新连接后仍有 {{count}} 条排队消息未送达。请重新发送。",
