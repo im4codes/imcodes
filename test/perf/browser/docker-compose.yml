@@ -236,6 +236,11 @@ services:
       - "--no-cli"
       - "--min-port=65436"
       - "--max-port=65535"
+      # Client, TURN server, and relay peer are all on the same docker-bridge
+      # private subnet here -- coturn's default anti-SSRF peer-IP checks
+      # otherwise silently drop relayed data to a private-range peer even
+      # after a successful Allocate/CreatePermission handshake.
+      - "--allow-loopback-peers"
     ports:
       - "3479:3479/udp"
       - "3479:3479/tcp"
@@ -255,6 +260,7 @@ services:
     environment:
       HOME: /tmp/imc-identity-home
       IMCODES_HOME: /tmp/imc-identity-home/.imcodes
+      LOG_LEVEL: ${IMC_PERF_IDENTITY_LOG_LEVEL:-info}
       IMC_PERF_WORKER_URL: http://server:19138
       IMC_PERF_SERVER_ID: imc_identity_real_server
       IMC_PERF_DAEMON_TOKEN: imc-identity-real-daemon-token

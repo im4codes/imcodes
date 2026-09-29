@@ -77,34 +77,60 @@ async function readDaemonLocalContent(scope, scopeKey) {
  * the two scenarios differ -- everything else about the flow is identical.
  */
 async function runScenario(chromiumArgs, label) {
-  const browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage', ...chromiumArgs] });
+  const browser = await chromium.launch({
+    headless: true,
+    args: ['--disable-dev-shm-usage', ...chromiumArgs],
+  });
   const routeMetrics = [];
+  const pendingRouteReads = [];
   try {
     const context = await browser.newContext({ viewport: { width: 1280, height: 900 }, bypassCSP: true });
     await context.addCookies([{ name: 'rcc_session', value: jwt(), url: BASE_URL }, { name: 'rcc_csrf', value: 'imc-identity-perf-csrf-token', url: BASE_URL }]);
     await context.addInitScript(({ apiKey, baseUrl, serverId, session }) => {
+      // BASE_URL is a docker-network hostname (e.g. http://server:19138), not
+      // literal localhost/127.0.0.1 -- Chromium's secure-context check only
+      // exempts the latter, so crypto.randomUUID() is undefined there. Same
+      // polyfill as upload-preview.spec.mjs's proven pattern for this gap.
+      if (typeof crypto.randomUUID !== 'function') {
+        crypto.randomUUID = () => {
+          const bytes = new Uint8Array(16);
+          crypto.getRandomValues(bytes);
+          bytes[6] = (bytes[6] & 0x0f) | 0x40;
+          bytes[8] = (bytes[8] & 0x3f) | 0x80;
+          const hex = Array.from(bytes, (value) => value.toString(16).padStart(2, '0')).join('');
+          return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+        };
+      }
       localStorage.setItem('rcc_api_key', apiKey);
       localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'imc_identity_perf_user', baseUrl }));
       localStorage.setItem('rcc_server', serverId);
     }, { apiKey: API_KEY, baseUrl: BASE_URL, serverId: SERVER_ID, session: SESSION_NAME });
     const page = await context.newPage();
     page.on('console', (msg) => {
-      const text = msg.text();
-      process.stderr.write(`[${label}] [browser console] ${msg.type()} ${text}\n`);
+      process.stderr.write(`[${label}] [browser console] ${msg.type()} ${msg.text()}\n`);
       // web/src/direct-file-transfer.ts's recordDirectFileTransferMetric logs
       // via console.debug('[direct-file-transfer]', {metric, route, ...}) --
-      // Playwright only gives us the formatted text, so parse the JSON tail.
-      if (text.includes('[direct-file-transfer]') && text.includes('"metric":"route"')) {
-        const jsonStart = text.indexOf('{');
-        if (jsonStart >= 0) {
-          try { routeMetrics.push(JSON.parse(text.slice(jsonStart))); } catch { /* not JSON on this line */ }
-        }
+      // a real object arg, not a JSON string (msg.text() renders it with
+      // unquoted keys, e.g. "{metric: route, route: direct}", which isn't
+      // parseable JSON). Read the real object back via the console message's
+      // JSHandle args instead. Both a dedicated `route` metric (download) and
+      // `direct_success`/`relay_success` (upload, route embedded inline)
+      // carry a `route` field -- capture whichever fires.
+      if (msg.text().startsWith('[direct-file-transfer]') && msg.args().length >= 2) {
+        pendingRouteReads.push(msg.args()[1].jsonValue().then((fields) => {
+          if (fields && typeof fields === 'object' && typeof fields.route === 'string') {
+            routeMetrics.push(fields);
+          }
+        }).catch(() => { /* handle no longer resolvable (page navigated/closed) */ }));
       }
     });
     page.on('requestfailed', (req) => process.stderr.write(`[${label}] [browser requestfailed] ${req.method()} ${req.url()} ${req.failure()?.errorText ?? ''}\n`));
 
+    // app.tsx reads identityTestHooks from window.location.search (the real
+    // query string), which comes BEFORE the hash in a hash-routed SPA -- put
+    // it there, not inside the #/server/session hash route itself.
     await page.goto(
-      `${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(SESSION_NAME)}?identityTestHooks=1`,
+      `${BASE_URL}/?identityTestHooks=1#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(SESSION_NAME)}`,
       { waitUntil: 'domcontentloaded', timeout: 30_000 },
     );
     const REQUIRED_CAPABILITIES = [
@@ -112,13 +138,24 @@ async function runScenario(chromiumArgs, label) {
       'file.transfer.direct.upload_recovery.v2',
       'file.transfer.direct.preview_download.v2',
     ];
-    await page.waitForFunction((required) => {
-      const ws = window.__identityTestWs__;
-      const mod = window.__identityTestDirectFileTransfer__;
-      if (!ws?.connected || !mod?.setSessionIdentityDirect || !mod?.getSessionIdentityDirect) return false;
-      const snapshot = ws.getDaemonCapabilitySnapshot?.();
-      return Boolean(snapshot) && required.every((capability) => snapshot.capabilities.includes(capability));
-    }, REQUIRED_CAPABILITIES, { timeout: 30_000 });
+    try {
+      await page.waitForFunction((required) => {
+        const ws = window.__identityTestWs__;
+        const mod = window.__identityTestDirectFileTransfer__;
+        if (!ws?.connected || !mod?.setSessionIdentityDirect || !mod?.getSessionIdentityDirect) return false;
+        const snapshot = ws.getDaemonCapabilitySnapshot?.();
+        return Boolean(snapshot) && required.every((capability) => snapshot.capabilities.includes(capability));
+      }, REQUIRED_CAPABILITIES, { timeout: 30_000 });
+    } catch (error) {
+      const diag = await page.evaluate(() => ({
+        hasWs: Boolean(window.__identityTestWs__),
+        hasMod: Boolean(window.__identityTestDirectFileTransfer__),
+        connected: window.__identityTestWs__?.connected,
+        snapshot: window.__identityTestWs__?.getDaemonCapabilitySnapshot?.() ?? null,
+      }));
+      process.stderr.write(`[${label}] [diagnostic] ${JSON.stringify(diag)}\n`);
+      throw error;
+    }
 
     const content = 'identity-perf-content-'.repeat(Math.ceil(CONTENT_CHARS / 23)).slice(0, CONTENT_CHARS);
     const expectedHash = sha256Hex(content);
@@ -152,6 +189,7 @@ async function runScenario(chromiumArgs, label) {
     if (getElapsedMs > SAVE_BUDGET_MS) throw new Error(`[${label}] GET took ${getElapsedMs}ms, over the ${SAVE_BUDGET_MS}ms budget`);
     if (getResult.content !== content) throw new Error(`[${label}] GET returned content that does not match what was SET`);
 
+    await Promise.all(pendingRouteReads);
     await context.close();
     return { setElapsedMs, getElapsedMs, contentHash: expectedHash, routeMetrics };
   } finally {
