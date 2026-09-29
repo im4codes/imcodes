@@ -174,7 +174,8 @@ describe('task-pair heartbeat, replacement and queue', () => {
     const inspect = vi.spyOn(mainCheckoutGuard, 'inspect').mockResolvedValue({ project: PROJECT, root: '/tmp/' + PROJECT, paths: ['.env.token', 'src/main.ts'], credentialPaths: ['.env.token'] });
     await automation.tick();
     expect(sentTo(BRAIN, 'main-checkout-guard')).toHaveLength(1);
-    expect(sentTo(EXEC, 'main-checkout-guard')).toHaveLength(1);
+    expect(sentTo(EXEC, 'main-checkout-guard')).toHaveLength(0);
+    expect(sentTo(AUD, 'main-checkout-guard')).toHaveLength(0);
     expect(sentTo(BRAIN, 'main-checkout-guard')[0]!.text).toContain('.env.token');
     inspect.mockRestore();
   });
