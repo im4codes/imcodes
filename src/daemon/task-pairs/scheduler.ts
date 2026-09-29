@@ -70,6 +70,7 @@ import {
   buildDispatchTrailer,
   buildExecutorHandoffMessage,
   buildExecutorResendMessage,
+  buildParticipantRecoveryMessage,
   buildNoBriefDigestMessage,
   buildNoBriefLine,
   buildNoPoolAskMessage,
@@ -108,6 +109,8 @@ const TASK_PAIR_STAGE_STALL_ESCALATE_MS = 2 * 60 * 60_000;
 const TASK_PAIR_PARTICIPANT_RECOVERY_MAX_PER_TICK = 8;
 const TASK_PAIR_PARTICIPANT_RECOVERY_MAX_ATTEMPTS = 3;
 const TASK_PAIR_PARTICIPANT_RECOVERY_WINDOW_MS = 5 * 60_000;
+/** Once executor silence is escalated, Brain reminders back off 30/60/120m. */
+const TASK_PAIR_EXECUTOR_ESCALATION_REMINDER_MS = [30 * 60_000, 60 * 60_000, 120 * 60_000] as const;
 
 export function resolveTaskPairParticipantHealthMs(env: NodeJS.ProcessEnv = process.env): number {
   const raw = Number(env[TASK_PAIR_PARTICIPANT_HEALTH_ENV]);
@@ -485,6 +488,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
       // survives a daemon restart without re-spamming Brain.
       const key = recoveryKey;
       const wasNotified = fresh.liveness.notified.includes(key) || this.#participantRecoveryNoticeKeys.has(key);
+      const restarted = getSession(candidate.name);
+      const restartId = restarted?.runtimeEpoch
+        ?? `${candidate.name}:${restarted?.restarts ?? priorAttempts}:${attemptAt}`;
+      const recoveryAlreadyDelivered = fresh.liveness.participantRecoveryRestartId === restartId;
       const next = {
         ...fresh.liveness,
         ...(ok ? {
@@ -493,13 +500,26 @@ export class TaskPairAutomation implements TaskPairScheduler {
           participantRecoveryCount: (fresh.liveness.participantRecoveryCount ?? 0) + 1,
         } : {}),
         ...(!wasNotified ? { notified: [...fresh.liveness.notified, key] } : {}),
+        ...(ok ? {
+          participantRecoveryRestartId: restartId,
+          ...(candidate.side === 'executor'
+            ? { participantObservedExecutorSession: candidate.name, participantObservedExecutorEpoch: restartId, participantRecoveryExecutorRestartId: restartId }
+            : { participantObservedAuditorSession: candidate.name, participantObservedAuditorEpoch: restartId, participantRecoveryAuditorRestartId: restartId }),
+        } : {}),
       };
       getTaskPairStore().saveLiveness(stored.project, pair.taskId, next);
       if (ok) {
         const instruction = candidate.side === 'executor' ? fresh.liveness.lastInstructionExecutor : fresh.liveness.lastInstructionAuditor;
-        const resumeText = instruction
-          ?? `Your provider was recovered after an error while working on ${pair.taskId}. Continue the pair now and report progress.`;
-        await sendTaskPairMessage(candidate.name, pair.taskId, 'recovery-resume', resumeText);
+        // The runtime epoch/restart id is durable, so a daemon restart or a
+        // retry after a failed transport cannot duplicate this state handoff.
+        if (!recoveryAlreadyDelivered) {
+          await sendTaskPairMessage(
+            candidate.name,
+            pair.taskId,
+            'recovery-resume',
+            buildParticipantRecoveryMessage(fresh.state, candidate.side, instruction),
+          );
+        }
         if (!wasNotified) {
           this.#participantRecoveryNoticeKeys.add(key);
           this.#queueLineNotice(fresh.state, 'participant-recovered', `Participant ${candidate.name} was automatically restarted and its last pair instruction was re-delivered for ${pair.taskId}.`);
@@ -549,6 +569,89 @@ export class TaskPairAutomation implements TaskPairScheduler {
       store.saveLiveness(stored.project, pair.taskId, escalated);
       this.#queueLineNotice(pair, 'stage-stall', `Pair ${pair.taskId} has stalled in ${phase}: no material event since ${new Date(liveness.lastMaterialAt ?? pair.updatedAt).toISOString()}, and the executor prompt received no progress after the escalation window.`);
     }
+  }
+
+  /**
+   * Keep an escalated executor from disappearing forever.  The first Brain
+   * escalation is immediate; subsequent reminders are durable and back off
+   * 30m, 60m, then a capped 120m interval until executor progress clears it.
+   */
+  #checkEscalatedExecutor(stored: StoredTaskPair, now: number): void {
+    const pair = stored.state;
+    const live = stored.liveness;
+    if (!pair.flags.includes('executor_silent') || !pair.executor) return;
+    const escalatedAt = live.executorEscalationAt;
+    if (!escalatedAt || live.progressExecutorAt > escalatedAt) return;
+    const count = live.executorEscalationReminderCount ?? 0;
+    const interval = TASK_PAIR_EXECUTOR_ESCALATION_REMINDER_MS[Math.min(count, TASK_PAIR_EXECUTOR_ESCALATION_REMINDER_MS.length - 1)]!;
+    const since = live.executorEscalationLastAt ?? escalatedAt;
+    if (now - since < interval) return;
+    const next = {
+      ...live,
+      executorEscalationReminderCount: count + 1,
+      executorEscalationLastAt: now,
+    };
+    getTaskPairStore().saveLiveness(stored.project, pair.taskId, next);
+    const silentFor = Math.max(0, now - (live.lastMaterialAt ?? escalatedAt));
+    this.#queueLineNotice(
+      pair,
+      'executor-silent-followup',
+      `Executor ${pair.executor} remains silent on ${pair.taskId} for ${Math.round(silentFor / 60_000)} minutes after escalation; last material event was ${new Date(live.lastMaterialAt ?? escalatedAt).toISOString()}. Choose REASSIGN, DONE force=true only after commit, or CANCEL.`,
+    );
+  }
+
+  /**
+   * External/session-manager restarts do not pass through #recoverParticipant.
+   * Track each participant's runtime epoch and deliver the same durable handoff
+   * when an otherwise healthy/idle session is replaced.  The observed epoch is
+   * initialized silently, so existing pairs are not spammed on upgrade; every
+   * later epoch change is delivered once and persisted before sending.
+   */
+  async #detectExternalParticipantRestart(stored: StoredTaskPair): Promise<boolean> {
+    const pair = stored.state;
+    let live = stored.liveness;
+    let changed = false;
+    let delivered = false;
+    for (const candidate of [
+      { role: 'executor' as const, name: pair.executor, observed: 'participantObservedExecutorEpoch' as const, observedSession: 'participantObservedExecutorSession' as const, watermark: 'participantRecoveryExecutorRestartId' as const },
+      { role: 'auditor' as const, name: pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined, observed: 'participantObservedAuditorEpoch' as const, observedSession: 'participantObservedAuditorSession' as const, watermark: 'participantRecoveryAuditorRestartId' as const },
+    ]) {
+      if (!candidate.name) continue;
+      const record = getSession(candidate.name);
+      const epoch = record?.runtimeEpoch;
+      if (!epoch) continue;
+      if (live[candidate.observedSession] !== undefined && live[candidate.observedSession] !== candidate.name) {
+        live = { ...live, [candidate.observedSession]: candidate.name, [candidate.observed]: epoch };
+        changed = true;
+        continue;
+      }
+      if (live[candidate.observed] === undefined) {
+        live = { ...live, [candidate.observedSession]: candidate.name, [candidate.observed]: epoch };
+        changed = true;
+        continue;
+      }
+      if (live[candidate.observed] === epoch) {
+        if (live[candidate.observedSession] === undefined) {
+          live = { ...live, [candidate.observedSession]: candidate.name };
+          changed = true;
+        }
+        continue;
+      }
+      live = { ...live, [candidate.observed]: epoch };
+      changed = true;
+      if (live[candidate.watermark] === epoch) continue;
+      live = { ...live, [candidate.watermark]: epoch, participantRecoveryRestartId: epoch };
+      getTaskPairStore().saveLiveness(stored.project, pair.taskId, live);
+      await sendTaskPairMessage(
+        candidate.name,
+        pair.taskId,
+        'recovery-resume',
+        buildParticipantRecoveryMessage(pair, candidate.role, candidate.role === 'executor' ? live.lastInstructionExecutor : live.lastInstructionAuditor),
+      );
+      delivered = true;
+    }
+    if (changed && !delivered) getTaskPairStore().saveLiveness(stored.project, pair.taskId, live);
+    return delivered;
   }
 
   #logQueueSkip(project: string, pair: TaskPairState, reason: string): void {
@@ -646,14 +749,22 @@ export class TaskPairAutomation implements TaskPairScheduler {
     this.#recoverySeenThisTick.clear();
     this.#recoveryCountThisTick = 0;
     try {
-      for (const stored of store.listActivePairs()) {
+    for (const stored of store.listActivePairs()) {
         if (!isPairsEngineProject(stored.project)) continue;
         brains.set(stored.state.brain, stored.project);
         try {
           await ensureTaskPairWorkspaceAvailable(stored.project, stored.state.taskId);
           await refreshTaskPairWorkspaceHead(stored.project, stored.state.taskId);
-          const recovered = await this.#recoverParticipant(stored, now);
-          if (!recovered) await this.#tickPair(stored, now);
+          const externallyRecovered = await this.#detectExternalParticipantRestart(stored);
+          const recovered = externallyRecovered || await this.#recoverParticipant(stored, now);
+          if (!recovered) {
+            this.#checkEscalatedExecutor(stored, now);
+            // The follow-up reminder updates liveness immediately; refresh the
+            // stored pair before the ordinary heartbeat so its stale snapshot
+            // cannot overwrite the reminder count/timestamp in the same tick.
+            const afterEscalation = store.getPair(stored.project, stored.state.taskId) ?? stored;
+            await this.#tickPair(afterEscalation, now);
+          }
           const current = store.getPair(stored.project, stored.state.taskId) ?? stored;
           await this.#checkStageStall(current, now);
         } catch (error) {
@@ -1352,8 +1463,16 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const store = getTaskPairStore();
     const stored = store.getPair(project, taskId);
     if (!stored || stored.state.flags.includes('executor_silent')) return;
-    const state = { ...stored.state, flags: [...stored.state.flags, 'executor_silent' as TaskPairFlag], updatedAt: this.#now() };
-    store.savePair(project, state);
+    const now = this.#now();
+    const state = { ...stored.state, flags: [...stored.state.flags, 'executor_silent' as TaskPairFlag], updatedAt: now };
+    store.savePair(project, state, {
+      liveness: {
+        ...stored.liveness,
+        executorEscalationAt: now,
+        executorEscalationReminderCount: 0,
+        executorEscalationLastAt: undefined,
+      },
+    });
     logger.info({ taskId, reason }, 'task-pair: executor escalated to Brain');
     this.#queueNotice(state, 'executor_silent');
   }

@@ -418,18 +418,53 @@ describe('task-pair marker ingestion', () => {
       marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-report', attrs: { executor: EXEC, auditor: AUD } },
       source: 'queue', eventId: 'ready-report-queue',
     });
-    service.implicitDispatch({
-      project: PROJECT, sender: EXEC, target: AUD, taskId: 'ready-report',
-      message: 'Validation result: task-pair suite passed 263/263; tsc passed; no failures.',
-      eventId: 'ready-report-send',
-    });
     service.applyMarker({
       project: PROJECT, writer: EXEC,
       marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'ready-report', attrs: { worktree: '/w', head: 'h1', base: 'b1' } },
       source: 'marker', now: 4_000, eventId: 'ready-report-ready',
     });
+    service.implicitDispatch({
+      project: PROJECT, sender: EXEC, target: AUD, taskId: 'ready-report',
+      message: 'Validation result: task-pair suite passed 263/263; tsc passed; no failures.',
+      eventId: 'ready-report-send',
+    });
     await flush();
-    expect(sent.filter((entry) => entry.id.includes(':validation-report:'))).toHaveLength(0);
+    expect(sent.filter((entry) => entry.id.includes(':validation-report:'))).toHaveLength(1);
+    expect(sent.filter((entry) => entry.id.includes(':ready-marker-reminder:'))).toHaveLength(0);
+  });
+
+  it('reminds both sides when a validation report arrives before READY_FOR_AUDIT', async () => {
+    service.setScheduler({ onIntent: () => undefined });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'report-before-ready', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', eventId: 'report-before-ready-dispatch',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'report-before-ready', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'queue', eventId: 'report-before-ready-queue',
+    });
+    service.implicitDispatch({
+      project: PROJECT, sender: EXEC, target: AUD, taskId: 'report-before-ready',
+      message: 'Validation result: focused tests passed 12/12; typecheck passed; no failures.',
+      eventId: 'report-before-ready-send',
+    });
+    await flush();
+    const executorReminder = sent.find((entry) => entry.id.includes(':ready-marker-reminder:'));
+    const auditorReminder = sent.find((entry) => entry.id.includes(':ready-marker-wait:'));
+    expect(executorReminder?.target).toBe(EXEC);
+    expect(executorReminder?.text).toContain('READY_FOR_AUDIT report-before-ready');
+    expect(auditorReminder?.target).toBe(AUD);
+    expect(auditorReminder?.text).toContain("do not ask Brain");
+    expect(sent.filter((entry) => entry.id.includes(':ready-marker-reminder:'))).toHaveLength(1);
+    service.implicitDispatch({
+      project: PROJECT, sender: EXEC, target: AUD, taskId: 'report-before-ready',
+      message: 'Validation result: focused tests passed 12/12; typecheck passed; no failures.',
+      eventId: 'report-before-ready-send-duplicate',
+    });
+    await flush();
+    expect(sent.filter((entry) => entry.id.includes(':ready-marker-reminder:'))).toHaveLength(1);
   });
 
   it('suppresses a participant relay that exactly repeats the partner report to Brain', () => {

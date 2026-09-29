@@ -325,6 +325,100 @@ describe('pairs run without legacy supervision artifacts', () => {
     expect(sentTo(BRAIN, 'brain-auditor_capacity_hold')).toHaveLength(1);
   });
 
+  it('delivers one durable full pair state handoff after participant recovery and does not repeat it on the next tick', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH recovery-state executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    const current = getTaskPairStore().getPair(PROJECT, 'recovery-state')!;
+    getTaskPairStore().savePair(PROJECT, {
+      ...current.state,
+      brief: '- [ ] recover the pair\n',
+      workspace: { kind: 'worktree', path: repo, base: 'base-sha', lastHead: 'head-sha', createdAt: now, status: 'active' },
+    });
+    upsertSession(session(EXEC, 'w1', { projectDir: repo, state: 'error', error: 'provider crashed' }));
+    automation = new TaskPairAutomation({
+      now: () => now,
+      isBusy: () => false,
+      isLimited: () => false,
+      pickCandidate: ({ exclude }) => (exclude.has(SPARE) ? undefined : SPARE),
+      provision: async () => undefined,
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+      restartParticipant: async (record) => {
+        upsertSession({ ...record, state: 'idle', error: undefined, restarts: record.restarts + 1, runtimeEpoch: 'epoch-restarted' });
+        return true;
+      },
+    });
+    taskPairService.setScheduler(automation);
+    sent = [];
+    await tick(1);
+    const recovery = sentTo(EXEC, 'recovery-resume');
+    expect(recovery).toHaveLength(1);
+    expect(recovery[0]!.text).toContain('role=executor');
+    expect(recovery[0]!.text).toContain('status=working');
+    expect(recovery[0]!.text).toContain('round=0');
+    expect(recovery[0]!.text).toContain(`Workspace: ${repo}`);
+    expect(recovery[0]!.text).toContain('Base: base-sha');
+    expect(recovery[0]!.text).toContain('Latest head: ');
+    expect(recovery[0]!.text).toContain('Unfinished checklist items: 1. recover the pair');
+    expect(recovery[0]!.text).toContain('Next: continue the task');
+    const firstCount = recovery.length;
+    await tick(1);
+    expect(sentTo(EXEC, 'recovery-resume')).toHaveLength(firstCount);
+  });
+
+  it('hands off state once when an idle participant runtime epoch changes externally', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH external-restart-state executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    const current = getTaskPairStore().getPair(PROJECT, 'external-restart-state')!;
+    getTaskPairStore().savePair(PROJECT, {
+      ...current.state,
+      brief: '- [ ] continue after external restart\n',
+      workspace: { kind: 'worktree', path: repo, base: 'base-sha', lastHead: 'head-sha', createdAt: now, status: 'active' },
+    }, { liveness: { ...current.liveness, participantObservedExecutorSession: EXEC, participantObservedExecutorEpoch: 'epoch-before' } });
+    upsertSession(session(EXEC, 'w1', { projectDir: repo, state: 'idle', runtimeEpoch: 'epoch-after' }));
+    sent = [];
+    await automation.tick();
+    await flush();
+    const handoff = sentTo(EXEC, 'recovery-resume');
+    expect(handoff).toHaveLength(1);
+    expect(handoff[0]!.text).toContain('Participant recovery state');
+    expect(handoff[0]!.text).toContain(`Workspace: ${repo}`);
+    await automation.tick();
+    await flush();
+    expect(sentTo(EXEC, 'recovery-resume')).toHaveLength(1);
+  });
+
+  it('reminds Brain again after executor_silent escalation with bounded 30/60/120 minute backoff and clears on progress', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH escalation-followup executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    const stored = getTaskPairStore().getPair(PROJECT, 'escalation-followup')!;
+    const escalatedAt = now;
+    getTaskPairStore().savePair(PROJECT, {
+      ...stored.state,
+      flags: [...stored.state.flags, 'executor_silent'],
+      updatedAt: escalatedAt,
+    }, { liveness: { ...stored.liveness, executorEscalationAt: escalatedAt, executorEscalationReminderCount: 0, progressExecutorAt: escalatedAt, lastMaterialAt: escalatedAt } });
+    sent = [];
+    now = escalatedAt + 29 * 60_000;
+    await automation.tick();
+    expect(sentTo(BRAIN, 'executor-silent-followup')).toHaveLength(0);
+    now += 1 * 60_000;
+    await automation.tick();
+    expect(sentTo(BRAIN, 'executor-silent-followup')).toHaveLength(1);
+    now = escalatedAt + 89 * 60_000;
+    await automation.tick();
+    expect(sentTo(BRAIN, 'executor-silent-followup')).toHaveLength(1);
+    now += 1 * 60_000;
+    await automation.tick();
+    expect(sentTo(BRAIN, 'executor-silent-followup')).toHaveLength(2);
+    timelineEmitter.emit(EXEC, 'assistant.text', { text: 'progress update', streaming: false }, { source: 'daemon', confidence: 'high', ts: now });
+    await flush();
+    expect(pair('escalation-followup').flags).not.toContain('executor_silent');
+    now += 3 * 60 * 60_000;
+    await automation.tick();
+    expect(sentTo(BRAIN, 'executor-silent-followup')).toHaveLength(2);
+  });
+
   it('replaces a REAL rate-limited auditor at once, unlike a mere capacity error', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH M6 executor=${EXEC} auditor=${AUD} -->`);
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT M6 worktree=/w head=abc1234 -->');

@@ -28,6 +28,7 @@ import {
   type TaskPairVerdictJudgement,
 } from '../../../shared/task-pair.js';
 import type { ResolvedTaskPairMaterial } from './material.js';
+import { parseTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 
 /**
  * Bare, never backtick-wrapped: this is copied verbatim onto its own line by
@@ -106,6 +107,49 @@ export function buildDoneReminderMessage(pair: TaskPairState): string {
   return [
     header(pair),
     `DONE without a PASS is not complete. Send your validation to auditor ${pair.auditor ?? '(being assigned)'} with send_message, then write ${readyMarker(pair)}. After the auditor's PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, then write DONE; Brain merges into dev and pushes dev.`,
+    contracts(pair.blocking),
+  ].join('\n');
+}
+
+/**
+ * State handoff sent after a participant runtime/process restart.  This is
+ * intentionally self-contained: a restarted participant must not need the
+ * old prompt, cwd, or a Brain round-trip to recover its exact next action.
+ */
+export function buildParticipantRecoveryMessage(
+  pair: TaskPairState,
+  role: 'executor' | 'auditor',
+  lastInstruction?: string,
+): string {
+  const workspace = pair.workspace;
+  const location = workspace
+    ? `Workspace: ${workspace.path} (absolute and authoritative; never use cwd or the project main checkout).`
+      + ` Base: ${workspace.base ?? pair.material?.base ?? '(not recorded)'}.`
+      + ` Latest head: ${workspace.lastHead ?? pair.material?.head ?? '(not recorded)'}.`
+    : `Workspace: (not recorded; use the path named by the next READY_FOR_AUDIT, never cwd or the project main checkout).`;
+  const incomplete = pair.brief
+    ? parseTaskPairChecklist(pair.brief).filter((item) => !item.implemented).map((item) => `${item.index}. ${item.text}`)
+    : [];
+  const next = role === 'auditor'
+    ? pair.status === 'in_audit'
+      ? `Next: audit the executor material for round ${pair.round} and return PASS/REWORK.`
+      : `Next: wait for the executor's READY_FOR_AUDIT for round ${pair.round}.`
+    : pair.status === 'in_audit'
+      ? `Next: if validation is complete, send the exact report to ${pair.auditor ?? 'the auditor'} and write READY_FOR_AUDIT for round ${pair.round}.`
+      : pair.status === 'passed'
+        ? `Next: commit locally, report the worktree and HEAD to Brain, then write DONE.`
+        : `Next: continue the task and report material progress; do not wait for legacy supervision artifacts.`;
+  const ready = workspace?.kind === 'worktree'
+    ? `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} worktree=${workspace.path} head=${workspace.lastHead ?? pair.material?.head ?? '<commit>'} base=${workspace.base ?? pair.material?.base ?? '<commit>'} -->`
+    : `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace?.path ?? '<task-directory>'} -->`;
+  return [
+    header(pair),
+    `Participant recovery state (role=${role}, status=${pair.status}, round=${pair.round}).`,
+    location,
+    incomplete.length > 0 ? `Unfinished checklist items: ${incomplete.join(' | ')}` : 'Unfinished checklist items: none recorded.',
+    next,
+    `If this is an audit-ready turn, use this exact marker format: ${ready}`,
+    ...(lastInstruction ? [`Last daemon instruction before restart: ${lastInstruction}`] : []),
     contracts(pair.blocking),
   ].join('\n');
 }

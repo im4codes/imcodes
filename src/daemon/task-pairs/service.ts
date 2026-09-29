@@ -185,6 +185,14 @@ function readyHasValidationReport(store: ReturnType<typeof getTaskPairStore>, st
   ));
 }
 
+function readyMarkerForPair(pair: TaskPairState): string {
+  const workspace = pair.workspace;
+  if (workspace?.kind === 'worktree') {
+    return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} worktree=${workspace.path} head=${workspace.lastHead ?? pair.material?.head ?? '<commit>'} base=${workspace.base ?? pair.material?.base ?? '<commit>'} -->`;
+  }
+  return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace?.path ?? pair.material?.path ?? '<task-directory>'} -->`;
+}
+
 const WORKSPACE_REVISION_SOURCE_LABEL: Record<TaskPairWorkspaceRevisionSource, string> = {
   branch: 'its own branch',
   lastHead: 'the last observed head',
@@ -952,6 +960,38 @@ export class TaskPairService {
         source: 'implicit_dispatch', fromStatus: state.status, toStatus: state.status,
         at,
       });
+      // A report sent to the auditor is useful evidence, but it does not open
+      // the material-backed audit round.  Remind both sides exactly once in
+      // the current round: the executor gets the marker format, while the
+      // auditor is told to wait for READY rather than ask Brain.
+      const reportBeforeReady = !!report
+        && input.sender === state.executor
+        && input.target === state.auditor
+        && state.auditor !== undefined
+        && state.auditor !== TASK_PAIR_NO_AUDITOR
+        && !store.listEvents(project, input.taskId, 500).some((event) => (
+          event.verb === 'READY_FOR_AUDIT' && event.attrs.__round === String(state.round)
+        ));
+      if (reportBeforeReady) {
+        const key = `ready-marker-reminder:${state.round}`;
+        if (!existing.liveness.notified.includes(key)) {
+          const nextLiveness = { ...existing.liveness, notified: [...existing.liveness.notified, key] };
+          store.saveLiveness(project, input.taskId, nextLiveness);
+          const ready = readyMarkerForPair(state);
+          void sendTaskPairMessage(
+            input.sender,
+            input.taskId,
+            'ready-marker-reminder',
+            `Validation report received for ${state.taskId}, but this round is not in audit yet. Send READY_FOR_AUDIT now with the exact workspace/head/base: ${ready}`,
+          );
+          void sendTaskPairMessage(
+            state.auditor!,
+            input.taskId,
+            'ready-marker-wait',
+            `Validation report received for ${state.taskId}. Wait for the executor's READY_FOR_AUDIT marker for round ${state.round}; do not ask Brain for the audit window.`,
+          );
+        }
+      }
       // A task-tagged send is progress on that pair, and its target now works on it.
       this.recordPairProgress(project, input.taskId, input.sender, at);
       noteTaskPairFocus(input.target, input.taskId);
@@ -1081,6 +1121,9 @@ export class TaskPairService {
       liveness.progressExecutorAt = now;
       liveness.activityExecutorAt = now;
       liveness.silenceExecutor = 0;
+      liveness.executorEscalationAt = undefined;
+      liveness.executorEscalationReminderCount = 0;
+      liveness.executorEscalationLastAt = undefined;
       liveness.bothIdleNudgedAt = undefined;
     }
     if (pair.state.auditor === writer) {
@@ -1089,7 +1132,10 @@ export class TaskPairService {
       liveness.silenceAuditor = 0;
       liveness.bothIdleNudgedAt = undefined;
     }
-    getTaskPairStore().saveLiveness(pair.project, pair.state.taskId, liveness);
+    const nextState = pair.state.executor === writer && pair.state.flags.includes('executor_silent')
+      ? { ...pair.state, flags: pair.state.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }
+      : pair.state;
+    getTaskPairStore().savePair(pair.project, nextState, { liveness });
   }
 
   #stampActivity(pair: StoredTaskPair, writer: string, now: number): void {
@@ -1110,6 +1156,9 @@ export class TaskPairService {
     if (pair.state.executor === writer) {
       liveness.activityExecutorAt = now;
       liveness.silenceExecutor = 0;
+      liveness.executorEscalationAt = undefined;
+      liveness.executorEscalationReminderCount = 0;
+      liveness.executorEscalationLastAt = undefined;
       liveness.bothIdleNudgedAt = undefined;
     }
     if (pair.state.auditor === writer) {
@@ -1117,7 +1166,10 @@ export class TaskPairService {
       liveness.silenceAuditor = 0;
       liveness.bothIdleNudgedAt = undefined;
     }
-    getTaskPairStore().saveLiveness(pair.project, pair.state.taskId, liveness);
+    const nextState = pair.state.executor === writer && pair.state.flags.includes('executor_silent')
+      ? { ...pair.state, flags: pair.state.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }
+      : pair.state;
+    getTaskPairStore().savePair(pair.project, nextState, { liveness });
   }
 
   #livenessAfterMarker(
@@ -1144,6 +1196,11 @@ export class TaskPairService {
     if (role === 'auditor') { next.progressAuditorAt = now; next.silenceAuditor = 0; }
     if (role === 'executor') next.activityExecutorAt = now;
     if (role === 'auditor') next.activityAuditorAt = now;
+    if (role === 'executor') {
+      next.executorEscalationAt = undefined;
+      next.executorEscalationReminderCount = 0;
+      next.executorEscalationLastAt = undefined;
+    }
     if (role === 'brain') {
       next.brainLastActivityAt = now;
       next.brainWaitKey = undefined;

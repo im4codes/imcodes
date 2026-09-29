@@ -76,6 +76,20 @@ export interface TaskPairLiveness {
   participantRecoveryAttempts?: number;
   participantRecoveryLastAt?: number;
   participantRecoveryEscalatedAt?: number;
+  /** Runtime/restart identity for the last recovery state message delivered. */
+  participantRecoveryRestartId?: string;
+  /** Last healthy runtime epoch observed for each participant. */
+  participantObservedExecutorEpoch?: string;
+  participantObservedAuditorEpoch?: string;
+  participantObservedExecutorSession?: string;
+  participantObservedAuditorSession?: string;
+  /** Restart handoff watermark per participant (manual/external restarts too). */
+  participantRecoveryExecutorRestartId?: string;
+  participantRecoveryAuditorRestartId?: string;
+  /** Executor-silence escalation watermark and reminder backoff. */
+  executorEscalationAt?: number;
+  executorEscalationReminderCount?: number;
+  executorEscalationLastAt?: number;
   phase?: string;
   phaseStartedAt?: number;
   lastMaterialAt?: number;
@@ -449,6 +463,16 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.participantRecoveryAttempts)) ? { participantRecoveryAttempts: Number(raw.participantRecoveryAttempts) } : {}),
     ...(Number.isFinite(Number(raw.participantRecoveryLastAt)) ? { participantRecoveryLastAt: Number(raw.participantRecoveryLastAt) } : {}),
     ...(Number.isFinite(Number(raw.participantRecoveryEscalatedAt)) ? { participantRecoveryEscalatedAt: Number(raw.participantRecoveryEscalatedAt) } : {}),
+    ...(typeof raw.participantRecoveryRestartId === 'string' ? { participantRecoveryRestartId: raw.participantRecoveryRestartId } : {}),
+    ...(typeof raw.participantObservedExecutorEpoch === 'string' ? { participantObservedExecutorEpoch: raw.participantObservedExecutorEpoch } : {}),
+    ...(typeof raw.participantObservedAuditorEpoch === 'string' ? { participantObservedAuditorEpoch: raw.participantObservedAuditorEpoch } : {}),
+    ...(typeof raw.participantObservedExecutorSession === 'string' ? { participantObservedExecutorSession: raw.participantObservedExecutorSession } : {}),
+    ...(typeof raw.participantObservedAuditorSession === 'string' ? { participantObservedAuditorSession: raw.participantObservedAuditorSession } : {}),
+    ...(typeof raw.participantRecoveryExecutorRestartId === 'string' ? { participantRecoveryExecutorRestartId: raw.participantRecoveryExecutorRestartId } : {}),
+    ...(typeof raw.participantRecoveryAuditorRestartId === 'string' ? { participantRecoveryAuditorRestartId: raw.participantRecoveryAuditorRestartId } : {}),
+    ...(Number.isFinite(Number(raw.executorEscalationAt)) ? { executorEscalationAt: Number(raw.executorEscalationAt) } : {}),
+    ...(Number.isFinite(Number(raw.executorEscalationReminderCount)) ? { executorEscalationReminderCount: Number(raw.executorEscalationReminderCount) } : {}),
+    ...(Number.isFinite(Number(raw.executorEscalationLastAt)) ? { executorEscalationLastAt: Number(raw.executorEscalationLastAt) } : {}),
     ...(typeof raw.phase === 'string' ? { phase: raw.phase } : {}),
     ...(Number.isFinite(Number(raw.phaseStartedAt)) ? { phaseStartedAt: Number(raw.phaseStartedAt) } : {}),
     ...(Number.isFinite(Number(raw.lastMaterialAt)) ? { lastMaterialAt: Number(raw.lastMaterialAt) } : {}),
