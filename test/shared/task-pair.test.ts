@@ -3,6 +3,7 @@ import {
   TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
   TASK_PAIR_AUDITOR_PROPOSAL_RULE,
   TASK_PAIR_BRAIN_REPORTING_RULE,
+  TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
   TASK_PAIR_INTEGRATION_RULE,
   TASK_PAIR_MESSAGE_CAP_PER_ROUND,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
@@ -241,6 +242,17 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain('Routine progress, REWORK rounds');
     expect(body).toContain(TASK_PAIR_BRAIN_REPORTING_RULE);
     expect(body).toContain('conditional non-convergence report');
+  });
+
+  it('ships a contract telling Brain to analyze before dispatching, with large analysis as a report-first task', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE);
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('what is PROVEN and what is only SUSPECTED');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('analysis-only task');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('does not implement');
+    expect(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE).toContain('then dispatches the execution task');
+    // The rule comes before the pairing policy it governs.
+    expect(body.indexOf(TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE)).toBeLessThan(body.indexOf('Automatic pairing policy'));
   });
 
   it('ships a contract stating auditor=none is a real choice with its own self-validation/report rules, not a lesser one', () => {
