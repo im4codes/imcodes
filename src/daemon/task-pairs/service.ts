@@ -175,7 +175,9 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     const latest = store.getPair(project, taskId);
     const latestWorkspace = latest?.state.workspace;
     if (!latest || !latestWorkspace || latestWorkspace.status === 'removed') return;
-    store.savePair(project, { ...latest.state, workspace: { ...latestWorkspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(latest.state.updatedAt, now) });
+    store.savePair(project, { ...latest.state, workspace: { ...latestWorkspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(latest.state.updatedAt, now) }, {
+      liveness: { ...latest.liveness, lastMaterialAt: now },
+    });
   } catch (error) {
     // Best-effort cache refresh: the async gap above can outlive the pair's
     // store (test teardown, daemon shutdown). Losing lastHead is harmless --
@@ -826,6 +828,7 @@ export class TaskPairService {
 
   #stampProgress(pair: StoredTaskPair, writer: string, now: number): void {
     const liveness = { ...pair.liveness };
+    liveness.lastMaterialAt = now;
     if (pair.state.brain === writer) {
       liveness.brainLastActivityAt = now;
       liveness.brainWaitKey = undefined;
@@ -852,6 +855,7 @@ export class TaskPairService {
 
   #stampActivity(pair: StoredTaskPair, writer: string, now: number): void {
     const liveness = { ...pair.liveness };
+    liveness.lastMaterialAt = now;
     // Any real Brain reply resolves the current wait immediately.  A later
     // state transition starts a new wait key and therefore a fresh 5-minute
     // cadence; this is deliberately durable so a restart cannot re-remind.
@@ -886,6 +890,17 @@ export class TaskPairService {
     const next: TaskPairLiveness = liveness
       ? { ...liveness, notified: [...liveness.notified] }
       : { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: now, progressAuditorAt: now, activityExecutorAt: now, activityAuditorAt: now, lastTickAt: now, notified: [] };
+    const phase = transition.toStatus ?? transition.pair?.status;
+    if (phase && next.phase !== phase) {
+      next.phase = phase;
+      next.phaseStartedAt = now;
+      next.stageStallPromptAt = undefined;
+      next.stageStallEscalatedAt = undefined;
+    } else if (phase && next.phaseStartedAt === undefined) {
+      next.phase = phase;
+      next.phaseStartedAt = now;
+    }
+    next.lastMaterialAt = now;
     if (role === 'executor') { next.progressExecutorAt = now; next.silenceExecutor = 0; }
     if (role === 'auditor') { next.progressAuditorAt = now; next.silenceAuditor = 0; }
     if (role === 'executor') next.activityExecutorAt = now;

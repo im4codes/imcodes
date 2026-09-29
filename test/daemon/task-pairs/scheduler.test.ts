@@ -182,6 +182,101 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(3);
   });
 
+  it('restarts an errored participant once, re-delivers its instruction, and notifies Brain once', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH RECOVER executor=${EXEC} auditor=${AUD} -->\nDo the recovery work\n<!-- IMCODES_TASK_END RECOVER -->`);
+    await flush();
+    sent = [];
+    const errored = session(EXEC, 'w1', { state: 'error', error: 'provider exited', updatedAt: now });
+    upsertSession(errored);
+    let restarts = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      isBusy: (name) => busy.has(name),
+      restartParticipant: async (record) => {
+        restarts += 1;
+        upsertSession({ ...record, state: 'idle', error: undefined, restarts: record.restarts + 1, restartTimestamps: [now], updatedAt: now });
+        return true;
+      },
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await tick(1);
+    await flush();
+    expect(restarts).toBe(1);
+    expect(sentTo(EXEC, 'recovery-resume')).toHaveLength(1);
+    expect(sentTo(EXEC, 'recovery-resume')[0]!.text).toContain('Do the recovery work');
+    expect(sentTo(BRAIN, 'participant-recovered')).toHaveLength(1);
+    await tick(1);
+    await flush();
+    expect(restarts).toBe(1);
+    expect(sentTo(EXEC, 'recovery-resume')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'participant-recovered')).toHaveLength(1);
+  });
+
+  it('prompts once for a stalled phase, then escalates once to Brain', async () => {
+    const previousPrompt = process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS;
+    const previousEscalate = process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS;
+    process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS = '1000';
+    process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS = '1000';
+    try {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH STALL executor=${EXEC} auditor=${AUD} -->\nstall work\n<!-- IMCODES_TASK_END STALL -->`);
+      await flush();
+      sent = [];
+      now += 2_000;
+      await automation.tick();
+      await flush();
+      expect(sentTo(EXEC, 'stage-stall-prompt')).toHaveLength(1);
+      now += 1_000;
+      await automation.tick();
+      await flush();
+      expect(sentTo(EXEC, 'stage-stall-prompt')).toHaveLength(1);
+      expect(sentTo(BRAIN, 'stage-stall')).toHaveLength(1);
+      now += 1_000;
+      await automation.tick();
+      await flush();
+      expect(sentTo(BRAIN, 'stage-stall')).toHaveLength(1);
+    } finally {
+      if (previousPrompt === undefined) delete process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS;
+      else process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS = previousPrompt;
+      if (previousEscalate === undefined) delete process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS;
+      else process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS = previousEscalate;
+    }
+  });
+
+  it('does not persist skipped heartbeat nudges', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH SKIP executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    busy.add(EXEC);
+    now += 10 * 60_000;
+    await automation.checkBothIdlePairs();
+    const skipped = getTaskPairStore().listEvents(PROJECT, 'SKIP')
+      .filter((event) => event.verb === 'NUDGE' && event.effect === 'skipped');
+    expect(skipped).toHaveLength(0);
+  });
+
+  it('caps repeated recovery attempts and escalates once instead of looping', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH CAP executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    sent = [];
+    upsertSession(session(EXEC, 'w1', { state: 'error', error: 'provider exited', updatedAt: now }));
+    let attempts = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      isBusy: () => false,
+      restartParticipant: async () => { attempts += 1; return false; },
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await automation.tick();
+    await automation.tick();
+    await automation.tick();
+    await automation.tick();
+    await flush();
+    expect(attempts).toBe(3);
+    expect(sentTo(BRAIN, 'participant-recovery-failed')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'participant-recovery-cap')).toHaveLength(1);
+  });
+
   it('queues a named participant held by another pair, then starts it when that pair ends', async () => {
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HOLD executor=${EXEC} auditor=${AUD} -->`);
     await flush();

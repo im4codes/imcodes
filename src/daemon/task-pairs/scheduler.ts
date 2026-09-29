@@ -18,7 +18,8 @@ import {
   setSupervisionHeartbeatProjection,
 } from '../supervision-heartbeat-projection.js';
 import logger from '../../util/logger.js';
-import { getSession } from '../../store/session-store.js';
+import { getSession, type SessionRecord } from '../../store/session-store.js';
+import { restartSession } from '../../agent/session-manager.js';
 import {
   TASK_PAIR_BOTH_IDLE_NUDGE_MS,
   TASK_PAIR_BRAIN_REMINDER_INITIAL_MS,
@@ -89,6 +90,34 @@ const TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS = 30_000;
 /** Bound pool discovery/provisioning so one provider or transport cannot freeze the queue. */
 export const TASK_PAIR_QUEUE_OPERATION_TIMEOUT_ENV = 'IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS' as const;
 const TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = 15_000;
+/** Participant error/idle recovery threshold; override for controlled tests. */
+export const TASK_PAIR_PARTICIPANT_HEALTH_ENV = 'IMCODES_TASK_PAIR_PARTICIPANT_HEALTH_MS' as const;
+const TASK_PAIR_PARTICIPANT_HEALTH_MS = 2 * 60 * 60_000;
+/** Stage-stall prompt threshold; override for controlled tests. */
+export const TASK_PAIR_STAGE_STALL_ENV = 'IMCODES_TASK_PAIR_STAGE_STALL_MS' as const;
+const TASK_PAIR_STAGE_STALL_MS = 2 * 60 * 60_000;
+/** Delay between the executor stall prompt and the one Brain escalation. */
+export const TASK_PAIR_STAGE_STALL_ESCALATE_ENV = 'IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS' as const;
+const TASK_PAIR_STAGE_STALL_ESCALATE_MS = 2 * 60 * 60_000;
+/** Keep one heartbeat bounded when many pairs fail together. */
+const TASK_PAIR_PARTICIPANT_RECOVERY_MAX_PER_TICK = 8;
+const TASK_PAIR_PARTICIPANT_RECOVERY_MAX_ATTEMPTS = 3;
+const TASK_PAIR_PARTICIPANT_RECOVERY_WINDOW_MS = 5 * 60_000;
+
+export function resolveTaskPairParticipantHealthMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env[TASK_PAIR_PARTICIPANT_HEALTH_ENV]);
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : TASK_PAIR_PARTICIPANT_HEALTH_MS;
+}
+
+export function resolveTaskPairStageStallMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env[TASK_PAIR_STAGE_STALL_ENV]);
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : TASK_PAIR_STAGE_STALL_MS;
+}
+
+export function resolveTaskPairStageStallEscalateMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env[TASK_PAIR_STAGE_STALL_ESCALATE_ENV]);
+  return Number.isFinite(raw) && raw >= 1_000 ? raw : TASK_PAIR_STAGE_STALL_ESCALATE_MS;
+}
 
 export interface TaskPairSchedulerDeps {
   now?: () => number;
@@ -99,6 +128,8 @@ export interface TaskPairSchedulerDeps {
   /** Import not-yet-imported in-flight legacy tasks of `pairs` projects (idempotent). */
   importLegacy?: (now: number) => void | Promise<void>;
   poolOf?: (brain: string, sessionName: string) => 'primary' | 'economy' | undefined;
+  /** Injectable participant relaunch for deterministic health/recovery tests. */
+  restartParticipant?: (record: SessionRecord) => Promise<boolean>;
 }
 
 export function resolveTaskPairHeartbeatMs(env: NodeJS.ProcessEnv = process.env): number {
@@ -156,6 +187,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #mainHeartbeatPending = new Set<string>();
   #mainHeartbeatSessions = new Set<string>();
   #startupParticipantCheckDone = false;
+  #participantRecovery = new Map<string, Promise<boolean>>();
+  #recoverySeenThisTick = new Set<string>();
+  #participantRecoveryNoticeKeys = new Set<string>();
+  #recoveryCountThisTick = 0;
 
   start(intervalMs = resolveTaskPairHeartbeatMs()): void {
     if (this.#timer) return;
@@ -325,6 +360,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
     return Number.isFinite(raw) && raw >= 1 ? raw : TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS;
   }
 
+  #participantHealthMs(): number { return resolveTaskPairParticipantHealthMs(); }
+  #stageStallMs(): number { return resolveTaskPairStageStallMs(); }
+  #stageStallEscalateMs(): number { return resolveTaskPairStageStallEscalateMs(); }
+
   async #withQueueTimeout<T>(operation: Promise<T>, label: string, taskId: string): Promise<T | undefined> {
     const timeoutMs = this.#queueOperationTimeoutMs();
     let timer: NodeJS.Timeout | undefined;
@@ -349,6 +388,159 @@ export class TaskPairAutomation implements TaskPairScheduler {
   async #queueProvision(input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude?: ReadonlySet<string>; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }): Promise<string | undefined> {
     const { exclude: _exclude, ...provisionInput } = input;
     return this.#withQueueTimeout(this.#provision(provisionInput), 'provision', input.taskId);
+  }
+
+  /**
+   * Recover a participant whose provider is in an error state (or whose
+   * acting turn has gone idle without any material activity for the bounded
+   * health window).  This intentionally excludes Brain, queued pairs and
+   * sessions that still report busy: a long legitimate provider operation is
+   * not a crash.  restartSession carries the durable three-in-five-minute
+   * restart budget, so daemon ticks cannot create an unbounded restart loop.
+   */
+  async #recoverParticipant(stored: StoredTaskPair, now: number): Promise<boolean> {
+    const pair = stored.state;
+    if (!TASK_PAIR_OPEN_STATUSES.includes(pair.status)
+      || pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION
+      || pair.status === 'passed') return false;
+    const actingSide = taskPairSideToAct(pair);
+    if (!actingSide) return false;
+    const candidates: Array<{ side: 'executor' | 'auditor'; name: string | undefined; activityAt: number | undefined }> = [
+      { side: 'executor', name: pair.executor, activityAt: stored.liveness.activityExecutorAt ?? stored.liveness.progressExecutorAt },
+      { side: 'auditor', name: pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? pair.auditor : undefined, activityAt: stored.liveness.activityAuditorAt ?? stored.liveness.progressAuditorAt },
+    ];
+    for (const candidate of candidates) {
+      if (!candidate.name || (candidate.side !== actingSide && getSession(candidate.name)?.state !== 'error')) continue;
+      if (this.#recoverySeenThisTick.has(candidate.name)) continue;
+      if (this.#recoveryCountThisTick >= TASK_PAIR_PARTICIPANT_RECOVERY_MAX_PER_TICK) return false;
+      const record = getSession(candidate.name);
+      if (!record || this.#busy(candidate.name)) continue;
+      const crashed = record.state === 'error';
+      const silent = record.state === 'idle'
+        && candidate.side === actingSide
+        && now - (candidate.activityAt ?? pair.updatedAt) >= this.#participantHealthMs();
+      if (!crashed && !silent) continue;
+      let latest = getTaskPairStore().getPair(stored.project, pair.taskId);
+      const priorAttempts = latest?.liveness.participantRecoveryAttempts ?? 0;
+      const priorAt = latest?.liveness.participantRecoveryLastAt ?? 0;
+      const recoveryKey = `participant-recovery:${candidate.name}`;
+      const capKey = `participant-recovery-cap:${candidate.name}`;
+      if (latest && priorAt > 0 && now - priorAt >= TASK_PAIR_PARTICIPANT_RECOVERY_WINDOW_MS) {
+        this.#participantRecoveryNoticeKeys.delete(recoveryKey);
+        this.#participantRecoveryNoticeKeys.delete(capKey);
+        latest = {
+          ...latest,
+          liveness: {
+            ...latest.liveness,
+            notified: latest.liveness.notified.filter((item) => item !== recoveryKey && item !== capKey),
+          },
+        };
+        getTaskPairStore().saveLiveness(stored.project, pair.taskId, latest.liveness);
+      }
+      if (priorAttempts >= TASK_PAIR_PARTICIPANT_RECOVERY_MAX_ATTEMPTS
+        && now - priorAt < TASK_PAIR_PARTICIPANT_RECOVERY_WINDOW_MS) {
+        if (latest && !latest.liveness.notified.includes(capKey)) {
+          getTaskPairStore().saveLiveness(stored.project, pair.taskId, {
+            ...latest.liveness,
+            participantRecoveryEscalatedAt: now,
+            notified: [...latest.liveness.notified, capKey],
+          });
+          this.#queueLineNotice(latest.state, 'participant-recovery-cap', `Participant ${candidate.name} exceeded the automatic recovery limit for ${pair.taskId}; Brain intervention is required.`);
+        }
+        return true;
+      }
+      this.#recoverySeenThisTick.add(candidate.name);
+      this.#recoveryCountThisTick += 1;
+      const attemptAt = now;
+      if (latest) {
+        getTaskPairStore().saveLiveness(stored.project, pair.taskId, {
+          ...latest.liveness,
+          participantRecoveryAttempts: priorAt && now - priorAt >= TASK_PAIR_PARTICIPANT_RECOVERY_WINDOW_MS ? 1 : priorAttempts + 1,
+          participantRecoveryLastAt: attemptAt,
+          participantRecoveryEscalatedAt: undefined,
+        });
+      }
+      const restart = this.#deps.restartParticipant ?? restartSession;
+      let inFlight = this.#participantRecovery.get(candidate.name);
+      if (!inFlight) {
+        inFlight = Promise.resolve(restart(record)).catch((error) => {
+          logger.warn({ err: error, session: candidate.name, taskId: pair.taskId }, 'task-pair: participant recovery failed');
+          return false;
+        }).finally(() => { this.#participantRecovery.delete(candidate.name!); });
+        this.#participantRecovery.set(candidate.name, inFlight);
+      }
+      const ok = await inFlight;
+      const fresh = getTaskPairStore().getPair(stored.project, pair.taskId);
+      if (!fresh) return ok;
+      // One notice per participant/pair recovery episode, not one per tick or
+      // one per retry in the bounded restart window.  The durable key also
+      // survives a daemon restart without re-spamming Brain.
+      const key = recoveryKey;
+      const wasNotified = fresh.liveness.notified.includes(key) || this.#participantRecoveryNoticeKeys.has(key);
+      const next = {
+        ...fresh.liveness,
+        ...(ok ? {
+          participantRecoveryAt: now,
+          participantRecoverySession: candidate.name,
+          participantRecoveryCount: (fresh.liveness.participantRecoveryCount ?? 0) + 1,
+        } : {}),
+        ...(!wasNotified ? { notified: [...fresh.liveness.notified, key] } : {}),
+      };
+      getTaskPairStore().saveLiveness(stored.project, pair.taskId, next);
+      if (ok) {
+        const instruction = candidate.side === 'executor' ? fresh.liveness.lastInstructionExecutor : fresh.liveness.lastInstructionAuditor;
+        const resumeText = instruction
+          ?? `Your provider was recovered after an error while working on ${pair.taskId}. Continue the pair now and report progress.`;
+        await sendTaskPairMessage(candidate.name, pair.taskId, 'recovery-resume', resumeText);
+        if (!wasNotified) {
+          this.#participantRecoveryNoticeKeys.add(key);
+          this.#queueLineNotice(fresh.state, 'participant-recovered', `Participant ${candidate.name} was automatically restarted and its last pair instruction was re-delivered for ${pair.taskId}.`);
+        }
+        return true;
+      }
+      if (!wasNotified) {
+        this.#participantRecoveryNoticeKeys.add(key);
+        this.#queueLineNotice(fresh.state, 'participant-recovery-failed', `Participant ${candidate.name} could not be automatically recovered for ${pair.taskId}; the restart budget or provider state requires Brain intervention.`);
+      }
+      // The attempt (including a bounded failure) handled this pair for the
+      // tick.  Do not run the ordinary heartbeat with the stale pre-recovery
+      // liveness snapshot and clobber the durable attempt counter.
+      return true;
+    }
+    return false;
+  }
+
+  /** Prompt an executor once for a stalled implementing/validation phase, then escalate once. */
+  async #checkStageStall(stored: StoredTaskPair, now: number): Promise<void> {
+    const pair = stored.state;
+    if (!['working', 'in_audit', 'awaiting_audit', 'rework'].includes(pair.status)) return;
+    const store = getTaskPairStore();
+    let liveness = stored.liveness;
+    const phase = pair.status;
+    const phaseChanged = liveness.phase !== phase;
+    if (phaseChanged || liveness.phaseStartedAt === undefined || liveness.lastMaterialAt === undefined) {
+      liveness = {
+        ...liveness,
+        phase,
+        phaseStartedAt: phaseChanged ? pair.updatedAt : (liveness.phaseStartedAt ?? pair.updatedAt),
+        lastMaterialAt: liveness.lastMaterialAt ?? pair.updatedAt,
+        ...(phaseChanged ? { stageStallPromptAt: undefined, stageStallEscalatedAt: undefined } : {}),
+      };
+      store.saveLiveness(stored.project, pair.taskId, liveness);
+    }
+    if (this.#busy(pair.executor ?? '') || now - (liveness.lastMaterialAt ?? pair.updatedAt) < this.#stageStallMs()) return;
+    if (liveness.stageStallPromptAt === undefined) {
+      const prompt = `Pair ${pair.taskId} has had no material progress in ${phase} for ${Math.round((now - (liveness.lastMaterialAt ?? pair.updatedAt)) / 60_000)} minutes. Report blockers + options or progress now.`;
+      liveness = { ...liveness, stageStallPromptAt: now };
+      store.saveLiveness(stored.project, pair.taskId, liveness);
+      if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'stage-stall-prompt', prompt);
+      return;
+    }
+    if (liveness.stageStallEscalatedAt === undefined && now - liveness.stageStallPromptAt >= this.#stageStallEscalateMs()) {
+      const escalated = { ...liveness, stageStallEscalatedAt: now };
+      store.saveLiveness(stored.project, pair.taskId, escalated);
+      this.#queueLineNotice(pair, 'stage-stall', `Pair ${pair.taskId} has stalled in ${phase}: no material event since ${new Date(liveness.lastMaterialAt ?? pair.updatedAt).toISOString()}, and the executor prompt received no progress after the escalation window.`);
+    }
   }
 
   #logQueueSkip(project: string, pair: TaskPairState, reason: string): void {
@@ -425,6 +617,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
     // per Brain (see #queueNotice), instead of one per pair -- a single pool
     // outage or import batch must not spam Brain with N separate escalations.
     this.#pendingNotices = new Map();
+    this.#recoverySeenThisTick.clear();
+    this.#recoveryCountThisTick = 0;
     try {
       for (const stored of store.listActivePairs()) {
         if (!isPairsEngineProject(stored.project)) continue;
@@ -432,7 +626,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
         try {
           await ensureTaskPairWorkspaceAvailable(stored.project, stored.state.taskId);
           await refreshTaskPairWorkspaceHead(stored.project, stored.state.taskId);
-          await this.#tickPair(stored, now);
+          const recovered = await this.#recoverParticipant(stored, now);
+          if (!recovered) await this.#tickPair(stored, now);
+          const current = store.getPair(stored.project, stored.state.taskId) ?? stored;
+          await this.#checkStageStall(current, now);
         } catch (error) {
           logger.warn({ err: error, taskId: stored.state.taskId }, 'task-pair: pair tick failed');
         }
@@ -791,6 +988,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   #recordLivenessDecision(stored: StoredTaskPair, verb: 'NUDGE' | 'REMIND', effect: string, reason: string, at: number): void {
+    if (verb === 'NUDGE' && effect === 'skipped') {
+      logger.info({ taskId: stored.state.taskId, verb, effect, reason }, 'task-pair: nudge skipped (not persisted)');
+      return;
+    }
     const id = `heartbeat:${verb.toLowerCase()}:${stored.project}:${stored.state.taskId}:${at}:${reason}`;
     getTaskPairStore().recordEvent({
       id, project: stored.project, taskId: stored.state.taskId, writer: 'daemon', role: 'daemon', verb,

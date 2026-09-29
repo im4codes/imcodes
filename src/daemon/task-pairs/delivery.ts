@@ -16,7 +16,8 @@ import { getTransportRuntime } from '../../agent/session-manager.js';
 import { dispatchSessionMessage } from '../session-dispatch.js';
 import { createSendDispatchId, type SendMessageId } from '../../../shared/send-message-id.js';
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
-import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NUDGE_ID_PREFIX } from '../../../shared/task-pair.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NUDGE_ID_PREFIX, isTerminalTaskPairStatus } from '../../../shared/task-pair.js';
+import { getTaskPairStore } from './store.js';
 import logger from '../../util/logger.js';
 
 export type TaskPairDeliveryResult = 'sent' | 'queued' | 'skipped_pending' | 'no_session' | 'failed';
@@ -70,6 +71,25 @@ export async function sendTaskPairMessage(
 ): Promise<TaskPairDeliveryResult> {
   const messageId = `${taskPairMessageIdPrefix(taskId, reason)}${randomUUID()}`;
   noteTaskPairFocus(target, taskId);
+  // Keep the last actionable pair instruction durable so participant recovery
+  // can resume the exact turn after a provider/process restart.  Aggregate
+  // Brain notices and terminal pairs are intentionally excluded.
+  if (!taskId.startsWith('__')) {
+    const store = getTaskPairStore();
+    for (const stored of store.listActivePairs().filter((item) => item.state.taskId === taskId && !isTerminalTaskPairStatus(item.state.status))) {
+      const liveness = { ...stored.liveness };
+      if (stored.state.executor === target) {
+        liveness.lastInstructionExecutor = text;
+        liveness.lastInstructionExecutorAt = Date.now();
+      } else if (stored.state.auditor === target) {
+        liveness.lastInstructionAuditor = text;
+        liveness.lastInstructionAuditorAt = Date.now();
+      } else {
+        continue;
+      }
+      store.saveLiveness(stored.project, taskId, liveness);
+    }
+  }
   if (testDeps?.send) {
     await testDeps.send(target, text, messageId);
     return 'sent';

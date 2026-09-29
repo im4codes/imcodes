@@ -61,6 +61,23 @@ export interface TaskPairLiveness {
   lastTickAt: number;
   /** Escalations already sent, so each is sent once. */
   notified: string[];
+  /** Last daemon-authored instruction delivered to each participant. */
+  lastInstructionExecutor?: string;
+  lastInstructionExecutorAt?: number;
+  lastInstructionAuditor?: string;
+  lastInstructionAuditorAt?: number;
+  /** Participant recovery/stall state; all fields are durable for restart idempotency. */
+  participantRecoveryAt?: number;
+  participantRecoverySession?: string;
+  participantRecoveryCount?: number;
+  participantRecoveryAttempts?: number;
+  participantRecoveryLastAt?: number;
+  participantRecoveryEscalatedAt?: number;
+  phase?: string;
+  phaseStartedAt?: number;
+  lastMaterialAt?: number;
+  stageStallPromptAt?: number;
+  stageStallEscalatedAt?: number;
 }
 
 export interface StoredTaskPair {
@@ -393,6 +410,21 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.lastNudgedAt)) ? { lastNudgedAt: Number(raw.lastNudgedAt) } : {}),
     lastTickAt: Number(raw.lastTickAt ?? 0),
     notified: Array.isArray(raw.notified) ? raw.notified.map(String) : [],
+    ...(typeof raw.lastInstructionExecutor === 'string' ? { lastInstructionExecutor: raw.lastInstructionExecutor } : {}),
+    ...(Number.isFinite(Number(raw.lastInstructionExecutorAt)) ? { lastInstructionExecutorAt: Number(raw.lastInstructionExecutorAt) } : {}),
+    ...(typeof raw.lastInstructionAuditor === 'string' ? { lastInstructionAuditor: raw.lastInstructionAuditor } : {}),
+    ...(Number.isFinite(Number(raw.lastInstructionAuditorAt)) ? { lastInstructionAuditorAt: Number(raw.lastInstructionAuditorAt) } : {}),
+    ...(Number.isFinite(Number(raw.participantRecoveryAt)) ? { participantRecoveryAt: Number(raw.participantRecoveryAt) } : {}),
+    ...(typeof raw.participantRecoverySession === 'string' ? { participantRecoverySession: raw.participantRecoverySession } : {}),
+    ...(Number.isFinite(Number(raw.participantRecoveryCount)) ? { participantRecoveryCount: Number(raw.participantRecoveryCount) } : {}),
+    ...(Number.isFinite(Number(raw.participantRecoveryAttempts)) ? { participantRecoveryAttempts: Number(raw.participantRecoveryAttempts) } : {}),
+    ...(Number.isFinite(Number(raw.participantRecoveryLastAt)) ? { participantRecoveryLastAt: Number(raw.participantRecoveryLastAt) } : {}),
+    ...(Number.isFinite(Number(raw.participantRecoveryEscalatedAt)) ? { participantRecoveryEscalatedAt: Number(raw.participantRecoveryEscalatedAt) } : {}),
+    ...(typeof raw.phase === 'string' ? { phase: raw.phase } : {}),
+    ...(Number.isFinite(Number(raw.phaseStartedAt)) ? { phaseStartedAt: Number(raw.phaseStartedAt) } : {}),
+    ...(Number.isFinite(Number(raw.lastMaterialAt)) ? { lastMaterialAt: Number(raw.lastMaterialAt) } : {}),
+    ...(Number.isFinite(Number(raw.stageStallPromptAt)) ? { stageStallPromptAt: Number(raw.stageStallPromptAt) } : {}),
+    ...(Number.isFinite(Number(raw.stageStallEscalatedAt)) ? { stageStallEscalatedAt: Number(raw.stageStallEscalatedAt) } : {}),
   };
   return {
     project: String(row.project),
