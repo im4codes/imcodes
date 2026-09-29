@@ -257,15 +257,19 @@ describe('TaskPairStatusPanel', () => {
   it('defaults collapsed on mobile but expanded on desktop, with independent layout keys', () => {
     const events = [{ eventId: 'layout-default', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'layout-default', title: 'Layout default', toStatus: 'working' } }] as never;
     const original = window.matchMedia;
+    const originalWidth = window.innerWidth;
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: (query: string) => ({ matches: query.includes('max-width'), media: query, addEventListener: () => {}, removeEventListener: () => {} }) });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 500 });
     const { container } = render(<TaskPairStatusPanel events={events} serverId="layout" />);
     expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(true);
     cleanup();
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: false, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1280 });
     render(<TaskPairStatusPanel events={events} serverId="layout" />);
     expect(document.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
     expect(window.localStorage.getItem('imcodes.task-pair-status-panel.collapsed:layout:mobile')).toBeNull();
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalWidth });
   });
 
   it('treats a phone user agent as mobile even when the viewport is wider than the breakpoint', () => {
@@ -688,11 +692,12 @@ describe('TaskPairStatusPanel', () => {
     expect(Number(topOffset)).toBeGreaterThanOrEqual(34);
   });
 
-  it('anchors the desktop collapsed toolbar to the right rail and floats mobile expansion', () => {
+  it('keeps the desktop collapsed toolbar in titlebar flow while expanding below controls', () => {
     const css = readCss();
-    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*position:\s*absolute/);
-    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*right:\s*8px/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*position:\s*static/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)\s*\{[^}]*position:\s*absolute/);
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?top:\s*max\(calc\(100% \+ 4px\), 40px\)/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*min\(65vh/);
   });
 
