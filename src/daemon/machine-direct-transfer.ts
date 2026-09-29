@@ -457,8 +457,10 @@ async function sendEncryptedFile(
   totalSize: number,
   start?: MachineDirectFetchStart,
   expectedSourceIdentity?: MachineDirectSourceIdentity,
+  onProgress?: () => void,
 ): Promise<number> {
   const { key, resumeOffset } = await authenticateMachineDirectSource(socket, request);
+  onProgress?.();
   if (!Number.isSafeInteger(resumeOffset) || resumeOffset < 0 || resumeOffset > totalSize) {
     throw new MachineDirectProtocolError('size_mismatch');
   }
@@ -478,6 +480,7 @@ async function sendEncryptedFile(
         counter++,
         encodeMachineDirectFetchStart({ ...start, ...(resumeOffset > 0 ? { resumeOffset } : {}) }),
       ));
+      onProgress?.();
     }
     for await (const chunk of source.createReadStream({
       autoClose: false,
@@ -492,6 +495,7 @@ async function sendEncryptedFile(
         counter++,
         Buffer.concat([Buffer.from([MACHINE_DIRECT_FRAME_TYPE.DATA]), bytes]),
       ));
+      onProgress?.();
     }
     const completedStat = await source.stat();
     if ((expectedSourceIdentity && !machineDirectSourceIdentityMatches(completedStat, expectedSourceIdentity))
@@ -515,6 +519,7 @@ async function sendEncryptedFile(
 export interface MachineDirectSender {
   candidates: MachineDirectCandidate[];
   completion: Promise<void>;
+  onProgress?(listener: () => void): () => void;
   close(): void;
 }
 
@@ -528,6 +533,8 @@ export async function startMachineDirectSender(options: {
   let resolveCompletion!: () => void;
   let rejectCompletion!: (error: Error) => void;
   const completion = new Promise<void>((resolve, reject) => { resolveCompletion = resolve; rejectCompletion = reject; });
+  const progressListeners = new Set<() => void>();
+  const emitProgress = () => { for (const listener of progressListeners) listener(); };
   const sockets = new Set<Socket>();
   let candidates: MachineDirectCandidate[] = [];
   const server = createServer((socket) => {
@@ -545,6 +552,7 @@ export async function startMachineDirectSender(options: {
       request.size,
       undefined,
       options.expectedSourceIdentity,
+      emitProgress,
     ).then(() => {
       if (settled) return;
       settled = true;
@@ -576,6 +584,10 @@ export async function startMachineDirectSender(options: {
   return {
     candidates,
     completion,
+    onProgress(listener) {
+      progressListeners.add(listener);
+      return () => progressListeners.delete(listener);
+    },
     close() {
       if (!settled) {
         settled = true;
@@ -710,6 +722,7 @@ export async function startMachineDirectFetchReceiver(options: {
   request: Omit<MachineDirectFetchRequest, 'candidates' | 'sourcePath'>;
   transferTimeoutMs?: number;
   stallTimeoutMs?: number;
+  onProgress?: () => void;
 }): Promise<MachineDirectFetchReceiver | null> {
   let activeConnections = 0;
   let settled = false;
@@ -749,6 +762,7 @@ export async function startMachineDirectFetchReceiver(options: {
         const resumeOffset = existing?.size ?? 0;
         const channel = await authenticateMachineDirectTarget(socket, options.request, resumeOffset);
         authenticated = true;
+        options.onProgress?.();
         let counter = 0n;
         const timeoutMs = options.transferTimeoutMs ?? MACHINE_DIRECT_FILE_TRANSFER_LIMITS.TRANSFER_TIMEOUT_MS;
         const start = decodeMachineDirectFetchStart(await readEncryptedMachineDirectFrame(
@@ -792,6 +806,7 @@ export async function startMachineDirectFetchReceiver(options: {
               if (bytesWritten <= 0) throw new MachineDirectProtocolError('write_failed');
               offset += bytesWritten;
             }
+            options.onProgress?.();
             continue;
           }
           if (plaintext[0] !== MACHINE_DIRECT_FRAME_TYPE.FINISH

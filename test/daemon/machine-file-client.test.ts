@@ -25,6 +25,7 @@ afterEach(async () => {
   startMachineDirectSenderMock.mockReset();
   startMachineDirectFetchReceiverMock.mockReset();
   vi.unstubAllGlobals();
+  vi.useRealTimers();
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
@@ -45,6 +46,186 @@ function sourceIdentity(version = 1, size = 5) {
 }
 
 describe('machine file client', () => {
+  it('falls back to relay when the direct control request stalls', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-direct-stall-'));
+    dirs.push(dir);
+    const sourcePath = join(dir, 'stall.txt');
+    await writeFile(sourcePath, 'hello');
+    const close = vi.fn();
+    startMachineDirectSenderMock.mockResolvedValueOnce({
+      candidates: [{ host: '192.0.2.1', port: 45123 }],
+      completion: new Promise(() => {}),
+      close,
+    });
+    const fetchMock = vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.endsWith('/machine-direct-upload')) {
+        return new Promise<Response>((_, reject) => {
+          init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')), { once: true });
+        });
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        ok: true,
+        attachment: attachment('s'.repeat(32), '/staging/stall.txt'),
+      }), { status: 200 }));
+    });
+    const resultPromise = sendFileToMachine({
+      serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token',
+      targetServerId: 'controlled-1', sourcePath, fetchImpl: fetchMock as typeof fetch,
+      timeoutPolicy: { directControlMs: 25, directStallMs: 25, relayAttemptMs: 25, relayTotalMs: 100 },
+    });
+    await expect(resultPromise).resolves.toMatchObject({ transport: 'relay', attachmentId: 's'.repeat(32) });
+    expect(close).toHaveBeenCalledOnce();
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps a slow direct transfer alive while progress continues', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-direct-progress-'));
+    dirs.push(dir);
+    const sourcePath = join(dir, 'progress.bin');
+    const size = FILE_TRANSFER_LIMITS.MAX_FILE_SIZE + 1;
+    await writeFile(sourcePath, '');
+    await truncate(sourcePath, size);
+    const close = vi.fn();
+    let progress: (() => void) | undefined;
+    startMachineDirectSenderMock.mockResolvedValueOnce({
+      candidates: [{ host: '192.0.2.1', port: 45123 }],
+      completion: Promise.resolve(),
+      close,
+      onProgress(listener: () => void) {
+        progress = listener;
+        return () => { progress = undefined; };
+      },
+    });
+    const fetchMock = vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const pathname = new URL(String(url)).pathname;
+      if (!pathname.endsWith('/machine-direct-upload')) {
+        return Promise.reject(new Error('relay must not be attempted'));
+      }
+      return new Promise<Response>((resolve) => {
+        const heartbeat = setInterval(() => progress?.(), 5);
+        setTimeout(() => {
+          clearInterval(heartbeat);
+          resolve(new Response(JSON.stringify({
+            type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+            requestId: JSON.parse(String(init?.body)).requestId,
+            attachment: { ...attachment('p'.repeat(32), '/uploads/progress.bin'), size },
+          }), { status: 200 }));
+        }, 120);
+      });
+    });
+
+    await expect(sendFileToMachine({
+      serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token',
+      targetServerId: 'controlled-1', sourcePath, fetchImpl: fetchMock as typeof fetch,
+      timeoutPolicy: { directControlMs: 20, directStallMs: 20, relayAttemptMs: 20 },
+    })).resolves.toMatchObject({ transport: 'direct', attachmentId: 'p'.repeat(32) });
+    expect(fetchMock).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledOnce();
+  });
+
+  it('bounds a repeated send when the first upload left direct control indeterminate', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-repeat-stall-'));
+    dirs.push(dir);
+    const sourcePath = join(dir, 'repeat.bin');
+    await writeFile(sourcePath, 'hello');
+    const closes = [vi.fn(), vi.fn()];
+    startMachineDirectSenderMock
+      .mockResolvedValueOnce({
+        candidates: [{ host: '192.0.2.1', port: 45123 }],
+        completion: Promise.resolve(),
+        close: closes[0],
+      })
+      .mockResolvedValueOnce({
+        candidates: [{ host: '192.0.2.1', port: 45123 }],
+        completion: Promise.resolve(),
+        close: closes[1],
+      });
+    let directCalls = 0;
+    const fetchMock = vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const pathname = new URL(String(url)).pathname;
+      if (!pathname.endsWith('/machine-direct-upload')) {
+        return Promise.resolve(new Response(JSON.stringify({
+          ok: true,
+          attachment: attachment('r'.repeat(32), '/staging/repeat.bin'),
+        }), { status: 200 }));
+      }
+      directCalls += 1;
+      if (directCalls === 1) {
+        const request = JSON.parse(String(init?.body)) as { requestId: string };
+        return Promise.resolve(new Response(JSON.stringify({
+          type: MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE,
+          requestId: request.requestId,
+          attachment: attachment('r'.repeat(32), '/uploads/repeat.bin'),
+        }), { status: 200 }));
+      }
+      return new Promise<Response>((_, reject) => {
+        init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')), { once: true });
+      });
+    });
+    const timeoutPolicy = { directControlMs: 25, directStallMs: 25, relayAttemptMs: 25 };
+    await expect(sendFileToMachine({
+      serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token',
+      targetServerId: 'controlled-1', sourcePath, fetchImpl: fetchMock as typeof fetch, timeoutPolicy,
+    })).resolves.toMatchObject({ transport: 'direct' });
+    await expect(sendFileToMachine({
+      serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token',
+      targetServerId: 'controlled-1', sourcePath, fetchImpl: fetchMock as typeof fetch, timeoutPolicy,
+    })).resolves.toMatchObject({ transport: 'relay' });
+    expect(directCalls).toBe(2);
+    expect(closes[0]).toHaveBeenCalledOnce();
+    expect(closes[1]).toHaveBeenCalledOnce();
+  });
+
+  it('returns a terminal error when relay attempts keep stalling', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-relay-stall-'));
+    dirs.push(dir);
+    const sourcePath = join(dir, 'relay-stall.txt');
+    await writeFile(sourcePath, 'hello');
+    startMachineDirectSenderMock.mockResolvedValueOnce(null);
+    const fetchMock = vi.fn((_url: string | URL | Request, init?: RequestInit) => new Promise<Response>((_, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')), { once: true });
+    }));
+    const resultPromise = sendFileToMachine({
+      serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token',
+      targetServerId: 'controlled-1', sourcePath, fetchImpl: fetchMock as typeof fetch,
+      timeoutPolicy: { directControlMs: 25, directStallMs: 25, relayAttemptMs: 25, relayTotalMs: 100 },
+    });
+    await expect(resultPromise).rejects.toMatchObject({ kind: 'transport' });
+    expect(fetchMock).toHaveBeenCalled();
+  });
+
+  it('cancels a direct control response whose body stalls after headers', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-control-body-stall-'));
+    dirs.push(dir);
+    const sourcePath = join(dir, 'body-stall.txt');
+    await writeFile(sourcePath, 'hello');
+    const close = vi.fn();
+    startMachineDirectSenderMock.mockResolvedValueOnce({
+      candidates: [{ host: '192.0.2.1', port: 45123 }],
+      completion: Promise.resolve(),
+      close,
+    });
+    const fetchMock = vi.fn((url: string | URL | Request, init?: RequestInit) => {
+      const pathname = new URL(String(url)).pathname;
+      if (pathname.endsWith('/machine-direct-upload')) {
+        const response = new Response(new ReadableStream<Uint8Array>({ start() {} }), { status: 200 });
+        return Promise.resolve(response);
+      }
+      return Promise.resolve(new Response(JSON.stringify({
+        ok: true,
+        attachment: attachment('b'.repeat(32), '/staging/body-stall.txt'),
+      }), { status: 200 }));
+    });
+    const resultPromise = sendFileToMachine({
+      serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token',
+      targetServerId: 'controlled-1', sourcePath, fetchImpl: fetchMock as typeof fetch,
+      timeoutPolicy: { directControlMs: 25, directStallMs: 25, relayAttemptMs: 25, relayTotalMs: 100 },
+    });
+    await expect(resultPromise).resolves.toMatchObject({ transport: 'relay', attachmentId: 'b'.repeat(32) });
+    expect(close).toHaveBeenCalledOnce();
+  });
+
   it('uploads a regular file through the existing multipart route', async () => {
     startMachineDirectSenderMock.mockResolvedValueOnce(null);
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-send-'));

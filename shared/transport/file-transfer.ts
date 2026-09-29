@@ -163,6 +163,10 @@ export const FILE_TRANSFER_RESUMABLE_UPLOAD = {
   /** Keeps multipart overhead bounded while avoiding hundreds of round trips. */
   CHUNK_BYTES: 8 * 1024 * 1024,
   MAX_ATTEMPTS_WITHOUT_PROGRESS: 5,
+  // Machine-to-machine relay attempts must not inherit the five-minute
+  // browser upload budget: a dead target otherwise leaves send_file_to_machine
+  // without a terminal result while every retry waits on the same request.
+  ATTEMPT_TIMEOUT_MS: 15_000,
   RETRY_BACKOFF_MS: [500, 1_000, 2_000, 4_000, 8_000] as const,
 } as const;
 

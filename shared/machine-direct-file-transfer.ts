@@ -57,7 +57,11 @@ export const MACHINE_DIRECT_FILE_TRANSFER_ERROR = {
 } as const;
 
 const MACHINE_DIRECT_TRANSFER_TIMEOUT_MS = 300_000;
-const MACHINE_DIRECT_CONTROL_GRACE_MS = 10_000;
+// The HTTP control request is an attempt/fallback gate, not the payload
+// lifetime.  Holding it until a stalled target finishes makes callers wait
+// minutes before relay can start.  Keep the direct attempt short while the
+// authenticated socket still has the longer payload budget below.
+const MACHINE_DIRECT_CONTROL_TIMEOUT_MS = 20_000;
 
 export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   MAX_CANDIDATES: 16,
@@ -76,14 +80,13 @@ export const MACHINE_DIRECT_FILE_TRANSFER_LIMITS = {
   // a healthy international path on the former four-second edge.
   CONNECT_TIMEOUT_MS: 8_000,
   HANDSHAKE_TIMEOUT_MS: 8_000,
-  // A control response is deliberately held by the Server until the target
-  // reports DONE.  Therefore its budget must cover the entire direct transfer
-  // rather than imposing a shorter total cap that would kill healthy, slow
-  // transfers and incorrectly force relay (or fail for relay-ineligible
-  // files).  Dead/stalled peers are bounded independently by STALL_TIMEOUT_MS.
+  // Dead/stalled peers are bounded independently by STALL_TIMEOUT_MS.  Clients
+  // use CONTROL_TIMEOUT_MS only until the authenticated lease/progress starts;
+  // thereafter each progress event resets the stall window.  The server bridge
+  // keeps the response open for the full TRANSFER_TIMEOUT_MS payload lifetime.
   STALL_TIMEOUT_MS: 30_000,
   TRANSFER_TIMEOUT_MS: MACHINE_DIRECT_TRANSFER_TIMEOUT_MS,
-  CONTROL_TIMEOUT_MS: MACHINE_DIRECT_TRANSFER_TIMEOUT_MS + MACHINE_DIRECT_CONTROL_GRACE_MS,
+  CONTROL_TIMEOUT_MS: MACHINE_DIRECT_CONTROL_TIMEOUT_MS,
   // This is only the window to begin an authenticated direct connection. Each
   // control hop re-mints it from its own clock, so it can be generous without
   // relying on synchronized machines or extending an in-flight transfer.

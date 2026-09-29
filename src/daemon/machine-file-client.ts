@@ -46,6 +46,50 @@ interface MachineFileBaseOptions {
   sharedMachineAuthority?: string;
   signal?: AbortSignal;
   fetchImpl?: typeof fetch;
+  /** Internal seam for bounded timeout tests; production callers use defaults. */
+  timeoutPolicy?: Partial<MachineFileTransferTimeoutPolicy>;
+}
+
+export interface MachineFileTransferTimeoutPolicy {
+  directControlMs: number;
+  directStallMs: number;
+  relayAttemptMs: number;
+  relayTotalMs?: number;
+}
+
+const DEFAULT_TIMEOUT_POLICY: MachineFileTransferTimeoutPolicy = {
+  directControlMs: MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS,
+  directStallMs: MACHINE_DIRECT_FILE_TRANSFER_LIMITS.STALL_TIMEOUT_MS,
+  relayAttemptMs: FILE_TRANSFER_RESUMABLE_UPLOAD.ATTEMPT_TIMEOUT_MS,
+};
+
+function resolveTimeoutPolicy(policy: Partial<MachineFileTransferTimeoutPolicy> | undefined): MachineFileTransferTimeoutPolicy {
+  return { ...DEFAULT_TIMEOUT_POLICY, ...policy };
+}
+
+function createProgressDeadline(
+  external: AbortSignal | undefined,
+  initialMs: number,
+  stallMs: number,
+): { signal: AbortSignal; progress(): void; close(): void } {
+  const controller = new AbortController();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const reset = (timeoutMs: number) => {
+    if (timer !== undefined) clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(new DOMException('transfer stalled', 'TimeoutError')), timeoutMs);
+  };
+  const close = () => { if (timer !== undefined) clearTimeout(timer); };
+  controller.signal.addEventListener('abort', close, { once: true });
+  reset(initialMs);
+  if (external) {
+    if (external.aborted) controller.abort(external.reason);
+    else external.addEventListener('abort', () => controller.abort(external.reason), { once: true });
+  }
+  return {
+    signal: external ? AbortSignal.any([external, controller.signal]) : controller.signal,
+    progress: () => reset(stallMs),
+    close,
+  };
 }
 
 export interface SendFileToMachineOptions extends MachineFileBaseOptions {
@@ -75,18 +119,60 @@ function authHeaders(sourceServerId: string, sourceToken: string, sharedMachineA
 }
 
 function boundedTransferSignal(signal: AbortSignal | undefined, timeoutMs: number): AbortSignal {
-  const timeout = AbortSignal.timeout(timeoutMs);
-  return signal ? AbortSignal.any([signal, timeout]) : timeout;
+  const timeoutController = new AbortController();
+  const timer = setTimeout(() => {
+    timeoutController.abort(new DOMException('transfer timed out', 'TimeoutError'));
+  }, timeoutMs);
+  timeoutController.signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+  if (!signal) return timeoutController.signal;
+  if (signal.aborted) {
+    clearTimeout(timer);
+    return signal;
+  }
+  signal.addEventListener('abort', () => clearTimeout(timer), { once: true });
+  return AbortSignal.any([signal, timeoutController.signal]);
 }
 
-async function readBoundedJson(response: Response): Promise<Record<string, unknown>> {
+async function boundedPromise<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new MachineControlPlaneError('transport', message)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) clearTimeout(timer);
+  }
+}
+
+async function readBoundedJson(response: Response, signal?: AbortSignal): Promise<Record<string, unknown>> {
   const reader = response.body?.getReader();
   if (!reader) throw new MachineControlPlaneError('malformed', 'empty control-plane response');
   const chunks: Uint8Array[] = [];
   let total = 0;
+  const read = async (): Promise<ReadableStreamReadResult<Uint8Array>> => {
+    if (!signal) return reader.read();
+    if (signal.aborted) throw signal.reason ?? new Error('aborted');
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        void reader.cancel().catch(() => {});
+        reject(signal.reason ?? new Error('aborted'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      void reader.read().then((result) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(result);
+      }, (error: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(error);
+      });
+    });
+  };
   try {
     for (;;) {
-      const { done, value } = await reader.read();
+      const { done, value } = await read();
       if (done) break;
       if (!value) continue;
       total += value.byteLength;
@@ -162,6 +248,7 @@ function transferErrorDetail(error: unknown): string {
 }
 
 export async function sendFileToMachine(options: SendFileToMachineOptions): Promise<MachineFileTransferResult> {
+  const timeouts = resolveTimeoutPolicy(options.timeoutPolicy);
   const source = await resolveReadableRegularFile(options.sourcePath);
   const doFetch = options.fetchImpl ?? fetch;
   const clientUploadId = createHash('sha256').update(JSON.stringify([
@@ -203,23 +290,30 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
       return null;
     });
     if (sender) {
+      const directDeadline = createProgressDeadline(options.signal, timeouts.directControlMs, timeouts.directStallMs);
+      const removeProgress = sender.onProgress?.(directDeadline.progress) ?? (() => {});
       try {
+        const controlSignal = directDeadline.signal;
         const response = await doFetch(
           `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/machine-direct-upload`,
           {
             method: 'POST',
             headers: { ...authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority), 'content-type': 'application/json' },
             body: JSON.stringify({ ...requestBase, candidates: sender.candidates }),
-            signal: boundedTransferSignal(options.signal, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS),
+            signal: controlSignal,
           },
         );
-        const body = await readBoundedJson(response);
+        const body = await readBoundedJson(response, controlSignal);
         const parsed = validateMachineDirectUploadResponse(body, validateAttachmentRef);
         if (response.ok
           && parsed.ok
           && parsed.value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.DONE
           && parsed.value.requestId === requestId) {
-          await sender.completion;
+          await boundedPromise(
+            sender.completion,
+            timeouts.directStallMs,
+            'direct upload completion timed out',
+          );
           const attachment = parsed.value.attachment;
           return {
             size: attachment.size ?? source.size,
@@ -232,6 +326,8 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
       } catch (error) {
         directFailure = `direct upload failed during control/transfer: ${transferErrorDetail(error)}`;
       } finally {
+        removeProgress();
+        directDeadline.close();
         sender.close();
       }
     }
@@ -240,6 +336,7 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
     throw new MachineControlPlaneError('malformed', 'source file is too large for Server relay fallback');
   }
   const sourceBlob = await openAsBlob(source.path);
+  const relayDeadline = timeouts.relayTotalMs === undefined ? undefined : Date.now() + timeouts.relayTotalMs;
   let committedBytes = 0;
   let attachment: AttachmentRef | null = null;
   let lastRelayFailure: string | undefined;
@@ -250,6 +347,11 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
     let body: Record<string, unknown> | null = null;
     lastRelayFailure = undefined;
     for (let attempt = 0; attempt <= FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS; attempt += 1) {
+      const remainingRelayMs = relayDeadline === undefined ? Number.POSITIVE_INFINITY : relayDeadline - Date.now();
+      if (remainingRelayMs <= 0) {
+        lastRelayFailure = 'relay upload total timeout';
+        break;
+      }
       const form = new FormData();
       form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.FILE, chunk, basename(source.path));
       form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.CLIENT_UPLOAD_ID, clientUploadId);
@@ -258,16 +360,20 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
       form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.ORIGINAL_NAME, basename(source.path));
       form.append(FILE_TRANSFER_RESUMABLE_UPLOAD_FIELD.LAST_MODIFIED, String(Math.trunc(source.mtimeMs)));
       try {
+        const relaySignal = boundedTransferSignal(
+          options.signal,
+              Math.min(timeouts.relayAttemptMs, remainingRelayMs),
+        );
         response = await doFetch(
           `${options.serverUrl.replace(/\/+$/, '')}/api/server/${encodeURIComponent(options.targetServerId)}/upload`,
           {
             method: 'POST',
             headers: authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority),
             body: form,
-            signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
+            signal: relaySignal,
           },
         );
-        body = await readBoundedJson(response);
+        body = await readBoundedJson(response, relaySignal);
         if (response.ok || response.status === 409) break;
         if (![408, 425, 429].includes(response.status) && response.status < 500) break;
       } catch (error) {
@@ -276,10 +382,14 @@ export async function sendFileToMachine(options: SendFileToMachineOptions): Prom
         lastRelayFailure = transferErrorDetail(error);
       }
       if (attempt < FILE_TRANSFER_RESUMABLE_UPLOAD.MAX_ATTEMPTS_WITHOUT_PROGRESS) {
-        await new Promise((resolveDelay) => setTimeout(
-          resolveDelay,
+        const remainingRelayMs = relayDeadline === undefined
+          ? Number.POSITIVE_INFINITY
+          : Math.max(0, relayDeadline - Date.now());
+        const delay = Math.min(
           FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS[Math.min(attempt, FILE_TRANSFER_RESUMABLE_UPLOAD.RETRY_BACKOFF_MS.length - 1)],
-        ));
+          remainingRelayMs,
+        );
+        if (delay > 0) await new Promise((resolveDelay) => setTimeout(resolveDelay, delay));
       }
     }
     if (!response || !body) {
@@ -358,6 +468,7 @@ async function commitDownloadedFile(temp: string, destination: string, overwrite
 }
 
 export async function fetchFileFromMachine(options: FetchFileFromMachineOptions): Promise<MachineFileTransferResult> {
+  const timeouts = resolveTimeoutPolicy(options.timeoutPolicy);
   const doFetch = options.fetchImpl ?? fetch;
   const base = options.serverUrl.replace(/\/+$/, '');
   const headers = authHeaders(options.sourceServerId, options.sourceToken, options.sharedMachineAuthority);
@@ -365,6 +476,7 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
   let directFailure = 'direct setup unavailable';
 
   {
+    const directDeadline = createProgressDeadline(options.signal, timeouts.directControlMs, timeouts.directStallMs);
     const requestId = randomBytes(24).toString('base64url');
     const requestBase = {
       type: MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_REQUEST,
@@ -372,25 +484,34 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
       capability: randomBytes(32).toString('base64url'),
       expiresAt: Date.now() + MACHINE_DIRECT_FILE_TRANSFER_LIMITS.AUTHORITY_TTL_MS,
     } as const;
-    const receiver = await startMachineDirectFetchReceiver({ tempPath: prepared.temp, request: requestBase }).catch((error: unknown) => {
+    const receiver = await startMachineDirectFetchReceiver({
+      tempPath: prepared.temp,
+      request: requestBase,
+      onProgress: directDeadline.progress,
+    }).catch((error: unknown) => {
       directFailure = `direct receiver setup failed: ${transferErrorDetail(error)}`;
       return null;
     });
     if (receiver) {
       try {
+        const controlSignal = directDeadline.signal;
         const response = await doFetch(`${base}/api/server/${encodeURIComponent(options.targetServerId)}/machine-direct-fetch`, {
           method: 'POST',
           headers: { ...headers, 'content-type': 'application/json' },
           body: JSON.stringify({ ...requestBase, sourcePath: options.sourcePath, candidates: receiver.candidates }),
-          signal: boundedTransferSignal(options.signal, MACHINE_DIRECT_FILE_TRANSFER_LIMITS.CONTROL_TIMEOUT_MS),
+          signal: controlSignal,
         });
-        const body = await readBoundedJson(response);
+        const body = await readBoundedJson(response, controlSignal);
         const terminal = validateMachineDirectFetchResponse(body);
         if (response.ok
           && terminal.ok
           && terminal.value.type === MACHINE_DIRECT_FILE_TRANSFER_MSG.FETCH_DONE
           && terminal.value.requestId === requestId) {
-          const start = await receiver.completion;
+          const start = await boundedPromise(
+            receiver.completion,
+            timeouts.directStallMs,
+            'direct fetch completion timed out',
+          );
           if (start.size !== terminal.value.size) throw new MachineControlPlaneError('malformed', 'direct fetch size mismatch');
           await commitDownloadedFile(prepared.temp, prepared.destination, options.overwrite === true);
           await removeMachineFetchResumeIdentity(prepared.temp);
@@ -405,23 +526,28 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
       } catch (error) {
         directFailure = `direct fetch failed during control/transfer: ${transferErrorDetail(error)}`;
       } finally {
+        directDeadline.close();
         receiver.close();
       }
+    } else {
+      directDeadline.close();
     }
   }
 
   let handleResponse: Response;
+  let handleSignal: AbortSignal;
   try {
+    handleSignal = boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS);
     handleResponse = await doFetch(`${base}/api/server/${encodeURIComponent(options.targetServerId)}/machine-file-handle`, {
       method: 'POST',
       headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ path: options.sourcePath }),
-      signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
+      signal: handleSignal,
     });
   } catch (error) {
     throw new MachineControlPlaneError('transport', `${directFailure}; relay file handle transport failed: ${transferErrorDetail(error)}`);
   }
-  const handleBody = await readBoundedJson(handleResponse);
+  const handleBody = await readBoundedJson(handleResponse, handleSignal);
   if (!handleResponse.ok) {
     const reason = typeof handleBody.error === 'string' ? handleBody.error : `http_${handleResponse.status}`;
     if (reason === FILE_PATH_HANDLE_ERROR.FILE_TOO_LARGE) {
