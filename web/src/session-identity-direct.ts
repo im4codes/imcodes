@@ -13,6 +13,7 @@
  * Participants keep using the fully access-controlled HTTP relay route
  * unchanged.
  */
+import { DIRECT_FILE_TRANSFER_LIMITS } from '@shared/direct-file-transfer.js';
 import type { SessionIdentityProfile, SessionIdentityScope } from '@shared/session-identity.js';
 import { SESSION_IDENTITY_WS } from '@shared/session-identity-ws.js';
 import {
@@ -26,6 +27,32 @@ import type { WsClient } from './ws-client.js';
 
 function isDirectScope(scope: SessionIdentityScope): scope is 'project' | 'session' {
   return scope === 'project' || scope === 'session';
+}
+
+/**
+ * The lease's own retry budget (up to MAX_ATTEMPTS negotiations, each up to
+ * NEGOTIATION_TIMEOUT_MS + CHANNEL_OPEN_TIMEOUT_MS) is sized for a transfer
+ * that's actually working, just slowly -- worst case it can run well past a
+ * minute. The owner's identity save/fetch has its own, much tighter
+ * "never times out" guarantee, so give the direct attempt a fixed budget:
+ * once it's blown, stop WAITING on it (it keeps running in the background
+ * and its eventual settlement is simply ignored) and fall back to the HTTP
+ * relay path immediately, rather than the shared lease machinery's own much
+ * longer worst case.
+ */
+const DIRECT_ATTEMPT_BUDGET_MS = DIRECT_FILE_TRANSFER_LIMITS.NEGOTIATION_TIMEOUT_MS;
+
+function withDirectAttemptBudget<T>(attempt: Promise<T>): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error('session_identity_direct_budget_exceeded')),
+      DIRECT_ATTEMPT_BUDGET_MS,
+    );
+    attempt.then(
+      (value) => { clearTimeout(timer); resolve(value); },
+      (error: unknown) => { clearTimeout(timer); reject(error); },
+    );
+  });
 }
 
 /** Content-addressed cache: skips a bytes fetch when the server's current hash already matches. */
@@ -105,7 +132,7 @@ export function fetchSessionIdentityProfileDirectFirst(
   scope: SessionIdentityScope, scopeKey: string, context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile | null> {
   if (!ws || !isDirectScope(scope) || !supportsSessionIdentityDirect(ws)) return fetchSessionIdentityProfile(scope, scopeKey, context);
-  return (async () => {
+  const attempt = (async () => {
     const resolved = await resolveIdentityDirect(ws, scope, context);
     if (!resolved) return null;
     const key = cacheKey(context.serverId, scope, resolved.scopeKey);
@@ -126,7 +153,8 @@ export function fetchSessionIdentityProfileDirectFirst(
       content: direct.content, contentHash: resolved.contentHash,
       revision: resolved.revision ?? 0, updatedAt: resolved.updatedAt ?? 0,
     });
-  })().catch(() => fetchSessionIdentityProfile(scope, scopeKey, context));
+  })();
+  return withDirectAttemptBudget(attempt).catch(() => fetchSessionIdentityProfile(scope, scopeKey, context));
 }
 
 /** See fetchSessionIdentityProfileDirectFirst's doc comment on why this is a plain function. */
@@ -135,7 +163,7 @@ export function saveSessionIdentityProfileDirectFirst(
   context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile> {
   if (!ws || !isDirectScope(input.scope) || !supportsSessionIdentityDirect(ws)) return saveSessionIdentityProfile(input, context);
-  return (async () => {
+  const attempt = (async () => {
     const resolved = await resolveIdentityDirect(ws, input.scope as 'project' | 'session', context);
     // A brand-new (never-saved) key still resolves to a scopeKey with no
     // hash/revision -- only a totally unknown session/scope returns null.
@@ -143,7 +171,8 @@ export function saveSessionIdentityProfileDirectFirst(
     const direct = await setSessionIdentityDirect(ws, context.serverId, input.scope as 'project' | 'session', resolved.scopeKey, input.content);
     identityCache.set(cacheKey(context.serverId, input.scope, resolved.scopeKey), { contentHash: direct.contentHash, content: input.content });
     return toProfile(input.scope, resolved.scopeKey, { content: input.content, ...direct });
-  })().catch(() => saveSessionIdentityProfile(input, context));
+  })();
+  return withDirectAttemptBudget(attempt).catch(() => saveSessionIdentityProfile(input, context));
 }
 
 /** Always the HTTP relay path -- see the module doc comment. */

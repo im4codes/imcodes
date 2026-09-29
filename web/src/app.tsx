@@ -3792,6 +3792,9 @@ export function App() {
       void import('./direct-file-transfer.js').then((mod) => {
         (window as unknown as { __identityTestDirectFileTransfer__?: unknown }).__identityTestDirectFileTransfer__ = mod;
       });
+      void import('./session-identity-direct.js').then((mod) => {
+        (window as unknown as { __identityTestDirectFirst__?: unknown }).__identityTestDirectFirst__ = mod;
+      });
     }
 
     const unsub = ws.onMessage((msg) => {
