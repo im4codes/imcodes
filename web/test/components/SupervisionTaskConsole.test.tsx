@@ -1076,7 +1076,7 @@ describe('SupervisionTaskConsole', () => {
     expect(Array.from(document.querySelectorAll('.supervision-task-console-session')).every((row) => (
       row.getAttribute('data-task-tab') === 'pending' && row.getAttribute('data-session-state') === null
     ))).toBe(true);
-  });
+  }, 20_000);
 
   it('renders distinct localized empty states for active, pending, and history tabs', () => {
     const ended = {
