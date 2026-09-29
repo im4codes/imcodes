@@ -143,19 +143,31 @@ function restartDaemon(): void {
 }
 
 // writeWindowsWatchdogFiles now delegates to the centralized launch-artifacts module.
-async function writeWindowsWatchdogFiles(): Promise<void> {
-  const { resolveLaunchPaths, writeWatchdogCmd, writeVbsLauncher, rotateWatchdogLog } = await import('../util/windows-launch-artifacts.js');
+async function writeWindowsWatchdogFiles(): Promise<import('../util/windows-launch-artifacts.js').LaunchPaths> {
+  const {
+    resolveLaunchPaths,
+    assertWindowsLaunchIdentity,
+    writeWatchdogCmd,
+    writeVbsLauncher,
+    rotateWatchdogLog,
+  } = await import('../util/windows-launch-artifacts.js');
   const paths = resolveLaunchPaths();
+  try {
+    assertWindowsLaunchIdentity(paths);
+  } catch (error) {
+    logger.error({ error, watchdogPath: paths.watchdogPath }, 'Refusing to write default Windows daemon artifacts from a scoped instance');
+    throw error;
+  }
   await writeWatchdogCmd(paths);
   await writeVbsLauncher(paths);
   await rotateWatchdogLog(paths);
+  return paths;
 }
 
 async function installWindowsStartup(): Promise<void> {
-  await writeWindowsWatchdogFiles();
+  const paths = await writeWindowsWatchdogFiles();
 
-  const { resolveLaunchPaths, windowsDaemonTaskName } = await import('../util/windows-launch-artifacts.js');
-  const paths = resolveLaunchPaths();
+  const { windowsDaemonTaskName } = await import('../util/windows-launch-artifacts.js');
   const taskName = windowsDaemonTaskName(paths);
   const scoped = taskName !== 'imcodes-daemon';
   const startupStem = scoped ? taskName : 'imcodes-daemon';

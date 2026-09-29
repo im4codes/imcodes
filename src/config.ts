@@ -3,6 +3,7 @@ import { homedir } from 'os';
 import { join } from 'path';
 import yaml from 'yaml';
 import { PROJECT_ROOT } from './util/project-root.js';
+import { resolveImcodesHome } from './util/windows-daemon-lock.js';
 
 const DEFAULT_CONFIG_PATH = join(PROJECT_ROOT, 'config', 'default.yaml');
 function userConfigPath(): string {
@@ -121,7 +122,7 @@ export async function loadConfig(): Promise<Config> {
     config.cf = {
       workerUrl: s.cfWorkerUrl,
       apiKey: s.cfApiKey ?? s.apiKey,
-      credentialsPath: s.credentialsPath ?? join(homedir(), '.imcodes', 'server.json'),
+      credentialsPath: s.credentialsPath ?? join(resolveImcodesHome(), 'server.json'),
     };
     delete config.server;
   }

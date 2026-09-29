@@ -1,6 +1,7 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import {
   UPGRADE_LOCK_FILE,
+  assertWindowsLaunchIdentity,
   encodeCmdAsUtf8Bom,
   encodeVbsAsUtf16,
   encodeWindowsDaemonScheduledTaskXml,
@@ -81,6 +82,17 @@ describe('writeWatchdogCmd', () => {
     expect(windowsDaemonTaskName(base)).toBe('imcodes-daemon');
     expect(windowsDaemonTaskName({ ...base, watchdogPath: 'C:\\Temp\\scopeA\\.imcodes\\daemon-watchdog.cmd' }))
       .toMatch(/^imcodes-daemon-[0-9a-f]{12}$/);
+  });
+
+  it('refuses a scoped process writing the default daemon artifacts', () => {
+    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
+    const paths = {
+      nodeExe: 'node.exe', imcodesScript: 'imcodes.js',
+      watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
+      vbsPath: 'C:\\Users\\X\\.imcodes\\daemon-launcher.vbs', logPath: 'x',
+    };
+    expect(() => assertWindowsLaunchIdentity(paths)).toThrow('windows_scoped_instance_refuses_default_daemon_artifacts');
   });
 
   it('generates watchdog with upgrade lock check', async () => {

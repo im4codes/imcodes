@@ -1,4 +1,4 @@
-import { homedir } from 'node:os';
+import { homedir, userInfo } from 'node:os';
 import { dirname, join, resolve, win32 } from 'node:path';
 import { normalizeWindowsTaskHome, windowsHomeHash } from './windows-daemon-watchdog.mjs';
 
@@ -13,15 +13,43 @@ export interface WindowsDaemonLockPathOptions {
   /** A daemon.sock path supplied by an isolated caller. */
   socketPath?: string;
   env?: NodeJS.ProcessEnv;
+  /** Real account profile, injectable for deterministic cross-platform tests. */
+  realProfileHome?: string;
+}
+
+/**
+ * Return the account profile that owns the Windows installation.  USERPROFILE
+ * is process-controlled and therefore cannot identify the machine-wide
+ * default when an isolated child overrides it.  libuv's userInfo().homedir
+ * comes from the account profile API and is independent of that override.
+ * Keep the Windows-shaped USERPROFILE fallback for POSIX unit tests that
+ * emulate Windows paths, and for runtimes where userInfo is unavailable.
+ */
+function resolveRealProfileHome(env: NodeJS.ProcessEnv): string {
+  const envProfile = env.USERPROFILE?.trim() ?? '';
+  if (process.platform !== 'win32') {
+    // Preserve POSIX homedir() semantics; Windows-shaped fixtures are the
+    // only non-Windows case where USERPROFILE intentionally emulates a
+    // Windows account profile.
+    return looksLikeWindowsPath(envProfile) ? envProfile : homedir();
+  }
+  try {
+    const profile = typeof userInfo === 'function' ? userInfo().homedir.trim() : '';
+    if (profile) return profile;
+  } catch { /* fall back to the platform home */ }
+  return homedir();
 }
 
 /** Resolve the immutable legacy installation home used for compatibility.
  * Scoped launchers may override USERPROFILE/HOME, so callers must be able to
  * carry the real default explicitly instead of deriving it from the child. */
-export function resolveWindowsDefaultHome(env: NodeJS.ProcessEnv = process.env): string {
+export function resolveWindowsDefaultHome(
+  env: NodeJS.ProcessEnv = process.env,
+  realProfileHome?: string,
+): string {
   const configured = env.IMCODES_DEFAULT_HOME?.trim();
   if (configured) return resolveLockPath(configured);
-  return resolveLockPath(join(env.USERPROFILE?.trim() || homedir(), '.imcodes'));
+  return resolveLockPath(join(realProfileHome?.trim() || resolveRealProfileHome(env), '.imcodes'));
 }
 
 /**
@@ -43,15 +71,15 @@ export function resolveImcodesHome(options: WindowsDaemonLockPathOptions = {}): 
     return resolveLockPath(socketHome);
   }
 
-  const configuredHome = options.env
-    ? options.env.IMCODES_HOME?.trim()
-    : process.env.IMCODES_HOME?.trim();
+  const env = options.env ?? process.env;
+  const configuredHome = env.IMCODES_HOME?.trim();
 
   // Test runners commonly override HOME without changing USERPROFILE (the
   // value Node uses for homedir() on Windows). Honor that explicit HOME when
   // it points somewhere else so isolated daemons receive their own pipe.
-  const configuredUserHome = options.env ? options.env.HOME?.trim() : process.env.HOME?.trim();
-  const configuredUserProfile = options.env ? options.env.USERPROFILE?.trim() : process.env.USERPROFILE?.trim();
+  const configuredUserHome = env.HOME?.trim();
+  const configuredUserProfile = env.USERPROFILE?.trim();
+  const realProfileHome = options.realProfileHome?.trim() || resolveRealProfileHome(env);
   if (configuredHome) return resolveLockPath(configuredHome);
   // On POSIX, HOME is the same source as os.homedir() and test suites often
   // mock homedir() without rewriting the process environment.  Treating an
@@ -63,11 +91,11 @@ export function resolveImcodesHome(options: WindowsDaemonLockPathOptions = {}): 
     || looksLikeWindowsPath(configuredUserHome ?? '')
     || looksLikeWindowsPath(configuredUserProfile ?? '');
   if (windowsHomeOverride && configuredUserHome
-    && normalizeWindowsLockPath(configuredUserHome) !== normalizeWindowsLockPath(homedir())) {
+    && normalizeWindowsLockPath(configuredUserHome) !== normalizeWindowsLockPath(realProfileHome)) {
     return resolveLockPath(join(configuredUserHome, '.imcodes'));
   }
 
-  return resolve(join(homedir(), '.imcodes'));
+  return resolveLockPath(join(realProfileHome, '.imcodes'));
 }
 
 function looksLikeWindowsPath(path: string): boolean {
@@ -96,7 +124,7 @@ export function normalizeWindowsLockPath(path: string): string {
  */
 export function windowsDaemonLockPipeName(options: WindowsDaemonLockPathOptions = {}): string {
   const homePath = resolveImcodesHome(options);
-  const defaultHome = resolveWindowsDefaultHome(options.env ?? process.env);
+  const defaultHome = resolveWindowsDefaultHome(options.env ?? process.env, options.realProfileHome);
   if (normalizeWindowsLockPath(homePath) === normalizeWindowsLockPath(defaultHome)) {
     return WINDOWS_DAEMON_LOCK_PIPE;
   }

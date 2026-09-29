@@ -3,6 +3,7 @@ import {
   WINDOWS_DAEMON_LOCK_PIPE,
   normalizeWindowsLockPath,
   resolveImcodesHome,
+  resolveWindowsDefaultHome,
   windowsDaemonLockPipeName,
 } from '../../src/util/windows-daemon-lock.js';
 
@@ -53,6 +54,22 @@ describe('Windows daemon lock pipe identity', () => {
     expect(scoped).toBe(windowsDaemonLockPipeName({
       homePath: 'C:\\scope\\.imcodes',
       env: { IMCODES_DEFAULT_HOME: 'C:\\Users\\admin' },
+    }));
+  });
+
+  it('derives the default identity from the real profile, not USERPROFILE', () => {
+    const env = {
+      USERPROFILE: 'C:\\scoped-test-home',
+      IMCODES_HOME: 'C:\\scoped-test-home\\.imcodes',
+    };
+    const realProfileHome = 'C:\\Users\\real-account';
+    expect(resolveWindowsDefaultHome(env, realProfileHome)).toBe('C:\\Users\\real-account\\.imcodes');
+    const scopedPipe = windowsDaemonLockPipeName({ env, realProfileHome });
+    expect(scopedPipe).not.toBe(WINDOWS_DAEMON_LOCK_PIPE);
+    expect(scopedPipe).toBe(windowsDaemonLockPipeName({
+      homePath: env.IMCODES_HOME,
+      env: { USERPROFILE: realProfileHome },
+      realProfileHome,
     }));
   });
 

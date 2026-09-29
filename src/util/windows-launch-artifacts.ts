@@ -3,7 +3,7 @@ import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs';
 import { execFileSync, execSync } from 'child_process';
 import path, { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { homedir, tmpdir } from 'os';
+import { tmpdir } from 'os';
 import {
   resolveImcodesHome,
   resolveWindowsDefaultHome,
@@ -32,6 +32,24 @@ export function windowsDaemonTaskName(paths: LaunchPaths): string {
   const stateHome = path.win32.dirname(paths.watchdogPath);
   const defaultHome = resolveWindowsDefaultHome();
   return windowsTaskName('daemon', stateHome, defaultHome);
+}
+
+/**
+ * Refuse to write machine-wide Windows launch artifacts from an isolated
+ * instance.  A child may override USERPROFILE, but that must never make its
+ * scoped state look like the default account home or let it overwrite the
+ * `imcodes-daemon` task and default watchdog files.
+ */
+export function assertWindowsLaunchIdentity(paths: LaunchPaths): void {
+  const stateHome = path.win32.dirname(paths.watchdogPath);
+  const currentHome = resolveImcodesHome();
+  const defaultHome = resolveWindowsDefaultHome();
+  const currentIsScoped = normalizeWindowsTaskHome(currentHome) !== normalizeWindowsTaskHome(defaultHome);
+  const writesDefaultPath = normalizeWindowsTaskHome(stateHome) === normalizeWindowsTaskHome(defaultHome);
+  const taskName = windowsTaskName('daemon', stateHome, defaultHome);
+  if (currentIsScoped && (writesDefaultPath || taskName === 'imcodes-daemon')) {
+    throw new Error('windows_scoped_instance_refuses_default_daemon_artifacts');
+  }
 }
 
 function scopedEnvironmentPrefix(paths: LaunchPaths): string {
@@ -171,6 +189,7 @@ export function encodeWindowsDaemonScheduledTaskXml(xml: string): Buffer {
 
 /** Replace legacy ONLOGON registrations with the durable task definition. */
 export function installWindowsScheduledTask(paths: LaunchPaths): boolean {
+  assertWindowsLaunchIdentity(paths);
   let taskDir: string | null = null;
   try {
     taskDir = mkdtempSync(join(tmpdir(), 'imcodes-daemon-task-'));
@@ -459,8 +478,9 @@ export async function rotateWatchdogLog(paths: LaunchPaths): Promise<void> {
  *  language-independent — works on en-US, zh-CN, ja-JP and any other Windows
  *  locale. */
 export async function regenerateAllArtifacts(): Promise<void> {
-  killAllStaleWatchdogsBeforeRegen();
   const paths = resolveLaunchPaths();
+  assertWindowsLaunchIdentity(paths);
+  killAllStaleWatchdogsBeforeRegen();
   await writeWatchdogCmd(paths);
   await writeVbsLauncher(paths);
   // Re-create the whole registration. `/Change /TR` preserves the legacy
@@ -476,7 +496,7 @@ function killAllStaleWatchdogsBeforeRegen(): void {
   // and scoped homes. The default pipe remains backward-compatible, but a
   // default restart must not kill another isolated instance's watchdog.
   const currentHome = resolveImcodesHome();
-  const defaultHome = path.resolve(homedir(), '.imcodes');
+  const defaultHome = resolveWindowsDefaultHome();
   // PowerShell first (works on every Windows including ones where wmic is gone)
   // CRITICAL: use a temp .ps1 file, NOT `-Command "..."` — nested double
   // quotes inside the script body get truncated by cmd.exe→powershell
