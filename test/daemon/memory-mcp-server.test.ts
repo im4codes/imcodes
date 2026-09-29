@@ -1740,6 +1740,50 @@ describe('mergeDefaultToolDeps per-field composition', () => {
     }
   });
 
+  it('does not retry daemon-memory RPC for a stopped exact session', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stale-stopped-'));
+    const previousHome = process.env.HOME;
+    process.env.HOME = home;
+    const requests: Array<Record<string, unknown>> = [];
+    const hookServer = createServer((req, res) => {
+      if (req.method !== 'POST' || req.url !== MEMORY_MCP_DAEMON_RPC_PATH) {
+        res.writeHead(404);
+        res.end();
+        return;
+      }
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        void (async () => {
+          requests.push(JSON.parse(raw) as Record<string, unknown>);
+          await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-new' }, 'stopped');
+          res.writeHead(409, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: false, error: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR }));
+        })();
+      });
+    });
+    try {
+      await writeWorkerSessionIdentity(home, { sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
+      await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+      const address = hookServer.address();
+      if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+      const merged = mergeDefaultToolDeps(caller, {}, {
+        sessionName: 'deck_sub_worker', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old',
+      }, {
+        resolveHookAuthority: async () => ({ ok: true, port: address.port, owner: null }),
+      });
+
+      await expect(merged.invokeDaemonMemoryTool!(MEMORY_MCP_TOOL_NAMES.SAVE_OBSERVATION, { content: 'x' }))
+        .rejects.toThrow(DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]).toMatchObject({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
+    } finally {
+      process.env.HOME = previousHome;
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
   it('self-heals shared machine authority after an ordinary session restart', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-machine-authority-heal-'));
     const previousHome = process.env.HOME;

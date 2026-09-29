@@ -645,6 +645,7 @@ export function mergeDefaultToolDeps(
                 hookPath: MEMORY_MCP_DAEMON_RPC_PATH,
                 timeoutMs: MEMORY_MCP_DEFAULT_REQUEST_TIMEOUT_MS,
                 staleRuntimeError: DAEMON_MEMORY_WORKER_STALE_RUNTIME_ERROR,
+                rejectStopped: true,
               });
             return async (name: MemoryMcpDaemonToolName, input?: unknown) => {
               const response = await postResourceOwnerHook({ serverId: caller.serverId, tool: name, input });
