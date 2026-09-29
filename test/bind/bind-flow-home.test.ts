@@ -27,7 +27,7 @@ describe('bind credential state home isolation', () => {
     await writeFile(join(defaultHome, 'server.json'), JSON.stringify({ serverId: 'default', token: 'default', workerUrl: 'https://default' }));
     await writeFile(join(scoped, 'server.json'), JSON.stringify({ serverId: 'scoped', token: 'scoped', workerUrl: 'https://scoped' }));
     process.env.IMCODES_HOME = scoped;
-    process.env.IMCODES_DEFAULT_HOME = defaultHome;
+    process.env.IMCODES_DEFAULT_HOME = join(root, 'default');
 
     const { loadCredentials } = await import('../../src/bind/bind-flow.js');
     await expect(loadCredentials()).resolves.toMatchObject({ serverId: 'scoped', workerUrl: 'https://scoped' });

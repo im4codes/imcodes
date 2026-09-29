@@ -73,7 +73,9 @@ describe('writeWatchdogCmd', () => {
   });
 
   it('derives scoped task names without changing the default registration', () => {
-    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
     const base = {
       nodeExe: 'node.exe', imcodesScript: 'imcodes.js',
       watchdogPath: 'C:\\Users\\X\\.imcodes\\daemon-watchdog.cmd',
@@ -85,7 +87,9 @@ describe('writeWatchdogCmd', () => {
   });
 
   it('refuses a scoped process writing the default daemon artifacts', () => {
-    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
     vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
     const paths = {
       nodeExe: 'node.exe', imcodesScript: 'imcodes.js',
@@ -130,7 +134,9 @@ describe('writeWatchdogCmd', () => {
   });
 
   it('bakes scoped HOME environment into the relaunch command', async () => {
-    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
     vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
     const paths = {
       nodeExe: 'C:\\Program Files\\nodejs\\node.exe',
@@ -472,7 +478,9 @@ describe('writeVbsLauncher', () => {
   });
 
   it('bakes scoped HOME into the Task Scheduler launcher', async () => {
-    vi.stubEnv('USERPROFILE', 'C:\\Users\\X');
+    // The default account profile is explicit: on real Windows the product
+    // takes it from the account (userInfo), not from USERPROFILE.
+    vi.stubEnv('IMCODES_DEFAULT_HOME', 'C:\\Users\\X');
     vi.stubEnv('IMCODES_HOME', 'C:\\Temp\\scopeA\\.imcodes');
     const paths = {
       nodeExe: '', imcodesScript: '', logPath: '',

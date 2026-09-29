@@ -47,8 +47,11 @@ export function resolveWindowsDefaultHome(
   env: NodeJS.ProcessEnv = process.env,
   realProfileHome?: string,
 ): string {
+  // IMCODES_DEFAULT_HOME names the default account's PROFILE directory (the
+  // launchers write dirname(defaultHome) and the upgrade runner appends
+  // .imcodes), so the state home is one level below it.
   const configured = env.IMCODES_DEFAULT_HOME?.trim();
-  if (configured) return resolveLockPath(configured);
+  if (configured) return resolveLockPath(join(configured, '.imcodes'));
   return resolveLockPath(join(realProfileHome?.trim() || resolveRealProfileHome(env), '.imcodes'));
 }
 

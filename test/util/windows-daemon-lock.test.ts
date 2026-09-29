@@ -57,6 +57,13 @@ describe('Windows daemon lock pipe identity', () => {
     }));
   });
 
+  it('treats IMCODES_DEFAULT_HOME as the default PROFILE directory, like the launchers that write it', () => {
+    // Launchers bake IMCODES_DEFAULT_HOME=dirname(<default>\.imcodes) and the
+    // upgrade runner appends .imcodes, so the resolver must do the same.
+    expect(resolveWindowsDefaultHome({ IMCODES_DEFAULT_HOME: 'C:\\Users\\admin' }))
+      .toBe('C:\\Users\\admin\\.imcodes');
+  });
+
   it('derives the default identity from the real profile, not USERPROFILE', () => {
     const env = {
       USERPROFILE: 'C:\\scoped-test-home',
