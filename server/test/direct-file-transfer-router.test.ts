@@ -16,6 +16,7 @@ import {
   validateDirectFileTransferServerMessage,
   type DirectFileTransferLeaseReady,
 } from '../../shared/direct-file-transfer.js';
+import { encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 
 const SERVER_ID = 'server-1';
 const TAB_A = 'browser-tab-a1';
@@ -32,6 +33,7 @@ function fixture() {
   let generation = 3;
   let available = true;
   let supported = true;
+  let ownerUserId: string | null = 'user-a';
   const sendDaemon = vi.fn((message: Record<string, unknown>, expectedGeneration: number) => {
     if (!available || expectedGeneration !== generation) return false;
     daemonMessages.push(message);
@@ -49,6 +51,7 @@ function fixture() {
       rows.push(message);
       browserMessages.set(socket, rows);
     },
+    daemonOwnerUserId: () => ownerUserId,
   });
   return {
     router,
@@ -60,6 +63,7 @@ function fixture() {
     setGeneration: (value: number) => { generation = value; router.setDaemonGeneration(value); },
     setAvailable: (value: boolean) => { available = value; },
     setSupported: (value: boolean) => { supported = value; },
+    setOwnerUserId: (value: string | null) => { ownerUserId = value; },
   };
 }
 
@@ -609,6 +613,59 @@ describe('DirectFileTransferRouter v2', () => {
 
     f.router.handleBrowser(f.browserB, 'user-a', uploadInit(lease));
     expect(f.messages(f.browserB).at(-1)).toMatchObject({ error: DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY });
+  });
+
+  it('P0: stamps identityOwnerAuthorized for the daemon owner, and independently refuses an identity handle for anyone else', () => {
+    // Defense in depth for tsk_cd_identity_p2p_authz: share-policy.ts
+    // already refuses this before the router ever sees it, but the router
+    // re-checks independently and is what stamps the marker the daemon
+    // worker requires.
+    const identityHandle = encodeSessionIdentityDirectHandle('project', 'owners-project');
+    const f = fixture();
+    f.setOwnerUserId('user-a');
+    const lease = readyLease(f);
+
+    f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease, { filename: identityHandle }));
+    expect(f.daemonMessages.at(-1)).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.PREPARE, identityOwnerAuthorized: true });
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED, identityOwnerAuthorized: true });
+
+    const downloadLease = readyLease(f, f.browserB, 'user-a');
+    f.router.handleBrowser(f.browserB, 'user-a', downloadInit(downloadLease, {
+      previewHandle: identityHandle,
+      requestId: 'attempt-request-2',
+      attemptId: 'attempt-id-2',
+      operationId: 'operation-id-2',
+      clientDownloadId: 'operation-id-2',
+    }));
+    expect(f.daemonMessages.at(-1)).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.PREPARE, identityOwnerAuthorized: true });
+  });
+
+  it('P0: refuses an identity-flavored OPERATION_INIT from a non-owner userId before it ever reaches the daemon', () => {
+    const identityHandle = encodeSessionIdentityDirectHandle('project', 'owners-project');
+    const f = fixture();
+    f.setOwnerUserId('user-a');
+    const lease = readyLease(f, f.browserA, 'user-not-owner');
+
+    const daemonMessagesBefore = f.daemonMessages.length;
+    f.router.handleBrowser(f.browserA, 'user-not-owner', uploadInit(lease, { filename: identityHandle }));
+    expect(f.daemonMessages.length).toBe(daemonMessagesBefore); // never reached the daemon
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({ error: DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY });
+
+    const downloadLease = readyLease(f, f.browserB, 'user-not-owner');
+    const daemonMessagesBeforeDownload = f.daemonMessages.length;
+    f.router.handleBrowser(f.browserB, 'user-not-owner', downloadInit(downloadLease, { previewHandle: identityHandle }));
+    expect(f.daemonMessages.length).toBe(daemonMessagesBeforeDownload);
+    expect(f.messages(f.browserB).at(-1)).toMatchObject({ error: DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY });
+  });
+
+  it('does not stamp or require identityOwnerAuthorized for an ordinary (non-identity) file, even for a non-owner userId', () => {
+    const f = fixture();
+    f.setOwnerUserId('user-a');
+    const lease = readyLease(f, f.browserA, 'user-not-owner');
+    f.router.handleBrowser(f.browserA, 'user-not-owner', uploadInit(lease));
+    const prepare = f.daemonMessages.at(-1)!;
+    expect(prepare).toMatchObject({ type: DIRECT_FILE_TRANSFER_MSG.PREPARE });
+    expect(prepare).not.toHaveProperty('identityOwnerAuthorized');
   });
 
   it('emits bounded redacted lifecycle telemetry for cancel and retry exhaustion', () => {
@@ -1390,6 +1447,7 @@ describe('a relay-required browser receives real relay material', () => {
       iceServers: (userId) => createTurnIceServerAuthority(userId, { env: PRODUCTION_TURN_ENV }),
       sendDaemon: (message) => { daemonMessages.push(message as Record<string, unknown>); return true; },
       sendBrowser: (_socket, message) => { messages.push(message as Record<string, unknown>); },
+      daemonOwnerUserId: () => 'user-mobile',
     });
 
     expect(router.handleBrowser(browser, 'user-mobile', leaseInit())).toBe(true);

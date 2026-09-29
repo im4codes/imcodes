@@ -1514,6 +1514,17 @@ async function startIdentityUpload(transfer: ActiveDirectTransfer): Promise<void
     await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST, false);
     return;
   }
+  // Defense in depth: the server already refuses to authorize an identity
+  // handle for anyone but the daemon owner (share-policy.ts's
+  // direct-file-operation check, plus direct-file-transfer-router.ts's
+  // independent re-check) and stamps this marker only when it does. Never
+  // trust a decoded identity handle without it -- a bug in either of those
+  // upstream checks would otherwise let a shared viewer/participant read or
+  // write the owner's identity content.
+  if (authority.identityOwnerAuthorized !== true) {
+    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
+    return;
+  }
   transfer.uploadBuffer = Buffer.allocUnsafe(authority.size);
   transfer.identityUpload = { scope: decoded.scope, scopeKey: decoded.scopeKey, source: 'web' };
   transfer.started = true;
@@ -1772,6 +1783,11 @@ async function startUpload(transfer: ActiveDirectTransfer, requestedResumeOffset
 async function startIdentityDownload(transfer: ActiveDirectTransfer, requestedResumeOffset: number): Promise<void> {
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) return;
+  // Defense in depth -- see startIdentityUpload's matching check.
+  if (authority.identityOwnerAuthorized !== true) {
+    await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
+    return;
+  }
   let source: { content: string; filename: string; size: number };
   try {
     source = await resolveIdentityDownloadSource(authority.previewHandle);

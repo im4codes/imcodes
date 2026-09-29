@@ -39,6 +39,7 @@ import {
   type DirectFileTransferTerminal,
   type DirectFileTransferOperationError,
 } from '../../../shared/direct-file-transfer.js';
+import { decodeSessionIdentityDirectHandle } from '../../../shared/session-identity.js';
 
 type BoundBrowserMessage = DirectFileTransferCancel
   | DirectFileTransferStatusQuery;
@@ -141,6 +142,17 @@ export interface DirectFileTransferRouterHooks {
   sendDaemon(message: Record<string, unknown>, generation: number): boolean;
   sendBrowser(socket: WebSocket, message: Record<string, unknown>): void;
   now?(): number;
+  /**
+   * Identity-over-the-lease (shared/session-identity.ts) is owner-only.
+   * share-policy.ts already refuses an identity-flavored OPERATION_INIT for
+   * any share-scoped caller before it ever reaches this router; this hook
+   * lets authorizeOperation independently re-check the same thing (defense
+   * in depth against a future bug in that first gate) and stamp the PREPARE
+   * frame it forwards to the daemon so the daemon's own worker can refuse an
+   * identity handle that somehow arrives without this authoritative,
+   * server-computed marker.
+   */
+  daemonOwnerUserId(): string | null;
 }
 
 function hashOpaque(value: string): Buffer {
@@ -626,6 +638,14 @@ export class DirectFileTransferRouter {
       this.sendOperationError(socket, init, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
       return;
     }
+    const identityHandleField = init.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD ? init.filename : init.previewHandle;
+    const isIdentityOperation = decodeSessionIdentityDirectHandle(identityHandleField) !== null;
+    if (isIdentityOperation && userId !== this.hooks.daemonOwnerUserId()) {
+      // Independent re-check of share-policy.ts's identity-handle gate --
+      // see the DirectFileTransferRouterHooks.daemonOwnerUserId doc comment.
+      this.sendOperationError(socket, init, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
+      return;
+    }
     if (lease.needsRebind || init.daemonGeneration !== this.hooks.daemonGeneration()
       || init.daemonGeneration !== lease.daemonGeneration) {
       this.sendOperationError(socket, init, DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION, true);
@@ -691,6 +711,13 @@ export class DirectFileTransferRouter {
       authorityExpiresAt,
       channelLabel: `${DIRECT_FILE_TRANSFER_OPERATION_CHANNEL_PREFIX}${init.attemptId}`,
       iceServers: lease.iceServers,
+      // Authoritative, server-computed marker -- `userId === daemonOwnerUserId()`
+      // is already guaranteed true here for an identity operation (the check
+      // above returns early otherwise). `init` can never carry this field
+      // itself: validateDirectFileTransferBrowserMessage's exact-key check
+      // rejects any browser message with an unrecognized extra field, so a
+      // client cannot forge it by just adding it to their own OPERATION_INIT.
+      ...(isIdentityOperation ? { identityOwnerAuthorized: true } : {}),
     };
     const prepare = { ...authorityMessage, type: DIRECT_FILE_TRANSFER_MSG.PREPARE };
     if (!this.hooks.sendDaemon(prepare, lease.daemonGeneration)) {

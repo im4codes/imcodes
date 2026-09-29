@@ -582,6 +582,16 @@ interface DirectFileTransferAuthorizedBase extends DirectFileTransferAttemptBind
   authorityExpiresAt: number;
   channelLabel: string;
   iceServers: DirectFileTransferIceServerConfig[];
+  /**
+   * Server-computed only, present exactly when the filename/previewHandle
+   * decodes to an identity handle (shared/session-identity.ts) AND the
+   * requesting userId is the daemon's owner -- see
+   * DirectFileTransferRouterHooks.daemonOwnerUserId in
+   * server/src/ws/direct-file-transfer-router.ts. A browser can never set
+   * this itself: authorityKeysFor strips it before validating the
+   * browser-facing OPERATION_INIT shape.
+   */
+  identityOwnerAuthorized?: true;
 }
 
 type DirectFileTransferOperationWithoutControlType =
@@ -1074,14 +1084,19 @@ function isOperationInit(value: Record<string, unknown>, type: string): boolean 
 
 function authorityKeysFor(value: Record<string, unknown>, type: string): boolean {
   const common = ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'authority', 'authorityExpiresAt', 'channelLabel', 'iceServers'];
+  // Server-only, server-computed (see DirectFileTransferRouterHooks.daemonOwnerUserId
+  // in server/src/ws/direct-file-transfer-router.ts): stripped out before
+  // isUploadInit/isDownloadInit, which also validate the browser-facing
+  // OPERATION_INIT shape where this field must never be accepted from a client.
+  if (value.identityOwnerAuthorized !== undefined && value.identityOwnerAuthorized !== true) return false;
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
-    const { authority: _authority, authorityExpiresAt: _authorityExpiresAt, channelLabel: _channelLabel, iceServers: _iceServers, ...operation } = value;
-    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256', 'destinationDirectory', 'originalName'])
+    const { authority: _authority, authorityExpiresAt: _authorityExpiresAt, channelLabel: _channelLabel, iceServers: _iceServers, identityOwnerAuthorized: _identityOwnerAuthorized, ...operation } = value;
+    return hasExactKeys(value, [...common, 'clientUploadId', 'filename', 'size'], ['sessionName', 'mime', 'sha256', 'destinationDirectory', 'originalName', 'identityOwnerAuthorized'])
       && isUploadInit(operation, type);
   }
   if (value.direction === DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
-    const { authority: _authority, authorityExpiresAt: _authorityExpiresAt, channelLabel: _channelLabel, iceServers: _iceServers, ...operation } = value;
-    return hasExactKeys(value, [...common, 'clientDownloadId', 'previewHandle'], ['sessionName'])
+    const { authority: _authority, authorityExpiresAt: _authorityExpiresAt, channelLabel: _channelLabel, iceServers: _iceServers, identityOwnerAuthorized: _identityOwnerAuthorized, ...operation } = value;
+    return hasExactKeys(value, [...common, 'clientDownloadId', 'previewHandle'], ['sessionName', 'identityOwnerAuthorized'])
       && isDownloadInit(operation, type);
   }
   return false;

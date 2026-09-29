@@ -2247,6 +2247,7 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
+    daemonOwnerUserId: () => this.daemonOwnerUserId,
   });
 
   /** Continuous-authority remote desktop signaling; media/input never enter Server. */

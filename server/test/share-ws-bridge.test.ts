@@ -36,6 +36,7 @@ import { CC_PRESET_MSG } from '../../shared/cc-presets.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
+import { encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -261,6 +262,82 @@ describe('WsBridge share-scoped sockets', () => {
       now,
       runtimeType: 'transport',
       activeDispatchId: null,
+    })).toEqual({ allowed: true });
+  });
+
+  it('P0: denies an identity-flavored handle over the direct-file surface for any shared viewer or participant, upload or download, even when the covered session is real', () => {
+    // Regression for tsk_cd_identity_p2p_authz: without the fix, a shared
+    // viewer/participant could read or write the daemon OWNER's identity
+    // content for an ARBITRARY project/session by putting a decodable
+    // identity handle in filename/previewHandle while supplying a
+    // `sessionName` they genuinely ARE covered for -- session coverage has
+    // no relationship to which project/session the handle actually names.
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const makeState = (role: 'viewer' | 'participant') => ({
+      userId: 'shared-user',
+      actorDisplayName: 'Shared User',
+      ticketId: `ticket-identity-${role}`,
+      target,
+      snapshot: coverage(target, role, now),
+      connectedAt: now,
+    });
+    const identityHandle = encodeSessionIdentityDirectHandle('project', 'owners-other-project');
+    const uploadInit = {
+      type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId,
+      browserTabId: 'browser-tab-identity',
+      leaseId: 'lease-id-identity',
+      leaseGeneration: 1,
+      daemonGeneration: 1,
+      requestId: '123e4567-e89b-12d3-a456-426614174010',
+      attemptId: '123e4567-e89b-12d3-a456-426614174012',
+      attempt: 1,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+      operationId: '123e4567-e89b-12d3-a456-426614174011',
+      clientUploadId: '123e4567-e89b-12d3-a456-426614174011',
+      filename: identityHandle,
+      size: 10,
+      // A session this attacker genuinely IS covered for -- the whole point
+      // of the bug is that this must not matter.
+      sessionName: 'deck_proj_brain',
+    };
+    const downloadInit = {
+      ...uploadInit,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD,
+      clientDownloadId: uploadInit.operationId,
+      previewHandle: identityHandle,
+    };
+    delete (downloadInit as { clientUploadId?: string; filename?: string; size?: number }).clientUploadId;
+    delete (downloadInit as { filename?: string }).filename;
+    delete (downloadInit as { size?: number }).size;
+
+    for (const role of ['viewer', 'participant'] as const) {
+      for (const msg of [uploadInit, downloadInit]) {
+        expect(evaluateShareCommand({
+          msg,
+          state: makeState(role),
+          now,
+          runtimeType: 'transport',
+          activeDispatchId: null,
+        })).toEqual({ allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED });
+      }
+    }
+
+    // Counter-example, same session/role, but an ordinary (non-identity)
+    // filename: behavior is unchanged from the existing reference test
+    // above -- participant upload allowed, viewer upload role-denied (not
+    // identity-denied), viewer download allowed.
+    const ordinaryUpload = { ...uploadInit, filename: 'shared.bin' };
+    expect(evaluateShareCommand({
+      msg: ordinaryUpload, state: makeState('participant'), now, runtimeType: 'transport', activeDispatchId: null,
+    })).toMatchObject({ allowed: true });
+    expect(evaluateShareCommand({
+      msg: ordinaryUpload, state: makeState('viewer'), now, runtimeType: 'transport', activeDispatchId: null,
+    })).toEqual({ allowed: false, reason: SHARE_REASONS.ROLE_DENIED });
+    const ordinaryDownload = { ...downloadInit, previewHandle: 'preview-handle-1' };
+    expect(evaluateShareCommand({
+      msg: ordinaryDownload, state: makeState('viewer'), now, runtimeType: 'transport', activeDispatchId: null,
     })).toEqual({ allowed: true });
   });
 
