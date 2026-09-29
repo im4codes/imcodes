@@ -218,7 +218,7 @@ describe('Brain work dispatch opens driven pairs', () => {
   it('a relay to a participant whose text names an existing open pair binds to it', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
     const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-existing', objective: 'Fix the login bug' },
+      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'tsk_send_mention_existing', objective: 'Fix the login bug' },
     } as never, deps());
     if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
     await flush();
@@ -226,9 +226,9 @@ describe('Brain work dispatch opens driven pairs', () => {
 
     // A relay to the pair executor remains attached to that pair.
     const notice = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'T-existing has been requeued; the audit window is pre-assigned.',
+      target: EXEC, message: 'tsk_send_mention_existing has been requeued; the audit window is pre-assigned.',
     } as never, deps());
-    expect(notice).toMatchObject({ status: 'accepted', taskId: 'T-existing' });
+    expect(notice).toMatchObject({ status: 'accepted', taskId: 'tsk_send_mention_existing' });
     await flush();
     expect(pairs()).toHaveLength(1);
   });
@@ -236,40 +236,40 @@ describe('Brain work dispatch opens driven pairs', () => {
   it('a plain mention of another pair stays with the target participant\'s own pair', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
     const first = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Work A.', task: { taskId: 'T-own', objective: 'Work A.' },
+      target: EXEC, message: 'Work A.', task: { taskId: 'tsk_send_mention_own', objective: 'Work A.' },
     } as never, deps());
     const second = await dispatchSendMessage(brainCaller, {
-      target: EXEC2, message: 'Work B.', task: { taskId: 'T-mentioned', objective: 'Work B.' },
+      target: EXEC2, message: 'Work B.', task: { taskId: 'tsk_send_mention_other', objective: 'Work B.' },
     } as never, deps());
-    expect(first).toMatchObject({ status: 'accepted', taskId: 'T-own' });
-    expect(second).toMatchObject({ status: 'accepted', taskId: 'T-mentioned' });
+    expect(first).toMatchObject({ status: 'accepted', taskId: 'tsk_send_mention_own' });
+    expect(second).toMatchObject({ status: 'accepted', taskId: 'tsk_send_mention_other' });
     await flush();
 
     const status = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Status update: T-mentioned is waiting on audit.',
+      target: EXEC, message: 'Status update: tsk_send_mention_other is waiting on audit.',
     } as never, deps());
-    expect(status).toMatchObject({ status: 'accepted', taskId: 'T-own' });
+    expect(status).toMatchObject({ status: 'accepted', taskId: 'tsk_send_mention_own' });
     expect(pairs()).toHaveLength(2);
   });
 
   it('an explicit objective that merely mentions another open pair still opens its own pair for a fresh target (CC8 P2)', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
     const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-mentioned', objective: 'Fix the login bug' },
+      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'tsk_send_mention_other', objective: 'Fix the login bug' },
     } as never, deps());
     if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
     await flush();
     expect(pairs()).toHaveLength(1);
 
-    // Real new work for a target that is NOT part of T-mentioned: the text
+    // Real new work for a target that is NOT part of tsk_send_mention_other: the text
     // referencing it is context, not a request to continue that pair.
     const newWork = await dispatchSendMessage(brainCaller, {
-      target: EXEC2, message: 'Fix Y -- follow-up to T-mentioned.', task: { objective: 'Fix Y' },
+      target: EXEC2, message: 'Fix Y -- follow-up to tsk_send_mention_other.', task: { objective: 'Fix Y' },
     } as never, deps());
     if (newWork.status !== 'accepted' || !newWork.taskId) throw new Error(JSON.stringify(newWork));
-    expect(newWork.taskId).not.toBe('T-mentioned');
+    expect(newWork.taskId).not.toBe('tsk_send_mention_other');
     await flush();
-    expect(pairs().map((entry) => entry.taskId).sort()).toEqual(['T-mentioned', newWork.taskId].sort());
+    expect(pairs().map((entry) => entry.taskId).sort()).toEqual(['tsk_send_mention_other', newWork.taskId].sort());
     expect(pairs().find((entry) => entry.taskId === newWork.taskId)).toMatchObject({ executor: EXEC2, title: '(untitled task)' });
   });
 

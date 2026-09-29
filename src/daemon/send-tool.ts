@@ -1445,10 +1445,15 @@ export async function dispatchSendMessage(
     // second one, for a follow-up, relay, or notice. A plain send like this
     // never carries an objective, so both checks always apply (unlike the
     // task-metadata branch above).
-    const existingTaskId = target
-      ? taskPairService.resolveMentionedOpenPair(callerProjectName, caller.sessionName, input.message ?? '')
-        ?? taskPairService.resolveSingleParticipantOpenPair(caller.sessionName, target)
-      : undefined;
+    let existingTaskId: string | undefined;
+    if (target) {
+      const mentioned = taskPairService.resolveMentionedOpenPair(callerProjectName, caller.sessionName, input.message ?? '');
+      const mentionedState = mentioned ? getTaskPairStore().getPair(callerProjectName, mentioned)?.state : undefined;
+      const targetAlreadyInMentionedPair = !!mentionedState
+        && (mentionedState.executor === target || mentionedState.auditor === target);
+      existingTaskId = (targetAlreadyInMentionedPair ? mentioned : undefined)
+        ?? taskPairService.resolveSingleParticipantOpenPair(caller.sessionName, target);
+    }
     if (existingTaskId) {
       return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, existingTaskId, projectSupervisionTaskObjective(input.message));
     }
