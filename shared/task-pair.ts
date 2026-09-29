@@ -279,6 +279,34 @@ export const TASK_PAIR_MERGE_VERIFICATION_RULE: string =
   + 'the suites the change touches; otherwise rerun the full suites. Batch '
   + 'small verified merges.';
 
+/**
+ * From the 2-hourly stall review: most READYs bounced within minutes for
+ * missing evidence, and pairs stopped to ask Brain about harness problems
+ * they could fix themselves.
+ */
+export const TASK_PAIR_READY_SELF_CHECK_RULE: string =
+  'READY self-check (executor): before READY_FOR_AUDIT, map every numbered '
+  + 'acceptance item and every Boundary checks item to its evidence (command, '
+  + 'machine, exact head, result). For a bug fix, include the counterexample '
+  + 'that fails on the base and passes on the head. Real-machine evidence '
+  + 'must come from the head under test (a scoped build), never from an '
+  + 'installed or default daemon. Any unmapped item means not READY: keep '
+  + 'working or raise NEEDS_INPUT. Send the validation report together with '
+  + 'the READY. Brain answers a question on a pair in audit with a plain '
+  + 'reply, never WORKING, which takes the pair out of audit and voids a '
+  + 'pending PASS.';
+
+export const TASK_PAIR_SELF_SUFFICIENCY_RULE: string =
+  'Fix your own harness (pair): test stacks and their URLs, test accounts '
+  + 'and keys minted in your own stack, and extra test participants are the '
+  + 'pair\'s job, not decisions for Brain. When a tool or channel fails, '
+  + 'switch to an available alternative (for example plain ssh instead of a '
+  + 'machine tool) before escalating. Any "cannot" sent to Brain includes '
+  + 'the exact command, the exact error and the alternatives already tried. '
+  + 'When a switch or option is missing, create the condition another way '
+  + '(an unpublished port, a temporary firewall rule on a test machine) '
+  + 'instead of dropping the row.';
+
 /** Short liveness rule shown with Brain decision notices. */
 export const TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE: string =
   'A plain reply to the participant (including delegation_reply) resolves the wait and stops reminders.';
@@ -1632,6 +1660,8 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_BOUNDARY_AUDIT_RULE,
     TASK_PAIR_MERGE_VERIFICATION_RULE,
     TASK_PAIR_EXECUTION_DISCIPLINE_RULE,
+    TASK_PAIR_READY_SELF_CHECK_RULE,
+    TASK_PAIR_SELF_SUFFICIENCY_RULE,
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. An empty or unconfigured pool asks the user which models to use; never invent a default. Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
     `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. Include title="<short specific title>" in the owner's UI language, for example DISPATCH tsk_demo title="Fix login retry" executor=<session> auditor=<session>. DISPATCH <taskId> title="..." executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,

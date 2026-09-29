@@ -5,6 +5,8 @@ import {
   TASK_PAIR_BRAIN_REPORTING_RULE,
   TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
   TASK_PAIR_EXECUTION_DISCIPLINE_RULE,
+  TASK_PAIR_READY_SELF_CHECK_RULE,
+  TASK_PAIR_SELF_SUFFICIENCY_RULE,
   TASK_PAIR_BRIEF_STRUCTURE_RULE,
   TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
   TASK_PAIR_BOUNDARY_AUDIT_RULE,
@@ -271,6 +273,18 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('never relay another pair');
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('freeze the head');
     expect(TASK_PAIR_EXECUTION_DISCIPLINE_RULE).toContain('only remove paths you created by exact name');
+  });
+
+  it('ships READY self-check and harness self-sufficiency rules', () => {
+    const body = buildTaskPairMarkerContract();
+    expect(body).toContain(TASK_PAIR_READY_SELF_CHECK_RULE);
+    expect(body).toContain(TASK_PAIR_SELF_SUFFICIENCY_RULE);
+    expect(TASK_PAIR_READY_SELF_CHECK_RULE).toContain('fails on the base and passes on the head');
+    expect(TASK_PAIR_READY_SELF_CHECK_RULE).toContain('never from an installed or default daemon');
+    expect(TASK_PAIR_READY_SELF_CHECK_RULE).toContain('never WORKING');
+    expect(TASK_PAIR_SELF_SUFFICIENCY_RULE).toContain('the exact command, the exact error');
+    expect(TASK_PAIR_SELF_SUFFICIENCY_RULE).toContain('switch to an available alternative');
+    expect(body.indexOf(TASK_PAIR_SELF_SUFFICIENCY_RULE)).toBeLessThan(body.indexOf('Automatic pairing policy'));
   });
 
   it('ships a contract where Brain sets direction and the pair gathers evidence, decides when clear and escalates otherwise', () => {
