@@ -1384,7 +1384,11 @@ export async function dispatchSendMessage(
         const mentionedState = getTaskPairStore().getPair(callerProjectName, mentioned)?.state;
         const targetAlreadyInMentionedPair = !!mentionedState
           && (mentionedState.executor === singleTarget || mentionedState.auditor === singleTarget);
-        if (!objective || targetAlreadyInMentionedPair) {
+        // A bare mention is context, not ownership.  Only bind the receipt to
+        // the mentioned pair when the recipient is one of its role holders;
+        // otherwise the participant lookup below must get first say so a
+        // Brain status note cannot steal another pair's history.
+        if (targetAlreadyInMentionedPair) {
           return bindAcceptedDispatchToTaskPair(
             caller, callerProjectName, result, mentioned, objective,
             input.task?.requestedExecutionType?.model, input.task?.title,

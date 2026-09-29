@@ -215,7 +215,7 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   // ---- 215/jdzj: implicit_dispatch minting duplicate wrapper pairs -----------
 
-  it('a notice whose text names an existing open pair binds to it, never opening a second pair for the relay', async () => {
+  it('a relay to a participant whose text names an existing open pair binds to it', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
     const opened = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-existing', objective: 'Fix the login bug' },
@@ -224,14 +224,32 @@ describe('Brain work dispatch opens driven pairs', () => {
     await flush();
     expect(pairs()).toHaveLength(1);
 
-    // A relay to a completely different, otherwise-idle worker: the message
-    // is only about the existing pair, not new work of its own.
+    // A relay to the pair executor remains attached to that pair.
     const notice = await dispatchSendMessage(brainCaller, {
-      target: EXEC2, message: 'T-existing has been requeued; the audit window is pre-assigned.',
+      target: EXEC, message: 'T-existing has been requeued; the audit window is pre-assigned.',
     } as never, deps());
     expect(notice).toMatchObject({ status: 'accepted', taskId: 'T-existing' });
     await flush();
     expect(pairs()).toHaveLength(1);
+  });
+
+  it('a plain mention of another pair stays with the target participant\'s own pair', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    const first = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Work A.', task: { taskId: 'T-own', objective: 'Work A.' },
+    } as never, deps());
+    const second = await dispatchSendMessage(brainCaller, {
+      target: EXEC2, message: 'Work B.', task: { taskId: 'T-mentioned', objective: 'Work B.' },
+    } as never, deps());
+    expect(first).toMatchObject({ status: 'accepted', taskId: 'T-own' });
+    expect(second).toMatchObject({ status: 'accepted', taskId: 'T-mentioned' });
+    await flush();
+
+    const status = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Status update: T-mentioned is waiting on audit.',
+    } as never, deps());
+    expect(status).toMatchObject({ status: 'accepted', taskId: 'T-own' });
+    expect(pairs()).toHaveLength(2);
   });
 
   it('an explicit objective that merely mentions another open pair still opens its own pair for a fresh target (CC8 P2)', async () => {
