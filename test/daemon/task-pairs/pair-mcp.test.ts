@@ -88,4 +88,23 @@ describe('pair MCP projections', () => {
     });
     expect(getTaskPairStore().getPair(PROJECT, 'title-1')?.state.brief).toBe('Fix the retry path.');
   });
+
+  it('lets current executor and auditor read pair_get while rejecting same-project nonparticipants explicitly', async () => {
+    getTaskPairStore().savePair(PROJECT, pair('participant-read', 'working'));
+    const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2'), session('sibling', 'w3')];
+    const executorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
+    await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET]({ taskId: 'participant-read' })).resolves.toMatchObject({
+      status: 'ok', pair: { taskId: 'participant-read' },
+    });
+    await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]({ taskId: 'participant-read' })).resolves.toMatchObject({
+      status: 'working', taskId: 'participant-read',
+    });
+    const siblingHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: 'sibling' }, { sendDeps: { listSessions: sessions } });
+    await expect(siblingHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_GET]({ taskId: 'participant-read' })).resolves.toMatchObject({
+      status: 'error', reason: 'scope_forbidden', message: expect.stringContaining('current pair participant'),
+    });
+    await expect(siblingHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]({ taskId: 'participant-read' })).resolves.toMatchObject({
+      status: 'error', reason: 'scope_forbidden', message: expect.stringContaining('current pair participant'),
+    });
+  });
 });

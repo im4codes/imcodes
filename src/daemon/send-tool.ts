@@ -1245,40 +1245,6 @@ function mintDispatchTaskPairId(caller: SendRuntimeCaller, project: string, inpu
   return taskPairService.mintTaskId(project, idempotencyKey ? `${caller.sessionName}\0${idempotencyKey}` : undefined);
 }
 
-/**
- * The worker a plain Brain dispatch opens a pair for, or undefined when it
- * opens none. Exactly one reached recipient; a worker of the same project
- * (never the Brain); and not already the executor or auditor of an open pair,
- * because a message to a session that is working on a pair continues that
- * pair (the Brain's progress checks, re-dispatches, audit follow-ups) rather
- * than starting a new task.
- */
-function implicitWorkPairTarget(
-  project: string,
-  taskId: string,
-  result: Extract<SendMessageResult, { status: 'accepted' }>,
-  sessions: readonly SessionRecord[],
-): string | undefined {
-  const reached = result.deliveries.filter((delivery) => isReachedDelivery(delivery.status));
-  if (result.deliveries.length !== 1 || reached.length !== 1) return undefined;
-  const target = reached[0]!.target;
-  const record = sessions.find((session) => session.name === target);
-  if (!record || record.projectName !== project || record.role === 'brain') return undefined;
-  // A replay of the same send (same idempotency key, same minted id) names
-  // the pair it already opened again.
-  if (getTaskPairStore().getPair(project, taskId)?.state.executor === target) return target;
-  if (getTaskPairStore().isParticipantOfOpenPair(target)) return undefined;
-  // A Brain follow-up sent to an auditor that was just removed from an open
-  // pair is ordinary correspondence, not a new dispatch.  Keep the prior
-  // auditor history from being mistaken for a fresh worker target while the
-  // handoff/resend messages are still in flight.
-  const recentlyRemoved = getTaskPairStore().listActivePairs(project).some((stored) => (
-    stored.state.previousAuditors.includes(target)
-  ));
-  if (recentlyRemoved) return undefined;
-  return target;
-}
-
 /** Open (or record on) the pair for each reached recipient and name it in the receipt. */
 function bindAcceptedDispatchToTaskPair(
   caller: SendRuntimeCaller,
@@ -1434,10 +1400,9 @@ export async function dispatchSendMessage(
       !!objective,
     );
   }
-  // A Brain that dispatches work with a plain send_message (no task metadata,
-  // no DISPATCH marker) on a `pairs` project with automatic audit still gets a
-  // pair: a daemon-level rule, not model guidance, so it holds whatever the
-  // Brain's prompt says. See implicitWorkPairTarget for exactly when.
+  // A plain Brain send_message is ordinary correspondence.  New pair work
+  // must carry explicit task metadata or a DISPATCH/QUEUE marker; this avoids
+  // minting an untitled task when a Brain sends a post-completion status note.
   if (!input.automaticSupervision && !noImplicitWorkPair.has(input)
     && isPairsEngineProject(callerProjectName) && !input.broadcast && !input.clone
     && caller.sessionName === projectBrainSession(callerProjectName)
@@ -1470,9 +1435,12 @@ export async function dispatchSendMessage(
     if (existingTaskId) {
       return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, existingTaskId, projectSupervisionTaskObjective(input.message), undefined, undefined, input.message);
     }
-    const taskId = mintDispatchTaskPairId(caller, callerProjectName, input);
-    if (!implicitWorkPairTarget(callerProjectName, taskId, result, d.listSessions())) return result;
-    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, projectSupervisionTaskObjective(input.message), undefined, undefined, input.message);
+    // A plain Brain send is correspondence, not a work request.  Only an
+    // explicit task payload/objective or a DISPATCH/QUEUE marker may create a
+    // new pair.  In particular, a recipient who just finished a pair must not
+    // be handed a new untitled task merely because the Brain sent a status
+    // note after that pair became terminal.
+    return result;
   }
   const autoProvision = input.task?.autoProvision === true;
   if (!input.target && !input.broadcast && !autoProvision) {

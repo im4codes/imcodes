@@ -131,6 +131,7 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(resolveProjectAuthoritativeSupervisionSnapshot(PROJECT, sessions).mode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
     const result = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'Transcribe the three m4a files and summarize decisions.', idempotencyKey: 'asr-1', reply: true,
+      task: { objective: 'Transcribe the three m4a files and summarize decisions.' },
     } as never, deps());
     if (result.status !== 'accepted' || !result.taskId) throw new Error(JSON.stringify(result));
     await flush();
@@ -191,8 +192,8 @@ describe('Brain work dispatch opens driven pairs', () => {
     getTaskPairStore().savePair(PROJECT, { ...stored, status: 'done', updatedAt: now += 1 });
     const fresh = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Start unrelated work.' } as never, deps());
     expect(fresh.status).toBe('accepted');
-    expect((fresh as { taskId?: string }).taskId).toBeTruthy();
-    expect((fresh as { taskId?: string }).taskId).not.toBe('nonterminal-continue');
+    expect((fresh as { taskId?: string }).taskId).toBeUndefined();
+    expect(getTaskPairStore().listPairs(PROJECT)).toHaveLength(1);
   });
 
   it('auto-audit on: a Brain-named task opens exactly that pair, and cron sends or worker sends open none', async () => {
@@ -250,6 +251,21 @@ describe('Brain work dispatch opens driven pairs', () => {
     } as never, deps());
     expect(status).toMatchObject({ status: 'accepted', taskId: 'tsk_send_mention_own' });
     expect(pairs()).toHaveLength(2);
+  });
+
+  it('does not create a pair for a plain note to an idle target merely because the note mentions another task', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    const opened = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Work A.', task: { taskId: 'tsk_mention_idle_source', objective: 'Work A.' },
+    } as never, deps());
+    expect(opened).toMatchObject({ status: 'accepted', taskId: 'tsk_mention_idle_source' });
+    await flush();
+    const note = await dispatchSendMessage(brainCaller, {
+      target: EXEC2, message: 'Status only: tsk_mention_idle_source is complete.',
+    } as never, deps());
+    expect(note).toMatchObject({ status: 'accepted' });
+    expect(note).not.toHaveProperty('taskId');
+    expect(pairs()).toHaveLength(1);
   });
 
   it('an explicit objective that merely mentions another open pair still opens its own pair for a fresh target (CC8 P2)', async () => {

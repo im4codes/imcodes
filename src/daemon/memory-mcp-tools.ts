@@ -1547,6 +1547,34 @@ function pairChecklistTarget(caller: McpRuntimeCaller, sessions: readonly Sessio
   return candidates.find((pair) => pair.state.executor === caller.sessionName || pair.state.auditor === caller.sessionName || pair.state.brain === caller.sessionName);
 }
 
+type PairChecklistAccess =
+  | { status: 'ok'; pair: NonNullable<ReturnType<typeof pairChecklistTarget>> }
+  | { status: 'forbidden'; pair: NonNullable<ReturnType<typeof pairChecklistTarget>> }
+  | { status: 'missing' };
+
+/** Resolve a pair read while preserving the distinction between an unknown
+ * task and a real pair the caller is not allowed to inspect.  Participants
+ * (including the executor and auditor) have the same read projection as the
+ * Brain; callers outside the role slots get an actionable scope error rather
+ * than the misleading "not found" response. */
+function pairChecklistAccess(caller: McpRuntimeCaller, sessions: readonly SessionRecord[], taskId?: string): PairChecklistAccess {
+  const pair = pairChecklistTarget(caller, sessions, taskId);
+  if (pair) return { status: 'ok', pair };
+  if (!taskId?.trim()) return { status: 'missing' };
+  const record = sessions.find((session) => session.name === caller.sessionName);
+  const project = (record ? resolveEffectiveProjectName(record, sessions) : undefined)
+    ?? projectOfSession(caller.sessionName ?? '')
+    ?? undefined;
+  const stored = project ? getTaskPairStore().getPair(project, taskId.trim()) : undefined;
+  return stored ? { status: 'forbidden', pair: stored } : { status: 'missing' };
+}
+
+function pairAccessError(access: PairChecklistAccess): ToolResult {
+  return access.status === 'forbidden'
+    ? error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair')
+    : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+}
+
 function pairChecklistView(pair: ReturnType<typeof pairChecklistTarget>) {
   if (!pair) return undefined;
   const markdown = pair.state.brief ?? '';
@@ -1884,16 +1912,18 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
   const handlers: Record<MemoryMcpToolName, MemoryMcpToolHandler> = {
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_GET]: async (input) => {
       const taskId = typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>).taskId === 'string' ? String((input as Record<string, unknown>).taskId) : undefined;
-      const view = pairChecklistView(pairChecklistTarget(caller, await sendSessions(), taskId));
-      return view ? view : error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      const access = pairChecklistAccess(caller, await sendSessions(), taskId);
+      if (access.status !== 'ok') return pairAccessError(access);
+      return pairChecklistView(access.pair)!;
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: async (input) => {
       const args = (input && typeof input === 'object' ? input : {}) as Record<string, unknown>;
       const markdown = typeof args.markdown === 'string' ? args.markdown : undefined;
       const title = typeof args.title === 'string' ? args.title.trim() : undefined;
       if (markdown === undefined && !title) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'markdown or title is required');
-      const pair = pairChecklistTarget(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
-      if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
+      if (access.status !== 'ok') return pairAccessError(access);
+      const pair = access.pair;
       if (title) {
         const savedTitle = taskPairService.setTaskPairTitle(pair.project, pair.state.taskId, title, caller.sessionName ?? 'unknown');
         if (!savedTitle) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain may set a valid task title');
@@ -1906,8 +1936,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const items = Array.isArray(args.items) && args.items.every((item) => Number.isInteger(item) && Number(item) > 0) ? args.items.map(Number) : undefined;
       const box = args.box === 'implemented' || args.box === 'audited' ? args.box : undefined;
       if (!items || !box || typeof args.checked !== 'boolean') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'items, box and checked are required');
-      const pair = pairChecklistTarget(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
-      if (!pair) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      const access = pairChecklistAccess(caller, await sendSessions(), typeof args.taskId === 'string' ? args.taskId : undefined);
+      if (access.status !== 'ok') return pairAccessError(access);
+      const pair = access.pair;
       const markdown = updateTaskPairChecklist(pair.state.brief ?? '', items, box, args.checked);
       return pairChecklistView(savePairBrief(pair, markdown, caller.sessionName ?? 'unknown'))!;
     },
@@ -2731,7 +2762,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const taskId = stringArg(args, 'taskId');
       if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
       const stored = getTaskPairStore().getPair(context.project, taskId);
-      if (!stored || stored.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'pair not found');
+      if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      const isParticipant = stored.state.brain === caller.sessionName
+        || stored.state.executor === caller.sessionName
+        || stored.state.auditor === caller.sessionName;
+      if (!isParticipant) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'only the project Brain or a current pair participant may query this task pair');
       const eventLimit = Math.min(200, Math.max(1, Math.floor(numberArg(args, 'eventLimit') ?? 50)));
       const queuePositions = stored.state.status === 'queued'
         ? queuePositionsOf(getTaskPairStore().listPairsForBrain(caller.sessionName!, context.project, false, 500))

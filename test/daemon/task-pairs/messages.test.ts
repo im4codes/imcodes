@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { scanTaskPairMarkers, type TaskPairState } from '../../../shared/task-pair.js';
-import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildNoBriefLine, buildNudgeMessage, buildUntitledTaskTitleRequest } from '../../../src/daemon/task-pairs/messages.js';
+import { buildAuditorAssignmentMessage, buildAuditRequestMessage, buildBriefEndHint, buildExecutorHandoffMessage, buildNoBriefLine, buildNudgeMessage, buildUntitledTaskTitleRequest } from '../../../src/daemon/task-pairs/messages.js';
 
 function basePair(overrides: Partial<TaskPairState> = {}): TaskPairState {
   return {
@@ -31,6 +31,23 @@ describe('daemon-authored marker examples parse when copied verbatim onto their 
     const pair = basePair({ material: { path: '/workspace', at: 1 } });
     expect(buildAuditorAssignmentMessage(pair)).toMatch(/concrete solution/);
     expect(buildAuditRequestMessage(pair, { path: '/workspace', source: 'executor' })).toMatch(/concrete solution/);
+  });
+
+  it('gives a reassigned executor the authoritative absolute workspace, base, and latest head', () => {
+    const text = buildExecutorHandoffMessage({
+      ...basePair({
+        status: 'working',
+        workspace: {
+          kind: 'worktree', path: '/Users/k/.imcodes/worktrees/pair_tsk_x/repo',
+          base: 'base-sha', lastHead: 'head-sha', status: 'active', createdAt: 1,
+        },
+      }),
+      material: { worktree: '/Users/k/.imcodes/worktrees/pair_tsk_x/repo', base: 'base-sha', head: 'head-sha', at: 2 },
+    }, 'deck_sub_old_exec', 'provider limit');
+    expect(text).toContain('/Users/k/.imcodes/worktrees/pair_tsk_x/repo');
+    expect(text).toContain('base base-sha');
+    expect(text).toContain('latest head head-sha');
+    expect(text).toContain('never use cwd or the project main checkout');
   });
   it('a QUEUE marker extracted from buildNoBriefLine parses to the right verb and taskId', () => {
     const text = buildNoBriefLine('tsk_x');

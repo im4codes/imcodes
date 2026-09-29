@@ -61,15 +61,15 @@ describe('pair checklist MCP tools', () => {
     expect(getTaskPairStore().getPair('p', state.taskId)?.state.brief).toBe(state.brief);
   });
 
-  it('refuses a same-project session that is not the pair\'s brain, executor or auditor: not found, brief untouched', async () => {
+  it('refuses a same-project session that is not the pair\'s brain, executor or auditor with an explicit scope error', async () => {
     const siblingCaller: McpRuntimeCaller = { ...caller, sessionName: 'sibling-not-in-pair' };
     const handlers = createMemoryMcpToolHandlers(siblingCaller, deps);
     const got = await handlers.pair_task_get!({ taskId: state.taskId });
-    expect(got).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    expect(got).toMatchObject({ reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, message: expect.stringContaining('current pair participant') });
     const updated = await handlers.pair_task_update!({ taskId: state.taskId, markdown: 'from a non-participant' });
-    expect(updated).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    expect(updated).toMatchObject({ reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, message: expect.stringContaining('current pair participant') });
     const checked = await handlers.pair_task_check!({ taskId: state.taskId, items: [1], box: 'audited', checked: true });
-    expect(checked).toMatchObject({ reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
+    expect(checked).toMatchObject({ reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, message: expect.stringContaining('current pair participant') });
     expect(getTaskPairStore().getPair('p', state.taskId)?.state.brief).toBe(state.brief);
   });
 });

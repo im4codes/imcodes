@@ -152,6 +152,37 @@ describe('send-tool', () => {
     }
   });
 
+  it('keeps a plain post-completion note as ordinary correspondence instead of minting a new pair', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain',
+      transportConfig: { supervision: { mode: 'supervised_audit' } },
+    });
+    const executor = session({ name: 'deck_alpha_executor', projectName: 'alpha', role: 'w1' });
+    getTaskPairStore().savePair('alpha', {
+      taskId: 'already-done', brain: brain.name, executor: executor.name, auditor: 'none',
+      status: 'done', flags: [], flagSides: {}, round: 1, blocking: ['P0'],
+      previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,
+    });
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    try {
+      const result = await dispatchSendMessage({ ...caller, sessionName: brain.name }, {
+        target: executor.name, message: 'The prior task is complete; thanks.',
+      }, {
+        listSessions: () => [brain, executor], dispatchMessage,
+      });
+      expect(result).toMatchObject({ status: 'accepted' });
+      expect(result).not.toHaveProperty('taskId');
+      expect(getTaskPairStore().listPairs('alpha')).toHaveLength(1);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
   it('surfaces the caller project\'s current supervision mode and auto-audit flag', () => {
     const enabledSnapshot = normalizeSessionSupervisionSnapshot({
       mode: 'supervised_audit',

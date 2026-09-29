@@ -444,9 +444,13 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
 function workplaceLine(pair: TaskPairState): string {
   const workspace = pair.workspace;
   if (workspace && workspace.status === 'active') {
+    const latestHead = workspace.lastHead ?? pair.material?.head;
+    const revision = workspace.kind === 'worktree'
+      ? `detached at base ${workspace.base ?? pair.material?.base ?? 'unknown'}; latest head ${latestHead ?? 'unknown'}`
+      : `base ${workspace.base ?? pair.material?.base ?? 'unknown'}; latest head ${latestHead ?? 'unknown'}`;
     return workspace.kind === 'dir'
-      ? `Work in the task directory the daemon created for this pair: ${workspace.path}. Write your results there.`
-      : `Work in the worktree the daemon created for this pair: ${workspace.path} (detached at base ${workspace.base ?? 'HEAD'}; make a local branch there if useful, commit locally, never push any branch, report the worktree path plus HEAD, and let Brain merge into dev and push dev).`;
+      ? `Work in the task directory the daemon created for this pair: ${workspace.path} (${revision}). This absolute path is authoritative; never use cwd or the project main checkout. Write your results there.`
+      : `Work in the worktree the daemon created for this pair: ${workspace.path} (${revision}; make a local branch there if useful, commit locally, never push any branch, report the worktree path plus HEAD, and let Brain merge into dev and push dev). This absolute path is authoritative; never use cwd or the project main checkout.`;
   }
   return `No workspace could be created for this pair: use your own git worktree under ~/.imcodes/worktrees for code in a git project, else a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/${pair.taskId}/, and name it on READY_FOR_AUDIT.`;
 }
