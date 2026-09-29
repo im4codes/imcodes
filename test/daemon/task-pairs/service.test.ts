@@ -384,6 +384,32 @@ describe('task-pair marker ingestion', () => {
     expect(reminders[0]?.target).toBe(EXEC);
   });
 
+  it('recognizes a taskId-bound validation report even without task.objective', async () => {
+    service.setScheduler({ onIntent: () => undefined });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-report', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', eventId: 'ready-report-dispatch',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-report', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'queue', eventId: 'ready-report-queue',
+    });
+    service.implicitDispatch({
+      project: PROJECT, sender: EXEC, target: AUD, taskId: 'ready-report',
+      message: 'Validation result: task-pair suite passed 263/263; tsc passed; no failures.',
+      eventId: 'ready-report-send',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: EXEC,
+      marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'ready-report', attrs: { worktree: '/w', head: 'h1', base: 'b1' } },
+      source: 'marker', now: 4_000, eventId: 'ready-report-ready',
+    });
+    await flush();
+    expect(sent.filter((entry) => entry.id.includes(':validation-report:'))).toHaveLength(0);
+  });
+
   it('suppresses a participant relay that exactly repeats the partner report to Brain', () => {
     service.setScheduler({ onIntent: () => undefined });
     service.applyMarker({

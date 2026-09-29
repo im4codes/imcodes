@@ -1281,6 +1281,9 @@ function bindAcceptedDispatchToTaskPair(
   // Preserve both the requested executor model and an explicit human title.
   executorModel?: string,
   explicitTitle?: string | null,
+  /** Original send body, retained for READY validation-report detection even
+   * when taskId is present without task.objective. */
+  message?: string,
   // True only when this taskId is being minted from real task metadata
   // (task.objective), not merely a plain send reinterpreted as one -- see
   // TaskPairService.implicitDispatch's suppressAutoPickAuditor.
@@ -1298,7 +1301,7 @@ function bindAcceptedDispatchToTaskPair(
       titleExplicit: Boolean(readSupervisionTaskTitle(explicitTitle)),
       ...(executorModel ? { executorModel } : {}),
       ...(hasObjective ? { hasObjective } : {}),
-      ...(objective ? { message: objective } : {}),
+      ...(message ? { message } : objective ? { message: objective } : {}),
       ...(objective ? { brief: objective } : {}),
       eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
     });
@@ -1371,7 +1374,7 @@ export async function dispatchSendMessage(
     if (!explicitTaskId && singleTarget) {
       const focused = taskPairService.recentBrainDispatch(callerProjectName, caller.sessionName!, singleTarget);
       if (focused && getTaskPairStore().getPair(callerProjectName, focused)?.state.executor === singleTarget) {
-        return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, focused, objective, input.task?.requestedExecutionType?.model, input.task?.title);
+        return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, focused, objective, input.task?.requestedExecutionType?.model, input.task?.title, input.message);
       }
       const mentioned = taskPairService.resolveMentionedOpenPair(callerProjectName, caller.sessionName!, input.message ?? '');
       if (mentioned) {
@@ -1392,7 +1395,7 @@ export async function dispatchSendMessage(
         if (targetAlreadyInMentionedPair) {
           return bindAcceptedDispatchToTaskPair(
             caller, callerProjectName, result, mentioned, objective,
-            input.task?.requestedExecutionType?.model, input.task?.title,
+            input.task?.requestedExecutionType?.model, input.task?.title, input.message,
           );
         }
       }
@@ -1401,7 +1404,7 @@ export async function dispatchSendMessage(
         if (existingTaskId) {
           return bindAcceptedDispatchToTaskPair(
             caller, callerProjectName, result, existingTaskId, objective,
-            input.task?.requestedExecutionType?.model, input.task?.title,
+            input.task?.requestedExecutionType?.model, input.task?.title, input.message,
           );
         }
       }
@@ -1419,6 +1422,7 @@ export async function dispatchSendMessage(
       objective,
       input.task?.requestedExecutionType?.model,
       input.task?.title,
+      input.message,
       !!objective,
     );
   }
@@ -1439,7 +1443,7 @@ export async function dispatchSendMessage(
     // receipt to it and, crucially, do not mint/bind a second implicit pair
     // for the follow-up message.
     if (focused && target && getTaskPairStore().getPair(callerProjectName, focused)?.state.executor === target) {
-      return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, focused, projectSupervisionTaskObjective(input.message));
+      return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, focused, projectSupervisionTaskObjective(input.message), undefined, undefined, input.message);
     }
     // The message names an open pair, or the target already holds a role in
     // exactly one open pair of this Brain: continue that pair, never a
@@ -1456,11 +1460,11 @@ export async function dispatchSendMessage(
         ?? taskPairService.resolveSingleParticipantOpenPair(caller.sessionName, target);
     }
     if (existingTaskId) {
-      return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, existingTaskId, projectSupervisionTaskObjective(input.message));
+      return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, existingTaskId, projectSupervisionTaskObjective(input.message), undefined, undefined, input.message);
     }
     const taskId = mintDispatchTaskPairId(caller, callerProjectName, input);
     if (!implicitWorkPairTarget(callerProjectName, taskId, result, d.listSessions())) return result;
-    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, projectSupervisionTaskObjective(input.message));
+    return bindAcceptedDispatchToTaskPair(caller, callerProjectName, result, taskId, projectSupervisionTaskObjective(input.message), undefined, undefined, input.message);
   }
   const autoProvision = input.task?.autoProvision === true;
   if (!input.target && !input.broadcast && !autoProvision) {
