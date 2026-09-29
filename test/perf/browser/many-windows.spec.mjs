@@ -312,7 +312,9 @@ async function openRealSession(context, session, { manualProtocol = session.inde
     // ReportEvents keeps trace records on the CDP event stream. ReturnAsStream
     // is not emitted reliably by the headless shell used on 211; the stream
     // reader below remains as a fallback for Chromium versions that do emit it.
-    try { await cdpWithTimeout(cdp.send('Tracing.start', { categories: 'devtools.timeline,v8,blink,disabled-by-default-v8.cpu_profiler', options: 'sampling-frequency=10000', transferMode: 'ReportEvents' }), 'Tracing.start'); } catch (error) { session.__traceError = error instanceof Error ? error.message : String(error); }
+    // IMC_PERF_NO_TRACING=1: profile with the V8 sampler only (tracing at 10 kHz is itself a CPU load).
+    if (process.env.IMC_PERF_NO_TRACING === '1') session.__traceError = 'disabled (IMC_PERF_NO_TRACING=1)';
+    else try { await cdpWithTimeout(cdp.send('Tracing.start', { categories: 'devtools.timeline,v8,blink,disabled-by-default-v8.cpu_profiler', options: 'sampling-frequency=10000', transferMode: 'ReportEvents' }), 'Tracing.start'); } catch (error) { session.__traceError = error instanceof Error ? error.message : String(error); }
   }
   if (session.__cdpError) session.__diagnostics.cdpError = session.__cdpError;
   if (session.__traceError) session.__diagnostics.traceError = session.__traceError;
@@ -509,7 +511,22 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
         })),
         new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 2_000)),
       ]).catch(() => ({ evaluateFailed: true }));
-      stallDiagnostics.push({ sessionId: main.id, phase: 'single-page-window-open', stalledAt: seen, state: stallState, ...(main.__diagnostics ?? {}) });
+      // Stop the CPU profiler NOW (bounded) so a stalled run still leaves a
+      // profile of what the renderer was doing, and record what the page's
+      // own state says about the sub-window it never opened.
+      const stallProfile = await Promise.race([
+        (main.__stopDiagnostics?.() ?? Promise.resolve(null)).then((result) => ({ profilePath: result?.profilePath ?? null, tracePath: result?.tracePath ?? null })),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 30_000)),
+      ]).catch((error) => ({ error: error instanceof Error ? error.message : String(error) }));
+      const stallDom = await Promise.race([
+        page.evaluate(() => ({
+          storage: Object.fromEntries(Object.keys(localStorage).filter((key) => /^rcc_(open_subs|subcard|session|server)/.test(key)).map((key) => [key, localStorage.getItem(key)?.slice(0, 400)])),
+          subClassCounts: Object.fromEntries(['.subsession-window', '.subsession-card', '.sub-session-card', '[data-subsession-retained]', '.chat-view', '.session-pane'].map((selector) => [selector, document.querySelectorAll(selector).length])),
+          innerWidth: window.innerWidth, innerHeight: window.innerHeight, maxTouchPoints: navigator.maxTouchPoints, userAgent: navigator.userAgent,
+        })),
+        new Promise((resolve) => setTimeout(() => resolve({ timedOut: true }), 3_000)),
+      ]).catch(() => ({ evaluateFailed: true }));
+      stallDiagnostics.push({ sessionId: main.id, phase: 'single-page-window-open', stalledAt: seen, state: stallState, stallProfile, stallDom, ...(main.__diagnostics ?? {}) });
       await persistCheckpoint({ status: 'stalled-single-page', stalledAt: seen, windowCurve, stallDiagnostics, correctness });
     }
     if (seen > 0) {
