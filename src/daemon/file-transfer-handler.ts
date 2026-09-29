@@ -134,12 +134,16 @@ const clientUploadClaims = new Map<string, {
   token: symbol;
   released: Promise<void>;
   release: () => void;
+  lastProgressAt: number;
 }>();
 
 // A direct sender can disappear after claiming an id (for example when its
 // worker crashes).  Relay retries must never wait forever for that claim to be
 // released; callers get a terminal error and may reconcile/retry later.
-export const CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS = 60_000;
+export const CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS = (() => {
+  const override = Number.parseInt(process.env.IMC_CLAIM_WAIT_TIMEOUT_MS ?? '', 10);
+  return Number.isFinite(override) && override > 0 ? override : 60_000;
+})();
 
 /**
  * Serialize direct transfer and relay fallback attempts that share the same
@@ -151,8 +155,18 @@ export function tryClaimClientUpload(clientUploadId: string): symbol | null {
   const token = Symbol(clientUploadId);
   let release = () => {};
   const released = new Promise<void>((resolve) => { release = resolve; });
-  clientUploadClaims.set(clientUploadId, { token, released, release });
+  clientUploadClaims.set(clientUploadId, { token, released, release, lastProgressAt: Date.now() });
   return token;
+}
+
+/** Refresh liveness for a claim-holder that is still receiving bytes. */
+export function touchClientUploadClaim(clientUploadId: string, token: symbol): void {
+  const claim = clientUploadClaims.get(clientUploadId);
+  if (claim?.token === token) claim.lastProgressAt = Date.now();
+}
+
+export function clientUploadClaimLastProgressAt(clientUploadId: string): number | null {
+  return clientUploadClaims.get(clientUploadId)?.lastProgressAt ?? null;
 }
 
 export function waitForClientUploadClaim(clientUploadId: string): Promise<void> | null {
@@ -479,7 +493,16 @@ async function acquireRelayUploadTurn(clientUploadId: string): Promise<
       await Promise.race([
         released,
         new Promise<never>((_, reject) => {
-          timeout = setTimeout(() => reject(new Error('client_upload_claim_timeout')), CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS);
+          const check = () => {
+            const lastProgressAt = clientUploadClaimLastProgressAt(clientUploadId);
+            if (lastProgressAt === null || Date.now() - lastProgressAt >= CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS) {
+              reject(new Error('client_upload_claim_timeout'));
+              return;
+            }
+            timeout = setTimeout(check, CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS);
+            timeout.unref?.();
+          };
+          timeout = setTimeout(check, CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS);
           timeout.unref?.();
         }),
       ]).finally(() => { if (timeout) clearTimeout(timeout); });

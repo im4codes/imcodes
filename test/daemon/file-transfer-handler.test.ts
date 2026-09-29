@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, readFile, realpath, rm, stat, symlink, unlink, writeFile } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
@@ -70,6 +71,71 @@ describe('file-transfer local handle hardening', () => {
     vi.resetModules();
     await rm(rootDir, { recursive: true, force: true });
   });
+
+  it.runIf(process.env.IMC_BIG_TRANSFER === '1')('real-stream 15KiB and 500MiB repeat/relay transfers preserve bytes', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    let fetchCount = 0;
+    const fetchMock = vi.fn(async () => {
+      const total = fetchCount++ === 0 ? 15 * 1024 : 500 * 1024 * 1024;
+      let sent = 0;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (sent >= total) { controller.close(); return; }
+          const chunk = new Uint8Array(Math.min(1024 * 1024, total - sent));
+          sent += chunk.byteLength;
+          controller.enqueue(chunk);
+        },
+      });
+      return new Response(body, { status: 200, headers: { 'content-length': String(total) } });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const done = createServerLinkMock();
+    await transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch', uploadId: 'small', clientUploadId: 'small-transfer-proof',
+      filename: 'small.bin', originalName: 'small.bin', size: 15 * 1024,
+      downloadUrl: 'https://relay.example/small',
+    }, done.serverLink as never);
+    const clientUploadId = 'big-transfer-repeat-proof';
+    const first = Date.now();
+    await transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch', uploadId: 'big-1', clientUploadId,
+      filename: 'big.bin', originalName: 'big.bin', size: 500 * 1024 * 1024,
+      downloadUrl: 'https://relay.example/big',
+    }, done.serverLink as never);
+    const firstMs = Date.now() - first;
+    const second = Date.now();
+    await transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch', uploadId: 'big-2', clientUploadId,
+      filename: 'big.bin', originalName: 'big.bin', size: 500 * 1024 * 1024,
+      downloadUrl: 'https://relay.example/big',
+    }, done.serverLink as never);
+    const secondMs = Date.now() - second;
+    const attachment = transfer.lookupAttachmentByClientUploadId(clientUploadId);
+    expect(attachment?.size).toBe(500 * 1024 * 1024);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(done.sent.filter((entry) => (entry as { type?: string }).type === 'file.upload_done')).toHaveLength(3);
+    const digest = createHash('sha256').update(await readFile(attachment!.daemonPath)).digest('hex');
+    expect(digest).toBe(createHash('sha256').update(Buffer.alloc(500 * 1024 * 1024)).digest('hex'));
+    expect(firstMs).toBeGreaterThan(0);
+    expect(secondMs).toBeLessThan(1_000);
+  }, 180_000);
+
+  it.runIf(process.env.IMC_BIG_TRANSFER === '1')('real-stream stuck claim returns a terminal error instead of hanging', async () => {
+    const transfer = await loadFileTransferHandler(fakeHome);
+    const done = createServerLinkMock();
+    const clientUploadId = 'big-transfer-stuck-claim';
+    const claim = transfer.tryClaimClientUpload(clientUploadId);
+    expect(claim).not.toBeNull();
+    const start = Date.now();
+    await transfer.handleFileUploadFetch({
+      type: 'file.upload_fetch', uploadId: 'stuck', clientUploadId,
+      filename: 'stuck.bin', originalName: 'stuck.bin', size: 500 * 1024 * 1024,
+      downloadUrl: 'https://relay.example/stuck',
+    }, done.serverLink as never);
+    expect(Date.now() - start).toBeGreaterThanOrEqual(transfer.CLIENT_UPLOAD_CLAIM_WAIT_TIMEOUT_MS);
+    expect(done.sent).toEqual([expect.objectContaining({ type: 'file.upload_error', uploadId: 'stuck' })]);
+    transfer.releaseClientUploadClaim(clientUploadId, claim!);
+  }, 180_000);
 
   it('registers allowed validated handles, including binary and too-large files', async () => {
     const projectDir = path.join(rootDir, 'project');

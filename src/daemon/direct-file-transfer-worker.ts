@@ -217,6 +217,10 @@ async function releaseClientUploadClaim(operationId: string, handle: UploadClaim
   await callHost(DIRECT_FILE_TRANSFER_HOST_METHOD.RELEASE_CLIENT_UPLOAD_CLAIM, [operationId, handle]);
 }
 
+async function touchClientUploadClaim(operationId: string, handle: UploadClaimHandle): Promise<void> {
+  await callHost(DIRECT_FILE_TRANSFER_HOST_METHOD.TOUCH_CLIENT_UPLOAD_CLAIM, [operationId, handle]);
+}
+
 async function lookupAttachmentByClientUploadId(clientUploadId: string): Promise<AttachmentRef | undefined> {
   const value = await callHost(
     DIRECT_FILE_TRANSFER_HOST_METHOD.LOOKUP_ATTACHMENT_BY_CLIENT_UPLOAD_ID, [clientUploadId],
@@ -313,6 +317,7 @@ interface ActiveDirectTransfer {
   received: number;
   /** Last `received` value already reported to the sender as a commit point. */
   committedReported: number;
+  lastClaimTouchAt: number;
   pendingBytes: number;
   downloadCredit: number;
   downloadSource: DirectFileDownloadSource | null;
@@ -1684,6 +1689,10 @@ function reportUploadCommit(transfer: ActiveDirectTransfer): void {
   const advanced = transfer.received - transfer.committedReported;
   if (advanced < DIRECT_FILE_TRANSFER_LIMITS.DATA_CHUNK_BYTES && transfer.received < transfer.authority.size) return;
   transfer.committedReported = transfer.received;
+  if (transfer.uploadClaim && Date.now() - transfer.lastClaimTouchAt >= 250) {
+    transfer.lastClaimTouchAt = Date.now();
+    void touchClientUploadClaim(transfer.authority.operationId, transfer.uploadClaim).catch(() => undefined);
+  }
   try {
     transfer.channel.sendMessage(JSON.stringify({
       type: DIRECT_FILE_TRANSFER_DATA_MSG.CREDIT,
@@ -2199,6 +2208,7 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Wo
     uploadClaim,
     received: 0,
     committedReported: 0,
+    lastClaimTouchAt: 0,
     pendingBytes: 0,
     downloadCredit: 0,
     downloadSource: null,

@@ -35,7 +35,9 @@ import {
   __setDirectFileTransferWorkerHostForTests as setWorkerHost,
 } from '../../src/daemon/direct-file-transfer-worker.js';
 import {
+  clientUploadClaimLastProgressAt,
   releaseClientUploadClaim,
+  touchClientUploadClaim,
   tryClaimClientUpload,
 } from '../../src/daemon/file-transfer-handler.js';
 
@@ -1295,6 +1297,17 @@ describe('direct file transfer worker boundary', () => {
       const reclaimed = tryClaimClientUpload('upload-at-shutdown');
       expect(reclaimed).not.toBeNull();
       releaseClientUploadClaim('upload-at-shutdown', reclaimed!);
+    });
+
+    it('refreshes claim liveness while the first upload is still progressing', async () => {
+      const token = tryClaimClientUpload('upload-progressing');
+      expect(token).not.toBeNull();
+      const before = clientUploadClaimLastProgressAt('upload-progressing');
+      await new Promise((resolve) => setTimeout(resolve, 2));
+      touchClientUploadClaim('upload-progressing', token!);
+      const after = clientUploadClaimLastProgressAt('upload-progressing');
+      expect(after).toBeGreaterThan(before ?? 0);
+      releaseClientUploadClaim('upload-progressing', token!);
     });
   });
 

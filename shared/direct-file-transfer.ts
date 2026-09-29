@@ -1618,6 +1618,7 @@ export const DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX = '.commit-intent.json';
 
 export const DIRECT_FILE_TRANSFER_HOST_METHOD = {
   TRY_CLAIM_CLIENT_UPLOAD: 'tryClaimClientUpload',
+  TOUCH_CLIENT_UPLOAD_CLAIM: 'touchClientUploadClaim',
   RELEASE_CLIENT_UPLOAD_CLAIM: 'releaseClientUploadClaim',
   LOOKUP_ATTACHMENT_BY_CLIENT_UPLOAD_ID: 'lookupAttachmentByClientUploadId',
   RESOLVE_DIRECT_FILE_DOWNLOAD_SOURCE: 'resolveDirectFileDownloadSource',

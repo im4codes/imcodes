@@ -43,6 +43,7 @@ import type { FileTransferSender } from './file-transfer-handler.js';
 import {
   lookupAttachmentByClientUploadId,
   releaseClientUploadClaim,
+  touchClientUploadClaim,
   resolveDirectFileDownloadSource,
   tryClaimClientUpload,
 } from './file-transfer-handler.js';
@@ -488,6 +489,12 @@ async function invokeHostMethod(generation: number, method: string, args: unknow
       const handle = `dft-claim-${claimHandleSeq}`;
       claimTokensByHandle.set(handle, { clientUploadId, token, generation });
       return handle;
+    }
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.TOUCH_CLIENT_UPLOAD_CLAIM: {
+      const handle = String(args[1] ?? '');
+      const claim = claimTokensByHandle.get(handle);
+      if (claim) touchClientUploadClaim(claim.clientUploadId, claim.token);
+      return null;
     }
     case DIRECT_FILE_TRANSFER_HOST_METHOD.RELEASE_CLIENT_UPLOAD_CLAIM: {
       const handle = String(args[1] ?? '');
