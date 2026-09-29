@@ -103,9 +103,14 @@ describe('writeWatchdogCmd', () => {
     expect(lockCheck).toBeGreaterThan(-1);
     expect(launchCmd).toBeGreaterThan(lockCheck);
 
-    // Lock file path must be in the check (now via %USERPROFILE% expansion
-    // so cmd.exe handles non-ASCII usernames natively at runtime).
+    // Lock file path must be in the check, via %IMCODES_HOME%. The default
+    // install defines it from %USERPROFILE% (so cmd.exe handles non-ASCII
+    // usernames natively) BEFORE first use; otherwise it expands to empty
+    // and the lock/log paths point at the drive root.
     expect(cmd).toContain('%IMCODES_HOME%\\upgrade.lock');
+    const homeDefinition = cmd.indexOf('set "IMCODES_HOME=%USERPROFILE%\\.imcodes"');
+    expect(homeDefinition).toBeGreaterThan(-1);
+    expect(homeDefinition).toBeLessThan(cmd.indexOf('%IMCODES_HOME%'));
 
     // When locked, should wait and loop back (not launch daemon)
     expect(cmd).toContain('Upgrade in progress, waiting');

@@ -53,6 +53,12 @@ function scopedEnvironmentPrefix(paths: LaunchPaths): string {
   return `set "IMCODES_HOME=${quote(stateHome)}"\r\nset "HOME=${quote(userHome)}"\r\nset "IMCODES_DEFAULT_HOME=${quote(path.win32.dirname(defaultHome))}"\r\n`;
 }
 
+/** Home lines for the watchdog .cmd: the scoped prefix, or the default install's %USERPROFILE%-based home. */
+function homeEnvironmentLines(paths: LaunchPaths): string[] {
+  const scoped = scopedEnvironmentPrefix(paths).trimEnd().split('\r\n').filter(Boolean);
+  return scoped.length > 0 ? scoped : ['set "IMCODES_HOME=%USERPROFILE%\\.imcodes"'];
+}
+
 function escapeXmlText(value: string): string {
   return value
     .replaceAll('&', '&amp;')
@@ -325,7 +331,11 @@ export async function writeWatchdogCmd(paths: LaunchPaths): Promise<void> {
   const watchdog = [
     '@echo off',
     'chcp 65001 >nul 2>&1',
-    ...scopedEnvironmentPrefix(paths).trimEnd().split('\r\n').filter(Boolean),
+    // Every path below goes through %IMCODES_HOME%. A scoped home bakes it in;
+    // the default install must still define it (via %USERPROFILE% so cmd.exe
+    // expands non-ASCII profile names natively), or it would expand to empty
+    // and the lock/log would land at the drive root.
+    ...homeEnvironmentLines(paths),
     ':loop',
     'if exist "%IMCODES_HOME%\\upgrade.lock" goto wait_lock',
     // Preflight FIRST (when the shim is installed): detects half-

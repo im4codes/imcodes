@@ -20,8 +20,17 @@ import { join } from 'node:path';
 /** Workers read this to find the run root; see isolated-home.ts. */
 export const ISOLATED_HOME_RUN_ROOT_ENV = 'IMCODES_TEST_HOME_RUN_ROOT';
 
+/**
+ * Base directory for isolated homes. macOS's per-user tmpdir()
+ * (/var/folders/…/T) is long enough that <home>/.imcodes/daemon.sock exceeds
+ * the 104-byte unix-socket path limit (listen EINVAL), so use /tmp there.
+ */
+export function isolatedHomeTmpBase(): string {
+  return process.platform === 'darwin' ? '/tmp' : tmpdir();
+}
+
 function runRootPath(): string {
-  return join(tmpdir(), `imcodes-test-homes-${process.pid}`);
+  return join(isolatedHomeTmpBase(), `imcodes-test-homes-${process.pid}`);
 }
 
 export async function setup(): Promise<void> {

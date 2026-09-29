@@ -168,13 +168,13 @@ describe('daemon test workers run in an isolated home', () => {
 describe('isolated home ownership and overrides', () => {
   it('removes only the root it owns', async () => {
     const setup = await import('./isolated-home.js');
-    const { ISOLATED_HOME_RUN_ROOT_ENV } = await import('./isolated-home-global.js');
+    const { ISOLATED_HOME_RUN_ROOT_ENV, isolatedHomeTmpBase } = await import('./isolated-home-global.js');
     const runRoot = process.env[ISOLATED_HOME_RUN_ROOT_ENV];
 
     // Two layers: the run owns one directory, each worker owns a subdirectory of
     // it named after its own pid and worker id.
     expect(setup.RUN_SCOPED, 'globalSetup did not provide a run root').toBe(true);
-    expect(runRoot).toBe(join(tmpdir(), `imcodes-test-homes-${process.ppid}`));
+    expect(runRoot).toBe(join(isolatedHomeTmpBase(), `imcodes-test-homes-${process.ppid}`));
     // A unique directory per setup-file invocation: the owner names it, it does
     // not identify it. Sharing one directory per worker leaks disk state between
     // the files that worker runs.

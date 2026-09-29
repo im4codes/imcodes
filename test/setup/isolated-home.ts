@@ -27,9 +27,9 @@
  */
 import { afterAll } from 'vitest';
 import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
-import { tmpdir, userInfo } from 'node:os';
+import { userInfo } from 'node:os';
 import { join } from 'node:path';
-import { ISOLATED_HOME_RUN_ROOT_ENV } from './isolated-home-global.js';
+import { ISOLATED_HOME_RUN_ROOT_ENV, isolatedHomeTmpBase } from './isolated-home-global.js';
 
 /**
  * A fresh home for THIS setup-file invocation, i.e. for this test file.
@@ -52,7 +52,7 @@ const OWNER = `${process.pid}-${process.env.VITEST_WORKER_ID ?? '0'}`;
 const RUN_ROOT = process.env[ISOLATED_HOME_RUN_ROOT_ENV];
 const RUN_SCOPED = typeof RUN_ROOT === 'string' && RUN_ROOT.length > 0;
 const ISOLATED_HOME = mkdtempSync(
-  RUN_SCOPED ? join(RUN_ROOT, `w-${OWNER}-`) : join(tmpdir(), `imcodes-test-home-${OWNER}-`),
+  RUN_SCOPED ? join(RUN_ROOT, `w-${OWNER}-`) : join(isolatedHomeTmpBase(), `imcodes-test-home-${OWNER}-`),
 );
 const ISOLATED_IMCODES_HOME = join(ISOLATED_HOME, '.imcodes');
 
