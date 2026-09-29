@@ -282,7 +282,12 @@ export const TASK_PAIR_BOUNDARY_AUDIT_RULE: string =
   + 'restart). When a change edits or replaces a shared function, list every '
   + 'call site and state its behaviour change; for heuristics, warnings and '
   + 'alerts, require a normal-use case that must NOT trigger and a time or '
-  + 'cost bound. A missed boundary that breaks existing behaviour is a P0.';
+  + 'cost bound. For protocol or wire changes, check version skew: an older '
+  + 'server or daemon on the other side (missing or unknown fields must keep '
+  + 'the safe old behaviour). For data migrations, check keys shared by '
+  + 'several owners (two daemons, two users of one project) so the first '
+  + 'owner\'s step cannot strand the others. A missed boundary that breaks '
+  + 'existing behaviour is a P0.';
 
 export const TASK_PAIR_MERGE_VERIFICATION_RULE: string =
   'Merge verification (Brain): read the diff for removed lines of recently '
