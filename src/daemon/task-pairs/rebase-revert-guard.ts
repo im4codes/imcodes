@@ -17,7 +17,9 @@ export interface PossibleSilentRevert {
   truncated?: boolean;
 }
 
-export async function isRewrittenHead(worktree: string, previousHead: string, nextHead: string): Promise<boolean> {
+export type RewrittenHeadProbe = (worktree: string, previousHead: string, nextHead: string) => Promise<boolean>;
+
+async function defaultIsRewrittenHead(worktree: string, previousHead: string, nextHead: string): Promise<boolean> {
   if (!previousHead || previousHead === nextHead) return false;
   try {
     await execFileAsync('git', ['-C', worktree, 'merge-base', '--is-ancestor', previousHead, nextHead], {
@@ -27,6 +29,22 @@ export async function isRewrittenHead(worktree: string, previousHead: string, ne
   } catch {
     return true;
   }
+}
+
+type SilentRevertInspector = (material: ResolvedTaskPairMaterial) => Promise<PossibleSilentRevert | undefined>;
+let rewrittenHeadProbe: RewrittenHeadProbe = defaultIsRewrittenHead;
+
+export async function isRewrittenHead(worktree: string, previousHead: string, nextHead: string): Promise<boolean> {
+  return rewrittenHeadProbe(worktree, previousHead, nextHead);
+}
+
+/** Test-only seams for proving advisory probes cannot delay durable head writes. */
+export function setRebaseRevertGuardDepsForTests(deps?: {
+  isRewrittenHead?: RewrittenHeadProbe;
+  inspectPossibleSilentRevert?: SilentRevertInspector;
+}): void {
+  rewrittenHeadProbe = deps?.isRewrittenHead ?? defaultIsRewrittenHead;
+  silentRevertInspector = deps?.inspectPossibleSilentRevert ?? defaultInspectPossibleSilentRevert;
 }
 
 interface Budget { deadline: number; }
@@ -81,7 +99,7 @@ async function integrationCommits(material: ResolvedTaskPairMaterial, budget: Bu
  * `ownershipHead` are required, so ordinary READY deletions never warn.
  * Every git operation shares one five-second budget and fails open.
  */
-export async function inspectPossibleSilentRevert(material: ResolvedTaskPairMaterial): Promise<PossibleSilentRevert | undefined> {
+async function defaultInspectPossibleSilentRevert(material: ResolvedTaskPairMaterial): Promise<PossibleSilentRevert | undefined> {
   const worktree = material.worktree;
   const base = material.base;
   const head = material.head;
@@ -154,6 +172,12 @@ export async function inspectPossibleSilentRevert(material: ResolvedTaskPairMate
     })),
     ...(byFile.size > MAX_FILES || removed > MAX_REMOVED ? { truncated: true } : {}),
   };
+}
+
+let silentRevertInspector: SilentRevertInspector = defaultInspectPossibleSilentRevert;
+
+export async function inspectPossibleSilentRevert(material: ResolvedTaskPairMaterial): Promise<PossibleSilentRevert | undefined> {
+  return silentRevertInspector(material);
 }
 
 export function formatPossibleSilentRevertWarning(result: PossibleSilentRevert | undefined): string | undefined {

@@ -170,9 +170,6 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     const now = Date.now();
     if (workspace.lastHead === material.head && workspace.lastHeadAt) return;
     const previousHead = workspace.lastHead;
-    const rewritten = previousHead
-      ? await isRewrittenHead(workspace.path, previousHead, material.head)
-      : false;
     // Re-read: resolveTaskPairMaterial was an async gap, and something else
     // (endWorkspace ending the pair, a self-heal rebuild) may have mutated the
     // workspace while it ran. Merge lastHead onto FRESH state, never onto the
@@ -181,17 +178,20 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     const latest = store.getPair(project, taskId);
     const latestWorkspace = latest?.state.workspace;
     if (!latest || !latestWorkspace || latestWorkspace.status === 'removed') return;
-    const shouldWarn = rewritten && latestWorkspace.lastRebaseNoticeHead !== material.head;
     const nextWorkspace = {
       ...latestWorkspace,
       lastHead: material.head,
       lastHeadAt: now,
-      ...(rewritten ? { lastRebaseNoticeHead: material.head, lastRebasePreviousHead: previousHead } : {}),
     };
     store.savePair(project, { ...latest.state, workspace: nextWorkspace, updatedAt: Math.max(latest.state.updatedAt, now) }, {
       liveness: { ...latest.liveness, lastMaterialAt: now },
     });
-    if (shouldWarn && previousHead) queueRebaseWarning(latest.state, taskId, material, previousHead);
+    // Head persistence and marker/audit handoff must never wait for the
+    // warning-only rewrite probe. Capture the old head and material, then do
+    // the bounded git inspection asynchronously after the durable write.
+    if (previousHead && previousHead !== material.head) {
+      queueWorkspaceRewriteCheck(project, latest.state, taskId, material, previousHead);
+    }
   } catch (error) {
     // Best-effort cache refresh: the async gap above can outlive the pair's
     // store (test teardown, daemon shutdown). Losing lastHead is harmless --
@@ -199,6 +199,33 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     // is not.
     logger.warn({ err: error, taskId }, 'task-pair: workspace head refresh failed');
   }
+}
+
+/** Detect a rewritten head after persistence; advisory work is fail-open and never blocks READY. */
+function queueWorkspaceRewriteCheck(
+  project: string,
+  pair: TaskPairState,
+  taskId: string,
+  material: Awaited<ReturnType<typeof resolveTaskPairMaterial>>,
+  previousHead: string,
+): void {
+  void (async () => {
+    if (!await isRewrittenHead(material.worktree!, previousHead, material.head!)) return;
+    const store = getTaskPairStore();
+    const latest = store.getPair(project, taskId);
+    const workspace = latest?.state.workspace;
+    if (!latest || !workspace || workspace.status === 'removed' || workspace.lastRebaseNoticeHead === material.head) return;
+    store.savePair(project, {
+      ...latest.state,
+      workspace: {
+        ...workspace,
+        lastRebaseNoticeHead: material.head,
+        lastRebasePreviousHead: previousHead,
+      },
+      updatedAt: Math.max(latest.state.updatedAt, Date.now()),
+    });
+    queueRebaseWarning(latest.state, taskId, material, previousHead);
+  })().catch((error) => logger.warn({ err: error, taskId }, 'task-pair: rewrite probe failed'));
 }
 
 /** Run the advisory after state delivery; never delay marker/audit handoff. */

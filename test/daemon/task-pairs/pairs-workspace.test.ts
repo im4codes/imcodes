@@ -24,6 +24,7 @@ import { removeSession, upsertSession } from '../../../src/store/session-store.j
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
 import { resetTaskPairFocusForTests, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { setTaskPairMaterialDepsForTests } from '../../../src/daemon/task-pairs/material.js';
+import { setRebaseRevertGuardDepsForTests } from '../../../src/daemon/task-pairs/rebase-revert-guard.js';
 import { ensureTaskPairWorkspaceAvailable, refreshTaskPairWorkspaceHead, taskPairService, type TaskPairScheduler } from '../../../src/daemon/task-pairs/service.js';
 import {
   releaseTaskPairWorkspace,
@@ -169,6 +170,7 @@ describe('pair workspaces', () => {
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairWorkspaceDepsForTests(undefined);
     setTaskPairMaterialDepsForTests(undefined);
+    setRebaseRevertGuardDepsForTests();
     setTaskPairStoreForTests(undefined);
     resetTaskPairFocusForTests();
     for (const name of [BRAIN, EXEC, AUD]) removeSession(name);
@@ -624,6 +626,37 @@ describe('pair workspaces', () => {
     await refreshTaskPairWorkspaceHead(PROJECT, 'R10');
     expect(sentTo(AUD, 'rebase-revert-warning')).toHaveLength(1);
     expect(sentTo(BRAIN, 'rebase-revert-warning')).toHaveLength(1);
+  });
+
+  it('persists a refreshed head before a delayed rewrite probe completes', async () => {
+    const path = await opened('R10-delay');
+    const original = git(path, 'rev-parse', 'HEAD');
+    writeFileSync(join(path, 'rebase.txt'), 'foreign fix\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'foreign fix: preserve state');
+    const oldHead = git(path, 'rev-parse', 'HEAD');
+    const state = pair('R10-delay');
+    getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
+    git(path, 'reset', '-q', '--hard', original);
+    writeFileSync(join(path, 'rebase.txt'), 'rewritten change\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'rebased stale resolution');
+
+    setRebaseRevertGuardDepsForTests({
+      isRewrittenHead: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+        return true;
+      },
+      inspectPossibleSilentRevert: async () => ({
+        files: [{ path: 'rebase.txt', removedLines: 1, origins: [{ commit: oldHead, subject: 'foreign fix: preserve state', count: 1 }] }],
+      }),
+    });
+    const started = Date.now();
+    await refreshTaskPairWorkspaceHead(PROJECT, 'R10-delay');
+    const elapsed = Date.now() - started;
+    expect(elapsed).toBeLessThan(500);
+    expect(pair('R10-delay').workspace?.lastHead).toBe(git(path, 'rev-parse', 'HEAD'));
+    await vi.waitFor(() => expect(sentTo(AUD, 'rebase-revert-warning')).toHaveLength(1), { timeout: 10_000 });
   });
 
   it('does not warn on refresh when a rewritten head drops a line owned by the old pair branch', async () => {
