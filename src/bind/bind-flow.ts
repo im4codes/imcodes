@@ -203,6 +203,18 @@ async function ensureServiceInstalled(): Promise<void> {
     await ensureTmux();
   }
 
+  // A scoped POSIX daemon deliberately has no launchd/systemd registration.
+  // Registering a per-instance plist under the user's LaunchAgents directory
+  // still mutates the default service domain (and launchd may respawn it as
+  // root), so scoped instances stay foreground/manual like the Windows guard.
+  if (process.platform === 'darwin' || process.platform === 'linux') {
+    const service = resolvePosixDaemonServicePaths();
+    if (service.scoped) {
+      console.log('Scoped daemon: skipped POSIX service installation to preserve default-service isolation.');
+      return;
+    }
+  }
+
   if (process.platform === 'darwin') {
     await installLaunchAgent();
     console.log('\nDaemon installed as a launch agent — starts automatically on login.');
@@ -276,6 +288,10 @@ async function ensureTmux(): Promise<void> {
 
 async function installLaunchAgent(): Promise<void> {
   const service = resolvePosixDaemonServicePaths();
+  if (service.scoped) {
+    console.log('Scoped daemon: skipped launchd service installation to preserve default-service isolation.');
+    return;
+  }
   const logPath = join(credentialsDir(), 'daemon.log');
   const launchAgentsDir = join(homedir(), 'Library', 'LaunchAgents');
 
@@ -339,6 +355,10 @@ ${service.scoped ? `    <key>IMCODES_HOME</key>
 
 async function installSystemdService(): Promise<void> {
   const service = resolvePosixDaemonServicePaths();
+  if (service.scoped) {
+    console.log('Scoped daemon: skipped systemd service installation to preserve default-service isolation.');
+    return;
+  }
   const logPath = join(credentialsDir(), 'daemon.log');
   const serviceDir = join(homedir(), '.config', 'systemd', 'user');
   const servicePath = service.systemdUnitPath;
