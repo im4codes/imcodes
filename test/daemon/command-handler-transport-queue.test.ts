@@ -1699,6 +1699,34 @@ describe('handleWebCommand transport queue behavior', () => {
     }));
   });
 
+  it('preserves a persisted main-session effort when restart omits thinking', async () => {
+    getSessionMock.mockImplementation((name: string) => name === 'deck_effort_main_brain'
+      ? {
+        name,
+        projectName: 'effort-main',
+        role: 'brain',
+        agentType: 'codex-sdk',
+        runtimeType: 'transport',
+        state: 'stopped',
+        effort: 'medium',
+      }
+      : undefined);
+
+    handleWebCommand({
+      type: 'session.start',
+      project: 'effort-main',
+      dir: '/proj',
+      agentType: 'codex-sdk',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_effort_main_brain',
+      agentType: 'codex-sdk',
+      effort: 'medium',
+    }));
+  });
+
   it('passes a validated selected-file identity into the initial SDK launch', async () => {
     handleWebCommand({
       type: 'session.start',
@@ -4153,6 +4181,39 @@ describe('handleWebCommand transport queue behavior', () => {
       requestedModel: 'grok-build',
       fresh: true,
       userCreated: true,
+    }));
+  });
+
+  it('preserves a persisted sub-session effort when relaunch omits thinking', async () => {
+    getSessionMock.mockImplementation((name: string) => {
+      if (name === 'deck_parent_brain') return { name, projectName: 'parent-project' };
+      if (name === 'deck_sub_effort_child') {
+        return {
+          name,
+          projectName: 'parent-project',
+          agentType: 'codex-sdk',
+          runtimeType: 'transport',
+          state: 'stopped',
+          effort: 'medium',
+        };
+      }
+      return undefined;
+    });
+
+    handleWebCommand({
+      type: 'subsession.start',
+      id: 'effort_child',
+      sessionType: 'codex-sdk',
+      cwd: '/tmp/project',
+      parentSession: 'deck_parent_brain',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(launchTransportSessionMock).toHaveBeenCalledWith(expect.objectContaining({
+      name: 'deck_sub_effort_child',
+      agentType: 'codex-sdk',
+      effort: 'medium',
+      fresh: true,
     }));
   });
 

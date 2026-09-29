@@ -2472,9 +2472,6 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
   const requestedModel = (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined);
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
-  const effort = isTransportEffortLevel(requestedEffort)
-    ? requestedEffort
-    : getDefaultThinkingLevel(agentType);
 
   if (!rawProject) {
     logger.warn('session.start: missing project name');
@@ -2495,6 +2492,13 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
     ? normalizeSessionIdentityContent(rawIdentityPrompt)
     : undefined;
   const sessionName = `deck_${project}_brain`;
+  // An explicit effort is authoritative.  When a session is being restored or
+  // relaunched without one, retain the persisted value instead of silently
+  // resetting it to the transport default (normally "high").
+  const existingMain = getSession(sessionName);
+  const effort = isTransportEffortLevel(requestedEffort)
+    ? requestedEffort
+    : existingMain?.effort ?? getDefaultThinkingLevel(agentType);
   // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
   if (isKnownTestSessionName(sessionName) || isKnownTestProjectName(rawProject)) {
@@ -7150,10 +7154,11 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     parentSession ? getSession(parentSession)?.projectDir : undefined,
   );
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  const sessionName = subSessionName(id);
+  const existingSub = getSession(sessionName);
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
-    : getDefaultThinkingLevel(type);
-  const sessionName = subSessionName(id);
+    : existingSub?.effort ?? getDefaultThinkingLevel(type);
   const projectName = parentSession
     ? (getSession(parentSession)?.projectName ?? parentSession)
     : sessionName;

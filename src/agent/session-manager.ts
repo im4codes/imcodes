@@ -3434,6 +3434,14 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     opts.userCreated ?? (!opts.fresh ? existing?.userCreated : undefined);
   const effectiveParentSession: string | undefined =
     opts.parentSession ?? (!opts.fresh ? existing?.parentSession : undefined);
+  // Effort is durable session configuration, not conversation state or a
+  // launch-time default. A restore/reconnect/fresh-conversation caller may
+  // omit it while rebuilding an existing runtime; carrying the persisted value
+  // here prevents that rebuild from erasing an explicit low/medium/max
+  // selection and letting providers fall back to high. The default is only
+  // appropriate for a session that has never had an explicit effort.
+  const effectiveEffort: LaunchOpts['effort'] =
+    opts.effort ?? existing?.effort;
   // recentInjectionHistory is maintained out-of-band by recent-injection-history.ts.
   // If we don't carry it forward, upsertSession below wipes the dedup ring buffer
   // and previously-injected memories get re-injected into the same conversation.
@@ -3640,7 +3648,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     bindExistingKey: effectiveBindExistingKey,
     skipCreate: effectiveSkipCreate,
     resumeId: transportResumeId,
-    effort: opts.effort,
+    effort: effectiveEffort,
     ...(existing?.crossVendorHandoff?.pending && !opts.fresh
       ? { pendingHandoff: existing.crossVendorHandoff.pending }
       : {}),
@@ -3699,7 +3707,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
           quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
         }),
         ...(sdkDisplay ?? {}),
-        ...(opts.effort ? { effort: opts.effort } : {}),
+        ...(effectiveEffort ? { effort: effectiveEffort } : {}),
         description,
         identityPrompt,
         ...(effectiveCcPreset ? { ccPreset: effectiveCcPreset } : {}),

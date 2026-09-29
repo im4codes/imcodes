@@ -500,6 +500,45 @@ describe('sdk transport session restore', () => {
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
+  it('preserves an explicit effort when a restore launch omits the optional field', async () => {
+    const name = 'deck_sdk_effort_sticky_brain';
+    mocks.store.set(name, {
+      name,
+      projectName: 'effort-sticky',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/effort-sticky',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-effort-sticky',
+      ccSessionId: 'cc-effort-sticky',
+      requestedModel: 'sonnet',
+      activeModel: 'sonnet',
+      effort: 'medium',
+    });
+
+    await connectProvider('claude-code-sdk', {});
+    // This models a fresh-conversation caller that has the durable record but
+    // omitted optional launch metadata. The persisted explicit choice must not
+    // be replaced by the provider/default high level.
+    await launchTransportSession({
+      name,
+      projectName: 'effort-sticky',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/effort-sticky',
+      ccSessionId: 'cc-effort-sticky',
+      fresh: true,
+    });
+
+    expect(mocks.store.get(name)?.effort).toBe('medium');
+  });
+
   it('restores claude-code-sdk sessions with persisted resume id and sends via resumed continuity', async () => {
     mocks.store.set('deck_sdk_cc_brain', {
       name: 'deck_sdk_cc_brain',
