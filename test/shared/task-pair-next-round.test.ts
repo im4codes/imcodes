@@ -25,6 +25,7 @@ const OTHER = 'deck_sub_other';
 const HEAD1 = 'a'.repeat(40);
 const DEV_TIP = 'b'.repeat(40);
 const HEAD2 = 'c'.repeat(40);
+const HEAD3 = 'd'.repeat(40);
 
 function ctx(writer: string, now: number): TaskPairApplyContext {
   return { writer, fallbackBrain: BRAIN, now, source: 'marker' };
@@ -223,5 +224,73 @@ describe('NEXT_ROUND: opening the next delivery round after PASS', () => {
     expect(sameTaskPairCommit(DEV_TIP.slice(0, 12), DEV_TIP)).toBe(true);
     expect(sameTaskPairCommit(DEV_TIP, HEAD1)).toBe(false);
     expect(sameTaskPairCommit('bbb', DEV_TIP)).toBe(false);
+  });
+});
+
+describe('material hold after a definite not-ancestor result (tsk_cd_next_round_ancestry_hold)', () => {
+  function inAuditRound2(): TaskPairState {
+    const round2 = apply(passedPair(), BRAIN, `<!-- IMCODES_TASK NEXT_ROUND T1 base=${DEV_TIP} -->`).pair!;
+    return apply(round2, EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT T1 worktree=/ws/T1 head=${HEAD2} -->`).pair!;
+  }
+  const held = (pair: TaskPairState): TaskPairState => ({
+    ...pair, materialHold: { reason: 'round_base_not_ancestor', head: HEAD2, base: DEV_TIP, at: 5 },
+  });
+
+  it('baseline: without a hold the same PASS applies (the hold is what changes the outcome)', () => {
+    const pair = inAuditRound2();
+    expect(pair.materialHold).toBeUndefined();
+    expect(apply(pair, AUD, '<!-- IMCODES_TASK PASS T1 blocking=P0 -->')).toMatchObject({ effect: 'verdict', toStatus: 'passed', unusual: false });
+  });
+
+  it('a PASS during the hold is recorded unusual, the status stays in_audit and both auditor and executor are told', () => {
+    const result = apply(held(inAuditRound2()), AUD, '<!-- IMCODES_TASK PASS T1 blocking=P0 -->');
+    expect(result).toMatchObject({ effect: 'recorded', unusual: true, fromStatus: 'in_audit', toStatus: 'in_audit' });
+    expect(result.pair?.status).toBe('in_audit');
+    expect(result.pair?.passRound).toBeUndefined();
+    expect(result.pair?.materialHold).toBeDefined();
+    expect(result.intents).toEqual([
+      expect.objectContaining({ kind: 'policy_notice', to: AUD, text: expect.stringContaining('was held') }),
+      expect.objectContaining({ kind: 'policy_notice', to: EXEC, text: expect.stringContaining('new READY_FOR_AUDIT') }),
+    ]);
+  });
+
+  it('Brain\'s PASS is held too (DONE force=true remains its way to accept)', () => {
+    expect(apply(held(inAuditRound2()), BRAIN, '<!-- IMCODES_TASK PASS T1 blocking=P0 -->').pair?.status).toBe('in_audit');
+  });
+
+  it('REWORK during the hold still works and clears it; the next READY starts a fresh audit round', () => {
+    const rework = apply(held(inAuditRound2()), AUD, '<!-- IMCODES_TASK REWORK T1 blocking=P0 p0=1 -->');
+    expect(rework).toMatchObject({ effect: 'verdict', unusual: false, toStatus: 'rework' });
+    expect(rework.pair?.materialHold).toBeUndefined();
+    const again = apply(rework.pair, EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT T1 worktree=/ws/T1 head=${HEAD3} -->`);
+    expect(again.pair).toMatchObject({ status: 'in_audit' });
+    expect(apply(again.pair, AUD, '<!-- IMCODES_TASK PASS T1 blocking=P0 -->').pair?.status).toBe('passed');
+  });
+
+  it('a fresh READY inside the held round lifts the hold, is relayed again (even without a head), and then PASS applies', () => {
+    const fresh = apply(held(inAuditRound2()), EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT T1 worktree=/ws/T1 head=${HEAD3} -->`);
+    expect(fresh.pair).toMatchObject({ status: 'in_audit', material: expect.objectContaining({ head: HEAD3, base: DEV_TIP }) });
+    expect(fresh.pair?.materialHold).toBeUndefined();
+    expect(fresh.intents).toEqual([{ kind: 'audit_request', to: AUD }]);
+    expect(apply(fresh.pair, AUD, '<!-- IMCODES_TASK PASS T1 blocking=P0 -->').pair?.status).toBe('passed');
+    // Leaving the head out must not bypass the check: the READY is still relayed for re-verification.
+    const bare = apply(held(inAuditRound2()), EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T1 -->');
+    expect(bare.pair?.materialHold).toBeUndefined();
+    expect(bare.intents).toEqual([{ kind: 'audit_request', to: AUD }]);
+  });
+
+  it('a READY whose base= text is rejected does not lift the hold', () => {
+    const rejected = apply(held(inAuditRound2()), EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT T1 worktree=/ws/T1 head=${HEAD3} base=${HEAD1} -->`);
+    expect(rejected).toMatchObject({ effect: 'recorded', unusual: true });
+    expect(rejected.pair?.materialHold).toBeDefined();
+    expect(rejected.pair?.material?.head).toBe(HEAD2);
+  });
+
+  it('first-round pairs (no NEXT_ROUND) are unaffected: a normal READY/PASS never sets or reads a hold', () => {
+    const first = passedPair();
+    expect(first.materialHold).toBeUndefined();
+    let pair = apply(undefined, BRAIN, `<!-- IMCODES_TASK DISPATCH T9 executor=${EXEC} auditor=${AUD} -->`).pair!;
+    pair = apply({ ...pair, status: 'working' }, EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT T9 worktree=/ws/T9 head=${HEAD1} -->`).pair!;
+    expect(apply(pair, AUD, '<!-- IMCODES_TASK PASS T9 blocking=P0 -->')).toMatchObject({ effect: 'verdict', toStatus: 'passed' });
   });
 });

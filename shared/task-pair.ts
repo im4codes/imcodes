@@ -130,6 +130,9 @@ export const TASK_PAIR_WORKSPACE_EVENT_VERB = 'WORKSPACE' as const;
 /** Verb/effect of a daemon-generated localized title landing on a pair (never a marker verb). */
 export const TASK_PAIR_TITLE_EVENT_VERB = 'TITLE' as const;
 export const TASK_PAIR_TITLE_GENERATED_EFFECT = 'title_generated' as const;
+/** Daemon-authored event: the round's material was held because its head does not build on the round base. */
+export const TASK_PAIR_MATERIAL_EVENT_VERB = 'MATERIAL' as const;
+export const TASK_PAIR_MATERIAL_HELD_EFFECT = 'material_held' as const;
 /**
  * Known non-informative titles a pair can carry (a legacy-import default
  * objective, a formatting fallback used elsewhere for a missing title).
@@ -522,6 +525,19 @@ export const TASK_PAIR_BRAIN_REMINDER_REPEAT_MS = 15 * 60_000;
 /** Hard minimum between any two aggregate Brain heartbeat/reminder messages. */
 export const TASK_PAIR_BRAIN_MIN_GAP_MS = 10 * 60_000;
 
+/**
+ * Set by the daemon when a READY's head definitely does not descend from the
+ * round base (git said "not an ancestor"): PASS is held until a fresh READY
+ * replaces the material. REWORK is unaffected. Persisted with the pair, so it
+ * survives a daemon restart.
+ */
+export interface TaskPairMaterialHold {
+  reason: 'round_base_not_ancestor';
+  head: string;
+  base: string;
+  at: number;
+}
+
 /** Base commit of a delivery round after NEXT_ROUND. */
 export interface TaskPairRoundBase {
   commit: string;
@@ -773,6 +789,8 @@ export interface TaskPairState {
   deliveryRound?: number;
   /** What this delivery round builds on; READY_FOR_AUDIT material is checked against it. */
   roundBase?: TaskPairRoundBase;
+  /** See {@link TaskPairMaterialHold}. */
+  materialHold?: TaskPairMaterialHold;
   blocking: AuditSeverity[];
   /**
    * Where `blocking` came from: `explicit` when a human/marker named it
@@ -1119,6 +1137,7 @@ function clonePair(pair: TaskPairState): TaskPairState {
     workspace: pair.workspace ? { ...pair.workspace } : undefined,
     output: pair.output ? { ...pair.output } : undefined,
     roundBase: pair.roundBase ? { ...pair.roundBase } : undefined,
+    materialHold: pair.materialHold ? { ...pair.materialHold } : undefined,
   };
 }
 
@@ -1535,13 +1554,18 @@ export function applyTaskPairMarker(
       if (roundBase && material?.base && !sameTaskPairCommit(material.base, roundBase)) {
         return reject(`Delivery round ${taskPairDeliveryRound(pair)} of ${marker.taskId} is based on ${roundBase}; READY_FOR_AUDIT base=${material.base} does not match. Omit base= or name ${roundBase}, rebase your work onto it, commit, and resend.`);
       }
+      // A fresh READY replaces the material, so it lifts a hold; the daemon
+      // re-verifies ancestry when it relays this one (below), so the hold can
+      // never be bypassed by leaving the head out.
+      const resubmitsHeld = !!pair.materialHold;
+      pair.materialHold = undefined;
       if (material) pair.material = roundBase && !material.base ? { ...material, base: roundBase } : material;
       else if (pair.workspace?.path) {
         pair.material = { path: pair.workspace.path, ...(pair.workspace.lastHead ? { head: pair.workspace.lastHead } : {}), ...(roundBase ? { base: roundBase } : {}), at: ctx.now };
       }
       if (pair.status === 'in_audit') {
         // A resubmission inside the round with new material is relayed again.
-        if (material && pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) intents.push({ kind: 'audit_request', to: pair.auditor });
+        if ((material || resubmitsHeld) && pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) intents.push({ kind: 'audit_request', to: pair.auditor });
         return done('status');
       }
       if (pair.status === 'queued' || pair.status === 'passed' || terminal) unusual = true;
@@ -1572,6 +1596,16 @@ export function applyTaskPairMarker(
       if (role !== 'auditor' && !roleAuthority) {
         return reject(`Only the assigned auditor may write ${verb} for ${marker.taskId}; your marker was recorded but not applied.`);
       }
+      if (verb === 'PASS' && pair.materialHold) {
+        // The daemon found this round's head does not build on the round
+        // base: nothing may PASS it until a fresh READY. REWORK still applies.
+        const held = pair.materialHold;
+        const blocked = reject(`PASS for ${marker.taskId} was held: the round's material head ${held.head} does not descend from the round base ${held.base}. The executor was asked to send a new READY_FOR_AUDIT; wait for the resent audit request (REWORK still applies).`);
+        if (blocked.pair && pair.executor) {
+          intents.push({ kind: 'policy_notice', to: pair.executor, taskId: marker.taskId, text: `A PASS for ${marker.taskId} was held: your head ${held.head} does not descend from the round base ${held.base}. Rebase or merge onto ${held.base}, commit, and send a new READY_FOR_AUDIT with the new head.` });
+        }
+        return blocked;
+      }
       const verdict = judgeTaskPairVerdict(verb, attrs, pair.blocking);
       if (verdict.blockingMismatch) unusual = true;
       if (terminal && verb === 'PASS') {
@@ -1579,6 +1613,7 @@ export function applyTaskPairMarker(
         return done('recorded', { verdict });
       }
       applyVerdict(pair, verb, verdict, ctx.writer, intents, ctx);
+      pair.materialHold = undefined;
       if (role === 'brain') resetCapFlagsOnBrainAction(pair);
       return done(isAppliedVerdict(verdict.judgement) ? 'verdict' : 'verdict_held', { verdict });
     }

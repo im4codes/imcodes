@@ -208,14 +208,14 @@ export function buildRoundBaseMismatchExecutorMessage(pair: TaskPairState, head:
   return [
     header(pair),
     `READY_FOR_AUDIT for delivery round ${taskPairDeliveryRound(pair)} was not relayed: head ${head} does not descend from the round base ${base}.`,
-    `Rebase or merge your work onto ${base} (or ask Brain for NEXT_ROUND base=<commit> if the base is wrong), commit, and resend ${readyMarker(pair)} with the new head.`,
+    `Rebase or merge your work onto ${base} (or ask Brain for NEXT_ROUND base=<commit> if the base is wrong), commit, and resend ${readyMarker(pair)} with the new head. PASS is held for this round until then.`,
   ].join('\n');
 }
 
 export function buildRoundBaseMismatchAuditorMessage(pair: TaskPairState, head: string, base: string): string {
   return [
     header(pair),
-    `Delivery round ${taskPairDeliveryRound(pair)} material is not ready: head ${head} does not descend from the round base ${base}. The executor was asked to rebase and resend; wait for the resent audit request.`,
+    `Delivery round ${taskPairDeliveryRound(pair)} material is not ready: head ${head} does not descend from the round base ${base}. The executor was asked to rebase and resend; wait for the resent audit request. PASS is held by the daemon until then (REWORK still applies).`,
   ].join('\n');
 }
 

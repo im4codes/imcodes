@@ -21,6 +21,8 @@ import {
   TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
   TASK_PAIR_TIMELINE_EVENT,
+  TASK_PAIR_MATERIAL_EVENT_VERB,
+  TASK_PAIR_MATERIAL_HELD_EFFECT,
   TASK_PAIR_TITLE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
@@ -32,6 +34,7 @@ import {
   mayContainTaskPairMarker,
   scanTaskPairMarkers,
   stripTaskPairMarkersForDisplay,
+  sameTaskPairCommit,
   taskPairRoleOf,
   type TaskPairEventPayload,
   type TaskPairEventSource,
@@ -1352,6 +1355,7 @@ export class TaskPairService {
               if (roundBase.status === 'not_ancestor') {
                 // The state machine cannot run git; a head that does not build
                 // on this round's base is sent back instead of audited.
+                this.#holdMaterialOutsideBase(project, pair, roundBase.head, roundBase.base);
                 if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'material-base-mismatch', buildRoundBaseMismatchExecutorMessage(pair, roundBase.head, roundBase.base));
                 await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildRoundBaseMismatchAuditorMessage(pair, roundBase.head, roundBase.base));
               } else {
@@ -1528,6 +1532,34 @@ export class TaskPairService {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
       }
     }
+  }
+
+  /**
+   * A definite "head is not a descendant of the round base": besides
+   * withholding the audit relay, hold PASS on the pair itself (persisted, so a
+   * restart keeps it) until a fresh READY replaces the material. A separate
+   * state field rather than clearing pair.material: the "no material -> no
+   * verdict" rule would also block the auditor's REWORK, which must stay
+   * possible, and a new pair flag would have to be threaded through every
+   * flag enumeration. Re-read first: a newer READY may already have replaced
+   * the material while git was running.
+   */
+  #holdMaterialOutsideBase(project: string, pair: TaskPairState, head: string, base: string): void {
+    const store = getTaskPairStore();
+    const latest = store.getPair(project, pair.taskId)?.state;
+    if (!latest || latest.status !== 'in_audit' || latest.materialHold) return;
+    if (!latest.material?.head || !sameTaskPairCommit(latest.material.head, head)) return;
+    const at = Date.now();
+    const next: TaskPairState = { ...latest, materialHold: { reason: 'round_base_not_ancestor', head, base, at }, updatedAt: at };
+    store.savePair(project, next);
+    const eventId = `material:${pair.taskId}:${TASK_PAIR_MATERIAL_HELD_EFFECT}:${at}`;
+    store.recordEvent({
+      id: eventId, project, taskId: pair.taskId, writer: 'daemon', role: 'daemon', verb: TASK_PAIR_MATERIAL_EVENT_VERB,
+      attrs: { head, base }, effect: TASK_PAIR_MATERIAL_HELD_EFFECT, unusual: true, source: 'heartbeat', fromStatus: next.status, toStatus: next.status, at,
+    });
+    emitTaskPairDaemonEvent(next, {
+      eventId, verb: TASK_PAIR_MATERIAL_EVENT_VERB, effect: TASK_PAIR_MATERIAL_HELD_EFFECT, source: 'heartbeat', fromStatus: next.status, toStatus: next.status, unusual: true,
+    });
   }
 
   #recordWorkspaceEvent(
