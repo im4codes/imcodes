@@ -603,6 +603,51 @@ describe('pair workspaces', () => {
     expect(pair('R9').workspace?.lastHead).toBe('deadbeefcafefeed0000000000000000000000');
   });
 
+  it('warns auditor and Brain once when refresh observes a rewritten head that drops a foreign fix', async () => {
+    const path = await opened('R10');
+    const original = git(path, 'rev-parse', 'HEAD');
+    writeFileSync(join(path, 'rebase.txt'), 'foreign fix\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'foreign fix: preserve state');
+    const oldHead = git(path, 'rev-parse', 'HEAD');
+    git(path, 'branch', '-f', 'dev', oldHead);
+    const state = pair('R10');
+    getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
+    git(path, 'reset', '-q', '--hard', original);
+    writeFileSync(join(path, 'rebase.txt'), 'rewritten change\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'rebased stale resolution');
+
+    await refreshTaskPairWorkspaceHead(PROJECT, 'R10');
+    await vi.waitFor(() => expect(sentTo(AUD, 'rebase-revert-warning')).toHaveLength(1), { timeout: 10_000 });
+    await vi.waitFor(() => expect(sentTo(BRAIN, 'rebase-revert-warning')).toHaveLength(1), { timeout: 10_000 });
+    await refreshTaskPairWorkspaceHead(PROJECT, 'R10');
+    expect(sentTo(AUD, 'rebase-revert-warning')).toHaveLength(1);
+    expect(sentTo(BRAIN, 'rebase-revert-warning')).toHaveLength(1);
+  });
+
+  it('does not warn on refresh when a rewritten head drops a line owned by the old pair branch', async () => {
+    const path = await opened('R11');
+    const original = git(path, 'rev-parse', 'HEAD');
+    writeFileSync(join(path, 'rebase.txt'), 'pair-only line\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'pair-only temporary change');
+    const oldHead = git(path, 'rev-parse', 'HEAD');
+    // The integration branch does not contain the pair-only commit.
+    git(path, 'branch', '-f', 'dev', original);
+    const state = pair('R11');
+    getTaskPairStore().savePair(PROJECT, { ...state, workspace: { ...state.workspace!, base: original, lastHead: oldHead } });
+    git(path, 'reset', '-q', '--hard', original);
+    writeFileSync(join(path, 'rebase.txt'), 'rewritten implementation\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'rebased pair implementation');
+
+    await refreshTaskPairWorkspaceHead(PROJECT, 'R11');
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    expect(sentTo(AUD, 'rebase-revert-warning')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'rebase-revert-warning')).toHaveLength(0);
+  });
+
   describe('deliverables', () => {
     let plain = '';
     let timeline: Array<{ session: string; payload: Record<string, unknown> }>;

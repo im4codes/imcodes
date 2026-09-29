@@ -45,6 +45,7 @@ import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import { resolveTaskPairMaterial } from './material.js';
+import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
 import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import { isUsableTaskPairTitle, taskPairTitlePlaceholder } from './title-generator.js';
@@ -168,6 +169,10 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     if (!material.head) return;
     const now = Date.now();
     if (workspace.lastHead === material.head && workspace.lastHeadAt) return;
+    const previousHead = workspace.lastHead;
+    const rewritten = previousHead
+      ? await isRewrittenHead(workspace.path, previousHead, material.head)
+      : false;
     // Re-read: resolveTaskPairMaterial was an async gap, and something else
     // (endWorkspace ending the pair, a self-heal rebuild) may have mutated the
     // workspace while it ran. Merge lastHead onto FRESH state, never onto the
@@ -176,9 +181,17 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     const latest = store.getPair(project, taskId);
     const latestWorkspace = latest?.state.workspace;
     if (!latest || !latestWorkspace || latestWorkspace.status === 'removed') return;
-    store.savePair(project, { ...latest.state, workspace: { ...latestWorkspace, lastHead: material.head, lastHeadAt: now }, updatedAt: Math.max(latest.state.updatedAt, now) }, {
+    const shouldWarn = rewritten && latestWorkspace.lastRebaseNoticeHead !== material.head;
+    const nextWorkspace = {
+      ...latestWorkspace,
+      lastHead: material.head,
+      lastHeadAt: now,
+      ...(rewritten ? { lastRebaseNoticeHead: material.head, lastRebasePreviousHead: previousHead } : {}),
+    };
+    store.savePair(project, { ...latest.state, workspace: nextWorkspace, updatedAt: Math.max(latest.state.updatedAt, now) }, {
       liveness: { ...latest.liveness, lastMaterialAt: now },
     });
+    if (shouldWarn && previousHead) queueRebaseWarning(latest.state, taskId, material, previousHead);
   } catch (error) {
     // Best-effort cache refresh: the async gap above can outlive the pair's
     // store (test teardown, daemon shutdown). Losing lastHead is harmless --
@@ -186,6 +199,28 @@ export async function refreshTaskPairWorkspaceHead(project: string, taskId: stri
     // is not.
     logger.warn({ err: error, taskId }, 'task-pair: workspace head refresh failed');
   }
+}
+
+/** Run the advisory after state delivery; never delay marker/audit handoff. */
+function queueRebaseWarning(
+  pair: TaskPairState,
+  taskId: string,
+  material: Awaited<ReturnType<typeof resolveTaskPairMaterial>>,
+  previousHead: string,
+): void {
+  void (async () => {
+    const warning = formatPossibleSilentRevertWarning(await inspectPossibleSilentRevert({
+      ...material,
+      base: previousHead,
+      ownershipBase: material.base,
+      ownershipHead: previousHead,
+    }));
+    if (!warning) return;
+    if (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) {
+      await sendTaskPairMessage(pair.auditor, taskId, 'rebase-revert-warning', warning);
+    }
+    await sendTaskPairMessage(pair.brain, taskId, 'rebase-revert-warning', warning);
+  })().catch((error) => logger.warn({ err: error, taskId }, 'task-pair: rebase advisory failed'));
 }
 
 export class TaskPairService {
@@ -1004,11 +1039,15 @@ export class TaskPairService {
             break;
           case 'audit_request': {
             const material = await resolveTaskPairMaterial(pair);
+            const warning = formatPossibleSilentRevertWarning(await inspectPossibleSilentRevert(material));
             if (material.source === 'pending' || (!material.worktree && !material.path)) {
               if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'material-pending', `Material is pending for ${pair.taskId}; resend READY_FOR_AUDIT with worktree=<absolute path> head=<commit> (or path=<task directory>).`);
               await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', `Material pending for ${pair.taskId}; the executor must resend READY_FOR_AUDIT with an explicit workspace path and head.`);
             } else {
-              await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material));
+              await sendTaskPairMessage(intent.to, pair.taskId, 'audit-request', buildAuditRequestMessage(pair, material, warning));
+              if (warning) {
+                await sendTaskPairMessage(pair.brain, pair.taskId, 'rebase-revert-warning', warning);
+              }
             }
             break;
           }

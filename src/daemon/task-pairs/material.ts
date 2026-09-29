@@ -25,6 +25,10 @@ export interface ResolvedTaskPairMaterial {
   base?: string;
   /** Task-directory material. */
   path?: string;
+  intentionalNote?: string;
+  /** Rebase-only ownership context; never persisted in pair material. */
+  ownershipBase?: string;
+  ownershipHead?: string;
   /** Who named the material: the executor's marker, or the daemon's fallback. */
   source: 'executor' | 'workspace' | 'pending';
 }
@@ -66,6 +70,7 @@ export async function resolveTaskPairMaterial(pair: TaskPairState, deps: TaskPai
     ...(worktree ? { worktree } : {}),
     ...(head ? { head } : {}),
     ...(named?.base ? { base: named.base } : workspace?.base ? { base: workspace.base } : {}),
+    ...(named?.intentionalNote ? { intentionalNote: named.intentionalNote } : {}),
     source: named?.worktree || named?.head ? 'executor' : workspace ? 'workspace' : 'pending',
   };
 }

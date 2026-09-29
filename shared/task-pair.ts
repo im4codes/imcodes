@@ -754,6 +754,8 @@ export interface TaskPairMaterial {
   base?: string;
   /** Task-directory material: the directory or the result files. */
   path?: string;
+  /** Explicit note that a deletion is intentional; suppresses only the advisory. */
+  intentionalNote?: string;
   at: number;
 }
 
@@ -767,6 +769,8 @@ export interface TaskPairWorkspace {
   /** Most recently observed commit, refreshed by markers/heartbeats. */
   lastHead?: string;
   lastHeadAt?: number;
+  /** Last rewritten head for which the daemon emitted the advisory. */
+  lastRebaseNoticeHead?: string;
   createdAt: number;
   /**
    * `ended` from DONE/CANCEL until the retention elapses; then `removed`, or
@@ -785,11 +789,12 @@ export interface TaskPairOutput {
 }
 
 /** READY_FOR_AUDIT attributes that name the audit material. */
-export const TASK_PAIR_MATERIAL_ATTRS = ['worktree', 'head', 'base', 'path'] as const;
+export const TASK_PAIR_MATERIAL_ATTRS = ['worktree', 'head', 'base', 'path', 'intentionalNote'] as const;
 
 function materialFromAttrs(attrs: Record<string, string>, now: number): TaskPairMaterial | undefined {
   const material: TaskPairMaterial = { at: now };
   for (const key of TASK_PAIR_MATERIAL_ATTRS) if (attrs[key]) material[key] = attrs[key];
+  if (!material.intentionalNote && attrs.note) material.intentionalNote = attrs.note;
   return material.worktree || material.head || material.base || material.path ? material : undefined;
 }
 

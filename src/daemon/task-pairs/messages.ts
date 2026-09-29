@@ -385,7 +385,7 @@ export function buildAuditorHandoffMessage(pair: TaskPairState): string {
 }
 
 /** An audit round opened: exactly where the material is, resolved by the daemon. */
-export function buildAuditRequestMessage(pair: TaskPairState, material: ResolvedTaskPairMaterial): string {
+export function buildAuditRequestMessage(pair: TaskPairState, material: ResolvedTaskPairMaterial, warning?: string): string {
   const where = materialLine(material)
     ?? `Material: the executor did not name a workspace and none could be resolved; ask ${pair.executor} for its worktree path and head, or its task-directory path.`;
   return [
@@ -393,6 +393,7 @@ export function buildAuditRequestMessage(pair: TaskPairState, material: Resolved
     TASK_PAIR_TITLE_RULE,
     `Audit request, round ${Math.max(1, pair.round)}, from executor ${pair.executor} (blocking=${pair.blocking.join(',')}).`,
     `${where}${material.source === 'workspace' ? ' (resolved by the daemon from the executor session)' : ''}`,
+    ...(warning ? [warning] : []),
     `Their validation (full suites for code) comes from them via send_message. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
     TASK_PAIR_AUDITOR_PROPOSAL_RULE,
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
