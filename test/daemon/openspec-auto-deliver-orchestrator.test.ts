@@ -193,6 +193,11 @@ function describeOrchestratorActivity(): string {
     .filter((msg) => !!msg?.projection)
     .map((msg) => `${msg.type}:${msg.projection?.status ?? '-'}/${msg.projection?.stage ?? '-'}`)
     .slice(-6);
+  const terminals = serverLinkMock.send.mock.calls
+    .map((call) => call[0] as { type?: string; projection?: { status?: string; terminalReason?: string; evidence?: Array<{ summary?: string }> } })
+    .filter((msg) => msg?.type === OPENSPEC_AUTO_DELIVER_MSG.TERMINAL)
+    .slice(-3)
+    .map((msg) => `${msg.projection?.status ?? '-'}:${msg.projection?.terminalReason ?? '-'} evidence=${(msg.projection?.evidence ?? []).map((entry) => entry.summary ?? '').slice(-4).join(' | ')}`);
   // The stage matters most when nothing was sent at all: the idle handler
   // matches a run by stage, so "which stage was it in" separates a slow worker
   // from an edge that matched no branch and was dropped.
@@ -202,6 +207,7 @@ function describeOrchestratorActivity(): string {
       + `${run.awaitingDispatch ? ' awaiting-dispatch' : ''}`);
   return `\nlast transport sends:\n  ${sends.join('\n  ') || '(none)'}`
     + `\nlast projections: ${projections.join(', ') || '(none)'}`
+    + `\nterminal projections: ${terminals.join(' || ') || '(none)'}`
     + `\nlive runs: ${runs.join(' | ') || '(none)'}`;
 }
 
