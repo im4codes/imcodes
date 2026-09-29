@@ -262,6 +262,7 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE).toContain('NEEDS_INPUT');
     expect(TASK_PAIR_BOUNDARY_AUDIT_RULE).toContain('before PASS');
     expect(TASK_PAIR_MERGE_VERIFICATION_RULE).toContain('removed lines');
+    expect(TASK_PAIR_MERGE_VERIFICATION_RULE).toContain('end-to-end tests');
     // Brain-side rules precede the pairing policy they govern.
     expect(body.indexOf(TASK_PAIR_BRIEF_STRUCTURE_RULE)).toBeLessThan(body.indexOf('Automatic pairing policy'));
   });

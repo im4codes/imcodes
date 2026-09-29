@@ -288,8 +288,9 @@ export const TASK_PAIR_MERGE_VERIFICATION_RULE: string =
   + 'merged work and for boundary regressions before merging. When the '
   + 'executor reported complete full-suite results for the exact head on a '
   + 'base equal to the current integration tip, rerun only type checks and '
-  + 'the suites the change touches; otherwise rerun the full suites. Batch '
-  + 'small verified merges.';
+  + 'the suites the change touches; otherwise rerun the full suites. A '
+  + 'change to a state machine, protocol or marker handling always includes '
+  + 'the end-to-end tests that drive it. Batch small verified merges.';
 
 /**
  * From the 2-hourly stall review: most READYs bounced within minutes for
