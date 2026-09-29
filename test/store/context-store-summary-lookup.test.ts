@@ -71,7 +71,7 @@ describe('context-store summary lookups', () => {
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
-  function assertLookups(): void {
+  function assertLookups(indexed: boolean): void {
     expect(store.getLatestRecentSummaryUpdatedAtForTarget(session('A'))).toBe(3000);
     expect(store.getLatestRecentSummaryUpdatedAtForTarget(session('B'))).toBe(2000);
     expect(store.getLatestRecentSummaryUpdatedAtForTarget(session('C'))).toBe(4000);
@@ -82,6 +82,12 @@ describe('context-store summary lookups', () => {
     expect(store.getLatestMasterSummaryUpdatedAt('A', NS)).toBe(3500);
     expect(store.getLatestMasterSummaryUpdatedAt('B', NS)).toBeUndefined();
 
+    if (!indexed) {
+      // Before the covering index exists the sweep must NOT fall back to a
+      // full-table json scan (5.7 s cold on a 1 GB store): it reports nothing.
+      expect(store.listLatestRecentSummarySessions(1000)).toEqual([]);
+      return;
+    }
     const listed = store.listLatestRecentSummarySessions(1000);
     const nsKey = (n: ContextNamespace) => serializeContextNamespace(n);
     expect(listed.map((s) => [s.sessionName, nsKey(s.namespace), s.updatedAt])).toEqual([
@@ -94,13 +100,13 @@ describe('context-store summary lookups', () => {
     expect(store.listLatestRecentSummarySessions(0)).toEqual([]);
   }
 
-  it('resolves per-target / master / sweep lookups correctly without the maintenance indexes', () => {
-    assertLookups();
+  it('resolves per-target / master lookups correctly, and defers the sweep, before the maintenance indexes exist', () => {
+    assertLookups(false);
   });
 
   it('resolves them identically once the maintenance indexes exist', () => {
     buildIndexes();
-    assertLookups();
+    assertLookups(true);
   });
 
   it('listProcessedProjections options push filters into SQL and keep the legacy default', () => {

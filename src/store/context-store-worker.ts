@@ -47,6 +47,9 @@ const MAINTENANCE_TICK_MS = 1_000;
  * cursor backfills forever (the stalled noise backfill). A bounded step is
  * therefore forced at least this often even under load. */
 const MAINTENANCE_FORCE_INTERVAL_MS = 10_000;
+/** While index builds are still pending, one is run at least this often even
+ * under load (each is bounded to a few hundred ms). */
+const MAINTENANCE_INDEX_BUSY_INTERVAL_MS = 2_000;
 /** A forced checkpoint under sustained load, so the WAL cannot grow unbounded
  * while the idle gate is never open. */
 const CHECKPOINT_FORCE_INTERVAL_MS = 120_000;
@@ -190,46 +193,50 @@ function drain(): void {
 interface MaintenanceStep {
   name: string;
   run: () => void;
-  /** Heavy steps (index builds) only run when nothing is queued. */
-  idleOnly: boolean;
 }
-const maintenanceSteps: MaintenanceStep[] = [
-  { name: 'ensureContextStoreMaintenanceIndexes', run: () => { store.ensureContextStoreMaintenanceIndexes(); }, idleOnly: true },
-  { name: 'backfillNamespaceFilterColumnsBatch', run: () => store.backfillNamespaceFilterColumnsBatch(), idleOnly: false },
-  { name: 'backfillProcessedNoiseBatch', run: () => { store.backfillProcessedNoiseBatch(); }, idleOnly: false },
-  { name: 'reconcileMaterializedStagedEventsBatch', run: () => { store.reconcileMaterializedStagedEventsBatch(); }, idleOnly: false },
-  { name: 'purgeMemoryNoiseProjectionsBatch', run: () => { store.purgeMemoryNoiseProjectionsBatch(); }, idleOnly: false },
+const cursorSteps: MaintenanceStep[] = [
+  { name: 'backfillNamespaceFilterColumnsBatch', run: () => store.backfillNamespaceFilterColumnsBatch() },
+  { name: 'backfillProcessedNoiseBatch', run: () => { store.backfillProcessedNoiseBatch(); } },
+  { name: 'reconcileMaterializedStagedEventsBatch', run: () => { store.reconcileMaterializedStagedEventsBatch(); } },
+  { name: 'purgeMemoryNoiseProjectionsBatch', run: () => { store.purgeMemoryNoiseProjectionsBatch(); } },
 ];
 let maintenanceCursor = 0;
 let lastMaintenanceAt = 0;
+let lastIndexStepAt = 0;
+let indexesDone = false;
 let lastCheckpointAt = Date.now();
 
 function isWorkerBusy(): boolean {
   return draining || hasQueued();
 }
 
-function maintenanceTick(): void {
-  const now = Date.now();
-  const busy = isWorkerBusy();
-  if (busy && now - lastMaintenanceAt < MAINTENANCE_FORCE_INTERVAL_MS) return;
-  // Pick the next step; a heavy step is skipped (not forced) while busy.
-  let step: MaintenanceStep | undefined;
-  for (let i = 0; i < maintenanceSteps.length; i += 1) {
-    const candidate = maintenanceSteps[(maintenanceCursor + i) % maintenanceSteps.length]!;
-    if (busy && candidate.idleOnly) continue;
-    step = candidate;
-    maintenanceCursor = (maintenanceCursor + i + 1) % maintenanceSteps.length;
-    break;
-  }
-  if (!step) return;
-  lastMaintenanceAt = now;
+function runStep(name: string, run: () => void): void {
   const startedAt = performance.now();
   try {
-    step.run();
+    run();
   } catch {
     // Best-effort; a busy/locked step is retried on a later tick.
   }
-  reportSlow('maintenance', step.name, performance.now() - startedAt);
+  reportSlow('maintenance', name, performance.now() - startedAt);
+}
+
+function maintenanceTick(): void {
+  const now = Date.now();
+  const busy = isWorkerBusy();
+  // Index builds come first and are NOT idle-only: queries such as the master
+  // sweep depend on them, so a busy worker that never built them would serve
+  // those queries as full scans indefinitely. One index per step (a few hundred
+  // ms on a 1 GB store), paced so a queued request waits at most one build.
+  if (!indexesDone && (!busy || now - lastIndexStepAt >= MAINTENANCE_INDEX_BUSY_INTERVAL_MS)) {
+    lastIndexStepAt = now;
+    runStep('ensureContextStoreMaintenanceIndexes', () => { indexesDone = store.ensureContextStoreMaintenanceIndexes().done; });
+    return;
+  }
+  if (busy && now - lastMaintenanceAt < MAINTENANCE_FORCE_INTERVAL_MS) return;
+  const step = cursorSteps[maintenanceCursor % cursorSteps.length]!;
+  maintenanceCursor = (maintenanceCursor + 1) % cursorSteps.length;
+  lastMaintenanceAt = now;
+  runStep(step.name, step.run);
 }
 
 function maybeCheckpoint(): void {

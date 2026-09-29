@@ -4868,6 +4868,11 @@ export function listLatestRecentSummarySessions(limit = 1000): LatestRecentSumma
   const safeLimit = Math.max(0, Math.min(5000, Math.floor(limit)));
   if (safeLimit === 0) return [];
   const database = ensureDb();
+  // Until the maintenance step has built the covering index (first run after an
+  // upgrade) this GROUP BY degrades to a full-table json scan - 5.7 s cold on a
+  // 1 GB store, longer than the RPC budget. The sweep is periodic housekeeping,
+  // so report "nothing yet" and let a later poll run it on the index.
+  if (!database.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?").get(PROCESSED_SESSION_SUMMARY_INDEX)) return [];
   // One covering-index GROUP BY yields the newest row per (namespace, session);
   // the noise check then touches only that one candidate row per session, with
   // a per-session early-exit fallback when the newest row is noise. This

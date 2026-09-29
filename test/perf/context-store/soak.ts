@@ -44,7 +44,7 @@ for (const level of ['warn', 'error', 'log'] as const) {
     if (line.includes('worker slow')) logCounts.slowOpLines += 1;
     if (line.includes('RPC timeout')) logCounts.rpcTimeout += 1;
     if (line.includes('respawned after repeated timeouts')) logCounts.respawned += 1;
-    if (level === 'warn' && line.includes('worker lost')) orig(line);
+    if (line.includes('worker lost') || line.includes('worker slow') || line.includes('RPC timeout')) orig(`[t+${Math.round((Date.now() - T0) / 1000)}s] ${line}`);
   };
 }
 
@@ -54,6 +54,7 @@ for (const level of ['warn', 'error', 'log'] as const) {
 const KILL_AT_SEC = Number(process.env.SOAK_KILL_AT_SEC ?? 0);
 const recovery = { killedAt: 0, firstOkAfterKillMs: -1 };
 
+const T0 = Date.now();
 const stats = new Map<string, { samples: number[]; errors: Record<string, number> }>();
 async function timed<T>(name: string, fn: () => Promise<T>): Promise<T | undefined> {
   const s = stats.get(name) ?? { samples: [], errors: {} };
