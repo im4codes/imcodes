@@ -82,7 +82,9 @@ class FakePeerConnection extends EventTarget {
   static hangSetLocalDescription = false;
   static hangSetRemoteDescription = false;
   static hangGetStats = false;
+  static rejectIceBeforeFreshAnswer = false;
   remoteDescription: RTCSessionDescription | null = null;
+  private awaitingFreshAnswer = false;
   connectionState: RTCPeerConnectionState = 'new';
   /** A stale SCTP association can still leave WebRTC reporting `connected`. */
   acceptsNewDataChannels = true;
@@ -113,6 +115,7 @@ class FakePeerConnection extends EventTarget {
 
   async createOffer(): Promise<RTCSessionDescriptionInit> {
     if (FakePeerConnection.hangCreateOffer) return new Promise(() => undefined);
+    if (FakePeerConnection.rejectIceBeforeFreshAnswer) this.awaitingFreshAnswer = true;
     this.offerChannelLabels.push(this.channels.map((channel) => channel.label));
     if (this.channels.length === 0) throw new Error('cold offer has no data-channel application section');
     return { type: 'offer', sdp: 'browser-lease-offer' };
@@ -124,6 +127,7 @@ class FakePeerConnection extends EventTarget {
   async setRemoteDescription(description: RTCSessionDescriptionInit): Promise<void> {
     if (FakePeerConnection.hangSetRemoteDescription) return new Promise(() => undefined);
     this.remoteDescription = description as RTCSessionDescription;
+    this.awaitingFreshAnswer = false;
     if (!FakePeerConnection.keepConnectingAfterAnswer) {
       this.connectionState = 'connected';
       this.dispatchEvent(new Event('connectionstatechange'));
@@ -136,6 +140,9 @@ class FakePeerConnection extends EventTarget {
     }));
   }
   async addIceCandidate(candidate?: RTCIceCandidateInit): Promise<void> {
+    if (FakePeerConnection.rejectIceBeforeFreshAnswer && this.awaitingFreshAnswer) {
+      throw new Error('candidate belongs to the previous remote description');
+    }
     if (candidate) this.addedCandidates.push(candidate);
   }
   async getStats(): Promise<RTCStatsReport> {
@@ -558,6 +565,7 @@ describe('direct file transfer v2 browser broker', () => {
     FakePeerConnection.hangSetLocalDescription = false;
     FakePeerConnection.hangSetRemoteDescription = false;
     FakePeerConnection.hangGetStats = false;
+    FakePeerConnection.rejectIceBeforeFreshAnswer = false;
     vi.stubGlobal('RTCPeerConnection', FakePeerConnection);
     apiMocks.uploadFile.mockResolvedValue({
       ok: true,
@@ -1582,6 +1590,41 @@ describe('direct file transfer v2 browser broker', () => {
     await vi.waitFor(() => expect(FakePeerConnection.instances.at(-1)!.addedCandidates)
       .toContainEqual(expect.objectContaining({ candidate: srflx })));
     release?.();
+  });
+
+  it('queues a daemon ICE candidate until the current restart answer replaces a stale description', async () => {
+    // During an ICE restart Chromium keeps the previous answer in
+    // remoteDescription while the new answer is in flight.  A candidate for
+    // the new request must not be offered to that stale description: Chromium
+    // rejects it, and swallowing that rejection removes the only relay path.
+    const { probeDirectConnectivity } = await import('../src/direct-file-transfer.js');
+    const { ws, sent, emit } = createWs(directCapabilities, 'success', { secondOfferAnswerDelayMs: 50 });
+
+    await expect(probeDirectConnectivity(ws, undefined, 'server-1')).resolves.toMatchObject({ route: 'lan_direct' });
+    const peer = FakePeerConnection.instances.at(-1)!;
+    expect(peer.remoteDescription).toBeTruthy();
+    peer.connectionState = 'disconnected';
+    FakePeerConnection.rejectIceBeforeFreshAnswer = true;
+    const restarting = probeDirectConnectivity(ws, undefined, 'server-1');
+    await vi.waitFor(() => expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(2));
+
+    const offer = sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER).at(-1)!;
+    const relay = 'candidate:77 1 UDP 1046015 43.248.99.95 49277 typ relay raddr 0.0.0.0 rport 0';
+    emit({
+      type: DIRECT_FILE_TRANSFER_MSG.LEASE_ICE,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: offer.serverId,
+      browserTabId: offer.browserTabId,
+      leaseId: offer.leaseId,
+      leaseGeneration: offer.leaseGeneration,
+      daemonGeneration: offer.daemonGeneration,
+      requestId: offer.requestId,
+      candidate: relay,
+      mid: '0',
+    });
+
+    await expect(restarting).resolves.toMatchObject({ route: 'lan_direct' });
+    expect(peer.addedCandidates).toContainEqual(expect.objectContaining({ candidate: relay }));
   });
 
   it('reuses one lease peer for an upload followed by a preview download', async () => {

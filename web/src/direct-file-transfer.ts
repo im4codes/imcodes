@@ -1537,13 +1537,20 @@ async function ensureLeasePeer(
     // with nothing but unroutable private addresses — which is why a LAN
     // connected and a phone never could.
     lease.leaseIceOff?.();
+    // `RTCPeerConnection.remoteDescription` remains populated with the
+    // previous answer during an ICE restart.  Using that property as the
+    // readiness check sends trickled candidates for the new request to the
+    // old description; Chromium rejects them (and the old code intentionally
+    // swallowed that rejection), which is fatal on TURN-only networks.  The
+    // answer for *this* request is the only description candidates may target.
+    let remoteDescriptionReady = false;
     const off = lease.ws.onMessage((raw) => {
       const message = parseMatchingControl(raw, requestId);
       if (!message || message.type !== DIRECT_FILE_TRANSFER_MSG.LEASE_ICE || !leaseSignalMatches(message, lease, requestId)) return;
       const candidateType = readWebRtcCandidateType(message.candidate);
       if (candidateType) lease.daemonCandidateTypes.add(candidateType);
       const candidate = { candidate: message.candidate, sdpMid: message.mid };
-      if (leasePeer.remoteDescription) void leasePeer.addIceCandidate(candidate).catch(() => undefined);
+      if (remoteDescriptionReady) void leasePeer.addIceCandidate(candidate).catch(() => undefined);
       else candidates.push(candidate);
     });
     lease.leaseIceOff = off;
@@ -1599,6 +1606,10 @@ async function ensureLeasePeer(
       assertCurrentControl(lease, epoch);
       await waitForPeerNegotiation((async () => {
         await leasePeer.setRemoteDescription({ type: 'answer', sdp: remote.sdp });
+        // Mark this negotiation ready only after its answer is installed.  A
+        // candidate arriving before this point is retained and flushed below,
+        // even when the peer still exposes a stale prior remoteDescription.
+        remoteDescriptionReady = true;
         assertCurrentControl(lease, epoch);
         if (lease.peer !== leasePeer || !hasLeaseBinding(lease)) {
           throw directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED);
