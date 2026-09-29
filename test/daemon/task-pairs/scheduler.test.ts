@@ -903,6 +903,47 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'brain-blocked')).toHaveLength(1);
   });
 
+  it('does not replace a healthy auditor while the executor is waiting for an owner decision', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH WAIT_DECISION executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT WAIT_DECISION -->');
+    await flush();
+    marker(EXEC, '<!-- IMCODES_TASK BLOCKED WAIT_DECISION about=auditor note="waiting for Brain decision" -->');
+    await flush();
+    expect(pair('WAIT_DECISION')).toMatchObject({ auditor: AUD, status: 'in_audit' });
+    expect(pair('WAIT_DECISION').previousAuditors).toEqual([]);
+    expect(sentTo(BRAIN, 'auditor-reassignment-held')).toHaveLength(1);
+  });
+
+  it('pins a Brain-selected auditor against healthy automatic replacement', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH PINNED executor=${EXEC} auditor=${AUD} -->`);
+    marker(BRAIN, `<!-- IMCODES_TASK REASSIGN PINNED auditor=${SPARE} -->`);
+    await flush();
+    expect(pair('PINNED')).toMatchObject({ auditor: SPARE, auditorPinned: SPARE });
+    candidates = [SPARE2];
+    expect(await automation.replaceAuditor(PROJECT, 'PINNED', 'auditor silent for 3 heartbeats')).toBe(false);
+    expect(pair('PINNED')).toMatchObject({ auditor: SPARE, status: 'working' });
+  });
+
+  it('retains an in-audit pair when the only replacement candidate is busy', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH BUSY_REPL executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT BUSY_REPL -->');
+    await flush();
+    candidates = [SPARE];
+    busy.add(SPARE);
+    expect(await automation.replaceAuditor(PROJECT, 'BUSY_REPL', 'auditor silent for 3 heartbeats')).toBe(false);
+    expect(pair('BUSY_REPL')).toMatchObject({ auditor: AUD, status: 'in_audit' });
+    expect(sentTo(BRAIN, 'auditor-reassignment-held')).toHaveLength(1);
+  });
+
+  it('still replaces an auditor that is genuinely errored', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ERR_AUD executor=${EXEC} auditor=${AUD} -->`);
+    marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT ERR_AUD -->');
+    await flush();
+    upsertSession(session(AUD, 'w2', { state: 'error', error: 'provider exited' }));
+    expect(await automation.replaceAuditor(PROJECT, 'ERR_AUD', 'auditor silent for 3 heartbeats')).toBe(true);
+    expect(pair('ERR_AUD')).toMatchObject({ auditor: SPARE, status: 'in_audit' });
+  });
+
   it('DISPATCH over the concurrency limit auto-queues instead of starting, then auto-starts once a slot frees', async () => {
     marker(BRAIN, '<!-- IMCODES_TASK QUEUE - max=1 -->');
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH D1 executor=${EXEC} auditor=${AUD} -->`);

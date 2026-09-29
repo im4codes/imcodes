@@ -45,6 +45,7 @@ import { SUPERVISION_MCP_TOOLS } from '../../shared/supervision-mcp-tools.js';
 import type { McpRuntimeCaller } from '../../src/daemon/memory-mcp-caller.js';
 import { freezeSupervisionIntegrationBundle } from '../../src/daemon/supervision-integration-bundle.js';
 import { SESSION_IDENTITY_SESSION_MAX_CHARS } from '../../shared/session-identity.js';
+import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
 
 function session(overrides: Partial<SessionRecord> & Pick<SessionRecord, 'name' | 'projectName' | 'role'>): SessionRecord {
   return {
@@ -116,6 +117,39 @@ describe('send-tool', () => {
       },
     ]);
     expect(result.items[0]).not.toHaveProperty('projectDir');
+  });
+
+  it('does not mint an unnamed pair when Brain messages an auditor just removed from an open pair', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    setTaskPairStoreForTests(new TaskPairStore(':memory:'));
+    const brain = session({
+      name: 'deck_alpha_brain', projectName: 'alpha', role: 'brain',
+      transportConfig: { supervision: { mode: 'supervised_audit' } },
+    });
+    const removedAuditor = session({ name: 'deck_alpha_old_auditor', projectName: 'alpha', role: 'w1' });
+    const currentAuditor = session({ name: 'deck_alpha_current_auditor', projectName: 'alpha', role: 'w2' });
+    getTaskPairStore().savePair('alpha', {
+      taskId: 'pair-with-removed-auditor', brain: brain.name, executor: 'deck_alpha_executor',
+      auditor: currentAuditor.name, status: 'in_audit', flags: [], flagSides: {}, round: 1,
+      blocking: ['P0'], previousAuditors: [removedAuditor.name], capCounts: {}, capRound: 0,
+      createdAt: 1, updatedAt: 1,
+    });
+    const dispatchMessage = vi.fn().mockResolvedValue('delivered');
+    try {
+      const result = await dispatchSendMessage({ ...caller, sessionName: brain.name }, {
+        target: removedAuditor.name, message: 'handoff context only',
+      }, {
+        listSessions: () => [brain, removedAuditor, currentAuditor], dispatchMessage,
+      });
+      expect(result).toMatchObject({ status: 'accepted' });
+      expect(result).not.toHaveProperty('taskId');
+      expect(getTaskPairStore().listActivePairs('alpha')).toHaveLength(1);
+    } finally {
+      setTaskPairStoreForTests(undefined);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
   });
 
   it('surfaces the caller project\'s current supervision mode and auto-audit flag', () => {

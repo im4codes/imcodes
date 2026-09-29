@@ -1268,6 +1268,14 @@ function implicitWorkPairTarget(
   // the pair it already opened again.
   if (getTaskPairStore().getPair(project, taskId)?.state.executor === target) return target;
   if (getTaskPairStore().isParticipantOfOpenPair(target)) return undefined;
+  // A Brain follow-up sent to an auditor that was just removed from an open
+  // pair is ordinary correspondence, not a new dispatch.  Keep the prior
+  // auditor history from being mistaken for a fresh worker target while the
+  // handoff/resend messages are still in flight.
+  const recentlyRemoved = getTaskPairStore().listActivePairs(project).some((stored) => (
+    stored.state.previousAuditors.includes(target)
+  ));
+  if (recentlyRemoved) return undefined;
   return target;
 }
 

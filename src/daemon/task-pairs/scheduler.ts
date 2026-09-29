@@ -712,6 +712,13 @@ export class TaskPairAutomation implements TaskPairScheduler {
     void sendTaskPairMessage(pair.brain, pair.taskId, reason, buildBrainLine(pair, text));
   }
 
+  #retainAuditorNotice(project: string, stored: StoredTaskPair, text: string, key: string): void {
+    if (stored.liveness.notified.includes(key)) return;
+    const liveness = { ...stored.liveness, notified: [...stored.liveness.notified, key] };
+    getTaskPairStore().saveLiveness(project, stored.state.taskId, liveness);
+    this.#queueLineNotice(stored.state, 'auditor-reassignment-held', text);
+  }
+
   async #flushPendingNotices(): Promise<void> {
     const pending = this.#pendingNotices;
     if (!pending) return;
@@ -1359,6 +1366,23 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (!stored || isTerminalTaskPairStatus(stored.state.status) || stored.state.auditor === TASK_PAIR_NO_AUDITOR) return false;
     const pair = stored.state;
     const hadRealAuditor = !!pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR;
+    const auditorRecord = pair.auditor ? getSession(pair.auditor) : undefined;
+    const auditorUnavailable = !auditorRecord || auditorRecord.state === 'error';
+    const executorWaitingForOwner = reason === 'executor blocked on the auditor'
+      && (pair.flags.includes('blocked') || pair.flags.includes('needs_input') || pair.flags.includes('executor_silent'))
+      && (pair.flagSides.blocked === 'executor' || pair.flagSides.needs_input === 'executor' || pair.flags.includes('executor_silent'));
+    // A BLOCKED/NEEDS_INPUT report is an escalation to Brain, not evidence
+    // that a healthy auditor is lost.  Do not bounce the auditor while the
+    // owner is deciding; retain the pair's working/in_audit state.
+    if (!opts.dueToLimit && hadRealAuditor && !auditorUnavailable
+      && (executorWaitingForOwner || (pair.auditorPinned === pair.auditor))) {
+      const key = `auditor-reassignment-held:${pair.round}:${reason}`;
+      this.#retainAuditorNotice(project, stored,
+        executorWaitingForOwner
+          ? `Executor is waiting for Brain/owner input; healthy auditor ${pair.auditor} remains assigned.`
+          : `Brain-pinned auditor ${pair.auditor} remains assigned while healthy; automatic replacement is suppressed.`, key);
+      return false;
+    }
     // Owner report (tsk_cd_limit_failover addendum): a "there is no auditor"
     // pick must never fire, or leave needs_auditor set, once a real auditor
     // is actually assigned. `executor_blocked`/limited/silent reasons are
@@ -1396,8 +1420,17 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const requestedModel = opts.dueToLimit ? undefined : pair.auditorModel;
     const avoidProviderFamily = opts.dueToLimit && hadRealAuditor ? providerFamilyOfSession(pair.auditor!) : undefined;
     const pickInput = { brain: pair.brain, role: 'auditor' as const, pool: 'primary' as const, exclude, project, requestedModel, avoidProviderFamily };
-    const next = this.#pick(pickInput) ?? await this.#provision({ ...pickInput, taskId });
-    if (!next || exclude.has(next)) {
+    const picked = this.#pick(pickInput);
+    const next = picked ?? await this.#provision({ ...pickInput, taskId });
+    // Injectable pickers are used by tests and integrations, so enforce the
+    // same idle/non-reserved contract here as the default pool picker.
+    if (next && (exclude.has(next) || this.#busy(next))) {
+      this.#retainAuditorNotice(project, stored,
+        `No idle auditor is available; retained ${pair.auditor ?? '(none)'} and left pair status ${pair.status}.`,
+        `auditor-reassignment-held:${pair.round}:no-idle-candidate`);
+      return false;
+    }
+    if (!next) {
       if (opts.dueToLimit) {
         // The current (limited) auditor is EXCLUDED from `exclude` above so
         // the pick never re-selects it -- but it must stay IN this scan, or

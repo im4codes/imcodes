@@ -722,6 +722,9 @@ export interface TaskPairState {
   blockingSource?: TaskPairBlockingSource;
   lastVerdict?: { verb: 'PASS' | 'REWORK'; counts: TaskPairSeverityCounts; judgement: TaskPairVerdictJudgement; round: number };
   previousAuditors: string[];
+  /** Auditor explicitly selected by Brain; heartbeat replacement must keep it
+   * unless the session is genuinely unavailable. */
+  auditorPinned?: string;
   executorPool?: string;
   auditorPool?: string;
   /**
@@ -1552,6 +1555,11 @@ export function applyTaskPairMarker(
       if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION) markTaskPairStarted(pair, ctx.now);
       const auditorBefore = pair.auditor;
       setRolesFromAttrs(pair, attrs, intents);
+      // A Brain-authorized auditor choice is a durable pin.  Heartbeat
+      // REASSIGNs use source=heartbeat and deliberately do not set it.
+      if (brainAuthority && attrs.auditor !== undefined) {
+        pair.auditorPinned = attrs.auditor === TASK_PAIR_NO_AUDITOR ? undefined : attrs.auditor;
+      }
       if (namedParticipantIsBusy(attrs, ctx.busySessions)) {
         pair.status = 'queued';
         intents.push({ kind: 'slot_changed' });
