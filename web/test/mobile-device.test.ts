@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { isMobileLayout } from '../src/mobile-device.js';
+import { isMobileDevice, isMobileLayout } from '../src/mobile-device.js';
 
 describe('shared mobile layout detection', () => {
   it.each([
@@ -27,8 +27,18 @@ describe('shared mobile layout detection', () => {
     })).toBe(false);
   });
 
-  it('recognizes a coarse touch device up to the medium breakpoint', () => {
+  it('recognizes a touch device independently of viewport width', () => {
     expect(isMobileLayout({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', width: 800, pointerCoarse: true, maxTouchPoints: 1 })).toBe(true);
-    expect(isMobileLayout({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', width: 1280, pointerCoarse: true, maxTouchPoints: 1 })).toBe(false);
+    expect(isMobileDevice({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', width: 1280, pointerCoarse: true, maxTouchPoints: 1 })).toBe(true);
+  });
+
+  it('keeps a narrow fine-pointer desktop in the desktop app shell', () => {
+    const desktop = { userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', width: 600, pointerCoarse: false, maxTouchPoints: 0 };
+    expect(isMobileDevice(desktop)).toBe(false);
+    expect(isMobileLayout(desktop)).toBe(true);
+  });
+
+  it('recognizes desktop-site phones through touch without using width', () => {
+    expect(isMobileDevice({ userAgent: 'Mozilla/5.0 (X11; Linux x86_64)', width: 1024, pointerCoarse: true, maxTouchPoints: 5 })).toBe(true);
   });
 });

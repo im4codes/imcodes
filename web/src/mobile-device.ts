@@ -1,10 +1,4 @@
-/**
- * Phone/tablet detection used by the app shell to choose its mobile layout.
- * Components that must agree with that layout (e.g. the task status panel)
- * use this instead of a viewport-width guess: some mobile WebViews report a
- * CSS width above the narrow-screen breakpoint while the app is in its mobile
- * layout.
- */
+/** Phone/tablet detection used by the app shell. */
 export function isMobileUserAgent(userAgent: string = typeof navigator === 'undefined' ? '' : navigator.userAgent): boolean {
   return /iPhone|iPad|iPod|Android/i.test(userAgent);
 }
@@ -18,13 +12,12 @@ export type MobileLayoutOptions = {
 };
 
 /**
- * The one layout decision shared by the app shell and responsive panels.
- * iPadOS can deliberately advertise a desktop Macintosh UA, and Capacitor
- * WebViews can report a wide CSS viewport, so UA/width alone is insufficient.
+ * Device decision for the app shell. This deliberately does not inspect
+ * viewport width: a desktop window may be resized narrow without becoming a
+ * phone layout, while desktop-site mobile browsers still expose touch.
  */
-export function isMobileLayout(options: MobileLayoutOptions = {}): boolean {
+export function isMobileDevice(options: MobileLayoutOptions = {}): boolean {
   const userAgent = options.userAgent ?? (typeof navigator === 'undefined' ? '' : navigator.userAgent);
-  const width = options.width ?? (typeof window !== 'undefined' && Number.isFinite(window.innerWidth) ? window.innerWidth : undefined);
   const maxTouchPoints = options.maxTouchPoints ?? (typeof navigator === 'undefined' ? 0 : navigator.maxTouchPoints || 0);
   const capacitor = (globalThis as { Capacitor?: { isNativePlatform?: () => boolean } }).Capacitor;
   const native = options.native ?? Boolean(capacitor?.isNativePlatform?.());
@@ -35,5 +28,11 @@ export function isMobileLayout(options: MobileLayoutOptions = {}): boolean {
   const coarse = options.pointerCoarse ?? (typeof window !== 'undefined' && typeof window.matchMedia === 'function'
     ? window.matchMedia('(pointer: coarse)').matches
     : false);
-  return width !== undefined && (width <= 720 || (coarse && width <= 1024));
+  return coarse && maxTouchPoints > 0;
+}
+
+/** Responsive panel decision; unlike the app shell, panels compact in narrow desktop windows. */
+export function isMobileLayout(options: MobileLayoutOptions = {}): boolean {
+  const width = options.width ?? (typeof window !== 'undefined' && Number.isFinite(window.innerWidth) ? window.innerWidth : undefined);
+  return isMobileDevice(options) || (width !== undefined && width <= 720);
 }

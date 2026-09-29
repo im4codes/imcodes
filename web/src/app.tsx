@@ -213,7 +213,7 @@ import {
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
-import { isMobileLayout } from './mobile-device.js';
+import { isMobileDevice, isMobileLayout } from './mobile-device.js';
 import {
   getAuthKey,
   clearAuthKey,
@@ -880,7 +880,7 @@ export function App() {
   // launch (owner: load silently, no big box on open). It opens only from its
   // toggle. Desktop keeps the remembered side-panel state.
   const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
-    () => !isMobileLayout() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
+    () => !isMobileDevice() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
   );
   const toggleSupervisionTaskConsole = useCallback(() => {
     setShowSupervisionTaskConsole((open) => {
@@ -2008,7 +2008,7 @@ export function App() {
   if (stackRef.current === null) stackRef.current = new MutableDesktopWindowStack();
   const [stackVersion, setStackVersion] = useState(0);
   const bumpStack = useCallback(() => setStackVersion((n) => n + 1), []);
-  const isMobileRef = useRef(/iPhone|iPad|iPod|Android/i.test(navigator.userAgent));
+  const isMobileRef = useRef(isMobileDevice());
 
   // Active (frontmost) sub-session. Managed EXPLICITLY rather than re-derived
   // from the mutable window stack on every render: opening/focusing a window
@@ -3658,7 +3658,7 @@ export function App() {
     }
   }, [activeSession, bringSubToFront, runVersionSensitiveAction, setPinnedPanels, subSessions, trans]);
 
-  const isMobile = isMobileLayout();
+  const isMobile = isMobileDevice();
   isMobileRef.current = isMobile;
   const desktopLayoutCapable = !isMobile;
   const visibleTeamDiscussions = useMemo(() => discussions.filter((discussion) => (

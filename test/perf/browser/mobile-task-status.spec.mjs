@@ -14,6 +14,7 @@ const taskSnapshot = {
 };
 
 async function openCase(browser, scenario) {
+  const expectMobilePanel = scenario.panelMobile ?? scenario.mobile;
   const context = await browser.newContext({
     viewport: { width: scenario.width, height: scenario.height },
     deviceScaleFactor: 2,
@@ -57,7 +58,7 @@ async function openCase(browser, scenario) {
     const collapse = panel.getByRole('button', { name: /collapse task status|收起任务状态|收起任務狀態/i }).first();
     if (await collapse.count()) await collapse.click();
   }
-  if (scenario.mobile && await panel.locator('.task-pair-status-compact').count() === 0) {
+  if (expectMobilePanel && await panel.locator('.task-pair-status-compact').count() === 0) {
     const diagnostic = await page.evaluate(() => ({
       panelClass: document.querySelector('[data-testid="task-pair-status-panel"]')?.className,
       media: window.matchMedia('(max-width: 720px)').matches,
@@ -108,7 +109,7 @@ async function openCase(browser, scenario) {
   };
   await ensureCollapsed();
   await assertNoCollision('collapsed');
-  if (scenario.mobile) {
+  if (expectMobilePanel) {
     assert.equal(await panel.locator('.task-pair-status-collapse-icon').count(), 0);
   } else {
     assert.ok(await panel.locator('.task-pair-status-toggle[aria-expanded="false"]').count() > 0, `${scenario.label}: desktop collapse control missing`);
@@ -118,7 +119,7 @@ async function openCase(browser, scenario) {
   await assertNoCollision('expanded');
   await panel.locator('.task-pair-status-toggle').first().click();
   assert.equal(await panel.locator('.task-pair-status-rows').count() > 0 ? await panel.locator('.task-pair-status-rows').isVisible() : false, false, `${scenario.label}: toggle did not collapse`);
-  if (scenario.mobile) {
+  if (expectMobilePanel) {
     assert.match(parentClass, /chat-titlebar/);
     assert.equal(await panel.locator('.task-pair-status-compact').count() > 0, true, `${scenario.label}: compact mobile strip missing`);
     const collapsedStyle = await panel.evaluate((element) => {
@@ -163,6 +164,7 @@ export async function runMobileTaskStatusScenario() {
     ...[1280, 1024, 800].flatMap((width) => [true, false].map((pinned) => ({
       label: `desktop-${width}-${pinned ? 'pinned' : 'no-pinned'}`, width, height: 900, mobile: false, pinned,
     }))),
+    { label: 'desktop-narrow-600', width: 600, height: 900, mobile: false, panelMobile: true, pinned: true },
   ];
   try {
     const results = [];
