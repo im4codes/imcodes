@@ -870,6 +870,8 @@ export interface TaskPairTransition {
   unusual: boolean;
   intents: TaskPairIntent[];
   verdict?: TaskPairVerdictJudgementResult;
+  /** Existing claim that blocked a CLAIM marker; exposed for actionable conflict reporting. */
+  resourceConflict?: TaskPairResourceClaim;
 }
 
 export interface TaskPairApplyContext {
@@ -1670,6 +1672,8 @@ export interface TaskPairEventPayload {
   fromStatus?: TaskPairStatus;
   toStatus?: TaskPairStatus;
   unusual: boolean;
+  /** Existing claim that blocked a CLAIM marker, including holder and expiry. */
+  resourceConflict?: TaskPairResourceClaim;
   title?: string;
   executor?: string;
   executorLabel?: string;

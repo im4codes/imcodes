@@ -39,6 +39,7 @@ import {
   type TaskPairMarker,
   type TaskPairState,
   type TaskPairResourceMode,
+  type TaskPairResourceClaim,
   type TaskPairTransition,
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
@@ -518,8 +519,9 @@ export class TaskPairService {
       const raw = Number(input.marker.attrs.ttl ?? 1800000); const ttlMs = Number.isFinite(raw) ? Math.max(60000, Math.min(86400000, raw < 1000 ? raw * 1000 : raw)) : 1800000;
       const claimed = resource && mode ? this.claimResource({ project: input.project, taskId: existing.state.taskId, owner: input.writer, resource, mode, ttlMs, now }) : { ok: false };
       const effect = claimed.ok ? 'resource_claimed' : 'resource_conflict';
+      const resourceConflict = !claimed.ok && 'conflict' in claimed ? claimed.conflict : undefined;
       store.recordEvent({ id: input.eventId, project: input.project, taskId: existing.state.taskId, writer: input.writer, role: taskPairRoleOf(existing.state, input.writer), verb: 'CLAIM', attrs: input.marker.attrs, effect, unusual: !claimed.ok, source: input.source, fromStatus: existing.state.status, toStatus: existing.state.status, at: now });
-      const transition = { pair: claimed.ok ? claimed.pair : existing.state, fromStatus: existing.state.status, toStatus: existing.state.status, effect, unusual: !claimed.ok, intents: [] } as TaskPairTransition;
+      const transition = { pair: claimed.ok ? claimed.pair : existing.state, fromStatus: existing.state.status, toStatus: existing.state.status, effect, unusual: !claimed.ok, intents: [], ...(resourceConflict ? { resourceConflict } : {}) } as TaskPairTransition;
       this.#emitEvent(input, existing.state.taskId, taskPairRoleOf(existing.state, input.writer), transition, transition.pair); return transition;
     }
     // A marker can be observed twice (the assistant reply and a relay copy).
@@ -570,6 +572,7 @@ export class TaskPairService {
       attrs: eventAttrs,
       effect: transition.effect,
       unusual: transition.unusual,
+      ...(transition.resourceConflict ? { resourceConflict: transition.resourceConflict } : {}),
       source: input.source,
       ...(transition.fromStatus ? { fromStatus: transition.fromStatus } : {}),
       ...(transition.toStatus ? { toStatus: transition.toStatus } : {}),
