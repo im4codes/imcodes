@@ -404,6 +404,8 @@ export const SHARE_DAEMON_MESSAGE_TYPES = {
   SUPERVISION_TASK_CONSOLE_DELTA: 'supervision.task_console.delta',
   SUPERVISION_TASK_CONSOLE_RESYNC_REQUIRED: 'supervision.task_console.resync_required',
   SUPERVISION_TASK_CONSOLE_UNAVAILABLE: 'supervision.task_console.unavailable',
+  SUPERVISION_TASK_CONSOLE_PAIR_DELTA: 'supervision.task_console.pair_delta',
+  SUPERVISION_TASK_CONSOLE_BRIEF_RESPONSE: 'supervision.task_console.brief_response',
 } as const;
 
 export type ShareDaemonMessageType = (typeof SHARE_DAEMON_MESSAGE_TYPES)[keyof typeof SHARE_DAEMON_MESSAGE_TYPES];
@@ -440,6 +442,8 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = {
   [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_DELTA]: daemonAllow('main', true),
   [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_RESYNC_REQUIRED]: daemonAllow('main', true),
   [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_UNAVAILABLE]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_PAIR_DELTA]: daemonAllow('main', true),
+  [SHARE_DAEMON_MESSAGE_TYPES.SUPERVISION_TASK_CONSOLE_BRIEF_RESPONSE]: daemonAllow('main', true),
 } as const satisfies Record<ShareDaemonMessageType, ShareDaemonMessagePolicyEntry>;
 
 export const SHARE_DAEMON_RELAY_INVENTORY = Object.values(SHARE_DAEMON_MESSAGE_TYPES);

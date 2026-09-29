@@ -320,6 +320,21 @@ export class TaskPairStore {
     return rows.map(rowToPair);
   }
 
+  /**
+   * Task ids of the pairs `listPairs` would return, in the same order, without
+   * parsing any pair JSON (the console delta path only needs set membership).
+   */
+  listPairWindowIds(project: string, limit = 200): string[] {
+    const rows = this.#db.prepare('SELECT task_id FROM task_pairs WHERE project = ? ORDER BY updated_at DESC LIMIT ?').all(project, limit) as Array<{ task_id: string }>;
+    return rows.map((row) => String(row.task_id));
+  }
+
+  /** Queued pairs of a project (few); the console recomputes their queue positions. */
+  listQueuedPairs(project: string): StoredTaskPair[] {
+    const rows = this.#db.prepare("SELECT * FROM task_pairs WHERE project = ? AND status = 'queued'").all(project) as Array<Record<string, unknown>>;
+    return rows.map(rowToPair);
+  }
+
   /** All pairs owned by one Brain, optionally including terminal history. */
   listPairsForBrain(brain: string, project?: string, includeFinished = false, limit = 500): StoredTaskPair[] {
     const terminal = TASK_PAIR_TERMINAL_STATUSES.map(() => '?').join(',');

@@ -206,7 +206,7 @@ function TaskPairConsoleDetails({ pair, taskId }: { pair: SupervisionConsolePair
       ))}
       {pair.checklist && <span class="supervision-task-console-checklist-progress">{t('taskPair.checklist_progress', { implemented: pair.checklist.implemented, audited: pair.checklist.audited, total: pair.checklist.total })}</span>}
       {pair.lastNudgedAt !== undefined && <span>{t('taskPair.last_nudged', { duration: Math.max(1, Math.round((Date.now() - pair.lastNudgedAt) / 60_000)) })}</span>}
-      <TaskPairBrief brief={pair.brief} taskId={taskId} className="supervision-task-console-brief" />
+      <TaskPairBrief brief={pair.brief} briefRevision={pair.briefRevision} checklist={pair.checklist} taskId={taskId} className="supervision-task-console-brief" />
     </div>
   );
 }

@@ -1557,20 +1557,29 @@ export async function startup(): Promise<DaemonContext> {
       onError: (error) => logger.warn({ error }, 'supervision console projection unavailable'),
     });
     logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
-    // Pair changes refresh the task console (resync) and the session badges,
-    // coalesced per project so a burst of markers costs one refresh.
-    const pendingPairRefresh = new Map<string, NodeJS.Timeout>();
-    const schedulePairRefresh = (project: string, reason: 'task_pair_changed' | 'session_activity_changed') => {
-      if (pendingPairRefresh.has(project)) return;
+    // Pair changes refresh the task console and the session badges, coalesced
+    // per project so a burst of markers costs one refresh. The console gets a
+    // one-pair delta for the pairs that changed; a legacy console viewer still
+    // re-subscribes for a full snapshot.
+    const pendingPairRefresh = new Map<string, { timer: NodeJS.Timeout; taskIds: Set<string>; reason: 'task_pair_changed' | 'session_activity_changed' }>();
+    const schedulePairRefresh = (project: string, taskId: string, reason: 'task_pair_changed' | 'session_activity_changed') => {
+      const pending = pendingPairRefresh.get(project);
+      if (pending) {
+        pending.taskIds.add(taskId);
+        if (reason === 'task_pair_changed') pending.reason = reason;
+        return;
+      }
+      const taskIds = new Set([taskId]);
       const timer = setTimeout(() => {
+        const flushed = pendingPairRefresh.get(project);
         pendingPairRefresh.delete(project);
-        supervisionConsole?.sessions.resyncProject(project, reason);
+        supervisionConsole?.sessions.pairsChanged(project, taskIds, flushed?.reason ?? reason);
         taskPairAutomation.publishBadges();
       }, 250);
       timer.unref?.();
-      pendingPairRefresh.set(project, timer);
+      pendingPairRefresh.set(project, { timer, taskIds, reason });
     };
-    getTaskPairStore().onPairSaved((project) => schedulePairRefresh(project, 'task_pair_changed'));
+    getTaskPairStore().onPairSaved((project, taskId) => schedulePairRefresh(project, taskId, 'task_pair_changed'));
     // State/tool events change live executorState/auditorState in the status
     // payload even when no pair row was saved. Resolve by participant so main
     // sessions and sub-sessions follow the same refresh path.
@@ -1582,7 +1591,7 @@ export async function startup(): Promise<DaemonContext> {
       if (event.type !== 'session.state' && event.type !== 'assistant.thinking' && event.type !== 'assistant.text'
         && event.type !== 'tool.call' && event.type !== 'tool.result') return;
       for (const pair of getTaskPairStore().pairsForSession(event.sessionId)) {
-        schedulePairRefresh(pair.project, 'session_activity_changed');
+        schedulePairRefresh(pair.project, pair.state.taskId, 'session_activity_changed');
       }
     });
   } catch (err) {

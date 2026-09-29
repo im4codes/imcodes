@@ -4471,6 +4471,8 @@
     "brief_collapse": "タスク内容を隠す",
     "brief_copy": "概要をコピー",
     "brief_copied": "コピーしました",
+    "brief_loading": "ブリーフを読み込み中…",
+    "brief_unavailable": "ブリーフを取得できません。もう一度開いて再試行してください。",
     "brief_content": "タスク内容",
     "brief_checklist": "チェックリスト"
   }

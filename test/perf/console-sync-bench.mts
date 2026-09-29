@@ -13,6 +13,13 @@
  * Run the SAME script against two source trees to compare revisions:
  *   BENCH_ROOT=/path/to/tree npx tsx test/perf/console-sync-bench.mts
  * (BENCH_ROOT defaults to this repository; the tree needs node_modules.)
+ *
+ * Each pair-activity tick first WRITES one pair (as the pairs engine does),
+ * then notifies the viewer exactly the way the tree's lifecycle does:
+ *   - trees with `registry.pairsChanged` and BENCH_VIEWER=delta (default): the
+ *     viewer declares pair_delta_v1 and receives a one-pair delta frame;
+ *   - otherwise (older trees, or BENCH_VIEWER=legacy): `resyncProject` -> the
+ *     viewer re-subscribes -> full snapshot with every brief inline.
  */
 import { DatabaseSync } from 'node:sqlite';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -29,6 +36,7 @@ const ASSIGNMENTS = Number(process.env.BENCH_ASSIGNMENTS ?? 2121);
 const EVENTS = Number(process.env.BENCH_EVENTS ?? 75_000);
 const PAIRS = Number(process.env.BENCH_PAIRS ?? 228);
 const STALL_MS = 75;
+const VIEWER = process.env.BENCH_VIEWER ?? 'delta';
 const PROJECT = 'perfproj';
 const SCOPE = { projectName: PROJECT, coordinatorSessionName: `deck_${PROJECT}_brain` };
 
@@ -99,6 +107,8 @@ const producer = new SupervisionConsoleProducer(db, {
   broadcast: (frame: unknown) => registry.broadcast(frame),
   resolveSessionPresentation: (name: string, at: number) => ({ label: name, model: 'm', state: 'running', source: 'runtime', observedAt: at }),
 });
+// Filled in once the registry exists; decides which viewer flavour subscribes.
+let useDelta = false;
 let bytesSent = 0;
 let frames = 0;
 let subscriptionSeq = 0;
@@ -109,10 +119,17 @@ const registry = new SupervisionConsoleSessionRegistry({
   now: () => Date.now(),
   send: (frame: { type?: string }) => {
     frames += 1;
-    bytesSent += JSON.stringify(frame).length;
+    const size = JSON.stringify(frame).length;
+    bytesSent += size;
+    if (frame.type === consoleShared.SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) { breakdown.snapshots += 1; breakdown.snapshotBytes += size; }
+    if (frame.type === consoleShared.SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA) { breakdown.deltas += 1; breakdown.deltaBytes += size; }
+    if (frame.type === consoleShared.SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED) breakdown.resyncs += 1;
     if (frame.type === consoleShared.SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED) setImmediate(subscribe);
   },
 });
+
+useDelta = VIEWER === 'delta' && typeof (registry as { pairsChanged?: unknown }).pairsChanged === 'function';
+const breakdown = { snapshots: 0, snapshotBytes: 0, deltas: 0, deltaBytes: 0, resyncs: 0 };
 
 function subscribe(): void {
   subscriptionSeq += 1;
@@ -128,6 +145,7 @@ function subscribe(): void {
     projectionVersion: 0,
     lastDurableEventId: null,
     projectionEpoch: 'bench-epoch',
+    ...(useDelta ? { features: [consoleShared.SUPERVISION_TASK_CONSOLE_FEATURES.PAIR_DELTA_V1] } : {}),
   });
   busy.resync += performance.now() - started;
 }
@@ -141,9 +159,20 @@ const sampler = setInterval(() => {
 }, 10);
 
 subscribe();
+let pairTick = 0;
 const resyncTimer = setInterval(() => {
+  // One pair is written per tick (exactly what a marker/verdict does)...
+  pairTick += 1;
+  const index = pairTick % PAIRS;
   const started = performance.now();
-  registry.resyncProject(PROJECT, 'task_pair_changed');
+  pairStore.savePair(PROJECT, {
+    taskId: `pair_${index}`, brain: SCOPE.coordinatorSessionName, executor: `deck_sub_${index % 40}`, auditor: `deck_sub_${(index + 7) % 40}`,
+    title: `Pair ${index}`, status: index % 5 === 0 ? 'working' : 'done', flags: [], flagSides: {}, round: pairTick, blocking: ['P0'],
+    previousAuditors: [], createdAt: 1, updatedAt: 10_000 + pairTick, brief, executorPool: 'primary',
+  } as never);
+  // ...then the console is told the way the tree's lifecycle tells it.
+  if (useDelta) (registry as any).pairsChanged(PROJECT, [`pair_${index}`], 'task_pair_changed');
+  else registry.resyncProject(PROJECT, 'task_pair_changed');
   busy.resync += performance.now() - started;
 }, 1000 / RESYNC_HZ);
 let nextEvent = 0;
@@ -167,7 +196,7 @@ const result = {
   root: ROOT,
   scale: { tasks: TASKS, assignments: ASSIGNMENTS, events: EVENTS, pairs: PAIRS, seconds: SECONDS, resyncHz: RESYNC_HZ, eventHz: EVENT_HZ },
   loop: { samples: lags.length, lagP50: +q(0.5).toFixed(2), lagP95: +q(0.95).toFixed(2), lagP99: +q(0.99).toFixed(2), lagMax: +(sorted.at(-1) ?? 0).toFixed(2), stallsOver75ms: lags.filter((lag) => lag > STALL_MS).length },
-  console: { subscribes: subscriptionSeq, framesSent: frames, bytesSent, busyMs: { resync: +busy.resync.toFixed(1), registry: +busy.registry.toFixed(1) }, busyPercentOfWall: +(((busy.resync + busy.registry) / (SECONDS * 1000)) * 100).toFixed(2) },
+  console: { viewer: useDelta ? 'delta' : 'legacy', pairWrites: pairTick, ...breakdown, subscribes: subscriptionSeq, framesSent: frames, bytesSent, busyMs: { resync: +busy.resync.toFixed(1), registry: +busy.registry.toFixed(1) }, busyPercentOfWall: +(((busy.resync + busy.registry) / (SECONDS * 1000)) * 100).toFixed(2) },
 };
 console.log(JSON.stringify(result));
 db.close();

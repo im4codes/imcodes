@@ -11,9 +11,14 @@
  * throw at a named boundary and assert the durable state that results, which is
  * the only way to show the transaction actually holds.
  */
-import { compareQueuedTaskPairs, isTerminalTaskPairStatus, TASK_PAIR_CONSOLE_LEGACY_STATUS, TASK_PAIR_NO_AUDITOR } from '../../shared/task-pair.js';
-import { taskPairChecklistCounts } from '../../shared/task-pair-checklist.js';
 import { getTaskPairStore } from './task-pairs/store.js';
+import {
+  buildPairConsoleRow,
+  computePairQueuePositions,
+  pairRowJson,
+  taskPairBriefRevision,
+  type PairScopeView,
+} from './supervision-console-pair-projection.js';
 import { isPairsEngineProject } from './task-pairs/engine.js';
 import {
   SUPERVISION_TASK_CONSOLE_MSG,
@@ -21,6 +26,9 @@ import {
   supervisionConsoleStatusGroup,
   type SupervisionConsoleDeltaOp,
   type SupervisionTaskConsoleDelta,
+  type SupervisionTaskConsolePairDelta,
+  type SupervisionTaskConsolePairDeltaUpsert,
+  type SupervisionTaskConsolePairUpsert,
   type SupervisionTaskConsoleScope,
   type SupervisionTaskConsoleSnapshot,
   type SupervisionTaskConsoleTaskRow,
@@ -183,6 +191,8 @@ export class SupervisionConsoleProducer {
     snapshot: Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>;
   }>();
   readonly #snapshotBuildInFlight = new Map<string, Promise<Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>>>();
+  /** Per scope: the pair rows + revision a PAIR_DELTA_V1 viewer was last sent. */
+  readonly #pairViews = new Map<string, PairScopeView>();
   /**
    * Assignment rows memoized for one synchronous projection pass. A replay of
    * N durable events used to re-project every assignment (and each owner's
@@ -235,13 +245,23 @@ export class SupervisionConsoleProducer {
     this.#snapshotCache.delete(this.#snapshotKey(scope));
   }
 
+  /** In-flight/cache key: a PAIR_DELTA_V1 snapshot (no briefs, seeds the pair view) is a different payload. */
+  #snapshotModeKey(scope: SupervisionTaskConsoleScope, pairDelta: boolean): string {
+    return pairDelta ? `${this.#snapshotKey(scope)}#pd` : this.#snapshotKey(scope);
+  }
+
   /** Build outside the inbound WS callback and coalesce concurrent requests. */
-  async buildSnapshotAsync(scope: SupervisionTaskConsoleScope, subscriptionId: string): Promise<SupervisionTaskConsoleSnapshot> {
-    const key = this.#snapshotKey(scope);
+  async buildSnapshotAsync(
+    scope: SupervisionTaskConsoleScope,
+    subscriptionId: string,
+    options: { pairDelta?: boolean } = {},
+  ): Promise<SupervisionTaskConsoleSnapshot> {
+    const pairDelta = options.pairDelta === true;
+    const key = this.#snapshotModeKey(scope, pairDelta);
     let work = this.#snapshotBuildInFlight.get(key);
     if (!work) {
       work = new Promise<Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>>((resolve) => {
-        setImmediate(() => resolve(withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => this.#buildSnapshotCached(scope))));
+        setImmediate(() => resolve(withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => this.#buildSnapshotCached(scope, pairDelta))));
       }).finally(() => {
         if (this.#snapshotBuildInFlight.get(key) === work) this.#snapshotBuildInFlight.delete(key);
       });
@@ -914,104 +934,126 @@ export class SupervisionConsoleProducer {
    * `pairs`-engine projects: rows come from the task-pair store. `status`
    * carries the closest legacy lifecycle so the console groups them like
    * legacy rows; `pair` carries the real pair state.
+   *
+   * `inlineBrief` (default) is the legacy shape with every brief embedded; a
+   * PAIR_DELTA_V1 viewer gets `briefRevision` instead and fetches the text on
+   * demand.
    */
-  readPairRows(projectName: string): { tasks: SupervisionTaskConsoleTaskRow[]; assignments: SupervisionTaskConsoleAssignmentRow[] } {
+  readPairRows(
+    projectName: string,
+    options: { inlineBrief?: boolean } = {},
+  ): { tasks: SupervisionTaskConsoleTaskRow[]; assignments: SupervisionTaskConsoleAssignmentRow[]; entries: SupervisionTaskConsolePairUpsert[] } {
+    const inlineBrief = options.inlineBrief !== false;
+    const pairs = getTaskPairStore().listPairs(projectName);
+    const queuePositions = computePairQueuePositions(pairs);
     const tasks: SupervisionTaskConsoleTaskRow[] = [];
     const assignments: SupervisionTaskConsoleAssignmentRow[] = [];
-    const pairs = getTaskPairStore().listPairs(projectName);
-    const queuePositions = new Map<string, number>();
-    const byBrain = new Map<string, typeof pairs>();
+    const entries: SupervisionTaskConsolePairUpsert[] = [];
     for (const stored of pairs) {
-      if (stored.state.status !== 'queued') continue;
-      const group = byBrain.get(stored.state.brain) ?? [];
-      group.push(stored);
-      byBrain.set(stored.state.brain, group);
-    }
-    for (const queued of byBrain.values()) {
-      queued.sort(compareQueuedTaskPairs).forEach((stored, index) => queuePositions.set(stored.state.taskId, index + 1));
-    }
-    for (const stored of pairs) {
-      const pair = stored.state;
-      const status = TASK_PAIR_CONSOLE_LEGACY_STATUS[pair.status];
-      const phase = supervisionConsoleStatusGroup(status);
-      const heartbeatAt = Math.max(stored.liveness.progressExecutorAt, stored.liveness.progressAuditorAt) || undefined;
-      tasks.push({
-        taskId: pair.taskId,
-        title: pair.title ?? pair.taskId,
-        status,
-        phase,
-        ...(pair.executor ? { ownerSessionName: pair.executor } : {}),
-        ...(pair.executorPool === 'primary' || pair.executorPool === 'economy' ? { poolKind: pair.executorPool } : {}),
-        validationState: 'unknown',
-        ...(pair.flags.includes('blocked') ? { blocker: 'blocked' } : {}),
-        ...(pair.round > 0 ? { auditRound: String(pair.round) } : {}),
-        ...(pair.lastVerdict ? { auditVerdict: pair.lastVerdict.verb } : {}),
-        ...(heartbeatAt ? { heartbeatAt } : {}),
-        updatedAt: pair.updatedAt,
-        lastEventId: 0,
-        pair: {
-          status: pair.status,
-          flags: [...pair.flags],
-          ...(pair.executor ? { executor: pair.executor } : {}),
-          ...(pair.auditor ? { auditor: pair.auditor } : {}),
-          round: pair.round,
-          blocking: [...pair.blocking],
-          createdAt: pair.createdAt,
-          ...(pair.startedAt !== undefined ? { startedAt: pair.startedAt } : {}),
-          updatedAt: pair.updatedAt,
-          ...(isTerminalTaskPairStatus(pair.status) ? { endedAt: pair.updatedAt } : {}),
-          queueOrder: stored.queueOrder,
-          ...(queuePositions.has(pair.taskId) ? { queuePosition: queuePositions.get(pair.taskId) } : {}),
-          ...(pair.urgent ? { urgent: true } : {}),
-          ...(pair.executor ? (() => { const p = this.#resolveSessionPresentation?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorModel: p?.model ?? pair.executorModel, executorState: p?.state }; })() : pair.executorModel ? { executorModel: pair.executorModel } : {}),
-          ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = this.#resolveSessionPresentation?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorModel: p?.model ?? pair.auditorModel, auditorState: p?.state }; })() : pair.auditor === TASK_PAIR_NO_AUDITOR ? { auditorModel: TASK_PAIR_NO_AUDITOR } : pair.auditorModel ? { auditorModel: pair.auditorModel } : {}),
-          ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
-          ...(pair.flags.includes('waiting_for_capacity') ? { waitingReason: pair.capacityWaitReason ?? null } : {}),
-          ...(pair.brief ? { brief: pair.brief, checklist: taskPairChecklistCounts(pair.brief) } : {}),
-          ...(stored.liveness.lastNudgedAt !== undefined ? { lastNudgedAt: stored.liveness.lastNudgedAt } : {}),
-        },
+      const entry = buildPairConsoleRow(stored, {
+        inlineBrief,
+        queuePosition: queuePositions.get(stored.state.taskId),
+        resolvePresentation: this.#resolveSessionPresentation,
       });
-      const roles: Array<['implementer' | 'auditor', string | undefined, number]> = [
-        ['implementer', pair.executor, stored.liveness.progressExecutorAt],
-        ['auditor', pair.auditor === TASK_PAIR_NO_AUDITOR ? undefined : pair.auditor, stored.liveness.progressAuditorAt],
-      ];
-      for (const [role, session, progressAt] of roles) {
-        if (!session) continue;
-        const presentation = this.#resolveSessionPresentation?.(session, progressAt);
-        assignments.push({
-          assignmentId: `${pair.taskId}:${role}`,
-          taskId: pair.taskId,
-          status,
-          phase,
-          role,
-          ownerSessionName: session,
-          ownerSessionLabel: presentation?.label,
-          observedModel: presentation?.model,
-          sessionState: presentation?.state ?? 'unknown',
-          sessionStateSource: presentation?.source ?? 'registry',
-          sessionStateObservedAt: presentation?.observedAt ?? progressAt,
-          validationState: 'unknown',
-          ...(role === 'auditor' && pair.lastVerdict ? { auditVerdict: pair.lastVerdict.verb } : {}),
-          ...(progressAt ? { heartbeatAt: progressAt } : {}),
-          updatedAt: pair.updatedAt,
-          lastEventId: 0,
-        });
-      }
+      entries.push(entry);
+      tasks.push(entry.task);
+      assignments.push(...entry.assignments);
     }
-    return { tasks, assignments };
+    return { tasks, assignments, entries };
   }
 
-  buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): SupervisionTaskConsoleSnapshot {
+  /** A pair's brief text + its revision, for the on-demand BRIEF_RESPONSE. */
+  readPairBrief(projectName: string, taskId: string): { briefRevision: string; brief: string } | null {
+    const brief = getTaskPairStore().getPair(projectName, taskId)?.state.brief;
+    return brief ? { briefRevision: taskPairBriefRevision(brief), brief } : null;
+  }
+
+  isPairsProject(scope: SupervisionTaskConsoleScope): boolean {
+    return isPairsEngineProject(scope.projectName);
+  }
+
+  /** The viewer of this scope went away or must be re-seeded by its next snapshot. */
+  dropPairView(scope: SupervisionTaskConsoleScope): void {
+    this.#pairViews.delete(this.#snapshotKey(scope));
+  }
+
+  /**
+   * One frame for the pairs that changed since this scope's viewer was last
+   * sent, or undefined when nothing the viewer can see changed (or it has no
+   * snapshot to be a delta against yet).
+   *
+   * Cost is O(changed pairs + queued pairs), not O(pairs): the 200-row window
+   * is checked with an id-only query, and only candidate rows are rebuilt and
+   * compared against what was sent.
+   */
+  buildPairDelta(scope: SupervisionTaskConsoleScope, subscriptionId: string, dirtyTaskIds: Iterable<string>): SupervisionTaskConsolePairDelta | undefined {
+    return withEventLoopWatchdogPhase('supervision-console.pair-delta', () => {
+      const view = this.#pairViews.get(this.#snapshotKey(scope));
+      if (!view) return undefined;
+      const store = getTaskPairStore();
+      const windowIds = store.listPairWindowIds(scope.projectName);
+      const windowSet = new Set(windowIds);
+      const removes: string[] = [];
+      for (const taskId of view.rows.keys()) if (!windowSet.has(taskId)) removes.push(taskId);
+      const queued = store.listQueuedPairs(scope.projectName).filter((stored) => windowSet.has(stored.state.taskId));
+      const queuedById = new Map(queued.map((stored) => [stored.state.taskId, stored] as const));
+      const queuePositions = computePairQueuePositions(queued);
+      const candidates = new Set<string>();
+      for (const taskId of dirtyTaskIds) if (windowSet.has(taskId)) candidates.add(taskId);
+      for (const taskId of windowIds) if (!view.rows.has(taskId)) candidates.add(taskId);
+      // Positions of sibling queued pairs shift when one is added/removed/reordered.
+      for (const taskId of queuedById.keys()) candidates.add(taskId);
+      const windowIndex = new Map(windowIds.map((id, index) => [id, index] as const));
+      const upserts: SupervisionTaskConsolePairDeltaUpsert[] = [];
+      for (const taskId of candidates) {
+        const stored = queuedById.get(taskId) ?? store.getPair(scope.projectName, taskId);
+        if (!stored) {
+          if (view.rows.has(taskId)) removes.push(taskId);
+          continue;
+        }
+        const upsert = buildPairConsoleRow(stored, {
+          inlineBrief: false,
+          queuePosition: queuePositions.get(taskId),
+          resolvePresentation: this.#resolveSessionPresentation,
+        });
+        const json = pairRowJson(upsert);
+        const previous = view.rows.get(taskId);
+        if (previous && (previous.json ??= pairRowJson(previous.upsert)) === json) continue;
+        view.rows.set(taskId, { json, upsert });
+        upserts.push({ ...upsert, position: windowIndex.get(taskId) ?? 0 });
+      }
+      for (const taskId of removes) view.rows.delete(taskId);
+      if (upserts.length === 0 && removes.length === 0) return undefined;
+      view.revision += 1;
+      return {
+        type: SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA,
+        scope,
+        subscriptionId,
+        pairRevision: view.revision,
+        generatedAt: this.#now(),
+        upserts,
+        removes,
+      };
+    });
+  }
+
+  buildSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string, options: { pairDelta?: boolean } = {}): SupervisionTaskConsoleSnapshot {
     return withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => traceSync(
       'supervision-console.build-snapshot',
       { projectName: scope.projectName },
-      () => ({ ...this.#buildSnapshotCached(scope), subscriptionId }),
+      () => ({ ...this.#buildSnapshotCached(scope, options.pairDelta === true), subscriptionId }),
     ));
   }
 
-  #buildSnapshotCached(scope: SupervisionTaskConsoleScope): Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> {
-    const key = this.#snapshotKey(scope);
+  #buildSnapshotCached(scope: SupervisionTaskConsoleScope, pairDelta = false): Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> {
+    const key = this.#snapshotModeKey(scope, pairDelta);
     const cursor = this.restoreCursor(scope);
+    // A pair-delta snapshot seeds the per-scope pair view, so it must be built
+    // fresh: a cached one would carry a pairRevision older than the deltas
+    // already sent and the viewer would see a gap.
+    if (pairDelta && isPairsEngineProject(scope.projectName)) {
+      return this.#withAssignmentPass(() => this.#buildSnapshotParts(scope, cursor, true));
+    }
     const now = Date.now();
     const dataVersion = this.#readDataVersion();
     const cached = this.#snapshotCache.get(key);
@@ -1024,7 +1066,7 @@ export class SupervisionConsoleProducer {
       && cached.projectionEpoch === cursor.projectionEpoch) {
       return cached.snapshot;
     }
-    const snapshot = this.#withAssignmentPass(() => this.#buildSnapshotParts(scope, cursor));
+    const snapshot = this.#withAssignmentPass(() => this.#buildSnapshotParts(scope, cursor, false));
     this.#snapshotCache.set(key, {
       builtAt: now,
       dataVersion,
@@ -1039,8 +1081,21 @@ export class SupervisionConsoleProducer {
   #buildSnapshotParts(
     scope: SupervisionTaskConsoleScope,
     cursor: ReturnType<SupervisionConsoleProducer['restoreCursor']>,
+    pairDelta: boolean,
   ): Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> {
-    const pairRows = isPairsEngineProject(scope.projectName) ? this.readPairRows(scope.projectName) : undefined;
+    const pairRows = isPairsEngineProject(scope.projectName)
+      ? this.readPairRows(scope.projectName, { inlineBrief: !pairDelta })
+      : undefined;
+    let pairRevision: number | undefined;
+    if (pairRows && pairDelta) {
+      const viewKey = this.#snapshotKey(scope);
+      // Revisions restart at 0 with each snapshot: deltas are only ever
+      // meaningful against the snapshot of the subscription they belong to.
+      const view: PairScopeView = { revision: 0, rows: new Map() };
+      for (const entry of pairRows.entries) view.rows.set(entry.task.taskId, { upsert: entry });
+      this.#pairViews.set(viewKey, view);
+      pairRevision = view.revision;
+    }
     const tasks = pairRows?.tasks ?? [...this.#visibleTaskIds(scope.projectName)]
       .map((taskId) => this.readTaskRow(taskId, scope.projectName))
       .filter((row): row is SupervisionTaskConsoleTaskRow => !!row);
@@ -1060,6 +1115,7 @@ export class SupervisionConsoleProducer {
       // it directly instead of projecting every historical assignment (~24 ms
       // on a real registry) just to derive two integers.
       pools: pairRows ? this.readPoolsIncremental(scope.projectName) : this.readPools(scope.projectName),
+      ...(pairRevision !== undefined ? { pairRevision } : {}),
     };
   }
 

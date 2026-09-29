@@ -11,6 +11,7 @@
  */
 import {
   SUPERVISION_TASK_CONSOLE_MSG,
+  SUPERVISION_TASK_CONSOLE_FEATURES,
   SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
   SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
   isSupervisionTaskConsoleMessageType,
@@ -37,6 +38,11 @@ export interface SupervisionConsoleSessionDeps {
 interface ActiveSubscription {
   subscriptionId: string;
   scope: SupervisionTaskConsoleScope;
+  /**
+   * The viewer declared PAIR_DELTA_V1 for a `pairs` project: its snapshots omit
+   * briefs and pair changes reach it as PAIR_DELTA instead of a re-subscribe.
+   */
+  pairDelta: boolean;
 }
 
 /**
@@ -129,6 +135,7 @@ export class SupervisionConsoleSessionRegistry {
       case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE: return this.#handleSubscribe(record);
       case SUPERVISION_TASK_CONSOLE_MSG.ACK: return this.#handleAck(record);
       case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE: return this.#handleUnsubscribe(record);
+      case SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST: return this.#handleBriefRequest(record);
       default:
         // SNAPSHOT/DELTA/RESYNC_REQUIRED are daemon->browser only. Receiving one
         // inbound means a confused or hostile peer; claim and drop it.
@@ -153,7 +160,8 @@ export class SupervisionConsoleSessionRegistry {
       const subscriptionId = typeof record.subscriptionId === 'string' ? record.subscriptionId : '';
       if (subscriptionId) {
         const countBefore = this.#subscriptions.size;
-        this.#subscriptions.set(key, { subscriptionId, scope });
+        this.#subscriptions.set(key, { subscriptionId, scope, pairDelta: this.#wantsPairDelta(record, scope) });
+        this.#deps.producer.dropPairView(scope);
         if (this.#subscriptions.size !== countBefore) {
           this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
         }
@@ -243,7 +251,11 @@ export class SupervisionConsoleSessionRegistry {
     // A newer subscribe supersedes the previous one for this scope, which is
     // what makes a late snapshot from the old one droppable at the browser.
     const countBefore = this.#subscriptions.size;
-    this.#subscriptions.set(key, { subscriptionId, scope });
+    const pairDelta = this.#wantsPairDelta(record, scope);
+    this.#subscriptions.set(key, { subscriptionId, scope, pairDelta });
+    // The new subscription's snapshot re-seeds the pair view. Until it does, a
+    // pair change must not produce a delta against the previous subscription.
+    this.#deps.producer.dropPairView(scope);
     if (this.#subscriptions.size !== countBefore) {
       this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
     }
@@ -263,7 +275,7 @@ export class SupervisionConsoleSessionRegistry {
       // client used to reconnect immediately on every unknown row, and each
       // subscribe could otherwise run a full synchronous synchronization.
       if (synchronize) this.#deps.producer.synchronizeDurableEvents(scope, { deliver: false });
-      if (afterEventId === null) return this.#sendSnapshot(scope, subscriptionId);
+      if (afterEventId === null) return this.#sendSnapshot(scope, subscriptionId, pairDelta);
 
       const clientVersion = typeof record.projectionVersion === 'number' ? record.projectionVersion : 0;
       const clientEpoch = typeof record.projectionEpoch === 'string' ? record.projectionEpoch : '';
@@ -280,6 +292,11 @@ export class SupervisionConsoleSessionRegistry {
         return this.#demandResync(scope, subscriptionId, 'authority_epoch_changed');
       }
 
+      // Pair state has no durable outbox: a viewer that resumes with a cursor
+      // could otherwise keep pair rows from before a reconnect. Answer with the
+      // current snapshot, which also seeds the pair view its deltas build on.
+      if (pairDelta) return this.#sendSnapshot(scope, subscriptionId, true);
+
       const owed = this.#deps.producer.pendingFrames(scope)
         .filter((row) => row.eventId > afterEventId)
         .sort((left, right) => left.projectionVersion - right.projectionVersion);
@@ -289,7 +306,7 @@ export class SupervisionConsoleSessionRegistry {
       // leaves it there forever even though its cursor is current. A snapshot is
       // the existing authenticated/current acknowledgement and also makes a
       // restart robust when the browser retained rows but the socket did not.
-      if (owed.length === 0) return this.#sendSnapshot(scope, subscriptionId);
+      if (owed.length === 0) return this.#sendSnapshot(scope, subscriptionId, false);
       // The oldest thing we still hold must be exactly the client's next version.
       // If the outbox has already been pruned past it we cannot patch the hole.
       if (owed[0]!.projectionVersion !== clientVersion + 1) {
@@ -333,14 +350,46 @@ export class SupervisionConsoleSessionRegistry {
       const key = scopeKey(scope);
       this.#subscriptions.delete(key);
       this.#subscribeBudgets.delete(key);
+      this.#deps.producer.dropPairView(scope);
       this.#deps.onActiveSubscriptionCountChanged?.(this.#subscriptions.size);
     }
     return true;
   }
 
-  #sendSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string): boolean {
+  #wantsPairDelta(record: Record<string, unknown>, scope: SupervisionTaskConsoleScope): boolean {
+    const features = record.features;
+    return Array.isArray(features)
+      && features.includes(SUPERVISION_TASK_CONSOLE_FEATURES.PAIR_DELTA_V1)
+      && this.#deps.producer.isPairsProject(scope);
+  }
+
+  /** On-demand brief for one pair of the caller's authorized, currently subscribed scope. */
+  #handleBriefRequest(record: Record<string, unknown>): boolean {
+    const scope = readScope(record.scope);
+    const taskId = record.taskId;
+    if (!scope || typeof taskId !== 'string' || !taskId) return true;
+    if (!this.#deps.authorize(scope)) { this.#refused += 1; return true; }
+    const active = this.#subscriptions.get(scopeKey(scope));
+    if (!active || active.subscriptionId !== record.subscriptionId) return true;
+    try {
+      const found = this.#deps.producer.readPairBrief(scope.projectName, taskId);
+      this.#deps.send({
+        type: SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE,
+        scope,
+        subscriptionId: active.subscriptionId,
+        taskId,
+        briefRevision: found?.briefRevision ?? null,
+        brief: found?.brief ?? null,
+      });
+    } catch (error) {
+      this.#deps.onError?.(error);
+    }
+    return true;
+  }
+
+  #sendSnapshot(scope: SupervisionTaskConsoleScope, subscriptionId: string, pairDelta = false): boolean {
     if (this.#deps.deferSnapshots) {
-      void this.#deps.producer.buildSnapshotAsync(scope, subscriptionId)
+      void this.#deps.producer.buildSnapshotAsync(scope, subscriptionId, { pairDelta })
         .then((snapshot) => {
           if (this.#subscriptions.get(scopeKey(scope))?.subscriptionId !== subscriptionId) return;
           this.#deps.send(snapshot);
@@ -358,7 +407,7 @@ export class SupervisionConsoleSessionRegistry {
         });
       return true;
     }
-    this.#deps.send(this.#deps.producer.buildSnapshot(scope, subscriptionId));
+    this.#deps.send(this.#deps.producer.buildSnapshot(scope, subscriptionId, { pairDelta }));
     return true;
   }
 
@@ -387,11 +436,39 @@ export class SupervisionConsoleSessionRegistry {
     this.#deps.send({ ...delta, subscriptionId: active.subscriptionId });
   }
 
-  /** A `pairs`-engine project changed: every viewer of it re-subscribes for a fresh snapshot. */
+  /**
+   * A `pairs`-engine project changed: every viewer of it re-subscribes for a
+   * fresh snapshot. Only legacy viewers (and a pair-delta viewer whose delta
+   * could not be produced) need this; see {@link pairsChanged}.
+   */
   resyncProject(projectName: string, reason: SupervisionConsoleResyncReason): void {
     for (const subscription of this.#subscriptions.values()) {
       if (subscription.scope.projectName !== projectName) continue;
       this.#demandResync(subscription.scope, subscription.subscriptionId, reason);
+    }
+  }
+
+  /**
+   * Pairs `taskIds` of `projectName` changed. A PAIR_DELTA_V1 viewer receives
+   * one frame for exactly the pairs whose visible row changed; a legacy viewer
+   * still re-subscribes for a full snapshot.
+   */
+  pairsChanged(projectName: string, taskIds: Iterable<string>, reason: SupervisionConsoleResyncReason): void {
+    const dirty = [...taskIds];
+    for (const subscription of this.#subscriptions.values()) {
+      if (subscription.scope.projectName !== projectName) continue;
+      if (!subscription.pairDelta) {
+        this.#demandResync(subscription.scope, subscription.subscriptionId, reason);
+        continue;
+      }
+      try {
+        const delta = this.#deps.producer.buildPairDelta(subscription.scope, subscription.subscriptionId, dirty);
+        if (delta) this.#deps.send(delta);
+      } catch (error) {
+        this.#deps.onError?.(error);
+        // The viewer's view is now unknowable: repair with a full snapshot.
+        this.#demandResync(subscription.scope, subscription.subscriptionId, reason);
+      }
     }
   }
 

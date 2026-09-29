@@ -57,7 +57,29 @@ export const SUPERVISION_TASK_CONSOLE_MSG = {
   ACK: 'supervision.task_console.ack',
   RESYNC_REQUIRED: 'supervision.task_console.resync_required',
   UNAVAILABLE: 'supervision.task_console.unavailable',
+  /**
+   * `pairs`-engine projects only: the ONE changed pair (or a few, when a
+   * queue reorder moves siblings), stamped with a per-scope pair revision.
+   * Replaces the old "re-subscribe for a full snapshot on every pair change".
+   */
+  PAIR_DELTA: 'supervision.task_console.pair_delta',
+  /** Browser -> daemon: fetch one pair's brief (the snapshot rows no longer embed it). */
+  BRIEF_REQUEST: 'supervision.task_console.brief_request',
+  BRIEF_RESPONSE: 'supervision.task_console.brief_response',
 } as const;
+
+/**
+ * Optional capabilities a browser declares on SUBSCRIBE. A daemon that does
+ * not know a feature ignores it and keeps sending the legacy shape; a browser
+ * that does not declare it keeps receiving the legacy shape, so either side
+ * can be upgraded first.
+ */
+export const SUPERVISION_TASK_CONSOLE_FEATURES = {
+  /** Snapshot rows omit `pair.brief`; pair changes arrive as PAIR_DELTA. */
+  PAIR_DELTA_V1: 'pair_delta_v1',
+} as const;
+export type SupervisionTaskConsoleFeature =
+  typeof SUPERVISION_TASK_CONSOLE_FEATURES[keyof typeof SUPERVISION_TASK_CONSOLE_FEATURES];
 export type SupervisionTaskConsoleMessageType =
   typeof SUPERVISION_TASK_CONSOLE_MSG[keyof typeof SUPERVISION_TASK_CONSOLE_MSG];
 
@@ -131,6 +153,8 @@ export interface SupervisionTaskConsoleSubscribe extends SupervisionTaskConsoleC
   /** null demands a full snapshot; a number resumes catch-up after that event. */
   afterEventId: number | null;
   reason: SupervisionConsoleResyncReason;
+  /** Capabilities of this client (see SUPERVISION_TASK_CONSOLE_FEATURES); absent = legacy client. */
+  features?: SupervisionTaskConsoleFeature[];
 }
 
 export interface SupervisionTaskConsoleUnsubscribe {
@@ -460,7 +484,13 @@ export interface SupervisionConsolePairInfo {
   auditorModel?: string;
   executorState?: SupervisionConsoleSessionState;
   auditorState?: SupervisionConsoleSessionState;
+  /**
+   * Full brief. Only legacy payloads (a client that did not declare
+   * PAIR_DELTA_V1) carry it inline; otherwise fetch it by `briefRevision`.
+   */
   brief?: string;
+  /** Present iff the pair has a brief; changes iff the brief text changes. */
+  briefRevision?: string;
   checklist?: { total: number; implemented: number; audited: number };
   /** Most recent participant nudge, used for liveness visibility. */
   lastNudgedAt?: number;
@@ -583,6 +613,60 @@ export interface SupervisionTaskConsoleSnapshot extends SupervisionTaskConsoleCu
   tasks: SupervisionTaskConsoleTaskRow[];
   assignments: SupervisionTaskConsoleAssignmentRow[];
   pools: SupervisionTaskConsolePoolRow[];
+  /**
+   * `pairs` projects on a PAIR_DELTA_V1 client: revision this snapshot's pair
+   * rows are at. The next PAIR_DELTA must carry exactly `pairRevision + 1`.
+   */
+  pairRevision?: number;
+}
+
+/** One pair's summary row plus its participant rows (a full replacement of that pair). */
+export interface SupervisionTaskConsolePairUpsert {
+  task: SupervisionTaskConsoleTaskRow;
+  assignments: SupervisionTaskConsoleAssignmentRow[];
+}
+
+/**
+ * Incremental frame for `pairs`-engine projects. Not part of the durable
+ * outbox: pair state is volatile and every (re)subscribe answers with a
+ * snapshot, so a lost or out-of-order frame is repaired by re-subscribing.
+ */
+export interface SupervisionTaskConsolePairDelta {
+  type: typeof SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA;
+  scope: SupervisionTaskConsoleScope;
+  subscriptionId: string;
+  /** Dense, per scope+subscription; the snapshot's `pairRevision` is the base. */
+  pairRevision: number;
+  generatedAt: number;
+  upserts: SupervisionTaskConsolePairDeltaUpsert[];
+  removes: string[];
+}
+
+/**
+ * `position` is the pair's final index in the snapshot's row order after this
+ * delta. The browser keeps untouched rows in their relative order and inserts
+ * each upserted pair at its position, so the merged list is in exactly the
+ * order a full snapshot would have.
+ */
+export interface SupervisionTaskConsolePairDeltaUpsert extends SupervisionTaskConsolePairUpsert {
+  position: number;
+}
+
+export interface SupervisionTaskConsoleBriefRequest {
+  type: typeof SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST;
+  scope: SupervisionTaskConsoleScope;
+  subscriptionId: string;
+  taskId: string;
+}
+
+/** `brief`/`briefRevision` are null when the pair no longer exists or has no brief. */
+export interface SupervisionTaskConsoleBriefResponse {
+  type: typeof SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE;
+  scope: SupervisionTaskConsoleScope;
+  subscriptionId: string;
+  taskId: string;
+  briefRevision: string | null;
+  brief: string | null;
 }
 
 /**
@@ -845,6 +929,33 @@ export function isValidSupervisionTaskConsoleEvent(
       // SUBSCRIBE/UNSUBSCRIBE/ACK/RESYNC_REQUIRED are control frames, not projections.
       return false;
   }
+}
+
+export function isValidSupervisionTaskConsolePairDelta(value: unknown): value is SupervisionTaskConsolePairDelta {
+  if (!isRecord(value) || value.type !== SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA) return false;
+  if (typeof value.subscriptionId !== 'string' || !value.subscriptionId) return false;
+  if (!isRecord(value.scope) || typeof value.scope.projectName !== 'string'
+    || typeof value.scope.coordinatorSessionName !== 'string') return false;
+  if (!Number.isInteger(value.pairRevision) || (value.pairRevision as number) < 1) return false;
+  if (!isFiniteNumber(value.generatedAt)) return false;
+  if (!Array.isArray(value.removes) || !value.removes.every((id) => typeof id === 'string' && id.length > 0)) return false;
+  return Array.isArray(value.upserts) && value.upserts.every((upsert) => (
+    isRecord(upsert)
+    && Number.isInteger(upsert.position) && (upsert.position as number) >= 0
+    && isTaskRow(upsert.task)
+    && Array.isArray(upsert.assignments)
+    && upsert.assignments.every((assignment) => isAssignmentRow(assignment)
+      && (assignment as SupervisionTaskConsoleAssignmentRow).taskId === (upsert.task as SupervisionTaskConsoleTaskRow).taskId)
+  ));
+}
+
+export function isValidSupervisionTaskConsoleBriefResponse(value: unknown): value is SupervisionTaskConsoleBriefResponse {
+  if (!isRecord(value) || value.type !== SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE) return false;
+  if (typeof value.subscriptionId !== 'string' || typeof value.taskId !== 'string' || !value.taskId) return false;
+  if (!isRecord(value.scope) || typeof value.scope.projectName !== 'string'
+    || typeof value.scope.coordinatorSessionName !== 'string') return false;
+  return (value.brief === null && value.briefRevision === null)
+    || (typeof value.brief === 'string' && typeof value.briefRevision === 'string' && value.briefRevision.length > 0);
 }
 
 /** Cursor a fresh client presents before it has any durable state. */

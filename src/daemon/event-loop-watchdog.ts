@@ -17,6 +17,12 @@ let phase = EVENT_LOOP_WATCHDOG_IDLE_PHASE;
  * phase happens to be current by then.
  */
 let attributedScopedStalls: Array<{ durationMs: number }> = [];
+/**
+ * How many scopes are open right now. A nested scope's milliseconds are already
+ * inside the enclosing scope's, so only the outermost scope reports a stall;
+ * otherwise the same block would be counted (and discounted) once per level.
+ */
+let scopeDepth = 0;
 
 /**
  * Low-level setter. Prefer {@link withEventLoopWatchdogPhase}: a phase set here
@@ -37,18 +43,21 @@ export function getEventLoopWatchdogPhase(): string {
  * `fn` blocks the loop -- it fires afterwards. A scope that itself runs longer
  * than the stall threshold therefore reports its stall directly, under its own
  * name, and the following tick discounts those milliseconds; a stall that no
- * scope explains still reports as the idle phase.
+ * scope explains still reports as the idle phase. Nested scopes report once,
+ * from the outermost.
  */
 export function withEventLoopWatchdogPhase<T>(name: string, fn: () => T): T {
   const previous = phase;
   setEventLoopWatchdogPhase(name);
+  scopeDepth += 1;
   const startedAt = performance.now();
   try {
     return fn();
   } finally {
     const durationMs = performance.now() - startedAt;
     phase = previous;
-    if (timer && durationMs > WATCHDOG_THRESHOLD_MS) {
+    scopeDepth -= 1;
+    if (scopeDepth === 0 && timer && durationMs > WATCHDOG_THRESHOLD_MS) {
       const stallMs = Math.round(durationMs);
       attributedScopedStalls.push({ durationMs });
       recordDaemonEventLoopStall({ stallMs, phase: name });

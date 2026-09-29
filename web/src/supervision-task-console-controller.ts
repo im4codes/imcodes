@@ -2,10 +2,13 @@ import { DAEMON_MSG } from '@shared/daemon-events.js';
 import {
   SUPERVISION_CONSOLE_RESYNC_REASONS,
   SUPERVISION_CONSOLE_UNAVAILABLE_REASONS,
+  SUPERVISION_TASK_CONSOLE_FEATURES,
   SUPERVISION_TASK_CONSOLE_MSG,
   initialSupervisionConsoleCursor,
+  isValidSupervisionTaskConsoleBriefResponse,
   type SupervisionConsoleResyncReason,
   type SupervisionTaskConsoleAck,
+  type SupervisionTaskConsoleBriefRequest,
   type SupervisionTaskConsoleResyncRequired,
   type SupervisionTaskConsoleScope,
   type SupervisionTaskConsoleSubscribe,
@@ -19,6 +22,7 @@ import {
   type SupervisionTaskConsoleReducerAction,
   type SupervisionTaskConsoleReducerState,
 } from './supervision-task-console-reducer.js';
+import { receiveTaskPairBrief, setTaskPairBriefRequester } from './task-pair-brief-store.js';
 import {
   clearSupervisionTaskConsoleCache,
   readSupervisionTaskConsoleCache,
@@ -115,6 +119,7 @@ export class SupervisionTaskConsoleController {
   private automaticResyncs: number[] = [];
   /** Set at the cap; only an explicit Retry re-enables automatic resyncs. */
   private automaticResyncExhausted = false;
+  private unregisterBriefRequester: (() => void) | null = null;
 
   constructor(
     private readonly socket: SupervisionTaskConsoleSocket,
@@ -154,6 +159,8 @@ export class SupervisionTaskConsoleController {
     this.connected = false;
     this.clearSubscribeTimeout();
     this.clearResyncTimer();
+    this.unregisterBriefRequester?.();
+    this.unregisterBriefRequester = null;
     this.unsubscribeMessage?.();
     this.unsubscribeMessage = null;
   }
@@ -260,7 +267,7 @@ export class SupervisionTaskConsoleController {
     if (next === previous) return;
     this.state = next;
     if (this.authority && next.hasAuthoritativeSnapshot
-      && (action.type === 'snapshot_received' || action.type === 'delta_received')) {
+      && (action.type === 'snapshot_received' || action.type === 'delta_received' || action.type === 'pair_delta_received')) {
       writeSupervisionTaskConsoleCache(this.authority, next);
     }
     this.emit();
@@ -311,10 +318,27 @@ export class SupervisionTaskConsoleController {
       subscriptionId,
       afterEventId: fullSnapshot ? null : current.lastDurableEventId,
       reason,
+      features: [SUPERVISION_TASK_CONSOLE_FEATURES.PAIR_DELTA_V1],
     };
     this.apply({ type: 'subscribe_started', subscriptionId });
+    // The daemon serves briefs only for the newest subscription of a scope, so
+    // the newest subscription is the one brief requests must go through.
+    this.unregisterBriefRequester?.();
+    this.unregisterBriefRequester = setTaskPairBriefRequester((taskId) => this.requestBrief(taskId));
     this.socket.send(frame);
     this.armSubscribeTimeout(subscriptionId);
+  }
+
+  private requestBrief(taskId: string): void {
+    const subscriptionId = this.state.subscriptionId;
+    if (!this.connected || !subscriptionId) return;
+    const frame: SupervisionTaskConsoleBriefRequest = {
+      type: SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST,
+      subscriptionId,
+      scope: this.scope,
+      taskId,
+    };
+    this.socket.send(frame);
   }
 
   private handleMessage(message: unknown): void {
@@ -355,6 +379,35 @@ export class SupervisionTaskConsoleController {
       if (message.subscriptionId === this.state.subscriptionId) this.clearSubscribeTimeout();
       if (typeof window !== 'undefined') { (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = message; window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: message })); }
       this.apply({ type: 'snapshot_received', payload: message, receivedAt: Date.now() });
+      return;
+    }
+    if (message.type === SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA) {
+      const before = this.state;
+      this.apply({ type: 'pair_delta_received', payload: message, receivedAt: Date.now() });
+      // Feed the compact panel exactly what a full snapshot would have: the
+      // whole merged list, in snapshot order, so its grouping/ordering (which
+      // depends on row order) is identical to the pre-delta behaviour.
+      if (typeof window !== 'undefined' && this.state.pairRevision !== before.pairRevision) {
+        const detail = {
+          type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+          scope: this.state.scope,
+          subscriptionId: this.state.subscriptionId,
+          generatedAt: this.state.lastSyncedAt,
+          tasks: Object.values(this.state.tasks),
+          assignments: Object.values(this.state.assignments),
+          pools: this.state.pools,
+        };
+        (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
+        window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
+      }
+      return;
+    }
+    if (message.type === SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE) {
+      if (!isValidSupervisionTaskConsoleBriefResponse(message)
+        || !this.state.subscriptionId
+        || message.subscriptionId !== this.state.subscriptionId
+        || !sameScope(message.scope, this.scope)) return;
+      receiveTaskPairBrief(message.taskId, message.briefRevision, message.brief);
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.DELTA) {

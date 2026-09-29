@@ -75,4 +75,44 @@ describe('event-loop watchdog phase attribution (tsk_cd_send_spinner_console_syn
     await sleep(250);
     expect(recordStall).not.toHaveBeenCalled();
   });
+
+  // A nested over-threshold scope's milliseconds are already inside its
+  // parent's. Counting both used to report (and discount) the block once per
+  // nesting level, which over-discounted the next tick and hid a real stall.
+  it('reports a nested over-threshold scope once, from the outermost, and discounts it once', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    recordStall.mockReset();
+    withEventLoopWatchdogPhase('outer-scope', () => {
+      withEventLoopWatchdogPhase('inner-scope', () => busyWait(220));
+    });
+    await sleep(350);
+    const stalls = recordStall.mock.calls.map(([arg]) => arg as { phase: string; stallMs: number });
+    expect(stalls.map((stall) => stall.phase)).toEqual(['outer-scope']);
+    expect(stalls[0]!.stallMs).toBeGreaterThanOrEqual(200);
+    expect(stalls[0]!.stallMs).toBeLessThan(320);
+  });
+
+  it('does not over-discount: an unlabelled stall right after a nested scope still reads as idle', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    withEventLoopWatchdogPhase('outer-scope', () => {
+      withEventLoopWatchdogPhase('inner-scope', () => busyWait(100));
+    });
+    recordStall.mockReset();
+    busyWait(220); // unlabelled, within the same tick window
+    await sleep(350);
+    const stalls = recordStall.mock.calls.map(([arg]) => arg as { phase: string });
+    expect(stalls.some((stall) => stall.phase === EVENT_LOOP_WATCHDOG_IDLE_PHASE)).toBe(true);
+  });
+
+  it('a scope that throws still closes its depth, so the next top-level scope reports', async () => {
+    startEventLoopWatchdog();
+    await sleep(120);
+    expect(() => withEventLoopWatchdogPhase('boom', () => { throw new Error('x'); })).toThrow('x');
+    recordStall.mockReset();
+    withEventLoopWatchdogPhase('after-throw', () => busyWait(220));
+    await sleep(350);
+    expect(recordStall.mock.calls.map(([arg]) => (arg as { phase: string }).phase)).toContain('after-throw');
+  });
 });

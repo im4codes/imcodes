@@ -4471,6 +4471,8 @@
     "brief_collapse": "Скрыть содержание",
     "brief_copy": "Копировать описание",
     "brief_copied": "Скопировано",
+    "brief_loading": "Загрузка брифа…",
+    "brief_unavailable": "Бриф недоступен. Раскройте снова, чтобы повторить.",
     "brief_content": "Содержание задачи",
     "brief_checklist": "Чек-лист"
   }

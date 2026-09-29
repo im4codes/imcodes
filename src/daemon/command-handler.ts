@@ -2296,6 +2296,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE:
     case SUPERVISION_TASK_CONSOLE_MSG.ACK:
+    case SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST:
       // Already handled: createProductionSupervisionConsoleBinding (wired in
       // lifecycle.ts) registers its OWN serverLink.onMessage handler, and
       // ServerLink.onMessage is multi-subscriber -- every handler, including

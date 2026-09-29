@@ -5,10 +5,12 @@ import {
   initialSupervisionConsoleCursor,
   isStaleSupervisionConsoleResponse,
   isValidSupervisionTaskConsoleEvent,
+  isValidSupervisionTaskConsolePairDelta,
   type SupervisionConsoleResyncReason,
   type SupervisionTaskConsoleAssignmentRow,
   type SupervisionConsoleDeltaOp,
   type SupervisionTaskConsoleDelta,
+  type SupervisionTaskConsolePairDelta,
   type SupervisionTaskConsolePoolRow,
   type SupervisionTaskConsoleScope,
   type SupervisionTaskConsoleSnapshot,
@@ -52,6 +54,11 @@ export interface SupervisionTaskConsoleReducerState {
   projectionVersion: number;
   lastDurableEventId: number | null;
   projectionEpoch: string;
+  /**
+   * Revision the pair rows are at, from a PAIR_DELTA_V1 snapshot; null when the
+   * daemon sent the legacy shape (it then repairs pair changes by resync).
+   */
+  pairRevision: number | null;
   tasks: Readonly<Record<string, SupervisionTaskConsoleTaskRow>>;
   assignments: Readonly<Record<string, SupervisionTaskConsoleAssignmentRow>>;
   eventsByTask: Readonly<Record<string, readonly SupervisionTaskConsoleEventEvidence[]>>;
@@ -72,6 +79,7 @@ export type SupervisionTaskConsoleReducerAction =
   | { type: 'subscribe_started'; subscriptionId: string }
   | { type: 'snapshot_received'; payload: unknown; receivedAt?: number }
   | { type: 'delta_received'; payload: unknown; receivedAt?: number }
+  | { type: 'pair_delta_received'; payload: unknown; receivedAt?: number }
   | { type: 'server_resync_required'; reason: SupervisionConsoleResyncReason }
   | { type: 'transport_error'; error: string }
   | { type: 'authority_invalidated'; error: string }
@@ -125,11 +133,24 @@ function normalizeUnknownLifecycleRows(payload: unknown): unknown {
       assignments: payload.assignments.map(normalize),
     };
   }
-  if (payload.type !== SUPERVISION_TASK_CONSOLE_MSG.DELTA) return payload;
   const normalize = (row: unknown): unknown => {
     if (!hasUnknownLifecycleStatus(row)) return row;
     return { ...(row as Record<string, unknown>), status: 'planned', phase: 'active', unknownStatus: (row as Record<string, unknown>).status };
   };
+  if (payload.type === SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA) {
+    if (!Array.isArray(payload.upserts)) return payload;
+    return {
+      ...payload,
+      upserts: payload.upserts.map((upsert) => (isRecord(upsert)
+        ? {
+          ...upsert,
+          task: normalize(upsert.task),
+          ...(Array.isArray(upsert.assignments) ? { assignments: upsert.assignments.map(normalize) } : {}),
+        }
+        : upsert)),
+    };
+  }
+  if (payload.type !== SUPERVISION_TASK_CONSOLE_MSG.DELTA) return payload;
   return {
     ...payload,
     ...(payload.task ? { task: normalize(payload.task) } : {}),
@@ -191,6 +212,7 @@ export function createSupervisionTaskConsoleState(
     projectionVersion: cursor.projectionVersion,
     lastDurableEventId: cursor.lastDurableEventId,
     projectionEpoch: cursor.projectionEpoch,
+    pairRevision: null,
     tasks: {},
     assignments: {},
     eventsByTask: {},
@@ -239,6 +261,7 @@ function applySnapshot(
     projectionVersion: snapshot.projectionVersion,
     lastDurableEventId: snapshot.lastDurableEventId,
     projectionEpoch: snapshot.projectionEpoch,
+    pairRevision: typeof snapshot.pairRevision === 'number' ? snapshot.pairRevision : null,
     tasks,
     assignments,
     eventsByTask: {},
@@ -340,6 +363,64 @@ function applyDelta(
   };
 }
 
+/**
+ * Merge a one-pair (or few-pair) delta. Untouched rows keep their identity and
+ * relative order; each upserted pair is inserted at the position the daemon
+ * reports, so the result is exactly the list a fresh snapshot would produce.
+ */
+function applyPairDelta(
+  state: SupervisionTaskConsoleReducerState,
+  delta: SupervisionTaskConsolePairDelta,
+  receivedAt: number,
+): SupervisionTaskConsoleReducerState {
+  if (!sameScope(state.scope, delta.scope)) return requestResync(state, 'scope_mismatch');
+  if (!state.subscriptionId || isStaleSupervisionConsoleResponse({
+    activeSubscriptionId: state.subscriptionId,
+    responseSubscriptionId: delta.subscriptionId,
+  })) return state;
+  // Still waiting for this subscription's snapshot: the snapshot is the base a
+  // delta applies to, and it will carry these changes itself.
+  if (state.syncing) return state;
+  if (state.pairRevision === null) return requestResync(state, 'cursor_unknown');
+  if (delta.pairRevision <= state.pairRevision) return state;
+  if (delta.pairRevision !== state.pairRevision + 1) return requestResync(state, 'version_gap');
+
+  const changed = new Set<string>([...delta.removes, ...delta.upserts.map((upsert) => upsert.task.taskId)]);
+  const order = Object.keys(state.tasks).filter((taskId) => !changed.has(taskId));
+  for (const upsert of [...delta.upserts].sort((left, right) => left.position - right.position)) {
+    order.splice(Math.min(upsert.position, order.length), 0, upsert.task.taskId);
+  }
+  const upserted = new Map(delta.upserts.map((upsert) => [upsert.task.taskId, upsert] as const));
+  const previousAssignments = new Map<string, SupervisionTaskConsoleAssignmentRow[]>();
+  for (const assignment of Object.values(state.assignments)) {
+    const group = previousAssignments.get(assignment.taskId) ?? [];
+    group.push(assignment);
+    previousAssignments.set(assignment.taskId, group);
+  }
+  const tasks: Record<string, SupervisionTaskConsoleTaskRow> = {};
+  const assignments: Record<string, SupervisionTaskConsoleAssignmentRow> = {};
+  for (const taskId of order) {
+    const upsert = upserted.get(taskId);
+    tasks[taskId] = upsert ? upsert.task : state.tasks[taskId]!;
+    for (const assignment of upsert ? upsert.assignments : previousAssignments.get(taskId) ?? []) {
+      assignments[assignment.assignmentId] = assignment;
+    }
+  }
+  const eventsByTask: Record<string, readonly SupervisionTaskConsoleEventEvidence[]> = { ...state.eventsByTask };
+  for (const taskId of delta.removes) delete eventsByTask[taskId];
+  return {
+    ...state,
+    pairRevision: delta.pairRevision,
+    hasAuthoritativeSnapshot: true,
+    syncState: SUPERVISION_TASK_CONSOLE_SYNC_STATE.SYNCED,
+    lastSyncedAt: receivedAt,
+    tasks,
+    assignments,
+    eventsByTask,
+    error: null,
+  };
+}
+
 export function supervisionTaskConsoleReducer(
   state: SupervisionTaskConsoleReducerState,
   action: SupervisionTaskConsoleReducerAction,
@@ -375,6 +456,12 @@ export function supervisionTaskConsoleReducer(
         return requestResync(state, 'cursor_unknown');
       }
       return applyDelta(state, payload, action.receivedAt ?? state.lastSyncedAt ?? 0);
+    }
+    case 'pair_delta_received': {
+      if (isStaleProjection(state, action.payload)) return state;
+      const payload = normalizeUnknownLifecycleRows(action.payload);
+      if (!isValidSupervisionTaskConsolePairDelta(payload)) return requestResync(state, 'cursor_unknown');
+      return applyPairDelta(state, payload, action.receivedAt ?? state.lastSyncedAt ?? 0);
     }
     case 'server_resync_required':
       return requestResync(state, action.reason);
