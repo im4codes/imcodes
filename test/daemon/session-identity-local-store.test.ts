@@ -39,4 +39,27 @@ describe('daemon-local session identity store', () => {
     expect(await getLocalSessionIdentityProfile('project', 'repo')).toMatchObject({ content: 'project' });
     expect(await getLocalSessionIdentityProfile('user', '')).toBeNull();
   });
+
+  /**
+   * Regression for the P0 the auditor found in round 1: every mutator did
+   * readStore() -> mutate -> writeStore() on the WHOLE shared file with no
+   * serialization. Firing two writes for DIFFERENT keys concurrently (no
+   * await between them) used to interleave so the second writeStore() call
+   * clobbered the file with a snapshot that never saw the first call's
+   * change -- exactly the concurrency this feature exists to serve (an MCP
+   * write racing a browser-triggered save, or two agent sessions writing
+   * PROJECT vs SESSION scope on the same daemon). Fails on the pre-fix code
+   * nondeterministically (one of the two entries goes missing); passes now
+   * that every mutation is queued.
+   */
+  it('never loses a concurrent write for a different scope/scopeKey', async () => {
+    vi.stubEnv('IMCODES_HOME', home);
+    await Promise.all([
+      putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'repo-a', content: 'a', source: 'mcp' }),
+      putLocalSessionIdentityProfile({ scope: 'project', scopeKey: 'repo-b', content: 'b', source: 'mcp' }),
+      putLocalSessionIdentityProfile({ scope: 'session', scopeKey: 'srv-1:deck_proj_brain', content: 'c', source: 'mcp' }),
+    ]);
+    const profiles = await listLocalSessionIdentityProfiles();
+    expect(profiles.map((profile) => profile.content).sort()).toEqual(['a', 'b', 'c']);
+  });
 });

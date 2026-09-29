@@ -82,10 +82,12 @@ export async function isSessionIdentityMigrated(): Promise<boolean> {
 }
 
 export async function markSessionIdentityMigrated(now = Date.now()): Promise<void> {
-  const store = await readStore();
-  if (typeof store.migratedAt === 'number') return;
-  store.migratedAt = now;
-  await writeStore(store);
+  return enqueueMutation(async () => {
+    const store = await readStore();
+    if (typeof store.migratedAt === 'number') return;
+    store.migratedAt = now;
+    await writeStore(store);
+  });
 }
 
 async function writeStore(store: DiskStore): Promise<void> {
@@ -94,6 +96,26 @@ async function writeStore(store: DiskStore): Promise<void> {
   await mkdir(dirname(target), { recursive: true });
   await writeFile(temporary, `${JSON.stringify(store)}\n`, { mode: 0o600 });
   await rename(temporary, target);
+}
+
+/**
+ * Every mutator below does readStore() -> mutate -> writeStore(): a
+ * read-modify-write on the whole shared file. Without serialization, two
+ * concurrent mutations for DIFFERENT scope/scopeKey keys (an MCP write
+ * racing a browser-triggered LOCAL_REQUEST, or two agent sessions on the
+ * same daemon writing PROJECT vs SESSION scope) can interleave so the
+ * second call's writeStore() overwrites the file with a snapshot that never
+ * saw the first call's change -- silently discarding it. Queuing every
+ * mutation's full read+mutate+write body here (mirroring session-store.ts's
+ * writeQueue) makes them serialize regardless of which key they touch.
+ * Reads stay outside the queue; eventual consistency for reads is fine.
+ */
+let mutationQueue: Promise<unknown> = Promise.resolve();
+
+function enqueueMutation<T>(fn: () => Promise<T>): Promise<T> {
+  const result = mutationQueue.then(fn, fn);
+  mutationQueue = result.then(() => undefined, () => undefined);
+  return result;
 }
 
 export interface LocalIdentityWrite {
@@ -128,20 +150,23 @@ export async function putLocalSessionIdentityProfile(input: LocalIdentityWrite):
   const content = normalizeSessionIdentityContent(input.content);
   const error = sessionIdentityContentError(content, input.scope);
   if (error) throw new Error(error);
-  const store = await readStore();
-  const previous = store.profiles[key(input.scope, input.scopeKey)];
-  const profile: DiskProfile = {
-    scope: input.scope,
-    scopeKey: input.scopeKey,
-    content,
-    contentHash: contentHash(content),
-    revision: Math.max(previous?.revision ?? 0, input.revision ?? 0) + 1,
-    updatedAt: Date.now(),
-    source: input.source,
-    ...(input.sourceFile ? { sourceFile: input.sourceFile } : {}),
-  };
-  store.profiles[key(input.scope, input.scopeKey)] = profile;
-  await writeStore(store);
+  const profile = await enqueueMutation(async () => {
+    const store = await readStore();
+    const previous = store.profiles[key(input.scope, input.scopeKey)];
+    const next: DiskProfile = {
+      scope: input.scope,
+      scopeKey: input.scopeKey,
+      content,
+      contentHash: contentHash(content),
+      revision: Math.max(previous?.revision ?? 0, input.revision ?? 0) + 1,
+      updatedAt: Date.now(),
+      source: input.source,
+      ...(input.sourceFile ? { sourceFile: input.sourceFile } : {}),
+    };
+    store.profiles[key(input.scope, input.scopeKey)] = next;
+    await writeStore(store);
+    return next;
+  });
   if (profile.scope === 'user') {
     report({
       type: SESSION_IDENTITY_WS.USER_REPORT, content: profile.content,
@@ -175,20 +200,22 @@ export async function putLocalSessionIdentityProfileExact(input: {
   sourceFile?: string;
 }): Promise<SessionIdentityProfile> {
   const content = normalizeSessionIdentityContent(input.content);
-  const store = await readStore();
-  const profile: DiskProfile = {
-    scope: input.scope,
-    scopeKey: input.scopeKey,
-    content,
-    contentHash: input.contentHash,
-    revision: input.revision,
-    updatedAt: input.updatedAt,
-    source: input.source,
-    ...(input.sourceFile ? { sourceFile: input.sourceFile } : {}),
-  };
-  store.profiles[key(input.scope, input.scopeKey)] = profile;
-  await writeStore(store);
-  return { ...profile };
+  return enqueueMutation(async () => {
+    const store = await readStore();
+    const profile: DiskProfile = {
+      scope: input.scope,
+      scopeKey: input.scopeKey,
+      content,
+      contentHash: input.contentHash,
+      revision: input.revision,
+      updatedAt: input.updatedAt,
+      source: input.source,
+      ...(input.sourceFile ? { sourceFile: input.sourceFile } : {}),
+    };
+    store.profiles[key(input.scope, input.scopeKey)] = profile;
+    await writeStore(store);
+    return { ...profile };
+  });
 }
 
 /** Removes without reporting -- used to apply a server-initiated USER-scope delete push. */
@@ -196,20 +223,25 @@ export async function removeLocalSessionIdentityProfileQuiet(
   scope: SessionIdentityScope,
   scopeKey: string,
 ): Promise<boolean> {
-  const store = await readStore();
-  const existed = delete store.profiles[key(scope, scopeKey)];
-  if (existed) await writeStore(store);
-  return existed;
+  return enqueueMutation(async () => {
+    const store = await readStore();
+    const existed = delete store.profiles[key(scope, scopeKey)];
+    if (existed) await writeStore(store);
+    return existed;
+  });
 }
 
 export async function removeLocalSessionIdentityProfile(
   scope: SessionIdentityScope,
   scopeKey: string,
 ): Promise<boolean> {
-  const store = await readStore();
-  const existed = delete store.profiles[key(scope, scopeKey)];
+  const existed = await enqueueMutation(async () => {
+    const store = await readStore();
+    const found = delete store.profiles[key(scope, scopeKey)];
+    if (found) await writeStore(store);
+    return found;
+  });
   if (existed) {
-    await writeStore(store);
     report(scope === 'user'
       ? { type: SESSION_IDENTITY_WS.USER_REPORT, deleted: true }
       : { type: SESSION_IDENTITY_WS.LOCAL_REPORT, scope, scopeKey, deleted: true });

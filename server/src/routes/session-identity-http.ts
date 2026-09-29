@@ -10,6 +10,7 @@ import {
   upsertSessionIdentityProfile,
 } from '../db/session-identity-queries.js';
 import { WsBridge } from '../ws/bridge.js';
+import logger from '../util/logger.js';
 import { SESSION_IDENTITY_LOCAL_RPC_TIMEOUT_MS } from '../../../shared/session-identity-ws.js';
 import {
   SESSION_IDENTITY_SCOPES,
@@ -177,13 +178,26 @@ export async function handleSessionIdentityPut<
   if (!daemon.ok) return daemon.response;
   const daemonBody = daemon.body;
   const contentHash = typeof daemonBody.contentHash === 'string' ? daemonBody.contentHash : createHash('sha256').update(content, 'utf8').digest('hex');
-  const metadata = await upsertSessionIdentityMetadata(c.env.DB, {
-    userId: ownerUserId, scope, scopeKey, contentHash,
-    contentLength: sessionIdentityContentLength(content),
-    source: 'web',
-    sourceFile: sourceFile || undefined,
-  });
-  return c.json({ profile: { ...metadata, content } });
+  const revision = typeof daemonBody.revision === 'number' ? daemonBody.revision : 1;
+  const updatedAt = typeof daemonBody.updatedAt === 'number' ? daemonBody.updatedAt : Date.now();
+  // The daemon-local write already succeeded -- a metadata-projection hiccup
+  // here must never surface as a write failure to the caller. A stale
+  // metadata row self-heals on the daemon's next LOCAL_REPORT or the next
+  // write; losing that report entirely would need the daemon to also be
+  // unreachable for its whole session, which callDaemonLocal above already
+  // guards against for the write itself.
+  try {
+    const metadata = await upsertSessionIdentityMetadata(c.env.DB, {
+      userId: ownerUserId, scope, scopeKey, contentHash,
+      contentLength: sessionIdentityContentLength(content),
+      source: 'web',
+      sourceFile: sourceFile || undefined,
+    });
+    return c.json({ profile: { ...metadata, content } });
+  } catch (err) {
+    logger.warn({ err, scope, scopeKey }, 'session identity metadata projection write failed after a successful daemon-local save');
+    return c.json({ profile: { scope, scopeKey, content, contentHash, revision, updatedAt, source: 'web' as const } });
+  }
 }
 
 export async function handleSessionIdentityDelete<
