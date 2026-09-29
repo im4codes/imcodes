@@ -1,4 +1,4 @@
-import { isMobileUserAgent } from '../mobile-device.js';
+import { isMobileLayout } from '../mobile-device.js';
 import { useCallback, useEffect, useLayoutEffect, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -14,13 +14,6 @@ export function collapsedStorageKey(serverId: string | null | undefined, mobile:
   const scope = serverId ? `:${serverId}` : '';
   return `${TASK_PAIR_STATUS_PANEL_STORAGE_KEY}${scope}:${mobile ? 'mobile' : 'desktop'}`;
 }
-function mobileLayout(): boolean {
-  // Agree with the app shell's mobile layout (device-based) first; the width
-  // query alone misses mobile WebViews wider than the breakpoint.
-  if (isMobileUserAgent()) return true;
-  try { return window.matchMedia?.('(max-width: 720px)').matches ?? false; } catch { return false; }
-}
-
 function readCollapsed(serverId: string | null | undefined, mobile: boolean): boolean {
   try {
     const stored = window.localStorage.getItem(collapsedStorageKey(serverId, mobile));
@@ -153,8 +146,8 @@ function resolveSessionModel(
 
 export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
   const { t } = useTranslation();
-  const [isMobile, setIsMobile] = useState(mobileLayout);
-  const [collapsed, setCollapsed] = useState(() => readCollapsed(serverId, mobileLayout()));
+  const [isMobile, setIsMobile] = useState(isMobileLayout);
+  const [collapsed, setCollapsed] = useState(() => readCollapsed(serverId, isMobileLayout()));
   const persistCollapsed = useCallback((next: boolean) => {
     setCollapsed(next);
     try { window.localStorage.setItem(collapsedStorageKey(serverId, isMobile), next ? '1' : '0'); } catch {}
@@ -162,7 +155,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   useEffect(() => {
     const media = window.matchMedia?.('(max-width: 720px)');
     if (!media) return undefined;
-    const onChange = () => { const mobile = mobileLayout(); setIsMobile(mobile); setCollapsed(readCollapsed(serverId, mobile)); };
+    const onChange = () => { const mobile = isMobileLayout(); setIsMobile(mobile); setCollapsed(readCollapsed(serverId, mobile)); };
     media.addEventListener?.('change', onChange);
     window.addEventListener('resize', onChange);
     return () => { media.removeEventListener?.('change', onChange); window.removeEventListener('resize', onChange); };
@@ -325,24 +318,13 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   const initialSnapshot = (window as Window & { __imcodesTaskPairSnapshot?: { authorityUnavailable?: boolean } }).__imcodesTaskPairSnapshot;
   const [active, setActive] = useState(() => hasPairActivity(props.events));
   const [authorityUnavailable, setAuthorityUnavailable] = useState(() => Boolean(initialSnapshot?.authorityUnavailable));
-  const [mobile, setMobile] = useState(() => active ? mobileLayout() : false);
   const [resolvedMobileAnchor, setResolvedMobileAnchor] = useState<Element | null>(() => props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null);
   useLayoutEffect(() => {
     const anchor = props.mobileAnchor ?? props.mobileAnchorRef?.current ?? null;
     if (anchor !== resolvedMobileAnchor) setResolvedMobileAnchor(anchor);
   }, [active, props.mobileAnchor, props.mobileAnchorRef, resolvedMobileAnchor]);
   useEffect(() => {
-    if (!active) return undefined;
-    const update = () => setMobile(mobileLayout());
-    update();
-    const media = window.matchMedia?.('(max-width: 720px)');
-    media?.addEventListener?.('change', update);
-    window.addEventListener('resize', update);
-    return () => { media?.removeEventListener?.('change', update); window.removeEventListener('resize', update); };
-  }, [active]);
-  useEffect(() => {
     if (!active && hasPairActivity(props.events)) {
-      setMobile(mobileLayout());
       setActive(true);
     }
   }, [active, props.events]);
@@ -376,8 +358,8 @@ export function TaskPairStatusPanelHost(props: { events: readonly TimelineEvent[
   if (authorityUnavailable) return null;
   const { mobileAnchor, mobileAnchorRef, ...panelProps } = props;
   const panel = <TaskPairStatusPanel {...panelProps} />;
-  // On phones the collapsed strip belongs to the titlebar row, immediately
-  // after the pinned-message control.  Portal only the active mobile host so
-  // desktop keeps its existing chat-main overlay and dimensions.
-  return mobile && resolvedMobileAnchor ? createPortal(panel, resolvedMobileAnchor) : panel;
+  // The titlebar is the only safe host: keeping the panel in normal flow makes
+  // both mobile and desktop controls reserve space instead of being covered by
+  // a chat-main overlay. Expanded rows still open below the titlebar.
+  return resolvedMobileAnchor ? createPortal(panel, resolvedMobileAnchor) : panel;
 }

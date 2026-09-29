@@ -17,7 +17,11 @@ async function openCase(browser, scenario) {
   const context = await browser.newContext({
     viewport: { width: scenario.width, height: scenario.height },
     deviceScaleFactor: 2,
-    ...(scenario.mobile ? { isMobile: true, hasTouch: true, userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1' } : {}),
+    ...(scenario.mobile || scenario.hasTouch || scenario.userAgent ? {
+      isMobile: scenario.isMobileContext ?? scenario.mobile,
+      hasTouch: scenario.hasTouch ?? scenario.mobile,
+      userAgent: scenario.userAgent ?? 'Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 Version/17.0 Mobile/15E148 Safari/604.1',
+    } : {}),
   });
   const page = await context.newPage();
   const pins = scenario.pinned ? '&pins=1' : '';
@@ -34,13 +38,22 @@ async function openCase(browser, scenario) {
       } }));
     }
   }, { snapshot: taskSnapshot, pinned: scenario.pinned });
+  if (scenario.pinned) {
+    // MessagePinsBar subscribes in an effect; repeat the fixture event after
+    // mount so pin/no-pin cases are deterministic across browsers.
+    await page.waitForTimeout(100);
+    await page.evaluate(() => window.dispatchEvent(new CustomEvent('imcodes:message-pins-changed', { detail: {
+      serverId: 'fixture-server',
+      pins: [{ id: 'fixture-pin', sessionName: 'fixture-window-0', eventId: 'fixture-event', eventTs: Date.now(), eventType: 'user.message', text: 'Pinned message preview' }],
+    } })));
+  }
   const panel = page.locator('[data-testid="task-pair-status-panel"]:visible').first();
   await panel.waitFor({ state: 'visible', timeout: 30_000 });
   const titlebar = page.locator('.chat-titlebar').first();
   await titlebar.waitFor({ state: 'visible' });
   // A fresh fixture can mount once before the responsive media effect settles;
   // normalize to the owner-requested collapsed state before measuring it.
-  if (scenario.mobile && await panel.locator('.task-pair-status-compact').count() === 0) {
+  if (await panel.locator('.task-pair-status-compact').count() === 0 && !await panel.locator('.task-pair-status-rows').isVisible().catch(() => false)) {
     const collapse = panel.getByRole('button', { name: /collapse task status|收起任务状态|收起任務狀態/i }).first();
     if (await collapse.count()) await collapse.click();
   }
@@ -48,6 +61,8 @@ async function openCase(browser, scenario) {
     const diagnostic = await page.evaluate(() => ({
       panelClass: document.querySelector('[data-testid="task-pair-status-panel"]')?.className,
       media: window.matchMedia('(max-width: 720px)').matches,
+      pointer: window.matchMedia('(pointer: coarse)').matches,
+      maxTouchPoints: navigator.maxTouchPoints,
       userAgent: navigator.userAgent,
     }));
     throw new Error(`${scenario.label}: mobile compact strip missing ${JSON.stringify(diagnostic)}`);
@@ -58,7 +73,6 @@ async function openCase(browser, scenario) {
     const style = getComputedStyle(element);
     return { border: style.border, height: style.height, boxShadow: style.boxShadow };
   });
-  const compact = panel.locator('.task-pair-status-compact');
   const result = {
     ...scenario,
     parentClass,
@@ -68,21 +82,51 @@ async function openCase(browser, scenario) {
     hasCompact: await page.evaluate(() => Boolean(document.querySelector('[data-testid="task-pair-status-panel"] .task-pair-status-compact'))),
     compactText: await page.evaluate(() => document.querySelector('[data-testid="task-pair-status-panel"] .task-pair-status-compact')?.textContent ?? ''),
     pinControlWidth: scenario.pinned ? await page.getByTestId('message-pins-trigger').first().evaluate((element) => element.getBoundingClientRect().width) : null,
-    headerCollisions: scenario.mobile ? await page.evaluate(() => {
-      const panels = [...document.querySelectorAll('[data-testid="task-pair-status-panel"]:not(.is-expanded)')];
-      const controls = [...document.querySelectorAll('.chat-top-actions button, .chat-titlebar button')];
+  };
+  const assertNoCollision = async (state) => {
+    const collisions = await page.evaluate(() => {
+      const panels = [...document.querySelectorAll('[data-testid="task-pair-status-panel"]')]
+        .filter((panel) => panel.getClientRects().length > 0);
       const rect = (element) => element.getBoundingClientRect();
       const intersects = (a, b) => a.left < b.right && a.right > b.left && a.top < b.bottom && a.bottom > b.top;
-      return panels.flatMap((panel) => controls.filter((control) => !panel.contains(control) && intersects(rect(panel), rect(control))).map((control) => control.outerHTML.slice(0, 160)));
-    }) : [],
+      return panels.flatMap((panel) => {
+        const scope = panel.closest('.chat-timeline-fixture-window') ?? document;
+        const controls = [...scope.querySelectorAll('.chat-top-actions button, .chat-titlebar button, .chat-titlebar [data-testid="message-pins-trigger"]')];
+        return controls.filter((control) => !panel.contains(control) && intersects(rect(panel), rect(control))).map((control) => ({
+          html: control.outerHTML.slice(0, 160), panel: rect(panel).toJSON(), control: rect(control).toJSON(),
+        }));
+      });
+    });
+    assert.deepEqual(collisions, [], `${scenario.label} ${state}: status overlaps a header control ${JSON.stringify(collisions)}`);
   };
+  const ensureCollapsed = async () => {
+    if (await panel.locator('.task-pair-status-compact').count() === 0) {
+      const button = panel.locator('.task-pair-status-toggle').first();
+      if (await button.getAttribute('aria-expanded') === 'true') await button.click();
+    }
+    await panel.locator('.task-pair-status-panel, .task-pair-status-compact').first().waitFor().catch(() => {});
+  };
+  await ensureCollapsed();
+  await assertNoCollision('collapsed');
+  if (scenario.mobile) {
+    assert.equal(await panel.locator('.task-pair-status-collapse-icon').count(), 0);
+  } else {
+    assert.ok(await panel.locator('.task-pair-status-toggle[aria-expanded="false"]').count() > 0, `${scenario.label}: desktop collapse control missing`);
+  }
+  await panel.locator('.task-pair-status-toggle').first().click();
+  await panel.locator('.task-pair-status-rows').waitFor({ state: 'visible' });
+  await assertNoCollision('expanded');
+  await panel.locator('.task-pair-status-toggle').first().click();
+  assert.equal(await panel.locator('.task-pair-status-rows').count() > 0 ? await panel.locator('.task-pair-status-rows').isVisible() : false, false, `${scenario.label}: toggle did not collapse`);
   if (scenario.mobile) {
     assert.match(parentClass, /chat-titlebar/);
-    assert.equal(result.hasCollapseArrow, false);
-    assert.equal(result.hasCompact, true, `${scenario.label}: compact mobile strip missing`);
-    assert.deepEqual(result.headerCollisions, [], `${scenario.label}: status overlaps a header control`);
-    assert.match(panelStyle.border, /^0px none /);
-    assert.equal(panelStyle.boxShadow, 'none');
+    assert.equal(await panel.locator('.task-pair-status-compact').count() > 0, true, `${scenario.label}: compact mobile strip missing`);
+    const collapsedStyle = await panel.evaluate((element) => {
+      const style = getComputedStyle(element);
+      return { border: style.border, boxShadow: style.boxShadow };
+    });
+    assert.match(collapsedStyle.border, /^0px none /);
+    assert.equal(collapsedStyle.boxShadow, 'none');
     assert.ok(titlebarHeight <= 40, `${scenario.label}: status changed titlebar height`);
     if (scenario.pinned) assert.ok(result.pinControlWidth >= 24, `${scenario.label}: pinned control lost its tap target`);
     const visiblePanels = page.locator('[data-testid="task-pair-status-panel"]:visible');
@@ -92,7 +136,7 @@ async function openCase(browser, scenario) {
       assert.match(await visiblePanels.nth(index).evaluate((element) => element.parentElement?.className ?? ''), /chat-titlebar/);
     }
   } else {
-    assert.match(parentClass, /chat-main/);
+    assert.match(parentClass, /chat-titlebar/);
   }
   await mkdir(OUTPUT_DIR, { recursive: true });
   const screenshot = `${OUTPUT_DIR}/${scenario.label}.png`;
@@ -108,7 +152,14 @@ export async function runMobileTaskStatusScenario() {
       label: `mobile-${width}x${width === 390 ? 844 : width === 360 ? 780 : 640}-${windows === 1 ? 'main' : 'subwindows'}-${pinned ? 'pinned' : 'no-pinned'}`,
       width, height: width === 390 ? 844 : width === 360 ? 780 : 640, mobile: true, pinned, windows,
     })))),
-    { label: 'desktop-1440x900-pinned', width: 1440, height: 900, mobile: false, pinned: true },
+    ...[
+      { label: 'android-412', width: 412, height: 915, mobile: true, hasTouch: true, pinned: true, userAgent: 'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 Chrome/128 Mobile Safari/537.36' },
+      { label: 'ipad-desktop-1024', width: 1024, height: 768, mobile: true, hasTouch: true, isMobileContext: false, pinned: true, userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15) AppleWebKit/605.1.15 Version/17.0 Safari/605.1.15' },
+      { label: 'desktop-site-phone-390', width: 390, height: 844, mobile: true, hasTouch: false, isMobileContext: false, pinned: false, userAgent: 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/128 Safari/537.36' },
+    ],
+    ...[1280, 1024, 800].flatMap((width) => [true, false].map((pinned) => ({
+      label: `desktop-${width}-${pinned ? 'pinned' : 'no-pinned'}`, width, height: 900, mobile: false, pinned,
+    }))),
   ];
   try {
     const results = [];

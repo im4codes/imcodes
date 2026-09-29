@@ -101,7 +101,7 @@ describe('supervision task console toolbar placement', () => {
 
   it('restores and persists panel open state through the shared preferences helper', () => {
     // Phones never re-open the large overlay at launch; desktop restores it.
-    expect(app).toMatch(/useState\(\s*\(\) => !isMobileUserAgent\(\) && loadSupervisionTaskConsolePreferences\(supervisionTaskConsolePreferenceBounds\(\)\)\.open/);
+    expect(app).toMatch(/useState\(\s*\(\) => !isMobileLayout\(\) && loadSupervisionTaskConsolePreferences\(supervisionTaskConsolePreferenceBounds\(\)\)\.open/);
     expect(app).toContain('saveSupervisionTaskConsolePreferences({ ...preferences, open: nextOpen }, bounds);');
     expect(app).toContain('saveSupervisionTaskConsolePreferences({ ...preferences, open: false }, bounds);');
     expect(app.match(/onToggle=\{toggleSupervisionTaskConsole\}/g)).toHaveLength(2);

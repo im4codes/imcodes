@@ -213,7 +213,7 @@ import {
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
-import { isMobileUserAgent } from './mobile-device.js';
+import { isMobileLayout } from './mobile-device.js';
 import {
   getAuthKey,
   clearAuthKey,
@@ -880,7 +880,7 @@ export function App() {
   // launch (owner: load silently, no big box on open). It opens only from its
   // toggle. Desktop keeps the remembered side-panel state.
   const [showSupervisionTaskConsole, setShowSupervisionTaskConsole] = useState(
-    () => !isMobileUserAgent() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
+    () => !isMobileLayout() && loadSupervisionTaskConsolePreferences(supervisionTaskConsolePreferenceBounds()).open,
   );
   const toggleSupervisionTaskConsole = useCallback(() => {
     setShowSupervisionTaskConsole((open) => {
@@ -3658,7 +3658,7 @@ export function App() {
     }
   }, [activeSession, bringSubToFront, runVersionSensitiveAction, setPinnedPanels, subSessions, trans]);
 
-  const isMobile = isMobileUserAgent();
+  const isMobile = isMobileLayout();
   isMobileRef.current = isMobile;
   const desktopLayoutCapable = !isMobile;
   const visibleTeamDiscussions = useMemo(() => discussions.filter((discussion) => (

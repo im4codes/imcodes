@@ -14528,20 +14528,29 @@ button.quick-agent-delegation-preset.active {
 .task-pair-status-panel.is-collapsed .task-pair-status-toggle {
   width: auto; padding: 1px 2px; justify-content: flex-start; align-items: center; gap: 0;
 }
-.chat-titlebar { position: relative; }
+.chat-titlebar {
+  position: relative;
+  /* top-actions is absolute; reserve its measured width for every layout so
+     the in-flow task strip cannot cover titlebar controls. */
+  padding-right: max(8px, var(--chat-top-actions-reserve, 56px)) !important;
+}
 .chat-titlebar > .task-pair-status-panel {
-  top: calc(100% + 4px); right: 8px; bottom: auto; height: min(65vh, calc(100dvh - 160px)); max-height: min(65vh, calc(100dvh - 160px)); overflow: hidden;
+  top: max(calc(100% + 4px), 40px); right: 8px; bottom: auto; height: min(65vh, calc(100dvh - 160px)); max-height: min(65vh, calc(100dvh - 160px)); overflow: hidden;
   width: min(var(--task-pair-panel-width), calc(100% - 16px));
 }
 .chat-titlebar > .task-pair-status-panel.is-collapsed {
-  position: absolute; right: 8px; top: calc(100% + 4px); z-index: 13;
-  /* The expanded titlebar panel has a fixed height; a collapsed one must
-     shrink to its icon strip, never keep an empty full-height frame. */
+  /* Keep the collapsed strip in the titlebar flex flow on desktop too. The
+     expanded rows remain positioned below the titlebar by the rule above. */
+  position: static; z-index: 13; flex: 0 1 auto; min-width: 0;
   height: auto; max-height: none; overflow: visible;
-  display: inline-flex; width: auto; max-width: calc(100% - 16px);
-  margin: 0; border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
+  display: inline-flex; width: auto; max-width: calc(48% - var(--chat-top-actions-reserve, 56px));
+  margin: 0 0 0 auto; border: 1px solid color-mix(in srgb, var(--chrome-accent, #38bdf8) 35%, transparent);
   border-radius: 8px; background: color-mix(in srgb, var(--chrome-panel, #0f172a) 88%, transparent);
   box-shadow: 0 3px 12px color-mix(in srgb, #000 25%, transparent);
+}
+.chat-titlebar > .task-pair-status-panel.is-collapsed .task-pair-status-toggle,
+.chat-titlebar > .task-pair-status-panel.is-collapsed .task-pair-status-icons {
+  min-width: 0; max-width: 100%; overflow: hidden;
 }
 /* The expanded panel belongs to chat-main, not the titlebar. Anchoring it to
    chat-main makes bottom:0 clear the composer and sub-window chrome instead
@@ -14606,6 +14615,7 @@ button.quick-agent-delegation-preset.active {
   min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   font-size: 11px; font-weight: 700;
 }
+.task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-icon.is-zero { display: none; }
 @media (max-width: 720px) {
   /* The mobile host portals into .chat-titlebar. Keep it in the same flex row
      as the pin control; the status strip is never an overlay or a new bar. */
@@ -14632,7 +14642,7 @@ button.quick-agent-delegation-preset.active {
     flex: 1 1 auto;
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
-    position: absolute; top: calc(100% + 4px); left: 8px; right: 8px; bottom: auto;
+    position: absolute; top: max(calc(100% + 4px), 40px); left: 8px; right: 8px; bottom: auto;
     width: auto; max-width: none; height: min(65vh, calc(100dvh - 160px));
     max-height: min(65vh, calc(100dvh - 160px)); z-index: 20; overflow: hidden;
     border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
@@ -14642,9 +14652,6 @@ button.quick-agent-delegation-preset.active {
     .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed {
       max-width: calc(100% - var(--chat-top-actions-reserve, 56px));
     }
-    .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-icon.is-zero {
-      display: none;
-    }
     .chat-titlebar > .task-pair-status-panel.is-mobile.is-collapsed .task-pair-status-mobile-label {
       max-width: 54px;
     }
@@ -14652,7 +14659,7 @@ button.quick-agent-delegation-preset.active {
   .task-pair-status-panel { position: relative; inset: auto; width: 100%; max-width: none; height: min(42vh, 420px); max-height: min(42vh, 420px); overflow: hidden; }
   .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; height: auto; max-height: none; overflow: visible; }
   .chat-titlebar > .task-pair-status-panel:not(.is-collapsed) {
-    position: absolute; inset: calc(100% + 4px) 8px auto; width: auto; max-width: none;
+    position: absolute; top: max(calc(100% + 4px), 40px); left: 8px; right: 8px; bottom: auto; width: auto; max-width: none;
     height: min(65vh, calc(100dvh - 160px)); max-height: min(65vh, calc(100dvh - 160px)); z-index: 20; overflow: hidden;
     border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
     box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
