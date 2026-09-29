@@ -193,9 +193,46 @@ function createWs(
   let leaseInitCount = 0;
   let leaseOfferCount = 0;
   let statusQueryCount = 0;
+  const identityStore = new Map<string, { content: string; contentHash: string; revision: number; updatedAt: number }>();
   const handleData = (channel: FakeDataChannel, value: unknown) => {
     if (typeof value !== 'string') return;
     const payload = JSON.parse(value) as Record<string, unknown>;
+    if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST) {
+      const key = `${payload.scope as string}\u0000${payload.scopeKey as string}`;
+      const base = {
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: payload.serverId, browserTabId: payload.browserTabId, leaseId: payload.leaseId,
+        leaseGeneration: payload.leaseGeneration, daemonGeneration: payload.daemonGeneration,
+        nonce: payload.nonce,
+      };
+      let body: Record<string, unknown>;
+      if (payload.op === 'set') {
+        const previous = identityStore.get(key);
+        const revision = (previous?.revision ?? 0) + 1;
+        const next = {
+          content: payload.content as string,
+          contentHash: revision.toString(16).padStart(64, '0'),
+          revision,
+          updatedAt: 1,
+        };
+        identityStore.set(key, next);
+        body = { status: 'ok', contentHash: next.contentHash, revision: next.revision, updatedAt: next.updatedAt };
+      } else if (payload.op === 'delete') {
+        identityStore.delete(key);
+        body = { status: 'ok' };
+      } else {
+        const existing = identityStore.get(key);
+        if (!existing) body = { status: 'ok' };
+        else if (payload.knownContentHash === existing.contentHash) {
+          body = { status: 'ok', unchanged: true, contentHash: existing.contentHash, revision: existing.revision, updatedAt: existing.updatedAt };
+        } else {
+          body = { status: 'ok', ...existing };
+        }
+      }
+      queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', { data: JSON.stringify({ ...base, ...body }) })));
+      return;
+    }
     if (payload.type === DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
       queueMicrotask(() => channel.dispatchEvent(new MessageEvent('message', {
         data: JSON.stringify({
@@ -2514,6 +2551,53 @@ describe('direct file transfer v2 browser broker', () => {
     ))).toHaveLength(2);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(1);
     expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_OFFER)).toHaveLength(1);
+  });
+
+  describe('session identity over the lease (phase 2)', () => {
+    it('sets then gets identity content over the lease, and a conditional GET reports unchanged from cache', async () => {
+      const { getSessionIdentityDirect, setSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
+      const { ws } = createWs(directCapabilities);
+
+      const written = await setSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain', 'session rules');
+      expect(written).toMatchObject({ content: 'session rules', revision: 1 });
+      expect(written.contentHash).toMatch(/^[a-f0-9]{64}$/);
+
+      const read = await getSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain');
+      expect(read).toMatchObject({ content: 'session rules', contentHash: written.contentHash });
+
+      // The cache populated by the first read is what powers the second
+      // read's conditional GET -- this test doesn't inspect the wire, but a
+      // regression here would show up as `read2` losing its content (a
+      // server-side "unchanged" reply with no content, misread as empty).
+      const read2 = await getSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain');
+      expect(read2).toMatchObject({ content: 'session rules', contentHash: written.contentHash });
+    });
+
+    it('delete then get returns null, and a missing key reads back null without error', async () => {
+      const { deleteSessionIdentityDirect, getSessionIdentityDirect, setSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
+      const { ws } = createWs(directCapabilities);
+
+      await expect(getSessionIdentityDirect(ws, 'server-1', 'project', 'never-written')).resolves.toBeNull();
+
+      await setSessionIdentityDirect(ws, 'server-1', 'project', 'repo-1', 'project rules');
+      await deleteSessionIdentityDirect(ws, 'server-1', 'project', 'repo-1');
+      await expect(getSessionIdentityDirect(ws, 'server-1', 'project', 'repo-1')).resolves.toBeNull();
+    });
+
+    it('rejects a set whose content exceeds IDENTITY_CONTENT_BYTES before ever touching the lease', async () => {
+      const { setSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
+      const { ws, sent } = createWs(directCapabilities);
+      const tooBig = 'x'.repeat(DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_CONTENT_BYTES + 1);
+
+      await expect(setSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain', tooBig)).rejects.toThrow();
+      expect(sent.filter((message) => message.type === DIRECT_FILE_TRANSFER_MSG.LEASE_INIT)).toHaveLength(0);
+    });
+
+    it('rejects when the direct capability is unavailable, leaving the caller to fall back to the WS-relayed HTTP path', async () => {
+      const { getSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
+      const { ws } = createWs([]);
+      await expect(getSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain')).rejects.toThrow();
+    });
   });
 
   it('reinitializes once the isolated child reports transient recovery during peer replacement', async () => {

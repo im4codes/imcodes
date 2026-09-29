@@ -442,3 +442,89 @@ describe('operation discharge vs terminal wire shape', () => {
     }
   });
 });
+
+describe('identity over the lease data messages (phase 2)', () => {
+  const binding = {
+    serverId: 'daemon-0001', browserTabId: 'browser-tab-0001', leaseId: 'lease-0001',
+    leaseGeneration: 1, daemonGeneration: 1,
+  };
+  const request = (overrides: Record<string, unknown> = {}) => ({
+    type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...binding,
+    nonce: 'nonce-0001',
+    op: 'get',
+    scope: 'project',
+    scopeKey: 'repo-1',
+    ...overrides,
+  });
+  const response = (overrides: Record<string, unknown> = {}) => ({
+    type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE,
+    protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+    ...binding,
+    nonce: 'nonce-0001',
+    status: 'ok',
+    ...overrides,
+  });
+  const sha256 = 'a'.repeat(64);
+
+  it('accepts a well-formed get/set/delete request for project and session scope', () => {
+    expect(validateDirectFileTransferDataMessage(request({ op: 'get', scope: 'project' })).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(request({ op: 'get', scope: 'session', scopeKey: 'srv:sess' })).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(request({ op: 'set', scope: 'project', content: 'rules' })).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(request({ op: 'set', scope: 'project', content: '' })).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(request({ op: 'delete', scope: 'project' })).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(request({
+      op: 'get', scope: 'project', knownContentHash: sha256,
+    })).ok).toBe(true);
+  });
+
+  it('rejects USER scope -- identity-over-lease never carries account-wide content', () => {
+    expect(validateDirectFileTransferDataMessage(request({ scope: 'user', scopeKey: '' })).ok).toBe(false);
+  });
+
+  it('rejects an unrecognized op', () => {
+    expect(validateDirectFileTransferDataMessage(request({ op: 'list' })).ok).toBe(false);
+  });
+
+  it('rejects content on get/delete and requires it (possibly empty) on set', () => {
+    expect(validateDirectFileTransferDataMessage(request({ op: 'get', content: 'x' })).ok).toBe(false);
+    expect(validateDirectFileTransferDataMessage(request({ op: 'delete', content: 'x' })).ok).toBe(false);
+    const { content: _drop, ...withoutContent } = request({ op: 'set' });
+    expect(validateDirectFileTransferDataMessage(withoutContent).ok).toBe(false);
+  });
+
+  it('rejects content over IDENTITY_CONTENT_BYTES -- oversized content must never attempt the direct wire path', () => {
+    const tooBig = 'x'.repeat(DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_CONTENT_BYTES + 1);
+    expect(validateDirectFileTransferDataMessage(request({ op: 'set', content: tooBig })).ok).toBe(false);
+    const atLimit = 'x'.repeat(DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_CONTENT_BYTES);
+    expect(validateDirectFileTransferDataMessage(request({ op: 'set', content: atLimit })).ok).toBe(true);
+  });
+
+  it('rejects a knownContentHash that is not a sha256 hex digest', () => {
+    expect(validateDirectFileTransferDataMessage(request({ knownContentHash: 'not-a-hash' })).ok).toBe(false);
+  });
+
+  it('rejects an unknown extra field (no silent protocol drift)', () => {
+    expect(validateDirectFileTransferDataMessage(request({ extra: 'field' })).ok).toBe(false);
+  });
+
+  it('accepts a well-formed ok/error response, including unchanged and a hashed content payload', () => {
+    expect(validateDirectFileTransferDataMessage(response()).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(response({ unchanged: true, contentHash: sha256, revision: 3, updatedAt: 10 })).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(response({
+      content: 'rules', contentHash: sha256, revision: 1, updatedAt: 10,
+    })).ok).toBe(true);
+    expect(validateDirectFileTransferDataMessage(response({ status: 'error', error: 'daemon_offline' })).ok).toBe(true);
+  });
+
+  it('rejects a response with content over IDENTITY_CONTENT_BYTES or a malformed contentHash', () => {
+    const tooBig = 'x'.repeat(DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_CONTENT_BYTES + 1);
+    expect(validateDirectFileTransferDataMessage(response({ content: tooBig })).ok).toBe(false);
+    expect(validateDirectFileTransferDataMessage(response({ contentHash: 'not-a-hash' })).ok).toBe(false);
+  });
+
+  it('rejects a status other than ok/error', () => {
+    expect(validateDirectFileTransferDataMessage(response({ status: 'pending' })).ok).toBe(false);
+  });
+});

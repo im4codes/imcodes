@@ -10,6 +10,7 @@ import {
   DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
+  DIRECT_FILE_TRANSFER_IDENTITY_OP,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
   uploadDirectConnectFallbackMs,
@@ -30,10 +31,13 @@ import {
   type DirectConnectivityCandidateType,
   type DirectFileConnectionStatus,
   type DirectFileTransferAuthorized,
+  type DirectFileTransferDataIdentityResponse,
   type DirectFileTransferDataMessage,
   type DirectFileTransferDirection,
   type DirectFileTransferError,
   type DirectFileTransferIceServerConfig,
+  type DirectFileTransferIdentityOp,
+  type DirectFileTransferIdentityScope,
   type DirectFileTransferLeaseAnswer,
   type DirectFileTransferLeaseReady,
   type DirectFileTransferOperationInit,
@@ -3064,4 +3068,173 @@ export async function probeDirectConnectivity(
   } finally {
     release();
   }
+}
+
+/**
+ * Session identity over the direct v2 lease (phase 2).
+ *
+ * Deliberately ONE attempt with a bounded timeout, not the 3-attempt budget
+ * `probeDirectConnectivity`/uploads use: identity content is small and the
+ * WS-relayed fallback (phase 1, `fetchSessionIdentityProfile` and friends in
+ * `api.ts`) is always available and itself fast, so retrying a P2P path that
+ * legitimately cannot establish (e.g. UDP blocked at the network layer) would
+ * only re-introduce the save-timeout problem this whole feature exists to fix.
+ * The caller is expected to fall back to the WS-relayed HTTP call on any
+ * rejection from these functions.
+ *
+ * Content above `IDENTITY_CONTENT_BYTES` never attempts the lease at all: the
+ * payload travels as one bounded data-channel frame (the lease's existing
+ * bootstrap/health channel), not the chunked byte-stream protocol built for
+ * arbitrarily large files, so oversized content goes straight to the relay.
+ */
+async function identityRequestOverLease(
+  lease: Lease,
+  request: {
+    op: DirectFileTransferIdentityOp;
+    scope: DirectFileTransferIdentityScope;
+    scopeKey: string;
+    content?: string;
+    knownContentHash?: string;
+    source?: 'web' | 'mcp';
+    sourceFile?: string;
+  },
+): Promise<DirectFileTransferDataIdentityResponse> {
+  const peer = lease.peer;
+  if (!peer || !lease.leaseId || !lease.leaseGeneration || !lease.daemonGeneration) {
+    throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
+  }
+  const channel = lease.bootstrapChannel;
+  if (!channel) throw directError(DIRECT_FILE_TRANSFER_ERROR.CONNECTION_FAILED);
+  const signal = lease.controlAbort.signal;
+  await waitForChannelOpen(channel, peer, signal);
+  const nonce = crypto.randomUUID();
+  return new Promise<DirectFileTransferDataIdentityResponse>((resolve, reject) => {
+    if (signal.aborted) return reject(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+    let settled = false;
+    const timer = setTimeout(() => done(directError(DIRECT_FILE_TRANSFER_ERROR.NO_PROGRESS_TIMEOUT)), DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_TIMEOUT_MS);
+    const onAbort = () => done(directError(DIRECT_FILE_TRANSFER_ERROR.LEASE_EXPIRED));
+    const onClosed = () => done(directError(DIRECT_FILE_TRANSFER_ERROR.CHANNEL_CLOSED));
+    const done = (error?: unknown, value?: DirectFileTransferDataIdentityResponse) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      channel.removeEventListener('message', onMessage);
+      channel.removeEventListener('close', onClosed);
+      channel.removeEventListener('error', onClosed);
+      signal.removeEventListener('abort', onAbort);
+      if (error) reject(error); else resolve(value!);
+    };
+    const onMessage = (event: MessageEvent) => {
+      if (typeof event.data !== 'string') return;
+      let raw: unknown;
+      try { raw = JSON.parse(event.data); } catch { raw = null; }
+      const parsed = validateDirectFileTransferDataMessage(raw);
+      if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE || parsed.value.nonce !== nonce) return;
+      done(undefined, parsed.value);
+    };
+    channel.addEventListener('message', onMessage);
+    channel.addEventListener('close', onClosed);
+    channel.addEventListener('error', onClosed);
+    signal.addEventListener('abort', onAbort, { once: true });
+    sendData(channel, {
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: lease.serverId,
+      browserTabId: lease.browserTabId,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+      nonce,
+      ...request,
+    });
+  });
+}
+
+/** Content-addressed cache: skips a bytes fetch when the daemon's current hash already matches. */
+const identityCache = new Map<string, { contentHash: string; content: string }>();
+
+function identityCacheKey(serverId: string, scope: DirectFileTransferIdentityScope, scopeKey: string): string {
+  return `${serverId}\u0000${scope}\u0000${scopeKey}`;
+}
+
+export interface SessionIdentityDirectProfile {
+  content: string;
+  contentHash: string;
+  revision: number;
+  updatedAt: number;
+}
+
+async function withIdentityLease<T>(
+  ws: WsClient, serverId: string, fn: (lease: Lease) => Promise<T>,
+): Promise<T> {
+  if (!supportsLease(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
+  const { lease, release } = acquireLease(ws, serverId);
+  try {
+    await ensureLease(lease);
+    return await fn(lease);
+  } finally {
+    release();
+  }
+}
+
+/** Read PROJECT/SESSION identity over the direct lease. Rejects on any failure -- callers fall back to HTTP. */
+export async function getSessionIdentityDirect(
+  ws: WsClient, serverId: string, scope: DirectFileTransferIdentityScope, scopeKey: string,
+): Promise<SessionIdentityDirectProfile | null> {
+  const cacheKey = identityCacheKey(serverId, scope, scopeKey);
+  const cached = identityCache.get(cacheKey);
+  return withIdentityLease(ws, serverId, async (lease) => {
+    const response = await identityRequestOverLease(lease, {
+      op: DIRECT_FILE_TRANSFER_IDENTITY_OP.GET, scope, scopeKey, knownContentHash: cached?.contentHash,
+    });
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: DIRECT_CONNECTIVITY_ROUTE.DIRECT });
+    if (response.status !== 'ok') throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true, response.error);
+    if (response.contentHash === undefined) {
+      identityCache.delete(cacheKey);
+      return null;
+    }
+    if (response.unchanged && cached) {
+      return { content: cached.content, contentHash: cached.contentHash, revision: response.revision ?? 0, updatedAt: response.updatedAt ?? 0 };
+    }
+    const content = response.content ?? '';
+    identityCache.set(cacheKey, { contentHash: response.contentHash, content });
+    return { content, contentHash: response.contentHash, revision: response.revision ?? 0, updatedAt: response.updatedAt ?? 0 };
+  });
+}
+
+/** Write PROJECT/SESSION identity over the direct lease. Rejects on any failure -- callers fall back to HTTP. */
+export async function setSessionIdentityDirect(
+  ws: WsClient, serverId: string, scope: DirectFileTransferIdentityScope, scopeKey: string,
+  content: string, options: { source?: 'web' | 'mcp'; sourceFile?: string } = {},
+): Promise<SessionIdentityDirectProfile> {
+  if (utf8ByteLength(content) > DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_CONTENT_BYTES) {
+    throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
+  }
+  return withIdentityLease(ws, serverId, async (lease) => {
+    const response = await identityRequestOverLease(lease, {
+      op: DIRECT_FILE_TRANSFER_IDENTITY_OP.SET, scope, scopeKey, content, source: options.source, sourceFile: options.sourceFile,
+    });
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: DIRECT_CONNECTIVITY_ROUTE.DIRECT });
+    if (response.status !== 'ok' || response.contentHash === undefined) {
+      throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true, response.error);
+    }
+    identityCache.set(identityCacheKey(serverId, scope, scopeKey), { contentHash: response.contentHash, content });
+    return { content, contentHash: response.contentHash, revision: response.revision ?? 0, updatedAt: response.updatedAt ?? 0 };
+  });
+}
+
+/** Delete PROJECT/SESSION identity over the direct lease. Rejects on any failure -- callers fall back to HTTP. */
+export async function deleteSessionIdentityDirect(
+  ws: WsClient, serverId: string, scope: DirectFileTransferIdentityScope, scopeKey: string,
+): Promise<void> {
+  return withIdentityLease(ws, serverId, async (lease) => {
+    const response = await identityRequestOverLease(lease, { op: DIRECT_FILE_TRANSFER_IDENTITY_OP.DELETE, scope, scopeKey });
+    recordDirectFileTransferMetric(DIRECT_FILE_TRANSFER_CLIENT_METRIC.ROUTE, { route: DIRECT_CONNECTIVITY_ROUTE.DIRECT });
+    if (response.status !== 'ok') throw directError(DIRECT_FILE_TRANSFER_ERROR.INTERNAL_ERROR, true, response.error);
+    identityCache.delete(identityCacheKey(serverId, scope, scopeKey));
+  });
+}
+
+function utf8ByteLength(value: string): number {
+  return new TextEncoder().encode(value).length;
 }

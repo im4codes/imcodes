@@ -12,6 +12,7 @@ import {
   directFileTransferAttemptBindingMatches,
   DIRECT_FILE_TRANSFER_HEALTH_CHANNEL_PREFIX,
   DIRECT_FILE_TRANSFER_ERROR_SCOPE,
+  DIRECT_FILE_TRANSFER_IDENTITY_OP,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
   DIRECT_FILE_TRANSFER_MSG,
@@ -26,6 +27,7 @@ import {
   type DirectFileTransferDirection,
   type DirectFileTransferError,
   type DirectFileTransferIceServerConfig,
+  type DirectFileTransferIdentityScope,
   type DirectFileTransferLeaseIce,
   type DirectFileTransferLeaseOffer,
   type DirectFileTransferLeasePrepare,
@@ -34,6 +36,7 @@ import {
   type DirectFileTransferTerminalState,
   type DirectConnectivityRuntimeError,
   type DirectConnectivityRuntimeStatus,
+  type DirectFileTransferDataIdentityRequest,
 } from '../../shared/direct-file-transfer.js';
 import type { AttachmentRef } from '../../shared/transport/file-transfer.js';
 import {
@@ -238,6 +241,36 @@ async function finalizeDirectUploadedFile(params: Record<string, unknown>): Prom
   return await callHost(
     DIRECT_FILE_TRANSFER_HOST_METHOD.FINALIZE_DIRECT_UPLOADED_FILE, [params],
   ) as AttachmentRef;
+}
+
+interface IdentityHostResult {
+  status: 'ok';
+  unchanged?: boolean;
+  content?: string;
+  contentHash?: string;
+  revision?: number;
+  updatedAt?: number;
+}
+
+async function identityGet(
+  scope: DirectFileTransferIdentityScope, scopeKey: string, knownContentHash: string | undefined,
+): Promise<IdentityHostResult> {
+  return await callHost(
+    DIRECT_FILE_TRANSFER_HOST_METHOD.IDENTITY_GET, [scope, scopeKey, knownContentHash],
+  ) as IdentityHostResult;
+}
+
+async function identitySet(
+  scope: DirectFileTransferIdentityScope, scopeKey: string, content: string,
+  source: 'web' | 'mcp' | undefined, sourceFile: string | undefined,
+): Promise<IdentityHostResult> {
+  return await callHost(
+    DIRECT_FILE_TRANSFER_HOST_METHOD.IDENTITY_SET, [scope, scopeKey, content, source, sourceFile],
+  ) as IdentityHostResult;
+}
+
+async function identityDelete(scope: DirectFileTransferIdentityScope, scopeKey: string): Promise<void> {
+  await callHost(DIRECT_FILE_TRANSFER_HOST_METHOD.IDENTITY_DELETE, [scope, scopeKey]);
 }
 
 const senderCache = new Map<string, WorkerControlSender>();
@@ -1416,8 +1449,60 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
     lease.healthChannel = null;
     closeOrRetireNative(channel);
   };
+  const stillLive = () => lease.healthChannel === channel && isCurrentLeaseCallback(lease, callbackGeneration);
+  const bindingMatches = (value: Pick<DirectFileTransferAttemptBinding, 'serverId' | 'browserTabId' | 'leaseId' | 'leaseGeneration' | 'daemonGeneration'>) =>
+    value.serverId === lease.binding.serverId
+    && value.browserTabId === lease.binding.browserTabId
+    && value.leaseId === lease.binding.leaseId
+    && value.leaseGeneration === lease.binding.leaseGeneration
+    && value.daemonGeneration === lease.binding.daemonGeneration;
+  /**
+   * Identity get/set/delete share this same authority-free bootstrap channel
+   * instead of opening a second one: like the health probe, it never carries
+   * file-transfer authority, and the payload is a single bounded frame (see
+   * IDENTITY_CONTENT_BYTES) rather than a chunked byte stream. Unlike the
+   * probe this does one async host call (disk I/O on the main thread), so the
+   * response is sent from a callback, not synchronously from `onMessage`.
+   */
+  const handleIdentityRequest = async (request: DirectFileTransferDataIdentityRequest) => {
+    let result: {
+      status: 'ok' | 'error'; unchanged?: boolean; content?: string;
+      contentHash?: string; revision?: number; updatedAt?: number; error?: string;
+    };
+    try {
+      if (request.op === DIRECT_FILE_TRANSFER_IDENTITY_OP.GET) {
+        result = await identityGet(request.scope, request.scopeKey, request.knownContentHash);
+      } else if (request.op === DIRECT_FILE_TRANSFER_IDENTITY_OP.SET) {
+        result = await identitySet(request.scope, request.scopeKey, request.content ?? '', request.source, request.sourceFile);
+      } else {
+        await identityDelete(request.scope, request.scopeKey);
+        result = { status: 'ok' };
+      }
+    } catch (error) {
+      result = { status: 'error', error: error instanceof Error ? error.message : String(error) };
+    }
+    // The channel (or the whole lease generation) may have gone away while
+    // the host call was in flight; a stale reply must never be sent.
+    if (!stillLive()) return;
+    try {
+      const sent = channel.sendMessage(JSON.stringify({
+        type: DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: lease.binding.serverId,
+        browserTabId: lease.binding.browserTabId,
+        leaseId: lease.binding.leaseId,
+        leaseGeneration: lease.binding.leaseGeneration,
+        daemonGeneration: lease.binding.daemonGeneration,
+        nonce: request.nonce,
+        ...result,
+      }));
+      if (!sent) retire();
+    } catch {
+      retire();
+    }
+  };
   channel.onMessage((message) => {
-    if (lease.healthChannel !== channel || !isCurrentLeaseCallback(lease, callbackGeneration)) {
+    if (!stillLive()) {
       retire();
       return;
     }
@@ -1428,12 +1513,15 @@ function attachLeaseHealthChannel(lease: DirectLease, channel: DataChannel): voi
     let raw: unknown;
     try { raw = JSON.parse(message); } catch { raw = null; }
     const parsed = validateDirectFileTransferDataMessage(raw);
-    if (!parsed.ok || parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE
-      || parsed.value.serverId !== lease.binding.serverId
-      || parsed.value.browserTabId !== lease.binding.browserTabId
-      || parsed.value.leaseId !== lease.binding.leaseId
-      || parsed.value.leaseGeneration !== lease.binding.leaseGeneration
-      || parsed.value.daemonGeneration !== lease.binding.daemonGeneration) {
+    if (!parsed.ok || !bindingMatches(parsed.value)) {
+      retire();
+      return;
+    }
+    if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST) {
+      void handleIdentityRequest(parsed.value);
+      return;
+    }
+    if (parsed.value.type !== DIRECT_FILE_TRANSFER_DATA_MSG.HEALTH_PROBE) {
       retire();
       return;
     }

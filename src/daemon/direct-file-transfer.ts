@@ -31,9 +31,15 @@ import {
   validateDirectFileTransferWorkerEnvelope,
   type DirectConnectivityRuntimeStatus,
   type DirectFileTransferDaemonCommand,
+  type DirectFileTransferIdentityScope,
   type DirectFileTransferLeaseBinding,
   type DirectFileTransferLeasePrepared,
 } from '../../shared/direct-file-transfer.js';
+import {
+  getLocalSessionIdentityProfile,
+  putLocalSessionIdentityProfile,
+  removeLocalSessionIdentityProfile,
+} from './session-identity-local-store.js';
 import {
   spawnDirectFileTransferChild,
   type DirectFileTransferIsolate,
@@ -514,6 +520,35 @@ async function invokeHostMethod(generation: number, method: string, args: unknow
       return await finalizeUploadedFileOnHost(
         args[0] as Parameters<FinalizeDirectUploadedFile>[0],
       );
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.IDENTITY_GET: {
+      const [scope, scopeKey, knownContentHash] = args as [DirectFileTransferIdentityScope, string, string | undefined];
+      const profile = await getLocalSessionIdentityProfile(scope, scopeKey);
+      if (!profile) return { status: 'ok' };
+      if (knownContentHash && profile.contentHash === knownContentHash) {
+        return {
+          status: 'ok', unchanged: true,
+          contentHash: profile.contentHash, revision: profile.revision, updatedAt: profile.updatedAt,
+        };
+      }
+      return {
+        status: 'ok', content: profile.content,
+        contentHash: profile.contentHash, revision: profile.revision, updatedAt: profile.updatedAt,
+      };
+    }
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.IDENTITY_SET: {
+      const [scope, scopeKey, content, source, sourceFile] = args as [
+        DirectFileTransferIdentityScope, string, string, 'web' | 'mcp' | undefined, string | undefined,
+      ];
+      const profile = await putLocalSessionIdentityProfile({
+        scope, scopeKey, content, source: source ?? 'web', sourceFile,
+      });
+      return { status: 'ok', contentHash: profile.contentHash, revision: profile.revision, updatedAt: profile.updatedAt };
+    }
+    case DIRECT_FILE_TRANSFER_HOST_METHOD.IDENTITY_DELETE: {
+      const [scope, scopeKey] = args as [DirectFileTransferIdentityScope, string];
+      await removeLocalSessionIdentityProfile(scope, scopeKey);
+      return { status: 'ok' };
+    }
     default:
       // Unreachable: the validator allowlists the method before we get here.
       throw new Error(`unsupported_host_method:${method}`);

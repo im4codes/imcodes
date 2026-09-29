@@ -1,5 +1,10 @@
 import type { AttachmentRef } from './transport/file-transfer.js';
 import { FILE_TRANSFER_PATH_MAX_BYTES, validateAttachmentRef } from './transport/file-transfer.js';
+import {
+  SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS,
+  SESSION_IDENTITY_SCOPES,
+  SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS,
+} from './session-identity.js';
 
 /**
  * Full daemons auto-upgrade, so this is a clean v2 protocol.  Do not add v1
@@ -72,8 +77,28 @@ export const DIRECT_FILE_TRANSFER_DATA_MSG = {
   DOWNLOAD_COMMITTED: 'direct_file.v2.data.download_committed',
   HEALTH_PROBE: 'direct_file.v2.data.health_probe',
   HEALTH_PONG: 'direct_file.v2.data.health_pong',
+  IDENTITY_REQUEST: 'direct_file.v2.data.identity_request',
+  IDENTITY_RESPONSE: 'direct_file.v2.data.identity_response',
   ERROR: 'direct_file.v2.data.error',
 } as const;
+
+export const DIRECT_FILE_TRANSFER_IDENTITY_OP = {
+  GET: 'get',
+  SET: 'set',
+  DELETE: 'delete',
+} as const;
+
+export type DirectFileTransferIdentityOp =
+  typeof DIRECT_FILE_TRANSFER_IDENTITY_OP[keyof typeof DIRECT_FILE_TRANSFER_IDENTITY_OP];
+
+/**
+ * Identity-over-lease covers only PROJECT/SESSION scope. USER scope stays
+ * server-authoritative and server-pushed (phase 1) -- it is small, already
+ * cached server-side, and the same content is shared by every one of the
+ * account's online daemons, which P2P has no natural way to fan out to.
+ */
+export type DirectFileTransferIdentityScope =
+  typeof SESSION_IDENTITY_SCOPES.PROJECT | typeof SESSION_IDENTITY_SCOPES.SESSION;
 
 export const DIRECT_FILE_TRANSFER_OPERATION_STATE = {
   AUTHORIZING: 'authorizing',
@@ -301,6 +326,21 @@ export const DIRECT_FILE_TRANSFER_LIMITS = {
   PROBE_CANDIDATE_ADDRESS_BYTES: 512,
   PROBE_CANDIDATE_TYPE_BYTES: 64,
   PROBE_TIMEOUT_MS: 8 * 1000,
+  /**
+   * Identity content travels as ONE data-channel frame on the lease's
+   * existing bounded bootstrap channel (same channel as HEALTH_PROBE/PONG),
+   * not the chunked START/CREDIT/FINISH byte-stream protocol built for
+   * arbitrarily large files. That keeps identity-over-lease a small,
+   * single-round-trip request/response instead of a second file-transfer
+   * state machine. This is therefore a HARD wire ceiling, independent of
+   * SESSION_IDENTITY_PROJECT_MAX_CHARS/SESSION_IDENTITY_SESSION_MAX_CHARS
+   * (which bound what the HTTP relay path accepts): content above it never
+   * attempts the direct path at all and goes straight to the existing
+   * server-relayed WS RPC from phase 1. Matches DATA_CHUNK_BYTES, the size
+   * this codebase already treats as safe for one reliable SCTP message.
+   */
+  IDENTITY_CONTENT_BYTES: 64 * 1024,
+  IDENTITY_TIMEOUT_MS: 8 * 1000,
 } as const;
 
 /**
@@ -788,6 +828,44 @@ export interface DirectFileTransferDataError extends DirectFileTransferAttemptBi
   error: DirectFileTransferError;
 }
 
+/**
+ * Lease-scoped, like HEALTH_PROBE/PONG -- no OPERATION_INIT/AUTHORIZED/
+ * PREPARE dance, since this never allocates a file-transfer authority.
+ */
+export interface DirectFileTransferDataIdentityRequest extends DirectFileTransferLeaseBinding {
+  type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST;
+  protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
+  nonce: string;
+  op: DirectFileTransferIdentityOp;
+  scope: DirectFileTransferIdentityScope;
+  scopeKey: string;
+  /** Required for `set`; absent for `get`/`delete`. */
+  content?: string;
+  /**
+   * Conditional GET: when the browser's cached content already has this
+   * hash, the daemon replies `unchanged: true` with no content, so an
+   * unmodified PROJECT/SESSION identity never has its bytes re-sent just
+   * because a settings panel was reopened.
+   */
+  knownContentHash?: string;
+  source?: 'web' | 'mcp';
+  sourceFile?: string;
+}
+
+export interface DirectFileTransferDataIdentityResponse extends DirectFileTransferLeaseBinding {
+  type: typeof DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE;
+  protocolVersion: typeof DIRECT_FILE_TRANSFER_PROTOCOL_VERSION;
+  nonce: string;
+  status: 'ok' | 'error';
+  /** `get` only: the daemon's cached content already matched `knownContentHash`. */
+  unchanged?: boolean;
+  content?: string;
+  contentHash?: string;
+  revision?: number;
+  updatedAt?: number;
+  error?: string;
+}
+
 export type DirectFileTransferBrowserMessage =
   | DirectFileTransferLeaseInit
   | DirectFileTransferLeaseRebind
@@ -836,6 +914,8 @@ export type DirectFileTransferDataMessage =
   | DirectFileTransferDataDownloadCommitted
   | DirectFileTransferDataHealthProbe
   | DirectFileTransferDataHealthPong
+  | DirectFileTransferDataIdentityRequest
+  | DirectFileTransferDataIdentityResponse
   | DirectFileTransferDataError;
 
 export type DirectFileTransferValidationResult<T> = { ok: true; value: T } | { ok: false; error: typeof DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
@@ -850,6 +930,8 @@ const TERMINAL_STATES = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_TERMI
 const ERRORS = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_ERROR));
 const RUNTIME_STATES = new Set<string>(Object.values(DIRECT_CONNECTIVITY_RUNTIME_STATE));
 const RUNTIME_ERRORS = new Set<string>(Object.values(DIRECT_CONNECTIVITY_RUNTIME_ERROR));
+const IDENTITY_OPS = new Set<string>(Object.values(DIRECT_FILE_TRANSFER_IDENTITY_OP));
+const IDENTITY_SCOPES = new Set<string>([SESSION_IDENTITY_SCOPES.PROJECT, SESSION_IDENTITY_SCOPES.SESSION]);
 
 function invalid<T>(): DirectFileTransferValidationResult<T> {
   return { ok: false, error: DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST };
@@ -1439,6 +1521,43 @@ export function validateDirectFileTransferDataMessage(value: unknown): DirectFil
       || !isDirectConnectivityCandidateInfo(value.localCandidate) || !isDirectConnectivityCandidateInfo(value.remoteCandidate)) return invalid();
     return { ok: true, value: value as unknown as DirectFileTransferDataHealthPong };
   }
+  if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_REQUEST) {
+    if (!hasExactKeys(
+      value,
+      ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'nonce', 'op', 'scope', 'scopeKey'],
+      ['content', 'knownContentHash', 'source', 'sourceFile'],
+    ) || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isLeaseBinding(value)
+      || !isBoundedString(value.nonce, DIRECT_FILE_TRANSFER_LIMITS.PROBE_NONCE_BYTES)
+      || typeof value.op !== 'string' || !IDENTITY_OPS.has(value.op)
+      || typeof value.scope !== 'string' || !IDENTITY_SCOPES.has(value.scope)
+      || !isBoundedString(value.scopeKey, SESSION_IDENTITY_SCOPE_KEY_MAX_CHARS)) return invalid();
+    if (value.op === DIRECT_FILE_TRANSFER_IDENTITY_OP.SET) {
+      if (!isBoundedString(value.content, DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_CONTENT_BYTES, true)) return invalid();
+    } else if (value.content !== undefined) {
+      return invalid();
+    }
+    if (value.knownContentHash !== undefined
+      && (typeof value.knownContentHash !== 'string' || !SHA256_RE.test(value.knownContentHash))) return invalid();
+    if (value.source !== undefined && value.source !== 'web' && value.source !== 'mcp') return invalid();
+    if (value.sourceFile !== undefined && !isBoundedString(value.sourceFile, SESSION_IDENTITY_SOURCE_FILE_MAX_CHARS)) return invalid();
+    return { ok: true, value: value as unknown as DirectFileTransferDataIdentityRequest };
+  }
+  if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.IDENTITY_RESPONSE) {
+    if (!hasExactKeys(
+      value,
+      ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'nonce', 'status'],
+      ['unchanged', 'content', 'contentHash', 'revision', 'updatedAt', 'error'],
+    ) || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isLeaseBinding(value)
+      || !isBoundedString(value.nonce, DIRECT_FILE_TRANSFER_LIMITS.PROBE_NONCE_BYTES)
+      || (value.status !== 'ok' && value.status !== 'error')) return invalid();
+    if (value.unchanged !== undefined && typeof value.unchanged !== 'boolean') return invalid();
+    if (value.content !== undefined && !isBoundedString(value.content, DIRECT_FILE_TRANSFER_LIMITS.IDENTITY_CONTENT_BYTES, true)) return invalid();
+    if (value.contentHash !== undefined && (typeof value.contentHash !== 'string' || !SHA256_RE.test(value.contentHash))) return invalid();
+    if (value.revision !== undefined && !isPositiveSafeInteger(value.revision)) return invalid();
+    if (value.updatedAt !== undefined && !isTimestamp(value.updatedAt)) return invalid();
+    if (value.error !== undefined && !isBoundedString(value.error, DIRECT_FILE_TRANSFER_LIMITS.ERROR_DETAIL_BYTES)) return invalid();
+    return { ok: true, value: value as unknown as DirectFileTransferDataIdentityResponse };
+  }
   if (value.type === DIRECT_FILE_TRANSFER_DATA_MSG.ERROR) {
     if (!hasExactKeys(value, ['type', 'protocolVersion', 'serverId', 'browserTabId', 'leaseId', 'leaseGeneration', 'daemonGeneration', 'requestId', 'attemptId', 'attempt', 'direction', 'operationId', 'error'])
       || value.protocolVersion !== DIRECT_FILE_TRANSFER_PROTOCOL_VERSION || !isDataAttemptBinding(value)
@@ -1623,6 +1742,9 @@ export const DIRECT_FILE_TRANSFER_HOST_METHOD = {
   LOOKUP_ATTACHMENT_BY_CLIENT_UPLOAD_ID: 'lookupAttachmentByClientUploadId',
   RESOLVE_DIRECT_FILE_DOWNLOAD_SOURCE: 'resolveDirectFileDownloadSource',
   FINALIZE_DIRECT_UPLOADED_FILE: 'finalizeDirectUploadedFile',
+  IDENTITY_GET: 'identityGet',
+  IDENTITY_SET: 'identitySet',
+  IDENTITY_DELETE: 'identityDelete',
 } as const;
 
 export type DirectFileTransferHostMethod =
