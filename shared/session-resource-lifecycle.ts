@@ -121,6 +121,9 @@ export const TASK_ADMISSION_OPERATION = {
   RELEASE: 'release',
 } as const;
 
+/** Hook response used when a stdio child still carries a pre-restart epoch. */
+export const TASK_ADMISSION_STALE_RUNTIME_ERROR = 'task_admission_stale_runtime' as const;
+
 export const TASK_ADMISSION_HOOK_PATH = '/resource-admission';
 
 export type TaskAdmission = typeof TASK_ADMISSION[keyof typeof TASK_ADMISSION];

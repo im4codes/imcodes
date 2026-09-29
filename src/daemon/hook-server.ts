@@ -63,7 +63,11 @@ import {
   type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
 import { isSendMessageId, type SendMessageId } from '../../shared/send-message-id.js';
-import { TASK_ADMISSION_HOOK_PATH, TASK_ADMISSION_OPERATION } from '../../shared/session-resource-lifecycle.js';
+import {
+  TASK_ADMISSION_HOOK_PATH,
+  TASK_ADMISSION_OPERATION,
+  TASK_ADMISSION_STALE_RUNTIME_ERROR,
+} from '../../shared/session-resource-lifecycle.js';
 import { getDaemonTaskAdmissionController } from './daemon-task-admission.js';
 import { measureSessionProcessTreeRssBytes } from './session-resource-service.js';
 import {
@@ -1032,7 +1036,7 @@ export async function startHookServer(
         if (body.sessionInstanceId !== session.sessionInstanceId
           || body.runtimeEpoch !== session.runtimeEpoch) {
           res.writeHead(409, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ ok: false, error: 'task_admission_stale_runtime' }));
+          res.end(JSON.stringify({ ok: false, error: TASK_ADMISSION_STALE_RUNTIME_ERROR }));
           return;
         }
         const controller = getDaemonTaskAdmissionController();

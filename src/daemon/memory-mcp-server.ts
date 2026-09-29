@@ -61,6 +61,7 @@ import {
   TASK_ADMISSION,
   TASK_ADMISSION_HOOK_PATH,
   TASK_ADMISSION_OPERATION,
+  TASK_ADMISSION_STALE_RUNTIME_ERROR,
   MEMORY_MCP_WATCHDOG,
   sessionResourceLifetimeFromEnv,
 } from '../../shared/session-resource-lifecycle.js';
@@ -226,7 +227,7 @@ async function observeDaemonTaskAdmission(
   tool: string,
   caller: McpRuntimeCaller,
   owner: SessionResourceOwner | null,
-): Promise<{ port: number; token: string } | null> {
+): Promise<{ token: string } | null> {
   if (!caller.sessionName || !owner || owner.sessionName !== caller.sessionName) {
     recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.IDENTITY_UNAVAILABLE);
     return null;
@@ -235,26 +236,26 @@ async function observeDaemonTaskAdmission(
     // Report WHICH endpoint-authority failure occurred; the old generic
     // 'no_hook_port' detail could not distinguish "daemon never published" from
     // "record points at a dead/foreign owner".
-    const authority = await resolveHookAuthority();
-    if (!authority.ok) {
-      recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.UNAVAILABLE, authority.reason);
-      return null;
-    }
-    const port = authority.port;
-    const response = await postHookSend(
-      port,
-      {
+    const requireAdmissionHookPort = async (operation: string): Promise<number> => {
+      const authority = await resolveHookAuthority();
+      if (!authority.ok) throw new HookAuthorityUnavailableError(authority.reason, operation, authority.detail);
+      return authority.port;
+    };
+    const postAdmissionHook = createResourceOwnerHookWithEpochRefresh({
+      resourceOwner: owner,
+      callerSessionName: caller.sessionName,
+      requireHookPort: requireAdmissionHookPort,
+      hookPath: TASK_ADMISSION_HOOK_PATH,
+      timeoutMs: 2_000,
+      staleRuntimeError: TASK_ADMISSION_STALE_RUNTIME_ERROR,
+      rejectStopped: true,
+    });
+    const response = await postAdmissionHook({
         operation: TASK_ADMISSION_OPERATION.ACQUIRE,
-        sessionInstanceId: owner.sessionInstanceId,
-        runtimeEpoch: owner.runtimeEpoch,
-      },
-      TASK_ADMISSION_HOOK_PATH,
-      caller.sessionName,
-      2_000,
-    );
+      });
     if (response.action === TASK_ADMISSION.ACCEPT && typeof response.token === 'string') {
       recordDaemonTaskAdmission(tool, DAEMON_TASK_ADMISSION_OUTCOME.ACCEPTED);
-      return { port, token: response.token };
+      return { token: response.token };
     }
     // Pressure is real and recorded. It still does not refuse the call.
     recordDaemonTaskAdmission(
@@ -274,21 +275,27 @@ async function observeDaemonTaskAdmission(
 async function releaseDaemonTaskAdmission(
   caller: McpRuntimeCaller,
   owner: SessionResourceOwner | null,
-  lease: { port: number; token: string } | null,
+  lease: { token: string } | null,
 ): Promise<void> {
   if (!lease || !caller.sessionName || !owner) return;
-  await postHookSend(
-    lease.port,
-    {
+  const requireAdmissionHookPort = async (operation: string): Promise<number> => {
+    const authority = await resolveHookAuthority();
+    if (!authority.ok) throw new HookAuthorityUnavailableError(authority.reason, operation, authority.detail);
+    return authority.port;
+  };
+  const postAdmissionHook = createResourceOwnerHookWithEpochRefresh({
+    resourceOwner: owner,
+    callerSessionName: caller.sessionName,
+    requireHookPort: requireAdmissionHookPort,
+    hookPath: TASK_ADMISSION_HOOK_PATH,
+    timeoutMs: 2_000,
+    staleRuntimeError: TASK_ADMISSION_STALE_RUNTIME_ERROR,
+    rejectStopped: true,
+  });
+  await postAdmissionHook({
       operation: TASK_ADMISSION_OPERATION.RELEASE,
       token: lease.token,
-      sessionInstanceId: owner.sessionInstanceId,
-      runtimeEpoch: owner.runtimeEpoch,
-    },
-    TASK_ADMISSION_HOOK_PATH,
-    caller.sessionName,
-    2_000,
-  ).catch(() => {});
+    }).catch(() => {});
 }
 
 function installMemoryMcpResourceGuard(
