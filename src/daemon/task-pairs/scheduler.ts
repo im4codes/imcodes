@@ -29,6 +29,7 @@ import {
   TASK_PAIR_HEARTBEAT_MS,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_OPEN_STATUSES,
+  TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_QUEUE_STALL_NOTICE_MS,
   TASK_PAIR_SILENCE_LIMIT,
   TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
@@ -87,6 +88,9 @@ export const TASK_PAIR_HEARTBEAT_ENV = 'IMCODES_TASK_PAIR_HEARTBEAT_MS' as const
 export const TASK_PAIR_BOTH_IDLE_NUDGE_ENV = 'IMCODES_TASK_PAIR_BOTH_IDLE_NUDGE_MS' as const;
 /** How often the lightweight both-idle check runs; independent of, and much cheaper than, a full heartbeat tick. */
 const TASK_PAIR_BOTH_IDLE_CHECK_INTERVAL_MS = 30_000;
+/** Skipped heartbeat decisions are diagnostic only; persist a first sample,
+ * then back off so a 30s poll cannot create an unbounded event stream. */
+const TASK_PAIR_SKIPPED_DECISION_BACKOFF_MS = 10 * 60_000;
 /** Bound pool discovery/provisioning so one provider or transport cannot freeze the queue. */
 export const TASK_PAIR_QUEUE_OPERATION_TIMEOUT_ENV = 'IMCODES_TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS' as const;
 const TASK_PAIR_QUEUE_OPERATION_TIMEOUT_MS = 15_000;
@@ -228,6 +232,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const bySession = new Map<string, StoredTaskPair[]>();
     for (const stored of getTaskPairStore().listActivePairs()) {
       if (!isPairsEngineProject(stored.project)) continue;
+      if (!TASK_PAIR_PARTICIPANT_STATUSES.includes(stored.state.status)) continue;
       for (const session of [stored.state.executor, stored.state.auditor]) {
         if (!session || session === TASK_PAIR_NO_AUDITOR) continue;
         const list = bySession.get(session) ?? [];
@@ -992,6 +997,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
       logger.info({ taskId: stored.state.taskId, verb, effect, reason }, 'task-pair: nudge skipped (not persisted)');
       return;
     }
+    if (verb === 'REMIND' && effect === 'skipped') {
+      const recent = getTaskPairStore().listEvents(stored.project, stored.state.taskId, 200)
+        .find((event) => event.verb === verb && event.effect === 'skipped' && event.attrs.reason === reason);
+      if (recent && at - recent.at < TASK_PAIR_SKIPPED_DECISION_BACKOFF_MS) return;
+    }
     const id = `heartbeat:${verb.toLowerCase()}:${stored.project}:${stored.state.taskId}:${at}:${reason}`;
     getTaskPairStore().recordEvent({
       id, project: stored.project, taskId: stored.state.taskId, writer: 'daemon', role: 'daemon', verb,
@@ -1715,8 +1725,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
           ? getTaskPairStore().listActivePairs().find((candidate) => candidate.state.taskId !== pair.taskId
             && (candidate.state.executor === heldSession || candidate.state.auditor === heldSession))
           : undefined;
+        const holderAge = holder ? Math.max(0, this.#now() - holder.state.updatedAt) : 0;
+        const holderAgeText = holder
+          ? holderAge < 60_000 ? `${Math.floor(holderAge / 1_000)}s`
+            : holderAge < 3_600_000 ? `${Math.floor(holderAge / 60_000)}m`
+              : `${Math.floor(holderAge / 3_600_000)}h`
+          : undefined;
         const detail = heldSession
-          ? `waiting for ${heldSession} (busy in ${holder?.state.taskId ?? 'another open pair'})`
+          ? `waiting for ${heldSession} (busy in ${holder?.state.taskId ?? 'another open pair'}${holder ? `, status ${holder.state.status}, age ${holderAgeText}` : ''})`
           : `waiting for ${busySession} (session busy)`;
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity', detail);
         this.#logQueueSkip(project, pair, detail);

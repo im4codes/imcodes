@@ -320,6 +320,97 @@ describe('task-pair marker ingestion', () => {
     expect(getTaskPairStore().listEvents(PROJECT, 'T3')).toHaveLength(4);
   });
 
+  it('does not let a queued pair reserve its named participants', () => {
+    service.setScheduler({ onIntent: () => undefined });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'QUEUE', knownVerb: 'QUEUE', taskId: 'queued-free', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', eventId: 'queued-free-create',
+    });
+    expect(pair('queued-free')?.status).toBe('queued');
+    expect(getTaskPairStore().isParticipantOfOpenPair(EXEC)).toBe(false);
+  });
+
+  it('deduplicates identical verdict markers with different event ids in one round', () => {
+    service.setScheduler({ onIntent: () => undefined });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'verdict-dedup', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', eventId: 'verdict-dispatch',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'verdict-dedup', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'queue', eventId: 'verdict-queue',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: EXEC,
+      marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'verdict-dedup', attrs: { worktree: '/w', head: 'h1', base: 'b1' } },
+      source: 'marker', now: 1_000, eventId: 'verdict-ready',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: AUD,
+      marker: { verb: 'REWORK', knownVerb: 'REWORK', taskId: 'verdict-dedup', attrs: { blocking: 'P0', p0: '1' } },
+      source: 'marker', now: 2_000, eventId: 'verdict-rework-1',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: AUD,
+      marker: { verb: 'REWORK', knownVerb: 'REWORK', taskId: 'verdict-dedup', attrs: { blocking: 'P0', p0: '1' } },
+      source: 'marker', now: 2_001, eventId: 'verdict-rework-2',
+    });
+    expect(getTaskPairStore().listEvents(PROJECT, 'verdict-dedup').filter((event) => event.verb === 'REWORK')).toHaveLength(1);
+  });
+
+  it('nudges the executor once when READY lacks an auditor validation report', async () => {
+    service.setScheduler({ onIntent: () => undefined });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-gate', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', eventId: 'ready-gate-dispatch',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-gate', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'queue', eventId: 'ready-gate-queue',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: EXEC,
+      marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'ready-gate', attrs: { worktree: '/w', head: 'h1', base: 'b1' } },
+      source: 'marker', now: 3_000, eventId: 'ready-gate-ready',
+    });
+    await flush();
+    const reminders = sent.filter((entry) => entry.id.includes(':validation-report:'));
+    expect(reminders).toHaveLength(1);
+    expect(reminders[0]?.target).toBe(EXEC);
+  });
+
+  it('suppresses a participant relay that exactly repeats the partner report to Brain', () => {
+    service.setScheduler({ onIntent: () => undefined });
+    service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'relay-dedup', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'marker', eventId: 'relay-dedup-dispatch',
+    });
+    service.applyMarker({
+      project: PROJECT, writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'relay-dedup', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'queue', eventId: 'relay-dedup-start',
+    });
+    const report = 'Validation passed: focused task-pair tests 45/45; no failures.';
+    service.implicitDispatch({
+      project: PROJECT, sender: EXEC, target: BRAIN, taskId: 'relay-dedup', message: report, eventId: 'relay-dedup-original',
+    });
+    service.implicitDispatch({
+      project: PROJECT, sender: AUD, target: BRAIN, taskId: 'relay-dedup', message: report, eventId: 'relay-dedup-relay',
+    });
+    const sends = getTaskPairStore().listEvents(PROJECT, 'relay-dedup')
+      .filter((event) => event.verb === 'SEND')
+      .sort((a, b) => a.at - b.at);
+    expect(sends).toHaveLength(2);
+    expect(sends.map((event) => event.effect).sort()).toEqual(['recorded', 'relay_suppressed']);
+    expect(sends.find((event) => event.effect === 'relay_suppressed')?.unusual).toBe(false);
+  });
+
   it('tells Brain once when an audited pair PASSes, with the verdict and material, and does not repeat it on DONE', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T63 executor=${EXEC} auditor=${AUD} -->`);
     await say(EXEC, 'Ready.\n<!-- IMCODES_TASK READY_FOR_AUDIT T63 worktree=/tmp/wt63 head=abc1234 base=def5678 -->');

@@ -124,6 +124,61 @@ function mentionsTaskId(text: string, taskId: string): boolean {
   return new RegExp(`(^|[^A-Za-z0-9_-])${escaped}($|[^A-Za-z0-9_-])`, 'u').test(text);
 }
 
+const TASK_PAIR_MARKER_DEDUP_WINDOW_MS = 15_000;
+
+function stableMarkerAttrs(attrs: Record<string, string>): string {
+  return JSON.stringify(Object.entries(attrs)
+    .filter(([key]) => !key.startsWith('__'))
+    .sort(([a], [b]) => a.localeCompare(b)));
+}
+
+function isDuplicateVerdictMarker(
+  store: ReturnType<typeof getTaskPairStore>,
+  existing: StoredTaskPair | undefined,
+  input: ApplyMarkerInput,
+  now: number,
+): boolean {
+  const verb = input.marker.knownVerb;
+  if (!existing || (verb !== 'PASS' && verb !== 'REWORK' && verb !== 'READY_FOR_AUDIT')) return false;
+  const head = input.marker.attrs.head
+    ?? existing.state.material?.head
+    ?? '';
+  const round = String(existing.state.round);
+  const attrs = stableMarkerAttrs(input.marker.attrs);
+  return store.listEvents(existing.project, existing.state.taskId, 200).some((event) => {
+    if (event.writer !== input.writer || event.verb !== verb) return false;
+    if (now - event.at < 0 || now - event.at > TASK_PAIR_MARKER_DEDUP_WINDOW_MS) return false;
+    if ((event.attrs.__round ?? '') !== round || (event.attrs.__head ?? '') !== head) return false;
+    return stableMarkerAttrs(event.attrs) === attrs;
+  });
+}
+
+function isLikelyValidationReport(text: string | undefined): boolean {
+  const value = text?.trim() ?? '';
+  if (!value) return false;
+  return /\b(?:validation|test(?:s|ing)?|typecheck|lint|build|suite)\b/iu.test(value)
+    && /\b(?:pass(?:ed)?|fail(?:ed)?|success(?:ful)?|result|output|skip(?:ped)?)\b/iu.test(value);
+}
+
+function readyHasValidationReport(store: ReturnType<typeof getTaskPairStore>, stored: StoredTaskPair, attrs: Record<string, string>): boolean {
+  if (Object.entries(attrs).some(([key, value]) => /report|validation/iu.test(key) && value.trim().length > 0)) return true;
+  const auditor = stored.state.auditor;
+  const executor = stored.state.executor;
+  if (!auditor || auditor === TASK_PAIR_NO_AUDITOR || !executor) return true;
+  // READY advances the round, while the executor normally sends the report
+  // immediately before READY. Accept either the newly opened round or its
+  // predecessor; a later report in the current round is also valid.
+  const acceptedRounds = new Set([String(stored.state.round), String(Math.max(0, stored.state.round - 1))]);
+  return store.listEvents(stored.project, stored.state.taskId, 500).some((event) => (
+    event.verb === 'SEND'
+    && event.writer === executor
+    && event.attrs.target === auditor
+    && acceptedRounds.has(event.attrs.__round ?? '')
+    && Object.entries(event.attrs).some(([key, value]) => key !== 'target' && key !== '__round' && value.trim().length > 0
+      && /report|validation/iu.test(key))
+  ));
+}
+
 const WORKSPACE_REVISION_SOURCE_LABEL: Record<TaskPairWorkspaceRevisionSource, string> = {
   branch: 'its own branch',
   lastHead: 'the last observed head',
@@ -444,6 +499,13 @@ export class TaskPairService {
     if (store.hasEvent(input.eventId)) return { effect: 'replayed', unusual: false, intents: [] };
     const taskId = this.resolveTaskId(input.project, input.writer, input.marker.taskId, input.marker.knownVerb);
     const existing = taskId && taskId !== TASK_PAIR_INFER_TASK_ID ? store.getPair(input.project, taskId) : undefined;
+    // A marker can be observed twice (the assistant reply and a relay copy).
+    // Treat an identical participant verdict/material marker in the same round
+    // as one occurrence, while allowing a later round or a different head to
+    // advance normally.
+    if (isDuplicateVerdictMarker(store, existing, input, now)) {
+      return { effect: 'replayed', unusual: false, intents: [] };
+    }
     // Read on both pair creation (newPair()) and a config-derived pair's next
     // round (READY_FOR_AUDIT starting a new round, applyTaskPairMarker), so
     // an open pair picks up a Brain config change without a restart.
@@ -467,6 +529,14 @@ export class TaskPairService {
         })
       : { effect: 'unresolved', unusual: true, intents: [] as TaskPairIntent[] } satisfies TaskPairTransition;
     const role = taskPairRoleOf(existing?.state ?? transition.pair, input.writer);
+    const eventPair = transition.pair ?? existing?.state;
+    const eventHead = input.marker.attrs.head ?? existing?.state.material?.head ?? eventPair?.material?.head ?? '';
+    const eventRound = input.marker.knownVerb === 'READY_FOR_AUDIT'
+      ? String(eventPair?.round ?? existing?.state.round ?? '')
+      : String(existing?.state.round ?? eventPair?.round ?? '');
+    const eventAttrs = (input.marker.knownVerb === 'PASS' || input.marker.knownVerb === 'REWORK' || input.marker.knownVerb === 'READY_FOR_AUDIT')
+      ? { ...input.marker.attrs, __round: eventRound, __head: eventHead }
+      : input.marker.attrs;
     const recorded = store.recordEvent({
       id: input.eventId,
       project: input.project,
@@ -474,7 +544,7 @@ export class TaskPairService {
       writer: input.writer,
       role,
       verb: input.marker.knownVerb ?? input.marker.verb,
-      attrs: input.marker.attrs,
+      attrs: eventAttrs,
       effect: transition.effect,
       unusual: transition.unusual,
       source: input.source,
@@ -510,6 +580,27 @@ export class TaskPairService {
     if (stored && transition.pair && this.#shouldAutoTickChecklist(input.marker.knownVerb, transition, stored.state)) {
       stored = this.#autoTickChecklist(input.project, stored, input.eventId, now, input.marker.knownVerb!);
       transition.pair = stored.state;
+    }
+    // READY is intentionally accepted even when the executor forgot to send
+    // the exact-revision validation report.  Nudge once per round immediately
+    // so the auditor does not sit in a material-backed round with no evidence.
+    if (stored && input.marker.knownVerb === 'READY_FOR_AUDIT'
+      && transition.toStatus === 'in_audit'
+      && input.writer === stored.state.executor
+      && !readyHasValidationReport(store, stored, input.marker.attrs)) {
+      const key = `validation-report:${stored.state.round}`;
+      if (!stored.liveness.notified.includes(key)) {
+        store.saveLiveness(input.project, stored.state.taskId, {
+          ...stored.liveness,
+          notified: [...stored.liveness.notified, key],
+        });
+        this.#track(sendTaskPairMessage(
+          input.writer,
+          stored.state.taskId,
+          'validation-report',
+          `READY_FOR_AUDIT for ${stored.state.taskId} was accepted, but no validation report was sent to the auditor in round ${stored.state.round}. Please send your exact-head validation report to ${stored.state.auditor ?? 'the auditor'} now.`,
+        ));
+      }
     }
     if (stored && input.marker.attrs.title && stored.state.brain === input.writer
       && isUsableTaskPairTitle(input.marker.attrs.title, stored.state.taskId)) {
@@ -684,13 +775,17 @@ export class TaskPairService {
     const details = conflicts.map((candidate) => {
       const held = [candidate.state.executor, candidate.state.auditor]
         .filter((session): session is string => !!session && busySessions.has(session));
-      return `${held.join('/')} held by ${candidate.state.taskId}`;
+      const ageMs = Math.max(0, Date.now() - candidate.state.updatedAt);
+      const age = ageMs < 60_000 ? `${Math.floor(ageMs / 1_000)}s`
+        : ageMs < 3_600_000 ? `${Math.floor(ageMs / 60_000)}m`
+          : `${Math.floor(ageMs / 3_600_000)}h`;
+      return `${held.join('/')} held by ${candidate.state.taskId} (status ${candidate.state.status}, age ${age})`;
     });
     const current = stored.state;
     const nextState = current.status === 'queued' && !current.flags.includes('waiting_for_capacity')
       ? { ...current, flags: [...current.flags, 'waiting_for_capacity' as const], updatedAt: Date.now() }
       : current;
-    const fresh = conflicts.filter((candidate) => details.some((detail) => detail.endsWith(` ${candidate.state.taskId}`)));
+    const fresh = conflicts;
     const freshKeys = fresh
       .map((candidate) => `participant_busy:${candidate.state.taskId}`)
       .filter((key) => !stored.liveness.notified.includes(key));
@@ -730,6 +825,9 @@ export class TaskPairService {
   /** send_message with task metadata: creates a missing pair, otherwise record only. */
   implicitDispatch(input: {
     project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; titleExplicit?: boolean; eventId: string;
+    /** Optional report metadata carried by executor -> auditor sends. */
+    reportAttrs?: Record<string, string>;
+    message?: string;
     /** Owner rule (design D-pool-sync): a bound `task.requestedExecutionType.model` on the initial send_message dispatch, kept so a later automatic executor replacement still honors it instead of falling back to the allowlist. */
     executorModel?: string;
     /** True only for a send carrying real task metadata (task.objective).
@@ -795,10 +893,31 @@ export class TaskPairService {
           : undefined;
       const unusual = input.sender !== state.brain && input.target !== counterpart;
       const at = Date.now();
+      const report = input.reportAttrs ?? (isLikelyValidationReport(input.message) ? { report: 'true' } : undefined);
+      const summaryHash = input.message?.trim()
+        ? createHash('sha256').update(input.message.trim()).digest('hex').slice(0, 16)
+        : undefined;
+      const partnerRelay = input.target === state.brain && !!counterpart && !!summaryHash
+        && store.listEvents(project, input.taskId, 100).some((event) => (
+          event.verb === 'SEND'
+          && event.writer === counterpart
+          && event.attrs.target === state.brain
+          && event.attrs.__round === String(state.round)
+          && event.attrs.__summaryHash === summaryHash
+          && at - event.at >= 0
+          && at - event.at <= TASK_PAIR_MARKER_DEDUP_WINDOW_MS
+        ));
+      const sendAttrs = {
+        target: input.target,
+        ...(report ?? {}),
+        ...(summaryHash ? { __summaryHash: summaryHash } : {}),
+        __round: String(state.round),
+      };
       store.recordEvent({
         id: input.eventId, project, taskId: input.taskId, writer: input.sender,
-        role: taskPairRoleOf(state, input.sender), verb: 'SEND', attrs: { target: input.target },
-        effect: 'recorded', unusual, source: 'implicit_dispatch', fromStatus: state.status, toStatus: state.status,
+        role: taskPairRoleOf(state, input.sender), verb: 'SEND', attrs: sendAttrs,
+        effect: partnerRelay ? 'relay_suppressed' : 'recorded', unusual: partnerRelay ? false : unusual,
+        source: 'implicit_dispatch', fromStatus: state.status, toStatus: state.status,
         at,
       });
       // A task-tagged send is progress on that pair, and its target now works on it.

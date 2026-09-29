@@ -437,10 +437,17 @@ export type TaskPairStatus = typeof TASK_PAIR_STATUSES[number];
 export const TASK_PAIR_TERMINAL_STATUSES: readonly TaskPairStatus[] = ['done', 'cancelled'];
 /** Statuses that occupy a concurrency slot. */
 export const TASK_PAIR_OPEN_STATUSES: readonly TaskPairStatus[] = ['working', 'in_audit', 'awaiting_audit', TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, 'rework', 'passed'];
-/** Every non-terminal status reserves its named executor/auditor participants, including queued pairs. */
-export const TASK_PAIR_PARTICIPANT_STATUSES: readonly TaskPairStatus[] = TASK_PAIR_STATUSES.filter(
-  (status) => !TASK_PAIR_TERMINAL_STATUSES.includes(status),
-);
+/**
+ * Statuses that reserve a named executor/auditor.  A queued pair is only a
+ * scheduling intent; it must not hold a participant and thereby prevent the
+ * pair that is actually running from progressing (or make REASSIGN bounce
+ * back to the queue).  `passed` remains held until the executor reports DONE
+ * so the Brain can still accept the audited result.
+ */
+export const TASK_PAIR_PARTICIPANT_STATUSES: readonly TaskPairStatus[] = [
+  'working', 'in_audit', 'awaiting_audit', TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
+  'rework', 'passed',
+];
 
 export const TASK_PAIR_FLAGS = [
   'blocked', 'needs_input', 'unaudited', 'needs_auditor', 'over_limit', 'off_pool', 'economy_unreviewed',

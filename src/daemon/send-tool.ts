@@ -1298,6 +1298,7 @@ function bindAcceptedDispatchToTaskPair(
       titleExplicit: Boolean(readSupervisionTaskTitle(explicitTitle)),
       ...(executorModel ? { executorModel } : {}),
       ...(hasObjective ? { hasObjective } : {}),
+      ...(objective ? { message: objective } : {}),
       ...(objective ? { brief: objective } : {}),
       eventId: `implicit:${delivery.messageId ?? result.dispatchId}`,
     });
