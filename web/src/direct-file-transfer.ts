@@ -591,6 +591,11 @@ function supportsPreviewDownload(ws: WsClient): boolean {
   ]);
 }
 
+/** Identity-over-lease needs both directions -- fail this fast (no lease attempt at all) before even asking the server to resolve anything. */
+export function supportsSessionIdentityDirect(ws: WsClient): boolean {
+  return supportsUpload(ws) && supportsPreviewDownload(ws);
+}
+
 export function toBrowserIceServers(iceServers: readonly DirectFileTransferIceServerConfig[]): RTCIceServer[] {
   return toWebRtcIceServers(iceServers);
 }

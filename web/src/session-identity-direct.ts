@@ -21,7 +21,7 @@ import {
   saveSessionIdentityProfile,
   type SessionIdentityAccessContext,
 } from './api.js';
-import { getSessionIdentityDirect, setSessionIdentityDirect } from './direct-file-transfer.js';
+import { getSessionIdentityDirect, setSessionIdentityDirect, supportsSessionIdentityDirect } from './direct-file-transfer.js';
 import type { WsClient } from './ws-client.js';
 
 function isDirectScope(scope: SessionIdentityScope): scope is 'project' | 'session' {
@@ -93,58 +93,57 @@ async function resolveIdentityDirect(
   return resolveSessionIdentityDirectMetadata(ws, scope, context.sessionName);
 }
 
-export async function fetchSessionIdentityProfileDirectFirst(
+/**
+ * A plain (non-`async`) function on purpose: when the fast path doesn't
+ * apply (no `ws`, wrong scope), this returns the SAME promise
+ * `fetchSessionIdentityProfile` itself returns, with zero extra microtask
+ * ticks of Promise-wrapping -- an `async function` always adds one such
+ * tick even to a bare `return somePromise`, which is enough to change
+ * timing existing callers/tests observe when nothing else changed.
+ */
+export function fetchSessionIdentityProfileDirectFirst(
   scope: SessionIdentityScope, scopeKey: string, context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile | null> {
-  if (ws && isDirectScope(scope)) {
-    try {
-      const resolved = await resolveIdentityDirect(ws, scope, context);
-      if (resolved) {
-        const key = cacheKey(context.serverId, scope, resolved.scopeKey);
-        const cached = identityCache.get(key);
-        if (!resolved.contentHash) {
-          identityCache.delete(key);
-          return null;
-        }
-        if (cached && cached.contentHash === resolved.contentHash) {
-          return toProfile(scope, resolved.scopeKey, {
-            content: cached.content, contentHash: cached.contentHash,
-            revision: resolved.revision ?? 0, updatedAt: resolved.updatedAt ?? 0,
-          });
-        }
-        const direct = await getSessionIdentityDirect(ws, context.serverId, scope, resolved.scopeKey);
-        identityCache.set(key, { contentHash: resolved.contentHash, content: direct.content });
-        return toProfile(scope, resolved.scopeKey, {
-          content: direct.content, contentHash: resolved.contentHash,
-          revision: resolved.revision ?? 0, updatedAt: resolved.updatedAt ?? 0,
-        });
-      }
-    } catch {
-      // Fall through to the WS-relayed HTTP path below.
+  if (!ws || !isDirectScope(scope) || !supportsSessionIdentityDirect(ws)) return fetchSessionIdentityProfile(scope, scopeKey, context);
+  return (async () => {
+    const resolved = await resolveIdentityDirect(ws, scope, context);
+    if (!resolved) return null;
+    const key = cacheKey(context.serverId, scope, resolved.scopeKey);
+    const cached = identityCache.get(key);
+    if (!resolved.contentHash) {
+      identityCache.delete(key);
+      return null;
     }
-  }
-  return fetchSessionIdentityProfile(scope, scopeKey, context);
+    if (cached && cached.contentHash === resolved.contentHash) {
+      return toProfile(scope, resolved.scopeKey, {
+        content: cached.content, contentHash: cached.contentHash,
+        revision: resolved.revision ?? 0, updatedAt: resolved.updatedAt ?? 0,
+      });
+    }
+    const direct = await getSessionIdentityDirect(ws, context.serverId, scope, resolved.scopeKey);
+    identityCache.set(key, { contentHash: resolved.contentHash, content: direct.content });
+    return toProfile(scope, resolved.scopeKey, {
+      content: direct.content, contentHash: resolved.contentHash,
+      revision: resolved.revision ?? 0, updatedAt: resolved.updatedAt ?? 0,
+    });
+  })().catch(() => fetchSessionIdentityProfile(scope, scopeKey, context));
 }
 
-export async function saveSessionIdentityProfileDirectFirst(
+/** See fetchSessionIdentityProfileDirectFirst's doc comment on why this is a plain function. */
+export function saveSessionIdentityProfileDirectFirst(
   input: { scope: SessionIdentityScope; scopeKey: string; content: string; sourceFile?: string },
   context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile> {
-  if (ws && isDirectScope(input.scope)) {
-    try {
-      const resolved = await resolveIdentityDirect(ws, input.scope, context);
-      // A brand-new (never-saved) key still resolves to a scopeKey with no
-      // hash/revision -- only a totally unknown session/scope returns null.
-      if (resolved) {
-        const direct = await setSessionIdentityDirect(ws, context.serverId, input.scope, resolved.scopeKey, input.content);
-        identityCache.set(cacheKey(context.serverId, input.scope, resolved.scopeKey), { contentHash: direct.contentHash, content: input.content });
-        return toProfile(input.scope, resolved.scopeKey, { content: input.content, ...direct });
-      }
-    } catch {
-      // Fall through to the WS-relayed HTTP path below.
-    }
-  }
-  return saveSessionIdentityProfile(input, context);
+  if (!ws || !isDirectScope(input.scope) || !supportsSessionIdentityDirect(ws)) return saveSessionIdentityProfile(input, context);
+  return (async () => {
+    const resolved = await resolveIdentityDirect(ws, input.scope as 'project' | 'session', context);
+    // A brand-new (never-saved) key still resolves to a scopeKey with no
+    // hash/revision -- only a totally unknown session/scope returns null.
+    if (!resolved) throw new Error('session_identity_resolve_failed');
+    const direct = await setSessionIdentityDirect(ws, context.serverId, input.scope as 'project' | 'session', resolved.scopeKey, input.content);
+    identityCache.set(cacheKey(context.serverId, input.scope, resolved.scopeKey), { contentHash: direct.contentHash, content: input.content });
+    return toProfile(input.scope, resolved.scopeKey, { content: input.content, ...direct });
+  })().catch(() => saveSessionIdentityProfile(input, context));
 }
 
 /** Always the HTTP relay path -- see the module doc comment. */

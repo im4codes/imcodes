@@ -80,6 +80,8 @@ export function SessionIdentityTabs({
       setDrafts(Object.fromEntries(entries) as Record<SessionIdentityScope, Draft>);
       setError('');
     }).catch((reason) => {
+      // eslint-disable-next-line no-console
+      console.error('DEBUG_TEMP', reason);
       if (live) setError(reason instanceof Error ? reason.message : String(reason));
     });
     return () => { live = false; };
