@@ -1,4 +1,5 @@
 import os from 'node:os';
+import fs from 'node:fs';
 import { performance } from 'node:perf_hooks';
 import type { TimelineEvent } from './timeline-event.js';
 import logger from '../util/logger.js';
@@ -62,6 +63,8 @@ import { getDaemonBuildInfo } from './build-info.js';
 import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
 import { daemonRemoteDesktopCapabilities } from './remote-desktop-registry.js';
 import { incrementCounter } from '../util/metrics.js';
+import { CoreLaneSocket, coreLaneWorkerEnabled } from './core-lane-socket.js';
+import { CORE_LANE_STALL_RESTART_DEFAULT_MS } from '../../shared/core-lane-liveness.js';
 import {
   TIMELINE_DELIVERY_METRICS,
   countableTimelineEventType,
@@ -88,6 +91,46 @@ interface SystemStats {
   shortRefHealth?: MemoryShortRefHealth;
   /** Optional WebRTC addon state; distinct from ICE/network reachability. */
   directConnectivity: DirectConnectivityRuntimeStatus;
+}
+
+/**
+ * Execute the deterministic test-only main-thread block and write the
+ * optional start/end marker. Kept separate from ServerLink so the causal
+ * marker contract can be exercised without opening a real WebSocket.
+ */
+export function runCoreLaneTestBlock({
+  blockMs,
+  blockMarkerFile,
+  pid = process.pid,
+  logger: blockLogger = logger,
+}: {
+  blockMs: number;
+  blockMarkerFile?: string;
+  pid?: number;
+  logger?: Pick<typeof logger, 'warn' | 'error'>;
+}): { pid: number; blockMs: number; startedAt: number; endedAt: number } {
+  const startedAt = Date.now();
+  if (blockMarkerFile) {
+    try {
+      fs.writeFileSync(blockMarkerFile, JSON.stringify({ pid, blockMs, startedAt }), 'utf8');
+    } catch (error) {
+      blockLogger.error({ error, blockMarkerFile }, 'Core-lane test fault: unable to write block-start marker');
+      throw error;
+    }
+  }
+  blockLogger.warn({ blockMs }, 'Core-lane test fault: blocking daemon main thread');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Math.trunc(blockMs));
+  const endedAt = Date.now();
+  if (blockMarkerFile) {
+    try {
+      fs.writeFileSync(blockMarkerFile, JSON.stringify({ pid, blockMs, startedAt, endedAt }), 'utf8');
+    } catch (error) {
+      blockLogger.error({ error, blockMarkerFile }, 'Core-lane test fault: unable to write block-end marker');
+      throw error;
+    }
+  }
+  blockLogger.warn({ blockMs, elapsedMs: endedAt - startedAt }, 'Core-lane test fault: main thread unblocked');
+  return { pid, blockMs, startedAt, endedAt };
 }
 
 /** Collect lightweight system stats for daemon.stats messages. */
@@ -305,6 +348,8 @@ export interface ServerLinkOpts {
   workerUrl: string;
   serverId: string;
   token: string;
+  authorizedSessions?: string[];
+  authorizedSessionsProvider?: () => string[];
 }
 
 export type MessageHandler = (msg: unknown) => void;
@@ -455,7 +500,7 @@ export function __setServerLinkDataPlaneQueueConfigForTests(options: {
 }
 
 export class ServerLink {
-  private ws: WebSocket | null = null;
+  private ws: WebSocket | CoreLaneSocket | null = null;
   /**
    * Pure observability, shared with the controlled-node runtime (see
    * src/node/startup-diagnostics.ts): the full daemon's connect/auth
@@ -472,8 +517,11 @@ export class ServerLink {
   private reconnectTimer?: ReturnType<typeof setTimeout>;
   private watchdogTimer?: ReturnType<typeof setInterval>;
   private loopProbeTimer?: ReturnType<typeof setInterval>;
+  /** One-shot synchronous block used only by isolated real-daemon tests. */
+  private testMainThreadBlockScheduled = false;
   /** Wall-clock of the last event-loop probe tick; 0 when not running. */
   private lastLoopProbeAt = 0;
+  private mainStallRestartIssued = false;
   private pongTimer?: ReturnType<typeof setTimeout>;
   /** A6 connect-timeout watchdog. Cleared on open/close/error. */
   private connectTimeoutTimer?: ReturnType<typeof setTimeout>;
@@ -502,6 +550,8 @@ export class ServerLink {
   private readonly workerUrl: string;
   private readonly serverId: string;
   private readonly token: string;
+  private readonly authorizedSessions?: string[];
+  private readonly authorizedSessionsProvider?: () => string[];
   readonly daemonVersion = DAEMON_VERSION;
   private helloEpoch = 0;
   private lastHelloSentAt = 0;
@@ -526,6 +576,8 @@ export class ServerLink {
     this.workerUrl = opts.workerUrl;
     this.serverId = opts.serverId;
     this.token = opts.token;
+    this.authorizedSessions = opts.authorizedSessions;
+    this.authorizedSessionsProvider = opts.authorizedSessionsProvider;
     this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.PROCESS_START, {
       platform: process.platform,
       pid: process.pid,
@@ -566,14 +618,42 @@ export class ServerLink {
     this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ATTEMPT, {});
     this.recordRuntimeLinkStatus({ state: 'connecting', workerUrl: this.workerUrl, serverId: this.serverId });
     this.reconnecting = false;
-    const ws = new WebSocket(wsUrl);
+    // Production uses the worker-owned control socket so a synchronous main
+    // thread task cannot pause auth, heartbeat, reconnect, or priority sends.
+    // Vitest keeps the injectable in-process socket for deterministic protocol
+    // tests; IMCODES_CORE_LINK_WORKER=0 is the documented field kill switch.
+    const useCoreLaneWorker = coreLaneWorkerEnabled();
+    const auth = JSON.stringify({
+      type: 'auth',
+      serverId: this.serverId,
+      token: this.token,
+      daemonVersion: this.daemonVersion,
+      [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
+        DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
+    });
+    const ws = useCoreLaneWorker
+      ? new CoreLaneSocket(wsUrl, {
+        auth,
+        daemonVersion: this.daemonVersion,
+        stallRestartMs: Number(process.env.IMCODES_CORE_LANE_STALL_RESTART_MS
+          ?? CORE_LANE_STALL_RESTART_DEFAULT_MS),
+        heartbeatMs: HEARTBEAT_MS,
+        connectTimeoutMs: CONNECT_TIMEOUT_MS,
+        authorizedSessions: this.authorizedSessions,
+      })
+      : new WebSocket(wsUrl);
     this.ws = ws;
+    // Both implementations expose the browser WebSocket event surface; the
+    // worker facade intentionally keeps a narrower listener type. Normalize
+    // the local view once so protocol handlers remain identical in tests and
+    // production without weakening ServerLink's public API.
+    const eventSocket = ws as unknown as WebSocket;
 
     // Audit fix (94b9b837-822 / A6) — kill the connect attempt after
     // CONNECT_TIMEOUT_MS so a hung TCP SYN cannot wedge the daemon
     // for 75-127 s. Cleared on any of open/close/error.
     if (this.connectTimeoutTimer) clearTimeout(this.connectTimeoutTimer);
-    this.connectTimeoutTimer = setTimeout(() => {
+    this.connectTimeoutTimer = useCoreLaneWorker ? undefined : setTimeout(() => {
       if (this.ws !== ws) return;
       if (ws.readyState === WebSocket.OPEN) return;
       logger.warn(
@@ -583,7 +663,7 @@ export class ServerLink {
       try { ws.close(); } catch { /* ignore */ }
       // close handler will schedule reconnect.
     }, CONNECT_TIMEOUT_MS);
-    try { (this.connectTimeoutTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
+    try { (this.connectTimeoutTimer as { unref?: () => void } | undefined)?.unref?.(); } catch { /* ignore */ }
 
     const clearConnectTimeout = () => {
       if (this.connectTimeoutTimer) {
@@ -592,7 +672,7 @@ export class ServerLink {
       }
     };
 
-    ws.addEventListener('open', () => {
+    eventSocket.addEventListener('open', () => {
       if (this.ws !== ws) return; // replaced before open
       clearConnectTimeout();
       logger.info('ServerLink: connected');
@@ -616,14 +696,10 @@ export class ServerLink {
       });
       // Send auth handshake immediately — server closes the socket if this is not
       // the first message or if credentials are invalid (5s timeout enforced server-side).
-      ws.send(JSON.stringify({
-        type: 'auth',
-        serverId: this.serverId,
-        token: this.token,
-        daemonVersion: this.daemonVersion,
-        [DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.AUTH_REVISION_FIELD]:
-          DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL.REVISION,
-      }));
+      // The worker sends auth before publishing `open`, so a synchronous main
+      // thread stall cannot delay the first protocol frame. The in-process
+      // test socket keeps the historical path for deterministic tests.
+      if (!useCoreLaneWorker) ws.send(auth);
       this.sendDaemonHello();
       for (const handler of this.openHandlers) {
         try { handler(); } catch (err) { logger.warn({ err }, 'ServerLink: open handler failed'); }
@@ -637,8 +713,9 @@ export class ServerLink {
         }
       });
       setProviderRegistryServerLink(this);
-      this.startHeartbeat();
-      this.startWatchdog();
+      this.startHeartbeat(useCoreLaneWorker);
+      this.startWatchdog(useCoreLaneWorker);
+      this.scheduleTestMainThreadBlock();
 
       // Flush any acks that couldn't be sent before/during previous disconnects.
       // The outbox handles ordering, attempt caps, TTL, and isConnected() gating.
@@ -711,7 +788,7 @@ export class ServerLink {
       })();
     });
 
-    ws.addEventListener('error', (event) => {
+    eventSocket.addEventListener('error', (event) => {
       if (this.ws !== ws) return; // stale socket — a newer connection already took over
       clearConnectTimeout();
       const errorMessage = (event as ErrorEvent).message ?? 'unknown';
@@ -727,10 +804,12 @@ export class ServerLink {
       // DNS failure) it may not. Schedule reconnect as a safety net — scheduleReconnect()
       // is idempotent (guards with `this.reconnecting`), so no double-reconnect risk
       // when close does fire.
-      if (!this.stopping) this.scheduleReconnect();
+      // A worker-owned socket reconnects itself. Scheduling a second worker
+      // here would race its bounded backoff and create duplicate connections.
+      if (!this.stopping && !useCoreLaneWorker) this.scheduleReconnect();
     });
 
-    ws.addEventListener('message', (event: MessageEvent) => {
+    eventSocket.addEventListener('message', (event: MessageEvent) => {
       if (this.ws !== ws) return; // stale socket
       this.lastPong = Date.now();
       if (typeof event.data !== 'string') {
@@ -774,12 +853,16 @@ export class ServerLink {
           });
         }
         for (const h of this.handlers) h(msg);
+        const inboundId = (event as MessageEvent & { inboundId?: unknown }).inboundId;
+        if (useCoreLaneWorker && typeof inboundId === 'string') {
+          (ws as unknown as CoreLaneSocket).commitInbound(inboundId);
+        }
       } catch {
         // ignore parse errors
       }
     });
 
-    ws.addEventListener('close', (event: CloseEvent) => {
+    eventSocket.addEventListener('close', (event: CloseEvent) => {
       // If this.ws has already been replaced by a newer socket (e.g. because we called
       // connect() again while this socket was still in-flight), the server will close
       // this one with 1001 "replaced" — that's expected and we must NOT reconnect,
@@ -796,7 +879,7 @@ export class ServerLink {
       this.stopHeartbeat();
       this.stopWatchdog();
       setTransportRelaySend(() => { /* disconnected — discard */ });
-      if (!this.stopping) this.scheduleReconnect();
+      if (!this.stopping && !useCoreLaneWorker) this.scheduleReconnect();
     });
   }
 
@@ -810,6 +893,20 @@ export class ServerLink {
 
   trySend(msg: unknown): boolean {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      // The worker-owned socket retains a bounded control queue while it is
+      // reconnecting. This is the core-lane exception to the historical
+      // best-effort drop rule: chat/control receipts must not disappear just
+      // because the main thread observed the transient CLOSED state.
+      if (this.ws instanceof CoreLaneSocket) {
+        try {
+          this.seq++;
+          const serialized = stringifyForServerSend(msg, this.seq);
+          this.ws.send(serialized.payload, 'priority');
+          return true;
+        } catch (err) {
+          logger.warn({ err }, 'ServerLink: core-lane queue rejected control send');
+        }
+      }
       clearServerLinkSecurity('send_without_open_socket');
       // Best-effort: silently drop messages when the link isn't up. Throwing
       // here would become an unhandled rejection in any fire-and-forget
@@ -837,7 +934,11 @@ export class ServerLink {
       const outboundQueueDepth = this.dataPlaneSendQueue.length;
       const outboundQueueBytes = this.dataPlaneSendQueueBytes;
       const outboundQueueAgeMs = this.dataPlaneQueueStartedAt === null ? 0 : sendStart - this.dataPlaneQueueStartedAt;
-      this.ws.send(serialized.payload);
+      if (this.ws instanceof CoreLaneSocket) {
+        this.ws.send(serialized.payload, this.shouldDeferDataPlaneSend(msg) ? 'normal' : 'priority');
+      } else {
+        this.ws.send(serialized.payload);
+      }
       const bufferedAmountAfter = typeof this.ws.bufferedAmount === 'number' ? this.ws.bufferedAmount : undefined;
       if ((bufferedAmountAfter ?? 0) > 0 && this.sendBacklogStartedAt === null) {
         this.sendBacklogStartedAt = sendStart;
@@ -1462,11 +1563,11 @@ export class ServerLink {
     this.ws = null;
   }
 
-  private startHeartbeat(): void {
+  private startHeartbeat(workerOwnsHeartbeat = false): void {
     // Runs for the lifetime of a connection so silence checks can tell a real
     // server outage from the daemon's own event-loop stalls.
     this.startLoopProbe();
-    this.heartbeatTimer = setInterval(() => {
+    if (!workerOwnsHeartbeat) this.heartbeatTimer = setInterval(() => {
       if (this.ws?.readyState === WebSocket.OPEN) {
         const now = Date.now();
         if (this.heartbeatAckTimedOut(now)) {
@@ -1512,7 +1613,8 @@ export class ServerLink {
   /** Watchdog: periodically verifies the connection is truly alive.
    *  A short missed-ack window is tolerated because the worker can update
    *  heartbeat state without returning a timely heartbeat_ack under load. */
-  private startWatchdog(): void {
+  private startWatchdog(workerOwnsHeartbeat = false): void {
+    if (workerOwnsHeartbeat) return;
     this.watchdogTimer = setInterval(() => {
       if (this.stopping) return;
 
@@ -1587,6 +1689,11 @@ export class ServerLink {
       this.lastLoopProbeAt = now;
       if (prev <= 0) return;
       const drift = now - prev - LOOP_PROBE_MS;
+      const coreLane = this.ws instanceof CoreLaneSocket ? this.ws : null;
+      coreLane?.updateMainLag(Math.max(0, drift));
+      if (coreLane && this.authorizedSessionsProvider) {
+        try { coreLane.updateAuthorizedSessions(this.authorizedSessionsProvider()); } catch { /* session store may be mid-shutdown */ }
+      }
       if (drift > EVENT_LOOP_STALL_THRESHOLD_MS && this.lastPong > 0) {
         // The loop was frozen for ~drift ms; inbound couldn't be read. Don't let
         // that window count as server silence — reset the proof baseline so the
@@ -1594,6 +1701,25 @@ export class ServerLink {
         // force-reconnecting a healthy socket.
         this.lastPong = now;
         logger.warn({ driftMs: drift }, 'ServerLink: event-loop stall detected — deferring silence-based reconnect');
+        const configuredRestartMs = Number(process.env.IMCODES_CORE_LANE_STALL_RESTART_MS
+          ?? CORE_LANE_STALL_RESTART_DEFAULT_MS);
+        if (!this.mainStallRestartIssued
+          && !process.env.VITEST
+          && Number.isFinite(configuredRestartMs)
+          && configuredRestartMs > 0
+          && drift >= configuredRestartMs) {
+          this.mainStallRestartIssued = true;
+          logger.error({ driftMs: drift, restartAfterMs: configuredRestartMs },
+            'ServerLink: prolonged main-thread stall — requesting controlled daemon restart');
+          this.recordRuntimeLinkStatus({
+            state: 'disconnected',
+            lastDisconnectedAt: now,
+            lastError: `main_event_loop_stall:${Math.trunc(drift)}ms`,
+          });
+          // SIGTERM is the existing lifecycle/supervisor restart path. The
+          // guard prevents a second signal during the same stall.
+          process.kill(process.pid, 'SIGTERM');
+        }
       }
     }, LOOP_PROBE_MS);
     try { (this.loopProbeTimer as { unref?: () => void }).unref?.(); } catch { /* ignore */ }
@@ -1602,6 +1728,44 @@ export class ServerLink {
   private stopLoopProbe(): void {
     if (this.loopProbeTimer) { clearInterval(this.loopProbeTimer); this.loopProbeTimer = undefined; }
     this.lastLoopProbeAt = 0;
+  }
+
+  /**
+   * Deterministic fault injection for the isolated core-lane matrix. It is
+   * deliberately gated to test daemons and never runs in a normal build.
+   * The worker heartbeat continues while this thread is blocked, allowing the
+   * browser/server evidence to prove that liveness and control ACKs stay off
+   * the main event loop.
+   */
+  private scheduleTestMainThreadBlock(): void {
+    if (this.testMainThreadBlockScheduled) return;
+    if (process.env.NODE_ENV !== 'test' && process.env.IMCODES_TEST_DAEMON !== '1') return;
+    const blockMs = Number(process.env.IMCODES_CORE_LANE_TEST_BLOCK_MS ?? 0);
+    if (!Number.isFinite(blockMs) || blockMs <= 0) return;
+    this.testMainThreadBlockScheduled = true;
+    const blockControlFile = process.env.IMCODES_CORE_LANE_TEST_BLOCK_CONTROL_FILE;
+    const blockMarkerFile = process.env.IMCODES_CORE_LANE_TEST_BLOCK_MARKER_FILE
+      ?? (blockControlFile ? `${blockControlFile}.marker` : undefined);
+    const block = () => {
+      runCoreLaneTestBlock({ blockMs, blockMarkerFile, pid: process.pid, logger });
+    };
+    if (blockControlFile) {
+      const poll = setInterval(() => {
+        try {
+          if (!fs.existsSync(blockControlFile)) return;
+          fs.unlinkSync(blockControlFile);
+          clearInterval(poll);
+          block();
+        } catch (error) {
+          logger.error({ error, blockControlFile }, 'Core-lane test fault: control-file poll failed');
+        }
+      }, 25);
+      try { (poll as { unref?: () => void }).unref?.(); } catch { /* test timer */ }
+      return;
+    }
+    const delayMs = Math.max(0, Number(process.env.IMCODES_CORE_LANE_TEST_BLOCK_AFTER_MS ?? 5_000));
+    const timer = setTimeout(block, delayMs);
+    try { (timer as { unref?: () => void }).unref?.(); } catch { /* test timer */ }
   }
 
   private recycleSilentConnection(reason: string, silenceMs: number): void {

@@ -220,6 +220,7 @@ import {
 import { REPO_MSG, REPO_RELAY_TYPES } from '../../../shared/repo-types.js';
 import { TRANSPORT_RELAY_TYPES, TRANSPORT_MSG } from '../../../shared/transport-events.js';
 import { isEmbeddingStatus } from '../../../shared/embedding-status.js';
+import { isCoreLaneStatus } from '../../../shared/core-lane-status.js';
 import {
   MEMORY_WS,
   isMemoryManagementRequestType,
@@ -8390,7 +8391,7 @@ export class WsBridge {
     }
 
     // ── Daemon stats: extract from heartbeat or standalone, broadcast to browsers ─
-    if (type === 'daemon.stats' || (type === 'heartbeat' && msg.cpu !== undefined)) {
+    if (type === 'daemon.stats' || (type === 'heartbeat' && (msg.cpu !== undefined || msg.mainEventLoopBlockedMs !== undefined))) {
       if (typeof msg.daemonVersion === 'string') this.daemonVersion = msg.daemonVersion;
       this.broadcastToBrowsers(JSON.stringify({
         type: 'daemon.stats',
@@ -8410,6 +8411,11 @@ export class WsBridge {
         // full. Rebuilding the payload without them put the signal in a hole:
         // it reached this pod and went no further.
         ...(isPlainRecord(msg.shortRefHealth) ? { shortRefHealth: msg.shortRefHealth } : {}),
+        ...(isCoreLaneStatus(msg) ? {
+          ...(typeof msg.mainEventLoopLagMs === 'number' ? { mainEventLoopLagMs: msg.mainEventLoopLagMs } : {}),
+          ...(typeof msg.mainEventLoopBlockedMs === 'number' ? { mainEventLoopBlockedMs: msg.mainEventLoopBlockedMs } : {}),
+          ...(typeof msg.mainEventLoopBusy === 'boolean' ? { mainEventLoopBusy: msg.mainEventLoopBusy } : {}),
+        } : {}),
       }));
       return;
     }

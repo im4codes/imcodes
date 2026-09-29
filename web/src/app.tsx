@@ -2959,7 +2959,7 @@ export function App() {
     }
     setShowDiscussionDialog(false);
   }, [pushDiscussionFailureToast]);
-  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number } | null>(null);
+  const [daemonStats, setDaemonStats] = useState<{ daemonVersion?: string | null; cpu: number; memUsed: number; memTotal: number; load1: number; load5: number; load15: number; uptime: number; mainEventLoopLagMs?: number; mainEventLoopBlockedMs?: number; mainEventLoopBusy?: boolean } | null>(null);
 
   useEffect(() => {
     if (!auth || !selectedServerId || sharedHashRestorePending) return;
@@ -4647,7 +4647,7 @@ export function App() {
     });
     const unsubStats = ws.onMessage((msg) => {
       if (msg.type === 'daemon.stats') {
-        setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime });
+        setDaemonStats({ daemonVersion: msg.daemonVersion, cpu: msg.cpu, memUsed: msg.memUsed, memTotal: msg.memTotal, load1: msg.load1, load5: msg.load5, load15: msg.load15, uptime: msg.uptime, mainEventLoopLagMs: msg.mainEventLoopLagMs, mainEventLoopBlockedMs: msg.mainEventLoopBlockedMs, mainEventLoopBusy: msg.mainEventLoopBusy });
         if (daemonOfflineGraceTimerRef.current) {
           clearTimeout(daemonOfflineGraceTimerRef.current);
           daemonOfflineGraceTimerRef.current = null;
@@ -6357,6 +6357,11 @@ export function App() {
                 <span style={{ color: '#60a5fa' }}>
                   Mem {(() => { const gb = daemonStats.memUsed / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memUsed / (1024 ** 2)).toFixed(0)}M`; })()}/{(() => { const gb = daemonStats.memTotal / (1024 ** 3); return gb >= 1 ? `${gb.toFixed(1)}G` : `${(daemonStats.memTotal / (1024 ** 2)).toFixed(0)}M`; })()}
                 </span>
+                {daemonStats.mainEventLoopBusy && (
+                  <span style={{ color: '#fb923c' }} title="Main daemon event loop is busy">
+                    Busy {Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms
+                  </span>
+                )}
                 <span style={{ color: '#94a3b8' }}>
                   {(() => { const s = daemonStats.uptime; const d = Math.floor(s / 86400); const h = Math.floor((s % 86400) / 3600); return d > 0 ? `${d}d ${h}h` : `${h}h`; })()}
                 </span>
@@ -7124,7 +7129,7 @@ export function App() {
                 <div class="mobile-sidebar-daemon-status">
                   <span title={daemonVersionForDisplay ? `v${daemonVersionForDisplay}` : undefined}>
                     {daemonVersionForDisplay && <span>v{formatDaemonVersionShort(daemonVersionForDisplay)}{daemonStats ? ' · ' : ''}</span>}
-                    {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}</span>}
+                    {daemonStats && <span>CPU {daemonStats.cpu}% · Load {daemonStats.load1}{daemonStats.mainEventLoopBusy ? ` · Busy ${Math.round(daemonStats.mainEventLoopBlockedMs ?? daemonStats.mainEventLoopLagMs ?? 0)}ms` : ''}</span>}
                   </span>
                   {daemonUpgrading && (
                     <span class="daemon-upgrading-badge" title={daemonUpgradingLabel(daemonUpgrading, trans, formatDaemonVersionShort)}>

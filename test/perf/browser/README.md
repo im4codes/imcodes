@@ -101,3 +101,14 @@ The one-line command for Cx13/Cx20 is:
 ```bash
 IMC_PERF_BASE_URL=http://127.0.0.1:19138 IMC_PERF_REVISION=$(git rev-parse HEAD) node test/perf/browser/run.mjs
 ```
+## Windows ConPTY shell runs
+
+For a real Windows daemon, run `windows-control-shim.mjs` on the controlled
+node and point the browser harness at its HTTP port with
+`IMC_PERF_SHELL_CONTROL_URL`. The shim is test-only: `/ready` polls the
+authenticated `/api/server/:id/sessions` endpoint, while `/kill` uses
+`taskkill /T /F` on the daemon process tree and relaunches the same isolated
+daemon. It does not send terminal input or create sessions; those go through
+the normal web/server-link/ConPTY path. Set `IMC_PERF_SHELL_PLATFORM=windows`
+so command fixtures use `cmd.exe`. Keep the daemon HOME, lock pipe, server
+ID/token and ports isolated from the installed controlled node.

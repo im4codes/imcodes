@@ -806,7 +806,7 @@ export async function startup(): Promise<DaemonContext> {
   let serverLink: ServerLink | null = null;
   let scheduleServerLinkRestoreBroadcast: (() => void) | null = null;
   if (creds) {
-    serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token });
+    serverLink = new ServerLink({ workerUrl: workerUrl!, serverId, token, authorizedSessions: listSessions().map((session) => session.name), authorizedSessionsProvider: () => listSessions().map((session) => session.name) });
     const capabilityBlobClient = createCapabilityBlobHttpClient({
       serverId,
       loadCredentials: async () => ({ serverId, token, workerUrl: workerUrl! }),

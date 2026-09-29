@@ -31,7 +31,10 @@ services:
       SERVER_URL: http://server:19138
       # The harness opens the real SPA from the server origin so browser WS
       # upgrades are same-origin; retain web:4300 for the optional fixture.
-      ALLOWED_ORIGINS: http://web:4300,http://server:19138
+      # Remote-OS matrix runs point a browser at the server's published host
+      # port. Keep the in-network defaults, while allowing an isolated run to
+      # add its externally visible origin without editing the fixture.
+      ALLOWED_ORIGINS: ${IMC_PERF_ALLOWED_ORIGINS:-http://web:4300,http://server:19138}
       HOME: /tmp/imc-perf-home
       IMCODES_HOME: /tmp/imc-perf-home/.imcodes
       IMCODES_PERF_DEBUG: "1"
@@ -40,7 +43,7 @@ services:
         condition: service_healthy
     # Host port is configurable so base/dev/Part-B runs can run in parallel;
     # containers continue using server:19138 on their private network.
-    ports: ["127.0.0.1:${IMC_PERF_PORT_BASE:-19138}:19138"]
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_PORT_BASE:-19138}:19138"]
     cpus: 2.0
     cpuset: ${IMC_PERF_CPUSET:-0-3}
     mem_limit: 1g
@@ -52,7 +55,7 @@ services:
     volumes:
       - ../../..:/repo
     command: ["bash", "-lc", "cd web && npm ci --ignore-scripts --no-audit --no-fund && npm run build:fixtures && npm run serve:fixtures -- --host 0.0.0.0"]
-    ports: ["127.0.0.1:${IMC_PERF_WEB_PORT_BASE:-4300}:4300"]
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_WEB_PORT_BASE:-4300}:4300"]
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4300/src/fixtures/chat-timeline/index.html').then(() => process.exit(0)).catch(() => process.exit(1))"]
       interval: 2s
@@ -154,13 +157,18 @@ services:
       IMC_PERF_WORKER_URL: http://server:19138
       IMC_PERF_SERVER_ID: imc_shell_real_server
       IMC_PERF_DAEMON_TOKEN: imc-shell-real-daemon-token
+      IMCODES_TEST_DAEMON: "1"
+      IMCODES_CORE_LINK_WORKER: ${IMCODES_CORE_LINK_WORKER:-1}
+      IMCODES_CORE_LANE_TEST_BLOCK_MS: ${IMC_PERF_CORE_LANE_BLOCK_MS:-30000}
+      IMCODES_CORE_LANE_TEST_BLOCK_CONTROL_FILE: /tmp/imc-shell-home/.imcodes/core-lane-block.request
+      IMCODES_CORE_LANE_TEST_BLOCK_MARKER_FILE: /tmp/imc-shell-home/.imcodes/core-lane-block.request.marker
       DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
     depends_on:
       postgres:
         condition: service_healthy
       server:
         condition: service_started
-    ports: ["127.0.0.1:${IMC_PERF_SHELL_CONTROL_PORT:-19139}:19139"]
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_SHELL_CONTROL_PORT:-19139}:19139"]
     cpus: 1.0
     mem_limit: 1g
     pids_limit: 256
@@ -179,8 +187,11 @@ services:
       IMC_PERF_SERVER_ID: imc_shell_real_server
       IMC_PERF_API_KEY: imc_shell_perf_browser_key
       IMC_PERF_SHELL_SESSION: deck_shell_perf_brain
+      IMC_SHELL_FOCUSED: ${IMC_SHELL_FOCUSED:-0}
+      IMC_PERF_SHELL_MOUNT_TIMEOUT_MS: ${IMC_PERF_SHELL_MOUNT_TIMEOUT_MS:-180000}
       IMC_PERF_SHELL_SCREENSHOT: ${IMC_PERF_SHELL_SCREENSHOT:-/repo/perf-results/shell-desktop.png}
       IMC_PERF_SHELL_MOBILE_SCREENSHOT: ${IMC_PERF_SHELL_MOBILE_SCREENSHOT:-/repo/perf-results/shell-mobile.png}
+      IMC_PERF_FAULT: ${IMC_PERF_FAULT:-0}
     command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/shell-stream.spec.mjs"]
     depends_on:
       shell-daemon:
