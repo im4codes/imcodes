@@ -1304,6 +1304,9 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
   }, [collapsed, isVerticalRail, layout, orderedSessions.length]);
 
   useEffect(() => {
+    // Another server (or socket) never inherits this one's disks, embedding,
+    // handle alert or direct status; the first frame of the new one fills in.
+    setStats(null);
     if (!ws) return;
     return ws.onMessage((msg) => {
       // Frames fold into the last snapshot (see mergeDaemonStats): a partial or
@@ -1315,6 +1318,10 @@ export function SubSessionBar({ subSessions, openIds, maximizedIds, desktopLayou
       }
     });
   }, [ws]);
+
+  useEffect(() => {
+    setStats(null);
+  }, [serverId]);
 
   useEffect(() => {
     if (!ws || !serverId || !connected) {

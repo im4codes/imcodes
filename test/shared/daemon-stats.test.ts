@@ -50,6 +50,39 @@ describe('daemon status frame merging', () => {
     }
   });
 
+  it('a full frame is authoritative for optional objects: what it omits or sends malformed clears', () => {
+    const failing = { stage: 'persist_store', failures: 3, lastFailureAt: 1, lastError: 'ENOSPC' };
+    const direct = { state: 'available' };
+    let view = mergeDaemonStats<DaemonStatsView>(null, { ...full, shortRefHealth: failing, directConnectivity: direct }, 1_000) as DaemonStatsView & Record<string, unknown>;
+    expect(view.shortRefHealth).toEqual(failing);
+    expect(view.directConnectivity).toEqual(direct);
+    expect(view.disks).toEqual(full.disks);
+    expect(view.embedding).toEqual(full.embedding);
+
+    // Recovery: the daemon stops sending shortRefHealth. The alert must clear.
+    const { disks: _disks, embedding: _embedding, ...healthyWithoutObjects } = full;
+    view = mergeDaemonStats(view, healthyWithoutObjects, 2_000) as typeof view;
+    expect(view.shortRefHealth).toBeNull();
+    expect(view.directConnectivity).toBeNull();
+    expect(view.disks).toBeNull();
+    expect(view.embedding).toBeNull();
+    expect(view.cpu).toBe(12);
+
+    // Malformed optional values are "none", not the previous value.
+    view = mergeDaemonStats(view, { ...full, shortRefHealth: failing }, 3_000) as typeof view;
+    view = mergeDaemonStats(view, { ...full, shortRefHealth: 'disk full', disks: 'nope', embedding: 7, directConnectivity: [] }, 4_000) as typeof view;
+    expect(view).toMatchObject({ shortRefHealth: null, disks: null, embedding: null, directConnectivity: null });
+  });
+
+  it('a number-less (degraded) frame keeps the previous optional objects', () => {
+    const failing = { stage: 'persist_store', failures: 3, lastFailureAt: 1, lastError: 'ENOSPC' };
+    let view = mergeDaemonStats<DaemonStatsView>(null, { ...full, shortRefHealth: failing }, 1_000) as DaemonStatsView & Record<string, unknown>;
+    view = mergeDaemonStats(view, { daemonVersion: '1.0.0' }, 2_000) as typeof view;
+    expect(view.shortRefHealth).toEqual(failing);
+    expect(view.disks).toEqual(full.disks);
+    expect(view.embedding).toEqual(full.embedding);
+  });
+
   it('a main-thread stats frame without liveness keeps the last liveness until fresh liveness replaces it', () => {
     let view = mergeDaemonLiveness<DaemonStatsView>(null, { mainEventLoopLagMs: 4, mainEventLoopBlockedMs: 30_000, mainEventLoopBusy: true }, 1_000);
     view = mergeDaemonStats(view, full, 2_000);

@@ -100,9 +100,15 @@ function mergeLiveness<S extends DaemonLivenessView>(next: S, frame: Record<stri
 }
 
 /**
- * Fold a `daemon.stats` frame into the last snapshot. Numbers replace only when
- * finite; everything else replaces only when the frame actually carries it, so
- * an incomplete frame (an older server, a future producer) cannot blank fields.
+ * Fold a `daemon.stats` frame into the last snapshot.
+ *
+ * A frame carrying at least one finite system number is a real stats frame and
+ * authoritative for the whole snapshot: an optional object it omits (or sends
+ * malformed) means "none" -- the daemon reports shortRefHealth only while
+ * persistence is failing, and a viewer must see that clear on recovery. Only a
+ * number-less frame is degraded (an older server relaying a link-worker
+ * heartbeat) and keeps the previous objects. Numbers replace only when finite,
+ * so NaN or a missing value can never overwrite a good one.
  */
 export function mergeDaemonStats<S extends DaemonStatsView>(
   previous: S | null,
@@ -117,10 +123,12 @@ export function mergeDaemonStats<S extends DaemonStatsView>(
     const value = frame[key];
     if (typeof value === 'string' || value === null) next[key] = value;
   }
-  if (isRecord(frame.embedding)) next.embedding = frame.embedding;
-  if (Array.isArray(frame.disks)) next.disks = frame.disks;
-  if (isRecord(frame.shortRefHealth)) next.shortRefHealth = frame.shortRefHealth;
-  if (isRecord(frame.directConnectivity)) next.directConnectivity = frame.directConnectivity;
+  if (DAEMON_STATS_NUMERIC_KEYS.some((key) => isFiniteStat(frame[key]))) {
+    next.embedding = isRecord(frame.embedding) ? frame.embedding : null;
+    next.disks = Array.isArray(frame.disks) ? frame.disks : null;
+    next.shortRefHealth = isRecord(frame.shortRefHealth) ? frame.shortRefHealth : null;
+    next.directConnectivity = isRecord(frame.directConnectivity) ? frame.directConnectivity : null;
+  }
   next = mergeLiveness(next as DaemonLivenessView, frame, now) as Record<string, unknown>;
   return next as S;
 }

@@ -6435,7 +6435,7 @@ export function App() {
             )}
             {daemonStats && (
               <div class="sidebar-stats-row">
-                <span style={{ color: { danger: '#f87171', warn: '#fbbf24', ok: '#4ade80' }[cpuSeverity(daemonStats.cpu) ?? 'ok'] }}>
+                <span style={{ color: { danger: '#f87171', warn: '#fbbf24', ok: '#4ade80', unknown: '#94a3b8' }[cpuSeverity(daemonStats.cpu) ?? 'unknown'] }}>
                   CPU {formatCpuPercent(daemonStats.cpu)}
                 </span>
                 <span style={{ color: '#a78bfa' }}>

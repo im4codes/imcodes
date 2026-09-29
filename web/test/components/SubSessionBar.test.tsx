@@ -1573,6 +1573,63 @@ describe('SubSessionBar', () => {
       },
     );
 
+    it.each([['collapsed', true], ['expanded', false]] as const)(
+      'clears the memory-handle alert when a healthy full frame follows a failing one (%s bar)',
+      async (_label, collapsed) => {
+        const statsWs = makeStatsWs();
+        const view = renderBarWithStats(collapsed, statsWs);
+        await waitFor(() => expect(statsWs.ws.onMessage).toHaveBeenCalled());
+
+        act(() => { statsWs.emit({ ...daemonStatsMessage, shortRefHealth: failingHealth }); });
+        expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeTruthy();
+
+        // The daemon only sends shortRefHealth while failing; recovery is the
+        // field going missing from an otherwise full frame.
+        act(() => { statsWs.emit(daemonStatsMessage); });
+        expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeNull();
+
+        // A number-less degraded frame must not resurrect or hide anything.
+        act(() => { statsWs.emit({ ...daemonStatsMessage, shortRefHealth: failingHealth }); });
+        act(() => { statsWs.emit({ type: 'daemon.stats', daemonVersion: '2026.5.2161-dev.7' }); });
+        expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeTruthy();
+      },
+    );
+
+    it('shows nothing from the previous server after the socket changes, until the new one reports', async () => {
+      const first = makeStatsWs();
+      const second = makeStatsWs();
+      const props = {
+        subSessions: [makeSubSession()],
+        openIds: new Set<string>(),
+        collapsed: false,
+        desktopLayoutCapable: true,
+        onOpen: vi.fn(),
+        onClose: vi.fn(),
+        onRestart: vi.fn(),
+        onNew: vi.fn(),
+        connected: true,
+        onDiff: vi.fn(),
+        onHistory: vi.fn(),
+      };
+      const view = render(<SubSessionBar {...props} ws={first.ws as any} serverId="srv-a" />);
+      await waitFor(() => expect(first.ws.onMessage).toHaveBeenCalled());
+      act(() => { first.emit({ ...daemonStatsMessage, shortRefHealth: failingHealth, disks: [{ mount: '/', totalBytes: 10 * 1024 ** 3, usedBytes: 5 * 1024 ** 3, usedPercent: 50 }] }); });
+      expect(view.container.querySelector('.daemon-stats-inline')).toBeTruthy();
+      expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeTruthy();
+      expect(view.container.querySelector('.daemon-stat-disk')).toBeTruthy();
+
+      view.rerender(<SubSessionBar {...props} ws={second.ws as any} serverId="srv-b" />);
+      await waitFor(() => expect(second.ws.onMessage).toHaveBeenCalled());
+      expect(view.container.querySelector('.daemon-stats-inline')).toBeNull();
+      expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeNull();
+
+      // The new server's first frame omits every optional object: none carried over.
+      act(() => { second.emit(daemonStatsMessage); });
+      expect(view.container.querySelector('.daemon-stats-inline')).toBeTruthy();
+      expect(view.container.querySelector('.daemon-stat-shortref-alert')).toBeNull();
+      expect(view.container.querySelector('.daemon-stat-disk')).toBeNull();
+    });
+
     it('shows a placeholder, never NaN, while no full stats frame has arrived yet', async () => {
       const statsWs = makeStatsWs();
       const view = renderBarWithStats(false, statsWs);
