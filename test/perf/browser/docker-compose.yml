@@ -305,6 +305,36 @@ services:
     shm_size: 1g
     pids_limit: 256
 
+  # Real-machine proof that a link-worker heartbeat never blanks the daemon
+  # status card (the shell profile's daemon runs the core-lane worker).
+  stats-harness:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_API_KEY: imc_shell_perf_browser_key
+      IMC_PERF_SHELL_SESSION: deck_shell_perf_brain
+      IMC_PERF_SHELL_CONTROL_URL: http://shell-daemon:19139
+      IMC_PERF_STATS_DURATION_MS: ${IMC_PERF_STATS_DURATION_MS:-150000}
+      IMC_PERF_STATS_EXPECT_FAILURE: ${IMC_PERF_STATS_EXPECT_FAILURE:-0}
+      IMC_PERF_STATS_OUT: /repo/perf-results/daemon-stats
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/daemon-stats-card.spec.mjs"]
+    depends_on:
+      shell-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
 volumes:
   perf_home:
   perf_results:
