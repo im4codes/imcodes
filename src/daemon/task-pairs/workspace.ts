@@ -16,6 +16,13 @@
  * pair sweep removes the workspace -- except a worktree that still holds work
  * existing nowhere else (uncommitted or untracked files, or commits no remote
  * has), which is kept and reported to Brain. The worktree GC is the backstop.
+ *
+ * Disk hygiene (workspace-hygiene.ts): at once when the pair ends, and again for
+ * any ended pair the hourly sweep finds unstripped, the rebuildable git-ignored
+ * weight (node_modules, build outputs) is removed while commits, tracked files
+ * and uncommitted work stay. A low-space volume strips the oldest ended pairs
+ * first. A pair reopened afterwards keeps its worktree but not that weight: its
+ * executor reinstalls what it needs.
  */
 import { execFile } from 'node:child_process';
 import { cp, lstat, mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';

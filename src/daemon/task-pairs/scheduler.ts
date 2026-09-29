@@ -801,6 +801,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
     // Workspaces of pairs that ended a week ago go (hourly at most).
     await taskPairService.sweepWorkspaces(now);
+    // Free space on the worktree volume: the reclaim (if any) runs in the background.
+    await taskPairService.checkDiskPressure(now);
     store.prune(now);
     this.#nextTickAt = now + this.#intervalMs;
     this.publishBadges();

@@ -420,6 +420,30 @@ export function buildLegacyImportCorrectionBrainLine(taskIds: readonly string[])
 }
 
 /** Bare, never backtick-wrapped: see {@link marker}. */
+export interface DiskPressureNoticeInput {
+  level: 'low' | 'critical';
+  freeBeforeBytes: number;
+  freeAfterBytes: number;
+  totalBytes: number;
+  strippedPairs: number;
+}
+
+const GIB = 1024 ** 3;
+
+/** One notice per crossing of a disk-space threshold on the worktree volume. */
+export function buildDiskPressureMessage(input: DiskPressureNoticeInput): string {
+  const gib = (bytes: number) => (bytes / GIB).toFixed(1);
+  const percent = (bytes: number) => ((bytes / input.totalBytes) * 100).toFixed(1);
+  return [
+    `[IM.codes task pairs] Disk space on the worktree volume is ${input.level === 'critical' ? 'critically low' : 'low'}: ${gib(input.freeBeforeBytes)} GiB free (${percent(input.freeBeforeBytes)}%).`,
+    input.strippedPairs > 0
+      ? `Stripped rebuildable ignored directories (node_modules, build outputs) from ${input.strippedPairs} finished pair(s), oldest first: now ${gib(input.freeAfterBytes)} GiB free (${percent(input.freeAfterBytes)}%). Commits, tracked files and uncommitted work were not touched.`
+      : `No finished pair had anything left to strip; ${gib(input.freeAfterBytes)} GiB free (${percent(input.freeAfterBytes)}%).`,
+    "An open pair's files are never removed by the daemon. If space stays low, finish or cancel pairs that are done, or have their executors delete their own node_modules. A reopened pair's executor reinstalls what it needs.",
+    `[Contract: ${TASK_PAIR_CONTRACT_ID}]`,
+  ].join('\n');
+}
+
 export function buildBriefEndHint(taskId: string): string {
   return `<!-- ${TASK_PAIR_BRIEF_END_TAG} ${taskId} -->`;
 }

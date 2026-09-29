@@ -118,6 +118,30 @@ export const TASK_PAIR_WORKSPACE_RETENTION_MS = 7 * 24 * 60 * 60_000;
 /** A git worktree for code in a git project; a plain task directory otherwise. */
 export const TASK_PAIR_WORKSPACE_KINDS = ['worktree', 'dir'] as const;
 export type TaskPairWorkspaceKind = typeof TASK_PAIR_WORKSPACE_KINDS[number];
+/**
+ * Rebuildable directory names stripped from a finished pair's worktree, and
+ * only ever when git reports the path as ignored (never tracked or untracked
+ * source). Deliberately a name allowlist, not "everything ignored": an ignored
+ * directory may hold something that cannot be rebuilt.
+ */
+export const TASK_PAIR_HEAVY_DIR_NAMES = [
+  'node_modules', 'dist', 'build', '.build', '.vite', '.turbo', '.next', '.nuxt', '.parcel-cache',
+  'coverage', 'cmake-build-debug', 'cmake-build-release',
+] as const;
+/** Free space on the worktree volume below which closed pairs are stripped, oldest first. */
+export const TASK_PAIR_DISK_LOW_FREE_BYTES = 10 * 1024 ** 3;
+export const TASK_PAIR_DISK_LOW_FREE_FRACTION = 0.05;
+/** Below this the notice to Brain says so plainly. */
+export const TASK_PAIR_DISK_CRITICAL_FREE_BYTES = 3 * 1024 ** 3;
+export const TASK_PAIR_DISK_CRITICAL_FREE_FRACTION = 0.02;
+/** A level only recovers once free space is this multiple above its threshold, so the boundary cannot flap. */
+export const TASK_PAIR_DISK_RECOVERY_FACTOR = 1.25;
+export const TASK_PAIR_DISK_LEVELS = ['ok', 'low', 'critical'] as const;
+export type TaskPairDiskLevel = typeof TASK_PAIR_DISK_LEVELS[number];
+/** Store meta key holding the last announced level, so Brain hears one message per crossing. */
+export const TASK_PAIR_DISK_LEVEL_META_KEY = 'task_pair_disk_level' as const;
+/** Pseudo task id of disk notices: they are aggregate notices, never a pair's durable instruction. */
+export const TASK_PAIR_DISK_NOTICE_TASK_ID = '__disk_hygiene' as const;
 /** Effects of daemon workspace events on the pair timeline. */
 export const TASK_PAIR_WORKSPACE_EFFECTS = {
   REMOVED: 'workspace_removed',
@@ -908,6 +932,12 @@ export interface TaskPairWorkspace {
   status: 'active' | 'ended' | 'removed' | 'kept';
   endedAt?: number;
   keptReason?: string;
+  /**
+   * When the daemon stripped this ended pair's rebuildable ignored directories
+   * (node_modules, build outputs...). Cleared on reopen; the executor then
+   * reinstalls what it needs.
+   */
+  strippedAt?: number;
 }
 
 export interface TaskPairOutput {

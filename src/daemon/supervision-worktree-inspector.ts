@@ -473,13 +473,18 @@ async function dirtyPathProbe(worktreePath: string, deadlineAt: number): Promise
 // Inspection
 // ---------------------------------------------------------------------------
 
+/** Root under which every assignment/pair worktree lives (`IMCODES_WORKTREES_ROOT` or `~/.imcodes/worktrees`). */
+export function resolveSupervisionWorktreesRoot(env: NodeJS.ProcessEnv = process.env): string {
+  return resolve(env.IMCODES_WORKTREES_ROOT?.trim() || join(homedir(), '.imcodes', 'worktrees'));
+}
+
 export function resolveSupervisionAssignmentWorktree(input: {
   sessionName: string;
   assignmentId: string;
   env?: NodeJS.ProcessEnv;
 }): string {
   const env = input.env ?? process.env;
-  const root = resolve(env.IMCODES_WORKTREES_ROOT?.trim() || join(homedir(), '.imcodes', 'worktrees'));
+  const root = resolveSupervisionWorktreesRoot(env);
   const projectDir = env.IMCODES_PROJECT_WORKTREE_NAMESPACE?.trim() || 'imcodes';
   return join(root, projectDir, input.sessionName, input.assignmentId, 'repo');
 }

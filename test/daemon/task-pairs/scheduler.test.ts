@@ -164,6 +164,14 @@ describe('task-pair heartbeat, replacement and queue', () => {
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
   });
 
+  it('checks free space on the worktree volume on every heartbeat tick, without waiting for a reclaim', async () => {
+    const check = vi.spyOn(taskPairService, 'checkDiskPressure').mockResolvedValue(undefined);
+    await automation.tick();
+    expect(check).toHaveBeenCalledTimes(1);
+    expect(check).toHaveBeenCalledWith(now);
+    check.mockRestore();
+  });
+
   it('guards the production main checkout once, prioritizes credentials, and ignores Brain activity', async () => {
     marker(BRAIN, '<!-- IMCODES_TASK DISPATCH GUARD executor=' + EXEC + ' auditor=' + AUD + ' -->');
     await flush();

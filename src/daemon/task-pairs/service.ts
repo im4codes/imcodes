@@ -8,6 +8,7 @@
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { stat } from 'node:fs/promises';
+import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { SUPERVISION_ID_PREFIXES } from '../../../shared/supervision-durable-identity.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import type { TimelineEvent } from '../timeline-event.js';
@@ -20,6 +21,8 @@ import {
   TASK_PAIR_OPEN_STATUSES,
   TASK_PAIR_PARTICIPANT_STATUSES,
   TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION,
+  TASK_PAIR_DISK_LEVEL_META_KEY,
+  TASK_PAIR_DISK_NOTICE_TASK_ID,
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_MATERIAL_EVENT_VERB,
   TASK_PAIR_MATERIAL_HELD_EFFECT,
@@ -36,6 +39,7 @@ import {
   stripTaskPairMarkersForDisplay,
   sameTaskPairCommit,
   taskPairRoleOf,
+  type TaskPairDiskLevel,
   type TaskPairEventPayload,
   type TaskPairEventSource,
   type TaskPairIntent,
@@ -53,6 +57,10 @@ import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js'
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
 import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
+import {
+  classifyDiskLevel, diskLevelRank, isDiskLevel, readWorktreeVolumeSpace, stripHeavyIgnoredDirs, taskPairHygieneDeps,
+} from './workspace-hygiene.js';
+import { resolveSupervisionWorktreesRoot } from '../supervision-worktree-inspector.js';
 import { isUsableTaskPairTitle, taskPairTitlePlaceholder } from './title-generator.js';
 import { getSession, listSessions } from '../../store/session-store.js';
 import { resolveProjectAuthoritativeSupervisionSnapshot } from '../supervision-snapshot.js';
@@ -65,6 +73,7 @@ import {
   buildWorkspaceKeptLine,
   buildBrainNoticeMessage,
   buildCorrectionMessage,
+  buildDiskPressureMessage,
   buildDoneReminderMessage,
   buildNoAuditorDoneNotice,
   buildPassDoneNoticeMessage,
@@ -134,6 +143,10 @@ function mentionsTaskId(text: string, taskId: string): boolean {
 }
 
 const TASK_PAIR_MARKER_DEDUP_WINDOW_MS = 15_000;
+/** How long a new worktree waits for a low-disk reclaim before it is created anyway. */
+const DISK_PREFLIGHT_WAIT_MS = 90_000;
+/** Heartbeat free-space check cadence: statfs is cheap, the reclaim it may start is not. */
+const DISK_CHECK_INTERVAL_MS = 60_000;
 
 function stableMarkerAttrs(attrs: Record<string, string>): string {
   return JSON.stringify(Object.entries(attrs)
@@ -609,7 +622,7 @@ export class TaskPairService {
       const pairToSave = reopensWorkspace && workspace
         ? {
             ...transition.pair,
-            workspace: { ...workspace, status: 'active' as const, endedAt: undefined, keptReason: undefined },
+            workspace: { ...workspace, status: 'active' as const, endedAt: undefined, keptReason: undefined, strippedAt: undefined },
           }
         : transition.pair;
       stored = store.savePair(input.project, pairToSave, {
@@ -1407,16 +1420,19 @@ export class TaskPairService {
     if (!current || !current.executor || isTerminalTaskPairStatus(current.status)) return current;
     if (current.workspace && current.workspace.status !== 'removed') {
       if (current.workspace.status === 'active') return current;
-      const { endedAt: _endedAt, keptReason: _keptReason, ...workspace } = current.workspace;
+      const { endedAt: _endedAt, keptReason: _keptReason, strippedAt: _strippedAt, ...workspace } = current.workspace;
       // A reopen starts a fresh retention window; the next terminal transition
       // must not inherit the previous terminal timestamp or keep reason.
       const reopened: TaskPairState = {
         ...current,
-        workspace: { ...workspace, status: 'active', endedAt: undefined, keptReason: undefined },
+        workspace: { ...workspace, status: 'active', endedAt: undefined, keptReason: undefined, strippedAt: undefined },
       };
       store.savePair(project, reopened);
       return reopened;
     }
+    // Before a new worktree is created: make room from finished pairs if the
+    // volume is short. Never blocks provisioning for long or fails it.
+    await this.checkDiskPressure(Date.now(), { force: true, waitMs: DISK_PREFLIGHT_WAIT_MS }).catch(() => undefined);
     const provision = await provisionTaskPairWorkspace(project, current).catch((error: unknown) => ({
       ok: false as const, detail: error instanceof Error ? error.message : 'workspace provisioning failed',
     }));
@@ -1447,6 +1463,13 @@ export class TaskPairService {
    * project directory and shown to the user.
    */
   async endWorkspace(project: string, taskId: string, now: number): Promise<void> {
+    await this.#endWorkspaceRetention(project, taskId, now);
+    // After the deliverable copy: an `output=` path may live inside a directory
+    // that is about to be stripped.
+    await this.#stripClosedWorkspace(project, taskId);
+  }
+
+  async #endWorkspaceRetention(project: string, taskId: string, now: number): Promise<void> {
     const store = getTaskPairStore();
     const pair = store.getPair(project, taskId)?.state;
     // Ending is scheduled after the marker is persisted.  A Brain can reopen
@@ -1491,6 +1514,10 @@ export class TaskPairService {
     if (!options.force && now - this.#lastSweepAt < 60 * 60_000) return;
     this.#lastSweepAt = now;
     const store = getTaskPairStore();
+    // Pairs that ended before stripping existed, or whose strip failed or was
+    // interrupted by a restart, are stripped now -- in the background: a
+    // backlog of large trees must not hold the heartbeat.
+    this.#stripBacklogInBackground();
     for (const stored of store.listEndedWorkspacePairs()) {
       const pair = stored.state;
       const workspace = pair.workspace;
@@ -1560,6 +1587,139 @@ export class TaskPairService {
     emitTaskPairDaemonEvent(next, {
       eventId, verb: TASK_PAIR_MATERIAL_EVENT_VERB, effect: TASK_PAIR_MATERIAL_HELD_EFFECT, source: 'heartbeat', fromStatus: next.status, toStatus: next.status, unusual: true,
     });
+  }
+
+  #stripBacklogRun?: Promise<void>;
+
+  #stripBacklogInBackground(): void {
+    if (this.#stripBacklogRun) return;
+    const run = (async () => {
+      const store = getTaskPairStore();
+      for (const stored of store.listEndedWorkspacePairs()) {
+        if (stored.state.workspace?.strippedAt !== undefined) continue;
+        await this.#stripClosedWorkspace(stored.project, stored.state.taskId);
+      }
+    })().catch((error: unknown) => logger.warn({ err: error }, 'task-pair: workspace strip backlog failed'))
+      .finally(() => { if (this.#stripBacklogRun === run) this.#stripBacklogRun = undefined; });
+    this.#stripBacklogRun = run;
+    this.#track(run);
+  }
+
+  /**
+   * A finished pair's rebuildable, git-ignored heavy directories go at once
+   * (node_modules, build outputs); its commits, tracked files and uncommitted
+   * work stay for the retention sweep to judge. Returns true when it stripped.
+   * An open or reopened pair is never touched: eligibility is re-read before
+   * every directory.
+   */
+  async #stripClosedWorkspace(project: string, taskId: string): Promise<boolean> {
+    const store = getTaskPairStore();
+    const pair = store.getPair(project, taskId)?.state;
+    const workspace = pair?.workspace;
+    if (!pair || !workspace || workspace.kind !== 'worktree' || !isTerminalTaskPairStatus(pair.status)) return false;
+    if (workspace.status !== 'ended' && workspace.status !== 'kept') return false;
+    if (workspace.strippedAt !== undefined) return false;
+    const endedAt = workspace.endedAt;
+    const stillEligible = (): boolean => {
+      const current = store.getPair(project, taskId)?.state;
+      return Boolean(current?.workspace
+        && isTerminalTaskPairStatus(current.status)
+        && (current.workspace.status === 'ended' || current.workspace.status === 'kept')
+        && current.workspace.endedAt === endedAt
+        && current.workspace.strippedAt === undefined);
+    };
+    try {
+      const deps = taskPairHygieneDeps();
+      const output = pair.output?.path;
+      const result = await stripHeavyIgnoredDirs(workspace.path, {
+        ...deps,
+        stillEligible,
+        keepPaths: [...(deps.keepPaths ?? []), ...(output ? [isAbsolute(output) ? output : resolvePath(workspace.path, output)] : [])],
+      });
+      // Unreadable git state: leave it unstripped so a later sweep retries.
+      // A directory that could not be removed leaves the pair unstripped, so the next sweep retries it.
+      if (!result.ok || result.aborted || result.skipped.some((entry) => entry.reason === 'error') || !stillEligible()) return false;
+      const latest = store.getPair(project, taskId)?.state;
+      if (!latest?.workspace) return false;
+      store.savePair(project, { ...latest, workspace: { ...latest.workspace, strippedAt: Date.now() } });
+      if (result.removed.length > 0) logger.info({ taskId, removed: result.removed.length }, 'task-pair: stripped finished workspace');
+      return true;
+    } catch (error) {
+      logger.warn({ err: error, taskId }, 'task-pair: workspace strip failed');
+      return false;
+    }
+  }
+
+  #diskRun?: Promise<void>;
+  #lastDiskCheckAt = 0;
+
+  /**
+   * Free-space guard for the worktree volume. Below the low threshold, finished
+   * pairs are stripped oldest first until it recovers; Brain hears one message
+   * per threshold crossing (not per heartbeat). Open pairs are never touched.
+   * `waitMs` bounds how long the caller waits for the reclaim (0: not at all).
+   */
+  async checkDiskPressure(now: number, options: { force?: boolean; waitMs?: number } = {}): Promise<void> {
+    const waitMs = options.waitMs ?? 0;
+    const wait = async (run: Promise<void>): Promise<void> => {
+      if (waitMs <= 0) return;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([run, new Promise<void>((resolve) => { timer = setTimeout(resolve, waitMs); timer.unref?.(); })]);
+      if (timer) clearTimeout(timer);
+    };
+    if (this.#diskRun) return wait(this.#diskRun);
+    if (!options.force && now - this.#lastDiskCheckAt < DISK_CHECK_INTERVAL_MS) return;
+    this.#lastDiskCheckAt = now;
+    const run = this.#runDiskCheck()
+      .catch((error: unknown) => logger.warn({ err: error }, 'task-pair: disk check failed'))
+      .finally(() => { if (this.#diskRun === run) this.#diskRun = undefined; });
+    this.#diskRun = run;
+    this.#track(run);
+    return wait(run);
+  }
+
+  async #runDiskCheck(): Promise<void> {
+    const store = getTaskPairStore();
+    const deps = taskPairHygieneDeps();
+    const root = deps.worktreesRoot ?? resolveSupervisionWorktreesRoot(process.env);
+    const before = await readWorktreeVolumeSpace(root, deps);
+    if (!before) return;
+    const storedLevel = store.getMeta(TASK_PAIR_DISK_LEVEL_META_KEY);
+    const announced: TaskPairDiskLevel = isDiskLevel(storedLevel) ? storedLevel : 'ok';
+    const level = classifyDiskLevel(before, announced);
+    if (level === 'ok') {
+      if (announced !== 'ok') store.setMeta(TASK_PAIR_DISK_LEVEL_META_KEY, 'ok');
+      return;
+    }
+    // Finished pairs only, oldest first. Their eligibility is re-checked per directory.
+    const closed = store.listEndedWorkspacePairs()
+      .filter((stored) => stored.state.workspace?.kind === 'worktree' && stored.state.workspace.strippedAt === undefined)
+      .sort((a, b) => (a.state.workspace?.endedAt ?? a.state.updatedAt) - (b.state.workspace?.endedAt ?? b.state.updatedAt));
+    let after = before;
+    const strippedBrains = new Set<string>();
+    let strippedPairs = 0;
+    for (const stored of closed) {
+      if (await this.#stripClosedWorkspace(stored.project, stored.state.taskId)) {
+        strippedPairs += 1;
+        strippedBrains.add(stored.state.brain);
+      }
+      const reading = await readWorktreeVolumeSpace(root, deps);
+      if (reading) after = reading;
+      if (classifyDiskLevel(after, level) === 'ok') break;
+    }
+    const settled = classifyDiskLevel(after, level);
+    // Persist before announcing: a failed send must not repeat next heartbeat.
+    store.setMeta(TASK_PAIR_DISK_LEVEL_META_KEY, settled);
+    if (diskLevelRank(level) <= diskLevelRank(announced)) return;
+    const brains = new Set<string>();
+    for (const stored of store.listActivePairs()) if (isPairsEngineProject(stored.project)) brains.add(stored.state.brain);
+    if (brains.size === 0) for (const brain of strippedBrains) brains.add(brain);
+    const text = buildDiskPressureMessage({
+      level, freeBeforeBytes: before.freeBytes, freeAfterBytes: after.freeBytes, totalBytes: before.totalBytes, strippedPairs,
+    });
+    for (const brain of brains) {
+      await sendTaskPairMessage(brain, TASK_PAIR_DISK_NOTICE_TASK_ID, 'brain-disk-pressure', text);
+    }
   }
 
   #recordWorkspaceEvent(
