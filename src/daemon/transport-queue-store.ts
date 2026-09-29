@@ -44,6 +44,29 @@ export function shouldQuarantineUnrestorableQueueSession(attempt: number): boole
   return Number.isFinite(attempt) && attempt >= MAX_ORPHAN_QUEUE_RESTORE_ATTEMPTS;
 }
 
+export type QueueSweepDecision =
+  | 'rehydrate_bound_runtime'
+  | 'count_orphan_attempt'
+  | 'skip_no_live_rows'
+  | 'restore_runtime';
+
+/**
+ * What the periodic durable-queue sweep does with one session that has queue
+ * rows. A restore is only worth attempting when there is live work to drain:
+ * a session whose rows are all terminal (failed/expired) has nothing to
+ * deliver, and its runtime is rebuilt on demand by the next send anyway.
+ */
+export function classifyQueueSweepCandidate(input: {
+  hasLiveRows: boolean;
+  hasBoundRuntime: boolean;
+  restorableSession: boolean;
+}): QueueSweepDecision {
+  if (input.hasLiveRows && input.hasBoundRuntime) return 'rehydrate_bound_runtime';
+  if (!input.restorableSession) return 'count_orphan_attempt';
+  if (!input.hasLiveRows) return 'skip_no_live_rows';
+  return 'restore_runtime';
+}
+
 export interface TransportQueueStoreOptions {
   dbPath?: string;
   database?: DatabaseSyncInstance;

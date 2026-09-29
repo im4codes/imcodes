@@ -282,7 +282,7 @@ export async function dispatchSessionMessage(
       if (runtime?.providerSessionId) {
         await drainTransportResendQueueForDispatch(target.name);
       } else {
-        void ensureTransportRuntimeForPendingResend(target.name);
+        void ensureTransportRuntimeForPendingResend(target.name, { bypassBackoff: true });
       }
       return 'queued';
     }
@@ -310,7 +310,7 @@ export async function dispatchSessionMessage(
       // Do not await provider startup on the inbound webhook path. The durable
       // resend entry is now authoritative; launch/restore drains it and owns
       // the eventual single user.message projection.
-      void ensureTransportRuntimeForPendingResend(target.name);
+      void ensureTransportRuntimeForPendingResend(target.name, { bypassBackoff: true });
       return 'queued';
     }
     if (deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {

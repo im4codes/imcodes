@@ -23,6 +23,13 @@ import { TransportSessionRuntime } from './transport-session-runtime.js';
 import { canonicalizeTransportCwd, normalizeTransportCwd } from './transport-paths.js';
 import { ensureProviderConnected, getProvider } from './provider-registry.js';
 import {
+  clearTransportRestoreBackoff,
+  isTransportRestoreBackedOff,
+  noteTransportRestoreUnbound,
+  transportRestoreFingerprint,
+  type TransportRestoreUnboundReason,
+} from './transport-restore-backoff.js';
+import {
   PROVIDER_ERROR_CODES,
   type RemoteSessionInfo,
   type SessionInfoUpdate,
@@ -438,6 +445,7 @@ export async function stopProject(
           }
         }
         removeSession(record.name);
+        clearTransportRestoreBackoff(record.name);
         // Session is gone — free its in-memory timeline ring buffer + dedup maps
         // (otherwise they leak for every session that ever ran), and drop any
         // queued resend work so it can't replay into a same-named session later.
@@ -2771,6 +2779,21 @@ export async function restoreTransportSessions(
     && (!options.sessionName || s.name === options.sessionName)
     && (!options.onlyWithPendingResend || getResendCount(s.name) > 0 || hasDurableTransportQueueEntries(s.name)),
   ).map((s) => ({ ...s, providerId, providerSessionId: s.providerSessionId! } as Restorable));
+  // A permanent-by-construction failure (see transport-restore-backoff.ts):
+  // recorded so on-demand callers stop retrying it every few seconds, and
+  // warned once per backoff step rather than once per attempt.
+  const noteUnboundRestore = (s: Restorable, reason: TransportRestoreUnboundReason, message: string): void => {
+    const current = getSession(s.name);
+    if (!current) return;
+    const note = noteTransportRestoreUnbound(s.name, s.providerId, transportRestoreFingerprint(current), reason);
+    if (!note.logNow) return;
+    logger.warn({
+      session: s.name,
+      providerId: s.providerId,
+      backoffStep: note.attempts,
+      nextRetryInMs: note.retryInMs,
+    }, message);
+  };
   const restoreOne = async (s: Restorable, index: number): Promise<void> => {
     let expectedAuthority = buildRestoreAuthority(s);
     let restoreCommitted = false;
@@ -2821,10 +2844,7 @@ export async function restoreTransportSessions(
       if (!provider) return;
       if (usesProviderResumeId(s.providerId) && !s.providerResumeId) {
         if (!provider.listSessions) {
-          logger.warn({
-            session: s.name,
-            providerId: s.providerId,
-          }, 'Transport restore requires a durable provider id but the provider cannot list sessions');
+          noteUnboundRestore(s, 'provider_cannot_list_sessions', 'Transport restore requires a durable provider id but the provider cannot list sessions');
           return;
         }
         const directoryScopedListing = usesDirectoryScopedSessionListing(s.providerId);
@@ -2832,10 +2852,7 @@ export async function restoreTransportSessions(
           ? canonicalizeTransportCwd(s.projectDir)
           : undefined;
         if (directoryScopedListing && !expectedDirectory?.trim()) {
-          logger.warn({
-            session: s.name,
-            providerId: s.providerId,
-          }, 'Transport restore requires a valid project directory for provider session discovery');
+          noteUnboundRestore(s, 'project_directory_required', 'Transport restore requires a valid project directory for provider session discovery');
           return;
         }
         const queryDirectories: Array<string | undefined> = directoryScopedListing
@@ -3323,6 +3340,8 @@ const transportLaunchInFlight = new Map<string, Promise<void>>();
 
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name } = opts;
+  // A (re)launch is an explicit session change: forget any restore backoff.
+  clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
   if (inFlight) {
     await inFlight.catch(() => {});
@@ -3808,9 +3827,21 @@ const transportRuntimeRecoveries = new Map<string, Promise<void>>();
  */
 export async function ensureTransportRuntimeAvailable(
   sessionName: string,
+  options: {
+    /** A message was just delivered to this session: attempt the restore even inside a backoff window. */
+    bypassBackoff?: boolean;
+  } = {},
 ): Promise<TransportSessionRuntime | undefined> {
   const existing = getTransportRuntime(sessionName);
   if (existing?.providerSessionId) return existing;
+
+  // A restore that already proved permanently unbound for this exact record
+  // state is not retried until its backoff window ends or the record/provider
+  // changes (fingerprint / provider reconnect). Sends bypass this.
+  if (!options.bypassBackoff) {
+    const current = getSession(sessionName);
+    if (current && isTransportRestoreBackedOff(sessionName, transportRestoreFingerprint(current))) return undefined;
+  }
 
   let recovery = transportRuntimeRecoveries.get(sessionName);
   if (!recovery) {
@@ -3874,9 +3905,12 @@ export async function ensureTransportRuntimeAvailable(
  * coalescing inside `launchTransportSession` (which drains the resend queue on
  * success) is the final concurrency guard.
  */
-export async function ensureTransportRuntimeForPendingResend(sessionName: string): Promise<void> {
+export async function ensureTransportRuntimeForPendingResend(
+  sessionName: string,
+  options: { bypassBackoff?: boolean } = {},
+): Promise<void> {
   try {
-    await ensureTransportRuntimeAvailable(sessionName);
+    await ensureTransportRuntimeAvailable(sessionName, options);
   } catch (err) {
     logger.error({ err, sessionName }, 'ensureTransportRuntimeForPendingResend failed');
   }

@@ -6,6 +6,7 @@ import { wireProviderToRelay, broadcastProviderStatus } from '../daemon/transpor
 import logger from '../util/logger.js';
 import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { clearTransportRestoreBackoffForProvider } from './transport-restore-backoff.js';
 
 const providers = new Map<string, TransportProvider>();
 
@@ -39,6 +40,8 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   const provider = await createProvider(id);
   await provider.connect(config);
   providers.set(id, provider);
+  // A reconnected provider may now be able to do what it could not before.
+  clearTransportRestoreBackoffForProvider(id);
   wireProviderToRelay(provider);
 
   // Materialize OC sessions before broadcasting status (sessions appear before catalog)

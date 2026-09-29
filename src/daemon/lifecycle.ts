@@ -64,9 +64,11 @@ import { setArchiveBackfillSchedulingEnabled } from '../store/archive-backfill-s
 import { getResendCount } from './transport-resend-queue.js';
 import {
   getTransportQueueStore,
+  classifyQueueSweepCandidate,
   shouldQuarantineUnrestorableQueueSession,
 } from './transport-queue-store.js';
 import { TRANSPORT_QUEUE_SWEEP_INTERVAL_MS } from '../../shared/transport-queue-types.js';
+import { pruneTransportRestoreBackoff } from '../agent/transport-restore-backoff.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
 import { isTransportAgent } from '../agent/detect.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
@@ -2292,6 +2294,8 @@ function startHealthPoller(): void {
 async function reconcileDurableTransportQueues(): Promise<void> {
   if (transportQueueSweepInFlight) return transportQueueSweepInFlight;
   const run = (async () => {
+    // Restore-backoff entries of sessions deleted in the meantime must not linger.
+    pruneTransportRestoreBackoff((name) => !!getSession(name));
     const store = getTransportQueueStore();
     const stale = store.expireStaleDelegationEntries();
     if (stale.length > 0) {
@@ -2333,13 +2337,25 @@ async function reconcileDurableTransportQueues(): Promise<void> {
       const liveCandidate = liveCandidates.get(candidate.sessionName);
       const runtime = getTransportRuntime(candidate.sessionName);
       try {
-        if (liveCandidate && runtime?.providerSessionId) {
-          const recovered = runtime.rehydratePendingFromStore();
-          if (recovered > 0) runtime.drainPendingIfIdle('durable-queue-sweep');
+        const session = getSession(candidate.sessionName);
+        const decision = classifyQueueSweepCandidate({
+          hasLiveRows: !!liveCandidate,
+          hasBoundRuntime: !!runtime?.providerSessionId,
+          restorableSession: !!session && isTransportAgent(session.agentType) && !!session.providerSessionId,
+        });
+        if (decision === 'rehydrate_bound_runtime') {
+          const recovered = runtime!.rehydratePendingFromStore();
+          if (recovered > 0) runtime!.drainPendingIfIdle('durable-queue-sweep');
           continue;
         }
-        const session = getSession(candidate.sessionName);
-        if (!session || !isTransportAgent(session.agentType) || !session.providerSessionId) {
+        if (decision === 'skip_no_live_rows') {
+          // Only terminal rows: nothing to drain, so no restore attempt (it
+          // used to be retried every sweep for a session that could never
+          // restore, e.g. cursor-headless without a durable provider id).
+          orphanQueueRestoreAttempts.delete(candidate.sessionName);
+          continue;
+        }
+        if (decision === 'count_orphan_attempt') {
           const attempt = (orphanQueueRestoreAttempts.get(candidate.sessionName) ?? 0) + 1;
           orphanQueueRestoreAttempts.set(candidate.sessionName, attempt);
           if (shouldQuarantineUnrestorableQueueSession(attempt)) {
