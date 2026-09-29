@@ -3961,22 +3961,22 @@ describe('direct file transfer v2 browser broker', () => {
       const { setSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
       const { ws, sent } = createWs(directCapabilities);
 
-      const result = await setSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain', 'session rules content');
+      const result = await setSessionIdentityDirect(ws, 'server-1', 'session', 'srv-1:deck_proj_brain', 'session rules content', 'deck_proj_brain');
 
       expect(result).toMatchObject({ contentHash: expect.any(String), revision: expect.any(Number), updatedAt: expect.any(Number) });
       const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
-      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, filename: 'imcodes-identity-session-7372762d313a6465636b5f70726f6a5f627261696e' });
+      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD, filename: 'imcodes-identity-session-7372762d313a6465636b5f70726f6a5f627261696e', sessionName: 'deck_proj_brain' });
     });
 
     it('GET sends a download OPERATION_INIT whose previewHandle carries the identity handle, and decodes the received bytes', async () => {
       const { getSessionIdentityDirect } = await import('../src/direct-file-transfer.js');
       const { ws, sent } = createWs(directCapabilities);
 
-      const result = await getSessionIdentityDirect(ws, 'server-1', 'project', 'repo-1');
+      const result = await getSessionIdentityDirect(ws, 'server-1', 'project', 'repo-1', 'deck_proj_brain');
 
       expect(result.content.length).toBeGreaterThan(0);
       const init = sent.find((message) => message.type === DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT);
-      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD, previewHandle: 'imcodes-identity-project-7265706f2d31' });
+      expect(init).toMatchObject({ direction: DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD, previewHandle: 'imcodes-identity-project-7265706f2d31', sessionName: 'deck_proj_brain' });
     });
 
     it('rejects when the daemon has not advertised the required capabilities, without ever attempting a lease', async () => {

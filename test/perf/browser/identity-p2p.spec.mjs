@@ -170,11 +170,11 @@ async function runDirectScenario() {
     const expectedHash = sha256Hex(content);
 
     const setStarted = Date.now();
-    const setResult = await page.evaluate(async ({ serverId, projectId, content }) => {
+    const setResult = await page.evaluate(async ({ serverId, projectId, content, sessionName }) => {
       const mod = window.__identityTestDirectFileTransfer__;
       const ws = window.__identityTestWs__;
-      return await mod.setSessionIdentityDirect(ws, serverId, 'project', projectId, content);
-    }, { serverId: SERVER_ID, projectId: PROJECT_ID, content });
+      return await mod.setSessionIdentityDirect(ws, serverId, 'project', projectId, content, sessionName);
+    }, { serverId: SERVER_ID, projectId: PROJECT_ID, content, sessionName: SESSION_NAME });
     const setElapsedMs = Date.now() - setStarted;
     if (setElapsedMs > SAVE_BUDGET_MS) throw new Error(`[direct] SET took ${setElapsedMs}ms, over the ${SAVE_BUDGET_MS}ms budget`);
     if (setResult.contentHash !== expectedHash) {
@@ -188,11 +188,11 @@ async function runDirectScenario() {
     }
 
     const getStarted = Date.now();
-    const getResult = await page.evaluate(async ({ serverId, projectId }) => {
+    const getResult = await page.evaluate(async ({ serverId, projectId, sessionName }) => {
       const mod = window.__identityTestDirectFileTransfer__;
       const ws = window.__identityTestWs__;
-      return await mod.getSessionIdentityDirect(ws, serverId, 'project', projectId);
-    }, { serverId: SERVER_ID, projectId: PROJECT_ID });
+      return await mod.getSessionIdentityDirect(ws, serverId, 'project', projectId, sessionName);
+    }, { serverId: SERVER_ID, projectId: PROJECT_ID, sessionName: SESSION_NAME });
     const getElapsedMs = Date.now() - getStarted;
     if (getElapsedMs > SAVE_BUDGET_MS) throw new Error(`[direct] GET took ${getElapsedMs}ms, over the ${SAVE_BUDGET_MS}ms budget`);
     if (getResult.content !== content) throw new Error('[direct] GET returned content that does not match what was SET');

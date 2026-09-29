@@ -2940,12 +2940,12 @@ export interface SessionIdentityDirectResult {
  * real attachment.
  */
 export async function setSessionIdentityDirect(
-  ws: WsClient, serverId: string, scope: 'project' | 'session', scopeKey: string, content: string,
+  ws: WsClient, serverId: string, scope: 'project' | 'session', scopeKey: string, content: string, sessionName: string,
 ): Promise<{ contentHash: string; revision: number; updatedAt: number }> {
   const handle = encodeSessionIdentityDirectHandle(scope, scopeKey);
   const file = new File([content], handle, { type: 'text/plain' });
   const clientUploadId = crypto.randomUUID().replace(/-/g, '');
-  const result = await uploadFileDirect(ws, file, clientUploadId, undefined, undefined, undefined, undefined, serverId);
+  const result = await uploadFileDirect(ws, file, clientUploadId, undefined, undefined, undefined, sessionName, serverId);
   const revision = Number(result.attachment.originalName);
   const updatedAt = Date.parse(result.attachment.createdAt);
   return {
@@ -3017,7 +3017,7 @@ function createInMemoryTextSink(): { destination: DirectPreviewDownloadDestinati
 }
 
 export async function getSessionIdentityDirect(
-  ws: WsClient, serverId: string, scope: 'project' | 'session', scopeKey: string,
+  ws: WsClient, serverId: string, scope: 'project' | 'session', scopeKey: string, sessionName: string,
 ): Promise<SessionIdentityDirectResult> {
   if (!supportsPreviewDownload(ws)) throw directError(DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE, false);
   const { lease, release } = acquireLease(ws, serverId);
@@ -3027,6 +3027,7 @@ export async function getSessionIdentityDirect(
     await retryDirect<OperationSuccess>(lease, async () => ({
       kind: 'download',
       previewHandle: encodeSessionIdentityDirectHandle(scope, scopeKey),
+      sessionName,
       operationId,
       writer: await createPreviewWriter(sink.destination, 0),
     }), undefined);

@@ -160,12 +160,15 @@ async function resolveIdentityDirect(
 export function fetchSessionIdentityProfileDirectFirst(
   scope: SessionIdentityScope, scopeKey: string, context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile | null> {
-  if (!ws || !isDirectScope(scope) || !supportsSessionIdentityDirect(ws) || isDirectRecentlyUnavailable(context.serverId)) {
+  if (!ws || !isDirectScope(scope) || !supportsSessionIdentityDirect(ws) || !context.sessionName || isDirectRecentlyUnavailable(context.serverId)) {
     return fetchSessionIdentityProfile(scope, scopeKey, context);
   }
+  const sessionName = context.sessionName;
   const attempt = (async () => {
     const resolved = await resolveIdentityDirect(ws, scope, context);
-    if (!resolved) return null;
+    // Denied (viewer, uncovered session), timed out, or unknown: let the HTTP
+    // route answer authoritatively rather than reporting an empty identity.
+    if (!resolved) throw new Error('session_identity_resolve_failed');
     const key = cacheKey(context.serverId, scope, resolved.scopeKey);
     const cached = identityCache.get(key);
     if (!resolved.contentHash) {
@@ -178,7 +181,7 @@ export function fetchSessionIdentityProfileDirectFirst(
         revision: resolved.revision ?? 0, updatedAt: resolved.updatedAt ?? 0,
       });
     }
-    const direct = await getSessionIdentityDirect(ws, context.serverId, scope, resolved.scopeKey);
+    const direct = await getSessionIdentityDirect(ws, context.serverId, scope, resolved.scopeKey, sessionName);
     identityCache.set(key, { contentHash: resolved.contentHash, content: direct.content });
     return toProfile(scope, resolved.scopeKey, {
       content: direct.content, contentHash: resolved.contentHash,
@@ -196,15 +199,16 @@ export function saveSessionIdentityProfileDirectFirst(
   input: { scope: SessionIdentityScope; scopeKey: string; content: string; sourceFile?: string },
   context: SessionIdentityAccessContext, ws?: WsClient | null,
 ): Promise<SessionIdentityProfile> {
-  if (!ws || !isDirectScope(input.scope) || !supportsSessionIdentityDirect(ws) || isDirectRecentlyUnavailable(context.serverId)) {
+  if (!ws || !isDirectScope(input.scope) || !supportsSessionIdentityDirect(ws) || !context.sessionName || isDirectRecentlyUnavailable(context.serverId)) {
     return saveSessionIdentityProfile(input, context);
   }
+  const sessionName = context.sessionName;
   const attempt = (async () => {
     const resolved = await resolveIdentityDirect(ws, input.scope as 'project' | 'session', context);
     // A brand-new (never-saved) key still resolves to a scopeKey with no
     // hash/revision -- only a totally unknown session/scope returns null.
     if (!resolved) throw new Error('session_identity_resolve_failed');
-    const direct = await setSessionIdentityDirect(ws, context.serverId, input.scope as 'project' | 'session', resolved.scopeKey, input.content);
+    const direct = await setSessionIdentityDirect(ws, context.serverId, input.scope as 'project' | 'session', resolved.scopeKey, input.content, sessionName);
     identityCache.set(cacheKey(context.serverId, input.scope, resolved.scopeKey), { contentHash: direct.contentHash, content: input.content });
     return toProfile(input.scope, resolved.scopeKey, { content: input.content, ...direct });
   })();

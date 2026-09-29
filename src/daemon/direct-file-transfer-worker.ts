@@ -1521,7 +1521,7 @@ async function startIdentityUpload(transfer: ActiveDirectTransfer): Promise<void
   // trust a decoded identity handle without it -- a bug in either of those
   // upstream checks would otherwise let a shared viewer/participant read or
   // write the owner's identity content.
-  if (authority.identityOwnerAuthorized !== true) {
+  if (authority.identityAuthorized !== true) {
     await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
     return;
   }
@@ -1784,7 +1784,7 @@ async function startIdentityDownload(transfer: ActiveDirectTransfer, requestedRe
   const authority = transfer.authority;
   if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) return;
   // Defense in depth -- see startIdentityUpload's matching check.
-  if (authority.identityOwnerAuthorized !== true) {
+  if (authority.identityAuthorized !== true) {
     await failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
     return;
   }

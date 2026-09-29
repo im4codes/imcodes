@@ -28,6 +28,7 @@ import {
   DIRECT_FILE_TRANSFER_MSG,
 } from '../../../shared/direct-file-transfer.js';
 import { decodeSessionIdentityDirectHandle } from '../../../shared/session-identity.js';
+import { SESSION_IDENTITY_WS } from '../../../shared/session-identity-ws.js';
 import { TRANSPORT_QUEUE_COMMANDS } from '../../../shared/transport-queue-types.js';
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../../shared/openspec-auto-deliver-constants.js';
 import { CC_PRESET_MSG } from '../../../shared/cc-presets.js';
@@ -180,6 +181,7 @@ export const SHARE_WS_COMMAND_POLICY_INVENTORY: readonly ShareBridgeCommandInven
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: SUPERVISION_TASK_CONSOLE_MSG.ACK, sharedCommand: SHARE_BROWSER_COMMANDS.SUPERVISION_TASK_CONSOLE_READ, policy: { kind: 'allow-main-covered-read' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_CANCEL, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_CANCEL, policy: { kind: 'participant-cancel' } },
+  { bridgeCommand: SESSION_IDENTITY_WS.RESOLVE_QUERY, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH, sharedCommand: SHARE_BROWSER_COMMANDS.SESSION_IDENTITY_REFRESH, policy: { kind: 'participant-covered-action' } },
   { bridgeCommand: 'discussion.comment', sharedCommand: SHARE_BROWSER_COMMANDS.DISCUSSION_COMMENT, policy: { kind: 'allow-covered-read', requireTarget: false } },
   { bridgeCommand: 'fs.ls', sharedCommand: SHARE_BROWSER_COMMANDS.FILE_BROWSE, policy: { kind: 'allow-covered-read', requireTarget: true } },
@@ -418,6 +420,11 @@ export function shareStateCoversSession(state: ShareScopedSocketState, sessionNa
     || !!state.coveredSessionNames?.includes(sessionName);
 }
 
+/** A share actor may use identity-over-the-lease only as a participant whose share covers the session (HTTP identity route parity). */
+export function shareStateMayUseIdentity(state: ShareScopedSocketState, sessionName: string): boolean {
+  return state.snapshot.effectiveRole === 'participant' && shareStateCoversSession(state, sessionName);
+}
+
 export function isConcreteShareTarget(target: ShareTarget): boolean {
   return target.kind === 'main' || target.kind === 'subsession';
 }
@@ -541,22 +548,22 @@ export function evaluateShareCommand(input: {
     if (direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD && direction !== DIRECT_FILE_TRANSFER_DIRECTION.DOWNLOAD) {
       return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
     }
-    // Identity-over-the-lease (shared/session-identity.ts) is owner-only:
-    // this whole function only ever runs for a share-scoped connection --
-    // evaluateShareScopedBrowserCommand (server/src/ws/bridge.ts) returns
-    // `allowed: true` immediately for the owner's own connection without
-    // calling here at all -- so reaching this point already means the
-    // caller is a shared viewer or participant, never the owner. Session
-    // coverage below authorizes access to a SESSION's files; it says
-    // nothing about which project/session identity the filename/
-    // previewHandle actually names, so a covered session cannot stand in
-    // for identity-scope authorization. Deny outright rather than let an
-    // identity-flavored handle ride through on borrowed session coverage.
+    // Identity-over-the-lease (shared/session-identity.ts) mirrors the HTTP
+    // identity routes (server/src/routes/session-mgmt.ts,
+    // resolveSupervisorDefaultsOwner): the owner/members, or a share
+    // PARTICIPANT covering the named session -- never a viewer, for read or
+    // write alike. Session coverage below only authorizes a SESSION's files;
+    // it says nothing about which project/session identity the handle names,
+    // so the router additionally pins the handle's scope key to the canonical
+    // key of the covered session (authorizeIdentityOperation hook in
+    // direct-file-transfer-router.ts) -- this check only removes viewers.
     const identityHandleField = direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD
       ? input.msg.filename
       : input.msg.previewHandle;
-    if (typeof identityHandleField === 'string' && decodeSessionIdentityDirectHandle(identityHandleField)) {
-      return { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
+    if (typeof identityHandleField === 'string'
+      && decodeSessionIdentityDirectHandle(identityHandleField)
+      && input.state.snapshot.effectiveRole !== 'participant') {
+      return { allowed: false, reason: SHARE_REASONS.ROLE_DENIED };
     }
     if (!targetlessCoveredForServerParticipant
       && (!sessionName || !shareStateCoversSession(input.state, sessionName))) {

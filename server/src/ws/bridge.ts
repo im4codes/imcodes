@@ -378,6 +378,7 @@ import {
   filterShareDaemonMessage,
   resolveShareCoverageFromDb,
   shareStateCoversSession,
+  shareStateMayUseIdentity,
   shareTargetKey,
   type EffectiveCoverage,
   type ShareCoverageResolver,
@@ -2247,7 +2248,9 @@ export class WsBridge {
     iceServers: (userId) => createTurnIceServerAuthority(userId),
     sendDaemon: (message, generation) => this.trySendDirectFileTransfer(message, generation),
     sendBrowser: (socket, message) => { safeSend(socket, JSON.stringify(message)); },
-    daemonOwnerUserId: () => this.daemonOwnerUserId,
+    authorizeIdentityOperation: (socket, scope, scopeKey, sessionName) => (
+      !!sessionName && this.canonicalIdentityScopeKeyForSocket(socket, scope, sessionName) === scopeKey
+    ),
   });
 
   /** Continuous-authority remote desktop signaling; media/input never enter Server. */
@@ -4976,31 +4979,46 @@ export class WsBridge {
   }
 
   /**
+   * Identity-over-the-lease access, mirroring the HTTP identity routes
+   * (server/src/routes/session-mgmt.ts: resolveSupervisorDefaultsOwner +
+   * canonicalSessionIdentityScopeKey): a server member/owner socket, or a
+   * share PARTICIPANT whose share covers `sessionName` (never a viewer, read
+   * or write), and only for the canonical scope key of THAT session -- so a
+   * participant cannot reach another session's or project's identity.
+   * Returns that canonical key, or null when access is denied.
+   */
+  private canonicalIdentityScopeKeyForSocket(
+    ws: WebSocket,
+    scope: 'project' | 'session',
+    sessionName: string,
+  ): string | null {
+    if (!sessionName) return null;
+    const shareState = this.browserShareStates.get(ws);
+    if (shareState && !shareStateMayUseIdentity(shareState, sessionName)) return null;
+    return scope === 'session'
+      ? sessionIdentitySessionKey(this.serverId, sessionName)
+      : this.resolveSessionIdentityProjectKey(sessionName);
+  }
+
+  /**
    * Identity-over-lease (phase 2): pure server-side, never touches the
-   * daemon. Owner-only -- a share participant gets `ok: false` and falls
-   * back to the existing HTTP relay path, which already carries full
-   * share-coverage access control this WS shortcut deliberately does not
-   * reimplement.
+   * daemon. Same access rule as the HTTP identity routes (see
+   * canonicalIdentityScopeKeyForSocket); anything else gets `ok: false` and
+   * falls back to the HTTP relay path.
    */
   private async handleSessionIdentityResolveQuery(ws: WebSocket, msg: Record<string, unknown>): Promise<void> {
     const requestId = typeof msg.requestId === 'string' ? msg.requestId : '';
     if (!requestId) return;
     const scope = msg.scope === 'project' || msg.scope === 'session' ? msg.scope : null;
     const sessionName = typeof msg.sessionName === 'string' ? msg.sessionName : '';
-    const userId = this.browserUserIds.get(ws)?.trim();
-    if (!scope || !sessionName || !userId || !this.daemonOwnerUserId || userId !== this.daemonOwnerUserId) {
-      safeSend(ws, JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE, requestId, ok: false }));
-      return;
-    }
-    const scopeKey = scope === 'session'
-      ? sessionIdentitySessionKey(this.serverId, sessionName)
-      : this.resolveSessionIdentityProjectKey(sessionName);
-    if (!scopeKey || !this.db) {
+    const ownerUserId = this.daemonOwnerUserId;
+    const scopeKey = scope ? this.canonicalIdentityScopeKeyForSocket(ws, scope, sessionName) : null;
+    if (!scope || !ownerUserId || !scopeKey || !this.db) {
       safeSend(ws, JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE, requestId, ok: false }));
       return;
     }
     try {
-      const metadata = await getSessionIdentityMetadata(this.db, userId, scope, scopeKey);
+      const metadata = await getSessionIdentityMetadata(this.db, ownerUserId, scope, scopeKey);
       safeSend(ws, JSON.stringify({
         type: SESSION_IDENTITY_WS.RESOLVE_RESPONSE,
         requestId,

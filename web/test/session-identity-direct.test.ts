@@ -87,13 +87,30 @@ describe('fetchSessionIdentityProfileDirectFirst', () => {
     expect(fetchSessionIdentityProfileMock).toHaveBeenCalledWith('project', 'p', context);
   });
 
+  it('falls back to the HTTP path when the resolve is denied or unanswered, instead of reporting an empty identity', async () => {
+    const context = makeContext();
+    const ws = makeWs(() => null);
+    fetchSessionIdentityProfileMock.mockResolvedValue({ scope: 'project', scopeKey: 'p', source: 'web', content: 'from-http', contentHash: 'h', revision: 1, updatedAt: 0 });
+    const result = await fetchSessionIdentityProfileDirectFirst('project', 'p', context, ws as never);
+    expect(result?.content).toBe('from-http');
+    expect(getSessionIdentityDirectMock).not.toHaveBeenCalled();
+  });
+
+  it('skips the direct path entirely when the context has no session name (the server pins keys to a covered session)', async () => {
+    const ws = makeWs(() => ({ scopeKey: 'resolved-key', contentHash: 'abc' }));
+    fetchSessionIdentityProfileMock.mockResolvedValue(null);
+    await fetchSessionIdentityProfileDirectFirst('project', 'p', { serverId: 'srv-nosession' }, ws as never);
+    expect(fetchSessionIdentityProfileMock).toHaveBeenCalled();
+    expect(getSessionIdentityDirectMock).not.toHaveBeenCalled();
+  });
+
   it('resolves the canonical key then fetches over the direct lease on success', async () => {
     const context = makeContext();
     const ws = makeWs(() => ({ scopeKey: 'resolved-key', contentHash: 'abc', revision: 3, updatedAt: 42 }));
     getSessionIdentityDirectMock.mockResolvedValue({ content: 'hello world' });
     const result = await fetchSessionIdentityProfileDirectFirst('project', 'p', context, ws as never);
     expect(result).toEqual({ scope: 'project', scopeKey: 'resolved-key', source: 'web', content: 'hello world', contentHash: 'abc', revision: 3, updatedAt: 42 });
-    expect(getSessionIdentityDirectMock).toHaveBeenCalledWith(ws, context.serverId, 'project', 'resolved-key');
+    expect(getSessionIdentityDirectMock).toHaveBeenCalledWith(ws, context.serverId, 'project', 'resolved-key', context.sessionName);
     expect(fetchSessionIdentityProfileMock).not.toHaveBeenCalled();
   });
 
@@ -164,7 +181,7 @@ describe('saveSessionIdentityProfileDirectFirst', () => {
     setSessionIdentityDirectMock.mockResolvedValue({ contentHash: 'newhash', revision: 2, updatedAt: 99 });
     const result = await saveSessionIdentityProfileDirectFirst(INPUT, context, ws as never);
     expect(result).toEqual({ scope: 'project', scopeKey: 'resolved-key', source: 'web', content: 'new content', contentHash: 'newhash', revision: 2, updatedAt: 99 });
-    expect(setSessionIdentityDirectMock).toHaveBeenCalledWith(ws, context.serverId, 'project', 'resolved-key', 'new content');
+    expect(setSessionIdentityDirectMock).toHaveBeenCalledWith(ws, context.serverId, 'project', 'resolved-key', 'new content', context.sessionName);
     expect(saveSessionIdentityProfileMock).not.toHaveBeenCalled();
   });
 

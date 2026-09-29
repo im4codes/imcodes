@@ -1587,7 +1587,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       const contentBytes = Buffer.byteLength(content, 'utf8');
       const handle = encodeSessionIdentityDirectHandle('session', 'srv-1:deck_proj_brain');
 
-      const uploadAuthority = uploadPrepare({ filename: handle, size: contentBytes, identityOwnerAuthorized: true });
+      const uploadAuthority = uploadPrepare({ filename: handle, size: contentBytes, identityAuthorized: true });
       await direct.handleDirectFileTransferCommand(uploadAuthority, sender);
       const uploadChannel = new FakeDataChannel(uploadAuthority.channelLabel as string);
       FakePeerConnection.latest!.emitDataChannel(uploadChannel);
@@ -1617,7 +1617,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       expect(finalizeDirectUploadedFile).not.toHaveBeenCalled();
       expect(identityStore.get('session\0srv-1:deck_proj_brain')).toMatchObject({ content, revision: 1 });
 
-      const downloadAuthority = downloadPrepare({ previewHandle: handle, identityOwnerAuthorized: true });
+      const downloadAuthority = downloadPrepare({ previewHandle: handle, identityAuthorized: true });
       await direct.handleDirectFileTransferCommand(downloadAuthority, sender);
       const downloadChannel = new FakeDataChannel(downloadAuthority.channelLabel as string);
       FakePeerConnection.latest!.emitDataChannel(downloadChannel);
@@ -1671,7 +1671,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
       const content = 'tampered content check';
       const contentBytes = Buffer.byteLength(content, 'utf8');
       const handle = encodeSessionIdentityDirectHandle('project', 'repo-1');
-      const uploadAuthority = uploadPrepare({ filename: handle, size: contentBytes, sha256: 'a'.repeat(64), identityOwnerAuthorized: true });
+      const uploadAuthority = uploadPrepare({ filename: handle, size: contentBytes, sha256: 'a'.repeat(64), identityAuthorized: true });
       await direct.handleDirectFileTransferCommand(uploadAuthority, sender);
       const uploadChannel = new FakeDataChannel(uploadAuthority.channelLabel as string);
       FakePeerConnection.latest!.emitDataChannel(uploadChannel);
@@ -1697,7 +1697,7 @@ describe('daemon direct file transfer v2 lease broker', () => {
     it('reports not-found for a download handle the identity store never had', async () => {
       const { direct, sent, sender } = await readyLease();
       const handle = encodeSessionIdentityDirectHandle('project', 'never-written');
-      const downloadAuthority = downloadPrepare({ previewHandle: handle, identityOwnerAuthorized: true });
+      const downloadAuthority = downloadPrepare({ previewHandle: handle, identityAuthorized: true });
       await direct.handleDirectFileTransferCommand(downloadAuthority, sender);
       const downloadChannel = new FakeDataChannel(downloadAuthority.channelLabel as string);
       FakePeerConnection.latest!.emitDataChannel(downloadChannel);
@@ -1721,14 +1721,14 @@ describe('daemon direct file transfer v2 lease broker', () => {
       await direct.shutdownDirectFileTransfers();
     });
 
-    it('P0: refuses an identity upload without identityOwnerAuthorized, defense in depth against a bug upstream of the daemon', async () => {
+    it('P0: refuses an identity upload without identityAuthorized, defense in depth against a bug upstream of the daemon', async () => {
       // tsk_cd_identity_p2p_authz: share-policy.ts and
       // direct-file-transfer-router.ts already refuse this before it ever
       // reaches the daemon; this proves the daemon does not blindly trust a
       // decoded identity handle on its own.
       const { direct, sender } = await readyLease();
       const handle = encodeSessionIdentityDirectHandle('project', 'owners-project');
-      const uploadAuthority = uploadPrepare({ filename: handle, size: 5 }); // no identityOwnerAuthorized
+      const uploadAuthority = uploadPrepare({ filename: handle, size: 5 }); // no identityAuthorized
       await direct.handleDirectFileTransferCommand(uploadAuthority, sender);
       const uploadChannel = new FakeDataChannel(uploadAuthority.channelLabel as string);
       FakePeerConnection.latest!.emitDataChannel(uploadChannel);
@@ -1743,14 +1743,14 @@ describe('daemon direct file transfer v2 lease broker', () => {
       await direct.shutdownDirectFileTransfers();
     });
 
-    it('P0: refuses an identity download without identityOwnerAuthorized, defense in depth against a bug upstream of the daemon', async () => {
+    it('P0: refuses an identity download without identityAuthorized, defense in depth against a bug upstream of the daemon', async () => {
       const { direct, sent, sender } = await readyLease();
       const content = 'owner content, should never be reachable without the marker';
       identityStore.set('project\0owners-project', {
         content, contentHash: 'x'.repeat(64), revision: 1, updatedAt: Date.now(),
       });
       const handle = encodeSessionIdentityDirectHandle('project', 'owners-project');
-      const downloadAuthority = downloadPrepare({ previewHandle: handle }); // no identityOwnerAuthorized
+      const downloadAuthority = downloadPrepare({ previewHandle: handle }); // no identityAuthorized
       await direct.handleDirectFileTransferCommand(downloadAuthority, sender);
       const downloadChannel = new FakeDataChannel(downloadAuthority.channelLabel as string);
       FakePeerConnection.latest!.emitDataChannel(downloadChannel);

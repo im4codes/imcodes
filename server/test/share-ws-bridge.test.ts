@@ -37,6 +37,7 @@ import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-cons
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { SESSION_GROUP_CLONE_MSG } from '../../shared/session-group-clone.js';
 import { encodeSessionIdentityDirectHandle } from '../../shared/session-identity.js';
+import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
 
 class MockWs extends EventEmitter {
   sent: Array<string | Buffer> = [];
@@ -94,12 +95,13 @@ function makeDb(
   auditRows: AuditInsert[] = [],
   options: {
     subSessions?: Array<{ id: string; parent_session: string | null }>;
+    ownerUserId?: string;
   } = {},
 ) {
   const discussionComments = new Map<string, Record<string, unknown>>();
   const db = {
     queryOne: async (sql: string, params?: unknown[]) => {
-      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t') };
+      if (sql.includes('SELECT token_hash')) return { token_hash: sha256Hex('t'), ...(options.ownerUserId ? { user_id: options.ownerUserId } : {}) };
       if (sql.includes('runtime_type')) return { runtime_type: runtimeType };
       if (sql.includes('SELECT 1 FROM sessions')) return { exists: 1 };
       if (sql.includes('SELECT 1 FROM sub_sessions')) return { exists: 1 };
@@ -265,13 +267,12 @@ describe('WsBridge share-scoped sockets', () => {
     })).toEqual({ allowed: true });
   });
 
-  it('P0: denies an identity-flavored handle over the direct-file surface for any shared viewer or participant, upload or download, even when the covered session is real', () => {
-    // Regression for tsk_cd_identity_p2p_authz: without the fix, a shared
-    // viewer/participant could read or write the daemon OWNER's identity
-    // content for an ARBITRARY project/session by putting a decodable
-    // identity handle in filename/previewHandle while supplying a
-    // `sessionName` they genuinely ARE covered for -- session coverage has
-    // no relationship to which project/session the handle actually names.
+  it('P0: identity handles over the direct-file surface -- viewers denied for read and write, covered participants pass the policy gate, uncovered sessions and ordinary files behave as before', () => {
+    // tsk_cd_identity_p2p_authz. Mirrors the HTTP identity routes
+    // (session-mgmt.ts resolveSupervisorDefaultsOwner): a share PARTICIPANT
+    // covering the session may read and write; a viewer may do neither. The
+    // canonical-scope-key pin lives in WsBridge (see the RESOLVE_QUERY and
+    // router-hook tests below), because only the bridge knows the key.
     const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     const makeState = (role: 'viewer' | 'participant') => ({
       userId: 'shared-user',
@@ -281,7 +282,7 @@ describe('WsBridge share-scoped sockets', () => {
       snapshot: coverage(target, role, now),
       connectedAt: now,
     });
-    const identityHandle = encodeSessionIdentityDirectHandle('project', 'owners-other-project');
+    const identityHandle = encodeSessionIdentityDirectHandle('project', 'any-project');
     const uploadInit = {
       type: DIRECT_FILE_TRANSFER_MSG.OPERATION_INIT,
       protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -298,8 +299,6 @@ describe('WsBridge share-scoped sockets', () => {
       clientUploadId: '123e4567-e89b-12d3-a456-426614174011',
       filename: identityHandle,
       size: 10,
-      // A session this attacker genuinely IS covered for -- the whole point
-      // of the bug is that this must not matter.
       sessionName: 'deck_proj_brain',
     };
     const downloadInit = {
@@ -311,34 +310,128 @@ describe('WsBridge share-scoped sockets', () => {
     delete (downloadInit as { clientUploadId?: string; filename?: string; size?: number }).clientUploadId;
     delete (downloadInit as { filename?: string }).filename;
     delete (downloadInit as { size?: number }).size;
+    const decide = (msg: Record<string, unknown>, role: 'viewer' | 'participant') => evaluateShareCommand({
+      msg, state: makeState(role), now, runtimeType: 'transport', activeDispatchId: null,
+    });
 
-    for (const role of ['viewer', 'participant'] as const) {
-      for (const msg of [uploadInit, downloadInit]) {
-        expect(evaluateShareCommand({
-          msg,
-          state: makeState(role),
-          now,
-          runtimeType: 'transport',
-          activeDispatchId: null,
-        })).toEqual({ allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED });
-      }
+    // Viewer: denied for read AND write (a viewer may still download an ordinary preview).
+    expect(decide(uploadInit, 'viewer')).toEqual({ allowed: false, reason: SHARE_REASONS.ROLE_DENIED });
+    expect(decide(downloadInit, 'viewer')).toEqual({ allowed: false, reason: SHARE_REASONS.ROLE_DENIED });
+    // Covered participant: passes the policy gate for read and write.
+    expect(decide(uploadInit, 'participant')).toMatchObject({ allowed: true });
+    expect(decide(downloadInit, 'participant')).toMatchObject({ allowed: true });
+    // A session the participant does not cover is still denied, identity handle or not.
+    for (const msg of [uploadInit, downloadInit]) {
+      expect(decide({ ...msg, sessionName: 'deck_other_brain' }, 'participant'))
+        .toEqual({ allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED });
     }
+    // Counter-example: ordinary files are unchanged.
+    expect(decide({ ...uploadInit, filename: 'shared.bin' }, 'participant')).toMatchObject({ allowed: true });
+    expect(decide({ ...uploadInit, filename: 'shared.bin' }, 'viewer')).toEqual({ allowed: false, reason: SHARE_REASONS.ROLE_DENIED });
+    expect(decide({ ...downloadInit, previewHandle: 'preview-handle-1' }, 'viewer')).toEqual({ allowed: true });
+  });
 
-    // Counter-example, same session/role, but an ordinary (non-identity)
-    // filename: behavior is unchanged from the existing reference test
-    // above -- participant upload allowed, viewer upload role-denied (not
-    // identity-denied), viewer download allowed.
-    const ordinaryUpload = { ...uploadInit, filename: 'shared.bin' };
-    expect(evaluateShareCommand({
-      msg: ordinaryUpload, state: makeState('participant'), now, runtimeType: 'transport', activeDispatchId: null,
-    })).toMatchObject({ allowed: true });
-    expect(evaluateShareCommand({
-      msg: ordinaryUpload, state: makeState('viewer'), now, runtimeType: 'transport', activeDispatchId: null,
-    })).toEqual({ allowed: false, reason: SHARE_REASONS.ROLE_DENIED });
-    const ordinaryDownload = { ...downloadInit, previewHandle: 'preview-handle-1' };
-    expect(evaluateShareCommand({
-      msg: ordinaryDownload, state: makeState('viewer'), now, runtimeType: 'transport', activeDispatchId: null,
-    })).toEqual({ allowed: true });
+  it('P0: session_identity.resolve_query follows the HTTP identity policy -- members and covered participants get the canonical key, viewers and uncovered sessions get nothing', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const daemon = new MockWs();
+    const db = makeDb(null, [], { ownerUserId: 'owner-user' });
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_proj_brain', runtimeType: 'transport', contextNamespace: { projectId: 'proj-a' } },
+        { name: 'deck_other_brain', runtimeType: 'transport', contextNamespace: { projectId: 'proj-b' } },
+      ],
+    }));
+    await flushAsync();
+
+    bridge.setShareCoverageResolverForTests(async ({ userId }) => coverage(target, userId === 'viewer-user' ? 'viewer' : 'participant', now));
+    const connectShare = async (role: 'viewer' | 'participant') => {
+      const socket = new MockWs();
+      bridge.handleShareBrowserConnection(socket as never, `${role}-user`, db, {
+        ticketId: `ticket-resolve-${role}`, target, snapshot: coverage(target, role, now),
+      });
+      await flushAsync();
+      return socket;
+    };
+    const member = new MockWs();
+    bridge.handleBrowserConnection(member as never, 'owner-user', db);
+    const participant = await connectShare('participant');
+    const viewer = await connectShare('viewer');
+    await flushAsync();
+
+    const resolve = async (socket: MockWs, scope: 'project' | 'session', sessionName: string) => {
+      const requestId = `resolve-${Math.random().toString(36).slice(2)}`;
+      socket.sent.length = 0;
+      socket.emit('message', JSON.stringify({ type: SESSION_IDENTITY_WS.RESOLVE_QUERY, requestId, scope, sessionName }));
+      for (let i = 0; i < 6; i += 1) await flushAsync();
+      return {
+        response: socket.sentJson.find((msg) => msg.type === SESSION_IDENTITY_WS.RESOLVE_RESPONSE && msg.requestId === requestId),
+        error: socket.sentJson.find((msg) => msg.type === 'error' && msg.originalType === SESSION_IDENTITY_WS.RESOLVE_QUERY),
+      };
+    };
+
+    // Member: canonical keys for the named session.
+    expect((await resolve(member, 'session', 'deck_proj_brain')).response).toMatchObject({ ok: true, scopeKey: `${serverId}:deck_proj_brain` });
+    expect((await resolve(member, 'project', 'deck_proj_brain')).response).toMatchObject({ ok: true, scopeKey: 'proj-a' });
+    // Covered participant: same canonical keys, so it gets the direct path too.
+    expect((await resolve(participant, 'session', 'deck_proj_brain')).response).toMatchObject({ ok: true, scopeKey: `${serverId}:deck_proj_brain` });
+    expect((await resolve(participant, 'project', 'deck_proj_brain')).response).toMatchObject({ ok: true, scopeKey: 'proj-a' });
+    // A participant asking about a session/project outside the share: rejected by the policy gate, no key disclosed.
+    const outside = await resolve(participant, 'project', 'deck_other_brain');
+    expect(outside.response).toBeUndefined();
+    expect(outside.error).toMatchObject({ code: SHARE_REASONS.DIRECT_SURFACE_DENIED });
+    // Viewer: denied for the covered session too.
+    const viewerAttempt = await resolve(viewer, 'project', 'deck_proj_brain');
+    expect(viewerAttempt.response).toBeUndefined();
+    expect(viewerAttempt.error).toMatchObject({ code: SHARE_REASONS.ROLE_DENIED });
+  });
+
+  it('P0: the router pins an identity handle to the canonical scope key of the covered session for participants, and to nothing else', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    const daemon = new MockWs();
+    const db = makeDb(null, [], { ownerUserId: 'owner-user' });
+    bridge.handleDaemonConnection(daemon as never, db, { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: 'session_list',
+      sessions: [
+        { name: 'deck_proj_brain', runtimeType: 'transport', contextNamespace: { projectId: 'proj-a' } },
+        { name: 'deck_other_brain', runtimeType: 'transport', contextNamespace: { projectId: 'proj-b' } },
+      ],
+    }));
+    await flushAsync();
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const participant = new MockWs();
+    bridge.handleShareBrowserConnection(participant as never, 'participant-user', db, {
+      ticketId: 'ticket-pin', target, snapshot: coverage(target, 'participant', now),
+    });
+    await flushAsync();
+    const member = new MockWs();
+    bridge.handleBrowserConnection(member as never, 'owner-user', db);
+
+    const authorize = (socket: MockWs, scope: 'project' | 'session', scopeKey: string, sessionName: string | undefined) => (
+      (bridge as unknown as {
+        directFileTransferRouter: { hooks: { authorizeIdentityOperation: (s: unknown, sc: string, k: string, n: string | undefined) => boolean } };
+      }).directFileTransferRouter.hooks.authorizeIdentityOperation(socket, scope, scopeKey, sessionName)
+    );
+    // Participant on its covered session's canonical keys: allowed.
+    expect(authorize(participant, 'project', 'proj-a', 'deck_proj_brain')).toBe(true);
+    expect(authorize(participant, 'session', `${serverId}:deck_proj_brain`, 'deck_proj_brain')).toBe(true);
+    // Any other key -- another project, another session's key, an outside session -- rejected.
+    expect(authorize(participant, 'project', 'proj-b', 'deck_proj_brain')).toBe(false);
+    expect(authorize(participant, 'session', `${serverId}:deck_other_brain`, 'deck_proj_brain')).toBe(false);
+    expect(authorize(participant, 'project', 'proj-b', 'deck_other_brain')).toBe(false);
+    expect(authorize(participant, 'project', 'proj-a', undefined)).toBe(false);
+    // Member/owner: unaffected on the session's canonical keys.
+    expect(authorize(member, 'project', 'proj-a', 'deck_proj_brain')).toBe(true);
+    expect(authorize(member, 'project', 'proj-b', 'deck_other_brain')).toBe(true);
+    expect(authorize(member, 'project', 'proj-b', 'deck_proj_brain')).toBe(false);
   });
 
   it('distinguishes server-share owner-equivalent commands from tab-share participant limits', () => {
