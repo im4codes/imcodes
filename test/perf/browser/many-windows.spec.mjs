@@ -356,9 +356,15 @@ async function openRealSession(context, session, { manualProtocol = session.inde
   ]);
   let cdp = null;
   diagnostics.phase = 'cdp-connecting';
-  try { cdp = await cdpWithTimeout(context.newCDPSession(page), 'newCDPSession'); } catch (error) {
-    session.__cdpError = error instanceof Error ? error.message : String(error);
-  }
+  // IMC_PERF_LEAN=1: no per-page CDP session. The 1 ms CPU profiler, Performance
+  // sampling and Network.webSocketFrame* capture are themselves a large constant
+  // load on the renderer (an observer effect that hides differences between
+  // builds); lean runs keep only the renderer-CPU and keypress probes.
+  if (process.env.IMC_PERF_LEAN !== '1') {
+    try { cdp = await cdpWithTimeout(context.newCDPSession(page), 'newCDPSession'); } catch (error) {
+      session.__cdpError = error instanceof Error ? error.message : String(error);
+    }
+  } else session.__cdpError = 'disabled (IMC_PERF_LEAN=1)';
   diagnostics.phase = cdp ? 'cdp-connected' : 'cdp-unavailable';
   const networkLog = [];
   const traceChunks = [];
