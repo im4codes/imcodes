@@ -1,4 +1,5 @@
 import { expect, test, type Page } from '@playwright/test';
+import { STREAMING_MARKDOWN_REFRESH_MS } from '../src/streaming-markdown.js';
 
 // Keep the perf samples isolated. Running the two long-session probes in
 // parallel on a shared CI runner makes the 8,000-row sample measure worker
@@ -63,6 +64,21 @@ const FLATNESS_LIMIT = 4;
 const WORST_CASE_UPDATE_MS = 12;
 
 /**
+ * A streamed chunk reaches the DOM within the Markdown refresh interval, not
+ * synchronously (ChatMarkdown re-parses a streaming block at most every
+ * STREAMING_MARKDOWN_REFRESH_MS; it never shows the un-parsed text meanwhile).
+ * The arrival contract is that interval plus this slack: two frames (one for
+ * the paint, one for this probe's rAF polling) and some scheduling noise for a
+ * shared CI host. Text that never arrives, or arrives far later, still fails.
+ */
+const ARRIVAL_SLACK_MS = 2 * (1000 / 60) + 30;
+const ARRIVAL_LIMIT_MS = STREAMING_MARKDOWN_REFRESH_MS + ARRIVAL_SLACK_MS;
+
+/** Chunks and cadence (25 Hz, a busy reply) of the arrival probe. */
+const ARRIVAL_CHUNKS = 30;
+const ARRIVAL_CADENCE_MS = 40;
+
+/**
  * Growth across the measured sizes, divided by the FASTEST size rather than the
  * first one.
  *
@@ -83,6 +99,14 @@ interface UpdateCost {
   medianMs: number;
   p95Ms: number;
   reflected: number;
+}
+
+interface StreamingArrival {
+  /** Chunks whose text never reached the DOM. */
+  missing: number;
+  /** Worst append-to-DOM delay over the chunks that arrived. */
+  maxLagMs: number;
+  medianLagMs: number;
 }
 
 interface FixtureNetworkIsolation {
@@ -182,6 +206,63 @@ async function measureStreamingUpdates(page: Page, updates: number): Promise<Upd
   }, updates);
 }
 
+/**
+ * When does each streamed chunk's text reach the DOM?
+ *
+ * The cost probe above appends back to back and never yields to a timer, so it
+ * can only see text that arrives synchronously; the throttled Markdown refresh
+ * is a timer. This probe paces chunks like a real stream and polls every frame.
+ * Streamed text is cumulative, so a marker being present proves every earlier
+ * one arrived: pending markers are checked newest first and all older ones
+ * are credited to that same poll.
+ */
+async function measureStreamingArrival(page: Page, chunks: number, cadenceMs: number, limitMs: number): Promise<StreamingArrival> {
+  return page.evaluate(async ({ count, cadence, limit }) => {
+    const harness = (window as unknown as {
+      __chatTimelineHarness: {
+        appendStreamingChunk(chunk?: string): { eventId: string; length: number };
+      };
+    }).__chatTimelineHarness;
+    const scroller = document.querySelector('.chat-view') as HTMLElement;
+    const appendedAt: number[] = [];
+    const arrivedAt: Array<number | null> = new Array(count).fill(null);
+    let seenUpTo = -1;
+    const poll = () => {
+      const text = scroller.textContent ?? '';
+      const now = performance.now();
+      for (let j = appendedAt.length - 1; j > seenUpTo; j -= 1) {
+        if (!text.includes(` arrival-${j}.`)) continue;
+        for (let k = seenUpTo + 1; k <= j; k += 1) arrivedAt[k] = now;
+        seenUpTo = j;
+        break;
+      }
+    };
+    let polling = true;
+    const frame = () => { poll(); if (polling) requestAnimationFrame(frame); };
+    requestAnimationFrame(frame);
+    for (let i = 0; i < count; i += 1) {
+      // '.' terminates the marker (arrival-1. is not a prefix of arrival-10.); display text is trimmed, so no trailing space.
+      harness.appendStreamingChunk(` arrival-${i}.`);
+      appendedAt.push(performance.now());
+      await new Promise((resolve) => setTimeout(resolve, cadence));
+    }
+    // The tail: nothing more is appended, so only the refresh timer can deliver it.
+    const deadline = performance.now() + limit * 3;
+    while (seenUpTo < count - 1 && performance.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    polling = false;
+    poll();
+    const lags = arrivedAt.map((at, i) => (at === null ? Number.POSITIVE_INFINITY : at - appendedAt[i]!));
+    const arrived = lags.filter((lag) => Number.isFinite(lag)).sort((a, b) => a - b);
+    return {
+      missing: count - arrived.length,
+      maxLagMs: arrived.length ? arrived[arrived.length - 1]! : Number.POSITIVE_INFINITY,
+      medianLagMs: arrived.length ? arrived[Math.floor(arrived.length / 2)]! : Number.POSITIVE_INFINITY,
+    };
+  }, { count: chunks, cadence: cadenceMs, limit: limitMs });
+}
+
 /** Cost of a new message arriving, which changes the row count as well. */
 async function measureAppendUpdates(page: Page, updates: number): Promise<UpdateCost> {
   return page.evaluate(async (count) => {
@@ -214,24 +295,32 @@ async function measureAppendUpdates(page: Page, updates: number): Promise<Update
 
 test('streaming stays flat as the conversation grows', async ({ page }) => {
   const isolated = await isolateFixtureNetwork(page);
-  const results: Array<{ size: number; cost: UpdateCost }> = [];
+  const results: Array<{ size: number; cost: UpdateCost; arrival: StreamingArrival }> = [];
   for (const size of SIZES) {
     await page.goto(`${FIXTURE}?size=${size}`);
     await waitForHarness(page);
     await measureStreamingUpdates(page, WARMUP_UPDATES); // warm-up, discarded
-    results.push({ size, cost: await measureStreamingUpdates(page, UPDATES) });
+    const cost = await measureStreamingUpdates(page, UPDATES);
+    const arrival = await measureStreamingArrival(page, ARRIVAL_CHUNKS, ARRIVAL_CADENCE_MS, ARRIVAL_LIMIT_MS);
+    results.push({ size, cost, arrival });
   }
 
   const table = results
-    .map((r) => `${r.size}: median ${r.cost.medianMs.toFixed(2)}ms p95 ${r.cost.p95Ms.toFixed(2)}ms reflected ${(r.cost.reflected * 100).toFixed(0)}%`)
+    .map((r) => `${r.size}: median ${r.cost.medianMs.toFixed(2)}ms p95 ${r.cost.p95Ms.toFixed(2)}ms arrival median ${r.arrival.medianLagMs.toFixed(0)}ms max ${r.arrival.maxLagMs.toFixed(0)}ms`)
     .join('  |  ');
   // eslint-disable-next-line no-console
-  console.log(`[streaming] ${table}`);
+  console.log(`[streaming] ${table} (arrival limit ${ARRIVAL_LIMIT_MS.toFixed(0)}ms = ${STREAMING_MARKDOWN_REFRESH_MS}ms refresh + slack)`);
 
-  // A sample that never reached the DOM describes nothing; fail loudly rather
-  // than reporting a fast number for an update that did not happen.
+  // Text has to reach the DOM: an update that never rendered describes nothing,
+  // and a fast cost number for it would be a lie. The synchronous cost above is
+  // still measured, but arrival is judged against the throttle contract: every
+  // chunk within the refresh interval plus slack, none lost.
   for (const result of results) {
-    expect(result.cost.reflected, `${result.size} updates reached the DOM`).toBeGreaterThan(0.9);
+    expect(result.arrival.missing, `${result.size}: streamed chunks that never reached the DOM`).toBe(0);
+    expect(
+      result.arrival.maxLagMs,
+      `${result.size}: worst append-to-DOM delay (refresh interval ${STREAMING_MARKDOWN_REFRESH_MS}ms + slack)`,
+    ).toBeLessThanOrEqual(ARRIVAL_LIMIT_MS);
   }
   expect(isolated.preferenceRequests, 'fixture preference reads stayed inside the browser harness').toBe(SIZES.length);
   expect(isolated.imageRequests, 'fixture images stayed inside the browser harness').toBeGreaterThan(0);

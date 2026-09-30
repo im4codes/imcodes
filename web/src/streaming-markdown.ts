@@ -11,6 +11,14 @@
  * open fenced code block is left alone: the Markdown parser already renders an
  * unterminated fence as a code block running to the end of the text.
  */
+/**
+ * A streaming block re-parses its Markdown at most this often (10 Hz), so a
+ * chunk reaches the DOM within this interval, not synchronously. The one place
+ * this is defined: ChatMarkdown throttles with it and the perf guard
+ * (web/e2e/chat-timeline-scaling.perf.spec.ts) asserts text arrival against it.
+ */
+export const STREAMING_MARKDOWN_REFRESH_MS = 100;
+
 const FENCE = /^ {0,3}(`{3,}|~{3,})/;
 
 export function repairStreamingMarkdown(text: string): string {
