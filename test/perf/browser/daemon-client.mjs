@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
+import { burstyGaps, nextMarkdownPiece } from './stream-script.mjs';
 
 const require = createRequire(new URL('../../../server/package.json', import.meta.url));
 let Client;
@@ -222,6 +223,20 @@ ws.on('message', (raw) => {
  * frames. The default mode (a fresh event per frame) exercises list growth instead.
  */
 const growingStream = process.env.IMC_PERF_STREAM_MODE === 'growing';
+/** IMC_PERF_STREAM_CONTENT=markdown streams the shared Markdown-heavy reply in token-sized pieces. */
+const markdownContent = process.env.IMC_PERF_STREAM_CONTENT === 'markdown';
+/** IMC_PERF_STREAM_CADENCE=bursty emits in bursts with pauses (the shared schedule) instead of every tick. */
+const burstyCadence = process.env.IMC_PERF_STREAM_CADENCE === 'bursty';
+const gaps = burstyCadence ? burstyGaps() : [];
+const nextEmitAt = new Map();
+function dueToEmit(name) {
+  if (!burstyCadence) return true;
+  const state = nextEmitAt.get(name) ?? { at: 0, index: 0 };
+  const now = Date.now();
+  if (now < state.at) return false;
+  nextEmitAt.set(name, { at: now + gaps[state.index % gaps.length], index: state.index + 1 });
+  return true;
+}
 const GROWING_FRAMES_PER_MESSAGE = 90;
 const growing = new Map();
 function sendGrowingChunk(name, burstNumber) {
@@ -229,7 +244,15 @@ function sendGrowingChunk(name, burstNumber) {
   if (!state) { state = { message: 0, frames: 0, text: '', eventId: null, seq: 0 }; growing.set(name, state); }
   if (!state.eventId) { state.message += 1; state.frames = 0; state.text = ''; state.eventId = `transport:${name}:perf-msg-${state.message}`; }
   state.frames += 1;
-  state.text += ` stream-${burstNumber}${state.frames % 12 === 0 ? '\n\nnext paragraph of the streamed answer' : ''}`;
+  if (markdownContent) {
+    // The message starts with a marker line (the probes find the streaming row by 'stream-'), then the shared script.
+    if (state.frames === 1) { state.text = `stream-msg-${state.message}\n\n`; state.position = 0; }
+    const next = nextMarkdownPiece(state.position ?? 0, state.frames);
+    state.position = next.position;
+    state.text += next.piece;
+  } else {
+    state.text += ` stream-${burstNumber}${state.frames % 12 === 0 ? '\n\nnext paragraph of the streamed answer' : ''}`;
+  }
   const finalize = state.frames >= GROWING_FRAMES_PER_MESSAGE;
   const events = history.get(name) ?? [];
   const seq = events.length + 1;
@@ -248,7 +271,7 @@ const tick = setInterval(() => {
   for (let index = 0; index < activeTimelineNames.length; index += 1) {
     const name = activeTimelineNames[index];
     if (index < streamingSessions) {
-      if (growingStream) sendGrowingChunk(name, ++burst);
+      if (growingStream) { if (dueToEmit(name)) sendGrowingChunk(name, ++burst); }
       else sendEvent(name, 'assistant.text', { text: `stream-${++burst}`, streaming: true });
     }
     else sendEvent(name, 'agent.status', { status: 'working', burst });

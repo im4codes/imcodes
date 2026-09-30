@@ -28,7 +28,7 @@
  */
 import { createRequire } from 'node:module';
 import { writeFileSync } from 'node:fs';
-import { installDriver, sleep, round, VIEWPORTS } from './chat-scroll-fixture.spec.mjs';
+import { installDriver, sleep, round, VIEWPORTS, STREAM_FIXTURES } from './chat-scroll-fixture.spec.mjs';
 const require = createRequire(new URL('../../../web/package.json', import.meta.url));
 const { chromium } = require('@playwright/test');
 
@@ -277,7 +277,7 @@ async function runVariant(browser, viewport, variant) {
   try {
     await page.goto(`${BASE_URL}/src/fixtures/chat-timeline/index.html?size=smoke&rows=1&windows=1`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('[data-chat-timeline-harness="ready"]', { timeout: 60_000 });
-    await page.evaluate(installDriver, { rows: variant.rows });
+    await page.evaluate(installDriver, { rows: variant.rows, ...STREAM_FIXTURES });
     await page.evaluate(installFlickerProbe);
     await page.waitForSelector('.chat-view:not(.chat-view-preview) [data-virtual-key], .chat-view:not(.chat-view-preview) .chat-event', { timeout: 30_000 });
     await sleep(1500);

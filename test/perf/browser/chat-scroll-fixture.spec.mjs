@@ -23,6 +23,7 @@
  */
 import { createRequire } from 'node:module';
 import { writeFileSync } from 'node:fs';
+import { MD_STREAM_SCRIPT, MD_PIECE_LENGTHS, burstyGaps } from './stream-script.mjs';
 const require = createRequire(new URL('../../../web/package.json', import.meta.url));
 const { chromium } = require('@playwright/test');
 
@@ -38,10 +39,13 @@ export const VIEWPORTS = [
 // Tolerances (product acceptance): no reverse movement > 1 px, bottomGap <= 1 px,
 // reading row drift <= 1 px.
 const TOL = 1;
+/** Shared streaming fixtures handed to the in-page driver (installDriver is serialized). */
+export const STREAM_FIXTURES = { gaps: burstyGaps(), mdScript: MD_STREAM_SCRIPT, mdPieceLengths: MD_PIECE_LENGTHS };
 
 /** Installed in the page: builds the event list, streams into the real ChatView
  * through the fixture harness, and samples every animation frame. */
-export function installDriver({ rows }) {
+export function installDriver({ rows, gaps = [], mdScript = '', mdPieceLengths = [4] }) {
+  // gaps / mdScript / mdPieceLengths: the shared streaming fixtures (stream-script.mjs)
   const sessionId = 'fixture-window-0';
   let seq = 0;
   let events = [];
@@ -51,27 +55,6 @@ export function installDriver({ rows }) {
     return Array.from({ length: lines }, (_, k) => `row ${i} line ${k}: ${'lorem ipsum dolor sit amet '.repeat(1 + ((i + k) % 4))}`).join('\n\n');
   };
   for (let i = 0; i < rows; i += 1) events.push(mk(i % 2 ? 'user.message' : 'assistant.text', { text: paragraph(i), streaming: false }));
-  const MD_SCRIPT = [
-    '好的，这次换一篇不同题材的。',
-    '',
-    '---',
-    '',
-    '**深夜的便利店**',
-    '',
-    '凌晨一点四十分，便利店的自动门"叮咚"响了一声。值班的小陈抬起头，进来的是个穿西装的中年男人。',
-    '',
-    '## 他买了什么',
-    '',
-    '- 一盒**饭团**',
-    '- 一瓶 `无糖` 茶',
-    '- 一包烟，没有拆封',
-    '',
-    '1. 先是沉默',
-    '2. 然后他说：**"能借用一下微波炉吗？"**',
-    '',
-    '收银台旁边的灯管一直在闪，像是在替谁数着时间。',
-    '',
-  ].join('\n');
   const cur0OpenText = (event) => typeof event?.payload?.text === 'string' && event.payload.text.includes('```');
   const harness = window.__chatTimelineHarness;
   const publish = () => harness.setEvents(events);
@@ -97,7 +80,7 @@ export function installDriver({ rows }) {
       if (streamingIndex < 0) driver.openStream();
       const n = ++driver.chunkCount;
       const piece = driver.pieceMode === 'md'
-        ? (() => { const len = 2 + (n % 6); const out = MD_SCRIPT.slice(driver.mdPos, driver.mdPos + len); driver.mdPos = (driver.mdPos + len) % MD_SCRIPT.length; return out || ' '; })()
+        ? (() => { const len = mdPieceLengths[n % mdPieceLengths.length]; const out = mdScript.slice(driver.mdPos, driver.mdPos + len); driver.mdPos = (driver.mdPos + len) % mdScript.length; return out || ' '; })()
         : driver.pieceMode === 'code'
         ? (cur0OpenText(events[streamingIndex]) ? `const value${n} = compute(${n}, 'streamed line ${n}');\n` : '```ts\n')
         : driver.pieceMode === 'list'
@@ -134,17 +117,9 @@ export function installDriver({ rows }) {
         if (n % 200 === 0) driver.tool();
       };
       if (driver.cadence === 'bursty') {
-        // Deterministic (mulberry32) so base and head see the same arrival pattern.
-        let seed = 0x9e3779b9;
-        const rand = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
-        let inBurst = 0;
-        const next = () => {
-          step();
-          if (inBurst > 0) { inBurst -= 1; driver.timer = setTimeout(next, 20); return; }
-          inBurst = 2 + Math.floor(rand() * 4);
-          driver.timer = setTimeout(next, 150 + Math.floor(rand() * 200));
-        };
-        driver.timer = setTimeout(next, 20);
+        let gapIndex = 0;
+        const next = () => { step(); driver.timer = setTimeout(next, gaps[gapIndex++ % gaps.length]); };
+        driver.timer = setTimeout(next, gaps[0]);
       } else {
         driver.timer = setInterval(step, 1000 / hz);
       }
@@ -302,7 +277,7 @@ async function runScenario(browser, viewport, { rows, pinnedMs, label, windows =
   try {
     await page.goto(`${BASE_URL}/src/fixtures/chat-timeline/index.html?size=smoke&rows=1&windows=${windows}`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('[data-chat-timeline-harness="ready"]', { timeout: 60_000 });
-    await page.evaluate(installDriver, { rows });
+    await page.evaluate(installDriver, { rows, ...STREAM_FIXTURES });
     await page.waitForSelector('.chat-view:not(.chat-view-preview) [data-virtual-key], .chat-view:not(.chat-view-preview) .chat-event', { timeout: 30_000 });
     // Settle the initial history layout at the tail, then start streaming.
     await sleep(1500);
@@ -411,7 +386,7 @@ async function runCpuScenario(browser, windows) {
   try {
     await page.goto(`${BASE_URL}/src/fixtures/chat-timeline/index.html?size=smoke&rows=1&windows=${windows}`, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('[data-chat-timeline-harness="ready"]', { timeout: 60_000 });
-    await page.evaluate(installDriver, { rows: 240 });
+    await page.evaluate(installDriver, { rows: 240, ...STREAM_FIXTURES });
     await sleep(2500);
     // Idle at the bottom, pinned, nothing arriving. Count rAF callbacks the page itself schedules.
     await page.evaluate(() => { window.__rafCount = 0; const raf = window.requestAnimationFrame.bind(window); window.requestAnimationFrame = (cb) => raf((t) => { window.__rafCount += 1; cb(t); }); });
