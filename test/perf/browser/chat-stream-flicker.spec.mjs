@@ -64,13 +64,13 @@ export function installFlickerProbe() {
   const newAcc = () => ({ stream: { elAdd: 0, elDel: 0, txtAdd: 0, txtDel: 0, chr: 0, attr: 0 }, near: { elAdd: 0, elDel: 0, txtAdd: 0, txtDel: 0, chr: 0, attr: 0 }, other: { elAdd: 0, elDel: 0, txtAdd: 0, txtDel: 0, chr: 0, attr: 0 } });
   P.acc = newAcc();
   const streamKey = () => (window.__flickerStreamKey ? window.__flickerStreamKey() : (window.__scrollDriver?.streamId ?? null));
-  const rowOf = (node) => (node?.nodeType === 1 ? node : node?.parentElement)?.closest?.('[data-virtual-key]') ?? null;
+  const rowOf = (node) => { const el = node?.nodeType === 1 ? node : node?.parentElement; return el?.closest?.('[data-virtual-key]') ?? el?.closest?.('[data-event-id]') ?? null; };
   const classify = (row) => {
     if (!row) return 'other';
-    const key = row.getAttribute('data-virtual-key');
+    const key = row.getAttribute('data-virtual-key') ?? row.getAttribute('data-event-id');
     const sk = streamKey();
     if (key === sk) return 'stream';
-    const stream = sk ? root()?.querySelector(`[data-virtual-key="${CSS.escape(sk)}"]`) : null;
+    const stream = sk ? (root()?.querySelector(`[data-virtual-key="${CSS.escape(sk)}"]`) ?? root()?.querySelector(`[data-event-id="${CSS.escape(sk)}"]`)) : null;
     if (stream && (row === stream.previousElementSibling || row === stream.nextElementSibling || row === stream.previousElementSibling?.previousElementSibling)) return 'near';
     return 'other';
   };
@@ -111,8 +111,9 @@ export function installFlickerProbe() {
     observe();
     const rootRect = r.getBoundingClientRect();
     const sk = streamKey();
-    const wrapper = sk ? r.querySelector(`[data-virtual-key="${CSS.escape(sk)}"]`) : null;
-    const event = wrapper?.querySelector('[data-event-id]') ?? null;
+    // A virtualized list wraps every row in [data-virtual-key]; a short (non-virtualized) chat has the event element itself.
+    const event = sk ? r.querySelector(`[data-event-id="${CSS.escape(sk)}"]`) : null;
+    const wrapper = (sk ? r.querySelector(`[data-virtual-key="${CSS.escape(sk)}"]`) : null) ?? event;
     const textEl = event?.firstElementChild ?? null;
     const track = (label, node) => {
       if (!node) return;
@@ -124,7 +125,7 @@ export function installFlickerProbe() {
     };
     track('wrapper', wrapper); track('event', event); track('text', textEl);
     const near = [wrapper?.previousElementSibling, wrapper?.previousElementSibling?.previousElementSibling, wrapper?.nextElementSibling].filter(Boolean);
-    near.forEach((n, i) => track(`near${i}:${n.getAttribute('data-virtual-key')}`, n));
+    near.forEach((n, i) => track(`near${i}:${n.getAttribute('data-virtual-key') ?? n.getAttribute('data-event-id')}`, n));
     const cs = event ? getComputedStyle(event) : null;
     const len = (event?.textContent ?? '').length;
     // Render mode of the streaming bubble: 'raw' = one bare <span> of text (the
