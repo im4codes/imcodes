@@ -351,10 +351,12 @@ export function isSessionBusy(sessionName: string, deps: TaskPairPoolDeps = {}):
 }
 
 /**
- * Why {@link isSessionBusy} is true (empty when idle). Queue admission uses the
- * same predicate as the daemon's own "can this session take a new turn": leftover
- * background/tool counters of a session that has been quiet for
- * TASK_PAIR_STALE_RESIDUAL_WORK_MS do not hold a queued pair back.
+ * Why {@link isSessionBusy} is true (empty when idle). Deliberately stricter than
+ * the transport runtime's own "can take a new turn" check, which ignores background
+ * work entirely: admission still waits on FRESH background work (a subagent that
+ * may be about to finish or report), but leftover background/tool counters of a
+ * session that has been quiet for TASK_PAIR_STALE_RESIDUAL_WORK_MS no longer hold
+ * a queued pair back.
  */
 export function describeSessionBusy(sessionName: string, deps: TaskPairPoolDeps = {}): string[] {
   const session = (deps.getSession ?? getSession)(sessionName);

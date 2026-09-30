@@ -88,6 +88,7 @@ import {
   buildUntitledTaskTitleRequest,
   buildAuditorProposalNudgeMessage,
   buildConvergenceCheckpointMessage,
+  buildHeldWaitReason,
   buildNextRoundNoticeMessage,
   buildRoundBaseAuditLine,
   buildRoundBaseMismatchAuditorMessage,
@@ -890,20 +891,18 @@ export class TaskPairService {
     });
     const current = stored.state;
     // The wait reason is computed here too: this arrival suppresses the immediate queue run
-    // (see #executeIntents), which is what normally writes it, so without it the pair would show
-    // the flag with no reason until the next 30 s sweep. Same wording as the scheduler's.
+    // (see #executeIntents), which is what normally writes it, so without it the pair would keep
+    // showing no reason, or the reason of whatever it waited for before (a REASSIGN onto a held
+    // session), until the next 30 s sweep. Whenever the holder named now differs from the stored
+    // reason, the stored one is replaced. Same wording as the scheduler's (buildHeldWaitReason).
     const firstConflict = conflicts[0]!;
     const firstHeld = [firstConflict.state.executor, firstConflict.state.auditor]
       .find((session): session is string => !!session && busySessions.has(session));
-    const conflictAgeMs = Math.max(0, Date.now() - firstConflict.state.updatedAt);
-    const conflictAge = conflictAgeMs < 60_000 ? `${Math.floor(conflictAgeMs / 1_000)}s`
-      : conflictAgeMs < 3_600_000 ? `${Math.floor(conflictAgeMs / 60_000)}m`
-        : `${Math.floor(conflictAgeMs / 3_600_000)}h`;
-    const heldReason = firstHeld
-      ? `waiting for ${firstHeld} (busy in ${firstConflict.state.taskId}, status ${firstConflict.state.status}, age ${conflictAge})`
-      : undefined;
+    const heldReason = firstHeld ? buildHeldWaitReason(firstHeld, firstConflict.state, Date.now()) : undefined;
     const needsFlag = current.status === 'queued' && !current.flags.includes('waiting_for_capacity');
-    const needsReason = current.status === 'queued' && heldReason !== undefined && current.capacityWaitReason === undefined;
+    const heldSessionChanged = heldReason !== undefined
+      && !current.capacityWaitReason?.startsWith(`waiting for ${firstHeld} (busy in ${firstConflict.state.taskId}`);
+    const needsReason = current.status === 'queued' && heldSessionChanged;
     const nextState = needsFlag || needsReason
       ? {
           ...current,

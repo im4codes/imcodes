@@ -5,6 +5,7 @@ import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../..
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 import { TaskPairAutomation } from '../../../src/daemon/task-pairs/scheduler.js';
+import { buildHeldWaitReason } from '../../../src/daemon/task-pairs/messages.js';
 import { clearSupervisionHeartbeatProjectionsForTests } from '../../../src/daemon/supervision-heartbeat-projection.js';
 
 const PROJECT = 'qaproj';
@@ -202,5 +203,69 @@ describe('queued pair admission', () => {
     } finally {
       restarted.stop();
     }
+  });
+
+  // ---- P0-1 class: a REASSIGN/arrival that parks a queued pair behind a session ANOTHER OPEN PAIR holds ----
+  const heldReason = (session: string, holder: string) => new RegExp(`^waiting for ${session} \\(busy in ${holder}, status working, age \\d+[smh]\\)$`);
+
+  it('REASSIGN of a queued pair (waiting on a runtime-busy session) onto a session another open pair holds names the NEW holder at once, without a sweep', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HP executor=${EXEC2} auditor=none -->`);
+    await flush();
+    busy.add(EXEC);
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH R3 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('R3').capacityWaitReason).toBe(`waiting for ${EXEC} (session busy)`);
+    marker(BRAIN, `<!-- IMCODES_TASK REASSIGN R3 executor=${EXEC2} -->`);
+    await flush();
+    expect(pair('R3').status).toBe('queued');
+    expect(pair('R3').capacityWaitReason).toMatch(heldReason(EXEC2, 'HP'));
+    expect(pair('R3').capacityWaitReason).not.toContain(EXEC + ' ');
+    expect(pair('R3').flags).toContain('waiting_for_capacity');
+  });
+
+  it('REASSIGN of the AUDITOR of a queued pair onto a held session names that auditor at once', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HA executor=${EXEC2} auditor=none -->`);
+    await flush();
+    busy.add(EXEC);
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH R4 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('R4').capacityWaitReason).toBe(`waiting for ${EXEC} (session busy)`);
+    // The auditor (idle) is swapped for a session that is held by HA; the executor is still runtime-busy.
+    marker(BRAIN, `<!-- IMCODES_TASK REASSIGN R4 auditor=${EXEC2} -->`);
+    await flush();
+    expect(pair('R4').capacityWaitReason).toMatch(heldReason(EXEC2, 'HA'));
+  });
+
+  it('REASSIGN from one held session to another held session replaces the holder, and to an idle session admits and clears', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HX executor=${EXEC} auditor=none -->`);
+    await flush();
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HY executor=${EXEC2} auditor=none -->`);
+    await flush();
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH R5 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    expect(pair('R5').capacityWaitReason).toMatch(heldReason(EXEC, 'HX'));
+    marker(BRAIN, `<!-- IMCODES_TASK REASSIGN R5 executor=${EXEC2} -->`);
+    await flush();
+    expect(pair('R5').capacityWaitReason).toMatch(heldReason(EXEC2, 'HY'));
+    marker(BRAIN, '<!-- IMCODES_TASK CANCEL HY -->');
+    await flush();
+    expect(pair('R5').status).toBe('working');
+    expect(pair('R5').capacityWaitReason).toBeUndefined();
+  });
+
+  it('the held-session wording is one helper shared by the arrival note and the queue run (a sweep rewrites the same text)', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH HW executor=${EXEC} auditor=none -->`);
+    await flush();
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH W1 executor=${EXEC} auditor=${AUD} -->`);
+    await flush();
+    const atArrival = pair('W1').capacityWaitReason!;
+    expect(atArrival).toMatch(heldReason(EXEC, 'HW'));
+    await automation.runQueue(PROJECT, BRAIN);
+    const afterSweep = pair('W1').capacityWaitReason!;
+    expect(afterSweep.replace(/age \d+[smh]/, 'age X')).toBe(atArrival.replace(/age \d+[smh]/, 'age X'));
+    expect(buildHeldWaitReason(EXEC, { taskId: 'T', status: 'working', updatedAt: 0 }, 5_000)).toBe(`waiting for ${EXEC} (busy in T, status working, age 5s)`);
+    expect(buildHeldWaitReason(EXEC, { taskId: 'T', status: 'working', updatedAt: 0 }, 3 * 3_600_000)).toContain('age 3h');
+    expect(buildHeldWaitReason(EXEC, { taskId: 'T', status: 'working', updatedAt: 0 }, 90_000)).toContain('age 1m');
+    expect(buildHeldWaitReason(EXEC, undefined, 0)).toBe(`waiting for ${EXEC} (busy in another open pair)`);
   });
 });

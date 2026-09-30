@@ -573,6 +573,27 @@ function workplaceLine(pair: TaskPairState): string {
   return `No workspace could be created for this pair: use your own git worktree under ~/.imcodes/worktrees for code in a git project, else a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/${pair.taskId}/, and name it on READY_FOR_AUDIT.`;
 }
 
+/** Compact age for a wait reason: 45s, 12m, 3h. */
+function formatWaitAge(ageMs: number): string {
+  const age = Math.max(0, ageMs);
+  return age < 60_000 ? `${Math.floor(age / 1_000)}s`
+    : age < 3_600_000 ? `${Math.floor(age / 60_000)}m`
+      : `${Math.floor(age / 3_600_000)}h`;
+}
+
+/**
+ * The queue wait reason for a pair whose named session is held by another open
+ * pair. The one wording: the scheduler's queue run and the participant-conflict
+ * note on arrival both use it, so the reason cannot drift between them.
+ */
+export function buildHeldWaitReason(
+  session: string,
+  holder: { taskId: string; status: string; updatedAt: number } | undefined,
+  now: number,
+): string {
+  return `waiting for ${session} (busy in ${holder?.taskId ?? 'another open pair'}${holder ? `, status ${holder.status}, age ${formatWaitAge(now - holder.updatedAt)}` : ''})`;
+}
+
 /** The participant that ran (or tried) a git write in the main checkout. */
 export function buildMainCheckoutWriteParticipantNotice(
   hit: { taskId: string; verb: string; dir: string; root: string; command: string },

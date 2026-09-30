@@ -75,6 +75,7 @@ import {
   buildParticipantRecoveryMessage,
   buildNoBriefDigestMessage,
   buildNoBriefLine,
+  buildHeldWaitReason,
   buildNoPoolAskMessage,
   buildNudgeMessage,
   buildQueueStallNoticeMessage,
@@ -1975,14 +1976,8 @@ export class TaskPairAutomation implements TaskPairScheduler {
           ? getTaskPairStore().listActivePairs().find((candidate) => candidate.state.taskId !== pair.taskId
             && (candidate.state.executor === heldSession || candidate.state.auditor === heldSession))
           : undefined;
-        const holderAge = holder ? Math.max(0, this.#now() - holder.state.updatedAt) : 0;
-        const holderAgeText = holder
-          ? holderAge < 60_000 ? `${Math.floor(holderAge / 1_000)}s`
-            : holderAge < 3_600_000 ? `${Math.floor(holderAge / 60_000)}m`
-              : `${Math.floor(holderAge / 3_600_000)}h`
-          : undefined;
         const detail = heldSession
-          ? `waiting for ${heldSession} (busy in ${holder?.state.taskId ?? 'another open pair'}${holder ? `, status ${holder.state.status}, age ${holderAgeText}` : ''})`
+          ? buildHeldWaitReason(heldSession, holder?.state, this.#now())
           : `waiting for ${busySession} (session busy${busyReasonsOf(busySession)})`;
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity', detail);
         this.#logQueueSkip(project, pair, detail);

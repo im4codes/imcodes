@@ -1790,15 +1790,20 @@ export function applyTaskPairMarker(
       if (brainAuthority && attrs.auditor !== undefined) {
         pair.auditorPinned = attrs.auditor === TASK_PAIR_NO_AUDITOR ? undefined : attrs.auditor;
       }
-      if (namedParticipantIsBusy(attrs, ctx.busySessions)) {
-        pair.status = 'queued';
-        intents.push({ kind: 'slot_changed' });
-      } else if (pair.status === 'queued' && (attrs.executor !== undefined || attrs.auditor !== undefined)) {
-        // A REASSIGN of a queued pair changes who it waits for: the wait reason
-        // named the old session, and admission must be re-evaluated now, not at
-        // the next 30 s sweep.
+      // Who a queued pair waits for changed: whatever reason named the old session is void, whichever
+      // branch below re-queues it (a busy named session re-derives it in the service, an idle one in
+      // the queue run this REASSIGN triggers).
+      const rolesChanged = attrs.executor !== undefined || attrs.auditor !== undefined;
+      if (rolesChanged) {
         delete pair.capacityWaitReason;
         removeFlag(pair, 'waiting_for_capacity');
+      }
+      if (namedParticipantIsBusy(attrs, ctx.busySessions)) {
+        pair.status = 'queued';
+        if (rolesChanged) addFlag(pair, 'waiting_for_capacity');
+        intents.push({ kind: 'slot_changed' });
+      } else if (pair.status === 'queued' && rolesChanged) {
+        // Admission must be re-evaluated now, not at the next 30 s sweep.
         intents.push({ kind: 'slot_changed' });
       }
       if (!pair.executor && attrs.executormodel) intents.push({ kind: 'pick_executor' });
