@@ -3780,8 +3780,11 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     const gapPlacementChanged = gapPlacementKindRef.current !== historyGapPlacement.kind;
     gapPlacementKindRef.current = historyGapPlacement.kind;
     if (preview || previous.length === 0) return;
-    const changedAbove = previous.last === next.last && (previous.first !== next.first || previous.length !== next.length);
-    if (!changedAbove && !gapPlacementChanged) return;
+    // Rows may arrive above AND below the reader in one commit (a window merging over a peeked tail), so the
+    // trigger is any change of the list's shape, not only "the bottom stayed put"; a pure text edit of a streaming
+    // row (same keys, same length) needs no work, and appending at the bottom re-aligns by a delta of zero.
+    const shapeChanged = previous.first !== next.first || previous.last !== next.last || previous.length !== next.length;
+    if (!shapeChanged && !gapPlacementChanged) return;
     if (autoScrollRef.current || scrollAnchorRef.current) return;
     restoreReaderAnchor();
   }, [displayViewItems, historyGapPlacement.kind]);
