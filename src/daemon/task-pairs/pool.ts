@@ -40,7 +40,9 @@ import { delegationTargetInputs } from '../delegation-admission.js';
 import { configMatchesSession, configuredPools, poolDefinition } from '../supervision-auto-provision.js';
 import { describeSupervisorDefaultsSyncGap } from '../supervisor-defaults-cache.js';
 import { getTransportRuntime } from '../../agent/session-manager.js';
-import { isSessionWorking } from '../session-working.js';
+import { describeSessionWork, isSessionWorking } from '../session-working.js';
+import type { TransportRuntimeDiagnosticSnapshot } from '../../agent/transport-session-runtime.js';
+import { TASK_PAIR_STALE_RESIDUAL_WORK_MS } from '../../../shared/task-pair.js';
 import { getTaskPairStore } from './store.js';
 
 export type TaskPairPickRole = 'executor' | 'auditor';
@@ -52,6 +54,8 @@ export interface TaskPairPoolDeps {
   hasPendingMessages?: (sessionName: string) => boolean;
   /** Test seam for the shared live-work predicate used by automatic picks. */
   isWorking?: (sessionName: string) => boolean;
+  /** Test seam: the transport runtime's diagnostic snapshot, for {@link describeSessionBusy}. */
+  getDiagnosticSnapshot?: (sessionName: string) => TransportRuntimeDiagnosticSnapshot | undefined;
 }
 
 function defaultHasPendingMessages(sessionName: string): boolean {
@@ -341,11 +345,30 @@ export function describeLimitedProviderFamilies(input: {
   return { text, families };
 }
 
-/** Running, or with messages still queued: not a moment to nudge. */
+/** Running, or with messages still queued: not a moment to nudge or to admit a queued pair. */
 export function isSessionBusy(sessionName: string, deps: TaskPairPoolDeps = {}): boolean {
+  return describeSessionBusy(sessionName, deps).length > 0;
+}
+
+/**
+ * Why {@link isSessionBusy} is true (empty when idle). Queue admission uses the
+ * same predicate as the daemon's own "can this session take a new turn": leftover
+ * background/tool counters of a session that has been quiet for
+ * TASK_PAIR_STALE_RESIDUAL_WORK_MS do not hold a queued pair back.
+ */
+export function describeSessionBusy(sessionName: string, deps: TaskPairPoolDeps = {}): string[] {
   const session = (deps.getSession ?? getSession)(sessionName);
-  if (!session) return false;
-  if (!deps.getSession && isSessionWorking(sessionName)) return true;
-  if (session.state === 'running') return true;
-  return (deps.hasPendingMessages ?? defaultHasPendingMessages)(sessionName);
+  if (!session) return [];
+  const reasons: string[] = [];
+  if (!deps.getSession || deps.getDiagnosticSnapshot) {
+    const work = describeSessionWork(
+      sessionName,
+      { ...(deps.getSession ? { getSession: deps.getSession } : {}), ...(deps.getDiagnosticSnapshot ? { getDiagnosticSnapshot: deps.getDiagnosticSnapshot } : {}) },
+      { staleResidualAfterMs: TASK_PAIR_STALE_RESIDUAL_WORK_MS },
+    );
+    if (work.working) reasons.push(...work.reasons);
+  }
+  if (session.state === 'running' && !reasons.includes('state_running')) reasons.push('state_running');
+  if (reasons.length === 0 && (deps.hasPendingMessages ?? defaultHasPendingMessages)(sessionName)) reasons.push('pending_messages');
+  return reasons;
 }

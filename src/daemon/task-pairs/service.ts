@@ -889,8 +889,28 @@ export class TaskPairService {
       return `${held.join('/')} held by ${candidate.state.taskId} (status ${candidate.state.status}, age ${age})`;
     });
     const current = stored.state;
-    const nextState = current.status === 'queued' && !current.flags.includes('waiting_for_capacity')
-      ? { ...current, flags: [...current.flags, 'waiting_for_capacity' as const], updatedAt: Date.now() }
+    // The wait reason is computed here too: this arrival suppresses the immediate queue run
+    // (see #executeIntents), which is what normally writes it, so without it the pair would show
+    // the flag with no reason until the next 30 s sweep. Same wording as the scheduler's.
+    const firstConflict = conflicts[0]!;
+    const firstHeld = [firstConflict.state.executor, firstConflict.state.auditor]
+      .find((session): session is string => !!session && busySessions.has(session));
+    const conflictAgeMs = Math.max(0, Date.now() - firstConflict.state.updatedAt);
+    const conflictAge = conflictAgeMs < 60_000 ? `${Math.floor(conflictAgeMs / 1_000)}s`
+      : conflictAgeMs < 3_600_000 ? `${Math.floor(conflictAgeMs / 60_000)}m`
+        : `${Math.floor(conflictAgeMs / 3_600_000)}h`;
+    const heldReason = firstHeld
+      ? `waiting for ${firstHeld} (busy in ${firstConflict.state.taskId}, status ${firstConflict.state.status}, age ${conflictAge})`
+      : undefined;
+    const needsFlag = current.status === 'queued' && !current.flags.includes('waiting_for_capacity');
+    const needsReason = current.status === 'queued' && heldReason !== undefined && current.capacityWaitReason === undefined;
+    const nextState = needsFlag || needsReason
+      ? {
+          ...current,
+          flags: needsFlag ? [...current.flags, 'waiting_for_capacity' as const] : current.flags,
+          ...(needsReason ? { capacityWaitReason: heldReason } : {}),
+          updatedAt: Date.now(),
+        }
       : current;
     const fresh = conflicts;
     const freshKeys = fresh

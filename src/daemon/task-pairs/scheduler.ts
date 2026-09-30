@@ -53,7 +53,9 @@ import {
   describeLimitedProviderFamilies,
   describePoolSyncGap,
   describeRequestedModelMiss,
+  describeSessionBusy,
   isSessionBusy,
+  type TaskPairPoolDeps,
   isSessionProviderLimited,
   listTaskPairCandidates,
   poolOfSession,
@@ -130,6 +132,8 @@ export function resolveTaskPairStageStallEscalateMs(env: NodeJS.ProcessEnv = pro
 export interface TaskPairSchedulerDeps {
   now?: () => number;
   isBusy?: (sessionName: string) => boolean;
+  /** Test seam for the real busy predicate (session lookup, runtime snapshot, pending messages) when `isBusy` is not overridden. */
+  busyProbe?: TaskPairPoolDeps;
   isLimited?: (sessionName: string) => boolean;
   pickCandidate?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; exclude: ReadonlySet<string>; project: string; requestedModel?: string; avoidProviderFamily?: string }) => string | undefined;
   provision?: (input: { brain: string; role: TaskPairPickRole; pool: 'primary' | 'economy'; project: string; taskId: string; requestedModel?: string; avoidProviderFamily?: string }) => Promise<string | undefined>;
@@ -284,7 +288,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
   #busy(session: string): boolean {
     const known = this.#tickBusy?.get(session);
     if (known !== undefined) return known;
-    const busy = (this.#deps.isBusy ?? ((name) => isSessionBusy(name)))(session);
+    const busy = (this.#deps.isBusy ?? ((name) => isSessionBusy(name, this.#deps.busyProbe)))(session);
     this.#tickBusy?.set(session, busy);
     return busy;
   }
@@ -1958,6 +1962,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
       const heldSession = [pair.executor, pair.auditor]
         .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
         .find((session) => namedParticipantHeld(session));
+      const busyReasonsOf = (session: string | false | undefined): string => {
+        if (!session || this.#deps.isBusy) return '';
+        const reasons = describeSessionBusy(session, this.#deps.busyProbe);
+        return reasons.length ? `: ${reasons.join(', ')}` : '';
+      };
       const busySession = !heldSession && [pair.executor, pair.auditor]
         .filter((session): session is string => !!session && session !== TASK_PAIR_NO_AUDITOR)
         .find((session) => this.#busy(session));
@@ -1974,7 +1983,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
           : undefined;
         const detail = heldSession
           ? `waiting for ${heldSession} (busy in ${holder?.state.taskId ?? 'another open pair'}${holder ? `, status ${holder.state.status}, age ${holderAgeText}` : ''})`
-          : `waiting for ${busySession} (session busy)`;
+          : `waiting for ${busySession} (session busy${busyReasonsOf(busySession)})`;
         this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity', detail);
         this.#logQueueSkip(project, pair, detail);
         continue;

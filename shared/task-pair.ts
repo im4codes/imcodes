@@ -500,6 +500,15 @@ export const TASK_PAIR_INERT_AUTHORIZATION_RULE: string =
 export const TASK_PAIR_DEFAULT_MAX_CONCURRENCY = 5;
 export const TASK_PAIR_HEARTBEAT_MS = 6 * 60_000;
 /**
+ * A session with no turn in progress but leftover background work or open-tool
+ * counters (a Claude subagent/native task, a Codex background item) stops
+ * blocking pair admission once it has produced no output and no activity for
+ * this long: a counter that never drains must not keep a queued pair waiting
+ * forever on a session that is idle in every other respect. Fresh background
+ * work still counts as working.
+ */
+export const TASK_PAIR_STALE_RESIDUAL_WORK_MS = 5 * 60_000;
+/**
  * How long the side(s) whose turn it is (or, with no real auditor, the
  * executor alone) must have been continuously idle before an out-of-band
  * nudge fires -- independent of, and faster than, the TASK_PAIR_HEARTBEAT_MS
@@ -1783,6 +1792,13 @@ export function applyTaskPairMarker(
       }
       if (namedParticipantIsBusy(attrs, ctx.busySessions)) {
         pair.status = 'queued';
+        intents.push({ kind: 'slot_changed' });
+      } else if (pair.status === 'queued' && (attrs.executor !== undefined || attrs.auditor !== undefined)) {
+        // A REASSIGN of a queued pair changes who it waits for: the wait reason
+        // named the old session, and admission must be re-evaluated now, not at
+        // the next 30 s sweep.
+        delete pair.capacityWaitReason;
+        removeFlag(pair, 'waiting_for_capacity');
         intents.push({ kind: 'slot_changed' });
       }
       if (!pair.executor && attrs.executormodel) intents.push({ kind: 'pick_executor' });
