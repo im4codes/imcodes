@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { computeMeasuredScrollCorrection } from '../src/chat-scroll-anchoring.js';
+import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor } from '../src/chat-scroll-anchoring.js';
 
 describe('chat scroll anchoring', () => {
   it('pins using the pre-growth bottom state, not the post-growth distance', () => {
@@ -36,5 +36,23 @@ describe('chat scroll anchoring', () => {
       clientHeight: 200,
       anchorDelta: 120,
     })).toBeNull();
+  });
+
+  it('picks the first row that reaches into the viewport as the reader anchor', () => {
+    const rows = [
+      { id: 'a', top: -300, bottom: -120 },
+      { id: 'b', top: -40, bottom: 60 }, // straddles the viewport top
+      { id: 'c', top: 60, bottom: 160 },
+    ];
+    expect(pickReaderAnchor(rows, 0, 900)).toEqual({ id: 'b', offset: -40, scrollTop: 900 });
+    expect(pickReaderAnchor([], 0, 0)).toBeNull();
+    expect(pickReaderAnchor([{ id: 'x', top: -50, bottom: 0.5 }], 0, 0)).toBeNull();
+  });
+
+  it('re-aligns a reader anchor by exactly the layout shift, once, ignoring sub-pixel noise', () => {
+    expect(computeReaderAnchorDelta(-40, 110)).toBe(150);
+    expect(computeReaderAnchorDelta(-40, -40)).toBe(0);
+    expect(computeReaderAnchorDelta(-40, -39.7)).toBe(0);
+    expect(computeReaderAnchorDelta(20, -12)).toBe(-32);
   });
 });

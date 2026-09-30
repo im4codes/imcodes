@@ -80,11 +80,12 @@ import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationC
 import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
 import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
 import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
-import { computeMeasuredScrollCorrection } from '../chat-scroll-anchoring.js';
+import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, type ReaderAnchor } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
   CHAT_MOUNT_SETTLE_TICK_MS,
+  CHAT_USER_SCROLL_UP_HOLD_MS,
   computeFollowThresholds,
 } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
@@ -2129,11 +2130,11 @@ interface VirtualizedViewItemsProps {
   /** A pinned/search target that must be mounted before its caller locates it. */
   revealKey?: string;
   /**
-   * Applies the one physical scroll correction caused by row measurement.
-   * The virtualizer reports the correction, but ChatView remains the single
-   * owner of scroll policy (follow vs reading anchor).
+   * Called after every commit / row measurement. The virtualizer only reports
+   * that layout may have changed; ChatView remains the single owner of scroll
+   * policy (re-pin a follower, re-align a reader's anchor row).
    */
-  onMeasuredLayout?: (root: HTMLDivElement, wasAtBottom: boolean, anchorDelta: number) => void;
+  onMeasuredLayout?: (root: HTMLDivElement, wasAtBottom: boolean) => void;
   renderItem: (item: ViewItem) => h.JSX.Element;
 }
 
@@ -2263,38 +2264,73 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     return undefined;
   }, [enabled, revealKey, items, scrollRef]);
 
+  // One measurement rule for both the synchronous post-commit pass and the
+  // ResizeObserver, so they can never disagree (a disagreement would make every
+  // render flip a row between two heights). Reports whether any row changed;
+  // ChatView (the single scroll owner) decides what to do about the viewport.
+  const commitMeasuredRows = (nodes: Iterable<HTMLElement>): boolean => {
+    let changed = false;
+    for (const node of nodes) {
+      const key = node.dataset.virtualKey;
+      if (!key) continue;
+      const height = Math.max(1, Math.ceil(node.getBoundingClientRect().height));
+      if ((heightsRef.current.get(key) ?? 72) === height) continue;
+      heightsRef.current.set(key, height);
+      changed = true;
+    }
+    return changed;
+  };
+
+  // Post-commit, PRE-PAINT pass. A commit can change the scroll range without
+  // any ResizeObserver delivery yet (new/streaming rows, a range swap that
+  // trades estimated spacer heights for measured rows). Measuring the mounted
+  // rows here - and re-pinning a pinned viewport in the same task, after the
+  // layout that the commit produced - means the browser never paints the
+  // stale range. The previous flow measured in a ResizeObserver AFTER the
+  // paint, re-rendered in a later task and never re-pinned after that render:
+  // that frame showed a 15-42px gap/reverse jump.
+  const lastCommitSignatureRef = useRef('');
+  const lastCommitClientHeightRef = useRef(0);
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const wasAtBottom = wasAtBottomRef.current;
+    const changed = commitMeasuredRows(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
+    // Only a commit that can have changed the scroll range acts: a row height
+    // changed, the row set changed (first/last key, length), the viewport itself
+    // resized (a banner/composer mounting beside the list in the same commit), or
+    // this render was our own layout re-render. A render that changed nothing
+    // visible (a non-rendered status/usage update) must leave the viewport alone.
+    // (A 0 -> N height is a pane becoming measurable, not a resize.)
+    const clientHeight = root.clientHeight;
+    const viewportResized = lastCommitClientHeightRef.current > 0 && clientHeight !== lastCommitClientHeightRef.current;
+    lastCommitClientHeightRef.current = clientHeight;
+    const signature = `${layoutVersion}:${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}`;
+    const layoutMayHaveChanged = changed || viewportResized || signature !== lastCommitSignatureRef.current;
+    lastCommitSignatureRef.current = signature;
+    if (!layoutMayHaveChanged) return;
+    onMeasuredLayout?.(root, wasAtBottom);
+    scrollTopRef.current = root.scrollTop;
+    // A measurement change alters the spacers: re-render (still before paint,
+    // Preact flushes it in a microtask) so the pin below runs on final geometry.
+    if (changed) setLayoutVersion((v) => v + 1);
+  });
+
   useEffect(() => {
     if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
     const root = scrollRef.current;
     if (!root) return undefined;
-    const itemIndex = new Map(items.map((item, index) => [item.key, index]));
-    const offsetBefore = (index: number): number => {
-      let total = 0;
-      for (let i = 0; i < index; i += 1) total += heightsRef.current.get(items[i].key) ?? 72;
-      return total;
-    };
     const observer = new ResizeObserver((entries) => {
-      let changed = false;
-      let anchorDelta = 0;
       const wasAtBottom = wasAtBottomRef.current;
-      for (const entry of entries) {
-        const key = (entry.target as HTMLElement).dataset.virtualKey;
-        if (!key) continue;
-        const height = Math.max(1, Math.ceil(entry.contentRect.height));
-        const previous = heightsRef.current.get(key) ?? 72;
-        if (previous === height) continue;
-        const index = itemIndex.get(key);
-        if (index !== undefined && !wasAtBottom && offsetBefore(index) < root.scrollTop) anchorDelta += height - previous;
-        heightsRef.current.set(key, height);
-        changed = true;
-      }
+      const changed = commitMeasuredRows(entries.map((entry) => entry.target as HTMLElement));
       // Do not infer pin state from the post-growth geometry: with
       // `overflow-anchor: none`, a row growing at the bottom makes the current
       // distance non-zero even though the user was pinned immediately before
       // the measurement. That used to classify a pinned stream as a reader
       // anchor, then fight ChatView's follow pass on the next frame.
       if (!changed) return;
-      onMeasuredLayout?.(root, wasAtBottom, anchorDelta);
+      onMeasuredLayout?.(root, wasAtBottom);
       scrollTopRef.current = root.scrollTop;
       setLayoutVersion((v) => v + 1);
     });
@@ -3181,12 +3217,61 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       pendingScrollFrameRef.current = null;
       const node = scrollRef.current;
       if (!node) return;
+      // A wheel/touch scroll-away can land between scheduling and this frame.
+      // Follow intent is re-checked HERE (not only when scheduled) so a reader
+      // is never snapped back down by a pin that was queued before they moved.
+      if (!engageFollow && !preview && !autoScrollRef.current) return;
       // Armed here rather than at call time: it is a 200ms one-shot guard
       // against the synthetic scroll event fired by the write below.
       markProgrammaticScroll();
       node.scrollTop = node.scrollHeight;
       lastScrollTopRef.current = node.scrollTop;
     });
+  };
+
+  // The reading anchor: the first row that reaches into the viewport, and where
+  // its top edge sat. Recorded on every user scroll event while the reader is
+  // NOT following. Whatever later changes layout above it (virtual rows measured,
+  // a banner mounting, an image loading) is undone by re-aligning that row - the
+  // DOM position is the truth, so there is no estimate to get wrong and no way
+  // to apply a correction twice.
+  const readerAnchorRef = useRef<ReaderAnchor | null>(null);
+  const captureReaderAnchor = () => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const rootTop = root.getBoundingClientRect().top;
+    // Stop at the first row that reaches into the viewport: rows above it are not
+    // measured, so a long normal-flow list costs O(rows above the viewport) reads
+    // of already-clean layout, not a scan of the whole history.
+    const rows: Array<{ id: string; top: number; bottom: number }> = [];
+    for (const node of root.querySelectorAll<HTMLElement>('[data-event-id]')) {
+      const id = node.getAttribute('data-event-id');
+      if (!id) continue;
+      const rect = node.getBoundingClientRect();
+      rows.push({ id, top: rect.top, bottom: rect.bottom });
+      if (rect.bottom > rootTop + 1) break;
+    }
+    readerAnchorRef.current = pickReaderAnchor(rows, rootTop, root.scrollTop);
+  };
+  const restoreReaderAnchor = () => {
+    const root = scrollRef.current;
+    const anchor = readerAnchorRef.current;
+    if (!root || !anchor) return;
+    // Attribute lookup by iteration: ids are opaque strings, and this avoids
+    // building a selector from them (no escaping rules to get wrong).
+    let node: HTMLElement | null = null;
+    for (const candidate of root.querySelectorAll<HTMLElement>('[data-event-id]')) {
+      if (candidate.getAttribute('data-event-id') === anchor.id) { node = candidate; break; }
+    }
+    // The reader moved since the anchor was recorded (wheel/touch/scrollbar; the
+    // scroll event may not have been delivered yet): that position is theirs.
+    // Adopt it instead of dragging them back to where they were.
+    if (!node || Math.abs(root.scrollTop - anchor.scrollTop) > 0.5) { captureReaderAnchor(); return; }
+    const delta = computeReaderAnchorDelta(anchor.offset, node.getBoundingClientRect().top - root.getBoundingClientRect().top);
+    if (delta === 0) return;
+    markProgrammaticScroll();
+    root.scrollTop += delta;
+    readerAnchorRef.current = { ...anchor, scrollTop: root.scrollTop };
   };
 
   // Virtualized row measurements are the only layout correction that may
@@ -3196,22 +3281,27 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // after a streaming row grows, the post-growth distance is necessarily
   // non-zero when `overflow-anchor` is disabled and must not be mistaken for a
   // user scroll-away.
-  const applyMeasuredLayoutScroll = useCallback((root: HTMLDivElement, wasAtBottom: boolean, anchorDelta: number) => {
+  // Single owner of the viewport after a commit / row measurement: a follower is
+  // re-pinned using the PRE-change pin bit (after a row grows the post-growth
+  // distance is non-zero even though the user was pinned - `overflow-anchor: none`
+  // means nothing else compensates); a reader's anchor row is re-aligned.
+  const applyMeasuredLayoutScroll = useCallback((root: HTMLDivElement, wasAtBottom: boolean) => {
+    if (!autoScrollRef.current) {
+      restoreReaderAnchor();
+      return;
+    }
     const correction = computeMeasuredScrollCorrection({
       wasAtBottom,
-      autoFollow: autoScrollRef.current,
+      autoFollow: true,
       currentTop: root.scrollTop,
       scrollHeight: root.scrollHeight,
       clientHeight: root.clientHeight,
-      anchorDelta,
+      anchorDelta: 0,
     });
-    if (!correction) return;
-    if (correction.kind === 'pin') {
+    if (correction?.kind === 'pin') {
       markProgrammaticScroll();
       root.scrollTop = correction.targetTop;
-      return;
     }
-    root.scrollTop += correction.delta;
   }, []);
 
   // (No `followIfEngaged` helper: the two callsites that need it are also
@@ -3509,6 +3599,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
   // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
   // threshold and the explicit wheel/touch up-gesture handlers below.
+  const userScrollUpUntilRef = useRef(0);
   const disengageFollow = () => {
     if (!autoScrollRef.current) return;
     autoScrollRef.current = false;
@@ -3517,6 +3608,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     setShowScrollBtn(true);
     lastScrollActivityRef.current = Date.now();
+    captureReaderAnchor();
   };
 
   // An explicit upward wheel/touch gesture is unambiguous "stop following"
@@ -3528,6 +3620,11 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // These events are never synthesised by scrollToBottom, so they can't
   // false-trigger. Re-engagement stays distance-based (scroll back to bottom).
   const handleUserScrollUpIntent = () => {
+    // Record the intent even when follow is already off: while the reader is
+    // still dragging/wheeling toward older content, handleScroll must not
+    // re-engage follow just because they are (briefly) still within the
+    // re-engage band of the bottom - the next stream pin would snap them back.
+    userScrollUpUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
     if (preview || !autoScrollRef.current) return;
     const el = scrollRef.current;
     if (!el) return;
@@ -3586,14 +3683,17 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     const { disengageThreshold, reengageThreshold } = computeFollowThresholds(clientHeight, scrollHeight);
     if (wasAutoFollowing && distance > disengageThreshold) {
       disengageFollow();
-    } else if (!wasAutoFollowing && distance < reengageThreshold) {
+    } else if (!wasAutoFollowing && distance < reengageThreshold && Date.now() >= userScrollUpUntilRef.current) {
       autoScrollRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     }
     setShowScrollBtn(!autoScrollRef.current);
-    if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();
+    if (!autoScrollRef.current) {
+      lastScrollActivityRef.current = Date.now();
+      captureReaderAnchor();
+    }
     lastScrollTopRef.current = scrollTop;
     // Auto-trigger load older when scrolled near top. Skip in preview mode —
     // preview cards have a fixed render tail (PREVIEW_RENDER_ITEM_LIMIT) and
@@ -3645,6 +3745,31 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     ro.observe(el);
     return () => ro.disconnect();
   }, [preview, scheduleFollowFrame, visible]);
+
+  // Local DOM growth that no ChatView render owns (a tool card / thinking block
+  // expanding, code block or image settling) changes scrollHeight in a commit
+  // that never reaches the pin effects above. A MutationObserver callback is a
+  // microtask, so it runs right after that commit and BEFORE the next animation
+  // frame: pin here (only while follow is engaged) and the viewport is at the
+  // bottom in the first frame that can observe the new height. Coalesced by the
+  // browser per microtask checkpoint, reads scrollHeight once, no per-frame work.
+  useEffect(() => {
+    if (!visible || preview) return undefined;
+    const el = scrollRef.current;
+    if (!el || typeof MutationObserver === 'undefined') return undefined;
+    const observer = new MutationObserver(() => {
+      if (loadingOlderRef.current || scrollAnchorRef.current) return;
+      // A reader's anchor row is re-aligned; only a follower is pinned.
+      if (!autoScrollRef.current) { restoreReaderAnchor(); return; }
+      const target = el.scrollHeight - el.clientHeight;
+      if (target - el.scrollTop <= 1) return;
+      markProgrammaticScroll();
+      el.scrollTop = target;
+      lastScrollTopRef.current = el.scrollTop;
+    });
+    observer.observe(el, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'open', 'hidden', 'aria-expanded'] });
+    return () => observer.disconnect();
+  }, [preview, visible]);
 
   // Hold the bottom through the post-mount layout settle.
   //
