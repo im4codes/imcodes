@@ -1,3 +1,4 @@
+import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
 import {
   isNeverRenderedTimelineEventType,
   projectAssistantTextForDisplay,
@@ -2152,7 +2153,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   const viewportRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const wasAtBottomRef = useRef(true);
-  const itemSignatureRef = useRef<string | null>(null);
+  const itemKeysRef = useRef<ItemKeySnapshot | null>(null);
   const resumeSnapshotRef = useRef<{ scrollTop: number; atBottom: boolean } | null>(null);
   const [resumeGeneration, setResumeGeneration] = useState(0);
   const estimate = 72;
@@ -2226,9 +2227,8 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     if (!enabled) return;
     const root = scrollRef.current;
     if (!root) return;
-    const signature = `${resumeGeneration}:${items.map((item) => item.key).join('\u0001')}`;
-    if (itemSignatureRef.current === signature) return;
-    itemSignatureRef.current = signature;
+    if (itemKeysUnchanged(itemKeysRef.current, resumeGeneration, items)) return;
+    itemKeysRef.current = snapshotItemKeys(resumeGeneration, items);
     const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
     const resumeSnapshot = resumeSnapshotRef.current;
     if (resumeSnapshot?.atBottom || (!resumeSnapshot && wasAtBottomRef.current)) {
