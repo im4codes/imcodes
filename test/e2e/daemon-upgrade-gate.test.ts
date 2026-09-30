@@ -678,7 +678,7 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     const sh = await captureUpgradeScript();
 
     const cleanupIdx = sh.indexOf('cleanup_stale_imcodes_staging_dirs "$GLOBAL_ROOT"');
-    // The install is now a STAGED one, done by posix-atomic-install.mjs (its npm flags are pinned in posix-atomic-upgrade.test.ts).
+    // The install is now a STAGED one, done by staged-package-install.mjs (its npm flags are pinned in posix-atomic-upgrade.test.ts).
     const installIdx = sh.indexOf('"$ATOMIC_INSTALLER" stage');
     expect(cleanupIdx).toBeGreaterThan(-1);
     expect(installIdx).toBeGreaterThan(-1);

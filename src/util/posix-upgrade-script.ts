@@ -4,7 +4,7 @@
  * retries, staged install, restart, health check, cooldown sentinel).
  *
  * Extracted verbatim from command-handler.ts; the install itself is now staged
- * and switched by the standalone helper `posix-atomic-install.mjs` (see its
+ * and switched by the standalone helper `staged-package-install.mjs` (see its
  * header for the incident and the contract).
  */
 import { copyFileSync, existsSync, mkdtempSync, writeFileSync } from 'node:fs';
@@ -21,10 +21,10 @@ import { POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE, buildPosixUpgradeLayoutRecover
 const here = dirname(fileURLToPath(import.meta.url));
 
 /** The standalone staged-install helper: the built sibling in dist/, else the source in src/ (tsx/dev). */
-export function resolvePosixAtomicInstallerPath(): string {
-  const built = resolve(here, 'posix-atomic-install.mjs');
+export function resolveStagedInstallerPath(): string {
+  const built = resolve(here, 'staged-package-install.mjs');
   if (existsSync(built)) return built;
-  const dev = resolve(here, '..', '..', 'src', 'util', 'posix-atomic-install.mjs');
+  const dev = resolve(here, '..', '..', 'src', 'util', 'staged-package-install.mjs');
   return existsSync(dev) ? dev : built;
 }
 
@@ -62,8 +62,8 @@ export function launchPosixUpgrade(params: Omit<PosixUpgradeScriptParams, 'logFi
   const statusFile = join(scriptDir, 'upgrade-status.json');
   const scriptPath = join(scriptDir, 'upgrade.sh');
   // The package this file lives in is replaced by the upgrade: run a copy.
-  const atomicInstallerPath = join(scriptDir, 'posix-atomic-install.mjs');
-  copyFileSync(resolvePosixAtomicInstallerPath(), atomicInstallerPath);
+  const atomicInstallerPath = join(scriptDir, 'staged-package-install.mjs');
+  copyFileSync(resolveStagedInstallerPath(), atomicInstallerPath);
   writeFileSync(scriptPath, buildPosixUpgradeScript({ ...params, logFile, scriptDir, statusFile, atomicInstallerPath }), { mode: 0o755 });
   const child = spawn('/bin/bash', [scriptPath], { detached: true, stdio: 'ignore' });
   return { scriptDir, logFile, statusFile, resultFile: join(scriptDir, 'upgrade-result'), scriptPath, child };
@@ -88,7 +88,7 @@ export interface PosixUpgradeScriptParams {
   /** Shell commands that restart the service (platform specific). */
   restartCmd: string;
   cleanupAfterSec: number;
-  /** Path of the copied posix-atomic-install.mjs. */
+  /** Path of the copied staged-package-install.mjs. */
   atomicInstallerPath: string;
   /** Test seam: waits, in seconds (production defaults keep the original timings). */
   timing?: { settleSec?: number; healthFirstWaitSec?: number; healthExtendedWaitSec?: number };

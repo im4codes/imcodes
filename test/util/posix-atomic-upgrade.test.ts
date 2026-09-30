@@ -4,7 +4,7 @@
  * ended mid `npm install -g` left 215 with a half-replaced package and a daemon
  * that could not start).
  *
- * These tests run the REAL generated upgrade.sh and the REAL posix-atomic-install.mjs
+ * These tests run the REAL generated upgrade.sh and the REAL staged-package-install.mjs
  * against a fake npm (a node script that builds a package tree under `--prefix`,
  * with injectable failures and delays) and a fake service restart, in a scratch
  * prefix laid out like an nvm one. Nothing here touches a real install, daemon
@@ -19,7 +19,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { START_NEW_DAEMON, createFixture, destroyFixture, startDaemon as startDaemonIn, treeHash, writePackage, type Fixture } from '../helpers/posix-upgrade-fixture.js';
-import { buildPosixUpgradeScript, resolvePosixAtomicInstallerPath } from '../../src/util/posix-upgrade-script.js';
+import { buildPosixUpgradeScript, resolveStagedInstallerPath } from '../../src/util/posix-upgrade-script.js';
 import { parsePosixUpgradeFailureStatus, POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE } from '../../src/util/posix-upgrade-layout-recovery.js';
 
 let fixture: Fixture;
@@ -41,8 +41,8 @@ function prepareScript(options: RunOptions = {}): { script: string; env: NodeJS.
   // A fresh scratch dir per run: the script schedules its own cleanup of it.
   fixture.scriptDir = mkdtempSync(join(fixture.root, 'scratch', 'run-'));
   const logFile = join(fixture.scriptDir, 'upgrade.log');
-  const installer = join(fixture.scriptDir, 'posix-atomic-install.mjs');
-  copyFileSync(resolvePosixAtomicInstallerPath(), installer);
+  const installer = join(fixture.scriptDir, 'staged-package-install.mjs');
+  copyFileSync(resolveStagedInstallerPath(), installer);
   const scriptPath = join(fixture.scriptDir, 'upgrade.sh');
   writeFileSync(scriptPath, buildPosixUpgradeScript({
     logFile, scriptDir: fixture.scriptDir, statusFile: join(fixture.scriptDir, 'upgrade-status.json'), registryArg: '',
@@ -300,8 +300,8 @@ else kill "$(cat "${fixture.stateDir}/daemon.pid")" 2>/dev/null; rm -f "${fixtur
   }, 60_000);
 });
 
-describe('posix-atomic-install.mjs', () => {
-  const helper = () => resolvePosixAtomicInstallerPath();
+describe('staged-package-install.mjs', () => {
+  const helper = () => resolveStagedInstallerPath();
   const run = (...args: string[]) => spawnSync(process.execPath, [helper(), ...args], { encoding: 'utf8' });
 
   it('switch then rollback restores the previous package exactly, including its bin link', () => {
@@ -366,9 +366,9 @@ describe('posix-atomic-install.mjs', () => {
   it('still runs when invoked through a symlinked path (macOS /var vs /private/var): a helper that silently did nothing and exited 0 looked like a successful install', () => {
     const linkDir = join(fixture.root, 'linked');
     symlinkSync(fixture.scriptDir, linkDir);
-    const copy = join(fixture.scriptDir, 'posix-atomic-install.mjs');
+    const copy = join(fixture.scriptDir, 'staged-package-install.mjs');
     copyFileSync(helper(), copy);
-    const viaLink = spawnSync(process.execPath, [join(linkDir, 'posix-atomic-install.mjs'), 'verify', '--pkg-dir', join(fixture.root, 'nope')], { encoding: 'utf8' });
+    const viaLink = spawnSync(process.execPath, [join(linkDir, 'staged-package-install.mjs'), 'verify', '--pkg-dir', join(fixture.root, 'nope')], { encoding: 'utf8' });
     expect(viaLink.status).toBe(75); // it ran, and failed as it should -- not a silent 0
     expect(viaLink.stdout).toContain('is not a directory');
   });
@@ -378,6 +378,51 @@ describe('posix-atomic-install.mjs', () => {
     expect(source).toContain("['install', '-g', '--ignore-scripts', '--prefer-online', ...registryArgs(args), '--prefix', stagePrefix, pkgSpec]");
     // --prefer-online revalidates cached metadata; a cache wipe would redownload the whole dependency graph.
     expect(source).not.toMatch(/cache['"], ?['"]clean/);
+  });
+
+  describe('Windows layout and locked renames (the runner\'s use)', () => {
+    const windowsEnv = (extra: Record<string, string> = {}) => ({ ...process.env, IMCODES_INSTALL_LAYOUT: 'windows', ...extra });
+    const runWin = (extra: Record<string, string>, ...args: string[]) =>
+      spawnSync(process.execPath, [helper(), ...args], { encoding: 'utf8', env: windowsEnv(extra) });
+
+    it('switch finds the staged package at <stage>/node_modules/imcodes under the windows layout', () => {
+      const stage = join(fixture.prefix, '.imcodes-stage.win1');
+      writePackage(join(stage, 'node_modules', 'imcodes'), '3.0.0');
+      const result = runWin({}, 'switch', '--global-root', fixture.globalRoot, '--tag', 'win1', '--stage-prefix', stage);
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(liveVersion()).toBe('3.0.0');
+    });
+
+    it('a rename that stays locked past the retry budget exits 78 with the live package exactly as it was', () => {
+      const stage = join(fixture.prefix, '.imcodes-stage.win2');
+      writePackage(join(stage, 'node_modules', 'imcodes'), '3.0.0');
+      const before = treeHash(fixture.livePackage);
+      const started = Date.now();
+      const result = runWin({ IMCODES_TEST_RENAME_FAIL_FOREVER: '1', IMCODES_RENAME_RETRY_MS: '700' }, 'switch', '--global-root', fixture.globalRoot, '--tag', 'win2', '--stage-prefix', stage);
+      expect(result.status, result.stdout + result.stderr).toBe(78);
+      expect(Date.now() - started).toBeLessThan(10_000);
+      expect(treeHash(fixture.livePackage)).toBe(before);
+      expect(leftovers()).toEqual([]);
+    });
+
+    it('a rename blocked twice then free succeeds inside the budget', () => {
+      const stage = join(fixture.prefix, '.imcodes-stage.win3');
+      writePackage(join(stage, 'node_modules', 'imcodes'), '3.0.0');
+      const result = runWin({ IMCODES_TEST_RENAME_FAIL_COUNT: '2', IMCODES_RENAME_RETRY_MS: '15000' }, 'switch', '--global-root', fixture.globalRoot, '--tag', 'win3', '--stage-prefix', stage);
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(result.stdout).toMatch(/succeeded on attempt/);
+      expect(liveVersion()).toBe('3.0.0');
+    });
+
+    it('preflight: ok on a writable root, 77 on too little disk, 75 when the root does not exist', () => {
+      const ok = runWin({}, 'preflight', '--global-root', fixture.globalRoot, '--pkg', 'imcodes@2.0.0', '--expected-bytes', '1000');
+      expect(ok.status, ok.stdout + ok.stderr).toBe(0);
+      const tooBig = runWin({}, 'preflight', '--global-root', fixture.globalRoot, '--pkg', 'imcodes@2.0.0', '--expected-bytes', String(2 ** 60));
+      expect(tooBig.status).toBe(77);
+      const missing = runWin({}, 'preflight', '--global-root', join(fixture.prefix, 'nope'), '--pkg', 'imcodes@2.0.0', '--expected-bytes', '1000');
+      expect(missing.status).toBe(75);
+      expect(existsSync(join(fixture.globalRoot, `.imcodes-probe.${process.pid}`))).toBe(false);
+    });
   });
 
   it('refuses an unknown command and missing arguments with a usage exit, never an install', () => {

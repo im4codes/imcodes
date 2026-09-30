@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -49,7 +49,8 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
     expect(src).toContain('process.argv[5]');
     expect(src).toContain('process.argv[6]');
     expect(src).toContain('process.argv[9]');
-    expect(src).toContain("'--prefix', NPM_PREFIX");
+    // npm installs into the STAGING prefix, never the live one.
+    expect(src).toContain("'--prefix', stagePrefix");
   });
 
   it('scopes state to IMCODES_HOME or the overridden HOME, without appending .imcodes twice', () => {
@@ -161,8 +162,10 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
       "trace(5, 'post-node-datachannel-repair')",
       "trace(6, 'pre-kill-watchdogs')",
       "trace(6, 'post-kill-watchdogs')",
-      "trace(7, 'pre-repair-watchdog')",
-      "trace(8, 'pre-scheduled-task-launch')",
+      "trace(7, `pre-repair-watchdog${stepLabel}`)",
+      "trace(8, `pre-scheduled-task-launch${stepLabel}`)",
+      "trace(9, 'pre-switch')",
+      "trace(9, 'post-switch'",
       "trace(10, 'pre-health-check')",
       "trace(99, 'main-exit-success')",
       "trace(99, 'main-exit-fatal')",
@@ -192,7 +195,7 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
 
   it('repairs and verifies node-datachannel after the script-free global install', () => {
     const repairIdx = src.indexOf('function nodeDatachannelRepair');
-    const callIdx = src.indexOf('try { nodeDatachannelRepair(npmPrefix)', repairIdx + 1);
+    const callIdx = src.indexOf('try { nodeDatachannelRepair(stagePrefix)', repairIdx + 1);
     const killIdx = src.indexOf("trace(6, 'pre-kill-watchdogs')");
     expect(repairIdx).toBeGreaterThan(-1);
     expect(src.slice(repairIdx, callIdx)).toContain('node-datachannel-repair.mjs');
@@ -257,10 +260,14 @@ describe('windows-upgrade-runner.mjs source invariants', () => {
 describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', () => {
   let scriptDir: string;
   let logFile: string;
+  let prefix: string;
 
   beforeEach(() => {
     scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-runner-test-'));
     logFile = join(scriptDir, 'upgrade.log');
+    // A real npm prefix holding an installed package: the staged install needs somewhere to stage beside.
+    prefix = join(scriptDir, 'npm-prefix');
+    mkdirSync(join(prefix, 'node_modules', 'imcodes'), { recursive: true });
   });
 
   afterEach(() => {
@@ -287,11 +294,15 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
         args.pkgSpec,
         args.targetVer,
         scriptDir,
+        '-',
+        '',
+        prefix,
       ], {
         encoding: 'utf8',
         timeout: 30_000,
         env: {
           ...process.env,
+          IMCODES_INSTALL_LAYOUT: 'windows',
           PATH: emptyPath,
           npm_config_registry: 'http://127.0.0.1:9',
         },
@@ -381,11 +392,15 @@ describe('windows-upgrade-runner.mjs behavior — failure path preserves tmp', (
         'imcodes@9.9.9-test',
         '9.9.9-test',
         scriptDir,
+        '-',
+        '',
+        prefix,
       ], {
         encoding: 'utf8',
         timeout: 30_000,
         env: {
           ...process.env,
+          IMCODES_INSTALL_LAYOUT: 'windows',
           USERPROFILE: fakeHome,
           HOME: fakeHome,
           PATH: emptyPath,

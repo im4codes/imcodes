@@ -8,4 +8,5 @@
  */
 export const WINDOWS_UPGRADE_RUNNER_STAGED_FILES = [
   'windows-daemon-watchdog.mjs',
+  'staged-package-install.mjs',
 ] as const;

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Staged, switchable install of the global `imcodes` package (Linux / macOS).
+ * Staged, switchable install of the global `imcodes` package (Linux, macOS and Windows).
  *
  * `npm install -g` replaces the live package IN PLACE: if it is interrupted (SSH
  * drop, OOM, power loss) the package is left half-replaced and the daemon's
@@ -23,13 +23,23 @@
  * because the package it lives in is replaced while it runs (the same reason the
  * Windows upgrade runner is copied alone).
  *
+ * One file, two callers: the POSIX upgrade script runs every command (npm included); the
+ * Windows upgrade runner runs its own npm (it needs its cmd.exe-free spawn rules) and uses
+ * `recover`, `preflight`, `verify`, `switch`, `rollback` and `commit` from here, so the swap
+ * logic exists once. Windows differences: npm's global layout has no `lib/`
+ * (<prefix>\node_modules\imcodes), there are .cmd shims instead of bin symlinks (the runner
+ * copies those), and a directory holding a loaded native addon cannot be renamed while a
+ * process has it open -- renames therefore retry with bounded backoff on EPERM/EBUSY/EACCES
+ * (antivirus and indexers hold files briefly) and report exit 78 when the lock outlasts it.
+ *
  * Exit codes: 0 ok, 75 install/verify failure (the old package is untouched),
- * 76 prefix not writable, 77 not enough free disk, 2 usage.
+ * 76 prefix not writable, 77 not enough free disk, 78 a rename stayed locked (nothing moved,
+ * or what moved was put back), 2 usage.
  */
 import { spawnSync } from 'node:child_process';
 import {
   accessSync, appendFileSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
-  readlinkSync, realpathSync, renameSync, rmSync, statSync, statfsSync, symlinkSync, unlinkSync,
+  readlinkSync, realpathSync, renameSync, rmSync, statSync, statfsSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, relative } from 'node:path';
 
@@ -37,6 +47,7 @@ const EXIT_OK = 0;
 const EXIT_INSTALL_FAILED = 75;
 const EXIT_PREFIX_NOT_WRITABLE = 76;
 const EXIT_LOW_DISK = 77;
+const EXIT_LOCKED = 78;
 const EXIT_USAGE = 2;
 
 const PACKAGE = 'imcodes';
@@ -94,8 +105,53 @@ function registryArgs(args) {
   return args.registry ? ['--registry', args.registry] : [];
 }
 
+/** npm's global layout: `<prefix>\node_modules\imcodes` on Windows, `<prefix>/lib/node_modules/imcodes` elsewhere. */
 function stagedPackageDir(stagePrefix) {
-  return join(stagePrefix, 'lib', 'node_modules', PACKAGE);
+  const layout = process.env.IMCODES_INSTALL_LAYOUT || (process.platform === 'win32' ? 'windows' : 'posix');
+  return layout === 'windows'
+    ? join(stagePrefix, 'node_modules', PACKAGE)
+    : join(stagePrefix, 'lib', 'node_modules', PACKAGE);
+}
+
+const RETRYABLE_RENAME_CODES = new Set(['EPERM', 'EBUSY', 'EACCES', 'ENOTEMPTY']);
+
+function sleepMs(ms) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+let injectedRenameFailures = Number.parseInt(process.env.IMCODES_TEST_RENAME_FAIL_COUNT || '0', 10) || 0;
+
+/**
+ * rename() that survives a file lock that is about to be released. A lock that outlasts the
+ * budget (default 30 s, exponential backoff capped at 2 s) is reported as EXIT_LOCKED with the
+ * offending path, never retried forever. POSIX has no such locks: one attempt.
+ */
+function renameWithRetry(from, to) {
+  const budgetMs = Number(process.env.IMCODES_RENAME_RETRY_MS || (process.platform === 'win32' || process.env.IMCODES_INSTALL_LAYOUT === 'windows' ? 30_000 : 0));
+  const started = Date.now();
+  let delay = 100;
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      if (process.env.IMCODES_TEST_RENAME_FAIL_FOREVER === '1' || injectedRenameFailures > 0) {
+        if (injectedRenameFailures > 0) injectedRenameFailures -= 1;
+        throw Object.assign(new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`), { code: 'EPERM' });
+      }
+      renameSync(from, to);
+      if (attempt > 1) say(`rename ${from} succeeded on attempt ${attempt} after ${Date.now() - started} ms`);
+      return;
+    } catch (error) {
+      const retryable = RETRYABLE_RENAME_CODES.has(error.code);
+      if (!retryable || Date.now() - started >= budgetMs) {
+        if (retryable && budgetMs > 0) {
+          throw new InstallError(EXIT_LOCKED, `${from} stayed locked for ${Math.round((Date.now() - started) / 1000)} s (${error.code}); a process still has a file inside it open`);
+        }
+        throw error;
+      }
+      if (attempt === 1) say(`rename of ${from} is blocked (${error.code}); retrying with backoff for up to ${Math.round(budgetMs / 1000)} s`);
+      sleepMs(Math.min(delay, 2000));
+      delay = Math.min(delay * 2, 2000);
+    }
+  }
 }
 
 function isDirectory(path) {
@@ -138,6 +194,9 @@ function directoryBytes(path) {
 }
 
 function expectedPackageBytes(args, liveDir) {
+  // A caller that already asked the registry (the Windows runner) passes the size.
+  const given = Number.parseInt(args['expected-bytes'] || '', 10);
+  if (Number.isFinite(given) && given > 0) return given;
   const view = runNpm(args, ['view', '--prefer-online', ...registryArgs(args), args.pkg, 'dist.unpackedSize', '--json'], { timeoutMs: 60_000 });
   const reported = Number.parseInt(String(view.stdout ?? '').trim().replace(/^"|"$/g, ''), 10);
   if (view.status === 0 && Number.isFinite(reported) && reported > 0) return reported;
@@ -150,8 +209,13 @@ function preflight(args) {
   if (!isDirectory(globalRoot)) throw new InstallError(EXIT_INSTALL_FAILED, `global root ${globalRoot} does not exist`);
   const parent = dirname(globalRoot);
   try {
-    accessSync(globalRoot, constants.W_OK);
-    accessSync(parent, constants.W_OK);
+    // A real create+delete, not access(W_OK): on Windows the permission bits say nothing about the ACL.
+    for (const dir of [globalRoot, parent]) {
+      accessSync(dir, constants.W_OK);
+      const probe = join(dir, `.imcodes-probe.${process.pid}`);
+      writeFileSync(probe, '');
+      unlinkSync(probe);
+    }
   } catch {
     throw new InstallError(
       EXIT_PREFIX_NOT_WRITABLE,
@@ -274,15 +338,16 @@ function switchInstall(args) {
   try { lstatSync(live); hadLive = true; } catch { /* a fresh install has no live package */ }
   if (hadLive) {
     removeQuietly(old);
-    renameSync(live, old);
+    // Nothing has moved yet: a lock here (EXIT_LOCKED) leaves the live package exactly as it was.
+    renameWithRetry(live, old);
   }
   try {
-    renameSync(staged, live);
+    renameWithRetry(staged, live);
   } catch (error) {
     if (hadLive) {
-      try { renameSync(old, live); } catch (restoreError) { say(`RESTORE FAILED: ${restoreError.message}; the previous package is at ${old}`); }
+      try { renameWithRetry(old, live); } catch (restoreError) { say(`RESTORE FAILED: ${restoreError.message}; the previous package is at ${old}`); }
     }
-    throw new InstallError(EXIT_INSTALL_FAILED, `could not move the staged package into place: ${error.message}; the previous package was put back`);
+    throw new InstallError(error.exitCode ?? EXIT_INSTALL_FAILED, `could not move the staged package into place: ${error.message}; the previous package was put back`);
   }
   relinkBins(args['bin-dir'], live);
   say(`switched: ${live} is now the staged package${hadLive ? `; previous package kept at ${old}` : ''}`);
@@ -296,8 +361,11 @@ function rollback(args) {
   if (!isDirectory(old)) throw new InstallError(EXIT_INSTALL_FAILED, `no previous package to roll back to at ${old}`);
   const failed = join(globalRoot, `${FAILED_PREFIX}${tag}`);
   removeQuietly(failed);
-  try { renameSync(live, failed); } catch { /* the live package may be gone entirely */ }
-  renameSync(old, live);
+  try { renameWithRetry(live, failed); } catch (error) {
+    // A locked failed package must not keep the previous one from coming back: fail loudly instead of pretending.
+    if (existsSync(live)) throw error;
+  }
+  renameWithRetry(old, live);
   relinkBins(args['bin-dir'], live);
   say(`rolled back: ${live} is the previous package again (the failed one is at ${failed})`);
 }
@@ -323,7 +391,7 @@ function recover(args) {
       .map((name) => ({ name, at: statSync(join(globalRoot, name)).mtimeMs }))
       .sort((a, b) => b.at - a.at);
     if (olds.length > 0) {
-      renameSync(join(globalRoot, olds[0].name), live);
+      renameWithRetry(join(globalRoot, olds[0].name), live);
       relinkBins(args['bin-dir'], live);
       say(`recovered an interrupted switch: ${olds[0].name} is the live package again`);
     }
@@ -352,7 +420,11 @@ function recover(args) {
   sweep(dirname(globalRoot), [STAGE_PREFIX]);
 }
 
-const COMMANDS = { stage, verify, switch: switchInstall, rollback, commit, recover };
+function preflightCommand(args) {
+  preflight(args);
+}
+
+const COMMANDS = { stage, preflight: preflightCommand, verify, switch: switchInstall, rollback, commit, recover };
 
 function main() {
   let parsed;
