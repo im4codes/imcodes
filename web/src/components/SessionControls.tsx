@@ -1197,7 +1197,7 @@ function extractManualP2pTargets(
 }
 
 export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
-  recordPerfRender('SessionControls');
+  recordPerfRender(activeSession?.name?.startsWith('deck_sub_') ? 'SessionControls:sub' : 'SessionControls:main');
   const { t, i18n } = useTranslation();
   const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
     parse: (raw) => Object.values(SESSION_SEND_DELIVERY_MODES).includes(raw as SessionSendDeliveryMode)

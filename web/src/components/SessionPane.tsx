@@ -169,7 +169,7 @@ export function SessionPane({
   onPendingPrefillApplied,
   onVersionSensitiveAction,
 }: SessionPaneProps) {
-  recordPerfRender('SessionPane');
+  recordPerfRender(isActive ? 'SessionPane:active' : 'SessionPane:hidden');
   const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
