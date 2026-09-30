@@ -6,9 +6,9 @@ DEFAULT_STATE="${DEFAULT_PROFILE%/}/.imcodes"
 KIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 # shellcheck source=agent-guard.sh
 source "$KIT_DIR/agent-guard.sh"
-usage() { echo "usage: $0 {install|teardown|status|snapshot-test|guard-check|fixture} --owner NAME --machine 211|m3 [--bind-link URL|--stack-manifest FILE|--server-json FILE] [--package TAR|--version V] [--registry URL] [--name FIXTURE_NAME --exec ABS_PATH]" >&2; exit 2; }
-cmd=${1:-}; shift || true; owner=; machine=; bind_link=; package=; version=; registry=; stack_manifest=; server_json=; fixture_name=; fixture_exec=
-while (($#)); do case "$1" in --owner) owner=${2:?}; shift 2;; --machine) machine=${2:?}; shift 2;; --bind-link) bind_link=${2:?}; shift 2;; --stack-manifest) stack_manifest=${2:?}; shift 2;; --server-json) server_json=${2:?}; shift 2;; --package) package=${2:?}; shift 2;; --version) version=${2:?}; shift 2;; --registry) registry=${2:?}; shift 2;; --name) fixture_name=${2:?}; shift 2;; --exec) fixture_exec=${2:?}; shift 2;; *) usage;; esac; done
+usage() { echo "usage: $0 {install|teardown|status|snapshot-test|guard-check|fixture} --owner NAME --machine 211|m3 [--bind-link URL|--stack-manifest FILE|--server-json FILE] [--package TAR|--version V|--prebuilt-tree DIR] [--registry URL] [--name FIXTURE_NAME --exec ABS_PATH]" >&2; exit 2; }
+cmd=${1:-}; shift || true; owner=; machine=; bind_link=; package=; version=; registry=; stack_manifest=; server_json=; fixture_name=; fixture_exec=; prebuilt_tree=
+while (($#)); do case "$1" in --owner) owner=${2:?}; shift 2;; --machine) machine=${2:?}; shift 2;; --bind-link) bind_link=${2:?}; shift 2;; --stack-manifest) stack_manifest=${2:?}; shift 2;; --server-json) server_json=${2:?}; shift 2;; --package) package=${2:?}; shift 2;; --version) version=${2:?}; shift 2;; --registry) registry=${2:?}; shift 2;; --prebuilt-tree) prebuilt_tree=${2:?}; shift 2;; --name) fixture_name=${2:?}; shift 2;; --exec) fixture_exec=${2:?}; shift 2;; *) usage;; esac; done
 [[ "$owner" =~ ^[A-Za-z0-9_.:-]{3,96}$ && "$machine" =~ ^(211|m3)$ ]] || usage
 if [[ -n "$stack_manifest" ]]; then [[ -f "$stack_manifest" ]] || { echo "stack manifest missing: $stack_manifest" >&2; exit 1; }; bind_link=${bind_link:-$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bindLink"])' "$stack_manifest")}; registry=${registry:-$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("registryUrl", ""))' "$stack_manifest")}; fi
 state="$ROOT/$owner"; home="$state/imcodes-home"; prefix="$state/prefix"; manifest="$state/daemon.json"; mkdir -p "$state" "$home" "$prefix"
@@ -119,7 +119,11 @@ install)
    [[ -n "$bind_link" || -n "$server_json" ]] || { echo '--bind-link or --server-json required' >&2; exit 2; }; require_disk_space; snapshot "$state/default.before"
    agent_guard_prepare "$state"; agent_guard_assert "$DEFAULT_PROFILE" || exit 1
    agent_guard_inventory "$DEFAULT_PROFILE" "$state/agent-homes.before"; agent_guard_live_agents "$state/agent-homes.before.procs"
-   if [[ -n "$package" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "$package" >/dev/null; elif [[ -n "$version" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "imcodes@$version" ${registry:+--registry "$registry"} >/dev/null; else echo 'package or version required' >&2; exit 2; fi
+   if [[ -n "$prebuilt_tree" ]]; then
+     # A built checkout (dist/ + node_modules) run in place: no npm install, ~0 extra disk. For low-disk hosts and fast iteration.
+     [[ "$prebuilt_tree" == /* && -f "$prebuilt_tree/dist/src/index.js" ]] || { echo "--prebuilt-tree must be an absolute built checkout (dist/src/index.js missing): $prebuilt_tree" >&2; exit 2; }
+     mkdir -p "$prefix/node_modules"; ln -sfn "$prebuilt_tree" "$prefix/node_modules/imcodes"
+   elif [[ -n "$package" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "$package" >/dev/null; elif [[ -n "$version" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "imcodes@$version" ${registry:+--registry "$registry"} >/dev/null; else echo 'package or version required' >&2; exit 2; fi
    cli="$prefix/bin/imcodes"; [[ -x "$cli" ]] || cli="$prefix/node_modules/.bin/imcodes"; if [[ ! -x "$cli" && -f "$prefix/node_modules/imcodes/dist/src/index.js" ]]; then cli="$state/imcodes-cli"; printf '#!/bin/sh\nexec %q %q "$@"\n' "$(command -v node)" "$prefix/node_modules/imcodes/dist/src/index.js" >"$cli"; chmod 700 "$cli"; fi; [[ -x "$cli" ]] || { echo "imcodes binary missing" >&2; exit 1; }
    # From here on every child (bind, the daemon, its tmux server, the exec helper, the agents) runs under the guard.
    agent_guard_export; agent_guard_assert "$DEFAULT_PROFILE" post || exit 1; agent_guard_assert_path_first || exit 1
@@ -154,7 +158,7 @@ PYMANIFEST
  guard-check) agent_guard_report "$state" && echo "no tripwire fired for $owner";;
  fixture) [[ -n "$fixture_name" && -n "$fixture_exec" ]] || usage; agent_guard_fixture "$state" "$fixture_name" "$fixture_exec";;
    teardown)
-   [[ -f "$manifest" ]] || { echo 'no manifest' >&2; exit 1; }; pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",0))' "$manifest"); gpid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("guardPid",0))' "$manifest"); if [[ "$gpid" =~ ^[1-9][0-9]*$ ]] && ps -o args= -p "$gpid" 2>/dev/null | grep -Fq guard-watch.py; then kill "$gpid" 2>/dev/null || true; for _ in {1..20}; do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done; fi
+   [[ -f "$manifest" ]] || { echo 'no manifest' >&2; exit 1; }; pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",0))' "$manifest"); gpid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("guardPid",0))' "$manifest"); if [[ "$gpid" =~ ^[1-9][0-9]*$ ]] && ps -o args= -p "$gpid" 2>/dev/null | grep -Fq guard-watch.mjs; then kill "$gpid" 2>/dev/null || true; for _ in {1..20}; do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done; fi
    tmux_tmp=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tmuxTmp",""))' "$manifest"); if [[ -n "$tmux_tmp" && -d "$tmux_tmp" ]]; then env -u TMUX TMUX_TMPDIR="$tmux_tmp" tmux kill-server 2>/dev/null || true; fi
    stop_owned_processes "$pid"; python3 - "$manifest" <<'PY'
 import json,sys,os,shutil,datetime

@@ -15,17 +15,17 @@
 #   3. assertion  - before anything starts, every scoped path is checked against the canonical
 #                   profile (IMCODES_DEFAULT_HOME); a scoped path that equals or contains it, or a
 #                   real agent dir, aborts the run.
-#   4. watcher    - guard-watch.py stops the scoped daemon the moment a marker appears; checker.sh
+#   4. watcher    - guard-watch.mjs stops the scoped daemon the moment a marker appears; checker.sh
 #                   fails the run and names the caller. An inventory (size, mtime, sha) of the real
 #                   agent dirs before/after proves nothing was written.
 # Real fixture CLIs are referenced by ABSOLUTE path only (transportConfig.binaryPath, or a path
 # printed by `launcher.sh fixture`), never through PATH.
 # This file never expands the process home variable or a tilde: the canonical profile is passed in.
 
-AGENT_GUARD_CLI_NAMES=(claude codex gemini opencode qwen cursor-agent agent copilot kimi hermes codebuddy qodercli qoder pi dsh deepseek)
-# Directories under the canonical profile that real agent CLIs write to. Inventory + assertion targets.
-AGENT_GUARD_REAL_DIRS=(.codex .claude .gemini .qwen .cursor .copilot .kimi .hermes .codebuddy .config/opencode .local/share/opencode .local/state/opencode .cache/opencode .config/github-copilot)
 AGENT_GUARD_KIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# One implementation of the checks (names, assertion, inventory, live processes, verdict, report) for POSIX and Windows.
+agent_guard_tool() { node "$AGENT_GUARD_KIT_DIR/agent-guard-tools.mjs" "$@"; }
+AGENT_GUARD_CLI_NAMES=(); while IFS= read -r _n; do AGENT_GUARD_CLI_NAMES+=("$_n"); done < <(agent_guard_tool names); unset _n
 
 # agent_guard_layout STATE -> sets AG_* path variables (no side effects).
 agent_guard_layout() {
@@ -101,35 +101,9 @@ agent_guard_export() {
 # agent_guard_assert DEFAULT_PROFILE [pre|post]: fails (non-zero, message on stderr) when the guard is not
 # what it claims to be. Pure path checks; run it BEFORE starting anything.
 agent_guard_assert() {
-  local default_profile=$1 phase=${2:-pre}
-  python3 - "$default_profile" "$AG_STATE" "$AG_BIN" "$AG_HOME" "$AG_TMUX" "${AGENT_GUARD_REAL_DIRS[*]}" "$phase" <<'PYASSERT'
-import os,sys
-profile,state,binp,home,tmux,real_dirs,phase=sys.argv[1:8]
-def rp(p): return os.path.realpath(p)
-if not profile or not os.path.isabs(profile): sys.exit('agent guard: refusing to start: IMCODES_DEFAULT_HOME must be an absolute path (got %r)' % profile)
-prof=rp(profile)
-real={rp(os.path.join(prof,d)) for d in real_dirs.split()}
-scoped={'agent home':home,'tripwire bin':binp,'tmux tmp':tmux}
-env_expect={'HOME':home,'CODEX_HOME':home+'/.codex','CLAUDE_CONFIG_DIR':home+'/.claude','GEMINI_CLI_HOME':home,
- 'XDG_CONFIG_HOME':home+'/.config','XDG_DATA_HOME':home+'/.local/share','XDG_STATE_HOME':home+'/.local/state','XDG_CACHE_HOME':home+'/.cache','TMUX_TMPDIR':tmux}
-problems=[]
-for label,p in list(scoped.items())+[('state',state)]+[('planned '+k,v) for k,v in env_expect.items()]:
-    r=rp(p)
-    if r==prof: problems.append('%s resolves to the real user home %s' % (label,prof))
-    elif prof.startswith(r.rstrip('/')+'/'): problems.append('%s (%s) contains the real user home %s' % (label,r,prof))
-    for d in real:
-        if r==d or r.startswith(d+'/'): problems.append('%s (%s) is inside a real agent dir %s' % (label,r,d))
-    short_tmux=(label in ('tmux tmp','planned TMUX_TMPDIR') and os.path.basename(r).startswith('imc-tmx-') and os.path.dirname(r) in ('/tmp',rp('/tmp')))
-    if not (r==rp(state) or r.startswith(rp(state)+'/') or short_tmux): problems.append('%s (%s) is outside the owner state dir %s' % (label,r,rp(state)))
-# After agent_guard_export the environment IS the guard: every variable must be the scoped value.
-if phase=='post':
-    for k,v in env_expect.items():
-        got=os.environ.get(k)
-        if got!=v: problems.append('exported %s=%r, expected the scoped %r' % (k,got,v))
-    if os.environ.get('PATH','').split(':')[0]!=binp: problems.append('PATH does not start with the tripwire dir')
-if len(rp(tmux))+len('/tmux-1000/default')>100: problems.append('TMUX_TMPDIR %r is too long for a unix socket path' % tmux)
-if problems: sys.exit('agent guard: refusing to start:\n  - '+'\n  - '.join(problems))
-PYASSERT
+  local phase=${2:-pre} post=()
+  [[ "$phase" == post ]] && post=(--post)
+  agent_guard_tool assert --profile "$1" --state "$AG_STATE" --bin "$AG_BIN" --home "$AG_HOME" --tmux "$AG_TMUX" ${post[@]+"${post[@]}"}
 }
 
 # agent_guard_assert_path_first: after agent_guard_export, the tripwire dir must be PATH[0] and shadow every name.
@@ -144,114 +118,25 @@ agent_guard_assert_path_first() {
 
 # agent_guard_inventory DEFAULT_PROFILE OUT: size, mtime (ns) and sha256 (files <= 8 MB) of every file
 # in the real agent dirs. Missing dirs are recorded as missing. Deterministic, sorted.
-agent_guard_inventory() {
-  python3 - "$1" "$2" "${AGENT_GUARD_REAL_DIRS[*]}" <<'PYINV'
-import hashlib,os,sys
-profile,out,dirs=sys.argv[1:4]; rows=[]
-for d in dirs.split():
-    root=os.path.join(profile,d)
-    if not os.path.exists(root): rows.append('%s\tmissing' % d); continue
-    for cur,subs,files in os.walk(root, followlinks=False):
-        subs.sort()
-        for f in sorted(files):
-            p=os.path.join(cur,f); rel=os.path.relpath(p,profile)
-            try:
-                st=os.lstat(p)
-                sha='-'
-                if os.path.isfile(p) and not os.path.islink(p) and st.st_size<=8*1024*1024:
-                    h=hashlib.sha256()
-                    with open(p,'rb') as fh:
-                        for chunk in iter(lambda: fh.read(1<<20), b''): h.update(chunk)
-                    sha=h.hexdigest()
-                rows.append('%s\t%d\t%d\t%s' % (rel,st.st_size,st.st_mtime_ns,sha))
-            except OSError as e:
-                rows.append('%s\tunreadable\t%s' % (rel,e.errno))
-open(out,'w').write('\n'.join(sorted(rows))+'\n')
-PYINV
-}
+agent_guard_inventory() { agent_guard_tool inventory --profile "$1" --out "$2"; }
 
 # agent_guard_live_agents OUT: real agent CLI processes alive on the machine right now (pid<TAB>command).
 # A machine whose default daemon has live real sessions (211 does) writes its own agent dirs all day, so a
 # before/after inventory diff there cannot by itself be blamed on the scoped run; see agent_guard_compare.
-agent_guard_live_agents() {
-  python3 - "$1" <<'PYLIVE'
-import os,re,subprocess,sys
-names={'claude','codex','gemini','opencode','qwen','cursor-agent','copilot','kimi','hermes','codebuddy','qodercli','qoder'}
-rows=subprocess.check_output(['ps','-axo','pid=,command='],text=True,stderr=subprocess.DEVNULL).splitlines()
-me={os.getpid(),os.getppid()}; out=[]
-for row in rows:
-    p=row.strip().split(None,1)
-    if len(p)<2 or not p[0].isdigit() or int(p[0]) in me: continue
-    toks=p[1].split()
-    if not toks: continue
-    exe=os.path.basename(toks[0]); script=os.path.basename(toks[1]) if exe in ('node','python3','python','bash','sh') and len(toks)>1 else ''
-    if exe in names or script in names: out.append('%s\t%s' % (p[0],p[1][:160]))
-open(sys.argv[1],'w').write('\n'.join(out)+('\n' if out else ''))
-PYLIVE
-}
+agent_guard_live_agents() { agent_guard_tool live --out "$1"; }
 
-# agent_guard_compare BEFORE AFTER DEFAULT_PROFILE STATE: verdict on a before/after inventory pair.
-# FAIL (return 1) when a change is attributable to the scoped run: the machine had no live real agent process at
-# either snapshot (or the operator set IMCODES_KIT_ASSUME_QUIESCENT=1), or an added/modified file contains the
-# owner's state dir (a rollout/session file whose cwd is the scoped project). Otherwise the diff is printed as
-# inconclusive, because a live default daemon legitimately writes there. The tripwire stays the primary detector.
-agent_guard_compare() {
-  python3 - "$1" "$2" "$3" "$4" "${IMCODES_KIT_ASSUME_QUIESCENT:-}" <<'PYCMP'
-import os,sys
-before,after,profile,state,assume=sys.argv[1:6]
-def load(p):
-    d={}
-    for line in open(p).read().splitlines():
-        if not line: continue
-        k,_,rest=line.partition('\t'); d[k]=rest
-    return d
-def procs(p):
-    try: return [l for l in open(p+'.procs').read().splitlines() if l]
-    except OSError: return []
-b,a=load(before),load(after)
-added=sorted(k for k in a if k not in b); removed=sorted(k for k in b if k not in a); modified=sorted(k for k in a if k in b and a[k]!=b[k])
-live=procs(before)+procs(after)
-quiet=(not live) or assume=='1'
-owner_ref=[]
-for k in added+modified:
-    path=os.path.join(profile,k)
-    try:
-        if os.path.getsize(path)<=8*1024*1024 and state.encode() in open(path,'rb').read(): owner_ref.append(k)
-    except OSError: pass
-print('real agent dirs: %d added, %d modified, %d removed; live real agent processes: %d' % (len(added),len(modified),len(removed),len(live)), file=sys.stderr)
-for label,items in (('added',added),('modified',modified),('removed',removed)):
-    for k in items[:15]: print('  %s: %s' % (label,k), file=sys.stderr)
-    if len(items)>15: print('  ... %d more %s' % (len(items)-15,label), file=sys.stderr)
-if owner_ref:
-    print('FAIL: these files reference the scoped run (%s): %s' % (state,', '.join(owner_ref[:10])), file=sys.stderr); sys.exit(1)
-if (added or modified or removed) and quiet:
-    print('FAIL: the machine had no live real agent process, so every change to its agent dirs came from the scoped run', file=sys.stderr); sys.exit(1)
-if added or modified or removed:
-    print('INCONCLUSIVE (not a failure): real agent processes were live on this machine: '+'; '.join(l.split('\t')[0] for l in live[:8])+'; the tripwire is the authoritative detector here', file=sys.stderr)
-PYCMP
-}
+# agent_guard_compare BEFORE AFTER DEFAULT_PROFILE STATE: verdict on a before/after inventory pair (see the tool for the rule).
+agent_guard_compare() { agent_guard_tool compare --before "$1" --after "$2" --profile "$3" --state "$4"; }
 
 # agent_guard_report STATE: prints every fired tripwire (caller named) and returns 1 if any fired.
-agent_guard_report() {
-  agent_guard_layout "$1"
-  local m fired=0
-  for m in "$AG_MARKERS"/*; do
-    [[ -f "$m" && "$m" != *.tmp ]] || continue
-    fired=1
-    echo "TRIPWIRE FIRED: $(sed -n 's/^tripwire=//p' "$m") launched by:" >&2
-    sed -n -e 's/^caller\.[0-9]*=/  caller: /p' -e 's/^argv\.[0-9]*=/  argv: /p' -e 's/^cwd=/  cwd: /p' -e 's/^env\.\(HOME\|CODEX_HOME\|PATH_FIRST\|TMUX\)=/  env \1=/p' "$m" | head -20 >&2
-    echo "  marker: $m" >&2
-  done
-  [[ -f "$AG_FIRED" ]] && echo "guard watcher stopped the scoped daemon: $(cat "$AG_FIRED")" >&2
-  return $((fired))
-}
+agent_guard_report() { agent_guard_layout "$1"; agent_guard_tool report --state "$1"; }
 
 # agent_guard_start_watcher STATE HOME: detached watcher that stops the scoped daemon on a marker.
 agent_guard_start_watcher() {
   agent_guard_layout "$1"
   local wfile="$1/guard.pid"
   rm -f "$AG_FIRED" "$wfile"
-  python3 - "$wfile" "$1/guard-watch.log" python3 "$AGENT_GUARD_KIT_DIR/guard-watch.py" "$AG_MARKERS" "$AG_FIRED" "$1/daemon.json" "$AG_TMUX" <<'PYSTART' &
+  python3 - "$wfile" "$1/guard-watch.log" node "$AGENT_GUARD_KIT_DIR/guard-watch.mjs" "$AG_MARKERS" "$AG_FIRED" "$1/daemon.json" "$AG_TMUX" <<'PYSTART' &
 import os,sys
 pid_file,log,exe,*args=sys.argv[1:]
 if os.fork(): os._exit(0)

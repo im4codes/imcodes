@@ -47,7 +47,7 @@ if [[ -d "$state/agent-guard/markers" ]]; then
   agent_guard_report "$state" || failed=1
   if [[ -f "$state/daemon.json" ]]; then
     gpid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("guardPid",0))' "$state/daemon.json")
-    if [[ "$gpid" =~ ^[1-9][0-9]*$ ]] && ps -o args= -p "$gpid" 2>/dev/null | grep -Fq guard-watch.py && [[ -f "$state/teardown.json" ]]; then echo "leftover guard watcher pid=$gpid" >&2; failed=1; fi
+    if [[ "$gpid" =~ ^[1-9][0-9]*$ ]] && ps -o args= -p "$gpid" 2>/dev/null | grep -Fq guard-watch.mjs && [[ -f "$state/teardown.json" ]]; then echo "leftover guard watcher pid=$gpid" >&2; failed=1; fi
     profile=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("defaultProfile",""))' "$state/daemon.json")
     if [[ -n "$profile" && -f "$state/agent-homes.before" ]]; then
       agent_guard_inventory "$profile" "$state/agent-homes.now"; agent_guard_live_agents "$state/agent-homes.now.procs"
