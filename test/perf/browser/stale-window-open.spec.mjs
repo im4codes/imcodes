@@ -264,11 +264,15 @@ async function runScenario(browser, mode) {
     }
     const pickAnchor = () => {
       const rootTop = root.getBoundingClientRect().top;
+      let partial = null;
       for (const node of root.querySelectorAll('[data-event-id]')) {
         const rect = node.getBoundingClientRect();
         if (rect.top >= rootTop + 8 && rect.bottom <= rootTop + root.clientHeight) return { id: node.getAttribute('data-event-id'), top: rect.top - rootTop };
+        // Consecutive assistant texts form one block that can be taller than the phone: then the reader's row is that
+        // block, tracked by where its top edge sits relative to the viewport.
+        if (partial === null && rect.bottom > rootTop + 40 && rect.top < rootTop + root.clientHeight - 40) partial = { id: node.getAttribute('data-event-id'), top: rect.top - rootTop };
       }
-      return null;
+      return partial;
     };
     const tick = () => {
       if (!state.active) return;
@@ -390,7 +394,8 @@ function analyzeOrder(requests, wsTiming) {
   const peekFirst = wsTiming.peekSentAt !== null && wsTiming.firstHistorySentAt !== null && wsTiming.peekSentAt <= wsTiming.firstHistorySentAt
     && requests.some((request) => request.contentFilter === 'text' && request.limit <= 30);
   // Backfill pages walk DOWN: every page that has an upper bound is below the previous one's.
-  const bounded = requests.filter((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null);
+  // The hole's own pages carry the recorded floor (afterTs); a later manual/refresh round is not part of the fill.
+  const bounded = requests.filter((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null && request.afterTs !== null && request.afterTs !== undefined);
   let descending = true;
   for (let i = 1; i < bounded.length; i += 1) if (!(bounded[i].beforeTs < bounded[i - 1].beforeTs)) descending = false;
   // No hole between consecutive pages: each page's newest event reaches the previous page's oldest one (the +1 overlap).
