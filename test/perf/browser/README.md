@@ -140,3 +140,18 @@ resyncs and registry commits) and samples event-loop lag on the same thread:
 ```bash
 BENCH_ROOT=<tree with node_modules> BENCH_SECONDS=60 npx tsx test/perf/console-sync-bench.mts
 ```
+
+## Stale chat window (tsk_cd_stale_window_newest_first)
+
+`run-stale-window.sh <app-ref> <label> [results-dir]` reopens a chat whose local cache ends long before the live head
+on a phone-shaped Chromium (iPhone 13 profile, 4x CPU throttle) against the real server and real SPA. The fake daemon
+(`IMC_PERF_HISTORY_FAITHFUL=1`, `IMC_PERF_STALE_SESSION=1`) serves a production-shaped 6,000-event timeline
+(`stale-timeline.mjs`; every 9th tool result is 30 KB) exactly as the real daemon serves history (newest `limit` of
+`(afterTs, beforeTs)`, text-only on `contentFilter: 'text'`) with `IMC_PERF_HISTORY_LATENCY_MS` (default 250) per request and
+logs each request. The spec (`stale-window-open.spec.mjs`) seeds the OLD 150 events into IndexedDB, opens the window and
+records: cache paint, newest-message time (`latestAfterCacheMs`, budget 1 s), the daemon's request order (tiny peek first, then
+pages walking newest -> oldest), the earlier-messages marker, per-frame layout drift of an on-screen row while pages arrive above
+it (reading scenario, <= 1 px) and the bottom gap (pinned scenario, <= 1 px), and whether the local cache ended complete with no
+hole recorded. The app revision is archived; only these harness files are overlaid from the current checkout, so the same spec
+measures base and head (set `IMC_PERF_STALE_EXPECT_HEAD=0` for a base revision: numbers are recorded, head-only behaviours are
+not asserted).

@@ -4546,6 +4546,17 @@ export function useTimeline(
   const fireHttpBackfillRef = useRef(fireHttpBackfill);
   fireHttpBackfillRef.current = fireHttpBackfill;
 
+  // A recorded hole is unfinished work for every window that shows this session: start (or resume) its
+  // newest→oldest fill as soon as it exists and whenever the window becomes visible/active — a visible
+  // sub-session window and a resumed-after-reload hole included, neither of which has a mount-time catch-up
+  // of its own. A hidden/minimized window stays quiet (fireHttpBackfill gates on visibility) and resumes when shown.
+  const hasHistoryGap = historyGap !== null;
+  useEffect(() => {
+    if (!hasHistoryGap || disableHistory || !serverId || !sessionId) return;
+    if (!isActiveSession && !isVisible) return;
+    fireHttpBackfillRef.current(0, { cooldownMs: 0, phase: 'refresh' });
+  }, [hasHistoryGap, disableHistory, serverId, sessionId, isActiveSession, isVisible]);
+
   const terminalTailIdleReconcileTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const terminalTailIdleReconcileKeyRef = useRef<string | null>(null);
   const clearTerminalTailIdleReconcile = useCallback(() => {

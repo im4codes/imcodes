@@ -60,22 +60,23 @@ function serve(all: TimelineEvent[], limit: number, afterTs?: number, beforeTs?:
   return inRange.slice(Math.max(0, inRange.length - limit));
 }
 
-function makeDaemon(all: TimelineEvent[], sessionName: string, opts: { ignoreContentFilter?: boolean } = {}): FakeDaemon {
+function makeDaemon(all: TimelineEvent[], sessionName: string, opts: { ignoreContentFilter?: boolean; windowDelayMs?: number; epoch?: number } = {}): FakeDaemon {
   let handler: ((msg: ServerMessage) => void) | null = null;
   let counter = 0;
   const requests: FakeDaemon['requests'] = [];
-  const respond = (requestId: string, events: TimelineEvent[], inRangeCount: number, limit: number) => {
-    queueMicrotask(() => {
+  const respond = (requestId: string, events: TimelineEvent[], inRangeCount: number, limit: number, delayMs = 0) => {
+    const deliver = () => {
       handler?.({
         type: TIMELINE_MESSAGES.HISTORY,
         sessionName,
         requestId,
-        epoch: 1,
+        epoch: opts.epoch ?? 1,
         events,
         status: TIMELINE_RESPONSE_STATUS.OK,
         hasMore: inRangeCount > limit,
       } as ServerMessage);
-    });
+    };
+    if (delayMs > 0) setTimeout(deliver, delayMs); else queueMicrotask(deliver);
   };
   const ws = {
     connected: true,
@@ -92,7 +93,7 @@ function makeDaemon(all: TimelineEvent[], sessionName: string, opts: { ignoreCon
       const events = serve(all, limit, afterTs, beforeTs, textOnly);
       const total = all.filter((event) => (afterTs === undefined || event.ts > afterTs) && (beforeTs === undefined || event.ts < beforeTs)
         && (!textOnly || event.type === 'assistant.text')).length;
-      respond(requestId, events, total, limit);
+      respond(requestId, events, total, limit, textOnly ? 0 : (opts.windowDelayMs ?? 0));
       return requestId;
     }),
     sendTimelinePageRequest: vi.fn(() => 'page-x'),
@@ -101,9 +102,10 @@ function makeDaemon(all: TimelineEvent[], sessionName: string, opts: { ignoreCon
   return { ws, requests, emit: (msg) => handler?.(msg) };
 }
 
-function installHttp(all: TimelineEvent[], requests: FakeDaemon['requests']) {
+function installHttp(all: TimelineEvent[], requests: FakeDaemon['requests'], delayMs = 0) {
   fetchSpy.mockImplementation(async (_serverId: string, _session: string, opts: { afterTs?: number; beforeTs?: number; limit?: number } = {}) => {
     const limit = opts.limit ?? 50;
+    if (delayMs > 0) await new Promise((resolve) => setTimeout(resolve, delayMs));
     requests.push({ via: 'http', limit, afterTs: opts.afterTs, beforeTs: opts.beforeTs });
     const events = serve(all, limit, opts.afterTs, opts.beforeTs);
     return { events, epoch: 1, hasMore: false, nextCursor: null };
@@ -130,12 +132,13 @@ describe('useTimeline — stale window: latest first, then newest→oldest', () 
     vi.restoreAllMocks();
   });
 
-  async function openStale(sessionName: string, total: number, cachedCount: number, options?: Parameters<typeof useTimeline>[3], daemonOpts?: { ignoreContentFilter?: boolean }) {
-    const all = makeSession(sessionName, total);
+  async function openStale(sessionName: string, total: number, cachedCount: number, options?: Parameters<typeof useTimeline>[3], daemonOpts?: { ignoreContentFilter?: boolean; windowDelayMs?: number; epoch?: number }) {
+    const all = makeSession(sessionName, total).map((event) => (daemonOpts?.epoch ? { ...event, epoch: daemonOpts.epoch } : event));
     // The local cache ends long ago (its newest ts is far in the past relative to "now").
-    __setTimelineCacheForTests(`${SERVER_ID}:${sessionName}`, all.slice(0, cachedCount));
+    // The cache was written by an earlier daemon epoch when one is requested (the daemon restarted since).
+    __setTimelineCacheForTests(`${SERVER_ID}:${sessionName}`, all.slice(0, cachedCount).map((event) => (daemonOpts?.epoch ? { ...event, epoch: 1 } : event)));
     const daemon = makeDaemon(all, sessionName, daemonOpts);
-    installHttp(all, daemon.requests);
+    installHttp(all, daemon.requests, daemonOpts?.windowDelayMs ?? 0);
     const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
     vi.useFakeTimers({ shouldAdvanceTime: true });
     render(h(Probe, { sessionName, ws: daemon.ws, hook, options }));
@@ -330,5 +333,38 @@ describe('useTimeline — stale window: latest first, then newest→oldest', () 
     const firstWindowOldest = all[all.length - 1 - (PAGE - 1)]!;
     expect(gap!.upperTs!).toBeLessThan(firstWindowOldest.ts + 1);
     expect(screen.getByTestId('probe')).toBeDefined();
+  });
+  it('the latest messages are on screen after the peek alone, before the (slower) newest window has answered', async () => {
+    const sessionName = `deck_stale_peek_first_${Date.now()}`;
+    const { all, daemon, hook } = await openStale(sessionName, 2600, 100, undefined, { windowDelayMs: 800 });
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    const newestText = [...all].reverse().find((event) => event.type === 'assistant.text')!;
+    expect(hook.current!.events.some((event) => event.eventId === newestText.eventId)).toBe(true);
+    // Only the cache + the 30 peeked messages so far: the window has not landed yet.
+    expect(hook.current!.events.length).toBeLessThan(100 + TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT + 5);
+    expect(getTimelineGap(`${SERVER_ID}:${sessionName}`)).toBeNull();
+    // ...and once the window lands the hole is recognised even though the peek already moved the newest cached ts.
+    await act(async () => { await vi.advanceTimersByTimeAsync(1_500); });
+    expect(getTimelineGap(`${SERVER_ID}:${sessionName}`)).not.toBeNull();
+    expect(daemon.requests[0]!.filter).toBe(TIMELINE_HISTORY_CONTENT_FILTERS.TEXT);
+  });
+
+  it('a daemon restart since the cache was written (epoch changed) still yields latest first, then the hole newest→oldest', async () => {
+    const sessionName = `deck_stale_epoch_${Date.now()}`;
+    const { all, hook } = await openStale(sessionName, 1200, 80, undefined, { epoch: 2 });
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    await waitFor(() => expect(getTimelineGap(`${SERVER_ID}:${sessionName}`)).toBeNull());
+    const ids = new Set(hook.current!.events.map((event) => event.eventId));
+    expect(all.slice(80).every((event) => ids.has(event.eventId))).toBe(true);
+  });
+
+  it('a visible sub-session window (not the active session) gets the same treatment', async () => {
+    const sessionName = `deck_sub_stale_${Date.now()}`;
+    const { all, daemon, hook } = await openStale(sessionName, 1200, 80, { isActiveSession: false, isVisible: true, bootstrapWhenVisible: true });
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    await waitFor(() => expect(getTimelineGap(`${SERVER_ID}:${sessionName}`)).toBeNull());
+    expect(daemon.requests[0]).toMatchObject({ via: 'ws', filter: TIMELINE_HISTORY_CONTENT_FILTERS.TEXT });
+    const ids = new Set(hook.current!.events.map((event) => event.eventId));
+    expect(all.slice(80).every((event) => ids.has(event.eventId))).toBe(true);
   });
 });
