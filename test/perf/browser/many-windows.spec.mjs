@@ -131,6 +131,61 @@ async function startCpuProbe(context) {
   };
 }
 
+/**
+ * How stale is what an on-screen sub-session card shows (IMC_PERF_CARD_LATENCY=1)?
+ *
+ * The fake daemon's streaming frames carry a unique `stream-<n>` text. An init
+ * script (before the app loads) records when each such frame reaches the page
+ * (WebSocket message) and a MutationObserver records when that text first
+ * appears inside a `.subcard-preview`. latency = appearance - arrival, per
+ * frame the card actually rendered (coalesced frames are not counted, so this
+ * is the age of the content at the moment the card updates).
+ */
+async function installCardLatencyProbe(context) {
+  if (process.env.IMC_PERF_CARD_LATENCY !== '1') return;
+  await context.addInitScript(() => {
+    const arrivals = new Map();
+    const latencies = [];
+    const seen = new Set();
+    const OriginalWebSocket = window.WebSocket;
+    window.WebSocket = class extends OriginalWebSocket {
+      constructor(...args) {
+        super(...args);
+        this.addEventListener('message', (event) => {
+          if (typeof event.data !== 'string' || !event.data.includes('stream-')) return;
+          const now = performance.now();
+          for (const match of event.data.matchAll(/stream-(\d+)/g)) if (!arrivals.has(match[1])) arrivals.set(match[1], now);
+        });
+      }
+    };
+    const inspect = (node) => {
+      const text = node.nodeType === 3 ? node.nodeValue : node.textContent;
+      if (!text || !text.includes('stream-')) return;
+      const element = node.nodeType === 3 ? node.parentElement : node;
+      if (!element?.closest?.('.subcard-preview')) return;
+      const now = performance.now();
+      for (const match of text.matchAll(/stream-(\d+)/g)) {
+        const id = match[1];
+        if (seen.has(id) || !arrivals.has(id)) continue;
+        seen.add(id);
+        latencies.push(now - arrivals.get(id));
+      }
+    };
+    const start = () => new MutationObserver((records) => {
+      for (const record of records) {
+        if (record.type === 'characterData') inspect(record.target);
+        for (const added of record.addedNodes) inspect(added);
+      }
+    }).observe(document.documentElement, { subtree: true, childList: true, characterData: true });
+    if (document.documentElement) start(); else document.addEventListener('DOMContentLoaded', start, { once: true });
+    window.__imcCardLatency = () => {
+      const sorted = [...latencies].sort((a, b) => a - b);
+      const q = (fraction) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] : 0;
+      return { samples: sorted.length, p50: q(0.5), p95: q(0.95), max: sorted.at(-1) ?? 0 };
+    };
+  });
+}
+
 async function startScrollJitterProbe(page) {
   if (process.env.IMC_PERF_SCROLL_JITTER !== '1' || !page) return false;
   return page.evaluate(() => {
@@ -715,6 +770,7 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     await pageWait(durationMs);
     const keypress = keypressProbe ? await keypressProbe.stop() : null;
     const rendererCpu = cpuProbe ? await cpuProbe.stop() : null;
+    const cardLatency = process.env.IMC_PERF_CARD_LATENCY === '1' ? await page.evaluate(() => window.__imcCardLatency?.() ?? null).catch(() => null) : null;
     const scrollJitter = await stopScrollJitterProbe(page);
     // Finals are emitted by the deterministic daemon during the measurement
     // window.  Evaluate the hidden-final invariant after that window, not
@@ -763,7 +819,7 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     metrics.ws.expectedHiddenFullBytes = visibleSdkCount
       ? ((metrics.ws.byMode?.full ?? 0) / visibleSdkCount) * hiddenSdkCount
       : 0;
-    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, keypress, rendererCpu, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
+    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, keypress, rendererCpu, cardLatency, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
   } catch (error) {
     correctness.failures.push(`single-page open failed: ${error instanceof Error ? error.message : String(error)}`);
     correctness.restored = false;
@@ -787,6 +843,7 @@ export async function runHarness() {
   });
   const browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
   const context = await browser.newContext({ reducedMotion: variant === 'reduced-motion' ? 'reduce' : undefined });
+  await installCardLatencyProbe(context);
   if (variant === 'reduced-motion') {
     await context.addInitScript(() => {
       const style = document.createElement('style');
