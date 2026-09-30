@@ -43,6 +43,52 @@ function analyzeScrollJitter(samples) {
   };
 }
 
+/**
+ * Keypress -> paint latency in the focused composer (IMC_PERF_KEYPRESS=1).
+ *
+ * Real CDP key events are sent to the first visible composer textarea every
+ * 300 ms. In the page, `keydown` (capture) records the event's own timestamp;
+ * after the resulting `input` event two animation frames are awaited, so the
+ * delay covers input queueing, the app's handlers/re-render and the paint.
+ */
+async function startKeypressProbe(page) {
+  if (process.env.IMC_PERF_KEYPRESS !== '1' || !page) return null;
+  const ready = await page.evaluate(() => {
+    const composer = [...document.querySelectorAll('textarea')].find((el) => el.offsetParent !== null && el.getBoundingClientRect().width > 50);
+    if (!composer) return false;
+    const probe = { delays: [], down: null };
+    document.addEventListener('keydown', (event) => { probe.down = event.timeStamp; }, true);
+    document.addEventListener('input', () => {
+      const started = probe.down;
+      probe.down = null;
+      if (started == null) return;
+      requestAnimationFrame(() => requestAnimationFrame(() => probe.delays.push(performance.now() - started)));
+    }, true);
+    composer.focus();
+    window.__imcKeypressProbe = probe;
+    return true;
+  }).catch(() => false);
+  if (!ready) return { ready: false, stop: async () => ({ samples: 0, error: 'no visible composer textarea' }) };
+  let busy = false;
+  const timer = setInterval(async () => {
+    if (busy) return;
+    busy = true;
+    try { await Promise.race([page.keyboard.press('KeyA'), new Promise((resolve) => setTimeout(resolve, 2_000))]); } catch { /* the page may be busy */ }
+    busy = false;
+  }, 300);
+  return {
+    ready: true,
+    stop: async () => {
+      clearInterval(timer);
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      const delays = await page.evaluate(() => window.__imcKeypressProbe?.delays ?? []).catch(() => []);
+      const sorted = [...delays].sort((a, b) => a - b);
+      const q = (fraction) => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * fraction))] : 0;
+      return { samples: sorted.length, p50: q(0.5), p95: q(0.95), max: sorted.at(-1) ?? 0 };
+    },
+  };
+}
+
 async function startScrollJitterProbe(page) {
   if (process.env.IMC_PERF_SCROLL_JITTER !== '1' || !page) return false;
   return page.evaluate(() => {
@@ -616,7 +662,9 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     // duration instead of ending immediately after mount/restore. When
     // enabled, the probe samples the real viewport during this stream.
     await startScrollJitterProbe(page);
+    const keypressProbe = await startKeypressProbe(page);
     await pageWait(durationMs);
+    const keypress = keypressProbe ? await keypressProbe.stop() : null;
     const scrollJitter = await stopScrollJitterProbe(page);
     // Finals are emitted by the deterministic daemon during the measurement
     // window.  Evaluate the hidden-final invariant after that window, not
@@ -665,7 +713,7 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     metrics.ws.expectedHiddenFullBytes = visibleSdkCount
       ? ((metrics.ws.byMode?.full ?? 0) / visibleSdkCount) * hiddenSdkCount
       : 0;
-    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
+    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, keypress, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
   } catch (error) {
     correctness.failures.push(`single-page open failed: ${error instanceof Error ? error.message : String(error)}`);
     correctness.restored = false;
