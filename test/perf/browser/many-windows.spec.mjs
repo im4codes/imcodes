@@ -90,6 +90,47 @@ async function startKeypressProbe(page) {
   };
 }
 
+/**
+ * Renderer CPU-seconds over a window (IMC_PERF_KEYPRESS=1 or IMC_PERF_CPU=1).
+ *
+ * Wall-clock "busy" (Performance TaskDuration) inflates when the container's CPU
+ * quota is throttled or the host is loaded, so it cannot compare two builds on
+ * a shared machine. CDP SystemInfo.getProcessInfo reports the CPU time each
+ * browser process actually consumed; the delta over the window divided by wall
+ * time is the renderer's real CPU load (in cores).
+ */
+async function startCpuProbe(context) {
+  if (process.env.IMC_PERF_KEYPRESS !== '1' && process.env.IMC_PERF_CPU !== '1') return null;
+  let session = null;
+  try { session = await context.browser().newBrowserCDPSession(); } catch { return null; }
+  const read = async () => {
+    try {
+      const { processInfo } = await session.send('SystemInfo.getProcessInfo');
+      const byType = {};
+      for (const info of processInfo) byType[info.type] = (byType[info.type] ?? 0) + info.cpuTime;
+      return byType;
+    } catch { return null; }
+  };
+  const before = await read();
+  const startedAt = Date.now();
+  return {
+    stop: async () => {
+      const after = await read();
+      const wallSeconds = (Date.now() - startedAt) / 1000;
+      await session.detach().catch(() => {});
+      if (!before || !after) return { error: 'SystemInfo.getProcessInfo unavailable' };
+      const delta = (type) => (after[type] ?? 0) - (before[type] ?? 0);
+      return {
+        wallSeconds,
+        rendererCpuSeconds: delta('renderer'),
+        rendererCores: delta('renderer') / wallSeconds,
+        gpuCpuSeconds: delta('GPU'),
+        browserCpuSeconds: delta('browser'),
+      };
+    },
+  };
+}
+
 async function startScrollJitterProbe(page) {
   if (process.env.IMC_PERF_SCROLL_JITTER !== '1' || !page) return false;
   return page.evaluate(() => {
@@ -663,9 +704,11 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     // duration instead of ending immediately after mount/restore. When
     // enabled, the probe samples the real viewport during this stream.
     await startScrollJitterProbe(page);
+    const cpuProbe = await startCpuProbe(context);
     const keypressProbe = await startKeypressProbe(page);
     await pageWait(durationMs);
     const keypress = keypressProbe ? await keypressProbe.stop() : null;
+    const rendererCpu = cpuProbe ? await cpuProbe.stop() : null;
     const scrollJitter = await stopScrollJitterProbe(page);
     // Finals are emitted by the deterministic daemon during the measurement
     // window.  Evaluate the hidden-final invariant after that window, not
@@ -714,7 +757,7 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     metrics.ws.expectedHiddenFullBytes = visibleSdkCount
       ? ((metrics.ws.byMode?.full ?? 0) / visibleSdkCount) * hiddenSdkCount
       : 0;
-    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, keypress, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
+    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, keypress, rendererCpu, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
   } catch (error) {
     correctness.failures.push(`single-page open failed: ${error instanceof Error ? error.message : String(error)}`);
     correctness.restored = false;
