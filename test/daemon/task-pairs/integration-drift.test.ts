@@ -712,6 +712,74 @@ describe('integration drift', () => {
         expect(text).not.toContain('untouched.txt');
       });
 
+      describe('the pair\'s own earlier rounds, cherry-picked into dev, are not "dev changed your files"', () => {
+        const cherryPick = (sha: string, ...extra: string[]): void => { run(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'cherry-pick', ...extra, sha); };
+        const reword = (subject: string, trailer?: string): void => { run(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--amend', '-m', trailer ? `${subject}\n\n${trailer}` : subject); };
+        /** Round 1 merged into dev (after an unrelated dev commit, so the SHA differs); the pair then continues on the same branch. */
+        const twoRounds = (taskId: string, merge: (round1: string) => void): { wt: string; base: string; round1: string; round2: string } => {
+          const { wt, base } = fixture(taskId, { 'shared.txt': 'a\n', 'other.txt': 'a\n' });
+          const round1 = commitFiles(wt, { 'shared.txt': 'round 1\n' }, 'feat: round 1 change');
+          commitFiles(main, { 'other.txt': 'dev\n' }, 'chore: unrelated dev commit');
+          merge(round1);
+          pushDev();
+          const round2 = commitFiles(wt, { 'shared.txt': 'round 2\n' }, 'feat: round 2 change');
+          openAudit(taskId, wt, base, round2);
+          return { wt, base, round1, round2 };
+        };
+
+        it('round 1 cherry-picked (a different SHA), round 2 READY on the old branch: no notice from round 1\'s own commit', async () => {
+          twoRounds('own1', (round1) => cherryPick(round1));
+          await checkStaleBaseNotice(PROJECT, 'own1', 'ready');
+          expect(notices()).toHaveLength(0);
+        });
+
+        it('recognised by patch-id alone (Brain reworded the subject, no trailer)', async () => {
+          twoRounds('own2', (round1) => { cherryPick(round1); reword('fix: reworded by Brain'); });
+          await checkStaleBaseNotice(PROJECT, 'own2', 'ready');
+          expect(notices()).toHaveLength(0);
+        });
+
+        it('recognised by the -x trailer alone (Brain edited the resolution, so the patch-id differs, and reworded the subject)', async () => {
+          const { round1 } = twoRounds('own3', (round1Sha) => {
+            cherryPick(round1Sha, '-x', '--no-commit');
+            writeFileSync(join(main, 'brain-resolution.txt'), 'a line Brain added while resolving\n');
+            run(main, 'add', '-A');
+            run(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', `fix: a completely different subject\n\n(cherry picked from commit ${round1Sha})`);
+          });
+          // Neither patch-id nor subject would have recognised it.
+          expect(run(main, 'cherry', 'origin/dev', round1)).toMatch(/^\+ /u);
+          await checkStaleBaseNotice(PROJECT, 'own3', 'ready');
+          expect(notices()).toHaveLength(0);
+        });
+
+        it('a FOREIGN dev change to the same file still gives one notice, naming only the foreign commit', async () => {
+          twoRounds('own4', (round1) => { cherryPick(round1); commitFiles(main, { 'shared.txt': 'round 1\nforeign\n' }, 'fix: someone else edits the shared file'); });
+          await checkStaleBaseNotice(PROJECT, 'own4', 'ready');
+          expect(toExecutor()).toHaveLength(1);
+          const text = toExecutor()[0]!.text;
+          expect(text).toContain('changed 1 of the files');
+          expect(text).toContain('shared.txt');
+          expect(text).toContain('"fix: someone else edits the shared file"');
+          expect(text).not.toContain('round 1 change');
+          expect(notices().filter((entry) => entry.target === BRAIN)).toHaveLength(1);
+        });
+
+        it('if git cannot say which dev commits are the pair\'s own by patch-id, nothing is hidden (the commit stays listed)', async () => {
+          twoRounds('own5', (round1) => { cherryPick(round1); reword('fix: reworded by Brain'); });
+          setIntegrationDriftDepsForTests({
+            now: () => clock,
+            send: async (target, taskId, reason, text) => { sent.push({ target, taskId, reason, text }); return 'sent'; },
+            git: async (cwd, args, timeoutMs, options) => {
+              if (args[0] === 'cherry') return { ok: false, stdout: '' };
+              try { return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'empty-gitconfig') } }) }; } catch (error) { return { ok: false, stdout: '', exitCode: (error as { status?: number }).status }; }
+            },
+          });
+          await checkStaleBaseNotice(PROJECT, 'own5', 'ready');
+          expect(toExecutor()).toHaveLength(1);
+          expect(toExecutor()[0]!.text).toContain('"fix: reworded by Brain"');
+        });
+      });
+
       it('lockfiles and evidence: commits alone are not an overlap', async () => {
         const { wt, base } = fixture('ov3', { 'package-lock.json': '1\n', 'notes.md': 'a\n', 'real.txt': 'a\n' });
         commitFiles(wt, { 'package-lock.json': 'pair\n' }, 'chore: pair bumps a dependency');

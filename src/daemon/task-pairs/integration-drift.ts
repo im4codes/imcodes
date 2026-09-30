@@ -413,23 +413,29 @@ function isIgnoredOverlapPath(path: string): boolean {
   return (TASK_PAIR_OVERLAP_IGNORED_BASENAMES as readonly string[]).includes(name);
 }
 
+/** The pair's own non-evidence commits after the merge base: what it changed, and how its commits are named (for telling them apart from dev's). */
+interface PairWork { files: Set<string>; subjects: Set<string>; hashes: string[] }
+
 /**
  * The files the pair changed after the merge base, from its own commits: `evidence:` commits are left out (never integrated, they
  * cannot conflict), lockfiles too. Renames are read as a delete plus an add (`--no-renames`), so both paths count.
  */
-async function pairChangedFiles(repoPath: string, mergeBase: string, head: string): Promise<Set<string> | undefined> {
-  const out = await git(repoPath, [...QUIET_PATHS, 'log', '--no-merges', '--no-renames', '--format=%x1e%s', '--name-only', `--max-count=${MAX_RANGE_COMMITS}`, `${mergeBase}..${head}`], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
+async function pairWorkOf(repoPath: string, mergeBase: string, head: string): Promise<PairWork | undefined> {
+  const out = await git(repoPath, [...QUIET_PATHS, 'log', '--no-merges', '--no-renames', '--format=%x1e%H%x1f%s', '--name-only', `--max-count=${MAX_RANGE_COMMITS}`, `${mergeBase}..${head}`], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
   if (!out.ok) return undefined;
-  const files = new Set<string>();
+  const work: PairWork = { files: new Set(), subjects: new Set(), hashes: [] };
   for (const record of out.stdout.split('\x1e')) {
-    const [subject = '', ...lines] = record.split('\n');
+    const [first = '', ...lines] = record.split('\n');
+    const [hash = '', subject = ''] = first.split('\x1f');
     if (subject.trim().toLowerCase().startsWith(TASK_PAIR_EVIDENCE_COMMIT_PREFIX)) continue;
+    if (hash.trim()) work.hashes.push(hash.trim().toLowerCase());
+    if (subject.trim()) work.subjects.add(subject.trim());
     for (const line of lines) {
       const path = line.trim();
-      if (path && !isIgnoredOverlapPath(path) && files.size < TASK_PAIR_OVERLAP_MAX_TRACKED_FILES) files.add(path);
+      if (path && !isIgnoredOverlapPath(path) && work.files.size < TASK_PAIR_OVERLAP_MAX_TRACKED_FILES) work.files.add(path);
     }
   }
-  return files;
+  return work;
 }
 
 /** What the integration ref did to each file since the merge base (one name-status diff; capped). */
@@ -448,36 +454,70 @@ async function integrationChangedFiles(repoPath: string, mergeBase: string, meas
   return files;
 }
 
+/** At most this many of the shared files are attributed to integration commits in the one path-limited log; the rest stay counted, unattributed. */
+const OVERLAP_PATHSPEC_LIMIT = 200;
+
+/**
+ * The integration commits that are the pair's OWN work: Brain cherry-picked an earlier round into the ref and the pair continued on the
+ * same branch (NEXT_ROUND) without rebasing, so those commits touch "your files" only because they ARE your files. A commit is the pair's
+ * when it is patch-equivalent to a pair commit (`git cherry <head> <ref>` marks such ref commits `-`), or has the same subject as one, or
+ * names one in a `(cherry picked from commit <sha>)` line. `undefined` when git cannot tell (the caller then keeps every commit).
+ */
+async function ownPatchEquivalents(repoPath: string, head: string, measure: string): Promise<Set<string> | undefined> {
+  const out = await git(repoPath, ['cherry', head, measure], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
+  if (!out.ok) return undefined;
+  const own = new Set<string>();
+  for (const line of out.stdout.split(/\r?\n/u)) {
+    const match = /^-\s+([0-9a-f]{40})$/u.exec(line.trim());
+    if (match) own.add(match[1]!);
+  }
+  return own;
+}
+
 /**
  * The files changed on BOTH sides since the pair's base: a merge of the pair into the integration branch would not be clean there, however
- * few commits behind the base is. Listed (at most 10) with the integration commits that touched them. Two name lists and, only when they
- * intersect, one path-limited log; any git failure (or an output beyond the buffer) answers "no overlap claimed".
+ * few commits behind the base is. Commits of the integration ref that are the pair's own (see ownPatchEquivalents) are not "someone else
+ * changed it": only files touched by a FOREIGN integration commit count. Listed (at most 10) with those commits' subjects. Two name lists
+ * and, only when they intersect, one `git cherry` and one path-limited log; any git failure (or an output beyond the buffer) answers
+ * "no overlap claimed" (and a failing `git cherry` keeps every commit, never hides a real overlap).
  */
 async function computeOverlap(repoPath: string, mergeBase: string, head: string, measure: string): Promise<StaleBaseReport['overlap'] | undefined> {
-  const mine = await pairChangedFiles(repoPath, mergeBase, head);
-  if (!mine || mine.size === 0) return undefined;
+  const mine = await pairWorkOf(repoPath, mergeBase, head);
+  if (!mine || mine.files.size === 0) return undefined;
   const theirs = await integrationChangedFiles(repoPath, mergeBase, measure);
   if (!theirs) return undefined;
-  const shared = [...mine].filter((path) => theirs.has(path)).sort();
+  const shared = [...mine.files].filter((path) => theirs.has(path)).sort();
   if (shared.length === 0) return undefined;
-  const listed = shared.slice(0, TASK_PAIR_OVERLAP_MAX_LISTED_FILES);
-  const subjectsByFile = new Map<string, string[]>();
-  const log = await git(repoPath, [...QUIET_PATHS, 'log', '--no-merges', '--no-renames', '--format=%x1e%s', '--name-only', '--max-count=200', `${mergeBase}..${measure}`, '--', ...listed], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
-  if (log.ok) {
-    for (const record of log.stdout.split('\x1e')) {
-      const [subject = '', ...lines] = record.split('\n');
-      const trimmed = subject.trim();
-      if (!trimmed) continue;
-      for (const line of lines) {
-        const path = line.trim();
-        if (!listed.includes(path)) continue;
-        const known = subjectsByFile.get(path) ?? [];
-        if (known.length < TASK_PAIR_OVERLAP_MAX_SUBJECTS_PER_FILE && !known.includes(trimmed)) known.push(trimmed);
-        subjectsByFile.set(path, known);
-      }
+  const ownByPatch = await ownPatchEquivalents(repoPath, head, measure);
+  const checked = shared.slice(0, OVERLAP_PATHSPEC_LIMIT);
+  const log = await git(repoPath, [...QUIET_PATHS, 'log', '--no-merges', '--no-renames', '--format=%x1e%H%x1f%s%x1f%b%x1f', '--name-only', '--max-count=300', `${mergeBase}..${measure}`, '--', ...checked], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
+  // Without the log nothing can be attributed: claim nothing (the same answer as any other git failure).
+  if (!log.ok) return undefined;
+  const foreign = new Map<string, string[]>();
+  for (const record of log.stdout.split('\x1e')) {
+    const [hashPart = '', subjectPart = '', body = '', filesPart = ''] = record.split('\x1f');
+    const hash = hashPart.trim().toLowerCase();
+    const subject = subjectPart.trim();
+    if (!hash) continue;
+    const pickedFrom = [...body.matchAll(PICKED_FROM_RE)].map((match) => match[1]!.toLowerCase());
+    const own = ownByPatch?.has(hash) === true
+      || mine.subjects.has(subject)
+      || pickedFrom.some((source) => mine.hashes.some((mineHash) => mineHash.startsWith(source) || source.startsWith(mineHash)));
+    if (own) continue;
+    for (const line of filesPart.split('\n')) {
+      const path = line.trim();
+      if (!path || !checked.includes(path)) continue;
+      const known = foreign.get(path) ?? [];
+      if (subject && known.length < TASK_PAIR_OVERLAP_MAX_SUBJECTS_PER_FILE && !known.includes(subject)) known.push(subject);
+      foreign.set(path, known);
     }
   }
-  return { total: shared.length, files: listed.map((path) => ({ path, kind: theirs.get(path) ?? 'modified', subjects: subjectsByFile.get(path) ?? [] })) };
+  // Files beyond the path limit were not attributed: they stay counted (a noisy notice beats a hidden conflict).
+  const unattributed = shared.slice(OVERLAP_PATHSPEC_LIMIT);
+  const real = [...checked.filter((path) => foreign.has(path)), ...unattributed];
+  if (real.length === 0) return undefined;
+  const listed = real.slice(0, TASK_PAIR_OVERLAP_MAX_LISTED_FILES);
+  return { total: real.length, files: listed.map((path) => ({ path, kind: theirs.get(path) ?? 'modified', subjects: foreign.get(path) ?? [] })) };
 }
 
 /** The worktree and head a pair's audit material names, when it is a git worktree of a repository with an integration ref. */
