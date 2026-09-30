@@ -375,6 +375,29 @@ describe('per-event pair write cost', () => {
       } finally { restarted.close(); }
     });
 
+    it('the service disposal at daemon shutdown flushes the deferred stamps of the active store', async () => {
+      vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
+      vi.setSystemTime(75_000_000);
+      const file = openFileStore();
+      setTaskPairStoreForTests(file);
+      try {
+        const pair = pairState(504, 'working');
+        file.savePair(PROJECT, pair);
+        const live = () => file.getPair(PROJECT, pair.taskId)!.liveness;
+        file.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: 30 });
+        vi.advanceTimersByTime(500);
+        file.saveLivenessActivityStamp(PROJECT, pair.taskId, { ...live(), activityExecutorAt: 31 });
+        const reader = openFileStore();
+        try {
+          expect(reader.getPair(PROJECT, pair.taskId)!.liveness.activityExecutorAt).toBe(30);
+          await service.dispose();
+          expect(reader.getPair(PROJECT, pair.taskId)!.liveness.activityExecutorAt).toBe(31);
+        } finally { reader.close(); }
+      } finally {
+        setTaskPairStoreForTests(undefined);
+      }
+    });
+
     it('a pair state change persists the newest stamp with it instead of an older one from the row', () => {
       vi.useFakeTimers({ toFake: ['Date', 'setTimeout', 'clearTimeout'] });
       vi.setSystemTime(80_000_000);

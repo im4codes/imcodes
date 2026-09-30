@@ -51,7 +51,7 @@ import {
   type TaskPairTransition,
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
-import { getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
+import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
@@ -449,6 +449,8 @@ export class TaskPairService {
     this.#unsubscribe?.();
     this.#unsubscribe = undefined;
     await this.waitForIdle();
+    // Activity stamps deferred in memory reach the database before exit.
+    flushTaskPairStoreLiveness();
   }
 
   setScheduler(scheduler: TaskPairScheduler | undefined): void {

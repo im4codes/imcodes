@@ -741,6 +741,11 @@ export function getTaskPairStore(): TaskPairStore {
   return singleton;
 }
 
+/** Writes the current store's deferred activity stamps (daemon shutdown); a no-op when no store was ever opened. */
+export function flushTaskPairStoreLiveness(): void {
+  try { singleton?.flushPendingLiveness(); } catch { /* the database may already be closed */ }
+}
+
 export function setTaskPairStoreForTests(store: TaskPairStore | undefined): void {
   singleton?.close?.();
   singleton = store;
