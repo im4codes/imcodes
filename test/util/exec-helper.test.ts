@@ -19,6 +19,7 @@ import {
   ExecHelperClient,
   __resetExecHelperForTests,
   execFileOffMain,
+  execFileOffMainIdempotent,
   getExecHelperStats,
   shutdownExecHelper,
   startExecHelper,
@@ -388,6 +389,19 @@ describe('exec helper (real forked process): same result as a direct call', () =
     if (POSIX) expect(zombieChildren()).toEqual([]);
     // The orphaned long-running child dies with its helper's pipe or its timeout; do not leak it past the test.
     try { process.kill(Number(readFileSync(orphanPidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+  }, 60_000);
+
+  it('a read-only call in flight when the helper dies is repeated directly instead of failing', async () => {
+    const script = ['-e', 'setTimeout(() => process.stdout.write("read finished"), 700)'];
+    const strict = execFileOffMain(node, script);
+    const idempotent = execFileOffMainIdempotent(node, script);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    process.kill(getExecHelperStats()!.pid!, 'SIGKILL');
+    await expect(strict).rejects.toMatchObject({ code: EXEC_HELPER_ERROR_CODE.CRASHED });
+    await expect(idempotent).resolves.toMatchObject({ stdout: 'read finished' });
+    // A genuine tool failure is not retried or rewritten.
+    await waitReady();
+    await expect(execFileOffMainIdempotent(node, ['-e', 'process.exit(4)'])).rejects.toMatchObject({ code: 4 });
   }, 60_000);
 
   it('after shutdown calls spawn directly and the helper process is gone', async () => {

@@ -31,6 +31,17 @@ import { promisify } from 'node:util';
 
 const execFileP = promisify(execFile);
 
+/**
+ * The `ps` walks (descendants, group members) spawn from the daemon's main thread on every turn
+ * teardown. The daemon points them at its exec helper at boot; every other process, and the
+ * standalone build the escalation test uses, keeps the direct spawn. `taskkill` always spawns
+ * directly: killing must never depend on the helper.
+ */
+let execFilePs: typeof execFileP = execFileP;
+export function useProcessTreeExecFile(exec: typeof execFileP | null): void {
+  execFilePs = exec ?? execFileP;
+}
+
 function isChildProcess(value: unknown): value is ChildProcess {
   // Note: do NOT require `pid` here. Unit tests use mock children that
   // implement `kill` but not `pid`; we still want to route those through
@@ -54,7 +65,7 @@ export async function collectDescendantPids(rootPid: number): Promise<number[]> 
     // `-A` = every process; `-o pid,ppid` = those two columns; no header thanks
     // to `=` trick on macOS/Linux ps. We use plain `-o pid,ppid` since `=`
     // formatting differs across ps implementations; we strip the header row.
-    const { stdout } = await execFileP('ps', ['-A', '-o', 'pid,ppid'], { timeout: 5_000 });
+    const { stdout } = await execFilePs('ps', ['-A', '-o', 'pid,ppid'], { timeout: 5_000 });
     const byParent = new Map<number, number[]>();
     for (const line of stdout.split('\n').slice(1)) {
       const match = line.trim().match(/^(\d+)\s+(\d+)$/);
@@ -121,7 +132,7 @@ function pidAlive(pid: number): boolean {
 async function groupMemberCount(pgid: number): Promise<number> {
   if (process.platform === 'win32') return 0;
   try {
-    const { stdout } = await execFileP('ps', ['-A', '-o', 'pid,pgid'], { timeout: 5_000 });
+    const { stdout } = await execFilePs('ps', ['-A', '-o', 'pid,pgid'], { timeout: 5_000 });
     let members = 0;
     for (const line of stdout.split('\n').slice(1)) {
       const match = line.trim().match(/^(\d+)\s+(\d+)$/);

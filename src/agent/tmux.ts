@@ -32,7 +32,7 @@ import {
 } from './wezterm.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
-import { execFileOffMain as execFile } from '../util/exec-helper.js';
+import { execFileOffMain as execFile, execFileOffMainIdempotent as execFileRead } from '../util/exec-helper.js';
 
 
 // ── Backend detection ───────────────────────────────────────────────────────────
@@ -261,7 +261,7 @@ async function tmuxRunSpawn(args: string[]): Promise<string> {
   for (let attempt = 0; attempt < attempts; attempt++) {
     await ensureTmuxServer();
     try {
-      const { stdout } = await execFile('tmux', args);
+      const { stdout } = await (isCoalescableTmuxRead(args) ? execFileRead : execFile)('tmux', args);
       return stdout.trim();
     } catch (error) {
       if (!isRecoverableTmuxServerError(error)) throw error;

@@ -58,7 +58,8 @@ import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runti
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
-import { shutdownExecHelper, startExecHelper } from '../util/exec-helper.js';
+import { execFileOffMainIdempotent, shutdownExecHelper, startExecHelper } from '../util/exec-helper.js';
+import { useProcessTreeExecFile } from '../util/kill-process-tree.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { backfillProjectionEmbeddings } from '../context/projection-embedding-maintenance.js';
@@ -598,6 +599,7 @@ export async function startup(): Promise<DaemonContext> {
   // Fork the exec helper FIRST, while the daemon is still small: every later tmux/git/ps
   // spawn is posted to it instead of forking from this (soon multi-GB) process.
   startExecHelper();
+  useProcessTreeExecFile(execFileOffMainIdempotent);
   logger.info({
     version: DAEMON_VERSION,
     buildSha: process.env.IMCODES_BUILD_SHA ?? process.env.GIT_COMMIT ?? process.env.SOURCE_VERSION ?? 'unknown',

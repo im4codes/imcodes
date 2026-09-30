@@ -283,6 +283,21 @@ export function getExecHelperStats(): ExecHelperStats | null {
   return defaultClient?.getStats() ?? null;
 }
 
+/**
+ * For read-only commands (`ps`, `git remote`, `tmux list-*`): a helper that dies or wedges under the call
+ * costs nothing, so instead of failing the call is repeated once with a direct spawn.
+ */
+export const execFileOffMainIdempotent: typeof directExecFile = (async (...params: unknown[]) => {
+  try {
+    return await (execFileOffMain as unknown as (...p: unknown[]) => Promise<unknown>)(...params);
+  } catch (error) {
+    const code = (error as { code?: unknown } | null)?.code;
+    if (code !== EXEC_HELPER_ERROR_CODE.CRASHED && code !== EXEC_HELPER_ERROR_CODE.UNRESPONSIVE) throw error;
+    const call = directExecFile as unknown as (...p: unknown[]) => Promise<unknown>;
+    return call(...params);
+  }
+}) as never;
+
 /** Drop-in for `promisify(execFile)`: same arguments, same `{ stdout, stderr }` result and error fields. */
 export const execFileOffMain: typeof directExecFile = ((file: string, args?: readonly string[] | null, options?: ExecFileOptions) => {
   if (defaultClient) return defaultClient.execFile(file, args as never, options as never);

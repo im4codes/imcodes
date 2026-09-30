@@ -3,7 +3,7 @@
 import type { RepoContext, RepoPlatform, RepoStatus } from './types.js';
 import { getCurrentBranch as getLocalCurrentBranch } from './local-git.js';
 import { getRepoGenerationSnapshot } from './generation.js';
-import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { execFileOffMainIdempotent as execFileAsync } from '../util/exec-helper.js';
 
 
 const GH_MIN_VERSION = '2.0.0';

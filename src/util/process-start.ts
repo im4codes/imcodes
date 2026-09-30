@@ -1,5 +1,5 @@
 import { readFile } from 'node:fs/promises';
-import { execFileOffMain as execFileAsync } from './exec-helper.js';
+import { execFileOffMainIdempotent as execFileAsync } from './exec-helper.js';
 
 
 export const PROCESS_START_BATCH = {
