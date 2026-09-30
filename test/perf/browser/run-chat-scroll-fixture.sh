@@ -20,7 +20,7 @@ cleanup() { docker run --rm --user 0:0 -v "$RUN_ROOT:/c" "$IMAGE" bash -lc 'rm -
 trap cleanup EXIT
 git -C "$ROOT" archive "$APP_REF" | tar -xf - -C "$RUN_ROOT"
 mkdir -p "$RUN_ROOT/test/perf/browser"
-cp "$ROOT/test/perf/browser/chat-scroll-fixture.spec.mjs" "$ROOT/test/perf/browser/chat-stream-flicker.spec.mjs" "$RUN_ROOT/test/perf/browser/"
+cp "$ROOT/test/perf/browser/chat-scroll-fixture.spec.mjs" "$ROOT/test/perf/browser/chat-stream-flicker.spec.mjs" "$ROOT/test/perf/browser/stream-script.mjs" "$RUN_ROOT/test/perf/browser/"
 APP_SHA="$(git -C "$ROOT" rev-parse "$APP_REF")"
 exec 9>"${IMC_PERF_LOCK_FILE:-/tmp/imc-perf.lock}"
 flock -w "${IMC_PERF_LOCK_WAIT_S:-10800}" 9
