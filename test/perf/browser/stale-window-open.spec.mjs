@@ -17,6 +17,7 @@
 import { createRequire } from 'node:module';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
+import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.ts';
 import { signPerfJwt } from './perf-auth.mjs';
 import { STALE_SESSION_NAME, buildStaleTimeline, newestStaleText } from './stale-timeline.mjs';
 
@@ -132,14 +133,14 @@ async function runScenario(browser, mode) {
   let openedAtNode = 0;
   await cdp.send('Network.enable');
   cdp.on('Network.webSocketFrameSent', ({ response }) => {
-    if (!openedAtNode || typeof response?.payloadData !== 'string' || !response.payloadData.includes('timeline.history_request')) return;
+    if (!openedAtNode || typeof response?.payloadData !== 'string' || !response.payloadData.includes(TIMELINE_MESSAGES.HISTORY_REQUEST)) return;
     let message; try { message = JSON.parse(response.payloadData); } catch { return; }
     if (wsTiming.firstHistorySentAt === null) wsTiming.firstHistorySentAt = Date.now() - openedAtNode;
     if (message.contentFilter === 'text' && wsTiming.peekSentAt === null) { wsTiming.peekSentAt = Date.now() - openedAtNode; wsTiming.peekRequestId = message.requestId; }
   });
   cdp.on('Network.webSocketFrameReceived', ({ response }) => {
     if (!wsTiming.peekRequestId || wsTiming.peekReceivedAt !== null || typeof response?.payloadData !== 'string') return;
-    if (response.payloadData.includes(wsTiming.peekRequestId) && response.payloadData.includes('timeline.history')) wsTiming.peekReceivedAt = Date.now() - openedAtNode;
+    if (response.payloadData.includes(wsTiming.peekRequestId) && response.payloadData.includes(TIMELINE_MESSAGES.HISTORY)) wsTiming.peekReceivedAt = Date.now() - openedAtNode;
   });
 
   page.on('console', (message) => { if (consoleLines.length < 400) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
