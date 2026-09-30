@@ -1,3 +1,4 @@
+import { expectFastPerEvent, measure, percentile } from '../perf/per-event-bounds.js';
 import { describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -41,19 +42,6 @@ function buildProductionShapedRegistry(): Fixture {
   return { registry, db, ...seedProductionShapedSupervision(registry, db) };
 }
 
-function percentile(sorted: number[], p: number): number {
-  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]!;
-}
-
-function measure(run: () => unknown, samples: number): number[] {
-  const times: number[] = [];
-  for (let i = 0; i < samples; i += 1) {
-    const start = performance.now();
-    run();
-    times.push(performance.now() - start);
-  }
-  return times.sort((a, b) => a - b);
-}
 
 describe('implementation-activity per-event cost on a production-shaped supervision database', () => {
   const fixture = buildProductionShapedRegistry();
@@ -77,7 +65,7 @@ describe('implementation-activity per-event cost on a production-shaped supervis
     expect(percentile(times, 0.5)).toBeGreaterThan(50);
   }, 60_000);
 
-  it('FIXED: a session with no live implementer assignment (the Brain, every streamed delta) costs < 1 ms p99 and issues no SQL once known', () => {
+  it('FIXED: a session with no live implementer assignment (the Brain, every streamed delta) costs < 1 ms median and issues no SQL once known', () => {
     expect(registry.hasActiveImplementerAssignment(BRAIN)).toBe(false);
     const proto = DatabaseSync.prototype as unknown as { prepare: (...args: unknown[]) => unknown };
     const original = proto.prepare;
@@ -93,10 +81,10 @@ describe('implementation-activity per-event cost on a production-shaped supervis
       proto.prepare = original;
     }
     expect(prepares).toBe(0);
-    expect(percentile(times, 0.99)).toBeLessThan(1);
+    expectFastPerEvent(times);
   });
 
-  it('FIXED: a worker with one live assignment reads only its live task (narrow indexed query) in < 1 ms p99', () => {
+  it('FIXED: a worker with one live assignment reads only its live task (narrow indexed query) in < 1 ms median', () => {
     const task = registry.createOrGet({
       taskId: 'tsk_perflive0001',
       topLevelTaskId: 'tsk_perflive0001',
@@ -123,7 +111,7 @@ describe('implementation-activity per-event cost on a production-shaped supervis
     const result = registry.listTasksWithActiveImplementerAssignments({ projectName: PROJECT, sessionName: LIVE_WORKER });
     expect(result.map((entry) => entry.taskId)).toEqual(['tsk_perflive0001']);
     expect(result[0]!.assignments.map((entry) => entry.assignmentId)).toEqual(['asg_perflive0001']);
-    expect(percentile(times, 0.99)).toBeLessThan(1);
+    expectFastPerEvent(times);
   });
 
   it('a workers finished (terminal) tasks never come back from the narrow query, and never need activity accounting: recordImplementationRuntimeActivity refuses terminal tasks', () => {

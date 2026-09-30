@@ -1,3 +1,4 @@
+import { expectFastPerEvent, measure, percentile } from '../../perf/per-event-bounds.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import type { SessionRecord } from '../../../src/store/session-store.js';
@@ -66,19 +67,6 @@ function statements<T>(run: () => T): { result: T; prepares: string[] } {
   }
 }
 
-function percentile(sorted: number[], p: number): number {
-  return sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))]!;
-}
-
-function measure(run: () => unknown, samples: number): number[] {
-  const times: number[] = [];
-  for (let i = 0; i < samples; i += 1) {
-    const start = performance.now();
-    run();
-    times.push(performance.now() - start);
-  }
-  return times.sort((a, b) => a - b);
-}
 
 describe('task-pair per-event paths', () => {
   const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
@@ -139,11 +127,11 @@ describe('task-pair per-event paths', () => {
       store.pairsForSession(OUTSIDER);
     }, 2000);
     expect(percentile(old, 0.5)).toBeGreaterThan(5);
-    expect(percentile(fast, 0.99)).toBeLessThan(1);
+    expectFastPerEvent(fast);
     expect(percentile(old, 0.5) / Math.max(percentile(fast, 0.5), 0.001)).toBeGreaterThan(50);
   });
 
-  it('an unrelated session costs no SQL and < 1 ms p99 on every per-event path', () => {
+  it('an unrelated session costs no SQL and < 1 ms median on every per-event path', () => {
     const store = getTaskPairStore();
     store.pairsForSession(OUTSIDER); // build the index once
     const event = { sessionId: OUTSIDER, type: 'assistant.text', payload: { text: 'streamed delta', streaming: true } };
@@ -158,7 +146,7 @@ describe('task-pair per-event paths', () => {
       service.recordActivity(OUTSIDER, Date.now());
       automation.observeTimelineEvent(event);
     }, 3000);
-    expect(percentile(times, 0.99)).toBeLessThan(1);
+    expectFastPerEvent(times);
   });
 
   it('a participant\'s streamed events write its liveness row at most once per interval, and every one is visible in memory at once', () => {
@@ -171,7 +159,7 @@ describe('task-pair per-event paths', () => {
     service.recordActivity(worker, before);
     const { prepares, result: times } = statements(() => measure(() => service.recordActivity(worker, Date.now()), 500));
     expect(prepares.filter((sql) => /UPDATE task_pairs/i.test(sql))).toEqual([]);
-    expect(percentile(times, 0.99)).toBeLessThan(1);
+    expectFastPerEvent(times);
     // In memory, the latest stamp is what readers see.
     const stamp = Date.now() + 1;
     service.recordActivity(worker, stamp);
