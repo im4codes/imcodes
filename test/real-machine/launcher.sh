@@ -118,7 +118,7 @@ case "$cmd" in
 install)
    [[ -n "$bind_link" || -n "$server_json" ]] || { echo '--bind-link or --server-json required' >&2; exit 2; }; require_disk_space; snapshot "$state/default.before"
    agent_guard_prepare "$state"; agent_guard_assert "$DEFAULT_PROFILE" || exit 1
-   agent_guard_inventory "$DEFAULT_PROFILE" "$state/agent-homes.before"
+   agent_guard_inventory "$DEFAULT_PROFILE" "$state/agent-homes.before"; agent_guard_live_agents "$state/agent-homes.before.procs"
    if [[ -n "$package" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "$package" >/dev/null; elif [[ -n "$version" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "imcodes@$version" ${registry:+--registry "$registry"} >/dev/null; else echo 'package or version required' >&2; exit 2; fi
    cli="$prefix/bin/imcodes"; [[ -x "$cli" ]] || cli="$prefix/node_modules/.bin/imcodes"; if [[ ! -x "$cli" && -f "$prefix/node_modules/imcodes/dist/src/index.js" ]]; then cli="$state/imcodes-cli"; printf '#!/bin/sh\nexec %q %q "$@"\n' "$(command -v node)" "$prefix/node_modules/imcodes/dist/src/index.js" >"$cli"; chmod 700 "$cli"; fi; [[ -x "$cli" ]] || { echo "imcodes binary missing" >&2; exit 1; }
    # From here on every child (bind, the daemon, its tmux server, the exec helper, the agents) runs under the guard.
@@ -147,8 +147,8 @@ PYMANIFEST
    assert_lock
    sleep "${IMCODES_KIT_GUARD_SETTLE_SEC:-5}"
    if ! agent_guard_report "$state"; then echo "tripwire fired: the scoped daemon tried to launch a real agent CLI; the run is aborted (see report above)" >&2; exit 1; fi
-   agent_guard_inventory "$DEFAULT_PROFILE" "$state/agent-homes.after"
-   diff -u "$state/agent-homes.before" "$state/agent-homes.after" >"$state/agent-homes.diff" || { echo "real agent home changed during the run:" >&2; head -40 "$state/agent-homes.diff" >&2; exit 1; }
+   agent_guard_inventory "$DEFAULT_PROFILE" "$state/agent-homes.after"; agent_guard_live_agents "$state/agent-homes.after.procs"
+   agent_guard_compare "$state/agent-homes.before" "$state/agent-homes.after" "$DEFAULT_PROFILE" "$state" || { echo "real agent home was written by the scoped run" >&2; exit 1; }
    cat "$manifest"
    ;;
  guard-check) agent_guard_report "$state" && echo "no tripwire fired for $owner";;

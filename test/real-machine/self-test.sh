@@ -273,11 +273,33 @@ grep -q 'fixture-ran --version' "$root/fixture.log" || { echo 'the fixture binar
 "${guard_env[@]}" "$KIT_DIR/launcher.sh" teardown --owner self-fixture --machine 211 >/dev/null
 "${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null || { echo 'checker rejected a clean fixture run' >&2; exit 1; }
 agent_guard_inventory "$profile" "$root/real.after-b"; diff -q "$root/real.before" "$root/real.after-b" >/dev/null || { echo 'real agent dir changed in run B' >&2; exit 1; }
-# a real agent home that changed during a run fails the checker with the file named
-printf 'written by a real CLI\n' >"$profile/.codex/sessions/rollout-intruder.jsonl"
-if "${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null 2>"$root/inv.err"; then echo 'checker missed a write into the real agent home' >&2; exit 1; fi
+# A real agent home that changed during a run: attributable changes fail the checker with the file named;
+# changes on a machine whose default daemon has live real agent processes are reported as inconclusive.
+intruder="$profile/.codex/sessions/rollout-intruder.jsonl"
+printf '{"cwd":"%s"}\n' "$root/kit/self-fixture/projects/p" >"$intruder"   # a rollout whose cwd is the scoped project
+if "${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null 2>"$root/inv.err"; then echo 'checker missed a write into the real agent home that references the scoped run' >&2; exit 1; fi
 grep -q 'rollout-intruder' "$root/inv.err" || { echo 'checker did not name the changed file' >&2; cat "$root/inv.err" >&2; exit 1; }
-rm -f "$profile/.codex/sessions/rollout-intruder.jsonl"
+printf 'written by something\n' >"$intruder"   # no reference to the run
+bash -c 'exec -a codex sleep 30' & live_agent=$!
+sleep 0.3
+"${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null 2>"$root/inv2.err" || { echo 'checker failed on an unattributable change while a real agent was live' >&2; cat "$root/inv2.err" >&2; kill "$live_agent" 2>/dev/null; exit 1; }
+grep -q 'INCONCLUSIVE' "$root/inv2.err" || { echo 'checker did not report the diff as inconclusive' >&2; cat "$root/inv2.err" >&2; kill "$live_agent" 2>/dev/null; exit 1; }
+kill "$live_agent" 2>/dev/null; wait "$live_agent" 2>/dev/null || true
+if "${guard_env[@]}" IMCODES_KIT_ASSUME_QUIESCENT=1 "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null 2>"$root/inv3.err"; then echo 'checker missed a change on a machine asserted quiescent' >&2; exit 1; fi
+grep -q 'rollout-intruder' "$root/inv3.err"
+rm -f "$intruder"
+"${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null || { echo 'checker rejected the run once the intruder file was gone' >&2; exit 1; }
+# verdict table of agent_guard_compare on hand-made inventories (no live-process dependence)
+cmp_dir="$root/cmp"; mkdir -p "$cmp_dir"
+printf 'f/a\t1\t1\tx\n' >"$cmp_dir/b"; : >"$cmp_dir/b.procs"
+printf 'f/a\t1\t2\ty\n' >"$cmp_dir/a"; : >"$cmp_dir/a.procs"
+if agent_guard_compare "$cmp_dir/b" "$cmp_dir/a" "$profile" "$root/kit/x" 2>"$cmp_dir/e1"; then echo 'quiet machine + changed file must FAIL' >&2; exit 1; fi
+grep -q 'no live real agent process' "$cmp_dir/e1"
+printf '4242\tcodex app-server\n' >"$cmp_dir/a.procs"
+agent_guard_compare "$cmp_dir/b" "$cmp_dir/a" "$profile" "$root/kit/x" 2>"$cmp_dir/e2" || { echo 'live real agent + changed file must be inconclusive, not a failure' >&2; exit 1; }
+grep -q 'INCONCLUSIVE' "$cmp_dir/e2"
+cp "$cmp_dir/b" "$cmp_dir/a"; : >"$cmp_dir/a.procs"
+agent_guard_compare "$cmp_dir/b" "$cmp_dir/a" "$profile" "$root/kit/x" 2>/dev/null || { echo 'identical inventories must pass' >&2; exit 1; }
 fixture_path=$(IMCODES_TEST_KIT_ROOT="$root/kit" IMCODES_DEFAULT_HOME="$profile" "$KIT_DIR/launcher.sh" fixture --owner self-fixture --machine 211 --name codex --exec "$fixture_bin")
 [[ "$fixture_path" == "$root/kit/self-fixture/agent-guard/fixtures/codex" && -x "$fixture_path" ]]
 echo 'agent guard self-test: PASS'

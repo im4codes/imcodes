@@ -170,6 +170,67 @@ open(out,'w').write('\n'.join(sorted(rows))+'\n')
 PYINV
 }
 
+# agent_guard_live_agents OUT: real agent CLI processes alive on the machine right now (pid<TAB>command).
+# A machine whose default daemon has live real sessions (211 does) writes its own agent dirs all day, so a
+# before/after inventory diff there cannot by itself be blamed on the scoped run; see agent_guard_compare.
+agent_guard_live_agents() {
+  python3 - "$1" <<'PYLIVE'
+import os,re,subprocess,sys
+names={'claude','codex','gemini','opencode','qwen','cursor-agent','copilot','kimi','hermes','codebuddy','qodercli','qoder'}
+rows=subprocess.check_output(['ps','-axo','pid=,command='],text=True,stderr=subprocess.DEVNULL).splitlines()
+me={os.getpid(),os.getppid()}; out=[]
+for row in rows:
+    p=row.strip().split(None,1)
+    if len(p)<2 or not p[0].isdigit() or int(p[0]) in me: continue
+    toks=p[1].split()
+    if not toks: continue
+    exe=os.path.basename(toks[0]); script=os.path.basename(toks[1]) if exe in ('node','python3','python','bash','sh') and len(toks)>1 else ''
+    if exe in names or script in names: out.append('%s\t%s' % (p[0],p[1][:160]))
+open(sys.argv[1],'w').write('\n'.join(out)+('\n' if out else ''))
+PYLIVE
+}
+
+# agent_guard_compare BEFORE AFTER DEFAULT_PROFILE STATE: verdict on a before/after inventory pair.
+# FAIL (return 1) when a change is attributable to the scoped run: the machine had no live real agent process at
+# either snapshot (or the operator set IMCODES_KIT_ASSUME_QUIESCENT=1), or an added/modified file contains the
+# owner's state dir (a rollout/session file whose cwd is the scoped project). Otherwise the diff is printed as
+# inconclusive, because a live default daemon legitimately writes there. The tripwire stays the primary detector.
+agent_guard_compare() {
+  python3 - "$1" "$2" "$3" "$4" "${IMCODES_KIT_ASSUME_QUIESCENT:-}" <<'PYCMP'
+import os,sys
+before,after,profile,state,assume=sys.argv[1:6]
+def load(p):
+    d={}
+    for line in open(p).read().splitlines():
+        if not line: continue
+        k,_,rest=line.partition('\t'); d[k]=rest
+    return d
+def procs(p):
+    try: return [l for l in open(p+'.procs').read().splitlines() if l]
+    except OSError: return []
+b,a=load(before),load(after)
+added=sorted(k for k in a if k not in b); removed=sorted(k for k in b if k not in a); modified=sorted(k for k in a if k in b and a[k]!=b[k])
+live=procs(before)+procs(after)
+quiet=(not live) or assume=='1'
+owner_ref=[]
+for k in added+modified:
+    path=os.path.join(profile,k)
+    try:
+        if os.path.getsize(path)<=8*1024*1024 and state.encode() in open(path,'rb').read(): owner_ref.append(k)
+    except OSError: pass
+print('real agent dirs: %d added, %d modified, %d removed; live real agent processes: %d' % (len(added),len(modified),len(removed),len(live)), file=sys.stderr)
+for label,items in (('added',added),('modified',modified),('removed',removed)):
+    for k in items[:15]: print('  %s: %s' % (label,k), file=sys.stderr)
+    if len(items)>15: print('  ... %d more %s' % (len(items)-15,label), file=sys.stderr)
+if owner_ref:
+    print('FAIL: these files reference the scoped run (%s): %s' % (state,', '.join(owner_ref[:10])), file=sys.stderr); sys.exit(1)
+if (added or modified or removed) and quiet:
+    print('FAIL: the machine had no live real agent process, so every change to its agent dirs came from the scoped run', file=sys.stderr); sys.exit(1)
+if added or modified or removed:
+    print('INCONCLUSIVE (not a failure): real agent processes were live on this machine: '+'; '.join(l.split('\t')[0] for l in live[:8])+'; the tripwire is the authoritative detector here', file=sys.stderr)
+PYCMP
+}
+
 # agent_guard_report STATE: prints every fired tripwire (caller named) and returns 1 if any fired.
 agent_guard_report() {
   agent_guard_layout "$1"
