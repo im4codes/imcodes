@@ -891,6 +891,21 @@ function scheduleTimelineIdle(callback: () => void): () => void {
   return scheduleBrowserFrame(callback);
 }
 
+/**
+ * A passive presentation (a summary-mode hidden pane, a collapsed card) shows
+ * nothing anyone is watching, yet each flush of its coalesced live events is a
+ * setState and a render of its whole subtree. With ~20 such presentations the
+ * 50 ms idle budget alone was ~20 renders/s each. Flush them slowly instead;
+ * the pending map coalesces by eventId, so the newest value of every signal
+ * still lands, and becoming visible/active flushes at once.
+ */
+export const PASSIVE_TIMELINE_FLUSH_MS = 500;
+
+function schedulePassiveTimelineFlush(callback: () => void): () => void {
+  const id = setTimeout(callback, PASSIVE_TIMELINE_FLUSH_MS);
+  return () => clearTimeout(id);
+}
+
 function subscribeCache(cacheKey: string, listener: (events: TimelineEvent[]) => void): () => void {
   const store = getTimelineStore(cacheKey);
   const wrapped = () => listener(store.getSnapshot().events);
@@ -3906,8 +3921,19 @@ export function useTimeline(
     const existing = pendingRealtimeEventsRef.current.get(event.eventId);
     pendingRealtimeEventsRef.current.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
     if (pendingRealtimeFlushCancelRef.current) return;
-    pendingRealtimeFlushCancelRef.current = scheduleTimelineIdle(flushPendingRealtimeEvents);
+    const passive = subscriptionModeRef.current === 'summary' && !isActiveSessionRef.current && !isVisibleRef.current;
+    pendingRealtimeFlushCancelRef.current = passive
+      ? schedulePassiveTimelineFlush(flushPendingRealtimeEvents)
+      : scheduleTimelineIdle(flushPendingRealtimeEvents);
   }, [appendEvent, flushPendingRealtimeEvents, idbPutEvents, scheduleStreamingIdlePersist]);
+
+  // A presentation that was passive and is now visible/active must not wait out
+  // the slow cadence: flush what accumulated so it paints current state.
+  useEffect(() => {
+    if (!(isVisible || isActiveSession) || pendingRealtimeEventsRef.current.size === 0) return;
+    pendingRealtimeFlushCancelRef.current?.();
+    flushPendingRealtimeEvents();
+  }, [flushPendingRealtimeEvents, isActiveSession, isVisible]);
 
   useEffect(() => () => {
     pendingRealtimeFlushCancelRef.current?.();
@@ -3951,6 +3977,8 @@ export function useTimeline(
   isActiveSessionRef.current = isActiveSession;
   const isVisibleRef = useRef(isVisible);
   isVisibleRef.current = isVisible;
+  const subscriptionModeRef = useRef(subscriptionMode);
+  subscriptionModeRef.current = subscriptionMode;
   const shouldBootstrapVisibleHistoryRef = useRef(shouldBootstrapVisibleHistory);
   shouldBootstrapVisibleHistoryRef.current = shouldBootstrapVisibleHistory;
   // Wall-clock of the last inbound live `timeline.event` for THIS session.
