@@ -130,7 +130,21 @@ async function runScenario(browser, mode) {
 
   const opened = Date.now();
   await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  const contains = (text, timeout) => page.waitForFunction((needle) => document.body.innerText.includes(needle), text, { polling: 'raf', timeout });
+  const consoleLines = [];
+  page.on('console', (message) => { if (consoleLines.length < 60) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
+  page.on('pageerror', (error) => { if (consoleLines.length < 60) consoleLines.push(`pageerror: ${String(error).slice(0, 300)}`); });
+  const contains = async (text, timeout) => {
+    try {
+      await page.waitForFunction((needle) => document.body.innerText.includes(needle), text, { polling: 'raf', timeout });
+    } catch (error) {
+      // Leave evidence of what the phone actually showed instead of a bare timeout.
+      await mkdir(OUT_DIR, { recursive: true });
+      await page.screenshot({ path: path.join(OUT_DIR, `timeout-${mode}.png`) }).catch(() => {});
+      const body = await page.evaluate(() => ({ url: location.href, text: document.body.innerText.slice(0, 1500), hasChat: !!document.querySelector('.chat-view') })).catch(() => null);
+      await writeFile(path.join(OUT_DIR, `timeout-${mode}.json`), JSON.stringify({ waitingFor: text, body, console: consoleLines }, null, 2));
+      throw error;
+    }
+  };
   await contains(newestCachedText, 60_000);
   const tCachePaintMs = Date.now() - opened;
   await contains(newestText, 60_000);
