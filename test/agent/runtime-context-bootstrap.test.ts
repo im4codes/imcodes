@@ -20,7 +20,12 @@ vi.mock('../../src/repo/detector.js', async (importOriginal) => {
   };
 });
 
-import { buildTransportStartupMemory, resolveTransportContextBootstrap, __clearOriginUrlCacheForTests } from '../../src/agent/runtime-context-bootstrap.js';
+import {
+  BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS,
+  buildTransportStartupMemory,
+  resolveTransportContextBootstrap,
+  __clearOriginUrlCacheForTests,
+} from '../../src/agent/runtime-context-bootstrap.js';
 
 describe('resolveTransportContextBootstrap', () => {
   let tempDir: string;
@@ -840,5 +845,75 @@ describe('resolveTransportContextBootstrap', () => {
     expect(personalStartup?.injectedText).toContain('reference only');
     expect(sharedStartup?.items).toHaveLength(1);
     expect(sharedStartup?.items[0]?.summary).toContain('Shared');
+  });
+  describe('a backend that never answers cannot hold the bootstrap', () => {
+    /** Accepts the request and never replies; only the caller's abort signal ends it. */
+    const hangingBackendFetch = () => vi.fn((_url: unknown, init?: RequestInit) => new Promise<Response>((_resolve, reject) => {
+      init?.signal?.addEventListener('abort', () => reject(init.signal?.reason ?? new Error('aborted')), { once: true });
+    }));
+
+    it('namespace resolution gives up at the bootstrap fetch cap and falls back to the personal namespace', async () => {
+      detectRepoMock.mockResolvedValue({ info: { remoteUrl: 'https://github.com/acme/repo.git' } });
+      const fetchMock = hangingBackendFetch();
+      vi.stubGlobal('fetch', fetchMock);
+      configureSharedContextRuntime({ workerUrl: 'http://worker.test', serverId: 'srv-1', token: 'daemon-token' });
+
+      const startedAt = Date.now();
+      const result = await resolveTransportContextBootstrap({ projectDir: '/tmp/project', transportConfig: {} });
+      const elapsed = Date.now() - startedAt;
+
+      expect(result.namespace).toEqual({ scope: 'personal', projectId: 'github.com/acme/repo' });
+      expect(result.diagnostics).toContain('namespace:server-resolution-failed');
+      // Two capped fetches in sequence (namespace, then remote startup memory); never an unbounded wait.
+      expect(elapsed).toBeGreaterThanOrEqual(BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS - 100);
+      expect(elapsed).toBeLessThan(2 * BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS + 2_000);
+      expect(fetchMock.mock.calls[0]?.[1]?.signal).toBeInstanceOf(AbortSignal);
+    }, 15_000);
+
+    it('remote startup memory gives up at the same cap and the bootstrap still returns', async () => {
+      const fetchMock = hangingBackendFetch();
+      vi.stubGlobal('fetch', fetchMock);
+      configureSharedContextRuntime({ workerUrl: 'http://worker.test', serverId: 'srv-1', token: 'daemon-token' });
+
+      const startedAt = Date.now();
+      const result = await resolveTransportContextBootstrap({
+        projectDir: '/tmp/project',
+        transportConfig: { sharedContextNamespace: { scope: 'personal', projectId: 'github.com/acme/repo' } },
+      });
+      const elapsed = Date.now() - startedAt;
+
+      expect(result.namespace).toEqual({ scope: 'personal', projectId: 'github.com/acme/repo' });
+      expect(elapsed).toBeLessThan(BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS + 1_500);
+      expect(fetchMock.mock.calls.some((call) => String(call[0]).includes('/shared-context/memory/search'))).toBe(true);
+    }, 15_000);
+  });
+
+  it('reports the namespace as soon as it is known, before any context-store work', async () => {
+    const seen: Array<{ namespace: unknown; diagnostics: string[] }> = [];
+    let resultReturned = false;
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: { sharedContextNamespace: { scope: 'personal', projectId: 'github.com/acme/repo' } },
+      onNamespaceResolved: (stage) => {
+        expect(resultReturned).toBe(false);
+        seen.push({ namespace: stage.namespace, diagnostics: stage.diagnostics });
+      },
+    });
+    resultReturned = true;
+
+    expect(seen).toEqual([{
+      namespace: { scope: 'personal', projectId: 'github.com/acme/repo' },
+      diagnostics: ['namespace:explicit'],
+    }]);
+    expect(result.namespace).toEqual(seen[0]?.namespace);
+  });
+
+  it('an observer that throws cannot break the bootstrap', async () => {
+    const result = await resolveTransportContextBootstrap({
+      projectDir: '/tmp/project',
+      transportConfig: { sharedContextNamespace: { scope: 'personal', projectId: 'github.com/acme/repo' } },
+      onNamespaceResolved: () => { throw new Error('observer bug'); },
+    });
+    expect(result.namespace).toEqual({ scope: 'personal', projectId: 'github.com/acme/repo' });
   });
 });

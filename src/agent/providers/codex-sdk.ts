@@ -270,6 +270,11 @@ const CODEX_MCP_RPC_METHOD = {
 const CODEX_MCP_TERMINAL_STARTUP_STATUS = new Set(['failed', 'cancelled']);
 /** Bound on the pre-turn IM transport probe; a slow answer is "alive", not "dead". */
 const CODEX_IM_MCP_PROBE_TIMEOUT_MS = 2_000;
+// Launch-path requests to the app-server that used to wait forever on a wedged child: a hung
+// `initialize` blocked every session launch on the shared app-server, and a hung
+// `thread/unsubscribe` blocked ending (and therefore relaunching) a session.
+export const CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS = 20_000;
+export const CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS = 5_000;
 
 export class ImcodesDelegationUnavailableError extends Error {
   constructor() {
@@ -2893,7 +2898,7 @@ export class CodexSdkProvider implements TransportProvider {
     this.clearRawChecklistPollTimer(state);
     this.clearChildSubagentRolloutPollTimer(state);
     if (state.threadId && state.loaded) {
-      await this.request('thread/unsubscribe', { threadId: state.threadId }).catch(() => {});
+      await this.request('thread/unsubscribe', { threadId: state.threadId }, CODEX_THREAD_UNSUBSCRIBE_TIMEOUT_MS).catch(() => {});
       this.threadToSession.delete(state.threadId);
     }
     this.sessions.delete(sessionId);
@@ -3488,7 +3493,7 @@ export class CodexSdkProvider implements TransportProvider {
       await this.request('initialize', {
         clientInfo: { name: 'imcodes', title: 'IM.codes', version: '0.1.0' },
         capabilities: { experimentalApi: true },
-      });
+      }, CODEX_APP_SERVER_INITIALIZE_TIMEOUT_MS);
       this.notify('initialized', {});
       this.config = config;
       this.appServerAuthFingerprint = authFingerprint;

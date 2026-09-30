@@ -48,6 +48,12 @@ export interface TransportContextBootstrapInput {
   transportConfig?: Record<string, unknown> | null;
   /** When true, skip the expensive startup-memory build step entirely. */
   startupMemoryAlreadyInjected?: boolean;
+  /**
+   * Called as soon as the namespace is known — before any context-store call (freshness,
+   * memory-injection toggle, startup memory). A launch that has to give up on the full
+   * bootstrap at its budget still keeps this much.
+   */
+  onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void;
 }
 
 export interface TransportContextBootstrap {
@@ -59,6 +65,16 @@ export interface TransportContextBootstrap {
   sharedPolicyOverride?: SharedScopePolicyOverride;
   startupMemory?: TransportMemoryRecallArtifact;
 }
+
+/** The part of the bootstrap that needs no context-store access (namespace + its control-plane facts). */
+export type TransportContextNamespaceStage = Omit<TransportContextBootstrap, 'localProcessedFreshness' | 'startupMemory'>;
+
+/**
+ * Cap on each control-plane fetch the bootstrap makes (namespace resolution, remote startup
+ * memory). Deliberately below the default transport context budget (2.5 s) so a hung backend
+ * costs one step, not the whole budget; the budget still bounds the total.
+ */
+export const BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS = 2_000;
 
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
@@ -110,7 +126,7 @@ export async function resolveTransportContextBootstrap(
   if (explicitNamespace) {
     return await buildBootstrapResult(explicitNamespace, {
       diagnostics: ['namespace:explicit'],
-    }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
+    }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId, input.onNamespaceResolved);
   }
 
   let originUrl: string | null | undefined;
@@ -129,7 +145,7 @@ export async function resolveTransportContextBootstrap(
     const credentials = getSharedContextRuntimeCredentials();
     if (credentials) {
       try {
-        const resolved = await fetchBackendSharedContextNamespace(credentials, canonical.key);
+        const resolved = await fetchBackendSharedContextNamespace(credentials, canonical.key, { timeoutMs: BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS });
         if (resolved?.namespace) {
           const namespace = resolved.namespace;
           return await buildBootstrapResult(namespace, {
@@ -137,7 +153,7 @@ export async function resolveTransportContextBootstrap(
             remoteProcessedFreshness: resolved.remoteProcessedFreshness,
             retryExhausted: resolved.retryExhausted,
             sharedPolicyOverride: resolved.sharedPolicyOverride,
-          }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
+          }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId, input.onNamespaceResolved);
         }
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
@@ -147,7 +163,7 @@ export async function resolveTransportContextBootstrap(
           diagnostics: ['namespace:server-personal-fallback', ...(resolved?.diagnostics ?? [])],
           remoteProcessedFreshness: resolved?.remoteProcessedFreshness,
           retryExhausted: resolved?.retryExhausted,
-        }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
+        }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId, input.onNamespaceResolved);
       } catch {
         const personalNamespace: ContextNamespace = {
           scope: 'personal',
@@ -155,7 +171,7 @@ export async function resolveTransportContextBootstrap(
         };
         return await buildBootstrapResult(personalNamespace, {
           diagnostics: ['namespace:server-resolution-failed', 'namespace:git-origin'],
-        }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
+        }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId, input.onNamespaceResolved);
       }
     }
   }
@@ -166,7 +182,7 @@ export async function resolveTransportContextBootstrap(
   };
   return await buildBootstrapResult(fallbackNamespace, {
     diagnostics: [`namespace:${canonical.kind}`],
-  }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId);
+  }, input.startupMemoryAlreadyInjected, projectDir, input.sessionId, input.providerId, input.serverId, input.trustedOwnerId, input.onNamespaceResolved);
 }
 
 async function buildBootstrapResult(
@@ -178,7 +194,13 @@ async function buildBootstrapResult(
   providerId?: string,
   serverId?: string,
   trustedOwnerId?: string,
+  onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void,
 ): Promise<TransportContextBootstrap> {
+  try {
+    onNamespaceResolved?.({ namespace, ...extras, diagnostics: [...(extras.diagnostics ?? [])] });
+  } catch {
+    // an observer must never break the bootstrap
+  }
   // Provider conversations retain ordinary startup memory across cold restore,
   // but managed Skill authority/generation can change while they are offline.
   // Rebuild only the bounded managed catalog/policy in that case. The same
@@ -220,7 +242,7 @@ async function buildTransportStartupMemoryForBootstrap(
 ): Promise<TransportMemoryRecallArtifact | undefined> {
   const credentials = getSharedContextRuntimeCredentials();
   const remoteItems = credentials
-    ? await fetchBackendStartupMemoryItems(credentials, namespace, STARTUP_MEMORY_TOTAL_LIMIT).catch(() => [])
+    ? await fetchBackendStartupMemoryItems(credentials, namespace, STARTUP_MEMORY_TOTAL_LIMIT, { timeoutMs: BOOTSTRAP_BACKEND_FETCH_TIMEOUT_MS }).catch(() => [])
     : [];
   return buildTransportStartupMemory(namespace, {
     projectDir,

@@ -119,6 +119,10 @@ import { type TaskPairEngineState } from '../../shared/task-pair.js';
 import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
 import type { QueueDeliveryFact, QueuePlacement, QueueSnapshot, QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
+import { getTransportContextBudgetMs, readBoundedTimeoutMs } from './transport-context-budget.js';
+import { withTimeoutOutcome } from '../util/timeout-outcome.js';
+
+export { getTransportContextBudgetMs };
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
@@ -354,13 +358,10 @@ export interface TransportRuntimeDiagnosticSnapshot {
   capacityRetry?: { attempt: number; /** 0 while an attempt is in flight */ retryAt: number; since: number; error: string };
 }
 
-const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
 const DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS = 10_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS = 300_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 5_000;
-const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
-const MAX_TRANSPORT_CONTEXT_BUDGET_MS = 30_000;
 const MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 50;
 const MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 10 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_RECOVERY_MS = 10_000;
@@ -421,37 +422,6 @@ function isRecoverableProviderBusyError(error: ProviderError): boolean {
     && /already busy|session is busy|provider is busy/i.test(error.message);
 }
 
-type TimeoutOutcome<T> =
-  | { timedOut: false; value: T }
-  | { timedOut: true };
-
-function readBoundedTimeoutMs(
-  envName: string,
-  fallbackMs: number,
-  minMs: number,
-  maxMs: number,
-  options?: { allowZero?: boolean },
-): number {
-  const raw = process.env[envName];
-  if (raw === undefined || raw.trim() === '') return fallbackMs;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallbackMs;
-  if (options?.allowZero && parsed === 0) return 0;
-  if (parsed < minMs) return minMs;
-  if (parsed > maxMs) return maxMs;
-  return parsed;
-}
-
-export function getTransportContextBudgetMs(): number {
-  return readBoundedTimeoutMs(
-    'IMCODES_TRANSPORT_CONTEXT_BUDGET_MS',
-    DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS,
-    MIN_TRANSPORT_CONTEXT_BUDGET_MS,
-    MAX_TRANSPORT_CONTEXT_BUDGET_MS,
-    { allowZero: false },
-  );
-}
-
 export function getTransportProviderSendTimeoutMs(): number {
   return readBoundedTimeoutMs(
     'IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS',
@@ -480,30 +450,6 @@ export function getTransportStalePendingCancelFallbackMs(): number {
     MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS,
     { allowZero: false },
   );
-}
-
-function withTimeoutOutcome<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-): Promise<TimeoutOutcome<T>> {
-  if (!timeoutMs || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
-    return promise.then((value) => ({ timedOut: false, value }));
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return new Promise<TimeoutOutcome<T>>((resolve, reject) => {
-    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        if (timer) clearTimeout(timer);
-        resolve({ timedOut: false, value });
-      },
-      (err) => {
-        if (timer) clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
 }
 
 interface ActiveDelegationNotificationAdmission {
@@ -669,6 +615,16 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _lastInjectedSupervisionContractSignature: string | null = null;
   private _supervisionContractInjectionAttempt: { previous: string | null } | null = null;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
+  /** Bumped by every applied bootstrap; lets a late result recognise that something newer already landed. */
+  private _contextBootstrapGeneration = 0;
+  /**
+   * A launch-time bootstrap that outlived the launch's context budget and is still running. The
+   * launch does not wait for it (see `deferContextBootstrap`); the first dispatch(es) reuse it
+   * instead of starting a second copy against a store that is already backed up.
+   */
+  private _deferredContextBootstrap: Promise<TransportContextBootstrap> | undefined;
+  /** `_contextBootstrapGeneration` when the deferred bootstrap was last (re)based; only an unchanged generation accepts its late result. */
+  private _deferredContextBootstrapBase = 0;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
 
@@ -2341,6 +2297,30 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextBootstrapResolver = resolver;
   }
 
+  /**
+   * The launch gave up waiting for `pending` (context budget spent) and is going ahead without
+   * it. Keep it: `initialize` skips its own bounded refresh (it would only burn the budget a
+   * second time), a result that arrives before anything newer was applied is applied late, and
+   * refreshes that start while it is still running wait on it rather than piling a duplicate
+   * on the same backed-up store.
+   */
+  deferContextBootstrap(pending: Promise<TransportContextBootstrap>): void {
+    this._deferredContextBootstrap = pending;
+    this._deferredContextBootstrapBase = this._contextBootstrapGeneration;
+    pending.then(
+      (bootstrap) => {
+        const stillCurrent = this._deferredContextBootstrap === pending;
+        if (stillCurrent) this._deferredContextBootstrap = undefined;
+        if (this._contextBootstrapGeneration !== this._deferredContextBootstrapBase) return;
+        incrementCounter('transport.context.bootstrap_late_applied', { provider: this.provider.id });
+        this.applyContextBootstrap(bootstrap);
+      },
+      () => {
+        if (this._deferredContextBootstrap === pending) this._deferredContextBootstrap = undefined;
+      },
+    );
+  }
+
   async initialize(config: SessionConfig): Promise<void> {
     this._pendingHandoff = config.pendingHandoff ?? null;
     // When resuming/restoring an existing conversation, mark startup memory
@@ -2387,7 +2367,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextLanguage: config.contextAuthoredContextLanguage,
       authoredContextFilePath: config.contextAuthoredContextFilePath,
     });
-    await this.refreshContextBootstrap({ phase: 'initialize' });
+    // A launch that already spent its context budget without an answer must not spend it again.
+    // The config values applied above are the baseline its late result is measured against.
+    this._deferredContextBootstrapBase = this._contextBootstrapGeneration;
+    if (!this._deferredContextBootstrap) await this.refreshContextBootstrap({ phase: 'initialize' });
 
     if (!alreadyInjected) {
       // Fresh conversation — reset the gate so the next turn will build and
@@ -4942,7 +4925,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const timeoutMs = options?.timeoutMs ?? getTransportContextBudgetMs();
     let bootstrapPromise: Promise<TransportContextBootstrap>;
     try {
-      bootstrapPromise = Promise.resolve(this._contextBootstrapResolver());
+      bootstrapPromise = this._deferredContextBootstrap ?? Promise.resolve(this._contextBootstrapResolver());
     } catch (err) {
       incrementCounter('transport.context.bootstrap_failed', { phase });
       logger.warn({ err, sessionKey: this.sessionKey, phase }, 'transport context bootstrap failed before dispatch; continuing with existing context');
@@ -4978,6 +4961,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextFilePath?: string;
     },
   ): void {
+    this._contextBootstrapGeneration += 1;
     this._contextNamespace = bootstrap.namespace;
     this._contextNamespaceDiagnostics = [...(bootstrap.diagnostics ?? [])];
     this._contextRemoteProcessedFreshness = bootstrap.remoteProcessedFreshness;

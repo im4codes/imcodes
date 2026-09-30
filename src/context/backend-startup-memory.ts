@@ -1,6 +1,7 @@
 import type { ContextNamespace, ProcessedContextClass } from '../../shared/context-types.js';
 import type { MemorySearchResultItem } from './memory-search.js';
 import type { BackendAuthoredContextCredentials } from './backend-authored-context.js';
+import { backendContextFetchSignal } from './backend-fetch-timeout.js';
 
 interface BackendStartupMemorySearchResponse {
   sourceSessionExclusionApplied?: boolean;
@@ -33,6 +34,8 @@ export async function fetchBackendStartupMemoryItems(
   options: {
     fetchImpl?: typeof fetch;
     excludeSourceSessionName?: string;
+    /** Abort the request (headers and body) after this long; defaults to the backend-context fetch default. */
+    timeoutMs?: number;
   } = {},
 ): Promise<MemorySearchResultItem[]> {
   if (!credentials.workerUrl || !credentials.serverId || !credentials.token) return [];
@@ -53,6 +56,7 @@ export async function fetchBackendStartupMemoryItems(
       limit,
       ...(excludeSourceSessionName ? { excludeSourceSessionName } : {}),
     }),
+    signal: backendContextFetchSignal(options.timeoutMs),
   });
   if (!response.ok) return [];
   const body = await response.json().catch(() => null) as BackendStartupMemorySearchResponse | null;

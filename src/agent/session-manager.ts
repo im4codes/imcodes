@@ -80,7 +80,13 @@ import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import { getSessionRuntimeType, isClaudeCodeFamily, isCodexFamily } from '../../shared/agent-types.js';
 import { providerQuotaMetaEquals } from '../../shared/provider-quota.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../shared/models/options.js';
-import { resolveTransportContextBootstrap } from './runtime-context-bootstrap.js';
+import {
+  resolveTransportContextBootstrap,
+  type TransportContextBootstrap,
+  type TransportContextNamespaceStage,
+} from './runtime-context-bootstrap.js';
+import { getTransportContextBudgetMs, readBoundedTimeoutMs } from './transport-context-budget.js';
+import { withTimeoutOutcome } from '../util/timeout-outcome.js';
 import { QWEN_AUTH_TYPES } from '../../shared/qwen-auth.js';
 import { TIMELINE_SUPPRESS_PUSH_FIELD } from '../../shared/push-notifications.js';
 import { IMCODES_SESSION_ENV, IMCODES_SESSION_LABEL_ENV } from '../../shared/imcodes-send.js';
@@ -2232,6 +2238,46 @@ function wireTransportCallbacks(
   };
 }
 
+/**
+ * What a launch takes from the context bootstrap. Memory/context enrichment must never gate a
+ * session launch (a saturated context store used to hold launches for minutes), so this is the
+ * full bootstrap when it arrives within the transport context budget, otherwise whatever the
+ * namespace stage produced before the budget ran out — the rest keeps running in the background
+ * (`deferred`) and is handed to the runtime, which applies it late.
+ */
+export interface LaunchContextBootstrap {
+  bootstrap: Partial<TransportContextBootstrap>;
+  deferred?: Promise<TransportContextBootstrap>;
+}
+
+async function resolveLaunchContextBootstrap(
+  sessionName: string,
+  resolve: (onNamespaceResolved: (stage: TransportContextNamespaceStage) => void) => Promise<TransportContextBootstrap>,
+): Promise<LaunchContextBootstrap> {
+  let stage: TransportContextNamespaceStage | undefined;
+  const full = Promise.resolve().then(() => resolve((resolved) => { stage = resolved; }));
+  const timeoutMs = getTransportContextBudgetMs();
+  const partial = (reason: string): Partial<TransportContextBootstrap> => ({
+    ...(stage ?? {}),
+    diagnostics: [...(stage?.diagnostics ?? []), reason],
+  });
+  try {
+    const outcome = await withTimeoutOutcome(full, timeoutMs);
+    if (!outcome.timedOut) return { bootstrap: outcome.value };
+    incrementCounter('transport.context.bootstrap_timeout', { phase: 'launch' });
+    logger.warn({
+      sessionName,
+      timeoutMs,
+      namespaceResolved: stage !== undefined,
+    }, 'transport context bootstrap exceeded the launch budget; launching without waiting for it');
+    return { bootstrap: partial('context-bootstrap:launch-timeout'), deferred: full };
+  } catch (err) {
+    incrementCounter('transport.context.bootstrap_failed', { phase: 'launch' });
+    logger.warn({ err, sessionName }, 'transport context bootstrap failed at launch; launching without it');
+    return { bootstrap: partial('context-bootstrap:launch-failed') };
+  }
+}
+
 function mergeSessionContextBootstrap(next: SessionRecord, info: SessionInfoUpdate): boolean {
   let changed = false;
 
@@ -3052,7 +3098,7 @@ export async function restoreTransportSessions(
       let piLlmConfig: PiLlmConfig | undefined;
       const boundServerId = await loadBoundServerIdForManagedMcp();
       const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
-      const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
+      const resolveRuntimeContextBootstrap = (onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void) => resolveTransportContextBootstrap({
         projectDir: s.projectDir,
         sessionId: s.name,
         providerId: provider.id,
@@ -3060,9 +3106,11 @@ export async function restoreTransportSessions(
         trustedOwnerId: capabilityOwnerId,
         transportConfig: getSession(s.name)?.transportConfig ?? s.transportConfig ?? {},
         startupMemoryAlreadyInjected: preserveStartupMemoryOnRestore,
+        ...(onNamespaceResolved ? { onNamespaceResolved } : {}),
       });
-      const contextBootstrap = await resolveRuntimeContextBootstrap();
-      runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
+      const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = await resolveLaunchContextBootstrap(s.name, resolveRuntimeContextBootstrap);
+      runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
+      if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
       if (s.providerId === 'claude-code-sdk' && s.ccPreset) {
         const { resolvePresetEnv, getPresetTransportOverrides } = await import('../daemon/cc-presets.js');
         extraEnv = await resolvePresetEnv(
@@ -3352,13 +3400,33 @@ export async function restoreTransportSessions(
  */
 const transportLaunchInFlight = new Map<string, Promise<void>>();
 
+/** How long a launch waits on an earlier in-flight launch of the same session before giving up. */
+export const DEFAULT_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS = 45_000;
+export function getTransportLaunchInFlightWaitMs(): number {
+  return readBoundedTimeoutMs(
+    'IMCODES_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS',
+    DEFAULT_TRANSPORT_LAUNCH_INFLIGHT_WAIT_MS,
+    50,
+    10 * 60_000,
+    { allowZero: false },
+  );
+}
+
 export async function launchTransportSession(opts: LaunchOpts): Promise<void> {
   const { name } = opts;
   // A (re)launch is an explicit session change: forget any restore backoff.
   clearTransportRestoreBackoff(name);
   const inFlight = transportLaunchInFlight.get(name);
   if (inFlight) {
-    await inFlight.catch(() => {});
+    // A wedged earlier launch must not hold every later launch of this session forever: wait a
+    // bounded time, then fail loudly so the caller (and the user) sees why nothing started.
+    const waitMs = getTransportLaunchInFlightWaitMs();
+    const outcome = await withTimeoutOutcome(inFlight.catch(() => {}), waitMs);
+    if (outcome.timedOut) {
+      incrementCounter('transport.launch.inflight_wait_timeout');
+      logger.warn({ sessionName: name, waitMs }, 'previous transport launch is still in progress; giving up waiting for it');
+      throw new Error(`Session ${name} is still starting from an earlier launch (no result after ${Math.round(waitMs / 1000)}s); try again once it settles or restart the daemon`);
+    }
     // A non-fresh caller only needs the session up: if the prior launch
     // registered a runtime, we're done. A fresh caller must proceed (it
     // intentionally tears down + recreates).
@@ -3493,7 +3561,7 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
   const preserveStartupMemoryInject = !opts.fresh && existing?.startupMemoryInjected === true;
   const boundServerId = await loadBoundServerIdForManagedMcp();
   const capabilityOwnerId = boundServerId ? getAuthenticatedCapabilityOwner(boundServerId) : undefined;
-  const resolveRuntimeContextBootstrap = () => resolveTransportContextBootstrap({
+  const resolveRuntimeContextBootstrap = (onNamespaceResolved?: (stage: TransportContextNamespaceStage) => void) => resolveTransportContextBootstrap({
     projectDir,
     sessionId: name,
     providerId: provider.id,
@@ -3501,9 +3569,11 @@ async function launchTransportSessionInner(opts: LaunchOpts): Promise<void> {
     trustedOwnerId: capabilityOwnerId,
     transportConfig: getSession(name)?.transportConfig ?? effectiveTransportConfig ?? {},
     startupMemoryAlreadyInjected: preserveStartupMemoryInject,
+    ...(onNamespaceResolved ? { onNamespaceResolved } : {}),
   });
-  const contextBootstrap = await resolveRuntimeContextBootstrap();
-  runtime.setContextBootstrapResolver(resolveRuntimeContextBootstrap);
+  const { bootstrap: contextBootstrap, deferred: deferredContextBootstrap } = await resolveLaunchContextBootstrap(name, resolveRuntimeContextBootstrap);
+  runtime.setContextBootstrapResolver(() => resolveRuntimeContextBootstrap());
+  if (deferredContextBootstrap) runtime.deferContextBootstrap(deferredContextBootstrap);
     if (agentType === 'qwen') {
       const qwenRuntime = await getQwenRuntimeConfig().catch(() => null);
       qwenAuthType = qwenRuntime?.authType;
