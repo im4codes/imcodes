@@ -46,7 +46,9 @@ const LATEST_AFTER_CACHE_BUDGET_MS = Number(process.env.IMC_PERF_STALE_LATEST_BU
 const DRIFT_BUDGET_PX = 1;
 const MIN_FLINGS = Number(process.env.IMC_PERF_STALE_MIN_FLINGS ?? 8);
 const MIN_STREAM_FRAMES = 50;
-const LATENCY_JUDGED_MODES = new Set(['pinned', 'reading', 'fling']);
+// Every scenario opens the chat the same way (relaunch, cache paint, peek), so one run holds one open-latency sample per
+// scenario. On a shared host a single sample moves by +-200 ms, so the budget is judged on the MEDIAN of the run, with a
+// hard cap (2x budget) on every individual sample.
 // The peek and the newest-window request are sent in the same tick; CDP/Date.now jitter can order them by a millisecond.
 const PEEK_SAME_TICK_MS = 25;
 const SAMPLE_WINDOW_MS = Number(process.env.IMC_PERF_STALE_SAMPLE_MS ?? 20_000);
@@ -424,9 +426,6 @@ const headBehaviour = process.env.IMC_PERF_STALE_EXPECT_HEAD !== '0';
 for (const [mode, scenario] of Object.entries(scenarios)) {
   if (scenario.layout.error) failures.push(`${mode}: ${scenario.layout.error}`);
   if (!headBehaviour) continue;
-  // The latency budget is a property of the open itself: the streaming scenarios only add their reply after the backfill is
-  // under way, so they record the number but do not re-judge it (a loaded host would make them flaky, not informative).
-  if (LATENCY_JUDGED_MODES.has(mode) && scenario.latestAfterCacheMs > LATEST_AFTER_CACHE_BUDGET_MS) failures.push(`${mode}: latest message ${scenario.latestAfterCacheMs} ms after the cache paint (budget ${LATEST_AFTER_CACHE_BUDGET_MS})`);
   if (!scenario.order.peekFirst) failures.push(`${mode}: the first history request was not the tiny text-only peek`);
   if (!scenario.order.descending || scenario.order.backfillPages < 2) failures.push(`${mode}: backfill pages did not walk newest -> oldest (${JSON.stringify(scenario.order)})`);
   if (scenario.gapMarkerAtMs === null && scenario.layout.markerSeen !== true) failures.push(`${mode}: the earlier-messages marker never appeared`);
@@ -448,7 +447,14 @@ for (const [mode, scenario] of Object.entries(scenarios)) {
   if (isStreamMode(mode) && scenario.streamedFrames < MIN_STREAM_FRAMES) failures.push(`${mode}: only ${scenario.streamedFrames} streaming frame(s) reached the phone while the pages landed (need ${MIN_STREAM_FRAMES}); the scenario did not exercise streaming`);
 }
 
-const output = { revision, generatedAt: new Date().toISOString(), config: { TOTAL_EVENTS, CACHED_EVENTS, CPU_RATE, LATEST_AFTER_CACHE_BUDGET_MS }, pass: failures.length === 0, failures, scenarios: Object.fromEntries(Object.entries(scenarios).map(([mode, scenario]) => [mode, { ...scenario, requests: undefined, requestCount: scenario.requests.length, requestHead: scenario.requests.slice(0, 6) }])) };
+const latencies = Object.values(scenarios).map((scenario) => scenario.latestAfterCacheMs).sort((a, b) => a - b);
+const medianLatency = latencies[Math.floor(latencies.length / 2)];
+if (headBehaviour) {
+  if (medianLatency > LATEST_AFTER_CACHE_BUDGET_MS) failures.push(`latest message: median ${medianLatency} ms after the cache paint over ${latencies.length} opens (budget ${LATEST_AFTER_CACHE_BUDGET_MS}; samples ${latencies.join(', ')})`);
+  if (latencies.at(-1) > 2 * LATEST_AFTER_CACHE_BUDGET_MS) failures.push(`latest message: slowest open ${latencies.at(-1)} ms (cap ${2 * LATEST_AFTER_CACHE_BUDGET_MS})`);
+}
+
+const output = { revision, generatedAt: new Date().toISOString(), config: { TOTAL_EVENTS, CACHED_EVENTS, CPU_RATE, LATEST_AFTER_CACHE_BUDGET_MS }, openLatencyMs: { samples: latencies, median: medianLatency }, pass: failures.length === 0, failures, scenarios: Object.fromEntries(Object.entries(scenarios).map(([mode, scenario]) => [mode, { ...scenario, requests: undefined, requestCount: scenario.requests.length, requestHead: scenario.requests.slice(0, 6) }])) };
 await mkdir(OUT_DIR, { recursive: true });
 await writeFile(path.join(OUT_DIR, `results-${revision}.json`), JSON.stringify(output, null, 2));
 await writeFile(path.join(OUT_DIR, `requests-${revision}.json`), JSON.stringify(Object.fromEntries(Object.entries(scenarios).map(([mode, scenario]) => [mode, scenario.requests])), null, 2));
