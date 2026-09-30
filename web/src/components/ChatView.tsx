@@ -84,6 +84,7 @@ import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers
 import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
 import { TIMELINE_DELETE_ERROR_CODES } from '@shared/timeline-protocol.js';
 import { requestTimelineMessageDelete, resolveTimelineDeleteTargets, timelineDeleteErrorKey, TimelineDeleteError } from '../timeline-delete.js';
+import { claimRunKey } from './chat-run-keys.js';
 import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, reconcileTopOffset, topOffsetStyle, type ReaderAnchor } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
@@ -1349,10 +1350,13 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
+  // Keys claimed by merged runs in this derivation (see chat-run-keys.ts).
+  const usedRunKeys = new Set<string>();
+
   const flushPending = () => {
     if (pendingEventIds.length > 0) {
       items.push({
-        key: pendingKey,
+        key: claimRunKey('assistant-block', pendingKey, pendingEventIds, usedRunKeys),
         type: 'assistant-block',
         text: pendingText.join('\n'),
         eventIds: [...pendingEventIds],
@@ -1376,7 +1380,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     if (pendingTools.length === 0) return;
     if (!showToolCalls) {
       items.push({
-        key: `ta_${pendingTools[0].eventId}`,
+        key: claimRunKey('tool-activity', `ta_${pendingTools[0].eventId}`, pendingTools.map((tool) => tool.eventId), usedRunKeys),
         type: 'tool-activity',
         toolEvents: [...pendingTools],
       });
@@ -1385,7 +1389,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     } else {
       // 2+ consecutive tool events → collapsible group
       items.push({
-        key: `tg_${pendingTools[0].eventId}`,
+        key: claimRunKey('tool-group', `tg_${pendingTools[0].eventId}`, pendingTools.map((tool) => tool.eventId), usedRunKeys),
         type: 'tool-group',
         toolEvents: [...pendingTools],
       });
@@ -4641,7 +4645,9 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
               return (
                 <AssistantBlock
                   key={item.key}
-                  eventId={item.key}
+                  // The row key is stable across the run losing its oldest event; the DOM
+                  // marker stays a real, current event id (the run's first).
+                  eventId={item.eventIds?.[0] ?? item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
                   streaming={item.assistantStreaming === true}
