@@ -8,8 +8,6 @@
  * surface, but every call answered `unavailable: supervision registry not
  * bound` -- a feature that looked present and was permanently inert.
  */
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { TASK_PAIR_WORKSPACE_RETENTION_MS, isTerminalTaskPairStatus } from '../../shared/task-pair.js';
 import { getSupervisionTaskRegistry, SUPERVISION_REVISION_AUTHORITATIVE_INTENTS } from './supervision-state-store.js';
@@ -50,9 +48,9 @@ import { resolveEffectiveSessionModel } from '../../shared/session-model.js';
 import logger from '../util/logger.js';
 import { runSupervisionRetentionGc } from './supervision-retention-gc.js';
 import { SUPERVISION_RETENTION_SCAN_LIMIT } from '../../shared/supervision-retention.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
 const SUPERVISION_WORKTREE_BYTES_WARNING = 20 * 1024 * 1024 * 1024;
-const execFileAsync = promisify(execFile);
 
 async function measureWorktreesRootBytes(root: string): Promise<number | undefined> {
   try {

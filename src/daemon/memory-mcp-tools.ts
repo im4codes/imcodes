@@ -7,8 +7,6 @@ import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklis
 import { taskPairRoleOf } from '../../shared/task-pair.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
-import { execFile as execFileCallback } from 'node:child_process';
-import { promisify } from 'node:util';
 import { lstat, readFile, realpath } from 'node:fs/promises';
 import { isAbsolute, relative, resolve } from 'node:path';
 import type { CallToolResult, ServerNotification, ServerRequest } from '@modelcontextprotocol/sdk/types.js';
@@ -249,9 +247,9 @@ import {
   removeVerificationMachineProfile,
   setVerificationMachineProfile,
 } from './verification-machine-mcp-client.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
 type ToolResult = Record<string, unknown>;
-const execFileAsync = promisify(execFileCallback);
 
 const recordOnlyPathArraySchema = z.unknown().optional().transform((value) => (
   Array.isArray(value)

@@ -1,6 +1,4 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-const execFileAsync = promisify(execFile);
+import { execFileOffMain as execFileAsync } from '../../util/exec-helper.js';
 const CREDENTIAL_PATH = /(?:token|secret|password|credential|id_rsa|\.pem$|\.key$|\.env(?:\.|$))/iu;
 export interface MainCheckoutGuardNotice { project: string; root: string; paths: string[]; credentialPaths: string[] }
 export interface MainCheckoutGuardOptions { exec?: (root: string) => Promise<string>; brainActive?: boolean; writerSession?: string; pairParticipants?: readonly string[]; brainSession?: string }

@@ -9,14 +9,13 @@
  *   Subscribers are wrapped in Readable streams by tmux.ts for terminal streaming.
  */
 
-import { execFile as execFileCallback } from 'node:child_process';
 import { dirname, join } from 'path';
-import { promisify } from 'node:util';
 
 import logger from '../util/logger.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
+import { execFileOffMain as execFile } from '../util/exec-helper.js';
 
 // ── node-pty type shim (package installed at runtime, not in devDependencies) ───
 
@@ -78,7 +77,6 @@ interface ConptySession {
 }
 
 const sessions = new Map<string, ConptySession>();
-const execFile = promisify(execFileCallback);
 
 // ── Ring buffer helper ──────────────────────────────────────────────────────────
 

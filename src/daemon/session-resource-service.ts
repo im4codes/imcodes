@@ -1,5 +1,3 @@
-import { execFile as execFileCallback } from 'node:child_process';
-import { promisify } from 'node:util';
 import { readProcessCpuMillis } from '../util/process-start.js';
 import type { SessionRecord } from '../store/session-store.js';
 import {
@@ -20,6 +18,7 @@ import {
   type SessionResourceOwner,
   type SessionResourceRecord,
 } from './session-resource-registry.js';
+import { execFileOffMain as execFile } from '../util/exec-helper.js';
 
 const registry = new SessionResourceRegistry({
   isTmuxHandleCurrent: async (name, paneId) => {
@@ -27,7 +26,6 @@ const registry = new SessionResourceRegistry({
     return isTmuxSessionResourceHandleCurrent(name, paneId);
   },
 });
-const execFile = promisify(execFileCallback);
 let stopExpirySweep: (() => void) | null = null;
 const mcpCpuSamples = new Map<string, {
   cpuMs: number;

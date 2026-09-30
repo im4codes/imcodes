@@ -1,7 +1,6 @@
-import { execFile as execFileCb, execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
-import { promisify } from 'util';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
@@ -33,8 +32,8 @@ import {
 } from './wezterm.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
+import { execFileOffMain as execFile } from '../util/exec-helper.js';
 
-const execFile = promisify(execFileCb);
 
 // ── Backend detection ───────────────────────────────────────────────────────────
 

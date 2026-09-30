@@ -1,9 +1,7 @@
-import { execFile as execFileCallback } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import {
   SESSION_RESOURCE_HANDLE_TYPE,
   SESSION_RESOURCE_KIND,
@@ -15,8 +13,8 @@ import {
 } from '../../shared/session-resource-lifecycle.js';
 import { MCP_LIFECYCLE_EVENT, appendMcpLifecycleEvent, mcpLifecycleLogPath } from './mcp-lifecycle-log.js';
 import { readProcessStart } from '../util/process-start.js';
+import { execFileOffMain as execFile } from '../util/exec-helper.js';
 
-const execFile = promisify(execFileCallback);
 const RECORD_VERSION = 1;
 const FIELD_LIMIT = 512;
 const PODMAN_ID = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;

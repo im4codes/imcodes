@@ -1,4 +1,3 @@
-import { execFile } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import {
   lstat,
@@ -16,7 +15,6 @@ import {
 } from 'node:fs/promises';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { TASK_PAIR_WORKTREE_PREFIX } from '../../shared/task-pair.js';
 import type { SupervisionRetentionGcResult } from './supervision-retention-gc.js';
 import {
@@ -25,8 +23,8 @@ import {
   isTerminalSupervisionWorktreeAssignmentStatus,
   isTerminalSupervisionWorktreeTaskStatus,
 } from '../../shared/supervision-retention.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 
 export const SUPERVISION_WORKTREE_GC_DEFAULT_LIMIT = 25 as const;
 export const SUPERVISION_WORKTREE_GC_MAX_LIMIT = 100 as const;

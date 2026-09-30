@@ -1,7 +1,5 @@
 /** GitHub RepoProvider — uses `gh api` (REST) via execFile. */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 
 import type {
   RepoContext,
@@ -21,8 +19,8 @@ import type {
 import type { RepoProvider, ListOptions, CommitListOptions } from './provider.js';
 import { DEFAULT_PAGE_SIZE } from './provider.js';
 import { detectRepo } from './detector.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 
 /** Translate gh CLI failures into typed RepoError. */
 function translateError(err: unknown): RepoError {

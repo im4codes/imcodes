@@ -114,10 +114,9 @@ import {
 import { homedir } from 'os';
 import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
-import { exec as execCb, execFile as execFileCb } from 'node:child_process';
+import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
-const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
 import {
   expandP2pTargets as expandP2pTargetsShared,
@@ -3589,6 +3588,7 @@ import {
   loadDaemonP2pStaticPolicy,
   readCachedHelloSnapshot,
 } from './p2p-workflow-static-policy.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
 function makeBindRuntimeContext(
   options: {

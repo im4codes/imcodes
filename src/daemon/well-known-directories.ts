@@ -24,14 +24,12 @@
  * same `resolveCanonical` / `isFilePreviewPathAllowed` gate as any other path;
  * see `handleFileDirectoryList`.
  */
-import { execFile } from 'node:child_process';
 import { readFile as fsReadFile, stat as fsStat } from 'node:fs/promises';
 import { homedir as osHomedir } from 'node:os';
 import path from 'node:path';
-import { promisify } from 'node:util';
 import { resolveMacosConsoleUser } from '../node/user-session-launcher.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 
 export const WELL_KNOWN_DIRECTORY = {
   HOME: 'home',

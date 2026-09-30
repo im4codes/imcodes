@@ -8,6 +8,7 @@ import type {
 } from '../../shared/context-types.js';
 import { GitOriginRepositoryIdentityService } from './repository-identity-service.js';
 import { detectRepo } from '../repo/detector.js';
+import { getRepoGenerationSnapshot } from '../repo/generation.js';
 import { fetchBackendStartupMemoryItems } from '../context/backend-startup-memory.js';
 import { fetchBackendSharedContextNamespace } from '../context/backend-context-namespace.js';
 import { getSharedContextRuntimeCredentials } from '../context/shared-context-runtime.js';
@@ -61,6 +62,46 @@ export interface TransportContextBootstrap {
 
 const repositoryIdentityService = new GitOriginRepositoryIdentityService();
 
+/**
+ * The bootstrap runs on every send and live-context ingest but only needs the
+ * origin URL, which barely changes. Re-running detectRepo's git/ssh/CLI/auth chain
+ * each time is what made this the second-largest spawner on the daemon main thread,
+ * so the URL is cached per project directory. A repo generation bump (an explicit
+ * repo refresh) invalidates the entry; otherwise it expires so an outside
+ * `git remote set-url` is still picked up. Failures are cached too (a directory
+ * that is not a repo stays not-a-repo for the TTL).
+ */
+export const ORIGIN_URL_CACHE_TTL_MS = 60_000;
+const originUrlCache = new Map<string, { url: string | null; repoGeneration: number; expiresAt: number }>();
+const originUrlInflight = new Map<string, Promise<string | null>>();
+
+export function __clearOriginUrlCacheForTests(): void {
+  originUrlCache.clear();
+  originUrlInflight.clear();
+}
+
+export async function resolveCachedOriginUrl(projectDir: string): Promise<string | null> {
+  const { repoGeneration } = getRepoGenerationSnapshot(projectDir);
+  const cached = originUrlCache.get(projectDir);
+  if (cached && cached.expiresAt > Date.now() && cached.repoGeneration === repoGeneration) return cached.url;
+  const inflight = originUrlInflight.get(projectDir);
+  if (inflight) return inflight;
+  const lookup = (async (): Promise<string | null> => {
+    let url: string | null = null;
+    try {
+      url = (await detectRepo(projectDir)).info?.remoteUrl ?? null;
+    } catch {
+      url = null;
+    }
+    originUrlCache.set(projectDir, { url, repoGeneration, expiresAt: Date.now() + ORIGIN_URL_CACHE_TTL_MS });
+    return url;
+  })().finally(() => {
+    originUrlInflight.delete(projectDir);
+  });
+  originUrlInflight.set(projectDir, lookup);
+  return lookup;
+}
+
 export async function resolveTransportContextBootstrap(
   input: TransportContextBootstrapInput,
 ): Promise<TransportContextBootstrap> {
@@ -75,8 +116,7 @@ export async function resolveTransportContextBootstrap(
   let originUrl: string | null | undefined;
   if (projectDir) {
     try {
-      const repo = await detectRepo(projectDir);
-      originUrl = repo.info?.remoteUrl ?? null;
+      originUrl = await resolveCachedOriginUrl(projectDir);
     } catch {
       originUrl = null;
     }

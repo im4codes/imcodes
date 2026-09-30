@@ -1,12 +1,10 @@
 /** Repo detection — platform, CLI, auth, branch. */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import type { RepoContext, RepoPlatform, RepoStatus } from './types.js';
 import { getCurrentBranch as getLocalCurrentBranch } from './local-git.js';
 import { getRepoGenerationSnapshot } from './generation.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 
 const GH_MIN_VERSION = '2.0.0';
 const GLAB_MIN_VERSION = '1.22.0';

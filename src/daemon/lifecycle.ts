@@ -58,6 +58,7 @@ import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runti
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
+import { shutdownExecHelper, startExecHelper } from '../util/exec-helper.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
 import { backfillProjectionEmbeddings } from '../context/projection-embedding-maintenance.js';
@@ -594,6 +595,9 @@ export function describeDaemonStartupFailure(error: unknown): DaemonStartupFailu
 
 /** Startup sequence: config → store → memory → sessions → server link */
 export async function startup(): Promise<DaemonContext> {
+  // Fork the exec helper FIRST, while the daemon is still small: every later tmux/git/ps
+  // spawn is posted to it instead of forking from this (soon multi-GB) process.
+  startExecHelper();
   logger.info({
     version: DAEMON_VERSION,
     buildSha: process.env.IMCODES_BUILD_SHA ?? process.env.GIT_COMMIT ?? process.env.SOURCE_VERSION ?? 'unknown',
@@ -2080,6 +2084,13 @@ async function performShutdown(exitCode: number): Promise<void> {
     logger.info('Store flushed');
   } catch (e) {
     logger.error({ err: e }, 'Error during shutdown');
+  }
+
+  // Last spawner to go: later spawns (lock release, exit paths) run directly, not via the helper.
+  try {
+    await shutdownExecHelper();
+  } catch (err) {
+    logger.warn({ errorKind: err instanceof Error ? err.name : typeof err }, 'Daemon shutdown exec helper stop failed');
   }
 
   if (lockServer) {

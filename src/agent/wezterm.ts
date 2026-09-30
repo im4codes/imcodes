@@ -11,15 +11,14 @@
  * from persisted SessionRecord.paneId values.
  */
 
-import { execFile as execFileCb, execFileSync } from 'child_process';
-import { promisify } from 'util';
+import { execFileSync } from 'child_process';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { Readable } from 'stream';
 import { TMUX_KEY_TO_ESCAPE } from './key-map.js';
+import { execFileOffMain as execFile } from '../util/exec-helper.js';
 
-const execFile = promisify(execFileCb);
 
 // ── Name → pane_id mapping ─────────────────────────────────────────────────────
 

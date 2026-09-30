@@ -20,7 +20,7 @@ vi.mock('../../src/repo/detector.js', async (importOriginal) => {
   };
 });
 
-import { buildTransportStartupMemory, resolveTransportContextBootstrap } from '../../src/agent/runtime-context-bootstrap.js';
+import { buildTransportStartupMemory, resolveTransportContextBootstrap, __clearOriginUrlCacheForTests } from '../../src/agent/runtime-context-bootstrap.js';
 
 describe('resolveTransportContextBootstrap', () => {
   let tempDir: string;
@@ -28,6 +28,7 @@ describe('resolveTransportContextBootstrap', () => {
 
   beforeEach(() => {
     detectRepoMock.mockReset();
+    __clearOriginUrlCacheForTests();
     resetMemoryShortRefsForTests();
     projectionOwnerCache.clear();
     configureSharedContextRuntime(null);

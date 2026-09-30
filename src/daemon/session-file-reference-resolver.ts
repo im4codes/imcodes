@@ -1,13 +1,11 @@
-import { execFile } from 'node:child_process';
 import { lstat, readdir, realpath, stat } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import * as path from 'node:path';
-import { promisify } from 'node:util';
 import { normalizeChatFileReference } from '../../shared/chat-local-path.js';
 import { FS_GENERIC_ERROR_CODES, type FsGenericErrorCode } from '../../shared/fs-error-codes.js';
 import { isFilePreviewPathAllowed } from './file-preview-path-policy.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 const SEARCH_MAX_DEPTH = 4;
 const SEARCH_MAX_ENTRIES = 2_000;
 const ATTEMPT_REPORT_LIMIT = 16;

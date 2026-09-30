@@ -1,7 +1,5 @@
 /** GitLab RepoProvider — read-only, uses `glab api`. */
 
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 
 import type {
   RepoBranch,
@@ -25,8 +23,8 @@ import type {
   RepoProvider,
 } from './provider.js';
 import { DEFAULT_PAGE_SIZE } from './provider.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 
 /** Map GitLab issue/MR state strings to our normalized states. */
 function mapIssueState(state: string): 'open' | 'closed' {

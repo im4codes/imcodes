@@ -1,8 +1,7 @@
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
-import { execFile, type ExecFileOptions } from 'node:child_process';
+import { type ExecFileOptions } from 'node:child_process';
 import { mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { promisify } from 'node:util';
 import logger from '../util/logger.js';
 import {
   IMCODES_MEMORY_MCP_LAUNCH_ARGS,
@@ -11,8 +10,8 @@ import {
 } from '../agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 import { MEMORY_MCP_PROVIDER_STATUS_REASON } from '../../shared/memory-ws.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 function noticeMarker(): string { return join(resolveImcodesHome(), 'qwen-mcp-notice-shown'); }
 const DAEMON_CONFLICT_SERVER_NAME = `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`;
 

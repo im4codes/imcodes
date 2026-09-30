@@ -1,8 +1,6 @@
-import { execFile as execFileCallback } from 'node:child_process';
 import { readFile } from 'node:fs/promises';
-import { promisify } from 'node:util';
+import { execFileOffMain as execFileAsync } from './exec-helper.js';
 
-const execFileAsync = promisify(execFileCallback);
 
 export const PROCESS_START_BATCH = {
   MAX_PIDS_PER_SPAWN: 200,

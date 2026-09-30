@@ -2,14 +2,12 @@ import { readFile } from 'node:fs/promises';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import type { ProviderQuotaMeta, ProviderQuotaWindow } from '../../shared/provider-quota.js';
 import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 import { getAgentVersion } from './agent-version.js';
 import logger from '../util/logger.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 
 // Private endpoint the Claude Code CLI's /usage uses; only `Authorization:
 // Bearer <oauth access token>` is required (verified). Returns the full

@@ -1,11 +1,9 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 
 import { getPanePids } from './tmux.js';
 import type { SessionRecord } from '../store/session-store.js';
 import logger from '../util/logger.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 const SAFE_IMCODES_SESSION_RE = /^deck_[a-zA-Z0-9_-]+$/;
 
 export type CloseStage =

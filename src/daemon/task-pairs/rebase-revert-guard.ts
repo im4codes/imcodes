@@ -1,10 +1,8 @@
 /** Bounded, warning-only guard for silent reverts across pair rebases. */
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { existsSync } from 'node:fs';
 import type { ResolvedTaskPairMaterial } from './material.js';
+import { execFileOffMain as execFileAsync } from '../../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 const COMMAND_TIMEOUT_MS = 4_000;
 const TOTAL_BUDGET_MS = 5_000;
 const MAX_OUTPUT = 256 * 1024;

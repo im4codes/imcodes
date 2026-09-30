@@ -1,12 +1,10 @@
-import { execFile } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { link, mkdir, readFile, realpath, rm, stat, writeFile } from 'node:fs/promises';
 import { basename, dirname, join, relative, resolve, sep } from 'node:path';
-import { promisify } from 'node:util';
 
 import { resolveSupervisionAssignmentWorktree } from './supervision-worktree-inspector.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 const JOURNAL_NAME = '.worktree-provision.json';
 const LEASE_NAME = '.worktree-provision.lock';

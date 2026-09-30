@@ -2,8 +2,6 @@ import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/c
 import { lstat, mkdir, readdir, readFile, realpath, stat } from 'node:fs/promises';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { getSession } from '../store/session-store.js';
 import { getTransportRuntime, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
@@ -91,6 +89,7 @@ import {
 import { resolveConfiguredP2pTargets } from './p2p-target-selection.js';
 import { enqueueResend, removeResendEntries, recipientFromSessionRecord } from './transport-resend-queue.js';
 import type { ExecutionCloneParentStage } from '../../shared/execution-clone.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
 /**
  * Parent stage owning the Auto Deliver IMPLEMENTATION prompt's task semantics.
@@ -338,7 +337,6 @@ const acceptanceAuditIdleRecheckTimers = new Map<string, ReturnType<typeof setTi
 const implementationAdvancesInFlight = new Set<Promise<void>>();
 const acceptanceAuditAdvancesInFlight = new Map<string, Promise<void>>();
 let timelineUnsubscribe: (() => void) | null = null;
-const execFileAsync = promisify(execFile);
 const OPENSPEC_AUTO_DELIVER_AUDIT_FIX_RETRY_WAIT_MS = process.env.NODE_ENV === 'test' ? 50 : 15_000;
 // Minimum spacing between implementation "marker missing" reminders. Unless the
 // implementation just made task progress, a reminder is throttled to at least
