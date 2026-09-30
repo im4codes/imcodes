@@ -58,6 +58,7 @@ import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActi
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
+import { checkStaleBaseNotice } from './integration-drift.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
 import { applyBackCow, hasUnfinishedApplyBack, rollbackApplyBack, undoApplyBack } from './non-git.js';
@@ -707,6 +708,12 @@ export class TaskPairService {
       });
       if (busySessions.size > 0) stored = this.#noteParticipantConflicts(input.project, stored, busySessions);
       this.#track(refreshTaskPairWorkspaceHead(input.project, stored.state.taskId));
+    }
+    // A head handed to audit or PASSed on a base far behind the integration branch: warn once (background, never a gate).
+    if (stored && transition.pair && !isTerminalTaskPairStatus(stored.state.status)) {
+      const staleStage = input.marker.knownVerb === 'READY_FOR_AUDIT' && transition.toStatus === 'in_audit' ? 'ready'
+        : input.marker.knownVerb === 'PASS' && transition.toStatus === 'passed' ? 'pass' : undefined;
+      if (staleStage) this.#track(checkStaleBaseNotice(input.project, stored.state.taskId, staleStage));
     }
     if (stored && transition.pair && this.#shouldAutoTickChecklist(input.marker.knownVerb, transition, stored.state)) {
       stored = this.#autoTickChecklist(input.project, stored, input.eventId, now, input.marker.knownVerb!);
@@ -1369,6 +1376,13 @@ export class TaskPairService {
       next.brainReminderLastAt = undefined;
     }
     next.bothIdleNudgedAt = undefined;
+    // A finished pair that is worked on again is no longer "integrated" or reminded about: its next DONE starts over.
+    if (transition.toStatus !== undefined && transition.toStatus !== 'done') {
+      next.integrationKey = undefined;
+      next.integrationReminderCount = undefined;
+      next.integrationReminderLastAt = undefined;
+      next.integrationIntegratedAt = undefined;
+    }
     // A new delivery round starts both sides with a clean slate: the pair
     // sat idle in `passed`, and neither that nor the previous round's silence
     // may count against the new round.

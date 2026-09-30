@@ -23,9 +23,7 @@ import { getSession, listSessions, type SessionRecord } from '../../store/sessio
 import { restartSession } from '../../agent/session-manager.js';
 import {
   TASK_PAIR_BOTH_IDLE_NUDGE_MS,
-  TASK_PAIR_BRAIN_REMINDER_INITIAL_MS,
-  TASK_PAIR_BRAIN_REMINDER_SECOND_MS,
-  TASK_PAIR_BRAIN_REMINDER_REPEAT_MS,
+  resolveTaskPairBrainReminderInterval,
   TASK_PAIR_BRAIN_MIN_GAP_MS,
   TASK_PAIR_HEARTBEAT_MS,
   TASK_PAIR_NO_AUDITOR,
@@ -43,6 +41,7 @@ import {
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { isPairsEngineProject, projectBrainSession, resolveTaskPairMaxConcurrency } from './engine.js';
+import { runIntegrationDriftPass } from './integration-drift.js';
 import { sendTaskPairMessage } from './delivery.js';
 import { hasRecentTaskPairProviderError } from './provider-errors.js';
 import { mainCheckoutGuard } from './main-checkout-guard.js';
@@ -160,10 +159,7 @@ export function resolveTaskPairBothIdleNudgeMs(env: NodeJS.ProcessEnv = process.
 
 /** Public pure helpers keep the cadence contract regression-testable without
  * starting a daemon timer or depending on session state. */
-export function resolveTaskPairBrainReminderInterval(count: number): number {
-  return count <= 0 ? TASK_PAIR_BRAIN_REMINDER_INITIAL_MS
-    : count === 1 ? TASK_PAIR_BRAIN_REMINDER_SECOND_MS : TASK_PAIR_BRAIN_REMINDER_REPEAT_MS;
-}
+export { resolveTaskPairBrainReminderInterval };
 
 export function isTaskPairBrainReminderDue(waitStartedAt: number, now: number, count = 0): boolean {
   return now - waitStartedAt >= resolveTaskPairBrainReminderInterval(count);
@@ -766,6 +762,10 @@ export class TaskPairAutomation implements TaskPairScheduler {
       this.#startupParticipantCheckDone = true;
       this.#reportStartupParticipantConflicts();
     }
+    // Finished pairs whose head never reached the integration branch: reminded to Brain (integration-drift.ts). In the
+    // background and one pass at a time -- git must never hold the heartbeat -- and it asks git only for pairs whose
+    // reminder is due.
+    void runIntegrationDriftPass(now).catch((error) => logger.warn({ err: error }, 'task-pair: integration drift pass failed'));
     const brains = new Map<string, string>();
     // One busy snapshot per tick: the nudge this tick queues for one pair must
     // not make the same idle session look busy for its other pairs.

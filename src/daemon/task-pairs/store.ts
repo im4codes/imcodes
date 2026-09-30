@@ -95,6 +95,15 @@ export interface TaskPairLiveness {
   lastMaterialAt?: number;
   stageStallPromptAt?: number;
   stageStallEscalatedAt?: number;
+  /**
+   * Unintegrated-DONE reminders (integration-drift.ts), durable so a restart neither repeats a burst nor restarts the grace.
+   * `integrationKey` names what they concern (`<head>@<ended at>`): a different head or a reopened-and-finished-again pair starts over.
+   */
+  integrationKey?: string;
+  integrationReminderCount?: number;
+  integrationReminderLastAt?: number;
+  /** The head was found integrated (ancestor or patch-equivalent) at this time: nothing more to remind or check. */
+  integrationIntegratedAt?: number;
 }
 
 export interface StoredTaskPair {
@@ -436,6 +445,22 @@ export class TaskPairStore {
     return rows.map((row) => this.#hydrate(row));
   }
 
+  /**
+   * Finished (done) git-worktree pairs since `sinceMs`, newest first, that still need the unintegrated-DONE check: not dismissed and
+   * not already found integrated. Filtered in SQL, so the input of the reminder pass is bounded by the pairs that can still matter,
+   * never by every recently closed pair (each row carries its brief).
+   */
+  listRecentDonePairs(sinceMs: number, limit: number): StoredTaskPair[] {
+    const rows = this.#db.prepare(
+      `SELECT * FROM task_pairs WHERE status = 'done' AND updated_at >= ?
+         AND json_extract(state_json, '$.workspace.kind') = 'worktree'
+         AND json_extract(state_json, '$.integrationDismissedAt') IS NULL
+         AND json_extract(liveness_json, '$.integrationIntegratedAt') IS NULL
+       ORDER BY updated_at DESC LIMIT ?`,
+    ).all(sinceMs, limit) as Array<Record<string, unknown>>;
+    return rows.map((row) => this.#hydrate(row));
+  }
+
   /** Non-terminal pairs in which a session takes part. */
   pairsForSession(sessionName: string): StoredTaskPair[] {
     // Served from memory. The returned pairs are shared with the cache: read
@@ -720,6 +745,10 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.lastMaterialAt)) ? { lastMaterialAt: Number(raw.lastMaterialAt) } : {}),
     ...(Number.isFinite(Number(raw.stageStallPromptAt)) ? { stageStallPromptAt: Number(raw.stageStallPromptAt) } : {}),
     ...(Number.isFinite(Number(raw.stageStallEscalatedAt)) ? { stageStallEscalatedAt: Number(raw.stageStallEscalatedAt) } : {}),
+    ...(typeof raw.integrationKey === 'string' ? { integrationKey: raw.integrationKey } : {}),
+    ...(Number.isFinite(Number(raw.integrationReminderCount)) ? { integrationReminderCount: Number(raw.integrationReminderCount) } : {}),
+    ...(Number.isFinite(Number(raw.integrationReminderLastAt)) ? { integrationReminderLastAt: Number(raw.integrationReminderLastAt) } : {}),
+    ...(Number.isFinite(Number(raw.integrationIntegratedAt)) ? { integrationIntegratedAt: Number(raw.integrationIntegratedAt) } : {}),
   };
   return {
     project: String(row.project),

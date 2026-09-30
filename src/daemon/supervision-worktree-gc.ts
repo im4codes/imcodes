@@ -554,19 +554,37 @@ export async function countTaskPairUnpushedCommits(repoPath: string, baseRevisio
   return Number.isFinite(count) ? count : undefined;
 }
 
-/** Count executor commits after base that are not patch-equivalent to origin/dev. */
-export async function countTaskPairCommitsNotInDev(repoPath: string, baseRevision: string): Promise<number | undefined> {
-  const commits = await runGit(repoPath, ['rev-list', '--reverse', `${baseRevision}..HEAD`]);
+/** The integration ref a worktree's commits are measured against unless a caller names another. */
+export const TASK_PAIR_DEFAULT_INTEGRATION_REF = 'origin/dev' as const;
+
+/**
+ * The executor commits after `baseRevision` (up to `head`, default HEAD) that are neither reachable from nor
+ * patch-equivalent to `integrationRef` (default origin/dev): what Brain has not integrated yet. Oldest first.
+ * `undefined` when git cannot tell (unknown revision, missing ref, timeout).
+ */
+export async function listTaskPairCommitsNotInIntegration(
+  repoPath: string,
+  baseRevision: string,
+  options: { integrationRef?: string; head?: string } = {},
+): Promise<string[] | undefined> {
+  const head = options.head ?? 'HEAD';
+  const integrationRef = options.integrationRef ?? TASK_PAIR_DEFAULT_INTEGRATION_REF;
+  const commits = await runGit(repoPath, ['rev-list', '--reverse', `${baseRevision}..${head}`]);
   if (!commits.ok) return undefined;
   const hashes = commits.stdout.trim().split(/\s+/u).filter(Boolean);
-  if (hashes.length === 0) return 0;
-  const cherry = await runGit(repoPath, ['cherry', 'origin/dev', 'HEAD']);
+  if (hashes.length === 0) return [];
+  const cherry = await runGit(repoPath, ['cherry', integrationRef, head]);
   if (!cherry.ok) return undefined;
   const unique = new Set(cherry.stdout.split(/\r?\n/u).flatMap((line) => {
     const match = /^\+\s+([0-9a-f]{40})$/u.exec(line.trim());
     return match ? [match[1]] : [];
   }));
-  return hashes.filter((hash) => unique.has(hash)).length;
+  return hashes.filter((hash) => unique.has(hash));
+}
+
+/** Count executor commits after base that are not patch-equivalent to origin/dev. */
+export async function countTaskPairCommitsNotInDev(repoPath: string, baseRevision: string): Promise<number | undefined> {
+  return (await listTaskPairCommitsNotInIntegration(repoPath, baseRevision))?.length;
 }
 
 export async function removeRegisteredGitWorktree(

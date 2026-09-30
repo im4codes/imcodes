@@ -115,6 +115,27 @@ export const TASK_PAIR_WORKS_DIR = 'works' as const;
 export const TASK_PAIR_WORKS_ROOT_ENV = 'IMCODES_WORKS_ROOT' as const;
 /** A pair's workspace is removed this long after the pair ends (DONE/CANCEL). */
 export const TASK_PAIR_WORKSPACE_RETENTION_MS = 7 * 24 * 60 * 60_000;
+
+/**
+ * Integration drift (owner rule: Brain merges every PASSed pair; tsk_cd_pair_integration_drift). A finished pair whose final
+ * head is not in the integration branch is reminded to Brain after this grace, then on the Brain-reminder pacing.
+ */
+export const TASK_PAIR_INTEGRATION_REMINDER_GRACE_MS = 20 * 60_000;
+/** Only pairs that ended this recently are reminded: pairs finished before the feature (or long ago) never flood Brain. */
+export const TASK_PAIR_INTEGRATION_REMINDER_WINDOW_MS = TASK_PAIR_WORKSPACE_RETENTION_MS;
+/** At most this many pairs (newest first) are tracked per heartbeat, and listed in one digest line each. */
+export const TASK_PAIR_INTEGRATION_REMINDER_MAX_PAIRS = 20;
+/** A head whose merge-base is more than this many commits or hours behind the integration ref draws the rebase warning. */
+export const TASK_PAIR_STALE_BASE_MAX_COMMITS = 50;
+export const TASK_PAIR_STALE_BASE_MAX_AGE_MS = 48 * 60 * 60_000;
+/** Overrides the integration ref (default: origin/dev, then origin/main, origin/master, then the same local branches). */
+export const TASK_PAIR_INTEGRATION_REF_ENV = 'IMCODES_PAIR_INTEGRATION_REF' as const;
+/** Commits whose subject starts with this prefix are evidence, never integrated, and do not count as unintegrated work. */
+export const TASK_PAIR_EVIDENCE_COMMIT_PREFIX = 'evidence:' as const;
+/** `DONE <taskId> integration=dismiss` (or CANCEL) from Brain on a finished pair ends its unintegrated-DONE reminders. */
+export const TASK_PAIR_INTEGRATION_ATTR = 'integration' as const;
+export const TASK_PAIR_INTEGRATION_DISMISS_VALUE = 'dismiss' as const;
+export const TASK_PAIR_INTEGRATION_DISMISSED_EFFECT = 'integration_dismissed' as const;
 /** A git worktree for code in a git project; a plain task directory otherwise. */
 export const TASK_PAIR_WORKSPACE_KINDS = ['worktree', 'dir'] as const;
 export type TaskPairWorkspaceKind = typeof TASK_PAIR_WORKSPACE_KINDS[number];
@@ -635,6 +656,12 @@ export type TaskPairFlag = typeof TASK_PAIR_FLAGS[number];
 export const TASK_PAIR_BRAIN_REMINDER_INITIAL_MS = 5 * 60_000;
 export const TASK_PAIR_BRAIN_REMINDER_SECOND_MS = 10 * 60_000;
 export const TASK_PAIR_BRAIN_REMINDER_REPEAT_MS = 15 * 60_000;
+
+/** Pacing of every Brain reminder: after `count` reminders already sent, wait this long for the next (5, 10, then 15 min). */
+export function resolveTaskPairBrainReminderInterval(count: number): number {
+  return count <= 0 ? TASK_PAIR_BRAIN_REMINDER_INITIAL_MS
+    : count === 1 ? TASK_PAIR_BRAIN_REMINDER_SECOND_MS : TASK_PAIR_BRAIN_REMINDER_REPEAT_MS;
+}
 /** Hard minimum between any two aggregate Brain heartbeat/reminder messages. */
 export const TASK_PAIR_BRAIN_MIN_GAP_MS = 10 * 60_000;
 
@@ -969,6 +996,8 @@ export interface TaskPairState {
   closedNoticeSentTo?: readonly string[];
   /** The round in which the executor was last told that its STARTED/WORKING was ignored because the pair is in audit (one notice per round). */
   inAuditNoticeRound?: number;
+  /** Brain dismissed the unintegrated-DONE reminders for this finished pair (DONE integration=dismiss, or CANCEL after DONE). */
+  integrationDismissedAt?: number;
   /** Actual start time. Undefined while queued; unlike createdAt this does not
    * include time spent waiting for a named participant or a free slot. */
   startedAt?: number;
@@ -1901,6 +1930,7 @@ export function applyTaskPairMarker(
     }
     case 'DONE': {
       const force = role === 'brain' && isTrue(attrs.force);
+      if (terminal && existing.status === 'done' && roleAuthority && attrs[TASK_PAIR_INTEGRATION_ATTR] === TASK_PAIR_INTEGRATION_DISMISS_VALUE) return dismissIntegration(existing, ctx.now);
       if (terminal) return recorded(existing, false);
       if (force) {
         applyOutputAttr(pair, attrs);
@@ -1988,6 +2018,8 @@ export function applyTaskPairMarker(
     }
     case 'CANCEL': {
       if (!roleAuthority) return reject('Only Brain or the daemon may CANCEL a pair; your marker was recorded but not applied.');
+      // A finished pair stays done; Brain's CANCEL says "do not merge it" and ends the unintegrated-DONE reminders.
+      if (existing.status === 'done') return dismissIntegration(existing, ctx.now);
       if (terminal) return recorded(existing, false);
       pair.status = 'cancelled';
       intents.push({ kind: 'slot_changed' });
@@ -1996,6 +2028,15 @@ export function applyTaskPairMarker(
     default:
       return recorded(existing);
   }
+}
+
+/** Brain's "do not remind me about merging this finished pair" (status untouched; already-dismissed is a no-op). */
+function dismissIntegration(existing: TaskPairState, now: number): TaskPairTransition {
+  if (existing.integrationDismissedAt !== undefined) return recorded(existing, false);
+  const pair = clonePair(existing);
+  pair.updatedAt = now;
+  pair.integrationDismissedAt = now;
+  return { pair, fromStatus: existing.status, toStatus: existing.status, effect: TASK_PAIR_INTEGRATION_DISMISSED_EFFECT, unusual: false, intents: [] };
 }
 
 function setRolesFromAttrsQueued(pair: TaskPairState, attrs: Record<string, string>): void {
@@ -2171,7 +2212,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_SELF_SUFFICIENCY_RULE,
     TASK_PAIR_SCOPE_DECISION_RULE,
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. An empty or unconfigured pool asks the user which models to use; never invent a default. Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
-    `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. Include title="<short specific title>" in the owner's UI language, for example DISPATCH tsk_demo title="Fix login retry" executor=<session> auditor=<session>. DISPATCH <taskId> title="..." executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
+    `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. Include title="<short specific title>" in the owner's UI language, for example DISPATCH tsk_demo title="Fix login retry" executor=<session> auditor=<session>. DISPATCH <taskId> title="..." executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; a finished pair whose head is not yet in the integration branch is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and DONE <taskId> integration=dismiss (or CANCEL <taskId>) stops the reminders for one you will not merge; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

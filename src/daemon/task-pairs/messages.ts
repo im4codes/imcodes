@@ -844,3 +844,45 @@ export function buildPassDoneNoticeMessage(pair: TaskPairState): string {
     ...(pair.status === 'passed' ? [`More rounds planned? Write ${marker('NEXT_ROUND', pair.taskId, '[base=<commit>] [note="..."]')} on this pair instead of letting it be DONE: it returns to working with the same workspace and participants. A DONE pair cannot open another round.`] : []),
   ].join('\n');
 }
+
+function formatDriftAge(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60_000));
+  if (minutes < 90) return `${minutes} min`;
+  const hours = minutes / 60;
+  return hours < 48 ? `${hours.toFixed(1).replace(/\.0$/u, '')} h` : `${Math.round(hours / 24)} d`;
+}
+
+export interface IntegrationDriftLine {
+  taskId: string;
+  head: string;
+  worktree: string;
+  ageMs: number;
+  ref: string;
+  missing: number;
+}
+
+/**
+ * The unintegrated-DONE reminder: ONE message per Brain, ONE line per finished pair whose final head is not in the integration
+ * branch (taskId, head, worktree, age). Brain merges every PASSed pair (owner rule); dismiss one it will not merge.
+ */
+export function buildIntegrationDriftDigest(lines: readonly IntegrationDriftLine[]): string {
+  const ref = lines[0]?.ref || 'the integration branch';
+  const body = lines.map((line) => `- ${line.taskId}: head ${line.head.slice(0, 12)} (${line.missing} commit${line.missing === 1 ? '' : 's'} not in ${line.ref || ref}), worktree ${line.worktree}, finished ${formatDriftAge(line.ageMs)} ago`).join('\n');
+  const example = lines[0]?.taskId ?? '<taskId>';
+  return `Finished pair${lines.length === 1 ? '' : 's'} not yet merged into ${ref} (cherry-picked equivalents count as merged):\n${body}\n`
+    + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head, then push dev). A pair you will not merge: ${marker('DONE', example, 'integration=dismiss')} (or CANCEL ${example}) stops these reminders.`;
+}
+
+const STALE_STAGE_LABEL = { ready: 'READY_FOR_AUDIT', pass: 'PASS' } as const;
+
+function describeStaleBase(head: string, stale: { ref: string; behind: number; ageMs: number }): string {
+  return `head ${head.slice(0, 12)} builds on a base ${stale.behind} commit${stale.behind === 1 ? '' : 's'} (${formatDriftAge(stale.ageMs)}) behind ${stale.ref}`;
+}
+
+export function buildStaleBaseExecutorNotice(pair: TaskPairState, head: string, stale: { ref: string; behind: number; ageMs: number }, stage: 'ready' | 'pass'): string {
+  return `${header(pair)} At ${STALE_STAGE_LABEL[stage]}: ${describeStaleBase(head, stale)}. Rebase onto ${stale.ref} before the final round, re-run the affected tests and send a new READY_FOR_AUDIT with the new head. This is a warning, not a gate.`;
+}
+
+export function buildStaleBaseBrainLine(pair: TaskPairState, head: string, stale: { ref: string; behind: number; ageMs: number }, stage: 'ready' | 'pass'): string {
+  return `${header(pair)} At ${STALE_STAGE_LABEL[stage]}: ${describeStaleBase(head, stale)}; executor ${pair.executor ?? '-'} was told to rebase before the final round (a warning, not a gate).`;
+}
