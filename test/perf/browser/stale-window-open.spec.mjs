@@ -130,6 +130,20 @@ async function runScenario(browser, mode) {
   const consoleLines = [];
   const cdp = await context.newCDPSession(page);
   if (CPU_RATE > 1) await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPU_RATE });
+  // Where the time goes between the tap and the newest message: when the peek left the phone and when its answer arrived.
+  const wsTiming = { peekSentAt: null, peekRequestId: null, peekReceivedAt: null, firstHistorySentAt: null };
+  let openedAtNode = 0;
+  await cdp.send('Network.enable');
+  cdp.on('Network.webSocketFrameSent', ({ response }) => {
+    if (!openedAtNode || typeof response?.payloadData !== 'string' || !response.payloadData.includes('timeline.history_request')) return;
+    let message; try { message = JSON.parse(response.payloadData); } catch { return; }
+    if (wsTiming.firstHistorySentAt === null) wsTiming.firstHistorySentAt = Date.now() - openedAtNode;
+    if (message.contentFilter === 'text' && wsTiming.peekSentAt === null) { wsTiming.peekSentAt = Date.now() - openedAtNode; wsTiming.peekRequestId = message.requestId; }
+  });
+  cdp.on('Network.webSocketFrameReceived', ({ response }) => {
+    if (!wsTiming.peekRequestId || wsTiming.peekReceivedAt !== null || typeof response?.payloadData !== 'string') return;
+    if (response.payloadData.includes(wsTiming.peekRequestId) && response.payloadData.includes('timeline.history')) wsTiming.peekReceivedAt = Date.now() - openedAtNode;
+  });
 
   // The app boots and lists its sessions first (that is not the window opening); the measured "open" is the
   // moment the phone user taps the stale chat, i.e. the route to it is taken.
@@ -142,6 +156,7 @@ async function runScenario(browser, mode) {
   page.on('pageerror', (error) => { if (consoleLines.length < 60) consoleLines.push(`pageerror: ${String(error).slice(0, 300)}`); });
   // One frame loop, installed BEFORE the tap, timestamps the first frame each thing is on screen: the stale cache
   // (any cached message: small indices) and the newest readable message. It reads textContent of the chat only.
+  openedAtNode = Date.now();
   await page.evaluate(({ hash, newest, cachedMax }) => {
     const marks = { openedAt: 0, cache: null, latest: null, gapMarker: null };
     window.__imcMarks = marks;
@@ -182,6 +197,7 @@ async function runScenario(browser, mode) {
     // measured from the tap.
     latestAfterCacheMs: tCachePaintMs === null ? tLatestTextMs : tLatestTextMs - tCachePaintMs,
     gapMarkerAtMs: marks.gapMarker === null ? null : Math.round(marks.gapMarker),
+    wsTiming,
   };
 
   // Sample layout on every frame while the older pages arrive.
@@ -269,7 +285,10 @@ function analyzeOrder(requests) {
   const bounded = requests.filter((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null);
   let descending = true;
   for (let i = 1; i < bounded.length; i += 1) if (!(bounded[i].beforeTs < bounded[i - 1].beforeTs)) descending = false;
-  return { peekFirst, backfillPages: bounded.length, descending };
+  // No hole between consecutive pages: each page's newest event reaches the previous page's oldest one (the +1 overlap).
+  let contiguous = bounded.length > 0;
+  for (let i = 1; i < bounded.length; i += 1) if (!(bounded[i].newestTs >= bounded[i - 1].oldestTs)) contiguous = false;
+  return { peekFirst, backfillPages: bounded.length, descending, contiguous };
 }
 
 const browser = await chromium.launch({ headless: true, args: ['--disable-dev-shm-usage'] });
@@ -295,7 +314,10 @@ for (const [mode, scenario] of Object.entries(scenarios)) {
   if (scenario.gapMarkerAtMs === null && scenario.layout.markerSeen !== true) failures.push(`${mode}: the earlier-messages marker never appeared`);
   if (scenario.markerPresentAtEnd) failures.push(`${mode}: the earlier-messages marker is still shown at the end`);
   if (scenario.gapRecord !== null) failures.push(`${mode}: a hole is still recorded at the end: ${JSON.stringify(scenario.gapRecord)}`);
-  if (scenario.idbRows < TOTAL_EVENTS - 5) failures.push(`${mode}: local cache holds ${scenario.idbRows} of ${TOTAL_EVENTS} events (holes)`);
+  // Pages are written to IndexedDB as they arrive; the app then trims each session's local copy to its newest
+  // LOCAL_RETAINED_EVENTS_PER_SESSION (1000) in the background, so the final row count can only be checked against that floor.
+  if (scenario.idbRows < Math.min(TOTAL_EVENTS, 1000) - 5) failures.push(`${mode}: local cache holds only ${scenario.idbRows} events`);
+  if (!scenario.order.contiguous) failures.push(`${mode}: the backfill pages left a hole between them (${JSON.stringify(scenario.order)})`);
   if (mode === 'reading' && (scenario.layout.driftPx === null || scenario.layout.driftPx > DRIFT_BUDGET_PX)) failures.push(`reading: on-screen row moved ${scenario.layout.driftPx} px (budget ${DRIFT_BUDGET_PX})`);
   if (mode === 'pinned' && scenario.layout.maxBottomGapPx > DRIFT_BUDGET_PX) failures.push(`pinned: view drifted ${scenario.layout.maxBottomGapPx} px from the bottom (budget ${DRIFT_BUDGET_PX})`);
 }

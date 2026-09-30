@@ -3762,6 +3762,30 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     scrollAnchorRef.current = null;
   }, [events, renderItemLimit]);
 
+  // Rows inserted (or a marker shown/removed) ABOVE a reader while newer content stays put — a stale window's hole
+  // being filled newest→oldest in the background — must not move what they are reading. The reader-anchor row keeps
+  // its place: same owner as the measured-layout correction, applied here at commit time because inserting above
+  // the viewport triggers no row measurement of its own. A follower is re-pinned by the follow effect, and a
+  // user-triggered load-older / reveal owns its own height anchor, so both are left alone.
+  const displayStructureRef = useRef<{ first?: string; last?: string; length: number }>({ length: 0 });
+  const gapPlacementKindRef = useRef(historyGapPlacement.kind);
+  useLayoutEffect(() => {
+    const previous = displayStructureRef.current;
+    const next = {
+      first: displayViewItems[0]?.key,
+      last: displayViewItems[displayViewItems.length - 1]?.key,
+      length: displayViewItems.length,
+    };
+    displayStructureRef.current = next;
+    const gapPlacementChanged = gapPlacementKindRef.current !== historyGapPlacement.kind;
+    gapPlacementKindRef.current = historyGapPlacement.kind;
+    if (preview || previous.length === 0) return;
+    const changedAbove = previous.last === next.last && (previous.first !== next.first || previous.length !== next.length);
+    if (!changedAbove && !gapPlacementChanged) return;
+    if (autoScrollRef.current || scrollAnchorRef.current) return;
+    restoreReaderAnchor();
+  }, [displayViewItems, historyGapPlacement.kind]);
+
   // Fallback for timestamp-based message additions. The layout effect above handles
   // streaming edits and other view changes that do not advance timestamps.
   useEffect(() => {
