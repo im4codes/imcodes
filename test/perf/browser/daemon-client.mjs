@@ -312,8 +312,11 @@ function sendGrowingChunk(name, burstNumber) {
 
 let burst = 0;
 let ticks = 0;
+// The stale-window spec asks for a reply streaming at the bottom of the stale chat (after the flip) by creating this file.
+const staleStreamFile = path.join(uploadRoot, 'stale-stream');
 const tick = setInterval(() => {
   ticks += 1;
+  if (staleSessionEnabled && existsSync(staleStreamFile) && existsSync(path.join(uploadRoot, 'stale-flip')) && dueToEmit(STALE_SESSION_NAME)) sendGrowingChunk(STALE_SESSION_NAME, ++burst);
   for (let index = 0; index < activeTimelineNames.length; index += 1) {
     const name = activeTimelineNames[index];
     if (index < streamingSessions) {

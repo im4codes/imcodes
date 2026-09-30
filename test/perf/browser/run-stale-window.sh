@@ -13,7 +13,7 @@ mkdir -p "$RESULTS" "$RUN_ROOT"
 APP_SHA="$(git -C "$ROOT" rev-parse "$APP_REF")"
 git -C "$ROOT" archive "$APP_REF" | tar -xf - -C "$RUN_ROOT"
 mkdir -p "$RUN_ROOT/test/perf/browser"
-for f in daemon-client.mjs stale-window-open.spec.mjs stale-timeline.mjs perf-auth.mjs docker-compose.yml Dockerfile; do
+for f in daemon-client.mjs stale-window-open.spec.mjs stale-timeline.mjs perf-auth.mjs touch-fling.mjs stream-script.mjs docker-compose.yml Dockerfile; do
   cp "$ROOT/test/perf/browser/$f" "$RUN_ROOT/test/perf/browser/$f"
 done
 PROJECT="imc-stale-$LABEL-$$"
@@ -23,6 +23,8 @@ export IMC_PERF_RESULTS_HOST="$RESULTS"
 export IMC_PERF_PORT_BASE="${IMC_PERF_PORT_BASE:-$((20000 + RANDOM % 2000))}"
 export IMC_PERF_WEB_PORT_BASE="${IMC_PERF_WEB_PORT_BASE:-$((24000 + RANDOM % 2000))}"
 export IMC_PERF_HISTORY_FAITHFUL=1 IMC_PERF_STALE_SESSION=1
+# The *-stream scenarios ask the fake daemon for a Markdown reply that streams in bursts at the bottom of the stale chat.
+export IMC_PERF_STREAM_CONTENT="${IMC_PERF_STREAM_CONTENT:-markdown}" IMC_PERF_STREAM_CADENCE="${IMC_PERF_STREAM_CADENCE:-bursty}"
 # One phone, one chat: the default 20-window load would put a dozen other timelines' history requests in the same
 # queue and measure that instead of the stale window.
 export IMC_PERF_SESSIONS="${IMC_PERF_SESSIONS:-2}"

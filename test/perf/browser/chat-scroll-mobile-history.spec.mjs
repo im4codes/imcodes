@@ -27,6 +27,7 @@
  */
 import { createRequire } from 'node:module';
 import { writeFileSync } from 'node:fs';
+import { fling } from './touch-fling.mjs';
 const require = createRequire(new URL('../../../web/package.json', import.meta.url));
 const { chromium } = require('@playwright/test');
 
@@ -187,25 +188,6 @@ function analyze({ frames, writes }, label) {
   out.maxBlankPx = round(out.maxBlankPx);
   out.maxJumpPx = round(out.maxJumpPx); out.activeWritePx = round(out.activeWritePx); out.maxAbsWritePx = round(out.maxAbsWritePx);
   return out;
-}
-
-async function fling(cdp, box, distance, speed) {
-  // Real touch drag that LIFTS WHILE MOVING, so Chromium's compositor keeps
-  // scrolling on momentum after the finger is gone (the phone case). Finger moves
-  // DOWN the screen = older rows revealed. `speed` is px/s at ~60 Hz move events.
-  const x = box.x + box.width / 2;
-  const perStep = Math.max(6, Math.round(speed / 60));
-  const steps = Math.max(4, Math.round(distance / perStep));
-  const y0 = box.y + box.height * 0.15;
-  const yMax = box.y + box.height * 0.9;
-  let y = y0;
-  await cdp.send('Input.dispatchTouchEvent', { type: 'touchStart', touchPoints: [{ x, y }] });
-  for (let i = 0; i < steps; i += 1) {
-    y = Math.min(yMax, y + perStep);
-    await cdp.send('Input.dispatchTouchEvent', { type: 'touchMove', touchPoints: [{ x, y }] });
-    await sleep(16);
-  }
-  await cdp.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
 }
 
 const SCENARIOS = {

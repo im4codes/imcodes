@@ -12,6 +12,10 @@
  *   requestOrder       the daemon's history requests in arrival order (peek first, then newest -> oldest pages)
  *   drift              reading scenario: max px an on-screen row moved while backfill pages arrived ABOVE it
  *   bottomGap          pinned scenario: max px the view drifted from the bottom while pages arrived
+ *   fling              a reader flinging with REAL touch drags (momentum after the finger lifts) while pages land:
+ *                      max px an on-screen row moved that neither the user's scrolling nor an app scroll write accounts
+ *                      for, and the app's scrollTop writes while the finger/momentum owns the scroller (must be 0)
+ *   *-stream           a reply streaming at the bottom while pages land above (pinned stays pinned, reader stays put)
  *   idbRows/gapRecord  what the local cache holds at the end and whether a hole is still recorded
  */
 import { createRequire } from 'node:module';
@@ -20,6 +24,7 @@ import path from 'node:path';
 import { TIMELINE_MESSAGES } from '../../../shared/timeline-protocol.ts';
 import { signPerfJwt } from './perf-auth.mjs';
 import { STALE_SESSION_NAME, buildStaleTimeline, newestStaleText } from './stale-timeline.mjs';
+import { fling } from './touch-fling.mjs';
 
 const require = createRequire(new URL('../../../web/package.json', import.meta.url));
 const { chromium, devices } = require('@playwright/test');
@@ -35,8 +40,11 @@ const OUT_DIR = process.env.IMC_PERF_STALE_OUT ?? '/repo/perf-results/stale-wind
 const UPLOAD_ROOT = process.env.IMC_PERF_UPLOAD_ROOT ?? '/tmp/imc-perf-uploads';
 const REQUEST_LOG = process.env.IMC_PERF_STALE_LOG ?? `${UPLOAD_ROOT}/stale-history.ndjson`;
 const FLIP_FILE = `${UPLOAD_ROOT}/stale-flip`;
+// While this file exists the fake daemon streams a reply into the stale session (a streaming message at the bottom).
+const STREAM_FILE = `${UPLOAD_ROOT}/stale-stream`;
 const LATEST_AFTER_CACHE_BUDGET_MS = Number(process.env.IMC_PERF_STALE_LATEST_BUDGET_MS ?? 1000);
 const DRIFT_BUDGET_PX = 1;
+const MIN_FLINGS = Number(process.env.IMC_PERF_STALE_MIN_FLINGS ?? 8);
 const SAMPLE_WINDOW_MS = Number(process.env.IMC_PERF_STALE_SAMPLE_MS ?? 20_000);
 const SAMPLE_CAP_MS = Number(process.env.IMC_PERF_STALE_CAP_MS ?? 150_000);
 const DB_NAME = 'imcodes-timeline';
@@ -119,10 +127,15 @@ async function countIdbRows(page) {
   }, { dbName: DB_NAME, storeName: STORE_NAME, key: cacheKey }).catch(() => -1);
 }
 
+// Scenario modes: pinned | reading | fling (reading + real touch flings) | pinned-stream | reading-stream.
+const isPinnedMode = (mode) => mode === 'pinned' || mode === 'pinned-stream';
+const isStreamMode = (mode) => mode.endsWith('-stream');
+
 async function runScenario(browser, mode) {
   const context = await newContext(browser);
   const route = `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`;
   const seeded = await buildStaleCache(context, route);
+  if (isStreamMode(mode)) await writeFile(STREAM_FILE, '1'); else await rm(STREAM_FILE, { force: true });
   const before = (await readRequestLog()).length;
   const page = await context.newPage();
   const consoleLines = [];
@@ -191,7 +204,7 @@ async function runScenario(browser, mode) {
     wsTiming,
   };
 
-  if (mode === 'reading') {
+  if (!isPinnedMode(mode)) {
     // The reader starts once the hole's backfill is under way: what is measured is pages arriving ABOVE a reader,
     // not the initial merge of the peeked tail with the newest window.
     for (let attempt = 0; attempt < 240; attempt += 1) {
@@ -202,7 +215,8 @@ async function runScenario(browser, mode) {
     await page.waitForTimeout(1200);
   }
   // Sample layout on every frame while the older pages arrive.
-  await page.evaluate(({ mode: sampleMode, windowMs, capMs, gapKey }) => {
+  const flinging = mode === 'fling';
+  await page.evaluate(({ mode: sampleMode, windowMs, capMs, gapKey, flinging }) => {
     const root = document.querySelector('.chat-view');
     const state = { active: true, done: false, samples: [], markerSeen: false, markerGoneAt: null, startedAt: performance.now(), anchorId: null, anchorTop0: null, gapSeen: false, gapClosedAt: null, lastGapCheck: 0 };
     const gapRecorded = () => {
@@ -212,6 +226,30 @@ async function runScenario(browser, mode) {
     if (!root) { state.error = 'no .chat-view'; return; }
     if (sampleMode === 'reading') {
       root.scrollTop = Math.max(0, root.scrollHeight - root.clientHeight - 900);
+    }
+    // Touch flings: per painted frame the content-space position of the rows on screen, and every programmatic scroll write
+    // with whether a finger / recent user scrolling owned the scroller at that moment.
+    const rec = { touching: false, lastUserScrollAt: -1e9, writes: [], frames: [] };
+    state.rec = rec;
+    if (flinging) {
+      const setTouch = (value) => () => { rec.touching = value; };
+      document.addEventListener('touchstart', setTouch(true), { capture: true, passive: true });
+      document.addEventListener('touchend', setTouch(false), { capture: true, passive: true });
+      document.addEventListener('touchcancel', setTouch(false), { capture: true, passive: true });
+      const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+      const logWrite = (to) => {
+        const from = desc.get.call(root);
+        rec.writes.push({ t: performance.now(), delta: to - from, gap: Math.max(0, root.scrollHeight - root.clientHeight - from), touching: rec.touching, sinceUserScrollMs: performance.now() - rec.lastUserScrollAt });
+      };
+      Object.defineProperty(root, 'scrollTop', { configurable: true, get() { return desc.get.call(this); }, set(value) { logWrite(value); desc.set.call(this, value); } });
+      const origTo = root.scrollTo.bind(root); const origBy = root.scrollBy.bind(root);
+      root.scrollTo = (...args) => { const o = typeof args[0] === 'object' ? args[0] : { top: args[1] }; if (typeof o.top === 'number') logWrite(o.top); return origTo(...args); };
+      root.scrollBy = (...args) => { const o = typeof args[0] === 'object' ? args[0] : { top: args[1] }; if (typeof o.top === 'number') logWrite(desc.get.call(root) + o.top); return origBy(...args); };
+      // A user scroll = a scroll event with no app write in the preceding task.
+      root.addEventListener('scroll', () => {
+        const last = rec.writes.at(-1);
+        if (!last || performance.now() - last.t > 60) rec.lastUserScrollAt = performance.now();
+      }, { passive: true });
     }
     const pickAnchor = () => {
       const rootTop = root.getBoundingClientRect().top;
@@ -241,6 +279,19 @@ async function runScenario(browser, mode) {
         }
       }
       state.samples.push(sample);
+      if (flinging) {
+        const rows = [];
+        for (const node of root.querySelectorAll('[data-event-id]')) {
+          const r = node.getBoundingClientRect();
+          if (r.bottom <= rootRect.top + 1) continue;
+          if (r.top >= rootRect.bottom - 1) break;
+          // The streaming row legitimately changes height; every other row's content position must hold still.
+          if ((node.textContent ?? '').includes('stream-msg-')) continue;
+          rows.push({ id: node.getAttribute('data-event-id'), content: r.top - rootRect.top + root.scrollTop });
+          if (rows.length >= 4) break;
+        }
+        rec.frames.push({ t: now, rows });
+      }
       if (now - state.lastGapCheck > 500) {
         state.lastGapCheck = now;
         const recorded = gapRecorded();
@@ -257,12 +308,23 @@ async function runScenario(browser, mode) {
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
-  }, { mode, windowMs: SAMPLE_WINDOW_MS, capMs: SAMPLE_CAP_MS, gapKey: cacheKey });
+  }, { mode: isPinnedMode(mode) ? 'pinned' : 'reading', windowMs: SAMPLE_WINDOW_MS, capMs: SAMPLE_CAP_MS, gapKey: cacheKey, flinging });
 
+  let flingCount = 0;
+  if (flinging) {
+    // A finger keeps flinging the chat (alternating older / newer so the reader stays inside what is loaded) while the
+    // hole's pages land above it.
+    const box = await page.evaluate(() => { const r = document.querySelector('.chat-view').getBoundingClientRect(); return { x: r.x, y: r.y, width: r.width, height: r.height }; });
+    while (!(await page.evaluate(() => window.__imcStale.done === true))) {
+      await fling(cdp, box, 500 + (flingCount % 4) * 250, 1800 + (flingCount % 3) * 1400, flingCount % 2 === 0 ? 1 : -1);
+      flingCount += 1;
+      await page.waitForTimeout(150);
+    }
+  }
   await page.waitForFunction(() => window.__imcStale?.done === true, undefined, { timeout: SAMPLE_CAP_MS + 30_000, polling: 250 });
   const layout = await page.evaluate(() => {
     const state = window.__imcStale;
-    return { error: state.error ?? null, samples: state.samples.length, markerSeen: state.markerSeen, markerGoneAtMs: state.markerGoneAt, gapClosedAtMs: state.gapClosedAt, anchorId: state.anchorId, anchorTop0: state.anchorTop0, samplesRaw: state.samples };
+    return { error: state.error ?? null, samples: state.samples.length, markerSeen: state.markerSeen, markerGoneAtMs: state.markerGoneAt, gapClosedAtMs: state.gapClosedAt, anchorId: state.anchorId, anchorTop0: state.anchorTop0, samplesRaw: state.samples, frames: state.rec.frames, writes: state.rec.writes };
   });
   const anchorTops = layout.samplesRaw.map((sample) => sample.anchorTop).filter((value) => typeof value === 'number');
   const drift = layout.anchorTop0 === null || anchorTops.length === 0 ? null : Math.max(...anchorTops.map((top) => Math.abs(top - layout.anchorTop0)));
@@ -275,10 +337,12 @@ async function runScenario(browser, mode) {
       anchorMoves.push({ t: Math.round(cur.t), anchorFrom: Math.round(prev.anchorTop), anchorTo: Math.round(cur.anchorTop), scrollTop: [Math.round(prev.scrollTop), Math.round(cur.scrollTop)], scrollHeight: [Math.round(prev.scrollHeight), Math.round(cur.scrollHeight)] });
     }
   }
+  if (flinging) result.fling = analyzeFling(layout.frames, layout.writes, flingCount);
   const gapRecord = await page.evaluate(() => {
     try { return JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}'); } catch { return {}; }
   });
   result.layout = { samples: layout.samples, markerSeen: layout.markerSeen, markerGoneAtMs: layout.markerGoneAtMs, gapClosedAtMs: layout.gapClosedAtMs, anchorId: layout.anchorId, driftPx: drift, maxBottomGapPx: bottomGap, anchorMoves, error: layout.error };
+  if (isStreamMode(mode)) result.streamedAtBottom = await page.evaluate(() => (document.querySelector('.chat-view')?.textContent ?? '').includes('stream-msg-'));
   result.markerPresentAtEnd = await page.evaluate(() => !!document.querySelector('[data-testid="chat-history-gap-marker"]'));
   result.idbRows = await countIdbRows(page);
   result.gapRecord = gapRecord[cacheKey] ?? null;
@@ -286,6 +350,27 @@ async function runScenario(browser, mode) {
   result.requests = (await readRequestLog()).slice(before);
   await context.close();
   return result;
+}
+
+/**
+ * Per painted frame: how far did a row visible in both frames move in CONTENT space, minus the app's own scroll writes in
+ * between (a write compensates by design)? Non-zero = layout shifted under the reader uncompensated. Also the programmatic
+ * scrollTop writes made while a finger or its momentum owns the scroller and the reader is not pinned (iOS cancels the
+ * momentum on such a write): must be 0.
+ */
+function analyzeFling(frames, writes, flings) {
+  let maxJumpPx = 0; let jumpAt = null;
+  for (let i = 1; i < frames.length; i += 1) {
+    const a = frames[i - 1]; const b = frames[i];
+    const common = b.rows.find((row) => a.rows.some((other) => other.id === row.id));
+    if (!common) continue;
+    const before = a.rows.find((other) => other.id === common.id);
+    const written = writes.filter((write) => write.t > a.t && write.t <= b.t).reduce((sum, write) => sum + write.delta, 0);
+    const jump = Math.abs(common.content - before.content - written);
+    if (jump > maxJumpPx) { maxJumpPx = jump; jumpAt = Math.round(b.t); }
+  }
+  const active = writes.filter((write) => write.gap > 50 && (write.touching || write.sinceUserScrollMs < 150));
+  return { flings, frames: frames.length, writes: writes.length, maxJumpPx: Math.round(maxJumpPx * 100) / 100, jumpAtMs: jumpAt, activeWrites: active.length, activeWriteSamples: active.slice(0, 8) };
 }
 
 function analyzeOrder(requests) {
@@ -328,8 +413,16 @@ for (const [mode, scenario] of Object.entries(scenarios)) {
   // LOCAL_RETAINED_EVENTS_PER_SESSION (1000) in the background, so the final row count can only be checked against that floor.
   if (scenario.idbRows < Math.min(TOTAL_EVENTS, 1000) - 5) failures.push(`${mode}: local cache holds only ${scenario.idbRows} events`);
   if (!scenario.order.contiguous) failures.push(`${mode}: the backfill pages left a hole between them (${JSON.stringify(scenario.order)})`);
-  if (mode === 'reading' && (scenario.layout.driftPx === null || scenario.layout.driftPx > DRIFT_BUDGET_PX)) failures.push(`reading: on-screen row moved ${scenario.layout.driftPx} px (budget ${DRIFT_BUDGET_PX})`);
-  if (mode === 'pinned' && scenario.layout.maxBottomGapPx > DRIFT_BUDGET_PX) failures.push(`pinned: view drifted ${scenario.layout.maxBottomGapPx} px from the bottom (budget ${DRIFT_BUDGET_PX})`);
+  // A flinging reader is moved by the finger: the anchored row's screen position is not constant, so it has its own verdict.
+  if (!isPinnedMode(mode) && mode !== 'fling' && (scenario.layout.driftPx === null || scenario.layout.driftPx > DRIFT_BUDGET_PX)) failures.push(`${mode}: on-screen row moved ${scenario.layout.driftPx} px (budget ${DRIFT_BUDGET_PX})`);
+  if (isPinnedMode(mode) && scenario.layout.maxBottomGapPx > DRIFT_BUDGET_PX) failures.push(`${mode}: view drifted ${scenario.layout.maxBottomGapPx} px from the bottom (budget ${DRIFT_BUDGET_PX})`);
+  if (mode === 'fling') {
+    const { fling: result } = scenario;
+    if (result.flings < MIN_FLINGS) failures.push(`fling: only ${result.flings} flings landed while pages arrived (need ${MIN_FLINGS})`);
+    if (result.maxJumpPx > DRIFT_BUDGET_PX) failures.push(`fling: an on-screen row jumped ${result.maxJumpPx} px with no scroll or write to account for it (budget ${DRIFT_BUDGET_PX})`);
+    if (result.activeWrites > 0) failures.push(`fling: ${result.activeWrites} programmatic scrollTop write(s) while the finger/momentum owned the scroller: ${JSON.stringify(result.activeWriteSamples)}`);
+  }
+  if (isStreamMode(mode) && !scenario.streamedAtBottom) failures.push(`${mode}: no reply streamed into the chat while the pages landed (the scenario did not exercise streaming)`);
 }
 
 const output = { revision, generatedAt: new Date().toISOString(), config: { TOTAL_EVENTS, CACHED_EVENTS, CPU_RATE, LATEST_AFTER_CACHE_BUDGET_MS }, pass: failures.length === 0, failures, scenarios: Object.fromEntries(Object.entries(scenarios).map(([mode, scenario]) => [mode, { ...scenario, requests: undefined, requestCount: scenario.requests.length, requestHead: scenario.requests.slice(0, 6) }])) };
