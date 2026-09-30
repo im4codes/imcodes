@@ -73,6 +73,24 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
     ]);
   });
 
+  it('keeps the command-mode marker when a runtime queue is preserved across a relaunch', () => {
+    const runtime = {
+      activeDispatchEntriesForResend: [{ clientMessageId: 'cmd-active-command', text: 'active raw command', commandMode: true }],
+      pendingEntriesForResend: [
+        { clientMessageId: 'cmd-pending-command', text: 'pending raw command', commandMode: true },
+        { clientMessageId: 'cmd-pending-plain', text: 'plain' },
+      ],
+    } as unknown as TransportSessionRuntime;
+
+    preserveTransportRuntimeQueuesToResend('deck_preserve_command', runtime);
+
+    const entries = getResendEntries('deck_preserve_command');
+    expect(entries.map((entry) => entry.commandId)).toEqual(['cmd-active-command', 'cmd-pending-command', 'cmd-pending-plain']);
+    expect(entries[0]).toMatchObject({ commandMode: true });
+    expect(entries[1]).toMatchObject({ commandMode: true });
+    expect(entries[2]).not.toHaveProperty('commandMode');
+  });
+
   it('dedupes against existing resend entries and within the runtime snapshot', () => {
     enqueueResend('deck_preserve_brain', {
       text: 'already queued',

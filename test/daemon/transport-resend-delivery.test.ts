@@ -111,6 +111,30 @@ describe('transport resend delivery policy', () => {
     );
   });
 
+  it('carries the command-mode marker through native append, the FIFO fallback and a plain send', async () => {
+    const harness = runtimeHarness();
+    harness.appendExternalMessageToActiveTurn.mockResolvedValue('unsupported');
+    harness.send.mockReturnValue('queued');
+    const entry = {
+      text: 'raw command',
+      commandId: 'cmd-command-mode',
+      clientMessageId: 'msg-command-mode',
+      deliveryMode: 'append' as const,
+      commandMode: true as const,
+      queuedAt: Date.now(),
+    };
+    await expect(deliverTransportResendEntry(harness.runtime, entry)).resolves.toBe('queued');
+    expect(harness.appendExternalMessageToActiveTurn).toHaveBeenCalledWith(
+      'raw command', 'msg-command-mode', undefined, undefined, { commandMode: true },
+    );
+    expect(harness.send).toHaveBeenCalledWith('raw command', 'msg-command-mode', undefined, undefined, { commandMode: true });
+
+    // Counterexample: an entry without the marker never gains one.
+    harness.send.mockClear();
+    await deliverTransportResendEntry(harness.runtime, { ...entry, commandMode: undefined, clientMessageId: 'msg-plain' });
+    expect(harness.send.mock.calls[0]![4]).not.toHaveProperty('commandMode');
+  });
+
   it.each(['stale', 'unsupported'] as const)(
     'falls back to the durable runtime FIFO when native append returns %s',
     async (appendResult) => {
