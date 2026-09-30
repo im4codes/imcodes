@@ -1,4 +1,5 @@
-import { copyFile, mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { copyFile, mkdir, open, readFile, rename, stat } from 'node:fs/promises';
+import { performance } from 'node:perf_hooks';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
@@ -28,6 +29,25 @@ const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
 const IDENTITY_PROMPT_REF_PREFIX = 'p';
 const SESSION_STORE_BACKUP_COUNT = 5;
+/**
+ * Serialisation runs in slices of at most this long, yielding to the event loop
+ * between them, so a 1.4 MB store never blocks the daemon for one long turn.
+ */
+let serializeSliceMs = 2;
+/** Batches written to the temporary file are at least this large (fewer syscalls, still sliced). */
+const WRITE_BATCH_BYTES = 256 * 1024;
+/**
+ * A file this process wrote itself is trusted (its session count is not
+ * re-derived by parsing it) while its size, mtime and inode are unchanged --
+ * but never for longer than this, so a same-signature replacement is still
+ * caught by a full parse within the minute.
+ */
+const KNOWN_FILE_TRUST_MS = 60_000;
+
+/** Test seam: slice budget in ms (0 yields after every record). */
+export function setSessionStoreSerializeSliceMsForTests(ms: number | undefined): void {
+  serializeSliceMs = ms ?? 2;
+}
 
 function storeDir(): string {
   return join(homedir(), '.imcodes');
@@ -268,6 +288,9 @@ let pendingWrite: Promise<void> | null = null;
 let store: SessionStore = { sessions: {} };
 let storeLoaded = false;
 let storeWriteAuthority: SessionStoreWriteAuthority | null = null;
+/** What this process last wrote to sessions.json, so a steady-state flush does not re-read and re-parse it. */
+interface KnownStoreFile { path: string; size: number; mtimeMs: number; ino: number; sessionCount: number; verifiedAt: number }
+let knownStoreFile: KnownStoreFile | null = null;
 let allowEmptyStoreWrite = false;
 let warnedReadOnlyWrite = false;
 /**
@@ -312,6 +335,8 @@ export function resetSessionStoreAuthorityForTests(): void {
   storeLoaded = false;
   allowEmptyStoreWrite = false;
   warnedReadOnlyWrite = false;
+  knownStoreFile = null;
+  serializeSliceMs = 2;
 }
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
@@ -323,10 +348,32 @@ function isPersistableSessionRecord(record: SessionRecord): boolean {
   });
 }
 
-function serializeStore(): string {
-  const identityPrompts: Record<string, string> = {};
+interface SerializedStore {
+  /** The file text, in pieces; joined it is exactly `JSON.stringify(persistedStore, null, 2)`. */
+  chunks: string[];
+  /** Persistable sessions in the snapshot: what the empty-overwrite guard compares. */
+  sessionCount: number;
+}
+
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+
+/** One record as a member of a two-space-indented object nested one level down. */
+function indentedMember(name: string, value: unknown): string {
+  return `    ${JSON.stringify(name)}: ${JSON.stringify(value, null, 2).replace(/\n/g, '\n    ')}`;
+}
+
+/**
+ * The store as JSON text, byte-identical to serialising the whole persisted
+ * object at once, built one record at a time. With `cooperative` the loop
+ * yields to the event loop whenever a slice has used its budget, so the main
+ * thread is never held for the whole store; a record mutated meanwhile is either
+ * in this snapshot or in the flush that mutation schedules.
+ */
+async function serializeStoreChunks(cooperative: boolean): Promise<SerializedStore> {
   const promptRefs = new Map<string, string>();
-  const persistableSessions: Record<string, PersistedSessionRecord> = {};
+  const promptMembers: string[] = [];
+  const sessionMembers: string[] = [];
+  let sliceStart = performance.now();
 
   for (const [name, record] of Object.entries(store.sessions)) {
     if (!isPersistableSessionRecord(record)) continue;
@@ -336,20 +383,36 @@ function serializeStore(): string {
       if (promptRef === undefined) {
         promptRef = `${IDENTITY_PROMPT_REF_PREFIX}${promptRefs.size}`;
         promptRefs.set(identityPrompt, promptRef);
-        identityPrompts[promptRef] = identityPrompt;
+        promptMembers.push(indentedMember(promptRef, identityPrompt));
       }
-      persistableSessions[name] = { ...persistedRecord, identityPromptRef: promptRef };
+      sessionMembers.push(indentedMember(name, { ...persistedRecord, identityPromptRef: promptRef }));
     } else {
-      persistableSessions[name] = persistedRecord;
+      sessionMembers.push(indentedMember(name, persistedRecord));
+    }
+    if (cooperative && performance.now() - sliceStart >= serializeSliceMs) {
+      await yieldToEventLoop();
+      sliceStart = performance.now();
     }
   }
 
-  const persistedStore: PersistedSessionStoreV2 = {
-    version: SESSION_STORE_DISK_VERSION,
-    sessions: persistableSessions,
-    identityPrompts,
-  };
-  return JSON.stringify(persistedStore, null, 2);
+  const object = (members: string[]): string => (members.length === 0 ? '{}' : `{\n${members.join(',\n')}\n  }`);
+  const chunks: string[] = [`{\n  "version": ${SESSION_STORE_DISK_VERSION},\n  "sessions": ${sessionMembers.length === 0 ? '{}' : '{\n'}`];
+  if (sessionMembers.length > 0) {
+    let batch = '';
+    for (let i = 0; i < sessionMembers.length; i += 1) {
+      batch += `${i === 0 ? '' : ',\n'}${sessionMembers[i]}`;
+      if (batch.length >= WRITE_BATCH_BYTES) { chunks.push(batch); batch = ''; }
+    }
+    if (batch) chunks.push(batch);
+    chunks.push('\n  }');
+  }
+  chunks.push(`,\n  "identityPrompts": ${object(promptMembers)}\n}`);
+  return { chunks, sessionCount: sessionMembers.length };
+}
+
+/** Test seam: the exact text a flush would write for the current in-memory store. */
+export async function serializeSessionStoreForTests(): Promise<string> {
+  return (await serializeStoreChunks(false)).chunks.join('');
 }
 
 function persistedSessionCount(raw: string): number | null {
@@ -362,7 +425,7 @@ function persistedSessionCount(raw: string): number | null {
 }
 
 function testSessionWouldTouchRealStore(targetPath: string): boolean {
-  return isRealImcodesPath(targetPath) && Object.values(store.sessions).some((record) => isKnownTestSessionLike({
+  return isRealImcodesPath(targetPath) && sessionValues().some((record) => isKnownTestSessionLike({
     name: record.name,
     projectName: record.projectName,
     projectDir: record.projectDir,
@@ -628,18 +691,55 @@ function scheduleWrite(targetPath = storePath()): void {
   }, DEBOUNCE_MS);
 }
 
+/** The sessions.json already on disk: absent, or how many sessions it holds (null: unreadable). */
+type ExistingStoreFile = { exists: false } | { exists: true; hasBytes: boolean; sessionCount: number | null };
+
+async function inspectExistingStoreFile(targetPath: string): Promise<ExistingStoreFile> {
+  const info = await stat(targetPath).catch(() => null);
+  if (!info) return { exists: false };
+  const known = knownStoreFile;
+  if (known && known.path === targetPath && known.size === info.size && known.mtimeMs === info.mtimeMs
+    && known.ino === info.ino && Date.now() - known.verifiedAt < KNOWN_FILE_TRUST_MS) {
+    return { exists: true, hasBytes: info.size > 0, sessionCount: known.sessionCount };
+  }
+  let raw: string;
+  try { raw = await readFile(targetPath, 'utf8'); } catch { return { exists: false }; }
+  return { exists: true, hasBytes: raw.trim().length > 0, sessionCount: persistedSessionCount(raw) };
+}
+
+async function rememberWrittenStoreFile(targetPath: string, sessionCount: number): Promise<void> {
+  const info = await stat(targetPath).catch(() => null);
+  knownStoreFile = info
+    ? { path: targetPath, size: info.size, mtimeMs: info.mtimeMs, ino: info.ino, sessionCount, verifiedAt: Date.now() }
+    : null;
+}
+
+/** Write the chunks to `file`, in batches, through a handle that is always closed. */
+async function writeChunks(file: string, chunks: string[]): Promise<void> {
+  const handle = await open(file, 'w', 0o600);
+  try {
+    let batch = '';
+    for (const chunk of chunks) {
+      batch += chunk;
+      if (batch.length >= WRITE_BATCH_BYTES) { await handle.write(batch, null, 'utf8'); batch = ''; }
+    }
+    if (batch) await handle.write(batch, null, 'utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
 async function writeStoreToDisk(bestEffort: boolean, targetPath = storePath()): Promise<void> {
   // Outside the best-effort catch on purpose: a test reaching the real store
   // must fail loudly, never be swallowed as a lost write.
   if (!hasWriteAuthority(targetPath)) return;
   try {
     await mkdir(dirname(targetPath), { recursive: true });
-    const serialized = serializeStore();
-    const nextCount = persistedSessionCount(serialized) ?? 0;
-    let existingRaw: string | null = null;
-    try { existingRaw = await readFile(targetPath, 'utf8'); } catch { /* first write */ }
-    const existingCount = existingRaw === null ? 0 : persistedSessionCount(existingRaw);
-    const existingHasBytes = existingRaw !== null && existingRaw.trim().length > 0;
+    // Sliced: the main thread yields between records instead of holding the loop for the whole store.
+    const { chunks, sessionCount: nextCount } = await serializeStoreChunks(true);
+    const existing = await inspectExistingStoreFile(targetPath);
+    const existingCount = existing.exists ? existing.sessionCount : 0;
+    const existingHasBytes = existing.exists && existing.hasBytes;
     if (existingHasBytes && (existingCount === null || existingCount > 0)
       && nextCount === 0 && !allowEmptyStoreWrite) {
       logger.error({ targetPath, existingCount }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
@@ -652,18 +752,20 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = storePath()): 
     for (let index = SESSION_STORE_BACKUP_COUNT; index >= 2; index -= 1) {
       try { await rename(`${targetPath}.${index - 1}`, `${targetPath}.${index}`); } catch { /* absent */ }
     }
-    if (existingRaw !== null && existingCount !== null) {
+    if (existing.exists && existingCount !== null) {
       await copyFile(targetPath, `${targetPath}.1`);
     }
     const temporary = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
     try {
-      await writeFile(temporary, serialized, { encoding: 'utf8', mode: 0o600 });
+      await writeChunks(temporary, chunks);
       await rename(temporary, targetPath);
     } finally {
       try { await rename(temporary, `${temporary}.stale`); } catch { /* already renamed */ }
     }
     allowEmptyStoreWrite = false;
+    await rememberWrittenStoreFile(targetPath, nextCount);
   } catch (error) {
+    knownStoreFile = null;
     if (!bestEffort) throw error;
     // Tests may tear down temp HOME dirs while a debounced write is pending.
     // Losing that best-effort write is fine; a later flush/load will recreate it.
@@ -693,6 +795,21 @@ async function drainPendingWritesForRead(): Promise<void> {
   }
   if (pendingWrite) await pendingWrite.catch(() => {});
   await writeQueue;
+}
+
+/**
+ * Object.values() on a ~300-key dictionary costs ~27 us and listSessions is
+ * called constantly; the values array is rebuilt only when the key set or a
+ * record object changes (upsert/remove replace records; load/prune replace the
+ * whole map, which the identity check catches). Callers always receive a copy.
+ */
+let sessionValuesCache: { sessions: Record<string, SessionRecord>; values: SessionRecord[] } | null = null;
+
+function sessionValues(): SessionRecord[] {
+  if (!sessionValuesCache || sessionValuesCache.sessions !== store.sessions) {
+    sessionValuesCache = { sessions: store.sessions, values: Object.values(store.sessions) };
+  }
+  return sessionValuesCache.values;
 }
 
 export function getSession(name: string): SessionRecord | undefined {
@@ -785,22 +902,24 @@ export function upsertSession(record: SessionRecord): void {
     ...(executionCloneMetadata !== undefined ? { executionCloneMetadata } : {}),
     updatedAt: Date.now(),
   };
+  sessionValuesCache = null;
   scheduleWrite();
 }
 
 export function removeSession(name: string): void {
   delete store.sessions[name];
+  sessionValuesCache = null;
   scheduleWrite();
 }
 
 export function listSessions(projectName?: string): SessionRecord[] {
-  const all = Object.values(store.sessions);
-  return projectName ? all.filter((s) => s.projectName === projectName) : all;
+  const all = sessionValues();
+  return projectName ? all.filter((s) => s.projectName === projectName) : all.slice();
 }
 
 /** Find a session by its provider session ID (for transport sessions). */
 export function findSessionByProviderSessionId(providerSessionId: string): SessionRecord | undefined {
-  return Object.values(store.sessions).find((s) => s.providerSessionId === providerSessionId);
+  return sessionValues().find((s) => s.providerSessionId === providerSessionId);
 }
 
 /**
