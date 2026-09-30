@@ -45,6 +45,7 @@ const STREAM_FILE = `${UPLOAD_ROOT}/stale-stream`;
 const LATEST_AFTER_CACHE_BUDGET_MS = Number(process.env.IMC_PERF_STALE_LATEST_BUDGET_MS ?? 1000);
 const DRIFT_BUDGET_PX = 1;
 const MIN_FLINGS = Number(process.env.IMC_PERF_STALE_MIN_FLINGS ?? 8);
+const MIN_STREAM_FRAMES = 50;
 const SAMPLE_WINDOW_MS = Number(process.env.IMC_PERF_STALE_SAMPLE_MS ?? 20_000);
 const SAMPLE_CAP_MS = Number(process.env.IMC_PERF_STALE_CAP_MS ?? 150_000);
 const DB_NAME = 'imcodes-timeline';
@@ -135,14 +136,16 @@ async function runScenario(browser, mode) {
   const context = await newContext(browser);
   const route = `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`;
   const seeded = await buildStaleCache(context, route);
-  if (isStreamMode(mode)) await writeFile(STREAM_FILE, '1'); else await rm(STREAM_FILE, { force: true });
+  // The reply starts streaming once the hole's backfill is under way (below), never at open: a chat that is already
+  // receiving live events when it mounts has no stale cache to speak of.
+  await rm(STREAM_FILE, { force: true });
   const before = (await readRequestLog()).length;
   const page = await context.newPage();
   const consoleLines = [];
   const cdp = await context.newCDPSession(page);
   if (CPU_RATE > 1) await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPU_RATE });
   // Where the time goes between opening and the newest message: when the peek left the phone and when its answer arrived.
-  const wsTiming = { peekSentAt: null, peekRequestId: null, peekReceivedAt: null, firstHistorySentAt: null };
+  const wsTiming = { peekSentAt: null, peekRequestId: null, peekReceivedAt: null, firstHistorySentAt: null, streamFrames: 0 };
   let openedAtNode = 0;
   await cdp.send('Network.enable');
   cdp.on('Network.webSocketFrameSent', ({ response }) => {
@@ -152,6 +155,7 @@ async function runScenario(browser, mode) {
     if (message.contentFilter === 'text' && wsTiming.peekSentAt === null) { wsTiming.peekSentAt = Date.now() - openedAtNode; wsTiming.peekRequestId = message.requestId; }
   });
   cdp.on('Network.webSocketFrameReceived', ({ response }) => {
+    if (typeof response?.payloadData === 'string' && response.payloadData.includes('stream-msg-')) wsTiming.streamFrames += 1;
     if (!wsTiming.peekRequestId || wsTiming.peekReceivedAt !== null || typeof response?.payloadData !== 'string') return;
     if (response.payloadData.includes(wsTiming.peekRequestId) && response.payloadData.includes(TIMELINE_MESSAGES.HISTORY)) wsTiming.peekReceivedAt = Date.now() - openedAtNode;
   });
@@ -204,15 +208,22 @@ async function runScenario(browser, mode) {
     wsTiming,
   };
 
-  if (!isPinnedMode(mode)) {
-    // The reader starts once the hole's backfill is under way: what is measured is pages arriving ABOVE a reader,
-    // not the initial merge of the peeked tail with the newest window.
+  // What is measured is pages arriving ABOVE a reader (or a follower), not the initial merge of the peeked tail with
+  // the newest window: wait until the hole's backfill is under way.
+  const waitForBackfillUnderway = async () => {
     for (let attempt = 0; attempt < 240; attempt += 1) {
       const seen = (await readRequestLog()).slice(before);
-      if (seen.some((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null && request.afterTs !== undefined)) break;
+      if (seen.some((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null && request.afterTs !== undefined)) return;
       await page.waitForTimeout(250);
     }
+  };
+  if (!isPinnedMode(mode)) {
+    await waitForBackfillUnderway();
     await page.waitForTimeout(1200);
+  }
+  if (isStreamMode(mode)) {
+    if (isPinnedMode(mode)) await waitForBackfillUnderway();
+    await writeFile(STREAM_FILE, '1');
   }
   // Sample layout on every frame while the older pages arrive.
   const flinging = mode === 'fling';
@@ -342,7 +353,7 @@ async function runScenario(browser, mode) {
     try { return JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}'); } catch { return {}; }
   });
   result.layout = { samples: layout.samples, markerSeen: layout.markerSeen, markerGoneAtMs: layout.markerGoneAtMs, gapClosedAtMs: layout.gapClosedAtMs, anchorId: layout.anchorId, driftPx: drift, maxBottomGapPx: bottomGap, anchorMoves, error: layout.error };
-  if (isStreamMode(mode)) result.streamedAtBottom = await page.evaluate(() => (document.querySelector('.chat-view')?.textContent ?? '').includes('stream-msg-'));
+  if (isStreamMode(mode)) result.streamedFrames = wsTiming.streamFrames;
   result.markerPresentAtEnd = await page.evaluate(() => !!document.querySelector('[data-testid="chat-history-gap-marker"]'));
   result.idbRows = await countIdbRows(page);
   result.gapRecord = gapRecord[cacheKey] ?? null;
@@ -373,9 +384,11 @@ function analyzeFling(frames, writes, flings) {
   return { flings, frames: frames.length, writes: writes.length, maxJumpPx: Math.round(maxJumpPx * 100) / 100, jumpAtMs: jumpAt, activeWrites: active.length, activeWriteSamples: active.slice(0, 8) };
 }
 
-function analyzeOrder(requests) {
-  const first = requests[0];
-  const peekFirst = !!first && first.contentFilter === 'text' && first.limit <= 30;
+function analyzeOrder(requests, wsTiming) {
+  // Wire order from the phone: the peek and the newest-window request leave in the same tick, so their ARRIVAL order at the
+  // daemon is a network race; what the app controls is that the peek is sent first.
+  const peekFirst = wsTiming.peekSentAt !== null && wsTiming.firstHistorySentAt !== null && wsTiming.peekSentAt <= wsTiming.firstHistorySentAt
+    && requests.some((request) => request.contentFilter === 'text' && request.limit <= 30);
   // Backfill pages walk DOWN: every page that has an upper bound is below the previous one's.
   const bounded = requests.filter((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null);
   let descending = true;
@@ -392,7 +405,7 @@ const scenarios = {};
 try {
   for (const mode of (process.env.IMC_PERF_STALE_MODES ?? 'pinned,reading').split(',')) {
     scenarios[mode] = await runScenario(browser, mode);
-    scenarios[mode].order = analyzeOrder(scenarios[mode].requests);
+    scenarios[mode].order = analyzeOrder(scenarios[mode].requests, scenarios[mode].wsTiming);
   }
 } finally {
   await browser.close();
@@ -422,7 +435,7 @@ for (const [mode, scenario] of Object.entries(scenarios)) {
     if (result.maxJumpPx > DRIFT_BUDGET_PX) failures.push(`fling: an on-screen row jumped ${result.maxJumpPx} px with no scroll or write to account for it (budget ${DRIFT_BUDGET_PX})`);
     if (result.activeWrites > 0) failures.push(`fling: ${result.activeWrites} programmatic scrollTop write(s) while the finger/momentum owned the scroller: ${JSON.stringify(result.activeWriteSamples)}`);
   }
-  if (isStreamMode(mode) && !scenario.streamedAtBottom) failures.push(`${mode}: no reply streamed into the chat while the pages landed (the scenario did not exercise streaming)`);
+  if (isStreamMode(mode) && scenario.streamedFrames < MIN_STREAM_FRAMES) failures.push(`${mode}: only ${scenario.streamedFrames} streaming frame(s) reached the phone while the pages landed (need ${MIN_STREAM_FRAMES}); the scenario did not exercise streaming`);
 }
 
 const output = { revision, generatedAt: new Date().toISOString(), config: { TOTAL_EVENTS, CACHED_EVENTS, CPU_RATE, LATEST_AFTER_CACHE_BUDGET_MS }, pass: failures.length === 0, failures, scenarios: Object.fromEntries(Object.entries(scenarios).map(([mode, scenario]) => [mode, { ...scenario, requests: undefined, requestCount: scenario.requests.length, requestHead: scenario.requests.slice(0, 6) }])) };
