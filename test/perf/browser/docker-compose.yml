@@ -112,6 +112,7 @@ services:
       IMC_PERF_HISTORY_LATENCY_MS: ${IMC_PERF_HISTORY_LATENCY_MS:-0}
       IMC_PERF_STALE_SESSION: ${IMC_PERF_STALE_SESSION:-0}
       IMC_PERF_STALE_EVENTS: ${IMC_PERF_STALE_EVENTS:-6000}
+      IMC_PERF_STALE_CACHED: ${IMC_PERF_STALE_CACHED:-150}
     command: ["node", "/repo/test/perf/browser/daemon-client.mjs"]
     depends_on:
       server:
@@ -190,7 +191,9 @@ services:
       - type: bind
         source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
         target: /repo/perf-results
-      - perf_uploads:/tmp/imc-perf-uploads:ro
+      # read-write: the spec drops the flip file that turns the fake daemon's stale session from "as the phone last saw
+      # it" into its full live history, and reads the request log the daemon writes here
+      - perf_uploads:/tmp/imc-perf-uploads
     environment:
       IMC_PERF_BASE_URL: http://server:19138
       IMC_PERF_REVISION: ${IMC_PERF_REVISION:-unknown}

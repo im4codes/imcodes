@@ -15,7 +15,7 @@
  *   idbRows/gapRecord  what the local cache holds at the end and whether a hole is still recorded
  */
 import { createRequire } from 'node:module';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { signPerfJwt } from './perf-auth.mjs';
 import { STALE_SESSION_NAME, buildStaleTimeline, newestStaleText } from './stale-timeline.mjs';
@@ -31,7 +31,9 @@ const TOTAL_EVENTS = Number(process.env.IMC_PERF_STALE_EVENTS ?? 6000);
 const CACHED_EVENTS = Number(process.env.IMC_PERF_STALE_CACHED ?? 150);
 const CPU_RATE = Number(process.env.IMC_PERF_STALE_CPU_RATE ?? 4);
 const OUT_DIR = process.env.IMC_PERF_STALE_OUT ?? '/repo/perf-results/stale-window';
-const REQUEST_LOG = process.env.IMC_PERF_STALE_LOG ?? '/tmp/imc-perf-uploads/stale-history.ndjson';
+const UPLOAD_ROOT = process.env.IMC_PERF_UPLOAD_ROOT ?? '/tmp/imc-perf-uploads';
+const REQUEST_LOG = process.env.IMC_PERF_STALE_LOG ?? `${UPLOAD_ROOT}/stale-history.ndjson`;
+const FLIP_FILE = `${UPLOAD_ROOT}/stale-flip`;
 const LATEST_AFTER_CACHE_BUDGET_MS = Number(process.env.IMC_PERF_STALE_LATEST_BUDGET_MS ?? 1000);
 const DRIFT_BUDGET_PX = 1;
 const SAMPLE_WINDOW_MS = Number(process.env.IMC_PERF_STALE_SAMPLE_MS ?? 20_000);
@@ -42,6 +44,7 @@ const STORE_NAME = 'events';
 const timeline = buildStaleTimeline({ total: TOTAL_EVENTS });
 const cached = timeline.slice(0, CACHED_EVENTS);
 const newestText = newestStaleText(timeline);
+const newestCachedText = newestStaleText(cached);
 const cacheKey = `${SERVER_ID}:${STALE_SESSION_NAME}`;
 
 async function readRequestLog() {
@@ -74,33 +77,26 @@ async function newContext(browser) {
   return context;
 }
 
-/** Boot the app once (it creates its IndexedDB), then write the OLD block of the session as the stale local cache. */
-async function seedStaleCache(context) {
+/**
+ * The phone's stale local cache, built the way it really gets built: the real app opens the chat while the fake daemon
+ * still serves only the session's OLD block (the daemon holds the stale view until the flip file appears), keeps it
+ * on screen long enough to persist it (IndexedDB + localStorage tail snapshot + module cache), and is closed.
+ * Then the daemon "moves on" to its full live history and a fresh page (the app relaunched) opens the same chat.
+ */
+async function buildStaleCache(context, route) {
+  await rm(FLIP_FILE, { force: true });
   const page = await context.newPage();
   await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForFunction(async (name) => {
-    const dbs = await indexedDB.databases?.();
-    return !dbs || dbs.some((db) => db.name === name);
-  }, DB_NAME, { timeout: 60_000 });
-  await page.waitForTimeout(1500);
-  const written = await page.evaluate(async ({ dbName, storeName, rows, key }) => {
-    const db = await new Promise((resolve, reject) => {
-      const request = indexedDB.open(dbName);
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-    await new Promise((resolve, reject) => {
-      const tx = db.transaction(storeName, 'readwrite');
-      const store = tx.objectStore(storeName);
-      for (const row of rows) store.put({ ...row, sessionId: key });
-      tx.oncomplete = () => resolve(undefined);
-      tx.onerror = () => reject(tx.error);
-    });
-    db.close();
-    return rows.length;
-  }, { dbName: DB_NAME, storeName: STORE_NAME, rows: cached, key: cacheKey });
-  await page.close();
-  return written;
+  await page.waitForSelector('#app', { timeout: 30_000 });
+  await page.waitForFunction(() => document.body.innerText.includes('long8000'), undefined, { timeout: 60_000, polling: 250 });
+  await page.waitForTimeout(500);
+  await page.evaluate((hash) => { window.location.hash = hash; window.dispatchEvent(new HashChangeEvent('hashchange')); }, route);
+  await page.waitForFunction((needle) => (document.querySelector('.chat-view')?.textContent ?? '').includes(needle), newestCachedText, { timeout: 60_000, polling: 250 });
+  // Let the tail snapshot / IndexedDB writes land, then close the page (pagehide flushes the snapshot).
+  await page.waitForTimeout(4000);
+  await page.close({ runBeforeUnload: true });
+  await writeFile(FLIP_FILE, '1');
+  return CACHED_EVENTS;
 }
 
 async function countIdbRows(page) {
@@ -124,7 +120,8 @@ async function countIdbRows(page) {
 
 async function runScenario(browser, mode) {
   const context = await newContext(browser);
-  const seeded = await seedStaleCache(context);
+  const route = `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`;
+  const seeded = await buildStaleCache(context, route);
   const before = (await readRequestLog()).length;
   const page = await context.newPage();
   const consoleLines = [];
@@ -151,7 +148,6 @@ async function runScenario(browser, mode) {
   await page.waitForSelector('#app', { timeout: 30_000 });
   await page.waitForFunction(() => document.body.innerText.includes('long8000'), undefined, { timeout: 60_000, polling: 250 });
   await page.waitForTimeout(500);
-  const route = `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`;
   page.on('console', (message) => { if (consoleLines.length < 400) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
   page.on('pageerror', (error) => { if (consoleLines.length < 60) consoleLines.push(`pageerror: ${String(error).slice(0, 300)}`); });
   // One frame loop, installed BEFORE the tap, timestamps the first frame each thing is on screen: the stale cache
@@ -200,6 +196,16 @@ async function runScenario(browser, mode) {
     wsTiming,
   };
 
+  if (mode === 'reading') {
+    // The reader starts once the hole's backfill is under way: what is measured is pages arriving ABOVE a reader,
+    // not the initial merge of the peeked tail with the newest window.
+    for (let attempt = 0; attempt < 240; attempt += 1) {
+      const seen = (await readRequestLog()).slice(before);
+      if (seen.some((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null && request.afterTs !== undefined)) break;
+      await page.waitForTimeout(250);
+    }
+    await page.waitForTimeout(1200);
+  }
   // Sample layout on every frame while the older pages arrive.
   await page.evaluate(({ mode: sampleMode, windowMs, capMs, gapKey }) => {
     const root = document.querySelector('.chat-view');

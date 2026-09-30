@@ -148,8 +148,9 @@ on a phone-shaped Chromium (iPhone 13 profile, 4x CPU throttle) against the real
 (`IMC_PERF_HISTORY_FAITHFUL=1`, `IMC_PERF_STALE_SESSION=1`) serves a production-shaped 6,000-event timeline
 (`stale-timeline.mjs`; every 9th tool result is 30 KB) exactly as the real daemon serves history (newest `limit` of
 `(afterTs, beforeTs)`, text-only on `contentFilter: 'text'`) with `IMC_PERF_HISTORY_LATENCY_MS` (default 250) per request and
-logs each request. The spec (`stale-window-open.spec.mjs`) seeds the OLD 150 events into IndexedDB, opens the window and
-records: cache paint, newest-message time (`latestAfterCacheMs`, budget 1 s), the daemon's request order (tiny peek first, then
+logs each request. The spec (`stale-window-open.spec.mjs`) builds the stale cache the way the app really builds it: it opens the
+chat while the daemon still serves only the session's OLD 150 events, lets the app persist them (IndexedDB + tail snapshot),
+closes the page, flips the daemon to its full history and reopens the chat on a fresh page, then records: cache paint, newest-message time (`latestAfterCacheMs`, budget 1 s), the daemon's request order (tiny peek first, then
 pages walking newest -> oldest), the earlier-messages marker, per-frame layout drift of an on-screen row while pages arrive above
 it (reading scenario, <= 1 px) and the bottom gap (pinned scenario, <= 1 px), and whether the local cache ended complete with no
 hole recorded. The app revision is archived; only these harness files are overlaid from the current checkout, so the same spec

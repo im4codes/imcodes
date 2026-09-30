@@ -4411,7 +4411,8 @@ export function useTimeline(
           const outcome = await runNewestWindowBackfill(afterTs, {
             limit: MAX_FORWARD_PAGE_EVENTS,
             maxPages,
-            initialBeforeTs: resumeBeforeTs ?? (roundGap?.upperTs != null ? roundGap.upperTs + 1 : undefined),
+            // Only the hole's own round resumes at its stitched top; a manual newest-window refresh starts at the newest.
+            initialBeforeTs: resumeBeforeTs ?? (mode !== 'manualLatestWindow' && roundGap?.upperTs != null ? roundGap.upperTs + 1 : undefined),
             fetchPage: ({ afterTs: at, beforeTs: bt }) => {
               pageBeforeTs = bt;
               return Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
@@ -4516,8 +4517,12 @@ export function useTimeline(
           // The mode-scoped in-flight/timer gates below let this reuse the
           // SAME dedupe/coalescing every other fireHttpBackfill call goes
           // through; only the resume cursor and round counter carry forward.
+          // While a hole is recorded, ITS filler owns the walk down: an unbounded newest-window refresh must not
+          // chain a second walker past the hole's floor.
+          const manualRoundDuringHole = mode === 'manualLatestWindow' && !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
           if (outcome.terminal === 'cap_hit' && outcome.resumeBeforeTs !== undefined
             && hadLocalEvents
+            && !manualRoundDuringHole
             && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
             backfillDebug('fireHttpBackfill: cap_hit → chaining next round', {
               sessionId: backfillSessionId, roundsChained: roundsChained + 1, resumeBeforeTs: outcome.resumeBeforeTs,

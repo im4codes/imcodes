@@ -1,5 +1,6 @@
 import crypto from 'node:crypto';
 import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { burstyGaps, nextMarkdownPiece } from './stream-script.mjs';
@@ -34,6 +35,7 @@ const historyFaithful = process.env.IMC_PERF_HISTORY_FAITHFUL === '1';
 const historyLatencyMs = Number(process.env.IMC_PERF_HISTORY_LATENCY_MS ?? 0);
 const staleSessionEnabled = process.env.IMC_PERF_STALE_SESSION === '1';
 const staleEvents = Number(process.env.IMC_PERF_STALE_EVENTS ?? 6000);
+const staleCachedEvents = Number(process.env.IMC_PERF_STALE_CACHED ?? 150);
 const perfSeed = (0x4d57494e).toString(36);
 const sessionNames = Array.from({ length: sessions }, (_, index) => `deck_perflat_imcperf-${perfSeed}-${index.toString(36)}_brain`);
 const subSessionIds = Array.from({ length: Math.max(0, sessions - 1) }, (_, index) => `perfsub${index.toString(36)}`);
@@ -180,7 +182,10 @@ async function handleDownload(msg) {
 const TEXT_TYPES = new Set(['user.message', 'assistant.text']);
 /** The real daemon's answer: the NEWEST `limit` events with afterTs < ts < beforeTs (text rows only for contentFilter=text). */
 async function serveFaithfulHistory(msg) {
-  const all = history.get(msg.sessionName) ?? [];
+  let all = history.get(msg.sessionName) ?? [];
+  // Until the spec drops the flip file the stale session is served as it was when the phone last had it open
+  // (only its old block): that is how the phone's local cache gets built by the real app, not by hand.
+  if (msg.sessionName === STALE_SESSION_NAME && !existsSync(path.join(uploadRoot, 'stale-flip'))) all = all.slice(0, staleCachedEvents);
   const limit = Math.max(1, Math.min(Number(msg.limit) || 200, 200));
   const afterTs = Number.isFinite(msg.afterTs) ? msg.afterTs : (Number.isFinite(msg.cursor?.afterTs) ? msg.cursor.afterTs : undefined);
   const beforeTs = Number.isFinite(msg.beforeTs) ? msg.beforeTs : (Number.isFinite(msg.cursor?.beforeTs) ? msg.cursor.beforeTs : undefined);
