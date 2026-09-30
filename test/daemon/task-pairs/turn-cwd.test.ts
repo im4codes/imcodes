@@ -118,6 +118,26 @@ describe('resolveTaskPairTurnCwd', () => {
     expect(resolveTaskPairTurnCwd(OWNER)).toEqual({ cwd: taskDir, taskId: 'T4', role: 'executor' });
   });
 
+  it('a non-git project: the executor and the auditor default to the task directory, whatever the workspace kind says', () => {
+    // ~/.imcodes/works/<project>/<taskId>/ -- no .git, kind `dir`.
+    const taskDir = dir('works/tcwdproj/T7');
+    savePair('T7', undefined, { workspace: { kind: 'dir', path: taskDir, createdAt: 1, status: 'active' } as never });
+    expect(resolveTaskPairTurnCwd(EXEC)).toEqual({ cwd: taskDir, taskId: 'T7', role: 'executor' });
+    expect(resolveTaskPairTurnCwd(AUD)).toEqual({ cwd: taskDir, taskId: 'T7', role: 'auditor' });
+    // The lookup is keyed on workspace.path, not the kind: the same directory as a snapshot with a private
+    // git (kind still `dir`), or recorded under another kind label, resolves identically.
+    mkdirSync(join(taskDir, '.git'), { recursive: true });
+    expect(resolveTaskPairTurnCwd(EXEC)?.cwd).toBe(taskDir);
+    savePair('T7', undefined, { workspace: { kind: 'worktree', path: taskDir, createdAt: 1, status: 'active' } as never });
+    expect(resolveTaskPairTurnCwd(EXEC)?.cwd).toBe(taskDir);
+    savePair('T7', undefined, { workspace: { kind: 'snapshot', path: taskDir, createdAt: 1, status: 'active' } as never });
+    expect(resolveTaskPairTurnCwd(AUD)?.cwd).toBe(taskDir);
+    // It ends with the pair, like any other workspace.
+    savePair('T7', undefined, { workspace: { kind: 'dir', path: taskDir, createdAt: 1, status: 'active' } as never }, 'done');
+    expect(resolveTaskPairTurnCwd(EXEC)).toBeUndefined();
+    expect(resolveTaskPairTurnCwd(AUD)).toBeUndefined();
+  });
+
   it('never points a turn at a workspace that is not usable', () => {
     savePair('T1', join(root, 'missing/repo'));
     expect(resolveTaskPairTurnCwd(EXEC)).toBeUndefined();
