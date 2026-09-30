@@ -241,11 +241,17 @@ describe('pairs that stopped driving themselves (215 / jdzj)', () => {
 
   async function sevenPassedPairs(): Promise<string[]> {
     const ids = Array.from({ length: 7 }, (_, index) => `P${index + 1}`);
-    for (const id of ids) {
-      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${id} executor=${EXEC} auditor=${AUD} -->`);
+    // One pair goes through the real flow; a queued DISPATCH naming an executor that is
+    // already held stays queued (and a participant's marker no longer starts it), so the
+    // other six open pairs of the same executor are seeded as copies, as the Q2 case below does.
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH ${ids[0]} executor=${EXEC} auditor=${AUD} -->`);
     // Owner rule: an auditor verdict requires material from READY_FOR_AUDIT.
-    marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${id} path=/workspace -->`);
-      marker(AUD, `<!-- IMCODES_TASK PASS ${id} blocking=P0 -->`);
+    marker(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT ${ids[0]} path=/workspace -->`);
+    marker(AUD, `<!-- IMCODES_TASK PASS ${ids[0]} blocking=P0 -->`);
+    await flush();
+    const first = getTaskPairStore().getPair(PROJECT, ids[0]!)!;
+    for (const id of ids.slice(1)) {
+      getTaskPairStore().savePair(PROJECT, { ...first.state, taskId: id, title: id, createdAt: now, updatedAt: now });
     }
     await flush();
     sent = [];

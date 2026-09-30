@@ -111,6 +111,10 @@ describe('legacy supervision tools and migration on the pairs engine', () => {
     // Two open pairs for the same executor: without the binding id the caller's
     // task could not be inferred.
     marker(BRAIN, `<!-- IMCODES_TASK DISPATCH L2 executor=${EXEC} auditor=${AUD} -->`);
+    // A queued DISPATCH naming a held executor stays queued (participant markers no longer start it),
+    // so the second open pair is seeded from the first, the way an older daemon left it.
+    const l1 = getTaskPairStore().getPair(PROJECT, 'L1')!;
+    getTaskPairStore().savePair(PROJECT, { ...l1.state, taskId: 'L2', title: 'L2', createdAt: l1.state.createdAt + 1, updatedAt: l1.state.updatedAt + 1 });
     // Owner rule: a PASS must close a real material-backed audit round.
     marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT L2 path=/workspace -->');
     marker(AUD, '<!-- IMCODES_TASK PASS L2 blocking=P0 -->');

@@ -52,7 +52,8 @@ function marker(line: string): TaskPairMarker {
 }
 
 function apply(pair: TaskPairState | undefined, writer: string, line: string) {
-  return applyTaskPairMarker(pair, marker(line), ctx(writer));
+  // The daemon's DISPATCH is the queue's admission (source 'queue'); every other writer is a marker.
+  return applyTaskPairMarker(pair, marker(line), ctx(writer, writer === 'daemon' ? { source: 'queue' } : {}));
 }
 
 /** Drive a sequence of (writer, line) markers from an empty state. */
@@ -65,6 +66,11 @@ function run(steps: Array<[string, string]>): { pair: TaskPairState; intents: un
     if (result.pair) pair = result.pair;
   }
   return { pair: pair!, intents };
+}
+
+/** The scheduler's admission: the ONLY route by which a queued pair starts (DISPATCH from the daemon, source 'queue'). */
+function admit(pair: TaskPairState, executor = EXEC, auditor = AUD): TaskPairState {
+  return applyTaskPairMarker(pair, marker(`<!-- IMCODES_TASK DISPATCH ${pair.taskId} executor=${executor} auditor=${auditor} -->`), ctx('daemon', { source: 'queue' })).pair!;
 }
 
 function dispatched(extra = ''): TaskPairState {
@@ -129,14 +135,34 @@ describe('task-pair marker grammar', () => {
     expect(isComplexSupervisionTaskBrief('Fix the login bug in src/a.ts and web/b.ts, then run the test suite')).toBe(true);
     expect(isComplexSupervisionTaskBrief('在 211 实机测试并修复跨文件回归问题')).toBe(true);
   });
-  it('records the real start and clears capacity flags when queued work begins', () => {
+  it('records the real start and clears capacity flags when queued work is admitted', () => {
     const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-start executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
     queued.flags = ['waiting_for_capacity', 'no_pool_configured'];
-    const started = applyTaskPairMarker(queued, marker('<!-- IMCODES_TASK STARTED T-start -->'), ctx(EXEC, { now: 9_000 })).pair!;
+    const started = applyTaskPairMarker(queued, marker(`<!-- IMCODES_TASK DISPATCH T-start executor=${EXEC} auditor=${AUD} -->`), ctx('daemon', { now: 9_000, source: 'queue' })).pair!;
     expect(started.status).toBe('working');
     expect(started.startedAt).toBe(9_000);
     expect(started.flags).not.toContain('waiting_for_capacity');
     expect(started.flags).not.toContain('no_pool_configured');
+  });
+
+  it('never starts a queued pair from participant activity or a Brain send: only admission (source queue) or Brain\'s explicit marker does', () => {
+    const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-guard executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
+    for (const [writer, line, source] of [
+      [EXEC, '<!-- IMCODES_TASK STARTED T-guard -->', 'marker'],
+      [EXEC, '<!-- IMCODES_TASK WORKING T-guard -->', 'legacy_tool'],
+      [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T-guard path=/w -->', 'marker'],
+      [BRAIN, '<!-- IMCODES_TASK WORKING T-guard -->', 'implicit_dispatch'],
+      [EXEC, '<!-- IMCODES_TASK WORKING T-guard -->', 'implicit_dispatch'],
+    ] as const) {
+      const result = applyTaskPairMarker(queued, marker(line), ctx(writer, { source, now: 5_000 }));
+      expect(result.pair, `${writer} ${line} via ${source}`).toBeUndefined(); // recorded only: no state change
+      expect(result.effect).toBe('recorded');
+      expect(result.intents).toContainEqual({ kind: 'slot_changed' }); // ...and the queue is asked to admit it
+    }
+    // The deliberate manual override: Brain's own marker still starts it.
+    expect(applyTaskPairMarker(queued, marker('<!-- IMCODES_TASK WORKING T-guard -->'), ctx(BRAIN, { now: 5_000 })).pair?.status).toBe('working');
+    // A pair that is already started is untouched by the rule (regression).
+    expect(applyTaskPairMarker(admit(queued), marker('<!-- IMCODES_TASK WORKING T-guard -->'), ctx(BRAIN, { source: 'implicit_dispatch', now: 6_000 })).pair?.status).toBe('working');
   });
 
   it('lets a Brain marker clear either side wait and resume an awaiting pair', () => {
@@ -390,6 +416,7 @@ describe('task-pair state machine', () => {
   it('runs the normal audit loop with severity-tagged verdicts and counts rounds', () => {
     const { pair } = run([
       [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
+      ['daemon', `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
       [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
       [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
       [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 -->'],
@@ -404,6 +431,7 @@ describe('task-pair state machine', () => {
   it('never notices Brain during a normal round: a REWORK, its fix, and the PASS are all settled between executor and auditor', () => {
     const { intents } = run([
       [BRAIN, `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
+      ['daemon', `<!-- IMCODES_TASK DISPATCH T42 executor=${EXEC} auditor=${AUD} -->`],
       [EXEC, '<!-- IMCODES_TASK STARTED T42 -->'],
       [EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T42 path=/workspace -->'],
       [AUD, '<!-- IMCODES_TASK REWORK T42 blocking=P0 p0=1 p1=2 -->'],

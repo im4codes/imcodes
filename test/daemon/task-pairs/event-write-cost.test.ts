@@ -109,20 +109,27 @@ describe('per-event pair write cost', () => {
   const started = (writer: string, taskId: string, eventId: string, now: number, attrs: Record<string, string> = {}) => service.applyMarker({
     project: PROJECT, writer, marker: { verb: 'STARTED', knownVerb: 'STARTED', taskId, attrs }, source: 'marker', eventId, now,
   });
+  /** The queue's admission: the only route by which a queued pair starts. */
+  const admit = (pair: { executor?: string; auditor?: string; taskId: string }, now: number) => service.applyMarker({
+    project: PROJECT, writer: 'daemon',
+    marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: pair.taskId, attrs: { executor: pair.executor!, auditor: pair.auditor! } },
+    source: 'queue', eventId: `admit-${pair.taskId}-${now}`, now,
+  });
   const startedEvents = (taskId: string) => getTaskPairStore().listEvents(PROJECT, taskId, 500).filter((event) => event.verb === 'STARTED');
 
   describe('repeated STARTED', () => {
-    it('leaves exactly one status event per pair, however many times the executor repeats it (54 in 95 minutes was seen)', () => {
+    it('writes no status event per repeated STARTED once the pair is started, however many times the executor repeats it (54 in 95 minutes was seen)', () => {
       const store = getTaskPairStore();
       const queued = pairState(0, 'queued');
       store.savePair(PROJECT, queued);
       const t0 = 10_000_000;
-      expect(started(queued.executor!, queued.taskId, 'first', t0).effect).toBe('status');
+      admit(queued, t0);
       expect(store.getPair(PROJECT, queued.taskId)!.state.status).toBe('working');
+      expect(started(queued.executor!, queued.taskId, 'first', t0).effect).toBe(TASK_PAIR_IDEMPOTENT_STARTED_EFFECT);
       saved = 0;
       const { result: results, prepares } = statements(() => Array.from({ length: 53 }, (_, i) => started(queued.executor!, queued.taskId, `again-${i}`, t0 + (i + 1) * 60_000)));
       expect(results.every((result) => result.effect === TASK_PAIR_IDEMPOTENT_STARTED_EFFECT)).toBe(true);
-      expect(startedEvents(queued.taskId)).toHaveLength(1);
+      expect(startedEvents(queued.taskId)).toHaveLength(0);
       // No pair rewrite, no console push, no event row: at most the throttled liveness row.
       expect(saved).toBe(0);
       expect(writesTo(prepares, 'task_pair_events')).toEqual([]);
@@ -154,10 +161,12 @@ describe('per-event pair write cost', () => {
 
     it('still records every STARTED that changes something: a queue start, a cleared flag, a re-assigned role, a foreign writer, a closed or passed pair', () => {
       const store = getTaskPairStore();
-      // queued -> working
+      // queued: an executor STARTED does not start it (only admission does) -- recorded, never swallowed as a no-op
       const queued = pairState(3, 'queued');
       store.savePair(PROJECT, queued);
-      expect(started(queued.executor!, queued.taskId, 'q1', 2_000_000).effect).toBe('status');
+      const early = started(queued.executor!, queued.taskId, 'q1', 2_000_000);
+      expect(early.effect).toBe('recorded'); // the marker itself changed nothing (the queue may admit the pair right after, on its own path)
+      expect(startedEvents(queued.taskId)).toHaveLength(1);
 
       // an executor-side blocked flag is cleared by a fresh STARTED: a real state change
       const blocked = pairState(4, 'working', { flags: ['blocked'], flagSides: { blocked: 'executor' } });

@@ -355,11 +355,13 @@ describe('task-pair heartbeat, replacement and queue', () => {
     sent = [];
     busy.add(EXEC);
     await tick(3);
-    expect(sent).toHaveLength(0);
+    // (This suite's project directory does not exist, so the daemon tells Brain once that the pair has no workspace: not a nudge.)
+    const nudges = () => sent.filter((entry) => !entry.id.includes(':brain-workspace-unprovisioned'));
+    expect(nudges()).toHaveLength(0);
     busy.delete(EXEC);
     taskPairService.recordProgress(EXEC, now + 1);
     await tick(1);
-    expect(sent).toHaveLength(0);
+    expect(nudges()).toHaveLength(0);
   });
 
   it('does not nudge a side that flagged itself blocked', async () => {
@@ -982,7 +984,7 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(pair('D3').status).toBe('working');
   });
 
-  it('starts a queued pair exactly once when its task-bound send reaches the named executor', async () => {
+  it('does not start a queued pair from a task-bound send to its executor: admission starts it once, with its brief', async () => {
     queuePairDirect('BOUND_SEND', 'bound brief');
     const queued = pair('BOUND_SEND');
     getTaskPairStore().savePair(PROJECT, {
@@ -991,21 +993,30 @@ describe('task-pair heartbeat, replacement and queue', () => {
       auditor: AUD,
       flags: ['waiting_for_capacity'],
     });
-    const queuedAt = pair('BOUND_SEND').createdAt;
+    busy.add(EXEC); // held: admission cannot start it right now
     const transition = taskPairService.implicitDispatch({
       project: PROJECT,
       sender: BRAIN,
       target: EXEC,
       taskId: 'BOUND_SEND',
-      eventId: 'bound-send-start',
+      eventId: 'bound-send-recorded',
       brief: 'bound brief',
     });
-    expect(transition?.effect).toBe('status');
-    expect(pair('BOUND_SEND')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
-    expect(pair('BOUND_SEND').startedAt).toBeGreaterThanOrEqual(queuedAt);
-    expect(pair('BOUND_SEND').flags).not.toContain('waiting_for_capacity');
-    await automation.runQueue(PROJECT, BRAIN);
+    await flush();
+    expect(transition?.effect).toBe('recorded');
+    expect(pair('BOUND_SEND')).toMatchObject({ status: 'queued', executor: EXEC, auditor: AUD });
+    expect(pair('BOUND_SEND').startedAt).toBeUndefined();
+    expect(pair('BOUND_SEND').workspace).toBeUndefined();
     expect(sentTo(EXEC, 'dispatch')).toHaveLength(0);
+
+    busy.delete(EXEC);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(pair('BOUND_SEND')).toMatchObject({ status: 'working', executor: EXEC, auditor: AUD });
+    expect(pair('BOUND_SEND').flags).not.toContain('waiting_for_capacity');
+    expect(sentTo(EXEC, 'dispatch')).toHaveLength(1);
+    expect(sentTo(EXEC, 'dispatch')[0]!.text.startsWith('bound brief')).toBe(true);
+    await automation.runQueue(PROJECT, BRAIN);
+    expect(sentTo(EXEC, 'dispatch')).toHaveLength(1); // exactly once
   });
 
   it('starts a queued pair on the executor STARTED marker with a fresh start time', async () => {

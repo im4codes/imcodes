@@ -368,6 +368,11 @@ describe('task-pair marker ingestion', () => {
       marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-after-rework', attrs: { executor: EXEC, auditor: AUD } },
       source: 'marker', eventId: 'rar-dispatch',
     });
+    service.applyMarker({ // the queue's admission: the only way a queued pair starts
+      project: PROJECT, writer: 'daemon',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'ready-after-rework', attrs: { executor: EXEC, auditor: AUD } },
+      source: 'queue', eventId: 'rar-admit',
+    });
     const ready = (eventId: string, now: number) => service.applyMarker({
       project: PROJECT, writer: EXEC,
       marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'ready-after-rework', attrs: { path: '/workspace' } },

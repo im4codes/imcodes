@@ -210,7 +210,11 @@ export const TASK_PAIR_WORKSPACE_EFFECTS = {
   APPLY_BACK_FAILED: 'apply_back_failed',
   /** An applied change was undone from the backup. */
   APPLY_BACK_UNDONE: 'apply_back_undone',
+  /** A started pair that had no workspace (its start skipped admission or provisioning failed) got one on a heartbeat. */
+  PROVISIONED_LATE: 'workspace_provisioned_late',
 } as const;
+/** Started, open pairs whose executor must have a workspace; the heartbeat provisions a missing one. */
+export const TASK_PAIR_WORKSPACE_REPAIR_STATUSES: readonly TaskPairStatus[] = ['working', 'in_audit', 'awaiting_audit', 'rework'];
 /** Verb of daemon workspace events (never a marker verb). */
 export const TASK_PAIR_WORKSPACE_EVENT_VERB = 'WORKSPACE' as const;
 /** Verb/effect of a daemon-generated localized title landing on a pair (never a marker verb). */
@@ -1497,6 +1501,21 @@ export function applyTaskPairMarker(
   if (existing.status === 'queued' && !existing.executor && !roleAuthority
     && (verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT' || verb === 'DONE')) {
     return recorded(existing);
+  }
+
+  // A queued pair starts ONLY through the scheduler's admission (a DISPATCH
+  // with source 'queue'): that path checks capacity and busy participants,
+  // provisions the pair's workspace and delivers the brief that names it. Any
+  // other route to `working` -- a participant's STARTED/WORKING/READY marker,
+  // a legacy tool, a Brain send_message bound to the pair -- would flip the
+  // status with no workspace and no brief (owner report,
+  // tsk_cd_implicit_working_no_workspace). Those are recorded and ask the
+  // queue to try to admit the pair now. Brain's own explicit marker stays the
+  // deliberate manual override; the daemon then briefs and provisions it.
+  if (existing.status === 'queued' && ctx.source !== 'queue'
+    && (verb === 'STARTED' || verb === 'WORKING' || verb === 'READY_FOR_AUDIT')
+    && (!roleAuthority || ctx.source === 'implicit_dispatch')) {
+    return recorded(existing, ctx.source !== 'implicit_dispatch', [{ kind: 'slot_changed' }]);
   }
 
   // A closed pair (cancelled or done) stays closed for a participant: only

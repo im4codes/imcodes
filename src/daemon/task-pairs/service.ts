@@ -29,6 +29,7 @@ import {
   TASK_PAIR_IDEMPOTENT_STARTED_EFFECT,
   TASK_PAIR_TITLE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_EFFECTS,
+  TASK_PAIR_WORKSPACE_REPAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_RETENTION_MS,
   isComplexSupervisionTaskBrief,
@@ -259,7 +260,14 @@ function redirectMaterialToCurrentWorkspace(pair: TaskPairState): TaskPairState 
 export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: string): Promise<void> {
   const store = getTaskPairStore();
   const stored = store.getPair(project, taskId);
-  if (!stored || !stored.state.executor || !stored.state.workspace) return;
+  if (!stored || !stored.state.executor) return;
+  // A started pair with no workspace at all (its start skipped admission, or
+  // provisioning failed then): give it one, once, instead of returning here and
+  // leaving its executor to work wherever it happens to be.
+  if (!stored.state.workspace) {
+    await taskPairService.provisionMissingWorkspace(project, taskId);
+    return;
+  }
   // An executor change (REASSIGN, limit failover, restart-recovered queue start)
   // leaves the worktree under the previous executor: settle it before deciding
   // whether the path is missing.
@@ -765,6 +773,12 @@ export class TaskPairService {
           && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')))) {
       this.#track(this.briefParticipants(input.project, stored.state.taskId));
     }
+    // Brain's explicit marker can still start a queued pair by hand. It must end
+    // up exactly like an admitted pair: workspace provisioned, brief delivered.
+    if (stored && input.source !== 'queue' && transition.fromStatus === 'queued'
+      && transition.toStatus && transition.toStatus !== 'queued' && !isTerminalTaskPairStatus(transition.toStatus)) {
+      this.#track(this.briefParticipants(input.project, stored.state.taskId));
+    }
     // A pair that just ended (DONE, CANCEL, DONE force=true): its workspace
     // starts its retention and a deliverable named on DONE is kept.
     if (stored && transition.toStatus && isTerminalTaskPairStatus(transition.toStatus)
@@ -961,6 +975,12 @@ export class TaskPairService {
     }
   }
 
+  /** Ask the queue to try to admit waiting pairs now (its normal, capacity-checked path). */
+  #requestQueueAdmission(project: string, brain: string): void {
+    const runQueue = this.#scheduler?.runQueue;
+    if (runQueue) this.#track(Promise.resolve(runQueue.call(this.#scheduler, project, brain)));
+  }
+
   /** send_message with task metadata: creates a missing pair, otherwise record only. */
   implicitDispatch(input: {
     project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; titleExplicit?: boolean; eventId: string;
@@ -997,24 +1017,16 @@ export class TaskPairService {
           return resolved;
         }
       }
-      // A task-bound send is itself evidence that the named participant has
-      // begun work.  This is especially important for a queued pair whose
-      // executor is already busy: waiting for the queue drain would otherwise
-      // resend the brief later, even though this send started the task.
-      const queuedActivity = existing.state.status === 'queued'
-        && (input.sender === existing.state.executor
-          || input.target === existing.state.executor);
-      if (queuedActivity) {
-        const resumed = this.applyMarker({
-          project,
-          writer: input.sender,
-          marker: { verb: 'WORKING', knownVerb: 'WORKING', taskId: input.taskId, attrs: {} },
-          source: 'implicit_dispatch',
-          eventId: input.eventId,
-        });
-        noteTaskPairFocus(input.target, input.taskId);
-        return resumed;
-      }
+      // A queued pair is NOT started by a task-bound send (owner report,
+      // tsk_cd_implicit_working_no_workspace): a status flip here skipped
+      // admission -- no capacity check, no workspace, no brief -- and left a
+      // "working" pair whose executor had nowhere to work. The message itself
+      // is still delivered (this is only bookkeeping); the queue admits the pair
+      // through its one path, and the request below makes that happen now
+      // when there is capacity instead of at the next heartbeat.
+      const queuedExecutorTraffic = existing.state.status === 'queued'
+        && (input.sender === existing.state.executor || input.target === existing.state.executor);
+      if (queuedExecutorTraffic) this.#requestQueueAdmission(project, existing.state.brain);
       // Record only: ordinary traffic (materials to the auditor, replies,
       // Brain messages) never changes a pair's roles or status.
       const state = existing.state;
@@ -1672,6 +1684,36 @@ export class TaskPairService {
       if (line) await sendTaskPairMessage(next.brain, taskId, 'brain-non-git-mode', line);
     }
     return next;
+  }
+
+  /**
+   * Repair pass: a started, open pair that has no workspace gets one now, and its
+   * participants are told where it is; when it cannot be created, Brain hears
+   * about it once. Legacy-imported pairs keep their own worktrees and are left alone.
+   */
+  async provisionMissingWorkspace(project: string, taskId: string): Promise<void> {
+    const store = getTaskPairStore();
+    const stored = store.getPair(project, taskId);
+    if (!stored || stored.legacyTaskId || !stored.state.executor || stored.state.workspace) return;
+    if (!TASK_PAIR_WORKSPACE_REPAIR_STATUSES.includes(stored.state.status)) return;
+    const pair = await this.ensureWorkspace(project, taskId);
+    const workspace = pair?.workspace;
+    if (pair && workspace) {
+      const latest = store.getPair(project, taskId);
+      if (latest?.state.workspaceRecoveryEscalatedAt) store.savePair(project, { ...latest.state, workspaceRecoveryEscalatedAt: undefined, updatedAt: Date.now() });
+      this.#recordWorkspaceEvent(project, pair, TASK_PAIR_WORKSPACE_EFFECTS.PROVISIONED_LATE, { path: workspace.path, kind: workspace.kind }, {}, true);
+      const notice = `${pair.taskId} had no workspace when it started. Its workspace is now ready at ${workspace.path}. Work and commit there; if you began elsewhere, move that work into it.`;
+      if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'workspace-provisioned', notice);
+      if (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(pair.auditor, pair.taskId, 'workspace-provisioned', notice);
+      return;
+    }
+    const latest = store.getPair(project, taskId);
+    if (!latest || latest.state.workspace || latest.state.workspaceRecoveryEscalatedAt) return;
+    const result = await sendTaskPairMessage(latest.state.brain, taskId, 'brain-workspace-unprovisioned', `${taskId} is ${latest.state.status} but has no workspace and the daemon could not create one. Check the project directory and disk space, or provide a workspace; this notice is sent once.`);
+    if (result === 'sent' || result === 'queued' || result === 'skipped_pending') {
+      const current = store.getPair(project, taskId);
+      if (current) store.savePair(project, { ...current.state, workspaceRecoveryEscalatedAt: Date.now(), updatedAt: Date.now() });
+    }
   }
 
   /**
