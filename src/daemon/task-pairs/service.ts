@@ -35,6 +35,7 @@ import {
   applyTaskPairMarker,
   resolveTaskPairBrainWait,
   isTerminalTaskPairStatus,
+  redirectTaskPairWorkspacePath,
   mayContainTaskPairMarker,
   scanTaskPairMarkers,
   stripTaskPairMarkersForDisplay,
@@ -53,10 +54,11 @@ import {
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
 import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
+import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
-import { copyTaskPairOutput, provisionTaskPairWorkspace, releaseTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
+import { copyTaskPairOutput, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import {
   classifyDiskLevel, diskLevelRank, isDiskLevel, readWorktreeVolumeSpace, stripHeavyIgnoredDirs, taskPairHygieneDeps,
@@ -71,7 +73,10 @@ import {
   buildAuditorAssignmentMessage,
   buildExecutorPairBrief,
   buildOutputFailedLine,
+  buildWorkspaceDuplicateNotice,
   buildWorkspaceKeptLine,
+  buildWorkspaceMoveFailedLine,
+  buildWorkspaceMovedNotice,
   buildBrainNoticeMessage,
   buildCorrectionMessage,
   buildDiskPressureMessage,
@@ -229,14 +234,34 @@ const WORKSPACE_REVISION_SOURCE_LABEL: Record<TaskPairWorkspaceRevisionSource, s
   directory: 'a fresh task directory',
 };
 
+/**
+ * A READY written after the worktree moved under a new executor may still name
+ * the old path (the executor's own memory of it): store the current one, so the
+ * pair never carries material that points at a dead path.
+ */
+function redirectMaterialToCurrentWorkspace(pair: TaskPairState): TaskPairState {
+  const { material, workspace } = pair;
+  if (!material || !workspace?.previousPaths?.length) return pair;
+  const worktree = material.worktree ? redirectTaskPairWorkspacePath(workspace, material.worktree) : undefined;
+  const path = material.path ? redirectTaskPairWorkspacePath(workspace, material.path) : undefined;
+  if (worktree === material.worktree && path === material.path) return pair;
+  return { ...pair, material: { ...material, ...(worktree ? { worktree } : {}), ...(path ? { path } : {}) } };
+}
+
 export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: string): Promise<void> {
   const store = getTaskPairStore();
   const stored = store.getPair(project, taskId);
   if (!stored || !stored.state.executor || !stored.state.workspace) return;
-  const workspace = stored.state.workspace;
+  // An executor change (REASSIGN, limit failover, restart-recovered queue start)
+  // leaves the worktree under the previous executor: settle it before deciding
+  // whether the path is missing.
+  await taskPairService.settleWorkspaceOwner(project, taskId, { notify: true });
+  const settled = store.getPair(project, taskId);
+  if (!settled || !settled.state.workspace) return;
+  const workspace = settled.state.workspace;
   const present = await stat(workspace.path).then(() => true).catch(() => false);
   if (present) return;
-  const provision = await provisionTaskPairWorkspace(project, stored.state).catch(() => ({ ok: false as const, detail: 'workspace rebuild failed' }));
+  const provision = await provisionTaskPairWorkspace(project, settled.state).catch(() => ({ ok: false as const, detail: 'workspace rebuild failed' }));
   if (!provision.ok) {
     if (!stored.state.workspaceRecoveryEscalatedAt) {
       const result = await sendTaskPairMessage(stored.state.brain, taskId, 'brain-workspace-unrecoverable', `Workspace for ${taskId} is missing and could not be rebuilt. Recovery sources exhausted; inspect the original branch/commit or provide a new workspace.`);
@@ -248,7 +273,7 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
   }
   const now = Date.now();
   const rebuilt = { kind: provision.kind, path: provision.path, ...(provision.base ? { base: provision.base } : {}), ...(provision.branch ? { branch: provision.branch } : {}), createdAt: now, status: 'active' as const };
-  const next = { ...stored.state, workspace: rebuilt, workspaceRecoveryEscalatedAt: undefined, updatedAt: now };
+  const next = { ...settled.state, workspace: rebuilt, workspaceRecoveryEscalatedAt: undefined, updatedAt: now };
   store.savePair(project, next);
   const notice = `Workspace for ${taskId} was rebuilt from ${WORKSPACE_REVISION_SOURCE_LABEL[provision.source]}: ${provision.path}`;
   await sendTaskPairMessage(stored.state.executor, taskId, 'workspace-rebuilt', notice);
@@ -428,6 +453,11 @@ export class TaskPairService {
       if (event.type === 'session.state') {
         noteTaskPairProviderError(event);
       } else if (event.type === 'user.message' || event.type === 'tool.call' || event.type === 'tool.result') {
+        // A participant's git write in the main checkout is reported at once; a pre-tool hook (claude-code-sdk) refuses it earlier.
+        // Own try/catch and first: neither this check nor the activity stamp may prevent the other.
+        if (event.type === 'tool.call') {
+          try { inspectToolCallForPairMainCheckoutWrite(event.sessionId, event.payload); } catch (error) { logger.warn({ err: error, session: event.sessionId }, 'task-pair: main-checkout write check failed'); }
+        }
         if (!(event.type === 'user.message' && (event.payload as Record<string, unknown>).automation === true)) {
           this.recordActivity(event.sessionId, event.ts ?? Date.now());
         }
@@ -642,7 +672,7 @@ export class TaskPairService {
             workspace: { ...workspace, status: 'active' as const, endedAt: undefined, keptReason: undefined, strippedAt: undefined },
           }
         : transition.pair;
-      stored = store.savePair(input.project, pairToSave, {
+      stored = store.savePair(input.project, redirectMaterialToCurrentWorkspace(pairToSave), {
         liveness: this.#livenessAfterMarker(existing?.liveness, transition, role, now),
       });
       if (busySessions.size > 0) stored = this.#noteParticipantConflicts(input.project, stored, busySessions);
@@ -1447,6 +1477,112 @@ export class TaskPairService {
     await this.#executeIntents(project, latest.state, [{ kind: 'pick_auditor' }]);
   }
 
+  #settleInFlight = new Map<string, Promise<TaskPairState | undefined>>();
+  #settleReported = new Set<string>();
+  /** A deferred move (busy session / process inside) is retried at most once a minute: the process probe is not free. */
+  #settleBackoffUntil = new Map<string, number>();
+
+  /**
+   * Keep one authoritative workspace under the pair's CURRENT executor: after
+   * an executor change the worktree is moved under the new executor (see
+   * rehomeTaskPairWorkspace), a same-task worktree found beside it is
+   * registered as a duplicate, and the pair's material naming the old path is
+   * rewritten to the new one. Serialised per pair (the brief and the heartbeat
+   * both call it) and idempotent: an unchanged pair costs two path compares.
+   * Returns the pair as stored afterwards.
+   */
+  settleWorkspaceOwner(project: string, taskId: string, options: { notify: boolean }): Promise<TaskPairState | undefined> {
+    const key = `${project}\u0000${taskId}`;
+    const running = this.#settleInFlight.get(key);
+    if (running) return running;
+    const promise = this.#settleWorkspaceOwner(project, taskId, options).finally(() => { this.#settleInFlight.delete(key); });
+    this.#settleInFlight.set(key, promise);
+    return promise;
+  }
+
+  async #settleWorkspaceOwner(project: string, taskId: string, options: { notify: boolean }): Promise<TaskPairState | undefined> {
+    const store = getTaskPairStore();
+    const current = store.getPair(project, taskId)?.state;
+    const workspace = current?.workspace;
+    if (!current || !workspace || workspace.kind !== 'worktree' || workspace.status === 'removed' || !current.executor) return current;
+    const backoffKey = `${project}\u0000${taskId}`;
+    if ((this.#settleBackoffUntil.get(backoffKey) ?? 0) > Date.now()) return current;
+    const result = await rehomeTaskPairWorkspace(current);
+    if (result.action === 'deferred') this.#settleBackoffUntil.set(backoffKey, Date.now() + 60_000);
+    else if (result.action === 'failed') this.#settleBackoffUntil.set(backoffKey, Date.now() + 5 * 60_000);
+    else this.#settleBackoffUntil.delete(backoffKey);
+    if (result.action === 'unchanged') return current;
+    const latest = store.getPair(project, taskId)?.state;
+    if (!latest) return undefined;
+    // A newer executor change, or a rebuild, landed while git ran: this result describes a stale pair.
+    if (latest.executor !== current.executor || latest.workspace?.path !== workspace.path) return latest;
+    const now = Date.now();
+    const reportOnce = (kind: string, detail: string): boolean => {
+      const reportKey = `${project}\u0000${taskId}\u0000${kind}\u0000${detail}`;
+      if (this.#settleReported.has(reportKey)) return false;
+      this.#settleReported.add(reportKey);
+      return true;
+    };
+    switch (result.action) {
+      case 'moved':
+      case 'adopted': {
+        const previousPaths = [...new Set([...(latest.workspace.previousPaths ?? []), result.from])];
+        // The executor may have branched off the detached start since the workspace was recorded: keep the branch current.
+        const branch = result.action === 'moved' ? result.branch : await gitBranchOf(result.to);
+        const moved = { ...latest.workspace, path: result.to, previousPaths, movedAt: now, ...(branch ? { branch } : {}) };
+        const siblings = await listTaskPairSiblingWorktrees({ ...latest, workspace: moved }).catch(() => [] as string[]);
+        const next: TaskPairState = {
+          ...latest,
+          workspace: { ...moved, ...(siblings.length ? { duplicatePaths: siblings } : { duplicatePaths: undefined }) },
+          ...(latest.material ? { material: {
+            ...latest.material,
+            ...(latest.material.worktree ? { worktree: redirectTaskPairWorkspacePath(moved, latest.material.worktree) } : {}),
+            ...(latest.material.path ? { path: redirectTaskPairWorkspacePath(moved, latest.material.path) } : {}),
+          } } : {}),
+          updatedAt: Math.max(latest.updatedAt, now),
+        };
+        store.savePair(project, next);
+        this.#recordWorkspaceEvent(project, next, result.action === 'moved' ? TASK_PAIR_WORKSPACE_EFFECTS.MOVED : TASK_PAIR_WORKSPACE_EFFECTS.ADOPTED, { from: result.from, to: result.to }, {}, false);
+        if (options.notify) {
+          const text = buildWorkspaceMovedNotice(next, result.from, result.to, result.action === 'adopted');
+          if (next.executor) await sendTaskPairMessage(next.executor, taskId, 'workspace-moved', text);
+          if (next.auditor && next.auditor !== TASK_PAIR_NO_AUDITOR) await sendTaskPairMessage(next.auditor, taskId, 'workspace-moved', text);
+        }
+        if (siblings.length && reportOnce('duplicate', siblings.join('|'))) {
+          await sendTaskPairMessage(next.brain, taskId, 'brain-workspace-duplicate', buildWorkspaceDuplicateNotice(next));
+        }
+        return next;
+      }
+      case 'duplicate': {
+        const already = latest.workspace.duplicatePaths?.includes(result.duplicate);
+        if (already) return latest;
+        const next: TaskPairState = {
+          ...latest,
+          workspace: { ...latest.workspace, duplicatePaths: [...new Set([...(latest.workspace.duplicatePaths ?? []), result.duplicate])] },
+          updatedAt: Math.max(latest.updatedAt, now),
+        };
+        store.savePair(project, next);
+        this.#recordWorkspaceEvent(project, next, TASK_PAIR_WORKSPACE_EFFECTS.DUPLICATE, { kept: result.kept, duplicate: result.duplicate }, {}, true);
+        const text = buildWorkspaceDuplicateNotice(next);
+        if (options.notify && next.executor) await sendTaskPairMessage(next.executor, taskId, 'workspace-duplicate', text);
+        if (reportOnce('duplicate', result.duplicate)) await sendTaskPairMessage(next.brain, taskId, 'brain-workspace-duplicate', text);
+        return next;
+      }
+      case 'deferred':
+        // Not an error: both sides are mid-work. One timeline entry per pair and holder, then quiet retries.
+        if (reportOnce('deferred', `${result.reason}:${result.detail}`)) {
+          this.#recordWorkspaceEvent(project, latest, TASK_PAIR_WORKSPACE_EFFECTS.MOVE_DEFERRED, { reason: result.reason, detail: result.detail }, {}, false);
+        }
+        return latest;
+      case 'failed':
+        if (reportOnce('failed', result.detail)) {
+          this.#recordWorkspaceEvent(project, latest, TASK_PAIR_WORKSPACE_EFFECTS.MOVE_FAILED, { detail: result.detail }, {}, true);
+          await sendTaskPairMessage(latest.brain, taskId, 'brain-workspace-move-failed', buildWorkspaceMoveFailedLine(latest, result.detail));
+        }
+        return latest;
+    }
+  }
+
   /**
    * The pair's workspace, created once per pair and recorded on it; a reopened
    * pair takes its ended workspace back. Returns the pair as stored afterwards
@@ -1457,12 +1593,16 @@ export class TaskPairService {
     const current = store.getPair(project, taskId)?.state;
     if (!current || !current.executor || isTerminalTaskPairStatus(current.status)) return current;
     if (current.workspace && current.workspace.status !== 'removed') {
-      if (current.workspace.status === 'active') return current;
-      const { endedAt: _endedAt, keptReason: _keptReason, strippedAt: _strippedAt, ...workspace } = current.workspace;
+      // The brief that follows an executor change carries the path itself, so
+      // the move needs no separate notice here.
+      const settled = (await this.settleWorkspaceOwner(project, taskId, { notify: false })) ?? current;
+      const existing = settled.workspace;
+      if (!existing || existing.status === 'active') return settled;
+      const { endedAt: _endedAt, keptReason: _keptReason, strippedAt: _strippedAt, ...workspace } = existing;
       // A reopen starts a fresh retention window; the next terminal transition
       // must not inherit the previous terminal timestamp or keep reason.
       const reopened: TaskPairState = {
-        ...current,
+        ...settled,
         workspace: { ...workspace, status: 'active', endedAt: undefined, keptReason: undefined, strippedAt: undefined },
       };
       store.savePair(project, reopened);

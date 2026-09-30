@@ -148,6 +148,15 @@ export const TASK_PAIR_WORKSPACE_EFFECTS = {
   KEPT: 'workspace_kept',
   OUTPUT_SAVED: 'output_saved',
   OUTPUT_FAILED: 'output_failed',
+  /** The worktree was moved under the new executor after an executor change. */
+  MOVED: 'workspace_moved',
+  /** The new executor already had a worktree for the task at the target path; it was adopted (the old path is gone). */
+  ADOPTED: 'workspace_adopted',
+  /** Another worktree for the same task exists next to the authoritative one; it is only registered, never used. */
+  DUPLICATE: 'workspace_duplicate',
+  /** The move waits until the old executor and every process working inside the worktree are idle. */
+  MOVE_DEFERRED: 'workspace_move_deferred',
+  MOVE_FAILED: 'workspace_move_failed',
 } as const;
 /** Verb of daemon workspace events (never a marker verb). */
 export const TASK_PAIR_WORKSPACE_EVENT_VERB = 'WORKSPACE' as const;
@@ -178,6 +187,7 @@ export const TASK_PAIR_WORKSPACE_RULES = [
   `Any other task (the project is not a git repo, or Brain dispatched it with workspace=dir) gets a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/<taskId>/: work and write results there; READY_FOR_AUDIT <taskId> path=<the directory or the result files>, no git HEAD needed.`,
   'Never work in the main checkout or /tmp, and never delete the workspace by hand: the daemon removes it 7 days after the pair ends (DONE/CANCEL), and keeps a git worktree that still has uncommitted work or commits not yet integrated into origin/dev.',
   'If your workspace is missing, rebuild it from the original branch (or use the rebuilt path the daemon sends) and continue; do not wait.',
+  'After an executor change the daemon moves the worktree under the new executor and names the one authoritative path; never work in a second copy of it. Git writes (reset, checkout, cherry-pick, commit) in the main checkout by a pair participant are refused or reported to Brain at once.',
   'Deliverables: judge from the task type whether the result must outlive the pair (a report, document or asset the user keeps) or is only temporary (scratch work, or code that is committed locally). If it must be kept, end with DONE <taskId> output=<path inside the workspace> [dest=<path inside the project directory>]: the daemon copies it into the project directory (by default under the same relative path, never overwriting) and tells the user where. Temporary work: plain DONE.',
 ].join(' ');
 
@@ -940,7 +950,22 @@ export interface TaskPairWorkspace {
    * reinstalls what it needs.
    */
   strippedAt?: number;
+  /**
+   * Paths this worktree lived at before an executor change moved it. A READY
+   * or audit material that still names one resolves to `path`
+   * (redirectTaskPairWorkspacePath), so nobody is sent to a dead path.
+   */
+  previousPaths?: string[];
+  /**
+   * Other worktrees for the same task found next to the authoritative one
+   * (e.g. a rebuild by an earlier executor). Registered so nothing forks
+   * silently; never used or removed by the daemon.
+   */
+  duplicatePaths?: string[];
+  movedAt?: number;
 }
+
+export { redirectTaskPairWorkspacePath } from './task-pair-workspace-path.js';
 
 export interface TaskPairOutput {
   /** Inside the workspace. */

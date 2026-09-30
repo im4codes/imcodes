@@ -25,7 +25,7 @@
  * executor reinstalls what it needs.
  */
 import { execFile } from 'node:child_process';
-import { cp, lstat, mkdir, realpath, rm, stat, writeFile } from 'node:fs/promises';
+import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rm, rmdir, stat, writeFile } from 'node:fs/promises';
 import { rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
@@ -37,7 +37,8 @@ import {
   type TaskPairState,
   type TaskPairWorkspaceKind,
 } from '../../../shared/task-pair.js';
-import { resolveSupervisionAssignmentWorktree } from '../supervision-worktree-inspector.js';
+import { isSessionBusy } from './pool.js';
+import { resolveSupervisionAssignmentWorktree, resolveSupervisionWorktreesRoot } from '../supervision-worktree-inspector.js';
 import { ensureSupervisionAssignmentWorktree } from '../supervision-worktree-provision.js';
 import {
   countTaskPairCommitsNotInDev,
@@ -50,7 +51,7 @@ import {
 const GIT_PROBE_TIMEOUT_MS = 5_000;
 const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
 
-function gitBranch(repoPath: string): Promise<string | undefined> {
+export function gitBranch(repoPath: string): Promise<string | undefined> {
   return new Promise((resolve) => execFile('git', ['-C', repoPath, 'symbolic-ref', '--short', '-q', 'HEAD'], { timeout: GIT_PROBE_TIMEOUT_MS }, (error, stdout) => {
     const value = String(stdout ?? '').trim();
     resolve(!error && value ? value : undefined);
@@ -178,6 +179,10 @@ export interface TaskPairWorkspaceDeps {
   /** Re-check ownership/liveness immediately before deleting the workspace. */
   beforeRemove?: () => boolean | Promise<boolean>;
   countCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  /** Rehome: is this session mid-turn (or has queued work)? */
+  isBusy?: (sessionName: string) => boolean;
+  /** Rehome: does any live process have its working directory inside `path`? */
+  hasProcessInside?: (path: string) => Promise<boolean>;
 }
 
 function allowWorkspaceRemoval(deps: TaskPairWorkspaceDeps): boolean | Promise<boolean> {
@@ -378,4 +383,151 @@ export async function copyTaskPairOutput(
   } catch {
     return { ok: false, reason: 'copy_failed' };
   }
+}
+
+
+// ---- executor change: keep exactly one authoritative workspace -------------
+
+export type TaskPairWorkspaceRehome =
+  | { action: 'unchanged' }
+  | { action: 'moved'; from: string; to: string; branch?: string }
+  /** The recorded path is gone and the new executor's worktree already exists there: it becomes the workspace. */
+  | { action: 'adopted'; from: string; to: string }
+  /** Both exist: the recorded worktree stays authoritative and the other one is only registered. */
+  | { action: 'duplicate'; kept: string; duplicate: string }
+  | { action: 'deferred'; reason: 'session_busy' | 'process_inside'; detail: string }
+  | { action: 'failed'; detail: string };
+
+/** Who owns a daemon-layout worktree path: `<root>/<namespace>/<session>/<assignmentId>/repo`. */
+function worktreeOwnerSession(repoPath: string, assignmentId: string): string | undefined {
+  if (basename(repoPath) !== 'repo') return undefined;
+  const assignmentRoot = dirname(repoPath);
+  if (basename(assignmentRoot) !== assignmentId) return undefined;
+  return basename(dirname(assignmentRoot)) || undefined;
+}
+
+/** Live processes whose working directory is inside `path` (a shell or test run the move would break). */
+async function defaultHasProcessInside(path: string): Promise<boolean> {
+  const inside = (cwd: string) => cwd === path || cwd.startsWith(path + sep);
+  if (process.platform === 'linux') {
+    const pids = await readdir('/proc').catch(() => [] as string[]);
+    for (const pid of pids) {
+      if (!/^\d+$/.test(pid)) continue;
+      const cwd = await readlink(`/proc/${pid}/cwd`).catch(() => undefined);
+      if (cwd && inside(cwd)) return true;
+    }
+    return false;
+  }
+  if (process.platform === 'win32') return false; // no cheap equivalent; the busy-session check still applies
+  return new Promise((resolvePromise) => {
+    execFile('lsof', ['-a', '-d', 'cwd', '-Fn'], { timeout: GIT_PROBE_TIMEOUT_MS * 2, maxBuffer: 8 * 1024 * 1024 }, (error, stdout) => {
+      // lsof exits 1 when nothing matched its filters; other failures mean "unknown": do not block on them.
+      if (error && !String(stdout ?? '')) return resolvePromise(false);
+      resolvePromise(String(stdout ?? '').split('\n').some((line) => line.startsWith('n') && inside(line.slice(1))));
+    });
+  });
+}
+
+function gitCommonDirOf(repoPath: string): Promise<string | undefined> {
+  return new Promise((resolvePromise) => {
+    execFile('git', ['-C', repoPath, 'rev-parse', '--path-format=absolute', '--git-common-dir'], { timeout: GIT_PROBE_TIMEOUT_MS, windowsHide: true }, (error, stdout) => {
+      const value = String(stdout ?? '').trim();
+      resolvePromise(!error && value ? value : undefined);
+    });
+  });
+}
+
+/**
+ * After an executor change the pair's worktree still sits under the previous
+ * executor's session directory. Move it (git worktree move: branch, HEAD,
+ * uncommitted work and stashes stay) under the new executor so there is one
+ * authoritative workspace under the executor that uses it.
+ *
+ * - Never while the old or new executor is busy, or any process has its cwd
+ *   inside the worktree: a running shell would lose its directory. Deferred;
+ *   the heartbeat asks again.
+ * - Crash safe: a move that finished on disk but not on the pair (the old path
+ *   is gone and the target exists) is adopted, never redone.
+ * - Never overwrites: a worktree already at the target is registered as a
+ *   duplicate and left alone.
+ * Paths that are not in the daemon's `<session>/pair_<task>/repo` layout (Brain
+ * named its own) are left where they are.
+ */
+export async function rehomeTaskPairWorkspace(
+  pair: TaskPairState,
+  deps: TaskPairWorkspaceDeps = testDeps ?? {},
+): Promise<TaskPairWorkspaceRehome> {
+  const workspace = pair.workspace;
+  if (!workspace || workspace.kind !== 'worktree' || workspace.status === 'removed' || !pair.executor) return { action: 'unchanged' };
+  const assignmentId = taskPairWorktreeName(pair.taskId);
+  const target = resolveSupervisionAssignmentWorktree({ sessionName: pair.executor, assignmentId, env: deps.env });
+  if (resolve(workspace.path) === resolve(target)) return { action: 'unchanged' };
+  const owner = worktreeOwnerSession(workspace.path, assignmentId);
+  if (!owner || owner === pair.executor) return { action: 'unchanged' };
+  const oldPresent = Boolean(await lstat(workspace.path).catch(() => undefined));
+  const newPresent = Boolean(await lstat(target).catch(() => undefined));
+  if (!oldPresent) return newPresent && await isGitWorkTree(target) ? { action: 'adopted', from: workspace.path, to: target } : { action: 'unchanged' };
+  if (newPresent) return { action: 'duplicate', kept: workspace.path, duplicate: target };
+  const busy = deps.isBusy ?? ((name: string) => isSessionBusy(name));
+  for (const name of new Set([owner, pair.executor])) {
+    if (busy(name)) return { action: 'deferred', reason: 'session_busy', detail: name };
+  }
+  if (await (deps.hasProcessInside ?? defaultHasProcessInside)(workspace.path)) {
+    return { action: 'deferred', reason: 'process_inside', detail: workspace.path };
+  }
+  const commonDir = await gitCommonDirOf(workspace.path);
+  if (!commonDir) return { action: 'failed', detail: 'the worktree is not readable by git' };
+  await mkdir(dirname(target), { recursive: true });
+  const moved = await new Promise<{ ok: boolean; detail: string }>((resolvePromise) => {
+    execFile('git', [`--git-dir=${commonDir}`, 'worktree', 'move', '--', workspace.path, target], { timeout: 30_000, windowsHide: true }, (error, _stdout, stderr) => {
+      resolvePromise({ ok: !error, detail: String(stderr ?? error?.message ?? '').trim().slice(0, 300) });
+    });
+  });
+  // Windows refuses to rename a directory some process still holds as its cwd (there is no cheap probe for that
+  // on Windows): that is "busy", not a failure -- retry later instead of alarming Brain.
+  if (!moved.ok && process.platform === 'win32' && /permission denied|used by another process|access is denied|invalid argument/i.test(moved.detail)) {
+    return { action: 'deferred', reason: 'process_inside', detail: workspace.path };
+  }
+  if (!moved.ok) return { action: 'failed', detail: moved.detail || 'git worktree move failed' };
+  // Keep the GC registration (metadata.json) beside the worktree it describes.
+  const oldRoot = dirname(workspace.path);
+  try {
+    const previous = JSON.parse(await readFile(join(oldRoot, 'metadata.json'), 'utf8')) as SupervisionWorktreeMetadata;
+    await writeFile(join(dirname(target), 'metadata.json'), JSON.stringify({ ...previous, sessionName: pair.executor, repoPath: target }));
+  } catch {
+    const metadata: SupervisionWorktreeMetadata = {
+      taskId: pair.taskId, assignmentId, sessionName: pair.executor, baseRevision: workspace.base ?? '', repoPath: target, createdAt: new Date().toISOString(),
+    };
+    await writeFile(join(dirname(target), 'metadata.json'), JSON.stringify(metadata)).catch(() => undefined);
+  }
+  await rm(join(oldRoot, 'metadata.json'), { force: true }).catch(() => undefined);
+  await rmdir(oldRoot).catch(() => undefined); // only when empty: never deletes leftovers
+  const branch = await gitBranch(target);
+  return { action: 'moved', from: workspace.path, to: target, ...(branch ? { branch } : {}) };
+}
+
+/**
+ * Other worktrees for this task under any executor's session directory
+ * (`<root>/<namespace>/<session>/pair_<task>/repo`) besides the pair's own.
+ * A previous executor's rebuild or an executor's private copy shows up here;
+ * the daemon names them in the brief and registers them, it never uses or
+ * deletes them. Reads one directory listing, so it is called on executor
+ * changes only, not per heartbeat.
+ */
+export async function listTaskPairSiblingWorktrees(
+  pair: TaskPairState,
+  deps: TaskPairWorkspaceDeps = testDeps ?? {},
+): Promise<string[]> {
+  const assignmentId = taskPairWorktreeName(pair.taskId);
+  const env = deps.env ?? process.env;
+  const namespaceDir = join(resolveSupervisionWorktreesRoot(env), env.IMCODES_PROJECT_WORKTREE_NAMESPACE?.trim() || 'imcodes');
+  const own = pair.workspace?.path ? resolve(pair.workspace.path) : undefined;
+  const sessions = await readdir(namespaceDir).catch(() => [] as string[]);
+  const found: string[] = [];
+  for (const sessionName of sessions) {
+    const candidate = join(namespaceDir, sessionName, assignmentId, 'repo');
+    if (own && resolve(candidate) === own) continue;
+    if (await lstat(candidate).catch(() => undefined)) found.push(candidate);
+  }
+  return found.sort();
 }

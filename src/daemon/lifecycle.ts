@@ -1,5 +1,7 @@
 import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { taskPairService } from './task-pairs/service.js';
+import { evaluatePairMainCheckoutGitWrite, mainCheckoutWriteRefusal } from './task-pairs/main-checkout-write-guard.js';
+import { setTransportToolExecutionEvaluator } from './transport-relay.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isSessionWorking } from './session-working.js';
@@ -1459,6 +1461,11 @@ export async function startup(): Promise<DaemonContext> {
   }));
   supervisionAutomation.init();
   taskPairService.init();
+  // A pair participant's git write in the main checkout is refused before it runs where the provider has a pre-tool hook.
+  setTransportToolExecutionEvaluator((sessionName, request) => {
+    const hit = evaluatePairMainCheckoutGitWrite(sessionName, request.toolName, request.input, { cwd: request.cwd });
+    return hit ? { allow: false, reason: mainCheckoutWriteRefusal(hit) } : { allow: true };
+  });
   taskPairService.setScheduler(taskPairAutomation);
   taskPairAutomation.start();
   // In-flight legacy tasks of `pairs` projects are imported once; off the startup path.

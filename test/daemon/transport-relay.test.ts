@@ -41,6 +41,7 @@ vi.mock('../../src/daemon/cc-presets.js', () => ({
 
 import {
   setTransportRelaySend,
+  setTransportToolExecutionEvaluator,
   wireProviderToRelay,
   emitTransportUserMessage,
   broadcastProviderStatus,
@@ -2270,5 +2271,31 @@ describe('same-eventId replacement semantics (appendEvent logic)', () => {
     expect(state).toHaveLength(2);
     expect(state[0].eventId).toBe(stableId);
     expect(state[1].eventId).toBe('transport:sess:msg-2');
+  });
+});
+
+describe('tool-execution guard seam (pair participants and the main checkout)', () => {
+  function wire() {
+    let installed: ((sid: string, request: { toolName: string; input: unknown; cwd?: string }) => { allow: boolean; reason?: string }) | undefined;
+    const { provider } = makeMockProvider();
+    (provider as unknown as { setToolExecutionGuard: (guard: typeof installed) => void }).setToolExecutionGuard = (guard) => { installed = guard; };
+    wireProviderToRelay(provider);
+    return installed!;
+  }
+  afterEach(() => setTransportToolExecutionEvaluator(undefined));
+
+  it('allows everything until the daemon lifecycle installs an evaluator', () => {
+    expect(wire()('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' } })).toEqual({ allow: true });
+  });
+
+  it('passes the resolved IM.codes session name and the request to the evaluator and returns its decision', () => {
+    const evaluator = vi.fn((_session: string, request: { input: unknown }) => (
+      JSON.stringify(request.input).includes('reset') ? { allow: false as const, reason: 'refused' } : { allow: true as const }
+    ));
+    setTransportToolExecutionEvaluator(evaluator);
+    const guard = wire();
+    expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' })).toEqual({ allow: false, reason: 'refused' });
+    expect(evaluator).toHaveBeenCalledWith('deck_sub_exec', { toolName: 'Bash', input: { command: 'git reset --hard' }, cwd: '/p' });
+    expect(guard('deck_sub_exec', { toolName: 'Bash', input: { command: 'git status' } })).toEqual({ allow: true });
   });
 });

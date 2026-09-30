@@ -16,6 +16,8 @@ import {
   type SdkTurnLostRecoveryMetadata,
   type SdkTurnLostRecoveryPhase,
   type TransportProvider,
+  type ToolExecutionGuardDecision,
+  type ToolExecutionRequest,
   type ProviderError,
   type ProviderStatusUpdate,
   type ProviderUsageUpdate,
@@ -373,6 +375,13 @@ export function setTransportRelaySend(fn: (msg: Record<string, unknown>) => void
   sendToServer = fn;
 }
 
+/** Decides, per session, whether a shell tool call may run. Installed once by the daemon lifecycle (the relay itself knows nothing about pairs). */
+export type TransportToolExecutionEvaluator = (sessionName: string, request: ToolExecutionRequest) => ToolExecutionGuardDecision;
+let toolExecutionEvaluator: TransportToolExecutionEvaluator | undefined;
+export function setTransportToolExecutionEvaluator(evaluator: TransportToolExecutionEvaluator | undefined): void {
+  toolExecutionEvaluator = evaluator;
+}
+
 /** Wire up a provider's callbacks to emit standard timeline events.
  *  Provider callbacks use providerSessionId; we resolve to IM.codes sessionName
  *  via the routing map before emitting. Unresolved routes are dropped + warned. */
@@ -383,6 +392,12 @@ export function wireProviderToRelay(provider: TransportProvider): void {
   provider.setNativeCollaborationGate?.((providerSid, request) => {
     const sessionName = resolveSessionName(providerSid);
     return sessionName ? evaluateNativeCollaborationPreExecution(sessionName, request) : { allow: true };
+  });
+  // Pre-execution veto for shell tools where the provider has a real pre-tool
+  // hook: a pair participant may not write git state in the main checkout.
+  provider.setToolExecutionGuard?.((providerSid, request) => {
+    const sessionName = resolveSessionName(providerSid);
+    return sessionName && toolExecutionEvaluator ? toolExecutionEvaluator(sessionName, request) : { allow: true };
   });
   // Per-session fence resolver for `session_fence` providers, asked on the
   // path that launches, loads or sends. A provider that launches before the

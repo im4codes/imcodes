@@ -558,14 +558,60 @@ function workplaceLine(pair: TaskPairState): string {
   const workspace = pair.workspace;
   if (workspace && workspace.status === 'active') {
     const latestHead = workspace.lastHead ?? pair.material?.head;
+    const where = workspace.branch ? `on branch ${workspace.branch}` : 'detached';
     const revision = workspace.kind === 'worktree'
-      ? `detached at base ${workspace.base ?? pair.material?.base ?? 'unknown'}; latest head ${latestHead ?? 'unknown'}`
+      ? `${where}, base ${workspace.base ?? pair.material?.base ?? 'unknown'}; latest head ${latestHead ?? 'unknown'}`
       : `base ${workspace.base ?? pair.material?.base ?? 'unknown'}; latest head ${latestHead ?? 'unknown'}`;
-    return workspace.kind === 'dir'
+    const line = workspace.kind === 'dir'
       ? `Work in the task directory the daemon created for this pair: ${workspace.path} (${revision}). This absolute path is authoritative; never use cwd or the project main checkout. Write your results there.`
-      : `Work in the worktree the daemon created for this pair: ${workspace.path} (${revision}; make a local branch there if useful, commit locally, never push any branch, report the worktree path plus HEAD, and let Brain merge into dev and push dev). This absolute path is authoritative; never use cwd or the project main checkout.`;
+      : `Work in the worktree the daemon created for this pair: ${workspace.path} (${revision}; ${workspace.branch ? 'keep committing on that branch' : 'make a local branch there if useful'}, commit locally, never push any branch, report the worktree path plus HEAD, and let Brain merge into dev and push dev). This absolute path is authoritative; never use cwd or the project main checkout.`;
+    const moved = workspace.previousPaths?.length
+      ? ` The previous executor's worktree was moved here from ${workspace.previousPaths[workspace.previousPaths.length - 1]}; that old path no longer exists, and any material naming it now resolves to this path.`
+      : '';
+    return line + moved + duplicateWorktreeWarning(workspace);
   }
   return `No workspace could be created for this pair: use your own git worktree under ~/.imcodes/worktrees for code in a git project, else a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/${pair.taskId}/, and name it on READY_FOR_AUDIT.`;
+}
+
+/** The participant that ran (or tried) a git write in the main checkout. */
+export function buildMainCheckoutWriteParticipantNotice(
+  hit: { taskId: string; verb: string; dir: string; root: string; command: string },
+  blocked: boolean,
+  workspace: string | undefined,
+): string {
+  return `[IM.codes task ${hit.taskId}] ${blocked ? 'REFUSED' : 'WARNING'}: \`git ${hit.verb}\` in the project's main checkout (${hit.dir}) while you hold this pair. ${blocked ? 'It did not run.' : 'It already ran: undo it now (tell Brain what changed) and do not repeat it.'} `
+    + `The main checkout is Brain's integration space and the owner's checkout; a pair works only in its own workspace${workspace ? `: ${workspace}` : ''}. Read-only git there (status, log, diff, show) is fine. Command: ${hit.command}`;
+}
+
+/** Brain: a pair participant wrote git state in the main checkout. */
+export function buildMainCheckoutWriteBrainLine(
+  hit: { taskId: string; session: string; role: string; verb: string; dir: string; command: string },
+  blocked: boolean,
+): string {
+  return `[IM.codes task ${hit.taskId}] ${hit.role} ${hit.session} ran \`git ${hit.verb}\` in the main checkout (${hit.dir}): ${blocked ? 'refused before it ran' : 'it ran; check the checkout (git status / reflog) before you merge'}. The participant was told at once. Command: ${hit.command}`;
+}
+
+/** Warning for a workspace that has other worktrees for the same task next to it. */
+function duplicateWorktreeWarning(workspace: NonNullable<TaskPairState['workspace']>): string {
+  if (!workspace.duplicatePaths?.length) return '';
+  return ` WARNING: another worktree for this task exists at ${workspace.duplicatePaths.join(', ')}. It is NOT this pair's workspace: do not work, commit or audit there; if it holds changes you need, copy them into ${workspace.path} (read-only look with git -C is fine).`;
+}
+
+/** Executor/auditor: the worktree moved under the new executor (heartbeat-time move; a brief carries the path itself). */
+export function buildWorkspaceMovedNotice(pair: TaskPairState, from: string, to: string, adopted: boolean): string {
+  const head = pair.workspace?.lastHead ?? pair.material?.head;
+  return `${header(pair)} The pair's worktree ${adopted ? 'is now' : 'was moved to'} ${to}${adopted ? ` (the previous location ${from} is gone)` : ` from ${from}`}. That is the single authoritative workspace${head ? ` (latest head ${head})` : ''}: branch, commits and uncommitted work are unchanged. Use ${to} from now on; any material naming the old path resolves to the new one.${pair.workspace ? duplicateWorktreeWarning(pair.workspace) : ''}`;
+}
+
+/** Brain (and the executor): another worktree for the same task exists next to the authoritative one. */
+export function buildWorkspaceDuplicateNotice(pair: TaskPairState): string {
+  const workspace = pair.workspace;
+  return `${header(pair)} ${workspace ? `The authoritative worktree is ${workspace.path}.` : ''}${workspace ? duplicateWorktreeWarning(workspace) : ''} The daemon registered it and does not touch it; ask the executor to copy anything needed into the authoritative worktree, and remove the duplicate yourself once it holds nothing unsaved.`;
+}
+
+/** Brain: moving the worktree under the new executor failed; the old path stays authoritative. */
+export function buildWorkspaceMoveFailedLine(pair: TaskPairState, detail: string): string {
+  return `${header(pair)} The daemon could not move the worktree ${pair.workspace?.path ?? ''} under executor ${pair.executor ?? ''}: ${detail}. The recorded path stays authoritative and unchanged; the executor can keep using it.`;
 }
 
 /** Brain: a finished pair's worktree still held unsaved work at removal time, so it was kept. */

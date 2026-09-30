@@ -15,7 +15,7 @@
  */
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
-import { sameTaskPairCommit, type TaskPairState } from '../../../shared/task-pair.js';
+import { redirectTaskPairWorkspacePath, sameTaskPairCommit, type TaskPairState } from '../../../shared/task-pair.js';
 
 const GIT_HEAD_TIMEOUT_MS = 5_000;
 
@@ -69,8 +69,17 @@ export function setTaskPairMaterialDepsForTests(deps: TaskPairMaterialDeps | und
 }
 
 export async function resolveTaskPairMaterial(pair: TaskPairState, deps: TaskPairMaterialDeps = testDeps ?? {}): Promise<ResolvedTaskPairMaterial> {
-  const named = pair.material;
   const workspace = pair.workspace && pair.workspace.status !== 'removed' ? pair.workspace : undefined;
+  // A READY written after the worktree moved under a new executor may still
+  // name the old path: it resolves to the workspace's current location, so an
+  // audit request never carries a dead path.
+  const named = pair.material && workspace?.previousPaths?.length
+    ? {
+        ...pair.material,
+        ...(pair.material.worktree ? { worktree: redirectTaskPairWorkspacePath(workspace, pair.material.worktree) } : {}),
+        ...(pair.material.path ? { path: redirectTaskPairWorkspacePath(workspace, pair.material.path) } : {}),
+      }
+    : pair.material;
   if (workspace?.kind === 'dir' && !named?.worktree && !named?.head) {
     return { path: named?.path ?? workspace.path, source: named?.path ? 'executor' : 'workspace' };
   }

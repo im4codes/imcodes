@@ -25,6 +25,7 @@ import type {
   ProviderUsageUpdate,
   ProviderDelegationNotification,
   ToolCallEvent,
+  ToolExecutionGuard,
 } from '../transport-provider.js';
 import {
   BACKGROUND_SUBAGENT_WAKE_MODES,
@@ -511,6 +512,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
   private errorCallbacks: Array<(sessionId: string, error: ProviderError) => void> = [];
   private toolCallCallbacks: Array<(sessionId: string, tool: ToolCallEvent) => void> = [];
   private nativeCollaborationGate?: NativeCollaborationGate;
+  private toolExecutionGuard?: ToolExecutionGuard;
   private sessionInfoCallbacks: Array<(sessionId: string, info: SessionInfoUpdate) => void> = [];
   private statusCallbacks: Array<(sessionId: string, status: ProviderStatusUpdate) => void> = [];
   private usageCallbacks: Array<(sessionId: string, update: ProviderUsageUpdate) => void> = [];
@@ -776,6 +778,34 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     this.nativeCollaborationGate = gate;
   }
 
+  setToolExecutionGuard(guard: ToolExecutionGuard): void {
+    this.toolExecutionGuard = guard;
+  }
+
+  /**
+   * PreToolUse hook for the Bash tool: the daemon may refuse a command before
+   * it runs (a pair participant writing git state in the main checkout). Any
+   * failure of the guard allows the call: a guard must never break a tool.
+   */
+  private evaluateToolExecutionHook(state: ClaudeSdkSessionState, input: unknown): Record<string, unknown> {
+    const hookInput = this.asRecord(input);
+    const guard = this.toolExecutionGuard;
+    if (!guard || !hookInput || hookInput.hook_event_name !== 'PreToolUse') return {};
+    try {
+      const decision = guard(state.routeId, {
+        toolName: typeof hookInput.tool_name === 'string' ? hookInput.tool_name : '',
+        input: hookInput.tool_input,
+        cwd: typeof hookInput.cwd === 'string' && hookInput.cwd ? hookInput.cwd : state.cwd,
+        ...(typeof hookInput.tool_use_id === 'string' ? { toolUseId: hookInput.tool_use_id } : {}),
+      });
+      if (decision.allow) return {};
+      return { hookSpecificOutput: { hookEventName: 'PreToolUse', permissionDecision: 'deny', permissionDecisionReason: decision.reason } };
+    } catch (error) {
+      logger.warn({ provider: this.id, error }, 'Claude SDK tool execution guard failed; allowing the call');
+      return {};
+    }
+  }
+
   /**
    * PreToolUse hook for native agent tools (Agent/Task spawn, Workflow
    * orchestration, SendMessage follow-up work). It records the request through
@@ -1005,6 +1035,9 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
         PreToolUse: [{
           matcher: CLAUDE_NATIVE_AGENT_TOOL_MATCHER,
           hooks: [async (input: unknown) => this.evaluateNativeAgentToolHook(state, input)],
+        }, {
+          matcher: 'Bash',
+          hooks: [async (input: unknown) => this.evaluateToolExecutionHook(state, input)],
         }],
       },
       pathToClaudeCodeExecutable: resolvedBinary,

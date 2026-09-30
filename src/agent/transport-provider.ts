@@ -571,6 +571,16 @@ export interface ProviderUsageUpdate {
  *   4. endSession()     — clean up a single session.
  *   5. disconnect()     — release all provider resources and stop background activity.
  */
+/** A tool call about to run, as far as the provider knows it. */
+export interface ToolExecutionRequest {
+  toolName: string;
+  input: unknown;
+  cwd?: string;
+  toolUseId?: string;
+}
+export type ToolExecutionGuardDecision = { allow: true } | { allow: false; reason: string };
+export type ToolExecutionGuard = (providerSessionId: string, request: ToolExecutionRequest) => ToolExecutionGuardDecision;
+
 export interface TransportProvider {
   /** Unique stable identifier for this provider implementation (e.g. 'openclaw', 'minimax'). */
   readonly id: string;
@@ -700,6 +710,13 @@ export interface TransportProvider {
    * before every native agent tool call.
    */
   setNativeCollaborationGate?(gate: NativeCollaborationGate): void;
+
+  /**
+   * Optional pre-execution veto for shell tools, installed by the daemon transport
+   * relay. Only a provider with a real pre-tool hook (claude-code-sdk) can
+   * honour a refusal; the others rely on the daemon's after-the-fact report.
+   */
+  setToolExecutionGuard?(guard: ToolExecutionGuard): void;
 
   /**
    * Install the daemon's fence resolver: does the IM.codes session served by
