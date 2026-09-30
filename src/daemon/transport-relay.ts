@@ -5,6 +5,7 @@
  * JSONL watchers), so ChatView renders them without any special handling.
  * Also cached to local JSONL for replay on reconnect/restart.
  */
+import { shouldRetryProviderErrorWithBackoff } from '../../shared/provider-error-classifier.js';
 import {
   PROVIDER_ERROR_CODES,
   PROVIDER_CANCEL_ORIGINS,
@@ -593,6 +594,27 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           type: 'assistant.text',
           sessionId: sessionName,
           text: cancelledText,
+        });
+      }
+      return;
+    }
+
+    // A transient failure (model at capacity, overloaded, 429, 5xx, dropped connection) is retried by the runtime every <=15 s
+    // until it goes through. Each attempt must NOT add an error bubble or a persisted session.error row (that would be ~240 per
+    // hour per session): the one user-visible signal is the episode notice (session.state.capacityRetry), and the runtime logs
+    // once per episode. A partial streamed bubble is still finalized so it does not hang as "streaming"; the retry regenerates it.
+    if (shouldRetryProviderErrorWithBackoff(error)) {
+      if (tracked?.text) {
+        timelineEmitter.emit(sessionName, 'assistant.text', {
+          text: tracked.text,
+          streaming: false,
+          memoryExcluded: true,
+          providerErrorCode: error.code,
+          providerErrorRecoverable: true,
+        }, {
+          source: 'daemon',
+          confidence: 'high',
+          eventId: tracked.eventId,
         });
       }
       return;

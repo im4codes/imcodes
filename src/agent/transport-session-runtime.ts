@@ -1030,7 +1030,9 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         }
         this.recordProviderError(error);
-        logger.warn(
+        // A capacity failure that is about to be retried logs at debug: the episode start (warn) and the periodic count carry it.
+        (this.willRetryAsCapacity(error) ? logger.debug : logger.warn).call(
+          logger,
           {
             sessionKey: this.sessionKey,
             provider: this.provider.id,
@@ -3748,6 +3750,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     return shouldRetryProviderErrorWithBackoff(error);
   }
 
+  /** Would `requeueAndScheduleCapacityRetry` take this failure? (Decided before the per-failure log line, which it must not spam.) */
+  private willRetryAsCapacity(error: ProviderError): boolean {
+    return this._activeDispatchEntries.length > 0 && this.isCapacityRetryError(error);
+  }
+
   private scheduleCapacityRetryTimer(): void {
     this.clearCapacityRetryTimer();
     const delay = capacityRetryDelayMs(this._capacityRetryAttempt);
@@ -4335,7 +4342,8 @@ export class TransportSessionRuntime implements SessionRuntime {
           return;
         }
         this.recordProviderError(providerError);
-        logger.warn(
+        (this.willRetryAsCapacity(providerError) ? logger.debug : logger.warn).call(
+          logger,
           {
             sessionKey: this.sessionKey,
             provider: this.provider.id,

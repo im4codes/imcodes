@@ -1002,6 +1002,54 @@ describe('transport-relay (timeline-emitter based)', () => {
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
     });
 
+    it('a transient (capacity) failure that the runtime retries adds NO error bubble and NO session.error row, however many attempts', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        fireError('sess-cap', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'Selected model is at capacity. Please try a different model.', recoverable: false });
+      }
+      await Promise.resolve();
+
+      expect(emitMock.mock.calls.filter(c => c[1] === 'assistant.text')).toHaveLength(0);
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(0);
+      expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
+    });
+
+    it('a transient failure still finalizes a partial streamed bubble (no hanging "streaming"), without an error suffix or a persisted row', async () => {
+      const { provider, fireDelta, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      fireDelta('sess-cap-partial', makeDelta({ messageId: 'msg-cap', delta: 'partial output' }));
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-cap-partial', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'API Error: 529 Overloaded', recoverable: false });
+      await Promise.resolve();
+
+      const texts = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(texts).toHaveLength(1);
+      expect(texts[0]![2]).toMatchObject({ text: 'partial output', streaming: false, memoryExcluded: true });
+      expect(texts[0]![2].text).not.toContain('Error');
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(0);
+    });
+
+    it('COUNTEREXAMPLE: a permanent error (401) still produces exactly one error bubble and one session.error', async () => {
+      const { provider, fireError } = makeMockProvider();
+      wireProviderToRelay(provider);
+      emitMock.mockClear();
+      appendMock.mockClear();
+
+      fireError('sess-401', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'API Error: 401 Invalid authentication credentials', recoverable: false });
+      await Promise.resolve();
+
+      const texts = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
+      expect(texts).toHaveLength(1);
+      expect(texts[0]![2].text).toBe('⚠️ Error: API Error: 401 Invalid authentication credentials');
+      expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(1);
+    });
+
     it('caches to JSONL via appendTransportEvent with type session.error', async () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
@@ -1313,10 +1361,12 @@ describe('transport-relay (timeline-emitter based)', () => {
       const { provider, fireError } = makeMockProvider();
       wireProviderToRelay(provider);
 
-      fireError('sess-ai', { code: 'PROVIDER_ERROR', message: 'AI service overloaded', recoverable: true });
+      // (A transient message such as "overloaded" is retried by the runtime and deliberately not bubbled per attempt: see the
+      // capacity tests above.)
+      fireError('sess-ai', { code: 'PROVIDER_ERROR', message: 'AI service returned malformed output', recoverable: true });
 
       const textCall = emitMock.mock.calls.find(c => c[1] === 'assistant.text');
-      expect(textCall![2].text).toBe('⚠️ Error: AI service overloaded');
+      expect(textCall![2].text).toBe('⚠️ Error: AI service returned malformed output');
     });
 
     it('reuses the streaming eventId on error and preserves partial text', () => {

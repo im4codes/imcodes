@@ -3669,6 +3669,48 @@ describe('TransportSessionRuntime', () => {
       }
     });
 
+    it('per-attempt output is bounded over 130 attempts: <=1+ceil(130/40) warn/info lines, and through the relay no error bubble or session.error at all', async () => {
+      const { wireProviderToRelay } = await import('../../src/daemon/transport-relay.js');
+      const { default: logger } = await import('../../src/util/logger.js');
+      // The mock provider keeps ONE error callback (the runtime's): capture the relay's registration instead of replacing it.
+      const relayErrorCallbacks: Array<(sid: string, error: ProviderError) => void> = [];
+      const runtimeOnError = mock.provider.onError;
+      (mock.provider as { onError: unknown }).onError = (cb: (sid: string, error: ProviderError) => void) => { relayErrorCallbacks.push(cb); return () => {}; };
+      wireProviderToRelay(mock.provider as never);
+      (mock.provider as { onError: unknown }).onError = runtimeOnError;
+      const failBoth = async () => {
+        const error = { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'Selected model is at capacity. Please try a different model.', recoverable: false };
+        relayErrorCallbacks.forEach((cb) => cb('sess-1', error)); // the relay's listener sees every failure too
+        mock.fireError('sess-1', { ...error });
+        await vi.advanceTimersByTimeAsync(0);
+      };
+      const lines: string[] = [];
+      const capture = (level: string) => (...args: unknown[]) => {
+        const [fields, text] = args as [Record<string, unknown> | string, string | undefined];
+        const ours = typeof fields === 'object' && fields !== null && fields.sessionKey === 'deck_test_brain';
+        if (ours) lines.push(`${level}:${typeof text === 'string' ? text : ''}`);
+      };
+      vi.spyOn(logger, 'warn').mockImplementation(capture('warn') as never);
+      vi.spyOn(logger, 'info').mockImplementation(capture('info') as never);
+      timelineEmitterEmitMock.mockClear();
+
+      runtime.send('bounded output', 'msg-bounded');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failBoth();
+      for (let attempt = 1; attempt <= 130; attempt += 1) {
+        const sends = sendMock().mock.calls.length;
+        while (sendMock().mock.calls.length === sends) await vi.advanceTimersByTimeAsync(100);
+        await failBoth();
+      }
+      const errorBubbles = timelineEmitterEmitMock.mock.calls.filter((call) => call[1] === 'assistant.text' && /⚠️ Error/.test(String((call[2] as { text?: string }).text)));
+      expect(errorBubbles).toHaveLength(0);
+      expect(lines.length).toBeLessThanOrEqual(1 + Math.ceil(130 / 40));
+      expect(lines.filter((line) => line.startsWith('warn:'))).toHaveLength(1); // the episode start
+      mock.fireComplete('sess-1');
+      await vi.advanceTimersByTimeAsync(0);
+    });
+
     it('a message the user sends during the retries is queued behind the retried turn: nothing dropped, nothing duplicated', async () => {
       runtime.send('first', 'msg-first');
       await flushDispatch();
