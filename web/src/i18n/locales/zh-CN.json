@@ -331,6 +331,9 @@
     },
     "delete_message": "删除消息",
     "delete_message_confirm": "为所有人删除此消息?此操作无法撤销。",
+    "delete_message_error": "删除消息失败，已恢复该消息，请重试。",
+    "delete_message_error_timeout": "守护进程未及时响应，已恢复该消息。请检查连接后重试。",
+    "delete_message_error_session": "已连接的守护进程上找不到该会话，已恢复该消息。",
     "dpad": {
       "title": "方向键 — 拖动发送方向键"
     },

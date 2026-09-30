@@ -331,6 +331,9 @@
     },
     "delete_message": "Eliminar mensaje",
     "delete_message_confirm": "¿Eliminar este mensaje para todos? Esta acción no se puede deshacer.",
+    "delete_message_error": "No se pudo eliminar el mensaje. Se ha restaurado; inténtalo de nuevo.",
+    "delete_message_error_timeout": "El daemon no respondió a tiempo y el mensaje se ha restaurado. Comprueba la conexión e inténtalo de nuevo.",
+    "delete_message_error_session": "Esta sesión no está disponible en el daemon conectado, así que el mensaje se ha restaurado.",
     "dpad": {
       "title": "Teclas de flecha: arrastra para mover"
     },

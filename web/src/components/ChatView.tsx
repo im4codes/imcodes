@@ -81,6 +81,8 @@ import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationC
 import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
 import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
 import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
+import { TIMELINE_DELETE_ERROR_CODES } from '@shared/timeline-protocol.js';
+import { requestTimelineMessageDelete, resolveTimelineDeleteTargets, timelineDeleteErrorKey, TimelineDeleteError } from '../timeline-delete.js';
 import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, type ReaderAnchor } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
@@ -2354,10 +2356,25 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   </>;
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+const EMPTY_ID_SET: ReadonlySet<string> = new Set();
+
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
+  // Optimistic delete: ids the user just deleted are hidden at once, before the daemon
+  // answers. A failed delete removes them again (message restored + visible error).
+  const [locallyDeletedIds, setLocallyDeletedIds] = useState<ReadonlySet<string>>(EMPTY_ID_SET);
+  const [deleteErrorKey, setDeleteErrorKey] = useState<string | null>(null);
+  const events = useMemo(
+    () => (locallyDeletedIds.size === 0 ? eventsProp : eventsProp.filter((event) => !locallyDeletedIds.has(event.eventId))),
+    [eventsProp, locallyDeletedIds],
+  );
+  useEffect(() => {
+    if (!deleteErrorKey) return undefined;
+    const timer = setTimeout(() => setDeleteErrorKey(null), 8_000);
+    return () => clearTimeout(timer);
+  }, [deleteErrorKey]);
   // Sent on every chatFileReference:true request (path click, preview, download).
   // The daemon needs the viewed session's identity to find its own in-project
   // root and its own assistant-published grants (session-file-read-grants.ts);
@@ -4079,6 +4096,29 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // `empty` is terminal like `done` — a cold local cache is not still working.
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
+  // Delete = hide at once (optimistic), then ask the daemon. Every stored event of the
+  // rendered block is named (assistant text segments merge into one bubble), and the
+  // outcome is never silent: an error/timeout restores the message and shows why.
+  const deleteMessage = (eventId: string, pin: MessagePin | undefined): void => {
+    if (!ws || !sessionId) return;
+    const targets = resolveTimelineDeleteTargets(viewItems, eventsProp, eventId);
+    setLocallyDeletedIds((prev) => new Set([...prev, ...targets.eventIds]));
+    requestTimelineMessageDelete(ws, sessionId, targets).then(
+      () => {
+        // A pinned message that is deleted for everyone must not linger as a ghost pin.
+        if (pin) void messagePins.unpinMessage(pin);
+      },
+      (err: unknown) => {
+        console.warn('delete timeline message failed', err);
+        setLocallyDeletedIds((prev) => {
+          const next = new Set(prev);
+          for (const id of targets.eventIds) next.delete(id);
+          return next;
+        });
+        setDeleteErrorKey(timelineDeleteErrorKey(err instanceof TimelineDeleteError ? err.code : TIMELINE_DELETE_ERROR_CODES.FAILED));
+      },
+    );
+  };
   const contextMenuEvent = ctxMenu?.eventId
     ? events.find((event) => event.eventId === ctxMenu.eventId)
     : undefined;
@@ -4566,11 +4606,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   if (!eid || !sessionId || !ws) return;
                   // Destructive + global → keep an explicit confirmation (no click-to-delete).
                   if (!window.confirm(t('chat.delete_message_confirm'))) return;
-                  try {
-                    ws.deleteTimelineMessage(sessionId, eid);
-                  } catch (err) {
-                    console.warn('delete timeline message failed', err);
-                  }
+                  deleteMessage(eid, contextMenuPin);
                   setCtxMenu(null);
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
@@ -4581,6 +4617,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           </div>
         )}
       </div>
+      {deleteErrorKey && (
+        <div class="chat-toast chat-toast-error" role="alert" data-chat-delete-error>
+          <span>{t(deleteErrorKey)}</span>
+          <button type="button" class="chat-toast-close" aria-label={t('common.close')} onClick={() => setDeleteErrorKey(null)}>✕</button>
+        </div>
+      )}
       {showAgentsPane && (
         <SdkAgentsPanel
           rows={sdkAgentsStatus.rows}

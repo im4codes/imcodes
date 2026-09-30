@@ -25,6 +25,45 @@ export const TIMELINE_MESSAGES = {
 
 export type TimelineMessageType = (typeof TIMELINE_MESSAGES)[keyof typeof TIMELINE_MESSAGES];
 
+/**
+ * Payload flag stamped on the durable tombstone a user delete writes. It is
+ * STICKY in the timeline merge (src/shared/timeline/merge.ts): a same-eventId
+ * revision carrying it beats any revision without it, whatever their
+ * streaming/completeness/seq, so a later stream delta, a hydrated (full) copy
+ * or a stale cache row can never resurrect a deleted message. `hidden` alone
+ * cannot do this - the daemon also uses `hidden` for its own internal rows.
+ */
+export const TIMELINE_USER_DELETED_PAYLOAD_KEY = 'userDeleted' as const;
+
+/** A delete may name every event of one rendered block (assistant text segments merge into one bubble). */
+export const TIMELINE_DELETE_MAX_EVENT_IDS = 200;
+export const TIMELINE_DELETE_MAX_EVENT_ID_LENGTH = 512;
+/** How long the web waits for the daemon's ack before it restores the message and says so. */
+export const TIMELINE_DELETE_ACK_TIMEOUT_MS = 10_000;
+
+/** Stable ack `error` codes for `timeline.delete` (the web maps them to localized text). */
+export const TIMELINE_DELETE_ERROR_CODES = {
+  INVALID_REQUEST: 'invalid_request',
+  SESSION_NOT_FOUND: 'session_not_found',
+  TOO_MANY_TARGETS: 'too_many_targets',
+  FAILED: 'delete_failed',
+  /** Client-side only: no ack arrived in time. */
+  TIMEOUT: 'timeout',
+} as const;
+export type TimelineDeleteErrorCode = (typeof TIMELINE_DELETE_ERROR_CODES)[keyof typeof TIMELINE_DELETE_ERROR_CODES];
+
+/** Web -> daemon. `eventId` stays for daemons that predate `eventIds`. */
+export interface TimelineDeleteRequest {
+  type: typeof TIMELINE_MESSAGES.DELETE;
+  sessionName: string;
+  eventId: string;
+  /** Every stored event the deleted block is made of (includes `eventId`). */
+  eventIds?: string[];
+  /** Optional per-id event type, used only when the daemon no longer holds the event. */
+  eventTypes?: Record<string, string>;
+  commandId: string;
+}
+
 /** Delivery quality for a browser socket/session pair. */
 export const TIMELINE_SUBSCRIPTION_MODES = {
   /** Visible/pinned window: all timeline frames, including streaming deltas.

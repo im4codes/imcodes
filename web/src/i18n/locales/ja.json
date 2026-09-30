@@ -331,6 +331,9 @@
     },
     "delete_message": "メッセージを削除",
     "delete_message_confirm": "このメッセージを全員から削除しますか?この操作は取り消せません。",
+    "delete_message_error": "メッセージを削除できませんでした。元に戻しました。もう一度お試しください。",
+    "delete_message_error_timeout": "デーモンが時間内に応答しなかったため、メッセージを元に戻しました。接続を確認してもう一度お試しください。",
+    "delete_message_error_session": "接続中のデーモンにこのセッションが見つからないため、メッセージを元に戻しました。",
     "dpad": {
       "title": "矢印キー — ドラッグで移動"
     },

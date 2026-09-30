@@ -60,6 +60,7 @@ import { scanFsGitStatusSnapshot } from './fs-git-status-worker.js';
 import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
 import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
+import { isUserDeletedTimelineEvent } from '../shared/timeline/merge.js';
 import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
@@ -104,9 +105,14 @@ import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
+  TIMELINE_DELETE_ERROR_CODES,
+  TIMELINE_DELETE_MAX_EVENT_IDS,
+  TIMELINE_DELETE_MAX_EVENT_ID_LENGTH,
   TIMELINE_MESSAGES,
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
+  TIMELINE_USER_DELETED_PAYLOAD_KEY,
+  type TimelineDeleteErrorCode,
   type TimelinePayloadMetadata,
   type TimelineResponseSource,
   type TimelineResponseStatus,
@@ -5883,31 +5889,63 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
 }
 
 /**
- * Globally delete (hide) one timeline message. Initiated by a right-click in the
- * web UI; the deletion is durable and propagates to every viewer.
+ * Globally delete (hide) timeline messages. Initiated by a right-click in the web UI;
+ * the deletion is durable and propagates to every viewer.
  *
- * Mechanism: re-emit the exact target event with `hidden: true`. The stable-eventId
+ * One rendered bubble can be several stored events (consecutive assistant.text
+ * segments merge into one block), so the request names every stored event id of
+ * the block (`eventIds`; `eventId` alone still works for older web builds).
+ *
+ * Mechanism per id: re-emit the event with `hidden: true` plus the sticky
+ * `userDeleted` payload flag (TIMELINE_USER_DELETED_PAYLOAD_KEY). The stable-eventId
  * path in `timelineEmitter.emit` replaces it in the ring buffer and re-broadcasts to
- * all viewers; the re-emit's fresh (higher) `seq` wins the same-eventId merge
- * (`preferTimelineEvent`) on BOTH the daemon and every web client; the renderer drops
- * `hidden` events (ChatView filters them); and the JSONL append + SQLite `hidden`
- * column make it durable across refresh/restart. The agent's already-processed
- * conversation context is intentionally untouched — this removes the message from the
- * timeline view, it does not rewrite history the model already saw.
+ * all viewers; the flag makes the tombstone win every same-eventId merge on the daemon
+ * AND every web client (a later stream delta, a hydrated copy or a stale cache row
+ * cannot resurrect it); the JSONL append + SQLite `hidden` column make it durable
+ * across refresh/restart. `streaming` is forced false so a message deleted mid-stream
+ * is persisted (streaming deltas are deliberately not).
  *
- * Double-insurance write path: the server pod-routes the command by serverId, and the
- * daemon independently re-checks that it actually owns `sessionName` before mutating.
+ * An id the daemon no longer holds (older than the JSONL retention window, or only in
+ * a web cache/history page) is NOT an error: the user can see it, so it gets a
+ * tombstone too, typed by the client's hint. No store read happens on this path - the
+ * old handler tail-scanned 5000 JSONL events synchronously on the main thread and
+ * answered "Message not found" for everything older, which the web then ignored.
+ *
+ * The agent's already-processed conversation context is intentionally untouched -
+ * this removes the message from the timeline view, it does not rewrite history the
+ * model already saw. Double-insurance write path: the server pod-routes the command
+ * by serverId, and the daemon independently re-checks that it owns `sessionName`.
  */
+const DELETABLE_TOMBSTONE_TYPES: ReadonlySet<string> = new Set([
+  'user.message', 'assistant.text', 'assistant.thinking', 'tool.call', 'tool.result',
+]);
+
+function readTimelineDeleteTargets(cmd: Record<string, unknown>): { ids: string[]; tooMany: boolean } {
+  const seen = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value !== 'string') return;
+    const id = value.trim();
+    if (id && id.length <= TIMELINE_DELETE_MAX_EVENT_ID_LENGTH) seen.add(id);
+  };
+  add(cmd.eventId);
+  if (Array.isArray(cmd.eventIds)) {
+    if (cmd.eventIds.length > TIMELINE_DELETE_MAX_EVENT_IDS) return { ids: [], tooMany: true };
+    for (const value of cmd.eventIds) add(value);
+  }
+  return { ids: [...seen], tooMany: false };
+}
+
 async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const startedAt = performance.now();
   const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
-  const eventId = typeof cmd.eventId === 'string' ? cmd.eventId.trim() : '';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
     ? cmd.commandId.trim()
     : `delete-msg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  if (!sessionName || !eventId) return;
+  const { ids, tooMany } = readTimelineDeleteTargets(cmd);
 
-  const ackError = (error: string): void => {
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
+  const ackError = (error: TimelineDeleteErrorCode, detail?: Record<string, unknown>): void => {
+    logger.warn({ sessionName, commandId, error, requested: ids.length, durationMs: Math.round(performance.now() - startedAt), ...detail }, 'timeline delete rejected');
+    timelineEmitter.emit(sessionName || '_unknown', 'command.ack', { commandId, status: 'error', error });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
   };
   const ackAccepted = (): void => {
@@ -5915,37 +5953,74 @@ async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverL
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
   };
 
+  // Every failure path answers: a silent return is what left the web with no feedback.
+  if (!sessionName || (ids.length === 0 && !tooMany)) {
+    ackError(TIMELINE_DELETE_ERROR_CODES.INVALID_REQUEST);
+    return;
+  }
+  if (tooMany) {
+    ackError(TIMELINE_DELETE_ERROR_CODES.TOO_MANY_TARGETS);
+    return;
+  }
   // Authorize: this daemon must actually own the session before touching its timeline.
   if (!getSession(sessionName)) {
-    ackError('Session not found');
+    ackError(TIMELINE_DELETE_ERROR_CODES.SESSION_NOT_FOUND);
     return;
   }
 
-  // Locate the target event: in-memory ring buffer first (covers recently-visible
-  // messages), then a bounded tail read of the persisted JSONL for older ones.
-  let target = timelineEmitter.getBufferedEvents(sessionName).find((e) => e.eventId === eventId);
-  if (!target) {
-    try {
-      target = timelineStore.read(sessionName, { limit: 5000 }).find((e) => e.eventId === eventId);
-    } catch { /* fall through to not-found */ }
-  }
-  if (!target) {
-    ackError('Message not found');
+  const typeHints = cmd.eventTypes && typeof cmd.eventTypes === 'object' && !Array.isArray(cmd.eventTypes)
+    ? cmd.eventTypes as Record<string, unknown>
+    : {};
+  let fromBuffer = 0;
+  let unknownToDaemon = 0;
+  let alreadyDeleted = 0;
+  try {
+    const buffered = new Map<string, TimelineEvent>();
+    for (const event of timelineEmitter.getBufferedEvents(sessionName)) buffered.set(event.eventId, event);
+    for (const id of ids) {
+      const target = buffered.get(id);
+      if (target && isUserDeletedTimelineEvent(target)) {
+        alreadyDeleted += 1; // Idempotent - already deleted.
+        continue;
+      }
+      if (target) {
+        fromBuffer += 1;
+        timelineEmitter.emit(sessionName, target.type, {
+          ...target.payload,
+          streaming: false,
+          [TIMELINE_USER_DELETED_PAYLOAD_KEY]: true,
+        }, {
+          eventId: target.eventId,
+          hidden: true,
+          source: target.source,
+          confidence: target.confidence,
+        });
+        continue;
+      }
+      unknownToDaemon += 1;
+      const hinted = typeof typeHints[id] === 'string' ? typeHints[id] as string : '';
+      timelineEmitter.emit(sessionName, (DELETABLE_TOMBSTONE_TYPES.has(hinted) ? hinted : 'assistant.text') as TimelineEvent['type'], {
+        [TIMELINE_USER_DELETED_PAYLOAD_KEY]: true,
+      }, {
+        eventId: id,
+        hidden: true,
+      });
+    }
+  } catch (err) {
+    logger.error({ err, sessionName, commandId, requested: ids.length }, 'timeline delete failed');
+    ackError(TIMELINE_DELETE_ERROR_CODES.FAILED);
     return;
   }
-  if (target.hidden) {
-    ackAccepted(); // Idempotent — already deleted.
-    return;
-  }
-
-  // Re-emit verbatim with hidden:true (see function doc for why this is the delete).
-  timelineEmitter.emit(sessionName, target.type, target.payload, {
-    eventId: target.eventId,
-    hidden: true,
-    source: target.source,
-    confidence: target.confidence,
-  });
   ackAccepted();
+  logger.info({
+    sessionName,
+    commandId,
+    requested: ids.length,
+    fromBuffer,
+    tombstonedWithoutOriginal: unknownToDaemon,
+    alreadyDeleted,
+    durationMs: Math.round((performance.now() - startedAt) * 100) / 100,
+  }, 'timeline delete handled');
 }
 
 async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {

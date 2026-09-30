@@ -43,6 +43,7 @@ import {
   TIMELINE_PROTOCOL_REVISION,
   TIMELINE_TERMINAL_SESSION_STATES,
   type TimelineCursor,
+  type TimelineDeleteRequest,
   type TimelineDetailRefV1,
   type TimelineDetailResponse,
   type TimelineHistoryResponse,
@@ -1264,14 +1265,23 @@ export class WsClient {
    * Acked via the normal command.ack path. Pod-routing is implicit: this WS is already
    * connected to the session's owning server.
    */
-  deleteTimelineMessage(sessionName: string, eventId: string): void {
-    if (!sessionName || !eventId) return;
-    this.send({
+  deleteTimelineMessage(
+    sessionName: string,
+    eventId: string,
+    opts: { eventIds?: readonly string[]; eventTypes?: Readonly<Record<string, string>>; commandId?: string } = {},
+  ): string {
+    const commandId = opts.commandId ?? crypto.randomUUID();
+    if (!sessionName || !eventId) return commandId;
+    const request: TimelineDeleteRequest = {
       type: TIMELINE_MESSAGES.DELETE,
       sessionName,
       eventId,
-      commandId: crypto.randomUUID(),
-    });
+      ...(opts.eventIds && opts.eventIds.length > 0 ? { eventIds: [...opts.eventIds] } : {}),
+      ...(opts.eventTypes && Object.keys(opts.eventTypes).length > 0 ? { eventTypes: { ...opts.eventTypes } } : {}),
+      commandId,
+    };
+    this.send(request);
+    return commandId;
   }
 
   /**

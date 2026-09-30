@@ -248,7 +248,10 @@ export class TimelineEmitter {
 
       const key = sessionId;
       const resolvedText = String(payload.text ?? '');
-      if (!allowDuplicate) {
+      // A hidden re-emit (a user delete of this very message) is never a duplicate
+      // send: without this guard deleting a message within 5s of sending it was a
+      // silent no-op that still acked "accepted".
+      if (!allowDuplicate && opts?.hidden !== true) {
         const prev = this.recentUserMsg.get(key);
         const now = Date.now();
         if (prev && prev.text === resolvedText && now - prev.ts < 5_000) {

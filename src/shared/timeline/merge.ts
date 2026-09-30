@@ -1,5 +1,6 @@
 import type { TimelineEvent } from './types.js';
 import {
+  TIMELINE_USER_DELETED_PAYLOAD_KEY,
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   type TimelineDetailFieldPath,
 } from '../../../shared/timeline-protocol.js';
@@ -15,6 +16,11 @@ export type { TimelineDetailFieldPath };
 
 function isStreaming(event: TimelineEvent): boolean {
   return event.payload.streaming === true;
+}
+
+/** True for the durable tombstone a user delete writes (see TIMELINE_USER_DELETED_PAYLOAD_KEY). */
+export function isUserDeletedTimelineEvent(event: TimelineEvent): boolean {
+  return event.payload?.[TIMELINE_USER_DELETED_PAYLOAD_KEY] === true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -124,6 +130,14 @@ function supplementUsageSnapshot(
 }
 
 function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  // A user delete is final. It outranks streaming/terminal, completeness (a
+  // hydrated copy is "fuller" than the tombstone) and seq (a stream delta or
+  // stale cache row arriving later has a higher seq): otherwise the message
+  // reappears on that client and the delete looks like it did nothing.
+  const existingDeleted = isUserDeletedTimelineEvent(existing);
+  const incomingDeleted = isUserDeletedTimelineEvent(incoming);
+  if (existingDeleted !== incomingDeleted) return incomingDeleted ? incoming : existing;
+
   const existingStreaming = isStreaming(existing);
   const incomingStreaming = isStreaming(incoming);
 

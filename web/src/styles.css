@@ -14789,3 +14789,12 @@ button.quick-agent-delegation-preset.active {
 .supervision-task-console-checklist-progress { font-size: 0.8em; opacity: 0.8; }
 
 .task-pair-status-sequence { position: absolute; top: 6px; right: 8px; min-width: 1.4em; color: color-mix(in srgb, currentColor 58%, transparent); font-size: 9px; line-height: 1.2; text-align: right; font-variant-numeric: tabular-nums; pointer-events: none; }
+
+/* Inline, dismissible error toast inside a chat pane (e.g. a message delete that failed). */
+.chat-toast {
+  position: absolute; left: 50%; bottom: 72px; transform: translateX(-50%); z-index: 30;
+  max-width: min(92%, 420px); display: flex; align-items: flex-start; gap: 8px;
+  padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.4;
+  background: #3b1d24; color: #fecaca; border: 1px solid #7f1d1d; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
+}
+.chat-toast-close { background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; padding: 0 2px; line-height: 1; }

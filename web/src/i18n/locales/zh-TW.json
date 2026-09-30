@@ -331,6 +331,9 @@
     },
     "delete_message": "刪除訊息",
     "delete_message_confirm": "為所有人刪除此訊息?此操作無法復原。",
+    "delete_message_error": "刪除訊息失敗，已還原該訊息，請重試。",
+    "delete_message_error_timeout": "守護程序未及時回應，已還原該訊息。請檢查連線後重試。",
+    "delete_message_error_session": "已連線的守護程序上找不到該工作階段，已還原該訊息。",
     "dpad": {
       "title": "方向鍵 — 拖曳發送方向鍵"
     },

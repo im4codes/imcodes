@@ -408,4 +408,22 @@ describe('TimelineDB — real IndexedDB (fake-indexeddb)', () => {
     const largestGetAll = probe.stats.getAllResultSizes.reduce((a, b) => Math.max(a, b), 0);
     expect(largestGetAll).toBe(0);
   });
+
+  it('a user-deleted tombstone in the cache is not resurrected by a stale or hydrated copy of the same event', async () => {
+    const db = new TimelineDB();
+    const original = ev('gone', 's', 1);
+    const tombstone: TimelineEvent = { ...ev('gone', 's', 5), hidden: true, payload: { text: 'gone', streaming: false, userDeleted: true } } as TimelineEvent;
+    // Deleting device: original cached, tombstone arrives.
+    await db.putEvents([original]);
+    await db.putEvents([tombstone]);
+    // A stale replay / a HYDRATED (fuller, higher-seq) copy lands afterwards.
+    await db.putEvents([original]);
+    await db.putEvents([{ ...original, seq: 9, payload: { text: 'gone', completeness: 'hydrated' } } as TimelineEvent]);
+
+    const got = await db.getRecentEvents('s', { limit: 10 });
+    const row = got.find((e) => e.eventId === 'gone');
+    expect(row?.hidden).toBe(true); // a cache reload must not bring the deleted message back
+    expect(row?.payload.userDeleted).toBe(true);
+  });
 });
+

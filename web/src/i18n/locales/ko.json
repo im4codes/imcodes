@@ -331,6 +331,9 @@
     },
     "delete_message": "메시지 삭제",
     "delete_message_confirm": "이 메시지를 모두에게서 삭제하시겠습니까? 이 작업은 되돌릴 수 없습니다.",
+    "delete_message_error": "메시지를 삭제하지 못했습니다. 메시지를 복원했으니 다시 시도해 주세요.",
+    "delete_message_error_timeout": "데몬이 제시간에 응답하지 않아 메시지를 복원했습니다. 연결을 확인한 뒤 다시 시도해 주세요.",
+    "delete_message_error_session": "연결된 데몬에서 이 세션을 찾을 수 없어 메시지를 복원했습니다.",
     "dpad": {
       "title": "방향키 — 드래그하여 이동"
     },

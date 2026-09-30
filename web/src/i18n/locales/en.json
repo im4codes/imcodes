@@ -331,6 +331,9 @@
     },
     "delete_message": "Delete message",
     "delete_message_confirm": "Delete this message for everyone? This can't be undone.",
+    "delete_message_error": "Couldn't delete the message. It has been restored — please try again.",
+    "delete_message_error_timeout": "The daemon didn't answer in time, so the message was restored. Check the connection and try again.",
+    "delete_message_error_session": "This session is not available on the connected daemon, so the message was restored.",
     "dpad": {
       "title": "Arrow keys — drag to move"
     },
