@@ -53,7 +53,7 @@ import { LoginPage } from './pages/LoginPage.js';
 import { isActiveTurnFinishedError } from './session-live-status.js';
 import { SessionTabs } from './components/SessionTabs.js';
 // TransportChatView removed — transport sessions use unified ChatView via timelineEmitter
-import { SessionPane } from './components/SessionPane.js';
+import { StableSessionPane as SessionPane } from './components/StableSessionPane.js';
 import {
   SupervisionTaskConsole,
   SupervisionTaskPairSnapshotBridge,
@@ -95,7 +95,7 @@ import {
   TEAM_DISCUSSION_LAYOUT,
   type TeamDiscussionLayout,
 } from './team-discussion-layout-preference.js';
-import { SubSessionWindow } from './components/SubSessionWindow.js';
+import { StableSubSessionWindow as SubSessionWindow } from './components/StableSubSessionWindow.js';
 import { OpenSpecAutoDeliverDetailsPanel } from './components/OpenSpecAutoDeliver.js';
 import { useOpenSpecAutoDeliver } from './hooks/useOpenSpecAutoDeliver.js';
 import { isOpenSpecAutoDeliverActiveProjection } from './openspec-auto-deliver.js';
