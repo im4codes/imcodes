@@ -1012,12 +1012,18 @@ function compatWorkerRun(job: CompatExportJob): Promise<{ ok: boolean; error?: s
       settle?.(message);
       releaseCompatWorkerIfIdle(worker);
     });
+    // Only the CURRENT worker's death fails the jobs in flight. A worker that was already replaced
+    // (a reset terminates it, and its 'exit' arrives later) has nothing left in the job table, and
+    // settling "all jobs" from its late event failed the NEXT worker's export -- an export that was
+    // then never written (intermittent ENOENT on sessions.json under load).
     worker.on('error', (error) => {
-      if (compatWorker === worker) compatWorker = null;
+      if (compatWorker !== worker) return;
+      compatWorker = null;
       settleCompatJobs({ ok: false, error: String(error?.message ?? error) });
     });
     worker.on('exit', () => {
-      if (compatWorker === worker) compatWorker = null;
+      if (compatWorker !== worker) return;
+      compatWorker = null;
       settleCompatJobs({ ok: false, error: 'compat export worker exited' });
     });
     // AFTER the listeners: adding a 'message' listener re-refs the port, and a ref'd worker keeps the process alive.

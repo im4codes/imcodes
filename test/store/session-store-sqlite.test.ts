@@ -607,6 +607,7 @@ describe('readers without write authority', () => {
           if (rows.size < 102) corrupt += 1;
         } catch (error) { corrupt += 1; } finally { db.closeSessionDb(handle); }
         reads += 1;
+        if (reads === 1) console.log('READY');
       }
       console.log('RESULT' + JSON.stringify({ reads, torn, corrupt, maxCounter }));
     `;
@@ -620,13 +621,18 @@ describe('readers without write authority', () => {
     });
     let out = '';
     child.stdout.on('data', (chunk) => { out += String(chunk); });
-    await sleep(1500); // let the reader start looping
+    // Wait for the reader's first read instead of a fixed delay: under CPU load a fresh tsx process can take
+    // far longer than that to start, and the writer would finish before a single read happened.
+    const readyBy = Date.now() + 60_000;
+    while (!out.includes('READY') && Date.now() < readyBy) await sleep(25);
+    expect(out).toContain('READY');
     for (let counter = 1; counter <= 150; counter += 1) {
       // Both rows change in one flush = one transaction; a reader must see both or neither.
       upsertSession(record('deck_realproj_pair_a', { counter }));
       upsertSession(record('deck_realproj_pair_b', { counter }));
       await flushStore();
     }
+    await sleep(200); // the reader keeps looping over the final state too
     await writeFile(stop, '1');
     await new Promise((resolve) => child.on('exit', resolve));
     const result = JSON.parse(out.split('\n').find((line) => line.startsWith('RESULT'))!.slice(6)) as { reads: number; torn: number; corrupt: number; maxCounter: number };
@@ -831,6 +837,23 @@ describe('sessions.json compatibility export (older processes, downgrade)', () =
     expect(probe.calls).toBe(1);
     expect((await oldBuildReadsSessions()).deck_realproj_probe_count).toBeDefined(); // and the export did run
   });
+
+  it('a worker replaced by a reset never fails the next export: its late exit only concerns its own jobs', async () => {
+    // resetSessionStoreAuthorityForTests terminates the worker; its 'exit' event arrives later, possibly
+    // after the next store has posted its export to a NEW worker. That late event used to settle every job
+    // in flight as failed, so the export was never written (intermittent ENOENT under load).
+    for (let round = 0; round < 25; round += 1) {
+      await loadStore({ probe: false });
+      upsertSession(record(`deck_realproj_round${round}`));
+      await flushStore();
+      await waitForCompatExportForTests();
+      const exported = JSON.parse(await readFile(jsonFile(), 'utf8')) as { sessions: Record<string, unknown> };
+      expect(Object.keys(exported.sessions)).toEqual([`deck_realproj_round${round}`]);
+      await rm(dir, { recursive: true, force: true });
+      await mkdir(dir, { recursive: true });
+      resetSessionStoreAuthorityForTests();
+    }
+  }, 60_000);
 
   it('a lost lock stops the export too (production ownership branch)', async () => {
     vi.stubEnv('VITEST', '');
