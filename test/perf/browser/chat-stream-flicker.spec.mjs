@@ -50,11 +50,13 @@ const VARIANTS = [
   // arriving in token-sized pieces in bursts. Uniform 25 Hz never triggered it.
   { label: 'markdown-bursty', pieceMode: 'md', cadence: 'bursty', rows: 240 },
   { label: 'markdown-uniform', pieceMode: 'md', cadence: 'uniform', rows: 240 },
+  // A short chat is not virtualized: rows are plain children of the chat root.
+  { label: 'markdown-bursty-short', pieceMode: 'md', cadence: 'bursty', rows: 12 },
 ];
 
 /** Installed in the page (after installDriver). */
 export function installFlickerProbe() {
-  const P = { recording: false, frames: [], painted: [], ids: new WeakMap(), nextId: 1, identity: new Map(), acc: null, animStarts: [], scrollWrites: [], lastLen: new Map(), lastText: new Map(), shrinkLog: [], remounts: [], removedLog: [] };
+  const P = { recording: false, frames: [], painted: [], ids: new WeakMap(), nextId: 1, identity: new Map(), acc: null, animStarts: [], scrollWrites: [], lastLen: new Map(), lastText: new Map(), shrinkLog: [], remounts: [], removedLog: [], rowIdentity: new Map(), rowRemounts: [] };
   window.__flicker = P;
   const idOf = (node) => { let v = P.ids.get(node); if (v === undefined) { v = P.nextId; P.nextId += 1; P.ids.set(node, v); } return v; };
   // Fixture: the single real ChatView and the driver's streaming event. Real app
@@ -112,8 +114,10 @@ export function installFlickerProbe() {
     const rootRect = r.getBoundingClientRect();
     const sk = streamKey();
     // A virtualized list wraps every row in [data-virtual-key]; a short (non-virtualized) chat has the event element itself.
-    const event = sk ? r.querySelector(`[data-event-id="${CSS.escape(sk)}"]`) : null;
-    const wrapper = (sk ? r.querySelector(`[data-virtual-key="${CSS.escape(sk)}"]`) : null) ?? event;
+    // __flickerFindRow (real app) finds the row by the streamed message itself, so the row's identity is tracked even if its
+    // data-event-id / key changes (a re-created row under a new key would otherwise look like a brand-new stream).
+    const event = sk ? (window.__flickerFindRow ? window.__flickerFindRow(sk) : r.querySelector(`[data-event-id="${CSS.escape(sk)}"]`)) : null;
+    const wrapper = (event ? event.closest('[data-virtual-key]') : null) ?? event;
     const textEl = event?.firstElementChild ?? null;
     const track = (label, node) => {
       if (!node) return;
@@ -124,6 +128,17 @@ export function installFlickerProbe() {
       set.add(id);
     };
     track('wrapper', wrapper); track('event', event); track('text', textEl);
+    // Every message row seen (real app): the DOM node that shows a message must never change once it exists.
+    if (window.__flickerAllKeys && window.__flickerFindRow) {
+      for (const key of window.__flickerAllKeys()) {
+        const row = window.__flickerFindRow(key);
+        if (!row) continue;
+        const id = idOf(row);
+        const seen = P.rowIdentity.get(key);
+        if (!seen) P.rowIdentity.set(key, { id, nodes: 1 });
+        else if (seen.id !== id) { seen.id = id; seen.nodes += 1; if (P.rowRemounts.length < 12) P.rowRemounts.push({ t: performance.now(), key, html: row.outerHTML.slice(0, 120), len: (row.textContent ?? '').length }); }
+      }
+    }
     const near = [wrapper?.previousElementSibling, wrapper?.previousElementSibling?.previousElementSibling, wrapper?.nextElementSibling].filter(Boolean);
     near.forEach((n, i) => track(`near${i}:${n.getAttribute('data-virtual-key') ?? n.getAttribute('data-event-id')}`, n));
     const cs = event ? getComputedStyle(event) : null;
@@ -161,17 +176,17 @@ export function installFlickerProbe() {
     if (s) { s.acc = null; P.painted.push(s); }
   };
   const paintedTick = () => { requestAnimationFrame(paintedTick); if (P.recording) channel.port2.postMessage(0); };
-  P.begin = () => { P.frames = []; P.painted = []; P.animStarts = []; P.scrollWrites = []; P.remounts = []; P.removedLog = []; P.lastText = new Map(); P.shrinkLog = []; P.identity = new Map(); P.lastLen = new Map(); P.acc = newAcc(); P.recording = true; if (!P.started) { P.started = true; requestAnimationFrame(tick); requestAnimationFrame(paintedTick); } };
+  P.begin = () => { P.frames = []; P.painted = []; P.animStarts = []; P.scrollWrites = []; P.remounts = []; P.removedLog = []; P.lastText = new Map(); P.shrinkLog = []; P.rowIdentity = new Map(); P.rowRemounts = []; P.identity = new Map(); P.lastLen = new Map(); P.acc = newAcc(); P.recording = true; if (!P.started) { P.started = true; requestAnimationFrame(tick); requestAnimationFrame(paintedTick); } };
   P.end = () => {
     P.recording = false;
     const identity = {}; for (const [k, set] of P.identity) identity[k] = set.size;
-    return { frames: P.frames, painted: P.painted, animStarts: P.animStarts, scrollWrites: P.scrollWrites, identity, remountEvents: P.remounts, removedLog: P.removedLog, shrinkLog: P.shrinkLog };
+    return { frames: P.frames, painted: P.painted, animStarts: P.animStarts, scrollWrites: P.scrollWrites, identity, remountEvents: P.remounts, removedLog: P.removedLog, shrinkLog: P.shrinkLog, rowIdentity: [...P.rowIdentity].map(([key, v]) => ({ key, nodes: v.nodes })), rowRemountLog: P.rowRemounts };
   };
 }
 
 function sum(frames, bucket, field) { return frames.reduce((a, f) => a + (f.acc?.[bucket]?.[field] ?? 0), 0); }
 
-export function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog, shrinkLog }) {
+export function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog, shrinkLog, rowIdentity, rowRemountLog }) {
   // Identity: distinct DOM nodes per (stream, part); >1 means the node was re-created while streaming.
   const remounts = { wrapper: 0, event: 0, text: 0, near: 0 };
   const perPart = [];
@@ -249,6 +264,8 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
   return {
     frames: frames.length, paintedFrames: painted.length, streamsSeen: new Set(frames.map((f) => f.key).filter(Boolean)).size,
     remounts, remountDetail: perPart.slice(0, 10), remountEvents: (remountEvents ?? []).slice(0, 8), removedElements: removedLog ?? [], shrinkLog: shrinkLog ?? [],
+    // Existing message rows whose DOM node was re-created (real app only; a NEW message's row is not counted).
+    rowRemounts: (rowIdentity ?? []).reduce((sum, row) => sum + (row.nodes - 1), 0), rowsTracked: (rowIdentity ?? []).length, rowRemountLog: rowRemountLog ?? [],
     mutations: {
       stream: { elAdd: sum(frames, 'stream', 'elAdd'), elDel: sum(frames, 'stream', 'elDel'), txtAdd: sum(frames, 'stream', 'txtAdd'), txtDel: sum(frames, 'stream', 'txtDel'), chr: sum(frames, 'stream', 'chr'), attr: sum(frames, 'stream', 'attr') },
       near: { elAdd: sum(frames, 'near', 'elAdd'), elDel: sum(frames, 'near', 'elDel'), txtAdd: sum(frames, 'near', 'txtAdd'), txtDel: sum(frames, 'near', 'txtDel'), chr: sum(frames, 'near', 'chr'), attr: sum(frames, 'near', 'attr') },
@@ -267,6 +284,7 @@ export function verdicts(result, variant = {}) {
   const need = (cond, msg) => { if (!cond) failures.push(msg); };
   need(a.frames >= 30, `only ${a.frames} frames`);
   need(a.remounts.wrapper === 0 && a.remounts.event === 0 && a.remounts.text === 0, `streaming row remounted (${JSON.stringify(a.remounts)})`);
+  need(a.rowsTracked === 0 || a.rowRemounts === 0, `${a.rowRemounts} existing message rows were re-created (${JSON.stringify(a.rowRemountLog.slice(0, 2))})`);
   need(a.remounts.near === 0, `neighbour rows remounted (${a.remounts.near})`);
   need(a.blankingFrames === 0, `${a.blankingFrames} blanking frames (text shrank / opacity 0 / hidden)`);
   // Allowed flips are PER STREAMED MESSAGE (every message opens with the variant's seed text).
