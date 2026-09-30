@@ -114,28 +114,74 @@ describe('resolveTaskPairTurnCwd', () => {
     savePair('T1', moved, { workspace: { kind: 'worktree', path: moved, createdAt: 1, status: 'active', previousPaths: [before] } as never });
     expect(resolveTaskPairTurnCwd(EXEC)?.cwd).toBe(moved);
     const taskDir = dir('works/tcwdproj/T4');
-    savePair('T4', undefined, { executor: OWNER, workspace: { kind: 'dir', path: taskDir, createdAt: 1, status: 'active' } as never });
+    savePair('T4', undefined, { executor: OWNER, workspaceKind: 'dir', workspace: { kind: 'dir', path: taskDir, createdAt: 1, status: 'active' } as never });
     expect(resolveTaskPairTurnCwd(OWNER)).toEqual({ cwd: taskDir, taskId: 'T4', role: 'executor' });
   });
 
-  it('a non-git project: the executor and the auditor default to the task directory, whatever the workspace kind says', () => {
-    // ~/.imcodes/works/<project>/<taskId>/ -- no .git, kind `dir`.
-    const taskDir = dir('works/tcwdproj/T7');
-    savePair('T7', undefined, { workspace: { kind: 'dir', path: taskDir, createdAt: 1, status: 'active' } as never });
-    expect(resolveTaskPairTurnCwd(EXEC)).toEqual({ cwd: taskDir, taskId: 'T7', role: 'executor' });
-    expect(resolveTaskPairTurnCwd(AUD)).toEqual({ cwd: taskDir, taskId: 'T7', role: 'auditor' });
-    // The lookup is keyed on workspace.path, not the kind: the same directory as a snapshot with a private
-    // git (kind still `dir`), or recorded under another kind label, resolves identically.
-    mkdirSync(join(taskDir, '.git'), { recursive: true });
-    expect(resolveTaskPairTurnCwd(EXEC)?.cwd).toBe(taskDir);
-    savePair('T7', undefined, { workspace: { kind: 'worktree', path: taskDir, createdAt: 1, status: 'active' } as never });
-    expect(resolveTaskPairTurnCwd(EXEC)?.cwd).toBe(taskDir);
-    savePair('T7', undefined, { workspace: { kind: 'snapshot', path: taskDir, createdAt: 1, status: 'active' } as never });
-    expect(resolveTaskPairTurnCwd(AUD)?.cwd).toBe(taskDir);
-    // It ends with the pair, like any other workspace.
-    savePair('T7', undefined, { workspace: { kind: 'dir', path: taskDir, createdAt: 1, status: 'active' } as never }, 'done');
-    expect(resolveTaskPairTurnCwd(EXEC)).toBeUndefined();
-    expect(resolveTaskPairTurnCwd(AUD)).toBeUndefined();
+  describe('the pair\'s recorded working location, by project kind', () => {
+    const inProject = (projectDir: string) => {
+      for (const name of [EXEC, AUD]) upsertSession({ ...session(name, 'w1'), projectDir });
+    };
+    const both = (cwd: string, taskId: string) => {
+      expect(resolveTaskPairTurnCwd(EXEC)).toEqual({ cwd, taskId, role: 'executor' });
+      expect(resolveTaskPairTurnCwd(AUD)).toEqual({ cwd, taskId, role: 'auditor' });
+    };
+
+    it('git project: the pair worktree, not the project directory', () => {
+      const project = dir('git-project');
+      mkdirSync(join(project, '.git'));
+      inProject(project);
+      const worktree = dir('worktrees/pair_g1/repo');
+      savePair('G1', worktree);
+      both(worktree, 'G1');
+    });
+
+    it('git project, workspace=dir task: the task directory Brain asked for', () => {
+      const project = dir('git-project-dir-task');
+      mkdirSync(join(project, '.git'));
+      inProject(project);
+      const taskDir = dir('works/gproj/D1');
+      savePair('D1', undefined, { workspaceKind: 'dir', workspace: { kind: 'dir', path: taskDir, createdAt: 1, status: 'active' } as never });
+      both(taskDir, 'D1');
+    });
+
+    it('non-git project, copy-on-write clone: the clone in the task directory (kind and mode do not matter)', () => {
+      const project = dir('plain-project-cow');
+      inProject(project);
+      const clone = dir('works/plain/C1');
+      for (const kind of ['worktree', 'dir', 'snapshot']) {
+        savePair('C1', undefined, { workspace: { kind, path: clone, createdAt: 1, status: 'active', snapshot: { mode: 'clone', projectRoot: project } } as never });
+        // 'dir' without a recorded workingDir falls back to the in-place rule; a recorded workingDir wins over it.
+        if (kind !== 'dir') both(clone, 'C1');
+      }
+      savePair('C1', undefined, { workspace: { kind: 'dir', path: clone, workingDir: clone, createdAt: 1, status: 'active' } as never });
+      both(clone, 'C1');
+    });
+
+    it('non-git project, in place: the project directory; the task directory is only scratch', () => {
+      const project = dir('plain-project-inplace');
+      inProject(project);
+      const scratch = dir('works/plain/P1');
+      // Recorded: workingDir names the project directory.
+      savePair('P1', undefined, { workspace: { kind: 'dir', path: scratch, workingDir: project, createdAt: 1, status: 'active' } as never });
+      both(project, 'P1');
+      // Not recorded (a pair from before the field): derived from "a daemon-made task dir in a project without .git".
+      savePair('P1', undefined, { workspace: { kind: 'dir', path: scratch, createdAt: 1, status: 'active' } as never });
+      both(project, 'P1');
+      // It ends with the pair, like any other workspace.
+      savePair('P1', undefined, { workspace: { kind: 'dir', path: scratch, workingDir: project, createdAt: 1, status: 'active' } as never }, 'done');
+      expect(resolveTaskPairTurnCwd(EXEC)).toBeUndefined();
+      expect(resolveTaskPairTurnCwd(AUD)).toBeUndefined();
+    });
+
+    it('a recorded workingDir that is missing or relative is never used', () => {
+      inProject(dir('plain-project-bad'));
+      const scratch = dir('works/plain/B1');
+      savePair('B1', undefined, { workspace: { kind: 'dir', path: scratch, workingDir: join(root, 'gone'), createdAt: 1, status: 'active' } as never });
+      expect(resolveTaskPairTurnCwd(EXEC)).toBeUndefined();
+      savePair('B1', undefined, { workspace: { kind: 'dir', path: scratch, workingDir: 'relative/dir', createdAt: 1, status: 'active' } as never });
+      expect(resolveTaskPairTurnCwd(EXEC)).toBeUndefined();
+    });
   });
 
   it('never points a turn at a workspace that is not usable', () => {

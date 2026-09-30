@@ -154,12 +154,13 @@ describe('transport runtime: pair participant turn cwd', () => {
     expect(payload!.assembledMessage).toContain(`cwd: ${workspace}`);
   });
 
-  it('a non-git project: a task-directory workspace is the turn cwd, as turnCwd or as the fallback line', async () => {
+  it('a workspace=dir task: its task directory is the turn cwd, as turnCwd or as the fallback line', async () => {
     const taskDir = join(root, 'works', PROJECT, 'T1');
     mkdirSync(taskDir, { recursive: true });
     const now = Date.now();
     getTaskPairStore().savePair(PROJECT, {
       taskId: 'T1', status: 'working', brain: BRAIN, executor: EXEC, auditor: 'deck_sub_rtcwdaud', round: 1, blocking: ['P0'], title: 'demo',
+      workspaceKind: 'dir',
       workspace: { kind: 'dir', path: taskDir, createdAt: now, status: 'active' },
       createdAt: now, updatedAt: now,
     } as unknown as TaskPairState);

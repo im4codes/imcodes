@@ -21,9 +21,9 @@
  * auditor of an OPEN pair on a `pairs` project. Brain sessions and sessions
  * without an open pair are never touched.
  */
-import { statSync } from 'node:fs';
-import { isAbsolute } from 'node:path';
-import { TASK_PAIR_PARTICIPANT_STATUSES } from '../../../shared/task-pair.js';
+import { existsSync, statSync } from 'node:fs';
+import { isAbsolute, join } from 'node:path';
+import { TASK_PAIR_PARTICIPANT_STATUSES, type TaskPairState } from '../../../shared/task-pair.js';
 import { getSession } from '../../store/session-store.js';
 import { isPairsEngineProject } from './engine.js';
 import { taskPairFocusOf } from './focus.js';
@@ -41,6 +41,34 @@ function isDirectory(path: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * Where the pair's executor and auditor work: the ONE place that decides what a
+ * pair's "working location" is, so nothing else in the turn path looks at the
+ * workspace kind or a snapshot's mode.
+ *
+ * The pair records it: `workspace.workingDir` when it differs from the workspace
+ * itself (a non-git project edited in place: the project directory), else
+ * `workspace.path` -- a git project's worktree, a non-git project's
+ * copy-on-write clone or sparse working set, or the task directory of a
+ * `workspace=dir` task.
+ *
+ * Fallback for a pair recorded before `workingDir` existed: a non-git project
+ * is edited IN PLACE (owner decision), so a daemon-made task directory
+ * (`kind === 'dir'`, not requested by Brain) in a project directory without a
+ * `.git` is only scratch and evidence space and the project directory is the
+ * location. Dead code once the non-git workspace records `workingDir`.
+ */
+export function pairWorkingLocation(pair: TaskPairState, projectDir: string | undefined): string | undefined {
+  const workspace = pair.workspace;
+  if (!workspace || workspace.status !== 'active' || !workspace.path) return undefined;
+  let location = workspace.workingDir;
+  if (!location) {
+    const derivedInPlace = workspace.kind === 'dir' && pair.workspaceKind !== 'dir' && !!projectDir && !existsSync(join(projectDir, '.git'));
+    location = derivedInPlace ? projectDir : workspace.path;
+  }
+  return location && isAbsolute(location) ? location : undefined;
 }
 
 /**
@@ -62,9 +90,8 @@ export function resolveTaskPairTurnCwd(sessionName: string): TaskPairTurnCwd | u
     if (!TASK_PAIR_PARTICIPANT_STATUSES.includes(pair.status)) continue;
     const role = pair.executor === sessionName ? 'executor' : pair.auditor === sessionName ? 'auditor' : undefined;
     if (!role || pair.brain === sessionName) continue;
-    const workspace = pair.workspace;
-    if (!workspace || workspace.status !== 'active' || !workspace.path || !isAbsolute(workspace.path)) continue;
-    candidates.push({ cwd: workspace.path, taskId: pair.taskId, role });
+    const cwd = pairWorkingLocation(pair, session.projectDir);
+    if (cwd) candidates.push({ cwd, taskId: pair.taskId, role });
   }
   if (candidates.length === 0) return undefined;
   const focus = taskPairFocusOf(sessionName);

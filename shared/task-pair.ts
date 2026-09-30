@@ -934,6 +934,11 @@ export interface TaskPairMaterial {
 export interface TaskPairWorkspace {
   kind: TaskPairWorkspaceKind;
   path: string;
+  /**
+   * Absolute directory where the pair's executor and auditor work by default (their turn cwd). Absent = `path`.
+   * Set when it is not the workspace itself, e.g. a non-git project edited in place (the project directory).
+   */
+  workingDir?: string;
   /** Base commit (worktrees only). */
   base?: string;
   /** Branch name when the workspace has one. */
