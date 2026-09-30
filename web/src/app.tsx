@@ -253,7 +253,7 @@ import {
 } from './terminal-subscribe-mode.js';
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
-import { isIdleSessionStateTimelineEvent, isRunningTimelineEvent } from './timeline-running.js';
+import { isIdleSessionStateTimelineEvent, noteLiveIdleSignal, isRunningTimelineEvent } from './timeline-running.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
@@ -292,7 +292,7 @@ import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
 } from '@shared/remote-desktop-local-management.js';
-import { markSessionRunningIfNeeded } from './session-state-updates.js';
+import { markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
@@ -2159,6 +2159,7 @@ export function App() {
   const openSubIdsKeyMemo = useMemo(() => openSubIdsKey(openSubIds), [openSubIds]);
   const maximizedSubIdsRef = useRef(maximizedSubIds);
   maximizedSubIdsRef.current = maximizedSubIds;
+  const liveIdleSessionsRef = useRef<Set<string>>(new Set());
   const flashIdleSession = useCallback((sessionName: string) => {
     setIdleFlashTokens((prev) => {
       const next = new Map(prev);
@@ -4014,10 +4015,13 @@ export function App() {
             setSessions((prev) => markSessionRunningIfNeeded(prev, event.sessionId));
           }
         }
-        if (isIdleSessionStateTimelineEvent(event)) {
+        // A repeat of an idle edge already handled (idle after idle with only
+        // telemetry between) neither flashes nor alerts nor re-renders the app.
+        const repeatedIdle = noteLiveIdleSignal(liveIdleSessionsRef.current, event);
+        if (isIdleSessionStateTimelineEvent(event) && !repeatedIdle) {
           flashIdleSession(event.sessionId);
           if (!event.sessionId.startsWith('deck_sub_')) {
-            setIdleAlerts((prev) => new Set([...prev, event.sessionId]));
+            setIdleAlerts((prev) => (prev.has(event.sessionId) ? prev : new Set([...prev, event.sessionId])));
           }
         }
         if (event.type === 'ask.question') {
@@ -4110,8 +4114,10 @@ export function App() {
         if (event.type === 'session.state' && !event.sessionId.startsWith('deck_sub_')) {
           const liveState = String(event.payload.state ?? '');
           if (liveState === 'queued' || liveState === 'running' || liveState === 'idle') {
-            setSessions((prev) => prev.map((s) => {
-              if (s.name !== event.sessionId) return s;
+            // A frame that repeats what the record already says must not
+            // re-render the app and every mounted pane (updateSessionIfChanged
+            // returns the same array, so setSessions bails out).
+            setSessions((prev) => updateSessionIfChanged(prev, event.sessionId, (s) => {
               const queuePatch = buildTransportPendingSyncPatch({
                 transportPendingMessages: s.transportPendingMessages,
                 transportPendingMessageEntries: s.transportPendingMessageEntries,
@@ -4130,9 +4136,9 @@ export function App() {
             const errorDetail = typeof event.payload.error === 'string' && event.payload.error.trim()
               ? event.payload.error.trim()
               : null;
-            setSessions((prev) => prev.map((s) => s.name === event.sessionId
-              ? { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
-              : s));
+            setSessions((prev) => updateSessionIfChanged(prev, event.sessionId, (s) => (
+              { ...s, state: 'error' as SessionInfo['state'], error: errorDetail ?? s.error ?? null }
+            )));
           }
         }
         if (event.type === 'session.state' && String(event.payload.state ?? '') === 'idle') {
@@ -4223,9 +4229,9 @@ export function App() {
         });
         if (!sessionName.startsWith('deck_sub_')) {
           // Main session: update state + tab alert
-          setSessions((prev) => prev.map((s) => s.name === sessionName ? { ...s, state: 'idle' as SessionInfo['state'] } : s));
+          setSessions((prev) => updateSessionIfChanged(prev, sessionName, (s) => ({ ...s, state: 'idle' as SessionInfo['state'] })));
           // Always flash the tab — even if it's the active one
-          setIdleAlerts((prev) => new Set([...prev, sessionName]));
+          setIdleAlerts((prev) => (prev.has(sessionName) ? prev : new Set([...prev, sessionName])));
         }
         flashIdleSession(sessionName);
         // Always show a toast (main + sub sessions)

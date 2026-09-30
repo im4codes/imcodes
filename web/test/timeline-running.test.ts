@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { hasActiveTimelineTurn, hasPendingUserSend, isRunningTimelineEvent } from '../src/timeline-running.js';
+import { hasActiveTimelineTurn, hasPendingUserSend, isRunningTimelineEvent, noteLiveIdleSignal } from '../src/timeline-running.js';
 
 const authoritativeIdlePayload = {
   state: 'idle',
@@ -277,5 +277,43 @@ describe('isRunningTimelineEvent', () => {
       { type: 'memory.compression', payload: { outcome: 'success' } },
       { type: 'memory.context', payload: {} },
     ] as any)).toBe(false);
+  });
+});
+
+
+describe('noteLiveIdleSignal (idle edge de-duplication)', () => {
+  const idle = (sessionId = 's1') => ({ sessionId, type: 'session.state' as const, payload: { state: 'idle' } });
+  const state = (value: string, sessionId = 's1') => ({ sessionId, type: 'session.state' as const, payload: { state: value } });
+  const other = (type: string, sessionId = 's1') => ({ sessionId, type: type as never, payload: {} });
+
+  it('the first idle fires, an immediate repeat does not', () => {
+    const seen = new Set<string>();
+    expect(noteLiveIdleSignal(seen, idle())).toBe(false);
+    expect(noteLiveIdleSignal(seen, idle())).toBe(true);
+    expect(noteLiveIdleSignal(seen, idle())).toBe(true);
+  });
+
+  it('telemetry between two idles does not re-arm the edge', () => {
+    const seen = new Set<string>();
+    noteLiveIdleSignal(seen, idle());
+    for (const type of ['agent.status', 'usage.update', 'mode.state']) noteLiveIdleSignal(seen, other(type));
+    expect(noteLiveIdleSignal(seen, idle())).toBe(true);
+  });
+
+  // Counterexamples: any real activity re-arms it, so the next genuine idle still flashes/alerts.
+  it('a non-idle state, a message, a tool call or streaming text re-arms the edge', () => {
+    for (const rearm of [state('running'), other('user.message'), other('tool.call'), other('assistant.text'), other('assistant.thinking')]) {
+      const seen = new Set<string>();
+      noteLiveIdleSignal(seen, idle());
+      noteLiveIdleSignal(seen, rearm);
+      expect(noteLiveIdleSignal(seen, idle())).toBe(false);
+    }
+  });
+
+  it('sessions are independent', () => {
+    const seen = new Set<string>();
+    noteLiveIdleSignal(seen, idle('a'));
+    expect(noteLiveIdleSignal(seen, idle('b'))).toBe(false);
+    expect(noteLiveIdleSignal(seen, idle('a'))).toBe(true);
   });
 });
