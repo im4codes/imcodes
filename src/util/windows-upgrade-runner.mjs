@@ -364,7 +364,7 @@ function sharpRepair(npmPrefix) {
     const dir = join(root, dep);
     const pkgJson = join(dir, 'package.json');
     if (!existsSync(pkgJson) && existsSync(dir)) {
-      try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+      try { cleanTree(dir); } catch { /* ignore */ }
     }
   }
   const imcodesDir = join(npmPrefix, 'node_modules', 'imcodes');
@@ -424,9 +424,12 @@ function nodeDatachannelRepair(npmPrefix) {
  *  cleanly without holding open file handles in SCRIPT_DIR. */
 function scheduleTmpDelete() {
   if (!SCRIPT_DIR) return;
+  // The shared helper removes the tree and proves it is gone (Node 24's rmSync silently keeps a path with
+  // non-ASCII characters on Windows, and a Chinese user name puts them in %TEMP%). It runs from its own
+  // loaded copy, so deleting the directory it sits in is fine.
   const detached = spawn(process.execPath, [
     '-e',
-    `setTimeout(() => { try { require('fs').rmSync(${JSON.stringify(SCRIPT_DIR)}, { recursive: true, force: true }); } catch {} }, 60_000);`,
+    `setTimeout(() => { try { require('child_process').spawnSync(process.execPath, [${JSON.stringify(STAGED_INSTALL_HELPER)}, 'clean', '--path', ${JSON.stringify(SCRIPT_DIR)}], { stdio: 'ignore' }); } catch {} }, 60_000);`,
   ], { detached: true, stdio: 'ignore', windowsHide: true });
   detached.unref();
 }
@@ -458,6 +461,12 @@ function stagedInstall(command, args, timeout = 10 * 60_000) {
   }
   if (result.stderr) log(`[staged-install ${command}] ${String(result.stderr).trim()}`);
   return result;
+}
+
+/** Remove a directory tree through the shared helper, which verifies it is really gone. */
+function cleanTree(path) {
+  const result = stagedInstall('clean', ['--path', path], 3 * 60_000);
+  if (result.status !== 0) log(`could not remove ${path} [exit ${result.status}] — a later run's recover sweeps it`);
 }
 
 function isAlive(pid) {
@@ -609,7 +618,7 @@ async function stageAndSwap(npmPrefix, oldPid, env) {
   trace(3, 'pre-npm-install');
   const installStartedAt = Date.now();
   if (REGISTRY) log(`pinning npm registry: ${REGISTRY}`);
-  rmSync(stagePrefix, { recursive: true, force: true });
+  cleanTree(stagePrefix);
   mkdirSync(stagePrefix, { recursive: true });
   const installResult = spawnNpm(
     NPM_CMD,
@@ -639,7 +648,7 @@ async function stageAndSwap(npmPrefix, oldPid, env) {
   trace(3, 'post-npm-install', `exit=${installResult.status} signal=${installResult.signal ?? 'none'} elapsed=${installElapsedMs}ms`);
   if (installResult.status !== 0 || !existsSync(stagedPackage)) {
     log(`install FAILED [exit ${installResult.status} signal ${installResult.signal ?? 'none'}] — the stage is discarded, the old package and daemon are untouched, lock released`);
-    rmSync(stagePrefix, { recursive: true, force: true });
+    cleanTree(stagePrefix);
     return false;
   }
   log('install OK (staged)');
@@ -662,13 +671,13 @@ async function stageAndSwap(npmPrefix, oldPid, env) {
   log(`installed version: ${installedVer || '?'}, target: ${TARGET_VER}`);
   if (verify.status !== 0 || !installedVer) {
     log(`staged package FAILED verification [exit ${verify.status}] — discarded; the old package and daemon are untouched`);
-    rmSync(stagePrefix, { recursive: true, force: true });
+    cleanTree(stagePrefix);
     return false;
   }
   // Downgrade guard for `latest`: a stale mirror can resolve below a local dev build. The daemon keeps running.
   if (TARGET_VER === 'latest' && CURRENT_VER && compareDaemonVersionsLocal(installedVer, CURRENT_VER) < 0) {
     log(`installed ${installedVer} is OLDER than current ${CURRENT_VER} — refusing to downgrade`);
-    rmSync(stagePrefix, { recursive: true, force: true });
+    cleanTree(stagePrefix);
     return false;
   }
 
@@ -703,7 +712,7 @@ async function stageAndSwap(npmPrefix, oldPid, env) {
   if (switched.status !== 0) {
     log(`switch FAILED [exit ${switched.status}] — the previous package is in place (a rename stayed locked or failed)`);
     restartPrevious('switch failed');
-    rmSync(stagePrefix, { recursive: true, force: true });
+    cleanTree(stagePrefix);
     return false;
   }
   copyShims(stagePrefix, npmPrefix, binNamesOf(livePackage));
@@ -716,14 +725,23 @@ async function stageAndSwap(npmPrefix, oldPid, env) {
     for (const pid of [readNumber(PIDFILE)].filter(Boolean)) { killed.add(pid); stopProcessTree(pid); }
     stopPackageLockers(livePackage);
     sleepMs(2_000);
-    const back = stagedInstall('rollback', swapArgs, 3 * 60_000);
+    // A process that started from the new package while it was being judged (a slow daemon start) can still
+    // hold a file in it: look again for lockers between attempts instead of giving up on the first lock.
+    let back = stagedInstall('rollback', swapArgs, 3 * 60_000);
+    for (let attempt = 2; attempt <= 3 && back.status === 78; attempt += 1) {
+      log(`rollback rename is locked — stopping whatever still runs from the new package and retrying (attempt ${attempt})`);
+      for (const pid of [readNumber(PIDFILE)].filter(Boolean)) { killed.add(pid); stopProcessTree(pid); }
+      stopPackageLockers(livePackage);
+      sleepMs(2_000);
+      back = stagedInstall('rollback', swapArgs, 3 * 60_000);
+    }
     if (back.status !== 0) {
       log(`ROLLBACK FAILED [exit ${back.status}] — the previous package is kept as ${join(globalRoot, `.imcodes-old.${tag}`)}`);
       return;
     }
     try { copyShims(oldShimsDir, npmPrefix, binNamesOf(livePackage)); } catch { /* best effort */ }
     restartPrevious('rolled back');
-    rmSync(stagePrefix, { recursive: true, force: true });
+    cleanTree(stagePrefix);
   };
 
   // The live shim must exist and run the new package.

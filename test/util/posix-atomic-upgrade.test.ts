@@ -414,6 +414,15 @@ describe('staged-package-install.mjs', () => {
       expect(liveVersion()).toBe('3.0.0');
     });
 
+    it('clean removes a tree under a path with spaces and non-ASCII names and proves it is gone (Node 24 rmSync keeps such paths on Windows)', () => {
+      const tree = join(fixture.prefix, '.imcodes-stage.测试 dir', '前缀', 'node_modules', 'imcodes');
+      mkdirSync(tree, { recursive: true });
+      writeFileSync(join(tree, 'package.json'), '{}');
+      const result = runWin({}, 'clean', '--path', join(fixture.prefix, '.imcodes-stage.测试 dir'));
+      expect(result.status, result.stdout + result.stderr).toBe(0);
+      expect(existsSync(join(fixture.prefix, '.imcodes-stage.测试 dir'))).toBe(false);
+    });
+
     it('preflight: ok on a writable root, 77 on too little disk, 75 when the root does not exist', () => {
       const ok = runWin({}, 'preflight', '--global-root', fixture.globalRoot, '--pkg', 'imcodes@2.0.0', '--expected-bytes', '1000');
       expect(ok.status, ok.stdout + ok.stderr).toBe(0);

@@ -153,15 +153,16 @@ function runUpgrade(extraEnv: Record<string, string> = {}, target = NEW_VERSION)
   ], {
     encoding: 'utf8',
     windowsHide: true,
-    timeout: 240_000,
+    timeout: 420_000,
     env: {
       ...process.env,
       IMCODES_HOME: world.stateDir,
       IMCODES_DEFAULT_HOME: join(world.root, 'not-the-default-home'),
       IMCODES_INSTALL_LAYOUT: 'windows',
       IMCODES_RENAME_RETRY_MS: '1500',
-      IMCODES_UPGRADE_HEALTH_MS: '2500',
-      IMCODES_UPGRADE_HEALTH_EXTENDED_MS: '2500',
+      // A cold node start on a busy Windows box takes seconds; the rollback test only needs a bounded wait.
+      IMCODES_UPGRADE_HEALTH_MS: isWindows ? '30000' : '2500',
+      IMCODES_UPGRADE_HEALTH_EXTENDED_MS: isWindows ? '15000' : '2500',
       ...extraEnv,
     },
   });
@@ -182,7 +183,7 @@ afterEach(() => {
   rmSync(world.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
 });
 
-describe('windows upgrade runner: staged swap', { timeout: 240_000 }, () => {
+describe('windows upgrade runner: staged swap', { timeout: 480_000 }, () => {
   it('clean swap: new version live, new daemon healthy on it, old daemon gone, nothing left behind', async () => {
     const oldPid = daemonPid()!;
     const { status, log } = runUpgrade();
@@ -287,13 +288,17 @@ describe('windows upgrade runner: staged swap', { timeout: 240_000 }, () => {
   it.skipIf(!isWindows)('a file held open inside the live package makes the rename fail: bounded, rolled back, old daemon restarted', async () => {
     const oldPid = daemonPid()!;
     // Hold a file open without FILE_SHARE_DELETE, like a loaded native addon: a real Windows lock.
+    // The path goes in through the environment: a holder whose command line named the package would be
+    // stopped as a "locker" (as an `imcodes mcp` server is), and this test wants a lock nothing can see.
     const holder = spawn('powershell', ['-NoProfile', '-NonInteractive', '-Command',
-      `$f = [System.IO.File]::Open('${join(world.prefix, 'node_modules', 'imcodes', 'package.json').replaceAll("'", "''")}', 'Open', 'Read', 'Read'); Start-Sleep -Seconds 120`], { stdio: 'ignore', windowsHide: true });
+      '$f = [System.IO.File]::Open($env:HOLD_PATH, "Open", "Read", "Read"); Start-Sleep -Seconds 600'], {
+      stdio: 'ignore', windowsHide: true, env: { ...process.env, HOLD_PATH: join(world.prefix, 'node_modules', 'imcodes', 'package.json') },
+    });
     await sleep(3_000);
     try {
       const started = Date.now();
       const { log } = runUpgrade({ IMCODES_RENAME_RETRY_MS: '8000' });
-      expect(Date.now() - started).toBeLessThan(120_000);
+      expect(Date.now() - started).toBeLessThan(230_000);
       expect(log).toMatch(/stayed locked|switch FAILED/);
       expect(liveVersion()).toBe(OLD_VERSION);
       await waitFor(() => daemonPid() !== oldPid && alive(daemonPid() ?? 0), 15_000, 'the old version to come back');

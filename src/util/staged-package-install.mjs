@@ -17,6 +17,7 @@
  *   rollback  put .imcodes-old.<tag> back (used when the new daemon does not come up)
  *   commit    drop the old copy and the stage
  *   recover   heal an interrupted switch (live missing, an old copy present)
+ *   clean     remove a tree and prove it is gone (Node 24 rmSync silently keeps non-ASCII paths on Windows)
  *
  * STANDALONE ON PURPOSE: node builtins only, no relative imports. The upgrade
  * script copies this one file into its scratch directory and runs it from there,
@@ -39,7 +40,7 @@
 import { spawnSync } from 'node:child_process';
 import {
   accessSync, appendFileSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
-  readlinkSync, realpathSync, renameSync, rmSync, statSync, statfsSync, symlinkSync, unlinkSync, writeFileSync,
+  readlinkSync, realpathSync, renameSync, rmSync, rmdirSync, statSync, statfsSync, symlinkSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, relative } from 'node:path';
 
@@ -158,8 +159,41 @@ function isDirectory(path) {
   try { return statSync(path).isDirectory(); } catch { return false; }
 }
 
+/** Remove a file or tree the long way: entry by entry. */
+function removeEntryByEntry(path) {
+  let info;
+  try { info = lstatSync(path); } catch { return; }
+  if (info.isDirectory() && !info.isSymbolicLink()) {
+    for (const name of readdirSync(path)) removeEntryByEntry(join(path, name));
+    rmdirSync(path);
+  } else {
+    unlinkSync(path);
+  }
+}
+
+/**
+ * Remove a tree and PROVE it is gone. Node 24's rmSync on Windows returns success without deleting
+ * when the path has non-ASCII characters (a Chinese user name in the profile is enough), so the
+ * result is checked and, if the tree is still there, removed entry by entry, with a few retries
+ * for a scanner or indexer that has a handle open for a moment.
+ */
+function removeTree(path) {
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    try { rmSync(path, { recursive: true, force: true }); } catch { /* checked below */ }
+    if (!existsSync(path) && !pathIsDangling(path)) return;
+    try { removeEntryByEntry(path); } catch { /* checked below */ }
+    if (!existsSync(path) && !pathIsDangling(path)) return;
+    if (attempt < 5) sleepMs(200 * attempt);
+  }
+  throw new Error(`${path} is still there after removal attempts`);
+}
+
+function pathIsDangling(path) {
+  try { lstatSync(path); return true; } catch { return false; }
+}
+
 function removeQuietly(path) {
-  try { rmSync(path, { recursive: true, force: true }); return true; } catch (error) {
+  try { removeTree(path); return true; } catch (error) {
     say(`could not remove ${path}: ${error.message}`);
     return false;
   }
@@ -420,11 +454,20 @@ function recover(args) {
   sweep(dirname(globalRoot), [STAGE_PREFIX]);
 }
 
+/** Remove a tree (the runner's stage and scratch directories), optionally after a delay. */
+function clean(args) {
+  const path = need(args, 'path');
+  const delay = Number.parseInt(args['delay-ms'] || '0', 10);
+  if (delay > 0) sleepMs(delay);
+  removeTree(path);
+  say(`removed ${path}`);
+}
+
 function preflightCommand(args) {
   preflight(args);
 }
 
-const COMMANDS = { stage, preflight: preflightCommand, verify, switch: switchInstall, rollback, commit, recover };
+const COMMANDS = { stage, preflight: preflightCommand, verify, switch: switchInstall, rollback, commit, recover, clean };
 
 function main() {
   let parsed;
