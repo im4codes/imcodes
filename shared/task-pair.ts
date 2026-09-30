@@ -1019,8 +1019,6 @@ export interface TaskPairWorkspace {
   kind: TaskPairWorkspaceKind;
   /** Present when the project was not a git repository: how it is handled for this pair. */
   nonGit?: TaskPairNonGitInfo;
-  /** Absolute directory where the pair's executor/auditor work by default (their turn cwd). Absent = workspace.path. */
-  workingDir?: string;
   path: string;
   /**
    * Absolute directory where the pair's executor and auditor work by default (their turn cwd). Absent = `path`.
