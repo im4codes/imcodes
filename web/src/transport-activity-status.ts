@@ -1,4 +1,5 @@
 import type { TimelineEvent } from './ws-client.js';
+import { CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX } from '@shared/capacity-retry.js';
 
 function stringArray(value: unknown): string[] {
   return Array.isArray(value)
@@ -11,15 +12,19 @@ function finiteNumber(value: unknown): number | null {
 }
 
 export function getLatestTransportActivityDetail(events: readonly TimelineEvent[]): string | null {
+  // A newer authoritative running state (it carries the full activity: busyReasons) WITHOUT capacityRetry means the episode ended:
+  // an older event that still carried the notice must not bring it back.
+  let capacityEpisodeEnded = false;
   for (let index = events.length - 1; index >= 0; index--) {
     const event = events[index];
     if (event.type !== 'session.state') continue;
     const state = String(event.payload.state ?? '');
     const retry = event.payload.capacityRetry;
-    if (state === 'running' && retry && typeof retry === 'object') {
+    if (state === 'running' && retry && typeof retry === 'object' && !capacityEpisodeEnded) {
       const r = retry as Record<string, unknown>;
-      if (typeof r.retryAt === 'number' && typeof r.attempt === 'number') return `capacity_retry:${r.retryAt}:${r.attempt}`;
+      if (typeof r.attempt === 'number') return `${CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX}${r.attempt}`;
     }
+    if (state === 'running' && !retry && Array.isArray(event.payload.busyReasons)) capacityEpisodeEnded = true;
     if (state === 'error') {
       const error = typeof event.payload.error === 'string' ? event.payload.error.trim() : '';
       return error || null;

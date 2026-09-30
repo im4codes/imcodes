@@ -38,6 +38,7 @@ import {
 import { setContextModelRuntimeConfig } from '../../src/context/context-model-config.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
+import { describeSessionWork } from '../../src/daemon/session-working.js';
 import { resetContextStoreClientForTests } from '../../src/store/context-store-worker-client.js';
 import { resetAllSummarySyncHistories } from '../../src/context/summary-sync-history.js';
 import { fingerprintRecentSummary } from '../../src/context/summary-sync.js';
@@ -3574,82 +3575,321 @@ describe('TransportSessionRuntime', () => {
     });
   });
 
-  it('retries a provider capacity refusal on the same session with bounded backoff', async () => {
-    runtime.send('capacity retry', 'msg-capacity');
-    await flushDispatch();
-    vi.useFakeTimers();
-    mock.fireError('sess-1', {
+  describe('provider capacity retry (owner rule: 1 → 2 → 4 → 8 → 15 s, then every 15 s, no give-up)', () => {
+    const CAPACITY = {
       code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-      message: 'Selected model is at capacity',
+      message: 'Selected model is at capacity. Please try a different model.',
       recoverable: false,
-    });
-    expect(runtime.getStatus()).toBe('thinking');
-    expect(runtime.pendingMessages).toEqual(['capacity retry']);
-    expect(runtime.getDiagnosticSnapshot().capacityRetry?.attempt).toBe(1);
-    await vi.advanceTimersByTimeAsync(29_999);
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(1);
-    await vi.runAllTicks();
-    expect(mock.provider.send).toHaveBeenCalledTimes(2);
-    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
-      userMessage: 'capacity retry',
-      deliveryId: 'msg-capacity',
-    }));
-  });
+    } as const;
+    const sendMock = () => mock.provider.send as ReturnType<typeof vi.fn>;
+    const NAMES = { CAPACITY_MS: [1_000, 2_000, 4_000, 8_000, 15_000] as const };
 
-  it('does not let a late completion bypass a pending capacity retry', async () => {
-    runtime.send('late completion', 'msg-capacity-late');
-    await flushDispatch();
-    vi.useFakeTimers();
-    mock.fireError('sess-1', {
-      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-      message: 'Selected model is at capacity',
-      recoverable: false,
-    });
-    // Simulate the provider callback for the failed turn arriving after the
-    // runtime has already preserved the entry and armed its retry timer.
-    mock.fireComplete('sess-1');
-    expect(runtime.getDiagnosticSnapshot().capacityRetry?.attempt).toBe(1);
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
-    await vi.advanceTimersByTimeAsync(29_999);
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
-  });
+    /** Fire the capacity error for the turn that is in flight, then let queued microtasks settle. */
+    const failWithCapacity = async () => {
+      mock.fireError('sess-1', { ...CAPACITY });
+      await vi.advanceTimersByTimeAsync(0);
+    };
 
-  it('stop drops a timer-fired capacity retry whose drain is deferred by blocking work', async () => {
-    runtime.send('stop deferred capacity retry', 'msg-capacity-stop');
-    await flushDispatch();
-    vi.useFakeTimers();
-    mock.fireError('sess-1', {
-      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
-      message: 'Selected model is at capacity',
-      recoverable: false,
+    beforeEach(() => {
+      vi.spyOn(Math, 'random').mockReturnValue(0); // jitter 0 = the exact base delays
     });
 
-    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
-      status: 'current',
-      activeWorkCount: 1,
-      activeToolCount: 1,
-      busyReasons: ['provider_tool_item'],
-      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
-      updatedAt: Date.now(),
-    }));
-    await vi.advanceTimersByTimeAsync(30_000);
-    expect(runtime.pendingMessages).toEqual(['stop deferred capacity retry']);
-    expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+    afterEach(() => {
+      vi.restoreAllMocks();
+    });
 
-    await runtime.cancel();
-    expect(runtime.pendingMessages).toEqual([]);
+    it('retries at exactly 1, 2, 4, 8, 15, 15, … s, for more than 30 minutes, keeps the message, and recovers when capacity returns', async () => {
+      expect(runtime.send('the turn', 'msg-capacity')).toBe('sent');
+      await flushDispatch();
+      vi.useFakeTimers();
+      expect(sendMock()).toHaveBeenCalledTimes(1);
 
-    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
-      status: 'current',
-      activeWorkCount: 0,
-      activeToolCount: 0,
-      busyReasons: [],
-      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
-      updatedAt: Date.now(),
-    }));
-    expect(runtime.drainPendingIfIdle('after-stop')).toBe(false);
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      const gaps: number[] = [];
+      let elapsedSinceError = 0;
+      let sends = 1;
+      await failWithCapacity();
+      const started = Date.now();
+      // 130 failed attempts: 1+2+4+8 s plus 126 × 15 s = 32+ minutes of continuous capacity failure.
+      for (let attempt = 1; attempt <= 130; attempt += 1) {
+        expect(runtime.pendingMessages).toEqual(['the turn']); // preserved, not dropped, not duplicated
+        expect(runtime.getStatus()).toBe('thinking');
+        expect(runtime.getDiagnosticSnapshot().capacityRetry).toMatchObject({ attempt });
+        const before = Date.now();
+        while (sendMock().mock.calls.length === sends) {
+          await vi.advanceTimersByTimeAsync(100);
+          expect(Date.now() - before).toBeLessThanOrEqual(15_000); // never waits more than 15 s
+        }
+        gaps.push(Math.round((Date.now() - before) / 100) * 100);
+        elapsedSinceError = Date.now() - started;
+        sends = sendMock().mock.calls.length;
+        expect(sendMock()).toHaveBeenLastCalledWith('sess-1', expect.objectContaining({ userMessage: 'the turn', deliveryId: 'msg-capacity' }));
+        await failWithCapacity();
+      }
+      expect(gaps.slice(0, 6)).toEqual([1_000, 2_000, 4_000, 8_000, 15_000, 15_000]);
+      expect(Math.max(...gaps)).toBe(15_000);
+      expect(gaps.every((gap, index) => gap === NAMES.CAPACITY_MS[Math.min(index, 4)])).toBe(true);
+      expect(elapsedSinceError).toBeGreaterThan(30 * 60_000); // no give-up window
+      expect(runtime.getStatus()).toBe('thinking');
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeDefined();
+
+      // Capacity returns: the next retry goes through and the turn completes.
+      const before = sendMock().mock.calls.length;
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(sendMock().mock.calls.length).toBe(before + 1);
+      mock.fireComplete('sess-1');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+      expect(runtime.pendingMessages).toEqual([]);
+      expect(runtime.getStatus()).toBe('idle');
+      // Nothing keeps retrying afterwards.
+      const settled = sendMock().mock.calls.length;
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sendMock().mock.calls.length).toBe(settled);
+    });
+
+    it('jitter only shortens: the first retry stays near 1 s and no interval exceeds 15 s', async () => {
+      (Math.random as ReturnType<typeof vi.fn>).mockReturnValue(0.999999);
+      runtime.send('jittered', 'msg-jitter');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      const before = Date.now();
+      let sends = 1;
+      while (sendMock().mock.calls.length === sends) await vi.advanceTimersByTimeAsync(10);
+      const first = Date.now() - before;
+      expect(first).toBeGreaterThanOrEqual(800);
+      expect(first).toBeLessThanOrEqual(1_000);
+      sends = sendMock().mock.calls.length;
+      for (let i = 0; i < 8; i += 1) {
+        await failWithCapacity();
+        const t0 = Date.now();
+        while (sendMock().mock.calls.length === sends) await vi.advanceTimersByTimeAsync(10);
+        expect(Date.now() - t0).toBeLessThanOrEqual(15_000);
+        sends = sendMock().mock.calls.length;
+      }
+    });
+
+    it('a message the user sends during the retries is queued behind the retried turn: nothing dropped, nothing duplicated', async () => {
+      runtime.send('first', 'msg-first');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      expect(runtime.send('second', 'msg-second')).toBe('queued');
+      expect(runtime.pendingMessages).toEqual(['first', 'second']);
+      await vi.advanceTimersByTimeAsync(1_000);
+      // The retry re-sends ONLY the failed turn; the new message waits for it.
+      expect(sendMock()).toHaveBeenCalledTimes(2);
+      expect(sendMock().mock.calls[1]?.[1]).toMatchObject({ userMessage: 'first', deliveryId: 'msg-first' });
+      expect(runtime.pendingMessages).toEqual(['second']);
+      mock.fireComplete('sess-1');
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(sendMock()).toHaveBeenCalledTimes(3);
+      expect(sendMock().mock.calls[2]?.[1]).toMatchObject({ userMessage: 'second', deliveryId: 'msg-second' });
+      const delivered = sendMock().mock.calls.map((call) => (call[1] as { deliveryId: string }).deliveryId);
+      expect(delivered.filter((id) => id === 'msg-first')).toHaveLength(2); // the failed attempt + the retry, never a third
+      expect(delivered.filter((id) => id === 'msg-second')).toHaveLength(1);
+    });
+
+    it('STOP during the retries cancels them immediately and drops only the retried turn', async () => {
+      runtime.send('to stop', 'msg-stop');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      runtime.send('after stop', 'msg-after');
+      await runtime.cancel();
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+      const afterStop = sendMock().mock.calls.length;
+      // The user's later message drains as a normal turn; the stopped turn never comes back.
+      await vi.advanceTimersByTimeAsync(120_000);
+      const delivered = sendMock().mock.calls.slice(afterStop).map((call) => (call[1] as { deliveryId: string }).deliveryId);
+      expect(delivered).not.toContain('msg-stop');
+      expect(runtime.pendingMessages).not.toContain('to stop');
+    });
+
+    it('COUNTEREXAMPLE: a permanent error fails fast, with no retry and no capacity notice', async () => {
+      runtime.send('bad credentials', 'msg-auth');
+      await flushDispatch();
+      vi.useFakeTimers();
+      mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'API Error: 401 Invalid authentication credentials', recoverable: false });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sendMock()).toHaveBeenCalledTimes(1);
+      expect(runtime.getStatus()).toBe('error');
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+      expect(runtime.lastProviderError).toMatchObject({ code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, recoverable: false });
+    });
+
+    it('a permanent error in the middle of an episode ends it: no more retries', async () => {
+      runtime.send('mid-episode', 'msg-mid');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sendMock()).toHaveBeenCalledTimes(2);
+      mock.fireError('sess-1', { code: PROVIDER_ERROR_CODES.AUTH_FAILED, message: 'token expired', recoverable: false });
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sendMock()).toHaveBeenCalledTimes(2);
+      expect(runtime.getStatus()).toBe('error');
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+    });
+
+    it('a duplicate error notification for the failed turn is absorbed: the session never looks dead while the retry is pending', async () => {
+      runtime.send('dup', 'msg-dup');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      await failWithCapacity();
+      expect(runtime.getStatus()).toBe('thinking');
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toMatchObject({ attempt: 1 });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sendMock()).toHaveBeenCalledTimes(2);
+    });
+
+    it('the notice is raised once per episode and cleared when the turn goes through', async () => {
+      const changes: boolean[] = [];
+      runtime.onCapacityRetryChange = (active) => { changes.push(active); };
+      runtime.send('notice', 'msg-notice');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      for (let i = 0; i < 6; i += 1) {
+        const sends = sendMock().mock.calls.length;
+        while (sendMock().mock.calls.length === sends) await vi.advanceTimersByTimeAsync(100);
+        await failWithCapacity();
+      }
+      expect(changes).toEqual([true]); // six attempts, one notice
+      const sends = sendMock().mock.calls.length;
+      while (sendMock().mock.calls.length === sends) await vi.advanceTimersByTimeAsync(100);
+      mock.fireComplete('sess-1');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(changes).toEqual([true, false]);
+    });
+
+    it('a retried turn that keeps running without another capacity failure ends the episode; the next failure starts over at 1 s', async () => {
+      runtime.send('long turn', 'msg-long');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      for (let i = 0; i < 5; i += 1) {
+        const sends = sendMock().mock.calls.length;
+        while (sendMock().mock.calls.length === sends) await vi.advanceTimersByTimeAsync(100);
+        if (i < 4) await failWithCapacity();
+      }
+      // The 5th retry is now running (15 s backoff reached); it survives 30 s → the episode is over.
+      await vi.advanceTimersByTimeAsync(31_000);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+      const sends = sendMock().mock.calls.length;
+      await failWithCapacity(); // a NEW failure of that long turn
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sendMock().mock.calls.length).toBe(sends + 1); // back to a 1 s first retry
+    });
+
+    it('a daemon restart during the retries resumes them: the retried turn is durable', async () => {
+      runtime.send('survives restart', 'msg-restart');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      // The retried turn is a durable queue row (not just in memory)…
+      expect(getTransportQueueStore().readSnapshot('deck_test_brain', 'test').pendingMessageEntries.map((entry) => entry.clientMessageId)).toContain('msg-restart');
+      vi.useRealTimers();
+      // …so a runtime started after the restart finds it and sends it.
+      const restartedMock = makeMockProvider();
+      const restarted = new TransportSessionRuntime(restartedMock.provider, 'deck_test_brain');
+      await restarted.initialize(defaultConfig);
+      expect(restarted.rehydratePendingFromStore()).toBe(1);
+      expect(restarted.pendingMessages).toEqual(['survives restart']);
+      restarted.drainPendingIfIdle('restart');
+      await waitForProviderSendCount(restartedMock.provider, 1);
+      expect(restartedMock.provider.send).toHaveBeenCalledWith('sess-1', expect.objectContaining({ userMessage: 'survives restart', deliveryId: 'msg-restart' }));
+    });
+
+    it('reports busy to the pair heartbeat for the whole episode (this is what keeps it from being recovered or replaced)', async () => {
+      runtime.send('busy while retrying', 'msg-busy');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      for (const minutes of [0, 1, 30, 240]) {
+        await vi.advanceTimersByTimeAsync(minutes * 60_000);
+        if (sendMock().mock.calls.length > 0) mock.fireError('sess-1', { ...CAPACITY }); // keep failing
+        await vi.advanceTimersByTimeAsync(0);
+        const work = describeSessionWork('deck_test_brain', {
+          getSession: () => ({ state: 'running' }) as never,
+          getDiagnosticSnapshot: () => runtime.getDiagnosticSnapshot(),
+        });
+        expect(work.working, `after ${minutes} min`).toBe(true);
+        expect(work.reasons.join(',')).toMatch(/pending_messages|blocking_work|status_thinking/);
+      }
+      expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('capacity_retry');
+    });
+
+    it('a blocked retry (other work still open) waits and tries again instead of giving up', async () => {
+      runtime.send('blocked', 'msg-blocked');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      let blocking = true;
+      (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+        status: 'current',
+        activeWorkCount: blocking ? 1 : 0,
+        activeToolCount: blocking ? 1 : 0,
+        busyReasons: blocking ? ['provider_tool_item'] : [],
+        generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+        updatedAt: Date.now(),
+      }));
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(sendMock()).toHaveBeenCalledTimes(1);
+      expect(runtime.pendingMessages).toEqual(['blocked']);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeDefined();
+      blocking = false;
+      await vi.advanceTimersByTimeAsync(15_000);
+      expect(sendMock()).toHaveBeenCalledTimes(2);
+    });
+
+    it('STOP also drops a timer-fired retry whose drain is deferred by blocking work', async () => {
+      runtime.send('stop deferred capacity retry', 'msg-capacity-stop');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+        status: 'current',
+        activeWorkCount: 1,
+        activeToolCount: 1,
+        busyReasons: ['provider_tool_item'],
+        generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+        updatedAt: Date.now(),
+      }));
+      await vi.advanceTimersByTimeAsync(2_000);
+      expect(runtime.pendingMessages).toEqual(['stop deferred capacity retry']);
+      await runtime.cancel();
+      expect(runtime.pendingMessages).toEqual([]);
+      (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+        status: 'current',
+        activeWorkCount: 0,
+        activeToolCount: 0,
+        busyReasons: [],
+        generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+        updatedAt: Date.now(),
+      }));
+      expect(runtime.drainPendingIfIdle('after-stop')).toBe(false);
+      await vi.advanceTimersByTimeAsync(60_000);
+      expect(sendMock()).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not let a late completion bypass a pending capacity retry', async () => {
+      runtime.send('late completion', 'msg-capacity-late');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      // The provider callback for the failed turn arriving after the retry timer was armed.
+      mock.fireComplete('sess-1');
+      expect(runtime.getDiagnosticSnapshot().capacityRetry?.attempt).toBe(1);
+      expect(sendMock()).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(999);
+      expect(sendMock()).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1);
+      expect(sendMock()).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('auto-retry redelivers a recoverable-failed message once the provider frees up', async () => {

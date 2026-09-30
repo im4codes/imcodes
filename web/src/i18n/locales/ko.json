@@ -1003,7 +1003,7 @@
       "loading": "사용 가능한 모델을 불러오는 중…",
       "unsupported": "이 세션 유형은 모델 전환을 지원하지 않습니다."
     },
-    "capacity_retrying": "{{seconds}}초 후 재시도 ({{attempt}}회차)",
+    "capacity_retrying": "모델 용량이 가득 찼습니다. 자동으로 재시도 중 (15초 이내 간격)",
     "state_error": "세션 오류",
     "state_error_detail": "오류: {{error}}"
   },

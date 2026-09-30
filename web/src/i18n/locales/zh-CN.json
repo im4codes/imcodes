@@ -1003,7 +1003,7 @@
       "loading": "正在加载可用模型…",
       "unsupported": "此会话类型不支持切换模型。"
     },
-    "capacity_retrying": "将在 {{seconds}} 秒后重试（第 {{attempt}} 次）",
+    "capacity_retrying": "模型容量已满，正在自动重试（间隔不超过 15 秒）",
     "state_error": "会话错误",
     "state_error_detail": "错误：{{error}}"
   },

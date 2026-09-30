@@ -5,6 +5,7 @@ export type SessionActivityBusyReason =
   | 'runtime_dispatch'
   | 'active_dispatch_entry'
   | 'recoverable_retry'
+  | 'capacity_retry'
   | 'provider_session_binding'
   | 'provider_tool_item'
   | 'provider_compaction'

@@ -19,7 +19,7 @@
  * also says so.
  */
 import { TASK_PAIR_HEARTBEAT_MS } from '../../../shared/task-pair.js';
-import { isTransientProviderError as isSharedTransientProviderError } from '../../../shared/provider-error-codes.js';
+import { isTransientProviderRefusalText } from '../../../shared/provider-error-classifier.js';
 import type { TimelineEvent } from '../timeline-event.js';
 
 /**
@@ -37,7 +37,7 @@ import type { TimelineEvent } from '../timeline-event.js';
  * "is this session rate-limited".
  */
 export function isTransientProviderError(message: string | undefined): boolean {
-  return isSharedTransientProviderError(message);
+  return isTransientProviderRefusalText(message);
 }
 
 const lastErrorAt = new Map<string, number>();

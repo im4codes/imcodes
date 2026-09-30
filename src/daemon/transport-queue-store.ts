@@ -1358,6 +1358,23 @@ export class TransportQueueStore {
     return !!row;
   }
 
+  /**
+   * Forget the delivery record of a message whose turn FAILED before it took effect and is being re-queued (a provider capacity
+   * failure retried with backoff). A record left behind would make a restart's rehydrate skip the re-queued row as "already
+   * delivered" and lose the turn. Current epoch only; returns whether a record existed.
+   */
+  clearDeliveryTombstone(sessionNameInput: string, clientMessageIdInput: string): boolean {
+    const sessionName = normalizeSessionName(sessionNameInput);
+    const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');
+    const queueEpoch = this.currentQueueEpoch(sessionName);
+    if (!queueEpoch) return false;
+    const removed = this.db.prepare(`
+      DELETE FROM queue_delivery_tombstones
+      WHERE session_name = ? AND client_message_id = ? AND queue_epoch = ?
+    `).run(sessionName, clientMessageId, queueEpoch);
+    return Number(removed.changes ?? 0) > 0;
+  }
+
   markDeleted(sessionNameInput: string, clientMessageIdInput: string, now = Date.now()): QueueSnapshot {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = requireNonEmpty(clientMessageIdInput.trim(), 'clientMessageId');

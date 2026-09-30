@@ -1003,7 +1003,7 @@
       "loading": "Cargando modelos disponibles…",
       "unsupported": "Este tipo de sesión no permite cambiar el modelo."
     },
-    "capacity_retrying": "Reintentando en {{seconds}} s (intento {{attempt}})",
+    "capacity_retrying": "Modelo al límite de capacidad: reintentando automáticamente (cada ≤15 s)",
     "state_error": "Error de sesión",
     "state_error_detail": "Error: {{error}}"
   },

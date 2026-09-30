@@ -238,6 +238,62 @@ describe('task-pair heartbeat, replacement and queue', () => {
     expect(sentTo(BRAIN, 'participant-recovered')).toHaveLength(1);
   });
 
+  it('a participant that keeps retrying provider capacity is busy and waiting: for 4 hours no nudge, recovery, escalation or replacement', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH RETRYING executor=${EXEC} auditor=${AUD} -->\nwork\n<!-- IMCODES_TASK_END RETRYING -->`);
+    await flush();
+    sent = [];
+    // What the real runtime reports during a capacity retry (see the runtime test 'reports busy to the pair heartbeat').
+    upsertSession(session(EXEC, 'w1', { state: 'running', updatedAt: now }));
+    let restarts = 0;
+    let provisions = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      busyProbe: {
+        getDiagnosticSnapshot: () => ({
+          status: 'thinking', sending: false, activeDispatchCount: 0, pendingCount: 1, blockingWorkCount: 1,
+          backgroundWorkCount: 0, activeToolCount: 0, busyReasons: ['capacity_retry'],
+          lastActivityAt: now, lastActivityAgeMs: 0, lastProviderOutputAgeMs: null,
+          capacityRetry: { attempt: 999, retryAt: now + 15_000, since: 1, error: 'Selected model is at capacity. Please try a different model.' },
+        }) as never,
+      },
+      restartParticipant: async () => { restarts += 1; return false; },
+      provision: async () => { provisions += 1; return SPARE; },
+      poolOf: () => 'primary',
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await tick(40); // 40 heartbeats × 6 min = 4 h of continuous retrying
+    await bothIdleCheck(40);
+    await flush();
+    expect(restarts).toBe(0);
+    expect(provisions).toBe(0);
+    expect(pair('RETRYING').executor).toBe(EXEC);
+    expect(pair('RETRYING').flags).not.toContain('executor_silent');
+    expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'participant-recovery-failed')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'brain-executor_silent')).toHaveLength(0);
+    expect(sentTo(BRAIN, 'brain-line-reassign')).toHaveLength(0);
+  });
+
+  it('COUNTEREXAMPLE for the test above: the same participant in a bare error state IS recovered (so the retry state is what protects it)', async () => {
+    marker(BRAIN, `<!-- IMCODES_TASK DISPATCH DEADSESSION executor=${EXEC} auditor=${AUD} -->\nwork\n<!-- IMCODES_TASK_END DEADSESSION -->`);
+    await flush();
+    sent = [];
+    upsertSession(session(EXEC, 'w1', { state: 'error', error: 'Selected model is at capacity. Please try a different model.', updatedAt: now }));
+    let restarts = 0;
+    automation = new TaskPairAutomation({
+      now: () => now,
+      busyProbe: { getDiagnosticSnapshot: () => undefined },
+      restartParticipant: async () => { restarts += 1; return false; },
+      importLegacy: () => undefined,
+    });
+    taskPairService.setScheduler(automation);
+    await tick(1);
+    await flush();
+    expect(restarts).toBe(1);
+    expect(sentTo(BRAIN, 'participant-recovery-failed')).toHaveLength(1);
+  });
+
   it('prompts once for a stalled phase, then escalates once to Brain', async () => {
     const previousPrompt = process.env.IMCODES_TASK_PAIR_STAGE_STALL_MS;
     const previousEscalate = process.env.IMCODES_TASK_PAIR_STAGE_STALL_ESCALATE_MS;

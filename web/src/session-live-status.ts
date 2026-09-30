@@ -7,6 +7,7 @@ import {
   type TransportQueueReducerState,
 } from '../../shared/transport-queue-reducer.js';
 import { isWorkingSessionState } from '../../shared/session-activity-types.js';
+import { CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX } from '../../shared/capacity-retry.js';
 
 export type SessionLiveStatusMode =
   | 'idle'
@@ -175,7 +176,7 @@ export function deriveSessionLiveStatus(input: SessionLiveStatusInput): SessionL
     mode = 'tool';
   } else if (activeThinking) {
     mode = 'thinking';
-  } else if (activityDetail?.startsWith('capacity_retry:')) {
+  } else if (activityDetail?.startsWith(CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX)) {
     mode = 'waiting';
   } else if (running || activeTransportTurn) {
     mode = 'running';

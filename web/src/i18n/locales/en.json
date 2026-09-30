@@ -1003,7 +1003,7 @@
       "loading": "Loading available models…",
       "unsupported": "This session type does not support model switching."
     },
-    "capacity_retrying": "Retrying in {{seconds}}s (attempt {{attempt}})",
+    "capacity_retrying": "Model at capacity — retrying automatically (every ≤15 s)",
     "state_error": "Session error",
     "state_error_detail": "Error: {{error}}"
   },

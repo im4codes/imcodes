@@ -2131,6 +2131,16 @@ function wireTransportCallbacks(
       void recoverTransportRuntimeAfterError(sessionName, runtime);
     }
   };
+  // Show the capacity-retry notice once per episode and clear it when the turn goes through (payload.capacityRetry comes
+  // from the runtime's diagnostic snapshot, so an ended episode emits a state without it).
+  runtime.onCapacityRetryChange = () => {
+    const built = buildTransportSessionStatePayload(sessionName, runtime, runtime.getStatus(), {
+      decisionReason: 'activity_reconciler_clear',
+      clearSource: 'transport-runtime',
+      queueReason: 'transport_status_idle',
+    });
+    timelineEmitter.emit(sessionName, 'session.state', built.payload, { source: 'daemon', confidence: 'high' });
+  };
   runtime.onDrain = (messages, merged, count, metadata) => {
     // The post-drain queue version. Stamped on the per-entry user.message
     // events AND the cleared session.state below so the UI advances its

@@ -12,6 +12,7 @@ import { deriveSessionLiveStatus } from '../session-live-status.js';
 import type { UsageData } from '../usage-data.js';
 import type { ProviderQuotaMeta } from '@shared/provider-quota.js';
 import { isAuthoritativeUsageContextWindowSource } from '@shared/usage-context-window.js';
+import { CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX } from '@shared/capacity-retry.js';
 import { usePref, parseBooleanish } from '../hooks/usePref.js';
 import { PREF_KEY_SHOW_TOOL_CALLS } from '../constants/prefs.js';
 import { CLAUDE_WEEKLY_QUOTA_PREF_KEY } from '@shared/claude-quota.js';
@@ -230,10 +231,8 @@ function UsageFooterImpl({ usage, sessionName, sessionState, agentType, modelOve
     }
     if (liveStatusMode === 'result') return statusText || t('session.state_idle');
     if (liveStatusMode === 'waiting') {
-      const match = liveStatus.activityDetail?.match(/^capacity_retry:(\d+):(\d+)$/);
-      if (match) {
-        const seconds = Math.max(0, Math.ceil((Number(match[1]) - (now ?? Date.now())) / 1000));
-        return t('session.capacity_retrying', { seconds, attempt: Number(match[2]), defaultValue: 'Retrying in {{seconds}}s (attempt {{attempt}})' });
+      if (liveStatus.activityDetail?.startsWith(CAPACITY_RETRY_ACTIVITY_DETAIL_PREFIX)) {
+        return t('session.capacity_retrying');
       }
       return statusText || t('session.state_idle');
     }
