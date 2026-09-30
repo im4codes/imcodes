@@ -94,6 +94,8 @@ export interface QueuePrivateDispatchMaterial {
   delegationReply?: {
     delegationId: string;
   };
+  /** Command-mode send (shared/send-command-mode.ts): delivered verbatim, no per-turn enrichment. */
+  commandMode?: true;
   /** Private peer-audit ownership marker. Never expose through queue projections. */
   peerAudit?: {
     contractVersion: string;

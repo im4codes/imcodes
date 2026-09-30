@@ -60,6 +60,7 @@ process.on('warning', (warning) => {
   // Don't forward warnings — too noisy.
 });
 
+import { SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH, sendCommandText, validateSendCommandRequest } from '../shared/send-command-mode.js';
 import { Command } from 'commander';
 // These modules are imported lazily to avoid eager tmux backend detection on Windows.
 // Commands like `bind` don't need tmux/conpty and shouldn't crash when node-pty is missing.
@@ -676,7 +677,8 @@ program
   .option('--list', 'List available sibling sessions')
   .option('--reply', 'Route the target response back automatically; no polling needed')
   .option('--no-reply', 'Disable automatic reply instruction (default)')
-  .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean }) => {
+  .option('--command', 'Command mode: deliver exactly the given text (trimmed) with no sender line, context, files, reply instruction or task/pair binding. Not combinable with --reply or --files. `/stop` stops the target.')
+  .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean; command?: boolean }) => {
     const { detectSenderSession } = await import('./util/detect-session.js');
 
     // ── --list mode: show available siblings ───────────────────────────────
@@ -754,6 +756,19 @@ program
     // Parse --files into array
     const files = opts.files ? opts.files.split(',').map((f) => f.trim()).filter(Boolean) : undefined;
 
+    // Command mode: one shared validator (shared/send-command-mode.ts), the same
+    // rules the daemon enforces. A command has no files, no reply channel and no
+    // wrapper, and goes to its own hook path so an older daemon refuses it.
+    if (opts.command) {
+      const invalid = validateSendCommandRequest({ message, reply: opts.reply, files });
+      if (invalid) {
+        console.error(`Error: ${invalid}`);
+        process.exit(1);
+      }
+      message = sendCommandText(message);
+    }
+    const sendPath = opts.command ? SEND_COMMAND_HOOK_PATH : '/send';
+
     // Try hook server IPC first (preferred — daemon handles target resolution, queuing, etc.)
     const hookPort = await resolveLiveHookPort();
     if (hookPort) {
@@ -770,7 +785,7 @@ program
 
         if (opts.all) {
           // Broadcast mode
-          const res = await postToHookServer(hookPort, '/send', {
+          const res = await postToHookServer(hookPort, sendPath, {
             from,
             to: '*',
             message,
@@ -784,7 +799,7 @@ program
 
         if (opts.type) {
           // Target by agent type
-          const res = await postToHookServer(hookPort, '/send', {
+          const res = await postToHookServer(hookPort, sendPath, {
             from,
             to: opts.type,
             message,
@@ -797,7 +812,7 @@ program
         }
 
         // Standard target (label or session name)
-        const res = await postToHookServer(hookPort, '/send', {
+        const res = await postToHookServer(hookPort, sendPath, {
           from,
           to: resolvedTarget!,
           message,
@@ -808,6 +823,12 @@ program
         printSendResult(res);
         return;
       } catch (err) {
+        // An older daemon has no command path: refuse instead of falling back to
+        // any wrapped delivery.
+        if (opts.command && (err as { statusCode?: number }).statusCode === 404) {
+          console.error(`Error: ${SEND_COMMAND_ERRORS.UNSUPPORTED_DAEMON}`);
+          process.exit(1);
+        }
         // Hook server unavailable — fall back to direct tmux send
         logger.debug({ err }, 'Hook server unavailable, falling back to direct send');
       }
@@ -863,7 +884,7 @@ async function postToHookServer(
           try {
             resolve(JSON.parse(responseBody) as Record<string, unknown>);
           } catch {
-            reject(new Error(`Invalid JSON response: ${responseBody}`));
+            reject(Object.assign(new Error(`Invalid JSON response: ${responseBody}`), { statusCode: res.statusCode }));
           }
         });
       },

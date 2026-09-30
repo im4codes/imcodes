@@ -6,6 +6,7 @@ import {
   isSessionModelSwitchCommandText,
 } from '../../shared/session-control-commands.js';
 import { createHash } from 'node:crypto';
+import { sendCommandText } from '../../shared/send-command-mode.js';
 import { createSendDispatchId, createSendMessageId, type SendDispatchId, type SendMessageId } from '../../shared/send-message-id.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import {
@@ -83,6 +84,13 @@ export interface SessionDispatchMessageOptions {
    * (external chat bridges route here too).
    */
   messageOrigin?: ChatMessageOrigin;
+  /**
+   * Command mode (shared/send-command-mode.ts): `message` is already the exact
+   * text to deliver. The target runtime delivers it without per-turn
+   * memory/identity enrichment and never merges it with other queued text; a
+   * process target skips memory recall and sandbox path rewriting.
+   */
+  command?: true;
 }
 
 export type SessionDispatchOptions = SessionDispatchMessageOptions;
@@ -100,6 +108,8 @@ type BuildSessionDispatchMessageInput = {
   contextTail?: string | null;
   contextOmitted?: boolean;
   contextStatus?: DelegationContextStatus;
+  /** Command mode: deliver `message.trim()` and nothing else (shared/send-command-mode.ts). */
+  command?: boolean;
 };
 
 /**
@@ -123,7 +133,7 @@ export function buildSessionDispatchMessage(
   // A session control command (/clear, /compact, /stop, /model X) must arrive
   // as exactly that text. The sender line, context tail or reply instruction
   // turned it into prose: the command never ran and the model read it instead.
-  if (isSessionControlDispatchText(message)) return message.trim();
+  if (options.command === true || isSessionControlDispatchText(message)) return sendCommandText(message);
   const contextStatus: DelegationContextStatus = options.contextStatus ?? (options.contextOmitted ? 'omitted' : 'ok');
   let result = message;
   if (options.from) {
@@ -259,6 +269,7 @@ export async function dispatchSessionMessage(
         text: message,
         commandId: options.messageId,
         clientMessageId: options.messageId,
+        ...(options.command ? { commandMode: true as const } : {}),
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
@@ -293,6 +304,7 @@ export async function dispatchSessionMessage(
         text: message,
         commandId: options.messageId,
         clientMessageId: options.messageId,
+        ...(options.command ? { commandMode: true as const } : {}),
         ...(options.sharedActor ? { sharedActor: options.sharedActor } : {}),
         ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
         ...(options.queueSupervisionReference ? { supervisionReference: options.queueSupervisionReference } : {}),
@@ -315,10 +327,13 @@ export async function dispatchSessionMessage(
     }
     if (deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
       const appendExternal = runtime.appendExternalMessageToActiveTurn;
+      const commandPrivateMetadata = options.command ? { commandMode: true as const } : undefined;
       const result = typeof appendExternal === 'function'
-        ? options.queueSupervisionReference
-          ? await appendExternal.call(runtime, message, options.messageId, options.queueSupervisionReference)
-          : await appendExternal.call(runtime, message, options.messageId)
+        ? commandPrivateMetadata
+          ? await appendExternal.call(runtime, message, options.messageId, options.queueSupervisionReference, undefined, commandPrivateMetadata)
+          : options.queueSupervisionReference
+            ? await appendExternal.call(runtime, message, options.messageId, options.queueSupervisionReference)
+            : await appendExternal.call(runtime, message, options.messageId)
         : 'unsupported';
       if (result === 'retry') {
         throw new Error('transport supervision authority temporarily unavailable');
@@ -348,7 +363,7 @@ export async function dispatchSessionMessage(
               supervisionReference: options.queueSupervisionReference,
               ...originMetadata(options),
             })
-          : options.messageOrigin
+          : options.messageOrigin || options.command
           ? runtime.send(message, options.messageId, undefined, undefined, originMetadata(options))
           : runtime.send(message, options.messageId);
         if (fallback === 'sent' && !options.suppressTimeline) {
@@ -386,7 +401,7 @@ export async function dispatchSessionMessage(
         })
       : options.sharedActor
       ? runtime.send(message, options.messageId, undefined, undefined, { sharedActor: options.sharedActor, ...originMetadata(options) })
-      : options.messageOrigin
+      : options.messageOrigin || options.command
       ? runtime.send(message, options.messageId, undefined, undefined, originMetadata(options))
       : runtime.send(message, options.messageId);
     if (result === 'sent' && !options.suppressTimeline) {
@@ -408,23 +423,19 @@ export async function dispatchSessionMessage(
   const userMessageMetadata = options.messageOrigin
     ? { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: options.messageOrigin } }
     : {};
-  if (options.suppressTimeline) {
-    await sendProcessSessionMessageForAutomation(target.name, message, {
-      suppressTimeline: true,
-      ...processDeliveryMode,
-      ...userMessageMetadata,
-    });
-  } else if (options.messageOrigin) {
-    await sendProcessSessionMessageForAutomation(target.name, message, {
-      ...processDeliveryMode,
-      ...userMessageMetadata,
-    });
+  // Command mode: the process sender delivers the text with no memory recall,
+  // sandbox path rewriting or preamble.
+  const processCommandMode = options.command ? { verbatim: true as const } : {};
+  const processOptions = {
+    ...(options.suppressTimeline ? { suppressTimeline: true as const } : {}),
+    ...processDeliveryMode,
+    ...userMessageMetadata,
+    ...processCommandMode,
+  };
+  if (Object.keys(processOptions).length > 0) {
+    await sendProcessSessionMessageForAutomation(target.name, message, processOptions);
   } else {
-    if (deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.QUEUE) {
-      await sendProcessSessionMessageForAutomation(target.name, message, processDeliveryMode);
-    } else {
-      await sendProcessSessionMessageForAutomation(target.name, message);
-    }
+    await sendProcessSessionMessageForAutomation(target.name, message);
   }
 }
 
@@ -546,8 +557,12 @@ export function cancelQueuedPeerAuditMessage(targetSessionName: string, messageI
   return Boolean(getTransportRuntime(targetSessionName)?.removePendingMessage(messageId));
 }
 
-function originMetadata(options: SessionDispatchMessageOptions): { messageOrigin?: ChatMessageOrigin } {
-  return options.messageOrigin ? { messageOrigin: options.messageOrigin } : {};
+/** Per-message runtime metadata: the author of a non-human message and command mode. */
+function originMetadata(options: SessionDispatchMessageOptions): { messageOrigin?: ChatMessageOrigin; commandMode?: true } {
+  return {
+    ...(options.messageOrigin ? { messageOrigin: options.messageOrigin } : {}),
+    ...(options.command ? { commandMode: true as const } : {}),
+  };
 }
 
 function emitStructuredTransportUserMessage(

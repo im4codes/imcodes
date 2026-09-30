@@ -1716,6 +1716,37 @@ describe('handleWebCommand memory context timeline', () => {
     );
   });
 
+  it('command mode (verbatim) delivers a process agent the exact text with no recall or summary injection; an ordinary send still gets it', async () => {
+    searchLocalMemorySemanticMock.mockResolvedValue({
+      items: [],
+      stats: { totalRecords: 0, matchedRecords: 0, recentSummaryCount: 0, durableCandidateCount: 0, projectCount: 0, stagedEventCount: 0, dirtyTargetCount: 0, pendingJobCount: 0 },
+    });
+    const summary = 'Summary that an ordinary process send would carry';
+    collectRecentSummarySyncCandidatesMock.mockResolvedValue([{
+      fingerprint: fingerprintRecentSummary(summary),
+      item: {
+        id: 'recent-verbatim-process',
+        type: 'processed',
+        projectId: 'github.com/imcodes/codedeck',
+        scope: 'personal',
+        summary,
+        projectionClass: 'recent_summary',
+        sourceKind: 'local_processed',
+      },
+    }]);
+
+    await sendProcessSessionMessageForAutomation('deck_process_brain', 'Please summarise the open work items now');
+    expect(String(sendKeysDelayedEnterMock.mock.calls.at(-1)?.[1])).toContain(summary);
+    const recallCallsBefore = searchLocalMemorySemanticMock.mock.calls.length;
+    const summaryCallsBefore = collectRecentSummarySyncCandidatesMock.mock.calls.length;
+
+    const raw = 'Please summarise the open work items now';
+    await sendProcessSessionMessageForAutomation('deck_process_brain', raw, { verbatim: true });
+    expect(sendKeysDelayedEnterMock.mock.calls.at(-1)?.[1]).toBe(raw);
+    expect(searchLocalMemorySemanticMock.mock.calls.length).toBe(recallCallsBefore);
+    expect(collectRecentSummarySyncCandidatesMock.mock.calls.length).toBe(summaryCallsBefore);
+  });
+
   it('REGRESSION GUARD: process recall queries must use canonical repo identity instead of projectName and this test must not be deleted', async () => {
     getSessionMock.mockReturnValue({
       name: 'deck_process_brain',

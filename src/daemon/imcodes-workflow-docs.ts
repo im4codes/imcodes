@@ -31,6 +31,7 @@ Notes:
 - Messages are delivered via the daemon's hook server. Inter-session sends append by default (with durable FIFO fallback only when the provider cannot append); use an explicit queue mode only when FIFO waiting is intentional.
 - A \`--reply\` send already arranges for the target's response to be delivered back to this session as a normal incoming message. The send command returns after dispatch; do not poll session state, logs, transcripts, or the target while waiting for that reply.
 - The \`--files\` flag attaches file references; format depends on the target agent type.
+- \`--command\` sends exactly the given text (trimmed) with no sender line, context, files, reply instruction or task binding, for slash commands or raw input (e.g. \`imcodes send --command <target> "/compact"\`). It cannot be combined with \`--reply\` or \`--files\`; the \`send_message\` MCP tool has the same \`command\` parameter.
 - Your session identity is auto-detected from $${IMCODES_SESSION_ENV}. SDK/transport sessions also expose
   $${IMCODES_SESSION_LABEL_ENV} for display only; prefer $${IMCODES_SESSION_ENV} in generated commands because labels
   can be duplicated.

@@ -32,6 +32,7 @@ function buildResendMetadata(
       : {}),
     ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
     ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+    ...(entry.commandMode ? { commandMode: true as const } : {}),
     ...(entry.supervisionReference
       ? { supervisionReference: entry.supervisionReference }
       : {}),
@@ -44,13 +45,14 @@ function buildResendMetadata(
 
 function buildAppendPrivateMetadata(
   entry: ResendEntry,
-): Pick<TransportSendMetadata, 'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply'> | undefined {
+): Pick<TransportSendMetadata, 'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply' | 'commandMode'> | undefined {
   const metadata = {
     ...(entry.activeTurnDeliveryKind
       ? { activeTurnDeliveryKind: entry.activeTurnDeliveryKind }
       : {}),
     ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
     ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+    ...(entry.commandMode ? { commandMode: true as const } : {}),
   };
   return Object.keys(metadata).length > 0 ? metadata : undefined;
 }

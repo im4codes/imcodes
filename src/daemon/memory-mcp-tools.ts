@@ -1,4 +1,5 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
+import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
 import { projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
@@ -2839,7 +2840,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     [MEMORY_MCP_TOOL_NAMES.SEND_MESSAGE]: async (input) => {
       const sessions = await sendSessions();
       const effectiveProjectRoot = sendIdentityProjectRoot(caller, sessions);
-      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
+      const args = pickAllowedMcpArgs(input, ['target', 'message', 'files', 'reply', 'command', 'audit', 'task', 'identity', 'broadcast', 'idempotencyKey', 'deliveryMode', 'clone']);
       const clone = parseCloneArg(args.clone);
       if (clone === 'invalid') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'clone request is invalid');
       const audit = parseAuditArg(args.audit);
@@ -2859,6 +2860,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         message: stringArg(args, 'message'),
         files: stringArrayArg(args, 'files'),
         reply: boolArg(args, 'reply'),
+        ...(boolArg(args, SEND_COMMAND_FIELD) === true ? { command: true } : {}),
         ...(audit ? { audit } : {}),
         ...(task ? { task } : {}),
         ...(identity ? { identity } : {}),
@@ -4061,6 +4063,7 @@ const schemas = {
       .optional(),
     files: z.array(z.string()).optional(),
     reply: z.boolean().optional(),
+    command: z.boolean().optional().describe(SEND_COMMAND_DESCRIPTION),
     task: z.object({
       taskId: z.string().optional(), assignmentId: z.string().optional(), topLevelTaskId: z.string().optional(), sliceId: z.string().optional(), classification: z.enum(SUPERVISION_TASK_CLASSIFICATIONS).optional(),
       objective: z.string().optional(), acceptance: z.array(z.string()).optional(), ownedFiles: z.array(z.string()).optional(), sharedFiles: z.array(z.string()).optional(), dependencies: z.array(z.string()).optional(),

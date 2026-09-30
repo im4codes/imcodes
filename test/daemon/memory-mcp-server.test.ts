@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import { SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
@@ -1136,6 +1137,64 @@ describe('memory MCP stdio server', () => {
         message: `${buildAgentDelegationSenderLine('deck_sub_worker', 'Worker')}\n\nhello late peer`,
         depth: 0,
       });
+    } finally {
+      await client.close();
+      await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
+    }
+  });
+
+  it('send_message command=true posts the exact text to the dedicated /send-command hook path, and refuses (not wraps) against an older daemon', async () => {
+    const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-hook-command-'));
+    await writeSessionStore(home);
+    const seen: Array<{ url: string; body: Record<string, unknown> }> = [];
+    let olderDaemon = false;
+    const hookServer = createServer((req, res) => {
+      let raw = '';
+      req.setEncoding('utf8');
+      req.on('data', (chunk) => { raw += chunk; });
+      req.on('end', () => {
+        seen.push({ url: req.url ?? '', body: raw ? JSON.parse(raw) as Record<string, unknown> : {} });
+        if (req.url === SEND_COMMAND_HOOK_PATH && !olderDaemon) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, delivered: true, target: 'deck_sub_peer' }));
+          return;
+        }
+        // An older daemon knows only /send and answers every other route with an empty 404.
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    await new Promise<void>((resolve) => hookServer.listen(0, '127.0.0.1', resolve));
+    const address = hookServer.address();
+    if (!address || typeof address === 'string') throw new Error('expected TCP hook server address');
+    await writeFile(join(home, '.imcodes', 'hook-port'), String(address.port), 'utf8');
+
+    const client = new Client({ name: 'memory-mcp-hook-command-test', version: '0.1.0' });
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ['--import', 'tsx', 'src/index.ts', 'memory', 'mcp'],
+      cwd: process.cwd(),
+      env: mcpEnv(home),
+      stderr: 'pipe',
+    });
+    try {
+      await client.connect(transport);
+      const raw = '  \n/compact 第二行 ✓\n ';
+      const ok = await callLazyTool(client, 'send_message', { target: 'deck_sub_peer', message: raw, command: true });
+      expect(ok.structuredContent).toMatchObject({
+        status: 'accepted',
+        deliveries: [expect.objectContaining({ target: 'deck_sub_peer', status: 'delivered' })],
+      });
+      expect(seen).toEqual([{
+        url: SEND_COMMAND_HOOK_PATH,
+        body: { from: 'deck_sub_worker', to: 'deck_sub_peer', message: raw.trim(), depth: 0, deliveryMode: 'append' },
+      }]);
+
+      olderDaemon = true;
+      seen.length = 0;
+      const refused = await callLazyTool(client, 'send_message', { target: 'deck_sub_peer', message: '/compact', command: true });
+      expect(JSON.stringify(refused.structuredContent ?? refused)).toContain(SEND_COMMAND_ERRORS.UNSUPPORTED_DAEMON);
+      expect(seen.map((entry) => entry.url)).toEqual([SEND_COMMAND_HOOK_PATH]);
     } finally {
       await client.close();
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));

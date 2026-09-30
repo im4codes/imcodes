@@ -41,6 +41,7 @@ function preserveEntries(
         activeTurnDeliveryKind: legacy.activeTurnDeliveryKind,
         peerAudit: legacy.peerAudit,
         delegationReply: legacy.delegationReply,
+        commandMode: legacy.commandMode,
         supervisionReference: legacy.supervisionReference,
         timelineCommitted: legacy.timelineCommitted,
         historyCommitted: legacy.historyCommitted,
@@ -59,6 +60,7 @@ function preserveEntries(
         activeTurnDeliveryKind: entry.activeTurnDeliveryKind,
         peerAudit: entry.peerAudit,
         delegationReply: entry.delegationReply,
+        commandMode: entry.commandMode,
         supervisionReference: entry.supervisionReference,
         timelineCommitted: entry.timelineCommitted,
         historyCommitted: entry.historyCommitted,
@@ -91,6 +93,7 @@ function preserveEntries(
         : {}),
       ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
       ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+      ...(entry.commandMode ? { commandMode: true as const } : {}),
       ...(entry.supervisionReference
         ? { supervisionReference: entry.supervisionReference }
         : {}),

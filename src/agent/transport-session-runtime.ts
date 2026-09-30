@@ -177,6 +177,12 @@ export interface PendingTransportMessage {
   delegationReply?: {
     delegationId: string;
   };
+  /**
+   * @internal: command-mode send (shared/send-command-mode.ts). Delivered as
+   * exactly this text: no per-turn memory/identity/preamble enrichment, and it
+   * is dispatched alone rather than merged with neighbouring queued messages.
+   */
+  commandMode?: true;
   /** @internal: daemon-owned lifecycle authority, never inferred from text. */
   supervisionReference?: QueueSupervisionReference;
   /** @internal: exact resend lease already transferred into this runtime. */
@@ -253,6 +259,7 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
   delete publicEntry.delegationReply;
+  delete publicEntry.commandMode;
   delete publicEntry.supervisionReference;
   delete publicEntry.queueHandoff;
   delete publicEntry.registeredSystemContract;
@@ -298,6 +305,8 @@ export interface TransportSendMetadata {
   delegationReply?: {
     delegationId: string;
   };
+  /** @internal: command-mode send, delivered verbatim (see PendingTransportMessage.commandMode). */
+  commandMode?: true;
   /** @internal: daemon-owned lifecycle authority revalidated before provider admission. */
   supervisionReference?: QueueSupervisionReference;
   /** @internal: existing durable lease transferred by drainResend. */
@@ -517,6 +526,20 @@ function sameDelegationNotification(
 
 function isTransportSlashControl(message: string | undefined): boolean {
   return message?.trim().startsWith('/') === true;
+}
+
+/**
+ * The entries one drained turn takes from the pending FIFO. Ordinary messages
+ * are merged into a single turn; a command-mode entry must reach the provider as
+ * exactly its own text, so it is never merged with a neighbour: the turn is the
+ * run of ordinary entries before the first command entry, or that command entry
+ * alone when it is at the head. Order is preserved; the rest drain next turn.
+ */
+function takeDrainBatch(entries: PendingTransportMessage[]): PendingTransportMessage[] {
+  const firstCommand = entries.findIndex((entry) => entry.commandMode === true);
+  if (firstCommand < 0) return entries;
+  if (firstCommand === 0) return [entries[0]!];
+  return entries.slice(0, firstCommand);
 }
 
 function makeCancelledProviderError(): ProviderError {
@@ -1649,6 +1672,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             activeTurnDeliveryKind?: unknown;
             peerAudit?: unknown;
             delegationReply?: unknown;
+            commandMode?: unknown;
             supervisionReference?: unknown;
             registeredSystemContract?: unknown;
           };
@@ -1683,6 +1707,7 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(material.delegationReply && typeof material.delegationReply === 'object'
                 ? { delegationReply: material.delegationReply as PendingTransportMessage['delegationReply'] }
                 : {}),
+              ...(material.commandMode === true ? { commandMode: true as const } : {}),
               ...((material.supervisionReference && typeof material.supervisionReference === 'object'
                 ? material.supervisionReference
                 : projection.supervisionReference)
@@ -2456,6 +2481,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         : {}),
       ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
       ...(metadata?.delegationReply ? { delegationReply: { ...metadata.delegationReply } } : {}),
+      ...(metadata?.commandMode ? { commandMode: true as const } : {}),
       ...(metadata?.supervisionReference
         ? { supervisionReference: { ...metadata.supervisionReference } }
         : {}),
@@ -2520,6 +2546,7 @@ export class TransportSessionRuntime implements SessionRuntime {
                 : {}),
               ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
               ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+              ...(entry.commandMode ? { commandMode: true } : {}),
               ...(entry.supervisionReference ? { supervisionReference: entry.supervisionReference } : {}),
               ...(entry.registeredSystemContract ? { registeredSystemContract: entry.registeredSystemContract } : {}),
             }),
@@ -2605,7 +2632,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     queueHandoff?: TransportQueueHandoffOwnership,
     privateMetadata?: Pick<
       TransportSendMetadata,
-      'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply'
+      'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply' | 'commandMode'
     >,
   ): Promise<ExternalAppendResult> {
     if (!this._providerSessionId) return 'stale';
@@ -2639,6 +2666,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       ...(privateMetadata?.delegationReply
         ? { delegationReply: privateMetadata.delegationReply }
         : {}),
+      ...(privateMetadata?.commandMode ? { commandMode: true as const } : {}),
       ...(supervisionReference ? { supervisionReference } : {}),
       ...(queueHandoff ? { queueHandoff } : {}),
     });
@@ -2863,6 +2891,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       return { status: 'attachments_unsupported' };
     }
     if (selected.some((entry) => isDelegationUnsupportedControlText(entry.text))) {
+      return { status: 'control_unsupported' };
+    }
+    // A command-mode message must reach the provider as exactly its own text.
+    // Native append joins the selected rows, so a command may only ride alone;
+    // otherwise it stays in the FIFO, where `_drainPending` delivers it alone.
+    if (selected.length > 1 && selected.some((entry) => entry.commandMode === true)) {
       return { status: 'control_unsupported' };
     }
 
@@ -3864,6 +3898,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     }]).map((entry) => ({ ...entry }));
     const isPrivateControlDispatch = this._activeDispatchEntries.length > 0
       && this._activeDispatchEntries.every((entry) => !!entry.peerAudit || !!entry.delegationReply);
+    // A command-mode turn is byte-clean exactly like a provider slash control:
+    // no startup/recall memory, preamble, identity, authored context or handoff.
+    // `_drainPending` dispatches a command entry alone, so `every` is `some`.
+    const isCommandDispatch = this._activeDispatchEntries.length > 0
+      && this._activeDispatchEntries.every((entry) => entry.commandMode === true);
     this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
     // Alias expansion (A′): the provider (and runtime history) receive the
@@ -3914,7 +3953,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     void (async () => {
-      if (!isTransportSlashControl(message) && !this._pendingHandoff && this._pendingHandoffReady) {
+      if (!isTransportSlashControl(message) && !isCommandDispatch && !this._pendingHandoff && this._pendingHandoffReady) {
         // The first target turn must carry the cross-vendor context whenever
         // the worker pack is ready, but session.send itself remains an immediate
         // acknowledgement. Wait only the bounded providerWaitMs window; a slow
@@ -3934,7 +3973,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
-      const isSlashControl = isTransportSlashControl(message);
+      const isSlashControl = isTransportSlashControl(message) || isCommandDispatch;
       const authority = resolveTransportDispatchAuthority(this.provider, {
         namespace: this._contextNamespace,
         remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
@@ -4570,9 +4609,9 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._pendingMessages = this._pendingMessages.filter((entry) => !messageIds.has(entry.clientMessageId));
       }
     } else {
-      messages = authorizedIds
+      messages = takeDrainBatch(authorizedIds
         ? this._pendingMessages.filter((entry) => authorizedIds!.has(entry.clientMessageId))
-        : [...this._pendingMessages];
+        : [...this._pendingMessages]);
       const messageIds = new Set(messages.map((entry) => entry.clientMessageId));
       this._pendingMessages = this._pendingMessages.filter((entry) => !messageIds.has(entry.clientMessageId));
     }

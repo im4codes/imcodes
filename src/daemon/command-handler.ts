@@ -5300,6 +5300,8 @@ async function sendProcessSessionMessage(
     agentMessagePreamble?: string;
     /** Daemon-owned control turn already represented by its lifecycle event. */
     suppressTimeline?: boolean;
+    /** Command mode: deliver `finalText` byte-for-byte (no sandbox rewrite, memory recall or preamble). */
+    verbatim?: boolean;
     /** Trusted daemon-owned metadata for automation surfaces such as P2P.
      * Values are projected only to the local user.message event. */
     userMessageMetadata?: Readonly<{
@@ -5342,7 +5344,7 @@ async function sendProcessSessionMessage(
   // They must not block earlier queued tmux writes any longer than necessary.
   let sendText = finalText;
   try {
-    if (agentType === 'gemini' || agentType === 'codex') {
+    if (!options?.verbatim && (agentType === 'gemini' || agentType === 'codex')) {
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
   } catch (rewriteErr) {
@@ -5353,16 +5355,18 @@ async function sendProcessSessionMessage(
   let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
   let memoryRecallCancelled = false;
   try {
-    const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
-    memoryContext = await withDeadline(
-      prependLocalMemory(sendText, sessionName, {
-        deadlineAt,
-        isCancelled: () => memoryRecallCancelled,
-      }),
-      PROCESS_MEMORY_RECALL_DEADLINE_MS,
-      'memory_recall_timeout',
-    );
-    sendText = memoryContext.text;
+    if (!options?.verbatim) {
+      const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
+      memoryContext = await withDeadline(
+        prependLocalMemory(sendText, sessionName, {
+          deadlineAt,
+          isCancelled: () => memoryRecallCancelled,
+        }),
+        PROCESS_MEMORY_RECALL_DEADLINE_MS,
+        'memory_recall_timeout',
+      );
+      sendText = memoryContext.text;
+    }
   } catch (recallErr) {
     memoryRecallCancelled = true;
     rollbackSummarySyncReservation(memoryContext.summaryReservation);
@@ -5419,6 +5423,8 @@ export async function sendProcessSessionMessageForAutomation(
   options?: {
     deliveryMode?: MemoryMcpSendDeliveryMode;
     suppressTimeline?: boolean;
+    /** Command mode (shared/send-command-mode.ts): no memory recall, sandbox path rewrite or preamble. */
+    verbatim?: boolean;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;
       memoryExcluded?: boolean;
@@ -5433,6 +5439,7 @@ export async function sendProcessSessionMessageForAutomation(
 ): Promise<void> {
   await sendProcessSessionMessage(sessionName, text, [], {
     originalText: text,
+    ...(options?.verbatim ? { verbatim: true } : {}),
     ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
   });

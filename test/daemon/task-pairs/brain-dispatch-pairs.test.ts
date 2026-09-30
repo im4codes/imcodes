@@ -196,6 +196,37 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(getTaskPairStore().listPairs(PROJECT)).toHaveLength(1);
   });
 
+  it('command mode is not pair traffic: a Brain command neither binds nor records against a pair, and opens none', async () => {
+    useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
+    const opened = await dispatchSendMessage(brainCaller, {
+      target: EXEC, message: 'Initial work.', task: { taskId: 'cmd-mode-pair', objective: 'Initial work.' },
+    } as never, deps());
+    expect(opened).toMatchObject({ status: 'accepted', taskId: 'cmd-mode-pair' });
+    await flush();
+    // Counterexample: an ordinary follow-up to the same participant is recorded onto the pair.
+    const ordinary = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Keep going.' } as never, deps());
+    expect(ordinary).toMatchObject({ status: 'accepted', taskId: 'cmd-mode-pair' });
+    const afterOrdinary = JSON.stringify(getTaskPairStore().getPair(PROJECT, 'cmd-mode-pair')?.state);
+
+    // The same participant, and a fresh idle target: a command touches no pair.
+    for (const target of [EXEC, EXEC2]) {
+      const command = await dispatchSendMessage(brainCaller, { target, message: '/compact', command: true } as never, deps());
+      expect(command.status).toBe('accepted');
+      expect((command as { taskId?: string }).taskId).toBeUndefined();
+      expect((command as { deliveries: Array<{ taskId?: string; delegationId?: string }> }).deliveries[0]).not.toHaveProperty('taskId');
+    }
+    expect(getTaskPairStore().listPairs(PROJECT)).toHaveLength(1);
+    expect(JSON.stringify(getTaskPairStore().getPair(PROJECT, 'cmd-mode-pair')?.state)).toBe(afterOrdinary);
+    expect(afterOrdinary).not.toBe('undefined');
+
+    // Pair-opening metadata cannot ride a command.
+    const withTask = await dispatchSendMessage(brainCaller, {
+      target: EXEC2, message: '/compact', command: true, task: { objective: 'sneak a pair' },
+    } as never, deps());
+    expect(withTask).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(getTaskPairStore().listPairs(PROJECT)).toHaveLength(1);
+  });
+
   it('auto-audit on: a Brain-named task opens exactly that pair, and cron sends or worker sends open none', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
     // A Brain-named task id: the pair is that one, never a second daemon-minted one.

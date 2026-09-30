@@ -25,6 +25,7 @@ import { refreshSessionWatcher } from './watcher-controls.js';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../../shared/imcodes-send.js';
 import { isDiscoverableInterAgentSession } from '../../shared/session-scope.js';
 import { dispatchHookSend } from './send-tool.js';
+import { SEND_COMMAND_HOOK_PATH, validateSendCommandRequest } from '../../shared/send-command-mode.js';
 import {
   DEFAULT_HOOK_PORT,
   HOOK_BIND_RETRY_SPAN,
@@ -610,6 +611,8 @@ interface SendRequest {
   context?: string;
   depth?: number;
   reply?: boolean;
+  /** Only meaningful on SEND_COMMAND_HOOK_PATH; rejected on `/send` (see handleSend). */
+  command?: boolean;
   deliveryMode?: MemoryMcpSendDeliveryMode;
   supervision?: { taskId: string; assignmentId: string; auditAttemptId?: string; auditRevision?: string };
   messageId?: SendMessageId;
@@ -633,8 +636,27 @@ function validSupervisionSendBinding(value: unknown): value is NonNullable<SendR
     && (record.auditRevision === undefined || validBoundedString(record.auditRevision));
 }
 
-async function handleSend(body: SendRequest): Promise<{ status: number; body: Record<string, unknown> }> {
+async function handleSend(
+  body: SendRequest,
+  commandMode = false,
+): Promise<{ status: number; body: Record<string, unknown> }> {
   const { from, to, message, depth = 0 } = body;
+
+  // Command mode is selected ONLY by the dedicated path, never by a body flag:
+  // a flag on `/send` would be silently ignored by an older daemon and deliver
+  // the message wrapped. Refuse the ambiguous form outright.
+  if (!commandMode && body.command !== undefined) {
+    return { status: 400, body: { ok: false, error: `command mode requires ${SEND_COMMAND_HOOK_PATH}` } };
+  }
+  if (commandMode) {
+    const invalid = validateSendCommandRequest({
+      message,
+      reply: body.reply,
+      files: body.files,
+      hasSendMetadata: body.supervision !== undefined || body.messageId !== undefined,
+    });
+    if (invalid) return { status: 400, body: { ok: false, error: invalid } };
+  }
 
   // Validate required fields
   if (!from || !to || !message) {
@@ -724,6 +746,7 @@ async function handleSend(body: SendRequest): Promise<{ status: number; body: Re
       files: body.files,
       projectRoot,
       reply: body.reply === true,
+      ...(commandMode ? { command: true } : {}),
       ...(body.deliveryMode ? { deliveryMode: body.deliveryMode } : {}),
       ...(body.supervision ? { supervision: body.supervision } : {}),
       ...(body.messageId ? { messageId: body.messageId } : {}),
@@ -1218,7 +1241,7 @@ export async function startHookServer(
       return;
     }
 
-    if (url === '/send') {
+    if (url === '/send' || url === SEND_COMMAND_HOOK_PATH) {
       // Content-Type validation for /send
       const contentType = req.headers['content-type'] ?? '';
       if (!contentType.includes('application/json')) {
@@ -1230,7 +1253,7 @@ export async function startHookServer(
       try {
         const body = await readBody(req);
         const parsed = JSON.parse(body) as SendRequest;
-        const result = await handleSend(parsed);
+        const result = await handleSend(parsed, url === SEND_COMMAND_HOOK_PATH);
         const retryAfterMs = result.status === 429 && typeof result.body.retryAfterMs === 'number' ? result.body.retryAfterMs : undefined;
         res.writeHead(result.status, {
           'Content-Type': 'application/json',

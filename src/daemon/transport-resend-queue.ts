@@ -64,6 +64,8 @@ export interface ResendEntry {
   delegationReply?: {
     delegationId: string;
   };
+  /** Command-mode send: delivered verbatim on drain, alone (never merged with other queued text). */
+  commandMode?: true;
   /** User-visible task text — the ORIGINAL marker text used for the timeline. */
   text: string;
   /**
@@ -220,6 +222,7 @@ function enqueueResendInternal(
       : {}),
     ...(normalizedEntry.peerAudit ? { peerAudit: normalizedEntry.peerAudit } : {}),
     ...(normalizedEntry.delegationReply ? { delegationReply: normalizedEntry.delegationReply } : {}),
+    ...(normalizedEntry.commandMode ? { commandMode: true } : {}),
     ...(normalizedEntry.timelineCommitted ? { timelineCommitted: true } : {}),
     ...(normalizedEntry.historyCommitted ? { historyCommitted: true } : {}),
     ...(normalizedEntry.supervisionReference

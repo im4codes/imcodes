@@ -23,6 +23,7 @@ import {
   readSupervisionTaskTitle,
 } from '../../shared/supervision-task-identity.js';
 import { createHash } from 'node:crypto';
+import { sendCommandText, validateSendCommandRequest } from '../../shared/send-command-mode.js';
 import {
   createSendDispatchId,
   createSendMessageId,
@@ -338,6 +339,12 @@ export interface SendMessageInput {
   message?: string;
   files?: string[];
   reply?: boolean;
+  /**
+   * Command mode (shared/send-command-mode.ts): deliver exactly `message.trim()`
+   * and nothing else. Cannot be combined with reply, files, task, audit,
+   * identity or clone.
+   */
+  command?: boolean;
   broadcast?: boolean;
   idempotencyKey?: string;
   /** Defaults to append; queue explicitly preserves ordinary durable FIFO. */
@@ -499,6 +506,8 @@ export interface HookSendDispatchInput {
   files?: string[];
   projectRoot?: string | null;
   reply?: boolean;
+  /** Command mode (shared/send-command-mode.ts): deliver exactly `message.trim()`, nothing else. */
+  command?: boolean;
   /** Internal MCP path only: prefer native append, retain FIFO fallback. */
   deliveryMode?: MemoryMcpSendDeliveryMode;
   /** This `/send` spawns work; see {@link SendMessageInput.newWorkload}. */
@@ -1316,6 +1325,12 @@ export async function dispatchSendMessage(
   const callerProjectName = effectiveCallerProjectName(caller, allSessions);
   if (!callerProjectName) {
     return { status: 'error', reason: MCP_ERROR_REASONS.SCOPE_FORBIDDEN, error: 'send_message requires a scoped caller' };
+  }
+  // Command mode is a plain delivery of the exact text. It returns before every
+  // branch below that binds task/pair/delegation state, wraps the message or
+  // enriches it, so none of that can ever apply to a command.
+  if (input.command === true) {
+    return dispatchCommandSend(caller, callerProjectName, allSessions, input, d, deps);
   }
   // On the `pairs` engine task/audit metadata is advisory: it can create a
   // missing pair (implicit DISPATCH) but never binds a legacy assignment,
@@ -5530,6 +5545,123 @@ export interface SendStopInput {
  * stopSessionNow on the priority lane). Returns the same shape as send_message
  * so callers get per-target status. Idempotent within the send window.
  */
+/**
+ * Command-mode send (`send_message` with `command: true`): the target receives
+ * exactly `message.trim()`. Nothing is added or created for it: no sender line,
+ * context tail, files, reply instruction, reply authority/delegation record,
+ * task or implicit pair binding. `/stop` takes the priority stop path
+ * (identical to `send_stop`), never the ordinary send queue. Provider-limit
+ * admission, target scoping, delivery mode (append default, queue opt-in) and
+ * idempotency are the same as for an ordinary send.
+ */
+async function dispatchCommandSend(
+  caller: SendRuntimeCaller,
+  callerProjectName: string,
+  allSessions: SessionRecord[],
+  input: SendMessageInput,
+  d: ReturnType<typeof depsWithDefaults>,
+  deps?: SendToolDeps,
+): Promise<SendMessageResult> {
+  const invalid = validateSendCommandRequest({
+    message: input.message,
+    reply: input.reply,
+    files: input.files,
+    hasSendMetadata: Boolean(input.task || input.audit || input.identity || input.clone),
+  });
+  if (invalid) return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: invalid };
+  if (!input.target && !input.broadcast) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'target is required unless broadcast is true' };
+  }
+  if (input.deliveryMode !== undefined
+    && !Object.values(MEMORY_MCP_SEND_DELIVERY_MODES).includes(input.deliveryMode)) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.VALIDATION_FAILED, error: 'deliveryMode is invalid' };
+  }
+  const text = sendCommandText(input.message!);
+  if (Buffer.byteLength(text, 'utf8') > MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES) {
+    return { status: 'error', reason: MCP_ERROR_REASONS.WRITE_QUOTA_EXCEEDED, error: `message exceeds ${MEMORY_MCP_CAPS.SEND_MESSAGE_MAX_BYTES} bytes` };
+  }
+  // Transport command liveness contract (CLAUDE.md): /stop is urgent control and
+  // must never ride the ordinary send queue.
+  if (text === '/stop') {
+    return dispatchSendStop(caller, {
+      ...(input.target ? { target: input.target } : {}),
+      ...(input.broadcast ? { broadcast: true } : {}),
+      ...(input.idempotencyKey ? { idempotencyKey: input.idempotencyKey } : {}),
+    }, deps);
+  }
+
+  const idempotencyKey = typeof input.idempotencyKey === 'string' ? input.idempotencyKey.trim() : '';
+  const idempotencyTarget = input.broadcast ? '*' : input.target ?? '';
+  const cacheKey = idempotencyKey ? `${caller.userId}\0${caller.sessionName}\0command\0${idempotencyTarget}\0${idempotencyKey}` : '';
+  const now = d.now();
+  if (cacheKey) {
+    const cached = idempotencyCache.get(cacheKey);
+    if (cached && cached.expiresAt > now) return { ...cached.result, idempotentReplay: true };
+    if (cached) idempotencyCache.delete(cacheKey);
+  }
+
+  const targets = resolveScopedTargets({ ...caller, projectName: callerProjectName }, input, allSessions, d.exactTargetOnly, 'exactCreatorOnly');
+  if (!targets.ok) return { status: 'error', reason: targets.reason, error: targets.error };
+  const gate = evaluateDelegationAdmission(allSessions, targets.targets, now, { newWorkload: false });
+  if (gate.dispatchable.length === 0 && gate.blocked.length > 0) {
+    const refusal = buildDelegationRefusal(
+      gate.blocked,
+      getSiblingSessions({ ...caller, projectName: callerProjectName }, allSessions),
+      gate.availability,
+    );
+    return {
+      status: 'error',
+      reason: refusal.reason,
+      error: gate.blocked.length === 1
+        ? `target ${gate.blocked[0]!.target} is ${gate.blocked[0]!.reason}`
+        : `every resolved target is unavailable (${refusal.reason})`,
+      limited: refusal,
+    };
+  }
+
+  const callerRecord = allSessions.find((session) => session.name === caller.sessionName);
+  const dispatchId = createSendDispatchId();
+  const deliveries: SendMessageDelivery[] = [];
+  for (const target of gate.dispatchable) {
+    const messageId = createSendMessageId();
+    try {
+      const dispatchResult = await d.dispatchMessage(target, buildSessionDispatchMessage({ message: text, command: true }), {
+        dispatchId,
+        messageId,
+        messageOrigin: CHAT_MESSAGE_ORIGINS.AGENT,
+        deliveryMode: input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+        command: true,
+        ...buildSharedServerMemberSharedActorOption(caller, callerRecord, target, messageId, now),
+      });
+      deliveries.push({
+        target: target.name,
+        messageId,
+        status: dispatchResult === 'queued' ? 'queued' : 'delivered',
+      });
+    } catch (err) {
+      deliveries.push({ target: target.name, status: 'failed', error: sanitizeMcpErrorMessage(err) });
+    }
+  }
+  const successful = deliveries.filter((delivery) => delivery.status !== 'failed');
+  const failed = deliveries.length - successful.length;
+  if (successful.length === 0) {
+    return {
+      status: 'error',
+      reason: MCP_ERROR_REASONS.INTERNAL_ERROR,
+      error: failed === 1 ? deliveries[0]?.error ?? 'send dispatch failed' : 'send dispatch failed for all targets',
+    };
+  }
+  const accepted: Extract<SendMessageResult, { status: 'accepted' }> = {
+    status: 'accepted',
+    dispatchId,
+    ...(deliveries.length === 1 && successful[0]?.messageId ? { messageId: successful[0].messageId } : {}),
+    deliveries,
+    ...(failed > 0 ? { partial: true } : {}),
+  };
+  if (cacheKey && failed === 0) idempotencyCache.set(cacheKey, { expiresAt: now + SEND_IDEMPOTENCY_WINDOW_MS, result: accepted });
+  return accepted;
+}
+
 export async function dispatchSendStop(
   caller: SendRuntimeCaller,
   input: SendStopInput,
@@ -5613,6 +5745,15 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   // append by default; the runtime boundary retains the durable FIFO fallback
   // when the provider cannot admit an active-turn append.
   const deliveryMode = input.deliveryMode ?? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND;
+  if (input.command) {
+    const invalid = validateSendCommandRequest({
+      message: input.message,
+      reply: input.reply,
+      files: input.files,
+      hasSendMetadata: Boolean(input.supervision),
+    });
+    if (invalid) throw new Error(invalid);
+  }
   const fileRefs = sanitizeFileReferences(input.files, input.projectRoot ?? null);
   if (!fileRefs.ok) throw new Error(fileRefs.error);
 
@@ -5650,7 +5791,8 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
   }
 
   for (const target of hookGate.dispatchable) {
-    const worktreeGate = await ensureHookSupervisionAssignmentWorktree({
+    // A command carries no supervision binding, so there is no assignment worktree to ensure.
+    const worktreeGate = input.command ? { ok: true as const } : await ensureHookSupervisionAssignmentWorktree({
       callerRecord,
       projectRoot: input.projectRoot,
       target,
@@ -5684,6 +5826,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
       fromLabel: callerRecord?.label,
       replyTo: input.reply ? input.from : null,
       ...(replyAuthority ? { replyAuthority: replyAuthority.authority } : {}),
+      ...(input.command ? { command: true } : {}),
     });
     try {
       const result = await d.dispatchMessage(target, message, {
@@ -5692,6 +5835,7 @@ export async function dispatchHookSend(input: HookSendDispatchInput, deps?: Send
         // A session's send, or a shell/script callback via `imcodes send`; never typed in the chat.
         messageOrigin: input.from === IMCODES_EXTERNAL_CLI_SENDER ? CHAT_MESSAGE_ORIGINS.SYSTEM : CHAT_MESSAGE_ORIGINS.AGENT,
         deliveryMode,
+        ...(input.command ? { command: true as const } : {}),
         ...buildSharedServerMemberSharedActorOption(
           {
             userId: input.from,

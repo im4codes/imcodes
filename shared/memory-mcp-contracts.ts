@@ -1,4 +1,5 @@
 import { MCP_ERROR_REASONS, isRecoverableMcpErrorReason, type MCPErrorReason } from './memory-mcp-errors.js';
+import { SEND_COMMAND_DESCRIPTION } from './send-command-mode.js';
 import { MEMORY_FEATURE_FLAGS_BY_NAME } from './feature-flags.js';
 import { MCP_FEATURE_FLAGS_BY_NAME } from './memory-mcp-feature-flags.js';
 import { MEMORY_MCP_SOURCE_FIELDS } from './memory-mcp-provenance.js';
@@ -803,6 +804,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
         maxItems: MEMORY_MCP_CAPS.SEND_FILES_MAX_COUNT,
       },
       reply: booleanSchema('Optional request for correlated replies to the runtime-bound caller session. Set true for audit/review reports or discussion invites; the target receives an opaque delegation id, while the daemon authenticates its current session identity and accepts bounded append-only replies. Each structured reply is delivered through the caller provider’s active-turn notification path when supported. Do not poll session state, logs, transcripts, or the target after a reply-enabled send.'),
+      command: booleanSchema(SEND_COMMAND_DESCRIPTION),
       task: {
         ...objectSchema({
           taskId: stringSchema('Existing visible task to append; missing or inaccessible ids never create work.'),

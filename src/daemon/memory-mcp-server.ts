@@ -1,4 +1,5 @@
 import { TASK_PAIR_LEGACY_TOOL_HOOK_PATH } from '../../shared/task-pair.js';
+import { SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
 import { stat } from 'node:fs/promises';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -851,7 +852,7 @@ export function mergeDefaultToolDeps(
             }
             return 'queued';
           }
-          const response = await postHookSend(port, {
+          const body = {
             from: caller.sessionName,
             to: target.name,
             message,
@@ -861,7 +862,21 @@ export function mergeDefaultToolDeps(
               supervision: options.supervision,
               messageId: options.messageId,
             } : {}),
-          });
+          };
+          if (options.command) {
+            // Dedicated path: an older daemon answers 404 and the command is
+            // refused, never delivered wrapped through the ordinary `/send`.
+            try {
+              const response = await postHookSend(port, body, SEND_COMMAND_HOOK_PATH);
+              return response.queued === true ? 'queued' : 'sent';
+            } catch (err) {
+              if (err instanceof Error && /status 404\b/.test(err.message)) {
+                throw new Error(SEND_COMMAND_ERRORS.UNSUPPORTED_DAEMON);
+              }
+              throw err;
+            }
+          }
+          const response = await postHookSend(port, body);
           return response.queued === true ? 'queued' : 'sent';
         }),
       // Per-field default: an injected `cancelSession` (tests) wins; otherwise
