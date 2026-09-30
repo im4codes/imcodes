@@ -2278,6 +2278,12 @@ export function useTimeline(
    */
   const localRestoredIdsRef = useRef<Set<string>>(new Set(events.map((event) => event.eventId)));
   /**
+   * Newest content-event ts among those local restores. Kept next to the ledger (and reset with it) instead of
+   * being re-derived from `events`: a restore is recorded before React applies it, and the stale-window hole
+   * decision must not depend on that ordering.
+   */
+  const localRestoredMaxTsRef = useRef<number | undefined>(getTimelineHistoryMaxTs(events));
+  /**
    * Which cacheKey the ledger above describes.
    *
    * Its own ref, NOT `cacheKeyRef`: that one is assigned during render, so by
@@ -2292,6 +2298,10 @@ export function useTimeline(
   const tryDecideOpenGapRef = useRef<(() => void) | null>(null);
   const recordLocalRestore = useCallback((restored: readonly TimelineEvent[]): number => {
     for (const event of restored) localRestoredIdsRef.current.add(event.eventId);
+    const restoredMaxTs = getTimelineHistoryMaxTs(restored);
+    if (restoredMaxTs !== undefined && (localRestoredMaxTsRef.current === undefined || restoredMaxTs > localRestoredMaxTsRef.current)) {
+      localRestoredMaxTsRef.current = restoredMaxTs;
+    }
     // A late local restore (IndexedDB) can be the piece that finally lets the hole be recognised.
     tryDecideOpenGapRef.current?.();
     return localRestoredIdsRef.current.size;
@@ -2324,13 +2334,7 @@ export function useTimeline(
     const key = cacheKeyRef.current;
     const override = openCursorOverrideRef.current;
     if (override && override.key === key) return override.ts;
-    let maxTs: number | undefined;
-    for (const event of eventsRef.current) {
-      if (!localRestoredIdsRef.current.has(event.eventId)) continue;
-      if (!isHistoryCursorEligibleEvent(event)) continue;
-      if (typeof event.ts === 'number' && (maxTs === undefined || event.ts > maxTs)) maxTs = event.ts;
-    }
-    return maxTs;
+    return localRestoredMaxTsRef.current;
   }, []);
 
   const tryDecideOpenGap = useCallback((): void => {
@@ -2365,7 +2369,12 @@ export function useTimeline(
   /** Record the first newest-window page since (re)open — its oldest event vs the cache cursor decides the hole. */
   const noteOpenWindowTail = useCallback((pageEvents: readonly TimelineEvent[], full: boolean): void => {
     const key = cacheKeyRef.current;
-    if (!key || openWindowTailRef.current?.key === key) return;
+    if (!key) return;
+    if (openWindowTailRef.current?.key === key) {
+      // Already have the evidence; the local cache may only just have become known, so try to decide again.
+      tryDecideOpenGap();
+      return;
+    }
     let minTs = Infinity;
     let maxTs = -Infinity;
     for (const event of pageEvents) {
@@ -2728,6 +2737,7 @@ export function useTimeline(
     if (localRestoredKeyRef.current !== cacheKey) {
       localRestoredKeyRef.current = cacheKey ?? null;
       localRestoredIdsRef.current = new Set();
+      localRestoredMaxTsRef.current = undefined;
     }
     // If the synchronous mount-time seed already populated `events`, mark
     // the cache step done immediately so the bootstrap overlay never flashes
@@ -2758,13 +2768,19 @@ export function useTimeline(
     // A window reopened after a long time asks for its newest few messages first (tiny, text-only), so it
     // shows where the conversation is now in about one round trip; the ordinary newest window and the
     // newest→oldest hole backfill follow. Sent ahead of the bootstrap window on the same socket.
-    const maybeSendStaleWindowPeek = (): void => {
+    const maybeSendStaleWindowPeek = (opts?: { cacheUnknown?: boolean }): void => {
       if (!ws || !sessionId || !cacheKey) return;
       const cursorTs = getLocalCacheCursorTs();
-      // Nothing cached: the ordinary newest window is already the first paint.
-      if (cursorTs === undefined) return;
       const now = Date.now();
-      if (now - cursorTs < staleWindowPeekMinAgeMs) return;
+      if (opts?.cacheUnknown) {
+        // Cache state unknown (local read pending): only a window that has not just peeked, and only when the
+        // peek is enabled at all (a huge min-age disables it).
+        if (!Number.isFinite(staleWindowPeekMinAgeMs)) return;
+      } else {
+        // Nothing cached: the ordinary newest window is already the first paint.
+        if (cursorTs === undefined) return;
+        if (now - cursorTs < staleWindowPeekMinAgeMs) return;
+      }
       const last = lastPeekRef.current;
       if (last && last.key === cacheKey && now - last.at < STALE_WINDOW_PEEK_REPEAT_MS) return;
       lastPeekRef.current = { key: cacheKey, at: now };
@@ -2893,6 +2909,10 @@ export function useTimeline(
         coldDaemonTimer = setTimeout(() => {
           coldDaemonTimer = null;
           if (cancelled || coldDaemonRequested) return;
+          // The local read is still pending, so whether a (possibly stale) cache exists is not known yet. A tiny
+          // text-only tail request costs next to nothing either way and, when there IS a stale cache, is what puts
+          // the latest messages on screen before the big window reply.
+          maybeSendStaleWindowPeek({ cacheUnknown: true });
           requestDaemonHistory(true, undefined, undefined, !isActiveSessionRef.current);
           coldDaemonRequested = true;
         }, LOCAL_HISTORY_DAEMON_HEDGE_MS);
@@ -4412,7 +4432,7 @@ export function useTimeline(
               backfillDebug('fireHttpBackfill: merging page', { sessionId: backfillSessionId, count: recovered.length });
               // The first newest-window page of an open is the evidence for a hole: record it BEFORE the merge
               // moves the cache's own newest ts (and BEFORE anything is persisted).
-              if (mode !== 'manualLatestWindow' && pageBeforeTs === undefined && !roundGap) {
+              if (pageBeforeTs === undefined && !roundGap) {
                 noteOpenWindowTail(recovered, recovered.length >= MAX_FORWARD_PAGE_EVENTS);
               }
               // While a hole is open the window must keep what it fills in, not only the newest 300.
