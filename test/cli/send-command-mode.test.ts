@@ -2,7 +2,9 @@
  * `imcodes send --command`: the CLI posts exactly the trimmed text to the
  * dedicated `/send-command` hook path (never `/send`), rejects invalid
  * combinations before any request, fails closed against a daemon that has no
- * command path, and documents the flag in `--help`.
+ * command path, and documents the flag in `--help`. Command mode has NO
+ * direct-tmux fallback: an unreachable hook, a timeout, any non-2xx status or an
+ * unreadable answer exits non-zero naming the cause and never types anything.
  */
 import { createServer, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -17,13 +19,18 @@ vi.mock('../../src/daemon/hook-port.js', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   resolveLiveHookPort: async () => mocks.hookPort.current,
 }));
+// Short enough for a real "hook never answers" test; every ordinary response is immediate.
+vi.mock('../../shared/send-command-mode.js', async (importOriginal) => ({
+  ...(await importOriginal<Record<string, unknown>>()),
+  SEND_COMMAND_HOOK_TIMEOUT_MS: 300,
+}));
 vi.mock('../../src/agent/tmux.js', async (importOriginal) => ({
   ...(await importOriginal<Record<string, unknown>>()),
   sendKeys: mocks.sendKeys,
 }));
 
 import { createProgram } from '../../src/cli.js';
-import { SEND_COMMAND_CLI_FLAG, SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH } from '../../shared/send-command-mode.js';
+import { SEND_COMMAND_CLI_FLAG, SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH, SEND_COMMAND_NO_FALLBACK_NOTE } from '../../shared/send-command-mode.js';
 
 interface Seen { path: string; body: Record<string, unknown> }
 
@@ -127,10 +134,128 @@ describe('imcodes send --command', () => {
     exit.mockRestore();
   });
 
+  describe('no direct-tmux fallback in command mode, whatever the hook does', () => {
+    const failing = async (args: string[]) => {
+      const exit = exitSpy();
+      await expect(run(SEND_COMMAND_CLI_FLAG, ...args)).rejects.toThrow('exit:1');
+      exit.mockRestore();
+      return errors.join('\n');
+    };
+    const neverTyped = () => expect(mocks.sendKeys).not.toHaveBeenCalled();
+
+    it('no live daemon hook at all: exits non-zero, names the cause, types nothing', async () => {
+      mocks.hookPort.current = null;
+      const text = await failing(['deck_proj_w1', '/stop']);
+      expect(text).toContain('no running daemon hook server was found');
+      expect(text).toContain(SEND_COMMAND_NO_FALLBACK_NOTE);
+      expect(seen).toEqual([]);
+      neverTyped();
+    });
+
+    it('hook unreachable (connection refused): exits non-zero, names the cause, types nothing', async () => {
+      const dead = createServer();
+      await new Promise<void>((resolve) => dead.listen(0, '127.0.0.1', resolve));
+      mocks.hookPort.current = (dead.address() as AddressInfo).port;
+      await new Promise<void>((resolve) => dead.close(() => resolve()));
+      const text = await failing(['deck_proj_w1', '/stop']);
+      expect(text).toMatch(/daemon hook server is unreachable \(ECONNREFUSED/);
+      neverTyped();
+    });
+
+    it('hook that never answers: times out, exits non-zero, names the cause, types nothing', async () => {
+      const hang = createServer(() => undefined); // accepts the request and never responds
+      await new Promise<void>((resolve) => hang.listen(0, '127.0.0.1', resolve));
+      mocks.hookPort.current = (hang.address() as AddressInfo).port;
+      try {
+        const text = await failing(['deck_proj_w1', '/stop']);
+        expect(text).toMatch(/daemon hook server timed out \(no answer within 300 ms\)/);
+        neverTyped();
+      } finally {
+        hang.closeAllConnections();
+        await new Promise<void>((resolve) => hang.close(() => resolve()));
+      }
+    });
+
+    it.each([
+      ['500 with a JSON error', { status: 500, body: { ok: false, error: 'dispatch exploded' } }, /rejected the command \(HTTP 500: dispatch exploded\)/],
+      ['500 with no body', { status: 500 }, /rejected the command \(HTTP 500\)/],
+      ['503', { status: 503 }, /HTTP 503/],
+      ['403', { status: 403, body: { ok: false, error: 'forbidden' } }, /HTTP 403: forbidden/],
+    ])('a %s exits non-zero with the status, types nothing', async (_name, reply, pattern) => {
+      respond = () => reply;
+      const text = await failing(['deck_proj_w1', '/stop']);
+      expect(text).toMatch(pattern);
+      expect(text).toContain(SEND_COMMAND_NO_FALLBACK_NOTE);
+      expect(seen.map((entry) => entry.path)).toEqual([SEND_COMMAND_HOOK_PATH]);
+      neverTyped();
+    });
+
+    it('a 200 whose body is not JSON is a failure too, not a delivery', async () => {
+      server.removeAllListeners('request');
+      server.on('request', (_req, res) => { res.writeHead(200); res.end('<html>not the daemon</html>'); });
+      const text = await failing(['deck_proj_w1', '/stop']);
+      expect(text).toMatch(/unreadable response \(HTTP 200, body is not JSON\)/);
+      neverTyped();
+    });
+
+    it('a 404 (older daemon) still names the upgrade, and types nothing', async () => {
+      respond = () => ({ status: 404 });
+      expect(await failing(['deck_proj_w1', '/stop'])).toContain(SEND_COMMAND_ERRORS.UNSUPPORTED_DAEMON);
+      neverTyped();
+    });
+
+    it('a daemon answer of ok:false is reported as before and types nothing', async () => {
+      respond = () => ({ status: 200, body: { ok: false, error: 'unknown target' } });
+      expect(await failing(['deck_proj_w1', '/stop'])).toContain('unknown target');
+      neverTyped();
+    });
+
+    it.each([
+      ['a process-agent session name', ['deck_proj_w1', '/stop']],
+      ['a project:role shorthand', ['proj:w1', '/stop']],
+      ['--all', ['--all', '/stop']],
+      ['--type', ['--type', 'codex', '/stop']],
+    ])('the same for %s, on a dead hook (also covers the ConPTY-backed sendKeys, which sits behind the same call)', async (_name, args) => {
+      mocks.hookPort.current = null;
+      await failing(args);
+      neverTyped();
+    });
+
+    it('the text is never altered on the way to a failure: exactly the trimmed command reaches the hook', async () => {
+      respond = () => ({ status: 500 });
+      await failing(['deck_proj_w1', '\n  /stop  \n']);
+      expect(seen).toHaveLength(1);
+      expect(seen[0]!.body.message).toBe('/stop');
+    });
+  });
+
+  describe('an ordinary (non-command) send keeps its direct fallback', () => {
+    it('hook unavailable: types the message into the pane, with the warning', async () => {
+      mocks.hookPort.current = null;
+      const warnings: string[] = [];
+      vi.spyOn(console, 'warn').mockImplementation((...args) => { warnings.push(args.join(' ')); });
+      await run('deck_proj_w1', 'hello there');
+      expect(mocks.sendKeys).toHaveBeenCalledTimes(1);
+      expect(mocks.sendKeys).toHaveBeenCalledWith('deck_proj_w1', 'hello there');
+      expect(warnings.join('\n')).toContain('hook server unavailable');
+      expect(seen).toEqual([]);
+    });
+
+    it('hook answering with a non-JSON 500: still falls back, as before', async () => {
+      server.removeAllListeners('request');
+      server.on('request', (_req, res) => { res.writeHead(500); res.end('boom'); });
+      vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+      await run('deck_proj_w1', 'hello there');
+      expect(mocks.sendKeys).toHaveBeenCalledWith('deck_proj_w1', 'hello there');
+    });
+  });
+
   it('documents the flag in --help', () => {
     const send = createProgram().commands.find((command) => command.name() === 'send')!;
-    const help = send.helpInformation();
+    const help = send.helpInformation().replace(/\s+/g, ' ');
     expect(help).toContain(SEND_COMMAND_CLI_FLAG);
     expect(help).toMatch(/exactly the given text/);
+    expect(help).toMatch(/never falls back to direct tmux input/);
+    expect(help).toMatch(/ordinary send falls back to direct tmux/);
   });
 });

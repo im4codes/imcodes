@@ -60,7 +60,7 @@ process.on('warning', (warning) => {
   // Don't forward warnings — too noisy.
 });
 
-import { SEND_COMMAND_ERRORS, SEND_COMMAND_HOOK_PATH, sendCommandText, validateSendCommandRequest } from '../shared/send-command-mode.js';
+import { sendCommandText, validateSendCommandRequest } from '../shared/send-command-mode.js';
 import { Command } from 'commander';
 // These modules are imported lazily to avoid eager tmux backend detection on Windows.
 // Commands like `bind` don't need tmux/conpty and shouldn't crash when node-pty is missing.
@@ -75,6 +75,8 @@ import { fileURLToPath } from 'url';
 import { IMCODES_EXTERNAL_CLI_SENDER } from '../shared/imcodes-send.js';
 import { printDirectSendResult, printSendResult } from './cli/send-output.js';
 import { runAuditReplyCommand } from './cli/audit-reply.js';
+import { postToHookServer } from './cli/hook-client.js';
+import { runSendCommand } from './cli/send-command.js';
 import { resolveLiveHookPort } from './daemon/hook-port.js';
 import {
   DAEMON_SERVER_LINK_FRESH_MS,
@@ -668,7 +670,7 @@ program
 
 program
   .command('send')
-  .description('Send a message to a session (via hook server IPC or direct tmux)')
+  .description('Send a message to a session (via hook server IPC; an ordinary send falls back to direct tmux when the hook is unavailable, --command never does)')
   .argument('[target]', 'Target: label, session name, or project:role')
   .argument('[message...]', 'Message text')
   .option('--files <paths>', 'Comma-separated file paths to include')
@@ -677,7 +679,7 @@ program
   .option('--list', 'List available sibling sessions')
   .option('--reply', 'Route the target response back automatically; no polling needed')
   .option('--no-reply', 'Disable automatic reply instruction (default)')
-  .option('--command', 'Command mode: deliver exactly the given text (trimmed) with no sender line, context, files, reply instruction or task/pair binding. Not combinable with --reply or --files. `/stop` stops the target.')
+  .option('--command', 'Command mode: deliver exactly the given text (trimmed) with no sender line, context, files, reply instruction or task/pair binding. Not combinable with --reply or --files. `/stop` stops the target. Command mode uses the daemon hook only: it never falls back to direct tmux input, and fails non-zero if the hook cannot be used.')
   .action(async (target: string | undefined, messageParts: string[] | undefined, opts: { files?: string; all?: boolean; type?: string; list?: boolean; reply?: boolean; command?: boolean }) => {
     const { detectSenderSession } = await import('./util/detect-session.js');
 
@@ -766,8 +768,18 @@ program
         process.exit(1);
       }
       message = sendCommandText(message);
+      // Hook only: command mode has no direct-tmux fallback, whatever goes wrong.
+      await runSendCommand({
+        hookPort: await resolveLiveHookPort(),
+        from: async () => (await detectSenderSession().catch(() => '')) || IMCODES_EXTERNAL_CLI_SENDER,
+        message,
+        all: opts.all,
+        type: opts.type,
+        target: resolvedTarget,
+      });
+      return;
     }
-    const sendPath = opts.command ? SEND_COMMAND_HOOK_PATH : '/send';
+    const sendPath = '/send';
 
     // Try hook server IPC first (preferred — daemon handles target resolution, queuing, etc.)
     const hookPort = await resolveLiveHookPort();
@@ -823,12 +835,6 @@ program
         printSendResult(res);
         return;
       } catch (err) {
-        // An older daemon has no command path: refuse instead of falling back to
-        // any wrapped delivery.
-        if (opts.command && (err as { statusCode?: number }).statusCode === 404) {
-          console.error(`Error: ${SEND_COMMAND_ERRORS.UNSUPPORTED_DAEMON}`);
-          process.exit(1);
-        }
         // Hook server unavailable — fall back to direct tmux send
         logger.debug({ err }, 'Hook server unavailable, falling back to direct send');
       }
@@ -854,46 +860,6 @@ program
     printDirectSendResult(name);
   });
 
-
-/** POST JSON to the hook server and return parsed response. */
-async function postToHookServer(
-  port: number,
-  path: string,
-  body: Record<string, unknown>,
-  headers: Record<string, string> = {},
-): Promise<Record<string, unknown>> {
-  const http = await import('http');
-  const data = JSON.stringify(body);
-  return new Promise((resolve, reject) => {
-    const req = http.request(
-      {
-        hostname: '127.0.0.1',
-        port,
-        path,
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Content-Length': Buffer.byteLength(data),
-          ...headers,
-        },
-      },
-      (res) => {
-        let responseBody = '';
-        res.on('data', (chunk: Buffer) => { responseBody += chunk.toString(); });
-        res.on('end', () => {
-          try {
-            resolve(JSON.parse(responseBody) as Record<string, unknown>);
-          } catch {
-            reject(Object.assign(new Error(`Invalid JSON response: ${responseBody}`), { statusCode: res.statusCode }));
-          }
-        });
-      },
-    );
-    req.on('error', reject);
-    req.write(data);
-    req.end();
-  });
-}
 
 program
   .command('audit-reply')
