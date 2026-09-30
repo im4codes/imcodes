@@ -324,7 +324,7 @@ describe('task-pair marker grammar', () => {
     expect(body).toContain(TASK_PAIR_SELF_SUFFICIENCY_RULE);
     expect(TASK_PAIR_READY_SELF_CHECK_RULE).toContain('fails on the base and passes on the head');
     expect(TASK_PAIR_READY_SELF_CHECK_RULE).toContain('never from an installed or default daemon');
-    expect(TASK_PAIR_READY_SELF_CHECK_RULE).toContain('never WORKING');
+    expect(TASK_PAIR_READY_SELF_CHECK_RULE).toContain('nobody writes WORKING or STARTED');
     expect(TASK_PAIR_SELF_SUFFICIENCY_RULE).toContain('the exact command, the exact error');
     expect(TASK_PAIR_SELF_SUFFICIENCY_RULE).toContain('switch to an available alternative');
     expect(body.indexOf(TASK_PAIR_SELF_SUFFICIENCY_RULE)).toBeLessThan(body.indexOf('Automatic pairing policy'));
