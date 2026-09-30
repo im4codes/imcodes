@@ -127,7 +127,7 @@ async function runScenario(browser, mode) {
   const consoleLines = [];
   const cdp = await context.newCDPSession(page);
   if (CPU_RATE > 1) await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPU_RATE });
-  // Where the time goes between the tap and the newest message: when the peek left the phone and when its answer arrived.
+  // Where the time goes between opening and the newest message: when the peek left the phone and when its answer arrived.
   const wsTiming = { peekSentAt: null, peekRequestId: null, peekReceivedAt: null, firstHistorySentAt: null };
   let openedAtNode = 0;
   await cdp.send('Network.enable');
@@ -142,26 +142,21 @@ async function runScenario(browser, mode) {
     if (response.payloadData.includes(wsTiming.peekRequestId) && response.payloadData.includes('timeline.history')) wsTiming.peekReceivedAt = Date.now() - openedAtNode;
   });
 
-  // The app boots and lists its sessions first (that is not the window opening); the measured "open" is the
-  // moment the phone user taps the stale chat, i.e. the route to it is taken.
-  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  await page.waitForSelector('#app', { timeout: 30_000 });
-  await page.waitForFunction(() => document.body.innerText.includes('long8000'), undefined, { timeout: 60_000, polling: 250 });
-  await page.waitForTimeout(500);
   page.on('console', (message) => { if (consoleLines.length < 400) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
   page.on('pageerror', (error) => { if (consoleLines.length < 60) consoleLines.push(`pageerror: ${String(error).slice(0, 300)}`); });
-  // One frame loop, installed BEFORE the tap, timestamps the first frame each thing is on screen: the stale cache
-  // (any cached message: small indices) and the newest readable message. It reads textContent of the chat only.
-  openedAtNode = Date.now();
-  await page.evaluate(({ hash, newest, cachedMax }) => {
-    const marks = { openedAt: 0, cache: null, latest: null, gapMarker: null };
+  // "Open" = the app relaunches on the phone and restores the chat it had open (the app remembers its selection), so
+  // everything is measured from navigation start. A frame loop installed before any script runs timestamps the first
+  // frame each thing is on screen: the stale cache (any cached message: small indices), the newest readable message
+  // and the earlier-messages marker. It reads the chat's textContent only.
+  await page.addInitScript(({ newest, cachedMax }) => {
+    const marks = { cache: null, latest: null, gapMarker: null };
     window.__imcMarks = marks;
     const cachedPattern = /stale-(?:msg|user)-(\d+)/g;
     const frame = () => {
       const chat = document.querySelector('.chat-view');
       if (chat) {
         const text = chat.textContent ?? '';
-        const now = performance.now() - marks.openedAt;
+        const now = performance.now();
         if (marks.cache === null) {
           for (const match of text.matchAll(cachedPattern)) { if (Number(match[1]) <= cachedMax) { marks.cache = now; break; } }
         }
@@ -170,11 +165,10 @@ async function runScenario(browser, mode) {
       }
       if (marks.latest === null) requestAnimationFrame(frame);
     };
-    marks.openedAt = performance.now();
-    window.location.hash = hash;
-    window.dispatchEvent(new HashChangeEvent('hashchange'));
     requestAnimationFrame(frame);
-  }, { hash: route, newest: newestText, cachedMax: CACHED_EVENTS });
+  }, { newest: newestText, cachedMax: CACHED_EVENTS });
+  openedAtNode = Date.now();
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
   await page.waitForFunction(() => window.__imcMarks?.latest !== null, undefined, { timeout: 60_000, polling: 100 }).catch(async (error) => {
     await mkdir(OUT_DIR, { recursive: true });
     await page.screenshot({ path: path.join(OUT_DIR, `timeout-${mode}.png`) }).catch(() => {});
@@ -190,7 +184,7 @@ async function runScenario(browser, mode) {
     mode, seededCachedEvents: seeded, totalEvents: TOTAL_EVENTS,
     tCachePaintMs, tLatestTextMs,
     // Null when the cache never got a frame of its own (the newest content arrived first): then latest-first is
-    // measured from the tap.
+    // measured from navigation start.
     latestAfterCacheMs: tCachePaintMs === null ? tLatestTextMs : tLatestTextMs - tCachePaintMs,
     gapMarkerAtMs: marks.gapMarker === null ? null : Math.round(marks.gapMarker),
     wsTiming,
