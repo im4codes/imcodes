@@ -104,49 +104,6 @@ import { imcodesStateDir } from './util/imcodes-state-dir.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
-function shellDoubleQuotedLiteral(value: string): string {
-  return `"${value.replace(/["\\$`]/g, '\\$&')}"`;
-}
-
-function buildImcodesCliWrapper(nodeBin: string, entryScript: string): string {
-  return `#!/bin/sh\nexec ${shellDoubleQuotedLiteral(nodeBin)} ${shellDoubleQuotedLiteral(entryScript)} "$@"\n`;
-}
-
-function writeExecutableShim(path: string, body: string): void {
-  mkdirSync(dirname(path), { recursive: true });
-  try {
-    if (lstatSync(path).isSymbolicLink()) unlinkSync(path);
-  } catch {
-    // Missing path is fine; writeFileSync below will create it.
-  }
-  writeFileSync(path, body, { mode: 0o755 });
-  chmodSync(path, 0o755);
-}
-
-function repairImcodesCliWrappers(nodeBin: string, entryScript: string): { userShim?: string; systemShim?: string; systemSkippedReason?: string } {
-  if (process.platform === 'win32') return {};
-  if (!existsSync(entryScript)) {
-    return { systemSkippedReason: `entry script not found: ${entryScript}` };
-  }
-
-  const body = buildImcodesCliWrapper(nodeBin, entryScript);
-  const userShim = join(homedir(), '.local', 'bin', 'imcodes');
-  writeExecutableShim(userShim, body);
-
-  const systemShim = '/usr/local/bin/imcodes';
-  try {
-    writeExecutableShim(systemShim, body);
-    return { userShim, systemShim };
-  } catch {
-    try {
-      execFileSync('sudo', ['-n', 'install', '-m', '755', userShim, systemShim], { stdio: 'ignore' });
-      return { userShim, systemShim };
-    } catch {
-      return { userShim, systemSkippedReason: '/usr/local/bin is not writable and passwordless sudo is unavailable' };
-    }
-  }
-}
-
 function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes < 0) return 'unknown';
   const units = ['B', 'KB', 'MB', 'GB', 'TB'];
