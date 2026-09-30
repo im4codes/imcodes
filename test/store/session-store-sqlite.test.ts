@@ -306,6 +306,50 @@ describe('one-time migration from sessions.json', () => {
       expect(Object.keys((JSON.parse(await readFile(jsonFile(), 'utf8')) as { sessions: object }).sessions)).toEqual(['deck_realproj_brain']);
     });
 
+    it('CAUSAL: sessions written while the file was unreadable do not stop the repaired file from migrating -- the database row wins for a shared name, the rest is added', async () => {
+      await writeFile(jsonFile(), corrupt, 'utf8');
+      await loadStore({ probe: false }); // unreadable: import not done, the daemon keeps working
+      upsertSession(record('deck_realproj_live', { note: 'written while the file was unreadable' }));
+      upsertSession(record('deck_realproj_shared', { note: 'live database row' }));
+      await flushStore();
+      expect(persistedSessions(home)).toHaveProperty('deck_realproj_live');
+
+      // The user repairs the file: it knows the shared name (stale) plus two sessions only it has.
+      await writeFile(jsonFile(), JSON.stringify({
+        version: 2,
+        sessions: {
+          deck_realproj_brain: record('deck_realproj_brain', { note: 'only in the file' }),
+          deck_realproj_w9: record('deck_realproj_w9', { note: 'only in the file too' }),
+          deck_realproj_shared: record('deck_realproj_shared', { note: 'stale file row' }),
+        },
+        identityPrompts: {},
+      }), 'utf8');
+      await fresh(); // the next start
+      const persisted = persistedSessions(home);
+      expect(Object.keys(persisted).sort()).toEqual(['deck_realproj_brain', 'deck_realproj_live', 'deck_realproj_shared', 'deck_realproj_w9']);
+      expect(persisted.deck_realproj_shared).toMatchObject({ note: 'live database row' }); // existing rows always win
+      expect(persisted.deck_realproj_live).toMatchObject({ note: 'written while the file was unreadable' });
+      expect(persisted.deck_realproj_brain).toMatchObject({ note: 'only in the file' });
+      const reader = openSessionDbReadOnly(sessionDbPathForHome(home))!;
+      expect(readSessionDbMeta(reader, SESSION_DB_META_LEGACY_IMPORT)).toBe(SESSION_DB_LEGACY_IMPORT_DONE);
+      closeSessionDb(reader);
+      expect(existsSync(frozenFile())).toBe(true);
+      expect(JSON.parse(await readFile(frozenFile(), 'utf8')).sessions.deck_realproj_shared.note).toBe('stale file row'); // the file itself is kept as it was
+    });
+
+    it('a database that already had every legacy name imports nothing and still marks the import done', async () => {
+      await writeFile(jsonFile(), corrupt, 'utf8');
+      await loadStore({ probe: false });
+      upsertSession(record('deck_realproj_brain', { note: 'live' }));
+      await flushStore();
+      await writeFile(jsonFile(), repaired(), 'utf8');
+      await fresh();
+      expect(persistedSessions(home).deck_realproj_brain).toMatchObject({ note: 'live' });
+      expect(existsSync(frozenFile())).toBe(true);
+      await fresh(); // and it is not imported again
+      expect(Object.keys(persistedSessions(home))).toEqual(['deck_realproj_brain']);
+    });
+
     it('a restart in the middle of the wait (a second unreadable start) still leaves the file alone', async () => {
       await writeFile(jsonFile(), corrupt, 'utf8');
       await loadStore({ probe: false });

@@ -200,12 +200,19 @@ export class EmptyStoreRefusal extends Error {
  * One-time import of legacy records. Atomic and idempotent: the rows and the
  * "imported" marker commit together, so an interrupted import leaves nothing
  * behind and a retry starts clean; a completed one is never repeated.
- * Returns how many rows were imported, or null when the import was not needed.
+ *
+ * Rows already in the database ALWAYS win: legacy records are inserted only for
+ * names the database does not have (`ON CONFLICT DO NOTHING`, never an upsert). That
+ * is what keeps a stale file from overwriting live rows, and it is also what lets an
+ * unreadable sessions.json that the user repairs LATER still be migrated when the
+ * daemon has written sessions in the meantime -- freezing the repaired file
+ * unimported would lose every session that only it knew about.
+ * Returns how many rows were inserted and how many names the database already had.
  */
 export function importLegacySessions(
   handle: SessionDbHandle,
   rows: SessionDbRow[],
-): { imported: number } | { skipped: 'already_done' | 'database_not_empty' } {
+): { imported: number; keptExisting: number } | { skipped: 'already_done' } {
   if (handle.readOnly) throw new Error('session store connection is read-only');
   const { db } = handle;
   rowWritesThisTransaction = 0;
@@ -215,18 +222,19 @@ export function importLegacySessions(
       db.exec('ROLLBACK');
       return { skipped: 'already_done' };
     }
-    if (countSessionRows(handle) > 0) {
-      // Rows exist without a marker: this database has been written since. A
-      // stale file must never overwrite live rows.
-      db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_LEGACY_IMPORT, SESSION_DB_LEGACY_IMPORT_DONE);
-      db.exec('COMMIT');
-      return { skipped: 'database_not_empty' };
+    const insertMissing = db.prepare(
+      `INSERT INTO sessions (name, project_name, parent_session, agent_type, state, updated_at, payload)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(name) DO NOTHING`,
+    );
+    let imported = 0;
+    for (const row of rows) {
+      noteRowWrite();
+      imported += Number(insertMissing.run(...bindRow(row)).changes);
     }
-    const upsert = upsertStatement(handle);
-    for (const row of rows) { noteRowWrite(); upsert.run(...bindRow(row)); }
     db.prepare('INSERT OR REPLACE INTO session_store_meta (key, value) VALUES (?, ?)').run(SESSION_DB_META_LEGACY_IMPORT, SESSION_DB_LEGACY_IMPORT_DONE);
     db.exec('COMMIT');
-    return { imported: rows.length };
+    return { imported, keptExisting: rows.length - imported };
   } catch (error) {
     try { db.exec('ROLLBACK'); } catch { /* the failure already ended the transaction */ }
     throw error;

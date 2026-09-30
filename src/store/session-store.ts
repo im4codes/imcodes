@@ -604,8 +604,14 @@ async function migrateLegacyJson(handle: SessionDbHandle): Promise<void> {
     markLegacyImportDone(handle);
   } else {
     const result = importLegacySessions(handle, rows);
-    if ('imported' in result) logger.info({ imported: result.imported }, 'Migrated sessions.json to SQLite');
-    else logger.warn({ skipped: result.skipped }, 'sessions.json import skipped');
+    if ('imported' in result) {
+      logger.info({ imported: result.imported }, 'Migrated sessions.json to SQLite');
+      if (result.keptExisting > 0) {
+        logger.warn({ keptExisting: result.keptExisting }, 'sessions.json was imported into a database that already had sessions: the database rows were kept, only missing sessions were added');
+      }
+    } else {
+      logger.warn({ skipped: result.skipped }, 'sessions.json import skipped');
+    }
   }
   if (sourceIsFile) {
     try { await rename(jsonPath, `${jsonPath}${LEGACY_JSON_FROZEN_SUFFIX}`); } catch { /* frozen export is best effort; the marker already says the file is never read again */ }
