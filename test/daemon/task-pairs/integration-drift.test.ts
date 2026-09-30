@@ -629,6 +629,171 @@ describe('integration drift', () => {
       expect(getTaskPairStore().getPair(PROJECT, 'st3')!.state.status).toBe('in_audit');
     });
 
+    describe('overlap: dev changed files the pair changed too (however few commits behind)', () => {
+      const writeFiles = (cwd: string, files: Record<string, string>): void => {
+        for (const [name, content] of Object.entries(files)) {
+          mkdirSync(join(cwd, name, '..'), { recursive: true });
+          writeFileSync(join(cwd, name), content);
+        }
+      };
+      const commitFiles = (cwd: string, files: Record<string, string>, subject: string): string => {
+        writeFiles(cwd, files);
+        run(cwd, 'add', '-A');
+        run(cwd, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '-m', subject);
+        return run(cwd, 'rev-parse', 'HEAD');
+      };
+      /** A base with the given files on dev, then a pair worktree cut from it. */
+      const fixture = (taskId: string, baseFiles: Record<string, string>): { wt: string; base: string } => {
+        setUpRepos();
+        const base = commitFiles(main, baseFiles, 'chore: base files');
+        run(main, 'push', '-q', 'origin', 'dev');
+        return { wt: addWorktree(taskId, base), base };
+      };
+      const openAudit = (taskId: string, wt: string, base: string, head: string): void => savePair(taskId, {
+        status: 'in_audit', material: { worktree: wt, head, base, at: T0 },
+        workspace: { kind: 'worktree', path: wt, base, lastHead: head, createdAt: 1, status: 'active' } as never,
+      });
+      const pushDev = (): void => { run(main, 'push', '-q', 'origin', 'dev'); };
+      const notices = () => sent.filter((entry) => entry.reason === 'stale-base' || entry.reason === 'brain-stale-base');
+      const toExecutor = () => notices().filter((entry) => entry.target === EXEC);
+
+      it('lists the overlapping files with the dev commit subjects, once; no overlap, no notice; a repeat READY on the same head and tip: none', async () => {
+        const { wt, base } = fixture('ov1', { 'shared.txt': 'a\n', 'other.txt': 'a\n', 'pair-only.txt': 'a\n' });
+        const head = commitFiles(wt, { 'shared.txt': 'pair\n', 'pair-only.txt': 'pair\n' }, 'feat: the pair change');
+        openAudit('ov1', wt, base, head);
+        // dev (5 commits, far below 50) changes a file the pair did NOT touch first: no overlap, no notice.
+        commitFiles(main, { 'other.txt': 'dev\n' }, 'chore: dev touches another file');
+        pushDev();
+        await checkStaleBaseNotice(PROJECT, 'ov1', 'ready');
+        expect(notices()).toHaveLength(0);
+        // Now dev touches the shared file too.
+        clock = T0 + 10 * MIN;
+        commitFiles(main, { 'shared.txt': 'dev\n' }, 'fix: dev changes the shared file');
+        pushDev();
+        await checkStaleBaseNotice(PROJECT, 'ov1', 'ready');
+        expect(notices().map((entry) => entry.target).sort()).toEqual([BRAIN, EXEC].sort());
+        const text = toExecutor()[0]!.text;
+        expect(text).toContain('changed 1 of the files');
+        expect(text).toContain('shared.txt');
+        expect(text).toContain('"fix: dev changes the shared file"');
+        expect(text).not.toContain('pair-only.txt');
+        expect(text).toContain('before audit');
+        expect(text).toContain(head.slice(0, 12));
+        // Same head, same tip: READY again and PASS both say nothing more.
+        sent = [];
+        await checkStaleBaseNotice(PROJECT, 'ov1', 'ready');
+        await checkStaleBaseNotice(PROJECT, 'ov1', 'pass');
+        expect(notices()).toHaveLength(0);
+        // dev moves on to the same file again: a new tip, new information, told again (at PASS: before the final round).
+        clock = T0 + 20 * MIN;
+        commitFiles(main, { 'shared.txt': 'dev2\n' }, 'fix: dev changes the shared file again');
+        pushDev();
+        await checkStaleBaseNotice(PROJECT, 'ov1', 'pass');
+        expect(toExecutor()).toHaveLength(1);
+        expect(toExecutor()[0]!.text).toContain('before the final round');
+        expect(toExecutor()[0]!.text).toContain('"fix: dev changes the shared file again"');
+      });
+
+      it('a file deleted in dev, a file renamed in dev and a file the pair renamed are all handled and listed', async () => {
+        const { wt, base } = fixture('ov2', { 'deleted.txt': 'a\n', 'renamed-old.txt': 'a\n', 'pair-renames.txt': 'a\n', 'untouched.txt': 'a\n' });
+        commitFiles(wt, { 'deleted.txt': 'pair\n', 'renamed-old.txt': 'pair\n' }, 'feat: edits two files');
+        run(wt, 'mv', 'pair-renames.txt', 'pair-renamed.txt');
+        const head = commitFiles(wt, {}, 'refactor: rename a file');
+        openAudit('ov2', wt, base, head);
+        run(main, 'rm', '-q', 'deleted.txt');
+        run(main, 'mv', 'renamed-old.txt', 'renamed-new.txt');
+        commitFiles(main, { 'pair-renames.txt': 'dev edit\n' }, 'fix: dev edits and deletes');
+        pushDev();
+        await expect(checkStaleBaseNotice(PROJECT, 'ov2', 'ready')).resolves.toBeUndefined();
+        const text = toExecutor()[0]!.text;
+        expect(text).toContain('deleted.txt [deleted in origin/dev]');
+        expect(text).toContain('renamed-old.txt [deleted in origin/dev]');
+        expect(text).toContain('pair-renames.txt');
+        expect(text).not.toContain('untouched.txt');
+      });
+
+      it('lockfiles and evidence: commits alone are not an overlap', async () => {
+        const { wt, base } = fixture('ov3', { 'package-lock.json': '1\n', 'notes.md': 'a\n', 'real.txt': 'a\n' });
+        commitFiles(wt, { 'package-lock.json': 'pair\n' }, 'chore: pair bumps a dependency');
+        const head = commitFiles(wt, { 'notes.md': 'measurements\n' }, 'evidence: measurements');
+        openAudit('ov3', wt, base, head);
+        commitFiles(main, { 'package-lock.json': 'dev\n', 'notes.md': 'dev notes\n' }, 'chore: dev bumps dependencies and edits notes');
+        pushDev();
+        await checkStaleBaseNotice(PROJECT, 'ov3', 'ready');
+        expect(notices()).toHaveLength(0);
+      });
+
+      it('a pair that has only evidence: commits gets no overlap notice', async () => {
+        const { wt, base } = fixture('ov4', { 'evidence.md': 'a\n' });
+        const head = commitFiles(wt, { 'evidence.md': 'numbers\n' }, 'evidence: only numbers');
+        openAudit('ov4', wt, base, head);
+        commitFiles(main, { 'evidence.md': 'dev\n' }, 'docs: dev edits the same file');
+        pushDev();
+        await checkStaleBaseNotice(PROJECT, 'ov4', 'ready');
+        expect(notices()).toHaveLength(0);
+      });
+
+      it('lists at most 10 files and says how many more; a huge dev diff is capped and still answers', async () => {
+        const many: Record<string, string> = {};
+        for (let i = 0; i < 14; i += 1) many[`src/m${String(i).padStart(2, '0')}.ts`] = 'a\n';
+        const { wt, base } = fixture('ov5', many);
+        const head = commitFiles(wt, Object.fromEntries(Object.keys(many).map((name) => [name, 'pair\n'])), 'feat: touch many files');
+        openAudit('ov5', wt, base, head);
+        const huge: Record<string, string> = Object.fromEntries(Object.keys(many).map((name) => [name, 'dev\n']));
+        for (let i = 0; i < 3000; i += 1) huge[`gen/file-${i}.txt`] = `${i}\n`;
+        commitFiles(main, huge, 'chore: dev regenerates thousands of files');
+        pushDev();
+        const started = Date.now();
+        await checkStaleBaseNotice(PROJECT, 'ov5', 'ready');
+        expect(Date.now() - started).toBeLessThan(8_000);
+        const text = toExecutor()[0]!.text;
+        expect(text).toContain('changed 14 of the files');
+        expect(text).toContain('+4 more');
+        expect(text.match(/src\/m\d\d\.ts/gu)).toHaveLength(10);
+        expect(text).not.toContain('gen/file-');
+      });
+
+      it('one message carries both reasons when the base is far behind AND files overlap', async () => {
+        const { wt, base } = fixture('ov6', { 'shared.txt': 'a\n' });
+        const head = commitFiles(wt, { 'shared.txt': 'pair\n' }, 'feat: pair');
+        openAudit('ov6', wt, base, head);
+        emptyCommits(main, TASK_PAIR_STALE_BASE_MAX_COMMITS + 5);
+        commitFiles(main, { 'shared.txt': 'dev\n' }, 'fix: dev shared');
+        pushDev();
+        await checkStaleBaseNotice(PROJECT, 'ov6', 'ready');
+        expect(toExecutor()).toHaveLength(1);
+        expect(toExecutor()[0]!.text).toContain('builds on a base');
+        expect(toExecutor()[0]!.text).toContain('changed 1 of the files');
+        expect(notices().filter((entry) => entry.target === BRAIN)).toHaveLength(1);
+      });
+
+      it('follows IMCODES_PAIR_INTEGRATION_REF (a ref that is not dev), and an unknown ref or an unreachable origin makes no notice and no crash', async () => {
+        const { wt, base } = fixture('ov7', { 'shared.txt': 'a\n' });
+        const head = commitFiles(wt, { 'shared.txt': 'pair\n' }, 'feat: pair');
+        openAudit('ov7', wt, base, head);
+        run(main, 'checkout', '-q', '-b', 'release-line', base);
+        commitFiles(main, { 'shared.txt': 'release\n' }, 'fix: the release branch edits the file');
+        run(main, 'push', '-q', 'origin', 'release-line');
+        process.env[TASK_PAIR_INTEGRATION_REF_ENV] = 'origin/release-line';
+        await checkStaleBaseNotice(PROJECT, 'ov7', 'ready');
+        expect(toExecutor()[0]!.text).toContain('origin/release-line changed 1 of the files');
+        // A ref that does not exist: nothing to compare against, nothing claimed.
+        sent = [];
+        savePair('ov7b', { status: 'in_audit', material: { worktree: wt, head, base, at: T0 }, workspace: { kind: 'worktree', path: wt, base, lastHead: head, createdAt: 1, status: 'active' } as never });
+        process.env[TASK_PAIR_INTEGRATION_REF_ENV] = 'origin/not-a-branch';
+        clock = T0 + 120 * MIN;
+        await expect(checkStaleBaseNotice(PROJECT, 'ov7b', 'ready')).resolves.toBeUndefined();
+        expect(notices()).toHaveLength(0);
+        // The origin is gone: the fetch fails, the check still runs on the ref it has and never throws.
+        delete process.env[TASK_PAIR_INTEGRATION_REF_ENV];
+        run(main, 'remote', 'set-url', 'origin', join(root, 'does-not-exist.git'));
+        const loggerModule = await import('../../../src/util/logger.js');
+        vi.spyOn(loggerModule.default, 'warn').mockImplementation(() => undefined as never);
+        clock = T0 + 300 * MIN;
+        await expect(checkStaleBaseNotice(PROJECT, 'ov7b', 'ready')).resolves.toBeUndefined();
+      });
+    });
+
     it('a non-git workspace or a missing worktree makes no notice and no git call', async () => {
       savePair('st4', { status: 'in_audit', material: { path: root, head: 'abc1234', at: T0 }, workspace: { kind: 'dir', path: root, createdAt: 1, status: 'active' } as never });
       await checkStaleBaseNotice(PROJECT, 'st4', 'ready');

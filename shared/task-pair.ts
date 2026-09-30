@@ -128,6 +128,22 @@ export const TASK_PAIR_INTEGRATION_REMINDER_MAX_PAIRS = 20;
 /** A head whose merge-base is more than this many commits or hours behind the integration ref draws the rebase warning. */
 export const TASK_PAIR_STALE_BASE_MAX_COMMITS = 50;
 export const TASK_PAIR_STALE_BASE_MAX_AGE_MS = 48 * 60 * 60_000;
+/**
+ * Overlap warning: besides "far behind", a head whose base is behind by ANY amount draws the warning when the integration ref changed
+ * files the pair changed too (the merge would not be clean; tsk_cd_stale_base_overlap). At most this many files are listed.
+ */
+export const TASK_PAIR_OVERLAP_MAX_LISTED_FILES = 10;
+/** Dev commit subjects shown per listed file. */
+export const TASK_PAIR_OVERLAP_MAX_SUBJECTS_PER_FILE = 2;
+/** Hard bound on the files read from either side; a bigger diff is capped (never read whole). */
+export const TASK_PAIR_OVERLAP_MAX_TRACKED_FILES = 20_000;
+/**
+ * Generated lockfiles are changed by almost every dependency bump and resolve mechanically, so on their own they are noise, not an
+ * overlap. Matched on the file's base name.
+ */
+export const TASK_PAIR_OVERLAP_IGNORED_BASENAMES = [
+  'package-lock.json', 'npm-shrinkwrap.json', 'yarn.lock', 'pnpm-lock.yaml', 'bun.lockb', 'Cargo.lock', 'Gemfile.lock', 'poetry.lock', 'composer.lock', 'go.sum',
+] as const;
 /** Overrides the integration ref (default: origin/dev, then origin/main, origin/master, then the same local branches). */
 export const TASK_PAIR_INTEGRATION_REF_ENV = 'IMCODES_PAIR_INTEGRATION_REF' as const;
 /** Commits whose subject starts with this prefix are evidence, never integrated, and do not count as unintegrated work. */

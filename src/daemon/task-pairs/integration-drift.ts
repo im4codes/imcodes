@@ -22,6 +22,10 @@ import { isAbsolute, resolve } from 'node:path';
 import {
   TASK_PAIR_EVIDENCE_COMMIT_PREFIX,
   TASK_PAIR_INTEGRATION_REF_ENV,
+  TASK_PAIR_OVERLAP_IGNORED_BASENAMES,
+  TASK_PAIR_OVERLAP_MAX_LISTED_FILES,
+  TASK_PAIR_OVERLAP_MAX_SUBJECTS_PER_FILE,
+  TASK_PAIR_OVERLAP_MAX_TRACKED_FILES,
   resolveTaskPairBrainReminderInterval,
   TASK_PAIR_INTEGRATION_REMINDER_GRACE_MS,
   TASK_PAIR_INTEGRATION_REMINDER_MAX_PAIRS,
@@ -36,7 +40,7 @@ import { listTaskPairCommitsNotInIntegration } from '../supervision-worktree-gc.
 import { sendTaskPairMessage, type TaskPairDeliveryResult } from './delivery.js';
 import { isPairsEngineProject } from './engine.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
-import { buildIntegrationDriftDigest, buildStaleBaseBrainLine, buildStaleBaseExecutorNotice } from './messages.js';
+import { buildIntegrationDriftDigest, buildStaleBaseBrainLine, buildStaleBaseExecutorNotice, type StaleBaseOverlapFile, type StaleBaseReport } from './messages.js';
 
 const GIT_TIMEOUT_MS = 8_000;
 const FETCH_TIMEOUT_MS = 20_000;
@@ -69,11 +73,9 @@ export interface PairIntegration {
   missing?: number;
 }
 
-export interface StaleBase {
-  ref: string;
-  behind: number;
-  ageMs: number;
-  stale: boolean;
+export interface StaleBase extends StaleBaseReport {
+  /** The integration ref's tip the answer belongs to (one notice per head + tip). */
+  tip: string;
 }
 
 interface GitOutcome { ok: boolean; stdout: string; exitCode?: number }
@@ -383,12 +385,12 @@ export async function inspectStaleBase(repoPath: string, head: string): Promise<
   const key = `${await repoKeyOf(repoPath)}\u0000${head}\u0000${tip}`;
   const cached = staleResults.get(key);
   if (cached && (cached.value !== undefined || now() - cached.at < UNKNOWN_CACHE_MS)) return cached.value;
-  const value = await computeStaleBase(repoPath, head, ref, measure);
+  const value = await computeStaleBase(repoPath, head, ref, measure, tip);
   remember(staleResults, key, { value, at: now() });
   return value;
 }
 
-async function computeStaleBase(repoPath: string, head: string, ref: string, measure: string): Promise<StaleBase | undefined> {
+async function computeStaleBase(repoPath: string, head: string, ref: string, measure: string, tip: string): Promise<StaleBase | undefined> {
   const mergeBase = (await git(repoPath, ['merge-base', head, measure])).stdout.trim();
   if (!/^[0-9a-f]{40}$/u.test(mergeBase)) return undefined;
   const behindOut = await git(repoPath, ['rev-list', '--count', `${mergeBase}..${measure}`]);
@@ -397,7 +399,85 @@ async function computeStaleBase(repoPath: string, head: string, ref: string, mea
   const times = await git(repoPath, ['show', '-s', '--format=%ct', mergeBase, `${measure}^{commit}`]);
   const [baseTime, tipTime] = times.stdout.split(/\s+/u).filter(Boolean).map((value) => Number.parseInt(value, 10));
   const ageMs = times.ok && Number.isFinite(baseTime) && Number.isFinite(tipTime) ? Math.max(0, (tipTime! - baseTime!) * 1000) : 0;
-  return { ref, behind, ageMs, stale: behind > TASK_PAIR_STALE_BASE_MAX_COMMITS || ageMs > TASK_PAIR_STALE_BASE_MAX_AGE_MS };
+  const overlap = behind > 0 ? await computeOverlap(repoPath, mergeBase, head, measure) : undefined;
+  return { ref, tip, behind, ageMs, stale: behind > TASK_PAIR_STALE_BASE_MAX_COMMITS || ageMs > TASK_PAIR_STALE_BASE_MAX_AGE_MS, ...(overlap ? { overlap } : {}) };
+}
+
+// ---- files both the pair and the integration ref changed since the pair's base ---------------------------------------------------
+
+const QUIET_PATHS = ['-c', 'core.quotePath=false'] as const;
+const OVERLAP_MAX_BUFFER = 8 * 1024 * 1024;
+
+function isIgnoredOverlapPath(path: string): boolean {
+  const name = path.slice(path.lastIndexOf('/') + 1);
+  return (TASK_PAIR_OVERLAP_IGNORED_BASENAMES as readonly string[]).includes(name);
+}
+
+/**
+ * The files the pair changed after the merge base, from its own commits: `evidence:` commits are left out (never integrated, they
+ * cannot conflict), lockfiles too. Renames are read as a delete plus an add (`--no-renames`), so both paths count.
+ */
+async function pairChangedFiles(repoPath: string, mergeBase: string, head: string): Promise<Set<string> | undefined> {
+  const out = await git(repoPath, [...QUIET_PATHS, 'log', '--no-merges', '--no-renames', '--format=%x1e%s', '--name-only', `--max-count=${MAX_RANGE_COMMITS}`, `${mergeBase}..${head}`], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
+  if (!out.ok) return undefined;
+  const files = new Set<string>();
+  for (const record of out.stdout.split('\x1e')) {
+    const [subject = '', ...lines] = record.split('\n');
+    if (subject.trim().toLowerCase().startsWith(TASK_PAIR_EVIDENCE_COMMIT_PREFIX)) continue;
+    for (const line of lines) {
+      const path = line.trim();
+      if (path && !isIgnoredOverlapPath(path) && files.size < TASK_PAIR_OVERLAP_MAX_TRACKED_FILES) files.add(path);
+    }
+  }
+  return files;
+}
+
+/** What the integration ref did to each file since the merge base (one name-status diff; capped). */
+async function integrationChangedFiles(repoPath: string, mergeBase: string, measure: string): Promise<Map<string, StaleBaseOverlapFile['kind']> | undefined> {
+  const out = await git(repoPath, [...QUIET_PATHS, 'diff', '--name-status', '--no-renames', `${mergeBase}..${measure}`], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
+  if (!out.ok) return undefined;
+  const files = new Map<string, StaleBaseOverlapFile['kind']>();
+  for (const line of out.stdout.split('\n')) {
+    const tab = line.indexOf('\t');
+    if (tab < 1) continue;
+    const path = line.slice(tab + 1).trim();
+    if (!path || isIgnoredOverlapPath(path) || files.size >= TASK_PAIR_OVERLAP_MAX_TRACKED_FILES) continue;
+    const status = line.slice(0, tab);
+    files.set(path, status.startsWith('D') ? 'deleted' : status.startsWith('A') ? 'added' : 'modified');
+  }
+  return files;
+}
+
+/**
+ * The files changed on BOTH sides since the pair's base: a merge of the pair into the integration branch would not be clean there, however
+ * few commits behind the base is. Listed (at most 10) with the integration commits that touched them. Two name lists and, only when they
+ * intersect, one path-limited log; any git failure (or an output beyond the buffer) answers "no overlap claimed".
+ */
+async function computeOverlap(repoPath: string, mergeBase: string, head: string, measure: string): Promise<StaleBaseReport['overlap'] | undefined> {
+  const mine = await pairChangedFiles(repoPath, mergeBase, head);
+  if (!mine || mine.size === 0) return undefined;
+  const theirs = await integrationChangedFiles(repoPath, mergeBase, measure);
+  if (!theirs) return undefined;
+  const shared = [...mine].filter((path) => theirs.has(path)).sort();
+  if (shared.length === 0) return undefined;
+  const listed = shared.slice(0, TASK_PAIR_OVERLAP_MAX_LISTED_FILES);
+  const subjectsByFile = new Map<string, string[]>();
+  const log = await git(repoPath, [...QUIET_PATHS, 'log', '--no-merges', '--no-renames', '--format=%x1e%s', '--name-only', '--max-count=200', `${mergeBase}..${measure}`, '--', ...listed], GIT_TIMEOUT_MS, { maxBuffer: OVERLAP_MAX_BUFFER });
+  if (log.ok) {
+    for (const record of log.stdout.split('\x1e')) {
+      const [subject = '', ...lines] = record.split('\n');
+      const trimmed = subject.trim();
+      if (!trimmed) continue;
+      for (const line of lines) {
+        const path = line.trim();
+        if (!listed.includes(path)) continue;
+        const known = subjectsByFile.get(path) ?? [];
+        if (known.length < TASK_PAIR_OVERLAP_MAX_SUBJECTS_PER_FILE && !known.includes(trimmed)) known.push(trimmed);
+        subjectsByFile.set(path, known);
+      }
+    }
+  }
+  return { total: shared.length, files: listed.map((path) => ({ path, kind: theirs.get(path) ?? 'modified', subjects: subjectsByFile.get(path) ?? [] })) };
 }
 
 /** The worktree and head a pair's audit material names, when it is a git worktree of a repository with an integration ref. */
@@ -421,17 +501,26 @@ export async function checkStaleBaseNotice(project: string, taskId: string, stag
     if (!stored || !isPairsEngineProject(project)) return;
     const material = gitMaterialOf(stored.state);
     if (!material) return;
-    const key = `stale-base:${stage}:${material.head}`;
-    if (stored.liveness.notified.includes(key)) return;
     const stale = await inspectStaleBase(material.repoPath, material.head);
-    if (!stale?.stale) return;
+    if (!stale) return;
+    // Two independent reasons, each told once: "far behind" once per stage and head; "dev changed files you changed" once per head and
+    // integration tip (a later dev commit on the same files is new information, a repeat READY on the same tip is not).
+    const sizeKey = `stale-base:${stage}:${material.head}`;
+    const overlapKey = `stale-overlap:${material.head}:${stale.tip}`;
     const latest = store.getPair(project, taskId);
-    if (!latest || latest.liveness.notified.includes(key)) return;
-    store.saveLiveness(project, taskId, { ...latest.liveness, notified: [...latest.liveness.notified, key] });
+    if (!latest) return;
+    const told = latest.liveness.notified;
+    const report: StaleBaseReport = {
+      ref: stale.ref, behind: stale.behind, ageMs: stale.ageMs,
+      stale: stale.stale && !told.includes(sizeKey),
+      ...(stale.overlap && !told.includes(overlapKey) ? { overlap: stale.overlap } : {}),
+    };
+    if (!report.stale && !report.overlap) return;
+    store.saveLiveness(project, taskId, { ...latest.liveness, notified: [...told, ...(report.stale ? [sizeKey] : []), ...(report.overlap ? [overlapKey] : [])] });
     const send = testDeps.send ?? sendTaskPairMessage;
     const pair = latest.state;
-    if (pair.executor && pair.executor !== 'none') await send(pair.executor, taskId, 'stale-base', buildStaleBaseExecutorNotice(pair, material.head, stale, stage));
-    await send(pair.brain, taskId, 'brain-stale-base', buildStaleBaseBrainLine(pair, material.head, stale, stage));
+    if (pair.executor && pair.executor !== 'none') await send(pair.executor, taskId, 'stale-base', buildStaleBaseExecutorNotice(pair, material.head, report, stage));
+    await send(pair.brain, taskId, 'brain-stale-base', buildStaleBaseBrainLine(pair, material.head, report, stage));
   } catch (error) {
     logger.warn({ err: error, taskId }, 'task-pair: stale-base check failed');
   }

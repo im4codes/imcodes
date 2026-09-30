@@ -874,15 +874,39 @@ export function buildIntegrationDriftDigest(lines: readonly IntegrationDriftLine
 }
 
 const STALE_STAGE_LABEL = { ready: 'READY_FOR_AUDIT', pass: 'PASS' } as const;
+const STALE_STAGE_DEADLINE = { ready: 'before audit', pass: 'before the final round' } as const;
 
-function describeStaleBase(head: string, stale: { ref: string; behind: number; ageMs: number }): string {
-  return `head ${head.slice(0, 12)} builds on a base ${stale.behind} commit${stale.behind === 1 ? '' : 's'} (${formatDriftAge(stale.ageMs)}) behind ${stale.ref}`;
+export interface StaleBaseOverlapFile { path: string; kind: 'modified' | 'deleted' | 'added'; subjects: string[] }
+
+/** What the stale-base warning reports: how far behind the base is, and/or the files the integration ref changed that the pair changed too. */
+export interface StaleBaseReport {
+  ref: string;
+  behind: number;
+  ageMs: number;
+  /** The base is more than the commit/age limit behind. */
+  stale: boolean;
+  overlap?: { total: number; files: StaleBaseOverlapFile[] };
 }
 
-export function buildStaleBaseExecutorNotice(pair: TaskPairState, head: string, stale: { ref: string; behind: number; ageMs: number }, stage: 'ready' | 'pass'): string {
-  return `${header(pair)} At ${STALE_STAGE_LABEL[stage]}: ${describeStaleBase(head, stale)}. Rebase onto ${stale.ref} before the final round, re-run the affected tests and send a new READY_FOR_AUDIT with the new head. This is a warning, not a gate.`;
+function describeStaleBase(head: string, stale: StaleBaseReport): string {
+  const parts: string[] = [];
+  if (stale.stale) parts.push(`head ${head.slice(0, 12)} builds on a base ${stale.behind} commit${stale.behind === 1 ? '' : 's'} (${formatDriftAge(stale.ageMs)}) behind ${stale.ref}`);
+  if (stale.overlap) {
+    const { files, total } = stale.overlap;
+    const listed = files.map((file) => {
+      const kind = file.kind === 'modified' ? '' : ` [${file.kind} in ${stale.ref}]`;
+      const why = file.subjects.length ? ` <- ${file.subjects.map((subject) => `"${subject.length > 80 ? `${subject.slice(0, 77)}...` : subject}"`).join('; ')}` : '';
+      return `${file.path}${kind}${why}`;
+    });
+    parts.push(`${stale.ref} changed ${total} of the files head ${head.slice(0, 12)} changed since its base (${stale.behind} commit${stale.behind === 1 ? '' : 's'} behind): ${listed.join(' | ')}${total > files.length ? ` | +${total - files.length} more` : ''}`);
+  }
+  return parts.join('. ');
 }
 
-export function buildStaleBaseBrainLine(pair: TaskPairState, head: string, stale: { ref: string; behind: number; ageMs: number }, stage: 'ready' | 'pass'): string {
-  return `${header(pair)} At ${STALE_STAGE_LABEL[stage]}: ${describeStaleBase(head, stale)}; executor ${pair.executor ?? '-'} was told to rebase before the final round (a warning, not a gate).`;
+export function buildStaleBaseExecutorNotice(pair: TaskPairState, head: string, stale: StaleBaseReport, stage: 'ready' | 'pass'): string {
+  return `${header(pair)} At ${STALE_STAGE_LABEL[stage]}: ${describeStaleBase(head, stale)}. Rebase onto ${stale.ref} ${STALE_STAGE_DEADLINE[stage]}, re-run the affected tests and send a new READY_FOR_AUDIT with the new head. This is a warning, not a gate.`;
+}
+
+export function buildStaleBaseBrainLine(pair: TaskPairState, head: string, stale: StaleBaseReport, stage: 'ready' | 'pass'): string {
+  return `${header(pair)} At ${STALE_STAGE_LABEL[stage]}: ${describeStaleBase(head, stale)}; executor ${pair.executor ?? '-'} was told to rebase ${STALE_STAGE_DEADLINE[stage]} (a warning, not a gate).`;
 }
