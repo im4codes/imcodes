@@ -3,6 +3,7 @@ import { mkdir, readFile, writeFile, appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { createRequire } from 'node:module';
 import { burstyGaps, nextMarkdownPiece } from './stream-script.mjs';
+import { STALE_SESSION_NAME, buildStaleTimeline } from './stale-timeline.mjs';
 
 const require = createRequire(new URL('../../../server/package.json', import.meta.url));
 let Client;
@@ -26,13 +27,20 @@ const apiKey = 'deck_perf_browser_key';
 const sessions = Number(process.env.IMC_PERF_SESSIONS ?? 20);
 const streamingSessions = Number(process.env.IMC_PERF_STREAMING_SESSIONS ?? (process.env.IMC_PERF_VARIANT === 'streaming-off' ? 0 : 5));
 const streamHz = Number(process.env.IMC_PERF_STREAM_HZ ?? 25);
+// Stale-window scenario (opt-in): one extra session with a production-shaped timeline whose history is served
+// exactly as the real daemon does (newest `limit` of (afterTs, beforeTs), optional text-only), with a per-request
+// latency, and every request logged for the browser spec to read back.
+const historyFaithful = process.env.IMC_PERF_HISTORY_FAITHFUL === '1';
+const historyLatencyMs = Number(process.env.IMC_PERF_HISTORY_LATENCY_MS ?? 0);
+const staleSessionEnabled = process.env.IMC_PERF_STALE_SESSION === '1';
+const staleEvents = Number(process.env.IMC_PERF_STALE_EVENTS ?? 6000);
 const perfSeed = (0x4d57494e).toString(36);
 const sessionNames = Array.from({ length: sessions }, (_, index) => `deck_perflat_imcperf-${perfSeed}-${index.toString(36)}_brain`);
 const subSessionIds = Array.from({ length: Math.max(0, sessions - 1) }, (_, index) => `perfsub${index.toString(36)}`);
 const subSessionNames = subSessionIds.map((id) => `deck_sub_${id}`);
 const activeTimelineNames = [...sessionNames.slice(0, 1), ...subSessionNames];
 const longChatSessions = [500, 2000, 8000].map((size) => ({ size, name: `deck_perflat_imcperf-long${size}_brain` }));
-const allSessionNames = [...sessionNames, ...longChatSessions.map((item) => item.name)];
+const allSessionNames = [...sessionNames, ...longChatSessions.map((item) => item.name), ...(staleSessionEnabled ? [STALE_SESSION_NAME] : [])];
 const historyNames = [...allSessionNames, ...subSessionNames];
 const hash = crypto.createHash('sha256').update(token).digest('hex');
 const apiKeyHash = crypto.createHash('sha256').update(apiKey).digest('hex');
@@ -116,6 +124,7 @@ for (const { name, size } of longChatSessions) {
   events.push({ eventId: `perf-${name}-${size - 1}`, sessionId: name, epoch, seq: size - 1, ts: Date.now() + size - 1, type: 'assistant.text', payload: { text: `Long chat streaming ${size}`, streaming: true } });
   events.push({ eventId: `perf-${name}-${size}`, sessionId: name, epoch, seq: size, ts: Date.now() + size, type: 'assistant.text', payload: { text: `Long chat final ${size}`, streaming: false } });
 }
+if (staleSessionEnabled) history.set(STALE_SESSION_NAME, buildStaleTimeline({ total: staleEvents }));
 const announce = () => ws.send(JSON.stringify({ type: 'session_list', daemonVersion: 'perf-harness', sessions: allSessionNames.map((name, index) => ({ name, project: 'perflat-imcperf', projectDir: '/tmp/imc-perf-project', role: 'brain', agentType: 'perf', state: 'idle', runtimeType: 'transport', label: name.includes('-long') ? name.slice(name.indexOf('-long') + 1, -6) : `Perf ${index + 1}` })) }));
 const announceSubSession = (id) => {
   const index = subSessionIds.indexOf(id);
@@ -168,6 +177,34 @@ async function handleDownload(msg) {
   ws.send(JSON.stringify({ type: 'file.download_done', downloadId: msg.downloadId, content: bytes.toString('base64'), mime: record.mime, filename: record.originalName, size: bytes.length }));
 }
 
+const TEXT_TYPES = new Set(['user.message', 'assistant.text']);
+/** The real daemon's answer: the NEWEST `limit` events with afterTs < ts < beforeTs (text rows only for contentFilter=text). */
+async function serveFaithfulHistory(msg) {
+  const all = history.get(msg.sessionName) ?? [];
+  const limit = Math.max(1, Math.min(Number(msg.limit) || 200, 200));
+  const afterTs = Number.isFinite(msg.afterTs) ? msg.afterTs : (Number.isFinite(msg.cursor?.afterTs) ? msg.cursor.afterTs : undefined);
+  const beforeTs = Number.isFinite(msg.beforeTs) ? msg.beforeTs : (Number.isFinite(msg.cursor?.beforeTs) ? msg.cursor.beforeTs : undefined);
+  const textOnly = msg.contentFilter === 'text';
+  const inRange = all.filter((event) => (afterTs === undefined || event.ts > afterTs)
+    && (beforeTs === undefined || event.ts < beforeTs)
+    && (!textOnly || TEXT_TYPES.has(event.type)));
+  const events = inRange.slice(Math.max(0, inRange.length - limit));
+  if (historyLatencyMs > 0) await new Promise((resolve) => setTimeout(resolve, historyLatencyMs));
+  const type = msg.type === 'timeline.page_request' ? 'timeline.page' : 'timeline.history';
+  const first = events[0];
+  ws.send(JSON.stringify({
+    type, sessionName: msg.sessionName, requestId: msg.requestId, status: 'ok', source: 'cache', epoch,
+    events, hasMore: inRange.length > limit, payloadTruncated: false,
+    ...(first ? { nextCursor: { epoch, beforeTs: first.ts, direction: 'older' } } : {}),
+  }));
+  if (msg.sessionName === STALE_SESSION_NAME) {
+    await appendFile(path.join(uploadRoot, 'stale-history.ndjson'), `${JSON.stringify({
+      t: Date.now(), type: msg.type, limit, afterTs, beforeTs, contentFilter: msg.contentFilter ?? null,
+      returned: events.length, oldestTs: first?.ts ?? null, newestTs: events.at(-1)?.ts ?? null,
+    })}\n`).catch(() => {});
+  }
+}
+
 ws.on('message', (raw) => {
   let msg;
   try { msg = JSON.parse(raw.toString()); } catch { return; }
@@ -208,6 +245,10 @@ ws.on('message', (raw) => {
     return;
   }
   if (typeof msg.sessionName !== 'string') return;
+  if (historyFaithful && (msg.type === 'timeline.history_request' || msg.type === 'timeline.page_request')) {
+    void serveFaithfulHistory(msg);
+    return;
+  }
   if (msg.type === 'timeline.history_request' || msg.type === 'timeline.replay_request' || msg.type === 'timeline.page_request') {
     const events = history.get(msg.sessionName) ?? [];
     const afterSeq = Number(msg.cursor?.afterSeq ?? msg.afterSeq ?? 0);

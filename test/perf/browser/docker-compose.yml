@@ -107,6 +107,11 @@ services:
       IMC_PERF_STREAM_CADENCE: ${IMC_PERF_STREAM_CADENCE:-}
       IMC_PERF_STREAMING_SESSIONS: ${IMC_PERF_STREAMING_SESSIONS:-5}
       IMC_PERF_UPLOAD_ROOT: /tmp/imc-perf-uploads
+      # Stale-window scenario (opt-in, see stale-window-open.spec.mjs); all inert unless set.
+      IMC_PERF_HISTORY_FAITHFUL: ${IMC_PERF_HISTORY_FAITHFUL:-0}
+      IMC_PERF_HISTORY_LATENCY_MS: ${IMC_PERF_HISTORY_LATENCY_MS:-0}
+      IMC_PERF_STALE_SESSION: ${IMC_PERF_STALE_SESSION:-0}
+      IMC_PERF_STALE_EVENTS: ${IMC_PERF_STALE_EVENTS:-6000}
     command: ["node", "/repo/test/perf/browser/daemon-client.mjs"]
     depends_on:
       server:
@@ -164,6 +169,44 @@ services:
       web:
         condition: service_healthy
       server:
+        condition: service_started
+    cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
+    mem_limit: 4g
+    shm_size: 1g
+    pids_limit: 512
+
+  # Stale chat window opened on a phone-shaped browser: latest messages first, then the gap newest -> oldest.
+  # Kept behind the stale profile; the shared `daemon` service must run with IMC_PERF_HISTORY_FAITHFUL=1 and
+  # IMC_PERF_STALE_SESSION=1 (run-stale-window.sh sets both).
+  stale-harness:
+    profiles: ["stale"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - type: bind
+        source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
+        target: /repo/perf-results
+      - perf_uploads:/tmp/imc-perf-uploads:ro
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_REVISION: ${IMC_PERF_REVISION:-unknown}
+      IMC_PERF_JWT_SIGNING_KEY: perf-only-jwt-jwt-signing-key-32-bytes-minimum
+      IMC_PERF_STALE_EVENTS: ${IMC_PERF_STALE_EVENTS:-6000}
+      IMC_PERF_STALE_CACHED: ${IMC_PERF_STALE_CACHED:-150}
+      IMC_PERF_STALE_CPU_RATE: ${IMC_PERF_STALE_CPU_RATE:-4}
+      IMC_PERF_STALE_MODES: ${IMC_PERF_STALE_MODES:-pinned,reading}
+      IMC_PERF_STALE_EXPECT_HEAD: ${IMC_PERF_STALE_EXPECT_HEAD:-1}
+      IMC_PERF_STALE_SAMPLE_MS: ${IMC_PERF_STALE_SAMPLE_MS:-20000}
+      IMC_PERF_STALE_OUT: /repo/perf-results/stale-window
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/stale-window-open.spec.mjs"]
+    depends_on:
+      server:
+        condition: service_started
+      daemon:
         condition: service_started
     cpus: 2.0
     cpuset: ${IMC_PERF_CPUSET:-0-3}

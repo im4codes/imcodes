@@ -6,6 +6,7 @@ import { planSubWindows, seedVisibility } from './sub-window-plan.mjs';
 const require = createRequire(new URL('../../../web/package.json', import.meta.url));
 const { chromium } = require('@playwright/test');
 import { buildWorkload } from './load-generator.mjs';
+import { signPerfJwt } from './perf-auth.mjs';
 import { aggregate, collectMetrics, installObservers } from './metrics.mjs';
 import { installFlickerProbe, analyze as analyzeFlicker, verdicts as flickerVerdicts } from './chat-stream-flicker.spec.mjs';
 
@@ -254,15 +255,7 @@ async function stopScrollJitterProbe(page) {
 }
 
 function perfJwt() {
-  const b64 = (value) => Buffer.from(value).toString('base64url');
-  const header = b64(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-  const now = Math.floor(Date.now() / 1000);
-  // The compose-only user is an owner so the real SPA's owner-scoped
-  // capabilities probe is authorized. This signing key is test-only and is
-  // never accepted by production deployments.
-  const claims = b64(JSON.stringify({ sub: 'imc_perf_user', role: 'owner', type: 'web', iat: now, exp: now + 3600 }));
-  const input = `${header}.${claims}`;
-  return `${input}.${crypto.createHmac('sha256', JWT_SIGNING_KEY).update(input).digest('base64url')}`;
+  return signPerfJwt(JWT_SIGNING_KEY);
 }
 
 
