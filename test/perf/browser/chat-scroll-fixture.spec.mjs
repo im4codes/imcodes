@@ -31,7 +31,7 @@ const OUTPUT = process.env.IMC_CHAT_SCROLL_OUTPUT ?? '/tmp/chat-scroll-fixture.j
 const PINNED_MS = Number(process.env.IMC_CHAT_SCROLL_PINNED_MS ?? 20_000);
 const LONG_ROWS = Number(process.env.IMC_CHAT_SCROLL_LONG_ROWS ?? 3_000);
 const NO_FAIL = process.env.IMC_CHAT_SCROLL_NO_FAIL === '1';
-const VIEWPORTS = [
+export const VIEWPORTS = [
   { label: 'desktop', width: 1280, height: 720, dpr: 1, mobile: false },
   { label: 'mobile', width: 390, height: 844, dpr: 2, mobile: true },
 ];
@@ -41,7 +41,7 @@ const TOL = 1;
 
 /** Installed in the page: builds the event list, streams into the real ChatView
  * through the fixture harness, and samples every animation frame. */
-function installDriver({ rows }) {
+export function installDriver({ rows }) {
   const sessionId = 'fixture-window-0';
   let seq = 0;
   let events = [];
@@ -51,6 +51,7 @@ function installDriver({ rows }) {
     return Array.from({ length: lines }, (_, k) => `row ${i} line ${k}: ${'lorem ipsum dolor sit amet '.repeat(1 + ((i + k) % 4))}`).join('\n\n');
   };
   for (let i = 0; i < rows; i += 1) events.push(mk(i % 2 ? 'user.message' : 'assistant.text', { text: paragraph(i), streaming: false }));
+  const cur0OpenText = (event) => typeof event?.payload?.text === 'string' && event.payload.text.includes('```');
   const harness = window.__chatTimelineHarness;
   const publish = () => harness.setEvents(events);
   let streamingIndex = -1;
@@ -59,14 +60,22 @@ function installDriver({ rows }) {
     streamId: null,
     chunkCount: 0,
     toolCount: 0,
+    /** 'prose' (default) | 'code' (an unclosed fenced block growing line by line) | 'list' (bullet list) */
+    pieceMode: 'prose',
+    /** Text the next opened stream starts with (very long single message). */
+    seedText: '',
     openStream() {
-      const e = mk('assistant.text', { text: '', streaming: true });
+      const e = mk('assistant.text', { text: driver.seedText, streaming: true });
       events = [...events, e]; streamingIndex = events.length - 1; driver.streamId = e.eventId; publish();
     },
     chunk() {
       if (streamingIndex < 0) driver.openStream();
       const n = ++driver.chunkCount;
-      const piece = n % 37 === 0 ? '\n\n## Section\n- point a\n- point b\n\n' : `${' word'.repeat(1 + (n % 4))}`;
+      const piece = driver.pieceMode === 'code'
+        ? (cur0OpenText(events[streamingIndex]) ? `const value${n} = compute(${n}, 'streamed line ${n}');\n` : '```ts\n')
+        : driver.pieceMode === 'list'
+          ? (n % 3 === 0 ? `\n- item ${n}${' word'.repeat(1 + (n % 5))}` : `${' word'.repeat(1 + (n % 4))}`)
+          : n % 37 === 0 ? '\n\n## Section\n- point a\n- point b\n\n' : `${' word'.repeat(1 + (n % 4))}`;
       const cur = events[streamingIndex];
       const next = [...events];
       next[streamingIndex] = { ...cur, payload: { ...cur.payload, text: `${cur.payload.text}${piece}`, streaming: true } };
@@ -164,7 +173,7 @@ function installDriver({ rows }) {
   jit.clearAnchor = () => { jit.anchorKey = null; };
 }
 
-const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+export const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function analyzePinned(frames) {
   let maxReverse = 0; let maxGap = 0; let reverseAt = null; let gapAt = null;
@@ -212,7 +221,7 @@ function maxForcedDown(frames) {
   for (let i = 1; i < frames.length; i += 1) { const d = frames[i].top - frames[i - 1].top; if (d > m) { m = d; at = i; } }
   return { px: round(m), context: at === null ? [] : frames.slice(Math.max(0, at - 3), at + 3).map((f) => ({ t: round(f.t), top: round(f.top), sh: f.scrollHeight, ch: f.clientHeight, gap: round(f.bottomGap) })) };
 }
-function round(v) { return Math.round(v * 100) / 100; }
+export function round(v) { return Math.round(v * 100) / 100; }
 
 async function gesture(page, cdp, viewport, direction, distance) {
   // direction 'up' = reveal older content. Real wheel on desktop, real touch
