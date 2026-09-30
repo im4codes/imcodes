@@ -129,6 +129,14 @@ export interface ChatTimelineHarnessApi {
    * Returns the id and the new text length.
    */
   appendStreamingChunk(chunk?: string): { eventId: string; length: number };
+  /**
+   * Turns on backward pagination like the real timeline hook: each `onLoadOlder`
+   * shows the loading state, then after `delayMs` prepends the next page (newest
+   * page first) and clears it. `hasOlderHistory` is true while pages remain.
+   */
+  setOlderPages(pages: TimelineEvent[][], delayMs?: number): void;
+  /** Older pages not yet prepended (a page counts as taken when its request starts). */
+  olderPagesRemaining(): number;
   /** Restores the generated fixture events (new array identity). */
   reset(): void;
   /** Times `buildViewItems` over the current events. */
@@ -154,6 +162,26 @@ let harnessCounter = 0;
 function publish(next: TimelineEvent[]): void {
   currentEvents = next;
   publishEvents?.(next);
+}
+
+/** Backward-pagination state (see `setOlderPages`). */
+let olderPages: TimelineEvent[][] = [];
+let olderDelayMs = 250;
+let olderLoading = false;
+let publishOlderState: ((state: { loading: boolean; hasMore: boolean }) => void) | null = null;
+function publishOlder(): void {
+  publishOlderState?.({ loading: olderLoading, hasMore: olderPages.length > 0 });
+}
+function loadOlderPage(): void {
+  if (olderLoading || olderPages.length === 0) return;
+  olderLoading = true;
+  publishOlder();
+  setTimeout(() => {
+    const page = olderPages.shift();
+    if (page) publish([...page, ...currentEvents]);
+    olderLoading = false;
+    publishOlder();
+  }, olderDelayMs);
 }
 
 /**
@@ -227,6 +255,13 @@ const harness: ChatTimelineHarnessApi = {
     publish(next);
     return { eventId: grown.eventId, length: text.length };
   },
+  olderPagesRemaining: () => olderPages.length,
+  setOlderPages(pages, delayMs = 250) {
+    olderPages = pages.map((page) => [...page]);
+    olderDelayMs = delayMs;
+    olderLoading = false;
+    publishOlder();
+  },
   reset() {
     harnessCounter = 0;
     publish([...initialEvents]);
@@ -269,10 +304,12 @@ function FixtureBottomChrome() {
 function FixtureHarness() {
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   publishEvents = setEvents;
+  const [older, setOlder] = useState({ loading: false, hasMore: false });
+  publishOlderState = setOlder;
   useEffect(() => {
     harness.ready = true;
     document.documentElement.setAttribute('data-chat-timeline-harness', 'ready');
-    return () => { publishEvents = null; };
+    return () => { publishEvents = null; publishOlderState = null; };
   }, []);
 
   const cellStyle = windowCount === 4
@@ -297,6 +334,9 @@ function FixtureHarness() {
               <ChatView
                 events={events}
                 loading={false}
+                loadingOlder={older.loading}
+                hasOlderHistory={older.hasMore}
+                onLoadOlder={loadOlderPage}
                 sessionId={`fixture-window-${i}`}
                 serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
                 messagePinsEnabled={fixturePinsEnabled}
@@ -306,6 +346,9 @@ function FixtureHarness() {
             <ChatView
               events={events}
               loading={false}
+              loadingOlder={older.loading}
+              hasOlderHistory={older.hasMore}
+              onLoadOlder={loadOlderPage}
               sessionId={`fixture-window-${i}`}
               serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
               messagePinsEnabled={fixturePinsEnabled}

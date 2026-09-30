@@ -166,12 +166,25 @@ export function installDriver({ rows, gaps = [], mdScript = '', mdPieceLengths =
   };
   const paintedTick = () => { requestAnimationFrame(paintedTick); if (jit.recording) channel.port2.postMessage(0); };
   window.__jit = jit;
+  // Programmatic scroll writes by the app (setter on the chat root), so a jump can be
+  // told apart from the browser/harness moving the viewport (e.g. an automation click
+  // scrolling its target into view).
+  jit.writes = [];
+  const hookWrites = () => {
+    const root = findRoot();
+    if (!root || root.__jitHooked) return;
+    root.__jitHooked = true;
+    const desc = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollTop');
+    Object.defineProperty(root, 'scrollTop', { configurable: true, get() { return desc.get.call(this); }, set(v) { if (jit.recording) jit.writes.push({ t: performance.now(), phase: jit.phase, from: desc.get.call(this), to: v }); desc.set.call(this, v); } });
+  };
   jit.begin = (phase) => {
+    hookWrites();
+    jit.writes = [];
     jit.frames = []; jit.painted = []; jit.phase = phase; jit.recording = true;
     if (!jit.started) { jit.started = true; requestAnimationFrame(tick); requestAnimationFrame(paintedTick); }
   };
   jit.setPhase = (phase) => { jit.phase = phase; };
-  jit.end = () => { jit.recording = false; const out = { frames: jit.frames, painted: jit.painted }; jit.frames = []; jit.painted = []; return out; };
+  jit.end = () => { jit.recording = false; const out = { frames: jit.frames, painted: jit.painted, writes: jit.writes }; jit.frames = []; jit.painted = []; return out; };
   /** Picks a real, fully visible message row (not the streaming/last row). */
   jit.pickAnchor = () => {
     const root = findRoot();
@@ -211,8 +224,10 @@ function analyzePinned(frames) {
   return { frames: frames.length, maxReversePx: round(maxReverse), maxBottomGapPx: round(maxGap), reverseAtFrame: reverseAt, gapAtFrame: gapAt, reverseContext: around(reverseAt), gapContext: around(gapAt) };
 }
 /** rAF-time frames (what Cx22's probe measured) plus painted-state frames. */
-function analyzeBoth({ frames, painted }) {
+function analyzeBoth({ frames, painted, writes }) {
   const raf = analyzePinned(frames);
+  raf.appWrites = (writes ?? []).length;
+  if (raf.maxReversePx > TOL || raf.maxBottomGapPx > TOL) raf.appWriteList = (writes ?? []).slice(0, 8).map((w) => ({ t: round(w.t), from: round(w.from), to: round(w.to) }));
   raf.painted = analyzePinned(painted);
   return raf;
 }
