@@ -151,11 +151,8 @@ describe('resolveTaskPairTurnCwd', () => {
       const clone = dir('works/plain/C1');
       for (const kind of ['worktree', 'dir', 'snapshot']) {
         savePair('C1', undefined, { workspace: { kind, path: clone, createdAt: 1, status: 'active', snapshot: { mode: 'clone', projectRoot: project } } as never });
-        // 'dir' without a recorded workingDir falls back to the in-place rule; a recorded workingDir wins over it.
-        if (kind !== 'dir') both(clone, 'C1');
+        both(clone, 'C1');
       }
-      savePair('C1', undefined, { workspace: { kind: 'dir', path: clone, workingDir: clone, createdAt: 1, status: 'active' } as never });
-      both(clone, 'C1');
     });
 
     it('non-git project, in place: the project directory; the task directory is only scratch', () => {
@@ -165,9 +162,10 @@ describe('resolveTaskPairTurnCwd', () => {
       // Recorded: workingDir names the project directory.
       savePair('P1', undefined, { workspace: { kind: 'dir', path: scratch, workingDir: project, createdAt: 1, status: 'active' } as never });
       both(project, 'P1');
-      // Not recorded (a pair from before the field): derived from "a daemon-made task dir in a project without .git".
+      // Not recorded (the empty task-directory fallback, or a pair from before the field): the workspace path, never the project.
       savePair('P1', undefined, { workspace: { kind: 'dir', path: scratch, createdAt: 1, status: 'active' } as never });
-      both(project, 'P1');
+      both(scratch, 'P1');
+      savePair('P1', undefined, { workspace: { kind: 'dir', path: scratch, workingDir: project, createdAt: 1, status: 'active' } as never });
       // It ends with the pair, like any other workspace.
       savePair('P1', undefined, { workspace: { kind: 'dir', path: scratch, workingDir: project, createdAt: 1, status: 'active' } as never }, 'done');
       expect(resolveTaskPairTurnCwd(EXEC)).toBeUndefined();
