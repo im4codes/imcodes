@@ -222,14 +222,14 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
   };
   // Render-mode flips of the streaming bubble (raw <-> Markdown) and height regressions.
   const modeStats = (list) => {
-    let flips = 0; let raw = 0; let prev = null; const flipAt = [];
+    let flips = 0; let raw = 0; let prev = null; const flipAt = []; const allFlips = [];
     for (const f of list) {
       if (!f.mounted || f.mode === 'empty') { prev = null; continue; }
       if (f.mode === 'raw') raw += 1;
-      if (prev && prev.key === f.key && prev.mode !== f.mode) { flips += 1; if (flipAt.length < 6) flipAt.push({ t: round(f.t), from: prev.mode, to: f.mode, len: f.len }); }
+      if (prev && prev.key === f.key && prev.mode !== f.mode) { flips += 1; allFlips.push(`${prev.mode}->${f.mode}`); if (flipAt.length < 6) flipAt.push({ t: round(f.t), from: prev.mode, to: f.mode, len: f.len }); }
       prev = f;
     }
-    return { flips, rawFrames: raw, flipAt };
+    return { flips, rawFrames: raw, flipAt, flipDirections: allFlips };
   };
   const heightStats = (list) => {
     let maxDrop = 0; let drops = 0; let prev = null; let atIdx = -1;
@@ -269,8 +269,11 @@ export function verdicts(result, variant = {}) {
   need(a.remounts.wrapper === 0 && a.remounts.event === 0 && a.remounts.text === 0, `streaming row remounted (${JSON.stringify(a.remounts)})`);
   need(a.remounts.near === 0, `neighbour rows remounted (${a.remounts.near})`);
   need(a.blankingFrames === 0, `${a.blankingFrames} blanking frames (text shrank / opacity 0 / hidden)`);
-  const maxFlips = variant.maxFlips ?? 0;
-  need(a.renderMode.rAF.flips <= maxFlips && a.renderMode.painted.flips <= maxFlips, `streaming bubble flipped raw<->Markdown ${a.renderMode.rAF.flips}x (rAF) / ${a.renderMode.painted.flips}x (painted), allowed ${maxFlips}`);
+  // Allowed flips are PER STREAMED MESSAGE (every message opens with the variant's seed text).
+  const maxFlips = (variant.maxFlips ?? 0) * Math.max(1, a.streamsSeen);
+  need(a.renderMode.rAF.flips <= maxFlips && a.renderMode.painted.flips <= maxFlips, `streaming bubble flipped raw<->Markdown ${a.renderMode.rAF.flips}x (rAF) / ${a.renderMode.painted.flips}x (painted), allowed ${maxFlips} (${a.streamsSeen} streams)`);
+  // Crossing the plain-text limit is one-way: never back to Markdown.
+  if (variant.allowRawTail) need(a.renderMode.rAF.flipDirections.every((direction) => direction === 'markdown->raw'), `a stream returned from plain text to Markdown (${a.renderMode.rAF.flipDirections.join(',')})`);
   if (variant.expectRaw) need(a.renderMode.rAF.rawFrames === a.frames - a.unmountedStreamFrames || a.renderMode.rAF.flips === 0, 'oversized message should be plain text throughout');
   else if (!variant.allowRawTail) need(a.renderMode.rAF.rawFrames === 0 && a.renderMode.painted.rawFrames === 0, `streaming bubble shown as raw text in ${a.renderMode.rAF.rawFrames} rAF / ${a.renderMode.painted.rawFrames} painted frames`);
   need(variant.allowRawTail || (a.height.rAF.dropFrames === 0 && a.height.painted.dropFrames === 0), `streaming bubble height shrank in ${a.height.rAF.dropFrames} rAF / ${a.height.painted.dropFrames} painted frames (max ${a.height.rAF.maxDropPx}px)`);
