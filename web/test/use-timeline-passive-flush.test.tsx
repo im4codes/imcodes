@@ -111,3 +111,77 @@ describe('passive timeline presentations flush slowly', () => {
     expect(t.events().find((e) => e.eventId === 'state-active')?.payload?.state).toBe('running');
   }, 60_000);
 });
+
+// Two presentations of ONE session (a window and its card) share the per-session
+// cache. A merge by the visible one used to re-render the passive one at once.
+describe('passive presentations do not re-render on every shared-cache merge', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(window, 'requestAnimationFrame').mockImplementation((cb: FrameRequestCallback) =>
+      setTimeout(() => cb(Date.now()), 0) as unknown as number);
+    vi.spyOn(window, 'cancelAnimationFrame').mockImplementation((id: number) => clearTimeout(id));
+    __resetTimelineCacheForTests();
+  });
+  afterEach(() => { cleanup(); __resetTimelineCacheForTests(); vi.restoreAllMocks(); vi.useRealTimers(); });
+
+  function pair(passiveOptions: Options) {
+    const handlers = new Set<(m: ServerMessage) => void>();
+    const ws = {
+      connected: false,
+      onMessage: (fn: (m: ServerMessage) => void) => { handlers.add(fn); return () => { handlers.delete(fn); }; },
+      sendTimelineHistoryRequest: vi.fn(() => 'history-req'),
+    } as unknown as WsClient;
+    const stats = { visibleRenders: 0, passiveRenders: 0 };
+    let visibleEvents: TimelineEvent[] = [];
+    let passiveEvents: TimelineEvent[] = [];
+    let passiveOpts = passiveOptions;
+    function Visible() {
+      stats.visibleRenders += 1;
+      visibleEvents = useTimeline('deck_perf_brain', ws, null, VISIBLE).events;
+      return <div>v{visibleEvents.length}</div>;
+    }
+    function Passive() {
+      stats.passiveRenders += 1;
+      passiveEvents = useTimeline('deck_perf_brain', ws, null, passiveOpts).events;
+      return <div>p{passiveEvents.length}</div>;
+    }
+    return {
+      Visible, Passive, stats,
+      setPassiveOptions: (next: Options) => { passiveOpts = next; },
+      // The server delivers a frame to every hook's subscription; only the
+      // visible hook flushes on the fast cadence, so it is the one that merges.
+      send: (e: TimelineEvent) => { for (const handler of [...handlers]) handler({ type: 'timeline.event', event: e } as ServerMessage); },
+      visibleEvents: () => visibleEvents,
+      passiveEvents: () => passiveEvents,
+    };
+  }
+
+  it('the passive hook applies the shared snapshot on the slow cadence; the visible hook does not wait', async () => {
+    const t = pair(PASSIVE);
+    render(<div><t.Visible /><t.Passive /></div>);
+    await act(async () => {});
+    await act(async () => { vi.advanceTimersByTime(20); await Promise.resolve(); });
+    const passiveBefore = t.stats.passiveRenders;
+    for (let i = 0; i < 40; i += 1) {
+      act(() => { t.send({ ...evt(i, 'session.state', { state: i % 2 ? 'idle' : 'running' }), eventId: 'state-shared' } as TimelineEvent); });
+      await act(async () => { vi.advanceTimersByTime(20); await Promise.resolve(); });
+    }
+    // 800 ms of 25 Hz traffic: the visible hook followed it, the passive one committed only a couple of times.
+    expect(t.visibleEvents().find((e) => e.eventId === 'state-shared')).toBeDefined();
+    expect(t.stats.passiveRenders - passiveBefore).toBeLessThanOrEqual(3);
+    await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS + 50); await Promise.resolve(); await Promise.resolve(); });
+    expect(t.passiveEvents().find((e) => e.eventId === 'state-shared'), 'it converges to the same snapshot').toBeDefined();
+    expect(t.passiveEvents()).toBe(t.visibleEvents());
+  }, 60_000);
+
+  // Counterexample: a second VISIBLE presentation must stay in lock-step (windows side by side).
+  it('a second visible presentation follows the shared cache without the slow cadence', async () => {
+    const t = pair(VISIBLE);
+    render(<div><t.Visible /><t.Passive /></div>);
+    await act(async () => {});
+    await act(async () => { vi.advanceTimersByTime(20); await Promise.resolve(); });
+    act(() => { t.send({ ...evt(1, 'session.state', { state: 'running' }), eventId: 'state-lockstep' } as TimelineEvent); });
+    await act(async () => { vi.advanceTimersByTime(80); await Promise.resolve(); await Promise.resolve(); });
+    expect(t.passiveEvents().find((e) => e.eventId === 'state-lockstep')?.payload?.state).toBe('running');
+  }, 60_000);
+});

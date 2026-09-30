@@ -2470,11 +2470,38 @@ export function useTimeline(
     setHistoryStatus(createBootstrapHistoryStatus({ canHttp: false }));
   }, [cacheKey, disableHistory, isActiveSession, sessionId]);
 
+  // The shared per-session cache fans every merge out to EVERY hook of that
+  // session (card, window, pane). Presentations nobody is looking at only need
+  // the newest snapshot eventually, so they apply it on the passive cadence
+  // instead of one render per merge; visible/active ones apply it at once.
+  const applyPassiveCacheSnapshotRef = useRef<(() => void) | null>(null);
   useEffect(() => {
     if (!cacheKey) return;
-    return subscribeCache(cacheKey, (nextEvents) => {
-      setEvents((prev) => (prev === nextEvents ? prev : nextEvents));
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let latest: TimelineEvent[] | null = null;
+    const apply = () => {
+      if (timer !== null) { clearTimeout(timer); timer = null; }
+      const next = latest;
+      latest = null;
+      if (next) setEvents((prev) => (prev === next ? prev : next));
+    };
+    applyPassiveCacheSnapshotRef.current = apply;
+    const unsubscribe = subscribeCache(cacheKey, (nextEvents) => {
+      const passive = subscriptionModeRef.current === 'summary' && !isActiveSessionRef.current && !isVisibleRef.current;
+      if (!passive) {
+        if (timer !== null) { clearTimeout(timer); timer = null; }
+        latest = null;
+        setEvents((prev) => (prev === nextEvents ? prev : nextEvents));
+        return;
+      }
+      latest = nextEvents;
+      if (timer === null) timer = setTimeout(apply, PASSIVE_TIMELINE_FLUSH_MS);
     });
+    return () => {
+      unsubscribe();
+      if (timer !== null) clearTimeout(timer);
+      applyPassiveCacheSnapshotRef.current = null;
+    };
   }, [cacheKey]);
 
   // Reset on session change — but DON'T clear events when sessionId becomes null
@@ -3930,7 +3957,9 @@ export function useTimeline(
   // A presentation that was passive and is now visible/active must not wait out
   // the slow cadence: flush what accumulated so it paints current state.
   useEffect(() => {
-    if (!(isVisible || isActiveSession) || pendingRealtimeEventsRef.current.size === 0) return;
+    if (!(isVisible || isActiveSession)) return;
+    applyPassiveCacheSnapshotRef.current?.();
+    if (pendingRealtimeEventsRef.current.size === 0) return;
     pendingRealtimeFlushCancelRef.current?.();
     flushPendingRealtimeEvents();
   }, [flushPendingRealtimeEvents, isActiveSession, isVisible]);
