@@ -329,6 +329,14 @@ function recover(args) {
     }
   }
   const now = Date.now();
+  // Leftovers are named after the upgrade script that made them (its pid). One whose
+  // owner is gone is an orphan (a killed or crashed run) and goes at once; one whose
+  // owner still runs is left alone; anything unparseable goes after a day.
+  const ownerIsGone = (name) => {
+    const pid = Number.parseInt(name.slice(name.lastIndexOf('.') + 1), 10);
+    if (!Number.isInteger(pid) || pid <= 1) return false;
+    try { process.kill(pid, 0); return false; } catch (error) { return error.code === 'ESRCH'; }
+  };
   const sweep = (dir, prefixes) => {
     let names = [];
     try { names = readdirSync(dir); } catch { return; }
@@ -336,7 +344,7 @@ function recover(args) {
       if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
       const full = join(dir, name);
       try {
-        if (now - statSync(full).mtimeMs > STALE_LEFTOVER_MS) { say(`removing stale ${full}`); removeQuietly(full); }
+        if (ownerIsGone(name) || now - statSync(full).mtimeMs > STALE_LEFTOVER_MS) { say(`removing orphaned ${full}`); removeQuietly(full); }
       } catch { /* gone */ }
     }
   };

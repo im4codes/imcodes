@@ -331,6 +331,21 @@ describe('posix-atomic-install.mjs', () => {
     expect(realpathSync(join(fixture.binDir, 'imcodes'))).toBe(join(fixture.livePackage, 'dist', 'src', 'index.js'));
   });
 
+  it('recover removes the stage and old copies of a dead upgrade at once, and leaves those of a live one alone', () => {
+    const lib = join(fixture.prefix, 'lib');
+    const live = spawn('sleep', ['300'], { stdio: 'ignore' });
+    children.push(live);
+    const dead = spawnSync('true').pid; // exited: its pid is gone
+    mkdirSync(join(lib, `.imcodes-stage.${dead}`), { recursive: true });
+    mkdirSync(join(fixture.globalRoot, `.imcodes-old.${dead}`), { recursive: true });
+    mkdirSync(join(lib, `.imcodes-stage.${live.pid}`), { recursive: true });
+    const result = run('recover', '--global-root', fixture.globalRoot, '--bin-dir', fixture.binDir);
+    expect(result.status).toBe(0);
+    expect(existsSync(join(lib, `.imcodes-stage.${dead}`))).toBe(false);
+    expect(existsSync(join(fixture.globalRoot, `.imcodes-old.${dead}`))).toBe(false);
+    expect(existsSync(join(lib, `.imcodes-stage.${live.pid}`))).toBe(true);
+  });
+
   it('a switch whose second rename fails puts the previous package back (nothing staged to move)', () => {
     const before = treeHash(fixture.livePackage);
     const result = run('switch', '--global-root', fixture.globalRoot, '--tag', 'nostage', '--stage-prefix', join(fixture.prefix, 'lib', '.imcodes-stage.missing'));
