@@ -135,6 +135,8 @@ vi.mock('fs', async (importOriginal) => {
   return {
     ...actual,
     writeFileSync: vi.fn(captureWriteFileSync),
+    // The staged POSIX upgrade copies its installer into the (mocked, never created) script dir.
+    copyFileSync: vi.fn(),
     mkdtempSync: vi.fn(() => '/tmp/imcodes-upgrade-gate-test'),
   };
 });
@@ -144,6 +146,8 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...actual,
     writeFileSync: vi.fn(captureWriteFileSync),
+    // The staged POSIX upgrade copies its installer into the (mocked, never created) script dir.
+    copyFileSync: vi.fn(),
     mkdtempSync: vi.fn(() => '/tmp/imcodes-upgrade-gate-test'),
   };
 });
