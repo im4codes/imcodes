@@ -11,7 +11,7 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks'
 import { useTranslation } from 'react-i18next';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
-import { SessionControls } from './SessionControls.js';
+import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';

@@ -20,7 +20,7 @@ import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
 import type { SubSession } from '../hooks/useSubSessions.js';
 import { getActiveThinkingTs, isVisuallyBusy } from '../thinking-utils.js';
-import { SessionControls } from './SessionControls.js';
+import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import type { SessionInfo } from '../types.js';
 import { IdleFlashLayer } from './IdleFlashLayer.js';
 import { useIdleFlashPlayback } from '../hooks/useIdleFlashPlayback.js';

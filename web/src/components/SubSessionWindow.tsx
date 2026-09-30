@@ -13,7 +13,7 @@ import { formatLabel } from '../format-label.js';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './FileBrowser.js';
-import { SessionControls } from './SessionControls.js';
+import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { FloatingPanel } from './FloatingPanel.js';
 import { DesktopWindowMaximizeButton } from './DesktopWindowMaximizeButton.js';

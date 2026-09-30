@@ -80,6 +80,7 @@ import { formatTransferBytes, formatTransferDuration } from '../util/transfer-fo
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
+import { collectSettledQueuedIds } from '../session-controls-queue.js';
 import { deriveSessionLiveStatus, isRunningSessionState } from '../session-live-status.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import {
@@ -307,6 +308,12 @@ interface Props {
    * queue card. This also closes event-before-listener and reconnect/replay gaps.
    */
   transportTimelineEvents?: readonly TimelineEvent[];
+  /**
+   * Precomputed `collectSettledQueuedIds(transportTimelineEvents, …)`, supplied by
+   * StableSessionControls so this component need not re-render (or rescan the
+   * timeline) when only unrelated timeline events changed.
+   */
+  timelineSettledQueuedIds?: ReadonlySet<string>;
   /** Mobile: open full-screen file browser overlay. */
   mobileFileBrowserOpen?: boolean;
   onMobileFileBrowserClose?: () => void;
@@ -1196,7 +1203,7 @@ function extractManualP2pTargets(
   return { orderedTargets, cleanText };
 }
 
-export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
+export function SessionControls({ ws, activeSession, connected: connectedProp, inputRef, onAfterAction, onStopProject, onRenameSession, onSettings, onShareSession, sessionPinned = false, stopBlockedByPinned = false, onToggleSessionPin, subSessionId, sessionDisplayName, quickData, detectedModel, hideShortcuts, onSend, onRemoveOptimisticMessage, onSubRestart, onSubNew, onSubStop, activeThinking = false, activeTransportTurn = false, transportTimelineEvents, timelineSettledQueuedIds: timelineSettledQueuedIdsProp, mobileFileBrowserOpen, onMobileFileBrowserClose, sessions, subSessions, serverId, fileDropTargetRef, quotes, onRemoveQuote, pendingPrefillText, onPendingPrefillApplied, compact, keyboardActive, onQuickOpenChange, onOverlayOpenChange, onTransportConfigSaved, onVersionSensitiveAction, onComposerTextChange }: Props) {
   recordPerfRender(activeSession?.name?.startsWith('deck_sub_') ? 'SessionControls:sub' : 'SessionControls:main');
   const { t, i18n } = useTranslation();
   const deliveryModePref = usePref<SessionSendDeliveryMode>(SESSION_SEND_DELIVERY_USER_PREF_KEY, {
@@ -1437,26 +1444,10 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const incomingQueuedTransportVersion = shouldUseRealtimeQueueOverride
     ? realtimeQueueOverride.version
     : activeSessionPendingVersion;
-  const timelineSettledQueuedIds = useMemo(() => {
-    const ids = new Set<string>();
-    const sessionName = activeSession?.name;
-    if (!sessionName || !transportTimelineEvents) return ids;
-    for (const event of transportTimelineEvents) {
-      if (event.sessionId !== sessionName) continue;
-      if (event.type !== 'user.message' && event.type !== TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE) continue;
-      const clientMessageId = typeof event.payload.clientMessageId === 'string'
-        ? event.payload.clientMessageId.trim()
-        : '';
-      if (clientMessageId) ids.add(clientMessageId);
-      if (event.type === 'user.message') {
-        const commandId = typeof event.payload.commandId === 'string'
-          ? event.payload.commandId.trim()
-          : '';
-        if (commandId) ids.add(commandId);
-      }
-    }
-    return ids;
-  }, [activeSession?.name, transportTimelineEvents]);
+  const timelineSettledQueuedIds = useMemo(
+    () => timelineSettledQueuedIdsProp ?? collectSettledQueuedIds(transportTimelineEvents, activeSession?.name),
+    [activeSession?.name, timelineSettledQueuedIdsProp, transportTimelineEvents],
+  );
   const queuedTransportEntries = useMemo<LocalQueuedTransportEntry[]>(() => {
     let merged: LocalQueuedTransportEntry[];
     if (optimisticQueuedEntries === null) merged = incomingQueuedTransportEntries;
