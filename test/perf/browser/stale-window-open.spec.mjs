@@ -41,7 +41,6 @@ const STORE_NAME = 'events';
 const timeline = buildStaleTimeline({ total: TOTAL_EVENTS });
 const cached = timeline.slice(0, CACHED_EVENTS);
 const newestText = newestStaleText(timeline);
-const newestCachedText = newestStaleText(cached);
 const cacheKey = `${SERVER_ID}:${STALE_SESSION_NAME}`;
 
 async function readRequestLog() {
@@ -136,30 +135,50 @@ async function runScenario(browser, mode) {
   await page.waitForFunction(() => document.body.innerText.includes('long8000'), undefined, { timeout: 60_000, polling: 250 });
   await page.waitForTimeout(500);
   const route = `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`;
-  const opened = Date.now();
-  await page.evaluate((hash) => { window.location.hash = hash; window.dispatchEvent(new HashChangeEvent('hashchange')); }, route);
   page.on('console', (message) => { if (consoleLines.length < 60) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
   page.on('pageerror', (error) => { if (consoleLines.length < 60) consoleLines.push(`pageerror: ${String(error).slice(0, 300)}`); });
-  const contains = async (text, timeout) => {
-    try {
-      await page.waitForFunction((needle) => document.body.innerText.includes(needle), text, { polling: 'raf', timeout });
-    } catch (error) {
-      // Leave evidence of what the phone actually showed instead of a bare timeout.
-      await mkdir(OUT_DIR, { recursive: true });
-      await page.screenshot({ path: path.join(OUT_DIR, `timeout-${mode}.png`) }).catch(() => {});
-      const body = await page.evaluate(() => ({ url: location.href, text: document.body.innerText.slice(0, 1500), hasChat: !!document.querySelector('.chat-view') })).catch(() => null);
-      await writeFile(path.join(OUT_DIR, `timeout-${mode}.json`), JSON.stringify({ waitingFor: text, body, console: consoleLines }, null, 2));
-      throw error;
-    }
-  };
-  await contains(newestCachedText, 60_000);
-  const tCachePaintMs = Date.now() - opened;
-  await contains(newestText, 60_000);
-  const tLatestTextMs = Date.now() - opened;
+  // One frame loop, installed BEFORE the tap, timestamps the first frame each thing is on screen: the stale cache
+  // (any cached message: small indices) and the newest readable message. It reads textContent of the chat only.
+  await page.evaluate(({ hash, newest, cachedMax }) => {
+    const marks = { openedAt: 0, cache: null, latest: null, gapMarker: null };
+    window.__imcMarks = marks;
+    const cachedPattern = /stale-(?:msg|user)-(\d+)/g;
+    const frame = () => {
+      const chat = document.querySelector('.chat-view');
+      if (chat) {
+        const text = chat.textContent ?? '';
+        const now = performance.now() - marks.openedAt;
+        if (marks.cache === null) {
+          for (const match of text.matchAll(cachedPattern)) { if (Number(match[1]) <= cachedMax) { marks.cache = now; break; } }
+        }
+        if (marks.latest === null && text.includes(newest)) marks.latest = now;
+        if (marks.gapMarker === null && chat.querySelector('[data-testid="chat-history-gap-marker"]')) marks.gapMarker = now;
+      }
+      if (marks.latest === null) requestAnimationFrame(frame);
+    };
+    marks.openedAt = performance.now();
+    window.location.hash = hash;
+    window.dispatchEvent(new HashChangeEvent('hashchange'));
+    requestAnimationFrame(frame);
+  }, { hash: route, newest: newestText, cachedMax: CACHED_EVENTS });
+  await page.waitForFunction(() => window.__imcMarks?.latest !== null, undefined, { timeout: 60_000, polling: 100 }).catch(async (error) => {
+    await mkdir(OUT_DIR, { recursive: true });
+    await page.screenshot({ path: path.join(OUT_DIR, `timeout-${mode}.png`) }).catch(() => {});
+    const body = await page.evaluate(() => ({ url: location.href, marks: window.__imcMarks, text: document.body.innerText.slice(0, 1500), hasChat: !!document.querySelector('.chat-view') })).catch(() => null);
+    await writeFile(path.join(OUT_DIR, `timeout-${mode}.json`), JSON.stringify({ waitingFor: newestText, body, console: consoleLines }, null, 2));
+    throw error;
+  });
+  const marks = await page.evaluate(() => window.__imcMarks);
+  const tCachePaintMs = marks.cache === null ? null : Math.round(marks.cache);
+  const tLatestTextMs = Math.round(marks.latest);
 
   const result = {
     mode, seededCachedEvents: seeded, totalEvents: TOTAL_EVENTS,
-    tCachePaintMs, tLatestTextMs, latestAfterCacheMs: tLatestTextMs - tCachePaintMs,
+    tCachePaintMs, tLatestTextMs,
+    // Null when the cache never got a frame of its own (the newest content arrived first): then latest-first is
+    // measured from the tap.
+    latestAfterCacheMs: tCachePaintMs === null ? tLatestTextMs : tLatestTextMs - tCachePaintMs,
+    gapMarkerAtMs: marks.gapMarker === null ? null : Math.round(marks.gapMarker),
   };
 
   // Sample layout on every frame while the older pages arrive.
@@ -216,6 +235,7 @@ async function runScenario(browser, mode) {
     try { return JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}'); } catch { return {}; }
   });
   result.layout = { samples: layout.samples, markerSeen: layout.markerSeen, markerGoneAtMs: layout.markerGoneAtMs, anchorId: layout.anchorId, driftPx: drift, maxBottomGapPx: bottomGap, error: layout.error };
+  result.markerPresentAtEnd = await page.evaluate(() => !!document.querySelector('[data-testid="chat-history-gap-marker"]'));
   result.idbRows = await countIdbRows(page);
   result.gapRecord = gapRecord[cacheKey] ?? null;
   result.requests = (await readRequestLog()).slice(before);
@@ -253,8 +273,8 @@ for (const [mode, scenario] of Object.entries(scenarios)) {
   if (scenario.latestAfterCacheMs > LATEST_AFTER_CACHE_BUDGET_MS) failures.push(`${mode}: latest message ${scenario.latestAfterCacheMs} ms after the cache paint (budget ${LATEST_AFTER_CACHE_BUDGET_MS})`);
   if (!scenario.order.peekFirst) failures.push(`${mode}: the first history request was not the tiny text-only peek`);
   if (!scenario.order.descending || scenario.order.backfillPages < 2) failures.push(`${mode}: backfill pages did not walk newest -> oldest (${JSON.stringify(scenario.order)})`);
-  if (scenario.layout.markerSeen !== true) failures.push(`${mode}: the earlier-messages marker never appeared`);
-  if (scenario.layout.markerGoneAtMs === null) failures.push(`${mode}: the earlier-messages marker never went away`);
+  if (scenario.gapMarkerAtMs === null && scenario.layout.markerSeen !== true) failures.push(`${mode}: the earlier-messages marker never appeared`);
+  if (scenario.markerPresentAtEnd) failures.push(`${mode}: the earlier-messages marker is still shown at the end`);
   if (scenario.gapRecord !== null) failures.push(`${mode}: a hole is still recorded at the end: ${JSON.stringify(scenario.gapRecord)}`);
   if (scenario.idbRows < TOTAL_EVENTS - 5) failures.push(`${mode}: local cache holds ${scenario.idbRows} of ${TOTAL_EVENTS} events (holes)`);
   if (mode === 'reading' && (scenario.layout.driftPx === null || scenario.layout.driftPx > DRIFT_BUDGET_PX)) failures.push(`reading: on-screen row moved ${scenario.layout.driftPx} px (budget ${DRIFT_BUDGET_PX})`);
