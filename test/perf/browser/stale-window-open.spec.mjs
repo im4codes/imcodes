@@ -125,12 +125,19 @@ async function runScenario(browser, mode) {
   const seeded = await seedStaleCache(context);
   const before = (await readRequestLog()).length;
   const page = await context.newPage();
+  const consoleLines = [];
   const cdp = await context.newCDPSession(page);
   if (CPU_RATE > 1) await cdp.send('Emulation.setCPUThrottlingRate', { rate: CPU_RATE });
 
+  // The app boots and lists its sessions first (that is not the window opening); the measured "open" is the
+  // moment the phone user taps the stale chat, i.e. the route to it is taken.
+  await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  await page.waitForSelector('#app', { timeout: 30_000 });
+  await page.waitForFunction(() => document.body.innerText.includes('long8000'), undefined, { timeout: 60_000, polling: 250 });
+  await page.waitForTimeout(500);
+  const route = `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`;
   const opened = Date.now();
-  await page.goto(`${BASE_URL}/#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-  const consoleLines = [];
+  await page.evaluate((hash) => { window.location.hash = hash; window.dispatchEvent(new HashChangeEvent('hashchange')); }, route);
   page.on('console', (message) => { if (consoleLines.length < 60) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
   page.on('pageerror', (error) => { if (consoleLines.length < 60) consoleLines.push(`pageerror: ${String(error).slice(0, 300)}`); });
   const contains = async (text, timeout) => {
