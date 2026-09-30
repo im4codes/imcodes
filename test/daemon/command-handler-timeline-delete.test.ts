@@ -251,13 +251,13 @@ describe('timeline.delete (daemon)', () => {
       } finally { off(); }
     });
 
-    it('a delete does not reset the same-state idle dedup (it is not visible activity)', () => {
-      timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
-      del({ eventId: 'evt-act-idle', eventTypes: { 'evt-act-idle': 'assistant.text' } });
+    it('a delete does not reset the same-state dedup (it is not visible activity)', () => {
+      timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
+      del({ eventId: 'evt-act-state', eventTypes: { 'evt-act-state': 'assistant.text' } });
       const seen: TimelineEvent[] = [];
       const off = timelineEmitter.on((e) => seen.push(e));
       try {
-        timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+        timelineEmitter.emit(SESSION, 'session.state', { state: 'running' });
         expect(seen.filter((e) => e.type === 'session.state')).toEqual([]);
       } finally { off(); }
     });
