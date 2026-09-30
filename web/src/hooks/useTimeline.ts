@@ -902,13 +902,20 @@ function scheduleTimelineIdle(callback: () => void): () => void {
 export const PASSIVE_TIMELINE_FLUSH_MS = 500;
 
 /**
- * A summary-mode presentation is a collapsed preview (hidden pane, sub-session
- * card) by construction -- whether its preview happens to be hydrated/on screen
- * or not -- so it may trail the live stream by PASSIVE_TIMELINE_FLUSH_MS. The
- * one exception is the presentation that owns focus/recovery.
+ * A presentation is passive only when NOTHING about it is on screen: summary
+ * subscription, not the focus/recovery owner, and not visible. A card in the
+ * sub-session bar counts as visible once its preview is hydrated (or its window
+ * is open / it is focused) -- while it is on screen it follows the live stream
+ * at the normal idle-frame cadence like any other on-screen view. Only what is
+ * off screen (hidden panes, un-hydrated previews) may trail by
+ * PASSIVE_TIMELINE_FLUSH_MS.
  */
-export function isPassiveTimelinePresentation(subscriptionMode: 'full' | 'summary', isActiveSession: boolean): boolean {
-  return subscriptionMode === 'summary' && !isActiveSession;
+export function isPassiveTimelinePresentation(
+  subscriptionMode: 'full' | 'summary',
+  isActiveSession: boolean,
+  isVisible: boolean,
+): boolean {
+  return subscriptionMode === 'summary' && !isActiveSession && !isVisible;
 }
 
 /** Spread passive flushes so dozens of presentations do not all wake in the same task. */
@@ -2500,7 +2507,7 @@ export function useTimeline(
     };
     applyPassiveCacheSnapshotRef.current = apply;
     const unsubscribe = subscribeCache(cacheKey, (nextEvents) => {
-      const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current);
+      const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current, isVisibleRef.current);
       if (!passive) {
         if (timer !== null) { clearTimeout(timer); timer = null; }
         latest = null;
@@ -3961,7 +3968,7 @@ export function useTimeline(
     const existing = pendingRealtimeEventsRef.current.get(event.eventId);
     pendingRealtimeEventsRef.current.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
     if (pendingRealtimeFlushCancelRef.current) return;
-    const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current);
+    const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current, isVisibleRef.current);
     pendingRealtimeFlushCancelRef.current = passive
       ? schedulePassiveTimelineFlush(flushPendingRealtimeEvents)
       : scheduleTimelineIdle(flushPendingRealtimeEvents);

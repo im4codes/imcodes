@@ -103,15 +103,26 @@ describe('passive timeline presentations flush slowly', () => {
     expect(t.events().find((e) => e.eventId === 'state-becomes')?.payload?.state).toBe('running');
   }, 60_000);
 
-  it('a hydrated (isVisible) summary-mode card is still a passive preview', async () => {
+  // tsk_cd_web_many_panes_render_cost2: a sub-session card that is on screen (its
+  // preview hydrated / window open / focused) is summary-mode but VISIBLE, and must
+  // follow the live stream at the normal idle-frame cadence, not the 0.5-0.75 s
+  // passive one (fails on dev fffe92846, where passive ignored visibility).
+  it('an on-screen (visible) summary-mode card follows the live stream within the idle-frame budget', async () => {
     const t = harness({ isActiveSession: false, isVisible: true, subscriptionMode: 'summary' });
     await mount(t);
-    const before = t.renders();
     act(() => { t.send({ ...evt(1, 'session.state', { state: 'running' }), eventId: 'state-card' } as TimelineEvent); });
-    await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS - 100); await Promise.resolve(); });
-    expect(t.renders() - before).toBe(0);
-    await act(async () => { vi.advanceTimersByTime(200 + PASSIVE_TIMELINE_JITTER_MS); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { vi.advanceTimersByTime(80); await Promise.resolve(); await Promise.resolve(); });
     expect(t.events().find((e) => e.eventId === 'state-card')?.payload?.state).toBe('running');
+  }, 60_000);
+
+  it('an off-screen summary-mode card stays passive until the slow flush', async () => {
+    const t = harness({ isActiveSession: false, isVisible: false, subscriptionMode: 'summary' });
+    await mount(t);
+    act(() => { t.send({ ...evt(1, 'session.state', { state: 'running' }), eventId: 'state-card-off' } as TimelineEvent); });
+    await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS - 100); await Promise.resolve(); });
+    expect(t.events().find((e) => e.eventId === 'state-card-off')).toBeUndefined();
+    await act(async () => { vi.advanceTimersByTime(200 + PASSIVE_TIMELINE_JITTER_MS); await Promise.resolve(); await Promise.resolve(); });
+    expect(t.events().find((e) => e.eventId === 'state-card-off')?.payload?.state).toBe('running');
   }, 60_000);
 
   it('an active pane is never treated as passive even in summary mode', async () => {
@@ -194,5 +205,15 @@ describe('passive presentations do not re-render on every shared-cache merge', (
     act(() => { t.send({ ...evt(1, 'session.state', { state: 'running' }), eventId: 'state-lockstep' } as TimelineEvent); });
     await act(async () => { vi.advanceTimersByTime(80); await Promise.resolve(); await Promise.resolve(); });
     expect(t.passiveEvents().find((e) => e.eventId === 'state-lockstep')?.payload?.state).toBe('running');
+  }, 60_000);
+
+  it('an on-screen summary-mode card follows the shared cache without the slow cadence', async () => {
+    const t = pair({ isActiveSession: false, isVisible: true, subscriptionMode: 'summary' });
+    render(<div><t.Visible /><t.Passive /></div>);
+    await act(async () => {});
+    await act(async () => { vi.advanceTimersByTime(20); await Promise.resolve(); });
+    act(() => { t.send({ ...evt(1, 'session.state', { state: 'running' }), eventId: 'state-onscreen-card' } as TimelineEvent); });
+    await act(async () => { vi.advanceTimersByTime(80); await Promise.resolve(); await Promise.resolve(); });
+    expect(t.passiveEvents().find((e) => e.eventId === 'state-onscreen-card')?.payload?.state).toBe('running');
   }, 60_000);
 });
