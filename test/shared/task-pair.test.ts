@@ -104,6 +104,7 @@ describe('task-pair marker grammar', () => {
     expect(buildTaskPairMarkerContract()).toContain('CHECK <taskId> box=implemented|audited');
     expect(buildTaskPairMarkerContract()).toContain('write STARTED once when you begin (never again on later turns');
     expect(buildTaskPairMarkerContract()).toContain('Your turns start inside that workspace: never write or commit there');
+    expect(buildTaskPairMarkerContract()).toContain('While a pair is in audit, nobody writes WORKING or STARTED');
   });
 
   it('nudges an auditor once when REWORK has no concrete proposal', () => {

@@ -445,9 +445,10 @@ export const TASK_PAIR_READY_SELF_CHECK_RULE: string =
   + 'must come from the head under test (a scoped build), never from an '
   + 'installed or default daemon. Any unmapped item means not READY: keep '
   + 'working or raise NEEDS_INPUT. Send the validation report together with '
-  + 'the READY. Brain answers a question on a pair in audit with a plain '
-  + 'reply, never WORKING, which takes the pair out of audit and voids a '
-  + 'pending PASS.';
+  + 'the READY. While a pair is in audit, nobody writes WORKING or STARTED: '
+  + 'Brain and the executor answer questions with a plain reply, because '
+  + 'WORKING takes the pair out of audit and voids a pending PASS; the '
+  + 'executor sends a new READY only after new commits.';
 
 export const TASK_PAIR_SELF_SUFFICIENCY_RULE: string =
   'Fix your own harness (pair): test stacks and their URLs, test accounts '
