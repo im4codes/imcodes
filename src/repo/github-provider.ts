@@ -19,7 +19,7 @@ import type {
 import type { RepoProvider, ListOptions, CommitListOptions } from './provider.js';
 import { DEFAULT_PAGE_SIZE } from './provider.js';
 import { detectRepo } from './detector.js';
-import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { repoExecFile as execFileAsync } from './repo-exec.js';
 
 
 /** Translate gh CLI failures into typed RepoError. */

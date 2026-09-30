@@ -8,7 +8,7 @@ import type {
   RepoListResult,
 } from './types.js';
 import { DEFAULT_PAGE_SIZE } from './provider.js';
-import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { repoExecFile as execFileAsync } from './repo-exec.js';
 
 
 const GIT_TIMEOUT_MS = 10_000;

@@ -58,7 +58,8 @@ import { fetchBackendSharedContextRuntimeConfig } from '../context/backend-runti
 import { setContextModelRuntimeConfig } from '../context/context-model-config.js';
 import { closeLiveContextMaterializationAdmission, LiveContextIngestion } from '../context/live-context-ingestion.js';
 import { LocalSkillReviewWorker } from '../context/skill-review-worker.js';
-import { execFileOffMainIdempotent, shutdownExecHelper, startExecHelper } from '../util/exec-helper.js';
+import { execFileOffMain, execFileOffMainIdempotent, shutdownExecHelper, startExecHelper } from '../util/exec-helper.js';
+import { setRepoExecFile } from '../repo/repo-exec.js';
 import { useProcessTreeExecFile } from '../util/kill-process-tree.js';
 import { resolveTransportContextBootstrap } from '../agent/runtime-context-bootstrap.js';
 import { pruneLocalMemory } from '../context/memory-pruning.js';
@@ -600,6 +601,8 @@ export async function startup(): Promise<DaemonContext> {
   // spawn is posted to it instead of forking from this (soon multi-GB) process.
   startExecHelper();
   useProcessTreeExecFile(execFileOffMainIdempotent);
+  // src/repo is shared with the server image, so it cannot import the helper itself.
+  setRepoExecFile({ offMain: execFileOffMain, offMainIdempotent: execFileOffMainIdempotent });
   logger.info({
     version: DAEMON_VERSION,
     buildSha: process.env.IMCODES_BUILD_SHA ?? process.env.GIT_COMMIT ?? process.env.SOURCE_VERSION ?? 'unknown',

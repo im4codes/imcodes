@@ -23,7 +23,7 @@ import type {
   RepoProvider,
 } from './provider.js';
 import { DEFAULT_PAGE_SIZE } from './provider.js';
-import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { repoExecFile as execFileAsync } from './repo-exec.js';
 
 
 /** Map GitLab issue/MR state strings to our normalized states. */
