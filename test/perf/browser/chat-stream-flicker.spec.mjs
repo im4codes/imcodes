@@ -150,12 +150,15 @@ export function installFlickerProbe() {
     const prevLen = P.lastLen.get(sk) ?? 0;
     const text = event?.textContent ?? '';
     const prevText = P.lastText.get(sk) ?? '';
-    if (len < prevLen && prevText && P.shrinkLog.length < 6) P.shrinkLog.push({ t: performance.now(), key: sk, prevLen, len, prevHead: prevText.slice(0, 90), prevTail: prevText.slice(-90), nowHead: text.slice(0, 90), nowTail: text.slice(-90) });
+    // The retained-event cap (or the tail window) trims the OLDEST text off the top of a merged block: the text that is left is
+    // a suffix of what was there. The view is pinned at the bottom, so nothing the reader sees moves; it is not a flicker.
+    const headTrim = len < prevLen && prevText.length > 0 && text.length > 0 && prevText.includes(text.slice(0, Math.min(60, text.length)));
+    if (len < prevLen && !headTrim && prevText && P.shrinkLog.length < 6) P.shrinkLog.push({ t: performance.now(), key: sk, prevLen, len, prevHead: prevText.slice(0, 90), prevTail: prevText.slice(-90), nowHead: text.slice(0, 90), nowTail: text.slice(-90) });
     P.lastText.set(sk, text);
-    P.lastLen.set(sk, Math.max(prevLen, len));
+    P.lastLen.set(sk, len); // the PREVIOUS FRAME's length: a shrink is a frame-to-frame event
     const rect = wrapper?.getBoundingClientRect();
     return {
-      t: performance.now(), key: sk, mounted: !!wrapper, mode, len, shrunk: len < prevLen, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
+      t: performance.now(), key: sk, mounted: !!wrapper, mode, len, shrunk: len < prevLen && !headTrim, headTrim, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
       contentTop: rect ? rect.top - rootRect.top + r.scrollTop : null, viewportTop: rect ? rect.top - rootRect.top : null, absTop: rect?.top ?? null, absBottom: rect?.bottom ?? null, height: rect?.height ?? null, width: rect?.width ?? null,
       opacity: cs ? Number(cs.opacity) : null, visibility: cs?.visibility ?? null, display: cs?.display ?? null,
       anims: event ? event.getAnimations({ subtree: true }).length : 0,
@@ -250,7 +253,7 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
     let maxDrop = 0; let drops = 0; let prev = null; let atIdx = -1;
     list.forEach((f, i) => {
       if (!f.mounted || f.height === null) { prev = null; return; }
-      if (prev && prev.key === f.key) { const d = prev.height - f.height; if (d > maxDrop) { maxDrop = d; atIdx = i; } if (d > TOL) drops += 1; }
+      if (prev && prev.key === f.key && !f.headTrim) { const d = prev.height - f.height; if (d > maxDrop) { maxDrop = d; atIdx = i; } if (d > TOL) drops += 1; }
       prev = f;
     });
     return { maxDropPx: round(maxDrop), dropFrames: drops, context: atIdx < 0 ? [] : list.slice(Math.max(0, atIdx - 2), atIdx + 2).map((f) => ({ t: round(f.t), h: round(f.height), len: f.len, mode: f.mode })) };
@@ -270,7 +273,7 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
       stream: { elAdd: sum(frames, 'stream', 'elAdd'), elDel: sum(frames, 'stream', 'elDel'), txtAdd: sum(frames, 'stream', 'txtAdd'), txtDel: sum(frames, 'stream', 'txtDel'), chr: sum(frames, 'stream', 'chr'), attr: sum(frames, 'stream', 'attr') },
       near: { elAdd: sum(frames, 'near', 'elAdd'), elDel: sum(frames, 'near', 'elDel'), txtAdd: sum(frames, 'near', 'txtAdd'), txtDel: sum(frames, 'near', 'txtDel'), chr: sum(frames, 'near', 'chr'), attr: sum(frames, 'near', 'attr') },
     },
-    renderMode: { rAF: modeStats(frames), painted: modeStats(painted) }, height: { rAF: heightStats(frames), painted: heightStats(painted) }, blankingFrames: blank, unmountedStreamFrames: unmountedFrames, fadingFrames: fades,
+    renderMode: { rAF: modeStats(frames), painted: modeStats(painted) }, height: { rAF: heightStats(frames), painted: heightStats(painted) }, blankingFrames: blank, headTrimFrames: frames.filter((f) => f.headTrim).length, unmountedStreamFrames: unmountedFrames, fadingFrames: fades,
     animationStartsOnRows: animStarts.length, animationStartDetail: animStarts.slice(0, 8),
     layout: { rAF: jitter(frames), painted: jitter(painted), bottomRAF: bottomJitter(frames), bottomPainted: bottomJitter(painted), viewportRAF: viewportTopJitter(frames), viewportPainted: viewportTopJitter(painted) },
     scroll: { writes: scrollWrites.length, writesPerFrame, scrollTopAssignments: nonPin, clientWidthChanges: widthChanges },
