@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 KIT_DIR=$(cd "$(dirname "$0")" && pwd)
-root=$(mktemp -d "${TMPDIR:-/tmp}/imc-kit-self.XXXXXX"); trap 'python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1],ignore_errors=True)" "$root"' EXIT
+root=$(mktemp -d "${TMPDIR:-/tmp}/imc-kit-self.XXXXXX")
+# Runs on success AND failure: a failed row must not leak daemons, watchers or tmux servers/dirs.
+cleanup_self_test() {
+  local o
+  for o in self-trip self-fixture self-json; do
+    IMCODES_TEST_KIT_ROOT="$root/kit" IMCODES_DEFAULT_HOME="$root/default-profile" "$KIT_DIR/launcher.sh" teardown --owner "$o" --machine 211 >/dev/null 2>&1 || true
+  done
+  for o in self-guard self-trip self-fixture self-json; do
+    if declare -F agent_guard_layout >/dev/null; then agent_guard_layout "$root/kit/$o"; [[ "$AG_TMUX" == /tmp/imc-tmx-* ]] && rm -rf "$AG_TMUX"; fi
+  done
+  python3 -c "import shutil,sys; shutil.rmtree(sys.argv[1],ignore_errors=True)" "$root"
+}
+trap cleanup_self_test EXIT
+export IMCODES_KIT_GUARD_SETTLE_SEC=${IMCODES_KIT_GUARD_SETTLE_SEC:-1}
 export IMCODES_TEST_LEASE_FILE="$root/lease.json" IMCODES_TEST_KIT_ROOT="$root/kit"
 mkdir -p "$root/default-profile/.imcodes"
 timestamp=$(python3 -c 'import time; print(int(time.time()*1000))'); [[ "$timestamp" =~ ^[0-9]+$ ]] || { echo 'timestamp portability check failed' >&2; exit 1; }
@@ -147,4 +160,125 @@ server.closeAllConnections?.(); server.close(); if(status.code!==0) throw new Er
 if(seen.length!==2 || seen[0].auth!=='Bearer server-secret' || seen[0]['server-id']!=='srv' || seen[1].auth!=='Bearer user-secret' || seen[1]['server-id']!==undefined) throw new Error(`unexpected auth wiring: ${JSON.stringify(seen)}`);
 console.log('load auth wiring: PASS');
 NODE
+# ---- agent-CLI guard (tripwire + scoped homes + watcher + inventory) -------------------------------
+# shellcheck source=agent-guard.sh
+source "$KIT_DIR/agent-guard.sh"
+profile="$root/default-profile"; mkdir -p "$profile/.codex/sessions" "$profile/.claude"
+printf 'real rollout\n' >"$profile/.codex/sessions/rollout-real.jsonl"
+guard_state="$root/kit/self-guard"; mkdir -p "$guard_state"
+agent_guard_prepare "$guard_state"
+# 1. every agent CLI name resolves to its tripwire once the guard is on PATH, and a tripwire records a caller,
+#    masks secrets, never runs a real CLI, and exits 97.
+(
+  agent_guard_export
+  agent_guard_assert "$profile" post
+  agent_guard_assert_path_first
+  set +e
+  bash -c 'codex --api-key=SUPERSECRET1 --token SUPERSECRET2 --model x "line
+two"' >"$root/tw.out" 2>"$root/tw.err"; rc=$?
+  [[ $rc -eq 97 ]] || { echo "tripwire exit code $rc, expected 97" >&2; exit 1; }
+  for n in claude gemini opencode qwen cursor-agent copilot kimi; do "$n" --version >/dev/null 2>&1; [[ $? -eq 97 ]] || { echo "tripwire $n did not fire" >&2; exit 1; }; done
+)
+marker=$(ls "$AG_MARKERS"/codex.* | head -1)
+grep -q '^tripwire=codex$' "$marker" && grep -q '^argv.1=--api-key=\[REDACTED\]$' "$marker" && grep -q '^argv.2=--token$' "$marker" && grep -q '^argv.3=\[REDACTED\]$' "$marker" && grep -q '^caller.1=' "$marker" && grep -q '^env.HOME=' "$marker" && grep -q '^env.PATH_FIRST=' "$marker" || { echo 'tripwire marker is missing fields' >&2; cat "$marker" >&2; exit 1; }
+if grep -q 'SUPERSECRET' "$marker" "$root/tw.err"; then echo 'tripwire leaked a secret' >&2; exit 1; fi
+grep -q 'refusing to run the real agent CLI' "$root/tw.err"
+[[ $(ls "$AG_MARKERS" | grep -c '^codex\.') -eq 1 ]]
+if agent_guard_report "$guard_state" 2>"$root/report.err"; then echo 'report accepted fired tripwires' >&2; exit 1; fi
+grep -q 'TRIPWIRE FIRED: codex' "$root/report.err"
+rm -rf "$AG_MARKERS"; mkdir -p "$AG_MARKERS"
+# 2. home assertion counterexamples: each scoped path that is (or contains, or sits in) the real profile aborts the run.
+assert_rejects() {
+  local why=$1; shift
+  if "$@" >/dev/null 2>"$root/assert.err"; then echo "guard assertion accepted: $why" >&2; exit 1; fi
+  grep -q 'agent guard: refusing to start' "$root/assert.err" || { echo "unexpected assertion output for $why: $(cat "$root/assert.err")" >&2; exit 1; }
+}
+( agent_guard_layout "$guard_state"; agent_guard_assert "$profile" pre ) || { echo 'guard assertion rejected a properly scoped layout' >&2; exit 1; }
+assert_rejects 'agent home == real profile' bash -c 'source "$0"; agent_guard_layout "$1"; AG_HOME="$2"; agent_guard_assert "$2"' "$KIT_DIR/agent-guard.sh" "$guard_state" "$profile"
+assert_rejects 'agent home == real .codex' bash -c 'source "$0"; agent_guard_layout "$1"; AG_HOME="$2/.codex"; agent_guard_assert "$2"' "$KIT_DIR/agent-guard.sh" "$guard_state" "$profile"
+assert_rejects 'agent home inside real .claude' bash -c 'source "$0"; agent_guard_layout "$1"; AG_HOME="$2/.claude/sub"; agent_guard_assert "$2"' "$KIT_DIR/agent-guard.sh" "$guard_state" "$profile"
+assert_rejects 'agent home contains the real profile' bash -c 'source "$0"; agent_guard_layout "$1"; AG_HOME="$3"; agent_guard_assert "$2"' "$KIT_DIR/agent-guard.sh" "$guard_state" "$profile" "$root"
+ln -sfn "$profile" "$root/link-to-real-profile"
+assert_rejects 'agent home is a symlink to the real profile' bash -c 'source "$0"; agent_guard_layout "$1"; AG_HOME="$3"; agent_guard_assert "$2"' "$KIT_DIR/agent-guard.sh" "$guard_state" "$profile" "$root/link-to-real-profile"
+assert_rejects 'relative canonical profile' bash -c 'source "$0"; agent_guard_layout "$1"; agent_guard_assert "relative/profile"' "$KIT_DIR/agent-guard.sh" "$guard_state"
+assert_rejects 'post-export check without the export' bash -c 'source "$0"; agent_guard_layout "$1"; agent_guard_assert "$2" post' "$KIT_DIR/agent-guard.sh" "$guard_state" "$profile"
+assert_rejects 'tripwire dir not first on PATH' bash -c 'source "$0"; agent_guard_layout "$1"; agent_guard_export; PATH="/usr/bin:$PATH"; agent_guard_assert "$2" post' "$KIT_DIR/agent-guard.sh" "$guard_state" "$profile"
+# 3. end to end through launcher.sh with a fake daemon.
+#    (A) bare `codex`: the tripwire fires, the watcher stops the daemon, install and checker fail naming the caller,
+#        and the real agent dir is byte-identical.
+#    (B) a fixture by absolute path runs with no tripwire; the scoped env reaches the daemon, its children, a
+#        daemon-initiated restart (what an upgrade script does) and the private tmux server.
+fixture_bin="$root/fixture-codex"; printf '#!/bin/sh\necho fixture-ran "$@" >>"%s/fixture.log"\n' "$root" >"$fixture_bin"; chmod 755 "$fixture_bin"
+cat >"$fake_bin/npm" <<'EOF'
+#!/usr/bin/env bash
+prefix=
+while (($#)); do [[ "$1" == --prefix ]] && { prefix=$2; shift 2; continue; }; shift; done
+mkdir -p "$prefix/bin"
+cat >"$prefix/bin/imcodes" <<'SH'
+#!/usr/bin/env bash
+if [[ "$1" == start ]]; then
+  { echo "HOME=$HOME"; echo "CODEX_HOME=$CODEX_HOME"; echo "CLAUDE_CONFIG_DIR=$CLAUDE_CONFIG_DIR"; echo "TMUX_TMPDIR=$TMUX_TMPDIR"; echo "PATH_FIRST=${PATH%%:*}"; sh -c 'echo "CHILD_HOME=$HOME"; echo "CHILD_PATH_FIRST=${PATH%%:*}"'; } >>"$IMCODES_HOME/env.dump"
+  python3 - "$IMCODES_HOME" "$$" <<'PY'
+import json,sys
+home,pid=sys.argv[1:]; json.dump({'pid':int(pid),'home':home},open(home+'/daemon.lock.json','w'))
+PY
+  if [[ -f "$IMCODES_HOME/mode-restart" && ! -f "$IMCODES_HOME/restarted" ]]; then
+    : >"$IMCODES_HOME/restarted"; ( nohup "$0" start >/dev/null 2>&1 & )
+  fi
+  if [[ -f "$IMCODES_HOME/mode-tmux" ]] && command -v tmux >/dev/null; then
+    tmux new-session -d -s selfguard "env >'$IMCODES_HOME/pane.env'; command -v codex >'$IMCODES_HOME/pane.codex'; sleep 30"
+  fi
+  ( sleep 1
+    if [[ -f "$IMCODES_HOME/mode-bare" ]]; then codex --version; else "$FIXTURE_CODEX" --version; fi ) &
+  trap 'exit 0' TERM INT
+  while :; do sleep 1; done
+fi
+SH
+chmod 700 "$prefix/bin/imcodes"
+EOF
+chmod 700 "$fake_bin/npm"
+guard_env=(env -u HOME PATH="$fake_bin:$PATH" IMCODES_DEFAULT_HOME="$profile" IMCODES_TEST_KIT_ROOT="$root/kit" IMCODES_KIT_GUARD_SETTLE_SEC=4 FIXTURE_CODEX="$fixture_bin")
+mk_owner() { mkdir -p "$root/kit/$1/imcodes-home"; printf '%s\n' '{"serverId":"srv-self","token":"token-self","workerUrl":"http://runner:24000"}' >"$root/kit/$1/imcodes-home/server.json"; for m in "${@:2}"; do : >"$root/kit/$1/imcodes-home/mode-$m"; done; }
+agent_guard_inventory "$profile" "$root/real.before"
+# (A)
+mk_owner self-trip bare
+if "${guard_env[@]}" "$KIT_DIR/launcher.sh" install --owner self-trip --machine 211 --package "$root/pkg.tgz" --server-json "$root/kit/self-trip/imcodes-home/server.json" >"$root/trip.out" 2>"$root/trip.err"; then echo 'install survived a fired tripwire' >&2; exit 1; fi
+grep -q 'TRIPWIRE FIRED: codex' "$root/trip.err" || { echo 'install did not name the fired tripwire' >&2; cat "$root/trip.err" >&2; exit 1; }
+grep -q 'caller: .*imcodes start' "$root/trip.err" || { echo 'install did not name the caller' >&2; cat "$root/trip.err" >&2; exit 1; }
+[[ -f "$root/kit/self-trip/tripwire.fired.json" ]]
+trip_pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$root/kit/self-trip/daemon.json")
+for _ in {1..30}; do kill -0 "$trip_pid" 2>/dev/null || break; sleep 0.2; done
+if kill -0 "$trip_pid" 2>/dev/null; then echo 'the watcher did not stop the daemon after the tripwire fired' >&2; exit 1; fi
+if "${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-trip --machine 211 >/dev/null 2>"$root/trip-check.err"; then echo 'checker passed a run whose tripwire fired' >&2; exit 1; fi
+grep -q 'TRIPWIRE FIRED: codex' "$root/trip-check.err"
+"${guard_env[@]}" "$KIT_DIR/launcher.sh" teardown --owner self-trip --machine 211 >/dev/null
+agent_guard_inventory "$profile" "$root/real.after-a"; diff -q "$root/real.before" "$root/real.after-a" >/dev/null || { echo 'real agent dir changed in run A' >&2; exit 1; }
+# (B)
+mk_owner self-fixture restart tmux
+"${guard_env[@]}" "$KIT_DIR/launcher.sh" install --owner self-fixture --machine 211 --package "$root/pkg.tgz" --server-json "$root/kit/self-fixture/imcodes-home/server.json" >"$root/fix.out" 2>"$root/fix.err" || { echo 'install with a fixture failed' >&2; cat "$root/fix.err" >&2; exit 1; }
+"${guard_env[@]}" "$KIT_DIR/launcher.sh" guard-check --owner self-fixture --machine 211 >/dev/null
+sleep 2
+[[ -f "$root/kit/self-fixture/imcodes-home/restarted" ]] || { echo 'the daemon-initiated restart did not happen' >&2; exit 1; }
+scoped_home="$root/kit/self-fixture/agent-home"; guard_bin="$root/kit/self-fixture/agent-guard/bin"; dump="$root/kit/self-fixture/imcodes-home/env.dump"
+[[ $(grep -c '^HOME=' "$dump") -ge 2 ]] || { echo 'expected the daemon and its restarted copy to both dump their env' >&2; cat "$dump" >&2; exit 1; }
+[[ $(grep '^HOME=' "$dump" | sort -u) == "HOME=$scoped_home" ]] && [[ $(grep '^CODEX_HOME=' "$dump" | sort -u) == "CODEX_HOME=$scoped_home/.codex" ]] && [[ $(grep '^CLAUDE_CONFIG_DIR=' "$dump" | sort -u) == "CLAUDE_CONFIG_DIR=$scoped_home/.claude" ]] && [[ $(grep -E '^(PATH_FIRST|CHILD_PATH_FIRST)=' "$dump" | sed 's/^[A-Z_]*=//' | sort -u) == "$guard_bin" ]] && [[ $(grep '^CHILD_HOME=' "$dump" | sort -u) == "CHILD_HOME=$scoped_home" ]] || { echo 'the scoped env did not survive to the daemon, its children and its restart' >&2; cat "$dump" >&2; exit 1; }
+expected_tmx=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["tmuxTmp"])' "$root/kit/self-fixture/daemon.json")
+grep -qx "TMUX_TMPDIR=$expected_tmx" "$dump"
+if command -v tmux >/dev/null; then
+  for _ in {1..30}; do [[ -s "$root/kit/self-fixture/imcodes-home/pane.codex" ]] && break; sleep 0.2; done
+  grep -q "^HOME=$scoped_home\$" "$root/kit/self-fixture/imcodes-home/pane.env" && grep -q "^CODEX_HOME=$scoped_home/.codex\$" "$root/kit/self-fixture/imcodes-home/pane.env" || { echo 'the tmux pane did not get the scoped home' >&2; cat "$root/kit/self-fixture/imcodes-home/pane.env" >&2; exit 1; }
+  [[ $(cat "$root/kit/self-fixture/imcodes-home/pane.codex") == "$guard_bin/codex" ]] || { echo 'codex in the tmux pane does not resolve to the tripwire' >&2; exit 1; }
+fi
+grep -q 'fixture-ran --version' "$root/fixture.log" || { echo 'the fixture binary did not run by absolute path' >&2; exit 1; }
+"${guard_env[@]}" "$KIT_DIR/launcher.sh" teardown --owner self-fixture --machine 211 >/dev/null
+"${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null || { echo 'checker rejected a clean fixture run' >&2; exit 1; }
+agent_guard_inventory "$profile" "$root/real.after-b"; diff -q "$root/real.before" "$root/real.after-b" >/dev/null || { echo 'real agent dir changed in run B' >&2; exit 1; }
+# a real agent home that changed during a run fails the checker with the file named
+printf 'written by a real CLI\n' >"$profile/.codex/sessions/rollout-intruder.jsonl"
+if "${guard_env[@]}" "$KIT_DIR/checker.sh" --owner self-fixture --machine 211 >/dev/null 2>"$root/inv.err"; then echo 'checker missed a write into the real agent home' >&2; exit 1; fi
+grep -q 'rollout-intruder' "$root/inv.err" || { echo 'checker did not name the changed file' >&2; cat "$root/inv.err" >&2; exit 1; }
+rm -f "$profile/.codex/sessions/rollout-intruder.jsonl"
+fixture_path=$(IMCODES_TEST_KIT_ROOT="$root/kit" IMCODES_DEFAULT_HOME="$profile" "$KIT_DIR/launcher.sh" fixture --owner self-fixture --machine 211 --name codex --exec "$fixture_bin")
+[[ "$fixture_path" == "$root/kit/self-fixture/agent-guard/fixtures/codex" && -x "$fixture_path" ]]
+echo 'agent guard self-test: PASS'
 echo 'real-machine kit self-test: PASS'

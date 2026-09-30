@@ -3,9 +3,12 @@ set -euo pipefail
 ROOT=${IMCODES_TEST_KIT_ROOT:?IMCODES_TEST_KIT_ROOT is required; use an owner-scoped absolute path}
 DEFAULT_PROFILE=${IMCODES_DEFAULT_HOME:?IMCODES_DEFAULT_HOME is required; pass the canonical account profile explicitly}
 DEFAULT_STATE="${DEFAULT_PROFILE%/}/.imcodes"
-usage() { echo "usage: $0 {install|teardown|status|snapshot-test} --owner NAME --machine 211|m3 [--bind-link URL|--stack-manifest FILE|--server-json FILE] [--package TAR|--version V] [--registry URL]" >&2; exit 2; }
-cmd=${1:-}; shift || true; owner=; machine=; bind_link=; package=; version=; registry=; stack_manifest=; server_json=
-while (($#)); do case "$1" in --owner) owner=${2:?}; shift 2;; --machine) machine=${2:?}; shift 2;; --bind-link) bind_link=${2:?}; shift 2;; --stack-manifest) stack_manifest=${2:?}; shift 2;; --server-json) server_json=${2:?}; shift 2;; --package) package=${2:?}; shift 2;; --version) version=${2:?}; shift 2;; --registry) registry=${2:?}; shift 2;; *) usage;; esac; done
+KIT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+# shellcheck source=agent-guard.sh
+source "$KIT_DIR/agent-guard.sh"
+usage() { echo "usage: $0 {install|teardown|status|snapshot-test|guard-check|fixture} --owner NAME --machine 211|m3 [--bind-link URL|--stack-manifest FILE|--server-json FILE] [--package TAR|--version V] [--registry URL] [--name FIXTURE_NAME --exec ABS_PATH]" >&2; exit 2; }
+cmd=${1:-}; shift || true; owner=; machine=; bind_link=; package=; version=; registry=; stack_manifest=; server_json=; fixture_name=; fixture_exec=
+while (($#)); do case "$1" in --owner) owner=${2:?}; shift 2;; --machine) machine=${2:?}; shift 2;; --bind-link) bind_link=${2:?}; shift 2;; --stack-manifest) stack_manifest=${2:?}; shift 2;; --server-json) server_json=${2:?}; shift 2;; --package) package=${2:?}; shift 2;; --version) version=${2:?}; shift 2;; --registry) registry=${2:?}; shift 2;; --name) fixture_name=${2:?}; shift 2;; --exec) fixture_exec=${2:?}; shift 2;; *) usage;; esac; done
 [[ "$owner" =~ ^[A-Za-z0-9_.:-]{3,96}$ && "$machine" =~ ^(211|m3)$ ]] || usage
 if [[ -n "$stack_manifest" ]]; then [[ -f "$stack_manifest" ]] || { echo "stack manifest missing: $stack_manifest" >&2; exit 1; }; bind_link=${bind_link:-$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bindLink"])' "$stack_manifest")}; registry=${registry:-$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("registryUrl", ""))' "$stack_manifest")}; fi
 state="$ROOT/$owner"; home="$state/imcodes-home"; prefix="$state/prefix"; manifest="$state/daemon.json"; mkdir -p "$state" "$home" "$prefix"
@@ -114,8 +117,12 @@ case "$cmd" in
    state="$ROOT/$owner"; home="$state/self-home"; prefix="$state/self-prefix"; mkdir -p "$home" "$prefix"; snapshot "$state/before"; env IMCODES_HOME="$home" bash -c 'exec -a imcodes-daemon-self-test sleep 8' & test_pid=$!; sleep .2; snapshot "$state/after" "$test_pid"; kill "$test_pid" 2>/dev/null || true; wait "$test_pid" 2>/dev/null || true; diff -u "$state/before" "$state/after" >/dev/null || { echo 'forked scoped daemon leaked into default snapshot' >&2; exit 1; }; echo 'snapshot fork test: PASS';;
 install)
    [[ -n "$bind_link" || -n "$server_json" ]] || { echo '--bind-link or --server-json required' >&2; exit 2; }; require_disk_space; snapshot "$state/default.before"
+   agent_guard_prepare "$state"; agent_guard_assert "$DEFAULT_PROFILE" || exit 1
+   agent_guard_inventory "$DEFAULT_PROFILE" "$state/agent-homes.before"
    if [[ -n "$package" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "$package" >/dev/null; elif [[ -n "$version" ]]; then npm install --ignore-scripts --no-audit --no-fund --prefix "$prefix" "imcodes@$version" ${registry:+--registry "$registry"} >/dev/null; else echo 'package or version required' >&2; exit 2; fi
    cli="$prefix/bin/imcodes"; [[ -x "$cli" ]] || cli="$prefix/node_modules/.bin/imcodes"; if [[ ! -x "$cli" && -f "$prefix/node_modules/imcodes/dist/src/index.js" ]]; then cli="$state/imcodes-cli"; printf '#!/bin/sh\nexec %q %q "$@"\n' "$(command -v node)" "$prefix/node_modules/imcodes/dist/src/index.js" >"$cli"; chmod 700 "$cli"; fi; [[ -x "$cli" ]] || { echo "imcodes binary missing" >&2; exit 1; }
+   # From here on every child (bind, the daemon, its tmux server, the exec helper, the agents) runs under the guard.
+   agent_guard_export; agent_guard_assert "$DEFAULT_PROFILE" post || exit 1; agent_guard_assert_path_first || exit 1
    if [[ -n "$server_json" ]]; then
      [[ -f "$server_json" ]] || { echo "server json missing: $server_json" >&2; exit 1; }
      [[ "$server_json" == "$home/server.json" ]] || cp "$server_json" "$home/server.json"; chmod 600 "$home/server.json"
@@ -127,24 +134,38 @@ install)
      fi
    fi
    export IMCODES_HOME="$home" IMCODES_DEFAULT_HOME="$DEFAULT_PROFILE"; pid=$(start_detached "$state/daemon.pid" "$state/daemon.log" "$cli" start --foreground)
-   python3 - "$manifest" "$owner" "$machine" "$home" "$prefix" "$pid" "$state/daemon.log" "$state/scoped-lock" <<'PYMANIFEST'
+   guard_pid=$(agent_guard_start_watcher "$state")
+   AG_GUARD_PID="$guard_pid" AG_DEFAULT_PROFILE="$DEFAULT_PROFILE" AG_TMUX="$AG_TMUX" python3 - "$manifest" "$owner" "$machine" "$home" "$prefix" "$pid" "$state/daemon.log" "$state/scoped-lock" <<'PYMANIFEST'
 import json,sys,os
-p,owner,machine,home,prefix,pid,log,lock=sys.argv[1:]; d={'owner':owner,'machine':machine,'home':home,'prefix':prefix,'pid':int(pid),'log':log,'lock':lock,'defaultBefore':os.path.join(os.path.dirname(p),'default.before'),'defaultAfter':os.path.join(os.path.dirname(p),'default.after')}; open(p,'w').write(json.dumps(d,indent=2)+'\n')
+p,owner,machine,home,prefix,pid,log,lock=sys.argv[1:]; d={'owner':owner,'machine':machine,'home':home,'prefix':prefix,'pid':int(pid),'log':log,'lock':lock,'defaultBefore':os.path.join(os.path.dirname(p),'default.before'),'defaultAfter':os.path.join(os.path.dirname(p),'default.after'),
+ 'defaultProfile':os.environ['AG_DEFAULT_PROFILE'],'guardPid':int(os.environ['AG_GUARD_PID']),'agentHome':os.path.join(os.path.dirname(p),'agent-home'),'guardBin':os.path.join(os.path.dirname(p),'agent-guard','bin'),
+ 'markers':os.path.join(os.path.dirname(p),'agent-guard','markers'),'tmuxTmp':os.environ['AG_TMUX'],'agentHomesBefore':os.path.join(os.path.dirname(p),'agent-homes.before')}; open(p,'w').write(json.dumps(d,indent=2)+'\n')
 PYMANIFEST
    kill -0 "$pid" 2>/dev/null || { echo "detached daemon exited before lock wait (pid=$pid)" >&2; exit 1; }
-   sleep 3; snapshot "$state/default.after" "$pid"; diff -u "$state/default.before" "$state/default.after" >/dev/null || { echo 'default daemon changed' >&2; kill "$pid" 2>/dev/null || true; exit 1; }; [[ -d "$home" ]] || { echo 'scoped home was not created' >&2; exit 1; }; assert_lock
+   sleep 3; snapshot "$state/default.after" "$pid"; diff -u "$state/default.before" "$state/default.after" >/dev/null || { echo 'default daemon changed' >&2; kill "$pid" 2>/dev/null || true; exit 1; }; [[ -d "$home" ]] || { echo 'scoped home was not created' >&2; exit 1; }
+   if ! agent_guard_report "$state"; then echo "tripwire fired: the scoped daemon tried to launch a real agent CLI; the run is aborted (see report above)" >&2; exit 1; fi
+   assert_lock
+   sleep "${IMCODES_KIT_GUARD_SETTLE_SEC:-5}"
+   if ! agent_guard_report "$state"; then echo "tripwire fired: the scoped daemon tried to launch a real agent CLI; the run is aborted (see report above)" >&2; exit 1; fi
+   agent_guard_inventory "$DEFAULT_PROFILE" "$state/agent-homes.after"
+   diff -u "$state/agent-homes.before" "$state/agent-homes.after" >"$state/agent-homes.diff" || { echo "real agent home changed during the run:" >&2; head -40 "$state/agent-homes.diff" >&2; exit 1; }
    cat "$manifest"
    ;;
+ guard-check) agent_guard_report "$state" && echo "no tripwire fired for $owner";;
+ fixture) [[ -n "$fixture_name" && -n "$fixture_exec" ]] || usage; agent_guard_fixture "$state" "$fixture_name" "$fixture_exec";;
    teardown)
-   [[ -f "$manifest" ]] || { echo 'no manifest' >&2; exit 1; }; pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",0))' "$manifest"); stop_owned_processes "$pid"; python3 - "$manifest" <<'PY'
+   [[ -f "$manifest" ]] || { echo 'no manifest' >&2; exit 1; }; pid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("pid",0))' "$manifest"); gpid=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("guardPid",0))' "$manifest"); if [[ "$gpid" =~ ^[1-9][0-9]*$ ]] && ps -o args= -p "$gpid" 2>/dev/null | grep -Fq guard-watch.py; then kill "$gpid" 2>/dev/null || true; for _ in {1..20}; do kill -0 "$gpid" 2>/dev/null || break; sleep 0.1; done; fi
+   tmux_tmp=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("tmuxTmp",""))' "$manifest"); if [[ -n "$tmux_tmp" && -d "$tmux_tmp" ]]; then env -u TMUX TMUX_TMPDIR="$tmux_tmp" tmux kill-server 2>/dev/null || true; fi
+   stop_owned_processes "$pid"; python3 - "$manifest" <<'PY'
 import json,sys,os,shutil,datetime
 p=sys.argv[1]; d=json.load(open(p));
 for k in ('prefix','home'):
  path=d.get(k)
  if path and os.path.exists(path): shutil.rmtree(path,ignore_errors=True)
-report={'owner':d['owner'],'cleanedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'defaultBefore':d['defaultBefore'],'defaultAfter':d['defaultAfter'],'homeRemoved':not os.path.exists(d.get('home','')),'prefixRemoved':not os.path.exists(d.get('prefix','')),'processesGone':True}
+report={'owner':d['owner'],'cleanedAt':datetime.datetime.now(datetime.timezone.utc).isoformat(),'defaultBefore':d['defaultBefore'],'defaultAfter':d['defaultAfter'],'homeRemoved':not os.path.exists(d.get('home','')),'prefixRemoved':not os.path.exists(d.get('prefix','')),'processesGone':True,'tripwireFired':os.path.exists(os.path.join(os.path.dirname(p),'tripwire.fired.json'))}
 open(os.path.join(os.path.dirname(p),'teardown.json'),'w').write(json.dumps(report,indent=2)+'\n')
 PY
+   if [[ -n "$tmux_tmp" && "$tmux_tmp" == /tmp/imc-tmx-* ]]; then rm -rf "$tmux_tmp"; fi
    echo "removed $owner (manifest retained)";;
  status) [[ -f "$manifest" ]] && cat "$manifest" || { echo 'no manifest' >&2; exit 1; };;
  *) usage;;
