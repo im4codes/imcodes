@@ -20,7 +20,7 @@
  * scheduler can reclaim closed pairs oldest-first before the volume fills.
  */
 import { execFile } from 'node:child_process';
-import { lstat, realpath, rm, statfs, unlink } from 'node:fs/promises';
+import { lstat, readdir, realpath, rm, statfs, unlink } from 'node:fs/promises';
 import path, { dirname, isAbsolute, sep } from 'node:path';
 import {
   TASK_PAIR_DISK_CRITICAL_FREE_BYTES,
@@ -173,6 +173,44 @@ export async function stripHeavyIgnoredDirs(repoPath: string, deps: StripDeps = 
       result.skipped.push({ path: rel, reason: 'error' });
     }
     // One directory at a time, with the loop yielded between them.
+    await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
+  }
+  return result;
+}
+
+/**
+ * Strip a plain task directory (no git in it, so no ignore list to consult): ONLY directories whose name is in
+ * TASK_PAIR_HEAVY_DIR_NAMES, at any depth, and never a file. `.git` is not entered. A `keepPaths` entry (a
+ * deliverable named on DONE) and everything above or below it survives. Symlinks are never followed; a heavy-named
+ * link is only unlinked.
+ */
+export async function stripHeavyNamedDirs(rootPath: string, deps: Pick<StripDeps, 'remove' | 'stillEligible' | 'keepPaths'> = {}): Promise<StripResult> {
+  const result: StripResult = { ok: true, removed: [], skipped: [], aborted: false };
+  const root = await realpath(rootPath).catch(() => undefined);
+  if (!root) return { ...result, ok: false };
+  const candidates: string[] = [];
+  const stack: string[] = [''];
+  while (stack.length > 0) {
+    const relDir = stack.pop()!;
+    const entries = await readdir(path.join(root, relDir), { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      const rel = relDir ? `${relDir}/${entry.name}` : entry.name;
+      if (HEAVY.has(entry.name) && (entry.isDirectory() || entry.isSymbolicLink())) candidates.push(rel);
+      else if (entry.isDirectory() && entry.name !== '.git') stack.push(rel);
+    }
+  }
+  for (const rel of candidates) {
+    if (deps.stillEligible && !deps.stillEligible()) { result.aborted = true; return result; }
+    const absolute = toAbsoluteCandidate(root, rel);
+    if (!absolute) { result.skipped.push({ path: rel, reason: 'outside_worktree' }); continue; }
+    if ((deps.keepPaths ?? []).some((keep) => overlaps(absolute, keep))) { result.skipped.push({ path: rel, reason: 'kept_path' }); continue; }
+    if (!(await lstat(absolute).catch(() => undefined))) { result.skipped.push({ path: rel, reason: 'missing' }); continue; }
+    try {
+      await (deps.remove ?? removeTree)(absolute);
+      result.removed.push(rel);
+    } catch {
+      result.skipped.push({ path: rel, reason: 'error' });
+    }
     await new Promise<void>((resolvePromise) => setImmediate(resolvePromise));
   }
   return result;

@@ -58,10 +58,12 @@ import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-g
 import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
+import { applyBackCow, hasUnfinishedApplyBack, rollbackApplyBack, undoApplyBack } from './non-git.js';
+import { mergePairIntoProject } from './git-init.js';
 import { copyTaskPairOutput, gitBranch as gitBranchOf, listTaskPairSiblingWorktrees, provisionTaskPairWorkspace, releaseTaskPairWorkspace, rehomeTaskPairWorkspace, type TaskPairWorkspaceRevisionSource } from './workspace.js';
 import { clearTaskPairProviderError, noteTaskPairProviderError } from './provider-errors.js';
 import {
-  classifyDiskLevel, diskLevelRank, isDiskLevel, readWorktreeVolumeSpace, stripHeavyIgnoredDirs, taskPairHygieneDeps,
+  classifyDiskLevel, diskLevelRank, isDiskLevel, readWorktreeVolumeSpace, stripHeavyIgnoredDirs, stripHeavyNamedDirs, taskPairHygieneDeps,
 } from './workspace-hygiene.js';
 import { resolveSupervisionWorktreesRoot } from '../supervision-worktree-inspector.js';
 import { isUsableTaskPairTitle, taskPairTitlePlaceholder } from './title-generator.js';
@@ -89,6 +91,8 @@ import {
   buildAuditorProposalNudgeMessage,
   buildConvergenceCheckpointMessage,
   buildHeldWaitReason,
+  buildNonGitFinishLine,
+  buildNonGitModeLine,
   buildNextRoundNoticeMessage,
   buildRoundBaseAuditLine,
   buildRoundBaseMismatchAuditorMessage,
@@ -220,6 +224,8 @@ function readyHasValidationReport(store: ReturnType<typeof getTaskPairStore>, st
 
 function readyMarkerForPair(pair: TaskPairState): string {
   const workspace = pair.workspace;
+  if (workspace?.nonGit?.mode === 'cow') return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace.path} -->`;
+  if (workspace?.nonGit?.mode === 'in_place') return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} path=${workspace.nonGit.projectRoot} files=<comma separated changed files> -->`;
   if (workspace?.kind === 'worktree') {
     return `<!-- IMCODES_TASK READY_FOR_AUDIT ${pair.taskId} worktree=${workspace.path} head=${workspace.lastHead ?? pair.material?.head ?? '<commit>'} base=${workspace.base ?? pair.material?.base ?? '<commit>'} -->`;
   }
@@ -233,6 +239,7 @@ const WORKSPACE_REVISION_SOURCE_LABEL: Record<TaskPairWorkspaceRevisionSource, s
   base: 'the recorded base',
   default: "the project's default branch",
   directory: 'a fresh task directory',
+  clone: 'a copy-on-write clone of the project',
 };
 
 /**
@@ -273,7 +280,11 @@ export async function ensureTaskPairWorkspaceAvailable(project: string, taskId: 
     return;
   }
   const now = Date.now();
-  const rebuilt = { kind: provision.kind, path: provision.path, ...(provision.base ? { base: provision.base } : {}), ...(provision.branch ? { branch: provision.branch } : {}), createdAt: now, status: 'active' as const };
+  const rebuilt = {
+    kind: provision.kind, path: provision.path, ...(provision.base ? { base: provision.base } : {}), ...(provision.branch ? { branch: provision.branch } : {}),
+    ...(provision.nonGit ? { nonGit: provision.nonGit } : {}), ...(provision.workingDir ? { workingDir: provision.workingDir } : {}),
+    createdAt: now, status: 'active' as const,
+  };
   const next = { ...settled.state, workspace: rebuilt, workspaceRecoveryEscalatedAt: undefined, updatedAt: now };
   store.savePair(project, next);
   const notice = `Workspace for ${taskId} was rebuilt from ${WORKSPACE_REVISION_SOURCE_LABEL[provision.source]}: ${provision.path}`;
@@ -447,6 +458,8 @@ export class TaskPairService {
 
   init(): void {
     if (this.#unsubscribe) return;
+    // A daemon restarted mid-copy-back / mid-merge: roll back what was half done and run it again.
+    this.#track(this.#resumeNonGitFinishes().catch((error: unknown) => logger.warn({ err: error }, 'task-pair: non-git finish resume failed')));
     this.#unsubscribe = timelineEmitter.on((event) => {
       // Activity is stamped synchronously so a heartbeat cannot race a just
       // emitted message/tool event. Marker parsing remains deferred off the
@@ -1646,11 +1659,18 @@ export class TaskPairService {
         path: provision.path,
         ...(provision.base ? { base: provision.base } : {}),
         ...(provision.branch ? { branch: provision.branch } : {}),
+        ...(provision.nonGit ? { nonGit: provision.nonGit } : {}),
+        ...(provision.workingDir ? { workingDir: provision.workingDir } : {}),
         createdAt: Date.now(),
         status: 'active',
       },
     };
     store.savePair(project, next);
+    if (provision.nonGit) {
+      this.#recordWorkspaceEvent(project, next, TASK_PAIR_WORKSPACE_EFFECTS.NON_GIT_MODE, { mode: provision.nonGit.mode, ...(provision.nonGit.fallbackReason ? { reason: provision.nonGit.fallbackReason } : {}) }, {}, false);
+      const line = provision.brainNotice ?? buildNonGitModeLine(next, provision.nonGit);
+      if (line) await sendTaskPairMessage(next.brain, taskId, 'brain-non-git-mode', line);
+    }
     return next;
   }
 
@@ -1661,6 +1681,8 @@ export class TaskPairService {
    */
   async endWorkspace(project: string, taskId: string, now: number): Promise<void> {
     await this.#endWorkspaceRetention(project, taskId, now);
+    // A non-git project's pair brings its work into the project first (git_init: merge; cow: checked copy-back).
+    await this.finishNonGitWorkspace(project, taskId);
     // After the deliverable copy: an `output=` path may live inside a directory
     // that is about to be stripped.
     await this.#stripClosedWorkspace(project, taskId);
@@ -1700,6 +1722,102 @@ export class TaskPairService {
     }
   }
 
+  #nonGitLocks = new Map<string, Promise<unknown>>();
+
+  #withNonGitLock<T>(key: string, work: () => Promise<T>): Promise<T> {
+    const previous = this.#nonGitLocks.get(key) ?? Promise.resolve();
+    const next = previous.catch(() => undefined).then(work);
+    this.#nonGitLocks.set(key, next);
+    void next.finally(() => { if (this.#nonGitLocks.get(key) === next) this.#nonGitLocks.delete(key); }).catch(() => undefined);
+    return next;
+  }
+
+  /**
+   * DONE on a non-git project's pair: bring its work into the project. git_init: merge the pair branch into the project's
+   * branch (refusing files with uncommitted user edits). cow: copy the changed files back (refusing files the project changed
+   * since the clone; overwritten files backed up). in_place: nothing to do (the edits are already there). Idempotent and
+   * retried by the hourly sweep while it is refused; Brain is told each time the outcome changes, never on a repeat.
+   */
+  async finishNonGitWorkspace(project: string, taskId: string): Promise<void> {
+    const store = getTaskPairStore();
+    const pair = store.getPair(project, taskId)?.state;
+    const workspace = pair?.workspace;
+    const nonGit = workspace?.nonGit;
+    if (!pair || !workspace || !nonGit || pair.status !== 'done' || nonGit.mode === 'in_place' || workspace.status === 'removed') return;
+    const previous = nonGit.applyBack?.status;
+    if (previous === 'applied' || previous === 'noop' || previous === 'undone') return;
+    await this.#withNonGitLock(`${nonGit.mode}:${nonGit.projectRoot}`, async () => {
+      const again = store.getPair(project, taskId)?.state;
+      if (!again?.workspace?.nonGit || again.status !== 'done') return;
+      const before = again.workspace.nonGit.applyBack;
+      if (before && (before.status === 'applied' || before.status === 'noop' || before.status === 'undone')) return;
+      this.#saveApplyBack(project, taskId, { status: 'applying', at: Date.now() });
+      let outcome: { status: 'applied' | 'noop' | 'conflict' | 'failed'; files: string[]; detail?: string };
+      try {
+        if (nonGit.mode === 'git_init') {
+          const merged = await mergePairIntoProject(nonGit.projectRoot, workspace.path, taskId);
+          outcome = merged.status === 'merged' ? { status: 'applied', files: merged.files, detail: merged.fastForward ? 'fast-forward' : 'merge commit' }
+            : merged.status === 'noop' ? { status: 'noop', files: [], detail: merged.detail }
+              : merged.status === 'failed' ? { status: 'failed', files: [], detail: merged.detail }
+                : { status: 'conflict', files: merged.files, detail: merged.detail };
+        } else {
+          // An apply that a restart cut short is rolled back first; then it runs again from the exact pre-apply state.
+          if (await hasUnfinishedApplyBack(workspace.path)) await rollbackApplyBack(workspace.path);
+          const applied = await applyBackCow(workspace.path);
+          outcome = applied.status === 'applied' ? { status: 'applied', files: applied.files, ...(applied.deleted.length ? { detail: `${applied.deleted.length} deleted` } : {}) }
+            : applied.status === 'noop' ? { status: 'noop', files: [] }
+              : applied.status === 'conflict' ? { status: 'conflict', files: applied.conflicts.map((conflict) => `${conflict.path} (${conflict.reason})`) }
+                : { status: 'failed', files: applied.files, detail: `${applied.detail}${applied.rolledBack ? ' (rolled back)' : ' (rollback incomplete)'}` };
+        }
+      } catch (error) {
+        outcome = { status: 'failed', files: [], detail: error instanceof Error ? error.message : 'unexpected error' };
+      }
+      const repeat = before?.status === outcome.status && (before.files ?? []).join('\n') === outcome.files.join('\n');
+      this.#saveApplyBack(project, taskId, { status: outcome.status, files: outcome.files, at: Date.now() });
+      if (repeat && outcome.status !== 'applied') return; // a refused merge retried by the sweep: no second notice for the same thing
+      const latest = store.getPair(project, taskId)?.state;
+      if (!latest) return;
+      const effect = outcome.status === 'applied' ? TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_APPLIED
+        : outcome.status === 'noop' ? TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_NOOP
+          : outcome.status === 'conflict' ? TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_CONFLICT : TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_FAILED;
+      this.#recordWorkspaceEvent(project, latest, effect, { mode: nonGit.mode, files: String(outcome.files.length) }, {}, outcome.status === 'conflict' || outcome.status === 'failed');
+      await sendTaskPairMessage(latest.brain, taskId, 'brain-non-git-finish', buildNonGitFinishLine(latest, nonGit.mode === 'git_init' ? 'git_init' : 'cow', outcome));
+    });
+  }
+
+  #saveApplyBack(project: string, taskId: string, applyBack: NonNullable<NonNullable<TaskPairState['workspace']>['nonGit']>['applyBack']): void {
+    const store = getTaskPairStore();
+    const latest = store.getPair(project, taskId)?.state;
+    if (!latest?.workspace?.nonGit) return;
+    store.savePair(project, { ...latest, workspace: { ...latest.workspace, nonGit: { ...latest.workspace.nonGit, applyBack } } });
+  }
+
+  /** Undo a copy-back from its backup (cow only: a git_init merge is undone with git). Files the user changed since are left alone. */
+  async undoNonGitApply(project: string, taskId: string): Promise<{ ok: boolean; detail: string; skipped?: string[] }> {
+    const store = getTaskPairStore();
+    const pair = store.getPair(project, taskId)?.state;
+    const nonGit = pair?.workspace?.nonGit;
+    if (!pair?.workspace || !nonGit || nonGit.mode !== 'cow') return { ok: false, detail: 'only a COW workspace has a backup to undo from (a merged git_init pair is undone with git revert)' };
+    if (nonGit.applyBack?.status !== 'applied') return { ok: false, detail: `nothing to undo (apply-back status ${nonGit.applyBack?.status ?? 'none'})` };
+    const result = await this.#withNonGitLock(`cow:${nonGit.projectRoot}`, () => undoApplyBack(pair.workspace!.path));
+    this.#saveApplyBack(project, taskId, { status: 'undone', files: result.restored.concat(result.removed), at: Date.now() });
+    const latest = store.getPair(project, taskId)?.state ?? pair;
+    this.#recordWorkspaceEvent(project, latest, TASK_PAIR_WORKSPACE_EFFECTS.APPLY_BACK_UNDONE, { restored: String(result.restored.length), removed: String(result.removed.length) }, {}, result.skipped.length > 0);
+    return { ok: result.ok, detail: `restored ${result.restored.length}, removed ${result.removed.length}${result.skipped.length ? `, left alone ${result.skipped.length} (changed since)` : ''}`, skipped: result.skipped.map((entry) => entry.path) };
+  }
+
+  /** After a restart (and hourly): finish or retry the copy-back / merge of every finished non-git pair that has not landed. */
+  async #resumeNonGitFinishes(): Promise<void> {
+    const store = getTaskPairStore();
+    for (const stored of store.listEndedWorkspacePairs()) {
+      const nonGit = stored.state.workspace?.nonGit;
+      if (!nonGit || nonGit.mode === 'in_place' || stored.state.status !== 'done') continue;
+      const status = nonGit.applyBack?.status;
+      if (status === 'applied' || status === 'noop' || status === 'undone') continue;
+      await this.finishNonGitWorkspace(stored.project, stored.state.taskId);
+    }
+  }
+
   #lastSweepAt = 0;
 
   /**
@@ -1711,6 +1829,7 @@ export class TaskPairService {
     if (!options.force && now - this.#lastSweepAt < 60 * 60_000) return;
     this.#lastSweepAt = now;
     const store = getTaskPairStore();
+    this.#track(this.#resumeNonGitFinishes().catch((error: unknown) => logger.warn({ err: error }, 'task-pair: non-git finish retry failed')));
     // Pairs that ended before stripping existed, or whose strip failed or was
     // interrupted by a restart, are stripped now -- in the background: a
     // backlog of large trees must not hold the heartbeat.
@@ -1813,7 +1932,7 @@ export class TaskPairService {
     const store = getTaskPairStore();
     const pair = store.getPair(project, taskId)?.state;
     const workspace = pair?.workspace;
-    if (!pair || !workspace || workspace.kind !== 'worktree' || !isTerminalTaskPairStatus(pair.status)) return false;
+    if (!pair || !workspace || (workspace.kind !== 'worktree' && workspace.kind !== 'dir') || !isTerminalTaskPairStatus(pair.status)) return false;
     if (workspace.status !== 'ended' && workspace.status !== 'kept') return false;
     if (workspace.strippedAt !== undefined) return false;
     const endedAt = workspace.endedAt;
@@ -1828,11 +1947,12 @@ export class TaskPairService {
     try {
       const deps = taskPairHygieneDeps();
       const output = pair.output?.path;
-      const result = await stripHeavyIgnoredDirs(workspace.path, {
-        ...deps,
-        stillEligible,
-        keepPaths: [...(deps.keepPaths ?? []), ...(output ? [isAbsolute(output) ? output : resolvePath(workspace.path, output)] : [])],
-      });
+      const keepPaths = [...(deps.keepPaths ?? []), ...(output ? [isAbsolute(output) ? output : resolvePath(workspace.path, output)] : [])];
+      // A git worktree strips what git reports as ignored; a plain task directory has no ignore list, so only directories
+      // named in the shared heavy list go, never a file.
+      const result = workspace.kind === 'dir'
+        ? await stripHeavyNamedDirs(workspace.path, { remove: deps.remove, stillEligible, keepPaths })
+        : await stripHeavyIgnoredDirs(workspace.path, { ...deps, stillEligible, keepPaths });
       // Unreadable git state: leave it unstripped so a later sweep retries.
       // A directory that could not be removed leaves the pair unstripped, so the next sweep retries it.
       if (!result.ok || result.aborted || result.skipped.some((entry) => entry.reason === 'error') || !stillEligible()) return false;
@@ -1890,7 +2010,7 @@ export class TaskPairService {
     }
     // Finished pairs only, oldest first. Their eligibility is re-checked per directory.
     const closed = store.listEndedWorkspacePairs()
-      .filter((stored) => stored.state.workspace?.kind === 'worktree' && stored.state.workspace.strippedAt === undefined)
+      .filter((stored) => (stored.state.workspace?.kind === 'worktree' || stored.state.workspace?.kind === 'dir') && stored.state.workspace.strippedAt === undefined)
       .sort((a, b) => (a.state.workspace?.endedAt ?? a.state.updatedAt) - (b.state.workspace?.endedAt ?? b.state.updatedAt));
     let after = before;
     const strippedBrains = new Set<string>();

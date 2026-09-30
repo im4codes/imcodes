@@ -209,12 +209,12 @@ describe('pair workspaces', () => {
     expect(gc.entries).toEqual([expect.objectContaining({ taskId: 'W1', action: 'retain', reason: SUPERVISION_WORKTREE_GC_REASONS.ACTIVE_REFERENCE })]);
   });
 
-  it('non-git project: allocates a task directory under the works root, never git-inits the project, and delivers the path', async () => {
+  it('workspace=dir on a non-git project (explicit non-code work): a plain task directory under the works root, the project is neither git-inited nor cloned, and the path is delivered', async () => {
     const plain = join(base, 'plain-project');
     mkdirSync(plain);
     writeFileSync(join(plain, 'notes.txt'), 'input\n');
     useProject(plain);
-    const dir = await opened('D1');
+    const dir = await opened('D1', `auditor=${AUD} workspace=dir`);
     expect(dir).toBe(join(worksRoot, PROJECT, 'D1'));
     expect(pair('D1').workspace).toMatchObject({ kind: 'dir', status: 'active' });
     expect(pair('D1').workspace?.base).toBeUndefined();
@@ -282,7 +282,7 @@ describe('pair workspaces', () => {
     const plain = join(base, 'plain-project');
     mkdirSync(plain);
     useProject(plain);
-    const dir = await opened('D3');
+    const dir = await opened('D3', `auditor=${AUD} workspace=dir`);
     writeFileSync(join(dir, 'scratch.txt'), 'temporary\n');
     marker(BRAIN, '<!-- IMCODES_TASK CANCEL D3 -->');
     const at = await endedAt('D3');
@@ -297,7 +297,7 @@ describe('pair workspaces', () => {
     const plain = join(base, 'plain-project');
     mkdirSync(plain);
     useProject(plain);
-    const dir = await opened('REOPEN', 'auditor=none');
+    const dir = await opened('REOPEN', 'auditor=none workspace=dir');
     marker(BRAIN, '<!-- IMCODES_TASK CANCEL REOPEN -->');
     const firstEnd = await endedAt('REOPEN');
     expect(pair('REOPEN').workspace).toMatchObject({ status: 'ended', endedAt: firstEnd });
@@ -324,7 +324,7 @@ describe('pair workspaces', () => {
     const plain = join(base, 'plain-project');
     mkdirSync(plain);
     useProject(plain);
-    const dir = await opened('RACE', 'auditor=none');
+    const dir = await opened('RACE', 'auditor=none workspace=dir');
     marker(BRAIN, '<!-- IMCODES_TASK CANCEL RACE -->');
     const at = await endedAt('RACE');
     const state = pair('RACE');
@@ -700,7 +700,7 @@ describe('pair workspaces', () => {
     const outputEvents = () => timeline.filter((entry) => entry.payload.verb === TASK_PAIR_WORKSPACE_EVENT_VERB);
 
     it('copies the deliverable named on DONE into the project directory and tells the user where', async () => {
-      const dir = await opened('O1', 'auditor=none');
+      const dir = await opened('O1', 'auditor=none workspace=dir');
       mkdirSync(join(dir, 'reports'));
       writeFileSync(join(dir, 'reports', 'summary.md'), '# result\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O1 output=reports/summary.md -->');
@@ -720,7 +720,7 @@ describe('pair workspaces', () => {
 
     it('honours dest= and never overwrites an existing file', async () => {
       writeFileSync(join(plain, 'final.md'), 'the user\'s own file\n');
-      const dir = await opened('O2', 'auditor=none');
+      const dir = await opened('O2', 'auditor=none workspace=dir');
       writeFileSync(join(dir, 'draft.md'), 'new\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O2 output=draft.md dest=final.md -->');
       marker(BRAIN, '<!-- IMCODES_TASK DONE O2 -->');
@@ -732,13 +732,13 @@ describe('pair workspaces', () => {
 
     it('refuses an output outside the workspace or a destination outside the project, and tells Brain', async () => {
       writeFileSync(join(base, 'secret.txt'), 'x\n');
-      await opened('O3', 'auditor=none');
+      await opened('O3', 'auditor=none workspace=dir');
       marker(EXEC, '<!-- IMCODES_TASK DONE O3 output=../../../secret.txt -->');
       marker(BRAIN, '<!-- IMCODES_TASK DONE O3 -->');
       await vi.waitFor(() => expect(sentTo(BRAIN, 'brain-output-failed')).toHaveLength(1), { timeout: 10_000 });
       expect(workspaceEvents('O3')).toEqual([expect.objectContaining({ effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED, attrs: expect.objectContaining({ reason: 'outside_workspace' }) })]);
 
-      const dir = await opened('O4', 'auditor=none');
+      const dir = await opened('O4', 'auditor=none workspace=dir');
       writeFileSync(join(dir, 'a.txt'), 'a\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O4 output=a.txt dest=../escaped.txt -->');
       marker(BRAIN, '<!-- IMCODES_TASK DONE O4 -->');
@@ -756,7 +756,7 @@ describe('pair workspaces', () => {
       } catch {
         return;
       }
-      const dir = await opened('O-SYMLINK', 'auditor=none');
+      const dir = await opened('O-SYMLINK', 'auditor=none workspace=dir');
       writeFileSync(join(dir, 'draft.md'), 'must stay in workspace\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O-SYMLINK output=draft.md dest=linked/escaped.md -->');
       marker(BRAIN, '<!-- IMCODES_TASK DONE O-SYMLINK -->');
@@ -769,13 +769,13 @@ describe('pair workspaces', () => {
     });
 
     it('copies nothing for temporary work (plain DONE, or CANCEL)', async () => {
-      const dir = await opened('O5', 'auditor=none');
+      const dir = await opened('O5', 'auditor=none workspace=dir');
       writeFileSync(join(dir, 'scratch.md'), 'temp\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O5 -->');
       marker(BRAIN, '<!-- IMCODES_TASK DONE O5 -->');
       await endedAt('O5');
       // An output named on an early DONE (no PASS yet) is dropped when the pair is cancelled.
-      const cancelled = await opened('O6', `auditor=${AUD}`);
+      const cancelled = await opened('O6', `auditor=${AUD} workspace=dir`);
       writeFileSync(join(cancelled, 'x.md'), 'x\n');
       marker(EXEC, '<!-- IMCODES_TASK DONE O6 output=x.md -->');
       // Owner rule: an audited pair cannot advance on executor DONE before PASS.

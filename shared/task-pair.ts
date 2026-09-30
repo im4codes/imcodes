@@ -128,6 +128,45 @@ export const TASK_PAIR_HEAVY_DIR_NAMES = [
   'node_modules', 'dist', 'build', '.build', '.vite', '.turbo', '.next', '.nuxt', '.parcel-cache',
   'coverage', 'cmake-build-debug', 'cmake-build-release',
 ] as const;
+/**
+ * A pair on a project that is NOT a git repository (owner 2026-09-30: "设备有安装git的 你可以创建git项目的", earlier "不是git就直接改",
+ * "支持cow的可以复制", and "几十g的你也复制吧 这个不太合适！" -- never a real full copy). The mode is chosen once, at pair start, and kept:
+ *  - `git_init`: git is installed, so the project directory becomes a local git repository (repo-local identity, an IM.codes block
+ *    in .gitignore for heavy directories and files over TASK_PAIR_GIT_INIT_LARGE_FILE_BYTES, a baseline commit, no remote, never a
+ *    push), refused above TASK_PAIR_GIT_INIT_MAX_TRACKED_BYTES with the init rolled back. Then the normal git worktree flow runs;
+ *    at DONE the daemon merges the pair branch into the project, refusing any file the user has uncommitted edits in.
+ *  - `cow`: fallback (no git, over the cap, init failed): the volume supports copy-on-write clones (APFS clonefile, Btrfs/XFS reflink)
+ *    and the project shares it with ~/.imcodes: the pair works on a clone; no git; a size/mtime manifest finds the changed files, the
+ *    audit request carries a per-file diff, and at DONE the changes are copied back with conflict refusal and backups.
+ *  - `in_place`: last resort: the pair edits the project directory itself; READY lists the changed files and pairs on the same
+ *    project run one after another unless Brain passes parallel=true.
+ */
+export const TASK_PAIR_NON_GIT_MODES = ['git_init', 'cow', 'in_place'] as const;
+export type TaskPairNonGitMode = typeof TASK_PAIR_NON_GIT_MODES[number];
+/** Files larger than this are not tracked by the auto-created repo (listed explicitly in the IM.codes .gitignore block). */
+export const TASK_PAIR_GIT_INIT_LARGE_FILE_BYTES = 50 * 1024 * 1024;
+export const TASK_PAIR_GIT_INIT_LARGE_FILE_BYTES_ENV = 'IMCODES_PAIR_GIT_INIT_LARGE_FILE_BYTES' as const;
+/** Tracked bytes above which the auto-init is refused and rolled back (fallback: COW clone, then in-place). */
+export const TASK_PAIR_GIT_INIT_MAX_TRACKED_BYTES = 2 * 1024 * 1024 * 1024;
+export const TASK_PAIR_GIT_INIT_MAX_TRACKED_BYTES_ENV = 'IMCODES_PAIR_GIT_INIT_MAX_TRACKED_BYTES' as const;
+/** Set to `off` to never `git init` a non-git project (straight to the COW / in-place fallbacks). */
+export const TASK_PAIR_GIT_INIT_ENABLE_ENV = 'IMCODES_PAIR_GIT_INIT' as const;
+/** Markers of the block IM.codes adds to the project's .gitignore. */
+export const TASK_PAIR_GITIGNORE_BLOCK_START = '# >>> IM.codes (auto: non-git project) >>>' as const;
+export const TASK_PAIR_GITIGNORE_BLOCK_END = '# <<< IM.codes <<<' as const;
+/** Directory names left out of a COW clone (rebuildable weight; not cloned, not compared, not copied back). */
+export const TASK_PAIR_CLONE_EXCLUDE_DIR_NAMES = [
+  ...TASK_PAIR_HEAVY_DIR_NAMES,
+  '.venv', 'venv', '__pycache__', 'target', '.gradle', '.mypy_cache', '.pytest_cache', '.tox',
+] as const;
+/** Directory inside a COW task directory holding the base manifest (never part of a comparison). */
+export const TASK_PAIR_COW_MANIFEST_DIR = '.imcodes-cow' as const;
+/** Directory inside a COW task directory holding the apply-back journal and the pre-apply backups. */
+export const TASK_PAIR_APPLY_BACK_DIR = '.imcodes-applyback' as const;
+/** The per-file diff a COW audit request refers to is cut at this size; the whole diff is written to the task directory. */
+export const TASK_PAIR_REVIEW_DIFF_MAX_BYTES = 48 * 1024;
+/** READY_FOR_AUDIT attribute listing the changed files (in-place mode: stated by the executor). */
+export const TASK_PAIR_READY_FILES_ATTR = 'files' as const;
 /** Free space on the worktree volume below which closed pairs are stripped, oldest first. */
 export const TASK_PAIR_DISK_LOW_FREE_BYTES = 10 * 1024 ** 3;
 export const TASK_PAIR_DISK_LOW_FREE_FRACTION = 0.05;
@@ -157,6 +196,18 @@ export const TASK_PAIR_WORKSPACE_EFFECTS = {
   /** The move waits until the old executor and every process working inside the worktree are idle. */
   MOVE_DEFERRED: 'workspace_move_deferred',
   MOVE_FAILED: 'workspace_move_failed',
+  /** A non-git project's workspace mode was chosen at pair start (cow clone or in-place). */
+  NON_GIT_MODE: 'non_git_mode',
+  /** A COW workspace's changes were copied back to the project. */
+  APPLY_BACK_APPLIED: 'apply_back_applied',
+  /** Nothing to copy back. */
+  APPLY_BACK_NOOP: 'apply_back_noop',
+  /** The project changed since the clone; nothing was written. */
+  APPLY_BACK_CONFLICT: 'apply_back_conflict',
+  /** The apply failed midway and was rolled back from the backup. */
+  APPLY_BACK_FAILED: 'apply_back_failed',
+  /** An applied change was undone from the backup. */
+  APPLY_BACK_UNDONE: 'apply_back_undone',
 } as const;
 /** Verb of daemon workspace events (never a marker verb). */
 export const TASK_PAIR_WORKSPACE_EVENT_VERB = 'WORKSPACE' as const;
@@ -187,6 +238,7 @@ export const TASK_PAIR_WORKSPACE_RULES = [
   `Any other task (the project is not a git repo, or Brain dispatched it with workspace=dir) gets a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/<taskId>/: work and write results there; READY_FOR_AUDIT <taskId> path=<the directory or the result files>, no git HEAD needed.`,
   'Never work in the main checkout or /tmp, and never delete the workspace by hand: the daemon removes it 7 days after the pair ends (DONE/CANCEL), and keeps a git worktree that still has uncommitted work or commits not yet integrated into origin/dev.',
   'If your workspace is missing, rebuild it from the original branch (or use the rebuilt path the daemon sends) and continue; do not wait.',
+  'A project that is not a git repository: when git is installed the daemon makes it a LOCAL repo (baseline commit, repo-local identity, no remote, never a push; heavy directories and files over 50 MB stay untracked via a marked block in .gitignore; refused above 2 GB tracked) and the normal worktree flow above runs; at DONE the daemon merges your branch into the project and refuses any file the user has uncommitted edits in. Fallbacks (no git, over the cap, init failed): a copy-on-write CLONE in the task directory, no git (the daemon finds your changed files by comparing with a manifest, the auditor gets a per-file diff, READY path=<clone>, and at DONE the changes are copied back with conflicts refused and overwritten files backed up); else IN-PLACE editing of the project directory (READY path=<project dir> files=<comma separated changed files>; pairs on that project run one at a time unless Brain passes parallel=true). The mode is fixed at pair start. Deleting unchanged files of a clone frees no disk (shared blocks); only the whole workspace or files you changed do.',
   'After an executor change the daemon moves the worktree under the new executor and names the one authoritative path; never work in a second copy of it. Git writes (reset, checkout, cherry-pick, commit) in the main checkout by a pair participant are refused or reported to Brain at once.',
   'Deliverables: judge from the task type whether the result must outlive the pair (a report, document or asset the user keeps) or is only temporary (scratch work, or code that is committed locally). If it must be kept, end with DONE <taskId> output=<path inside the workspace> [dest=<path inside the project directory>]: the daemon copies it into the project directory (by default under the same relative path, never overwriting) and tells the user where. Temporary work: plain DONE.',
 ].join(' ');
@@ -880,6 +932,8 @@ export interface TaskPairState {
   auditorProposalNudgeRound?: number;
   /** Workspace Brain asked for on DISPATCH/QUEUE (`workspace=dir`); otherwise chosen by the project. */
   workspaceKind?: TaskPairWorkspaceKind;
+  /** Brain's `parallel=true` on DISPATCH/QUEUE: run alongside another pair editing the same non-git project in place. */
+  parallelInPlace?: boolean;
   /** Queue priority requested by the Brain; urgent queued work runs before normal FIFO work. */
   urgent?: boolean;
   /** Deliverable to keep, named on DONE (`output=`, `dest=`); copied into the project when the pair ends DONE. */
@@ -928,11 +982,43 @@ export interface TaskPairMaterial {
   path?: string;
   /** Explicit note that a deletion is intentional; suppresses only the advisory. */
   intentionalNote?: string;
+  /** Changed files the executor stated on READY (comma separated); in-place mode's only record of what changed. */
+  files?: string;
   at: number;
+}
+
+/** Outcome of bringing a non-git pair's changes into the project (git_init: merge of the pair branch; cow: checked copy-back). */
+export const TASK_PAIR_APPLY_BACK_STATUSES = ['pending', 'applying', 'applied', 'noop', 'conflict', 'failed', 'undone'] as const;
+export type TaskPairApplyBackStatus = typeof TASK_PAIR_APPLY_BACK_STATUSES[number];
+
+export interface TaskPairApplyBackState {
+  status: TaskPairApplyBackStatus;
+  /** Files (project-relative, `/`-separated) touched, or in conflict. */
+  files?: string[];
+  at: number;
+}
+
+/** How a non-git project is handled for this pair (fixed at pair start). */
+export interface TaskPairNonGitInfo {
+  mode: TaskPairNonGitMode;
+  /** The project directory: cloned from (cow) or edited directly (in_place). */
+  projectRoot: string;
+  /** Why the step before was not used (cow: git init refused; in_place: git init and clone refused), e.g. `git_unavailable`, `clone_unsupported:EXDEV`. */
+  fallbackReason?: string;
+  /** git_init: what the auto-created repository tracks and what it left out. */
+  gitInit?: { created: boolean; trackedFiles: number; trackedBytes: number; ignoredLargeFiles: number; ignoredHeavyDirs: string[]; ms: number };
+  /** cow: what the clone cost. */
+  clone?: { files: number; logicalBytes: number; ms: number; extraDiskBytes?: number };
+  createdAt: number;
+  applyBack?: TaskPairApplyBackState;
 }
 
 export interface TaskPairWorkspace {
   kind: TaskPairWorkspaceKind;
+  /** Present when the project was not a git repository: how it is handled for this pair. */
+  nonGit?: TaskPairNonGitInfo;
+  /** Absolute directory where the pair's executor/auditor work by default (their turn cwd). Absent = workspace.path. */
+  workingDir?: string;
   path: string;
   /**
    * Absolute directory where the pair's executor and auditor work by default (their turn cwd). Absent = `path`.
@@ -989,7 +1075,7 @@ export interface TaskPairOutput {
 }
 
 /** READY_FOR_AUDIT attributes that name the audit material. */
-export const TASK_PAIR_MATERIAL_ATTRS = ['worktree', 'head', 'base', 'path', 'intentionalNote'] as const;
+export const TASK_PAIR_MATERIAL_ATTRS = ['worktree', 'head', 'base', 'path', 'intentionalNote', 'files'] as const;
 
 /** Two commit ids name the same commit when one is a (>=7 hex) prefix of the other. */
 export function sameTaskPairCommit(a: string, b: string): boolean {
@@ -1014,6 +1100,7 @@ function materialFromAttrs(attrs: Record<string, string>, now: number): TaskPair
 function applyWorkspaceAttr(pair: TaskPairState, attrs: Record<string, string>): void {
   const kind = attrs.workspace;
   if (kind && (TASK_PAIR_WORKSPACE_KINDS as readonly string[]).includes(kind)) pair.workspaceKind = kind as TaskPairWorkspaceKind;
+  if (attrs.parallel === 'true') pair.parallelInPlace = true;
 }
 
 function applyOutputAttr(pair: TaskPairState, attrs: Record<string, string>): void {

@@ -498,7 +498,43 @@ export function buildAuditorHandoffMessage(pair: TaskPairState): string {
 }
 
 /** An audit round opened: exactly where the material is, resolved by the daemon. */
+/** How to review a non-git pair: the clone's comparison and per-file diff (cow), or the listed files in the project itself (in-place). */
+function nonGitReviewLines(material: ResolvedTaskPairMaterial): string[] {
+  if (material.nonGit?.mode === 'cow') {
+    const review = material.review;
+    const list = review?.changes.length ? review.changes.map((change) => `${change.kind} ${change.path}`).join('; ') : 'none: the clone is unchanged';
+    return [
+      `Material: copy-on-write CLONE ${material.path} of the project ${material.nonGit.projectRoot} (not a git repository: there is no HEAD or base). Changed files, computed by the daemon by comparing the clone with the manifest taken when it was cloned: ${list}.`,
+      ...(review?.summaries.length ? [`Not shown as text: ${review.summaries.join('; ')}.`] : []),
+      ...(review?.diff ? [`Per-file diff, clone vs the project original${review.diffTruncated ? ` (cut; the whole diff is in ${review.diffFile})` : review.diffFile ? ` (also in ${review.diffFile})` : ''}:`, '```diff', review.diff.replace(/```/g, "'''"), '```'] : []),
+    ];
+  }
+  if (material.nonGit?.mode === 'in_place') {
+    return [
+      `Material: the project directory ${material.nonGit.projectRoot}, edited IN PLACE (it is not a git repository and could not be cloned, so there is no HEAD, base or diff). Review the changed files where they are.`,
+      material.files ? `Changed files stated by the executor: ${material.files}.` : 'The executor did not list the changed files: ask for the list before judging.',
+    ];
+  }
+  return [];
+}
+
 export function buildAuditRequestMessage(pair: TaskPairState, material: ResolvedTaskPairMaterial, warning?: string): string {
+  if (material.nonGit) {
+    return [
+      header(pair),
+      TASK_PAIR_TITLE_RULE,
+      `Audit request, round ${Math.max(1, pair.round)}, from executor ${pair.executor} (blocking=${pair.blocking.join(',')}).`,
+      ...nonGitReviewLines(material),
+      ...(warning ? [warning] : []),
+      `Their validation (full suites for code) comes from them via send_message. Judge by ${AUDIT_CONVERGENCE_CONTRACT_ID}, reply to the executor with every finding tagged [P0]..[P4], then write ${marker('PASS', pair.taskId, `blocking=${pair.blocking.join(',')}`)} or ${marker('REWORK', pair.taskId, `blocking=${pair.blocking.join(',')} p0=<n> ...`)}.`,
+      TASK_PAIR_AUDITOR_PROPOSAL_RULE,
+      TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
+      TASK_PAIR_VALIDATION_REPORT_RULE,
+      TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
+      `${NO_LEGACY_ARTIFACTS} If the material cannot be reached (executor limited/offline, workspace unreadable), write ${marker('NEEDS_INPUT', pair.taskId, 'note="..."')} and wait; that is never a P0 or REWORK.`,
+      contracts(pair.blocking),
+    ].join('\n');
+  }
   const where = materialLine(material)
     ?? `Material: the executor did not name a workspace and none could be resolved; ask ${pair.executor} for its worktree path and head, or its task-directory path.`;
   return [
@@ -538,7 +574,7 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
     workplaceLine(pair),
     pair.auditor === TASK_PAIR_NO_AUDITOR
       ? `No audit window for this pair -- do proportionate self-validation instead (full suites for code), then commit locally in the worktree (never push any branch). Report straight to Brain in the same closing reply as your ${marker('DONE', pair.taskId)}: what changed, your worktree path and HEAD (or file paths for non-code work), and your validation result. Brain merges commits into dev and pushes dev; the daemon relays that reply to Brain as the completion notice, so write it as if Brain will read only that.`
-      : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. After their PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write ${marker('DONE', pair.taskId)}; Brain merges into dev and pushes dev.`,
+      : `When done, send the auditor your validation (full suites for code) with send_message and write ${readyMarker(pair)}; the daemon relays that to the auditor. ${afterPassLine(pair)}`,
     TASK_PAIR_WORKSPACE_RULES,
     TASK_PAIR_VALIDATION_REPORT_RULE,
     TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
@@ -550,12 +586,54 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
   ].join('\n');
 }
 
+/** Brain, once per pair: which way a non-git project is handled, and why not the ones before it. */
+export function buildNonGitModeLine(pair: TaskPairState, nonGit: NonNullable<NonNullable<TaskPairState['workspace']>['nonGit']>): string | undefined {
+  const header0 = header(pair);
+  if (nonGit.mode === 'git_init') return undefined; // the repo-created notice is sent once, when it is made
+  const why = nonGit.fallbackReason ? ` (a local git repo was not used: ${nonGit.fallbackReason})` : '';
+  if (nonGit.mode === 'cow') {
+    const clone = nonGit.clone;
+    return `${header0} Non-git project ${nonGit.projectRoot}${why}: the pair works on a copy-on-write clone${clone ? ` (${clone.files} files, ${Math.round(clone.logicalBytes / 1024 / 1024)} MiB logical, cloned in ${clone.ms} ms${clone.extraDiskBytes !== undefined ? `, extra disk used about ${Math.round(clone.extraDiskBytes / 1024)} KiB` : ''})` : ''}. Changes are copied back to the project at DONE; conflicts are refused and reported, overwritten files are backed up.`;
+  }
+  return `${header0} Non-git project ${nonGit.projectRoot}${why}: NO isolated copy could be made, so the pair edits the project directory in place (no undo). Pairs on this project run one at a time; pass parallel=true on DISPATCH to override.`;
+}
+
+/** Brain: how bringing a non-git pair's work into the project went. */
+export function buildNonGitFinishLine(pair: TaskPairState, mode: 'git_init' | 'cow', outcome: { status: 'applied' | 'noop' | 'conflict' | 'failed'; files: string[]; detail?: string }): string {
+  const root = pair.workspace?.nonGit?.projectRoot ?? 'the project';
+  const shown = outcome.files.slice(0, 12).join(', ') + (outcome.files.length > 12 ? `, +${outcome.files.length - 12} more` : '');
+  const how = mode === 'git_init' ? 'merge of the pair branch into the project' : 'copy-back of the clone into the project';
+  if (outcome.status === 'applied') return `${header(pair)} DONE: ${how} succeeded${outcome.detail ? ` (${outcome.detail})` : ''}: ${outcome.files.length} file(s) in ${root}${shown ? `: ${shown}` : ''}.${mode === 'cow' ? ' Every overwritten or deleted project file is backed up in the task directory and can be restored.' : ''}`;
+  if (outcome.status === 'noop') return `${header(pair)} DONE: nothing to bring into ${root}${outcome.detail ? ` (${outcome.detail})` : ''}.`;
+  if (outcome.status === 'conflict') {
+    return `${header(pair)} DONE, but the ${how} was REFUSED and nothing was written: ${mode === 'git_init' ? 'the project has uncommitted edits in (or staged changes touching) files the pair changed, or the commits conflict' : 'these project files changed since the clone was made, or are in the way'}: ${shown}. Nothing in ${root} was overwritten. Resolve it (commit or move your edits, or redo the change on the current files); the daemon retries hourly and tells you when it lands. The pair's work is kept in ${pair.workspace?.path}.`;
+  }
+  return `${header(pair)} DONE, but the ${how} FAILED${outcome.detail ? `: ${outcome.detail}` : ''}. The pair's work is kept in ${pair.workspace?.path}; the daemon retries hourly.`;
+}
+
+/** What happens after PASS, for the executor's closing instruction. */
+function afterPassLine(pair: TaskPairState): string {
+  const nonGit = pair.workspace?.nonGit;
+  const done = marker('DONE', pair.taskId);
+  if (nonGit?.mode === 'git_init') return `After their PASS, commit locally in the worktree (never push any branch) and write ${done}; the daemon merges your branch into the project (refusing any file with uncommitted user edits) and tells Brain.`;
+  if (nonGit?.mode === 'cow') return `After their PASS, write ${done}; the daemon copies your changed files back into the project (conflicts refused and reported, overwritten files backed up).`;
+  if (nonGit?.mode === 'in_place') return `After their PASS, write ${done}; your edits are already in the project, so report the changed files to Brain in the same reply.`;
+  return `After their PASS, commit locally in the worktree (never push any branch), report the worktree path and HEAD to Brain, and write ${done}; Brain merges into dev and pushes dev.`;
+}
+
 /**
  * Where the executor works: the workspace the daemon created for the pair (a
  * worktree or a task directory), or, if none could be created, its own.
  */
 function workplaceLine(pair: TaskPairState): string {
   const workspace = pair.workspace;
+  const nonGit = workspace?.status === 'active' ? workspace.nonGit : undefined;
+  if (workspace && nonGit?.mode === 'cow') {
+    return `Work in the copy-on-write CLONE of the project the daemon made for this pair: ${workspace.path} (the project ${nonGit.projectRoot} is not a git repository, so there is no git here). Heavy directories such as node_modules were not cloned: install or link what you need. The project itself is not touched while you work: the daemon finds your changed files by comparing the clone with the manifest it took, sends the auditor a per-file diff against the original, and after PASS copies your changes back at DONE (any file the project changed meanwhile is refused and reported, never overwritten; overwritten files are backed up). Write READY_FOR_AUDIT with path=${workspace.path}. This absolute path is authoritative; never use cwd or write into ${nonGit.projectRoot}.`;
+  }
+  if (workspace && nonGit?.mode === 'in_place') {
+    return `Work DIRECTLY in the project directory: ${nonGit.projectRoot}. It is not a git repository and this machine could not make it one or clone it (${nonGit.fallbackReason ?? 'no reason recorded'}), so there is no isolated copy and no undo: make deliberate edits and keep a list of every file you change. ${workspace.path} is only for scratch, evidence and deliverables. Write READY_FOR_AUDIT with path=${nonGit.projectRoot} files=<comma separated changed files>. Pairs on this project run one at a time unless Brain passed parallel=true.`;
+  }
   if (workspace && workspace.status === 'active') {
     const latestHead = workspace.lastHead ?? pair.material?.head;
     const where = workspace.branch ? `on branch ${workspace.branch}` : 'detached';
@@ -568,7 +646,10 @@ function workplaceLine(pair: TaskPairState): string {
     const moved = workspace.previousPaths?.length
       ? ` The previous executor's worktree was moved here from ${workspace.previousPaths[workspace.previousPaths.length - 1]}; that old path no longer exists, and any material naming it now resolves to this path.`
       : '';
-    return line + moved + duplicateWorktreeWarning(workspace);
+    const initNote = nonGit?.mode === 'git_init'
+      ? ` ${nonGit.projectRoot} was not a git repository: IM.codes made it a LOCAL git repo (no remote, never push). Do not commit in ${nonGit.projectRoot} yourself; after PASS and DONE the daemon merges your branch into the project (it refuses any file the user has uncommitted edits in and tells Brain).`
+      : '';
+    return line + initNote + moved + duplicateWorktreeWarning(workspace);
   }
   return `No workspace could be created for this pair: use your own git worktree under ~/.imcodes/worktrees for code in a git project, else a task directory under ~/.imcodes/${TASK_PAIR_WORKS_DIR}/<project>/${pair.taskId}/, and name it on READY_FOR_AUDIT.`;
 }
@@ -637,7 +718,7 @@ export function buildWorkspaceMoveFailedLine(pair: TaskPairState, detail: string
 
 /** Brain: a finished pair's worktree still held unsaved work at removal time, so it was kept. */
 export function buildWorkspaceKeptLine(pair: TaskPairState, reason: string): string {
-  const why = reason === 'unpushed' ? 'has commits not yet integrated into dev' : reason === 'dirty' ? 'has uncommitted changes' : reason === 'untracked' ? 'has untracked files' : `could not be checked (${reason})`;
+  const why = reason === 'unapplied' ? 'holds work that never reached the project (see the merge / copy-back notice)' : reason === 'unpushed' ? 'has commits not yet integrated into dev' : reason === 'dirty' ? 'has uncommitted changes' : reason === 'untracked' ? 'has untracked files' : `could not be checked (${reason})`;
   return `${header(pair)} The pair ended 7 days ago but its worktree ${pair.workspace?.path ?? ''} ${why}, so it was kept instead of deleted. Have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; it is removed once clean or integrated into dev.`;
 }
 
@@ -658,6 +739,9 @@ export function buildOutputFailedLine(pair: TaskPairState, reason: string): stri
 }
 
 function readyMarker(pair: TaskPairState): string {
+  const nonGit = pair.workspace?.nonGit;
+  if (nonGit?.mode === 'cow' && pair.workspace) return marker('READY_FOR_AUDIT', pair.taskId, `path=${pair.workspace.path}`);
+  if (nonGit?.mode === 'in_place') return marker('READY_FOR_AUDIT', pair.taskId, `path=${nonGit.projectRoot} files=<comma separated changed files>`);
   return pair.workspace?.kind === 'dir'
     ? marker('READY_FOR_AUDIT', pair.taskId, 'path=<the task directory or the result files>')
     : marker('READY_FOR_AUDIT', pair.taskId, 'worktree=<absolute path> head=<commit> base=<commit>');

@@ -18,6 +18,7 @@ import {
   setSupervisionHeartbeatProjection,
 } from '../supervision-heartbeat-projection.js';
 import logger from '../../util/logger.js';
+import { resolve as resolvePath } from 'node:path';
 import { getSession, listSessions, type SessionRecord } from '../../store/session-store.js';
 import { restartSession } from '../../agent/session-manager.js';
 import {
@@ -2018,6 +2019,14 @@ export class TaskPairAutomation implements TaskPairScheduler {
         this.#logQueueSkip(project, pair, detail);
         continue;
       }
+      // Pairs that edit the same non-git project directory in place run one after another (Brain overrides with parallel=true).
+      const inPlaceHolder = this.#inPlaceHolder(pair, executor);
+      if (inPlaceHolder) {
+        const detail = `waiting for ${inPlaceHolder.state.taskId} (it edits ${inPlaceHolder.state.workspace?.nonGit?.projectRoot} in place; pass parallel=true on DISPATCH to run alongside)`;
+        this.#flagQuiet(project, pair.taskId, 'waiting_for_capacity', detail);
+        this.#logQueueSkip(project, pair, detail);
+        continue;
+      }
       const result = taskPairService.applyMarker({
         project,
         writer: 'daemon',
@@ -2045,6 +2054,25 @@ export class TaskPairAutomation implements TaskPairScheduler {
       }
       await sendTaskPairMessage(brain, pair.taskId, 'brain-line-dispatch', buildBrainLine(cleaned, `dispatched from the queue: executor ${executor}, auditor ${auditor}.`));
     }
+  }
+
+  /**
+   * Another open pair that is editing, in place, the same non-git project directory this pair's executor works in. The
+   * in-place mode has no isolation, so two such pairs would edit the same files at the same time; the second waits. A
+   * git worktree, a git-init'd project and a COW clone never serialize (git and the copy-back catch conflicts).
+   */
+  #inPlaceHolder(pair: TaskPairState, executor: string): StoredTaskPair | undefined {
+    if (pair.parallelInPlace || pair.workspaceKind === 'dir') return undefined;
+    const projectDir = getSession(executor)?.projectDir;
+    if (!projectDir) return undefined;
+    const root = resolvePath(projectDir);
+    return getTaskPairStore().listActivePairs().find((candidate) => (
+      candidate.state.taskId !== pair.taskId
+      && TASK_PAIR_OPEN_STATUSES.includes(candidate.state.status)
+      && candidate.state.workspace?.nonGit?.mode === 'in_place'
+      && candidate.state.workspace.status === 'active'
+      && resolvePath(candidate.state.workspace.nonGit.projectRoot) === root
+    ));
   }
 
   #flagOnceWithKey(stored: StoredTaskPair, key: string, text: string): void {

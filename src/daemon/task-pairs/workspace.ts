@@ -34,11 +34,14 @@ import {
   TASK_PAIR_WORKS_DIR,
   TASK_PAIR_WORKS_ROOT_ENV,
   TASK_PAIR_WORKTREE_PREFIX,
+  type TaskPairNonGitInfo,
   type TaskPairState,
   type TaskPairWorkspaceKind,
 } from '../../../shared/task-pair.js';
 import { isSessionBusy } from './pool.js';
 import { resolveSupervisionAssignmentWorktree, resolveSupervisionWorktreesRoot } from '../supervision-worktree-inspector.js';
+import { initProjectRepo, isImcodesInitRepo } from './git-init.js';
+import { createCowClone, probeCopyOnWrite, readCowManifest, type CloneEngine, type CloneFile } from './non-git.js';
 import { ensureSupervisionAssignmentWorktree } from '../supervision-worktree-provision.js';
 import {
   countTaskPairCommitsNotInDev,
@@ -91,7 +94,7 @@ function pruneStaleWorktreeRegistration(projectRoot: string, worktreePath: strin
   });
 }
 
-export type TaskPairWorkspaceRevisionSource = 'branch' | 'lastHead' | 'materialHead' | 'base' | 'default' | 'directory';
+export type TaskPairWorkspaceRevisionSource = 'branch' | 'lastHead' | 'materialHead' | 'base' | 'default' | 'directory' | 'clone';
 
 interface ResolvedWorkspaceRevision {
   revision: string;
@@ -158,7 +161,15 @@ export function resolveTaskPairTaskDir(project: string, taskId: string, env: Nod
 }
 
 export type TaskPairWorkspaceProvision =
-  | { ok: true; kind: TaskPairWorkspaceKind; path: string; base?: string; branch?: string; source: TaskPairWorkspaceRevisionSource }
+  | {
+    ok: true; kind: TaskPairWorkspaceKind; path: string; base?: string; branch?: string; source: TaskPairWorkspaceRevisionSource;
+    /** A non-git project's mode: git_init (kind worktree), cow or in_place (kind dir). */
+    nonGit?: TaskPairNonGitInfo;
+    /** In-place mode: the directory the pair works in (the project); the task directory is scratch. */
+    workingDir?: string;
+    /** For Brain, once: the project was turned into a local repository. */
+    brainNotice?: string;
+  }
   | { ok: false; detail: string };
 
 export type TaskPairWorkspaceRelease =
@@ -166,7 +177,7 @@ export type TaskPairWorkspaceRelease =
   | { action: 'absent' }
   /** The pair changed while release was in flight; nothing was removed. */
   | { action: 'skipped' }
-  | { action: 'kept'; reason: 'dirty' | 'untracked' | 'unpushed' | 'locked' | 'unreadable' };
+  | { action: 'kept'; reason: 'dirty' | 'untracked' | 'unpushed' | 'locked' | 'unreadable' | 'unapplied' };
 
 export type TaskPairOutputCopy =
   | { ok: true; dest: string }
@@ -179,6 +190,8 @@ export interface TaskPairWorkspaceDeps {
   /** Re-check ownership/liveness immediately before deleting the workspace. */
   beforeRemove?: () => boolean | Promise<boolean>;
   countCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  /** Non-git projects: the copy-on-write primitive (tests simulate a filesystem without it). */
+  cloneEngine?: CloneEngine | CloneFile;
   /** Rehome: is this session mid-turn (or has queued work)? */
   isBusy?: (sessionName: string) => boolean;
   /** Rehome: does any live process have its working directory inside `path`? */
@@ -230,6 +243,45 @@ async function provisionTaskDir(project: string, pair: TaskPairState, env?: Node
 }
 
 /**
+ * The fallbacks for a non-git project when a local repo cannot be made (no git, over the size cap, init failed, disabled): if the
+ * project can be cloned copy-on-write into the task directory (probe: one file, same volume) the pair works on the clone;
+ * otherwise it edits the project directory itself and the task directory is scratch. Never a real full copy.
+ */
+async function provisionNonGit(project: string, pair: TaskPairState, projectRoot: string, deps: TaskPairWorkspaceDeps, gitReason: string): Promise<TaskPairWorkspaceProvision> {
+  const path = resolveTaskPairTaskDir(project, pair.taskId, deps.env);
+  const existing = await readdir(path).catch(() => undefined);
+  // A clone made just before a restart that had not been recorded yet: adopt it.
+  const adoptable = existing && existing.length > 0 ? await readCowManifest(path) : undefined;
+  if (adoptable) {
+    return { ok: true, kind: 'dir', path, source: 'clone', nonGit: { mode: 'cow', projectRoot: adoptable.projectRoot, fallbackReason: gitReason, createdAt: adoptable.createdAt } };
+  }
+  // A plain task directory that already holds results: never clone over it.
+  if (existing && existing.length > 0) return provisionTaskDir(project, pair, deps.env);
+  await mkdir(path, { recursive: true });
+  const probe = await probeCopyOnWrite(projectRoot, path, deps.cloneEngine).catch(() => ({ supported: false, reason: 'probe_failed' }));
+  let fallbackReason = probe.supported ? gitReason : `${gitReason}; ${probe.reason}`;
+  if (probe.supported) {
+    const cloned = await createCowClone(projectRoot, path, { engine: deps.cloneEngine });
+    if (cloned.ok) {
+      return {
+        ok: true, kind: 'dir', path, source: 'clone',
+        nonGit: {
+          mode: 'cow', projectRoot, fallbackReason: gitReason,
+          clone: { files: cloned.files, logicalBytes: cloned.logicalBytes, ms: cloned.ms, ...(cloned.extraDiskBytes !== undefined ? { extraDiskBytes: cloned.extraDiskBytes } : {}) },
+          createdAt: Date.now(),
+        },
+      };
+    }
+    fallbackReason = `${gitReason}; ${cloned.reason}: ${cloned.detail}`;
+    await mkdir(path, { recursive: true });
+  }
+  return {
+    ok: true, kind: 'dir', path, source: 'directory', workingDir: projectRoot,
+    nonGit: { mode: 'in_place', projectRoot, fallbackReason, createdAt: Date.now() },
+  };
+}
+
+/**
  * Create (or reuse) the pair's workspace: a worktree from the project
  * checkout's HEAD for code in a git project, a task directory otherwise.
  */
@@ -242,8 +294,31 @@ export async function provisionTaskPairWorkspace(
   const projectRoot = taskPairProjectRoot(pair, deps);
   if (!projectRoot) return { ok: false, detail: 'no project directory for the pair' };
   if (!(await stat(projectRoot).catch(() => undefined))?.isDirectory()) return { ok: false, detail: 'the project directory does not exist' };
-  // Only a git checkout gets a worktree; a non-git project is never git-initialised.
-  if (pair.workspaceKind === 'dir' || !(await isGitWorkTree(projectRoot))) return provisionTaskDir(project, pair, deps.env);
+  if (pair.workspaceKind === 'dir') return provisionTaskDir(project, pair, deps.env);
+  // A non-git project: turn it into a local git repo (git is installed) and run the normal worktree flow; COW clone, then
+  // in-place editing, are only the fallbacks. The mode chosen at pair start is kept for the pair's life.
+  let nonGit: TaskPairNonGitInfo | undefined = pair.workspace?.nonGit?.mode === 'git_init' ? pair.workspace.nonGit : undefined;
+  let brainNotice: string | undefined;
+  if (pair.workspace?.nonGit && pair.workspace.nonGit.mode !== 'git_init') {
+    if (pair.workspace.nonGit.mode === 'cow') return { ok: false, detail: 'the COW workspace is gone; its changes cannot be rebuilt from the project' };
+    const scratch = await provisionTaskDir(project, pair, deps.env);
+    return scratch.ok ? { ...scratch, nonGit: pair.workspace.nonGit, workingDir: pair.workspace.nonGit.projectRoot } : scratch;
+  }
+  const alreadyGit = await isGitWorkTree(projectRoot);
+  // A project IM.codes turned into a repo for an earlier pair is still a "git_init" project: its pairs merge into it at DONE.
+  if (!alreadyGit || (!nonGit && await isImcodesInitRepo(projectRoot))) {
+    const init = await initProjectRepo(projectRoot, { taskId: pair.taskId, ...(deps.env ? { env: deps.env } : {}) });
+    if (!init.ok) return provisionNonGit(project, pair, projectRoot, deps, `git_init_${init.reason}: ${init.detail}`);
+    nonGit = {
+      mode: 'git_init', projectRoot, createdAt: Date.now(),
+      gitInit: { created: init.created, trackedFiles: init.trackedFiles, trackedBytes: init.trackedBytes, ignoredLargeFiles: init.ignoredLargeFiles, ignoredHeavyDirs: init.ignoredHeavyDirs, ms: init.ms },
+    };
+    if (init.created) {
+      brainNotice = `The project ${projectRoot} was not a git repository. IM.codes created a LOCAL repo in it (repo-local identity, no remote, never pushed) with the baseline commit "imcodes: baseline before pair ${pair.taskId}": `
+        + `${init.trackedFiles} files / ${Math.round(init.trackedBytes / 1024 / 1024)} MiB tracked, ${init.ignoredLargeFiles} large file(s) and the heavy directories (${init.ignoredHeavyDirs.slice(0, 6).join(', ')}, ...) ignored via a marked block in .gitignore. `
+        + 'Pairs on this project now use the normal git worktree flow; at DONE the daemon merges the pair branch into the project, refusing any file you have uncommitted edits in.';
+    }
+  }
   const assignmentId = taskPairWorktreeName(pair.taskId);
   const resolved = await resolveWorkspaceRebuildRevision(projectRoot, pair);
   // A git repo without a commit has nothing to branch from: a task directory still works.
@@ -271,7 +346,10 @@ export async function provisionTaskPairWorkspace(
   // instead of drifting into a detached HEAD no one is tracking.
   if (resolved.source === 'branch' && resolved.branch) await checkoutExistingBranch(result.worktreePath, resolved.branch);
   const branch = await gitBranch(result.worktreePath);
-  return { ok: true, kind: 'worktree', path: result.worktreePath, base: result.baseRevision, source: resolved.source, ...(branch ? { branch } : {}) };
+  return {
+    ok: true, kind: 'worktree', path: result.worktreePath, base: result.baseRevision, source: resolved.source, ...(branch ? { branch } : {}),
+    ...(nonGit ? { nonGit } : {}), ...(brainNotice ? { brainNotice } : {}),
+  };
 }
 
 /**
@@ -284,6 +362,10 @@ export async function releaseTaskPairWorkspace(
 ): Promise<TaskPairWorkspaceRelease> {
   const workspace = pair.workspace;
   if (!workspace) return { action: 'absent' };
+  // A finished non-git pair whose work never reached the project (merge refused, copy-back conflicted or failed, not run yet)
+  // is kept: this workspace is the only place the work is.
+  const landed = ['applied', 'noop', 'undone'].includes(workspace.nonGit?.applyBack?.status ?? '');
+  if (workspace.nonGit && workspace.nonGit.mode !== 'in_place' && pair.status === 'done' && !landed) return { action: 'kept', reason: 'unapplied' };
   if (workspace.kind === 'dir') {
     const allowed = allowWorkspaceRemoval(deps);
     if (typeof allowed === 'boolean' ? !allowed : !(await allowed)) return { action: 'skipped' };
@@ -307,9 +389,13 @@ export async function releaseTaskPairWorkspace(
   if (inspection.untracked) return { action: 'kept', reason: 'untracked' };
   // Commits the executor made that Brain has not integrated into origin/dev
   // would be lost. A cherry-picked equivalent in dev is safe to remove.
-  const notInDev = workspace.base
-    ? await (deps.countCommitsNotInDev ?? countTaskPairCommitsNotInDev)(repoPath, workspace.base)
-    : undefined;
+  // A repo IM.codes made has no dev/origin: the pair's commits stay reachable on their branch after the worktree goes, and a
+  // finished pair was merged into the project (or kept above), so only uncommitted work (checked before) is at risk.
+  const notInDev = workspace.nonGit?.mode === 'git_init'
+    ? 0
+    : workspace.base
+      ? await (deps.countCommitsNotInDev ?? countTaskPairCommitsNotInDev)(repoPath, workspace.base)
+      : undefined;
   if (notInDev === undefined || notInDev > 0) return { action: 'kept', reason: 'unpushed' };
   if (!(await removalAllowed(deps))) return { action: 'skipped' };
   if (!(await removeRegisteredGitWorktree(inspection, repoPath))) return { action: 'kept', reason: 'unreadable' };

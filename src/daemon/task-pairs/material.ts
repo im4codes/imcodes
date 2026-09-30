@@ -16,6 +16,7 @@
 import { execFile } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { redirectTaskPairWorkspacePath, sameTaskPairCommit, type TaskPairState } from '../../../shared/task-pair.js';
+import { buildCowReview } from './non-git.js';
 
 const GIT_HEAD_TIMEOUT_MS = 5_000;
 
@@ -25,6 +26,12 @@ export interface ResolvedTaskPairMaterial {
   base?: string;
   /** Task-directory material. */
   path?: string;
+  /** Non-git project (cow clone / in-place): which way it is handled, so the audit request says how to review. */
+  nonGit?: { mode: 'cow' | 'in_place'; projectRoot: string };
+  /** In-place mode: the changed files the executor stated on READY (comma separated). */
+  files?: string;
+  /** COW mode: the daemon's comparison of the clone with its manifest, and the per-file diff against the project original. */
+  review?: { changes: Array<{ kind: 'added' | 'modified' | 'deleted'; path: string }>; diff: string; diffTruncated: boolean; diffFile?: string; summaries: string[] };
   intentionalNote?: string;
   /** Rebase-only ownership context; never persisted in pair material. */
   ownershipBase?: string;
@@ -80,6 +87,22 @@ export async function resolveTaskPairMaterial(pair: TaskPairState, deps: TaskPai
         ...(pair.material.path ? { path: redirectTaskPairWorkspacePath(workspace, pair.material.path) } : {}),
       }
     : pair.material;
+  const nonGit = workspace?.kind === 'dir' ? workspace.nonGit : undefined;
+  if (workspace && nonGit?.mode === 'cow' && !named?.worktree && !named?.head) {
+    // The executor names the clone; the changed files are the daemon's own comparison with the manifest, never the executor's word.
+    const review = await buildCowReview(workspace.path).catch(() => undefined);
+    return {
+      path: workspace.path, source: named?.path ? 'executor' : 'workspace', nonGit: { mode: 'cow', projectRoot: nonGit.projectRoot },
+      ...(review ? { review: { changes: review.changes.map((change) => ({ kind: change.kind, path: change.path })), diff: review.diff, diffTruncated: review.diffTruncated, ...(review.diffFile ? { diffFile: review.diffFile } : {}), summaries: review.summaries } } : {}),
+    };
+  }
+  if (workspace && nonGit?.mode === 'in_place' && !named?.worktree && !named?.head) {
+    // The project directory itself is the material; there is no HEAD or base to flag.
+    return {
+      path: nonGit.projectRoot, source: named?.path ? 'executor' : 'workspace', nonGit: { mode: 'in_place', projectRoot: nonGit.projectRoot },
+      ...(named?.files ? { files: named.files } : {}),
+    };
+  }
   if (workspace?.kind === 'dir' && !named?.worktree && !named?.head) {
     return { path: named?.path ?? workspace.path, source: named?.path ? 'executor' : 'workspace' };
   }
