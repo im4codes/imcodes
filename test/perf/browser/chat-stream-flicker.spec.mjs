@@ -107,7 +107,8 @@ export function installFlickerProbe() {
       P.animStarts.push({ t: performance.now(), type, name: event.animationName ?? event.propertyName, cls: classify(row), tag: `${event.target.tagName}.${String(event.target.className).slice(0, 40)}` });
     }, true);
   }
-  const sample = () => {
+  // kind: 'raf' (time of the rAF callback) or 'paint' (task queued after the frame); each keeps its OWN previous-frame state.
+  const sample = (kind) => {
     const r = root();
     if (!r) return null;
     observe();
@@ -147,15 +148,16 @@ export function installFlickerProbe() {
     // un-parsed fallback), 'markdown' = block elements, 'empty' before any text.
     const rich = event?.querySelector('.chat-rich-text') ?? null;
     const mode = !rich ? 'empty' : (rich.children.length === 1 && rich.firstElementChild.tagName === 'SPAN' ? 'raw' : 'markdown');
-    const prevLen = P.lastLen.get(sk) ?? 0;
+    const stateKey = `${kind}:${sk}`;
+    const prevLen = P.lastLen.get(stateKey) ?? 0;
     const text = event?.textContent ?? '';
-    const prevText = P.lastText.get(sk) ?? '';
+    const prevText = P.lastText.get(stateKey) ?? '';
     // The retained-event cap (or the tail window) trims the OLDEST text off the top of a merged block: the text that is left is
     // a suffix of what was there. The view is pinned at the bottom, so nothing the reader sees moves; it is not a flicker.
     const headTrim = len < prevLen && prevText.length > 0 && text.length > 0 && prevText.includes(text.slice(0, Math.min(60, text.length)));
     if (len < prevLen && !headTrim && prevText && P.shrinkLog.length < 6) P.shrinkLog.push({ t: performance.now(), key: sk, prevLen, len, prevHead: prevText.slice(0, 90), prevTail: prevText.slice(-90), nowHead: text.slice(0, 90), nowTail: text.slice(-90) });
-    P.lastText.set(sk, text);
-    P.lastLen.set(sk, len); // the PREVIOUS FRAME's length: a shrink is a frame-to-frame event
+    P.lastText.set(stateKey, text);
+    P.lastLen.set(stateKey, len); // the PREVIOUS FRAME's length: a shrink is a frame-to-frame event
     const rect = wrapper?.getBoundingClientRect();
     return {
       t: performance.now(), key: sk, mounted: !!wrapper, mode, len, shrunk: len < prevLen && !headTrim, headTrim, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
@@ -169,13 +171,13 @@ export function installFlickerProbe() {
   const tick = () => {
     requestAnimationFrame(tick);
     if (!P.recording) return;
-    const s = sample();
+    const s = sample('raf');
     if (s) { s.acc = flush(); P.frames.push(s); }
   };
   const channel = new MessageChannel();
   channel.port1.onmessage = () => {
     if (!P.recording) return;
-    const s = sample();
+    const s = sample('paint');
     if (s) { s.acc = null; P.painted.push(s); }
   };
   const paintedTick = () => { requestAnimationFrame(paintedTick); if (P.recording) channel.port2.postMessage(0); };
