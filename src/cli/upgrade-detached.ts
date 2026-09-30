@@ -5,8 +5,10 @@
  * that closes or a daemon-managed session that is restarted no longer takes an
  * `npm install -g` down with it (production incident on 215).
  */
-import { existsSync, openSync, readSync, closeSync, readFileSync, statSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { launchWindowsUpgrade } from '../util/windows-upgrade-script.js';
 import { buildPosixRestartCommand, launchPosixUpgrade, type PosixUpgradeScriptParams } from '../util/posix-upgrade-script.js';
 
 /** How an upgrade script run ended (its `upgrade-result` file). */
@@ -92,13 +94,35 @@ export async function runDetachedPosixUpgrade(input: DetachedUpgradeInput, deps:
   started.child.on('exit', () => { childExited = true; });
   write(`Upgrade started in the background (it keeps going if this session ends). Log: ${started.logFile}`);
 
+  return followUpgrade({
+    logFile: started.logFile,
+    readResult: () => readResult(started.resultFile),
+    childExited: () => childExited,
+    write, pollMs, limit,
+  });
+}
+
+interface FollowInput {
+  logFile: string;
+  /** How the run ended, once known. */
+  readResult: () => UpgradeResult | null;
+  /** The script process is gone (used when it died without writing a result). */
+  childExited: () => boolean;
+  write: (line: string) => void;
+  pollMs: number;
+  limit: number;
+}
+
+/** Stream the log as it grows until the run ends; resolves with the exit code. */
+async function followUpgrade(input: FollowInput): Promise<number> {
+  const { logFile, write, pollMs, limit } = input;
   let offset = 0;
   let pending = '';
   const flush = (): void => {
-    if (!existsSync(started.logFile)) return;
-    const size = statSync(started.logFile).size;
+    if (!existsSync(logFile)) return;
+    const size = statSync(logFile).size;
     if (size <= offset) return;
-    const fd = openSync(started.logFile, 'r');
+    const fd = openSync(logFile, 'r');
     try {
       const buffer = Buffer.alloc(size - offset);
       const read = readSync(fd, buffer, 0, buffer.length, offset);
@@ -114,24 +138,65 @@ export async function runDetachedPosixUpgrade(input: DetachedUpgradeInput, deps:
 
   for (;;) {
     flush();
-    const result = readResult(started.resultFile);
+    const result = input.readResult();
     if (result) {
       flush();
-      const { code, message } = describeUpgradeResult(result, started.logFile);
+      const { code, message } = describeUpgradeResult(result, logFile);
       write(message);
       return code;
     }
-    if (childExited) {
-      // Exited without the result file (killed hard): that is a failure, not a success.
+    if (input.childExited()) {
+      // Exited without a result (killed hard): that is a failure, not a success.
       flush();
-      const { code, message } = describeUpgradeResult(readResult(started.resultFile) ?? 'failed', started.logFile);
+      const { code, message } = describeUpgradeResult(input.readResult() ?? 'failed', logFile);
       write(message);
       return code;
     }
     if (Date.now() > limit) {
-      write(`Still running after the wait limit; the upgrade continues in the background. Log: ${started.logFile}`);
+      write(`Still running after the wait limit; the upgrade continues in the background. Log: ${logFile}`);
       return 0;
     }
     await new Promise((resolve) => setTimeout(resolve, pollMs));
   }
+}
+
+/** How the Windows runner's log says it ended ('ok' / 'failed'), or null while it runs. */
+export function readWindowsUpgradeResult(logFile: string): UpgradeResult | null {
+  let text = '';
+  try { text = readFileSync(logFile, 'utf8'); } catch { return null; }
+  if (text.includes('=== upgrade done')) return 'ok';
+  if (text.includes('=== upgrade FAILED')) return 'failed';
+  return null;
+}
+
+/**
+ * `imcodes upgrade` on Windows: the same hand-off. The existing Windows runner (staged
+ * alone into a scratch directory, started hidden through wscript) does the install, the
+ * watchdog/daemon restart and the health check; this process only follows its log.
+ */
+export async function runDetachedWindowsUpgrade(
+  input: { pkgSpec: string; targetVer: string; registry: string | null },
+  deps: { write?: (line: string) => void; pollMs?: number; followLimitMs?: number; launch?: typeof launchWindowsUpgrade } = {},
+): Promise<number> {
+  const write = deps.write ?? ((line: string) => { console.log(line); });
+  const launch = deps.launch ?? launchWindowsUpgrade;
+  const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
+  const logFile = join(scriptDir, 'upgrade.log');
+  launch({
+    scriptDir,
+    logFile,
+    pkgSpec: input.pkgSpec,
+    targetVer: input.targetVer,
+    registryArg: input.registry ?? '-',
+    currentVer: '', // an explicit request: no automatic downgrade guard
+  });
+  write(`Upgrade started in the background (it keeps going if this session ends). Log: ${logFile}`);
+  return followUpgrade({
+    logFile,
+    readResult: () => readWindowsUpgradeResult(logFile),
+    childExited: () => false,
+    write,
+    pollMs: deps.pollMs ?? 500,
+    limit: Date.now() + (deps.followLimitMs ?? 30 * 60_000),
+  });
 }

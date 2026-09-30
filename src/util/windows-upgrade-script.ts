@@ -1,7 +1,9 @@
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WINDOWS_UPGRADE_RUNNER_STAGED_FILES } from './windows-upgrade-runner-staged-files.js';
+import { encodeCmdAsUtf8Bom, encodeVbsAsUtf16 } from './windows-launch-artifacts.js';
 
 /** The filename used by the VBS launcher for the staged runner entrypoint. */
 export const WINDOWS_UPGRADE_RUNNER_ENTRY_FILE = 'upgrade.mjs';
@@ -128,4 +130,50 @@ export function resolveWindowsUpgradePrefix(runnerPath: string): string | null {
   if (index <= 0) return null;
   const prefix = normalized.slice(0, index);
   return prefix || null;
+}
+
+
+/**
+ * Stage the Windows upgrade runner into `scriptDir` and start it hidden and fully
+ * detached (wscript -> node upgrade.mjs), exactly as the daemon's own upgrade does.
+ * The daemon and `imcodes upgrade` share this one launcher: whoever asked for the
+ * upgrade can exit, or be killed, without touching the install. Throws when the
+ * runner cannot be staged (nothing has been started then).
+ */
+export function launchWindowsUpgrade(input: {
+  scriptDir: string;
+  logFile: string;
+  pkgSpec: string;
+  /** Pinned version, or `latest`. */
+  targetVer: string;
+  /** Registry base, or '-' for npm's ambient default. */
+  registryArg: string;
+  /** Running version for the `latest` downgrade guard; '' disables it (an explicit CLI request). */
+  currentVer: string;
+}): { runnerCopy: string } {
+  const npmBin = join(dirname(process.execPath), 'npm.cmd');
+  const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
+  const runnerSrc = resolveWindowsUpgradeRunnerPath();
+  const npmPrefix = resolveWindowsUpgradePrefix(runnerSrc);
+  // Stage the runner with its complete relative-import closure because npm can
+  // replace the installed package while the upgrade is running.
+  const runnerCopy = stageWindowsUpgradeRunner(input.scriptDir, runnerSrc).runnerPath;
+
+  // The cleanup .cmd is still cmd.exe, but a 4-line idempotent rmdir with no control
+  // flow. The runner self-cleans too; this covers a runner that dies before its finally.
+  const cleanupPath = join(input.scriptDir, 'cleanup.cmd');
+  const cleanupVbsPath = join(input.scriptDir, 'cleanup.vbs');
+  writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(input.scriptDir)));
+  writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
+
+  const upgradeVbsPath = join(input.scriptDir, 'upgrade.vbs');
+  writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(buildWindowsUpgradeRunnerVbs({
+    nodeExe: process.execPath,
+    runnerPath: runnerCopy,
+    args: [input.logFile, npmCmd, input.pkgSpec, input.targetVer, input.scriptDir, input.registryArg, input.currentVer, npmPrefix ?? ''],
+  })));
+
+  spawn('wscript', [upgradeVbsPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  spawn('wscript', [cleanupVbsPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+  return { runnerCopy };
 }

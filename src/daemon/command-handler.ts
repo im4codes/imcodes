@@ -173,14 +173,7 @@ import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
-import {
-  buildWindowsCleanupScript,
-  buildWindowsCleanupVbs,
-  buildWindowsUpgradeRunnerVbs,
-  resolveWindowsUpgradeRunnerPath,
-  resolveWindowsUpgradePrefix,
-  stageWindowsUpgradeRunner,
-} from '../util/windows-upgrade-script.js';
+import { launchWindowsUpgrade } from '../util/windows-upgrade-script.js';
 import { buildPosixRestartCommand, launchPosixUpgrade } from '../util/posix-upgrade-script.js';
 import {
   parsePosixUpgradeFailureStatus,
@@ -188,7 +181,6 @@ import {
 } from '../util/posix-upgrade-layout-recovery.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { getDefaultUpgradeBlockedOutbox } from './upgrade-blocked-outbox.js';
-import { encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
 import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
@@ -8621,79 +8613,26 @@ async function handleDaemonUpgrade(
   if (process.platform === 'linux' || process.platform === 'darwin') {
     restartCmd = buildPosixRestartCommand({ platform: process.platform, home: homedir(), stateDir: imcodesStateDir() });
   } else if (process.platform === 'win32') {
-    // Windows: drive the upgrade with a Node.js runner instead of a
-    // cmd.exe batch.  The batch was the source of every Windows
-    // auto-upgrade outage we shipped (paren-counting in if-blocks,
-    // timeout-needs-stdin, del silent failures, codepage issues with
-    // non-ASCII %TEMP% / %USERPROFILE% paths).  Node fs APIs use the
-    // Windows wide-char API natively, so Chinese / Cyrillic / etc.
-    // paths round-trip transparently.
-    //
-    // Layout: copy the bundled runner to %TEMP%/imcodes-upgrade-X/upgrade.mjs
-    // BEFORE spawning, so the in-flight `npm install -g` doesn't
-    // overwrite the runner's source under itself when the new
-    // package's files land at the same global path.
-    const npmBin = join(dirname(process.execPath), 'npm.cmd');
-    const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
-    const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
-    const targetVer = targetVersion ?? 'latest';
-
-    const runnerSrc = resolveWindowsUpgradeRunnerPath();
-    const npmPrefix = resolveWindowsUpgradePrefix(runnerSrc);
-    let runnerCopy: string;
+    // Windows: the Node.js runner (never a cmd.exe batch: paren-counting, timeout
+    // needing stdin, codepage trouble with non-ASCII paths). The launcher is shared
+    // with `imcodes upgrade`; it stages the runner with its import closure first,
+    // because the in-flight install replaces the package it would otherwise run from.
     try {
-      // Stage the runner with its complete relative-import closure because
-      // npm can replace the installed package while the upgrade is running.
-      // The helper's returned path is also the VBS launch target.
-      runnerCopy = stageWindowsUpgradeRunner(scriptDir, runnerSrc).runnerPath;
+      const launched = launchWindowsUpgrade({
+        scriptDir,
+        logFile,
+        pkgSpec: targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest',
+        targetVer: targetVersion ?? 'latest',
+        // '-' when official/default, so no redundant --registry is added.
+        registryArg: upgradeRegistry.explicit ? upgradeRegistry.base : '-',
+        // Lets the runner apply the post-install downgrade guard for `latest`.
+        currentVer: DAEMON_VERSION,
+      });
+      logger.info({ log: logFile, runnerCopy: launched.runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     } catch (err) {
-      logger.error({ err, runnerSrc }, 'daemon.upgrade: failed to stage upgrade runner — cannot proceed');
+      logger.error({ err }, 'daemon.upgrade: failed to stage upgrade runner — cannot proceed');
       return;
     }
-
-    // Cleanup .cmd is still cmd.exe — but it's a 4-line idempotent rmdir
-    // with NO control flow.  No parens, no timeout, no del — just one
-    // ping sleep and one rmdir.  Kept because the runner self-cleans via
-    // its own deferred rmSync, but this is a belt-and-suspenders for
-    // the case where the runner crashes before reaching the finally block.
-    const cleanupPath = join(scriptDir, 'cleanup.cmd');
-    const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
-    writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(scriptDir)));
-    writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
-
-    // VBS launcher — runs the JS runner via `node upgrade.mjs <args>`
-    // hidden + detached.  Bake all paths as args so the runner doesn't
-    // depend on env-var expansion or working directory.
-    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
-    // Pass the resolved registry (sentinel '-' when official/default so we
-    // don't add a redundant --registry) and the current daemon version so the
-    // runner can apply a post-install downgrade guard for `latest` (Linux/macOS
-    // do this in-script; Windows had no such guard before).
-    const winRegistryArg = upgradeRegistry.explicit ? upgradeRegistry.base : '-';
-    const upgradeVbs = buildWindowsUpgradeRunnerVbs({
-      nodeExe: process.execPath,
-      runnerPath: runnerCopy,
-      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir, winRegistryArg, DAEMON_VERSION, npmPrefix ?? ''],
-    });
-    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(upgradeVbs));
-
-    // Launch via wscript: hidden + fully detached, survives our exit.
-    const child = spawn('wscript', [upgradeVbsPath], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
-    child.unref();
-
-    // Also kick off cleanup deferred 120 s — the runner cleans up too,
-    // but if it crashes before its finally block we still want %TEMP% tidy.
-    spawn('wscript', [cleanupVbsPath], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    }).unref();
-
-    logger.info({ log: logFile, runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     upgradeScriptSpawned = true;
     announceUpgrading();
     scheduleUpgradeMemoryFreezeRelease();

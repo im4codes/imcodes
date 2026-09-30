@@ -1068,30 +1068,21 @@ program
       });
       process.exit(code);
     }
+    if (isGlobal && platform === 'win32') {
+      // Windows: the existing upgrade runner does the install and the restart, detached;
+      // this process only follows its log, so a dropped session cannot interrupt it.
+      const { runDetachedWindowsUpgrade } = await import('./cli/upgrade-detached.js');
+      process.exit(await runDetachedWindowsUpgrade({
+        pkgSpec: pkg,
+        targetVer: /^\d/.test(pkgTag) ? pkgTag : 'latest',
+        registry,
+      }));
+    }
     if (isGlobal) {
-      const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
-      const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
-      const regFlag = registry ? ` --registry "${registry}"` : '';
-      try {
-        execSync(`"${npmCmd}" install -g ${pkg}${regFlag}`, { stdio: 'inherit' });
-      } catch {
-        console.error('npm install failed.');
-        process.exit(1);
-      }
-      try {
-        const globalRoot = execSync(`"${npmCmd}" root -g`, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-        installedEntryScript = join(globalRoot, 'imcodes', 'dist', 'src', 'index.js');
-        const repair = repairImcodesCliWrappers(process.execPath, installedEntryScript);
-        if (repair.userShim) console.log(`CLI wrapper refreshed: ${repair.userShim}`);
-        if (repair.systemShim) {
-          console.log(`CLI wrapper refreshed: ${repair.systemShim}`);
-        } else if (repair.systemSkippedReason) {
-          console.warn(`CLI wrapper global refresh skipped: ${repair.systemSkippedReason}`);
-        }
-      } catch (err) {
-        const reason = err instanceof Error ? err.message : String(err);
-        console.warn(`CLI wrapper refresh failed (non-fatal): ${reason}`);
-      }
+      // linux, darwin and win32 returned above. There is no in-place `npm install -g`
+      // here any more: that is the path that left 215 half-installed.
+      console.error(`Upgrading a global install is not supported on ${platform}.`);
+      process.exit(1);
     } else {
       const projectRoot = PROJECT_ROOT;
       try {
