@@ -10,7 +10,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
 import {
-  existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync,
+  existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmdirSync, rmSync, unlinkSync, writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -169,6 +169,15 @@ function runUpgrade(extraEnv: Record<string, string> = {}, target = NEW_VERSION)
   return { status: result.status, log: existsSync(world.logFile) ? readFileSync(world.logFile, 'utf8') : '' };
 }
 
+function removeEntryByEntry(path: string): void {
+  if (lstatSync(path).isDirectory()) {
+    for (const name of readdirSync(path)) removeEntryByEntry(join(path, name));
+    rmdirSync(path);
+  } else {
+    unlinkSync(path);
+  }
+}
+
 function leftovers(): string[] {
   const names = [...readdirSync(world.prefix), ...readdirSync(join(world.prefix, 'node_modules'))];
   return names.filter((name) => /^\.imcodes-(stage|old|failed)\./.test(name));
@@ -180,7 +189,9 @@ afterEach(() => {
   for (const pid of new Set([...world.daemons, daemonPid() ?? 0])) {
     if (pid > 0 && alive(pid)) { try { process.kill(pid, 'SIGKILL'); } catch { /* gone */ } }
   }
+  // Node 24's rmSync silently keeps a Windows path with non-ASCII characters (the world's root has some on purpose).
   rmSync(world.root, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 });
+  if (existsSync(world.root)) removeEntryByEntry(world.root);
 });
 
 describe('windows upgrade runner: staged swap', { timeout: 480_000 }, () => {
