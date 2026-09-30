@@ -277,7 +277,9 @@ const tick = setInterval(() => {
     else sendEvent(name, 'agent.status', { status: 'working', burst });
     if (index < 3) sendEvent(name, 'usage.update', { inputTokens: burst, outputTokens: burst * 2 });
   }
-  if (ticks % 250 === 0) for (const name of activeTimelineNames) sendEvent(name, 'assistant.text', { text: `Final answer for ${name}.`, streaming: false });
+  // A growing stream finalizes its own messages; an unrelated assistant.text injected mid-stream would
+  // merge into the streaming block (consecutive assistant texts form one block) and change its composition.
+  if (ticks % 250 === 0) for (const name of activeTimelineNames) { if (!(growingStream && growing.has(name))) sendEvent(name, 'assistant.text', { text: `Final answer for ${name}.`, streaming: false }); }
   if (burst % 25 === 0) for (const name of sessionNames) sendEvent(name, 'session.state', { state: 'idle' });
 }, Math.max(1, Math.round(1000 / streamHz)));
 process.on('SIGTERM', () => { clearInterval(tick); clearInterval(announceTimer); ws.close(); process.exit(0); });
