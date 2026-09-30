@@ -219,7 +219,7 @@ describe('ExecHelperClient (fake helper process)', () => {
   });
 });
 
-describe.skipIf(!POSIX)('exec helper (real forked process): same result as a direct call', () => {
+describe('exec helper (real forked process): same result as a direct call', () => {
   let dir: string;
   beforeEach(async () => {
     dir = mkdtempSync(join(tmpdir(), 'imc-exec-helper-'));
@@ -317,9 +317,12 @@ describe.skipIf(!POSIX)('exec helper (real forked process): same result as a dir
   it('runs each call in its own cwd and environment, whatever the helper was forked with', async () => {
     const otherDir = mkdtempSync(join(tmpdir(), 'imc-exec-helper-cwd-'));
     try {
-      const probe = ['-e', 'process.stdout.write(process.cwd() + "|" + (process.env.EXEC_HELPER_PROBE ?? "unset") + "|" + (process.env.HOME ?? "nohome"))'];
+      const probe = ['-e', 'process.stdout.write(require("fs").realpathSync.native(process.cwd()) + "|" + (process.env.EXEC_HELPER_PROBE ?? "unset") + "|" + (process.env.HOME ?? "nohome"))'];
+      const minimalEnv: Record<string, string | undefined> = POSIX
+        ? { PATH: process.env.PATH }
+        : { PATH: process.env.PATH ?? process.env.Path, SystemRoot: process.env.SystemRoot };
       const inDir = await execFileOffMain(node, probe, { cwd: otherDir, env: { ...process.env, EXEC_HELPER_PROBE: 'call-1' } });
-      const inOther = await execFileOffMain(node, probe, { cwd: dir, env: { PATH: process.env.PATH } });
+      const inOther = await execFileOffMain(node, probe, { cwd: dir, env: minimalEnv });
       process.env.EXEC_HELPER_PROBE = 'set-after-fork';
       let implicit: { stdout: string };
       try {
@@ -346,7 +349,7 @@ describe.skipIf(!POSIX)('exec helper (real forked process): same result as a dir
     expect(readFileSync(log, 'utf8').trim().split('\n').map(Number)).toEqual(Array.from({ length: 40 }, (_, i) => i));
   }, 30_000);
 
-  it('starts child processes in the order they were issued when not awaited one by one', async () => {
+  it.skipIf(!POSIX)('starts child processes in the order they were issued when not awaited one by one', async () => {
     const log = join(dir, 'issue-order.log');
     writeFileSync(log, '');
     const calls = Array.from({ length: 12 }, (_, i) => execFileOffMain('sh', ['-c', `echo ${i} >> ${JSON.stringify(log)}`]));
@@ -355,7 +358,7 @@ describe.skipIf(!POSIX)('exec helper (real forked process): same result as a dir
     expect([...started].sort((a, b) => a - b)).toEqual(Array.from({ length: 12 }, (_, i) => i));
   });
 
-  it('git and ps run through the helper with the same output as a direct call', async () => {
+  it.skipIf(!POSIX)('git and ps run through the helper with the same output as a direct call', async () => {
     const repo = join(dir, 'repo');
     execFileSync('git', ['init', '-q', repo]);
     execFileSync('git', ['-C', repo, 'remote', 'add', 'origin', 'https://example.com/acme/widgets.git']);
@@ -381,7 +384,7 @@ describe.skipIf(!POSIX)('exec helper (real forked process): same result as a dir
     expect(after.crashes).toBe(1);
     expect((await execFileOffMain(node, ['-e', 'process.stdout.write("via new helper")'])).stdout).toBe('via new helper');
     await new Promise((resolve) => setTimeout(resolve, 300));
-    expect(zombieChildren()).toEqual([]);
+    if (POSIX) expect(zombieChildren()).toEqual([]);
     // The orphaned long-running child dies with its helper's pipe or its timeout; do not leak it past the test.
     try { process.kill(Number(readFileSync(orphanPidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
   }, 60_000);
@@ -392,7 +395,7 @@ describe.skipIf(!POSIX)('exec helper (real forked process): same result as a dir
     expect((await execFileOffMain(node, ['-e', 'process.stdout.write("direct after")'])).stdout).toBe('direct after');
     await new Promise((resolve) => setTimeout(resolve, 200));
     expect(() => process.kill(pid, 0)).toThrow();
-    expect(zombieChildren()).toEqual([]);
+    if (POSIX) expect(zombieChildren()).toEqual([]);
   });
 
   it('the helper dies with the daemon: closing its IPC channel ends it and its children', async () => {
@@ -415,7 +418,7 @@ describe.skipIf(!POSIX)('exec helper (real forked process): same result as a dir
 });
 
 function readRealpath(path: string): string {
-  return execFileSync(node, ['-e', `process.stdout.write(require("fs").realpathSync(${JSON.stringify(path)}))`], { encoding: 'utf8' });
+  return execFileSync(node, ['-e', `process.stdout.write(require("fs").realpathSync.native(${JSON.stringify(path)}))`], { encoding: 'utf8' });
 }
 
 function zombieChildren(): string[] {
@@ -426,6 +429,64 @@ function zombieChildren(): string[] {
     .filter((m) => Number(m[2]) === process.pid && m[3]!.startsWith('Z'))
     .map((m) => m[0]);
 }
+
+describe.skipIf(POSIX)('Windows: PowerShell and the process-start batch through the exec helper', () => {
+  beforeEach(async () => {
+    process.env[EXEC_HELPER_ENV_SWITCH] = '1';
+    startExecHelper();
+    const deadline = Date.now() + 20_000;
+    while (!getExecHelperStats()?.ready) {
+      if (Date.now() > deadline) throw new Error('exec helper never became ready');
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+  });
+  afterEach(async () => {
+    await shutdownExecHelper();
+    __resetExecHelperForTests();
+    delete process.env[EXEC_HELPER_ENV_SWITCH];
+  });
+
+  const powershell = (script: string) => ['-NoProfile', '-NonInteractive', '-Command', script];
+
+  it('runs powershell.exe with the same output and the same non-zero exit as a direct call', async () => {
+    const ok = powershell('Write-Output "hello from ps"');
+    const viaDirect = await direct('powershell.exe', ok, { windowsHide: true, timeout: 20_000 });
+    const before = getExecHelperStats()!.viaHelper;
+    const viaHelper = await execFileOffMain('powershell.exe', ok, { windowsHide: true, timeout: 20_000 });
+    expect(getExecHelperStats()!.viaHelper).toBe(before + 1);
+    expect(viaHelper).toEqual(viaDirect);
+    const failing = powershell('Write-Output "before"; exit 3');
+    const capture = async (run: () => Promise<unknown>) => run().then(() => null, (e: any) => ({ code: e.code, killed: e.killed, signal: e.signal, stdout: e.stdout }));
+    const directFail = await capture(() => direct('powershell.exe', failing, { windowsHide: true, timeout: 20_000 }));
+    const helperFail = await capture(() => execFileOffMain('powershell.exe', failing, { windowsHide: true, timeout: 20_000 }));
+    expect(helperFail).toEqual(directFail);
+    expect(helperFail).toMatchObject({ code: 3, killed: false });
+  }, 60_000);
+
+  it('kills a PowerShell that outlives its timeout exactly like a direct call', async () => {
+    const script = powershell('Start-Sleep -Seconds 30');
+    const capture = async (run: () => Promise<unknown>) => run().then(() => null, (e: any) => ({ killed: e.killed, signal: e.signal }));
+    const directTimeout = await capture(() => direct('powershell.exe', script, { windowsHide: true, timeout: 1_500 }));
+    const helperTimeout = await capture(() => execFileOffMain('powershell.exe', script, { windowsHide: true, timeout: 1_500 }));
+    expect(helperTimeout).toEqual(directTimeout);
+    expect(helperTimeout).toMatchObject({ killed: true });
+  }, 60_000);
+
+  it('the process-start batch (one PowerShell spawn for many pids) works through the helper and yields the same values', async () => {
+    const { ProcessStartReader } = await import('../../src/util/process-start.js');
+    const before = getExecHelperStats()!.viaHelper;
+    const reader = new ProcessStartReader();
+    const [own, parent, gone] = await Promise.all([reader.read(process.pid), reader.read(process.ppid), reader.read(999_999_999)]);
+    expect(getExecHelperStats()!.viaHelper).toBeGreaterThan(before);
+    expect(own).toMatch(/^\d+$/);
+    expect(parent === undefined || /^\d+$/.test(parent)).toBe(true);
+    expect(gone).toBeUndefined();
+    // Same value as the identical batch spawned directly (the registry compares these strings across restarts).
+    const script = `Get-Process -Id ${process.pid} -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Id.ToString() + ' ' + $_.StartTime.ToUniversalTime().Ticks.ToString() } catch {} }`;
+    const directOut = await direct('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { windowsHide: true, timeout: 20_000 });
+    expect(directOut.stdout.trim()).toBe(`${process.pid} ${own}`);
+  }, 60_000);
+});
 
 describe('kill switch and default state', () => {
   it('without startExecHelper (CLI, tests, other processes) every call is a plain direct spawn', async () => {
