@@ -18,6 +18,7 @@ import { createSendDispatchId, type SendMessageId } from '../../../shared/send-m
 import { MEMORY_MCP_SEND_DELIVERY_MODES } from '../../../shared/memory-mcp-contracts.js';
 import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_NUDGE_ID_PREFIX, isTerminalTaskPairStatus } from '../../../shared/task-pair.js';
 import { getTaskPairStore } from './store.js';
+import { noteTaskPairFocus, resetTaskPairFocusForTests, taskPairFocusOf } from './focus.js';
 import logger from '../../util/logger.js';
 
 export type TaskPairDeliveryResult = 'sent' | 'queued' | 'skipped_pending' | 'no_session' | 'failed';
@@ -34,24 +35,7 @@ export function hasPendingTaskPairMessage(sessionName: string, taskId: string, r
   return runtime.pendingEntries.some((entry) => entry.clientMessageId.startsWith(prefix));
 }
 
-/**
- * The pair each session was last messaged about (in memory). A session in
- * several pairs usually answers the message it just got, so its plain output
- * is progress on that pair and not on every pair it belongs to.
- */
-const lastMessagedTask = new Map<string, string>();
-
-export function noteTaskPairFocus(sessionName: string, taskId: string): void {
-  lastMessagedTask.set(sessionName, taskId);
-}
-
-export function taskPairFocusOf(sessionName: string): string | undefined {
-  return lastMessagedTask.get(sessionName);
-}
-
-export function resetTaskPairFocusForTests(): void {
-  lastMessagedTask.clear();
-}
+export { noteTaskPairFocus, taskPairFocusOf, resetTaskPairFocusForTests };
 
 export interface TaskPairDeliveryDeps {
   send?: (target: string, text: string, messageId: string) => Promise<void>;

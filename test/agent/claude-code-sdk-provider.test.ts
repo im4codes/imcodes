@@ -1827,6 +1827,60 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(second.prompt).not.toContain(CRON_CONTROL_TRUSTED_SYSTEM_CLAUSE);
   });
 
+  it('starts a pair participant query in the pair workspace and every other query in the session cwd', async () => {
+    const provider = new ClaudeCodeSdkProvider();
+    await provider.connect({ binaryPath: 'claude' });
+    await provider.createSession({ sessionKey: 'route-pair-cwd', cwd: '/tmp/project', resumeId: 'session-pair-cwd' });
+    const pairCwdPayload = (turnCwd?: string): ProviderContextPayload => ({
+      userMessage: 'work on the pair',
+      assembledMessage: 'work on the pair',
+      sessionSystemText: 'Stable runtime',
+      turnSystemText: undefined,
+      systemText: 'Stable runtime',
+      messagePreamble: undefined,
+      attachments: [],
+      ...(turnCwd ? { turnCwd } : {}),
+      context: {
+        sessionSystemText: 'Stable runtime',
+        turnSystemText: undefined,
+        systemText: 'Stable runtime',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-pair-cwd' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+          diagnostics: [],
+      },
+      supportClass: 'full-normalized-context-injection',
+      diagnostics: [],
+    });
+
+    const before = sdkMock.runs.length;
+    await provider.send('route-pair-cwd', pairCwdPayload('/tmp/worktrees/pair_tsk_demo/repo'));
+    await flush();
+    await provider.send('route-pair-cwd', pairCwdPayload());
+    await flush();
+    await provider.send('route-pair-cwd', 'plain message');
+    await flush();
+    await provider.send('route-pair-cwd', pairCwdPayload('C:\\Users\\k\\.imcodes\\worktrees\\pair_tsk_demo\\repo'));
+    await flush();
+
+    expect(sdkMock.runs.slice(before).map((run) => run.options.cwd)).toEqual([
+      '/tmp/worktrees/pair_tsk_demo/repo',
+      '/tmp/project',
+      '/tmp/project',
+      'C:\\Users\\k\\.imcodes\\worktrees\\pair_tsk_demo\\repo',
+    ]);
+    expect(provider.capabilities.turnCwd).toBe(true);
+  });
+
   it('accepts a normalized provider payload', async () => {
     sdkMock.setNextMessages([
       { type: 'system', subtype: 'init', session_id: 'session-payload', model: 'claude-sonnet-4-6' },

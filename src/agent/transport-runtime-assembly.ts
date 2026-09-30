@@ -48,6 +48,8 @@ export interface TransportRuntimeAssemblyInput {
   userMessage: string;
   /** Stable logical delivery identity retained across recoverable dispatch retries. */
   deliveryId?: string;
+  /** This turn's working directory when it is not the session's own (see ProviderContextPayload.turnCwd). */
+  turnCwd?: string;
   description?: string;
   /** Resolved deterministic user/project/session Agent identity contract. */
   identityPrompt?: string;
@@ -306,6 +308,7 @@ export function buildProviderContextPayload(
     sessionSystemText: compiledContext.sessionSystemText,
     turnSystemText: compiledContext.turnSystemText,
     ...(input.sessionIdentity?.role ? { sessionRole: input.sessionIdentity.role } : {}),
+    ...(input.turnCwd ? { turnCwd: input.turnCwd } : {}),
     systemText: compiledContext.systemText,
     messagePreamble: compiledContext.messagePreamble,
     attachments: input.attachments,

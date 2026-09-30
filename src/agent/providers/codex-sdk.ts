@@ -723,13 +723,12 @@ async function discoverCodexChildSubagentRolloutSnapshots(
 function codexChildSubagentRolloutMatchesSession(
   snapshot: CodexChildSubagentRolloutSnapshot,
   sessionId: string,
-  cwd: string,
+  ...cwds: Array<string | undefined>
 ): boolean {
   if (snapshot.imcodesSessionName !== sessionId) return false;
   if (!snapshot.cwd) return true;
-  const normalizedCwd = normalizeTransportCwd(cwd) ?? cwd;
   const snapshotCwd = normalizeTransportCwd(snapshot.cwd) ?? snapshot.cwd;
-  return snapshotCwd === normalizedCwd;
+  return cwds.some((cwd) => !!cwd && (normalizeTransportCwd(cwd) ?? cwd) === snapshotCwd);
 }
 
 function isCodexAuthFailureMessage(message: string): boolean {
@@ -1082,6 +1081,12 @@ interface CodexSdkSessionState {
   turnDelegationDispatches?: DelegationDispatchFact[];
   imcodesSessionName?: string;
   cwd: string;
+  /**
+   * The cwd the latest turn was started in when it was not `cwd` (an open pair's
+   * workspace). Codex records it as the cwd of everything that turn spawns, so
+   * child-rollout matching must accept it next to the session's own.
+   */
+  turnCwd?: string;
   env?: Record<string, string>;
   mcpConfig?: Record<string, unknown>;
   /** Exact thread-scoped MCP generation observed closed and not yet rehydrated. */
@@ -2632,6 +2637,8 @@ export class CodexSdkProvider implements TransportProvider {
     attachments: false,
     reasoningEffort: true,
     serviceTier: true,
+    // turn/start carries `cwd` on every turn (the pair workspace, else the session cwd).
+    turnCwd: true,
     supportedEffortLevels: CODEX_SDK_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.RUNTIME,
@@ -3711,11 +3718,14 @@ export class CodexSdkProvider implements TransportProvider {
         state.pendingSessionSystemTextUpdateTurnId = undefined;
       }
       state.turnStartInFlight = true;
+      // Every turn names its cwd, so a turn without a pair workspace starts in
+      // the session's own directory again: nothing needs undoing when a pair ends.
+      state.turnCwd = payload.turnCwd;
       this.refreshActiveTurnLease(sessionId, state, { strong: true, turnStartInFlight: true });
       const result = await this.request('turn/start', {
         threadId: state.threadId,
         input: [{ type: 'text', text: inputText }],
-        cwd: state.cwd,
+        cwd: payload.turnCwd ?? state.cwd,
         ...this.sessionEnvironmentParams(state),
         approvalPolicy: 'never',
         sandboxPolicy: { type: 'dangerFullAccess' },
@@ -4615,7 +4625,7 @@ export class CodexSdkProvider implements TransportProvider {
     // when they do not name this thread as their parent.
     const sessionName = state.imcodesSessionName ?? sessionId;
     for (const snapshot of discovered) {
-      if (codexChildSubagentRolloutMatchesSession(snapshot, sessionName, state.cwd)) {
+      if (codexChildSubagentRolloutMatchesSession(snapshot, sessionName, state.cwd, state.turnCwd)) {
         rememberSnapshot(snapshot);
       }
     }

@@ -180,6 +180,13 @@ export interface ProviderContextPayload {
    * Brain-only behaviour on this; it is never inferred from a session name.
    */
   sessionRole?: 'brain' | `w${number}`;
+  /**
+   * Working directory for THIS turn only, when it differs from the session's
+   * own cwd (an open pair's executor/auditor runs in the pair workspace).
+   * Honoured by providers declaring `capabilities.turnCwd`; absent means the
+   * session's own cwd, which is also what reverts the turn afterwards.
+   */
+  turnCwd?: string;
   sessionSystemText?: string;
   turnSystemText?: string;
   /**

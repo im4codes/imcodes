@@ -113,6 +113,7 @@ import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
 import { projectOfSession, resolveTaskPairEngineState } from '../daemon/task-pairs/engine.js';
+import { resolveTaskPairTurnCwd } from '../daemon/task-pairs/turn-cwd.js';
 import { type TaskPairEngineState } from '../../shared/task-pair.js';
 import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
 import type { QueueDeliveryFact, QueueSnapshot, QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
@@ -1220,6 +1221,19 @@ export class TransportSessionRuntime implements SessionRuntime {
       return resolveTaskPairEngineState(projectOfSession(this.sessionKey));
     } catch {
       return 'off';
+    }
+  }
+  /**
+   * The pair workspace this turn must run in (an open pair's executor/auditor),
+   * resolved from live pair state on every turn so nothing needs reverting when
+   * the pair ends. Never throws: a turn must not fail because of a lookup.
+   */
+  private resolvePairTurnCwd(): string | undefined {
+    try {
+      return resolveTaskPairTurnCwd(this.sessionKey)?.cwd;
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'pair turn cwd unavailable; the turn runs in the session cwd');
+      return undefined;
     }
   }
   setAgentId(agentId: string): void {
@@ -4008,11 +4022,19 @@ export class TransportSessionRuntime implements SessionRuntime {
       const automaticSupervisionEnabled = this.resolveAutomaticSupervisionEnabled();
       const taskPairEngine = this.resolveTaskPairEngine();
       const brainContractVariant = brainContractVariantKey(automaticSupervisionEnabled, taskPairEngine);
+      // Provider-native slash controls stay byte-clean, like the identity above.
+      const pairTurnCwd = isSlashControl ? undefined : this.resolvePairTurnCwd();
+      const providerTakesTurnCwd = this.provider.capabilities?.turnCwd === true;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
         deliveryId: this._activeDispatchEntries.map((entry) => entry.clientMessageId).join('\n'),
         activityGeneration: this.currentActivityGeneration(),
-        messagePreamble,
+        // A provider that cannot start a turn in another directory is told the
+        // workspace on one line instead (see task-pairs/turn-cwd.ts).
+        messagePreamble: pairTurnCwd && !providerTakesTurnCwd
+          ? [`cwd: ${pairTurnCwd}`, messagePreamble].filter(Boolean).join('\n')
+          : messagePreamble,
+        ...(pairTurnCwd && providerTakesTurnCwd ? { turnCwd: pairTurnCwd } : {}),
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
         // Provider-native slash controls must remain byte-clean. The stable

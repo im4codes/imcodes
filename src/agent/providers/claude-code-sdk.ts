@@ -477,6 +477,8 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
     multiTurn: true,
     attachments: false,
     reasoningEffort: true,
+    // Every query names its cwd (the pair workspace, else the session cwd); a resumed session keeps its history under another cwd.
+    turnCwd: true,
     supportedEffortLevels: CLAUDE_SDK_EFFORT_LEVELS,
     contextSupport: 'full-normalized-context-injection',
     backgroundSubagentWake: BACKGROUND_SUBAGENT_WAKE_MODES.NATIVE,
@@ -1027,7 +1029,7 @@ export class ClaudeCodeSdkProvider implements TransportProvider, InteractiveQues
       append: baseSystemPrompt,
     } : undefined;
     const options: Record<string, unknown> = {
-      cwd: state.cwd,
+      cwd: payload.turnCwd ?? state.cwd,
       ...(state.env ? { env: { ...process.env, ...state.env } } : {}),
       permissionMode: state.permissionMode,
       disallowedTools: DISALLOWED_NATIVE_TOOLS,

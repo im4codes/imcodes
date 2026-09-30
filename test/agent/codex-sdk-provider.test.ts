@@ -5006,6 +5006,71 @@ describe('CodexSdkProvider', () => {
     }
   });
 
+  it('starts a pair participant turn in the pair workspace and every other turn in the session cwd', async () => {
+    const provider = createCodexProvider();
+    await provider.connect({ binaryPath: 'codex' });
+    await provider.createSession({ sessionKey: 'route-pair-cwd', cwd: '/tmp/project', agentId: 'gpt-5.4' });
+    const pairCwdPayload = (turnCwd?: string): ProviderContextPayload => ({
+      userMessage: 'work on the pair',
+      assembledMessage: 'work on the pair',
+      sessionSystemText: 'Stable runtime',
+      turnSystemText: undefined,
+      systemText: 'Stable runtime',
+      messagePreamble: undefined,
+      attachments: [],
+      ...(turnCwd ? { turnCwd } : {}),
+      context: {
+        sessionSystemText: 'Stable runtime',
+        turnSystemText: undefined,
+        systemText: 'Stable runtime',
+        messagePreamble: undefined,
+        requiredAuthoredContext: [],
+        advisoryAuthoredContext: [],
+        appliedDocumentVersionIds: [],
+        diagnostics: [],
+      },
+      authority: {
+        namespace: { scope: 'personal', projectId: 'route-pair-cwd' },
+        authoritySource: 'none',
+        freshness: 'missing',
+        fallbackAllowed: true,
+        retryScheduled: false,
+        providerPolicyOutcome: 'allowed',
+        diagnostics: [],
+      },
+      supportClass: 'degraded-message-side-context-mapping',
+      diagnostics: [],
+    });
+
+    const completed = { method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed', error: null } } };
+    const turnCwds = () => childProcessMock.children[0]!.requests.filter((req) => req.method === 'turn/start').map((req) => req.params?.cwd);
+
+    await provider.send('route-pair-cwd', pairCwdPayload('/tmp/worktrees/pair_tsk_demo/repo'));
+    childProcessMock.children[0]!.emits(completed);
+    await flush();
+    // The pair ended (or the session left the role): the next turn carries no turnCwd and reverts by itself.
+    await provider.send('route-pair-cwd', pairCwdPayload());
+    childProcessMock.children[0]!.emits(completed);
+    await flush();
+    // A plain string send (legacy callers, scheduled sends) is a non-pair turn too.
+    await provider.send('route-pair-cwd', 'plain message');
+    childProcessMock.children[0]!.emits(completed);
+    await flush();
+    // A moved workspace is followed on the next turn.
+    await provider.send('route-pair-cwd', pairCwdPayload('C:\\Users\\k\\.imcodes\\worktrees\\pair_tsk_demo\\repo'));
+
+    expect(turnCwds()).toEqual([
+      '/tmp/worktrees/pair_tsk_demo/repo',
+      '/tmp/project',
+      '/tmp/project',
+      'C:\\Users\\k\\.imcodes\\worktrees\\pair_tsk_demo\\repo',
+    ]);
+    // thread/start keeps the session's own cwd: a restarted session resumes there and re-resolves per turn.
+    expect(childProcessMock.children[0]!.requests.find((req) => req.method === 'thread/start')?.params?.cwd).toBe('/tmp/project');
+    expect(provider.capabilities.turnCwd).toBe(true);
+    await provider.disconnect();
+  });
+
   it('delivers changed split stable IM.codes context once after a Codex thread is loaded', async () => {
     const provider = createCodexProvider();
     await provider.connect({ binaryPath: 'codex' });

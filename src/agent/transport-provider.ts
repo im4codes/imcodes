@@ -253,6 +253,12 @@ export interface ProviderCapabilities {
    * Codex's "Fast" (`priority`) tier being the one that spends plan usage faster.
    */
   serviceTier?: boolean;
+  /**
+   * The provider starts every turn in `ProviderContextPayload.turnCwd` when it
+   * is set (and in the session's own cwd otherwise). Providers without it get
+   * the pair workspace as a `cwd:` preamble line instead.
+   */
+  turnCwd?: boolean;
   /** Supported effort levels when reasoningEffort is true. */
   supportedEffortLevels?: readonly TransportEffortLevel[];
   /** How well this provider can honor normalized shared-context payloads. */
