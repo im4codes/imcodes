@@ -1,3 +1,4 @@
+import { createSignalWriteBatcher } from '../signal-write-batcher.js';
 import {
   TIMELINE_PREFERENCE_DEPENDENT_TYPES,
   isGuaranteedVisibleTimelineEvent,
@@ -1184,6 +1185,7 @@ function clearPendingTimelineSnapshotWrites(): void {
 }
 
 function flushTimelineSnapshotsBeforeFreeze(): number {
+  signalWriteBatcher.flush();
   flushPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   // A full page refresh during an active transport turn otherwise loses the
@@ -1349,11 +1351,26 @@ function scopeEventsForDb(cacheKey: string, events: TimelineEvent[]): TimelineEv
   return events.map((event) => (event.sessionId === cacheKey ? event : { ...event, sessionId: cacheKey }));
 }
 
+/**
+ * Last-value signals are only ever kept as the newest per (session, type), so
+ * every presentation of every session used to open its own IDB transaction per
+ * flush for values the next flush overwrites. They now share one batched write
+ * per SIGNAL_WRITE_INTERVAL_MS (page hide / unload flushes at once); conversation
+ * events are still written immediately.
+ */
+const signalWriteBatcher = createSignalWriteBatcher({
+  write: (events) => { sharedDb.putEvents(events).catch(() => {}); },
+});
+
 function persistTimelineEvents(cacheKey: string, events: TimelineEvent[]): void {
   if (events.length === 0) return;
   const persistable = events.filter(shouldPersistTimelineEvent);
   if (persistable.length === 0) return;
-  sharedDb.putEvents(scopeEventsForDb(cacheKey, persistable)).catch(() => {});
+  const scoped = scopeEventsForDb(cacheKey, persistable);
+  const conversation = scoped.filter((event) => !isLastValueTimelineEventType(event.type));
+  const signals = scoped.filter((event) => isLastValueTimelineEventType(event.type));
+  if (conversation.length > 0) sharedDb.putEvents(conversation).catch(() => {});
+  if (signals.length > 0) signalWriteBatcher.push(signals);
   scheduleLocalHistoryPrune(cacheKey, persistable.length);
 }
 
@@ -1559,6 +1576,7 @@ export function __getSharedTimelineBaseForTests(
 }
 
 export function __resetTimelineCacheForTests(): void {
+  signalWriteBatcher.cancel();
   cancelPendingTimelineCacheIngests();
   flushPendingTimelineSnapshotWrites();
   eventsCache.clear();
