@@ -49,7 +49,7 @@ export function buildBashSharpRepair(): string {
 # crashed on \`Cannot find module 'detect-libc'\` and semantic search
 # permanently sticky-disabled. This costs ~2 s when needed, ~0 s when
 # the install was clean.
-GLOBAL_ROOT_CHECK=$(eval "$NPM_RUN root -g" 2>/dev/null)
+GLOBAL_ROOT_CHECK="\${IMCODES_REPAIR_ROOT:-$(eval "$NPM_RUN root -g" 2>/dev/null)}"
 SHARP_BROKEN=0
 SHARP_BROKEN_DEP=""
 for dep in ${SHARP_REQUIRED_DEPS.join(' ')}; do
