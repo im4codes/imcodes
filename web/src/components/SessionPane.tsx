@@ -6,6 +6,7 @@
  * Extracted from app.tsx as part of the sidebar-redesign refactor (task 1.5).
  */
 
+import { recordPerfRender } from '../perf-render-debug.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { TerminalView } from './TerminalView.js';
@@ -168,6 +169,7 @@ export function SessionPane({
   onPendingPrefillApplied,
   onVersionSensitiveAction,
 }: SessionPaneProps) {
+  recordPerfRender('SessionPane');
   const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';

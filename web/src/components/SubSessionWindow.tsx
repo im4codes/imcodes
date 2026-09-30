@@ -2,6 +2,7 @@
  * SubSessionWindow — floating, draggable/resizable window for a sub-session.
  * Uses the full SessionControls for input (same as the main session).
  */
+import { recordPerfRender } from '../perf-render-debug.js';
 import { useState, useRef, useCallback, useEffect, useLayoutEffect, useMemo } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
@@ -279,6 +280,7 @@ function saveLocal(id: string, geom: WindowGeometry, viewMode: ViewMode) {
 export function SubSessionWindow({
   sub, ws, connected, active, visible = true, onPendingQuestion, idleFlashToken, onDiff, onHistory, onMinimize, onClose, maximized = false, onToggleMaximized, onRestoreBeforeClose, getMaximizeBounds, desktopLayoutCapable = true, onRestart, onRename, onSettings, onShareSession, onViewRepo, onTransportConfigSaved, onPreviewFile, onOpenLocalWebPreview, zIndex, onFocus, desktopFileBrowserZIndex, onDesktopFileBrowserOpen, onDesktopFileBrowserFocus, onDesktopFileBrowserClose, onPin, sessions, subSessions, serverId, pendingPrefillText, onPendingPrefillApplied, onVersionSensitiveAction, detectedModelHint, inP2p, sharedState, accentColor = DEFAULT_SUBSESSION_ACCENT_COLOR, daemonOnline, onOpenRemoteDesktop, remoteDesktopCanSetUp = true,
 }: Props) {
+  recordPerfRender('SubSessionWindow');
   const { t } = useTranslation();
   const activeIdleFlashToken = useIdleFlashPlayback(idleFlashToken, visible);
   const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent);

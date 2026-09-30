@@ -229,6 +229,7 @@ import {
 import { WsClient, type P2pWorkflowRequestScope } from './ws-client.js';
 import { configure as configureApi, configureExpectedUserId, apiFetch, onAuthExpired, startProactiveRefresh, stopProactiveRefresh, refreshSessionIfStale, ApiError, configureApiKey, clearApiKey, fetchMe, getApiKey, normalizeLocalWebPreviewPath, listP2pRuns, discoverSharedEntries, openSharedEntry, listManagedSharesForServer, type SharedEntrySummary } from './api.js';
 import { isNative, getServerUrl, clearServerUrl } from './native.js';
+import { recordPerfRender } from './perf-render-debug.js';
 import { isMobileDevice } from './mobile-device.js';
 import {
   getAuthKey,
@@ -645,6 +646,7 @@ function settingsIdentityProjectKey(
 }
 
 export function App() {
+  recordPerfRender('App');
   const { t: trans } = useTranslation();
   const remoteDesktopConnectionManagerRef = useRef<RemoteDesktopConnectionManager | null>(null);
   if (!remoteDesktopConnectionManagerRef.current) {
