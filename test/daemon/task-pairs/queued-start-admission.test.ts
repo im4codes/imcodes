@@ -270,12 +270,15 @@ describe('a queued pair starts only through admission', () => {
       expect(pair(`R-${status}`).workspace).toMatchObject({ status: 'active' });
     });
 
-    it('a non-git project is repaired exactly like admission provisions it (owner decision: local git init, then a worktree)', async () => {
+    it('a non-git project is repaired exactly like admission provisions it (owner decision: local git init, then a worktree), and workspace=dir gets a task directory', async () => {
       useProject(plainDir);
       startedWithoutWorkspace('R2', 'working');
+      startedWithoutWorkspace('R2d', 'working', { workspaceKind: 'dir' }, EXEC2, AUD2);
       await tick(1);
       expect(pair('R2').workspace).toMatchObject({ kind: 'worktree', status: 'active', nonGit: { mode: 'git_init', projectRoot: plainDir } });
       expect(existsSync(join(plainDir, '.git'))).toBe(true);
+      expect(pair('R2d').workspace).toMatchObject({ kind: 'dir', status: 'active' });
+      expect(pair('R2d').workspace!.path.startsWith(worksRoot)).toBe(true);
     });
 
     it('when it cannot be created, Brain is told exactly once; the repair still succeeds later and clears that state', async () => {
