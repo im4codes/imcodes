@@ -62,6 +62,8 @@ async function newContext(browser) {
     { name: 'rcc_session', value: signPerfJwt(JWT_SIGNING_KEY), url: BASE_URL },
     { name: 'rcc_csrf', value: 'imc-perf-csrf-token', url: BASE_URL },
   ]);
+  // The app's own backfill trace (console.debug) — kept with the results so a run can be explained after the fact.
+  await context.addInitScript(() => { window.__deck_debug_backfill = true; });
   await context.addInitScript(({ apiKey, baseUrl, session }) => {
     localStorage.setItem('rcc_api_key', apiKey);
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'imc_perf_user', baseUrl }));
@@ -135,7 +137,7 @@ async function runScenario(browser, mode) {
   await page.waitForFunction(() => document.body.innerText.includes('long8000'), undefined, { timeout: 60_000, polling: 250 });
   await page.waitForTimeout(500);
   const route = `#/${encodeURIComponent(SERVER_ID)}/${encodeURIComponent(STALE_SESSION_NAME)}`;
-  page.on('console', (message) => { if (consoleLines.length < 60) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
+  page.on('console', (message) => { if (consoleLines.length < 400) consoleLines.push(`${message.type()}: ${message.text().slice(0, 300)}`); });
   page.on('pageerror', (error) => { if (consoleLines.length < 60) consoleLines.push(`pageerror: ${String(error).slice(0, 300)}`); });
   // One frame loop, installed BEFORE the tap, timestamps the first frame each thing is on screen: the stale cache
   // (any cached message: small indices) and the newest readable message. It reads textContent of the chat only.
@@ -238,6 +240,7 @@ async function runScenario(browser, mode) {
   result.markerPresentAtEnd = await page.evaluate(() => !!document.querySelector('[data-testid="chat-history-gap-marker"]'));
   result.idbRows = await countIdbRows(page);
   result.gapRecord = gapRecord[cacheKey] ?? null;
+  result.appTrace = consoleLines.filter((line) => line.includes('[backfill]')).slice(0, 120);
   result.requests = (await readRequestLog()).slice(before);
   await context.close();
   return result;
