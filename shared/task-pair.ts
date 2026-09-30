@@ -225,6 +225,12 @@ export const TASK_PAIR_MATERIAL_EVENT_VERB = 'MATERIAL' as const;
 export const TASK_PAIR_MATERIAL_HELD_EFFECT = 'material_held' as const;
 /** Result of a repeated STARTED from the current executor of an already-working pair: nothing is recorded or rewritten. */
 export const TASK_PAIR_IDEMPOTENT_STARTED_EFFECT = 'idempotent_started' as const;
+/** An executor's STARTED/WORKING while its pair is in audit: recorded as unusual, the status (and the auditor's pending verdict) untouched. */
+export const TASK_PAIR_IN_AUDIT_GUARDED_EFFECT = 'in_audit_guarded' as const;
+/** A READY_FOR_AUDIT that names the material the open audit round already has: nothing is recorded, rewritten or relayed. */
+export const TASK_PAIR_DUPLICATE_READY_EFFECT = 'duplicate_ready' as const;
+/** Statuses in which the audit (or its start) is pending and only the executor's READY or the auditor's verdict may move the pair. */
+export const TASK_PAIR_AUDIT_HELD_STATUSES: readonly TaskPairStatus[] = ['in_audit', 'awaiting_audit'];
 /**
  * Known non-informative titles a pair can carry (a legacy-import default
  * objective, a formatting fallback used elsewhere for a missing title).
@@ -958,6 +964,8 @@ export interface TaskPairState {
    * Cleared whenever Brain/the daemon reopens the pair (D-armed on revival).
    */
   closedNoticeSentTo?: readonly string[];
+  /** The round in which the executor was last told that its STARTED/WORKING was ignored because the pair is in audit (one notice per round). */
+  inAuditNoticeRound?: number;
   /** Actual start time. Undefined while queued; unlike createdAt this does not
    * include time spent waiting for a named participant or a free slot. */
   startedAt?: number;
@@ -1100,6 +1108,26 @@ function materialFromAttrs(attrs: Record<string, string>, now: number): TaskPair
   for (const key of TASK_PAIR_MATERIAL_ATTRS) if (attrs[key]) material[key] = attrs[key];
   if (!material.intentionalNote && attrs.note) material.intentionalNote = attrs.note;
   return material.worktree || material.head || material.base || material.path ? material : undefined;
+}
+
+function taskPairFileSet(files: string | undefined): string {
+  return (files ?? '').split(',').map((file) => file.trim().replace(/\\/g, '/')).filter(Boolean).sort().join('\n');
+}
+
+/**
+ * Does a READY_FOR_AUDIT name the material the open round already holds? Head,
+ * worktree, path and the stated changed files must match; a base or note the
+ * new READY leaves out is not a difference (executors often omit base=). A
+ * different head, path or file list is new material.
+ */
+function sameAuditMaterial(current: TaskPairMaterial, next: TaskPairMaterial): boolean {
+  if ((current.head === undefined) !== (next.head === undefined)) return false;
+  if (current.head !== undefined && next.head !== undefined && !sameTaskPairCommit(current.head, next.head)) return false;
+  if (current.worktree !== next.worktree || current.path !== next.path) return false;
+  if (taskPairFileSet(current.files) !== taskPairFileSet(next.files)) return false;
+  if (next.base !== undefined && (current.base === undefined || !sameTaskPairCommit(current.base, next.base))) return false;
+  if (next.intentionalNote !== undefined && next.intentionalNote !== current.intentionalNote) return false;
+  return true;
 }
 
 function applyWorkspaceAttr(pair: TaskPairState, attrs: Record<string, string>): void {
@@ -1706,6 +1734,25 @@ export function applyTaskPairMarker(
     }
     case 'STARTED':
     case 'WORKING': {
+      // The executor's progress marker while the audit is pending must not take
+      // the pair out of audit: that voids the auditor's pending verdict (their
+      // PASS/REWORK is then recorded as unusual and does not apply). Recorded
+      // as unusual, status untouched; Brain's WORKING/STARTED keeps its manual
+      // override effect. The executor is told once per round.
+      if (role === 'executor' && !roleAuthority && TASK_PAIR_AUDIT_HELD_STATUSES.includes(existing.status)) {
+        if (existing.inAuditNoticeRound === existing.round) return { ...recorded(existing), effect: TASK_PAIR_IN_AUDIT_GUARDED_EFFECT };
+        const noticed = clonePair(existing);
+        noticed.updatedAt = ctx.now;
+        noticed.inAuditNoticeRound = existing.round;
+        return {
+          pair: noticed, fromStatus: existing.status, toStatus: existing.status,
+          effect: TASK_PAIR_IN_AUDIT_GUARDED_EFFECT, unusual: true,
+          intents: [{
+            kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId,
+            text: `Your ${verb} for ${marker.taskId} was ignored: the pair is ${existing.status === 'in_audit' ? 'in audit' : 'awaiting audit'} and a status change would void the auditor's pending verdict. Answer questions with a plain reply (no marker); after new commits send a new READY_FOR_AUDIT with the new head.`,
+          }],
+        };
+      }
       if (pair.status === TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION && (role === 'executor' || roleAuthority)) {
         markTaskPairStarted(pair, ctx.now);
         return done('status');
@@ -1731,6 +1778,19 @@ export function applyTaskPairMarker(
       const roundBase = pair.roundBase?.commit;
       if (roundBase && material?.base && !sameTaskPairCommit(material.base, roundBase)) {
         return reject(`Delivery round ${taskPairDeliveryRound(pair)} of ${marker.taskId} is based on ${roundBase}; READY_FOR_AUDIT base=${material.base} does not match. Omit base= or name ${roundBase}, rebase your work onto it, commit, and resend.`);
+      }
+      // The same material again while the round is open (a marker seen twice,
+      // an executor repeating itself) is a no-op: no status event, no relay to
+      // the auditor. A held round is excluded: the daemon re-verifies ancestry
+      // on every READY, so a resend must reach it. A different head (or path,
+      // or file list) is new material and falls through to replace it.
+      if (existing.status === 'in_audit' && existing.material && !existing.materialHold) {
+        const candidate: TaskPairMaterial | undefined = material
+          ? (roundBase && !material.base ? { ...material, base: roundBase } : material)
+          : (pair.workspace?.path ? { path: pair.workspace.path, ...(pair.workspace.lastHead ? { head: pair.workspace.lastHead } : {}), at: ctx.now } : undefined);
+        if (candidate && sameAuditMaterial(existing.material, candidate)) {
+          return { ...recorded(existing, false), effect: TASK_PAIR_DUPLICATE_READY_EFFECT };
+        }
       }
       // A fresh READY replaces the material, so it lifts a hold; the daemon
       // re-verifies ancestry when it relays this one (below), so the hold can

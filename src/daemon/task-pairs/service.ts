@@ -26,6 +26,7 @@ import {
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_MATERIAL_EVENT_VERB,
   TASK_PAIR_MATERIAL_HELD_EFFECT,
+  TASK_PAIR_DUPLICATE_READY_EFFECT,
   TASK_PAIR_IDEMPOTENT_STARTED_EFFECT,
   TASK_PAIR_TITLE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_EFFECTS,
@@ -650,6 +651,13 @@ export class TaskPairService {
     if (existing && this.#isIdempotentStarted(input, existing, transition, role)) {
       store.saveLivenessActivityStamp(input.project, existing.state.taskId, this.#livenessAfterMarker(existing.liveness, transition, role, now));
       return { effect: TASK_PAIR_IDEMPOTENT_STARTED_EFFECT, fromStatus: 'working', toStatus: 'working', unusual: false, intents: [] };
+    }
+    // The same READY_FOR_AUDIT again while its round is open changes nothing:
+    // no event row, no pair rewrite, no relay to the auditor. It is still the
+    // executor's activity, so it is stamped like any other.
+    if (existing && transition.effect === TASK_PAIR_DUPLICATE_READY_EFFECT) {
+      store.saveLivenessActivityStamp(input.project, existing.state.taskId, this.#livenessAfterMarker(existing.liveness, transition, role, now));
+      return { effect: TASK_PAIR_DUPLICATE_READY_EFFECT, fromStatus: existing.state.status, toStatus: existing.state.status, unusual: false, intents: [] };
     }
     const eventPair = transition.pair ?? existing?.state;
     const eventHead = input.marker.attrs.head ?? existing?.state.material?.head ?? eventPair?.material?.head ?? '';
