@@ -692,3 +692,88 @@ it('publishes the finalized streaming text immediately after throttled updates',
   expect(container.textContent).toContain('final');
   vi.useRealTimers();
 });
+
+describe('streaming render mode', () => {
+  // The owner's recording: the streaming bubble alternated between the Markdown
+  // rendering and the raw text ("**bold**", "---" shown literally) because the
+  // snapshot timer was a debounce (reset by every chunk) and a lagging snapshot
+  // was rendered as a raw <span>. Every state a viewer can see must be Markdown.
+  const REPLY = [
+    '好的，这次换一篇不同题材的。',
+    '',
+    '---',
+    '',
+    '**深夜的便利店**',
+    '',
+    '凌晨一点四十分，便利店的自动门"叮咚"响了一声。',
+    '',
+    '- 第一条',
+    '- 第二条',
+  ].join('\n');
+
+  // Raw mode = the bubble is one bare <span> of text (the Markdown renderer emits
+  // block elements; its own empty <span> separators sit between them).
+  const isRawMode = (container: Element) => {
+    const root = container.querySelector('.chat-rich-text');
+    const bareText = root?.children.length === 1 && root.firstElementChild?.tagName === 'SPAN';
+    return Boolean(bareText) || /\*\*|^---$/m.test(container.textContent ?? '');
+  };
+
+  it('never shows the raw text while chunks keep arriving faster than the refresh interval', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container, rerender } = render(<ChatMarkdown text="好的，" cacheKey="stream-mode" streaming />);
+      const modes: boolean[] = [];
+      for (let end = 8; end <= REPLY.length; end += 4) {
+        rerender(<ChatMarkdown text={REPLY.slice(0, end)} cacheKey="stream-mode" streaming />);
+        modes.push(isRawMode(container));
+        await vi.advanceTimersByTimeAsync(40);
+        modes.push(isRawMode(container));
+      }
+      expect(modes.filter(Boolean)).toHaveLength(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('keeps one render mode when chunks arrive in bursts with gaps longer than the refresh interval', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container, rerender } = render(<ChatMarkdown text="好的，" cacheKey="stream-burst" streaming />);
+      const modes: boolean[] = [];
+      let end = 8;
+      for (let burst = 0; end <= REPLY.length; burst += 1) {
+        for (let i = 0; i < 3 && end <= REPLY.length; i += 1, end += 3) {
+          rerender(<ChatMarkdown text={REPLY.slice(0, end)} cacheKey="stream-burst" streaming />);
+          modes.push(isRawMode(container));
+          await vi.advanceTimersByTimeAsync(15);
+          modes.push(isRawMode(container));
+        }
+        await vi.advanceTimersByTimeAsync(250);
+        modes.push(isRawMode(container));
+      }
+      expect(modes.filter(Boolean)).toHaveLength(0);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('follows the stream at most one refresh interval behind and is exact once it stops', async () => {
+    vi.useFakeTimers();
+    try {
+      const { container, rerender } = render(<ChatMarkdown text="a" cacheKey="stream-lag" streaming />);
+      rerender(<ChatMarkdown text={'a\n\n**b**'} cacheKey="stream-lag" streaming />);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(container.querySelector('strong')?.textContent).toBe('b');
+      rerender(<ChatMarkdown text={'a\n\n**b**\n\n# c'} cacheKey="stream-lag" streaming />);
+      await vi.advanceTimersByTimeAsync(150);
+      expect(container.querySelector('h1')?.textContent).toBe('c');
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('a long single message that crosses the enhancement limit stays raw from then on (one switch, never back)', () => {
+    const big = `# ${'x '.repeat(RICH_TEXT_ENHANCEMENT_CHAR_LIMIT)}`;
+    const { container, rerender } = render(<ChatMarkdown text="# small" cacheKey="stream-big" streaming />);
+    expect(container.querySelector('h1')).not.toBeNull();
+    rerender(<ChatMarkdown text={big} cacheKey="stream-big" streaming />);
+    expect(container.querySelector('h1')).toBeNull();
+    rerender(<ChatMarkdown text={`${big}more`} cacheKey="stream-big" streaming />);
+    expect(container.querySelector('h1')).toBeNull();
+  });
+});

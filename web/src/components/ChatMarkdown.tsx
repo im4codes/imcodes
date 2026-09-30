@@ -9,7 +9,7 @@
  * - All existing chat CSS classes
  */
 import { h } from 'preact';
-import { useEffect, useMemo, useState } from 'preact/hooks';
+import { useEffect, useMemo, useRef, useState } from 'preact/hooks';
 import { marked, type Token, type Tokens } from 'marked';
 import { useTranslation } from 'react-i18next';
 import {
@@ -22,6 +22,7 @@ import {
 import { splitTextByHttpUrls, trimDetectedUrl } from '../link-detection.js';
 import { copyToClipboard } from '../util/clipboard.js';
 import { shouldSkipRichTextEnhancement } from '../chat-render-limits.js';
+import { repairStreamingMarkdown } from '../streaming-markdown.js';
 import {
   isImagePreviewPath,
   renderChatPathActions,
@@ -33,11 +34,14 @@ import {
   type ChatLocalWebPreviewOpenHandler,
 } from './ChatLoopbackLink.js';
 
+/** Streaming blocks re-parse their Markdown at most this often (10 Hz). */
+const STREAMING_MARKDOWN_REFRESH_MS = 100;
+
 interface Props {
   text: string;
   /** Stable event id used with the content revision to cache parsed tokens. */
   cacheKey?: string;
-  /** Streaming blocks are refreshed at most 10Hz; finalized blocks update immediately. */
+  /** Streaming blocks re-parse at most 10Hz (always rendered as Markdown); finalized blocks update immediately. */
   streaming?: boolean;
   onPathClick?: (path: string) => void;
   onUrlClick?: (url: string) => void;
@@ -520,21 +524,37 @@ function parseMarkdownTokens(text: string, cacheKey?: string): Token[] {
 
 export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview }: Props) {
   const { t } = useTranslation();
-  // Keep raw streaming text live immediately, while limiting the expensive
-  // markdown lex/AST refresh to 10Hz. Finalized text bypasses the timer.
+  // A streaming block re-parses at most every STREAMING_MARKDOWN_REFRESH_MS
+  // (a THROTTLE with a trailing update: a steady stream can never starve it, and
+  // the newest text always lands within one interval). The block is always
+  // rendered as Markdown from the latest snapshot: showing the un-parsed text
+  // while the snapshot lags flipped the bubble between raw text and Markdown
+  // (different heights) on every burst. Finalized text bypasses the timer.
   const [parsedText, setParsedText] = useState(text);
+  const latestTextRef = useRef(text);
+  latestTextRef.current = text;
+  const timerRef = useRef<number | null>(null);
+  const lastAppliedAtRef = useRef(0);
   useEffect(() => {
     if (!streaming) {
+      if (timerRef.current !== null) { window.clearTimeout(timerRef.current); timerRef.current = null; }
       setParsedText(text);
-      return undefined;
+      return;
     }
-    const timer = window.setTimeout(() => setParsedText(text), 100);
-    return () => window.clearTimeout(timer);
-  }, [text, streaming]);
+    if (parsedText === text || timerRef.current !== null) return;
+    const wait = Math.max(0, lastAppliedAtRef.current + STREAMING_MARKDOWN_REFRESH_MS - Date.now());
+    timerRef.current = window.setTimeout(() => {
+      timerRef.current = null;
+      lastAppliedAtRef.current = Date.now();
+      setParsedText(latestTextRef.current);
+    }, wait);
+  }, [text, streaming, parsedText]);
+  useEffect(() => () => {
+    if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+  }, []);
   const skipRichTextEnhancement = shouldSkipRichTextEnhancement(text);
-  // Final/non-streaming updates must be visible in the same render. Streaming
-  // blocks may use the throttled snapshot until the next refresh tick.
-  const effectiveParsedText = streaming ? parsedText : text;
+  // Final/non-streaming updates must be visible in the same render.
+  const effectiveParsedText = streaming ? repairStreamingMarkdown(parsedText) : text;
   const tokens = useMemo(() => (
     skipRichTextEnhancement ? [] : parseMarkdownTokens(effectiveParsedText, cacheKey)
   ), [skipRichTextEnhancement, effectiveParsedText, cacheKey]);
@@ -550,14 +570,6 @@ export function ChatMarkdown({ text, cacheKey, streaming = false, onPathClick, o
   }), [onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, onOpenLocalWebPreview, t]);
 
   if (skipRichTextEnhancement) {
-    return (
-      <div class="chat-rich-text">
-        <span>{text}</span>
-      </div>
-    );
-  }
-
-  if (streaming && parsedText !== text) {
     return (
       <div class="chat-rich-text">
         <span>{text}</span>
