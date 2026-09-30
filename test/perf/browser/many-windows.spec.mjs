@@ -54,7 +54,8 @@ function analyzeScrollJitter(samples) {
 async function startKeypressProbe(page) {
   if (process.env.IMC_PERF_KEYPRESS !== '1' || !page) return null;
   const ready = await page.evaluate(() => {
-    const composer = [...document.querySelectorAll('textarea')].find((el) => el.offsetParent !== null && el.getBoundingClientRect().width > 50);
+    // The chat composer is a contenteditable role=textbox; a plain textarea is the fallback.
+    const composer = [...document.querySelectorAll('[data-onboarding="chat-input"][contenteditable="true"], textarea')].find((el) => el.offsetParent !== null && el.getBoundingClientRect().width > 50);
     if (!composer) return false;
     const probe = { delays: [], down: null };
     document.addEventListener('keydown', (event) => { probe.down = event.timeStamp; }, true);
@@ -68,7 +69,7 @@ async function startKeypressProbe(page) {
     window.__imcKeypressProbe = probe;
     return true;
   }).catch(() => false);
-  if (!ready) return { ready: false, stop: async () => ({ samples: 0, error: 'no visible composer textarea' }) };
+  if (!ready) return { ready: false, stop: async () => ({ samples: 0, error: 'no visible composer' }) };
   let busy = false;
   const timer = setInterval(async () => {
     if (busy) return;
