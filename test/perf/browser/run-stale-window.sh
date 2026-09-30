@@ -23,6 +23,9 @@ export IMC_PERF_RESULTS_HOST="$RESULTS"
 export IMC_PERF_PORT_BASE="${IMC_PERF_PORT_BASE:-$((20000 + RANDOM % 2000))}"
 export IMC_PERF_WEB_PORT_BASE="${IMC_PERF_WEB_PORT_BASE:-$((24000 + RANDOM % 2000))}"
 export IMC_PERF_HISTORY_FAITHFUL=1 IMC_PERF_STALE_SESSION=1
+# One phone, one chat: the default 20-window load would put a dozen other timelines' history requests in the same
+# queue and measure that instead of the stale window.
+export IMC_PERF_SESSIONS="${IMC_PERF_SESSIONS:-2}"
 export IMC_PERF_HISTORY_LATENCY_MS="${IMC_PERF_HISTORY_LATENCY_MS:-250}"
 cleanup() {
   "${COMPOSE[@]}" logs --no-color daemon > "$RESULTS/daemon.log" 2>&1 || true
