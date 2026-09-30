@@ -114,7 +114,8 @@ function Get-AgentGuardReport([string]$Node, [string]$State) {
 function Start-AgentGuardWatcher($g, [string]$Node, [string]$ManifestPath) {
   Remove-Item -LiteralPath $g.Fired -Force -ErrorAction SilentlyContinue
   $log = Join-Path $g.State 'guard-watch.log'
-  $watchArgs = @((Join-Path $script:AgentGuardKit 'guard-watch.mjs'), $g.Markers, $g.Fired, $ManifestPath, '')
+  # No tmux dir on Windows. Every argument is quoted (Start-Process joins them on spaces) and none may be empty.
+  $watchArgs = @((Join-Path $script:AgentGuardKit 'guard-watch.mjs'), $g.Markers, $g.Fired, $ManifestPath) | ForEach-Object { "`"$_`"" }
   $p = Start-Process -FilePath $Node -ArgumentList $watchArgs -PassThru -WindowStyle Hidden -RedirectStandardOutput $log -RedirectStandardError "$log.err"
   $p.Id
 }

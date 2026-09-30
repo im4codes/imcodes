@@ -72,11 +72,15 @@ try {
   Check 'the report names the fired tripwire' ((Get-AgentGuardReport $node $state) -ne 0)
 
   if ($RepoRoot -and (Test-Path (Join-Path $RepoRoot 'node_modules\tsx'))) {
-    $probe = "import { resolveExecutableForSpawn } from '$(($RepoRoot -replace '\\','/'))/src/agent/transport-paths.ts'; console.log(JSON.stringify(resolveExecutableForSpawn('codex')));"
-    $resolved = (& $node --import tsx --input-type=module -e $probe 2>&1 | Select-Object -Last 1) | ConvertFrom-Json
+    $probeFile = Join-Path $state 'resolve-probe.mts'
+    Set-Content -LiteralPath $probeFile -Encoding ASCII -Value "import { resolveExecutableForSpawn } from '$(([Uri](Join-Path $RepoRoot 'src\agent\transport-paths.ts')).AbsoluteUri)'; console.log(JSON.stringify(resolveExecutableForSpawn('codex')));"
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { $resolvedText = (& $node --import tsx $probeFile 2>$null | Select-Object -Last 1) } finally { $ErrorActionPreference = $prevEap }
+    $resolved = $resolvedText | ConvertFrom-Json
     Check 'the daemon resolver resolves codex to node + the tripwire script' (([string]$resolved.executable -ieq $node) -and ([string]$resolved.prependArgs[0] -like '*tripwire-codex.js')) ($resolved | ConvertTo-Json -Compress)
     $before = @(Get-ChildItem $g.Markers | Where-Object { $_.Name -notlike '*.tmp' }).Count
-    & $resolved.executable @($resolved.prependArgs) '--version' 2>$null
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & $resolved.executable @($resolved.prependArgs) '--version' 2>$null | Out-Null } finally { $ErrorActionPreference = $prevEap }
     Check 'spawning what the resolver returned fires the tripwire' (($LASTEXITCODE -eq 97) -and (@(Get-ChildItem $g.Markers | Where-Object { $_.Name -notlike '*.tmp' }).Count -gt $before))
   } else { Write-Host '  skip: daemon resolver check (no -RepoRoot with node_modules\tsx)' }
 } finally { Restore-AgentGuardEnv $saved }
@@ -85,7 +89,7 @@ Check 'this process environment is restored (USERPROFILE, HOME, Path)' (($env:US
 # 4. watcher stops a stand-in scoped daemon
 Write-Host '4. watcher'
 Get-ChildItem $g.Markers | Remove-Item -Force
-$dummy = Start-Process -FilePath $node -ArgumentList @('-e', 'setInterval(() => {}, 1000)') -PassThru -WindowStyle Hidden
+$dummy = Start-Process -FilePath $node -ArgumentList @('-e', '"setInterval(() => {}, 1000)"') -PassThru -WindowStyle Hidden
 $manifestPath = Join-Path $state 'daemon.json'
 @{ pid = $dummy.Id } | ConvertTo-Json | Set-Content -LiteralPath $manifestPath
 $wpid = Start-AgentGuardWatcher $g $node $manifestPath

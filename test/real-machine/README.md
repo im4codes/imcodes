@@ -8,8 +8,12 @@ by that owner.
 ## Safety rules
 
 * Use a unique owner (`deck_sub_...` or a CI run id), never `default`.
-* Launchers set **only** `IMCODES_HOME`; they never override `HOME`,
-  `USERPROFILE` or `APPDATA`.
+* Launchers never touch the machine's real profile. The **scoped daemon's own environment** (and only that:
+  its process tree, its tmux server, the exec helper and every agent it spawns) gets `IMCODES_HOME` plus the
+  agent-CLI guard below: a scoped `HOME` (Windows: `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`), scoped agent homes
+  and a tripwire `PATH`. The default daemon, its scheduled task and the machine-wide environment are never
+  changed. `HOME` must be scoped: the daemon keeps its session store under `HOME/.imcodes`, not under
+  `IMCODES_HOME`, so an unscoped kit daemon would open the machine's real `sessions.sqlite`.
 * Linux/macOS use `launcher.sh`; Windows uses `launcher.ps1`. Paths and task names are
   owner-hashed and default daemon snapshots are checked before and after.
 * `stack.sh` uses Docker Compose on 211 and plain Docker on m3. All resources
@@ -77,7 +81,7 @@ owner and project labels match; shared or caller-supplied images remain.
 
 * 211 cannot reach services bound to `192.168.2.x`; use m3 for those rows.
 * Do not run a foreground SSH daemon; use the detached launcher.
-* Do not override Windows `USERPROFILE`; use `IMCODES_HOME` only.
+* Never override `USERPROFILE` machine-wide or for the default daemon; the launcher sets it only inside the scoped daemon's own environment.
 * Do not publish through the public npm gate; use the stack's Verdaccio URL.
 * Never delete a shared `C:\\core-lane-*`, `/tmp/imc-*`, or another owner's
   Docker project. The checker reports foreign resources and leaves them alone.
@@ -110,3 +114,56 @@ the kit); it is used for protocol load/restart rows. `codex-fixture.mjs` remains
 a tiny offline smoke fixture.
 
 On Windows, run `powershell -File windows-identity-test.ps1` before a row; it is a no-write counterexample proving a USERPROFILE decoy cannot become the default profile.
+
+## Agent-CLI guard (automatic for every kit daemon)
+
+Rule: no real-machine test may launch a real agent CLI (`codex`, `claude`, `gemini`, `opencode`, `qwen`,
+`cursor-agent`, `copilot`, `kimi`, ...) against a machine's default home. On 2026-09-30 a scoped daemon whose session
+had no `transportConfig.binaryPath` ran `/usr/local/bin/codex` and wrote `/home/k/.codex` twice. The kit now enforces the
+rule itself, so nobody has to remember it. `launcher.sh install` / `launcher.ps1 -Action install` do all of this:
+
+1. **Tripwires first on PATH.** `<state>/agent-guard/bin` holds an executable for every agent CLI (`*.cmd` npm-shaped
+   shims + `tripwire-<name>.js` on Windows, so the daemon's own resolver lands on them too). A tripwire writes a marker
+   (`<state>/agent-guard/markers/<name>.<pid>.<ts>`: argv with secrets masked, the caller chain, an env summary), prints why,
+   never runs the real CLI and exits 97.
+2. **Scoped homes.** The scoped daemon starts with `HOME` (Windows: `USERPROFILE`, `APPDATA`, `LOCALAPPDATA`) =
+   `<state>/agent-home`, `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `GEMINI_CLI_HOME`, the `XDG_*` dirs, and (POSIX) a private
+   `TMUX_TMPDIR`, so its tmux server and panes inherit them. An absolute real CLI that slips past the tripwire
+   (e.g. `/usr/local/bin/claude`) can therefore only touch the scoped home.
+3. **Assertion before start.** Every scoped path is checked against the canonical profile (`IMCODES_DEFAULT_HOME`): one
+   that equals it, contains it, or sits in a real agent dir (`.codex`, `.claude`, ...) aborts the run; after the export
+   the environment is checked again (the tripwire dir must be `PATH[0]`).
+4. **Watcher.** `guard-watch.mjs` stops the scoped daemon (process tree, private tmux server) the moment a marker appears
+   and writes `<state>/tripwire.fired.json`. `checker.*` then fails the run and prints `TRIPWIRE FIRED: <cli> launched by:` with
+   the caller chain and marker path. `launcher.* guard-check` prints the same report at any time.
+5. **Real agent dirs.** A size/mtime/sha256 inventory of the real agent dirs is taken before and after. A machine whose
+   default daemon has live real agent sessions (211 does) writes there all day, so the verdict is attributed: FAIL when the
+   machine had no live real agent process at either snapshot (or `IMCODES_KIT_ASSUME_QUIESCENT=1`), or an added/modified
+   file contains the owner's state dir; otherwise the diff is printed as INCONCLUSIVE and the tripwire is the authority.
+
+Using it: nothing to do. Pass real fixtures by ABSOLUTE path only.
+
+```bash
+# register a fixture CLI; prints the absolute path to use as transportConfig.binaryPath
+test/real-machine/launcher.sh fixture --owner deck_demo --machine 211 --name codex --exec /abs/path/to/fixture-codex
+test/real-machine/launcher.ps1 -Action fixture -Owner deck_demo -Machine 201 -Name codex -Exec C:\fixtures\codex.exe
+# seed a restorable session BEFORE install (the daemon warm-restores it ~100 s after start; then run the checker)
+IMCODES_TEST_KIT_ROOT=/var/tmp/imc-kit-deck_demo node test/real-machine/seed-session.mjs \
+  --state /var/tmp/imc-kit-deck_demo/deck_demo --name deck_kit_brain --project kit --agent codex-sdk \
+  --project-dir /var/tmp/imc-kit-deck_demo/deck_demo/projects/kit [--binary-path <fixture path>]
+# install a built checkout in place (no npm install; ~0 disk) instead of --package/--version
+test/real-machine/launcher.sh install --owner deck_demo --machine 211 --prebuilt-tree /path/to/built/checkout --server-json ...
+test/real-machine/launcher.sh guard-check --owner deck_demo --machine 211
+```
+
+Notes and limits:
+
+* Tripwire names live in `agent-guard-tools.mjs` (`AGENT_CLI_NAMES`); add a new agent CLI there and both platforms pick it up.
+  Session names in `seed-session.mjs` must not match `shared/test-session-guard.ts` patterns (the store prunes them).
+* The guard covers what the scoped daemon starts itself. A daemon restart done by a service manager (a systemd/launchd unit
+  written by `bind`) starts from the unit's environment: `bind` runs under the guard, so `PATH` and `HOME` are baked into the
+  unit, but `TMUX_TMPDIR` is not. Foreground kit daemons (`--server-json`, the default) inherit the guard across restarts.
+* On the current base the startup warm-restore ignores a session's `transportConfig.binaryPath` (`ensureProviderConnected(id, {})`),
+  so a restored codex session trips the wire even with a fixture path set; that is the product bug the guard exists to catch.
+* Self-tests: `test/real-machine/self-test.sh` (POSIX, includes a fake daemon that trips a wire, a fixture run, a daemon-initiated
+  restart and a tmux pane) and `agent-guard-test.ps1 -Root <scoped dir> [-RepoRoot <checkout with node_modules>]` (Windows, needs no daemon).

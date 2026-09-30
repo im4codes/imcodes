@@ -124,10 +124,10 @@ function liveAgents(a) {
 
 function load(path) {
   const d = new Map();
-  for (const line of readFileSync(path, 'utf8').split('\n')) { if (!line) continue; const i = line.indexOf('\t'); d.set(line.slice(0, i), line.slice(i + 1)); }
+  for (const line of readFileSync(path, 'utf8').split(/\r?\n/)) { if (!line) continue; const i = line.indexOf('\t'); d.set(line.slice(0, i), line.slice(i + 1)); }
   return d;
 }
-function procs(path) { try { return readFileSync(`${path}.procs`, 'utf8').split('\n').filter(Boolean); } catch { return []; } }
+function procs(path) { try { return readFileSync(`${path}.procs`, 'utf8').split(/\r?\n/).filter((l) => l.trim()); } catch { return []; } }
 
 // Verdict on a before/after inventory pair. FAIL (exit 1) when a change is attributable to the scoped run: the machine had
 // no live real agent process at either snapshot (or IMCODES_KIT_ASSUME_QUIESCENT=1), or an added/modified file contains the
