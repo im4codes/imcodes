@@ -367,4 +367,121 @@ describe('useTimeline — stale window: latest first, then newest→oldest', () 
     const ids = new Set(hook.current!.events.map((event) => event.eventId));
     expect(all.slice(80).every((event) => ids.has(event.eventId))).toBe(true);
   });
+
+  /** The daemon's envelope trim: the page comes back short, oldest events dropped, flagged like the real `compactTimelineMessageToBudget`. */
+  function trimmedPage(events: TimelineEvent[], dropOldest: number) {
+    const kept = events.slice(dropOldest);
+    return { events: kept, epoch: 1, hasMore: true, payloadTruncated: true, droppedEvents: dropOldest, truncatedEvents: dropOldest, nextCursor: null };
+  }
+
+  it('a payload-trimmed hole page neither closes nor forgets the hole: it stays recorded and the filler resumes and closes it', async () => {
+    const sessionName = `deck_stale_trim_mid_${Date.now()}`;
+    const all = makeSession(sessionName, 1500);
+    const cacheKey = `${SERVER_ID}:${sessionName}`;
+    __setTimelineCacheForTests(cacheKey, all.slice(0, 60));
+    const daemon = makeDaemon(all, sessionName);
+    installHttp(all, daemon.requests);
+    const realImpl = fetchSpy.getMockImplementation()! as (...a: unknown[]) => Promise<{ events: TimelineEvent[] }>;
+    let descendingPages = 0;
+    let trimmedTop: number | null = null;
+    let trimmedPageMax = 0;
+    fetchSpy.mockImplementation(async (...args: unknown[]) => {
+      const opts = (args[2] ?? {}) as { beforeTs?: number };
+      const page = await realImpl(...args);
+      if (opts.beforeTs === undefined) return page;
+      descendingPages += 1;
+      // The second hole page is delivered trimmed (150 of 200 events kept) exactly once.
+      if (descendingPages === 2 && trimmedTop === null) {
+        trimmedTop = opts.beforeTs;
+        trimmedPageMax = page.events[page.events.length - 1]!.ts;
+        return trimmedPage(page.events, 50);
+      }
+      return page;
+    });
+    const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe, { sessionName, ws: daemon.ws, hook }));
+    // Run until the trimmed page has been served, then look at the hole before any retry can fire.
+    for (let i = 0; i < 100 && trimmedTop === null; i += 1) await act(async () => { await vi.advanceTimersByTimeAsync(20); });
+    expect(trimmedTop).not.toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    const gapAfterTrim = getTimelineGap(cacheKey);
+    expect(gapAfterTrim).not.toBeNull();
+    // The top never moves below what the trimmed page proved (its dropped events are inside its range).
+    expect(gapAfterTrim!.upperTs!).toBeGreaterThanOrEqual(trimmedPageMax);
+    expect(hook.current!.historyGap).not.toBeNull();
+
+    // Nothing else restarts the fill: the round's own follow-up does, and closes the hole on complete pages.
+    await act(async () => { await vi.advanceTimersByTimeAsync(20_000); });
+    await waitFor(() => expect(getTimelineGap(cacheKey)).toBeNull());
+    const ids = new Set(hook.current!.events.map((event) => event.eventId));
+    expect(all.slice(60).every((event) => ids.has(event.eventId))).toBe(true);
+    expect(hook.current!.events.length).toBe(ids.size);
+  });
+
+  it('a hole page that stays trimmed every time is held a bounded number of times, then the fill descends past it instead of wedging', async () => {
+    const sessionName = `deck_stale_trim_wedge_${Date.now()}`;
+    const all = makeSession(sessionName, 1200);
+    const cacheKey = `${SERVER_ID}:${sessionName}`;
+    __setTimelineCacheForTests(cacheKey, all.slice(0, 60));
+    const daemon = makeDaemon(all, sessionName);
+    installHttp(all, daemon.requests);
+    const realImpl = fetchSpy.getMockImplementation()! as (...a: unknown[]) => Promise<{ events: TimelineEvent[] }>;
+    let wedgeTop: number | null = null;
+    let wedgeFetches = 0;
+    fetchSpy.mockImplementation(async (...args: unknown[]) => {
+      const opts = (args[2] ?? {}) as { beforeTs?: number };
+      const page = await realImpl(...args);
+      if (opts.beforeTs === undefined) return page;
+      if (wedgeTop === null) wedgeTop = opts.beforeTs;
+      if (opts.beforeTs === wedgeTop) {
+        wedgeFetches += 1;
+        return trimmedPage(page.events, 50);
+      }
+      return page;
+    });
+    const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe, { sessionName, ws: daemon.ws, hook }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    await waitFor(() => expect(getTimelineGap(cacheKey)).toBeNull());
+    // Refetched more than once (the dropped events were given a chance), but not forever.
+    expect(wedgeFetches).toBeGreaterThan(1);
+    expect(wedgeFetches).toBeLessThanOrEqual(4);
+  });
+
+  it('the first HTTP newest-window page being incomplete AND short still records the hole against a stale cache', async () => {
+    const sessionName = `deck_stale_trim_open_${Date.now()}`;
+    const all = makeSession(sessionName, 900);
+    const cacheKey = `${SERVER_ID}:${sessionName}`;
+    __setTimelineCacheForTests(cacheKey, all.slice(0, 60));
+    const daemon = makeDaemon(all, sessionName);
+    // The WS window never answers: the HTTP catch-up is the only evidence of the hole.
+    (daemon.ws as unknown as { sendTimelineHistoryRequest: unknown }).sendTimelineHistoryRequest = vi.fn(() => 'ws-silent');
+    installHttp(all, daemon.requests);
+    const realImpl = fetchSpy.getMockImplementation()! as (...a: unknown[]) => Promise<{ events: TimelineEvent[] }>;
+    let firstServed = false;
+    fetchSpy.mockImplementation(async (...args: unknown[]) => {
+      const opts = (args[2] ?? {}) as { beforeTs?: number };
+      const page = await realImpl(...args);
+      if (!firstServed && opts.beforeTs === undefined) {
+        firstServed = true;
+        return trimmedPage(page.events, 60); // 140 events: incomplete and short
+      }
+      return page;
+    });
+    const hook: { current: ReturnType<typeof useTimeline> | null } = { current: null };
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe, { sessionName, ws: daemon.ws, hook }));
+    for (let i = 0; i < 200 && !firstServed; i += 1) await act(async () => { await vi.advanceTimersByTimeAsync(50); });
+    expect(firstServed).toBe(true);
+    await act(async () => { await vi.advanceTimersByTimeAsync(100); });
+    const gap = getTimelineGap(cacheKey);
+    expect(gap).not.toBeNull();
+    expect(gap!.lowerTs).toBeLessThan(all[59]!.ts);
+    await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+    await waitFor(() => expect(getTimelineGap(cacheKey)).toBeNull());
+    const ids = new Set(hook.current!.events.map((event) => event.eventId));
+    expect(all.slice(60).every((event) => ids.has(event.eventId))).toBe(true);
+  });
 });

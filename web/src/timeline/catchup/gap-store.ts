@@ -180,9 +180,22 @@ export function foldPageIntoGap(
     fullPage: boolean;
     /** The page was fetched for the hole itself (`beforeTs` = the stitched top): contiguous by construction. */
     descending?: boolean;
+    /**
+     * The page was payload-trimmed / dropped / reset (the pager's `pageIsIncomplete`). Its event count says
+     * nothing about exhaustion, and the trimmed events lie inside its range: it can neither prove "no hole"
+     * nor close one, and it holds the stitched top instead of lowering it (the next round refetches the
+     * page; the merge dedups). `skipIncomplete` is the escape hatch for a page that stays trimmed every time:
+     * treat it as a normal full page so the filler still descends past it instead of wedging on it.
+     */
+    incomplete?: boolean;
+    skipIncomplete?: boolean;
   },
 ): { lowerTs: number; upperTs: number | null } | null {
-  const { pageMinTs, pageMaxTs, fullPage } = page;
+  const { pageMinTs, pageMaxTs } = page;
+  const holdIncomplete = page.incomplete === true && page.skipIncomplete !== true;
+  // An incomplete page that is still being held is treated as a full window for the decision to OPEN a hole
+  // (short means nothing for a trimmed page), and holds the top for an open one.
+  const fullPage = page.fullPage || page.incomplete === true;
   if (pageMinTs === null || pageMaxTs === null) {
     // nothing came back: nothing to stitch; an empty answer for a window that should hold events means "no more"
     return current ? { lowerTs: current.lowerTs, upperTs: current.upperTs } : null;
@@ -193,8 +206,14 @@ export function foldPageIntoGap(
     return { lowerTs: page.lowerTs, upperTs: pageMinTs };
   }
   const floor = current.lowerTs;
-  if (pageMinTs <= floor || !fullPage) return null;
   const top = current.upperTs;
+  if (holdIncomplete) {
+    // Never closes on its own (only a page that reaches the floor with nothing above it does, below) and never
+    // lowers the top past what the page proved: the trimmed events are inside its range.
+    if (pageMaxTs <= floor) return null;
+    return { lowerTs: floor, upperTs: top === null ? null : Math.min(top, pageMaxTs) };
+  }
+  if (pageMinTs <= floor || !fullPage) return null;
   if (top === null) return { lowerTs: floor, upperTs: pageMinTs };
   if (pageMaxTs < top && page.descending !== true) return { lowerTs: floor, upperTs: top };
   return { lowerTs: floor, upperTs: Math.min(top, pageMinTs) };

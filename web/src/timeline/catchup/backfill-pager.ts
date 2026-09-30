@@ -138,7 +138,7 @@ export interface NewestWindowBackfillOutcome {
   resumeBeforeTs?: number;
 }
 
-function pageIsIncomplete(page: BackfillPage): boolean {
+export function pageIsIncomplete(page: BackfillPage): boolean {
   return page.payloadTruncated === true
     || (page.droppedEvents ?? 0) > 0
     || (page.truncatedEvents ?? 0) > 0

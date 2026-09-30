@@ -103,7 +103,7 @@ import { TIMELINE_HISTORY_CONTENT_TYPES } from '../../../src/shared/timeline/typ
 import { fetchTimelineHistoryHttp, sendSessionViaHttp } from '../api.js';
 import { MESSAGE_PIN_EVENT_TYPES, MESSAGE_PIN_LIMITS } from '@shared/message-pins.js';
 import { SESSION_SEND_DELIVERY_MODES } from '@shared/session-send-delivery.js';
-import { runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
+import { pageIsIncomplete, runNewestWindowBackfill } from '../timeline/catchup/backfill-pager.js';
 import { buildTransportPendingSyncPatch, normalizeTransportPendingEntries } from '../transport-queue.js';
 
 const TRANSPORT_QUEUE_EVENT_TYPES = new Set([
@@ -231,6 +231,15 @@ const BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS = 60_000;
 const backgroundBackfillGateByCacheKey = new Map<string, { inFlight: number; failureStreak: number; nextAllowedAt: number }>();
 /** Sessions whose stale-window hole is being filled right now (any window): one filler per session. */
 const gapBackfillInFlight = new Set<string>();
+/**
+ * A hole page the daemon keeps trimming to its payload budget is refetched (the dropped events lie inside its
+ * range), at most this many times at the same stitched top; after that the filler descends past it so one
+ * permanently oversized page cannot wedge the whole fill.
+ */
+const INCOMPLETE_HOLE_PAGE_HOLDS = 2;
+const incompleteHoleHoldByCacheKey = new Map<string, { top: number | null; holds: number }>();
+/** Delay before a hole's filler is re-fired after a payload-trimmed round (nothing else would restart it). */
+const INCOMPLETE_HOLE_RETRY_DELAY_MS = 1_500;
 /** A (re)connect is new evidence the link works again: let the next
  *  background catch-up run instead of waiting out a failure backoff. */
 function liftBackgroundBackfillBackoff(cacheKey: string | null | undefined): void {
@@ -1613,6 +1622,7 @@ export function __resetTimelineCacheForTests(): void {
   watchdogStateByCacheKey.clear();
   backgroundBackfillGateByCacheKey.clear();
   gapBackfillInFlight.clear();
+  incompleteHoleHoldByCacheKey.clear();
   __resetTimelineGapsForTests();
 }
 
@@ -4408,19 +4418,23 @@ export function useTimeline(
         try {
           // The page currently being fetched: `undefined` = the newest window, else a step down the hole.
           let pageBeforeTs: number | undefined;
+          // Whether that page arrived payload-trimmed/dropped/reset (the pager ends such a round `truncated`).
+          let pageIncomplete = false;
           const outcome = await runNewestWindowBackfill(afterTs, {
             limit: MAX_FORWARD_PAGE_EVENTS,
             maxPages,
             // Only the hole's own round resumes at its stitched top; a manual newest-window refresh starts at the newest.
             initialBeforeTs: resumeBeforeTs ?? (mode !== 'manualLatestWindow' && roundGap?.upperTs != null ? roundGap.upperTs + 1 : undefined),
-            fetchPage: ({ afterTs: at, beforeTs: bt }) => {
+            fetchPage: async ({ afterTs: at, beforeTs: bt }) => {
               pageBeforeTs = bt;
-              return Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+              const page = await fetchTimelineHistoryHttp(serverId, backfillSessionId, {
                 afterTs: at,
                 ...(bt !== undefined ? { beforeTs: bt } : {}),
                 limit: MAX_FORWARD_PAGE_EVENTS,
                 timeoutMs: resolveBackfillTimeoutMs(opts),
-              }));
+              });
+              pageIncomplete = page ? pageIsIncomplete(page) : false;
+              return page;
             },
             mergePage: async (events) => {
               if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
@@ -4437,7 +4451,8 @@ export function useTimeline(
               // The first newest-window page of an open is the evidence for a hole: record it BEFORE the merge
               // moves the cache's own newest ts (and BEFORE anything is persisted).
               if (pageBeforeTs === undefined && !roundGap) {
-                noteOpenWindowTail(recovered, recovered.length >= MAX_FORWARD_PAGE_EVENTS);
+                // A trimmed page's length proves nothing: it counts as a full window (the hole is not ruled out).
+                noteOpenWindowTail(recovered, pageIncomplete || recovered.length >= MAX_FORWARD_PAGE_EVENTS);
               }
               // While a hole is open the window must keep what it fills in, not only the newest 300.
               const wideMerge = !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
@@ -4472,12 +4487,27 @@ export function useTimeline(
               if (backfillCacheKey && Number.isFinite(minTs) && Number.isFinite(maxTs)) {
                 const currentGap = getTimelineGap(backfillCacheKey);
                 if (currentGap) {
+                  // A page held at the same stitched top too often stops being held, so the fill cannot wedge on it.
+                  let skipIncomplete = false;
+                  if (pageIncomplete) {
+                    const streak = incompleteHoleHoldByCacheKey.get(backfillCacheKey);
+                    const holds = streak && streak.top === currentGap.upperTs ? streak.holds + 1 : 1;
+                    skipIncomplete = holds > INCOMPLETE_HOLE_PAGE_HOLDS;
+                    incompleteHoleHoldByCacheKey.set(backfillCacheKey, { top: currentGap.upperTs, holds });
+                  } else {
+                    incompleteHoleHoldByCacheKey.delete(backfillCacheKey);
+                  }
                   const folded = foldPageIntoGap(currentGap, {
                     lowerTs: currentGap.lowerTs,
                     pageMinTs: minTs,
                     pageMaxTs: maxTs,
                     fullPage: recovered.length >= MAX_FORWARD_PAGE_EVENTS,
                     descending: pageBeforeTs !== undefined,
+                    incomplete: pageIncomplete,
+                    skipIncomplete,
+                  });
+                  backfillDebug('fireHttpBackfill: hole page folded', {
+                    pageIncomplete, skipIncomplete, pageMinTs: minTs, pageMaxTs: maxTs, before: currentGap, after: folded,
                   });
                   setTimelineGap(backfillCacheKey, folded);
                 }
@@ -4493,6 +4523,19 @@ export function useTimeline(
           // The window down to the floor is exhausted: the hole is filled.
           if (terminal === 'caught_up' && backfillCacheKey && mode !== 'manualLatestWindow') {
             setTimelineGap(backfillCacheKey, null);
+            incompleteHoleHoldByCacheKey.delete(backfillCacheKey);
+          }
+          // A payload-trimmed page ended the round with the hole still open. Nothing else would restart the fill
+          // (the hole's own effect keys on the hole existing, which it still does), so re-fire it once after a
+          // short pause; bounded by the same round budget as the cap_hit chain.
+          if (terminal === 'truncated' && backfillCacheKey && mode !== 'manualLatestWindow'
+            && !!getTimelineGap(backfillCacheKey) && roundsChained < CATCHUP_TAIL_MAX_ROUNDS) {
+            backfillDebug('fireHttpBackfill: truncated round with an open hole → re-fire', {
+              sessionId: backfillSessionId, roundsChained: roundsChained + 1,
+            });
+            setTimeout(() => {
+              fireHttpBackfillRef.current(0, { ...opts, _roundsChained: roundsChained + 1, _retryAttempt: 0, _resumeBeforeTs: undefined });
+            }, INCOMPLETE_HOLE_RETRY_DELAY_MS);
           }
           // Transient null on the FIRST page → preserve the legacy retry-with-backoff.
           // A null on a later page means ≥1 page already merged; stop (next trigger

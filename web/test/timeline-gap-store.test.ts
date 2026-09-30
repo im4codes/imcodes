@@ -23,6 +23,33 @@ describe('foldPageIntoGap', () => {
     { lowerTs: 1000, pageMinTs, pageMaxTs, fullPage: true, ...extra }
   );
 
+
+  it('a payload-incomplete page can neither close a hole nor lower its stitched top past the page', () => {
+    const gap = { lowerTs: 1000, upperTs: 9000, createdAt: 1 };
+    // short (150 of 200) and trimmed: a normal short page would close the hole
+    expect(foldPageIntoGap(gap, full(6000, 9000, { descending: true, fullPage: false, incomplete: true })))
+      .toEqual({ lowerTs: 1000, upperTs: 9000 });
+    // it reaches the floor by its oldest RETAINED event: still cannot close
+    expect(foldPageIntoGap(gap, full(900, 9000, { descending: true, fullPage: false, incomplete: true })))
+      .toEqual({ lowerTs: 1000, upperTs: 9000 });
+    // the stitched top never rises either (page newest below it)
+    expect(foldPageIntoGap(gap, full(6000, 8000, { descending: true, fullPage: false, incomplete: true })))
+      .toEqual({ lowerTs: 1000, upperTs: 8000 });
+    // an unstitched hole stays unstitched
+    expect(foldPageIntoGap({ lowerTs: 1000, upperTs: null, createdAt: 1 }, full(6000, 9000, { fullPage: false, incomplete: true })))
+      .toEqual({ lowerTs: 1000, upperTs: null });
+  });
+
+  it('an incomplete page that keeps failing (skipIncomplete) is folded as a normal page so the fill still descends', () => {
+    const gap = { lowerTs: 1000, upperTs: 9000, createdAt: 1 };
+    expect(foldPageIntoGap(gap, full(6000, 9000, { descending: true, fullPage: true, incomplete: true, skipIncomplete: true })))
+      .toEqual({ lowerTs: 1000, upperTs: 6000 });
+  });
+
+  it('an incomplete short first page still proves a hole (it counts as a full window)', () => {
+    expect(foldPageIntoGap(null, full(5000, 9000, { fullPage: false, incomplete: true }))).toEqual({ lowerTs: 1000, upperTs: 5000 });
+    expect(foldPageIntoGap(null, full(900, 9000, { fullPage: false, incomplete: true }))).toBeNull();
+  });
   it('a full newest-window page whose oldest event is above the floor proves a hole (floor, oldest]', () => {
     expect(foldPageIntoGap(null, full(5000, 9000))).toEqual({ lowerTs: 1000, upperTs: 5000 });
   });
