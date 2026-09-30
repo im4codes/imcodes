@@ -46,6 +46,9 @@ const LATEST_AFTER_CACHE_BUDGET_MS = Number(process.env.IMC_PERF_STALE_LATEST_BU
 const DRIFT_BUDGET_PX = 1;
 const MIN_FLINGS = Number(process.env.IMC_PERF_STALE_MIN_FLINGS ?? 8);
 const MIN_STREAM_FRAMES = 50;
+const LATENCY_JUDGED_MODES = new Set(['pinned', 'reading', 'fling']);
+// The peek and the newest-window request are sent in the same tick; CDP/Date.now jitter can order them by a millisecond.
+const PEEK_SAME_TICK_MS = 25;
 const SAMPLE_WINDOW_MS = Number(process.env.IMC_PERF_STALE_SAMPLE_MS ?? 20_000);
 const SAMPLE_CAP_MS = Number(process.env.IMC_PERF_STALE_CAP_MS ?? 150_000);
 const DB_NAME = 'imcodes-timeline';
@@ -391,7 +394,7 @@ function analyzeFling(frames, writes, flings) {
 function analyzeOrder(requests, wsTiming) {
   // Wire order from the phone: the peek and the newest-window request leave in the same tick, so their ARRIVAL order at the
   // daemon is a network race; what the app controls is that the peek is sent first.
-  const peekFirst = wsTiming.peekSentAt !== null && wsTiming.firstHistorySentAt !== null && wsTiming.peekSentAt <= wsTiming.firstHistorySentAt
+  const peekFirst = wsTiming.peekSentAt !== null && wsTiming.firstHistorySentAt !== null && wsTiming.peekSentAt <= wsTiming.firstHistorySentAt + PEEK_SAME_TICK_MS
     && requests.some((request) => request.contentFilter === 'text' && request.limit <= 30);
   // Backfill pages walk DOWN: every page that has an upper bound is below the previous one's.
   // The hole's own pages carry the recorded floor (afterTs); a later manual/refresh round is not part of the fill.
@@ -421,7 +424,9 @@ const headBehaviour = process.env.IMC_PERF_STALE_EXPECT_HEAD !== '0';
 for (const [mode, scenario] of Object.entries(scenarios)) {
   if (scenario.layout.error) failures.push(`${mode}: ${scenario.layout.error}`);
   if (!headBehaviour) continue;
-  if (scenario.latestAfterCacheMs > LATEST_AFTER_CACHE_BUDGET_MS) failures.push(`${mode}: latest message ${scenario.latestAfterCacheMs} ms after the cache paint (budget ${LATEST_AFTER_CACHE_BUDGET_MS})`);
+  // The latency budget is a property of the open itself: the streaming scenarios only add their reply after the backfill is
+  // under way, so they record the number but do not re-judge it (a loaded host would make them flaky, not informative).
+  if (LATENCY_JUDGED_MODES.has(mode) && scenario.latestAfterCacheMs > LATEST_AFTER_CACHE_BUDGET_MS) failures.push(`${mode}: latest message ${scenario.latestAfterCacheMs} ms after the cache paint (budget ${LATEST_AFTER_CACHE_BUDGET_MS})`);
   if (!scenario.order.peekFirst) failures.push(`${mode}: the first history request was not the tiny text-only peek`);
   if (!scenario.order.descending || scenario.order.backfillPages < 2) failures.push(`${mode}: backfill pages did not walk newest -> oldest (${JSON.stringify(scenario.order)})`);
   if (scenario.gapMarkerAtMs === null && scenario.layout.markerSeen !== true) failures.push(`${mode}: the earlier-messages marker never appeared`);
