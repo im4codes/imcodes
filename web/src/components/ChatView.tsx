@@ -83,7 +83,7 @@ import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers
 import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
 import { TIMELINE_DELETE_ERROR_CODES } from '@shared/timeline-protocol.js';
 import { requestTimelineMessageDelete, resolveTimelineDeleteTargets, timelineDeleteErrorKey, TimelineDeleteError } from '../timeline-delete.js';
-import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, type ReaderAnchor } from '../chat-scroll-anchoring.js';
+import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, reconcileTopOffset, topOffsetStyle, type ReaderAnchor } from '../chat-scroll-anchoring.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
@@ -2138,8 +2138,31 @@ interface VirtualizedViewItemsProps {
    * policy (re-pin a follower, re-align a reader's anchor row).
    */
   onMeasuredLayout?: (root: HTMLDivElement, wasAtBottom: boolean) => void;
+  /**
+   * Filled by the virtualizer: absorbs a layout shift ABOVE the reader into its top
+   * offset (no scrollTop write) and returns the part it could not absorb (all of it
+   * when the list is not virtualized). See `topOffsetStyle`.
+   */
+  absorbTopShiftRef?: { current: ((delta: number) => number) | null };
+  /** After the idle reconcile moved content (ChatView re-records its reader anchor). */
+  onTopOffsetReconciled?: () => void;
+  /** Identity of the conversation shown; a change drops the recorded offset/anchor. */
+  resetKey?: string;
+  /** True while the viewport follows the tail: pin writes own scrollTop then, so the idle reconcile stands down. */
+  isFollowing?: () => boolean;
   renderItem: (item: ViewItem) => h.JSX.Element;
 }
+
+/** How long the scroller must be still (no scroll events, no finger) before the
+ * virtual list may move its content with a single compensated scrollTop write. */
+const VIRTUAL_IDLE_RECONCILE_MS = 160;
+/** Unmeasured rows are estimated below the measured mean on purpose: a low
+ * estimate only hides content above the scroll origin (invisible, reconciled when
+ * idle), a high one would show a blank gap. */
+const VIRTUAL_ESTIMATE_FLOOR = 72;
+const VIRTUAL_ESTIMATE_MEAN_FACTOR = 0.75;
+const VIRTUAL_ESTIMATE_CEIL = 1200;
+const VIRTUAL_ESTIMATE_MIN_SAMPLES = 6;
 
 /**
  * Viewport virtualization for the chat list. Heights are measured after mount
@@ -2148,7 +2171,7 @@ interface VirtualizedViewItemsProps {
  * remains the owner of follow/anchor policy and therefore streaming and history
  * prepend semantics stay unchanged.
  */
-function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasuredLayout, renderItem }: VirtualizedViewItemsProps) {
+function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasuredLayout, absorbTopShiftRef, onTopOffsetReconciled, resetKey, isFollowing, renderItem }: VirtualizedViewItemsProps) {
   const heightsRef = useRef(new Map<string, number>());
   const [layoutVersion, setLayoutVersion] = useState(0);
   const scrollTopRef = useRef(0);
@@ -2158,8 +2181,31 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
   const itemKeysRef = useRef<ItemKeySnapshot | null>(null);
   const resumeSnapshotRef = useRef<{ scrollTop: number; atBottom: boolean } | null>(null);
   const [resumeGeneration, setResumeGeneration] = useState(0);
-  const estimate = 72;
-  const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimate;
+  // Height of a row nobody has measured yet. Starts at the floor and follows the
+  // measured mean (re-derived each time the sample count doubles, so it does not
+  // churn the offsets on every commit).
+  const estimateRef = useRef(VIRTUAL_ESTIMATE_FLOOR);
+  const measuredSumRef = useRef(0);
+  const nextEstimateAtRef = useRef(VIRTUAL_ESTIMATE_MIN_SAMPLES);
+  const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimateRef.current;
+  // Layout shifts above the reader are absorbed here instead of by scrollTop: the
+  // rendered top offset is `range.topSpacer + biasRef.current`.
+  const biasRef = useRef(0);
+  const topSpacerElRef = useRef<HTMLDivElement | null>(null);
+  const topSpacerBaseRef = useRef(0);
+  const atTopRef = useRef(false);
+  // Which mounted row sits at the viewport top, and where. The mounted range is
+  // derived from THIS (DOM truth) rather than from scrollTop, so absorbing a layout
+  // shift into `biasRef` can never move the range and flip a boundary row in and
+  // out of the DOM (which would shift the layout again and loop).
+  const viewportAnchorRef = useRef<{ key: string; top: number } | null>(null);
+  const resetKeyRef = useRef(resetKey);
+  const touchingRef = useRef(false);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onTopOffsetReconciledRef = useRef(onTopOffsetReconciled);
+  onTopOffsetReconciledRef.current = onTopOffsetReconciled;
+  const isFollowingRef = useRef(isFollowing);
+  isFollowingRef.current = isFollowing;
 
   useEffect(() => {
     if (!enabled) return undefined;
@@ -2172,19 +2218,94 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       scrollTopRef.current = root.scrollTop;
       viewportRef.current = root.clientHeight;
       wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
+      captureViewportAnchor();
+      scheduleIdleReconcile();
       if (rafRef.current !== null) return;
       rafRef.current = requestAnimationFrame(() => {
         rafRef.current = null;
         setLayoutVersion((v) => v + 1);
       });
     };
+    const onTouchStart = () => { touchingRef.current = true; };
+    const onTouchEnd = () => { touchingRef.current = false; scheduleIdleReconcile(); };
     root.addEventListener('scroll', onScroll, { passive: true });
+    root.addEventListener('touchstart', onTouchStart, { passive: true });
+    root.addEventListener('touchend', onTouchEnd, { passive: true });
+    root.addEventListener('touchcancel', onTouchEnd, { passive: true });
     return () => {
       root.removeEventListener('scroll', onScroll);
+      root.removeEventListener('touchstart', onTouchStart);
+      root.removeEventListener('touchend', onTouchEnd);
+      root.removeEventListener('touchcancel', onTouchEnd);
       if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
       rafRef.current = null;
+      if (idleTimerRef.current !== null) clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+      touchingRef.current = false;
     };
   }, [enabled, scrollRef]);
+
+  const captureViewportAnchor = () => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const rootTop = root.getBoundingClientRect().top;
+    viewportAnchorRef.current = null;
+    for (const node of root.querySelectorAll<HTMLElement>('[data-virtual-key]')) {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom <= rootTop + 1) continue;
+      const key = node.dataset.virtualKey;
+      if (key) viewportAnchorRef.current = { key, top: rect.top - rootTop };
+      break;
+    }
+  };
+
+  const patchTopSpacer = (x: number) => {
+    const el = topSpacerElRef.current;
+    if (!el) return;
+    const style = topOffsetStyle(x);
+    el.style.height = `${style.height}px`;
+    el.style.marginTop = `${style.marginTop}px`;
+  };
+  // A shift the top offset absorbed can leave content above the scroll origin (or a
+  // gap above the first row). Once the viewport is idle - no finger, no scroll event
+  // for a moment, so there is no momentum to cancel - move it back with ONE write
+  // that is exactly compensated in the same task, so nothing moves on screen.
+  const reconcileIdle = () => {
+    idleTimerRef.current = null;
+    const root = scrollRef.current;
+    if (!root) return;
+    if (touchingRef.current) { scheduleIdleReconcile(); return; }
+    // A follower's scrollTop belongs to the pin (rows keep growing at the tail); the
+    // offset is reconciled when the reader next scrolls and comes to rest.
+    if (isFollowingRef.current?.()) return;
+    const x = topSpacerBaseRef.current + biasRef.current;
+    const result = reconcileTopOffset(x, atTopRef.current, root.scrollTop);
+    if (!result) return;
+    biasRef.current += result.x - x;
+    patchTopSpacer(result.x);
+    root.scrollTop += result.scrollTopDelta;
+    scrollTopRef.current = root.scrollTop;
+    captureViewportAnchor();
+    setLayoutVersion((v) => v + 1);
+    onTopOffsetReconciledRef.current?.();
+  };
+  const scheduleIdleReconcile = () => {
+    if (idleTimerRef.current !== null) clearTimeout(idleTimerRef.current);
+    idleTimerRef.current = setTimeout(reconcileIdle, VIRTUAL_IDLE_RECONCILE_MS);
+  };
+
+  useEffect(() => {
+    if (!absorbTopShiftRef || !enabled) return undefined;
+    absorbTopShiftRef.current = (delta: number) => {
+      if (!topSpacerElRef.current) return delta;
+      biasRef.current -= delta;
+      patchTopSpacer(topSpacerBaseRef.current + biasRef.current);
+      setLayoutVersion((v) => v + 1);
+      scheduleIdleReconcile();
+      return 0;
+    };
+    return () => { absorbTopShiftRef.current = null; };
+  }, [enabled, absorbTopShiftRef]);
 
   // iOS may reset the nested scrollTop while the WebView is backgrounded,
   // without a useful scroll event when it becomes visible again. Capture the
@@ -2241,6 +2362,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       else if (resumeSnapshot && Math.abs(root.scrollTop - preferredTop) > 1) root.scrollTop = preferredTop;
     }
     resumeSnapshotRef.current = null;
+    viewportAnchorRef.current = null;
     scrollTopRef.current = root.scrollTop;
     viewportRef.current = root.clientHeight;
     wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
@@ -2259,9 +2381,10 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     ));
     if (!root || index < 0) return undefined;
     const heights = items.map(getHeight);
-    const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, index);
+    const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, index) + biasRef.current;
     if (Math.abs(root.scrollTop - targetTop) > 1) root.scrollTop = targetTop;
     scrollTopRef.current = targetTop;
+    viewportAnchorRef.current = null;
     setLayoutVersion((v) => v + 1);
     return undefined;
   }, [enabled, revealKey, items, scrollRef]);
@@ -2275,10 +2398,25 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     for (const node of nodes) {
       const key = node.dataset.virtualKey;
       if (!key) continue;
+      // A ResizeObserver also reports rows that were just unmounted (their box
+      // collapses to 0x0). Measuring a detached node would overwrite the row's
+      // real height with the 1px floor, so its spacer share would vanish and the
+      // list below would jump by the whole row every time it left the window.
+      if (!node.isConnected) continue;
       const height = Math.max(1, Math.ceil(node.getBoundingClientRect().height));
-      if ((heightsRef.current.get(key) ?? 72) === height) continue;
+      const known = heightsRef.current.get(key);
+      if (known === height) continue;
+      // First sight of a row is recorded (it feeds the estimate) even when it happens
+      // to match the estimate; only a real difference is a layout change.
+      if ((known ?? estimateRef.current) !== height) changed = true;
       heightsRef.current.set(key, height);
-      changed = true;
+      measuredSumRef.current += height - (known ?? 0);
+    }
+    if (heightsRef.current.size >= nextEstimateAtRef.current) {
+      nextEstimateAtRef.current = heightsRef.current.size * 2;
+      const mean = measuredSumRef.current / heightsRef.current.size;
+      const next = Math.min(VIRTUAL_ESTIMATE_CEIL, Math.max(VIRTUAL_ESTIMATE_FLOOR, Math.round(mean * VIRTUAL_ESTIMATE_MEAN_FACTOR)));
+      if (next !== estimateRef.current) { estimateRef.current = next; changed = true; }
     }
     return changed;
   };
@@ -2314,6 +2452,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
     if (!layoutMayHaveChanged) return;
     onMeasuredLayout?.(root, wasAtBottom);
     scrollTopRef.current = root.scrollTop;
+    captureViewportAnchor();
     // A measurement change alters the spacers: re-render (still before paint,
     // Preact flushes it in a microtask) so the pin below runs on final geometry.
     if (changed) setLayoutVersion((v) => v + 1);
@@ -2334,6 +2473,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
       if (!changed) return;
       onMeasuredLayout?.(root, wasAtBottom);
       scrollTopRef.current = root.scrollTop;
+      captureViewportAnchor();
       setLayoutVersion((v) => v + 1);
     });
     root.querySelectorAll<HTMLElement>('[data-virtual-key]').forEach((node) => observer.observe(node));
@@ -2342,11 +2482,39 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
 
   // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
   // real viewport exists, preserving deterministic rendering and accessibility.
-  if (!enabled || items.length <= 24 || viewportRef.current <= 0) return <>{items.map(renderItem)}</>;
+  if (!enabled || items.length <= 24 || viewportRef.current <= 0) {
+    // Not virtualized (short list, hidden pane): there is no spacer to carry an offset.
+    biasRef.current = 0;
+    viewportAnchorRef.current = null;
+    return <>{items.map(renderItem)}</>;
+  }
+  if (resetKeyRef.current !== resetKey) {
+    // A different conversation: nothing recorded about the previous one applies.
+    resetKeyRef.current = resetKey;
+    biasRef.current = 0;
+    viewportAnchorRef.current = null;
+  }
   // Keep the arithmetic local and deterministic; no O(n) DOM work occurs.
-  const range = __computeVirtualChatRangeForTests(items.map(getHeight), scrollTopRef.current, viewportRef.current);
+  const heights = items.map(getHeight);
+  // Viewport top in offset space: from the anchor row when it is still in the list
+  // (immune to bias / estimate / prepend changes), else from scrollTop (a jump past
+  // every mounted row).
+  let viewportTop = scrollTopRef.current - biasRef.current;
+  const viewportAnchor = viewportAnchorRef.current;
+  if (viewportAnchor) {
+    const anchorIndex = items.findIndex((item) => item.key === viewportAnchor.key);
+    if (anchorIndex >= 0) {
+      let offset = 0;
+      for (let i = 0; i < anchorIndex; i += 1) offset += Math.max(1, heights[i] || 0);
+      viewportTop = offset - viewportAnchor.top;
+    }
+  }
+  const range = __computeVirtualChatRangeForTests(heights, viewportTop, viewportRef.current);
+  topSpacerBaseRef.current = range.topSpacer;
+  atTopRef.current = range.start === 0;
+  const topStyle = topOffsetStyle(range.topSpacer + biasRef.current);
   return <>
-    <div aria-hidden="true" style={{ height: `${range.topSpacer}px`, flexShrink: 0 }} />
+    <div aria-hidden="true" ref={topSpacerElRef} style={{ height: `${topStyle.height}px`, marginTop: `${topStyle.marginTop}px`, flexShrink: 0 }} />
     {items.slice(range.start, range.end).map((item) => (
       <div class="chat-virtual-item" data-virtual-key={item.key} key={item.key}>
         {renderItem(item)}
@@ -3246,13 +3414,22 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     });
   };
 
-  // The reading anchor: the first row that reaches into the viewport, and where
-  // its top edge sat. Recorded on every user scroll event while the reader is
-  // NOT following. Whatever later changes layout above it (virtual rows measured,
-  // a banner mounting, an image loading) is undone by re-aligning that row - the
-  // DOM position is the truth, so there is no estimate to get wrong and no way
-  // to apply a correction twice.
+  // The reading anchor: the first row that reaches into the viewport and where its
+  // top edge sits in SCROLL-CONTENT coordinates (which do not change while the
+  // reader scrolls, only when layout above the row changes). Recorded on every user
+  // scroll event while the reader is NOT following. Whatever later changes layout
+  // above it (virtual rows measured, a page of older history prepended, a banner
+  // mounting, an image loading) is undone by moving that row back: the DOM position
+  // is the truth, so there is no estimate to get wrong and no way to apply a
+  // correction twice.
+  //
+  // HOW it is undone matters on a phone. A scrollTop write while a finger or its
+  // momentum owns the scroller stops the momentum and jumps the content (iOS has no
+  // scroll anchoring to lean on), so a virtualized list absorbs the shift in its top
+  // offset instead (`absorbTopShiftRef`): nothing on screen moves and no write is
+  // made. Only a list that is not virtualized falls back to scrollTop.
   const readerAnchorRef = useRef<ReaderAnchor | null>(null);
+  const absorbTopShiftRef = useRef<((delta: number) => number) | null>(null);
   const captureReaderAnchor = () => {
     const root = scrollRef.current;
     if (!root) return;
@@ -3280,15 +3457,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     for (const candidate of root.querySelectorAll<HTMLElement>('[data-event-id]')) {
       if (candidate.getAttribute('data-event-id') === anchor.id) { node = candidate; break; }
     }
-    // The reader moved since the anchor was recorded (wheel/touch/scrollbar; the
-    // scroll event may not have been delivered yet): that position is theirs.
-    // Adopt it instead of dragging them back to where they were.
-    if (!node || Math.abs(root.scrollTop - anchor.scrollTop) > 0.5) { captureReaderAnchor(); return; }
-    const delta = computeReaderAnchorDelta(anchor.offset, node.getBoundingClientRect().top - root.getBoundingClientRect().top);
+    // The anchor row left the DOM (virtualized out): pick the row now in view.
+    if (!node) { captureReaderAnchor(); return; }
+    const contentTop = node.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop;
+    const delta = computeReaderAnchorDelta(anchor.contentTop, contentTop);
     if (delta === 0) return;
+    const remainder = absorbTopShiftRef.current ? absorbTopShiftRef.current(delta) : delta;
+    if (remainder === 0) return; // absorbed: the row is back where it was, nothing was written
     markProgrammaticScroll();
-    root.scrollTop += delta;
-    readerAnchorRef.current = { ...anchor, scrollTop: root.scrollTop };
+    root.scrollTop += remainder;
+    // Content moved by `remainder`, the viewport followed it: re-record the row.
+    readerAnchorRef.current = { ...anchor, contentTop: anchor.contentTop + remainder };
   };
 
   // Virtualized row measurements are the only layout correction that may
@@ -4420,6 +4599,10 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             enabled={!preview}
             revealKey={virtualRevealKey}
             onMeasuredLayout={applyMeasuredLayoutScroll}
+            absorbTopShiftRef={absorbTopShiftRef}
+            resetKey={sessionId ?? undefined}
+            isFollowing={() => autoScrollRef.current}
+            onTopOffsetReconciled={() => { if (!autoScrollRef.current) captureReaderAnchor(); }}
             renderItem={(item) => {
             if (item.type === 'supervision-status-run') {
               return <SupervisionStatusRun key={item.key} item={item} />;

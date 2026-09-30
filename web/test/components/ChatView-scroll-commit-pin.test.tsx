@@ -40,10 +40,16 @@ vi.mock('../../src/hooks/usePref.js', () => ({
 import { ChatView } from '../../src/components/ChatView.js';
 import type { TimelineEvent } from '../../src/ws-client.js';
 
+/** Records every callback so a test can deliver ResizeObserver entries itself. */
+const resizeCallbacks = new Set<ResizeObserverCallback>();
 class FakeResizeObserver {
+  constructor(private readonly callback: ResizeObserverCallback) { resizeCallbacks.add(callback); }
   observe(): void {}
   unobserve(): void {}
-  disconnect(): void {}
+  disconnect(): void { resizeCallbacks.delete(this.callback); }
+}
+function deliverResize(targets: Element[]): void {
+  act(() => { for (const cb of [...resizeCallbacks]) cb(targets.map((target) => ({ target })) as unknown as ResizeObserverEntry[], {} as ResizeObserver); });
 }
 class FakeIntersectionObserver {
   observe(): void {}
@@ -72,24 +78,47 @@ function flushFrames(): void {
 /** jsdom has no layout. Geometry lives on the prototype so it is in place BEFORE
  * the first render (the virtualizer reads the viewport height at mount) and rows
  * measure at exactly the virtualizer's own estimate (no spurious re-measure). */
-const geometry = { scrollTop: 0, scrollHeight: 1200, clientHeight: 200, aboveShift: 0 };
+const geometry = { scrollTop: 0, scrollHeight: 1200, clientHeight: 200, aboveShift: 0, spacerBase: 0 };
 const isChatView = (el: Element): boolean => el.classList.contains('chat-view') && !el.classList.contains('chat-view-preview');
+/** Change of the virtual list's top offset since the test recorded its baseline. */
+function topOffsetDelta(el: Element): number {
+  const root = el.closest('.chat-view');
+  const spacer = root?.querySelector(':scope > [aria-hidden="true"]') as HTMLElement | null;
+  if (!spacer) return 0;
+  const offset = (parseFloat(spacer.style.height) || 0) + (parseFloat(spacer.style.marginTop) || 0);
+  return offset - geometry.spacerBase;
+}
+function recordTopOffsetBaseline(scrollEl: HTMLElement): void {
+  const spacer = scrollEl.querySelector(':scope > [aria-hidden="true"]') as HTMLElement | null;
+  geometry.spacerBase = spacer ? (parseFloat(spacer.style.height) || 0) + (parseFloat(spacer.style.marginTop) || 0) : 0;
+}
 function installGeometry(): void {
-  geometry.scrollTop = 0; geometry.scrollHeight = 1200; geometry.clientHeight = 200; geometry.aboveShift = 0;
+  geometry.scrollTop = 0; geometry.scrollHeight = 1200; geometry.clientHeight = 200; geometry.aboveShift = 0; geometry.spacerBase = 0;
   Object.defineProperty(HTMLElement.prototype, 'scrollTop', { configurable: true, get(this: HTMLElement) { return isChatView(this) ? geometry.scrollTop : 0; }, set(this: HTMLElement, v: number) { if (isChatView(this)) geometry.scrollTop = v; } });
   Object.defineProperty(HTMLElement.prototype, 'scrollHeight', { configurable: true, get(this: HTMLElement) { return isChatView(this) ? geometry.scrollHeight : 0; } });
   Object.defineProperty(HTMLElement.prototype, 'clientHeight', { configurable: true, get(this: HTMLElement) { return isChatView(this) ? geometry.clientHeight : 0; } });
   vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
     const el = this as HTMLElement;
+    // A detached element has no box: browsers report an all-zero rect for it.
+    if (!el.isConnected) return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) } as DOMRect;
     // Message rows: 100px tall, stacked, shifted by whatever mounted above them,
     // relative to the (fixed, top = 0) viewport.
     const eventId = el.getAttribute?.('data-event-id');
     if (eventId) {
-      const top = Number(eventId.replace('evt-', '')) * 100 + geometry.aboveShift - geometry.scrollTop;
+      // The virtual list's top offset (spacer height + negative margin) is real DOM state the
+      // code under test writes: a shift it absorbs there moves every row on screen, exactly as
+      // it would in a browser.
+      const top = Number(eventId.replace('evt-', '')) * 100 + geometry.aboveShift + topOffsetDelta(el) - geometry.scrollTop;
       return { x: 0, y: top, top, left: 0, right: 0, bottom: top + 100, width: 0, height: 100, toJSON: () => ({}) } as DOMRect;
     }
-    const height = el.dataset?.virtualKey ? 72 : 0;
-    return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: height, width: 0, height, toJSON: () => ({}) } as DOMRect;
+    if (el.dataset?.virtualKey) {
+      // A virtual row wrapper sits where its (72px estimate) slot in the list is.
+      const inner = el.querySelector?.('[data-event-id]')?.getAttribute('data-event-id');
+      const index = inner ? Number(inner.replace('evt-', '')) : 0;
+      const top = index * 72 + geometry.aboveShift + topOffsetDelta(el) - geometry.scrollTop;
+      return { x: 0, y: top, top, left: 0, right: 0, bottom: top + 72, width: 0, height: 72, toJSON: () => ({}) } as DOMRect;
+    }
+    return { x: 0, y: 0, top: 0, left: 0, right: 0, bottom: 0, width: 0, height: 0, toJSON: () => ({}) } as DOMRect;
   });
 }
 
@@ -109,6 +138,7 @@ async function mountPinned(count: number) {
 describe('ChatView — scroll ownership across commits', () => {
   beforeEach(() => {
     queuedFrames = [];
+    resizeCallbacks.clear();
     installGeometry();
     vi.stubGlobal('ResizeObserver', FakeResizeObserver as unknown as typeof ResizeObserver);
     vi.stubGlobal('IntersectionObserver', FakeIntersectionObserver as unknown as typeof IntersectionObserver);
@@ -190,7 +220,7 @@ describe('ChatView — scroll ownership across commits', () => {
     expect(geometry.scrollTop).toBe(400);
   });
 
-  it("keeps a reader's row exactly where it was when a block mounts ABOVE it", async () => {
+  it("keeps a reader's row exactly where it was when a block mounts ABOVE it, without writing scrollTop (virtualized list)", async () => {
     const { scrollEl } = await mountPinned(30);
 
     // The reader scrolls up and reads around row 12 (its top sits a little
@@ -198,10 +228,36 @@ describe('ChatView — scroll ownership across commits', () => {
     geometry.scrollTop = 1180;
     fireEvent.wheel(scrollEl, { deltaY: -120 });
     fireEvent.scroll(scrollEl);
+    recordTopOffsetBaseline(scrollEl);
     const before = (scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top;
 
     // A 150px banner mounts above every row (tool-chooser / load-older / todo list):
     // every row moves down 150px while scrollTop stays put.
+    geometry.aboveShift = 150;
+    geometry.scrollHeight += 150;
+    const scrollTopWrites: number[] = [];
+    const spy = vi.spyOn(HTMLElement.prototype, 'scrollTop', 'set').mockImplementation(function (this: HTMLElement, v: number) {
+      if (isChatView(this)) { scrollTopWrites.push(v); geometry.scrollTop = v; }
+    });
+    await act(async () => {
+      scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
+      await Promise.resolve();
+    });
+    spy.mockRestore();
+
+    const after = (scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top;
+    expect(after).toBe(before); // the row did not move on screen...
+    expect(scrollTopWrites).toEqual([]); // ...and nothing wrote scrollTop (a write would cancel iOS momentum)
+    expect(geometry.scrollTop).toBe(1180);
+  });
+
+  it("falls back to a scrollTop write for a reader's row when the list is not virtualized", async () => {
+    const { scrollEl } = await mountPinned(12);
+    geometry.scrollTop = 500;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    const before = (scrollEl.querySelector('[data-event-id="evt-6"]') as HTMLElement).getBoundingClientRect().top;
+
     geometry.aboveShift = 150;
     geometry.scrollHeight += 150;
     await act(async () => {
@@ -209,9 +265,67 @@ describe('ChatView — scroll ownership across commits', () => {
       await Promise.resolve();
     });
 
-    const after = (scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top;
-    expect(after).toBe(before); // the viewport followed the row: nothing moved on screen
-    expect(geometry.scrollTop).toBe(1180 + 150);
+    const after = (scrollEl.querySelector('[data-event-id="evt-6"]') as HTMLElement).getBoundingClientRect().top;
+    expect(after).toBe(before);
+    expect(geometry.scrollTop).toBe(500 + 150);
+  });
+
+  it('does not re-measure a row that was just unmounted as 1px (the ResizeObserver also reports removed rows)', async () => {
+    const { scrollEl } = await mountPinned(60);
+    const spacerHeights = () => [...scrollEl.querySelectorAll(':scope > [aria-hidden="true"]')].map((el) => parseFloat((el as HTMLElement).style.height) || 0);
+    const bottomRows = [...scrollEl.querySelectorAll('[data-virtual-key]')] as HTMLElement[];
+    expect(bottomRows.length).toBeGreaterThan(0);
+
+    // The reader jumps far up: the rows at the bottom leave the mounted range.
+    geometry.scrollTop = 300;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    flushFrames();
+    const unmounted = bottomRows.filter((row) => !row.isConnected);
+    expect(unmounted.length).toBeGreaterThan(0);
+    const before = spacerHeights();
+
+    // The browser now reports the removed rows (0x0). Their real height must survive.
+    deliverResize(unmounted);
+    flushFrames();
+    expect(spacerHeights()).toEqual(before);
+  });
+
+  it('absorbs a shift bigger than the spacer as content above the scroll origin, and reconciles it with one write once idle', async () => {
+    const { scrollEl } = await mountPinned(30);
+    geometry.scrollTop = 1180;
+    fireEvent.wheel(scrollEl, { deltaY: -120 });
+    fireEvent.scroll(scrollEl);
+    recordTopOffsetBaseline(scrollEl);
+    const before = (scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top;
+
+    // A finger is down and momentum is running while a huge block mounts above.
+    fireEvent.touchStart(scrollEl, { touches: [{ clientY: 100 }] });
+    const writes: number[] = [];
+    const spy = vi.spyOn(HTMLElement.prototype, 'scrollTop', 'set').mockImplementation(function (this: HTMLElement, v: number) {
+      if (isChatView(this)) { writes.push(v); geometry.scrollTop = v; }
+    });
+    geometry.aboveShift = 5_000;
+    geometry.scrollHeight += 5_000;
+    await act(async () => {
+      scrollEl.insertBefore(document.createElement('div'), scrollEl.firstChild);
+      await Promise.resolve();
+    });
+    const spacer = scrollEl.querySelector(':scope > [aria-hidden="true"]') as HTMLElement;
+    expect(parseFloat(spacer.style.marginTop)).toBeLessThan(0); // hidden above the origin, not written to scrollTop
+    expect((scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top).toBe(before);
+
+    // Still touching: no reconcile, however long it takes.
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 400)); });
+    expect(writes).toEqual([]);
+
+    // Finger up and the scroller stays still: exactly one compensated write.
+    fireEvent.touchEnd(scrollEl);
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 400)); });
+    spy.mockRestore();
+    expect(writes).toHaveLength(1);
+    expect(parseFloat(spacer.style.marginTop)).toBe(0);
+    expect((scrollEl.querySelector('[data-event-id="evt-12"]') as HTMLElement).getBoundingClientRect().top).toBe(before);
   });
 
   it('a short upward drag inside the re-engage band does not re-engage follow mid-gesture', async () => {
