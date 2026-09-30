@@ -1003,7 +1003,7 @@ program
   // sidesteps that entirely. Accepts a full version or a dist-tag (latest|dev).
   .argument('[version]', 'Version or dist-tag to install (e.g. 2026.5.2477-dev.2586, latest, dev); overrides --channel')
   .option('--channel <channel>', 'Release channel: latest (stable) | dev — defaults to the channel this build is on')
-  .action((versionArg: string | undefined, opts: { channel?: string }) => {
+  .action(async (versionArg: string | undefined, opts: { channel?: string }) => {
     const platform = process.platform;
 
     // ── Resolve target package spec + channel ──────────────────────────────
@@ -1051,6 +1051,23 @@ program
     // Step 1: Install new version (do NOT kill daemon — upgrade may be running from
     // a daemon-managed session, so killing it would kill ourselves).
     let installedEntryScript: string | null = null;
+    if (isGlobal && (platform === 'linux' || platform === 'darwin')) {
+      // Linux/macOS: the install, the verification, the switch and the restart all
+      // run in the detached upgrade script (the one the daemon's own upgrade uses),
+      // so nothing below depends on this process or its terminal surviving.
+      const { runDetachedPosixUpgrade } = await import('./cli/upgrade-detached.js');
+      const code = await runDetachedPosixUpgrade({
+        pkgSpec: pkg,
+        // A dist-tag (latest|dev) resolves to whatever it points at; only a concrete version is pinned.
+        targetVer: /^\d/.test(pkgTag) ? pkgTag : 'latest',
+        registry,
+        currentVer: version,
+        platform,
+        stateDir: imcodesStateDir(),
+        home: homedir(),
+      });
+      process.exit(code);
+    }
     if (isGlobal) {
       const npmBin = resolve(dirname(process.execPath), platform === 'win32' ? 'npm.cmd' : 'npm');
       const npmCmd = existsSync(npmBin) ? npmBin : 'npm';

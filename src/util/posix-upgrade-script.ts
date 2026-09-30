@@ -92,6 +92,8 @@ export interface PosixUpgradeScriptParams {
   atomicInstallerPath: string;
   /** Test seam: waits, in seconds (production defaults keep the original timings). */
   timing?: { settleSec?: number; healthFirstWaitSec?: number; healthExtendedWaitSec?: number };
+  /** An explicit, human-requested install of an older version (the CLI): do not refuse it as a downgrade. */
+  allowDowngrade?: boolean;
   /** Test seam: skip the launch-chain and CLI-wrapper rewrites (they touch $HOME). */
   skipLaunchChain?: boolean;
 }
@@ -123,6 +125,7 @@ log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
 trap '' HUP
 ATOMIC_INSTALLER=${shellQuote(atomicInstallerPath)}
 SKIP_LAUNCH_CHAIN=${params.skipLaunchChain ? 1 : 0}
+ALLOW_DOWNGRADE=${params.allowDowngrade ? 1 : 0}
 SETTLE_SEC=${params.timing?.settleSec ?? 3}
 HEALTH_FIRST_WAIT_SEC=${params.timing?.healthFirstWaitSec ?? 14}
 HEALTH_EXTENDED_WAIT_SEC=${params.timing?.healthExtendedWaitSec ?? 120}
@@ -470,6 +473,11 @@ while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
   INSTALL_RC=$?
   # Always tee the attempt's output into the main log for forensics.
   cat "$INSTALL_OUT" >> "$LOG"
+  # A helper that exits 0 must have produced the staged package; never trust the exit code alone.
+  if [ "$INSTALL_RC" -eq 0 ] && [ ! -d "$STAGE_PREFIX/lib/node_modules/imcodes" ]; then
+    log "[step 2] the staging helper reported success but no staged package exists — treating as a failed install"
+    INSTALL_RC=75
+  fi
   if [ "$INSTALL_RC" -eq 0 ]; then
     log "[step 2] install attempt $ATTEMPT succeeded"
     break
@@ -537,6 +545,12 @@ log "[step 2.5] verifying the staged package"
 VERIFY_OUT=$("$NODE" "$ATOMIC_INSTALLER" verify --stage-prefix "$STAGE_PREFIX" --target "${targetVer}" --node "$NODE" 2>>"$LOG")
 VERIFY_RC=$?
 printf '%s\n' "$VERIFY_OUT" | grep -v '^VERIFIED_VERSION=' >> "$LOG"
+INSTALLED_VER=$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^VERIFIED_VERSION=//p' | tail -1)
+if [ "$VERIFY_RC" -eq 0 ] && [ -z "$INSTALLED_VER" ]; then
+  # Exit 0 without a version means the helper did not actually verify anything.
+  VERIFY_RC=1
+  log "[step 2.5] the verifier reported no version — treating that as a failed verification"
+fi
 if [ "$VERIFY_RC" -ne 0 ]; then
   log "[step 2.5] staged package FAILED verification (exit $VERIFY_RC) — the current install is untouched and keeps running"
   write_install_failure_status "verify-failed" "$ATTEMPT" "$VERIFY_RC" \
@@ -545,7 +559,6 @@ if [ "$VERIFY_RC" -ne 0 ]; then
   schedule_self_cleanup
   exit ${POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE}
 fi
-INSTALLED_VER=$(printf '%s\n' "$VERIFY_OUT" | sed -n 's/^VERIFIED_VERSION=//p' | tail -1)
 log "[step 3] staged version: $INSTALLED_VER, target: ${targetVer}"
 
 NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
@@ -628,7 +641,9 @@ CURRENT_VER="${currentVer}"
 " "$INSTALLED_VER" "$CURRENT_VER"
 CMP=$?
 # Exit codes: 0=equal, 1=installed<current (downgrade), 2=installed>current (upgrade)
-if [ "$CMP" = "1" ]; then
+if [ "$CMP" = "1" ] && [ "$ALLOW_DOWNGRADE" = "1" ]; then
+  log "[step 3] installed $INSTALLED_VER is older than current $CURRENT_VER — installing it anyway: an older version was requested explicitly"
+elif [ "$CMP" = "1" ]; then
   log "[step 3] installed $INSTALLED_VER is OLDER than current $CURRENT_VER — refusing to downgrade"
   log "=== upgrade aborted ==="
   UPGRADE_RESULT="refused"

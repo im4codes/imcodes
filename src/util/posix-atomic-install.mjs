@@ -31,13 +31,13 @@ import {
   accessSync, appendFileSync, constants, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync,
   readlinkSync, realpathSync, renameSync, rmSync, statSync, statfsSync, symlinkSync, unlinkSync,
 } from 'node:fs';
-import { basename, dirname, join, relative, resolve } from 'node:path';
+import { basename, dirname, join, relative } from 'node:path';
 
-export const EXIT_OK = 0;
-export const EXIT_INSTALL_FAILED = 75;
-export const EXIT_PREFIX_NOT_WRITABLE = 76;
-export const EXIT_LOW_DISK = 77;
-export const EXIT_USAGE = 2;
+const EXIT_OK = 0;
+const EXIT_INSTALL_FAILED = 75;
+const EXIT_PREFIX_NOT_WRITABLE = 76;
+const EXIT_LOW_DISK = 77;
+const EXIT_USAGE = 2;
 
 const PACKAGE = 'imcodes';
 const OLD_PREFIX = '.imcodes-old.';
@@ -366,6 +366,8 @@ function main() {
   }
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === resolve(new URL(import.meta.url).pathname)) {
-  process.exit(main());
-}
+// Always run: this file is only ever executed as a script (never imported). An
+// "am I the entry point" guard compared argv[1] with the module URL and silently
+// did NOTHING, exiting 0, whenever the two spellings of the path differed (macOS
+// /var vs /private/var) -- a no-op that looked like a successful install.
+process.exit(main());
