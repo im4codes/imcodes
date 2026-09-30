@@ -3,6 +3,7 @@ import { useMemo, useRef } from 'preact/hooks';
 import type { ComponentProps } from 'preact';
 import { SessionControls as SessionControlsImpl } from './SessionControls.js';
 import { useStableCallbacks } from '../hooks/useStableCallbacks.js';
+import { recordChangedProps } from '../perf-render-debug.js';
 import { collectSettledQueuedIds } from '../session-controls-queue.js';
 
 const MemoizedSessionControls = memo(SessionControlsImpl);
@@ -36,5 +37,8 @@ export function StableSessionControls(props: Props) {
   );
   if (!sameMembers(settledRef.current, settled)) settledRef.current = settled;
   const stable = useStableCallbacks({ ...rest, activeSession, timelineSettledQueuedIds: settledRef.current } as Record<string, unknown>) as unknown as Props;
+  const previousRef = useRef<Record<string, unknown> | null>(null);
+  recordChangedProps('StableSessionControls', previousRef.current, stable as unknown as Record<string, unknown>);
+  previousRef.current = stable as unknown as Record<string, unknown>;
   return <MemoizedSessionControls {...stable} />;
 }

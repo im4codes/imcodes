@@ -35,3 +35,11 @@ export function recordPerfRender(component: string): void {
   const byFrame = value.renders![component] ?? (value.renders![component] = {});
   byFrame[frame] = (byFrame[frame] ?? 0) + 1;
 }
+
+/** Opt-in: which props of a memoized boundary differ from the previous render (perf harness only). */
+export function recordChangedProps(component: string, previous: Record<string, unknown> | null, next: Record<string, unknown>): void {
+  if (!previous || !state()) return;
+  for (const key of Object.keys(next)) {
+    if (previous[key] !== next[key]) recordPerfRender(`${component}.prop:${key}`);
+  }
+}
