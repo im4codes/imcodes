@@ -103,6 +103,17 @@ describe('passive timeline presentations flush slowly', () => {
     expect(t.events().find((e) => e.eventId === 'state-becomes')?.payload?.state).toBe('running');
   }, 60_000);
 
+  it('a hydrated (isVisible) summary-mode card is still a passive preview', async () => {
+    const t = harness({ isActiveSession: false, isVisible: true, subscriptionMode: 'summary' });
+    await mount(t);
+    const before = t.renders();
+    act(() => { t.send({ ...evt(1, 'session.state', { state: 'running' }), eventId: 'state-card' } as TimelineEvent); });
+    await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS - 100); await Promise.resolve(); });
+    expect(t.renders() - before).toBe(0);
+    await act(async () => { vi.advanceTimersByTime(200); await Promise.resolve(); await Promise.resolve(); });
+    expect(t.events().find((e) => e.eventId === 'state-card')?.payload?.state).toBe('running');
+  }, 60_000);
+
   it('an active pane is never treated as passive even in summary mode', async () => {
     const t = harness({ isActiveSession: true, isVisible: false, subscriptionMode: 'summary' });
     await mount(t);

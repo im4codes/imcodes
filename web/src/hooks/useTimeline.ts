@@ -901,6 +901,16 @@ function scheduleTimelineIdle(callback: () => void): () => void {
  */
 export const PASSIVE_TIMELINE_FLUSH_MS = 500;
 
+/**
+ * A summary-mode presentation is a collapsed preview (hidden pane, sub-session
+ * card) by construction -- whether its preview happens to be hydrated/on screen
+ * or not -- so it may trail the live stream by PASSIVE_TIMELINE_FLUSH_MS. The
+ * one exception is the presentation that owns focus/recovery.
+ */
+export function isPassiveTimelinePresentation(subscriptionMode: 'full' | 'summary', isActiveSession: boolean): boolean {
+  return subscriptionMode === 'summary' && !isActiveSession;
+}
+
 function schedulePassiveTimelineFlush(callback: () => void): () => void {
   const id = setTimeout(callback, PASSIVE_TIMELINE_FLUSH_MS);
   return () => clearTimeout(id);
@@ -2487,7 +2497,7 @@ export function useTimeline(
     };
     applyPassiveCacheSnapshotRef.current = apply;
     const unsubscribe = subscribeCache(cacheKey, (nextEvents) => {
-      const passive = subscriptionModeRef.current === 'summary' && !isActiveSessionRef.current && !isVisibleRef.current;
+      const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current);
       if (!passive) {
         if (timer !== null) { clearTimeout(timer); timer = null; }
         latest = null;
@@ -3948,7 +3958,7 @@ export function useTimeline(
     const existing = pendingRealtimeEventsRef.current.get(event.eventId);
     pendingRealtimeEventsRef.current.set(event.eventId, existing ? preferTimelineEvent(existing, event) : event);
     if (pendingRealtimeFlushCancelRef.current) return;
-    const passive = subscriptionModeRef.current === 'summary' && !isActiveSessionRef.current && !isVisibleRef.current;
+    const passive = isPassiveTimelinePresentation(subscriptionModeRef.current, isActiveSessionRef.current);
     pendingRealtimeFlushCancelRef.current = passive
       ? schedulePassiveTimelineFlush(flushPendingRealtimeEvents)
       : scheduleTimelineIdle(flushPendingRealtimeEvents);
