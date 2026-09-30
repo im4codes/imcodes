@@ -146,7 +146,7 @@ describe('timeline response shaper', () => {
 
   it('collects worker detail candidates only for selected history events', async () => {
     vi.doMock('node:worker_threads', () => ({
-      workerData: {},
+      workerData: { dbPath: '/nonexistent/timeline.sqlite' },
       parentPort: {
         on: vi.fn(),
         postMessage: vi.fn(),

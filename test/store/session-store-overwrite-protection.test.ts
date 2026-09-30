@@ -54,6 +54,8 @@ beforeEach(async () => {
   metadataPath = join(home, '.imcodes', 'daemon.lock.json');
   vi.stubEnv('HOME', home);
   vi.stubEnv('USERPROFILE', home);
+  // IMCODES_HOME (pinned by the test setup) is the state directory and wins over HOME: move it with HOME.
+  vi.stubEnv('IMCODES_HOME', join(home, '.imcodes'));
   // Exercise the production ownership branch rather than Vitest's isolated-
   // home allowance. The path is still temporary and never the real HOME.
   vi.stubEnv('VITEST', '');
@@ -153,6 +155,7 @@ describe('session-store ownership and recovery', () => {
 
   it('test mode rejects the real HOME even when VITEST is absent', async () => {
     vi.stubEnv('HOME', userInfo().homedir);
+    vi.stubEnv('IMCODES_HOME', ''); // unset: the default state directory derives from the (real) HOME
     vi.stubEnv('NODE_ENV', 'test');
     vi.stubEnv('VITEST', '');
     // The path guard is asserted by loadStore before any mkdir/write side effect.

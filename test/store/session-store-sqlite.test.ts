@@ -110,6 +110,7 @@ beforeEach(async () => {
   await mkdir(dir, { recursive: true });
   vi.stubEnv('HOME', home);
   vi.stubEnv('USERPROFILE', home);
+  vi.stubEnv('IMCODES_HOME', dir); // the state directory wins over HOME: move both
   resetSessionStoreAuthorityForTests();
 });
 
@@ -188,7 +189,7 @@ describe('one-time migration from sessions.json', () => {
     const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
       cwd: process.cwd(),
       env: {
-        ...process.env, HOME: home, USERPROFILE: home,
+        ...process.env, HOME: home, IMCODES_HOME: join(home, '.imcodes'), USERPROFILE: home,
         DB_MODULE: new URL('../../src/store/session-store-db.ts', import.meta.url).href,
         STORE_MODULE: new URL('../../src/store/session-store.ts', import.meta.url).href,
       },
@@ -503,7 +504,7 @@ describe('readers without write authority', () => {
     `;
     const { stdout } = await execFileAsync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
       cwd: process.cwd(),
-      env: { ...process.env, HOME: home, USERPROFILE: home, VITEST: '', NODE_ENV: 'production', STORE_MODULE: new URL('../../src/store/session-store.ts', import.meta.url).href },
+      env: { ...process.env, HOME: home, IMCODES_HOME: join(home, '.imcodes'), USERPROFILE: home, VITEST: '', NODE_ENV: 'production', STORE_MODULE: new URL('../../src/store/session-store.ts', import.meta.url).href },
     });
     expect(JSON.parse(stdout.split('\n').find((line) => line.startsWith('RESULT'))!.slice(6))).toEqual({ count: 61, prompt: 'exact ✓' });
   }, 60_000);
@@ -537,7 +538,7 @@ describe('readers without write authority', () => {
     const child = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
       cwd: process.cwd(),
       env: {
-        ...process.env, HOME: home, DB_MODULE: new URL('../../src/store/session-store-db.ts', import.meta.url).href,
+        ...process.env, HOME: home, IMCODES_HOME: join(home, '.imcodes'), DB_MODULE: new URL('../../src/store/session-store-db.ts', import.meta.url).href,
         DB_FILE: sessionDbPathForHome(home), STOP_FILE: stop,
       },
       stdio: ['ignore', 'pipe', 'inherit'],
@@ -715,7 +716,7 @@ describe('sessions.json compatibility export (older processes, downgrade)', () =
     const started = Date.now();
     await execFileAsync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
       cwd: process.cwd(),
-      env: { ...process.env, HOME: home, USERPROFILE: home, STORE_MODULE: new URL('../../src/store/session-store.ts', import.meta.url).href },
+      env: { ...process.env, HOME: home, IMCODES_HOME: join(home, '.imcodes'), USERPROFILE: home, STORE_MODULE: new URL('../../src/store/session-store.ts', import.meta.url).href },
       timeout: 30_000,
     });
     expect(Date.now() - started).toBeLessThan(25_000); // a ref'd export worker would run into the timeout above

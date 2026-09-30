@@ -25,7 +25,7 @@ import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
 import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
-import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter, shellQuote } from '../agent/tmux.js';
+import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
@@ -3590,6 +3590,7 @@ import {
 } from './p2p-workflow-static-policy.js';
 import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
+import { shellQuote } from '../util/shell-quote.js';
 
 function makeBindRuntimeContext(
   options: {

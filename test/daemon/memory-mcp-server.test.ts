@@ -1698,7 +1698,9 @@ describe('mergeDefaultToolDeps per-field composition', () => {
   it('self-heals invokeDaemonMemoryTool after a stale_runtime 409 from an ordinary session restart', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stale-heal-'));
     const previousHome = process.env.HOME;
+    const previousImcodesHome = process.env.IMCODES_HOME;
     process.env.HOME = home;
+    process.env.IMCODES_HOME = join(home, '.imcodes'); // the state directory wins over HOME: move both
     const requests: Array<Record<string, unknown>> = [];
     const hookServer = createServer((req, res) => {
       if (req.method !== 'POST' || req.url !== MEMORY_MCP_DAEMON_RPC_PATH) {
@@ -1747,6 +1749,8 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       ]);
     } finally {
       process.env.HOME = previousHome;
+      if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previousImcodesHome;
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
@@ -1754,7 +1758,9 @@ describe('mergeDefaultToolDeps per-field composition', () => {
   it('never retries a stale_runtime 409 under a different sessionInstanceId, preserving the anti-spoofing check', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stale-no-heal-'));
     const previousHome = process.env.HOME;
+    const previousImcodesHome = process.env.IMCODES_HOME;
     process.env.HOME = home;
+    process.env.IMCODES_HOME = join(home, '.imcodes'); // the state directory wins over HOME: move both
     const requests: Array<Record<string, unknown>> = [];
     const hookServer = createServer((req, res) => {
       if (req.method !== 'POST' || req.url !== MEMORY_MCP_DAEMON_RPC_PATH) {
@@ -1795,6 +1801,8 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       ]);
     } finally {
       process.env.HOME = previousHome;
+      if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previousImcodesHome;
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
@@ -1802,7 +1810,9 @@ describe('mergeDefaultToolDeps per-field composition', () => {
   it('does not retry daemon-memory RPC for a stopped exact session', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-stale-stopped-'));
     const previousHome = process.env.HOME;
+    const previousImcodesHome = process.env.IMCODES_HOME;
     process.env.HOME = home;
+    process.env.IMCODES_HOME = join(home, '.imcodes'); // the state directory wins over HOME: move both
     const requests: Array<Record<string, unknown>> = [];
     const hookServer = createServer((req, res) => {
       if (req.method !== 'POST' || req.url !== MEMORY_MCP_DAEMON_RPC_PATH) {
@@ -1839,6 +1849,8 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       expect(requests[0]).toMatchObject({ sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-old' });
     } finally {
       process.env.HOME = previousHome;
+      if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previousImcodesHome;
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
@@ -1846,7 +1858,9 @@ describe('mergeDefaultToolDeps per-field composition', () => {
   it('self-heals shared machine authority after an ordinary session restart', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-machine-authority-heal-'));
     const previousHome = process.env.HOME;
+    const previousImcodesHome = process.env.IMCODES_HOME;
     process.env.HOME = home;
+    process.env.IMCODES_HOME = join(home, '.imcodes'); // the state directory wins over HOME: move both
     const requests: Array<Record<string, unknown>> = [];
     const hookServer = createServer((req, res) => {
       if (req.method !== 'POST' || req.url !== SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
@@ -1896,6 +1910,8 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       ]);
     } finally {
       process.env.HOME = previousHome;
+      if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previousImcodesHome;
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
@@ -1903,7 +1919,9 @@ describe('mergeDefaultToolDeps per-field composition', () => {
   it('does not adopt a replacement session when machine authority sees stale runtime', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-machine-authority-reuse-'));
     const previousHome = process.env.HOME;
+    const previousImcodesHome = process.env.IMCODES_HOME;
     process.env.HOME = home;
+    process.env.IMCODES_HOME = join(home, '.imcodes'); // the state directory wins over HOME: move both
     const requests: Array<Record<string, unknown>> = [];
     const hookServer = createServer((req, res) => {
       if (req.method !== 'POST' || req.url !== SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
@@ -1942,6 +1960,8 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       expect(requests).toHaveLength(1);
     } finally {
       process.env.HOME = previousHome;
+      if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previousImcodesHome;
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });
@@ -1949,7 +1969,9 @@ describe('mergeDefaultToolDeps per-field composition', () => {
   it('does not retry machine authority for a stopped exact session', async () => {
     const home = await mkdtemp(join(tmpdir(), 'imcodes-mcp-machine-authority-stopped-'));
     const previousHome = process.env.HOME;
+    const previousImcodesHome = process.env.IMCODES_HOME;
     process.env.HOME = home;
+    process.env.IMCODES_HOME = join(home, '.imcodes'); // the state directory wins over HOME: move both
     const requests: Array<Record<string, unknown>> = [];
     const hookServer = createServer((req, res) => {
       if (req.method !== 'POST' || req.url !== SHARED_MACHINE_AUTHORITY_HOOK_PATH) {
@@ -1988,6 +2010,8 @@ describe('mergeDefaultToolDeps per-field composition', () => {
       expect(requests).toHaveLength(1);
     } finally {
       process.env.HOME = previousHome;
+      if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previousImcodesHome;
       await new Promise<void>((resolve, reject) => hookServer.close((err) => (err ? reject(err) : resolve())));
     }
   });

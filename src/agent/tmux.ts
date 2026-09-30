@@ -32,6 +32,7 @@ import {
 } from './wezterm.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { terminalStageTrace } from '../util/terminal-stage-trace.js';
+import { shellQuote } from '../util/shell-quote.js';
 import { execFileOffMain as execFile, execFileOffMainIdempotent as execFileRead } from '../util/exec-helper.js';
 
 
@@ -1058,11 +1059,6 @@ export async function sendRawInput(session: string, data: string): Promise<void>
 }
 
 // ── pipe-pane streaming (tmux-only) ─────────────────────────────────────────────
-
-/** Shell-quote a string using single-quote wrapping. */
-export function shellQuote(str: string): string {
-  return "'" + str.replace(/'/g, "'\\''") + "'";
-}
 
 /** Validates the FIFO path against strict character whitelist. */
 function validateFifoPath(p: string): boolean {

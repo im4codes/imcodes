@@ -56,11 +56,15 @@ describe('real ~/.imcodes is off limits to tests', () => {
 
   it('refuses to load the session store when HOME points at the real home', async () => {
     const previous = process.env.HOME;
+    const previousImcodesHome = process.env.IMCODES_HOME;
     process.env.HOME = userInfo().homedir;
+    delete process.env.IMCODES_HOME; // unset: the default state directory derives from the (real) HOME
     try {
       await expect(loadStore()).rejects.toThrow(/real ~\/\.imcodes/);
     } finally {
       process.env.HOME = previous;
+      if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = previousImcodesHome;
     }
   });
 });
@@ -68,11 +72,13 @@ describe('real ~/.imcodes is off limits to tests', () => {
 describe('authoritative store is never replaced by a disk snapshot', () => {
   let home = '';
   const previousHome = process.env.HOME;
+  const previousImcodesHome = process.env.IMCODES_HOME;
 
   beforeEach(() => {
     home = mkdtempSync(join(tmpdir(), 'imcodes-test-home-guard-'));
     mkdirSync(join(home, '.imcodes'), { recursive: true });
     process.env.HOME = home;
+    process.env.IMCODES_HOME = join(home, '.imcodes'); // the state directory wins over HOME: move both
   });
 
   afterEach(async () => {
@@ -80,6 +86,8 @@ describe('authoritative store is never replaced by a disk snapshot', () => {
     await flushStore();
     resetSessionStoreAuthorityForTests();
     process.env.HOME = previousHome;
+    if (previousImcodesHome === undefined) delete process.env.IMCODES_HOME;
+    else process.env.IMCODES_HOME = previousImcodesHome;
     rmSync(home, { recursive: true, force: true });
   });
 

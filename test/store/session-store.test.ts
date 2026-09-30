@@ -80,6 +80,7 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
       env: {
         ...process.env,
         HOME: tempDir,
+        IMCODES_HOME: join(tempDir, '.imcodes'),
         IMCODES_TEST_SESSION_STORE_MODULE_URL: moduleUrl,
       },
     }));
@@ -149,6 +150,7 @@ async function importSessionStore() {
 beforeEach(() => {
   tempDir = mkdtempSync(join(tmpdir(), 'deck-test-'));
   vi.stubEnv('HOME', tempDir);
+  vi.stubEnv('IMCODES_HOME', join(tempDir, '.imcodes')); // the state directory wins over HOME: move both
 });
 
 afterEach(() => {
@@ -560,6 +562,7 @@ describe('session-store', () => {
         await store.loadStore();
 
         vi.stubEnv('HOME', secondHome);
+        vi.stubEnv('IMCODES_HOME', join(secondHome, '.imcodes'));
         await writeSessionsFixture({
           sessions: {
             deck_next_brain: {
@@ -582,6 +585,7 @@ describe('session-store', () => {
         vi.doUnmock('../../src/store/session-state-probe-events.js');
         vi.doUnmock('../../src/daemon/timeline-emitter.js');
         vi.stubEnv('HOME', firstHome);
+        vi.stubEnv('IMCODES_HOME', join(firstHome, '.imcodes'));
         rmSync(secondHome, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
       }
     });
