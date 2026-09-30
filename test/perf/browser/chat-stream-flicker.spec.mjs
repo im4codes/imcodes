@@ -42,7 +42,10 @@ const VARIANTS = [
   { label: 'prose', pieceMode: 'prose', rows: 240 },
   { label: 'code', pieceMode: 'code', rows: 240 },
   { label: 'list', pieceMode: 'list', rows: 240 },
-  { label: 'long', pieceMode: 'prose', rows: 240, seedChars: 30_000 },
+  // Over RICH_TEXT_ENHANCEMENT_CHAR_LIMIT (20k chars) a message is plain text by design: it must be raw from the first frame and never flip.
+  { label: 'long', pieceMode: 'prose', rows: 240, seedChars: 30_000, expectRaw: true },
+  // Crosses the limit while streaming: Markdown -> plain text exactly once, never back.
+  { label: 'long-cross', pieceMode: 'prose', rows: 240, seedChars: 19_800, maxFlips: 1, allowRawTail: true },
   // The owner's recording: a Markdown-heavy reply (heading, ---, **bold**, lists)
   // arriving in token-sized pieces in bursts. Uniform 25 Hz never triggered it.
   { label: 'markdown-bursty', pieceMode: 'md', cadence: 'bursty', rows: 240 },
@@ -252,7 +255,7 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
   };
 }
 
-export function verdicts(result) {
+export function verdicts(result, variant = {}) {
   const failures = [];
   const a = result.analysis;
   if (result.error) { failures.push(`error: ${result.error.split('\n')[0]}`); return failures; }
@@ -261,9 +264,11 @@ export function verdicts(result) {
   need(a.remounts.wrapper === 0 && a.remounts.event === 0 && a.remounts.text === 0, `streaming row remounted (${JSON.stringify(a.remounts)})`);
   need(a.remounts.near === 0, `neighbour rows remounted (${a.remounts.near})`);
   need(a.blankingFrames === 0, `${a.blankingFrames} blanking frames (text shrank / opacity 0 / hidden)`);
-  need(a.renderMode.rAF.flips === 0 && a.renderMode.painted.flips === 0, `streaming bubble flipped raw<->Markdown ${a.renderMode.rAF.flips}x (rAF) / ${a.renderMode.painted.flips}x (painted)`);
-  need(a.renderMode.rAF.rawFrames === 0 && a.renderMode.painted.rawFrames === 0, `streaming bubble shown as raw text in ${a.renderMode.rAF.rawFrames} rAF / ${a.renderMode.painted.rawFrames} painted frames`);
-  need(a.height.rAF.dropFrames === 0 && a.height.painted.dropFrames === 0, `streaming bubble height shrank in ${a.height.rAF.dropFrames} rAF / ${a.height.painted.dropFrames} painted frames (max ${a.height.rAF.maxDropPx}px)`);
+  const maxFlips = variant.maxFlips ?? 0;
+  need(a.renderMode.rAF.flips <= maxFlips && a.renderMode.painted.flips <= maxFlips, `streaming bubble flipped raw<->Markdown ${a.renderMode.rAF.flips}x (rAF) / ${a.renderMode.painted.flips}x (painted), allowed ${maxFlips}`);
+  if (variant.expectRaw) need(a.renderMode.rAF.rawFrames === a.frames - a.unmountedStreamFrames || a.renderMode.rAF.flips === 0, 'oversized message should be plain text throughout');
+  else if (!variant.allowRawTail) need(a.renderMode.rAF.rawFrames === 0 && a.renderMode.painted.rawFrames === 0, `streaming bubble shown as raw text in ${a.renderMode.rAF.rawFrames} rAF / ${a.renderMode.painted.rawFrames} painted frames`);
+  need(variant.allowRawTail || (a.height.rAF.dropFrames === 0 && a.height.painted.dropFrames === 0), `streaming bubble height shrank in ${a.height.rAF.dropFrames} rAF / ${a.height.painted.dropFrames} painted frames (max ${a.height.rAF.maxDropPx}px)`);
   need(a.animationStartsOnRows === 0, `${a.animationStartsOnRows} CSS animations/transitions started on chat rows`);
   need(a.layout.bottomRAF.maxBottomStepPx <= TOL && a.layout.bottomPainted.maxBottomStepPx <= TOL, `streaming row bottom moved ${a.layout.bottomRAF.maxBottomStepPx}px (rAF) / ${a.layout.bottomPainted.maxBottomStepPx}px (painted) on screen while pinned`);
   need(a.scroll.clientWidthChanges === 0, `viewport width changed ${a.scroll.clientWidthChanges}x (scrollbar toggling reflows the text)`);
@@ -300,7 +305,7 @@ async function runVariant(browser, viewport, variant) {
   } finally {
     await context.close();
   }
-  result.failures = verdicts(result);
+  result.failures = verdicts(result, variant);
   result.pass = result.failures.length === 0;
   return result;
 }
