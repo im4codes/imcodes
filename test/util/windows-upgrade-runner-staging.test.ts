@@ -74,8 +74,8 @@ describe('Windows staged upgrade runner closure', () => {
         args: ['log', 'npm', 'imcodes@next', 'next', stagingDir, '-', 'current'],
       });
       expect(vbs).toContain(`""${runnerPath}""`);
-      expect(readFileSync(resolve(repoRoot, 'src/daemon/command-handler.ts'), 'utf8'))
-        .toContain('runnerCopy = stageWindowsUpgradeRunner(scriptDir, runnerSrc).runnerPath');
+      expect(readFileSync(resolve(repoRoot, 'src/util/windows-upgrade-script.ts'), 'utf8'))
+        .toContain('const runnerCopy = stageWindowsUpgradeRunner(input.scriptDir, runnerSrc).runnerPath');
     } finally {
       rmSync(stagingDir, { recursive: true, force: true });
     }

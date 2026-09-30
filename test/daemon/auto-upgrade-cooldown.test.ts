@@ -175,22 +175,27 @@ describe('evaluateAutoUpgradeCooldown', () => {
  */
 describe('upgrade.sh cooldown sentinel is written unconditionally', () => {
   const source = readFileSync(
-    join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'daemon', 'command-handler.ts'),
+    join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'src', 'util', 'posix-upgrade-script.ts'),
     'utf8',
   );
 
   it('writes the sentinel outside the health-check success branch', () => {
-    const write = 'last-upgrade-at" 2>/dev/null || true';
-    const healthIf = source.indexOf('if [ -z "$HEALTH_PID" ]; then');
-    const writeAt = source.indexOf(write, healthIf);
-    expect(healthIf).toBeGreaterThan(-1);
+    const write = `printf '%s\\n' "$(( $(date +%s) * 1000 ))" > "$IMCODES_STATE_DIR/last-upgrade-at" 2>/dev/null || true`;
+    const writeAt = source.indexOf(write);
     expect(writeAt).toBeGreaterThan(-1);
-    // The `fi` that closes the health-check block must come BEFORE the sentinel
-    // write, i.e. the write is no longer nested in the success `else` branch.
-    const fiAt = source.indexOf('\nfi\n', healthIf);
-    expect(fiAt).toBeGreaterThan(-1);
-    expect(fiAt).toBeLessThan(writeAt);
-    // And there is no `else` between the health `if` and its closing `fi`.
-    expect(source.slice(healthIf, fiAt)).not.toContain('\nelse\n');
+    // Top level of the script (column 0): not nested in any if/else, so neither a slow start nor
+    // a failed health check can skip it.
+    expect(source.lastIndexOf('\n', writeAt) + 1).toBe(writeAt);
+    // It comes after the health check and after the rollback decision, and before the rolled-back
+    // exit -- so a rolled-back upgrade arms the cooldown too (it was attempted).
+    const healthAt = source.indexOf('if wait_for_new_daemon "$HEALTH_FIRST_WAIT_SEC"; then');
+    const rollbackAt = source.indexOf('[step 5.5] ROLLBACK');
+    const rolledBackExitAt = source.indexOf('if [ "$ROLLED_BACK" = "1" ]; then');
+    expect(healthAt).toBeGreaterThan(-1);
+    expect(rollbackAt).toBeGreaterThan(healthAt);
+    expect(writeAt).toBeGreaterThan(rollbackAt);
+    expect(rolledBackExitAt).toBeGreaterThan(writeAt);
+    // Nothing between the health check and the sentinel exits the script.
+    expect(source.slice(healthAt, writeAt)).not.toMatch(/^\s*exit\b/m);
   });
 });

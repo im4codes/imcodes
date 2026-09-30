@@ -373,6 +373,13 @@ describe('posix-atomic-install.mjs', () => {
     expect(viaLink.stdout).toContain('is not a directory');
   });
 
+  it('installs with the flags the in-place upgrade always used, but into a --prefix stage and never `-g` on the live prefix', () => {
+    const source = readFileSync(helper(), 'utf8');
+    expect(source).toContain("['install', '-g', '--ignore-scripts', '--prefer-online', ...registryArgs(args), '--prefix', stagePrefix, pkgSpec]");
+    // --prefer-online revalidates cached metadata; a cache wipe would redownload the whole dependency graph.
+    expect(source).not.toMatch(/cache['"], ?['"]clean/);
+  });
+
   it('refuses an unknown command and missing arguments with a usage exit, never an install', () => {
     expect(run('bogus').status).toBe(2);
     expect(run('stage').status).toBe(2);
