@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { WINDOWS_UPGRADE_RUNNER_STAGED_FILES } from './windows-upgrade-runner-staged-files.js';
-import { encodeCmdAsUtf8Bom, encodeVbsAsUtf16 } from './windows-launch-artifacts.js';
+import { encodeVbsAsUtf16 } from './windows-launch-artifacts.js';
 
 /** The filename used by the VBS launcher for the staged runner entrypoint. */
 export const WINDOWS_UPGRADE_RUNNER_ENTRY_FILE = 'upgrade.mjs';
@@ -32,29 +32,6 @@ export function stageWindowsUpgradeRunner(scriptDir: string, runnerSrc: string):
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-
-/** Cleanup script — kept as cmd.exe because it's a 4-line idempotent
- *  rmdir invoked from a wscript wrapper.  No control flow, no parens,
- *  no timeout — just ping for the 120 s settle and a single rmdir. */
-export function buildWindowsCleanupScript(scriptDir: string): string {
-  void scriptDir;
-  return `@echo off\r
-chcp 65001 >nul 2>&1\r
-setlocal\r
-rem ping-based sleep: works when launched via wscript (no console for stdin),\r
-rem unlike "timeout /t N /nobreak" which aborts with "Input redirection is\r
-rem not supported" and returns immediately.  -n 121 ≈ 120 s wait.\r
-ping -n 121 127.0.0.1 >nul 2>&1\r
-for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"\r
-rmdir /s /q "%SCRIPT_DIR%"\r
-`;
-}
-
-/** VBS wrapper that runs the cleanup cmd in a hidden window (no taskbar flash).
- *  `On Error Resume Next` ensures no error dialog pops up. */
-export function buildWindowsCleanupVbs(cleanupPath: string): string {
-  return `On Error Resume Next\r\nSet WshShell = CreateObject("WScript.Shell")\r\nWshShell.Run """${cleanupPath}""", 0, False\r\n`;
-}
 
 /** Build a VBS launcher that runs `<nodeExe> <runner.mjs> <args...>`
  *  hidden + detached.  This replaces the historical pattern of
@@ -159,13 +136,9 @@ export function launchWindowsUpgrade(input: {
   // replace the installed package while the upgrade is running.
   const runnerCopy = stageWindowsUpgradeRunner(input.scriptDir, runnerSrc).runnerPath;
 
-  // The cleanup .cmd is still cmd.exe, but a 4-line idempotent rmdir with no control
-  // flow. The runner self-cleans too; this covers a runner that dies before its finally.
-  const cleanupPath = join(input.scriptDir, 'cleanup.cmd');
-  const cleanupVbsPath = join(input.scriptDir, 'cleanup.vbs');
-  writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(input.scriptDir)));
-  writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
-
+  // No cleanup timer of our own: a fixed-delay `rmdir` of this directory would delete the runner, its helper
+  // and its log while a real install (minutes) is still running. The runner removes the directory itself
+  // after a successful run and deliberately keeps it, log included, after a failed one.
   const upgradeVbsPath = join(input.scriptDir, 'upgrade.vbs');
   writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(buildWindowsUpgradeRunnerVbs({
     nodeExe: process.execPath,
@@ -174,6 +147,5 @@ export function launchWindowsUpgrade(input: {
   })));
 
   spawn('wscript', [upgradeVbsPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
-  spawn('wscript', [cleanupVbsPath], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
   return { runnerCopy };
 }
