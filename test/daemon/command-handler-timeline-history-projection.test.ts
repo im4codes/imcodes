@@ -833,4 +833,83 @@ describe('command-handler timeline history with SQLite-preferred reads', () => {
       hasMore: false,
     }));
   });
+  describe('contentFilter: text (stale-window tail peek)', () => {
+    const textEvent = (id: string, ts: number, type = 'assistant.text') => ({
+      eventId: id, sessionId: 'deck_peek', ts, seq: ts, epoch: 1, source: 'daemon', confidence: 'high', type, payload: { text: id },
+    });
+
+    it('reads only the readable message types and never the state rows (main-thread path)', async () => {
+      getSessionMock.mockReturnValue({ name: 'deck_peek', agentType: 'codex' });
+      readByTypesPreferredMock.mockResolvedValue([textEvent('t1', 10), textEvent('t2', 20, 'user.message')]);
+
+      handleWebCommand({
+        type: 'timeline.history_request', sessionName: 'deck_peek', requestId: 'peek-1', limit: 30, contentFilter: 'text',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(readByTypesPreferredMock).toHaveBeenCalledTimes(1);
+      expect(readByTypesPreferredMock).toHaveBeenCalledWith(
+        'deck_peek',
+        ['user.message', 'assistant.text'],
+        expect.objectContaining({ limit: 31 }),
+      );
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: TIMELINE_MESSAGES.HISTORY,
+        requestId: 'peek-1',
+        events: [expect.objectContaining({ eventId: 't1' }), expect.objectContaining({ eventId: 't2' })],
+      }));
+    });
+
+    it('narrows the worker request the same way (no state types, text content types only)', async () => {
+      shouldUseHistoryWorkerMock.mockReturnValue(true);
+      getSessionMock.mockReturnValue({ name: 'deck_peek', agentType: 'codex' });
+      historyWorkerDispatchMock.mockResolvedValue({
+        events: [textEvent('t1', 10)], detailCandidates: [], eventsRead: 1, payloadBytes: 40,
+        droppedEvents: 0, truncatedEvents: 0, readMs: 1, sanitizeMs: 0,
+      });
+
+      handleWebCommand({
+        type: 'timeline.history_request', sessionName: 'deck_peek', requestId: 'peek-2', limit: 30, contentFilter: 'text',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(historyWorkerDispatchMock).toHaveBeenCalledWith(expect.objectContaining({
+        contentTypes: ['user.message', 'assistant.text'],
+        stateTypes: [],
+        limit: 30,
+      }), expect.anything());
+    });
+
+    it('an unknown filter value is ignored (the full window is served), and no filter keeps today\'s types', async () => {
+      shouldUseHistoryWorkerMock.mockReturnValue(true);
+      getSessionMock.mockReturnValue({ name: 'deck_peek', agentType: 'codex' });
+      historyWorkerDispatchMock.mockResolvedValue({
+        events: [], detailCandidates: [], eventsRead: 0, payloadBytes: 2, droppedEvents: 0, truncatedEvents: 0, readMs: 1, sanitizeMs: 0,
+      });
+
+      handleWebCommand({ type: 'timeline.history_request', sessionName: 'deck_peek', requestId: 'f-1', limit: 30, contentFilter: 'bogus' }, serverLink as any);
+      handleWebCommand({ type: 'timeline.history_request', sessionName: 'deck_peek', requestId: 'f-2', limit: 31 }, serverLink as any);
+      await flushAsync();
+
+      for (const call of historyWorkerDispatchMock.mock.calls) {
+        expect(call[0].contentTypes).toEqual(expect.arrayContaining(['user.message', 'assistant.text', 'tool.result']));
+        expect(call[0].stateTypes).toEqual(['session.state']);
+      }
+    });
+
+    it('a filtered and an unfiltered request with identical bounds are two answers, not one shared in-flight read', async () => {
+      shouldUseHistoryWorkerMock.mockReturnValue(true);
+      getSessionMock.mockReturnValue({ name: 'deck_peek', agentType: 'codex' });
+      historyWorkerDispatchMock.mockImplementation(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        return { events: [], detailCandidates: [], eventsRead: 0, payloadBytes: 2, droppedEvents: 0, truncatedEvents: 0, readMs: 1, sanitizeMs: 0 };
+      });
+
+      handleWebCommand({ type: 'timeline.history_request', sessionName: 'deck_peek', requestId: 'same-a', limit: 30, contentFilter: 'text' }, serverLink as any);
+      handleWebCommand({ type: 'timeline.history_request', sessionName: 'deck_peek', requestId: 'same-b', limit: 30 }, serverLink as any);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      expect(historyWorkerDispatchMock).toHaveBeenCalledTimes(2);
+    });
+  });
 });

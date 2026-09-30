@@ -348,6 +348,7 @@
     "session_state": "会话 {{state}}",
     "load_older": "加载更早的消息",
     "loading_older": "加载中...",
+    "history_gap_loading": "更早的消息仍在加载…",
     "refreshing_history": "更新历史消息中…",
     "timelineStatus": {
       "ok": "历史已更新",

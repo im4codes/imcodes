@@ -226,6 +226,33 @@ export interface TimelineDetailRequestV1 {
 
 export type TimelineDetailRequest = TimelineDetailRequestLegacy | TimelineDetailRequestV1;
 
+/**
+ * Optional content filter on a history/page request. `text` narrows the window to the readable
+ * messages (`TIMELINE_TEXT_HISTORY_EVENT_TYPES`) and skips state rows, so a tool-heavy session's
+ * newest few messages are not buried under tool events and the reply stays small. A daemon that
+ * predates the field ignores it and answers the unfiltered window, which callers must tolerate
+ * (it is a superset of what they asked for).
+ */
+export const TIMELINE_HISTORY_CONTENT_FILTERS = {
+  TEXT: 'text',
+} as const;
+
+export type TimelineHistoryContentFilter =
+  (typeof TIMELINE_HISTORY_CONTENT_FILTERS)[keyof typeof TIMELINE_HISTORY_CONTENT_FILTERS];
+
+export function isTimelineHistoryContentFilter(value: unknown): value is TimelineHistoryContentFilter {
+  return value === TIMELINE_HISTORY_CONTENT_FILTERS.TEXT;
+}
+
+/** The event types a `text` content filter selects. */
+export const TIMELINE_TEXT_HISTORY_EVENT_TYPES = ['user.message', 'assistant.text'] as const;
+
+/**
+ * How many of the newest messages the stale-window "peek" asks for before anything else, so a
+ * window that has not been opened for a long time shows the conversation's latest state at once.
+ */
+export const TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT = 30;
+
 export interface TimelineHistoryRequest {
   type: typeof TIMELINE_MESSAGES.HISTORY_REQUEST;
   sessionName: string;
@@ -236,6 +263,7 @@ export interface TimelineHistoryRequest {
   cursor?: TimelineCursor | null;
   includeDetails?: boolean;
   budgetBytes?: number;
+  contentFilter?: TimelineHistoryContentFilter;
 }
 
 export interface TimelineReplayRequest {

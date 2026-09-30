@@ -43,6 +43,7 @@ import {
   TIMELINE_PROTOCOL_REVISION,
   TIMELINE_TERMINAL_SESSION_STATES,
   type TimelineCursor,
+  type TimelineHistoryContentFilter,
   type TimelineDeleteRequest,
   type TimelineDetailRefV1,
   type TimelineDetailResponse,
@@ -2053,6 +2054,7 @@ export class WsClient {
     beforeTs?: number,
     cursor?: TimelineCursor,
     budgetBytes?: number,
+    contentFilter?: TimelineHistoryContentFilter,
   ): string {
     const key = JSON.stringify([
       TIMELINE_MESSAGES.HISTORY_REQUEST,
@@ -2062,6 +2064,8 @@ export class WsClient {
       beforeTs ?? null,
       cursor ?? null,
       budgetBytes ?? null,
+      // Keyed only when set, so every existing (unfiltered) key stays byte-identical.
+      ...(contentFilter ? [contentFilter] : []),
     ]);
     const requestId = this.beginOwnedDataRequest(
       key,
@@ -2074,6 +2078,7 @@ export class WsClient {
         ...(beforeTs !== undefined ? { beforeTs } : {}),
         ...(cursor ? { cursor } : {}),
         ...(budgetBytes !== undefined ? { budgetBytes } : {}),
+        ...(contentFilter ? { contentFilter } : {}),
       }),
       (nextRequestId) => ({
         type: TIMELINE_MESSAGES.HISTORY,

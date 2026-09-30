@@ -309,6 +309,7 @@ export function SubSessionWindow({
     loadingOlder,
     hasOlderHistory,
     loadOlderEvents,
+    historyGap,
     loadMessageContext,
   } = useTimeline(sub.sessionName, ws, serverId, {
     // Exactly one focused/topmost window owns opportunistic recovery. Other
@@ -1052,6 +1053,7 @@ export function SubSessionWindow({
             loadingOlder={loadingOlder}
             hasOlderHistory={hasOlderHistory}
             onLoadOlder={loadOlderEvents}
+            historyGap={historyGap}
             onLoadMessageContext={loadMessageContext}
             sessionId={sub.sessionName}
             onForceSync={timelineForceRefresh}

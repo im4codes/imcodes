@@ -348,6 +348,7 @@
     "session_state": "Session {{state}}",
     "load_older": "載入更早的訊息",
     "loading_older": "載入中...",
+    "history_gap_loading": "較早的訊息仍在載入…",
     "refreshing_history": "更新歷史訊息中…",
     "timelineStatus": {
       "ok": "歷史已更新",

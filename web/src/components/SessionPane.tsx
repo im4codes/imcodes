@@ -198,6 +198,7 @@ export function SessionPane({
     removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
+    historyGap: timelineHistoryGap,
     loadMessageContext,
     forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
@@ -459,6 +460,7 @@ export function SessionPane({
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
+          historyGap={timelineHistoryGap}
           onLoadMessageContext={loadMessageContext}
           sessionId={sessionName}
           sessions={sessions}

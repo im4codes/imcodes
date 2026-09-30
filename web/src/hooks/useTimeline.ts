@@ -11,10 +11,20 @@ import {
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_REVISION,
+  TIMELINE_HISTORY_CONTENT_FILTERS,
   TIMELINE_RESPONSE_STATUS,
+  TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
   type TimelineCursor,
   type TimelinePayloadMetadata,
 } from '@shared/timeline-protocol.js';
+import {
+  __resetTimelineGapsForTests,
+  foldPageIntoGap,
+  getTimelineGap,
+  setTimelineGap,
+  subscribeTimelineGap,
+  type TimelineGap,
+} from '../timeline/catchup/gap-store.js';
 import {
   TIMELINE_DETAIL_ERROR_REASONS,
   TIMELINE_HISTORY_ERROR_REASONS,
@@ -219,6 +229,8 @@ const MOUNT_BACKFILL_COOLDOWN_MS = 60_000;
 const BACKGROUND_BACKFILL_FAILURE_BACKOFF_BASE_MS = 5_000;
 const BACKGROUND_BACKFILL_FAILURE_BACKOFF_MAX_MS = 60_000;
 const backgroundBackfillGateByCacheKey = new Map<string, { inFlight: number; failureStreak: number; nextAllowedAt: number }>();
+/** Sessions whose stale-window hole is being filled right now (any window): one filler per session. */
+const gapBackfillInFlight = new Set<string>();
 /** A (re)connect is new evidence the link works again: let the next
  *  background catch-up run instead of waiting out a failure backoff. */
 function liftBackgroundBackfillBackoff(cacheKey: string | null | undefined): void {
@@ -464,6 +476,21 @@ const MAX_MEMORY_EVENTS = 300;
 // unbounded payload even when older callers still pass MAX_MEMORY_EVENTS.
 const MAX_FORWARD_PAGE_EVENTS = 200;
 const MAX_FORWARD_PAGE_BYTES = 1024 * 1024;
+/**
+ * A window whose newest cached event is older than this asks for its latest few messages FIRST
+ * (a tiny text-only request) before the ordinary newest-window/backfill machinery — so a chat
+ * reopened after a long time shows where the conversation is now in about one round trip.
+ */
+const STALE_WINDOW_PEEK_DEFAULT_MIN_AGE_MS = 60_000;
+/** A window that just peeked does not peek again (effect re-runs on dependency churn) for this long. */
+const STALE_WINDOW_PEEK_REPEAT_MS = 60_000;
+let staleWindowPeekMinAgeMs = STALE_WINDOW_PEEK_DEFAULT_MIN_AGE_MS;
+/** Test seam: how old the newest cached event must be before a reopen sends the tail peek (`Infinity` disables it). */
+export function __setStaleWindowPeekMinAgeMsForTests(ms: number | null): void {
+  staleWindowPeekMinAgeMs = ms ?? STALE_WINDOW_PEEK_DEFAULT_MIN_AGE_MS;
+}
+/** The peek is a handful of messages; a small budget keeps its reply tiny on a mobile link. */
+const STALE_WINDOW_PEEK_BUDGET_BYTES = 256 * 1024;
 const MAX_HISTORY_EVENTS = 2000;
 const MAX_PIN_CONTEXT_EVENTS = MESSAGE_PIN_LIMITS.CONTEXT_EVENTS_BEFORE
   + 1
@@ -1585,6 +1612,8 @@ export function __resetTimelineCacheForTests(): void {
   lastHttpBackfillResponseAt.clear();
   watchdogStateByCacheKey.clear();
   backgroundBackfillGateByCacheKey.clear();
+  gapBackfillInFlight.clear();
+  __resetTimelineGapsForTests();
 }
 
 export function __resetBackfillCooldownsForTests(): void {
@@ -1624,12 +1653,18 @@ function isHistoryCursorEligibleEvent(ev: TimelineEvent): boolean {
   return true;
 }
 
-function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined {
+/** Newest ts of any event a history cursor may anchor on (content events only, never optimistic bubbles). */
+function getTimelineHistoryMaxTs(events: readonly TimelineEvent[]): number | undefined {
   let maxTs: number | undefined;
   for (const ev of events) {
     if (!isHistoryCursorEligibleEvent(ev)) continue;
     if (typeof ev.ts === 'number' && (maxTs === undefined || ev.ts > maxTs)) maxTs = ev.ts;
   }
+  return maxTs;
+}
+
+function getTimelineHistoryAfterTs(events: TimelineEvent[]): number | undefined {
+  const maxTs = getTimelineHistoryMaxTs(events);
   if (maxTs === undefined) return undefined;
   return Math.max(0, maxTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS);
 }
@@ -1721,6 +1756,12 @@ export interface UseTimelineResult {
   ) => void;
   /** Load older events before the earliest currently loaded event. */
   loadOlderEvents: () => void;
+  /**
+   * The hole between this window's stale local cache and the newest messages it has already shown, while
+   * it is still being filled newest→oldest (null when there is none). `lowerTs` is exclusive: the newest
+   * cached event; `upperTs` is where the stitched newest block begins (null = not known yet).
+   */
+  historyGap: TimelineGap | null;
   /** Explicit user-triggered sync for THIS session (the chat ↻ button):
    *  visible (shows the refreshing overlay), force (works even when this hook
    *  isn't the active session, e.g. a visible sub-session card/window), and
@@ -2248,10 +2289,90 @@ export function useTimeline(
   /** Bounds how long the daemon step may claim "still coming" with no socket. */
   const daemonWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Union in a local restore and return the running distinct total. */
+  const tryDecideOpenGapRef = useRef<(() => void) | null>(null);
   const recordLocalRestore = useCallback((restored: readonly TimelineEvent[]): number => {
     for (const event of restored) localRestoredIdsRef.current.add(event.eventId);
+    // A late local restore (IndexedDB) can be the piece that finally lets the hole be recognised.
+    tryDecideOpenGapRef.current?.();
     return localRestoredIdsRef.current.size;
   }, []);
+
+  // ── Stale-window gap (see timeline/catchup/gap-store.ts) ────────────────────
+  // The hole between the local cache and the newest window, filled newest→oldest. Module-level and
+  // persisted, so every window of the session and a reload share one record.
+  const [historyGap, setHistoryGap] = useState<TimelineGap | null>(() => getTimelineGap(cacheKey));
+  useEffect(() => {
+    if (!cacheKey) {
+      setHistoryGap(null);
+      return undefined;
+    }
+    setHistoryGap(getTimelineGap(cacheKey));
+    return subscribeTimelineGap(cacheKey, setHistoryGap);
+  }, [cacheKey]);
+  /** First newest-window page seen since this window (re)opened; the evidence a hole is decided from. */
+  const openWindowTailRef = useRef<{ key: string; minTs: number; maxTs: number; full: boolean } | null>(null);
+  /** The open a decision was already taken for (once per open: later pages are paging, not opening). */
+  const openGapDecidedKeyRef = useRef<string | null>(null);
+  /** Newest cached ts captured at a reconnect (the local-restore ledger only describes the first open). */
+  const openCursorOverrideRef = useRef<{ key: string; ts: number } | null>(null);
+  /** Outstanding stale-window peek request, and when/for what it was last sent. */
+  const peekRequestIdRef = useRef<string | null>(null);
+  const lastPeekRef = useRef<{ key: string; at: number } | null>(null);
+
+  /** Newest content-event ts the LOCAL cache held (memory / snapshot / IndexedDB), never daemon-fetched rows. */
+  const getLocalCacheCursorTs = useCallback((): number | undefined => {
+    const key = cacheKeyRef.current;
+    const override = openCursorOverrideRef.current;
+    if (override && override.key === key) return override.ts;
+    let maxTs: number | undefined;
+    for (const event of eventsRef.current) {
+      if (!localRestoredIdsRef.current.has(event.eventId)) continue;
+      if (!isHistoryCursorEligibleEvent(event)) continue;
+      if (typeof event.ts === 'number' && (maxTs === undefined || event.ts > maxTs)) maxTs = event.ts;
+    }
+    return maxTs;
+  }, []);
+
+  const tryDecideOpenGap = useCallback((): void => {
+    const key = cacheKeyRef.current;
+    if (!key || openGapDecidedKeyRef.current === key) return;
+    const tail = openWindowTailRef.current;
+    if (!tail || tail.key !== key) return;
+    // A hole recorded by an earlier open (or another window) is resumed as it is, never re-derived.
+    if (getTimelineGap(key)) {
+      openGapDecidedKeyRef.current = key;
+      return;
+    }
+    const cursorTs = getLocalCacheCursorTs();
+    // Nothing local yet: cold so far. A late local restore re-runs this, so do not decide.
+    if (cursorTs === undefined) return;
+    openGapDecidedKeyRef.current = key;
+    openCursorOverrideRef.current = null;
+    const next = foldPageIntoGap(null, {
+      lowerTs: Math.max(0, cursorTs - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS),
+      pageMinTs: tail.minTs,
+      pageMaxTs: tail.maxTs,
+      fullPage: tail.full,
+    });
+    if (next) setTimelineGap(key, next);
+  }, [getLocalCacheCursorTs]);
+  tryDecideOpenGapRef.current = tryDecideOpenGap;
+
+  /** Record the first newest-window page since (re)open — its oldest event vs the cache cursor decides the hole. */
+  const noteOpenWindowTail = useCallback((pageEvents: readonly TimelineEvent[], full: boolean): void => {
+    const key = cacheKeyRef.current;
+    if (!key || openWindowTailRef.current?.key === key) return;
+    let minTs = Infinity;
+    let maxTs = -Infinity;
+    for (const event of pageEvents) {
+      if (!isHistoryCursorEligibleEvent(event) || typeof event.ts !== 'number' || !Number.isFinite(event.ts)) continue;
+      if (event.ts < minTs) minTs = event.ts;
+      if (event.ts > maxTs) maxTs = event.ts;
+    }
+    if (!Number.isFinite(minTs)) return;
+    openWindowTailRef.current = { key, minTs, maxTs, full };
+    tryDecideOpenGap();
+  }, [tryDecideOpenGap]);
   const transportQueueStateRef = useRef<TransportQueueReducerState>(
     createTransportQueueReducerState(sessionId ?? undefined),
   );
@@ -2447,6 +2568,17 @@ export function useTimeline(
     }
     reconnectRefreshInFlightRef.current = true;
     lastReconnectRefreshAtRef.current = now;
+    // A reconnect after a long absence is a reopen as far as the hole is concerned: remember what the
+    // cache held BEFORE the refresh merges anything, and let the next newest-window page decide again.
+    const gapKey = cacheKeyRef.current;
+    if (gapKey && !getTimelineGap(gapKey)) {
+      const cursorTs = getTimelineHistoryMaxTs(eventsRef.current);
+      if (cursorTs !== undefined) {
+        openCursorOverrideRef.current = { key: gapKey, ts: cursorTs };
+        openWindowTailRef.current = null;
+        openGapDecidedKeyRef.current = null;
+      }
+    }
     return true;
   }, [sessionId]);
 
@@ -2618,6 +2750,31 @@ export function useTimeline(
       setRefreshing(false);
     };
 
+    // A window reopened after a long time asks for its newest few messages first (tiny, text-only), so it
+    // shows where the conversation is now in about one round trip; the ordinary newest window and the
+    // newest→oldest hole backfill follow. Sent ahead of the bootstrap window on the same socket.
+    const maybeSendStaleWindowPeek = (): void => {
+      if (!ws || !sessionId || !cacheKey) return;
+      const cursorTs = getLocalCacheCursorTs();
+      // Nothing cached: the ordinary newest window is already the first paint.
+      if (cursorTs === undefined) return;
+      const now = Date.now();
+      if (now - cursorTs < staleWindowPeekMinAgeMs) return;
+      const last = lastPeekRef.current;
+      if (last && last.key === cacheKey && now - last.at < STALE_WINDOW_PEEK_REPEAT_MS) return;
+      lastPeekRef.current = { key: cacheKey, at: now };
+      peekRequestIdRef.current = ws.sendTimelineHistoryRequest(
+        sessionId,
+        TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
+        undefined,
+        undefined,
+        undefined,
+        STALE_WINDOW_PEEK_BUDGET_BYTES,
+        TIMELINE_HISTORY_CONTENT_FILTERS.TEXT,
+      );
+      updateHistoryStep('textTail', 'running', 'bootstrap');
+    };
+
     const requestDaemonHistory = (visible: boolean, limit?: number, sourceEvents?: TimelineEvent[], force = false): void => {
       if (!wsConnected || !ws) return;
       // Gate passive card/hidden history requests, but let an on-screen chat
@@ -2650,6 +2807,7 @@ export function useTimeline(
       } else {
         markDaemonHistoryBackground();
       }
+      maybeSendStaleWindowPeek();
       sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(limit, sourceEvents));
     };
 
@@ -2968,7 +3126,7 @@ export function useTimeline(
       cancelled = true;
       if (coldDaemonTimer) clearTimeout(coldDaemonTimer);
     };
-  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, isActiveSession, sendForwardHistoryRequest, sessionId, shouldBootstrapVisibleHistory, ws, wsConnected]);
+  }, [buildForwardHistoryArgs, cacheKey, clearForwardHistoryTimeout, clearHttpBackfillTimer, disableHistory, getLocalCacheCursorTs, isActiveSession, sendForwardHistoryRequest, sessionId, shouldBootstrapVisibleHistory, ws, wsConnected]);
 
   // Map of commandId → optimistic eventId for O(1) lookup on command.ack / dedup.
   const optimisticIdsByCommandRef = useRef(new Map<string, string>());
@@ -4133,7 +4291,8 @@ export function useTimeline(
       httpBackfillTimerRef.current[mode] = null;
       httpBackfillTimerDueAtRef.current[mode] = 0;
       if (cacheKeyRef.current !== backfillCacheKey) return;
-      if (backfillCacheKey && cooldownMs > 0) {
+      // A recorded hole is unfinished work, whatever the last successful catch-up says.
+      if (backfillCacheKey && cooldownMs > 0 && !getTimelineGap(backfillCacheKey)) {
         const lastOk = lastHttpBackfillResponseAt.get(backfillCacheKey);
         if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) {
           backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, mode, lastOk, cooldownMs });
@@ -4160,8 +4319,31 @@ export function useTimeline(
           return;
         }
       }
+      // One filler per session: a second window (or a later trigger) leaves a running hole backfill alone;
+      // the merges it produces reach every window through the shared cache.
+      const roundGap = backfillCacheKey ? getTimelineGap(backfillCacheKey) : null;
+      const isGapFiller = !!backfillCacheKey && !!roundGap && mode !== 'manualLatestWindow';
+      if (isGapFiller && retryAttempt === 0 && roundsChained === 0 && gapBackfillInFlight.has(backfillCacheKey!)) {
+        backfillDebug('fireHttpBackfill: hole backfill already running', { sessionId: backfillSessionId, mode });
+        return;
+      }
+      let holdsGapFiller = isGapFiller;
+      if (isGapFiller) gapBackfillInFlight.add(backfillCacheKey!);
       if (gate) gate.inFlight += 1;
-      const afterTs = mode === 'manualLatestWindow' ? undefined : getTimelineHistoryAfterTs(eventsRef.current);
+      // The lower bound of a catch-up is normally the newest ts the cache holds. While a hole is recorded
+      // (or the reopen has not yet decided whether there is one) that would be wrong: the merged tail has
+      // already moved "the newest ts" above the hole. So the recorded floor, or the cursor captured at
+      // open, wins.
+      const undecidedOpenCursor = !roundGap && !!backfillCacheKey && openGapDecidedKeyRef.current !== backfillCacheKey
+        ? getLocalCacheCursorTs()
+        : undefined;
+      const afterTs = mode === 'manualLatestWindow'
+        ? undefined
+        : roundGap
+          ? roundGap.lowerTs
+          : undecidedOpenCursor !== undefined
+            ? Math.max(0, undecidedOpenCursor - TIMELINE_HISTORY_AFTER_TS_OVERLAP_MS)
+            : getTimelineHistoryAfterTs(eventsRef.current);
       // A cold visible pane has no local cursor to anchor a delta. Paint one
       // bounded newest page and let the live subscription carry forward; do
       // not walk the entire historical backlog before the first render. Once
@@ -4172,7 +4354,7 @@ export function useTimeline(
       // events may arrive before this delayed HTTP task fires on a cold pane;
       // using eventsRef here would misclassify that cold start as cached and
       // immediately walk the entire historical backlog.
-      const hadLocalEvents = localRestoredIdsRef.current.size > 0;
+      const hadLocalEvents = localRestoredIdsRef.current.size > 0 || !!roundGap;
       const maxPages = mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
       if (visible) {
@@ -4195,16 +4377,21 @@ export function useTimeline(
       void (async () => {
         let terminal: 'caught_up' | 'cap_hit' | 'truncated' | 'transient_null' | 'error' | null = null;
         try {
+          // The page currently being fetched: `undefined` = the newest window, else a step down the hole.
+          let pageBeforeTs: number | undefined;
           const outcome = await runNewestWindowBackfill(afterTs, {
             limit: MAX_FORWARD_PAGE_EVENTS,
             maxPages,
-            initialBeforeTs: resumeBeforeTs,
-            fetchPage: ({ afterTs: at, beforeTs: bt }) => Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
-              afterTs: at,
-              ...(bt !== undefined ? { beforeTs: bt } : {}),
-              limit: MAX_FORWARD_PAGE_EVENTS,
-              timeoutMs: resolveBackfillTimeoutMs(opts),
-            })),
+            initialBeforeTs: resumeBeforeTs ?? (roundGap?.upperTs != null ? roundGap.upperTs + 1 : undefined),
+            fetchPage: ({ afterTs: at, beforeTs: bt }) => {
+              pageBeforeTs = bt;
+              return Promise.resolve(fetchTimelineHistoryHttp(serverId, backfillSessionId, {
+                afterTs: at,
+                ...(bt !== undefined ? { beforeTs: bt } : {}),
+                limit: MAX_FORWARD_PAGE_EVENTS,
+                timeoutMs: resolveBackfillTimeoutMs(opts),
+              }));
+            },
             mergePage: async (events) => {
               if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
               const recovered = events.filter(
@@ -4217,6 +4404,18 @@ export function useTimeline(
               );
               if (recovered.length === 0) return { candidateCount: 0, minTs: null, maxTs: null };
               backfillDebug('fireHttpBackfill: merging page', { sessionId: backfillSessionId, count: recovered.length });
+              // The first newest-window page of an open is the evidence for a hole: record it BEFORE the merge
+              // moves the cache's own newest ts (and BEFORE anything is persisted).
+              if (mode !== 'manualLatestWindow' && pageBeforeTs === undefined && !roundGap) {
+                noteOpenWindowTail(recovered, recovered.length >= MAX_FORWARD_PAGE_EVENTS);
+              }
+              // While a hole is open the window must keep what it fills in, not only the newest 300.
+              const wideMerge = !!backfillCacheKey && !!getTimelineGap(backfillCacheKey);
+              // This very page just revealed the hole: from here on this round is its filler.
+              if (wideMerge && !holdsGapFiller && mode !== 'manualLatestWindow') {
+                holdsGapFiller = true;
+                gapBackfillInFlight.add(backfillCacheKey!);
+              }
               // Apply large pages in small turns.  A 200-event page can carry
               // megabytes of markdown/tool payload; merging it synchronously
               // blocks input and first paint across every mounted pane.
@@ -4224,7 +4423,7 @@ export function useTimeline(
               for (let offset = 0; offset < recovered.length; offset += APPLY_CHUNK) {
                 if (cacheKeyRef.current !== backfillCacheKey) return { candidateCount: 0, minTs: null, maxTs: null };
                 const chunk = recovered.slice(offset, offset + APPLY_CHUNK);
-                mergeEvents(chunk);
+                mergeEvents(chunk, wideMerge ? MAX_HISTORY_EVENTS : undefined);
                 for (const recoveredEvent of chunk) {
                   settleOptimisticByCommandAckEvent(recoveredEvent);
                   settleOptimisticByTimelineProgress(recoveredEvent);
@@ -4240,6 +4439,19 @@ export function useTimeline(
                 if (recoveredEvent.ts < minTs) minTs = recoveredEvent.ts;
                 if (recoveredEvent.ts > maxTs) maxTs = recoveredEvent.ts;
               }
+              if (backfillCacheKey && Number.isFinite(minTs) && Number.isFinite(maxTs)) {
+                const currentGap = getTimelineGap(backfillCacheKey);
+                if (currentGap) {
+                  const folded = foldPageIntoGap(currentGap, {
+                    lowerTs: currentGap.lowerTs,
+                    pageMinTs: minTs,
+                    pageMaxTs: maxTs,
+                    fullPage: recovered.length >= MAX_FORWARD_PAGE_EVENTS,
+                    descending: pageBeforeTs !== undefined,
+                  });
+                  setTimelineGap(backfillCacheKey, folded);
+                }
+              }
               return {
                 candidateCount: recovered.length,
                 minTs: Number.isFinite(minTs) ? minTs : null,
@@ -4248,6 +4460,10 @@ export function useTimeline(
             },
           });
           terminal = outcome.terminal;
+          // The window down to the floor is exhausted: the hole is filled.
+          if (terminal === 'caught_up' && backfillCacheKey && mode !== 'manualLatestWindow') {
+            setTimelineGap(backfillCacheKey, null);
+          }
           // Transient null on the FIRST page → preserve the legacy retry-with-backoff.
           // A null on a later page means ≥1 page already merged; stop (next trigger
           // continues) rather than restart the whole round.
@@ -4299,6 +4515,7 @@ export function useTimeline(
           /* opportunistic — WS path is primary */
         }
         finally {
+          if (holdsGapFiller && backfillCacheKey) gapBackfillInFlight.delete(backfillCacheKey);
           if (gate) {
             gate.inFlight = Math.max(0, gate.inFlight - 1);
             if (terminal === 'error' || terminal === 'transient_null') {
@@ -4320,7 +4537,7 @@ export function useTimeline(
         }
       })();
     }, delayMs);
-  }, [clearHttpBackfillTimer, disableHistory, isActiveSession, serverId, sessionId, cacheKey, mergeEvents, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
+  }, [clearHttpBackfillTimer, disableHistory, isActiveSession, serverId, sessionId, cacheKey, getLocalCacheCursorTs, mergeEvents, noteOpenWindowTail, idbPutEvents, settleOptimisticByCommandAckEvent, settleOptimisticByTimelineProgress, updateHistoryStep]);
 
   // Stable indirection — lets the session-mount effect below call the latest
   // `fireHttpBackfill` without having to list it (and transitively its five
@@ -4947,6 +5164,15 @@ export function useTimeline(
           return;
         }
 
+        // Stale-window peek: the newest few messages, merged as a preview of the tail and nothing else
+        // (never a window, so it neither decides the hole nor ends the bootstrap).
+        if (msg.type === TIMELINE_MESSAGES.HISTORY && msg.requestId && msg.requestId === peekRequestIdRef.current) {
+          peekRequestIdRef.current = null;
+          updateHistoryStep('textTail', 'done', 'bootstrap');
+          if (msg.events.length > 0 && responseState !== 'error') mergeHistoryEventsYielding(msg.events);
+          return;
+        }
+
         // Accept any same-session history batch for forward sync. Mobile
         // reconnect/background churn can legitimately create overlapping history
         // requests; dropping the earlier response can leave the UI stuck on old
@@ -4956,6 +5182,15 @@ export function useTimeline(
         if (isCurrentForwardHistoryResponse) {
           clearForwardHistoryTimeout();
           reconnectRefreshInFlightRef.current = false;
+          // The newest window is here: an unanswered peek is now redundant.
+          if (peekRequestIdRef.current) {
+            peekRequestIdRef.current = null;
+            updateHistoryStep('textTail', 'done', 'bootstrap');
+          }
+          // This newest-window page is the evidence for whether a hole sits between the cache and it.
+          if (msg.requestId && msg.type === TIMELINE_MESSAGES.HISTORY && responseState !== 'error' && msg.events.length > 0) {
+            noteOpenWindowTail(msg.events, msg.hasMore === true);
+          }
         }
         if (!olderRequestIdRef.current || msg.requestId !== olderRequestIdRef.current) {
           if (!historyRequestIdRef.current || msg.requestId === historyRequestIdRef.current) {
@@ -4996,7 +5231,8 @@ export function useTimeline(
             replaceEvents(next);
             idbPutEvents(msg.events);
           } else {
-            mergeHistoryEventsYielding(msg.events);
+            // While a hole is open the window keeps the tail AND the cache it will be stitched to.
+            mergeHistoryEventsYielding(msg.events, getTimelineGap(cacheKeyRef.current) ? MAX_HISTORY_EVENTS : undefined);
           }
         } else if (historyRetryRef.current < 2 && ws?.connected && isActiveSessionRef.current && shouldRetryTimelineHistoryResponse(msg, eventsRef.current.length > 0)) {
           // Legacy empty response with no cached events — retry once after a
@@ -5339,6 +5575,7 @@ export function useTimeline(
     removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
+    historyGap,
     forceRefresh,
     loadMessageContext,
   };

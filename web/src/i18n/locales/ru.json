@@ -348,6 +348,7 @@
     "session_state": "Сессия {{state}}",
     "load_older": "Загрузить старые сообщения",
     "loading_older": "Загрузка...",
+    "history_gap_loading": "Более ранние сообщения ещё загружаются…",
     "refreshing_history": "Обновление истории…",
     "timelineStatus": {
       "ok": "История обновлена",

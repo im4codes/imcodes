@@ -1,4 +1,5 @@
 import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
+import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker } from './chat-history-gap.js';
 import {
   isNeverRenderedTimelineEventType,
   projectAssistantTextForDisplay,
@@ -169,6 +170,8 @@ interface Props {
   loadingOlder?: boolean;
   /** False when no more history is available */
   hasOlderHistory?: boolean;
+  /** The hole between a stale local cache and the newest block, while it is still being filled newest→oldest. */
+  historyGap?: { lowerTs: number; upperTs: number | null } | null;
   /** Called when user wants to load older messages */
   onLoadOlder?: () => void;
   sessionState?: string;
@@ -219,7 +222,7 @@ function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {
   key: string;
-  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity' | 'supervision-status-run';
+  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity' | 'supervision-status-run' | 'history-gap';
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
@@ -1581,6 +1584,7 @@ function eventRevision(event: TimelineEvent): string {
 }
 
 function viewItemRevision(item: ViewItem): string {
+  if (item.type === 'history-gap') return `${item.key}:history-gap`;
   if (item.type === 'supervision-status-run') {
     return `${item.key}:supervision-status-run:${item.heartbeatCount ?? 0}:${item.waitingCount ?? 0}:`
       + (item.statusItems ?? []).map(viewItemRevision).join('|');
@@ -2526,7 +2530,7 @@ function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasured
 
 const EMPTY_ID_SET: ReadonlySet<string> = new Set();
 
-function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
   recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
@@ -3201,9 +3205,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
     () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-effectiveRenderLimit) : viewItems),
     [hiddenRenderedItemCount, effectiveRenderLimit, viewItems],
   );
+  // The "earlier messages are still loading" row lives IN the list (between the older cached block and the
+  // stitched newest block), so its arrival and removal take the same layout/anchor path as any other row.
+  const displayViewItems = useMemo(
+    () => (preview
+      ? renderedViewItems
+      : insertHistoryGapMarker(renderedViewItems, historyGap, { key: HISTORY_GAP_MARKER_KEY, type: 'history-gap' }) as ViewItem[]),
+    [preview, renderedViewItems, historyGap],
+  );
   const renderedRevision = useMemo(
-    () => getRenderedViewRevision(renderedViewItems),
-    [renderedViewItems],
+    () => getRenderedViewRevision(displayViewItems),
+    [displayViewItems],
   );
   const viewItemsRef = useRef(viewItems);
   viewItemsRef.current = viewItems;
@@ -4594,7 +4606,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
           )}
           {/* No `loading` guard: whatever is already restored renders now. */}
           <VirtualizedViewItems
-            items={renderedViewItems}
+            items={displayViewItems}
             scrollRef={scrollRef}
             enabled={!preview}
             revealKey={virtualRevealKey}
@@ -4604,6 +4616,14 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             isFollowing={() => autoScrollRef.current}
             onTopOffsetReconciled={() => { if (!autoScrollRef.current) captureReaderAnchor(); }}
             renderItem={(item) => {
+            if (item.type === 'history-gap') {
+              return (
+                <div key={item.key} className="chat-history-gap-marker" role="status" data-testid="chat-history-gap-marker">
+                  <span className="chat-refreshing-spinner" aria-hidden="true" />
+                  <span>{t('chat.history_gap_loading')}</span>
+                </div>
+              );
+            }
             if (item.type === 'supervision-status-run') {
               return <SupervisionStatusRun key={item.key} item={item} />;
             }

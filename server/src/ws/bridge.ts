@@ -432,6 +432,7 @@ import { FS_READ_ERROR_CODES } from '../../../shared/fs-read-error-codes.js';
 import {
   TIMELINE_HISTORY_CANCEL_CAPABILITY,
   TIMELINE_CURSOR_DIRECTIONS,
+  isTimelineHistoryContentFilter,
   TIMELINE_MESSAGES,
   TIMELINE_PROTOCOL_CAPABILITY,
   TIMELINE_RESPONSE_SOURCES,
@@ -4194,6 +4195,8 @@ export class WsBridge {
       afterSeq: optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.afterSeq) ?? optionalNumber(msg.afterSeq) ?? null,
       epoch: optionalNumber((msg.cursor as Record<string, unknown> | undefined)?.epoch) ?? optionalNumber(msg.epoch) ?? null,
       direction: (msg.cursor as Record<string, unknown> | undefined)?.direction ?? null,
+      // A text-only window and a full window with the same bounds are different answers.
+      contentFilter: isTimelineHistoryContentFilter(msg.contentFilter) ? msg.contentFilter : null,
     });
   }
 

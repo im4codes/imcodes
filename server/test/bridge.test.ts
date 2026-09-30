@@ -7184,6 +7184,40 @@ describe('WsBridge', () => {
       }
     });
 
+    it('relays contentFilter to the daemon and never merges a text-only window with an unfiltered one', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserA = new MockWs();
+      const browserB = new MockWs();
+      bridge.handleBrowserConnection(browserA as never, 'test-user', makeDb('valid-hash'));
+      bridge.handleBrowserConnection(browserB as never, 'test-user', makeDb('valid-hash'));
+      const request = (requestId: string, contentFilter?: string) => ({
+        type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+        sessionName: 'deck_sub_qwen',
+        requestId,
+        limit: 30,
+        ...(contentFilter ? { contentFilter } : {}),
+      });
+      browserA.emit('message', JSON.stringify(request('peek-a', 'text')));
+      browserB.emit('message', JSON.stringify(request('window-b')));
+      await flushAsync();
+      const outbound = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+      // Same session/limit/bounds, different content: two daemon reads, and the filter reached the daemon.
+      expect(outbound).toHaveLength(2);
+      expect(outbound.find((msg) => msg.requestId === 'peek-a')?.contentFilter).toBe('text');
+      expect(outbound.find((msg) => msg.requestId === 'window-b')?.contentFilter).toBeUndefined();
+
+      // Identical peeks (same filter and bounds) still join the read already in flight instead of adding more.
+      browserA.emit('message', JSON.stringify(request('peek-c', 'text')));
+      browserB.emit('message', JSON.stringify(request('peek-d', 'text')));
+      await flushAsync();
+      const after = daemonWs.sentStrings
+        .map((raw) => JSON.parse(raw) as Record<string, unknown>)
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+      expect(after).toHaveLength(2);
+    });
+
     it('cleans up pending request after 30s timeout', async () => {
       vi.useFakeTimers();
       const { bridge, daemonWs } = await setupAuth();

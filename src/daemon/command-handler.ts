@@ -61,7 +61,7 @@ import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport }
 import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
 import { isUserDeletedTimelineEvent } from '../shared/timeline/merge.js';
-import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
+import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent, type TimelineEventType } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { enqueueResend, getResendEntries, clearResend, recipientFromSessionRecord } from './transport-resend-queue.js';
@@ -105,6 +105,9 @@ import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
+  TIMELINE_TEXT_HISTORY_EVENT_TYPES,
+  isTimelineHistoryContentFilter,
+  type TimelineHistoryContentFilter,
   TIMELINE_DELETE_ERROR_CODES,
   TIMELINE_DELETE_MAX_EVENT_IDS,
   TIMELINE_DELETE_MAX_EVENT_ID_LENGTH,
@@ -6816,6 +6819,19 @@ interface TimelineHistoryRequestParams {
   afterTs?: number;
   beforeTs?: number;
   maxResponseBytes: number;
+  /** `text`: only user.message/assistant.text rows (no tool/state rows) — see TIMELINE_HISTORY_CONTENT_FILTERS. */
+  contentFilter?: TimelineHistoryContentFilter;
+}
+
+/** Which event types one history request reads: the whole chat window, or only its readable messages. */
+function timelineHistoryTypesForFilter(contentFilter: TimelineHistoryContentFilter | undefined): {
+  contentTypes: TimelineEventType[];
+  stateTypes: TimelineEventType[];
+} {
+  if (contentFilter === undefined) {
+    return { contentTypes: [...TIMELINE_HISTORY_CONTENT_TYPES], stateTypes: [...TIMELINE_HISTORY_STATE_TYPES] };
+  }
+  return { contentTypes: [...TIMELINE_TEXT_HISTORY_EVENT_TYPES], stateTypes: [] };
 }
 
 interface TimelineHistoryBuildResult {
@@ -6889,6 +6905,7 @@ function timelineHistoryInflightKey(params: TimelineHistoryRequestParams): strin
     afterTs: params.afterTs ?? null,
     beforeTs: params.beforeTs ?? null,
     maxResponseBytes: params.maxResponseBytes,
+    contentFilter: params.contentFilter ?? null,
   });
 }
 
@@ -6941,12 +6958,13 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   // O(requested rows) instead of decoding thousands of unrelated state events.
   // Do NOT filter by epoch — history should include events across daemon restarts.
   const tRead0 = Date.now();
+  const historyTypes = timelineHistoryTypesForFilter(params.contentFilter);
   let substantive: TimelineEvent[];
   let stateEvents: TimelineEvent[] = [];
   try {
     substantive = await timelineStore.readByTypesPreferred(
       params.sessionName,
-      [...TIMELINE_HISTORY_CONTENT_TYPES],
+      historyTypes.contentTypes,
       { limit: params.limit + 1, afterTs: params.afterTs, beforeTs: params.beforeTs },
     );
   } catch (err) {
@@ -6955,13 +6973,13 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     }
     throw err;
   }
-  if (substantive.length > 0) {
+  if (substantive.length > 0 && historyTypes.stateTypes.length > 0) {
     const cutoffTs = substantive[0]!.ts;
     const stateAfterTs = params.afterTs === undefined ? cutoffTs - 1 : Math.max(params.afterTs, cutoffTs - 1);
     try {
       stateEvents = await timelineStore.readByTypesPreferred(
         params.sessionName,
-        [...TIMELINE_HISTORY_STATE_TYPES],
+        historyTypes.stateTypes,
         { limit: Math.max(params.limit * 2, 100), afterTs: stateAfterTs, beforeTs: params.beforeTs },
       );
     } catch (err) {
@@ -7027,7 +7045,7 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   // 200 substantive events could retain hundreds of additional state rows and
   // recreate the large-history retention spike at the bridge.
   if (trimmed.length > TIMELINE_HISTORY_LIMITS.MAX_EVENTS) {
-    const contentTypes = TIMELINE_HISTORY_CONTENT_TYPES as readonly string[];
+    const contentTypes = historyTypes.contentTypes;
     const content = trimmed.filter((event) => contentTypes.includes(event.type));
     const state = trimmed.filter((event) => !contentTypes.includes(event.type));
     const stateBudget = Math.max(0, TIMELINE_HISTORY_LIMITS.MAX_EVENTS - content.length);
@@ -7066,8 +7084,7 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
     afterTs: params.afterTs,
     beforeTs: params.beforeTs,
     maxResponseBytes: params.maxResponseBytes,
-    contentTypes: [...TIMELINE_HISTORY_CONTENT_TYPES],
-    stateTypes: [...TIMELINE_HISTORY_STATE_TYPES],
+    ...timelineHistoryTypesForFilter(params.contentFilter),
   }, { deadlineAt: Date.now() + 4_500 });
   const detailRefs = (result.detailCandidates ?? [])
     .map((candidate) => getDefaultTimelineDetailStore().put(candidate))
@@ -7139,7 +7156,11 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     return;
   }
 
-  const params: TimelineHistoryRequestParams = { sessionName, requestId, limit, afterTs, beforeTs, maxResponseBytes };
+  const contentFilter = isTimelineHistoryContentFilter(cmd.contentFilter) ? cmd.contentFilter : undefined;
+  const params: TimelineHistoryRequestParams = {
+    sessionName, requestId, limit, afterTs, beforeTs, maxResponseBytes,
+    ...(contentFilter ? { contentFilter } : {}),
+  };
   const tStart = Date.now();
   try {
     const result = await getTimelineHistoryResult(params);
@@ -7173,6 +7194,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       limit,
       afterTs,
       beforeTs,
+      ...(contentFilter ? { contentFilter } : {}),
       includeDetails: cmd.includeDetails === true,
       ...(requestedBudgetBytes !== undefined ? { requestedBudgetBytes } : {}),
       maxResponseBytes,

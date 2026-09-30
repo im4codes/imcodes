@@ -2054,6 +2054,22 @@ describe('WsClient', () => {
     client.disconnect();
   });
 
+  it('puts a text-only contentFilter on the wire and keeps it a different owner key from the unfiltered window', async () => {
+    const client = await connectClient();
+    lastWs!.send.mockClear();
+    const peek = client.sendTimelineHistoryRequest('deck_peek', 30, undefined, undefined, undefined, 256 * 1024, 'text');
+    const window = client.sendTimelineHistoryRequest('deck_peek', 30, undefined, undefined, undefined, 256 * 1024);
+    // Identical peeks single-flight; the unfiltered request with the same bounds is another read.
+    expect(client.sendTimelineHistoryRequest('deck_peek', 30, undefined, undefined, undefined, 256 * 1024, 'text')).toBe(peek);
+    expect(window).not.toBe(peek);
+    const messages = lastWs!.send.mock.calls.map(([raw]) => JSON.parse(String(raw)) as Record<string, unknown>)
+      .filter((message) => message.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+    expect(messages).toHaveLength(2);
+    expect(messages.find((message) => message.requestId === peek)).toMatchObject({ contentFilter: 'text', limit: 30, budgetBytes: 256 * 1024 });
+    expect(messages.find((message) => message.requestId === window)?.contentFilter).toBeUndefined();
+    client.disconnect();
+  });
+
   it('rate-limits unique owner data reads without blocking control traffic and emits a recoverable result', async () => {
     const client = await connectClient();
     const handler = vi.fn();

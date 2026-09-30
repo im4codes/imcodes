@@ -24,6 +24,7 @@ import {
   __getSharedTimelineBaseForTests,
   __resetLocalHistoryPruneStateForTests,
   __resetTimelineCacheForTests,
+  __setStaleWindowPeekMinAgeMsForTests,
   __setTimelineCacheForTests,
   __shouldRequestNewerTimelineCursorForTests,
   ingestTimelineEventForCache,
@@ -89,6 +90,8 @@ function createRawPreactHarness(): RawPreactHarness {
 
 describe('useTimeline window-isolated cache bounds', () => {
   beforeEach(() => {
+    // These fixtures seed ancient cache rows and count history requests; the stale-window tail peek has its own tests.
+    __setStaleWindowPeekMinAgeMsForTests(Infinity);
     __resetTimelineCacheForTests();
     __clearPersistedTimelineSnapshotsForTests();
     cleanup();
@@ -99,6 +102,7 @@ describe('useTimeline window-isolated cache bounds', () => {
   });
 
   afterEach(() => {
+    __setStaleWindowPeekMinAgeMsForTests(null);
     vi.useRealTimers();
     vi.restoreAllMocks();
   });

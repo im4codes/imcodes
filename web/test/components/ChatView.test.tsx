@@ -1615,6 +1615,32 @@ describe('ChatView', () => {
     expect(screen.queryByText('chat.load_older')).toBeNull();
   });
 
+  it('shows the earlier-messages-loading marker between the cached block and the stitched newest block, and drops it when the hole closes', () => {
+    const events = [
+      { eventId: 'old-1', type: 'assistant.text', ts: 1000, payload: { text: 'cached older message' } },
+      { eventId: 'old-2', type: 'user.message', ts: 1100, payload: { text: 'cached older question' } },
+      { eventId: 'new-1', type: 'assistant.text', ts: 900_000, payload: { text: 'stitched newest message' } },
+    ] as any;
+    const { container, rerender } = render(
+      <ChatView events={events} loading={false} historyGap={{ lowerTs: 1100, upperTs: 900_000 }} sessionId="deck_gap_marker_brain" />,
+    );
+
+    const marker = container.querySelector('[data-testid="chat-history-gap-marker"]');
+    expect(marker).not.toBeNull();
+    expect(marker!.textContent).toContain('chat.history_gap_loading');
+    // It is a row of the list itself: after the cached rows, before the newest one.
+    const rows = [...container.querySelectorAll('.chat-virtual-item, [data-testid="chat-history-gap-marker"], .chat-event, .chat-assistant-block')];
+    const text = container.textContent ?? '';
+    expect(text.indexOf('cached older question')).toBeLessThan(text.indexOf('chat.history_gap_loading'));
+    expect(text.indexOf('chat.history_gap_loading')).toBeLessThan(text.indexOf('stitched newest message'));
+    expect(rows.length).toBeGreaterThan(0);
+    // Reader-anchor capture only looks at event rows: the marker must not be one.
+    expect(marker!.getAttribute('data-event-id')).toBeNull();
+
+    rerender(<ChatView events={events} loading={false} historyGap={null} sessionId="deck_gap_marker_brain" />);
+    expect(container.querySelector('[data-testid="chat-history-gap-marker"]')).toBeNull();
+  });
+
   it('renders history fetch progress as a bottom overlay instead of footer layout content', () => {
     const { container } = render(
       <ChatView

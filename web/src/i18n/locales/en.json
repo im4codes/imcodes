@@ -348,6 +348,7 @@
     "session_state": "Session {{state}}",
     "load_older": "Load older messages",
     "loading_older": "Loading...",
+    "history_gap_loading": "Earlier messages are still loading…",
     "refreshing_history": "Updating history…",
     "timelineStatus": {
       "ok": "History updated",
