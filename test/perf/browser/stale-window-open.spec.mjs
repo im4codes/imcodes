@@ -133,8 +133,11 @@ async function countIdbRows(page) {
   }, { dbName: DB_NAME, storeName: STORE_NAME, key: cacheKey }).catch(() => -1);
 }
 
-// Scenario modes: pinned | reading | fling (reading + real touch flings) | pinned-stream | reading-stream.
-const isPinnedMode = (mode) => mode === 'pinned' || mode === 'pinned-stream';
+// Scenario modes: pinned | reading | fling (reading + real touch flings) | pinned-stream | reading-stream |
+// reload (pinned; the page is reloaded mid-backfill and must resume the recorded hole where it stopped).
+const isPinnedMode = (mode) => mode === 'pinned' || mode === 'pinned-stream' || mode === 'reload';
+const RELOAD_AFTER_PAGES = 6;
+const isHolePage = (request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null && request.afterTs !== null && request.afterTs !== undefined;
 const isStreamMode = (mode) => mode.endsWith('-stream');
 
 async function runScenario(browser, mode) {
@@ -222,6 +225,21 @@ async function runScenario(browser, mode) {
       await page.waitForTimeout(250);
     }
   };
+  let reloadInfo = null;
+  if (mode === 'reload') {
+    await waitForBackfillUnderway();
+    let pagesBefore = [];
+    for (let attempt = 0; attempt < 240 && pagesBefore.length < RELOAD_AFTER_PAGES; attempt += 1) {
+      pagesBefore = (await readRequestLog()).slice(before).filter(isHolePage);
+      if (pagesBefore.length < RELOAD_AFTER_PAGES) await page.waitForTimeout(250);
+    }
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 });
+    await page.waitForSelector('.chat-view', { timeout: 60_000 });
+    const gapAfterReload = await page.evaluate((key) => {
+      try { return JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}')[key] ?? null; } catch { return null; }
+    }, cacheKey);
+    reloadInfo = { pagesBeforeReload: pagesBefore.length, lastPageBeforeReloadBeforeTs: pagesBefore.at(-1)?.beforeTs ?? null, gapAfterReload };
+  }
   if (!isPinnedMode(mode)) {
     await waitForBackfillUnderway();
     await page.waitForTimeout(1200);
@@ -358,6 +376,7 @@ async function runScenario(browser, mode) {
     }
   }
   if (flinging) result.fling = analyzeFling(layout.frames, layout.writes, flingCount);
+  if (reloadInfo) result.reload = reloadInfo;
   const gapRecord = await page.evaluate(() => {
     try { return JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}'); } catch { return {}; }
   });
@@ -393,7 +412,7 @@ function analyzeFling(frames, writes, flings) {
   return { flings, frames: frames.length, writes: writes.length, maxJumpPx: Math.round(maxJumpPx * 100) / 100, jumpAtMs: jumpAt, activeWrites: active.length, activeWriteSamples: active.slice(0, 8) };
 }
 
-function analyzeOrder(requests, wsTiming) {
+function analyzeOrder(requests, wsTiming, allowRepeat = false) {
   // Wire order from the phone: the peek and the newest-window request leave in the same tick, so their ARRIVAL order at the
   // daemon is a network race; what the app controls is that the peek is sent first.
   const peekFirst = wsTiming.peekSentAt !== null && wsTiming.firstHistorySentAt !== null && wsTiming.peekSentAt <= wsTiming.firstHistorySentAt + PEEK_SAME_TICK_MS
@@ -402,7 +421,8 @@ function analyzeOrder(requests, wsTiming) {
   // The hole's own pages carry the recorded floor (afterTs); a later manual/refresh round is not part of the fill.
   const bounded = requests.filter((request) => request.beforeTs !== null && request.beforeTs !== undefined && request.contentFilter === null && request.afterTs !== null && request.afterTs !== undefined);
   let descending = true;
-  for (let i = 1; i < bounded.length; i += 1) if (!(bounded[i].beforeTs < bounded[i - 1].beforeTs)) descending = false;
+  // After a reload the resumed fill may repeat the page that was in flight when the page went away (never one above it).
+  for (let i = 1; i < bounded.length; i += 1) if (!(allowRepeat ? bounded[i].beforeTs <= bounded[i - 1].beforeTs : bounded[i].beforeTs < bounded[i - 1].beforeTs)) descending = false;
   // No hole between consecutive pages: each page's newest event reaches the previous page's oldest one (the +1 overlap).
   let contiguous = bounded.length > 0;
   for (let i = 1; i < bounded.length; i += 1) if (!(bounded[i].newestTs >= bounded[i - 1].oldestTs)) contiguous = false;
@@ -415,7 +435,7 @@ const scenarios = {};
 try {
   for (const mode of (process.env.IMC_PERF_STALE_MODES ?? 'pinned,reading').split(',')) {
     scenarios[mode] = await runScenario(browser, mode);
-    scenarios[mode].order = analyzeOrder(scenarios[mode].requests, scenarios[mode].wsTiming);
+    scenarios[mode].order = analyzeOrder(scenarios[mode].requests, scenarios[mode].wsTiming, mode === 'reload');
   }
 } finally {
   await browser.close();
@@ -443,6 +463,15 @@ for (const [mode, scenario] of Object.entries(scenarios)) {
     if (result.flings < MIN_FLINGS) failures.push(`fling: only ${result.flings} flings landed while pages arrived (need ${MIN_FLINGS})`);
     if (result.maxJumpPx > DRIFT_BUDGET_PX) failures.push(`fling: an on-screen row jumped ${result.maxJumpPx} px with no scroll or write to account for it (budget ${DRIFT_BUDGET_PX})`);
     if (result.activeWrites > 0) failures.push(`fling: ${result.activeWrites} programmatic scrollTop write(s) while the finger/momentum owned the scroller: ${JSON.stringify(result.activeWriteSamples)}`);
+  }
+  if (mode === 'reload') {
+    const { reload } = scenario;
+    const pages = scenario.requests.filter(isHolePage);
+    const resumed = pages[reload.pagesBeforeReload];
+    if (reload.pagesBeforeReload < RELOAD_AFTER_PAGES) failures.push(`reload: only ${reload.pagesBeforeReload} hole pages landed before the reload (need ${RELOAD_AFTER_PAGES})`);
+    if (!reload.gapAfterReload || reload.gapAfterReload.upperTs === null || reload.gapAfterReload.upperTs === undefined) failures.push(`reload: the hole was not persisted with its stitched top across the reload (${JSON.stringify(reload.gapAfterReload)})`);
+    // RESUME, not restart: the first hole page after the reload continues at (or just below) where the fill stopped.
+    else if (!resumed || resumed.beforeTs > reload.gapAfterReload.upperTs + 1 || resumed.beforeTs >= pages[0].beforeTs) failures.push(`reload: the fill did not resume where it stopped (recorded top ${reload.gapAfterReload.upperTs}, first page after reload beforeTs ${resumed?.beforeTs}, first page overall ${pages[0]?.beforeTs})`);
   }
   if (isStreamMode(mode) && scenario.streamedFrames < MIN_STREAM_FRAMES) failures.push(`${mode}: only ${scenario.streamedFrames} streaming frame(s) reached the phone while the pages landed (need ${MIN_STREAM_FRAMES}); the scenario did not exercise streaming`);
 }
