@@ -54,7 +54,7 @@ const VARIANTS = [
 
 /** Installed in the page (after installDriver). */
 export function installFlickerProbe() {
-  const P = { recording: false, frames: [], painted: [], ids: new WeakMap(), nextId: 1, identity: new Map(), acc: null, animStarts: [], scrollWrites: [], lastLen: new Map(), remounts: [], removedLog: [] };
+  const P = { recording: false, frames: [], painted: [], ids: new WeakMap(), nextId: 1, identity: new Map(), acc: null, animStarts: [], scrollWrites: [], lastLen: new Map(), lastText: new Map(), shrinkLog: [], remounts: [], removedLog: [] };
   window.__flicker = P;
   const idOf = (node) => { let v = P.ids.get(node); if (v === undefined) { v = P.nextId; P.nextId += 1; P.ids.set(node, v); } return v; };
   // Fixture: the single real ChatView and the driver's streaming event. Real app
@@ -133,6 +133,10 @@ export function installFlickerProbe() {
     const rich = event?.querySelector('.chat-rich-text') ?? null;
     const mode = !rich ? 'empty' : (rich.children.length === 1 && rich.firstElementChild.tagName === 'SPAN' ? 'raw' : 'markdown');
     const prevLen = P.lastLen.get(sk) ?? 0;
+    const text = event?.textContent ?? '';
+    const prevText = P.lastText.get(sk) ?? '';
+    if (len < prevLen && prevText && P.shrinkLog.length < 6) P.shrinkLog.push({ t: performance.now(), key: sk, prevLen, len, prevHead: prevText.slice(0, 90), prevTail: prevText.slice(-90), nowHead: text.slice(0, 90), nowTail: text.slice(-90) });
+    P.lastText.set(sk, text);
     P.lastLen.set(sk, Math.max(prevLen, len));
     const rect = wrapper?.getBoundingClientRect();
     return {
@@ -157,17 +161,17 @@ export function installFlickerProbe() {
     if (s) { s.acc = null; P.painted.push(s); }
   };
   const paintedTick = () => { requestAnimationFrame(paintedTick); if (P.recording) channel.port2.postMessage(0); };
-  P.begin = () => { P.frames = []; P.painted = []; P.animStarts = []; P.scrollWrites = []; P.remounts = []; P.removedLog = []; P.identity = new Map(); P.lastLen = new Map(); P.acc = newAcc(); P.recording = true; if (!P.started) { P.started = true; requestAnimationFrame(tick); requestAnimationFrame(paintedTick); } };
+  P.begin = () => { P.frames = []; P.painted = []; P.animStarts = []; P.scrollWrites = []; P.remounts = []; P.removedLog = []; P.lastText = new Map(); P.shrinkLog = []; P.identity = new Map(); P.lastLen = new Map(); P.acc = newAcc(); P.recording = true; if (!P.started) { P.started = true; requestAnimationFrame(tick); requestAnimationFrame(paintedTick); } };
   P.end = () => {
     P.recording = false;
     const identity = {}; for (const [k, set] of P.identity) identity[k] = set.size;
-    return { frames: P.frames, painted: P.painted, animStarts: P.animStarts, scrollWrites: P.scrollWrites, identity, remountEvents: P.remounts, removedLog: P.removedLog };
+    return { frames: P.frames, painted: P.painted, animStarts: P.animStarts, scrollWrites: P.scrollWrites, identity, remountEvents: P.remounts, removedLog: P.removedLog, shrinkLog: P.shrinkLog };
   };
 }
 
 function sum(frames, bucket, field) { return frames.reduce((a, f) => a + (f.acc?.[bucket]?.[field] ?? 0), 0); }
 
-export function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog }) {
+export function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog, shrinkLog }) {
   // Identity: distinct DOM nodes per (stream, part); >1 means the node was re-created while streaming.
   const remounts = { wrapper: 0, event: 0, text: 0, near: 0 };
   const perPart = [];
@@ -244,7 +248,7 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
   const nonPin = scrollWrites.filter((w) => w.via === 'scrollTop').length;
   return {
     frames: frames.length, paintedFrames: painted.length, streamsSeen: new Set(frames.map((f) => f.key).filter(Boolean)).size,
-    remounts, remountDetail: perPart.slice(0, 10), remountEvents: (remountEvents ?? []).slice(0, 8), removedElements: removedLog ?? [],
+    remounts, remountDetail: perPart.slice(0, 10), remountEvents: (remountEvents ?? []).slice(0, 8), removedElements: removedLog ?? [], shrinkLog: shrinkLog ?? [],
     mutations: {
       stream: { elAdd: sum(frames, 'stream', 'elAdd'), elDel: sum(frames, 'stream', 'elDel'), txtAdd: sum(frames, 'stream', 'txtAdd'), txtDel: sum(frames, 'stream', 'txtDel'), chr: sum(frames, 'stream', 'chr'), attr: sum(frames, 'stream', 'attr') },
       near: { elAdd: sum(frames, 'near', 'elAdd'), elDel: sum(frames, 'near', 'elDel'), txtAdd: sum(frames, 'near', 'txtAdd'), txtDel: sum(frames, 'near', 'txtDel'), chr: sum(frames, 'near', 'chr'), attr: sum(frames, 'near', 'attr') },
