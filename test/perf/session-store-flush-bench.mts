@@ -9,14 +9,19 @@
  * few KB, and most are well under 1 KB. The store lives in a throwaway home;
  * the real ~/.imcodes is never read or written.
  *
- * It measures what the daemon's event loop pays for one mutation followed by
- * its debounced flush: the event loop's active time across the flush
- * (performance.eventLoopUtilization) and its worst stall
- * (monitorEventLoopDelay). The mutation itself only re-arms a timer; the cost
- * is the flush, so "per mutation" here means one mutation plus the flush it
- * causes -- the worst case the debounce ever produces.
+ * It measures what the daemon pays for one mutation followed by the debounced
+ * flush it causes: the event loop's active time across the whole debounce
+ * window (performance.eventLoopUtilization), its worst stall
+ * (monitorEventLoopDelay) and the bytes written. `--mode flush` measures an
+ * explicit flushStore() instead (the shutdown path).
+ *
+ * It only uses the store's public API, so it runs unchanged against the JSON
+ * store (base) and the SQLite store: bytes are the WAL growth per flush for
+ * SQLite (a side connection truncates the WAL before each mutation), and the
+ * sessions.json rewrite plus the .1 backup copy for the JSON store.
  */
-import { mkdtempSync, rmSync, statSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, statSync, writeFileSync, mkdirSync, existsSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { monitorEventLoopDelay, performance } from 'node:perf_hooks';
@@ -25,7 +30,9 @@ const args = new Map<string, string>();
 for (let i = 2; i < process.argv.length; i += 2) args.set(process.argv[i]!.replace(/^--/, ''), process.argv[i + 1] ?? '');
 const SESSIONS = Number(args.get('sessions') ?? 300);
 const ITERATIONS = Number(args.get('iterations') ?? 60);
+const MODE = args.get('mode') ?? 'debounce';
 const WARMUP = 5;
+const DEBOUNCE_WAIT_MS = 700;
 
 // The store lives in `$HOME/.imcodes`: point HOME at a throwaway directory.
 const fakeHome = mkdtempSync(join(tmpdir(), 'imcodes-store-bench-'));
@@ -78,10 +85,10 @@ for (let i = 0; i < SESSIONS; i += 1) {
 mkdirSync(home, { recursive: true });
 writeFileSync(join(home, 'sessions.json'), JSON.stringify({ version: 2, sessions, identityPrompts: {} }, null, 2));
 
+const fileBytes = statSync(join(home, 'sessions.json')).size; // the legacy-format fixture (the SQLite store migrates and freezes it)
 const store = await import('../../src/store/session-store.js');
 await store.loadStore({ probe: false });
 const names = Object.keys(sessions);
-const fileBytes = statSync(join(home, 'sessions.json')).size;
 
 const stats = (values: number[]) => {
   const sorted = [...values].sort((a, b) => a - b);
@@ -89,28 +96,44 @@ const stats = (values: number[]) => {
   return { mean: +mean.toFixed(2), p50: +sorted[Math.floor(sorted.length * 0.5)]!.toFixed(2), p95: +sorted[Math.floor(sorted.length * 0.95)]!.toFixed(2), max: +sorted.at(-1)!.toFixed(2) };
 };
 
+const sqlitePath = join(home, 'sessions.sqlite');
+const usesSqlite = existsSync(sqlitePath);
+const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+const sideConnection = usesSqlite ? new DatabaseSync(sqlitePath) : null;
+const sizeOf = (path: string) => { try { return statSync(path).size; } catch { return 0; } };
+const bytes: number[] = [];
+
 async function oneFlush(i: number): Promise<{ busyMs: number; wallMs: number }> {
   const name = names[(i * 37) % names.length]!;
+  sideConnection?.exec('PRAGMA wal_checkpoint(TRUNCATE)');
   const before = performance.eventLoopUtilization();
   const started = performance.now();
   store.updateSessionState(name, i % 2 === 0 ? 'running' : 'idle');
-  await store.flushStore();
+  if (MODE === 'flush') await store.flushStore();
+  else await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_WAIT_MS)); // the 500 ms debounce fires and its write completes
   const wallMs = performance.now() - started;
   const delta = performance.eventLoopUtilization(before);
+  bytes.push(usesSqlite ? sizeOf(`${sqlitePath}-wal`) : fileBytes * 2);
   return { busyMs: delta.active, wallMs };
 }
 
 for (let i = 0; i < WARMUP; i += 1) await oneFlush(i);
 
-const delay = monitorEventLoopDelay({ resolution: 1 });
-delay.enable();
+// Two passes: the delay histogram wakes the loop every millisecond, which would itself add
+// active time across a 700 ms debounce window. Pass 1 measures busy time with no monitor;
+// pass 2 measures the worst stall with the monitor and reports no busy time.
 const busy: number[] = [];
 const wall: number[] = [];
 for (let i = 0; i < ITERATIONS; i += 1) {
   const result = await oneFlush(WARMUP + i);
   busy.push(result.busyMs);
   wall.push(result.wallMs);
-  // A short quiet gap so the delay histogram sees the loop idle between flushes, as production does.
+  await new Promise((resolve) => setTimeout(resolve, 5));
+}
+const delay = monitorEventLoopDelay({ resolution: 1 });
+delay.enable();
+for (let i = 0; i < ITERATIONS; i += 1) {
+  await oneFlush(WARMUP + ITERATIONS + i);
   await new Promise((resolve) => setTimeout(resolve, 5));
 }
 delay.disable();
@@ -134,7 +157,10 @@ const listProjectMicros = ((performance.now() - listProjectStart) / LISTS) * 100
 console.log(JSON.stringify({
   sessions: SESSIONS,
   fileBytes,
+  storage: usesSqlite ? 'sqlite' : 'json',
+  mode: MODE,
   iterations: ITERATIONS,
+  bytesWrittenPerFlush: stats(bytes.slice(WARMUP, WARMUP + ITERATIONS)),
   flushMainThreadBusyMs: stats(busy),
   flushWallMs: stats(wall),
   worstEventLoopStallMs: +(delay.max / 1e6).toFixed(2),

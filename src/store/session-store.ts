@@ -1,4 +1,5 @@
-import { copyFile, mkdir, open, readFile, rename, stat } from 'node:fs/promises';
+import { statSync } from 'node:fs';
+import { mkdir, readFile, rename, rm } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { dirname, join } from 'path';
 import { homedir } from 'os';
@@ -19,6 +20,26 @@ import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
 import { emitSessionStateProbeCorrection } from './session-state-probe-events.js';
+import {
+  SESSION_DB_FILE,
+  SESSION_DB_LEGACY_IMPORT_DONE,
+  SESSION_DB_META_LEGACY_IMPORT,
+  EmptyStoreRefusal,
+  closeSessionDb,
+  commitSessionChanges,
+  countSessionRows,
+  countSnapshotRows,
+  importLegacySessions,
+  markLegacyImportDone,
+  openSessionDbForWrite,
+  openSessionDbReadOnly,
+  readSessionDbMeta,
+  readSessionPayloads,
+  readSnapshotPayloads,
+  snapshotSessionDb,
+  type SessionDbHandle,
+  type SessionDbRow,
+} from './session-store-db.js';
 import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { assertNotRealImcodesPathInTests, isRealImcodesPath, isUnderTestRunner } from '../util/test-home-guard.js';
 import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type DaemonProcessIdentity } from '../daemon/instance-lock.js';
@@ -27,34 +48,41 @@ import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-
 
 const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
-const IDENTITY_PROMPT_REF_PREFIX = 'p';
-const SESSION_STORE_BACKUP_COUNT = 5;
+/** The pre-SQLite snapshot: read once by the migration, then frozen under this suffix. */
+const LEGACY_JSON_FILE = 'sessions.json';
+const LEGACY_JSON_FROZEN_SUFFIX = '.migrated-to-sqlite';
+const LEGACY_JSON_BACKUP_COUNT = 5;
 /**
- * Serialisation runs in slices of at most this long, yielding to the event loop
- * between them, so a 1.4 MB store never blocks the daemon for one long turn.
+ * Records mutated in place through getSession() (no store call announces them)
+ * are picked up by a full compare of every row against what was last written.
+ * That compare serialises the whole store, so it runs at most this often on a
+ * flush, and always on an explicit flushStore() (shutdown).
  */
-let serializeSliceMs = 2;
-/** Batches written to the temporary file are at least this large (fewer syscalls, still sliced). */
-const WRITE_BATCH_BYTES = 256 * 1024;
-/**
- * A file this process wrote itself is trusted (its session count is not
- * re-derived by parsing it) while its size, mtime and inode are unchanged --
- * but never for longer than this, so a same-signature replacement is still
- * caught by a full parse within the minute.
- */
-const KNOWN_FILE_TRUST_MS = 60_000;
+const FULL_SWEEP_INTERVAL_MS = 30_000;
+/** The sweep serialises in slices of at most this long, yielding between them. */
+let sweepSliceMs = 2;
+/** An online snapshot of the database is taken at most this often; the newest few are kept. */
+let backupIntervalMs = 60 * 60 * 1000;
+const SESSION_DB_BACKUP_COUNT = 3;
 
-/** Test seam: slice budget in ms (0 yields after every record). */
-export function setSessionStoreSerializeSliceMsForTests(ms: number | undefined): void {
-  serializeSliceMs = ms ?? 2;
+/** Test seams. */
+export function setSessionStoreSweepSliceMsForTests(ms: number | undefined): void {
+  sweepSliceMs = ms ?? 2;
+}
+export function setSessionStoreBackupIntervalMsForTests(ms: number | undefined): void {
+  backupIntervalMs = ms ?? 60 * 60 * 1000;
 }
 
 function storeDir(): string {
   return join(homedir(), '.imcodes');
 }
 
-function storePath(): string {
-  return join(storeDir(), 'sessions.json');
+function dbPath(): string {
+  return join(storeDir(), SESSION_DB_FILE);
+}
+
+function legacyJsonPath(): string {
+  return join(storeDir(), LEGACY_JSON_FILE);
 }
 
 export type SessionState = 'running' | 'idle' | 'error' | 'stopped';
@@ -261,6 +289,7 @@ interface PersistedSessionRecord extends Omit<SessionRecord, 'identityPrompt'> {
   identityPromptRef?: string;
 }
 
+/** The pre-SQLite sessions.json shape, read only by the one-time migration and the unmigrated read-only fallback. */
 interface PersistedSessionStoreV2 {
   version: typeof SESSION_STORE_DISK_VERSION;
   sessions: Record<string, PersistedSessionRecord>;
@@ -288,18 +317,25 @@ let pendingWrite: Promise<void> | null = null;
 let store: SessionStore = { sessions: {} };
 let storeLoaded = false;
 let storeWriteAuthority: SessionStoreWriteAuthority | null = null;
-/** What this process last wrote to sessions.json, so a steady-state flush does not re-read and re-parse it. */
-interface KnownStoreFile { path: string; size: number; mtimeMs: number; ino: number; sessionCount: number; verifiedAt: number }
-let knownStoreFile: KnownStoreFile | null = null;
+/** The writer connection: only a process with write authority ever opens one. */
+let writerDb: SessionDbHandle | null = null;
+/** name -> payload of every row as last committed by (or loaded into) this process. */
+let committedPayloads = new Map<string, string>();
+/** Sessions changed through the store API since the last commit: the only rows a normal flush touches. */
+const dirtyNames = new Set<string>();
+let lastFullSweepAt = 0;
+let fullSweepRequested = true;
+let lastBackupAt = 0;
+let backupInFlight: Promise<void> | null = null;
 let allowEmptyStoreWrite = false;
 let warnedReadOnlyWrite = false;
 /**
  * Set once by the daemon after its startup load: from then on this process's
- * in-memory store is the authority for sessions.json, and a read-only refresh
- * (`loadStore({ probe: false })`, e.g. the in-daemon send_message target list)
- * must never replace it with whatever happens to be on disk. Replacing it let a
- * foreign/partial sessions.json silently wipe the daemon's live main sessions,
- * which the daemon then persisted.
+ * in-memory store is the authority for the persisted sessions, and a read-only
+ * refresh (`loadStore({ probe: false })`, e.g. the in-daemon send_message
+ * target list) must never replace it with whatever happens to be on disk.
+ * Replacing it let a foreign/partial snapshot silently wipe the daemon's live
+ * main sessions, which the daemon then persisted.
  */
 let storeAuthoritative = false;
 
@@ -335,8 +371,15 @@ export function resetSessionStoreAuthorityForTests(): void {
   storeLoaded = false;
   allowEmptyStoreWrite = false;
   warnedReadOnlyWrite = false;
-  knownStoreFile = null;
-  serializeSliceMs = 2;
+  closeSessionDb(writerDb);
+  writerDb = null;
+  committedPayloads = new Map();
+  dirtyNames.clear();
+  lastFullSweepAt = 0;
+  fullSweepRequested = true;
+  lastBackupAt = 0;
+  sweepSliceMs = 2;
+  backupIntervalMs = 60 * 60 * 1000;
 }
 
 function isPersistableSessionRecord(record: SessionRecord): boolean {
@@ -346,82 +389,6 @@ function isPersistableSessionRecord(record: SessionRecord): boolean {
     projectDir: record.projectDir,
     parentSession: record.parentSession,
   });
-}
-
-interface SerializedStore {
-  /** The file text, in pieces; joined it is exactly `JSON.stringify(persistedStore, null, 2)`. */
-  chunks: string[];
-  /** Persistable sessions in the snapshot: what the empty-overwrite guard compares. */
-  sessionCount: number;
-}
-
-const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
-
-/** One record as a member of a two-space-indented object nested one level down. */
-function indentedMember(name: string, value: unknown): string {
-  return `    ${JSON.stringify(name)}: ${JSON.stringify(value, null, 2).replace(/\n/g, '\n    ')}`;
-}
-
-/**
- * The store as JSON text, byte-identical to serialising the whole persisted
- * object at once, built one record at a time. With `cooperative` the loop
- * yields to the event loop whenever a slice has used its budget, so the main
- * thread is never held for the whole store; a record mutated meanwhile is either
- * in this snapshot or in the flush that mutation schedules.
- */
-async function serializeStoreChunks(cooperative: boolean): Promise<SerializedStore> {
-  const promptRefs = new Map<string, string>();
-  const promptMembers: string[] = [];
-  const sessionMembers: string[] = [];
-  let sliceStart = performance.now();
-
-  for (const [name, record] of Object.entries(store.sessions)) {
-    if (!isPersistableSessionRecord(record)) continue;
-    const { identityPrompt, ...persistedRecord } = record;
-    if (typeof identityPrompt === 'string') {
-      let promptRef = promptRefs.get(identityPrompt);
-      if (promptRef === undefined) {
-        promptRef = `${IDENTITY_PROMPT_REF_PREFIX}${promptRefs.size}`;
-        promptRefs.set(identityPrompt, promptRef);
-        promptMembers.push(indentedMember(promptRef, identityPrompt));
-      }
-      sessionMembers.push(indentedMember(name, { ...persistedRecord, identityPromptRef: promptRef }));
-    } else {
-      sessionMembers.push(indentedMember(name, persistedRecord));
-    }
-    if (cooperative && performance.now() - sliceStart >= serializeSliceMs) {
-      await yieldToEventLoop();
-      sliceStart = performance.now();
-    }
-  }
-
-  const object = (members: string[]): string => (members.length === 0 ? '{}' : `{\n${members.join(',\n')}\n  }`);
-  const chunks: string[] = [`{\n  "version": ${SESSION_STORE_DISK_VERSION},\n  "sessions": ${sessionMembers.length === 0 ? '{}' : '{\n'}`];
-  if (sessionMembers.length > 0) {
-    let batch = '';
-    for (let i = 0; i < sessionMembers.length; i += 1) {
-      batch += `${i === 0 ? '' : ',\n'}${sessionMembers[i]}`;
-      if (batch.length >= WRITE_BATCH_BYTES) { chunks.push(batch); batch = ''; }
-    }
-    if (batch) chunks.push(batch);
-    chunks.push('\n  }');
-  }
-  chunks.push(`,\n  "identityPrompts": ${object(promptMembers)}\n}`);
-  return { chunks, sessionCount: sessionMembers.length };
-}
-
-/** Test seam: the exact text a flush would write for the current in-memory store. */
-export async function serializeSessionStoreForTests(): Promise<string> {
-  return (await serializeStoreChunks(false)).chunks.join('');
-}
-
-function persistedSessionCount(raw: string): number | null {
-  try {
-    const hydrated = hydrateStore(JSON.parse(raw));
-    return hydrated ? Object.keys(hydrated.store.sessions).length : null;
-  } catch {
-    return null;
-  }
 }
 
 function testSessionWouldTouchRealStore(targetPath: string): boolean {
@@ -434,7 +401,7 @@ function testSessionWouldTouchRealStore(targetPath: string): boolean {
 }
 
 function hasWriteAuthority(targetPath: string): boolean {
-  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
+  assertNotRealImcodesPathInTests(targetPath, SESSION_DB_FILE);
   if (testSessionWouldTouchRealStore(targetPath)) {
     throw new Error(`refusing to persist test-looking sessions in the real ~/.imcodes (${targetPath})`);
   }
@@ -463,19 +430,54 @@ function hasWriteAuthority(targetPath: string): boolean {
   return true;
 }
 
-async function readNewestBackup(targetPath: string): Promise<{ store: SessionStore; legacy: boolean } | null> {
-  for (let index = 1; index <= SESSION_STORE_BACKUP_COUNT; index += 1) {
+/** The newest non-empty pre-SQLite rotated backup (sessions.json.1-.5): a migration source when sessions.json is missing or empty. */
+async function readNewestLegacyJsonBackup(jsonPath: string): Promise<{ store: SessionStore; legacy: boolean } | null> {
+  for (let index = 1; index <= LEGACY_JSON_BACKUP_COUNT; index += 1) {
     try {
-      const raw = await readFile(`${targetPath}.${index}`, 'utf8');
+      const raw = await readFile(`${jsonPath}.${index}`, 'utf8');
       const hydrated = hydrateStore(JSON.parse(raw));
       if (hydrated && Object.keys(hydrated.store.sessions).length > 0) return hydrated;
     } catch {
-      // A missing or partially-written older backup is skipped. The next
-      // rotation remains usable and startup must never fail just because one
-      // historical snapshot is corrupt.
+      // A missing or partially-written older backup is skipped; startup must
+      // never fail just because one historical snapshot is corrupt.
     }
   }
   return null;
+}
+
+/** One session as a database row. The record is stored whole, as compact JSON. */
+function rowFromRecord(name: string, record: SessionRecord): SessionDbRow | null {
+  let payload: string;
+  try {
+    payload = JSON.stringify(record);
+  } catch (error) {
+    // One unserialisable record must not stop every other session persisting.
+    logger.error({ err: error, session: name }, 'Session record cannot be serialised; skipped');
+    return null;
+  }
+  return {
+    name,
+    projectName: typeof record.projectName === 'string' ? record.projectName : '',
+    parentSession: typeof record.parentSession === 'string' ? record.parentSession : null,
+    agentType: typeof record.agentType === 'string' ? record.agentType : '',
+    state: typeof record.state === 'string' ? record.state : '',
+    updatedAt: typeof record.updatedAt === 'number' && Number.isFinite(record.updatedAt) ? record.updatedAt : 0,
+    payload,
+  };
+}
+
+/** Rows read from the database, as records. A row that no longer parses is skipped, never fatal. */
+function recordsFromPayloads(payloads: Map<string, string>): Record<string, SessionRecord> {
+  const sessions: Record<string, SessionRecord> = {};
+  for (const [name, payload] of payloads) {
+    try {
+      const parsed = JSON.parse(payload) as unknown;
+      if (isObjectRecord(parsed)) sessions[name] = parsed as unknown as SessionRecord;
+    } catch (error) {
+      logger.error({ err: error, session: name }, 'Session row is not valid JSON; skipped');
+    }
+  }
+  return sessions;
 }
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
@@ -521,68 +523,175 @@ function pruneNonPersistableSessions(): boolean {
   return Object.keys(store.sessions).length !== before;
 }
 
+/** The writer connection for `targetPath`, opened (and the schema created) on first use. */
+function writerHandle(targetPath: string): SessionDbHandle {
+  if (writerDb && writerDb.path === targetPath) return writerDb;
+  // HOME rotates between test workers: what was committed to another database says nothing about this one.
+  closeSessionDb(writerDb);
+  writerDb = null;
+  committedPayloads = new Map();
+  dirtyNames.clear();
+  fullSweepRequested = true;
+  lastBackupAt = 0;
+  writerDb = openSessionDbForWrite(targetPath);
+  return writerDb;
+}
+
+/**
+ * One-time import of the pre-SQLite sessions.json, on the first start of a
+ * build that has the database. Atomic (rows and the "imported" marker commit
+ * together), idempotent, and safe to retry after an interruption. The file is
+ * frozen under a new name afterwards as a rollback export and never read again.
+ * An unreadable file is reported and left exactly where it is.
+ */
+async function migrateLegacyJson(handle: SessionDbHandle): Promise<void> {
+  if (readSessionDbMeta(handle, SESSION_DB_META_LEGACY_IMPORT) === SESSION_DB_LEGACY_IMPORT_DONE) return;
+  const jsonPath = legacyJsonPath();
+  let source: { store: SessionStore; legacy: boolean } | null = null;
+  let unreadable = false;
+  let sourceIsFile = false;
+  try {
+    const raw = await readFile(jsonPath, 'utf8');
+    try {
+      source = hydrateStore(JSON.parse(raw));
+      sourceIsFile = source !== null;
+      if (!source) unreadable = true;
+    } catch {
+      unreadable = true;
+    }
+  } catch (err) {
+    if ((err as { code?: string } | null)?.code !== 'ENOENT') unreadable = true;
+  }
+  if (unreadable) {
+    logger.error({ jsonPath }, 'sessions.json could not be read for migration to SQLite; it is left untouched');
+  }
+  if (!source || Object.keys(source.store.sessions).length === 0) {
+    const backup = await readNewestLegacyJsonBackup(jsonPath);
+    if (backup) {
+      source = backup;
+      sourceIsFile = false;
+      logger.warn({ jsonPath }, 'sessions.json was missing or empty; migrating the newest non-empty backup instead');
+    }
+  }
+  // Retry on the next start rather than record "nothing to migrate" for a file we could not read.
+  if (unreadable && (!source || Object.keys(source.store.sessions).length === 0)) return;
+  const rows: SessionDbRow[] = [];
+  for (const [name, record] of Object.entries(source?.store.sessions ?? {})) {
+    if (!isObjectRecord(record)) continue;
+    const row = rowFromRecord(name, record as unknown as SessionRecord);
+    if (row) rows.push(row);
+  }
+  if (rows.length === 0) {
+    markLegacyImportDone(handle);
+  } else {
+    const result = importLegacySessions(handle, rows);
+    if ('imported' in result) logger.info({ imported: result.imported }, 'Migrated sessions.json to SQLite');
+    else logger.warn({ skipped: result.skipped }, 'sessions.json import skipped');
+  }
+  if (sourceIsFile) {
+    try { await rename(jsonPath, `${jsonPath}${LEGACY_JSON_FROZEN_SUFFIX}`); } catch { /* frozen export is best effort; the marker already says the file is never read again */ }
+  }
+}
+
+/** An empty database with a usable snapshot beside it: restore the newest non-empty one. */
+function restoreFromDatabaseSnapshot(handle: SessionDbHandle, targetPath: string): Map<string, string> | null {
+  for (let index = 1; index <= SESSION_DB_BACKUP_COUNT; index += 1) {
+    const snapshot = `${targetPath}.bak.${index}`;
+    if (!countSnapshotRows(snapshot)) continue;
+    const payloads = readSnapshotPayloads(snapshot);
+    if (!payloads || payloads.size === 0) continue;
+    const upserts: SessionDbRow[] = [];
+    for (const [name, payload] of payloads) {
+      try {
+        const row = rowFromRecord(name, JSON.parse(payload) as SessionRecord);
+        if (row) upserts.push(row);
+      } catch { /* a bad row in an old snapshot is skipped */ }
+    }
+    if (upserts.length === 0) continue;
+    commitSessionChanges(handle, { upserts, deletes: [], allowEmpty: true });
+    logger.warn({ snapshot, restored: upserts.length }, 'Session store was empty; restored the newest non-empty database snapshot');
+    return new Map(upserts.map((row) => [row.name, row.payload]));
+  }
+  return null;
+}
+
+/** Read-only consumers: the database when it has been migrated, else the pre-SQLite file (never written). */
+async function readWithoutAuthority(targetPath: string): Promise<Record<string, SessionRecord> | null> {
+  const reader = openSessionDbReadOnly(targetPath);
+  try {
+    if (reader && readSessionDbMeta(reader, SESSION_DB_META_LEGACY_IMPORT) === SESSION_DB_LEGACY_IMPORT_DONE) {
+      return recordsFromPayloads(readSessionPayloads(reader));
+    }
+  } finally {
+    closeSessionDb(reader);
+  }
+  // Not migrated yet (an older daemon still owns sessions.json).
+  const jsonPath = legacyJsonPath();
+  assertNotRealImcodesPathInTests(jsonPath, LEGACY_JSON_FILE);
+  try {
+    const hydrated = hydrateStore(JSON.parse(await readFile(jsonPath, 'utf8')));
+    if (hydrated && Object.keys(hydrated.store.sessions).length > 0) return hydrated.store.sessions;
+    const backup = await readNewestLegacyJsonBackup(jsonPath);
+    return backup ? backup.store.sessions : hydrated ? hydrated.store.sessions : null;
+  } catch (err) {
+    if ((err as { code?: string } | null)?.code === 'ENOENT') {
+      const backup = await readNewestLegacyJsonBackup(jsonPath);
+      return backup ? backup.store.sessions : {};
+    }
+    throw err;
+  }
+}
+
 export async function loadStore(options: LoadStoreOptions = {}): Promise<SessionStore> {
   // Bind every asynchronous consequence of this load to the same store path.
   // HOME is stable in production, but test workers deliberately rotate it;
   // a delayed startup probe must never write an old snapshot into the next
-  // authority's sessions.json after that rotation.
-  const targetPath = storePath();
-  assertNotRealImcodesPathInTests(targetPath, 'sessions.json');
+  // authority's database after that rotation.
+  const targetPath = dbPath();
+  assertNotRealImcodesPathInTests(targetPath, SESSION_DB_FILE);
   // The authoritative owner already holds the newest state; a read-only refresh
   // there is a no-op rather than a disk overwrite of live memory.
   if (options.probe === false && storeAuthoritative) return store;
   await drainPendingWritesForRead();
-  if (hasWriteAuthority(targetPath)) await mkdir(dirname(targetPath), { recursive: true });
-  let loadedLegacySnapshot = false;
-  let loadedFromBackup = false;
+  const canWrite = hasWriteAuthority(targetPath);
+  let dirty = false;
   try {
-    const raw = await readFile(targetPath, 'utf8');
-    const hydrated = hydrateStore(JSON.parse(raw));
-    if (hydrated) {
-      store = hydrated.store;
-      loadedLegacySnapshot = hydrated.legacy;
-      if (Object.keys(store.sessions).length === 0) {
-        const backup = await readNewestBackup(targetPath);
-        if (backup) {
-          store = backup.store;
-          loadedLegacySnapshot = backup.legacy;
-          loadedFromBackup = true;
-        }
+    if (canWrite) {
+      await mkdir(dirname(targetPath), { recursive: true });
+      const handle = writerHandle(targetPath);
+      await migrateLegacyJson(handle);
+      let payloads = readSessionPayloads(handle);
+      if (payloads.size === 0) {
+        const restored = restoreFromDatabaseSnapshot(handle, targetPath);
+        if (restored) { payloads = restored; dirty = true; }
       }
+      committedPayloads = payloads;
+      store = { sessions: recordsFromPayloads(payloads) };
+    } else {
+      const sessions = await readWithoutAuthority(targetPath);
+      if (sessions) store = { sessions };
     }
   } catch (err) {
-    // Reset to an empty store ONLY when the file genuinely doesn't exist. A
-    // transient read/parse failure (a concurrent writer truncating the file
-    // mid-read, an empty read while another process rewrites it, or an IO
-    // hiccup under load) must NOT wipe every session — keep the last good
-    // in-memory store. Otherwise a reload (e.g. send_message's refresh) can
-    // momentarily expose zero sessions, which surfaced as flaky CI:
-    // `send_message` intermittently returned status:'error' (target not found).
-    if ((err as { code?: string } | null)?.code === 'ENOENT') {
-      const backup = await readNewestBackup(targetPath);
-      if (backup) {
-        store = backup.store;
-        loadedLegacySnapshot = backup.legacy;
-        loadedFromBackup = true;
-      } else {
-        store = { sessions: {} };
-      }
-    }
+    // Reset to an empty store ONLY when nothing is stored. A transient read
+    // failure (a locked database, an IO hiccup under load) must NOT wipe every
+    // session -- keep the last good in-memory store. Otherwise a reload (e.g.
+    // send_message's refresh) can momentarily expose zero sessions, which
+    // surfaced as flaky CI: `send_message` intermittently returned
+    // status:'error' (target not found).
+    logger.warn({ err, targetPath }, 'Session store read failed; keeping the last good in-memory store');
   }
   storeLoaded = true;
-  if (loadedFromBackup) {
-    logger.warn({ targetPath }, 'Session store was empty; restored the newest non-empty backup');
-  }
-  // Read-only consumers (probe:false — e.g. an MCP tool refreshing its send
+  if (dirty) fullSweepRequested = true;
+  // Read-only consumers (probe:false -- e.g. an MCP tool refreshing its send
   // targets) return the freshly-read snapshot as-is: NO prune/reconcile/probe
-  // and NO scheduleWrite. Such a consumer does not own sessions.json, and
-  // letting it write back its (possibly stale) in-memory store would clobber
-  // the daemon's external writes — intermittently dropping a just-added session
-  // and failing send_message (flaky CI at the memory-mcp send-refresh path).
+  // and NO scheduleWrite. Such a consumer does not own the store, and letting
+  // it write back its (possibly stale) in-memory copy would clobber the
+  // daemon's writes -- intermittently dropping a just-added session and failing
+  // send_message (flaky CI at the memory-mcp send-refresh path).
   if (options.probe === false) return store;
-  if (loadedLegacySnapshot || loadedFromBackup) scheduleWrite(targetPath);
-  if (pruneNonPersistableSessions()) scheduleWrite(targetPath);
-  if (reconcilePersistedSessions()) scheduleWrite(targetPath);
+  if (dirty) scheduleWrite(targetPath);
+  if (pruneNonPersistableSessions()) { fullSweepRequested = true; scheduleWrite(targetPath); }
+  if (reconcilePersistedSessions()) { fullSweepRequested = true; scheduleWrite(targetPath); }
   // Probe actual state of each session via terminal detection.
   // Without this, stale "running" states from before daemon restart persist
   // and cause UI animations to trigger for idle agents.
@@ -680,102 +789,150 @@ async function probeSessionStates(targetPath: string): Promise<void> {
   } catch { /* probeSessionStates is best-effort — don't crash daemon */ }
 }
 
-function scheduleWrite(targetPath = storePath()): void {
+function scheduleWrite(targetPath = dbPath()): void {
   if (writeTimer) clearTimeout(writeTimer);
   writeTimerPath = targetPath;
   writeTimer = setTimeout(() => {
-    const targetPath = writeTimerPath ?? storePath();
+    const targetPath = writeTimerPath ?? dbPath();
     writeTimer = null;
     writeTimerPath = null;
     void enqueueWrite(true, targetPath);
   }, DEBOUNCE_MS);
 }
 
-/** The sessions.json already on disk: absent, or how many sessions it holds (null: unreadable). */
-type ExistingStoreFile = { exists: false } | { exists: true; hasBytes: boolean; sessionCount: number | null };
+const yieldToEventLoop = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
 
-async function inspectExistingStoreFile(targetPath: string): Promise<ExistingStoreFile> {
-  const info = await stat(targetPath).catch(() => null);
-  if (!info) return { exists: false };
-  const known = knownStoreFile;
-  if (known && known.path === targetPath && known.size === info.size && known.mtimeMs === info.mtimeMs
-    && known.ino === info.ino && Date.now() - known.verifiedAt < KNOWN_FILE_TRUST_MS) {
-    return { exists: true, hasBytes: info.size > 0, sessionCount: known.sessionCount };
-  }
-  let raw: string;
-  try { raw = await readFile(targetPath, 'utf8'); } catch { return { exists: false }; }
-  return { exists: true, hasBytes: raw.trim().length > 0, sessionCount: persistedSessionCount(raw) };
+/** Record a change made through the store API: this row is rewritten by the next flush. */
+function markDirty(name: string): void {
+  dirtyNames.add(name);
 }
 
-async function rememberWrittenStoreFile(targetPath: string, sessionCount: number): Promise<void> {
-  const info = await stat(targetPath).catch(() => null);
-  knownStoreFile = info
-    ? { path: targetPath, size: info.size, mtimeMs: info.mtimeMs, ino: info.ino, sessionCount, verifiedAt: Date.now() }
-    : null;
-}
-
-/** Write the chunks to `file`, in batches, through a handle that is always closed. */
-async function writeChunks(file: string, chunks: string[]): Promise<void> {
-  const handle = await open(file, 'w', 0o600);
-  try {
-    let batch = '';
-    for (const chunk of chunks) {
-      batch += chunk;
-      if (batch.length >= WRITE_BATCH_BYTES) { await handle.write(batch, null, 'utf8'); batch = ''; }
+/**
+ * Serialise every persistable record, in slices that yield to the event loop,
+ * and return the names whose payload differs from what was last committed.
+ * This is what finds records mutated in place through getSession(), which no
+ * store call announces.
+ */
+async function findChangedSessions(): Promise<Set<string>> {
+  const changed = new Set<string>();
+  let sliceStart = performance.now();
+  for (const [name, record] of Object.entries(store.sessions)) {
+    if (!isPersistableSessionRecord(record)) continue;
+    const row = rowFromRecord(name, record);
+    if (row && committedPayloads.get(name) !== row.payload) changed.add(name);
+    if (performance.now() - sliceStart >= sweepSliceMs) {
+      await yieldToEventLoop();
+      sliceStart = performance.now();
     }
-    if (batch) await handle.write(batch, null, 'utf8');
-  } finally {
-    await handle.close();
   }
+  return changed;
 }
 
-async function writeStoreToDisk(bestEffort: boolean, targetPath = storePath()): Promise<void> {
+/**
+ * Persist what changed: upsert the changed rows and delete the removed ones in
+ * one transaction. A normal flush touches only the sessions the store API marked
+ * dirty. `sweep` additionally compares every record with its committed row, so
+ * an in-place mutation is never lost -- the sweep is what an explicit
+ * flushStore() (shutdown) and the periodic full check use.
+ */
+async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
   // Outside the best-effort catch on purpose: a test reaching the real store
   // must fail loudly, never be swallowed as a lost write.
   if (!hasWriteAuthority(targetPath)) return;
+  const sweep = forceSweep || fullSweepRequested || Date.now() - lastFullSweepAt >= FULL_SWEEP_INTERVAL_MS;
+  const drained = new Set<string>();
   try {
-    await mkdir(dirname(targetPath), { recursive: true });
-    // Sliced: the main thread yields between records instead of holding the loop for the whole store.
-    const { chunks, sessionCount: nextCount } = await serializeStoreChunks(true);
-    const existing = await inspectExistingStoreFile(targetPath);
-    const existingCount = existing.exists ? existing.sessionCount : 0;
-    const existingHasBytes = existing.exists && existing.hasBytes;
-    if (existingHasBytes && (existingCount === null || existingCount > 0)
-      && nextCount === 0 && !allowEmptyStoreWrite) {
-      logger.error({ targetPath, existingCount }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
+    const handle = writerHandle(targetPath);
+    const swept = sweep ? await findChangedSessions() : new Set<string>();
+
+    // From here to the commit nothing awaits: the rows reflect one instant, and a
+    // mutation made while the sweep yielded is in `dirtyNames` and is included.
+    const names = new Set<string>([...dirtyNames, ...swept]);
+    for (const name of dirtyNames) drained.add(name);
+    dirtyNames.clear();
+    const upserts: SessionDbRow[] = [];
+    const deletes: string[] = [];
+    for (const name of names) {
+      const record = store.sessions[name];
+      if (record && isPersistableSessionRecord(record)) {
+        const row = rowFromRecord(name, record);
+        if (row && committedPayloads.get(name) !== row.payload) upserts.push(row);
+      } else if (committedPayloads.has(name)) {
+        deletes.push(name);
+      }
+    }
+    if (sweep) {
+      for (const name of committedPayloads.keys()) {
+        if (names.has(name)) continue;
+        const record = store.sessions[name];
+        if (!record || !isPersistableSessionRecord(record)) deletes.push(name);
+      }
+    }
+    if (upserts.length > 0 || deletes.length > 0) {
+      commitSessionChanges(handle, { upserts, deletes, allowEmpty: allowEmptyStoreWrite });
+      for (const row of upserts) committedPayloads.set(row.name, row.payload);
+      for (const name of deletes) committedPayloads.delete(name);
+      allowEmptyStoreWrite = false;
+    }
+    if (sweep) { lastFullSweepAt = Date.now(); fullSweepRequested = false; }
+    maybeStartSnapshot(handle, targetPath);
+  } catch (error) {
+    if (error instanceof EmptyStoreRefusal) {
+      logger.error({ targetPath, sessions: committedPayloads.size }, 'Refusing to overwrite a non-empty session store with an empty snapshot');
       return;
     }
-
-    // Keep a bounded history before every replacement. Rotation and the final
-    // rename happen on the same filesystem, so readers see either the old
-    // complete JSON or the new complete JSON, never a truncated file.
-    for (let index = SESSION_STORE_BACKUP_COUNT; index >= 2; index -= 1) {
-      try { await rename(`${targetPath}.${index - 1}`, `${targetPath}.${index}`); } catch { /* absent */ }
-    }
-    if (existing.exists && existingCount !== null) {
-      await copyFile(targetPath, `${targetPath}.1`);
-    }
-    const temporary = `${targetPath}.${process.pid}.${randomUUID()}.tmp`;
-    try {
-      await writeChunks(temporary, chunks);
-      await rename(temporary, targetPath);
-    } finally {
-      try { await rename(temporary, `${temporary}.stale`); } catch { /* already renamed */ }
-    }
-    allowEmptyStoreWrite = false;
-    await rememberWrittenStoreFile(targetPath, nextCount);
-  } catch (error) {
-    knownStoreFile = null;
+    // Nothing was committed: keep the rows dirty so the next flush retries them.
+    for (const name of drained) dirtyNames.add(name);
+    if (sweep) fullSweepRequested = true;
     if (!bestEffort) throw error;
     // Tests may tear down temp HOME dirs while a debounced write is pending.
     // Losing that best-effort write is fine; a later flush/load will recreate it.
   }
 }
 
-function enqueueWrite(bestEffort: boolean, targetPath = storePath()): Promise<void> {
+/**
+ * A consistent online snapshot of the database, at most once per interval, the
+ * newest few kept. Replaces the five whole-file copies the JSON store rotated
+ * on every flush. Never blocks the flush: the copy runs on its own.
+ */
+function maybeStartSnapshot(handle: SessionDbHandle, targetPath: string): void {
+  if (backupInFlight || committedPayloads.size === 0) return;
+  if (lastBackupAt === 0) {
+    try { lastBackupAt = statSync(`${targetPath}.bak.1`).mtimeMs; } catch { lastBackupAt = 1; }
+  }
+  if (Date.now() - lastBackupAt < backupIntervalMs) return;
+  lastBackupAt = Date.now();
+  const temporary = `${targetPath}.bak.tmp`;
+  const inFlight: Promise<void> = (async () => {
+    try {
+      await rm(temporary, { force: true });
+      await snapshotSessionDb(handle, temporary);
+      for (let index = SESSION_DB_BACKUP_COUNT; index >= 2; index -= 1) {
+        try { await rename(`${targetPath}.bak.${index - 1}`, `${targetPath}.bak.${index}`); } catch { /* absent */ }
+      }
+      await rename(temporary, `${targetPath}.bak.1`);
+    } catch (error) {
+      logger.warn({ err: error, targetPath }, 'Session store snapshot failed');
+      await rm(temporary, { force: true }).catch(() => {});
+    }
+  })().finally(() => { if (backupInFlight === inFlight) backupInFlight = null; });
+  backupInFlight = inFlight;
+}
+
+/** Test seam: the writer connection (null before the first write-authorised load). */
+export function sessionStoreWriterConnectionForTests(): SessionDbHandle['db'] | null {
+  return writerDb?.db ?? null;
+}
+
+/** Test seam: resolves when a started snapshot has finished. */
+export async function waitForSessionStoreSnapshotForTests(): Promise<void> {
+  if (backupInFlight) await backupInFlight;
+}
+
+function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
   const queued = writeQueue.then(
-    () => writeStoreToDisk(bestEffort, targetPath),
-    () => writeStoreToDisk(bestEffort, targetPath),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
+    () => writeStoreToDisk(bestEffort, targetPath, forceSweep),
   );
   const tracked = queued.finally(() => {
     if (pendingWrite === tracked) pendingWrite = null;
@@ -787,7 +944,7 @@ function enqueueWrite(bestEffort: boolean, targetPath = storePath()): Promise<vo
 
 async function drainPendingWritesForRead(): Promise<void> {
   if (writeTimer) {
-    const targetPath = writeTimerPath ?? storePath();
+    const targetPath = writeTimerPath ?? dbPath();
     clearTimeout(writeTimer);
     writeTimer = null;
     writeTimerPath = null;
@@ -903,12 +1060,14 @@ export function upsertSession(record: SessionRecord): void {
     updatedAt: Date.now(),
   };
   sessionValuesCache = null;
+  markDirty(record.name);
   scheduleWrite();
 }
 
 export function removeSession(name: string): void {
   delete store.sessions[name];
   sessionValuesCache = null;
+  markDirty(name);
   scheduleWrite();
 }
 
@@ -1005,6 +1164,7 @@ export function updateSessionState(name: string, state: SessionState, error?: st
   if (normalizedError) s.error = normalizedError;
   else delete s.error;
   s.updatedAt = Date.now();
+  markDirty(name);
   scheduleWrite();
 }
 
@@ -1013,11 +1173,11 @@ export async function flushStore(): Promise<void> {
   // loading the daemon store or acquiring its lock. It must not flush the
   // initial empty in-memory value over the live daemon's sessions.
   if (!storeLoaded && !isUnderTestRunner()) return;
-  const targetPath = writeTimerPath ?? storePath();
+  const targetPath = writeTimerPath ?? dbPath();
   if (writeTimer) {
     clearTimeout(writeTimer);
     writeTimer = null;
     writeTimerPath = null;
   }
-  await enqueueWrite(false, targetPath);
+  await enqueueWrite(false, targetPath, true);
 }

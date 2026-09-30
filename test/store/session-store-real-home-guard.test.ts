@@ -8,7 +8,7 @@
  *  - once the daemon owns the store, a read-only refresh never replaces memory
  *    with a disk snapshot.
  */
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -24,6 +24,7 @@ import {
 } from '../../src/store/session-store.js';
 import { assertNotRealImcodesPathInTests, isRealImcodesPath } from '../../src/util/test-home-guard.js';
 import { TaskPairStore } from '../../src/daemon/task-pairs/store.js';
+import { replacePersistedSessions } from '../helpers/session-store-db.js';
 
 const realImcodes = join(userInfo().homedir, '.imcodes');
 
@@ -53,7 +54,7 @@ describe('real ~/.imcodes is off limits to tests', () => {
     expect(() => new TaskPairStore(join(realImcodes, 'task-pairs.sqlite'))).toThrow(/real ~\/\.imcodes/);
   });
 
-  it('refuses to load sessions.json when HOME points at the real home', async () => {
+  it('refuses to load the session store when HOME points at the real home', async () => {
     const previous = process.env.HOME;
     process.env.HOME = userInfo().homedir;
     try {
@@ -83,17 +84,14 @@ describe('authoritative store is never replaced by a disk snapshot', () => {
   });
 
   it('a read-only refresh keeps the daemon memory when a foreign writer clobbered the file', async () => {
-    const storeFile = join(home, '.imcodes', 'sessions.json');
     await loadStore();
     upsertSession(record('deck_guardproj_brain', home));
     upsertSession(record('deck_guardproj_w1', home));
     await flushStore();
     markSessionStoreAuthoritative();
 
-    // A foreign process rewrites sessions.json with a partial snapshot.
-    const disk = JSON.parse(readFileSync(storeFile, 'utf8')) as { sessions: Record<string, unknown> };
-    disk.sessions = { deck_guardproj_w2: { ...record('deck_guardproj_w2', home) } };
-    writeFileSync(storeFile, JSON.stringify(disk));
+    // A foreign process rewrites the persisted sessions with a partial snapshot.
+    replacePersistedSessions(home, [{ ...record('deck_guardproj_w2', home) }]);
 
     await loadStore({ probe: false });
     const names = listSessions().map((session) => session.name).sort();
@@ -101,14 +99,11 @@ describe('authoritative store is never replaced by a disk snapshot', () => {
   });
 
   it('a non-authoritative consumer still refreshes from disk', async () => {
-    const storeFile = join(home, '.imcodes', 'sessions.json');
     await loadStore();
     upsertSession(record('deck_guardproj_brain', home));
     await flushStore();
 
-    const disk = JSON.parse(readFileSync(storeFile, 'utf8')) as { sessions: Record<string, unknown> };
-    disk.sessions = { deck_guardproj_w2: { ...record('deck_guardproj_w2', home) } };
-    writeFileSync(storeFile, JSON.stringify(disk));
+    replacePersistedSessions(home, [{ ...record('deck_guardproj_w2', home) }]);
 
     await loadStore({ probe: false });
     expect(listSessions().map((session) => session.name)).toEqual(['deck_guardproj_w2']);

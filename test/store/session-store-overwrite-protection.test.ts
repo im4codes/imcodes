@@ -1,5 +1,5 @@
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
-import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import {
@@ -11,9 +11,11 @@ import {
   removeSession,
   resetSessionStoreAuthorityForTests,
   upsertSession,
+  waitForSessionStoreSnapshotForTests,
   type SessionRecord,
 } from '../../src/store/session-store.js';
 import { currentDaemonProcessIdentity } from '../../src/daemon/instance-lock.js';
+import { persistedSessions, replacePersistedSessions } from '../helpers/session-store-db.js';
 
 const identity = currentDaemonProcessIdentity();
 let home = '';
@@ -66,18 +68,27 @@ afterEach(async () => {
 });
 
 describe('session-store ownership and recovery', () => {
-  it('a non-owner is read-only and cannot create or clobber sessions.json', async () => {
+  it('a non-owner is read-only and cannot create or clobber the persisted sessions', async () => {
     await installOwner();
     await loadStore();
     upsertSession(record('deck_store_owner_brain'));
     await flushStore();
-    const storePath = join(home, '.imcodes', 'sessions.json');
-    const before = await readFile(storePath, 'utf8');
+    const before = persistedSessions(home);
+    expect(Object.keys(before)).toEqual(['deck_store_owner_brain']);
     resetSessionStoreAuthorityForTests();
     await loadStore();
     removeSession('deck_store_owner_brain');
+    upsertSession(record('deck_store_intruder_w1'));
     await flushStore();
-    expect(await readFile(storePath, 'utf8')).toBe(before);
+    expect(persistedSessions(home)).toEqual(before);
+  });
+
+  it('a non-owner never creates the database', async () => {
+    await mkdir(join(home, '.imcodes'), { recursive: true });
+    await loadStore();
+    upsertSession(record('deck_store_intruder_brain'));
+    await flushStore();
+    expect((await readdir(join(home, '.imcodes'))).filter((file) => file.startsWith('sessions'))).toEqual([]);
   });
 
   it('stops writing when the lock metadata changes to another pid/start token', async () => {
@@ -85,8 +96,7 @@ describe('session-store ownership and recovery', () => {
     await loadStore();
     upsertSession(record('deck_store_owner_brain'));
     await flushStore();
-    const storePath = join(home, '.imcodes', 'sessions.json');
-    const before = await readFile(storePath, 'utf8');
+    const before = persistedSessions(home);
     await writeFile(metadataPath, JSON.stringify({
       version: 1,
       pid: identity.pid + 1,
@@ -97,13 +107,14 @@ describe('session-store ownership and recovery', () => {
       residualResources: [],
     }), 'utf8');
     removeSession('deck_store_owner_brain');
+    upsertSession(record('deck_store_late_w1'));
     await flushStore();
-    expect(await readFile(storePath, 'utf8')).toBe(before);
+    expect(persistedSessions(home)).toEqual(before);
   });
 
   it('does not flush an unloaded in-memory store from a stop-like process', async () => {
     await flushStore();
-    await expect(readFile(join(home, '.imcodes', 'sessions.json'), 'utf8')).rejects.toMatchObject({ code: 'ENOENT' });
+    expect((await readdir(join(home, '.imcodes')).catch(() => [] as string[])).filter((file) => file.startsWith('sessions'))).toEqual([]);
   });
 
   it('refuses an empty replacement until explicitly authorized', async () => {
@@ -111,36 +122,33 @@ describe('session-store ownership and recovery', () => {
     await loadStore();
     upsertSession(record('deck_store_owner_brain'));
     await flushStore();
-    const storePath = join(home, '.imcodes', 'sessions.json');
-    const before = await readFile(storePath, 'utf8');
+    const before = persistedSessions(home);
 
     removeSession('deck_store_owner_brain');
     await flushStore();
-    expect(await readFile(storePath, 'utf8')).toBe(before);
+    expect(persistedSessions(home)).toEqual(before);
 
     authorizeEmptySessionStoreWrite();
     await flushStore();
-    expect(JSON.parse(await readFile(storePath, 'utf8')).sessions).toEqual({});
+    expect(persistedSessions(home)).toEqual({});
   });
 
-  it('rotates atomic backups and restores the newest non-empty backup', async () => {
+  it('restores the newest non-empty database snapshot when the live database was emptied', async () => {
     await installOwner();
     await loadStore();
     upsertSession(record('deck_store_owner_brain'));
     await flushStore();
-    upsertSession({ ...record('deck_store_owner_brain'), state: 'running' });
-    await flushStore();
-    const storePath = join(home, '.imcodes', 'sessions.json');
-    expect(JSON.parse(await readFile(`${storePath}.1`, 'utf8')).sessions.deck_store_owner_brain.state).toBe('idle');
+    await waitForSessionStoreSnapshotForTests(); // the first flush started the periodic online snapshot
+    expect(await readdir(join(home, '.imcodes'))).toContain('sessions.sqlite.bak.1');
 
-    // Simulate the incident's empty file while retaining the rotating backup.
-    await writeFile(storePath, JSON.stringify({ version: 2, sessions: {}, identityPrompts: {} }), 'utf8');
+    // Simulate the incident's empty store while the snapshot is retained.
+    replacePersistedSessions(home, []);
     resetSessionStoreAuthorityForTests();
     await installOwner();
     await loadStore();
     expect(listSessions().map((session) => session.name)).toEqual(['deck_store_owner_brain']);
     await flushStore();
-    expect(JSON.parse(await readFile(storePath, 'utf8')).sessions.deck_store_owner_brain).toBeDefined();
+    expect(persistedSessions(home).deck_store_owner_brain).toBeDefined();
   });
 
   it('test mode rejects the real HOME even when VITEST is absent', async () => {

@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { readFile } from 'node:fs/promises';
+import { persistedSessions } from '../helpers/session-store-db.js';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { vi } from 'vitest';
@@ -36,10 +37,10 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
     const { join } = await import('node:path');
     const { homedir } = await import('node:os');
     const childHome = homedir();
-    const childStorePath = join(childHome, '.imcodes', 'sessions.json');
+    const childStorePath = join(childHome, '.imcodes', 'sessions.sqlite');
     const readStoreSnapshot = () => {
       try {
-        return { content: readFileSync(childStorePath, 'utf8') };
+        return { bytes: readFileSync(childStorePath).length };
       } catch (error) {
         return { error: { code: error?.code, message: error?.message } };
       }
@@ -92,20 +93,18 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
     stdout = childError.stdout ?? stdout;
     stderr = childError.stderr ?? stderr;
     exit = childError.code ?? childError.signal ?? 'unknown';
-    const actualStore = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')
-      .catch((readError: unknown) => `[unreadable: ${String(readError)}]`);
+    const actualStore = JSON.stringify(persistedSessions(tempDir));
     throw new Error(
       `fresh session-store process failed; exit=${String(exit)}; stdout=${JSON.stringify(stdout)}; `
-      + `stderr=${JSON.stringify(stderr)}; actual sessions.json=${JSON.stringify(actualStore)}`,
+      + `stderr=${JSON.stringify(stderr)}; persisted sessions=${JSON.stringify(actualStore)}`,
     );
   }
   const resultLine = stdout.split(/\r?\n/).find((line) => line.startsWith(resultMarker));
   if (!resultLine) {
-    const actualStore = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')
-      .catch((error: unknown) => `[unreadable: ${String(error)}]`);
+    const actualStore = JSON.stringify(persistedSessions(tempDir));
     throw new Error(
       `fresh session-store process did not emit its result; exit=${String(exit)}; stdout=${JSON.stringify(stdout)}; `
-      + `stderr=${JSON.stringify(stderr)}; actual sessions.json=${JSON.stringify(actualStore)}`,
+      + `stderr=${JSON.stringify(stderr)}; persisted sessions=${JSON.stringify(actualStore)}`,
     );
   }
   const payload = JSON.parse(resultLine.slice(resultMarker.length)) as {
@@ -116,13 +115,12 @@ async function loadStoreInFreshProcess(sessionName: string): Promise<{
     diagnostics: object;
   };
   if (!payload.session) {
-    const actualStore = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')
-      .catch((error: unknown) => `[unreadable: ${String(error)}]`);
+    const actualStore = JSON.stringify(persistedSessions(tempDir));
     throw new Error(
       `fresh session-store process lost ${JSON.stringify(sessionName)}; exit=${String(exit)}; `
       + `stdout=${JSON.stringify(stdout)}; stderr=${JSON.stringify(stderr)}; `
       + `child=${JSON.stringify(payload.diagnostics)}; `
-      + `actual sessions.json=${JSON.stringify(actualStore)}`,
+      + `persisted sessions=${JSON.stringify(actualStore)}`,
     );
   }
   return payload.session as {
@@ -284,14 +282,12 @@ describe('session-store', () => {
       expect(store.getSession('deck_existing_brain')).toBeUndefined();
       expect(store.getSession('deck_real_brain')).toBeDefined();
       await store.flushStore();
-      const persisted = JSON.parse(await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8')) as {
-        sessions: Record<string, unknown>;
-      };
-      expect(persisted.sessions.deck_existing_brain).toBeUndefined();
-      expect(persisted.sessions.deck_real_brain).toBeDefined();
+      const persisted = persistedSessions(tempDir);
+      expect(persisted.deck_existing_brain).toBeUndefined();
+      expect(persisted.deck_real_brain).toBeDefined();
     });
 
-    it('deduplicates repeated identity prompts on disk and hydrates them exactly on reload', async () => {
+    it('persists a large shared identity prompt exactly on every row and hydrates it on reload', async () => {
       const prompt = `shared identity\n${'provider-safe instructions\n'.repeat(3_000)}`;
       const store = await importSessionStore();
       for (let index = 0; index < 60; index += 1) {
@@ -311,19 +307,9 @@ describe('session-store', () => {
       }
 
       await store.flushStore();
-      const raw = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8');
-      const persisted = JSON.parse(raw) as {
-        version: number;
-        sessions: Record<string, { identityPrompt?: string; identityPromptRef?: string }>;
-        identityPrompts: Record<string, string>;
-      };
-      expect(persisted.version).toBe(2);
-      expect(Object.values(persisted.identityPrompts)).toEqual([prompt]);
-      expect(new Set(Object.values(persisted.sessions).map((entry) => entry.identityPromptRef))).toEqual(
-        new Set(['p0']),
-      );
-      expect(Object.values(persisted.sessions).every((entry) => entry.identityPrompt === undefined)).toBe(true);
-      expect(raw.length).toBeLessThan(prompt.length * 2);
+      const persisted = persistedSessions(tempDir);
+      expect(Object.keys(persisted)).toHaveLength(60);
+      expect(Object.values(persisted).every((entry) => entry.identityPrompt === prompt)).toBe(true);
 
       vi.resetModules();
       const reloaded = await importSessionStore();
@@ -331,7 +317,7 @@ describe('session-store', () => {
       expect(reloaded.getSession('deck_dedup_37_brain')?.identityPrompt).toBe(prompt);
     });
 
-    it('migrates legacy inline identity prompts to references without changing content', async () => {
+    it('migrates legacy inline identity prompts from sessions.json without changing content', async () => {
       const prompt = 'legacy identity\nwith exact content';
       await writeSessionsFixture({
         sessions: {
@@ -348,17 +334,8 @@ describe('session-store', () => {
       expect(store.getSession('deck_legacy_prompt_brain')?.identityPrompt).toBe(prompt);
       await store.flushStore();
 
-      const persisted = JSON.parse(
-        await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8'),
-      ) as {
-        version: number;
-        sessions: Record<string, { identityPrompt?: string; identityPromptRef?: string }>;
-        identityPrompts: Record<string, string>;
-      };
-      expect(persisted.version).toBe(2);
-      expect(persisted.sessions.deck_legacy_prompt_brain).toMatchObject({ identityPromptRef: 'p0' });
-      expect(persisted.sessions.deck_legacy_prompt_brain.identityPrompt).toBeUndefined();
-      expect(persisted.identityPrompts.p0).toBe(prompt);
+      expect(persistedSessions(tempDir).deck_legacy_prompt_brain).toMatchObject({ identityPrompt: prompt });
+      expect(persistedSessions(tempDir).deck_legacy_prompt_brain).not.toHaveProperty('identityPromptRef');
     });
 
     it('fails closed when a compact snapshot contains a missing identity prompt reference', async () => {
@@ -432,7 +409,7 @@ describe('session-store', () => {
         },
       });
       await expect(loadStoreInFreshProcess('deck_missing_brain')).rejects.toThrow(
-        /lost "deck_missing_brain"; exit=0; stdout=.*stderr=.*child=.*actual sessions\.json=.*deck_present_brain/,
+        /lost "deck_missing_brain"; exit=0; stdout=.*stderr=.*child=.*persisted sessions=.*deck_present_brain/,
       );
     });
 
@@ -597,14 +574,9 @@ describe('session-store', () => {
         await emitted;
         await store.flushStore();
 
-        const secondStore = JSON.parse(
-          await readFile(join(secondHome, '.imcodes', 'sessions.json'), 'utf8'),
-        ) as { sessions: Record<string, unknown> };
-        expect(Object.keys(secondStore.sessions)).toEqual(['deck_next_brain']);
-        const firstStore = JSON.parse(
-          await readFile(join(firstHome, '.imcodes', 'sessions.json'), 'utf8'),
-        ) as { sessions: Record<string, { state?: string }> };
-        expect(firstStore.sessions.deck_probe_brain?.state).toBe('idle');
+        // The second home only ever got its fixture (never migrated: nothing loaded it).
+        expect(Object.keys(persistedSessions(secondHome))).toEqual([]);
+        expect(persistedSessions(firstHome).deck_probe_brain?.state).toBe('idle');
       } finally {
         vi.doUnmock('../../src/agent/detect.js');
         vi.doUnmock('../../src/store/session-state-probe-events.js');
@@ -696,7 +668,7 @@ describe('session-store', () => {
     expect(getSession(base.name)?.runtimeEpoch).toBe(replacedEpoch);
   });
 
-  it('does not persist known leaked e2e sessions to sessions.json', async () => {
+  it('does not persist known leaked e2e sessions', async () => {
     const { upsertSession, flushStore } = await importSessionStore();
     upsertSession({
       name: 'deck_bootmainabc123_brain',
@@ -724,8 +696,7 @@ describe('session-store', () => {
     });
 
     await flushStore();
-    const raw = await readFile(join(tempDir, '.imcodes', 'sessions.json'), 'utf8');
-    expect(raw).not.toContain('deck_bootmainabc123_brain');
-    expect(raw).toContain('deck_cd_brain');
+    const persisted = persistedSessions(tempDir);
+    expect(Object.keys(persisted)).toEqual(['deck_cd_brain']);
   });
 });
