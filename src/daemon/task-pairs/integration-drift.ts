@@ -44,8 +44,8 @@ const FETCH_MIN_INTERVAL_MS = 5 * 60_000;
 const FETCH_FAILURE_BACKOFF_MS = 30 * 60_000;
 /** A fetch this recent makes the private ref the measuring ref; older (fetch failing), the user's own origin/<branch> is the better local knowledge. */
 const PRIVATE_REF_FRESH_MS = 30 * 60_000;
-/** A fetch from a detached daemon must never wait for a prompt: an HTTPS remote without cached credentials or an unknown ssh host fails at once. */
-const FETCH_ENV = { GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: `${process.env.GIT_SSH_COMMAND?.trim() || 'ssh'} -o BatchMode=yes` } as const;
+/** ssh must not wait for a password or host-key answer either; only added when the user has no ssh command of their own (see fetchEnvFor). */
+const BATCH_MODE_SSH_COMMAND = 'ssh -o BatchMode=yes';
 const MAX_RANGE_COMMITS = 3_000;
 const RANGE_MAX_BUFFER = 8 * 1024 * 1024;
 const PICKED_FROM_RE = /\(cherry picked from commit ([0-9a-f]{7,64})\)/giu;
@@ -116,6 +116,8 @@ interface RepoState {
   fetchedAt: number;
   /** The private integration ref was fetched successfully at this time (see refreshIntegrationRef). */
   privateAt?: number;
+  /** Whether the user's git config names an ssh command (core.sshCommand), read once per repository. */
+  hasSshCommandConfig?: boolean;
   fetchFailedAt?: number;
   fetching?: Promise<void>;
   loggedFailure: boolean;
@@ -202,6 +204,25 @@ function privateRefOf(branch: string): string {
 }
 
 /**
+ * The environment of the fetch. A detached daemon must never wait for a prompt: `GIT_TERMINAL_PROMPT=0` always (an HTTPS remote
+ * without cached credentials fails at once). For ssh, `-o BatchMode=yes` is added through GIT_SSH_COMMAND ONLY when the user has no
+ * ssh command of their own: `GIT_SSH_COMMAND` in the environment wins over `core.sshCommand` in the config, so setting it would throw
+ * away a configured `ssh -i ~/.ssh/key` and the fetch would fail. Their command (from the environment or from `core.sshCommand`,
+ * repository, global or system config, read once per repository through `git config`) is left untouched; a detached process has no
+ * terminal for ssh to prompt on anyway.
+ */
+async function fetchEnvFor(repoPath: string, state: RepoState): Promise<Record<string, string>> {
+  const env: Record<string, string> = { GIT_TERMINAL_PROMPT: '0' };
+  if (process.env.GIT_SSH_COMMAND?.trim()) return env;
+  if (state.hasSshCommandConfig === undefined) {
+    const configured = await git(repoPath, ['config', '--get', 'core.sshCommand']);
+    state.hasSshCommandConfig = configured.ok && configured.stdout.trim().length > 0;
+  }
+  if (!state.hasSshCommandConfig) env.GIT_SSH_COMMAND = BATCH_MODE_SSH_COMMAND;
+  return env;
+}
+
+/**
  * Bring the integration ref up to date: at most one fetch per repository per five minutes, one in flight at a time, bounded.
  * A failure (no remote, offline, a lock held by another daemon on the same repository) is logged once and not retried for
  * thirty minutes; the checks then use the ref as it is.
@@ -215,7 +236,7 @@ async function refreshIntegrationRef(repoPath: string, ref: string): Promise<voi
   if (current - state.fetchedAt < FETCH_MIN_INTERVAL_MS) return;
   if (state.fetchFailedAt !== undefined && current - state.fetchFailedAt < FETCH_FAILURE_BACKOFF_MS) return;
   state.fetching = (async () => {
-    const outcome = await git(repoPath, ['fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+refs/heads/${branch}:${privateRefOf(branch)}`], FETCH_TIMEOUT_MS, { env: FETCH_ENV });
+    const outcome = await git(repoPath, ['fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+refs/heads/${branch}:${privateRefOf(branch)}`], FETCH_TIMEOUT_MS, { env: await fetchEnvFor(repoPath, state) });
     if (outcome.ok) {
       tips.delete(`${key}\u0000${privateRefOf(branch)}`);
       tips.delete(`${key}\u0000${ref}`);

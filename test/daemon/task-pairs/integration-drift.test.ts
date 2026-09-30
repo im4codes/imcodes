@@ -4,7 +4,7 @@
  * clone, pair worktrees, cherry-picks) in temp directories; only the delivery of messages and the clock are injected.
  */
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -111,10 +111,13 @@ const passAt = (minutesAfterDone: number) => {
 
 describe('integration drift', () => {
   const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+  const previousSshCommand = process.env.GIT_SSH_COMMAND;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'imc-drift-'));
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
     delete process.env[TASK_PAIR_INTEGRATION_REF_ENV];
+    delete process.env.GIT_SSH_COMMAND;
+    writeFileSync(join(root, 'empty-gitconfig'), '');
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     sent = [];
     gitCalls = [];
@@ -129,7 +132,7 @@ describe('integration drift', () => {
         gitCalls.push(args.join(' '));
         gitOptions.push({ args: args.join(' '), ...(options?.env ? { env: options.env } : {}) });
         try {
-          return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) };
+          return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'empty-gitconfig'), ...(options?.env ?? {}) } }) };
         } catch (error) {
           return { ok: false, stdout: '', exitCode: (error as { status?: number }).status };
         }
@@ -146,6 +149,8 @@ describe('integration drift', () => {
     for (const name of [BRAIN, EXEC, AUD]) removeSession(name);
     rmSync(root, { recursive: true, force: true });
     delete process.env[TASK_PAIR_INTEGRATION_REF_ENV];
+    if (previousSshCommand === undefined) delete process.env.GIT_SSH_COMMAND;
+    else process.env.GIT_SSH_COMMAND = previousSshCommand;
     if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
     else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
     vi.restoreAllMocks();
@@ -429,6 +434,68 @@ describe('integration drift', () => {
       expect(fetch.args).toContain('+refs/heads/dev:refs/imcodes/integration/dev');
       expect(fetch.env?.GIT_TERMINAL_PROMPT).toBe('0');
       expect(fetch.env?.GIT_SSH_COMMAND).toContain('BatchMode=yes');
+    });
+
+    describe('the fetch leaves the user\'s ssh command alone', () => {
+      /** An "ssh" that records that git ran it, then fails like an unreachable host. */
+      const fakeSsh = (name: string): { script: string; marker: string } => {
+        const marker = join(root, `${name}.ran`);
+        const script = join(root, `${name}.sh`);
+        writeFileSync(script, `#!/bin/sh\necho "ran $@" >> "${marker}"\nexit 255\n`, { mode: 0o755 });
+        return { script, marker };
+      };
+      const sshRemote = (base: string, id: string): string => {
+        run(main, 'remote', 'set-url', 'origin', 'git@fake.invalid:org/repo.git');
+        const wt = addWorktree(id, base);
+        donePair(id, wt, commit(wt, `${id}.txt`, 'x\n', `feat: ${id}`), base);
+        return wt;
+      };
+      const fetchCalls = () => gitOptions.filter((call) => call.args.startsWith('fetch'));
+
+      it('a repo with core.sshCommand keeps it: no GIT_SSH_COMMAND is set, and git really runs the user\'s command', async () => {
+        const { base } = setUpRepos();
+        const { script, marker } = fakeSsh('config');
+        run(main, 'config', 'core.sshCommand', script);
+        sshRemote(base, 'sc1');
+        const loggerModule = await import('../../../src/util/logger.js');
+        vi.spyOn(loggerModule.default, 'warn').mockImplementation(() => undefined as never);
+        await passAt(30);
+        expect(fetchCalls()).toHaveLength(1);
+        expect(fetchCalls()[0]!.env).toEqual({ GIT_TERMINAL_PROMPT: '0' });
+        // The proof that matters: had the daemon forced GIT_SSH_COMMAND, git would never have run the configured command.
+        expect(readFileSync(marker, 'utf8')).toContain('ran');
+      });
+
+      it('a GIT_SSH_COMMAND already in the environment is left untouched too', async () => {
+        const { base } = setUpRepos();
+        const { script, marker } = fakeSsh('envvar');
+        process.env.GIT_SSH_COMMAND = script;
+        sshRemote(base, 'sc2');
+        const loggerModule = await import('../../../src/util/logger.js');
+        vi.spyOn(loggerModule.default, 'warn').mockImplementation(() => undefined as never);
+        await passAt(30);
+        expect(fetchCalls()[0]!.env).toEqual({ GIT_TERMINAL_PROMPT: '0' });
+        expect(readFileSync(marker, 'utf8')).toContain('ran');
+      });
+
+      it('without either, the fetch cannot prompt: GIT_TERMINAL_PROMPT=0 and ssh BatchMode (as before)', async () => {
+        const { base } = setUpRepos();
+        const wt = addWorktree('sc3', base);
+        donePair('sc3', wt, commit(wt, 'sc3.txt', 'x\n', 'feat: sc3'), base);
+        await passAt(30);
+        expect(fetchCalls()[0]!.env).toEqual({ GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: 'ssh -o BatchMode=yes' });
+      });
+
+      it('reads core.sshCommand once per repository, however many fetches follow', async () => {
+        const { base } = setUpRepos();
+        const wt = addWorktree('sc4', base);
+        donePair('sc4', wt, commit(wt, 'sc4.txt', 'x\n', 'feat: sc4'), base);
+        await passAt(30);
+        await passAt(45);
+        await passAt(70);
+        expect(fetchCalls().length).toBeGreaterThanOrEqual(2);
+        expect(gitCalls.filter((call) => call === 'config --get core.sshCommand')).toHaveLength(1);
+      });
     });
 
     it('a project whose integration branch is main (no dev anywhere) falls back to origin/main', async () => {
