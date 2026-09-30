@@ -8,7 +8,7 @@ import { defineConfig } from 'vitest/config';
 export default defineConfig({
   test: {
     name: 'perf',
-    include: ['test/perf/daemon-event-path/**/*.perf.ts'],
+    include: ['test/perf/daemon-event-path/**/*.perf.ts', 'test/perf/timeline-delete/**/*.perf.ts'],
     environment: 'node',
     globals: false,
     setupFiles: ['./test/setup/isolated-home.ts'],
