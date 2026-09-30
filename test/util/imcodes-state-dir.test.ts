@@ -6,11 +6,14 @@ import {
   childProcessEnvWithStateDir,
   IMCODES_HOME_ENV,
   imcodesStateDir,
+  imcodesStateDirEnv,
   imcodesStateDirForHome,
   imcodesStatePath,
 } from '../../src/util/imcodes-state-dir.js';
 import { resolveImcodesHome } from '../../src/util/windows-daemon-lock.js';
 import { resolveTaskPairsDbPath } from '../../src/daemon/task-pairs/store.js';
+import { getDefaultMcpServers } from '../../src/agent/providers/getDefaultMcpServers.js';
+import { buildMemoryMcpServerEnv } from '../../shared/memory-mcp-env.js';
 import { getManagedSkillRoot } from '../../src/capability/managed-skill-paths.js';
 
 const DEFAULT_STATE_DIR = join(homedir(), '.imcodes');
@@ -56,6 +59,24 @@ describe('imcodesStateDir', () => {
     vi.stubEnv(IMCODES_HOME_ENV, '/tmp/scoped-home');
     expect(getManagedSkillRoot()).toBe(join(resolve('/tmp/scoped-home'), 'skills', 'managed'));
     expect(getManagedSkillRoot('/some/test/home')).toBe(join('/some/test/home', '.imcodes', 'skills', 'managed'));
+  });
+
+  it('gives agent session and MCP children the state directory only when IMCODES_HOME is set', () => {
+    expect(imcodesStateDirEnv({})).toEqual({});
+    expect(imcodesStateDirEnv({ IMCODES_HOME: '  ' })).toEqual({});
+    expect(imcodesStateDirEnv({ IMCODES_HOME: 'rel/state' })).toEqual({ IMCODES_HOME: resolve('rel/state') });
+
+    // The MCP server is a separate process that only receives an allowlisted env: IMCODES_HOME must be on it, resolved.
+    expect(buildMemoryMcpServerEnv({}, { PATH: '/bin', IMCODES_HOME: '/tmp/scoped-home', SECRET: 'x' })).toEqual({
+      PATH: '/bin',
+      IMCODES_HOME: '/tmp/scoped-home',
+    });
+    vi.stubEnv(IMCODES_HOME_ENV, 'rel/state');
+    const scoped = getDefaultMcpServers({ sessionName: 'deck_p_w1' } as never)['imcodes-memory'];
+    expect(scoped?.env?.IMCODES_HOME).toBe(resolve('rel/state'));
+    vi.stubEnv(IMCODES_HOME_ENV, '');
+    const plain = getDefaultMcpServers({ sessionName: 'deck_p_w1' } as never)['imcodes-memory'];
+    expect(plain?.env && 'IMCODES_HOME' in plain.env).toBe(false);
   });
 
   it('hands children the RESOLVED directory so a relative IMCODES_HOME cannot drift with the child cwd', () => {

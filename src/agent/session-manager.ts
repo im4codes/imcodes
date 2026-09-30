@@ -116,6 +116,7 @@ import { clearSummarySyncHistory, getSummarySyncFingerprints } from '../context/
 import { getAuthenticatedCapabilityOwner } from '../capability/capability-authorization.js';
 import { registerMasterCompaction } from '../daemon/master-compaction-registry.js';
 import type { DaemonTransportQueuesSnapshot } from '../util/daemon-status.js';
+import { imcodesStateDirEnv } from '../util/imcodes-state-dir.js';
 import { extractSessionSupervisionSnapshot } from '../../shared/supervision-config.js';
 import { beginCrossVendorHandoffState, isCrossVendorHandoffLaunchCurrent, normalizeCrossVendorHandoffConfig, type CrossVendorHandoffCutoff } from '../../shared/cross-vendor-handoff.js';
 import { buildCrossVendorHandoffPack, resolveCrossVendorHandoffPack, shouldCreateCrossVendorHandoff } from '../daemon/cross-vendor-handoff.js';
@@ -1057,6 +1058,7 @@ export async function respawnSession(record: SessionRecord): Promise<boolean> {
   // Env injection: on ConPTY (Windows), pass env directly to the PTY spawn so cmd.exe
   // doesn't need to parse POSIX `export` syntax.  On tmux/wezterm, prepend `export` to cmd.
   const mergedEnv: Record<string, string> = {
+    ...imcodesStateDirEnv(),
     IMCODES_SESSION: record.name,
     ...resourceOwnerEnv({
       sessionName: record.name,
@@ -1532,6 +1534,7 @@ function buildTransportSessionEnv(
     ...(extraEnv ?? {}),
     [IMCODES_SESSION_ENV]: sessionName,
     [IMCODES_SESSION_LABEL_ENV]: label?.trim() || sessionName,
+    ...imcodesStateDirEnv(),
   };
 }
 
@@ -3967,6 +3970,7 @@ export async function launchSession(opts: LaunchOpts): Promise<void> {
   // Inject both the display identity and the exact logical/runtime owner tuple.
   const mergedEnv: Record<string, string> = {
     ...extraEnv,
+    ...imcodesStateDirEnv(),
     IMCODES_SESSION: name,
     ...resourceOwnerEnv({ sessionName: name, sessionInstanceId: resourceSessionInstanceId, runtimeEpoch: resourceRuntimeEpoch }),
   };

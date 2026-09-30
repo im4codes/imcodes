@@ -1,3 +1,4 @@
+import { IMCODES_HOME_ENV } from './imcodes-home-env.js';
 import { SESSION_RESOURCE_OWNER_ENV } from './session-resource-lifecycle.js';
 
 export const IMCODES_DAEMON_USER_ID_ENV = 'IMCODES_DAEMON_USER_ID';
@@ -41,7 +42,8 @@ export const MEMORY_MCP_IDENTITY_ENV_KEYS = [
 export type MemoryMcpIdentityEnvKey = typeof MEMORY_MCP_IDENTITY_ENV_KEYS[number];
 export type MemoryMcpEnvSource = Record<string, string | undefined>;
 
-const SAFE_PASSTHROUGH_ENV_KEYS = ['PATH', 'HOME', 'NODE_OPTIONS'] as const;
+// IMCODES_HOME rides along so the MCP server (a separate process) reads the same state directory as the daemon that launched it.
+const SAFE_PASSTHROUGH_ENV_KEYS = ['PATH', 'HOME', 'NODE_OPTIONS', IMCODES_HOME_ENV] as const;
 const MEMORY_MCP_CONFIG_ENV_KEYS = [IMCODES_MCP_TOOL_CATALOG_MODE_ENV] as const;
 
 export type MemoryMcpEnvInput = Partial<Record<MemoryMcpIdentityEnvKey, string | null | undefined>>;

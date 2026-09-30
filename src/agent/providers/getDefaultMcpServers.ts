@@ -15,6 +15,7 @@ import {
 } from '../../../shared/memory-mcp-env.js';
 import { SESSION_RESOURCE_OWNER_ENV } from '../../../shared/session-resource-lifecycle.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
+import { imcodesStateDirEnv } from '../../util/imcodes-state-dir.js';
 import {
   MCP_TOOL_CATALOG_MODES,
   type McpToolCatalogMode,
@@ -168,6 +169,8 @@ export function getDefaultMcpServers(
       args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
       env: {
         ...buildIdentityEnv(config),
+        // The raw passthrough may be relative to the daemon's cwd; the MCP child gets the resolved directory.
+        ...imcodesStateDirEnv(),
         [IMCODES_MCP_TOOL_CATALOG_MODE_ENV]: toolCatalogMode,
       },
     },

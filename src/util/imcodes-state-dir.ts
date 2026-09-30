@@ -17,10 +17,10 @@
  */
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { IMCODES_HOME_ENV } from '../../shared/imcodes-home-env.js';
 import { resolveImcodesHome } from './windows-daemon-lock.js';
 
-/** Environment variable that relocates the whole state directory. */
-export const IMCODES_HOME_ENV = 'IMCODES_HOME' as const;
+export { IMCODES_HOME_ENV };
 /** Directory name under the account home when IMCODES_HOME is not set. */
 export const IMCODES_STATE_DIR_NAME = '.imcodes' as const;
 
@@ -51,4 +51,12 @@ export function imcodesStatePath(...segments: string[]): string {
  */
 export function childProcessEnvWithStateDir(env: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return env[IMCODES_HOME_ENV]?.trim() ? { ...env, [IMCODES_HOME_ENV]: imcodesStateDir(env) } : env;
+}
+
+/**
+ * Just the state-directory entry, for env objects that are built from scratch instead of inheriting `process.env` (agent session
+ * launch env, MCP server definitions). Empty when IMCODES_HOME is not set, so a default install's launch env is unchanged.
+ */
+export function imcodesStateDirEnv(env: NodeJS.ProcessEnv = process.env): Record<string, string> {
+  return env[IMCODES_HOME_ENV]?.trim() ? { [IMCODES_HOME_ENV]: imcodesStateDir(env) } : {};
 }
