@@ -17,6 +17,9 @@ interface FakeChild {
 const appServer = vi.hoisted(() => {
   const children: FakeChild[] = [];
   let turnCounter = 0;
+  // Simulates a starved event loop (a loaded CI runner): every app-server message reaches the provider this many REAL ms late.
+  let lagMs = 0;
+  const realSetTimeout = setTimeout;
   const spawn = vi.fn(() => {
     const stdout = new PassThrough();
     const stderr = new PassThrough();
@@ -46,7 +49,15 @@ const appServer = vi.hoisted(() => {
     const child = new EventEmitter() as FakeChild['child'];
     Object.assign(child, { stdout, stderr, stdin, killed: false });
     child.kill = () => { child.killed = true; child.emit('exit', 0); return true; };
-    record = { child, requests: [], emits: (message) => { stdout.write(`${JSON.stringify(message)}\n`); } };
+    record = {
+      child,
+      requests: [],
+      emits: (message) => {
+        const line = `${JSON.stringify(message)}\n`;
+        if (lagMs > 0) realSetTimeout(() => { stdout.write(line); }, lagMs); // equal lag keeps message order
+        else stdout.write(line);
+      },
+    };
     children.push(record);
     return child;
   });
@@ -55,7 +66,7 @@ const appServer = vi.hoisted(() => {
     callback?.(null, 'ok\n', '');
     return {} as never;
   });
-  return { children, spawn, execFile, turnStarts: () => children.flatMap((c) => c.requests).filter((r) => r.method === 'turn/start').length, resetTurns: () => { turnCounter = 0; } };
+  return { children, spawn, execFile, setLagMs: (ms: number) => { lagMs = ms; }, turnStarts: () => children.flatMap((c) => c.requests).filter((r) => r.method === 'turn/start').length, resetTurns: () => { turnCounter = 0; } };
 });
 
 vi.mock('node:child_process', () => ({ spawn: appServer.spawn, execFile: appServer.execFile }));
@@ -73,20 +84,24 @@ const CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different 
 const realSetImmediate = setImmediate;
 const realSetTimeout = setTimeout;
 
-/** Advance the fake clock, then let the provider's real async work (fs, streams) finish without moving the fake clock. */
+/** Advance the fake clock and flush microtasks. It does NOT wait for the provider's real I/O: use {@link waitFor} for that. */
 async function settle(ms = 0): Promise<void> {
   await vi.advanceTimersByTimeAsync(ms);
-  for (let i = 0; i < 3; i += 1) await new Promise<void>((resolve) => realSetImmediate(resolve));
 }
 
-/** After the retry timer fired: let the provider's own dispatch chain (a few real awaits and short timers) reach the app-server. */
-async function untilSent(sends: number): Promise<number> {
-  const started = Date.now();
-  for (let i = 0; i < 100 && appServer.turnStarts() === sends; i += 1) {
-    await vi.advanceTimersByTimeAsync(10);
+/**
+ * Wait, in REAL time and with the fake clock frozen, for a condition that depends on the provider's real async work (stream
+ * parsing, fs). A fixed number of event-loop turns raced that work on a loaded runner (the CI flake: the check ran before the
+ * provider had processed the app-server's `turn/completed`), so every such wait is on the observable signal itself, with a
+ * generous real-time bound that only matters when something is genuinely stuck.
+ */
+async function waitFor(what: string, condition: () => boolean, realTimeoutMs = 30_000): Promise<void> {
+  const deadline = Date.now() + realTimeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    if (vi.isFakeTimers()) await vi.advanceTimersByTimeAsync(0);
     await new Promise<void>((resolve) => realSetTimeout(resolve, 2));
   }
-  return Date.now() - started;
 }
 
 describe('codex-sdk "model at capacity" against a fake app-server', () => {
@@ -97,6 +112,7 @@ describe('codex-sdk "model at capacity" against a fake app-server', () => {
     resetTransportQueueStoreForTests();
     appServer.children.length = 0;
     appServer.resetTurns();
+    appServer.setLagMs(0);
     vi.spyOn(Math, 'random').mockReturnValue(0);
     provider = new CodexSdkProvider();
     await provider.connect({ binaryPath: 'codex' });
@@ -112,22 +128,28 @@ describe('codex-sdk "model at capacity" against a fake app-server', () => {
   });
 
   /** The app-server fails the newest turn exactly as codex reports a saturated model. */
-  const failNewestTurn = async (message = CAPACITY_MESSAGE) => {
+  const failNewestTurn = (message = CAPACITY_MESSAGE) => {
     const child = appServer.children.at(-1)!;
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: `turn-${appServer.turnStarts()}`, status: 'failed', error: { message } } } });
-    await settle();
+  };
+  /** The provider has parsed the failure and the runtime has armed retry number `attempt` (the signal, not a guess about timing). */
+  const retryArmed = (attempt: number) => () => {
+    const retry = runtime.getDiagnosticSnapshot().capacityRetry;
+    return retry?.attempt === attempt && retry.retryAt > 0;
   };
 
-  it('keeps the turn, retries at <=15 s with no give-up for 30+ minutes, and returns to idle when capacity is back', async () => {
+  it.each([0, 25])('keeps the turn, retries at <=15 s with no give-up for 30+ minutes, and returns to idle when capacity is back (app-server messages arrive %i ms late)', async (lagMs) => {
+    appServer.setLagMs(lagMs);
     runtime.send('implement the feature', 'msg-codex-1');
-    for (let i = 0; i < 200 && appServer.turnStarts() < 1; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    await waitFor('the first turn/start to reach the app-server', () => appServer.turnStarts() >= 1);
     expect(appServer.turnStarts()).toBe(1);
     vi.useFakeTimers();
 
     const gaps: number[] = [];
     let sends = appServer.turnStarts();
-    await failNewestTurn();
+    failNewestTurn();
     for (let attempt = 1; attempt <= 130; attempt += 1) {
+      await waitFor(`retry ${attempt} to be armed`, retryArmed(attempt));
       expect(runtime.pendingMessages).toEqual(['implement the feature']); // still queued, never dropped
       expect(runtime.getStatus()).toBe('thinking'); // busy and waiting, not error
       expect(runtime.lastProviderError?.message ?? CAPACITY_MESSAGE).toBe(CAPACITY_MESSAGE);
@@ -139,30 +161,32 @@ describe('codex-sdk "model at capacity" against a fake app-server', () => {
       for (let waited = 0; waited < scheduled - 1; waited += 50) await settle(Math.min(50, scheduled - 1 - waited));
       expect(appServer.turnStarts()).toBe(sends);
       // …and at the timer the runtime hands the turn to the provider again. The provider's own dispatch chain does real I/O, so
-      // wait for it in REAL time while the fake clock stays where the timer fired.
+      // wait for it in REAL time with the fake clock frozen: the send must not need any further virtual time.
       await vi.advanceTimersByTimeAsync(1);
-      const latency = await untilSent(sends);
-      expect(appServer.turnStarts()).toBe(sends + 1);
-      expect(latency).toBeLessThanOrEqual(200); // provider dispatch latency on top of the runtime's <=15 s timer
+      const firedAt = Date.now();
+      await waitFor(`retry ${attempt} to reach the app-server`, () => appServer.turnStarts() === sends + 1);
+      expect(Date.now()).toBe(firedAt);
       sends = appServer.turnStarts();
-      await failNewestTurn();
+      failNewestTurn();
     }
     expect(gaps.slice(0, 6)).toEqual([1_000, 2_000, 4_000, 8_000, 15_000, 15_000]);
     expect(Math.max(...gaps)).toBe(15_000);
     expect(gaps.reduce((a, b) => a + b, 0)).toBeGreaterThan(30 * 60_000);
 
     // Capacity is back: the next retry succeeds and the turn completes.
+    await waitFor('retry 131 to be armed', retryArmed(131));
     const finalDelay = runtime.getDiagnosticSnapshot().capacityRetry!.retryAt - Date.now();
     expect(finalDelay).toBeLessThanOrEqual(15_000);
     for (let waited = 0; waited < finalDelay; waited += 50) await settle(Math.min(50, finalDelay - waited));
-    await untilSent(sends);
-    expect(appServer.turnStarts()).toBe(sends + 1);
+    await waitFor('the final retry to reach the app-server', () => appServer.turnStarts() === sends + 1);
     const child = appServer.children.at(-1)!;
     child.emits({ method: 'turn/completed', params: { threadId: 'thread-1', turn: { id: `turn-${appServer.turnStarts()}`, status: 'completed', error: null } } });
-    await settle(1_000);
-    expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+    // The COMPLETION must clear the episode. Wait on that signal with the fake clock frozen (advancing it 30 s would let the
+    // runtime's own "survived 30 s" timer end the episode and hide a completion that failed to).
+    const completedAt = Date.now();
+    await waitFor('the completion to clear the capacity retry state', () => runtime.getDiagnosticSnapshot().capacityRetry === undefined && runtime.getStatus() === 'idle');
+    expect(Date.now() - completedAt).toBeLessThan(30_000);
     expect(runtime.pendingMessages).toEqual([]);
-    expect(runtime.getStatus()).toBe('idle');
     // The user's message went out on every attempt, always as the same turn text.
     const userTexts = appServer.children.flatMap((c) => c.requests).filter((r) => r.method === 'turn/start')
       .map((r) => JSON.stringify(r.params?.input ?? r.params));
@@ -171,10 +195,11 @@ describe('codex-sdk "model at capacity" against a fake app-server', () => {
 
   it('COUNTEREXAMPLE: a permanent refusal (invalid model) from the same app-server is NOT retried and fails fast', async () => {
     runtime.send('needs auth', 'msg-codex-auth');
-    for (let i = 0; i < 200 && appServer.turnStarts() < 1; i += 1) await new Promise((resolve) => setTimeout(resolve, 5));
+    await waitFor('the first turn/start to reach the app-server', () => appServer.turnStarts() >= 1);
     vi.useFakeTimers();
     // Real message from this daemon's log: a permanent invalid-model refusal, reported by the same app-server.
-    await failNewestTurn('{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \'gpt-6-sol\' model is not supported when using Codex with a ChatGPT account."}}');
+    failNewestTurn('{"type":"error","status":400,"error":{"type":"invalid_request_error","message":"The \'gpt-6-sol\' model is not supported when using Codex with a ChatGPT account."}}');
+    await waitFor('the permanent refusal to fail the session', () => runtime.getStatus() === 'error');
     await settle(120_000);
     expect(appServer.turnStarts()).toBe(1);
     expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();

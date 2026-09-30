@@ -3713,6 +3713,45 @@ describe('TransportSessionRuntime', () => {
       await vi.advanceTimersByTimeAsync(0);
     });
 
+    it('a success that lands in the same tick as the retry timer clears the episode and cancels every timer (no stale state, no extra send)', async () => {
+      runtime.send('race the timer', 'msg-race');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toMatchObject({ attempt: 1 });
+      // The timer fires (the retry is dispatched) and the provider's success arrives before the runtime has awaited anything.
+      await vi.advanceTimersByTimeAsync(1_000);
+      mock.fireComplete('sess-1');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+      expect(runtime.getStatus()).toBe('idle');
+      expect(runtime.pendingMessages).toEqual([]);
+      const sends = sendMock().mock.calls.length;
+      expect(sends).toBe(2);
+      // Neither the retry timer nor the 30 s "survived" timer is left to re-arm anything.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      expect(sendMock().mock.calls.length).toBe(sends);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+      expect(runtime.getStatus()).toBe('idle');
+    });
+
+    it('a success that arrives while the retry timer is still pending is not the retried turn: the retry still happens, and ITS success clears the episode', async () => {
+      runtime.send('late success first', 'msg-late-first');
+      await flushDispatch();
+      vi.useFakeTimers();
+      await failWithCapacity();
+      mock.fireComplete('sess-1'); // the failed turn's late completion, before the timer
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toMatchObject({ attempt: 1 });
+      expect(sendMock()).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(sendMock()).toHaveBeenCalledTimes(2);
+      mock.fireComplete('sess-1');
+      await vi.advanceTimersByTimeAsync(0);
+      expect(runtime.getDiagnosticSnapshot().capacityRetry).toBeUndefined();
+      expect(runtime.getStatus()).toBe('idle');
+    });
+
     it('a message the user sends during the retries is queued behind the retried turn: nothing dropped, nothing duplicated', async () => {
       runtime.send('first', 'msg-first');
       await flushDispatch();

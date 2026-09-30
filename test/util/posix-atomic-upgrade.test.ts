@@ -317,6 +317,34 @@ describe('staged-package-install.mjs', () => {
     expect(realpathSync(join(fixture.binDir, 'imcodes'))).toBe(join(fixture.livePackage, 'dist', 'src', 'index.js'));
   });
 
+  it('a reader polling the live package during `switch` sees only whole packages or, for the instant between the two renames, none — never a torn one', async () => {
+    // The switch is two same-filesystem renames (live -> old copy, staged -> live). A reader that lands between them gets ENOENT:
+    // that is the design (the old copy is kept for rollback; `recover` heals a crash there), and it is why pollers in tests
+    // (upgrade-detached.test.ts) must treat ENOENT as "switching", not as a failure. What may NEVER be observed is a
+    // half-written package: every successful read is a complete, valid package.json of the old or the new version.
+    const stage = join(fixture.prefix, 'lib', '.imcodes-stage.tw');
+    writePackage(join(stage, 'lib', 'node_modules', 'imcodes'), '3.0.0');
+    const packageJson = join(fixture.livePackage, 'package.json');
+    const seen = new Map<string, number>();
+    const note = (key: string) => seen.set(key, (seen.get(key) ?? 0) + 1);
+    const child = spawn(process.execPath, [helper(), 'switch', '--global-root', fixture.globalRoot, '--tag', 'tw', '--bin-dir', fixture.binDir, '--stage-prefix', stage], { stdio: 'ignore' });
+    children.push(child);
+    let exited = false;
+    const done = new Promise<number | null>((resolve) => child.on('exit', (code) => { exited = true; resolve(code); }));
+    while (!exited) {
+      try {
+        note(`version:${(JSON.parse(readFileSync(packageJson, 'utf8')) as { version: string }).version}`);
+      } catch (error) {
+        note((error as NodeJS.ErrnoException).code === 'ENOENT' ? 'absent' : `broken:${(error as Error).message}`);
+      }
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    expect(await done).toBe(0);
+    expect([...seen.keys()].filter((key) => key.startsWith('broken:'))).toEqual([]);
+    expect([...seen.keys()].filter((key) => key.startsWith('version:')).every((key) => key === 'version:1.0.0' || key === 'version:3.0.0')).toBe(true);
+    expect(liveVersion()).toBe('3.0.0');
+  });
+
   it('recover heals a switch interrupted between its two renames (live missing, old copy present)', () => {
     const before = treeHash(fixture.livePackage);
     // Exactly the window: the live package has been renamed away and the staged one is not in place yet.

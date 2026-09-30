@@ -5,7 +5,7 @@
  * leave a half-replaced package.
  */
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { describeUpgradeResult, runDetachedPosixUpgrade, UPGRADE_RESULTS, type DetachedUpgradeInput } from '../../src/cli/upgrade-detached.js';
@@ -17,7 +17,7 @@ import {
 let fixture: Fixture;
 const children: ChildProcess[] = [];
 const saved: Record<string, string | undefined> = {};
-const ENV_KEYS = ['FAKE_PREFIX', 'FAKE_NPM_MODE', 'FAKE_STARTED_FILE', 'FAKE_INSTALL_DELAY_MS', 'HOME', 'IMCODES_HOME'];
+const ENV_KEYS = ['FAKE_PREFIX', 'FAKE_NPM_MODE', 'FAKE_STARTED_FILE', 'FAKE_INSTALL_DELAY_MS', 'FAKE_INSTALL_GATE_FILE', 'HOME', 'IMCODES_HOME'];
 
 beforeEach(() => {
   fixture = createFixture();
@@ -52,6 +52,22 @@ const fixtureLaunch: typeof launchPosixUpgrade = (params) => launchPosixUpgrade(
 });
 
 const liveVersion = () => JSON.parse(readFileSync(join(fixture.livePackage, 'package.json'), 'utf8')).version as string;
+
+/**
+ * The live package version, or `null` while it is momentarily absent. The switch is TWO same-filesystem renames (live → the kept
+ * old copy, staged → live: see posix-atomic-install.mjs), so between them there is no live package for a few microseconds; a
+ * poller that lands there gets ENOENT. That is the design (the old copy is kept for rollback, and `recover` repairs a crash
+ * between the renames), not a torn package — a read either fails with ENOENT or returns a WHOLE, valid version. Anything else
+ * (unparseable JSON, another error) is a real failure and still throws.
+ */
+const liveVersionOrAbsent = (): string | null => {
+  try {
+    return liveVersion();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+};
 
 describe('runDetachedPosixUpgrade', () => {
   it('starts the detached script, streams its log, and returns 0 when the upgrade completes', async () => {
@@ -100,6 +116,9 @@ describe('runDetachedPosixUpgrade', () => {
   it('KILLING THE CLI PROCESS mid-upgrade (SIGKILL, like a dropped SSH session): the install completes and the daemon runs afterwards', async () => {
     const oldPid = startDaemon(fixture, children);
     const started = join(fixture.root, 'npm-started');
+    // npm stays mid-install until the test releases this gate: "the CLI was killed while npm was working" is then a fact, not a
+    // race against a fixed 3 s delay that a loaded runner can outrun.
+    const gate = join(fixture.root, 'npm-gate');
     const overrides = {
       nodeBin: join(fixture.nodeDir, 'node'), nodeDir: fixture.nodeDir, stateDir: fixture.stateDir,
       restartCmd: START_NEW_DAEMON(fixture.stateDir), skipLaunchChain: true, cleanupAfterSec: 3600,
@@ -117,7 +136,7 @@ describe('runDetachedPosixUpgrade', () => {
     const cli = spawn(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
       cwd: process.cwd(),
       env: {
-        ...process.env, FAKE_STARTED_FILE: started, FAKE_INSTALL_DELAY_MS: '3000',
+        ...process.env, FAKE_STARTED_FILE: started, FAKE_INSTALL_GATE_FILE: gate,
         CLI_MODULE: new URL('../../src/cli/upgrade-detached.ts', import.meta.url).href,
         SCRIPT_MODULE: new URL('../../src/util/posix-upgrade-script.ts', import.meta.url).href,
         OVERRIDES: JSON.stringify(overrides),
@@ -132,13 +151,28 @@ describe('runDetachedPosixUpgrade', () => {
     await new Promise((resolve) => cli.on('exit', resolve));
     // The package is whole at every instant: still the old one while npm works in the stage.
     expect(liveVersion()).toBe('1.0.0');
+    writeFileSync(gate, 'release'); // the install may now finish — with the CLI long dead
 
     const pidFile = join(fixture.stateDir, 'daemon.pid');
     const waitUntil = Date.now() + 60_000;
+    const seen = new Set<string | null>();
+    let absentSince = 0;
+    let longestAbsentMs = 0;
     while (Date.now() < waitUntil) {
-      if (liveVersion() === '2.0.0' && existsSync(pidFile) && Number(readFileSync(pidFile, 'utf8')) !== oldPid) break;
+      const version = liveVersionOrAbsent();
+      seen.add(version);
+      if (version === null) {
+        absentSince ||= Date.now();
+        longestAbsentMs = Math.max(longestAbsentMs, Date.now() - absentSince);
+      } else {
+        absentSince = 0;
+      }
+      if (version === '2.0.0' && existsSync(pidFile) && Number(readFileSync(pidFile, 'utf8')) !== oldPid) break;
       await new Promise((resolve) => setTimeout(resolve, 200));
     }
+    // Only whole packages were ever observed (old or new); "absent" is the between-the-renames instant and never lasts.
+    expect([...seen].filter((version) => version !== null).every((version) => version === '1.0.0' || version === '2.0.0')).toBe(true);
+    expect(longestAbsentMs).toBeLessThan(2_000);
     expect(liveVersion()).toBe('2.0.0');
     expect(spawnSync(process.execPath, [join(fixture.livePackage, 'dist', 'src', 'index.js'), '--version'], { encoding: 'utf8' }).stdout.trim()).toBe('2.0.0');
     const newPid = Number(readFileSync(pidFile, 'utf8'));

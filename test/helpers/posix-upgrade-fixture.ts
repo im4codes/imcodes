@@ -35,6 +35,11 @@ if (cmd === 'install') {
   fs.writeFileSync(path.join(dir, 'package.json'), JSON.stringify({ name: 'imcodes', version, bin: { imcodes: 'dist/src/index.js' } }));
   if (env.FAKE_STARTED_FILE) fs.writeFileSync(env.FAKE_STARTED_FILE, String(process.pid));
   if (env.FAKE_INSTALL_DELAY_MS) Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, Number(env.FAKE_INSTALL_DELAY_MS));
+  // A gate instead of a fixed delay: npm stays mid-install until the test releases it (capped, so a lost test cannot hang it).
+  if (env.FAKE_INSTALL_GATE_FILE) {
+    const napper = new Int32Array(new SharedArrayBuffer(4));
+    for (let waited = 0; waited < 120000 && !fs.existsSync(env.FAKE_INSTALL_GATE_FILE); waited += 25) Atomics.wait(napper, 0, 0, 25);
+  }
   if (env.FAKE_NPM_MODE === 'fail-mid') { console.error('npm error code EINJECTED'); console.error('npm error injected failure halfway through the install'); process.exit(1); }
   const printed = env.FAKE_NPM_MODE === 'wrong-version' ? '9.9.9' : version;
   const entry = env.FAKE_NPM_MODE === 'broken-entry'
