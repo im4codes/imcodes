@@ -35,6 +35,7 @@ const REQUEST_LOG = process.env.IMC_PERF_STALE_LOG ?? '/tmp/imc-perf-uploads/sta
 const LATEST_AFTER_CACHE_BUDGET_MS = Number(process.env.IMC_PERF_STALE_LATEST_BUDGET_MS ?? 1000);
 const DRIFT_BUDGET_PX = 1;
 const SAMPLE_WINDOW_MS = Number(process.env.IMC_PERF_STALE_SAMPLE_MS ?? 20_000);
+const SAMPLE_CAP_MS = Number(process.env.IMC_PERF_STALE_CAP_MS ?? 150_000);
 const DB_NAME = 'imcodes-timeline';
 const STORE_NAME = 'events';
 
@@ -184,9 +185,12 @@ async function runScenario(browser, mode) {
   };
 
   // Sample layout on every frame while the older pages arrive.
-  await page.evaluate(({ mode: sampleMode, windowMs }) => {
+  await page.evaluate(({ mode: sampleMode, windowMs, capMs, gapKey }) => {
     const root = document.querySelector('.chat-view');
-    const state = { active: true, done: false, samples: [], markerSeen: false, markerGoneAt: null, startedAt: performance.now(), anchorId: null, anchorTop0: null };
+    const state = { active: true, done: false, samples: [], markerSeen: false, markerGoneAt: null, startedAt: performance.now(), anchorId: null, anchorTop0: null, gapSeen: false, gapClosedAt: null, lastGapCheck: 0 };
+    const gapRecorded = () => {
+      try { return !!JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}')[gapKey]; } catch { return false; }
+    };
     window.__imcStale = state;
     if (!root) { state.error = 'no .chat-view'; return; }
     if (sampleMode === 'reading') {
@@ -219,16 +223,28 @@ async function runScenario(browser, mode) {
         }
       }
       state.samples.push(sample);
-      if (now - state.startedAt > windowMs) { state.active = false; state.done = true; return; }
+      if (now - state.lastGapCheck > 500) {
+        state.lastGapCheck = now;
+        const recorded = gapRecorded();
+        if (recorded) state.gapSeen = true;
+        else if (state.gapSeen && state.gapClosedAt === null) state.gapClosedAt = now - state.startedAt;
+      }
+      const elapsed = now - state.startedAt;
+      // Sample until the hole is closed (plus a moment to see the layout settle), never past the cap; a run that never
+      // recorded a hole (older revision) is sampled for the fixed window.
+      const finished = state.gapSeen
+        ? (state.gapClosedAt !== null && elapsed - state.gapClosedAt > 1500) || elapsed > capMs
+        : elapsed > windowMs;
+      if (finished) { state.active = false; state.done = true; return; }
       requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
-  }, { mode, windowMs: SAMPLE_WINDOW_MS });
+  }, { mode, windowMs: SAMPLE_WINDOW_MS, capMs: SAMPLE_CAP_MS, gapKey: cacheKey });
 
-  await page.waitForFunction(() => window.__imcStale?.done === true, undefined, { timeout: SAMPLE_WINDOW_MS + 30_000, polling: 250 });
+  await page.waitForFunction(() => window.__imcStale?.done === true, undefined, { timeout: SAMPLE_CAP_MS + 30_000, polling: 250 });
   const layout = await page.evaluate(() => {
     const state = window.__imcStale;
-    return { error: state.error ?? null, samples: state.samples.length, markerSeen: state.markerSeen, markerGoneAtMs: state.markerGoneAt, anchorId: state.anchorId, anchorTop0: state.anchorTop0, samplesRaw: state.samples };
+    return { error: state.error ?? null, samples: state.samples.length, markerSeen: state.markerSeen, markerGoneAtMs: state.markerGoneAt, gapClosedAtMs: state.gapClosedAt, anchorId: state.anchorId, anchorTop0: state.anchorTop0, samplesRaw: state.samples };
   });
   const anchorTops = layout.samplesRaw.map((sample) => sample.anchorTop).filter((value) => typeof value === 'number');
   const drift = layout.anchorTop0 === null || anchorTops.length === 0 ? null : Math.max(...anchorTops.map((top) => Math.abs(top - layout.anchorTop0)));
@@ -236,7 +252,7 @@ async function runScenario(browser, mode) {
   const gapRecord = await page.evaluate(() => {
     try { return JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}'); } catch { return {}; }
   });
-  result.layout = { samples: layout.samples, markerSeen: layout.markerSeen, markerGoneAtMs: layout.markerGoneAtMs, anchorId: layout.anchorId, driftPx: drift, maxBottomGapPx: bottomGap, error: layout.error };
+  result.layout = { samples: layout.samples, markerSeen: layout.markerSeen, markerGoneAtMs: layout.markerGoneAtMs, gapClosedAtMs: layout.gapClosedAtMs, anchorId: layout.anchorId, driftPx: drift, maxBottomGapPx: bottomGap, error: layout.error };
   result.markerPresentAtEnd = await page.evaluate(() => !!document.querySelector('[data-testid="chat-history-gap-marker"]'));
   result.idbRows = await countIdbRows(page);
   result.gapRecord = gapRecord[cacheKey] ?? null;

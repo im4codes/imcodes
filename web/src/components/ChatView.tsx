@@ -1,5 +1,5 @@
 import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
-import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker } from './chat-history-gap.js';
+import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker, placeHistoryGapMarker } from './chat-history-gap.js';
 import {
   isNeverRenderedTimelineEventType,
   projectAssistantTextForDisplay,
@@ -3207,11 +3207,13 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
   );
   // The "earlier messages are still loading" row lives IN the list (between the older cached block and the
   // stitched newest block), so its arrival and removal take the same layout/anchor path as any other row.
-  const displayViewItems = useMemo(
-    () => (preview
-      ? renderedViewItems
-      : insertHistoryGapMarker(renderedViewItems, historyGap, { key: HISTORY_GAP_MARKER_KEY, type: 'history-gap' }) as ViewItem[]),
+  const historyGapPlacement = useMemo(
+    () => (preview ? { kind: 'none' as const } : placeHistoryGapMarker(renderedViewItems, historyGap)),
     [preview, renderedViewItems, historyGap],
+  );
+  const displayViewItems = useMemo(
+    () => insertHistoryGapMarker(renderedViewItems, historyGapPlacement, { key: HISTORY_GAP_MARKER_KEY, type: 'history-gap' }) as ViewItem[],
+    [renderedViewItems, historyGapPlacement],
   );
   const renderedRevision = useMemo(
     () => getRenderedViewRevision(displayViewItems),
@@ -4577,6 +4579,14 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                 </button>
               </div>
               <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
+            </div>
+          )}
+          {/* The hole lies above everything rendered: the same marker as the inline one, as a plain row at the top
+              (outside the virtualized list, so it is always in the DOM while the hole is open). */}
+          {historyGapPlacement.kind === 'above' && (
+            <div className="chat-history-gap-marker" role="status" data-testid="chat-history-gap-marker">
+              <span className="chat-refreshing-spinner" aria-hidden="true" />
+              <span>{t('chat.history_gap_loading')}</span>
             </div>
           )}
           {!loading && !preview && viewItems.length > 0 && (loadingOlder || revealingOlder) && (

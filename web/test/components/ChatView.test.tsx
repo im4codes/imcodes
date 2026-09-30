@@ -1641,6 +1641,18 @@ describe('ChatView', () => {
     expect(container.querySelector('[data-testid="chat-history-gap-marker"]')).toBeNull();
   });
 
+  it('shows the marker as a top row when the hole lies above everything rendered, and only one marker at a time', () => {
+    const events = [
+      { eventId: 'new-1', type: 'assistant.text', ts: 900_000, payload: { text: 'stitched newest message A' } },
+      { eventId: 'new-2', type: 'assistant.text', ts: 901_000, payload: { text: 'stitched newest message B' } },
+    ] as any;
+    const { container } = render(
+      <ChatView events={events} loading={false} historyGap={{ lowerTs: 1100, upperTs: 900_000 }} sessionId="deck_gap_marker_top_brain" />,
+    );
+    expect(container.querySelectorAll('[data-testid="chat-history-gap-marker"]')).toHaveLength(1);
+    expect(container.querySelector('.chat-virtual-item [data-testid="chat-history-gap-marker"]')).toBeNull();
+  });
+
   it('renders history fetch progress as a bottom overlay instead of footer layout content', () => {
     const { container } = render(
       <ChatView

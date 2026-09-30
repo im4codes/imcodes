@@ -29,18 +29,19 @@ export function viewItemStartTs(item: GapPlaceableItem): number | undefined {
   return firstStatus ? viewItemStartTs(firstStatus) : undefined;
 }
 
-/**
- * Insert `marker` before the first item that begins at or after the stitched newest block (`gap.upperTs`).
- * Returns `items` itself (same reference) when there is no hole to mark, so memoised consumers stay put.
- * When every listed item is already part of the newest block the marker sits at the top: the hole lies
- * above everything rendered.
- */
-export function insertHistoryGapMarker<T extends GapPlaceableItem>(
-  items: readonly T[],
+export type HistoryGapPlacement =
+  /** No hole to mark (none recorded, top unknown, nothing listed, or the newest block is not listed). */
+  | { kind: 'none' }
+  /** Between the older cached block and the stitched newest block: before `items[index]` (index > 0). */
+  | { kind: 'inline'; index: number }
+  /** Every listed item already belongs to the newest block: the hole lies above everything rendered. */
+  | { kind: 'above' };
+
+export function placeHistoryGapMarker(
+  items: readonly GapPlaceableItem[],
   gap: { upperTs: number | null } | null | undefined,
-  marker: T,
-): readonly T[] {
-  if (!gap || gap.upperTs === null || items.length === 0) return items;
+): HistoryGapPlacement {
+  if (!gap || gap.upperTs === null || items.length === 0) return { kind: 'none' };
   let index = -1;
   for (let i = 0; i < items.length; i += 1) {
     const ts = viewItemStartTs(items[i]!);
@@ -50,6 +51,16 @@ export function insertHistoryGapMarker<T extends GapPlaceableItem>(
     }
   }
   // Nothing at or above the stitched block is listed (it is not rendered yet): nothing to place the marker against.
-  if (index < 0) return items;
-  return [...items.slice(0, index), marker, ...items.slice(index)];
+  if (index < 0) return { kind: 'none' };
+  return index === 0 ? { kind: 'above' } : { kind: 'inline', index };
+}
+
+/** `items` with `marker` inserted for an inline placement; the very same array otherwise (memoised consumers stay put). */
+export function insertHistoryGapMarker<T extends GapPlaceableItem>(
+  items: readonly T[],
+  placement: HistoryGapPlacement,
+  marker: T,
+): readonly T[] {
+  if (placement.kind !== 'inline') return items;
+  return [...items.slice(0, placement.index), marker, ...items.slice(placement.index)];
 }

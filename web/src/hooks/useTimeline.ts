@@ -2387,6 +2387,7 @@ export function useTimeline(
     backfillDebug('gap: newest-window page noted', { key, minTs, maxTs, full, count: pageEvents.length });
     tryDecideOpenGap();
   }, [tryDecideOpenGap]);
+
   const transportQueueStateRef = useRef<TransportQueueReducerState>(
     createTransportQueueReducerState(sessionId ?? undefined),
   );
@@ -2451,6 +2452,42 @@ export function useTimeline(
       counts: count === undefined ? prev.counts : { ...prev.counts, [step]: count },
     }));
   }, []);
+
+  /** Which cacheKey's local read (memory / snapshot / IndexedDB) has settled: after that an empty ledger means "cold". */
+  const localReadSettledKeyRef = useRef<string | null>(null);
+  /**
+   * A window reopened after a long time asks for its newest few readable messages FIRST — a tiny text-only
+   * request sent ahead of the newest window — so the conversation's latest state is on screen after one small
+   * round trip instead of after the (up to 1 MiB) window. Sent when the local cache is known and stale, or when
+   * the local read has not answered yet (a stale cache may be about to appear; a cold one just gets 30 messages
+   * it would have got anyway). Never for a settled-empty (cold) window, and at most once a minute per window.
+   */
+  const sendStaleWindowPeek = useCallback((): void => {
+    if (!ws?.connected || !sessionId || !cacheKey) return;
+    if (!Number.isFinite(staleWindowPeekMinAgeMs)) return;
+    const now = Date.now();
+    const cursorTs = getLocalCacheCursorTs();
+    if (cursorTs !== undefined) {
+      if (now - cursorTs < staleWindowPeekMinAgeMs) return;
+    } else if (localReadSettledKeyRef.current === cacheKey) {
+      return;
+    }
+    const last = lastPeekRef.current;
+    if (last && last.key === cacheKey && now - last.at < STALE_WINDOW_PEEK_REPEAT_MS) return;
+    lastPeekRef.current = { key: cacheKey, at: now };
+    peekRequestIdRef.current = ws.sendTimelineHistoryRequest(
+      sessionId,
+      TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
+      undefined,
+      undefined,
+      undefined,
+      STALE_WINDOW_PEEK_BUDGET_BYTES,
+      TIMELINE_HISTORY_CONTENT_FILTERS.TEXT,
+    );
+    updateHistoryStep('textTail', 'running', 'bootstrap');
+  }, [cacheKey, getLocalCacheCursorTs, sessionId, updateHistoryStep, ws]);
+  const sendStaleWindowPeekRef = useRef(sendStaleWindowPeek);
+  sendStaleWindowPeekRef.current = sendStaleWindowPeek;
 
   const recordTimelineResponse = useCallback((
     msg: TimelineProtocolServerMessage,
@@ -2765,37 +2802,6 @@ export function useTimeline(
       setRefreshing(false);
     };
 
-    // A window reopened after a long time asks for its newest few messages first (tiny, text-only), so it
-    // shows where the conversation is now in about one round trip; the ordinary newest window and the
-    // newest→oldest hole backfill follow. Sent ahead of the bootstrap window on the same socket.
-    const maybeSendStaleWindowPeek = (opts?: { cacheUnknown?: boolean }): void => {
-      if (!ws || !sessionId || !cacheKey) return;
-      const cursorTs = getLocalCacheCursorTs();
-      const now = Date.now();
-      if (opts?.cacheUnknown) {
-        // Cache state unknown (local read pending): only a window that has not just peeked, and only when the
-        // peek is enabled at all (a huge min-age disables it).
-        if (!Number.isFinite(staleWindowPeekMinAgeMs)) return;
-      } else {
-        // Nothing cached: the ordinary newest window is already the first paint.
-        if (cursorTs === undefined) return;
-        if (now - cursorTs < staleWindowPeekMinAgeMs) return;
-      }
-      const last = lastPeekRef.current;
-      if (last && last.key === cacheKey && now - last.at < STALE_WINDOW_PEEK_REPEAT_MS) return;
-      lastPeekRef.current = { key: cacheKey, at: now };
-      peekRequestIdRef.current = ws.sendTimelineHistoryRequest(
-        sessionId,
-        TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT,
-        undefined,
-        undefined,
-        undefined,
-        STALE_WINDOW_PEEK_BUDGET_BYTES,
-        TIMELINE_HISTORY_CONTENT_FILTERS.TEXT,
-      );
-      updateHistoryStep('textTail', 'running', 'bootstrap');
-    };
-
     const requestDaemonHistory = (visible: boolean, limit?: number, sourceEvents?: TimelineEvent[], force = false): void => {
       if (!wsConnected || !ws) return;
       // Gate passive card/hidden history requests, but let an on-screen chat
@@ -2828,7 +2834,7 @@ export function useTimeline(
       } else {
         markDaemonHistoryBackground();
       }
-      maybeSendStaleWindowPeek();
+      sendStaleWindowPeekRef.current();
       sendForwardHistoryRequest('bootstrap', buildForwardHistoryArgs(limit, sourceEvents));
     };
 
@@ -2909,10 +2915,6 @@ export function useTimeline(
         coldDaemonTimer = setTimeout(() => {
           coldDaemonTimer = null;
           if (cancelled || coldDaemonRequested) return;
-          // The local read is still pending, so whether a (possibly stale) cache exists is not known yet. A tiny
-          // text-only tail request costs next to nothing either way and, when there IS a stale cache, is what puts
-          // the latest messages on screen before the big window reply.
-          maybeSendStaleWindowPeek({ cacheUnknown: true });
           requestDaemonHistory(true, undefined, undefined, !isActiveSessionRef.current);
           coldDaemonRequested = true;
         }, LOCAL_HISTORY_DAEMON_HEDGE_MS);
@@ -2982,6 +2984,7 @@ export function useTimeline(
         clearTimeout(coldDaemonTimer);
         coldDaemonTimer = null;
       }
+      if (first.kind === 'result') localReadSettledKeyRef.current = cacheKey ?? null;
       let { stored, cursor, rawAlreadyRead } = first.kind === 'result'
         ? first.result
         : await localRead;
@@ -4873,6 +4876,9 @@ export function useTimeline(
     prevIsActiveRef.current = isActiveSession;
     if (!prev && isActiveSession) {
       backfillDebug('isActiveSession false→true: firing backfill', { sessionId });
+      // Tapping a chat that was not on screen: its latest messages first (tiny text-only tail), before the
+      // window request below is even sent.
+      sendStaleWindowPeekRef.current();
       // Short on-screen timeline → also re-read local history (idempotent merge).
       // Same rationale as the activation-event handler above
       // (ACTIVE_LOCAL_RELOAD_MAX_EVENTS): recover a truncated reopen without
