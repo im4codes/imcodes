@@ -14,7 +14,7 @@ vi.mock('react-i18next', () => ({
 }));
 
 import { TaskPairEventChip } from '../../src/components/TaskPairEventChip.js';
-import { TaskPairStatusPanel, TaskPairStatusPanelHost } from '../../src/components/TaskPairStatusPanel.js';
+import { TaskPairStatusPanel, TaskPairStatusPanelHost, collapsedStorageKey } from '../../src/components/TaskPairStatusPanel.js';
 import { taskConsoleStateToPairSnapshot } from '../../src/components/SupervisionTaskConsole.js';
 import { formatElapsedDuration } from '../../src/util/tool-duration.js';
 import { watchProjectionStore } from '../../src/watch-projection.js';
@@ -361,6 +361,58 @@ describe('TaskPairStatusPanel', () => {
     fireEvent.keyDown(container.querySelector('.task-pair-status-compact') as HTMLElement, { key: ' ' });
     expect(container.querySelector('.task-pair-status-panel')?.classList.contains('is-collapsed')).toBe(false);
     Object.defineProperty(window, 'matchMedia', { configurable: true, value: original });
+  });
+
+  it('mobile: an expanded panel is bounded to the measured chat area; when almost nothing is left it presents the strip without touching the stored choice', async () => {
+    const events = [{ eventId: 'fit-1', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fit-1', title: 'Fit task', toStatus: 'working' } }] as never;
+    const originalMedia = window.matchMedia;
+    const originalRaf = window.requestAnimationFrame;
+    const originalObserver = globalThis.ResizeObserver;
+    const originalViewport = Object.getOwnPropertyDescriptor(window, 'visualViewport');
+    Object.defineProperty(window.navigator, 'maxTouchPoints', { configurable: true, value: 5 });
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: () => ({ matches: true, media: '', addEventListener: () => {}, removeEventListener: () => {} }) });
+    const frames: FrameRequestCallback[] = [];
+    window.requestAnimationFrame = ((callback: FrameRequestCallback) => { frames.push(callback); return frames.length; }) as never;
+    let resize: (() => void) | undefined;
+    globalThis.ResizeObserver = class { constructor(cb: () => void) { resize = cb; } observe() {} disconnect() {} unobserve() {} } as never;
+    const viewport = { offsetTop: 0, height: 844, addEventListener: () => {}, removeEventListener: () => {} };
+    Object.defineProperty(window, 'visualViewport', { configurable: true, value: viewport });
+    window.localStorage.setItem(collapsedStorageKey('fit-server', true), '0');
+    const rect = (top: number, bottom: number) => ({ top, bottom, left: 0, right: 390, width: 390, height: bottom - top, x: 0, y: top, toJSON: () => ({}) }) as DOMRect;
+    const main = document.createElement('div'); main.className = 'chat-main';
+    const titlebar = document.createElement('div'); titlebar.className = 'chat-titlebar';
+    main.appendChild(titlebar); document.body.appendChild(main);
+    let mainBottom = 600;
+    main.getBoundingClientRect = () => rect(0, mainBottom);
+    titlebar.getBoundingClientRect = () => rect(40, 80);
+    const flush = async () => { const pending = frames.splice(0); await waitFor(() => { pending.forEach((cb) => cb(0)); }); };
+    try {
+      render(<TaskPairStatusPanel events={events} serverId="fit-server" />, { container: titlebar });
+      const panel = () => titlebar.querySelector('.task-pair-status-panel') as HTMLElement;
+      expect(panel().classList.contains('is-collapsed')).toBe(false);
+      expect(panel().style.getPropertyValue('--task-pair-panel-max-h')).toBe(`${600 - 84 - 8}px`);
+
+      mainBottom = 120; // e.g. software keyboard / a tiny sub-window: < 96px usable
+      resize?.();
+      await flush();
+      await waitFor(() => expect(panel().classList.contains('is-collapsed')).toBe(true));
+      expect(titlebar.querySelector('.task-pair-status-rows')).toBeNull();
+      expect(window.localStorage.getItem(collapsedStorageKey('fit-server', true))).toBe('0');
+
+      mainBottom = 600; // keyboard closes: the user's stored (expanded) choice returns
+      resize?.();
+      await flush();
+      await waitFor(() => expect(panel().classList.contains('is-collapsed')).toBe(false));
+      expect(panel().style.getPropertyValue('--task-pair-panel-max-h')).toBe(`${600 - 84 - 8}px`);
+    } finally {
+      cleanup();
+      main.remove();
+      Object.defineProperty(window, 'matchMedia', { configurable: true, value: originalMedia });
+      window.requestAnimationFrame = originalRaf;
+      globalThis.ResizeObserver = originalObserver;
+      if (originalViewport) Object.defineProperty(window, 'visualViewport', originalViewport);
+      else delete (window as { visualViewport?: unknown }).visualViewport;
+    }
   });
 
   it('portals the collapsed mobile status into the pinned-message header row', async () => {
@@ -744,7 +796,9 @@ describe('TaskPairStatusPanel', () => {
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel\.is-collapsed\s*\{[^}]*max-width:\s*calc\(48% - var\(--chat-top-actions-reserve/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)\s*\{[^}]*position:\s*absolute/);
     expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?top:\s*max\(calc\(100% \+ 4px\), 40px\)/);
-    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*min\(65vh/);
+    // Mobile expanded rules bound the height by the measured chat area (--task-pair-panel-max-h, see
+    // task-pair-panel-fit.ts); the viewport-relative value survives as the fallback inside var().
+    expect(css).toMatch(/\.chat-titlebar > \.task-pair-status-panel:not\(\.is-collapsed\)[\s\S]*?max-height:\s*(?:var\(--task-pair-panel-max-h,\s*)?min\(65vh/);
   });
 
   it('gives the panel an opaque background from tokens that are actually defined, so it never renders transparent over the toolbar or chat text', () => {

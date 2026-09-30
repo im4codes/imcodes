@@ -14556,6 +14556,16 @@ button.quick-agent-delegation-preset.active {
   top: max(calc(100% + 4px), 40px); right: 8px; bottom: auto; height: min(65vh, calc(100dvh - 160px)); max-height: min(65vh, calc(100dvh - 160px)); overflow: hidden;
   width: min(var(--task-pair-panel-width), calc(100% - 16px));
 }
+/* Mobile expanded panel: bound to the VISIBLE chat area, not the viewport.
+   --task-pair-panel-max-h is measured by task-pair-panel-fit.ts (panel top to
+   the bottom of .chat-main, capped by the visual viewport), so the panel never
+   extends under the context progress bar / agent row / composer or the
+   software keyboard and the rows list -- the only scroll container -- reaches
+   every card. The viewport-relative value is only the pre-measurement / no-JS
+   fallback. Height follows the content up to that bound. */
+.chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
+  height: auto; max-height: var(--task-pair-panel-max-h, min(65vh, calc(100dvh - 160px)));
+}
 .chat-titlebar > .task-pair-status-panel.is-collapsed {
   /* Keep the collapsed strip in the titlebar flex flow on desktop too. The
      expanded rows remain positioned below the titlebar by the rule above. */
@@ -14661,8 +14671,8 @@ button.quick-agent-delegation-preset.active {
   }
   .chat-titlebar > .task-pair-status-panel.is-mobile:not(.is-collapsed) {
     position: absolute; top: max(calc(100% + 4px), 40px); left: 8px; right: 8px; bottom: auto;
-    width: auto; max-width: none; height: min(65vh, calc(100dvh - 160px));
-    max-height: min(65vh, calc(100dvh - 160px)); z-index: 20; overflow: hidden;
+    width: auto; max-width: none; height: auto;
+    max-height: var(--task-pair-panel-max-h, min(65vh, calc(100dvh - 160px))); z-index: 20; overflow: hidden;
     border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
     box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
   }
@@ -14678,7 +14688,7 @@ button.quick-agent-delegation-preset.active {
   .task-pair-status-panel.is-collapsed { position: static; width: auto; max-width: none; height: auto; max-height: none; overflow: visible; }
   .chat-titlebar > .task-pair-status-panel:not(.is-collapsed) {
     position: absolute; top: max(calc(100% + 4px), 40px); left: 8px; right: 8px; bottom: auto; width: auto; max-width: none;
-    height: min(65vh, calc(100dvh - 160px)); max-height: min(65vh, calc(100dvh - 160px)); z-index: 20; overflow: hidden;
+    height: auto; max-height: var(--task-pair-panel-max-h, min(65vh, calc(100dvh - 160px))); z-index: 20; overflow: hidden;
     border: 1px solid var(--status-info-border, var(--chrome-accent)); border-radius: 10px;
     box-shadow: 0 8px 28px color-mix(in srgb, #000 35%, transparent);
   }

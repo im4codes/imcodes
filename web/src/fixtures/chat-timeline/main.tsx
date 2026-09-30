@@ -139,6 +139,13 @@ const query = readQuery();
 const { events: initialEvents, label: fixtureLabel } = resolveEvents(query);
 const windowCount = query.get('windows') === '4' ? 4 : 1;
 const fixturePinsEnabled = query.get('pins') === '1';
+/**
+ * `chrome=1` adds a stand-in for the bottom chrome the real app stacks under
+ * the chat (context progress bar, agent status row, control row, composer,
+ * queue chip, sub-session bar; ~300 CSS px on a phone) so layout checks can
+ * measure against the elements a chat overlay must never reach.
+ */
+const fixtureChromeEnabled = query.get('chrome') === '1';
 /** Live events array. Replaced (never mutated) on every harness update. */
 let currentEvents: TimelineEvent[] = initialEvents;
 let publishEvents: ((next: TimelineEvent[]) => void) | null = null;
@@ -241,6 +248,24 @@ const harness: ChatTimelineHarnessApi = {
 
 (window as unknown as { __chatTimelineHarness?: ChatTimelineHarnessApi }).__chatTimelineHarness = harness;
 
+const FIXTURE_CHROME_ROWS: ReadonlyArray<readonly [string, number]> = [
+  ['progress-bar', 12], ['agent-row', 56], ['control-row', 50], ['composer', 64], ['queue-chip', 40], ['session-bar', 80],
+];
+
+function FixtureBottomChrome() {
+  return (
+    <div data-testid="fixture-bottom-chrome" style={{ flex: '0 0 auto', display: 'flex', flexDirection: 'column' }}>
+      {FIXTURE_CHROME_ROWS.map(([name, height]) => (
+        <div
+          key={name}
+          data-testid={`fixture-${name}`}
+          style={{ height, flex: '0 0 auto', boxSizing: 'border-box', borderTop: '1px solid #334155', background: '#0f172a', color: '#94a3b8', font: '11px monospace' }}
+        >{name}</div>
+      ))}
+    </div>
+  );
+}
+
 function FixtureHarness() {
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   publishEvents = setEvents;
@@ -267,13 +292,26 @@ function FixtureHarness() {
     >
       {Array.from({ length: windowCount }, (_, i) => (
         <div key={i} class="chat-timeline-fixture-window" data-window-index={i} style={cellStyle}>
-          <ChatView
-            events={events}
-            loading={false}
-            sessionId={`fixture-window-${i}`}
-            serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
-            messagePinsEnabled={fixturePinsEnabled}
-          />
+          {fixtureChromeEnabled ? (
+            <div style={{ flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              <ChatView
+                events={events}
+                loading={false}
+                sessionId={`fixture-window-${i}`}
+                serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
+                messagePinsEnabled={fixturePinsEnabled}
+              />
+            </div>
+          ) : (
+            <ChatView
+              events={events}
+              loading={false}
+              sessionId={`fixture-window-${i}`}
+              serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
+              messagePinsEnabled={fixturePinsEnabled}
+            />
+          )}
+          {fixtureChromeEnabled && <FixtureBottomChrome />}
         </div>
       ))}
     </div>

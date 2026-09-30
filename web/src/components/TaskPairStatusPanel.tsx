@@ -1,5 +1,6 @@
 import { isMobileLayout } from '../mobile-device.js';
-import { useCallback, useEffect, useLayoutEffect, useState } from 'preact/hooks';
+import { bindTaskPairPanelFit } from '../task-pair-panel-fit.js';
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
@@ -147,11 +148,22 @@ function resolveSessionModel(
 export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
   const { t } = useTranslation();
   const [isMobile, setIsMobile] = useState(isMobileLayout);
-  const [collapsed, setCollapsed] = useState(() => readCollapsed(serverId, isMobileLayout()));
+  const [storedCollapsed, setCollapsed] = useState(() => readCollapsed(serverId, isMobileLayout()));
+  // The mobile panel is measured against the visible chat area; when too little
+  // room is left (landscape phone, keyboard open) the collapsed strip is shown
+  // instead, without touching the user's stored choice.
+  const [cramped, setCramped] = useState(false);
+  const panelRef = useRef<HTMLElement>(null);
+  const collapsed = storedCollapsed || (isMobile && cramped);
   const persistCollapsed = useCallback((next: boolean) => {
     setCollapsed(next);
     try { window.localStorage.setItem(collapsedStorageKey(serverId, isMobile), next ? '1' : '0'); } catch {}
   }, [serverId, isMobile]);
+  useLayoutEffect(() => {
+    const panel = panelRef.current;
+    if (!isMobile || !panel) { setCramped(false); return undefined; }
+    return bindTaskPairPanelFit(panel, setCramped);
+  }, [isMobile]);
   useEffect(() => {
     const media = window.matchMedia?.('(max-width: 720px)');
     if (!media) return undefined;
@@ -275,7 +287,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--queued">{t('taskPair.panel_count_queued', { count: counts.queued })}</span>
       <span class="task-pair-status-badge task-pair-status-badge--sm task-pair-chip--awaiting_brain_decision">{t('taskPair.status.awaiting_brain_decision')} ({counts.awaitingBrain})</span>
     </span><span class="task-pair-status-collapse-icon" aria-hidden="true">⌃</span></>;
-  return <aside class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
+  return <aside ref={panelRef} class={`task-pair-status-panel${collapsed ? ' is-collapsed' : ''}${isMobile ? ' is-mobile' : ' is-desktop'}`} data-testid="task-pair-status-panel">
     {isMobile && collapsed ? <div class="task-pair-status-toggle task-pair-status-compact" role="button" tabIndex={0} aria-expanded={false} aria-label={toggleLabel} title={t('taskPair.panel_expand')} onClick={toggle} onKeyDown={toggleWithKeyboard}>
       {toggleContent}
     </div> : <button type="button" class="task-pair-status-toggle" aria-expanded={!collapsed} aria-label={toggleLabel} title={t(collapsed ? 'taskPair.panel_expand' : 'taskPair.panel_collapse')} onClick={toggle}>
