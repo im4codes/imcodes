@@ -118,9 +118,13 @@ afterEach(async () => {
   setSessionDbRowWriteHookForTests(null);
   vi.useRealTimers();
   vi.restoreAllMocks();
+  // The store schedules an online snapshot of the database after its first flush and writes it into
+  // `home` asynchronously; removing the directory under it made rm() fail with ENOTEMPTY (macOS CI /
+  // load), so wait for it first, and let rm retry for the terminated export worker's last file.
+  await waitForSessionStoreSnapshotForTests().catch(() => undefined);
   resetSessionStoreAuthorityForTests();
   vi.unstubAllEnvs();
-  await rm(home, { recursive: true, force: true });
+  await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
 describe('one-time migration from sessions.json', () => {
