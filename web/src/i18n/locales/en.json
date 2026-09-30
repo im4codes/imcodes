@@ -3483,11 +3483,12 @@
     "error_invalid_params": "Invalid request."
   },
   "codex_credit_balance": {
-    "title": "Codex usage credit balance",
+    "title": "Codex credits balance: {{balance}} credits",
+    "title_unlimited": "Codex credits balance: unlimited",
     "history_title": "Credit consumption",
     "no_consumption": "No recorded consumption yet",
-    "spent": "Spent {{amount}}",
-    "balance_now": "balance {{amount}}",
+    "spent": "Spent {{amount}} credits",
+    "balance_now": "balance {{amount}} credits",
     "error_generic": "Request failed."
   },
   "sessionUsage": {

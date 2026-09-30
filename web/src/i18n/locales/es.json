@@ -3483,11 +3483,12 @@
     "error_invalid_params": "Solicitud no válida."
   },
   "codex_credit_balance": {
-    "title": "Saldo de créditos de uso de Codex",
+    "title": "Saldo de créditos de Codex: {{balance}} créditos",
+    "title_unlimited": "Saldo de créditos de Codex: ilimitado",
     "history_title": "Consumo de créditos",
     "no_consumption": "Sin consumo registrado",
-    "spent": "Gastado {{amount}}",
-    "balance_now": "saldo {{amount}}",
+    "spent": "Gastados {{amount}} créditos",
+    "balance_now": "saldo {{amount}} créditos",
     "error_generic": "Error de solicitud."
   },
   "sessionUsage": {

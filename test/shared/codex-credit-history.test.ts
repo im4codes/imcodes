@@ -7,21 +7,62 @@ import {
 } from '../../shared/codex-credit-history.js';
 
 describe('formatCodexCreditBalance', () => {
-  it('formats a decimal-string balance as a two-decimal dollar amount', () => {
-    expect(formatCodexCreditBalance('12.5')).toBe('$12.50');
-    expect(formatCodexCreditBalance('0')).toBe('$0.00');
-    expect(formatCodexCreditBalance('100')).toBe('$100.00');
+  // The Codex app-server reports a CREDIT count (the CLI labels it "Balance credits"), not USD:
+  // "62500" used to render as "$62500.00" (owner report).
+  it('shows a credit count as a grouped integer with no currency symbol', () => {
+    expect(formatCodexCreditBalance('62500')).toBe('62,500');
+    expect(formatCodexCreditBalance('0')).toBe('0');
+    expect(formatCodexCreditBalance('100')).toBe('100');
+    expect(formatCodexCreditBalance('999')).toBe('999');
+    expect(formatCodexCreditBalance('1000')).toBe('1,000');
+    expect(formatCodexCreditBalance('1234567')).toBe('1,234,567');
+  });
+
+  it('keeps decimals only when the value has a fractional part', () => {
+    expect(formatCodexCreditBalance('12.5')).toBe('12.5');
+    expect(formatCodexCreditBalance('12.50')).toBe('12.5');
+    expect(formatCodexCreditBalance('12.00')).toBe('12');
+    expect(formatCodexCreditBalance('1234.567')).toBe('1,234.567');
+    expect(formatCodexCreditBalance('0.25')).toBe('0.25');
+    expect(formatCodexCreditBalance('62500.0')).toBe('62,500');
+  });
+
+  it('never renders a currency symbol', () => {
+    for (const value of ['62500', '12.5', '0', '1e5', 'not-a-number', '']) {
+      expect(formatCodexCreditBalance(value)).not.toContain('$');
+    }
+  });
+
+  it('keeps every digit of a huge count (no float rounding) and handles padding, sign and whitespace', () => {
+    expect(formatCodexCreditBalance('123456789012345678901234567890')).toBe('123,456,789,012,345,678,901,234,567,890');
+    expect(formatCodexCreditBalance('9007199254740993')).toBe('9,007,199,254,740,993');
+    expect(formatCodexCreditBalance('007')).toBe('7');
+    expect(formatCodexCreditBalance('000')).toBe('0');
+    expect(formatCodexCreditBalance('-1500')).toBe('-1,500');
+    expect(formatCodexCreditBalance('-0')).toBe('0');
+    expect(formatCodexCreditBalance('  62500 ')).toBe('62,500');
   });
 
   it('shows the infinity glyph for an unlimited account regardless of the reported balance', () => {
     expect(formatCodexCreditBalance('0', true)).toBe('∞');
     expect(formatCodexCreditBalance('99', true)).toBe('∞');
+    expect(formatCodexCreditBalance(undefined, true)).toBe('∞');
   });
 
-  it('falls back to $0.00 for a missing balance and to the raw string for a non-numeric one', () => {
-    expect(formatCodexCreditBalance(undefined)).toBe('$0.00');
-    expect(formatCodexCreditBalance(null)).toBe('$0.00');
+  it('shows 0 for a missing or empty balance and passes a non-numeric string through unchanged', () => {
+    expect(formatCodexCreditBalance(undefined)).toBe('0');
+    expect(formatCodexCreditBalance(null)).toBe('0');
+    expect(formatCodexCreditBalance('')).toBe('0');
     expect(formatCodexCreditBalance('not-a-number')).toBe('not-a-number');
+  });
+
+  it('formats an exponent form through Number instead of passing it through', () => {
+    expect(formatCodexCreditBalance('1e5')).toBe('100,000');
+  });
+
+  it('formats a consumption amount the same way (a spend of 2.50 credits is "2.5", of 20.00 is "20")', () => {
+    expect(formatCodexCreditBalance('2.50')).toBe('2.5');
+    expect(formatCodexCreditBalance('20.00')).toBe('20');
   });
 });
 

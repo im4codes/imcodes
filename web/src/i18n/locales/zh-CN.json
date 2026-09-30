@@ -3483,11 +3483,12 @@
     "error_invalid_params": "请求无效。"
   },
   "codex_credit_balance": {
-    "title": "Codex 使用积分余额",
+    "title": "Codex 积分余额：{{balance}} 积分",
+    "title_unlimited": "Codex 积分余额：无限",
     "history_title": "积分消耗记录",
     "no_consumption": "暂无消耗记录",
-    "spent": "消耗 {{amount}}",
-    "balance_now": "余额 {{amount}}",
+    "spent": "消耗 {{amount}} 积分",
+    "balance_now": "余额 {{amount}} 积分",
     "error_generic": "请求失败。"
   },
   "sessionUsage": {

@@ -3482,11 +3482,12 @@
     "error_invalid_params": "無効なリクエストです。"
   },
   "codex_credit_balance": {
-    "title": "Codex 利用クレジット残高",
+    "title": "Codex クレジット残高：{{balance}} クレジット",
+    "title_unlimited": "Codex クレジット残高：無制限",
     "history_title": "クレジット消費履歴",
     "no_consumption": "消費履歴はまだありません",
-    "spent": "{{amount}} 消費",
-    "balance_now": "残高 {{amount}}",
+    "spent": "{{amount}} クレジット消費",
+    "balance_now": "残高 {{amount}} クレジット",
     "error_generic": "リクエストに失敗しました。"
   },
   "sessionUsage": {

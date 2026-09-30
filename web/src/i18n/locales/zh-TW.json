@@ -3483,11 +3483,12 @@
     "error_invalid_params": "請求無效。"
   },
   "codex_credit_balance": {
-    "title": "Codex 使用點數餘額",
+    "title": "Codex 點數餘額：{{balance}} 點數",
+    "title_unlimited": "Codex 點數餘額：無限",
     "history_title": "點數消耗記錄",
     "no_consumption": "尚無消耗記錄",
-    "spent": "消耗 {{amount}}",
-    "balance_now": "餘額 {{amount}}",
+    "spent": "消耗 {{amount}} 點數",
+    "balance_now": "餘額 {{amount}} 點數",
     "error_generic": "請求失敗。"
   },
   "sessionUsage": {

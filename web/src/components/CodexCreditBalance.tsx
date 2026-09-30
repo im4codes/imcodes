@@ -7,7 +7,8 @@
  *
  * DIFFERENT from CodexResetCredits (the 🎟 button to its left): that spends a
  * bonus credit to force-reset the 5h/weekly rate-limit window early, and has
- * no balance of its own. This shows a real spendable dollar balance.
+ * no balance of its own. This shows the spendable credit balance: a unit-less
+ * credit count (never a currency amount), see formatCodexCreditBalance.
  *
  * The current balance rides the ordinary session-sync channel (props, from
  * SessionRecord.codexCreditsBalance) so it's always up to date without the
@@ -140,7 +141,12 @@ export function CodexCreditBalance({ wsClient, connected, balance, unlimited }: 
         type="button"
         class="codex-credit-balance-trigger"
         onClick={toggle}
-        title={t('codex_credit_balance.title')}
+        title={unlimited === true
+          ? t('codex_credit_balance.title_unlimited')
+          : t('codex_credit_balance.title', { balance: displayBalance })}
+        aria-label={unlimited === true
+          ? t('codex_credit_balance.title_unlimited')
+          : t('codex_credit_balance.title', { balance: displayBalance })}
       >
         💳 {displayBalance}
       </button>
@@ -175,7 +181,7 @@ export function CodexCreditBalance({ wsClient, connected, balance, unlimited }: 
           {!loading && !error && events.map((event) => (
             <div key={event.atCapturedAt} class="codex-credit-balance-item" style={{ padding: '4px 0', borderTop: '1px solid #374151' }}>
               <div style={{ color: '#e5e7eb' }}>
-                {t('codex_credit_balance.spent', { amount: event.spent })}
+                {t('codex_credit_balance.spent', { amount: formatCodexCreditBalance(event.spent) })}
               </div>
               <div style={{ color: '#9ca3af', fontSize: 10 }}>
                 {formatCodexCreditSnapshotTime(event.atCapturedAt, i18n.resolvedLanguage ?? i18n.language)}

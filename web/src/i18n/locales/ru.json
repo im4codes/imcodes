@@ -3482,11 +3482,12 @@
     "error_invalid_params": "Неверный запрос."
   },
   "codex_credit_balance": {
-    "title": "Баланс кредитов использования Codex",
+    "title": "Баланс кредитов Codex: {{balance}}",
+    "title_unlimited": "Баланс кредитов Codex: без ограничений",
     "history_title": "Расход кредитов",
     "no_consumption": "Расход пока не зафиксирован",
-    "spent": "Потрачено {{amount}}",
-    "balance_now": "баланс {{amount}}",
+    "spent": "Потрачено кредитов: {{amount}}",
+    "balance_now": "баланс кредитов: {{amount}}",
     "error_generic": "Ошибка запроса."
   },
   "sessionUsage": {

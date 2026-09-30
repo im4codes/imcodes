@@ -36,9 +36,10 @@ export interface CodexCreditSnapshot {
   accountId?: string;
   planType?: string;
   /**
-   * Decimal string as reported by the codex backend (e.g. "12.50"), kept as
-   * a string end to end rather than parsed to a float — avoids rounding
-   * drift through storage/transport for a value that represents money.
+   * Decimal string as reported by the codex backend (e.g. "62500"): a count of
+   * CREDITS, not a currency amount (the Codex CLI labels the same value
+   * "Balance credits"). Kept as a string end to end rather than parsed to a
+   * float — avoids rounding drift through storage/transport.
    */
   balance: string;
   hasCredits: boolean;
@@ -56,7 +57,7 @@ export interface CodexCreditConsumptionEvent {
   atCapturedAt: number;
   fromBalance: string;
   toBalance: string;
-  /** fromBalance − toBalance, as a fixed 2-decimal string; always > 0. */
+  /** fromBalance − toBalance in credits, as a fixed 2-decimal string; always > 0. Show it through formatCodexCreditBalance. */
   spent: string;
 }
 
@@ -66,16 +67,31 @@ function parseDecimal(value: string | undefined | null): number | undefined {
   return Number.isFinite(n) ? n : undefined;
 }
 
+/** Credit counts are shown with thousands separators in a fixed locale, so the same balance reads the same in every UI language. */
+const CREDIT_GROUP_SEPARATOR = ',';
+const PLAIN_DECIMAL_RE = /^([+-]?)(\d+)(?:\.(\d+))?$/;
+
 /**
- * Format a decimal-string balance for display, e.g. `"12.5"` → `"$12.50"`.
- * Falls back to the raw string when it isn't numeric, so an unexpected
- * backend shape degrades to "show something" rather than a crash.
+ * Format a credit balance for display, e.g. `"62500"` → `"62,500"`, `"12.50"`
+ * → `"12.5"`. Credits are a unit-less count: no currency symbol, decimals only
+ * when the value has a fractional part. A plain decimal string is grouped as
+ * text (no float round trip, so a huge count keeps every digit); any other
+ * numeric form (`"1e5"`) goes through Number, and a non-numeric string is
+ * returned as is, so an unexpected backend shape degrades to "show something".
  */
 export function formatCodexCreditBalance(balance: string | undefined | null, unlimited?: boolean): string {
   if (unlimited) return '∞';
-  if (!balance) return '$0.00';
+  if (!balance) return '0';
+  const plain = PLAIN_DECIMAL_RE.exec(balance.trim());
+  if (plain) {
+    const [, sign, whole, fraction] = plain;
+    const grouped = whole!.replace(/^0+(?=\d)/, '').replace(/\B(?=(\d{3})+(?!\d))/g, CREDIT_GROUP_SEPARATOR);
+    const trimmedFraction = (fraction ?? '').replace(/0+$/, '');
+    const negative = sign === '-' && (grouped !== '0' || trimmedFraction !== '');
+    return `${negative ? '-' : ''}${grouped}${trimmedFraction ? `.${trimmedFraction}` : ''}`;
+  }
   const n = parseDecimal(balance);
-  return n === undefined ? balance : `$${n.toFixed(2)}`;
+  return n === undefined ? balance : n.toLocaleString('en-US', { maximumFractionDigits: 6 });
 }
 
 /**
