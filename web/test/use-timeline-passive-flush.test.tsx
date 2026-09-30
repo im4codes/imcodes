@@ -5,7 +5,7 @@ import { h } from 'preact';
 import { act, cleanup, render } from '@testing-library/preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { ServerMessage, TimelineEvent, WsClient } from '../src/ws-client.js';
-import { PASSIVE_TIMELINE_FLUSH_MS, __resetTimelineCacheForTests, useTimeline } from '../src/hooks/useTimeline.js';
+import { PASSIVE_TIMELINE_FLUSH_MS, PASSIVE_TIMELINE_JITTER_MS, __resetTimelineCacheForTests, useTimeline } from '../src/hooks/useTimeline.js';
 
 /**
  * A passive presentation (summary-mode hidden pane / collapsed card) flushes its
@@ -76,7 +76,7 @@ describe('passive timeline presentations flush slowly', () => {
     }
     await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS - 50); await Promise.resolve(); });
     expect(t.renders() - before, 'nothing committed inside the passive window').toBe(0);
-    await act(async () => { vi.advanceTimersByTime(100); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { vi.advanceTimersByTime(100 + PASSIVE_TIMELINE_JITTER_MS); await Promise.resolve(); await Promise.resolve(); });
     expect(t.renders() - before).toBeLessThanOrEqual(2);
     const row = t.events().find((e) => e.eventId === 'state-1');
     expect(row?.payload?.state, 'the newest value wins').toBe('idle');
@@ -110,7 +110,7 @@ describe('passive timeline presentations flush slowly', () => {
     act(() => { t.send({ ...evt(1, 'session.state', { state: 'running' }), eventId: 'state-card' } as TimelineEvent); });
     await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS - 100); await Promise.resolve(); });
     expect(t.renders() - before).toBe(0);
-    await act(async () => { vi.advanceTimersByTime(200); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { vi.advanceTimersByTime(200 + PASSIVE_TIMELINE_JITTER_MS); await Promise.resolve(); await Promise.resolve(); });
     expect(t.events().find((e) => e.eventId === 'state-card')?.payload?.state).toBe('running');
   }, 60_000);
 
@@ -180,7 +180,7 @@ describe('passive presentations do not re-render on every shared-cache merge', (
     // 800 ms of 25 Hz traffic: the visible hook followed it, the passive one committed only a couple of times.
     expect(t.visibleEvents().find((e) => e.eventId === 'state-shared')).toBeDefined();
     expect(t.stats.passiveRenders - passiveBefore).toBeLessThanOrEqual(3);
-    await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS + 50); await Promise.resolve(); await Promise.resolve(); });
+    await act(async () => { vi.advanceTimersByTime(PASSIVE_TIMELINE_FLUSH_MS + PASSIVE_TIMELINE_JITTER_MS + 50); await Promise.resolve(); await Promise.resolve(); });
     expect(t.passiveEvents().find((e) => e.eventId === 'state-shared'), 'it converges to the same snapshot').toBeDefined();
     expect(t.passiveEvents()).toBe(t.visibleEvents());
   }, 60_000);

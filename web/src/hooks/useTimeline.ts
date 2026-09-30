@@ -911,8 +911,11 @@ export function isPassiveTimelinePresentation(subscriptionMode: 'full' | 'summar
   return subscriptionMode === 'summary' && !isActiveSession;
 }
 
+/** Spread passive flushes so dozens of presentations do not all wake in the same task. */
+export const PASSIVE_TIMELINE_JITTER_MS = 250;
+
 function schedulePassiveTimelineFlush(callback: () => void): () => void {
-  const id = setTimeout(callback, PASSIVE_TIMELINE_FLUSH_MS);
+  const id = setTimeout(callback, PASSIVE_TIMELINE_FLUSH_MS + Math.random() * PASSIVE_TIMELINE_JITTER_MS);
   return () => clearTimeout(id);
 }
 
@@ -2505,7 +2508,7 @@ export function useTimeline(
         return;
       }
       latest = nextEvents;
-      if (timer === null) timer = setTimeout(apply, PASSIVE_TIMELINE_FLUSH_MS);
+      if (timer === null) timer = setTimeout(apply, PASSIVE_TIMELINE_FLUSH_MS + Math.random() * PASSIVE_TIMELINE_JITTER_MS);
     });
     return () => {
       unsubscribe();

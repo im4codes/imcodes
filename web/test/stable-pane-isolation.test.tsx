@@ -93,3 +93,57 @@ describe('per-session isolation through the stable pane boundary', () => {
     void act;
   });
 });
+
+describe('hidden panes take session-list updates on a slow cadence', () => {
+  afterEach(() => { cleanup(); vi.useRealTimers(); for (const k of Object.keys(renders.pane)) delete renders.pane[k]; });
+
+  const SESSION_A = { name: 'a', state: 'idle' };
+  const SESSION_B = { name: 'b', state: 'idle' };
+  function Lists(props: { sessions: S[]; active: string }) {
+    return (
+      <div>
+        {['a', 'b'].map((name) => (
+          <StableSessionPane
+            key={name}
+            {...({ session: name === 'a' ? SESSION_A : SESSION_B, isActive: name === props.active, viewMode: 'chat', connected: true, sessions: props.sessions, subSessions: [] } as never)}
+          />
+        ))}
+      </div>
+    );
+  }
+  const list = (state: string): S[] => [{ name: 'a', state }, { name: 'b', state }];
+  const seenSessions = (name: string) => (renders.lastPane[name]!.sessions as S[])[0]!.state;
+
+  it('a hidden pane ignores the session-state churn until the refresh, an active pane never waits', async () => {
+    vi.useFakeTimers();
+    const view = render(<Lists sessions={list('idle')} active="a" />);
+    const hiddenBefore = renders.pane.b!;
+    for (let i = 0; i < 30; i += 1) view.rerender(<Lists sessions={list(i % 2 ? 'idle' : 'running')} active="a" />);
+    expect(renders.pane.b, 'hidden pane not re-rendered by 30 list changes').toBe(hiddenBefore);
+    expect(seenSessions('a'), 'the active pane follows the list immediately').toBe('idle');
+    await act(async () => { vi.advanceTimersByTime(3_000); });
+    expect(renders.pane.b, 'one refresh after the cadence').toBe(hiddenBefore + 1);
+    expect(seenSessions('b'), 'and it converged to the newest list').toBe('idle');
+  });
+
+  // Counterexample: becoming active must not wait for the cadence.
+  it('a pane that becomes active gets the current list at once', () => {
+    vi.useFakeTimers();
+    const view = render(<Lists sessions={list('idle')} active="a" />);
+    view.rerender(<Lists sessions={list('running')} active="a" />);
+    expect(seenSessions('b')).toBe('idle');
+    view.rerender(<Lists sessions={list('running')} active="b" />);
+    expect(seenSessions('b')).toBe('running');
+  });
+
+  it('constant churn cannot postpone the refresh forever', async () => {
+    vi.useFakeTimers();
+    const view = render(<Lists sessions={list('idle')} active="a" />);
+    let flip = 0;
+    for (let ms = 0; ms < 6_000; ms += 100) {
+      view.rerender(<Lists sessions={list(flip++ % 2 ? 'idle' : 'running')} active="a" />);
+      await act(async () => { vi.advanceTimersByTime(100); });
+    }
+    expect(renders.pane.b!, 'refreshed at least twice in 6 s of constant churn').toBeGreaterThanOrEqual(3);
+  });
+});
