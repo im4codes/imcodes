@@ -273,6 +273,11 @@ describe('pairs engine rows', () => {
     const { taskPairService } = await import('../../src/daemon/task-pairs/service.js');
     taskPairService.ingestText('codedeck', 'deck_cd_brain',
       '<!-- IMCODES_TASK DISPATCH P1 executor=deck_sub_exec auditor=deck_sub_aud title="Export" -->', 'console-turn-1');
+    // The queue's admission (the only route by which a queued pair starts).
+    taskPairService.applyMarker({
+      project: 'codedeck', writer: 'daemon', source: 'queue', eventId: 'console-admit-1',
+      marker: { verb: 'DISPATCH', knownVerb: 'DISPATCH', taskId: 'P1', attrs: { executor: 'deck_sub_exec', auditor: 'deck_sub_aud' } },
+    });
     // Owner rule: the auditor verdict must be tied to material from a real
     // READY_FOR_AUDIT round.
     taskPairService.ingestText('codedeck', 'deck_sub_exec', '<!-- IMCODES_TASK READY_FOR_AUDIT P1 path=/workspace -->', 'console-turn-2');
