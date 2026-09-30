@@ -165,6 +165,7 @@ console.log(JSON.stringify({
   flushWallMs: stats(wall),
   worstEventLoopStallMs: +(delay.max / 1e6).toFixed(2),
   p99EventLoopDelayMs: +(delay.percentile(99) / 1e6).toFixed(2),
+  compatExportMainThreadMs: (store as { sessionsJsonCompatExportStatsForTests?: () => { lastMainThreadMs: number; completed: number } }).sessionsJsonCompatExportStatsForTests?.() ?? null,
   mutationCallMicros: +mutationUs.toFixed(2),
   listSessionsAllMicros: +listAllMicros.toFixed(2),
   listSessionsByProjectMicros: +listProjectMicros.toFixed(2),

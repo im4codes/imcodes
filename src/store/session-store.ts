@@ -1,4 +1,5 @@
 import { statSync } from 'node:fs';
+import { Worker } from 'node:worker_threads';
 import { mkdir, readFile, rename, rm } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { dirname, join } from 'path';
@@ -16,6 +17,12 @@ import type { ProviderQuotaMeta } from '../../shared/provider-quota.js';
 import type { SessionContextBootstrapState } from '../../shared/session-context-bootstrap.js';
 import type { CrossVendorHandoffSessionState } from '../../shared/cross-vendor-handoff.js';
 import { isKnownTestSessionLike } from '../../shared/test-session-guard.js';
+import {
+  SESSIONS_JSON_COMPAT_EXPORT_FORMAT_VERSION,
+  SESSIONS_JSON_COMPAT_EXPORT_MARKER_KEY,
+  SESSIONS_JSON_COMPAT_EXPORT_MIN_INTERVAL_MS,
+  isSessionsJsonCompatExportEnabled,
+} from '../../shared/session-store-compat.js';
 import { getSessionRuntimeType } from '../../shared/agent-types.js';
 import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/execution-clone.js';
 import { isMarkedSessionLaunchIdentity } from '../../shared/session-resource-lifecycle.js';
@@ -55,10 +62,10 @@ const LEGACY_JSON_BACKUP_COUNT = 5;
 /**
  * Records mutated in place through getSession() (no store call announces them)
  * are picked up by a full compare of every row against what was last written.
- * That compare serialises the whole store, so it runs at most this often on a
- * flush, and always on an explicit flushStore() (shutdown).
+ * That compare serialises the whole store (~3 ms at 300 sessions, in yielding
+ * slices), so it runs at most this often on a flush, and always on an explicit flushStore() (shutdown).
  */
-const FULL_SWEEP_INTERVAL_MS = 30_000;
+const FULL_SWEEP_INTERVAL_MS = 5_000;
 /** The sweep serialises in slices of at most this long, yielding between them. */
 let sweepSliceMs = 2;
 /** An online snapshot of the database is taken at most this often; the newest few are kept. */
@@ -329,6 +336,11 @@ let lastBackupAt = 0;
 let backupInFlight: Promise<void> | null = null;
 let allowEmptyStoreWrite = false;
 let warnedReadOnlyWrite = false;
+/** sessions.json compatibility export (shared/session-store-compat.ts): write-only, off the main thread. */
+let compatExportPending = false;
+let compatExportTimer: ReturnType<typeof setTimeout> | null = null;
+let lastCompatExportAt = 0;
+let compatExportChain: Promise<void> = Promise.resolve();
 /**
  * Set once by the daemon after its startup load: from then on this process's
  * in-memory store is the authority for the persisted sessions, and a read-only
@@ -378,6 +390,7 @@ export function resetSessionStoreAuthorityForTests(): void {
   lastFullSweepAt = 0;
   fullSweepRequested = true;
   lastBackupAt = 0;
+  resetCompatExportForTests();
   sweepSliceMs = 2;
   backupIntervalMs = 60 * 60 * 1000;
 }
@@ -667,6 +680,7 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       }
       committedPayloads = payloads;
       store = { sessions: recordsFromPayloads(payloads) };
+      scheduleCompatExport(targetPath, true); // older processes see the migrated sessions at once
     } else {
       const sessions = await readWithoutAuthority(targetPath);
       if (sessions) store = { sessions };
@@ -782,6 +796,7 @@ async function probeSessionStates(targetPath: string): Promise<void> {
         s.state = newState;
         s.updatedAt = Date.now();
         mutated = true;
+        markDirty(s.name);
         emitSessionStateProbeCorrection(s.name, newState);
       }
     }
@@ -873,6 +888,7 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
       for (const row of upserts) committedPayloads.set(row.name, row.payload);
       for (const name of deletes) committedPayloads.delete(name);
       allowEmptyStoreWrite = false;
+      scheduleCompatExport(targetPath);
     }
     if (sweep) { lastFullSweepAt = Date.now(); fullSweepRequested = false; }
     maybeStartSnapshot(handle, targetPath);
@@ -917,6 +933,162 @@ function maybeStartSnapshot(handle: SessionDbHandle, targetPath: string): void {
     }
   })().finally(() => { if (backupInFlight === inFlight) backupInFlight = null; });
   backupInFlight = inFlight;
+}
+
+// --- sessions.json compatibility export (shared/session-store-compat.ts) -------------------------
+// Write-only: nothing in this build ever reads it back except the one-time migration. It is
+// built from the payloads already committed to the database (string concatenation, no
+// re-stringify) and written by a persistent worker thread, atomically (tmp + rename), with
+// no rotation, so the main thread pays only for handing the strings over.
+
+interface CompatExportJob { path: string; tmp: string; head: string; parts: string[]; tail: string }
+
+const COMPAT_WORKER_SOURCE = `
+  const { parentPort } = require('node:worker_threads');
+  const fs = require('node:fs');
+  parentPort.on('message', (job) => {
+    try {
+      fs.writeFileSync(job.tmp, job.head + job.parts.join(',') + job.tail, { mode: 0o600 });
+      fs.renameSync(job.tmp, job.path);
+      parentPort.postMessage({ id: job.id, ok: true });
+    } catch (error) {
+      try { fs.unlinkSync(job.tmp); } catch (_) { /* never created */ }
+      parentPort.postMessage({ id: job.id, ok: false, error: String(error && error.message || error) });
+    }
+  });
+`;
+
+/** Observability for tests and the perf bench: exports completed and the main-thread cost of the last one. */
+const compatExportStats = { completed: 0, lastMainThreadMs: 0 };
+export function sessionsJsonCompatExportStatsForTests(): { completed: number; lastMainThreadMs: number } {
+  return { ...compatExportStats };
+}
+
+let compatWorker: Worker | null = null;
+let compatJobSeq = 0;
+const compatJobs = new Map<number, (result: { ok: boolean; error?: string }) => void>();
+
+function settleCompatJobs(result: { ok: boolean; error?: string }): void {
+  for (const settle of compatJobs.values()) settle(result);
+  compatJobs.clear();
+}
+
+/** The worker keeps the process alive exactly while an export is in flight (a flush awaiting it must not be cut off), never otherwise. */
+function releaseCompatWorkerIfIdle(worker: Worker): void {
+  if (compatJobs.size === 0) worker.unref();
+}
+
+function compatWorkerRun(job: CompatExportJob): Promise<{ ok: boolean; error?: string }> {
+  if (!compatWorker) {
+    // execArgv: [] -- the worker must not inherit `--input-type=module` / `--import tsx` from a parent started with them.
+    const worker = new Worker(COMPAT_WORKER_SOURCE, { eval: true, execArgv: [] });
+    worker.on('message', (message: { id: number; ok: boolean; error?: string }) => {
+      const settle = compatJobs.get(message.id);
+      compatJobs.delete(message.id);
+      settle?.(message);
+      releaseCompatWorkerIfIdle(worker);
+    });
+    worker.on('error', (error) => {
+      if (compatWorker === worker) compatWorker = null;
+      settleCompatJobs({ ok: false, error: String(error?.message ?? error) });
+    });
+    worker.on('exit', () => {
+      if (compatWorker === worker) compatWorker = null;
+      settleCompatJobs({ ok: false, error: 'compat export worker exited' });
+    });
+    // AFTER the listeners: adding a 'message' listener re-refs the port, and a ref'd worker keeps the process alive.
+    worker.unref(); // never keeps the daemon, a cli process or a test process alive
+    compatWorker = worker;
+  }
+  const id = ++compatJobSeq;
+  return new Promise((resolve) => {
+    compatJobs.set(id, resolve);
+    compatWorker!.ref(); // in flight: do not let the process exit under a pending flush
+    compatWorker!.postMessage({ id, ...job });
+  });
+}
+
+/** Ask for an export: coalesced to at most one per interval, and only ever after committed changes. */
+function scheduleCompatExport(targetPath: string, immediate = false): void {
+  if (!isSessionsJsonCompatExportEnabled()) return;
+  compatExportPending = true;
+  if (compatExportTimer) return;
+  const wait = immediate ? 0 : Math.max(0, lastCompatExportAt + SESSIONS_JSON_COMPAT_EXPORT_MIN_INTERVAL_MS - Date.now());
+  compatExportTimer = setTimeout(() => {
+    compatExportTimer = null;
+    void runCompatExport(targetPath);
+  }, wait);
+  compatExportTimer.unref?.();
+}
+
+function runCompatExport(targetPath: string): Promise<void> {
+  const run = async (): Promise<void> => {
+    if (!compatExportPending) return;
+    try {
+      if (!isSessionsJsonCompatExportEnabled()) { compatExportPending = false; return; }
+      // Same authority as any other write; a process that lost the lock must not touch the file.
+      if (!hasWriteAuthority(targetPath)) return;
+      // Bound to the store this export was scheduled for, exactly like every other write:
+      // HOME rotates between test workers and a late export must never land in the next one.
+      const jsonPath = join(dirname(targetPath), LEGACY_JSON_FILE);
+      assertNotRealImcodesPathInTests(jsonPath, LEGACY_JSON_FILE);
+      compatExportPending = false;
+      lastCompatExportAt = Date.now();
+      const mainStart = performance.now();
+      const parts: string[] = [];
+      for (const [name, payload] of committedPayloads) parts.push(`${JSON.stringify(name)}:${payload}`);
+      const marker = JSON.stringify({
+        format: SESSIONS_JSON_COMPAT_EXPORT_FORMAT_VERSION,
+        source: SESSION_DB_FILE,
+        note: 'write-only compatibility copy for older builds; the database is the source of truth and this file is never read back',
+      });
+      const pending = compatWorkerRun({
+        path: jsonPath,
+        tmp: `${jsonPath}.${process.pid}.${randomUUID()}.tmp`,
+        head: `{"version":${SESSION_STORE_DISK_VERSION},"${SESSIONS_JSON_COMPAT_EXPORT_MARKER_KEY}":${marker},"sessions":{`,
+        parts,
+        tail: '},"identityPrompts":{}}',
+      });
+      compatExportStats.lastMainThreadMs = performance.now() - mainStart; // building + handing over; the write is in the worker
+      const result = await pending;
+      if (result.ok) compatExportStats.completed += 1;
+      if (!result.ok) {
+        compatExportPending = true; // retry on the next flush
+        logger.warn({ error: result.error, jsonPath }, 'sessions.json compatibility export failed');
+      }
+    } catch (error) {
+      logger.warn({ err: error }, 'sessions.json compatibility export failed');
+    }
+  };
+  compatExportChain = compatExportChain.then(run, run);
+  return compatExportChain;
+}
+
+/** Shutdown / explicit flush: export what is pending now instead of waiting for the interval. */
+async function flushCompatExport(targetPath: string): Promise<void> {
+  if (compatExportTimer) { clearTimeout(compatExportTimer); compatExportTimer = null; }
+  if (compatExportPending) await runCompatExport(targetPath);
+  else await compatExportChain;
+}
+
+function resetCompatExportForTests(): void {
+  if (compatExportTimer) clearTimeout(compatExportTimer);
+  compatExportTimer = null;
+  compatExportPending = false;
+  lastCompatExportAt = 0;
+  compatExportChain = Promise.resolve();
+  compatExportStats.completed = 0;
+  compatExportStats.lastMainThreadMs = 0;
+  const worker = compatWorker;
+  compatWorker = null;
+  settleCompatJobs({ ok: false, error: 'reset' });
+  void worker?.terminate();
+}
+
+/** Test seam: resolves when every requested export has been written. */
+export async function waitForCompatExportForTests(): Promise<void> {
+  if (compatExportTimer) { clearTimeout(compatExportTimer); compatExportTimer = null; await runCompatExport(dbPath()); }
+  await compatExportChain;
 }
 
 /** Test seam: the writer connection (null before the first write-authorised load). */
@@ -1180,4 +1352,5 @@ export async function flushStore(): Promise<void> {
     writeTimerPath = null;
   }
   await enqueueWrite(false, targetPath, true);
+  await flushCompatExport(targetPath);
 }

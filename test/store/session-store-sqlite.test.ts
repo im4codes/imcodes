@@ -29,7 +29,9 @@ import {
   setSessionStoreSweepSliceMsForTests,
   updateSessionState,
   upsertSession,
+  waitForCompatExportForTests,
   waitForSessionStoreSnapshotForTests,
+  sessionsJsonCompatExportStatsForTests,
   type SessionRecord,
 } from '../../src/store/session-store.js';
 import {
@@ -43,6 +45,11 @@ import {
 } from '../../src/store/session-store-db.js';
 import { currentDaemonProcessIdentity } from '../../src/daemon/instance-lock.js';
 import logger from '../../src/util/logger.js';
+import {
+  SESSIONS_JSON_COMPAT_EXPORT_FORMAT_VERSION,
+  SESSIONS_JSON_COMPAT_EXPORT_MARKER_KEY,
+  SESSIONS_JSON_COMPAT_EXPORT_SUNSET_AT_MS,
+} from '../../shared/session-store-compat.js';
 import { persistedSessions, sessionDbPathForHome } from '../helpers/session-store-db.js';
 
 const execFileAsync = promisify(execFile);
@@ -118,7 +125,6 @@ describe('one-time migration from sessions.json', () => {
     expect(Object.keys(persistedSessions(home))).toHaveLength(300);
     expect(persistedSessions(home)).toEqual(expected);
     expect(Object.fromEntries(listSessions().map((session) => [session.name, JSON.parse(JSON.stringify(session))]))).toEqual(expected);
-    expect(existsSync(jsonFile())).toBe(false);
     expect(await readFile(frozenFile(), 'utf8')).toBe(text); // byte-identical rollback export
     const reader = openSessionDbReadOnly(sessionDbPathForHome(home))!;
     expect(readSessionDbMeta(reader, SESSION_DB_META_LEGACY_IMPORT)).toBe(SESSION_DB_LEGACY_IMPORT_DONE);
@@ -145,8 +151,7 @@ describe('one-time migration from sessions.json', () => {
     await fresh();
     await fresh();
     expect(persistedSessions(home)).toEqual(afterEdit);
-    expect(getSession('deck_old_brain')).toBeUndefined();
-    expect(existsSync(jsonFile())).toBe(true); // not touched: it is nobody's file now
+    expect(getSession('deck_old_brain')).toBeUndefined(); // sessions.json is write-only now: never read back
   });
 
   it('a crash mid-import leaves nothing behind and the retry imports everything', async () => {
@@ -162,7 +167,7 @@ describe('one-time migration from sessions.json', () => {
     setSessionDbFailAfterRowWritesForTests(null);
     await fresh();
     expect(persistedSessions(home)).toEqual(expected);
-    expect(existsSync(jsonFile())).toBe(false);
+    expect(existsSync(frozenFile())).toBe(true);
   });
 
   it('survives a real SIGKILL in the middle of the import transaction', async () => {
@@ -549,21 +554,220 @@ describe('readers without write authority', () => {
   }, 120_000);
 });
 
+/**
+ * What a process running the PREVIOUS build does to see sessions: the body of the base
+ * build's loadStore + hydrateStore read path (read sessions.json, v2 with or without
+ * prompt references, else fall back to the newest rotated backup, else nothing).
+ */
+async function oldBuildReadsSessions(): Promise<Record<string, Record<string, unknown>>> {
+  const hydrate = (value: unknown): Record<string, Record<string, unknown>> | null => {
+    const v = value as { version?: number; sessions?: Record<string, Record<string, unknown>>; identityPrompts?: Record<string, string> } | null;
+    if (!v || typeof v !== 'object' || !v.sessions || typeof v.sessions !== 'object') return null;
+    if (v.version === 2 && v.identityPrompts && typeof v.identityPrompts === 'object') {
+      const out: Record<string, Record<string, unknown>> = {};
+      for (const [name, raw] of Object.entries(v.sessions)) {
+        const { identityPromptRef, identityPrompt: inline, ...rest } = raw as Record<string, unknown>;
+        const rec: Record<string, unknown> = { ...rest };
+        if (typeof inline === 'string') rec.identityPrompt = inline;
+        else if (typeof identityPromptRef === 'string' && typeof v.identityPrompts[identityPromptRef] === 'string') rec.identityPrompt = v.identityPrompts[identityPromptRef];
+        out[name] = rec;
+      }
+      return out;
+    }
+    return v.sessions;
+  };
+  try {
+    return hydrate(JSON.parse(await readFile(jsonFile(), 'utf8'))) ?? {};
+  } catch {
+    for (let index = 1; index <= 5; index += 1) {
+      try {
+        const backup = hydrate(JSON.parse(await readFile(`${jsonFile()}.${index}`, 'utf8')));
+        if (backup && Object.keys(backup).length > 0) return backup;
+      } catch { /* next backup */ }
+    }
+    return {};
+  }
+}
+
+describe('sessions.json compatibility export (older processes, downgrade)', () => {
+  const finishedExports = async () => { await waitForCompatExportForTests(); return sessionsJsonCompatExportStatsForTests().completed; };
+
+  it('an old-build reader sees a session created AFTER the migration (P0 skew counterexample)', async () => {
+    await writeFile(jsonFile(), productionShapedFile(40).text, 'utf8');
+    await loadStore({ probe: false });
+    await finishedExports();
+    expect(Object.keys(await oldBuildReadsSessions())).toHaveLength(40); // right after migration, not a stale .1-.5
+
+    upsertSession(record('deck_realproj_after_upgrade', { identityPrompt: 'p ✓' }));
+    updateSessionState('deck_realproj0_brain0', 'error', 'boom');
+    await flushStore();
+    const seen = await oldBuildReadsSessions();
+    expect(seen.deck_realproj_after_upgrade).toMatchObject({ projectName: 'realproj', identityPrompt: 'p ✓' });
+    expect(seen.deck_realproj0_brain0).toMatchObject({ state: 'error', error: 'boom' });
+    expect(Object.keys(seen)).toHaveLength(41);
+  });
+
+  it('carries a format marker and mirrors the database exactly', async () => {
+    await writeFile(jsonFile(), productionShapedFile(30).text, 'utf8');
+    await loadStore({ probe: false });
+    await flushStore();
+    const exported = JSON.parse(await readFile(jsonFile(), 'utf8')) as Record<string, unknown>;
+    expect(exported.version).toBe(2);
+    expect(exported[SESSIONS_JSON_COMPAT_EXPORT_MARKER_KEY]).toMatchObject({ format: SESSIONS_JSON_COMPAT_EXPORT_FORMAT_VERSION, source: 'sessions.sqlite' });
+    expect(exported.sessions).toEqual(persistedSessions(home));
+  });
+
+  it('is written only after a flush that committed changed rows, coalesced to one per interval', async () => {
+    await loadStore({ probe: false });
+    await flushStore();
+    const baseline = await finishedExports();
+    await flushStore(); await flushStore(); // nothing changed
+    expect(await finishedExports()).toBe(baseline);
+
+    // shutdown/explicit flushes export what is pending at once (the old readers must be current at exit)
+    upsertSession(record('deck_realproj_explicit'));
+    await flushStore();
+    expect((await oldBuildReadsSessions()).deck_realproj_explicit).toBeDefined();
+  });
+
+  it('debounced commits inside the interval are coalesced into one export that carries all of them', async () => {
+    await loadStore({ probe: false });
+    await flushStore(); // exports now: the interval starts
+    const baseline = await finishedExports();
+    for (let i = 0; i < 5; i += 1) { upsertSession(record(`deck_realproj_c${i}`)); await sleep(650); } // 5 commits, ~3.3 s < 5 s
+    expect(persistedSessions(home)).toHaveProperty('deck_realproj_c4'); // all committed to the database...
+    expect(sessionsJsonCompatExportStatsForTests().completed).toBe(baseline); // ...and not one export yet
+    expect(Object.keys(await oldBuildReadsSessions())).toEqual([]);
+    await sleep(2_600); // the interval elapses
+    expect(sessionsJsonCompatExportStatsForTests().completed).toBe(baseline + 1); // one export, not five
+    expect(Object.keys(await oldBuildReadsSessions()).sort()).toEqual(['deck_realproj_c0', 'deck_realproj_c1', 'deck_realproj_c2', 'deck_realproj_c3', 'deck_realproj_c4']);
+  }, 30_000);
+
+  it('a debounced write is exported by the timer, not per mutation', async () => {
+    await loadStore({ probe: false });
+    await flushStore();
+    const before = await finishedExports();
+    upsertSession(record('deck_realproj_timer'));
+    await sleep(900); // debounce 500 ms; then the export timer (interval is far from elapsed only if it just ran)
+    await sleep(5_300);
+    expect(sessionsJsonCompatExportStatsForTests().completed).toBeGreaterThan(before);
+    expect((await oldBuildReadsSessions()).deck_realproj_timer).toBeDefined();
+  }, 30_000);
+
+  it('is atomic (no leftover temporary file) and never rotates .1-.5', async () => {
+    await loadStore({ probe: false });
+    for (let i = 0; i < 8; i += 1) { upsertSession(record(`deck_realproj_r${i}`)); await flushStore(); }
+    await waitForCompatExportForTests();
+    const files = await readdir(dir);
+    expect(files.filter((file) => file.endsWith('.tmp'))).toEqual([]);
+    expect(files.filter((file) => /^sessions\.json\.\d$/.test(file))).toEqual([]);
+  });
+
+  it('an empty-store refusal exports nothing new', async () => {
+    await loadStore({ probe: false });
+    upsertSession(record('deck_realproj_keep'));
+    await flushStore();
+    const baseline = await finishedExports();
+    removeSession('deck_realproj_keep');
+    await flushStore(); // refused
+    expect(await finishedExports()).toBe(baseline);
+    expect(Object.keys(await oldBuildReadsSessions())).toEqual(['deck_realproj_keep']);
+  });
+
+  it('stops at the sunset instant: the one switch', async () => {
+    await loadStore({ probe: false });
+    upsertSession(record('deck_realproj_before'));
+    await flushStore();
+    await waitForCompatExportForTests();
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(SESSIONS_JSON_COMPAT_EXPORT_SUNSET_AT_MS + 1000);
+    const baseline = sessionsJsonCompatExportStatsForTests().completed;
+    upsertSession(record('deck_realproj_after_sunset'));
+    await flushStore();
+    expect(sessionsJsonCompatExportStatsForTests().completed).toBe(baseline);
+    expect((await oldBuildReadsSessions()).deck_realproj_after_sunset).toBeUndefined();
+    expect(persistedSessions(home).deck_realproj_after_sunset).toBeDefined(); // the database is unaffected
+  });
+
+  it('the main thread only hands the strings over: well under a millisecond-scale budget at 300 sessions', async () => {
+    await writeFile(jsonFile(), productionShapedFile(300).text, 'utf8');
+    await loadStore({ probe: false });
+    await flushStore();
+    updateSessionState('deck_realproj1_w11', 'running');
+    await flushStore();
+    expect(sessionsJsonCompatExportStatsForTests().lastMainThreadMs).toBeLessThan(15); // generous CI bound; measured ~1 ms
+  });
+
+  it('does not keep a process alive: a writer process that loaded, flushed and exported exits by itself', async () => {
+    const script = `
+      const store = await import(process.env.STORE_MODULE);
+      await store.loadStore({ probe: false });
+      store.upsertSession(${JSON.stringify(record('deck_realproj_exit'))});
+      await store.flushStore();
+    `;
+    const started = Date.now();
+    await execFileAsync(process.execPath, ['--import', 'tsx', '--input-type=module', '--eval', script], {
+      cwd: process.cwd(),
+      env: { ...process.env, HOME: home, USERPROFILE: home, STORE_MODULE: new URL('../../src/store/session-store.ts', import.meta.url).href },
+      timeout: 30_000,
+    });
+    expect(Date.now() - started).toBeLessThan(25_000); // a ref'd export worker would run into the timeout above
+    expect(JSON.parse(await readFile(jsonFile(), 'utf8')).sessions.deck_realproj_exit).toBeDefined();
+  }, 40_000);
+
+  it('never reads it back: a downgrade-and-reupgrade keeps the database, ignoring what the old daemon wrote', async () => {
+    await writeFile(jsonFile(), productionShapedFile(30).text, 'utf8');
+    await loadStore({ probe: false });
+    await flushStore();
+    const rows = persistedSessions(home);
+    // An older daemon ran (downgrade window) and rewrote sessions.json with different sessions.
+    await writeFile(jsonFile(), JSON.stringify({ version: 2, sessions: { deck_old_brain: record('deck_old_brain') }, identityPrompts: {} }), 'utf8');
+    await fresh();
+    expect(persistedSessions(home)).toEqual(rows);
+    expect(getSession('deck_old_brain')).toBeUndefined();
+    expect(listSessions()).toHaveLength(30);
+  });
+
+  it('a lost lock stops the export too (production ownership branch)', async () => {
+    vi.stubEnv('VITEST', '');
+    vi.stubEnv('NODE_ENV', 'production');
+    resetSessionStoreAuthorityForTests();
+    const identity = currentDaemonProcessIdentity();
+    const metadataPath = join(dir, 'daemon.lock.json');
+    const lock = (startToken: string) => writeFile(metadataPath, JSON.stringify({
+      version: 1, pid: identity.pid, startToken, acquiredAt: Date.now(), socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [],
+    }), 'utf8');
+    await lock(identity.startToken);
+    configureSessionStoreWriteAuthority(identity, metadataPath);
+    await loadStore();
+    upsertSession(record('deck_realproj_owned'));
+    await flushStore();
+    await waitForCompatExportForTests();
+    const exported = await readFile(jsonFile(), 'utf8');
+    await lock(`${identity.startToken}-other`);
+    upsertSession(record('deck_realproj_intruder'));
+    await flushStore();
+    await waitForCompatExportForTests();
+    expect(await readFile(jsonFile(), 'utf8')).toBe(exported);
+  });
+});
+
 describe('downgrade and version skew', () => {
-  it('leaves what an older daemon needs to start: the frozen export, the untouched rotated backups, and no wiped rows', async () => {
+  it('an older daemon started after the migration reads the current export, and the database is never touched by it', async () => {
     const { text } = productionShapedFile(30);
     await writeFile(jsonFile(), text, 'utf8');
     await writeFile(`${jsonFile()}.1`, text, 'utf8');
     await loadStore({ probe: false });
-    // An older daemon has no sessions.json but finds its newest rotated backup, exactly as after its own crash.
-    expect(await readFile(`${jsonFile()}.1`, 'utf8')).toBe(text);
-    expect(await readFile(frozenFile(), 'utf8')).toBe(text);
+    upsertSession(record('deck_realproj_current'));
+    await flushStore();
+    const seen = await oldBuildReadsSessions();
+    expect(Object.keys(seen)).toHaveLength(31); // current, not the stale .1
+    expect(await readFile(frozenFile(), 'utf8')).toBe(text); // rollback export stays byte-identical
     const rows = persistedSessions(home);
-    // It then writes its own sessions.json; the database is neither read nor written by it.
-    await writeFile(jsonFile(), JSON.stringify({ version: 2, sessions: {}, identityPrompts: {} }), 'utf8');
+    await writeFile(jsonFile(), JSON.stringify({ version: 2, sessions: {}, identityPrompts: {} }), 'utf8'); // the older daemon rewrites it
     await fresh();
     expect(persistedSessions(home)).toEqual(rows);
-    expect(listSessions()).toHaveLength(30);
+    expect(listSessions()).toHaveLength(31);
   });
 });
 
