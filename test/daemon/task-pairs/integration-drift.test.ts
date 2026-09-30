@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
+import { listTaskPairCommitsNotInIntegration } from '../../../src/daemon/supervision-worktree-gc.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
 import {
@@ -45,6 +46,7 @@ let origin: string;
 let main: string;
 let sent: Array<{ target: string; taskId: string; reason: string; text: string }>;
 let gitCalls: string[];
+let gitOptions: Array<{ args: string; env?: Record<string, string> }>;
 let seq = 0;
 let clock = T0;
 
@@ -116,16 +118,18 @@ describe('integration drift', () => {
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     sent = [];
     gitCalls = [];
+    gitOptions = [];
     seq = 0;
     clock = T0;
     setTaskPairDeliveryDepsForTests({ send: async (target, text, id) => { sent.push({ target, taskId: 'n/a', reason: id.split(':')[1] === '__integration__' ? TASK_PAIR_INTEGRATION_DIGEST_REASON : id, text }); } });
     setIntegrationDriftDepsForTests({
       now: () => clock,
       send: async (target, taskId, reason, text) => { sent.push({ target, taskId, reason, text }); return 'sent'; },
-      git: async (cwd, args, timeoutMs) => {
+      git: async (cwd, args, timeoutMs, options) => {
         gitCalls.push(args.join(' '));
+        gitOptions.push({ args: args.join(' '), ...(options?.env ? { env: options.env } : {}) });
         try {
-          return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'] }) };
+          return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] }) };
         } catch (error) {
           return { ok: false, stdout: '', exitCode: (error as { status?: number }).status };
         }
@@ -198,6 +202,58 @@ describe('integration drift', () => {
       await passAt(48 + 20 + 600);
       expect(digests()).toHaveLength(before);
       expect(gitCalls).toHaveLength(0);
+    });
+
+    // Brain cherry-picks onto a dev that has moved: the hunk context differs, so the patch-id differs, and `git cherry` (the strict
+    // rule the worktree retention keeps) says "not merged" for a commit that IS in dev (audit: 21 of 44 flagged pairs were such).
+    const moveContext = (): string => {
+      const lines = Array.from({ length: 30 }, (_, i) => `line ${i + 1}`).join('\n') + '\n';
+      return lines;
+    };
+    const setUpMovedContext = (subject: string): { wt: string; head: string; base: string } => {
+      const { base: root0 } = setUpRepos();
+      commit(main, 'shared.txt', moveContext(), 'chore: add shared file');
+      run(main, 'push', '-q', 'origin', 'dev');
+      const base = run(main, 'rev-parse', 'HEAD');
+      expect(root0).not.toBe(base);
+      const wt = addWorktree('mc', base);
+      const head = commit(wt, 'shared.txt', moveContext().replace('line 15\n', 'line 15 changed by the pair\n'), subject);
+      // dev meanwhile changes lines right next to the pair's hunk, then Brain cherry-picks the pair commit (3-way merge).
+      commit(main, 'shared.txt', moveContext().replace('line 13\n', 'line 13 changed on dev\n'), 'fix: an unrelated change on dev');
+      run(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'cherry-pick', ...(subject.startsWith('X') ? ['-x'] : []), head);
+      run(main, 'push', '-q', 'origin', 'dev');
+      return { wt, head, base };
+    };
+
+    it('a cherry-pick whose patch-id changed (dev moved the hunk context) is integrated: same subject in dev, no reminder', async () => {
+      const { wt, head, base } = setUpMovedContext('feat: the pair change to the shared file');
+      // The counterexample: the strict patch-id rule still says the commit is missing.
+      expect(run(main, 'cherry', 'origin/dev', head)).toMatch(/^\+ /u);
+      expect(await listTaskPairCommitsNotInIntegration(wt, base, { integrationRef: 'origin/dev', head })).toEqual([head]);
+      donePair('mc', wt, head, base);
+      const result = await passAt(30);
+      expect(result.integrated).toBe(1);
+      expect(digests()).toHaveLength(0);
+      expect(live('mc').integrationIntegratedAt).toBeDefined();
+    });
+
+    it('a cherry-pick -x whose subject was edited is recognised by its "(cherry picked from commit ...)" line', async () => {
+      const { wt, head, base } = setUpMovedContext('X feat: original subject');
+      run(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-q', '--amend', '-m', `fix: reworded on dev\n\n(cherry picked from commit ${head})`);
+      run(main, 'push', '-q', '--force', 'origin', 'dev');
+      donePair('mcx', wt, head, base);
+      expect((await passAt(30)).integrated).toBe(1);
+      expect(digests()).toHaveLength(0);
+    });
+
+    it('a commit whose subject is NOT in dev stays unintegrated even though dev moved past it', async () => {
+      const { wt, head, base } = setUpMovedContext('feat: merged one');
+      const extra = commit(wt, 'extra.txt', 'x\n', 'feat: never merged extra work');
+      donePair('mc2', wt, extra, base);
+      const result = await passAt(30);
+      expect(result.reminded).toBe(1);
+      expect(digests()[0]!.text).toContain('1 commit not in');
+      expect(head).not.toBe(extra);
     });
 
     it('sends nothing when the head is already an ancestor of dev', async () => {
@@ -354,6 +410,25 @@ describe('integration drift', () => {
       sent = [];
       await passAt(300);
       expect(digests()).toHaveLength(0);
+    });
+
+    it('the fetch never prompts (no terminal, ssh BatchMode) and lands in a private ref, leaving the owner\'s origin/dev alone', async () => {
+      const { base } = setUpRepos();
+      const wt = addWorktree('pf', base);
+      const head = commit(wt, 'pf.txt', 'x\n', 'feat: pf');
+      // Brain merges and pushes from elsewhere: origin has the head, this checkout's own origin/dev is stale.
+      run(main, 'push', '-q', 'origin', `${head}:refs/heads/dev`);
+      run(main, 'update-ref', 'refs/remotes/origin/dev', base);
+      donePair('pf', wt, head, base);
+      const result = await passAt(30);
+      expect(result.integrated).toBe(1);
+      expect(digests()).toHaveLength(0);
+      expect(run(main, 'rev-parse', 'origin/dev')).toBe(base);
+      expect(run(main, 'rev-parse', 'refs/imcodes/integration/dev')).toBe(head);
+      const fetch = gitOptions.find((call) => call.args.startsWith('fetch'))!;
+      expect(fetch.args).toContain('+refs/heads/dev:refs/imcodes/integration/dev');
+      expect(fetch.env?.GIT_TERMINAL_PROMPT).toBe('0');
+      expect(fetch.env?.GIT_SSH_COMMAND).toContain('BatchMode=yes');
     });
 
     it('a project whose integration branch is main (no dev anywhere) falls back to origin/main', async () => {

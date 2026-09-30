@@ -42,6 +42,13 @@ const GIT_TIMEOUT_MS = 8_000;
 const FETCH_TIMEOUT_MS = 20_000;
 const FETCH_MIN_INTERVAL_MS = 5 * 60_000;
 const FETCH_FAILURE_BACKOFF_MS = 30 * 60_000;
+/** A fetch this recent makes the private ref the measuring ref; older (fetch failing), the user's own origin/<branch> is the better local knowledge. */
+const PRIVATE_REF_FRESH_MS = 30 * 60_000;
+/** A fetch from a detached daemon must never wait for a prompt: an HTTPS remote without cached credentials or an unknown ssh host fails at once. */
+const FETCH_ENV = { GIT_TERMINAL_PROMPT: '0', GIT_SSH_COMMAND: `${process.env.GIT_SSH_COMMAND?.trim() || 'ssh'} -o BatchMode=yes` } as const;
+const MAX_RANGE_COMMITS = 3_000;
+const RANGE_MAX_BUFFER = 8 * 1024 * 1024;
+const PICKED_FROM_RE = /\(cherry picked from commit ([0-9a-f]{7,64})\)/giu;
 const REF_CACHE_MS = 10 * 60_000;
 const UNKNOWN_CACHE_MS = 30 * 60_000;
 const MAX_CACHE_ENTRIES = 500;
@@ -70,10 +77,11 @@ export interface StaleBase {
 }
 
 interface GitOutcome { ok: boolean; stdout: string; exitCode?: number }
+interface GitOptions { env?: Record<string, string>; maxBuffer?: number }
 
 export interface IntegrationDriftDeps {
   now?: () => number;
-  git?: (cwd: string, args: readonly string[], timeoutMs: number) => Promise<GitOutcome>;
+  git?: (cwd: string, args: readonly string[], timeoutMs: number, options?: GitOptions) => Promise<GitOutcome>;
   send?: (target: string, taskId: string, reason: string, text: string) => Promise<TaskPairDeliveryResult>;
 }
 
@@ -86,9 +94,12 @@ export function setIntegrationDriftDepsForTests(deps: IntegrationDriftDeps | und
 
 const now = (): number => (testDeps.now ?? Date.now)();
 
-async function defaultGit(cwd: string, args: readonly string[], timeoutMs: number): Promise<GitOutcome> {
+async function defaultGit(cwd: string, args: readonly string[], timeoutMs: number, options: GitOptions = {}): Promise<GitOutcome> {
   try {
-    const result = await execFileOffMain('git', ['-C', cwd, ...args], { timeout: timeoutMs, maxBuffer: 1024 * 1024, windowsHide: true });
+    const result = await execFileOffMain('git', ['-C', cwd, ...args], {
+      timeout: timeoutMs, maxBuffer: options.maxBuffer ?? 1024 * 1024, windowsHide: true,
+      ...(options.env ? { env: { ...process.env, ...options.env } } : {}),
+    });
     return { ok: true, stdout: String(result.stdout ?? '') };
   } catch (error) {
     const code = (error as { code?: unknown }).code;
@@ -96,13 +107,15 @@ async function defaultGit(cwd: string, args: readonly string[], timeoutMs: numbe
   }
 }
 
-const git = (cwd: string, args: readonly string[], timeoutMs = GIT_TIMEOUT_MS): Promise<GitOutcome> => (testDeps.git ?? defaultGit)(cwd, args, timeoutMs);
+const git = (cwd: string, args: readonly string[], timeoutMs = GIT_TIMEOUT_MS, options?: GitOptions): Promise<GitOutcome> => (testDeps.git ?? defaultGit)(cwd, args, timeoutMs, options);
 
 // ---- per-repository state ---------------------------------------------------------------------------------------------------
 
 interface RepoState {
   ref?: { name: string | undefined; at: number };
   fetchedAt: number;
+  /** The private integration ref was fetched successfully at this time (see refreshIntegrationRef). */
+  privateAt?: number;
   fetchFailedAt?: number;
   fetching?: Promise<void>;
   loggedFailure: boolean;
@@ -120,6 +133,7 @@ export function resetIntegrationDriftCachesForTests(): void {
   commonDirs.clear();
   tips.clear();
   results.clear();
+  ranges.clear();
   staleResults.clear();
 }
 
@@ -179,6 +193,15 @@ function remoteBranchOf(ref: string): string | undefined {
 }
 
 /**
+ * The daemon's own copy of the remote branch. Fetching into it (not into the user's refs/remotes/origin/<branch>) never contends for
+ * a ref lock with Brain's own push/fetch in the main checkout, and never moves what the owner sees as origin/<branch> (`--refmap=`
+ * switches off git's opportunistic update of the configured remote-tracking refs).
+ */
+function privateRefOf(branch: string): string {
+  return `refs/imcodes/integration/${branch}`;
+}
+
+/**
  * Bring the integration ref up to date: at most one fetch per repository per five minutes, one in flight at a time, bounded.
  * A failure (no remote, offline, a lock held by another daemon on the same repository) is logged once and not retried for
  * thirty minutes; the checks then use the ref as it is.
@@ -192,10 +215,12 @@ async function refreshIntegrationRef(repoPath: string, ref: string): Promise<voi
   if (current - state.fetchedAt < FETCH_MIN_INTERVAL_MS) return;
   if (state.fetchFailedAt !== undefined && current - state.fetchFailedAt < FETCH_FAILURE_BACKOFF_MS) return;
   state.fetching = (async () => {
-    const outcome = await git(repoPath, ['fetch', '--quiet', '--no-tags', 'origin', branch], FETCH_TIMEOUT_MS);
+    const outcome = await git(repoPath, ['fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+refs/heads/${branch}:${privateRefOf(branch)}`], FETCH_TIMEOUT_MS, { env: FETCH_ENV });
     if (outcome.ok) {
+      tips.delete(`${key}\u0000${privateRefOf(branch)}`);
       tips.delete(`${key}\u0000${ref}`);
       state.fetchedAt = now();
+      state.privateAt = now();
       state.fetchFailedAt = undefined;
       state.loggedFailure = false;
     } else {
@@ -207,6 +232,14 @@ async function refreshIntegrationRef(repoPath: string, ref: string): Promise<voi
     }
   })().finally(() => { state.fetching = undefined; });
   return state.fetching;
+}
+
+/** The ref the checks measure against: the private (freshly fetched) copy while the fetches work, else the candidate itself. */
+async function measuringRef(repoPath: string, ref: string): Promise<string> {
+  const branch = remoteBranchOf(ref);
+  if (!branch) return ref;
+  const { state } = await repoState(repoPath);
+  return state.privateAt !== undefined && now() - state.privateAt < PRIVATE_REF_FRESH_MS ? privateRefOf(branch) : ref;
 }
 
 /** The integration ref's tip, cached for 30 s per repository (and dropped when a fetch moved it): one rev-parse per pass, not per pair. */
@@ -249,33 +282,67 @@ export async function inspectPairIntegration(repoPath: string, head: string, bas
   const permanent = results.get(permanentKey);
   if (permanent) return permanent.value;
   await refreshIntegrationRef(repoPath, ref);
-  const tip = await tipOf(repoPath, ref);
+  const measure = await measuringRef(repoPath, ref);
+  const tip = await tipOf(repoPath, measure);
   if (!tip) return { state: 'unknown', ref, reason: 'no_integration_tip' };
   const key = `${repoKey}\u0000${head}\u0000${tip}`;
   const cached = results.get(key);
   if (cached && (cached.value.state !== 'unknown' || now() - cached.at < UNKNOWN_CACHE_MS)) return cached.value;
-  const value = await computeIntegration(repoPath, head, base, ref);
+  const value = await computeIntegration(repoPath, head, base, ref, measure, tip);
   remember(results, value.state === 'integrated' ? permanentKey : key, { value, at: now() });
   return value;
 }
 
-async function computeIntegration(repoPath: string, head: string, base: string | undefined, ref: string): Promise<PairIntegration> {
-  const ancestor = await git(repoPath, ['merge-base', '--is-ancestor', head, ref]);
+/**
+ * What the integration ref gained since the pair branched: the trimmed subject of every commit and the source of every
+ * `(cherry picked from commit <sha>)` line. Cached per repository, branch point and tip; bounded (3000 commits, 8 MB).
+ */
+interface RangeIndex { subjects: Set<string>; pickedFrom: string[] }
+const ranges = new Map<string, { value: RangeIndex | undefined; at: number }>();
+
+async function rangeIndex(repoPath: string, from: string, measure: string, tip: string): Promise<RangeIndex | undefined> {
+  const key = `${await repoKeyOf(repoPath)}\u0000${from}\u0000${tip}`;
+  const cached = ranges.get(key);
+  if (cached && (cached.value !== undefined || now() - cached.at < UNKNOWN_CACHE_MS)) return cached.value;
+  const out = await git(repoPath, ['log', `--max-count=${MAX_RANGE_COMMITS}`, '--format=%s%x1f%b%x1e', `${from}..${measure}`], GIT_TIMEOUT_MS, { maxBuffer: RANGE_MAX_BUFFER });
+  let value: RangeIndex | undefined;
+  if (out.ok) {
+    value = { subjects: new Set(), pickedFrom: [] };
+    for (const record of out.stdout.split('\x1e')) {
+      const [subject = '', body = ''] = record.split('\x1f');
+      const trimmed = subject.trim();
+      if (trimmed) value.subjects.add(trimmed);
+      for (const match of body.matchAll(PICKED_FROM_RE)) value.pickedFrom.push(match[1]!.toLowerCase());
+    }
+  }
+  remember(ranges, key, { value, at: now() });
+  return value;
+}
+
+async function computeIntegration(repoPath: string, head: string, base: string | undefined, ref: string, measure: string, tip: string): Promise<PairIntegration> {
+  const ancestor = await git(repoPath, ['merge-base', '--is-ancestor', head, measure]);
   if (ancestor.ok) return { state: 'integrated', ref, reason: 'ancestor' };
   if (ancestor.exitCode !== 1) return { state: 'unknown', ref, reason: 'git_failed' };
-  let from = base;
-  if (!from) {
-    const mergeBase = await git(repoPath, ['merge-base', head, ref]);
-    from = mergeBase.stdout.trim() || undefined;
-  }
+  const branchPoint = (await git(repoPath, ['merge-base', head, measure])).stdout.trim();
+  const from = base ?? (branchPoint || undefined);
   if (!from) return { state: 'unknown', ref, reason: 'no_base' };
-  const missing = await listTaskPairCommitsNotInIntegration(repoPath, from, { integrationRef: ref, head });
+  const missing = await listTaskPairCommitsNotInIntegration(repoPath, from, { integrationRef: measure, head });
   if (missing === undefined) return { state: 'unknown', ref, reason: 'git_failed' };
   if (missing.length === 0) return { state: 'integrated', ref, reason: 'patch_equivalent' };
   const subjects = await subjectsOf(repoPath, missing);
   if (!subjects) return { state: 'unknown', ref, reason: 'git_failed' };
-  const real = missing.filter((hash) => !(subjects.get(hash) ?? '').toLowerCase().startsWith(TASK_PAIR_EVIDENCE_COMMIT_PREFIX));
+  let real = missing.filter((hash) => !(subjects.get(hash) ?? '').toLowerCase().startsWith(TASK_PAIR_EVIDENCE_COMMIT_PREFIX));
   if (real.length === 0) return { state: 'integrated', ref, reason: 'evidence_only' };
+  // Brain's cherry-picks onto a dev that has moved change the hunk context, so the patch-id differs (git cherry says "not merged")
+  // although the commit is in dev: recognise it by the `(cherry picked from commit <sha>)` line of `-x`, or by the identical subject
+  // among the commits the ref gained since the pair branched. (Subject equivalence can hide a genuinely unmerged commit that reuses
+  // another commit's subject; the pair subjects are descriptive and a stream of false reminders is the worse failure.)
+  if (branchPoint) {
+    const index = await rangeIndex(repoPath, branchPoint, measure, tip);
+    if (!index) return { state: 'unknown', ref, reason: 'git_failed' };
+    real = real.filter((hash) => !index.subjects.has((subjects.get(hash) ?? '').trim()) && !index.pickedFrom.some((source) => hash.startsWith(source) || source.startsWith(hash)));
+    if (real.length === 0) return { state: 'integrated', ref, reason: 'subject_equivalent' };
+  }
   return { state: 'unintegrated', ref, missing: real.length };
 }
 
@@ -289,23 +356,24 @@ export async function inspectStaleBase(repoPath: string, head: string): Promise<
   const ref = await resolveIntegrationRef(repoPath);
   if (!ref) return undefined;
   await refreshIntegrationRef(repoPath, ref);
-  const tip = await tipOf(repoPath, ref);
+  const measure = await measuringRef(repoPath, ref);
+  const tip = await tipOf(repoPath, measure);
   if (!tip) return undefined;
   const key = `${await repoKeyOf(repoPath)}\u0000${head}\u0000${tip}`;
   const cached = staleResults.get(key);
   if (cached && (cached.value !== undefined || now() - cached.at < UNKNOWN_CACHE_MS)) return cached.value;
-  const value = await computeStaleBase(repoPath, head, ref);
+  const value = await computeStaleBase(repoPath, head, ref, measure);
   remember(staleResults, key, { value, at: now() });
   return value;
 }
 
-async function computeStaleBase(repoPath: string, head: string, ref: string): Promise<StaleBase | undefined> {
-  const mergeBase = (await git(repoPath, ['merge-base', head, ref])).stdout.trim();
+async function computeStaleBase(repoPath: string, head: string, ref: string, measure: string): Promise<StaleBase | undefined> {
+  const mergeBase = (await git(repoPath, ['merge-base', head, measure])).stdout.trim();
   if (!/^[0-9a-f]{40}$/u.test(mergeBase)) return undefined;
-  const behindOut = await git(repoPath, ['rev-list', '--count', `${mergeBase}..${ref}`]);
+  const behindOut = await git(repoPath, ['rev-list', '--count', `${mergeBase}..${measure}`]);
   const behind = Number.parseInt(behindOut.stdout.trim(), 10);
   if (!behindOut.ok || !Number.isFinite(behind)) return undefined;
-  const times = await git(repoPath, ['show', '-s', '--format=%ct', mergeBase, `${ref}^{commit}`]);
+  const times = await git(repoPath, ['show', '-s', '--format=%ct', mergeBase, `${measure}^{commit}`]);
   const [baseTime, tipTime] = times.stdout.split(/\s+/u).filter(Boolean).map((value) => Number.parseInt(value, 10));
   const ageMs = times.ok && Number.isFinite(baseTime) && Number.isFinite(tipTime) ? Math.max(0, (tipTime! - baseTime!) * 1000) : 0;
   return { ref, behind, ageMs, stale: behind > TASK_PAIR_STALE_BASE_MAX_COMMITS || ageMs > TASK_PAIR_STALE_BASE_MAX_AGE_MS };
