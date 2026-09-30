@@ -7,7 +7,7 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { mkdir, open, lstat, readFile, realpath, rename, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
-import { homedir, networkInterfaces } from 'node:os';
+import { networkInterfaces } from 'node:os';
 import { createServer, connect, isIP, type Server, type Socket } from 'node:net';
 import { basename, dirname, join, resolve } from 'node:path';
 import {
@@ -43,6 +43,7 @@ import {
   resolveUploadPath,
   tryClaimClientUpload,
 } from './file-transfer-handler.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 class MachineDirectProtocolError extends Error {}
 
@@ -915,8 +916,8 @@ export async function receiveMachineDirectUpload(
   try {
     await initFileTransfer();
     const resumeBase = `${MACHINE_DIRECT_RESUME_FILE_PREFIX}${request.clientUploadId}`;
-    temp = join(homedir(), '.imcodes', 'uploads', `${resumeBase}.part`);
-    resumeMetaPath = join(homedir(), '.imcodes', 'uploads', `${resumeBase}.json`);
+    temp = join(imcodesStateDir(), 'uploads', `${resumeBase}.part`);
+    resumeMetaPath = join(imcodesStateDir(), 'uploads', `${resumeBase}.json`);
     type ResumeMeta = {
       version: 1;
       filename: string;

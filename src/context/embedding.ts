@@ -6,7 +6,6 @@
  * Lazy-loaded on first call — subsequent calls reuse the pipeline.
  */
 
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE, EMBEDDING_DIM } from '../../shared/embedding-config.js';
@@ -16,6 +15,7 @@ import {
   spawnChildProcessWorker,
   type ChildProcessWorkerHandle,
 } from '../util/child-process-worker.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 // Re-export shared constants for backward compatibility with existing imports
 export { EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.js';
@@ -42,7 +42,7 @@ export { EMBEDDING_DIM, cosineSimilarity } from '../../shared/embedding-config.j
 function resolveEmbeddingCacheDir(): string {
   const fromEnv = process.env.IMCODES_EMBEDDING_CACHE_DIR?.trim();
   if (fromEnv) return fromEnv;
-  return join(homedir(), '.imcodes', 'embedding-cache');
+  return join(imcodesStateDir(), 'embedding-cache');
 }
 
 // ── Engine abstraction ──────────────────────────────────────────────────────

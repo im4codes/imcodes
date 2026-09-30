@@ -81,6 +81,13 @@ describe('Linux unit templates', () => {
     expect(diagnostics).toContain('result=%%s exit=%%s/%%s at %%s');
   });
 
+  it('writes the service log into the daemon state directory (IMCODES_HOME), with the shell expansion escaped from systemd', () => {
+    const diagnostics = renderSystemdTerminalDiagnostics();
+    // systemd expands ${VAR}/$VAR in Exec lines itself; `$$` reaches /bin/sh as a literal `$`.
+    expect(diagnostics).toContain('"$${IMCODES_HOME:-$$HOME/.imcodes}/daemon-service.log"');
+    expect(diagnostics).not.toMatch(/(?<!\$)\$\{IMCODES_HOME/);
+  });
+
   it('proves an unrecoverable launch cannot loop thousands of times', () => {
     // Without a start limit, RestartSec=5 alone yields 17280 executions per day.
     expect(unboundedStartAttemptsPerDay(5)).toBe(17_280);

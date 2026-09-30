@@ -50,7 +50,8 @@ const value = (name, fallback) => {
 };
 
 const dryRun = flag('--dry-run');
-const dbPath = value('--db', join(homedir(), '.imcodes', 'shared-agent-context.sqlite'));
+const STATE_DIR = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'); // IMCODES_HOME is the state directory itself
+const dbPath = value('--db', join(STATE_DIR, 'shared-agent-context.sqlite'));
 const limit = Number(value('--limit', '0')) || 0;
 
 if (!existsSync(dbPath)) {
@@ -61,7 +62,7 @@ if (!existsSync(dbPath)) {
 // Match the daemon's cache-dir resolution so the model file gets reused
 // instead of downloaded again into a temp location.
 process.env.IMCODES_EMBEDDING_CACHE_DIR = process.env.IMCODES_EMBEDDING_CACHE_DIR
-  || join(homedir(), '.imcodes', 'embedding-cache');
+  || join(STATE_DIR, 'embedding-cache');
 
 // Use the same model + dtype constants the daemon uses so the vectors we
 // write here land in the same coordinate space as live daemon writes.

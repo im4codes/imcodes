@@ -1060,7 +1060,7 @@ export async function sendRawInput(session: string, data: string): Promise<void>
 // ── pipe-pane streaming (tmux-only) ─────────────────────────────────────────────
 
 /** Shell-quote a string using single-quote wrapping. */
-function shellQuote(str: string): string {
+export function shellQuote(str: string): string {
   return "'" + str.replace(/'/g, "'\\''") + "'";
 }
 

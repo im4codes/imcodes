@@ -50,6 +50,7 @@ import {
   type SupervisionWorktreeGitInspection,
   type SupervisionWorktreeMetadata,
 } from '../supervision-worktree-gc.js';
+import { imcodesStateDir } from '../../util/imcodes-state-dir.js';
 
 const GIT_PROBE_TIMEOUT_MS = 5_000;
 const COMMIT_SHA_RE = /^[0-9a-f]{40}$/;
@@ -152,7 +153,7 @@ function safeSegment(value: string): string {
 
 /** `~/.imcodes/works` (or the override): the root of every pair task directory. */
 export function resolveTaskPairWorksRoot(env: NodeJS.ProcessEnv = process.env): string {
-  return resolve(env[TASK_PAIR_WORKS_ROOT_ENV]?.trim() || join(homedir(), '.imcodes', TASK_PAIR_WORKS_DIR));
+  return resolve(env[TASK_PAIR_WORKS_ROOT_ENV]?.trim() || join(imcodesStateDir(env), TASK_PAIR_WORKS_DIR));
 }
 
 /** `~/.imcodes/works/<project>/<taskId>/` */

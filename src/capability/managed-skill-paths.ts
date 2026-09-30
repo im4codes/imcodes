@@ -6,6 +6,7 @@ import {
   MANAGED_SKILL_ROOT_SEGMENTS,
   MANAGED_SKILL_STORE_MARKER,
 } from '../../shared/capability-management.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 export const MANAGED_SKILL_DIRECTORY = MANAGED_SKILL_ROOT_SEGMENTS.at(-1)!;
 export const MANAGED_SKILL_MARKER = MANAGED_SKILL_STORE_MARKER;
@@ -36,7 +37,7 @@ export function assertOpaqueCapabilityId(value: string, label: string): string {
 }
 
 export function getManagedSkillRoot(homeDir = homedir()): string {
-  return join(getUserSkillRoot(homeDir), MANAGED_SKILL_DIRECTORY);
+  return join(getUserSkillRoot(homeDir, imcodesStateDirForHome(homeDir)), MANAGED_SKILL_DIRECTORY);
 }
 
 export function getManagedSkillMarkerPath(homeDir = homedir()): string {
@@ -66,11 +67,11 @@ export function getManagedSkillManifestPath(homeDir: string, registryId: string,
 }
 
 export function getCapabilityQuarantineRoot(homeDir = homedir()): string {
-  return join(homeDir, '.imcodes', CAPABILITY_QUARANTINE_DIRECTORY);
+  return join(imcodesStateDirForHome(homeDir), CAPABILITY_QUARANTINE_DIRECTORY);
 }
 
 export function getManagedSkillTrashRoot(homeDir = homedir()): string {
-  return join(homeDir, '.imcodes', MANAGED_SKILL_TRASH_DIRECTORY);
+  return join(imcodesStateDirForHome(homeDir), MANAGED_SKILL_TRASH_DIRECTORY);
 }
 
 export function isManagedSkillStoreEstablished(homeDir = homedir()): boolean {

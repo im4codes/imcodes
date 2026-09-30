@@ -28,6 +28,7 @@ import {
   type CapabilityAuthorizationKey,
 } from '../../shared/capability-management.js';
 import type { DaemonCapabilityReviewedEvidence, DaemonCapabilityRollbackSnapshot } from './capability-service-adapter.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 const SCHEMA_VERSION = 1 as const;
 
@@ -95,7 +96,7 @@ interface JournalState {
 
 function journalPath(homeDir: string, serverId: string): string {
   const key = createHash('sha256').update(serverId).digest('hex');
-  return join(homeDir, '.imcodes', 'capability-operations', `${key}.json`);
+  return join(imcodesStateDirForHome(homeDir), 'capability-operations', `${key}.json`);
 }
 
 function atomicWrite(path: string, value: JournalState): void {

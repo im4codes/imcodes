@@ -726,7 +726,10 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     const installIdx = sh.indexOf('install -g --ignore-scripts --prefer-online');
     const restartIdx = sh.indexOf('log "[step 4] running restart command"');
 
-    expect(sh).toContain('UPGRADE_LOCK_DIR="$HOME/.imcodes/upgrade.lock.d"');
+    // The state directory is resolved by the daemon (IMCODES_HOME aware) and handed to the script, never guessed from $HOME.
+    expect(sh).toMatch(/^IMCODES_STATE_DIR='[^']+'$/m);
+    expect(sh).toContain('UPGRADE_LOCK_DIR="$IMCODES_STATE_DIR/upgrade.lock.d"');
+    expect(sh).not.toContain('$HOME/.imcodes');
     expect(sh).toContain('another upgrade is already running');
     expect(sh).toContain('trap release_upgrade_lock EXIT');
     expect(sh).toContain('mv "$UPGRADE_LOCK_DIR" "$STALE_LOCK"');

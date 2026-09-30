@@ -32,6 +32,7 @@ import {
   MANAGED_SKILL_DIRECTORY,
   isManagedSkillStoreEstablished,
 } from '../capability/managed-skill-paths.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 const MAX_SKILL_FILES = 64;
 const MAX_SCAN_DEPTH = 4;
@@ -157,7 +158,7 @@ function writeRegistry(path: string, entries: SkillRegistryEntry[]): SkillRegist
 
 export function buildUserSkillRegistry(input: { homeDir?: string; context?: SkillProjectContext } = {}): SkillRegistrySnapshot {
   const homeDir = input.homeDir ?? homedir();
-  const root = getUserSkillRoot(homeDir);
+  const root = getUserSkillRoot(homeDir, imcodesStateDirForHome(homeDir));
   const entries: SkillRegistryEntry[] = [];
   const excludeRootDirectories = isManagedSkillStoreEstablished(homeDir) ? [MANAGED_SKILL_DIRECTORY] : [];
   for (const path of listMarkdownFiles(root, { excludeRootDirectories })) {

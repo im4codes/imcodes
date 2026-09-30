@@ -1,7 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
-import { homedir } from 'node:os';
-import { join } from 'node:path';
 import type { TimelineEvent } from './timeline-event.js';
 import { shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
 import {
@@ -23,9 +21,11 @@ const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
 type DatabaseSyncInstance = InstanceType<typeof DatabaseSync>;
 
 const EXPECTED_TIMELINE_PROJECTION_VERSION = 1;
-const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
-  ? workerData.dbPath
-  : join(homedir(), '.imcodes', 'timeline.sqlite');
+// The pool resolves the (IMCODES_HOME aware) projection db path and passes it in; a worker never guesses a home directory itself.
+if (typeof workerData?.dbPath !== 'string' || !workerData.dbPath) {
+  throw new Error('timeline history worker requires workerData.dbPath (resolved by the pool)');
+}
+const dbPath: string = workerData.dbPath;
 
 let db: DatabaseSyncInstance | null = null;
 

@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, readFileSync, renameSync, statfsSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { imcodesStateDir } from './imcodes-state-dir.js';
 
 type ExecFileSyncLike = (
   file: string,
@@ -349,7 +349,7 @@ export function readServiceRestartCount(
 }
 
 export function defaultDaemonRuntimeStatusDir(): string {
-  return join(homedir(), '.imcodes');
+  return imcodesStateDir();
 }
 
 export function readDaemonRuntimeStatus(baseDir: string = defaultDaemonRuntimeStatusDir()): DaemonRuntimeStatus | null {

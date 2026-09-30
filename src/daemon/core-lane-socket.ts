@@ -1,4 +1,6 @@
 import { Worker } from 'node:worker_threads';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
+import { join } from 'node:path';
 
 type Kind = 'open' | 'message' | 'error' | 'close';
 type Listener = (event: Event & { data?: unknown; message?: string; code?: number; reason?: string }) => void;
@@ -54,7 +56,8 @@ export class CoreLaneSocket {
     if (this.stopping) return;
     const workerFile = 'server-link-worker-bootstrap.mjs';
     const worker = new Worker(new URL(`./${workerFile}`, import.meta.url), {
-      workerData: { url: this.url, ...this.options },
+      // The worker gets the resolved path in its init message: it must not re-derive the state directory from homedir().
+      workerData: { url: this.url, ...this.options, inboundInboxPath: this.options.inboundInboxPath ?? join(imcodesStateDir(), 'core-lane-inbound.jsonl') },
       execArgv: process.execArgv,
     });
     this.worker = worker;

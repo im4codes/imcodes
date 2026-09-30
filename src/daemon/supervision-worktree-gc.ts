@@ -13,7 +13,7 @@ import {
   utimes,
   writeFile,
 } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, join, relative, resolve } from 'node:path';
 import { TASK_PAIR_WORKTREE_PREFIX } from '../../shared/task-pair.js';
 import type { SupervisionRetentionGcResult } from './supervision-retention-gc.js';
@@ -24,6 +24,7 @@ import {
   isTerminalSupervisionWorktreeTaskStatus,
 } from '../../shared/supervision-retention.js';
 import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 
 export const SUPERVISION_WORKTREE_GC_DEFAULT_LIMIT = 25 as const;
@@ -280,13 +281,11 @@ interface GcJournal {
 }
 
 function defaultWorktreesRoot(): string {
-  const imcodesHome = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes');
-  return resolve(imcodesHome, 'worktrees');
+  return resolve(imcodesStateDir(), 'worktrees');
 }
 
 function defaultBackupsRoot(): string {
-  const imcodesHome = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes');
-  return resolve(imcodesHome, 'worktree-backups');
+  return resolve(imcodesStateDir(), 'worktree-backups');
 }
 
 async function safeExternalIntegrationPath(path: string): Promise<boolean> {

@@ -1,6 +1,5 @@
 import { execFile } from 'node:child_process';
 import { readFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 import {
@@ -50,6 +49,7 @@ import type { RemoteDesktopCommandTarget } from '../node/remote-desktop-dispatch
 import { downloadControlledNodeRemoteDesktopWorker } from '../node/self-upgrade.js';
 import { loadDaemonCredential, type DaemonCredential } from './machine-mcp-deps.js';
 import logger from '../util/logger.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const execFileAsync = promisify(execFile);
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -63,8 +63,8 @@ const SHA256_RE = /^[a-f0-9]{64}$/;
  * process's search order. The daemon runs as the user who owns this directory,
  * so it passes the artifact in explicitly instead.
  */
-export function daemonRemoteDesktopRoot(home = homedir()): string {
-  return join(home, '.imcodes');
+export function daemonRemoteDesktopRoot(home?: string): string {
+  return home ? join(home, '.imcodes') : imcodesStateDir();
 }
 
 function workerExecutablePath(root: string): string {

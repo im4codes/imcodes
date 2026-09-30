@@ -55,6 +55,7 @@ import {
   verifyCapabilityAuthorityRecord,
   verifyCapabilitySkillAuthorization,
 } from './capability-authorization.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 export interface CapabilityBlobUploadFailure {
   capabilityId: string;
@@ -622,7 +623,7 @@ export class CapabilityOperationHandler {
           }
           const bytes = Buffer.from(durable.archiveBase64, 'base64');
           if (bytes.byteLength !== durable.blobByteSize) throw new Error('persisted candidate byte size changed');
-          const root = join(this.options.homeDir ?? homedir(), '.imcodes', 'capability-operations', 'restore');
+          const root = join(imcodesStateDirForHome(this.options.homeDir ?? homedir()), 'capability-operations', 'restore');
           mkdirSync(root, { recursive: true, mode: 0o700 });
           temporary = mkdtempSync(join(root, 'candidate-'));
           const restoredName = durable.operation.displayName;

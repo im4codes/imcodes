@@ -2,7 +2,6 @@ import { parentPort, workerData } from 'node:worker_threads';
 import { createRequire } from 'node:module';
 import { mkdirSync, statSync, existsSync, readFileSync, openSync, readSync, closeSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import type { TimelineEvent, TimelineEventType } from './timeline-event.js';
 import type {
   ProjectionSessionMeta,
@@ -21,16 +20,22 @@ type WorkerRequest = {
 }[ProjectionWorkerRequestType];
 
 const PROJECTION_VERSION = 1;
-const dbPath = typeof workerData?.dbPath === 'string' && workerData.dbPath
-  ? workerData.dbPath
-  : join(process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'), 'timeline.sqlite');
+// The worker entry must not import local modules (it loads as raw .ts without a `.js` resolver), so it cannot ask the state-dir
+// resolver itself: the client resolves the paths once and hands them over. There is deliberately no homedir() guess here — a worker
+// that guessed would open the real ~/.imcodes for a scoped daemon.
+if (typeof workerData?.dbPath !== 'string' || !workerData.dbPath) {
+  throw new Error('timeline projection worker requires workerData.dbPath (resolved by the client)');
+}
+const dbPath: string = workerData.dbPath;
+/** State directory the client resolved (IMCODES_HOME aware); defaults to the directory holding the projection db. */
+const stateDir: string = typeof workerData?.stateDir === 'string' && workerData.stateDir ? workerData.stateDir : dirname(dbPath);
 function timelineDir(): string {
   // Production clients pass the canonical <home>/timeline.sqlite path. The
   // worker contract also allows an arbitrary test db path, in which case the
-  // JSONL fixture remains under the mocked user's ~/.imcodes/timeline tree.
+  // JSONL fixture remains under the client-supplied state directory's timeline tree.
   return dbPath.endsWith('timeline.sqlite')
     ? join(dirname(dbPath), 'timeline')
-    : join(homedir(), '.imcodes', 'timeline');
+    : join(stateDir, 'timeline');
 }
 
 let db: DatabaseSyncInstance | null = null;

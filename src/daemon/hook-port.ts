@@ -33,7 +33,6 @@ import {
   readdirSync, statSync, linkSync, rmSync,
 } from 'node:fs';
 import { randomBytes } from 'node:crypto';
-import { homedir } from 'node:os';
 import { join, basename } from 'node:path';
 import net from 'node:net';
 import http from 'node:http';
@@ -73,6 +72,7 @@ import {
   type DaemonProcessIdentity,
   type ProcessLiveness,
 } from './instance-lock.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 /** First port the hook server tries to bind; it increments on conflict. */
 export const DEFAULT_HOOK_PORT = 51913;
@@ -113,7 +113,7 @@ export const HOOK_BIND_RETRY_SPAN = 20;
  *  the daemon (e.g. `session-resource-registry.ts`), which is what lets a test
  *  or a child process point the whole record set at a temp dir. */
 export function imcodesHomeDir(): string {
-  return process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes');
+  return imcodesStateDir();
 }
 
 /** Paths of the authority pair. Resolved at CALL time, never captured at module

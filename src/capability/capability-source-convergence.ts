@@ -11,6 +11,7 @@ import {
 } from './managed-skill-store.js';
 import { assertOpaqueCapabilityId } from './managed-skill-paths.js';
 import type { CapabilitySyncPublication } from './capability-sync-service.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 const CONVERGENCE_SCHEMA_VERSION = 1 as const;
 const CONVERGENCE_DIRECTORY = 'capability-convergence';
@@ -157,8 +158,7 @@ export class CapabilitySourceConvergenceStore {
     assertOpaqueCapabilityId(capabilityId, 'authoritative registry ID');
     assertOpaqueCapabilityId(versionId, 'authoritative version ID');
     return join(
-      this.homeDir,
-      '.imcodes',
+      imcodesStateDirForHome(this.homeDir),
       CONVERGENCE_DIRECTORY,
       sha256(ownerId),
       `${sha256(`${capabilityId}\0${versionId}`)}.json`,

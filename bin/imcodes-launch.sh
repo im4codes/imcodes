@@ -47,8 +47,9 @@ PKG_ROOT="$(cd "$(dirname "$SELF_REAL")/.." 2>/dev/null && pwd)"
 ENTRY="$PKG_ROOT/dist/src/index.js"
 NODE="${IMCODES_NODE_BIN:-$(command -v node 2>/dev/null || echo /usr/bin/node)}"
 NPM="${IMCODES_NPM_BIN:-$(command -v npm 2>/dev/null || true)}"
-HOME_DIR="${IMCODES_HOME:-$HOME}"
-REPAIR_LOG="${IMCODES_LAUNCH_REPAIR_LOG:-$HOME_DIR/.imcodes/launch-repair.log}"
+# IMCODES_HOME is the state directory itself (the daemon's resolveImcodesHome); default is $HOME/.imcodes.
+STATE_DIR="${IMCODES_HOME:-$HOME/.imcodes}"
+REPAIR_LOG="${IMCODES_LAUNCH_REPAIR_LOG:-$STATE_DIR/launch-repair.log}"
 
 log() {
   echo "[imcodes-launch $(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
@@ -85,7 +86,7 @@ is_half_installed() {
 # Cheap: a stat per startup. Idempotent: never touches a lock that's
 # fresh (a real upgrade really does block daemon restarts during its
 # 5–60 s install window).
-LOCK_DIR="$HOME_DIR/.imcodes/upgrade.lock.d"
+LOCK_DIR="$STATE_DIR/upgrade.lock.d"
 LOCK_STALE_AFTER_SEC="${IMCODES_LAUNCH_LOCK_STALE_AFTER_SEC:-1800}"
 if [ -d "$LOCK_DIR" ]; then
   started=""
@@ -164,7 +165,7 @@ if [ "$needs_repair" = "1" ]; then
         echo "PKG_ROOT=$PKG_ROOT"
         echo "missing:$missing_summary"
       } >>"$REPAIR_LOG" 2>&1 || true
-      rm -rf "$GLOBAL_LIB"/.imcodes-* "$HOME_DIR/.imcodes/upgrade.lock.d" >>"$REPAIR_LOG" 2>&1 || true
+      rm -rf "$GLOBAL_LIB"/.imcodes-* "$STATE_DIR/upgrade.lock.d" >>"$REPAIR_LOG" 2>&1 || true
       if "$NPM" install -g --ignore-scripts --prefer-online "imcodes@$pinned" >>"$REPAIR_LOG" 2>&1; then
         log "self-repair OK"
       else

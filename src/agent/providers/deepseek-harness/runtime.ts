@@ -27,7 +27,6 @@
  * loader accepts them verbatim while we avoid hand-rolling YAML escaping.
  */
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import {
@@ -38,6 +37,7 @@ import {
   type DshLlmConfig,
 } from '../../../../shared/deepseek-harness.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../../shared/memory-mcp-server-name.js';
+import { imcodesStateDir } from '../../../util/imcodes-state-dir.js';
 
 /** Stock profile we overlay. `dsh` owns its bootstrap and dependency install. */
 export const DSH_BASE_PROFILE = 'headless';
@@ -107,7 +107,7 @@ export function resolveBridgeEntry(): string {
 
 /** Directory holding generated per-session overlays. */
 export function dshOverlayDir(): string {
-  return join(homedir(), '.imcodes', 'dsh');
+  return join(imcodesStateDir(), 'dsh');
 }
 
 /** Minimal stdio MCP server description the overlay can mount. */

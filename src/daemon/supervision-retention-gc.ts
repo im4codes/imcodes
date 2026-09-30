@@ -1,5 +1,4 @@
 import { lstat, opendir, readFile, realpath, rename, rm, unlink, utimes } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join, relative, resolve } from 'node:path';
 import {
   SUPERVISION_ARTIFACT_ORPHAN_GRACE_MS,
@@ -17,6 +16,7 @@ import {
   isTerminalSupervisionWorktreeAssignmentStatus,
   isTerminalSupervisionWorktreeTaskStatus,
 } from '../../shared/supervision-retention.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 export type SupervisionRetentionMode = 'dryRun' | 'apply';
 export type SupervisionRetentionReason =
@@ -97,7 +97,7 @@ interface RetentionCandidate { path: string; key: string; quarantine: boolean }
 interface TreeActivity { mtimeMs: number; truncated: boolean }
 
 function imcodesHome(): string {
-  return resolve(process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'));
+  return imcodesStateDir();
 }
 
 async function directoryBytes(path: string): Promise<number> {

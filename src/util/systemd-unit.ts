@@ -36,11 +36,14 @@ export function renderSystemdStartLimitBlock(): string {
  * `%` is a systemd specifier prefix in unit files (`%s` = the user's shell), so
  * printf's conversions must be written `%%s`; unescaped, every field logged as
  * the login shell (e.g. "result=/usr/bin/fish exit=/usr/bin/fish/...").
+ *
+ * systemd also expands `${VAR}`/`$VAR` in Exec lines itself, so the shell's own `${IMCODES_HOME:-$HOME/.imcodes}` (the log
+ * lives in the state directory of a scoped daemon too) is written with `$$`.
  */
 export function renderSystemdTerminalDiagnostics(): string {
   return 'ExecStopPost=/bin/sh -c \'printf "[imcodes] unit stopped result=%%s exit=%%s/%%s at %%s\\n"'
     + ' "$SERVICE_RESULT" "$EXIT_CODE" "$EXIT_STATUS" "$(date -Is)"'
-    + ' >> "$HOME/.imcodes/daemon-service.log" 2>/dev/null || true\'';
+    + ' >> "$${IMCODES_HOME:-$$HOME/.imcodes}/daemon-service.log" 2>/dev/null || true\'';
 }
 
 /**

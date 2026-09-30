@@ -3,7 +3,6 @@ import { Worker } from 'node:worker_threads';
 import { mkdir, readFile, rename, rm } from 'node:fs/promises';
 import { performance } from 'node:perf_hooks';
 import { dirname, join } from 'path';
-import { homedir } from 'os';
 import { randomUUID } from 'node:crypto';
 import type { QwenAuthType } from '../../shared/qwen-auth.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
@@ -52,6 +51,7 @@ import { assertNotRealImcodesPathInTests, isRealImcodesPath, isUnderTestRunner }
 import { readInstanceLockMetadata, isRecordedProcessIdentityCurrent, type DaemonProcessIdentity } from '../daemon/instance-lock.js';
 import logger from '../util/logger.js';
 import { SESSION_ERROR_WORKING_DIRECTORY_NOT_FOUND } from '../../shared/session-errors.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const DEBOUNCE_MS = 500;
 const SESSION_STORE_DISK_VERSION = 2;
@@ -81,7 +81,7 @@ export function setSessionStoreBackupIntervalMsForTests(ms: number | undefined):
 }
 
 function storeDir(): string {
-  return join(homedir(), '.imcodes');
+  return imcodesStateDir();
 }
 
 function dbPath(): string {

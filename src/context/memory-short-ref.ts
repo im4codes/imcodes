@@ -10,8 +10,8 @@ import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { incrementCounter } from '../util/metrics.js';
 import logger from '../util/logger.js';
 import { mkdirSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 export type MemoryShortRefKind = 'projection' | 'observation';
 
@@ -151,7 +151,7 @@ function shortRefStorePath(): string | undefined {
  */
 function legacyShortRefFilePath(): string {
   const configured = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH?.trim();
-  return configured ? configured : join(homedir(), '.imcodes', 'memory-short-refs.json');
+  return configured ? configured : join(imcodesStateDir(), 'memory-short-refs.json');
 }
 
 /**
@@ -168,14 +168,14 @@ function recoveryJournalPath(): string | undefined {
   // MCP providers and the daemon are separate processes. Give each writer its
   // own atomic checkpoint so one process can never overwrite another process's
   // unflushed refs with a smaller snapshot.
-  return join(homedir(), '.imcodes', processRecoveryJournalName);
+  return join(imcodesStateDir(), processRecoveryJournalName);
 }
 
 function recoveryJournalCandidates(): string[] {
   const configured = process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH?.trim();
   if (configured) return [configured];
   if (process.env.VITEST || process.env.NODE_ENV === 'test') return [];
-  const directory = join(homedir(), '.imcodes');
+  const directory = imcodesStateDir();
   try {
     return readdirSync(directory)
       // Keep accepting the first-generation PID-only journal name so an

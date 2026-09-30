@@ -33,6 +33,7 @@ import { scanAgentSkillPackage } from './skill-scanner.js';
 import { inventoryAgentSkillPackage } from './agent-skill-package.js';
 import { extractSkillTransferArchive } from './skill-transfer-archive.js';
 import { CapabilitySourceConvergenceStore } from './capability-source-convergence.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 const SYNC_DOWNLOAD_DIRECTORY = 'capability-sync-downloads';
 
@@ -111,7 +112,7 @@ export class CapabilitySyncRuntime {
     if (access.blobDigest !== version.blobDigest || access.maxBytes !== version.blobByteSize) {
       throw new CapabilityBlobHttpError(CAPABILITY_ERROR.INTEGRITY_FAILED, 'Capability blob grant does not match authoritative metadata');
     }
-    const root = join(this.homeDir, '.imcodes', SYNC_DOWNLOAD_DIRECTORY);
+    const root = join(imcodesStateDirForHome(this.homeDir), SYNC_DOWNLOAD_DIRECTORY);
     mkdirSync(root, { recursive: true, mode: 0o700 });
     const temporary = await mkdtemp(join(root, 'blob-'));
     const destination = join(temporary, 'package');

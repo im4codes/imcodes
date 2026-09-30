@@ -1,6 +1,6 @@
 import { appendFileSync, mkdirSync, renameSync, statSync } from 'node:fs';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 /**
  * Durable, cross-process record of IM.codes MCP stdio process lifecycle.
@@ -49,7 +49,7 @@ export const MCP_BOOTSTRAP_EXIT_REASON = {
 export type McpBootstrapExitReason = typeof MCP_BOOTSTRAP_EXIT_REASON[keyof typeof MCP_BOOTSTRAP_EXIT_REASON];
 
 export function mcpLifecycleLogPath(env: NodeJS.ProcessEnv = process.env): string {
-  return join(env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'), 'logs', MCP_LIFECYCLE_LOG_FILE);
+  return join(imcodesStateDir(env), 'logs', MCP_LIFECYCLE_LOG_FILE);
 }
 
 /** Append one JSON line. Never throws: logging must not change lifecycle behavior. */

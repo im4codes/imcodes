@@ -73,6 +73,7 @@ import {
   type SkillTransferArchive,
 } from './skill-transfer-archive.js';
 import { activateCapabilitySkill } from './capability-skill-activation.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 export interface DaemonCapabilityServiceAdapterOptions {
   ownerId: string;
@@ -145,7 +146,7 @@ export type ExactLocalMcpManageResult =
   | { ok: false; code: 'not_found' | 'forbidden' | 'conflict' | 'invalid_action' | 'integrity_failed' };
 
 function localMcpStorePath(homeDir: string, ownerId: string): string {
-  return join(homeDir, '.imcodes', 'capability-local-mcp', `${sha256(ownerId)}.json`);
+  return join(imcodesStateDirForHome(homeDir), 'capability-local-mcp', `${sha256(ownerId)}.json`);
 }
 
 function sha256(value: string): string {
@@ -1211,7 +1212,7 @@ export class DaemonCapabilityServiceAdapter implements SharedCapabilityService {
       .find((entry) => entry.registryId === capabilityId);
     if (skill) {
       const homeDir = this.options.homeDir ?? homedir();
-      const root = join(homeDir, '.imcodes', 'capability-operation-backups');
+      const root = join(imcodesStateDirForHome(homeDir), 'capability-operation-backups');
       mkdirSync(root, { recursive: true, mode: 0o700 });
       const backupDirectory = join(root, `${sha256(`${this.options.ownerId}\0${capabilityId}`)}-${randomUUID()}`);
       const source = getManagedSkillRegistryRoot(homeDir, capabilityId);
@@ -1294,7 +1295,7 @@ export class DaemonCapabilityServiceAdapter implements SharedCapabilityService {
   }
 
   private validManageBackupPath(path: string): boolean {
-    const root = resolve(this.options.homeDir ?? homedir(), '.imcodes', 'capability-operation-backups');
+    const root = resolve(imcodesStateDirForHome(this.options.homeDir ?? homedir()), 'capability-operation-backups');
     const candidate = resolve(path);
     const rel = relative(root, candidate);
     return Boolean(rel) && !rel.startsWith('..') && !isAbsolute(rel);

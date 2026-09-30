@@ -7,6 +7,7 @@ import { formatProviderQuotaLabel } from '../../shared/provider-quota.js';
 import { getAgentVersion } from './agent-version.js';
 import logger from '../util/logger.js';
 import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 
 // Private endpoint the Claude Code CLI's /usage uses; only `Authorization:
@@ -29,7 +30,7 @@ const IDLE_FETCH_SUPPRESS_MS = 15 * 60 * 1000;
 const IS_TEST_ENV = !!process.env.VITEST || process.env.NODE_ENV === 'test';
 // Persist the snapshot so a daemon restart (it auto-upgrades often) doesn't lose
 // the quota or trigger an immediate re-fetch. Mirrors src/agent/provider-quota.ts.
-const CACHE_DIR = join(IS_TEST_ENV ? tmpdir() : homedir(), '.imcodes');
+const CACHE_DIR = IS_TEST_ENV ? join(tmpdir(), '.imcodes') : imcodesStateDir();
 const CACHE_PATH = join(CACHE_DIR, 'claude-usage-quota.json');
 const FIVE_HOUR_MINS = 5 * 60;
 const SEVEN_DAY_MINS = 7 * 24 * 60;

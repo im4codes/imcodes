@@ -8,7 +8,6 @@
 import { createRequire } from 'node:module';
 import { mkdirSync } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir } from 'node:os';
 import {
   TASK_PAIR_DEFAULT_MAX_CONCURRENCY,
   TASK_PAIR_PARTICIPANT_STATUSES,
@@ -22,6 +21,7 @@ import {
   type TaskPairResourceMode,
 } from '../../../shared/task-pair.js';
 import { assertNotRealImcodesPathInTests } from '../../util/test-home-guard.js';
+import { imcodesStateDir } from '../../util/imcodes-state-dir.js';
 
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as typeof import('node:sqlite');
@@ -32,7 +32,7 @@ const TERMINAL_PAIR_RETENTION_MS = 30 * 24 * 60 * 60_000;
 const EVENT_RETENTION_MS = 90 * 24 * 60 * 60_000;
 
 export function resolveTaskPairsDbPath(env: NodeJS.ProcessEnv = process.env): string {
-  return env[TASK_PAIRS_DB_PATH_ENV]?.trim() || join(homedir(), '.imcodes', 'task-pairs.sqlite');
+  return env[TASK_PAIRS_DB_PATH_ENV]?.trim() || join(imcodesStateDir(env), 'task-pairs.sqlite');
 }
 
 /** Per-side liveness bookkeeping kept beside the pure pair state. */

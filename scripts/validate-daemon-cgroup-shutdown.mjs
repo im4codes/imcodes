@@ -41,7 +41,8 @@ const scratch = mkdtempSync(join(tmpdir(), 'imcodes-cgroup-validation-'));
 const dropInDir = join(homedir(), '.config', 'systemd', 'user', `${service}.d`);
 const dropIn = join(dropInDir, 'zz-cgroup-validation.conf');
 const pidFile = join(scratch, 'probe-pids.json');
-const daemonLog = join(homedir(), '.imcodes', 'logs', 'daemon.log');
+const STATE_DIR = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'); // IMCODES_HOME is the state directory itself
+const daemonLog = join(STATE_DIR, 'logs', 'daemon.log');
 const results = { nodeId, cycles, normalCycles: [], timeoutFallback: null, restoredInitialState: false };
 
 function snapshot() {

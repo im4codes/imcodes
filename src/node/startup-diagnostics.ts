@@ -6,9 +6,9 @@ import {
   stat,
 } from 'node:fs/promises';
 import { dirname, join, win32, posix } from 'node:path';
-import { homedir } from 'node:os';
 import { redactObject, type Redactable } from '../../shared/logging/redact.js';
 import { windowsCredentialDir } from './installer.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 /**
  * Pure observability. This module records what happened during a controlled
@@ -114,7 +114,7 @@ export function startupDiagnosticsDir(
   platform: NodeJS.Platform = process.platform,
   env: NodeJS.ProcessEnv = process.env,
 ): string {
-  return platform === 'win32' ? windowsCredentialDir(env) : join(homedir(), '.imcodes');
+  return platform === 'win32' ? windowsCredentialDir(env) : imcodesStateDir(env);
 }
 
 export function startupDiagnosticsLogPath(

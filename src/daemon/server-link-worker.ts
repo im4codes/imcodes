@@ -9,6 +9,8 @@ import {
   coreLaneBlockedMs,
   shouldRequestCoreLaneRestart,
 } from '../../shared/core-lane-liveness.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
+import { join } from 'node:path';
 
 const port = parentPort;
 if (!port) throw new Error('server-link-worker requires parentPort');
@@ -45,7 +47,7 @@ let lastInboundAt = 0;
 let sendQueueBlockedAt: number | null = null;
 let lastMainLagSampleAt = 0;
 let stallRestartRequested = false;
-const inboundInbox = new CoreLaneInboundInbox(config.inboundInboxPath);
+const inboundInbox = new CoreLaneInboundInbox(config.inboundInboxPath ?? join(imcodesStateDir(), 'core-lane-inbound.jsonl'));
 let authorizedSessions = new Set(config.authorizedSessions ?? []);
 let authorizedSessionsReady = Array.isArray(config.authorizedSessions);
 let inboundHandoffBytes = inboundInbox.pending().reduce((total, entry) => total + Buffer.byteLength(entry.payload), 0);

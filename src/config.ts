@@ -4,10 +4,11 @@ import { join } from 'path';
 import yaml from 'yaml';
 import { PROJECT_ROOT } from './util/project-root.js';
 import { resolveImcodesHome } from './util/windows-daemon-lock.js';
+import { IMCODES_STATE_DIR_NAME, imcodesStateDir } from './util/imcodes-state-dir.js';
 
 const DEFAULT_CONFIG_PATH = join(PROJECT_ROOT, 'config', 'default.yaml');
 function userConfigPath(): string {
-  return join(homedir(), '.imcodes', 'config.yaml');
+  return join(imcodesStateDir(), 'config.yaml');
 }
 
 export interface Config {
@@ -84,6 +85,11 @@ function expandConfig(obj: unknown): unknown {
 }
 
 function expandPaths(obj: unknown): unknown {
+  // `~/.imcodes/...` names the state directory, which IMCODES_HOME relocates.
+  const stateDirPrefix = `~/${IMCODES_STATE_DIR_NAME}`;
+  if (typeof obj === 'string' && (obj === stateDirPrefix || obj.startsWith(`${stateDirPrefix}/`))) {
+    return join(imcodesStateDir(), obj.slice(stateDirPrefix.length));
+  }
   if (typeof obj === 'string' && obj.startsWith('~/')) {
     return join(homedir(), obj.slice(2));
   }

@@ -15,7 +15,7 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 
@@ -24,6 +24,7 @@ import type {
   SupervisionWorktreeSnapshot,
 } from './supervision-worktree-inspector.js';
 import { isCanonicalSupervisionRepoPath } from './supervision-integration-scope.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const BUNDLE_VERSION = 1 as const;
 const SHA256_RE = /^[a-f0-9]{64}$/;
@@ -133,7 +134,7 @@ function manifestText(manifest: BundleManifest): string {
 }
 
 export function resolveSupervisionIntegrationBundleRoot(env: NodeJS.ProcessEnv = process.env): string {
-  const home = env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes');
+  const home = imcodesStateDir(env);
   return resolve(env.IMCODES_SUPERVISION_BUNDLES_ROOT?.trim()
     || join(home, 'supervision-integration-bundles'));
 }

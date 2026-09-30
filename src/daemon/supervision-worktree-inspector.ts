@@ -3,8 +3,8 @@ import { execFile } from 'node:child_process';
 import {
   lstatSync, openSync, closeSync, readFileSync, readdirSync, realpathSync, statSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const COMMIT_RE = /^[0-9a-f]{40}$/;
 
@@ -475,7 +475,7 @@ async function dirtyPathProbe(worktreePath: string, deadlineAt: number): Promise
 
 /** Root under which every assignment/pair worktree lives (`IMCODES_WORKTREES_ROOT` or `~/.imcodes/worktrees`). */
 export function resolveSupervisionWorktreesRoot(env: NodeJS.ProcessEnv = process.env): string {
-  return resolve(env.IMCODES_WORKTREES_ROOT?.trim() || join(homedir(), '.imcodes', 'worktrees'));
+  return resolve(env.IMCODES_WORKTREES_ROOT?.trim() || join(imcodesStateDir(env), 'worktrees'));
 }
 
 export function resolveSupervisionAssignmentWorktree(input: {

@@ -22,6 +22,7 @@ import type { ProcessAgent } from './detect.js';
 import { findCodexRolloutPathByUuid } from '../util/codex-rollout-path.js';
 import logger from '../util/logger.js';
 import type { NativeAgentFenceResolver } from './transport-provider.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 /** Claude Code tools that start, orchestrate or hand more work to a native agent. */
 export const CLAUDE_NATIVE_AGENT_TOOLS = ['Agent', 'Task', 'Workflow', 'SendMessage'] as const;
@@ -239,7 +240,7 @@ export function geminiUserPoliciesDir(env: NodeJS.ProcessEnv = process.env): str
 }
 
 /** Write (idempotently) and return the daemon-owned Gemini advisory file. */
-export function ensureGeminiNativeAgentPolicyFile(root: string = join(homedir(), '.imcodes', 'policies')): string {
+export function ensureGeminiNativeAgentPolicyFile(root: string = join(imcodesStateDir(), 'policies')): string {
   const path = join(root, 'gemini-native-agent-deny.toml');
   let current: string | undefined;
   try {

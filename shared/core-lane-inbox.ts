@@ -1,6 +1,5 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 
 export type CoreLaneInboundRecord = {
   id: string;
@@ -19,7 +18,8 @@ export class CoreLaneInboundInbox {
   private readonly filePath: string;
   private readonly entries = new Map<string, CoreLaneInboundRecord>();
 
-  constructor(filePath = join(homedir(), '.imcodes', 'core-lane-inbound.jsonl')) {
+  /** `filePath` is required: the shared module cannot know the state directory (the daemon resolves it once and hands it to the worker). */
+  constructor(filePath: string) {
     this.filePath = filePath;
     mkdirSync(join(filePath, '..'), { recursive: true });
     this.load();

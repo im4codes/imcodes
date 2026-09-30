@@ -25,7 +25,7 @@ import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
 import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
-import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
+import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter, shellQuote } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
@@ -1280,7 +1280,7 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   const projectDir = record?.projectDir;
   if (!projectDir) return text;
 
-  const imcodesDir = nodePath.join(homedir(), '.imcodes');
+  const imcodesDir = imcodesStateDir();
   const escapedImcodesDir = imcodesDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const legacyAtPathRegex = new RegExp(`@(${escapedImcodesDir}[/\\\\][^\\s)]+)`, 'g');
   const taggedPathRegex = new RegExp(`#\\d+:\\((${escapedImcodesDir}[/\\\\][^)]+)\\)`, 'g');
@@ -3589,6 +3589,7 @@ import {
   readCachedHelloSnapshot,
 } from './p2p-workflow-static-policy.js';
 import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 function makeBindRuntimeContext(
   options: {
@@ -8396,10 +8397,9 @@ async function handleDaemonUpgrade(
   // must report their specific block reason rather than being preempted by a
   // recent-upgrade cooldown.
   try {
-    const { homedir: _homedir } = await import('os');
     const { join: _join } = await import('path');
     const { readFileSync: _readFile } = await import('fs');
-    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
+    const sentinelPath = _join(imcodesStateDir(), 'last-upgrade-at');
     const verdict = evaluateAutoUpgradeCooldown({
       targetVersion,
       cooldownMs: parseInt(
@@ -8630,7 +8630,7 @@ async function handleDaemonUpgrade(
     }
   } else if (process.platform === 'darwin') {
     const plist = join(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
-    const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
+    const pidFile = join(imcodesStateDir(), 'daemon.pid');
     restartCmd = `launchctl unload "${plist}" 2>/dev/null || true
 # Kill any lingering daemon processes after unload
 STALE_PID=$(cat "${pidFile}" 2>/dev/null)
@@ -8843,7 +8843,8 @@ log "[step 0] registry: \${REGISTRY_ARG:-<npm default>}"
 # second upgrade has already installed a good copy.  Keep the old daemon
 # serving while the install runs, but allow only ONE upgrade script to touch
 # the global install / service restart path at a time.
-UPGRADE_LOCK_DIR="$HOME/.imcodes/upgrade.lock.d"
+IMCODES_STATE_DIR=${shellQuote(imcodesStateDir())}
+UPGRADE_LOCK_DIR="$IMCODES_STATE_DIR/upgrade.lock.d"
 UPGRADE_LOCK_PID="$UPGRADE_LOCK_DIR/pid"
 UPGRADE_LOCK_STARTED="$UPGRADE_LOCK_DIR/started"
 UPGRADE_LOCK_STALE_AFTER_SEC=1800
@@ -8868,7 +8869,7 @@ lock_age_seconds() {
 }
 
 acquire_upgrade_lock() {
-  mkdir -p "$HOME/.imcodes" 2>/dev/null || true
+  mkdir -p "$IMCODES_STATE_DIR" 2>/dev/null || true
   while true; do
     if mkdir "$UPGRADE_LOCK_DIR" 2>/dev/null; then
       echo "$$" > "$UPGRADE_LOCK_PID" 2>/dev/null || true
@@ -9385,7 +9386,7 @@ fi
 # but if its ExecStart fails (e.g. node crashes immediately on a stale
 # module path that survived step 3.5), Restart=always immediately re-spawns
 # it, and the failure repeats invisibly. The new daemon's PID is recorded
-# in ~/.imcodes/daemon.pid AFTER successful startup, so we can use the pid
+# in <state dir>/daemon.pid AFTER successful startup, so we can use the pid
 # file as a positive-liveness signal: read it 5–15 s after restart and
 # kill -0 it.
 #
@@ -9396,8 +9397,8 @@ log "[step 5] post-restart health check"
 sleep 5
 HEALTH_PID=""
 for i in 1 2 3; do
-  if [ -f "$HOME/.imcodes/daemon.pid" ]; then
-    HEALTH_PID=$(cat "$HOME/.imcodes/daemon.pid" 2>/dev/null || true)
+  if [ -f "$IMCODES_STATE_DIR/daemon.pid" ]; then
+    HEALTH_PID=$(cat "$IMCODES_STATE_DIR/daemon.pid" 2>/dev/null || true)
     if [ -n "$HEALTH_PID" ] && kill -0 "$HEALTH_PID" 2>/dev/null && [ "$HEALTH_PID" != "${oldDaemonPid}" ]; then
       log "[step 5] new daemon healthy: PID $HEALTH_PID (after \${i}x check)"
       break
@@ -9431,8 +9432,8 @@ fi
 # auto-upgrade thrash loop. seconds*1000 is ms-granular enough for a
 # multi-minute cooldown and works on both GNU and BSD date. Best-effort: a
 # missing sentinel means no cooldown.
-printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
-log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
+printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$IMCODES_STATE_DIR/last-upgrade-at" 2>/dev/null || true
+log "[step 5] cooldown sentinel updated: $IMCODES_STATE_DIR/last-upgrade-at"
 
 log "=== upgrade script done ==="
 
@@ -9531,7 +9532,7 @@ async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<strin
   const entry = lookupAttachment(rawPath);
   if (!entry || entry.source !== 'upload' || Date.now() > entry.expiresAt) return null;
 
-  const uploadRoot = nodePath.resolve(homedir(), '.imcodes', 'uploads');
+  const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
   const registeredPath = nodePath.resolve(entry.daemonPath);
   if (registeredPath === uploadRoot || !isSameOrInsidePath(uploadRoot, registeredPath)) return null;
 

@@ -69,6 +69,7 @@ import {
   type ManagedSkillIndexEntry,
 } from './managed-skill-store.js';
 import { assertOpaqueCapabilityId } from './managed-skill-paths.js';
+import { imcodesStateDirForHome } from '../util/imcodes-state-dir.js';
 
 const CAPABILITY_SYNC_STATE_SCHEMA_VERSION = 1 as const;
 const SYNC_DIRECTORY = 'capability-sync';
@@ -685,7 +686,7 @@ function syncStatePreimage(state: Omit<CapabilitySyncPersistentState, 'stateDige
 }
 
 function stateDirectory(homeDir: string, ownerId: string, serverId: string): string {
-  return join(homeDir, '.imcodes', SYNC_DIRECTORY, sha256(`${ownerId}\0${serverId}`));
+  return join(imcodesStateDirForHome(homeDir), SYNC_DIRECTORY, sha256(`${ownerId}\0${serverId}`));
 }
 
 function emptyState(ownerId: string, serverId: string): CapabilitySyncPersistentState {

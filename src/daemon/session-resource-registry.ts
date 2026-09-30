@@ -1,6 +1,5 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises';
-import { homedir } from 'node:os';
 import { join } from 'node:path';
 import {
   SESSION_RESOURCE_HANDLE_TYPE,
@@ -14,6 +13,7 @@ import {
 import { MCP_LIFECYCLE_EVENT, appendMcpLifecycleEvent, mcpLifecycleLogPath } from './mcp-lifecycle-log.js';
 import { readProcessStart } from '../util/process-start.js';
 import { execFileOffMain as execFile } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 const RECORD_VERSION = 1;
 const FIELD_LIMIT = 512;
@@ -326,10 +326,7 @@ export class SessionResourceRegistry {
   private mutationTail: Promise<void> = Promise.resolve();
 
   constructor(options: SessionResourceRegistryOptions = {}) {
-    this.directory = options.directory ?? join(
-      process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes'),
-      'session-resources',
-    );
+    this.directory = options.directory ?? join(imcodesStateDir(), 'session-resources');
     this.now = options.now ?? Date.now;
     this.cleanup = options.cleanup ?? cleanupSessionResource;
     this.resolveTmuxIdentity = options.resolveTmuxIdentity ?? resolveLiveTmuxIdentity;

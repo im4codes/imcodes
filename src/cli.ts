@@ -100,6 +100,7 @@ import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/inst
 import { daemonProcessAppearsRunning, isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
 import { resolveImcodesHome } from './util/windows-daemon-lock.js';
 import { resolvePosixDaemonServicePaths } from './util/posix-daemon-service.js';
+import { imcodesStateDir } from './util/imcodes-state-dir.js';
 
 const { version } = JSON.parse(readFileSync(join(PROJECT_ROOT, 'package.json'), 'utf8')) as { version: string };
 
@@ -1037,7 +1038,7 @@ program
     // region resolves through the same mirror the daemon's auto-upgrade uses.
     let registry: string | null = null;
     try {
-      const raw = readFileSync(join(homedir(), '.imcodes', INSTALLER_CONFIG_BASENAME), 'utf8');
+      const raw = readFileSync(join(imcodesStateDir(), INSTALLER_CONFIG_BASENAME), 'utf8');
       registry = normalizeRegistryBase((JSON.parse(raw) as { npmRegistry?: unknown }).npmRegistry);
     } catch { /* no install.json — use npm's ambient/default registry */ }
 
