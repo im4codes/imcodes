@@ -52,6 +52,12 @@ import {
 } from '../../shared/session-store-compat.js';
 import { persistedSessions, sessionDbPathForHome } from '../helpers/session-store-db.js';
 
+const probe = vi.hoisted(() => ({ calls: 0 }));
+vi.mock('../../src/daemon/instance-lock.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../src/daemon/instance-lock.js')>();
+  return { ...actual, isRecordedProcessIdentityCurrent: (...args: Parameters<typeof actual.isRecordedProcessIdentityCurrent>) => { probe.calls += 1; return actual.isRecordedProcessIdentityCurrent(...args); } };
+});
+
 const execFileAsync = promisify(execFile);
 let home = '';
 let dir = '';
@@ -188,8 +194,9 @@ describe('one-time migration from sessions.json', () => {
       },
       stdio: 'ignore',
     });
-    const signal = await new Promise<string | null>((resolve) => child.on('exit', (_code, sig) => resolve(sig)));
-    expect(signal).toBe('SIGKILL');
+    const exit = await new Promise<{ code: number | null; signal: string | null }>((resolve) => child.on('exit', (code, signal) => resolve({ code, signal })));
+    // POSIX reports the signal; Windows terminates the process outright (no signal, non-zero code).
+    expect(exit.signal === 'SIGKILL' || (process.platform === 'win32' && exit.code !== 0)).toBe(true);
 
     expect(await readFile(jsonFile(), 'utf8')).toBe(text); // source intact
     expect(persistedSessions(home)).toEqual({}); // the half-import never committed
@@ -726,6 +733,27 @@ describe('sessions.json compatibility export (older processes, downgrade)', () =
     expect(persistedSessions(home)).toEqual(rows);
     expect(getSession('deck_old_brain')).toBeUndefined();
     expect(listSessions()).toHaveLength(30);
+  });
+
+  it('the export adds no process-identity probe: one flush with its export costs exactly one (the database write\'s)', async () => {
+    vi.stubEnv('VITEST', '');
+    vi.stubEnv('NODE_ENV', 'production');
+    resetSessionStoreAuthorityForTests();
+    const identity = currentDaemonProcessIdentity();
+    const metadataPath = join(dir, 'daemon.lock.json');
+    await writeFile(metadataPath, JSON.stringify({
+      version: 1, ...identity, acquiredAt: Date.now(), socketPath: join(dir, 'daemon.sock'), sessionIds: [], residualResources: [],
+    }), 'utf8');
+    configureSessionStoreWriteAuthority(identity, metadataPath);
+    await loadStore();
+    await flushStore();
+    await waitForCompatExportForTests();
+    upsertSession(record('deck_realproj_probe_count'));
+    probe.calls = 0;
+    await flushStore(); // one database write + one export
+    await waitForCompatExportForTests();
+    expect(probe.calls).toBe(1);
+    expect((await oldBuildReadsSessions()).deck_realproj_probe_count).toBeDefined(); // and the export did run
   });
 
   it('a lost lock stops the export too (production ownership branch)', async () => {

@@ -413,7 +413,13 @@ function testSessionWouldTouchRealStore(targetPath: string): boolean {
   }));
 }
 
-function hasWriteAuthority(targetPath: string): boolean {
+/**
+ * @param verifyProcess false skips the process-identity probe (a synchronous `ps`/PowerShell
+ * spawn, ~5 ms on macOS and seconds on a loaded Windows host) and keeps the cheap lock-metadata
+ * ownership check. Only the write-only compatibility export uses that: it follows a database
+ * write that already passed the full check, and must not double the probes per flush.
+ */
+function hasWriteAuthority(targetPath: string, verifyProcess = true): boolean {
   assertNotRealImcodesPathInTests(targetPath, SESSION_DB_FILE);
   if (testSessionWouldTouchRealStore(targetPath)) {
     throw new Error(`refusing to persist test-looking sessions in the real ~/.imcodes (${targetPath})`);
@@ -433,7 +439,7 @@ function hasWriteAuthority(targetPath: string): boolean {
   if (!lock
     || lock.pid !== authority.identity.pid
     || lock.startToken !== authority.identity.startToken
-    || !isRecordedProcessIdentityCurrent(authority.identity)) {
+    || (verifyProcess && !isRecordedProcessIdentityCurrent(authority.identity))) {
     if (!warnedReadOnlyWrite) {
       warnedReadOnlyWrite = true;
       logger.warn({ targetPath }, 'Session store write refused: daemon lock ownership changed');
@@ -1026,8 +1032,9 @@ function runCompatExport(targetPath: string): Promise<void> {
     if (!compatExportPending) return;
     try {
       if (!isSessionsJsonCompatExportEnabled()) { compatExportPending = false; return; }
-      // Same authority as any other write; a process that lost the lock must not touch the file.
-      if (!hasWriteAuthority(targetPath)) return;
+      // Same ownership as any other write (a process that lost the lock must not touch the file),
+      // without a second process-identity probe: the database write it follows already ran one.
+      if (!hasWriteAuthority(targetPath, false)) return;
       // Bound to the store this export was scheduled for, exactly like every other write:
       // HOME rotates between test workers and a late export must never land in the next one.
       const jsonPath = join(dirname(targetPath), LEGACY_JSON_FILE);
