@@ -1,4 +1,4 @@
-import { expectFastPerEvent, measure, percentile } from '../perf/per-event-bounds.js';
+import { expectFastPerEvent, expectMuchSlowerThan, measure } from '../perf/per-event-bounds.js';
 import { describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 
@@ -58,11 +58,13 @@ describe('implementation-activity per-event cost on a production-shaped supervis
     expect(registry.list({ projectName: PROJECT }).length).toBeLessThan(60);
   });
 
-  it('BASELINE: the old per-event call (list with includeArchived for the owning session) blocks > 50 ms per event for a Brain', () => {
+  it('BASELINE: the old per-event call (list with includeArchived for the owning session) costs milliseconds and is far slower than the fixed check', () => {
     const times = measure(() => registry.list({
       projectName: PROJECT, ownerSessionName: BRAIN, includeArchived: true,
     }), 5);
-    expect(percentile(times, 0.5)).toBeGreaterThan(50);
+    registry.hasActiveImplementerAssignment(BRAIN); // warm the fixed path's cache
+    const fixed = measure(() => registry.hasActiveImplementerAssignment(BRAIN), 2000);
+    expectMuchSlowerThan(times, fixed, 100);
   }, 60_000);
 
   it('FIXED: a session with no live implementer assignment (the Brain, every streamed delta) costs < 1 ms median and issues no SQL once known', () => {

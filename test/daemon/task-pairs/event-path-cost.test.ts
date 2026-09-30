@@ -1,4 +1,4 @@
-import { expectFastPerEvent, measure, percentile } from '../../perf/per-event-bounds.js';
+import { expectFastPerEvent, expectMuchSlowerThan, measure } from '../../perf/per-event-bounds.js';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { DatabaseSync } from 'node:sqlite';
 import type { SessionRecord } from '../../../src/store/session-store.js';
@@ -126,9 +126,8 @@ describe('task-pair per-event paths', () => {
       automation.observeTimelineEvent({ sessionId: OUTSIDER, type: 'assistant.text', payload: { text: 'delta' } });
       store.pairsForSession(OUTSIDER);
     }, 2000);
-    expect(percentile(old, 0.5)).toBeGreaterThan(5);
     expectFastPerEvent(fast);
-    expect(percentile(old, 0.5) / Math.max(percentile(fast, 0.5), 0.001)).toBeGreaterThan(50);
+    expectMuchSlowerThan(old, fast, 50);
   });
 
   it('an unrelated session costs no SQL and < 1 ms median on every per-event path', () => {

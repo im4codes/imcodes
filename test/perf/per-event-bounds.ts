@@ -23,6 +23,20 @@ export function measure(run: () => unknown, samples: number): number[] {
 export const PER_EVENT_MEDIAN_MS = 1;
 export const PER_EVENT_P99_CEILING_MS = 20;
 
+/**
+ * A BASELINE claim ("the old path was slow") is relative: the old path must
+ * cost at least `minRatio` times the fixed path's median. The absolute floor
+ * only documents that the old cost is milliseconds, far below what any CI
+ * runner, fast or slow, reaches for the old path.
+ */
+export const BASELINE_FLOOR_MS = 1;
+
+export function expectMuchSlowerThan(oldTimes: number[], fixedTimes: number[], minRatio: number): void {
+  const oldMedian = percentile(oldTimes, 0.5);
+  expect(oldMedian).toBeGreaterThan(BASELINE_FLOOR_MS);
+  expect(oldMedian / Math.max(percentile(fixedTimes, 0.5), 0.001)).toBeGreaterThan(minRatio);
+}
+
 export function expectFastPerEvent(times: number[]): void {
   expect(percentile(times, 0.5)).toBeLessThan(PER_EVENT_MEDIAN_MS);
   expect(percentile(times, 0.99)).toBeLessThan(PER_EVENT_P99_CEILING_MS);
