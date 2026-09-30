@@ -12,7 +12,7 @@ export function markSessionRunningIfNeeded(sessions: SessionInfo[], sessionName:
 }
 
 /** Structural equality for the small JSON-ish values a session record holds. */
-function looselyEqual(a: unknown, b: unknown): boolean {
+export function looselyEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
   if (Array.isArray(a) || Array.isArray(b)) {
@@ -42,6 +42,18 @@ export function updateSessionIfChanged(
   const next = build(current);
   if (next === current || looselyEqual(current, next)) return sessions;
   const copy = sessions.slice();
+  copy[index] = next;
+  return copy;
+}
+
+/**
+ * `list` with `list[index]` replaced by `next`, or `list` itself when `next` is
+ * structurally the same record (see {@link updateSessionIfChanged}).
+ */
+export function replaceAtIfChanged<T>(list: T[], index: number, next: T): T[] {
+  const current = list[index];
+  if (current === next || looselyEqual(current, next)) return list;
+  const copy = list.slice();
   copy[index] = next;
   return copy;
 }

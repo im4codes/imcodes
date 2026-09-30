@@ -2,6 +2,7 @@
  * useSubSessions — loads sub-session list from PG, handles create/close,
  * and triggers daemon rebuild on connect.
  */
+import { replaceAtIfChanged } from '../session-state-updates.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   listSubSessions,
@@ -542,19 +543,20 @@ export function useSubSessions(
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
       if (state === 'queued' || state === 'running' || state === 'idle') {
+        // Streaming text, tool calls and repeated session.state frames say
+        // "running"/"idle" again and again: keep the same array when nothing
+        // changed so App (and every mounted window) is not re-rendered for it.
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
-          const next = [...prev];
           const transportPendingPatch = msg.type === 'timeline.event' && msg.event.type === 'session.state'
             ? buildTransportPendingSyncPatch(prev[idx], msg.event.payload as Record<string, unknown>, sessionName)
             : {};
-          next[idx] = {
-            ...next[idx],
+          return replaceAtIfChanged(prev, idx, {
+            ...prev[idx],
             state: state as SubSession['state'],
             ...transportPendingPatch,
-          };
-          return next;
+          });
         });
         return;
       }

@@ -293,7 +293,8 @@ import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
 } from '@shared/remote-desktop-local-management.js';
-import { markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
+import { looselyEqual, markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
+import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batcher.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
@@ -644,6 +645,9 @@ function settingsIdentityProjectKey(
   const parent = parentName ? sessions.find((session) => session.name === parentName) : undefined;
   return (parent && sessionIdentityProjectKey(parent)) || undefined;
 }
+
+/** Token-usage bars refresh at most this often; the newest value always wins. */
+const SUB_USAGE_COMMIT_INTERVAL_MS = 250;
 
 export function App() {
   recordPerfRender('App');
@@ -1902,6 +1906,26 @@ export function App() {
   const [detectedModels, setDetectedModels] = useState<Map<string, string>>(new Map());
   const detectedModelsRef = useRef<Map<string, string>>(new Map());
   const [subUsages, setSubUsages] = useState<Map<string, { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string }>>(new Map());
+  type SubUsageValue = { inputTokens: number; cacheTokens: number; contextWindow: number; contextWindowSource?: UsageContextWindowSource; model?: string };
+  const subUsagesRef = useRef(subUsages);
+  subUsagesRef.current = subUsages;
+  const subUsageBatcherRef = useRef<MapUpdateBatcher<string, SubUsageValue> | null>(null);
+  if (subUsageBatcherRef.current === null) {
+    subUsageBatcherRef.current = createMapUpdateBatcher<string, SubUsageValue>({
+      intervalMs: SUB_USAGE_COMMIT_INTERVAL_MS,
+      read: (key) => subUsagesRef.current.get(key),
+      commit: (updates) => setSubUsages((prev) => {
+        let next: Map<string, SubUsageValue> | null = null;
+        for (const [key, value] of updates) {
+          if (looselyEqual(prev.get(key), value)) continue;
+          next ??= new Map(prev);
+          next.set(key, value);
+        }
+        return next ?? prev;
+      }),
+    });
+  }
+  useEffect(() => () => subUsageBatcherRef.current?.cancel(), []);
   const quickData = useQuickData();
   const lastImcodesActivityRef = useRef(Date.now());
   const resubscribeTimersRef = useRef<Set<ReturnType<typeof setTimeout>>>(new Set());
@@ -4190,13 +4214,9 @@ export function App() {
             const displayPayload = effectiveModel && payload.model !== effectiveModel
               ? { ...payload, model: effectiveModel }
               : payload;
-            setSubUsages((prev) => {
-              const merged = mergeUsageUpdate(prev.get(event.sessionId), displayPayload as Record<string, unknown>);
-              if (!merged) return prev;
-              const next = new Map(prev);
-              next.set(event.sessionId, merged);
-              return next;
-            });
+            // Token usage arrives at up to 25 Hz per session; commit it in one
+            // batch per interval instead of re-rendering the app per frame.
+            subUsageBatcherRef.current?.push(event.sessionId, (current) => mergeUsageUpdate(current, displayPayload as Record<string, unknown>));
           }
         }
       }
