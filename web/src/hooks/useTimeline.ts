@@ -2345,7 +2345,10 @@ export function useTimeline(
     }
     const cursorTs = getLocalCacheCursorTs();
     // Nothing local yet: cold so far. A late local restore re-runs this, so do not decide.
-    if (cursorTs === undefined) return;
+    if (cursorTs === undefined) {
+      backfillDebug('gap: undecided, no local cursor yet', { key, tailMinTs: tail.minTs, tailFull: tail.full });
+      return;
+    }
     openGapDecidedKeyRef.current = key;
     openCursorOverrideRef.current = null;
     const next = foldPageIntoGap(null, {
@@ -2354,6 +2357,7 @@ export function useTimeline(
       pageMaxTs: tail.maxTs,
       fullPage: tail.full,
     });
+    backfillDebug('gap: decided', { key, cursorTs, tailMinTs: tail.minTs, tailMaxTs: tail.maxTs, tailFull: tail.full, gap: next });
     if (next) setTimelineGap(key, next);
   }, [getLocalCacheCursorTs]);
   tryDecideOpenGapRef.current = tryDecideOpenGap;
@@ -2371,6 +2375,7 @@ export function useTimeline(
     }
     if (!Number.isFinite(minTs)) return;
     openWindowTailRef.current = { key, minTs, maxTs, full };
+    backfillDebug('gap: newest-window page noted', { key, minTs, maxTs, full, count: pageEvents.length });
     tryDecideOpenGap();
   }, [tryDecideOpenGap]);
   const transportQueueStateRef = useRef<TransportQueueReducerState>(
@@ -4337,6 +4342,7 @@ export function useTimeline(
       const undecidedOpenCursor = !roundGap && !!backfillCacheKey && openGapDecidedKeyRef.current !== backfillCacheKey
         ? getLocalCacheCursorTs()
         : undefined;
+      backfillDebug('fireHttpBackfill: round bounds', { mode, hasGap: !!roundGap, gapLower: roundGap?.lowerTs, gapUpper: roundGap?.upperTs, undecidedOpenCursor });
       const afterTs = mode === 'manualLatestWindow'
         ? undefined
         : roundGap
