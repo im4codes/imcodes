@@ -156,3 +156,11 @@ it (reading scenario, <= 1 px) and the bottom gap (pinned scenario, <= 1 px), an
 hole recorded. The app revision is archived; only these harness files are overlaid from the current checkout, so the same spec
 measures base and head (set `IMC_PERF_STALE_EXPECT_HEAD=0` for a base revision: numbers are recorded, head-only behaviours are
 not asserted).
+
+`IMC_PERF_STALE_MODES` picks the scenarios (default `pinned,reading,fling,pinned-stream,reading-stream`): `pinned` follows the
+bottom, `reading` sits on an older row, `fling` flings the chat with real touch drags (`touch-fling.mjs`, shared with the phone
+history-scroll matrix) while pages land (no row may jump by more than 1 px that neither the finger nor an app write accounts for, and
+the app must make no scrollTop write while the finger or its momentum owns the scroller), and the `*-stream` variants start a
+Markdown reply streaming at the bottom of the chat (the fake daemon reacts to the `stale-stream` file) once the backfill is
+under way. The open latency is judged on the median of a run's opens (every scenario opens the chat the same way), with a hard cap
+per sample, because a shared host moves a single sample by +-200 ms.
