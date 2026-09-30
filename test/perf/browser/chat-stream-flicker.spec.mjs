@@ -125,7 +125,7 @@ export function installFlickerProbe() {
     const rect = wrapper?.getBoundingClientRect();
     return {
       t: performance.now(), key: sk, mounted: !!wrapper, len, shrunk: len < prevLen, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
-      contentTop: rect ? rect.top - rootRect.top + r.scrollTop : null, viewportTop: rect ? rect.top - rootRect.top : null, height: rect?.height ?? null, width: rect?.width ?? null,
+      contentTop: rect ? rect.top - rootRect.top + r.scrollTop : null, viewportTop: rect ? rect.top - rootRect.top : null, absTop: rect?.top ?? null, absBottom: rect?.bottom ?? null, height: rect?.height ?? null, width: rect?.width ?? null,
       opacity: cs ? Number(cs.opacity) : null, visibility: cs?.visibility ?? null, display: cs?.display ?? null,
       anims: event ? event.getAnimations({ subtree: true }).length : 0,
       acc: P.acc, writes: P.scrollWrites.length,
@@ -194,12 +194,14 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
   const bottomJitter = (list) => {
     let max = 0; let at = null; let over = 0; let prev = null; let atIdx = -1;
     list.forEach((f, i) => {
-      if (f.viewportTop === null || !f.mounted) { prev = null; return; }
-      const bottom = f.viewportTop + f.height;
+      if (f.absBottom === null || !f.mounted) { prev = null; return; }
+      // SCREEN coordinates: a banner/composer mounting beside the list moves the
+      // chat root's own top edge, which is not the text moving.
+      const bottom = f.absBottom;
       if (prev && prev.key === f.key) { const d = Math.abs(bottom - prev.bottom); if (d > max) { max = d; at = f.t; atIdx = i; } if (d > TOL) over += 1; }
       prev = { key: f.key, bottom };
     });
-    const ctx = atIdx < 0 ? [] : list.slice(Math.max(0, atIdx - 2), atIdx + 2).map((f) => ({ t: round(f.t), key: f.key, top: round(f.viewportTop), h: round(f.height), sh: f.scrollHeight, st: round(f.rootScrollTop), ch: f.clientHeight, len: f.len }));
+    const ctx = atIdx < 0 ? [] : list.slice(Math.max(0, atIdx - 2), atIdx + 2).map((f) => ({ t: round(f.t), key: f.key, top: round(f.absTop), h: round(f.height), sh: f.scrollHeight, st: round(f.rootScrollTop), ch: f.clientHeight, len: f.len }));
     return { maxBottomStepPx: round(max), framesOverTol: over, atMs: at === null ? null : round(at), context: ctx };
   };
   const unmountedFrames = frames.filter((f) => !f.mounted).length;
@@ -232,7 +234,7 @@ export function verdicts(result) {
   need(a.remounts.near === 0, `neighbour rows remounted (${a.remounts.near})`);
   need(a.blankingFrames === 0, `${a.blankingFrames} blanking frames (text shrank / opacity 0 / hidden)`);
   need(a.animationStartsOnRows === 0, `${a.animationStartsOnRows} CSS animations/transitions started on chat rows`);
-  need(a.layout.bottomRAF.maxBottomStepPx <= TOL && a.layout.bottomPainted.maxBottomStepPx <= TOL, `streaming row bottom moved ${a.layout.bottomRAF.maxBottomStepPx}px (rAF) / ${a.layout.bottomPainted.maxBottomStepPx}px (painted) in the viewport while pinned`);
+  need(a.layout.bottomRAF.maxBottomStepPx <= TOL && a.layout.bottomPainted.maxBottomStepPx <= TOL, `streaming row bottom moved ${a.layout.bottomRAF.maxBottomStepPx}px (rAF) / ${a.layout.bottomPainted.maxBottomStepPx}px (painted) on screen while pinned`);
   need(a.scroll.clientWidthChanges === 0, `viewport width changed ${a.scroll.clientWidthChanges}x (scrollbar toggling reflows the text)`);
   return failures;
 }
