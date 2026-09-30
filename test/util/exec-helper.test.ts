@@ -2,6 +2,7 @@ import { execFile as execFileCb, execFileSync } from 'node:child_process';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { promisify } from 'node:util';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
@@ -107,7 +108,7 @@ describe('ExecHelperClient (fake helper process)', () => {
     ['stdio', { stdio: 'inherit' }],
     ['abort signal', { signal: new AbortController().signal }],
     ['argv0', { argv0: 'renamed' }],
-    ['non-string cwd', { cwd: new URL('file:///tmp') }],
+    ['non-string cwd', { cwd: pathToFileURL(process.cwd()) }],
   ])('spawns directly for an option the helper cannot forward (%s)', async (_label, options) => {
     const { client, workers } = fakeClient();
     client.start();
@@ -475,7 +476,14 @@ describe.skipIf(POSIX)('Windows: PowerShell and the process-start batch through 
   it('the process-start batch (one PowerShell spawn for many pids) works through the helper and yields the same values', async () => {
     const { ProcessStartReader } = await import('../../src/util/process-start.js');
     const before = getExecHelperStats()!.viaHelper;
-    const reader = new ProcessStartReader();
+    // The production batch timeout (2 s) is shorter than a cold PowerShell start on a slow host, which would make
+    // every read undefined with or without the helper; lift only that timeout so the batch script itself is exercised.
+    const reader = new ProcessStartReader({
+      execFile: (command, args, options) => execFileOffMain(command, args, { ...options, timeout: 60_000 }),
+      readFile: async () => { throw Object.assign(new Error('ENOENT'), { code: 'ENOENT' }); },
+      platform: 'win32',
+      ownPid: process.pid,
+    });
     const [own, parent, gone] = await Promise.all([reader.read(process.pid), reader.read(process.ppid), reader.read(999_999_999)]);
     expect(getExecHelperStats()!.viaHelper).toBeGreaterThan(before);
     expect(own).toMatch(/^\d+$/);
