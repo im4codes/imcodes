@@ -43,6 +43,10 @@ const VARIANTS = [
   { label: 'code', pieceMode: 'code', rows: 240 },
   { label: 'list', pieceMode: 'list', rows: 240 },
   { label: 'long', pieceMode: 'prose', rows: 240, seedChars: 30_000 },
+  // The owner's recording: a Markdown-heavy reply (heading, ---, **bold**, lists)
+  // arriving in token-sized pieces in bursts. Uniform 25 Hz never triggered it.
+  { label: 'markdown-bursty', pieceMode: 'md', cadence: 'bursty', rows: 240 },
+  { label: 'markdown-uniform', pieceMode: 'md', cadence: 'uniform', rows: 240 },
 ];
 
 /** Installed in the page (after installDriver). */
@@ -120,11 +124,15 @@ export function installFlickerProbe() {
     near.forEach((n, i) => track(`near${i}:${n.getAttribute('data-virtual-key')}`, n));
     const cs = event ? getComputedStyle(event) : null;
     const len = (event?.textContent ?? '').length;
+    // Render mode of the streaming bubble: 'raw' = one bare <span> of text (the
+    // un-parsed fallback), 'markdown' = block elements, 'empty' before any text.
+    const rich = event?.querySelector('.chat-rich-text') ?? null;
+    const mode = !rich ? 'empty' : (rich.children.length === 1 && rich.firstElementChild.tagName === 'SPAN' ? 'raw' : 'markdown');
     const prevLen = P.lastLen.get(sk) ?? 0;
     P.lastLen.set(sk, Math.max(prevLen, len));
     const rect = wrapper?.getBoundingClientRect();
     return {
-      t: performance.now(), key: sk, mounted: !!wrapper, len, shrunk: len < prevLen, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
+      t: performance.now(), key: sk, mounted: !!wrapper, mode, len, shrunk: len < prevLen, rootScrollTop: r.scrollTop, clientWidth: r.clientWidth, clientHeight: r.clientHeight, scrollHeight: r.scrollHeight,
       contentTop: rect ? rect.top - rootRect.top + r.scrollTop : null, viewportTop: rect ? rect.top - rootRect.top : null, absTop: rect?.top ?? null, absBottom: rect?.bottom ?? null, height: rect?.height ?? null, width: rect?.width ?? null,
       opacity: cs ? Number(cs.opacity) : null, visibility: cs?.visibility ?? null, display: cs?.display ?? null,
       anims: event ? event.getAnimations({ subtree: true }).length : 0,
@@ -204,6 +212,26 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
     const ctx = atIdx < 0 ? [] : list.slice(Math.max(0, atIdx - 2), atIdx + 2).map((f) => ({ t: round(f.t), key: f.key, top: round(f.absTop), h: round(f.height), sh: f.scrollHeight, st: round(f.rootScrollTop), ch: f.clientHeight, len: f.len }));
     return { maxBottomStepPx: round(max), framesOverTol: over, atMs: at === null ? null : round(at), context: ctx };
   };
+  // Render-mode flips of the streaming bubble (raw <-> Markdown) and height regressions.
+  const modeStats = (list) => {
+    let flips = 0; let raw = 0; let prev = null; const flipAt = [];
+    for (const f of list) {
+      if (!f.mounted || f.mode === 'empty') { prev = null; continue; }
+      if (f.mode === 'raw') raw += 1;
+      if (prev && prev.key === f.key && prev.mode !== f.mode) { flips += 1; if (flipAt.length < 6) flipAt.push({ t: round(f.t), from: prev.mode, to: f.mode, len: f.len }); }
+      prev = f;
+    }
+    return { flips, rawFrames: raw, flipAt };
+  };
+  const heightStats = (list) => {
+    let maxDrop = 0; let drops = 0; let prev = null; let atIdx = -1;
+    list.forEach((f, i) => {
+      if (!f.mounted || f.height === null) { prev = null; return; }
+      if (prev && prev.key === f.key) { const d = prev.height - f.height; if (d > maxDrop) { maxDrop = d; atIdx = i; } if (d > TOL) drops += 1; }
+      prev = f;
+    });
+    return { maxDropPx: round(maxDrop), dropFrames: drops, context: atIdx < 0 ? [] : list.slice(Math.max(0, atIdx - 2), atIdx + 2).map((f) => ({ t: round(f.t), h: round(f.height), len: f.len, mode: f.mode })) };
+  };
   const unmountedFrames = frames.filter((f) => !f.mounted).length;
   const blank = frames.filter((f) => f.mounted && (f.shrunk || f.opacity === 0 || f.visibility === 'hidden' || f.display === 'none')).length;
   const fades = frames.filter((f) => f.mounted && f.opacity !== null && f.opacity < 1).length;
@@ -217,7 +245,7 @@ export function analyze({ frames, painted, animStarts, scrollWrites, identity, r
       stream: { elAdd: sum(frames, 'stream', 'elAdd'), elDel: sum(frames, 'stream', 'elDel'), txtAdd: sum(frames, 'stream', 'txtAdd'), txtDel: sum(frames, 'stream', 'txtDel'), chr: sum(frames, 'stream', 'chr'), attr: sum(frames, 'stream', 'attr') },
       near: { elAdd: sum(frames, 'near', 'elAdd'), elDel: sum(frames, 'near', 'elDel'), txtAdd: sum(frames, 'near', 'txtAdd'), txtDel: sum(frames, 'near', 'txtDel'), chr: sum(frames, 'near', 'chr'), attr: sum(frames, 'near', 'attr') },
     },
-    blankingFrames: blank, unmountedStreamFrames: unmountedFrames, fadingFrames: fades,
+    renderMode: { rAF: modeStats(frames), painted: modeStats(painted) }, height: { rAF: heightStats(frames), painted: heightStats(painted) }, blankingFrames: blank, unmountedStreamFrames: unmountedFrames, fadingFrames: fades,
     animationStartsOnRows: animStarts.length, animationStartDetail: animStarts.slice(0, 8),
     layout: { rAF: jitter(frames), painted: jitter(painted), bottomRAF: bottomJitter(frames), bottomPainted: bottomJitter(painted), viewportRAF: viewportTopJitter(frames), viewportPainted: viewportTopJitter(painted) },
     scroll: { writes: scrollWrites.length, writesPerFrame, scrollTopAssignments: nonPin, clientWidthChanges: widthChanges },
@@ -233,6 +261,9 @@ export function verdicts(result) {
   need(a.remounts.wrapper === 0 && a.remounts.event === 0 && a.remounts.text === 0, `streaming row remounted (${JSON.stringify(a.remounts)})`);
   need(a.remounts.near === 0, `neighbour rows remounted (${a.remounts.near})`);
   need(a.blankingFrames === 0, `${a.blankingFrames} blanking frames (text shrank / opacity 0 / hidden)`);
+  need(a.renderMode.rAF.flips === 0 && a.renderMode.painted.flips === 0, `streaming bubble flipped raw<->Markdown ${a.renderMode.rAF.flips}x (rAF) / ${a.renderMode.painted.flips}x (painted)`);
+  need(a.renderMode.rAF.rawFrames === 0 && a.renderMode.painted.rawFrames === 0, `streaming bubble shown as raw text in ${a.renderMode.rAF.rawFrames} rAF / ${a.renderMode.painted.rawFrames} painted frames`);
+  need(a.height.rAF.dropFrames === 0 && a.height.painted.dropFrames === 0, `streaming bubble height shrank in ${a.height.rAF.dropFrames} rAF / ${a.height.painted.dropFrames} painted frames (max ${a.height.rAF.maxDropPx}px)`);
   need(a.animationStartsOnRows === 0, `${a.animationStartsOnRows} CSS animations/transitions started on chat rows`);
   need(a.layout.bottomRAF.maxBottomStepPx <= TOL && a.layout.bottomPainted.maxBottomStepPx <= TOL, `streaming row bottom moved ${a.layout.bottomRAF.maxBottomStepPx}px (rAF) / ${a.layout.bottomPainted.maxBottomStepPx}px (painted) on screen while pinned`);
   need(a.scroll.clientWidthChanges === 0, `viewport width changed ${a.scroll.clientWidthChanges}x (scrollbar toggling reflows the text)`);
@@ -250,11 +281,13 @@ async function runVariant(browser, viewport, variant) {
     await page.evaluate(installFlickerProbe);
     await page.waitForSelector('.chat-view:not(.chat-view-preview) [data-virtual-key], .chat-view:not(.chat-view-preview) .chat-event', { timeout: 30_000 });
     await sleep(1500);
-    await page.evaluate(({ pieceMode, seedChars }) => {
+    await page.evaluate(({ pieceMode, seedChars, cadence }) => {
       const d = window.__scrollDriver;
       d.pieceMode = pieceMode;
+      d.cadence = cadence ?? 'uniform';
+      d.mdPos = 0;
       d.seedText = seedChars ? `${'A long single streamed message paragraph with several words in it. '.repeat(Math.ceil(seedChars / 64))}\n\n`.slice(0, seedChars) : '';
-    }, { pieceMode: variant.pieceMode, seedChars: variant.seedChars ?? 0 });
+    }, { pieceMode: variant.pieceMode, seedChars: variant.seedChars ?? 0, cadence: variant.cadence });
     await page.evaluate(() => window.__scrollDriver.start(25));
     await sleep(1500);
     await page.evaluate(() => window.__flicker.begin());
@@ -289,7 +322,7 @@ async function main() {
   for (const r of results) {
     if (!r.pass) failed += 1;
     const a = r.analysis;
-    process.stdout.write(`${r.pass ? 'PASS' : 'FAIL'} ${r.viewport}/${r.label}${REDUCED ? '/reduced' : ''} ${a ? `frames=${a.frames} remounts=${JSON.stringify(a.remounts)} blank=${a.blankingFrames} anims=${a.animationStartsOnRows} bottomStep=${a.layout.bottomRAF.maxBottomStepPx}/${a.layout.bottomPainted.maxBottomStepPx} scrollWrites/frame=${a.scroll.writesPerFrame} widthChg=${a.scroll.clientWidthChanges} streamMut=${JSON.stringify(a.mutations.stream)}` : ''} ${JSON.stringify(r.failures)}\n`);
+    process.stdout.write(`${r.pass ? 'PASS' : 'FAIL'} ${r.viewport}/${r.label}${REDUCED ? '/reduced' : ''} ${a ? `frames=${a.frames} remounts=${JSON.stringify(a.remounts)} modeFlips=${a.renderMode.rAF.flips}/${a.renderMode.painted.flips} raw=${a.renderMode.rAF.rawFrames}/${a.renderMode.painted.rawFrames} heightDrops=${a.height.rAF.dropFrames}/${a.height.painted.dropFrames} blank=${a.blankingFrames} anims=${a.animationStartsOnRows} bottomStep=${a.layout.bottomRAF.maxBottomStepPx}/${a.layout.bottomPainted.maxBottomStepPx} scrollWrites/frame=${a.scroll.writesPerFrame} widthChg=${a.scroll.clientWidthChanges} streamMut=${JSON.stringify(a.mutations.stream)}` : ''} ${JSON.stringify(r.failures)}\n`);
   }
   process.stdout.write(`chat-stream-flicker: ${results.length - failed}/${results.length} passed -> ${OUTPUT}\n`);
   if (failed && !NO_FAIL) process.exit(1);

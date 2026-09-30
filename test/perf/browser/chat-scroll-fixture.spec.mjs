@@ -51,6 +51,27 @@ export function installDriver({ rows }) {
     return Array.from({ length: lines }, (_, k) => `row ${i} line ${k}: ${'lorem ipsum dolor sit amet '.repeat(1 + ((i + k) % 4))}`).join('\n\n');
   };
   for (let i = 0; i < rows; i += 1) events.push(mk(i % 2 ? 'user.message' : 'assistant.text', { text: paragraph(i), streaming: false }));
+  const MD_SCRIPT = [
+    '好的，这次换一篇不同题材的。',
+    '',
+    '---',
+    '',
+    '**深夜的便利店**',
+    '',
+    '凌晨一点四十分，便利店的自动门"叮咚"响了一声。值班的小陈抬起头，进来的是个穿西装的中年男人。',
+    '',
+    '## 他买了什么',
+    '',
+    '- 一盒**饭团**',
+    '- 一瓶 `无糖` 茶',
+    '- 一包烟，没有拆封',
+    '',
+    '1. 先是沉默',
+    '2. 然后他说：**"能借用一下微波炉吗？"**',
+    '',
+    '收银台旁边的灯管一直在闪，像是在替谁数着时间。',
+    '',
+  ].join('\n');
   const cur0OpenText = (event) => typeof event?.payload?.text === 'string' && event.payload.text.includes('```');
   const harness = window.__chatTimelineHarness;
   const publish = () => harness.setEvents(events);
@@ -60,8 +81,12 @@ export function installDriver({ rows }) {
     streamId: null,
     chunkCount: 0,
     toolCount: 0,
-    /** 'prose' (default) | 'code' (an unclosed fenced block growing line by line) | 'list' (bullet list) */
+    /** 'prose' (default) | 'code' (an unclosed fenced block growing line by line) | 'list' (bullet list)
+     *  | 'md' (a Markdown-heavy reply - heading, ---, **bold**, lists, inline code - streamed in 2-7 character token-sized pieces) */
     pieceMode: 'prose',
+    /** 'uniform' (default: one chunk every 1000/hz ms) | 'bursty' (3-6 chunks 20 ms apart, then a 150-350 ms pause, like a real token stream) */
+    cadence: 'uniform',
+    mdPos: 0,
     /** Text the next opened stream starts with (very long single message). */
     seedText: '',
     openStream() {
@@ -71,7 +96,9 @@ export function installDriver({ rows }) {
     chunk() {
       if (streamingIndex < 0) driver.openStream();
       const n = ++driver.chunkCount;
-      const piece = driver.pieceMode === 'code'
+      const piece = driver.pieceMode === 'md'
+        ? (() => { const len = 2 + (n % 6); const out = MD_SCRIPT.slice(driver.mdPos, driver.mdPos + len); driver.mdPos = (driver.mdPos + len) % MD_SCRIPT.length; return out || ' '; })()
+        : driver.pieceMode === 'code'
         ? (cur0OpenText(events[streamingIndex]) ? `const value${n} = compute(${n}, 'streamed line ${n}');\n` : '```ts\n')
         : driver.pieceMode === 'list'
           ? (n % 3 === 0 ? `\n- item ${n}${' word'.repeat(1 + (n % 5))}` : `${' word'.repeat(1 + (n % 4))}`)
@@ -100,14 +127,29 @@ export function installDriver({ rows }) {
     start(hz = 25) {
       driver.stop();
       let n = 0;
-      driver.timer = setInterval(() => {
+      const step = () => {
         n += 1;
         driver.chunk();
-        if (n % 90 === 0) driver.row();
+        if (n % 90 === 0) { driver.mdPos = 0; driver.row(); }
         if (n % 200 === 0) driver.tool();
-      }, 1000 / hz);
+      };
+      if (driver.cadence === 'bursty') {
+        // Deterministic (mulberry32) so base and head see the same arrival pattern.
+        let seed = 0x9e3779b9;
+        const rand = () => { seed = (seed + 0x6d2b79f5) | 0; let t = Math.imul(seed ^ (seed >>> 15), 1 | seed); t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t; return ((t ^ (t >>> 14)) >>> 0) / 4294967296; };
+        let inBurst = 0;
+        const next = () => {
+          step();
+          if (inBurst > 0) { inBurst -= 1; driver.timer = setTimeout(next, 20); return; }
+          inBurst = 2 + Math.floor(rand() * 4);
+          driver.timer = setTimeout(next, 150 + Math.floor(rand() * 200));
+        };
+        driver.timer = setTimeout(next, 20);
+      } else {
+        driver.timer = setInterval(step, 1000 / hz);
+      }
     },
-    stop() { if (driver.timer) clearInterval(driver.timer); driver.timer = null; },
+    stop() { if (driver.timer) { clearInterval(driver.timer); clearTimeout(driver.timer); } driver.timer = null; },
   };
   window.__scrollDriver = driver;
 
