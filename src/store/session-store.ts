@@ -612,6 +612,20 @@ async function migrateLegacyJson(handle: SessionDbHandle): Promise<void> {
   }
 }
 
+/**
+ * Whether the one-time sessions.json import is recorded as done in the database `handle` owns.
+ *
+ * INVARIANT: until it is, sessions.json may be the user's only copy of their sessions (a
+ * corrupt file is left exactly where it is so it can be repaired and migrated on a later
+ * start), so NOTHING in this build may write it -- the write-only compatibility export
+ * included. That export was requested by every load, including the ones whose import could
+ * not run, and replaced the unreadable/repaired file with a dump of the still-empty
+ * database: the next start then migrated nothing (macOS CI flake, dev c4e92ab9c).
+ */
+function legacyImportDone(handle: SessionDbHandle | null): boolean {
+  return handle !== null && readSessionDbMeta(handle, SESSION_DB_META_LEGACY_IMPORT) === SESSION_DB_LEGACY_IMPORT_DONE;
+}
+
 /** An empty database with a usable snapshot beside it: restore the newest non-empty one. */
 function restoreFromDatabaseSnapshot(handle: SessionDbHandle, targetPath: string): Map<string, string> | null {
   for (let index = 1; index <= SESSION_DB_BACKUP_COUNT; index += 1) {
@@ -678,6 +692,9 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
     if (canWrite) {
       await mkdir(dirname(targetPath), { recursive: true });
       const handle = writerHandle(targetPath);
+      // An export from an earlier load must finish (bounded) before this one reads and freezes
+      // sessions.json, so a late file replacement can never land between its read and its rename.
+      await settleCompatExportBeforeMigration();
       await migrateLegacyJson(handle);
       let payloads = readSessionPayloads(handle);
       if (payloads.size === 0) {
@@ -686,7 +703,8 @@ export async function loadStore(options: LoadStoreOptions = {}): Promise<Session
       }
       committedPayloads = payloads;
       store = { sessions: recordsFromPayloads(payloads) };
-      scheduleCompatExport(targetPath, true); // older processes see the migrated sessions at once
+      // Older processes see the migrated sessions at once -- but only once they ARE migrated.
+      if (legacyImportDone(handle)) scheduleCompatExport(targetPath, true);
     } else {
       const sessions = await readWithoutAuthority(targetPath);
       if (sessions) store = { sessions };
@@ -1035,6 +1053,14 @@ function runCompatExport(targetPath: string): Promise<void> {
       // Same ownership as any other write (a process that lost the lock must not touch the file),
       // without a second process-identity probe: the database write it follows already ran one.
       if (!hasWriteAuthority(targetPath, false)) return;
+      // The database this export was scheduled for must have imported sessions.json (see legacyImportDone).
+      // Read from the live writer connection at run time, never from a flag captured when it was scheduled;
+      // the load that completes the import schedules it again.
+      if (!legacyImportDone(writerDb && writerDb.path === targetPath ? writerDb : null)) {
+        compatExportPending = false;
+        logger.debug({ targetPath }, 'sessions.json compatibility export skipped: the legacy import is not done, the file is left untouched');
+        return;
+      }
       // Bound to the store this export was scheduled for, exactly like every other write:
       // HOME rotates between test workers and a late export must never land in the next one.
       const jsonPath = join(dirname(targetPath), LEGACY_JSON_FILE);
@@ -1069,6 +1095,21 @@ function runCompatExport(targetPath: string): Promise<void> {
   };
   compatExportChain = compatExportChain.then(run, run);
   return compatExportChain;
+}
+
+/** Upper bound on waiting for an earlier load's export before migrating (a hung disk must not hang startup). */
+const COMPAT_EXPORT_SETTLE_TIMEOUT_MS = 3_000;
+
+async function settleCompatExportBeforeMigration(): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      compatExportChain,
+      new Promise<void>((resolve) => { timer = setTimeout(resolve, COMPAT_EXPORT_SETTLE_TIMEOUT_MS); timer.unref?.(); }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Shutdown / explicit flush: export what is pending now instead of waiting for the interval. */

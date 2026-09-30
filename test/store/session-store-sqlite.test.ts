@@ -246,6 +246,81 @@ describe('one-time migration from sessions.json', () => {
     expect(Object.keys(persistedSessions(home))).toEqual(['deck_realproj_brain']);
   });
 
+  // The one-time import retries on the next start for as long as sessions.json cannot be
+  // read, so until the marker says "imported" the file is the user's only copy. Nothing may
+  // replace it -- least of all the write-only compatibility export of the (still empty)
+  // database. CI flake (macOS, dev c4e92ab9c): the export requested by the first load landed
+  // after the user repaired the file and replaced it, so the next start migrated nothing.
+  describe('an unmigrated sessions.json is the only copy: the compat export never touches it', () => {
+    const corrupt = '{"version": 2, "sessions": {"deck_realproj_brain": {"name": "x"';
+    const repaired = () => JSON.stringify({ version: 2, sessions: { deck_realproj_brain: record('deck_realproj_brain') }, identityPrompts: {} });
+    const leftovers = async () => (await readdir(dir)).filter((entry) => entry.startsWith('sessions.json.') && entry.endsWith('.tmp'));
+    let error: ReturnType<typeof vi.spyOn>;
+    beforeEach(() => { error = vi.spyOn(logger, 'error').mockImplementation(() => undefined); });
+
+    it('a corrupt file survives every export the store would run, byte for byte', async () => {
+      await writeFile(jsonFile(), corrupt, 'utf8');
+      await loadStore({ probe: false });
+      await waitForCompatExportForTests();
+      expect(await readFile(jsonFile(), 'utf8')).toBe(corrupt);
+
+      // Ordinary session writes and a flush also request exports: still not the file's business.
+      upsertSession(record('deck_realproj_w1'));
+      await flushStore();
+      await waitForCompatExportForTests();
+      expect(await readFile(jsonFile(), 'utf8')).toBe(corrupt);
+      expect(await leftovers()).toEqual([]);
+      expect(sessionsJsonCompatExportStatsForTests().completed).toBe(0);
+      expect(error).toHaveBeenCalled();
+    });
+
+    it('CAUSAL RACE: corrupt -> load -> the user repairs the file -> the pending export fires -> the next start still migrates the sessions', async () => {
+      await writeFile(jsonFile(), corrupt, 'utf8');
+      await loadStore({ probe: false }); // the first load requests an export
+      const text = repaired(); // the user repairs the file while that export is pending
+      await writeFile(jsonFile(), text, 'utf8');
+      await waitForCompatExportForTests(); // the pending export fires now
+      expect(await readFile(jsonFile(), 'utf8')).toBe(text); // the repaired file is intact
+      await fresh(); // the next start
+      expect(Object.keys(persistedSessions(home))).toEqual(['deck_realproj_brain']);
+      expect(existsSync(frozenFile())).toBe(true);
+    });
+
+    it('once the import is done the export is written again, unchanged', async () => {
+      await writeFile(jsonFile(), corrupt, 'utf8');
+      await loadStore({ probe: false });
+      await writeFile(jsonFile(), repaired(), 'utf8');
+      await fresh();
+      await waitForCompatExportForTests();
+      const exported = JSON.parse(await readFile(jsonFile(), 'utf8')) as Record<string, unknown>;
+      expect(exported[SESSIONS_JSON_COMPAT_EXPORT_MARKER_KEY]).toMatchObject({ format: SESSIONS_JSON_COMPAT_EXPORT_FORMAT_VERSION });
+      expect(Object.keys(exported.sessions as object)).toEqual(['deck_realproj_brain']);
+      expect(sessionsJsonCompatExportStatsForTests().completed).toBeGreaterThan(0);
+    });
+
+    it('an empty file, or no file at all, is "nothing to migrate": marked done, and the export works', async () => {
+      await loadStore({ probe: false });
+      upsertSession(record('deck_realproj_brain'));
+      await flushStore();
+      await waitForCompatExportForTests();
+      expect(Object.keys((JSON.parse(await readFile(jsonFile(), 'utf8')) as { sessions: object }).sessions)).toEqual(['deck_realproj_brain']);
+    });
+
+    it('a restart in the middle of the wait (a second unreadable start) still leaves the file alone', async () => {
+      await writeFile(jsonFile(), corrupt, 'utf8');
+      await loadStore({ probe: false });
+      await fresh(); // still corrupt on the next start
+      await waitForCompatExportForTests();
+      expect(await readFile(jsonFile(), 'utf8')).toBe(corrupt);
+      const text = repaired();
+      await writeFile(jsonFile(), text, 'utf8');
+      await waitForCompatExportForTests();
+      expect(await readFile(jsonFile(), 'utf8')).toBe(text);
+      await fresh();
+      expect(Object.keys(persistedSessions(home))).toEqual(['deck_realproj_brain']);
+    });
+  });
+
   it('a 1000-session store migrates and then flushes one row per change', async () => {
     const { text, expected } = productionShapedFile(1000);
     await writeFile(jsonFile(), text, 'utf8');
