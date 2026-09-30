@@ -46,14 +46,17 @@ const VARIANTS = [
 ];
 
 /** Installed in the page (after installDriver). */
-function installFlickerProbe() {
+export function installFlickerProbe() {
   const P = { recording: false, frames: [], painted: [], ids: new WeakMap(), nextId: 1, identity: new Map(), acc: null, animStarts: [], scrollWrites: [], lastLen: new Map(), remounts: [], removedLog: [] };
   window.__flicker = P;
   const idOf = (node) => { let v = P.ids.get(node); if (v === undefined) { v = P.nextId; P.nextId += 1; P.ids.set(node, v); } return v; };
-  const root = () => document.querySelector('.chat-view:not(.chat-view-preview)');
+  // Fixture: the single real ChatView and the driver's streaming event. Real app
+  // (many-windows): window.__flickerRoot() / __flickerStreamKey() pick the
+  // measured window and its currently streaming eventId.
+  const root = () => (window.__flickerRoot ? window.__flickerRoot() : document.querySelector('.chat-view:not(.chat-view-preview)'));
   const newAcc = () => ({ stream: { elAdd: 0, elDel: 0, txtAdd: 0, txtDel: 0, chr: 0, attr: 0 }, near: { elAdd: 0, elDel: 0, txtAdd: 0, txtDel: 0, chr: 0, attr: 0 }, other: { elAdd: 0, elDel: 0, txtAdd: 0, txtDel: 0, chr: 0, attr: 0 } });
   P.acc = newAcc();
-  const streamKey = () => window.__scrollDriver?.streamId ?? null;
+  const streamKey = () => (window.__flickerStreamKey ? window.__flickerStreamKey() : (window.__scrollDriver?.streamId ?? null));
   const rowOf = (node) => (node?.nodeType === 1 ? node : node?.parentElement)?.closest?.('[data-virtual-key]') ?? null;
   const classify = (row) => {
     if (!row) return 'other';
@@ -152,7 +155,7 @@ function installFlickerProbe() {
 
 function sum(frames, bucket, field) { return frames.reduce((a, f) => a + (f.acc?.[bucket]?.[field] ?? 0), 0); }
 
-function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog }) {
+export function analyze({ frames, painted, animStarts, scrollWrites, identity, remountEvents, removedLog }) {
   // Identity: distinct DOM nodes per (stream, part); >1 means the node was re-created while streaming.
   const remounts = { wrapper: 0, event: 0, text: 0, near: 0 };
   const perPart = [];
@@ -219,7 +222,7 @@ function analyze({ frames, painted, animStarts, scrollWrites, identity, remountE
   };
 }
 
-function verdicts(result) {
+export function verdicts(result) {
   const failures = [];
   const a = result.analysis;
   if (result.error) { failures.push(`error: ${result.error.split('\n')[0]}`); return failures; }

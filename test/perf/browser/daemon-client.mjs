@@ -215,13 +215,42 @@ ws.on('message', (raw) => {
   }
 });
 
+/**
+ * IMC_PERF_STREAM_MODE=growing streams like the real daemon (transport-relay):
+ * ONE assistant.text eventId per message whose cumulative text grows on every
+ * frame (streaming:true), finalized (streaming:false) every GROWING_FRAMES_PER_MESSAGE
+ * frames. The default mode (a fresh event per frame) exercises list growth instead.
+ */
+const growingStream = process.env.IMC_PERF_STREAM_MODE === 'growing';
+const GROWING_FRAMES_PER_MESSAGE = 90;
+const growing = new Map();
+function sendGrowingChunk(name, burstNumber) {
+  let state = growing.get(name);
+  if (!state) { state = { message: 0, frames: 0, text: '', eventId: null, seq: 0 }; growing.set(name, state); }
+  if (!state.eventId) { state.message += 1; state.frames = 0; state.text = ''; state.eventId = `transport:${name}:perf-msg-${state.message}`; }
+  state.frames += 1;
+  state.text += ` stream-${burstNumber}${state.frames % 12 === 0 ? '\n\nnext paragraph of the streamed answer' : ''}`;
+  const finalize = state.frames >= GROWING_FRAMES_PER_MESSAGE;
+  const events = history.get(name) ?? [];
+  const seq = events.length + 1;
+  const event = { eventId: state.eventId, sessionId: name, epoch, seq, ts: Date.now(), type: 'assistant.text', payload: { text: state.text, streaming: !finalize } };
+  const existing = events.findIndex((candidate) => candidate.eventId === state.eventId);
+  if (existing >= 0) events[existing] = { ...event, seq: events[existing].seq }; else events.push(event);
+  history.set(name, events);
+  ws.send(JSON.stringify({ type: 'timeline.event', event }));
+  if (finalize) state.eventId = null;
+}
+
 let burst = 0;
 let ticks = 0;
 const tick = setInterval(() => {
   ticks += 1;
   for (let index = 0; index < activeTimelineNames.length; index += 1) {
     const name = activeTimelineNames[index];
-    if (index < streamingSessions) sendEvent(name, 'assistant.text', { text: `stream-${++burst}`, streaming: true });
+    if (index < streamingSessions) {
+      if (growingStream) sendGrowingChunk(name, ++burst);
+      else sendEvent(name, 'assistant.text', { text: `stream-${++burst}`, streaming: true });
+    }
     else sendEvent(name, 'agent.status', { status: 'working', burst });
     if (index < 3) sendEvent(name, 'usage.update', { inputTokens: burst, outputTokens: burst * 2 });
   }

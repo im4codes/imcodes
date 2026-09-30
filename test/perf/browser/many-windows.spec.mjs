@@ -7,6 +7,7 @@ const require = createRequire(new URL('../../../web/package.json', import.meta.u
 const { chromium } = require('@playwright/test');
 import { buildWorkload } from './load-generator.mjs';
 import { aggregate, collectMetrics, installObservers } from './metrics.mjs';
+import { installFlickerProbe, analyze as analyzeFlicker, verdicts as flickerVerdicts } from './chat-stream-flicker.spec.mjs';
 
 const BASE_URL = process.env.IMC_PERF_BASE_URL ?? 'http://127.0.0.1:19138';
 const SERVER_ID = process.env.IMC_PERF_SERVER_ID ?? 'imc_perf_harness_server';
@@ -141,6 +142,40 @@ async function startCpuProbe(context) {
  * frame the card actually rendered (coalesced frames are not counted, so this
  * is the age of the content at the moment the card updates).
  */
+/**
+ * IMC_PERF_FLICKER=1: the streaming-flicker probe (chat-stream-flicker.spec.mjs)
+ * on the REAL app path (server -> useTimeline -> ChatView), measuring the first
+ * on-screen chat window that shows a streaming reply. Use with
+ * IMC_PERF_STREAM_MODE=growing so the fake daemon streams like the real one
+ * (one eventId per message, cumulative text).
+ */
+async function startFlickerProbe(page) {
+  if (process.env.IMC_PERF_FLICKER !== '1') return null;
+  await page.evaluate(installFlickerProbe);
+  await page.evaluate(() => {
+    let chosen = null;
+    window.__flickerRoot = () => {
+      if (chosen?.isConnected) return chosen;
+      chosen = [...document.querySelectorAll('.chat-view:not(.chat-view-preview)')].find((el) => el.getClientRects().length > 0 && el.textContent.includes('stream-')) ?? null;
+      return chosen;
+    };
+    window.__flickerStreamKey = () => {
+      const root = window.__flickerRoot();
+      if (!root) return null;
+      const rows = [...root.querySelectorAll('.chat-assistant[data-event-id]')].filter((el) => el.textContent.includes('stream-'));
+      return rows.at(-1)?.getAttribute('data-event-id') ?? null;
+    };
+  });
+  await page.evaluate(() => window.__flicker.begin());
+  return {
+    async stop() {
+      const raw = await page.evaluate(() => window.__flicker.end());
+      const analysis = analyzeFlicker(raw);
+      return { analysis, failures: flickerVerdicts({ analysis }) };
+    },
+  };
+}
+
 async function installCardLatencyProbe(context) {
   if (process.env.IMC_PERF_CARD_LATENCY !== '1') return;
   await context.addInitScript(() => {
@@ -767,7 +802,9 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     await startScrollJitterProbe(page);
     const cpuProbe = await startCpuProbe(context);
     const keypressProbe = await startKeypressProbe(page);
+    const flickerProbe = await startFlickerProbe(page);
     await pageWait(durationMs);
+    const flicker = flickerProbe ? await flickerProbe.stop() : null;
     const keypress = keypressProbe ? await keypressProbe.stop() : null;
     const rendererCpu = cpuProbe ? await cpuProbe.stop() : null;
     const cardLatency = process.env.IMC_PERF_CARD_LATENCY === '1' ? await page.evaluate(() => window.__imcCardLatency?.() ?? null).catch(() => null) : null;
@@ -819,7 +856,7 @@ async function runSinglePageScenario(context, workload, { windowCurve, stallDiag
     metrics.ws.expectedHiddenFullBytes = visibleSdkCount
       ? ((metrics.ws.byMode?.full ?? 0) / visibleSdkCount) * hiddenSdkCount
       : 0;
-    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, keypress, rendererCpu, cardLatency, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
+    return { workload: { ...workload, sessions: workload.sessions.map(({ events, __page, __diagnostics, ...session }) => session) }, correctness, restoreMs: 0, restoreTotalMs: 0, windowCurve, stallDiagnostics, longChats: {}, scrollJitter, keypress, rendererCpu, cardLatency, flicker, diagnostics: { tracePath: lowLevel?.tracePath ?? null, profilePath: lowLevel?.profilePath ?? null, networkLog: lowLevel?.networkLog ?? [], httpCounts, performanceSamples: lowLevel?.performanceSamples ?? [], performanceDeltas: lowLevel?.performanceDeltas ?? [], hiddenMode: hiddenModeDiagnostics, companion: Boolean(companionItem) }, serverDebug: await page.evaluate(() => window.__perfServerDebug ?? []).catch(() => []), metrics };
   } catch (error) {
     correctness.failures.push(`single-page open failed: ${error instanceof Error ? error.message : String(error)}`);
     correctness.restored = false;
