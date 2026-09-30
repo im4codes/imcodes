@@ -41,6 +41,18 @@ const AUD = 'deck_sub_driftaud';
 const MIN = 60_000;
 const T0 = 1_800_000_000_000;
 
+/**
+ * Every git this file runs (its own fixtures AND the product's, which inherit process.env) uses this config: no automatic gc / maintenance,
+ * and nothing detached. A commit or fetch that trips `gc --auto` otherwise leaves a background git writing into .git/objects after the test
+ * body is done, and the afterEach rmSync races it (CI: ENOTEMPTY on .../main/.git/objects, Node 22 job).
+ */
+const GIT_TEST_CONFIG = '[gc]\n\tauto = 0\n\tautoDetach = false\n[maintenance]\n\tauto = false\n[receive]\n\tautogc = false\n';
+const GIT_ENV_KEYS = ['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM'] as const;
+const isFetch = (args: string): boolean => args.split(' ').includes('fetch');
+const removeTree = (path: string): void => rmSync(path, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
+const services: TaskPairService[] = [];
+const newService = (): TaskPairService => { const service = new TaskPairService(); services.push(service); return service; };
+
 let root: string;
 let origin: string;
 let main: string;
@@ -112,12 +124,15 @@ const passAt = (minutesAfterDone: number) => {
 describe('integration drift', () => {
   const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
   const previousSshCommand = process.env.GIT_SSH_COMMAND;
+  const previousGitEnv = Object.fromEntries(GIT_ENV_KEYS.map((key) => [key, process.env[key]]));
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'imc-drift-'));
     process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
     delete process.env[TASK_PAIR_INTEGRATION_REF_ENV];
     delete process.env.GIT_SSH_COMMAND;
-    writeFileSync(join(root, 'empty-gitconfig'), '');
+    writeFileSync(join(root, 'test-gitconfig'), GIT_TEST_CONFIG);
+    process.env.GIT_CONFIG_GLOBAL = join(root, 'test-gitconfig');
+    process.env.GIT_CONFIG_NOSYSTEM = '1';
     setTaskPairStoreForTests(new TaskPairStore(':memory:'));
     sent = [];
     gitCalls = [];
@@ -132,7 +147,7 @@ describe('integration drift', () => {
         gitCalls.push(args.join(' '));
         gitOptions.push({ args: args.join(' '), ...(options?.env ? { env: options.env } : {}) });
         try {
-          return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'empty-gitconfig'), ...(options?.env ?? {}) } }) };
+          return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'test-gitconfig'), ...(options?.env ?? {}) } }) };
         } catch (error) {
           return { ok: false, stdout: '', exitCode: (error as { status?: number }).status };
         }
@@ -142,12 +157,18 @@ describe('integration drift', () => {
     upsertSession(session(EXEC, 'w1'));
     upsertSession(session(AUD, 'w2'));
   });
-  afterEach(() => {
+  afterEach(async () => {
+    // Background work the service started from a marker (stale-base check, workspace head refresh) is finished before anything is removed.
+    await Promise.all(services.splice(0).map((service) => service.waitForIdle()));
     setIntegrationDriftDepsForTests(undefined);
     setTaskPairDeliveryDepsForTests(undefined);
     setTaskPairStoreForTests(undefined);
     for (const name of [BRAIN, EXEC, AUD]) removeSession(name);
-    rmSync(root, { recursive: true, force: true });
+    removeTree(root);
+    for (const key of GIT_ENV_KEYS) {
+      if (previousGitEnv[key] === undefined) delete process.env[key];
+      else process.env[key] = previousGitEnv[key];
+    }
     delete process.env[TASK_PAIR_INTEGRATION_REF_ENV];
     if (previousSshCommand === undefined) delete process.env.GIT_SSH_COMMAND;
     else process.env.GIT_SSH_COMMAND = previousSshCommand;
@@ -288,7 +309,7 @@ describe('integration drift', () => {
 
     it('Brain dismisses a finished pair with DONE integration=dismiss or CANCEL: reminders stop, the pair stays done', async () => {
       const { base } = setUpRepos();
-      const service = new TaskPairService();
+      const service = newService();
       for (const [taskId, verb, attrs] of [['t4', 'DONE', { [TASK_PAIR_INTEGRATION_ATTR]: TASK_PAIR_INTEGRATION_DISMISS_VALUE }], ['t5', 'CANCEL', {}]] as const) {
         const wt = addWorktree(taskId, base);
         const head = commit(wt, `${taskId}.txt`, 'x\n', `feat: ${taskId}`);
@@ -380,7 +401,7 @@ describe('integration drift', () => {
       const head = commit(wt, 'f.txt', 'f\n', 'feat: solo');
       donePair('s1', wt, head, base);
       expect((await passAt(30)).reminded).toBe(1);
-      expect(gitCalls.some((call) => call.startsWith('fetch'))).toBe(false);
+      expect(gitCalls.some((call) => isFetch(call))).toBe(false);
       run(bare, 'merge', '-q', '--ff-only', head);
       expect((await passAt(60)).integrated).toBe(1);
     });
@@ -398,7 +419,7 @@ describe('integration drift', () => {
       const fetchWarnings = warn.mock.calls.filter((call) => String(call[1] ?? call[0]).includes('integration ref'));
       expect(fetchWarnings).toHaveLength(1);
       // Backed off: one fetch attempt inside the backoff window, not one per heartbeat.
-      expect(gitCalls.filter((call) => call.startsWith('fetch')).length).toBeLessThanOrEqual(2);
+      expect(gitCalls.filter((call) => isFetch(call)).length).toBeLessThanOrEqual(2);
     });
 
     it('a renamed integration branch is followed through IMCODES_PAIR_INTEGRATION_REF, and an unknown ref sends nothing', async () => {
@@ -430,8 +451,10 @@ describe('integration drift', () => {
       expect(digests()).toHaveLength(0);
       expect(run(main, 'rev-parse', 'origin/dev')).toBe(base);
       expect(run(main, 'rev-parse', 'refs/imcodes/integration/dev')).toBe(head);
-      const fetch = gitOptions.find((call) => call.args.startsWith('fetch'))!;
+      const fetch = gitOptions.find((call) => isFetch(call.args))!;
       expect(fetch.args).toContain('+refs/heads/dev:refs/imcodes/integration/dev');
+      // The daemon's fetch never starts a detached gc / maintenance in the user's repository.
+      expect(fetch.args).toContain('-c gc.auto=0 -c maintenance.auto=false -c gc.autoDetach=false');
       expect(fetch.env?.GIT_TERMINAL_PROMPT).toBe('0');
       expect(fetch.env?.GIT_SSH_COMMAND).toContain('BatchMode=yes');
     });
@@ -450,7 +473,7 @@ describe('integration drift', () => {
         donePair(id, wt, commit(wt, `${id}.txt`, 'x\n', `feat: ${id}`), base);
         return wt;
       };
-      const fetchCalls = () => gitOptions.filter((call) => call.args.startsWith('fetch'));
+      const fetchCalls = () => gitOptions.filter((call) => isFetch(call.args));
 
       it('a repo with core.sshCommand keeps it: no GIT_SSH_COMMAND is set, and git really runs the user\'s command', async () => {
         const { base } = setUpRepos();
@@ -550,7 +573,7 @@ describe('integration drift', () => {
         expect(digests()).toHaveLength(2);
       } finally {
         setTaskPairStoreForTests(undefined);
-        rmSync(dir, { recursive: true, force: true });
+        removeTree(dir);
       }
     });
 
@@ -619,7 +642,7 @@ describe('integration drift', () => {
     it('the READY marker itself triggers it (in the background) and the audit still opens', async () => {
       const { wt, head } = await staleFixture(TASK_PAIR_STALE_BASE_MAX_COMMITS + 3, 'st3');
       savePair('st3', { status: 'working', workspace: { kind: 'worktree', path: wt, base: run(wt, 'rev-parse', 'HEAD~1'), lastHead: head, createdAt: 1, status: 'active' } as never });
-      const service = new TaskPairService();
+      const service = newService();
       const transition = service.applyMarker({
         project: PROJECT, writer: EXEC, source: 'marker', eventId: 'ready-st3', now: T0,
         marker: { verb: 'READY_FOR_AUDIT', knownVerb: 'READY_FOR_AUDIT', taskId: 'st3', attrs: { worktree: wt, head } },
@@ -771,7 +794,7 @@ describe('integration drift', () => {
             send: async (target, taskId, reason, text) => { sent.push({ target, taskId, reason, text }); return 'sent'; },
             git: async (cwd, args, timeoutMs, options) => {
               if (args[0] === 'cherry') return { ok: false, stdout: '' };
-              try { return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'empty-gitconfig') } }) }; } catch (error) { return { ok: false, stdout: '', exitCode: (error as { status?: number }).status }; }
+              try { return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, maxBuffer: options?.maxBuffer ?? 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'], env: { ...process.env, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: join(root, 'test-gitconfig') } }) }; } catch (error) { return { ok: false, stdout: '', exitCode: (error as { status?: number }).status }; }
             },
           });
           await checkStaleBaseNotice(PROJECT, 'own5', 'ready');

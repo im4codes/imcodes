@@ -50,6 +50,12 @@ const FETCH_FAILURE_BACKOFF_MS = 30 * 60_000;
 const PRIVATE_REF_FRESH_MS = 30 * 60_000;
 /** ssh must not wait for a password or host-key answer either; only added when the user has no ssh command of their own (see fetchEnvFor). */
 const BATCH_MODE_SSH_COMMAND = 'ssh -o BatchMode=yes';
+/**
+ * A fetch ends with `git maintenance run --auto` / `gc --auto`, which can start a DETACHED repack in the user's repository: a heavy
+ * background process the daemon neither asked for nor can wait for or stop (it also keeps writing into .git/objects after the call
+ * returned). The daemon's fetch turns that off for this one invocation; the user's own git keeps its settings.
+ */
+const NO_BACKGROUND_MAINTENANCE = ['-c', 'gc.auto=0', '-c', 'maintenance.auto=false', '-c', 'gc.autoDetach=false'] as const;
 const MAX_RANGE_COMMITS = 3_000;
 const RANGE_MAX_BUFFER = 8 * 1024 * 1024;
 const PICKED_FROM_RE = /\(cherry picked from commit ([0-9a-f]{7,64})\)/giu;
@@ -238,7 +244,7 @@ async function refreshIntegrationRef(repoPath: string, ref: string): Promise<voi
   if (current - state.fetchedAt < FETCH_MIN_INTERVAL_MS) return;
   if (state.fetchFailedAt !== undefined && current - state.fetchFailedAt < FETCH_FAILURE_BACKOFF_MS) return;
   state.fetching = (async () => {
-    const outcome = await git(repoPath, ['fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+refs/heads/${branch}:${privateRefOf(branch)}`], FETCH_TIMEOUT_MS, { env: await fetchEnvFor(repoPath, state) });
+    const outcome = await git(repoPath, [...NO_BACKGROUND_MAINTENANCE, 'fetch', '--quiet', '--no-tags', '--refmap=', 'origin', `+refs/heads/${branch}:${privateRefOf(branch)}`], FETCH_TIMEOUT_MS, { env: await fetchEnvFor(repoPath, state) });
     if (outcome.ok) {
       tips.delete(`${key}\u0000${privateRefOf(branch)}`);
       tips.delete(`${key}\u0000${ref}`);
