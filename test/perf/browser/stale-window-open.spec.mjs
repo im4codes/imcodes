@@ -228,6 +228,7 @@ async function runScenario(browser, mode) {
       if (marker) state.markerSeen = true;
       if (state.markerSeen && !marker && state.markerGoneAt === null) state.markerGoneAt = now - state.startedAt;
       const sample = { bottomGap: Math.max(0, root.scrollHeight - root.clientHeight - root.scrollTop) };
+      sample.scrollTop = root.scrollTop; sample.scrollHeight = root.scrollHeight; sample.t = now - state.startedAt;
       if (sampleMode === 'reading') {
         if (state.anchorId === null) {
           const anchor = pickAnchor();
@@ -265,10 +266,18 @@ async function runScenario(browser, mode) {
   const anchorTops = layout.samplesRaw.map((sample) => sample.anchorTop).filter((value) => typeof value === 'number');
   const drift = layout.anchorTop0 === null || anchorTops.length === 0 ? null : Math.max(...anchorTops.map((top) => Math.abs(top - layout.anchorTop0)));
   const bottomGap = Math.max(0, ...layout.samplesRaw.map((sample) => sample.bottomGap));
+  // Every frame on which the anchored row moved: enough to see WHAT moved it (scroll offset vs content height).
+  const anchorMoves = [];
+  for (let i = 1; i < layout.samplesRaw.length && anchorMoves.length < 25; i += 1) {
+    const prev = layout.samplesRaw[i - 1]; const cur = layout.samplesRaw[i];
+    if (typeof prev.anchorTop === 'number' && typeof cur.anchorTop === 'number' && Math.abs(cur.anchorTop - prev.anchorTop) > 1) {
+      anchorMoves.push({ t: Math.round(cur.t), anchorFrom: Math.round(prev.anchorTop), anchorTo: Math.round(cur.anchorTop), scrollTop: [Math.round(prev.scrollTop), Math.round(cur.scrollTop)], scrollHeight: [Math.round(prev.scrollHeight), Math.round(cur.scrollHeight)] });
+    }
+  }
   const gapRecord = await page.evaluate(() => {
     try { return JSON.parse(localStorage.getItem('imcodes.timelineGaps.v1') ?? '{}'); } catch { return {}; }
   });
-  result.layout = { samples: layout.samples, markerSeen: layout.markerSeen, markerGoneAtMs: layout.markerGoneAtMs, gapClosedAtMs: layout.gapClosedAtMs, anchorId: layout.anchorId, driftPx: drift, maxBottomGapPx: bottomGap, error: layout.error };
+  result.layout = { samples: layout.samples, markerSeen: layout.markerSeen, markerGoneAtMs: layout.markerGoneAtMs, gapClosedAtMs: layout.gapClosedAtMs, anchorId: layout.anchorId, driftPx: drift, maxBottomGapPx: bottomGap, anchorMoves, error: layout.error };
   result.markerPresentAtEnd = await page.evaluate(() => !!document.querySelector('[data-testid="chat-history-gap-marker"]'));
   result.idbRows = await countIdbRows(page);
   result.gapRecord = gapRecord[cacheKey] ?? null;
