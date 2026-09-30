@@ -157,6 +157,8 @@ export const TASK_PAIR_TITLE_GENERATED_EFFECT = 'title_generated' as const;
 /** Daemon-authored event: the round's material was held because its head does not build on the round base. */
 export const TASK_PAIR_MATERIAL_EVENT_VERB = 'MATERIAL' as const;
 export const TASK_PAIR_MATERIAL_HELD_EFFECT = 'material_held' as const;
+/** Result of a repeated STARTED from the current executor of an already-working pair: nothing is recorded or rewritten. */
+export const TASK_PAIR_IDEMPOTENT_STARTED_EFFECT = 'idempotent_started' as const;
 /**
  * Known non-informative titles a pair can carry (a legacy-import default
  * objective, a formatting fallback used elsewhere for a missing title).

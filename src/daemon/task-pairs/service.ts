@@ -26,6 +26,7 @@ import {
   TASK_PAIR_TIMELINE_EVENT,
   TASK_PAIR_MATERIAL_EVENT_VERB,
   TASK_PAIR_MATERIAL_HELD_EFFECT,
+  TASK_PAIR_IDEMPOTENT_STARTED_EFFECT,
   TASK_PAIR_TITLE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_EFFECTS,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
@@ -97,6 +98,12 @@ export interface TaskPairScheduler {
   flagEconomyUnreviewed?(project: string, taskId: string): void;
   /** Re-arm/clear the single aggregate Brain heartbeat after liveness changes. */
   publishBadges?(): void;
+  /**
+   * The liveness a Brain reply at `at` nets out to for this pair (pure): the wait is
+   * cleared and the reminder refresh re-arms it for the same state, so a reply during
+   * a fresh wait only moves the activity clocks.
+   */
+  brainReplyLiveness?(stored: StoredTaskPair, at: number): TaskPairLiveness;
 }
 
 export interface ApplyMarkerInput {
@@ -582,6 +589,14 @@ export class TaskPairService {
         })
       : { effect: 'unresolved', unusual: true, intents: [] as TaskPairIntent[] } satisfies TaskPairTransition;
     const role = taskPairRoleOf(existing?.state ?? transition.pair, input.writer);
+    // An executor that writes STARTED again while its pair is already working
+    // changes nothing: no event row, no pair rewrite, no console push, no git
+    // head refresh. It still counts as the executor's progress, so it is
+    // stamped like any other activity (throttled, in memory first).
+    if (existing && this.#isIdempotentStarted(input, existing, transition, role)) {
+      store.saveLivenessActivityStamp(input.project, existing.state.taskId, this.#livenessAfterMarker(existing.liveness, transition, role, now));
+      return { effect: TASK_PAIR_IDEMPOTENT_STARTED_EFFECT, fromStatus: 'working', toStatus: 'working', unusual: false, intents: [] };
+    }
     const eventPair = transition.pair ?? existing?.state;
     const eventHead = input.marker.attrs.head ?? existing?.state.material?.head ?? eventPair?.material?.head ?? '';
     const eventRound = input.marker.knownVerb === 'READY_FOR_AUDIT'
@@ -1166,7 +1181,11 @@ export class TaskPairService {
     const nextState = pair.state.executor === writer && pair.state.flags.includes('executor_silent')
       ? { ...pair.state, flags: pair.state.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }
       : pair.state;
-    getTaskPairStore().savePair(pair.project, nextState, { liveness });
+    // A stamp that changes no pair state is only liveness: it goes through the
+    // throttled path instead of rewriting the whole pair row (brief included)
+    // and pushing a console delta for every final assistant message.
+    if (nextState === pair.state) getTaskPairStore().saveLivenessActivityStamp(pair.project, pair.state.taskId, liveness);
+    else getTaskPairStore().savePair(pair.project, nextState, { liveness });
   }
 
   /** Returns true when the stamp changed more than an activity timestamp. */
@@ -1176,14 +1195,17 @@ export class TaskPairService {
     // Any real Brain reply resolves the current wait immediately.  A later
     // state transition starts a new wait key and therefore a fresh 5-minute
     // cadence; this is deliberately durable so a restart cannot re-remind.
+    const foldBrainReply = pair.state.brain === writer && !!this.#scheduler?.brainReplyLiveness;
     if (pair.state.brain === writer) {
       liveness.brainLastActivityAt = now;
-      liveness.brainWaitKey = undefined;
-      liveness.brainWaitStartedAt = undefined;
-      liveness.brainReminderCount = 0;
-      liveness.brainReminderResolvedAt = now;
-      liveness.brainReminderDue = undefined;
-      liveness.brainReminderLastAt = undefined;
+      if (!foldBrainReply) {
+        liveness.brainWaitKey = undefined;
+        liveness.brainWaitStartedAt = undefined;
+        liveness.brainReminderCount = 0;
+        liveness.brainReminderResolvedAt = now;
+        liveness.brainReminderDue = undefined;
+        liveness.brainReminderLastAt = undefined;
+      }
     }
     if (pair.state.executor === writer) {
       liveness.activityExecutorAt = now;
@@ -1205,9 +1227,23 @@ export class TaskPairService {
       getTaskPairStore().savePair(pair.project, nextState, { liveness });
       return true;
     }
-    const material = livenessChangedBeyondActivityTimestamps(pair.liveness, liveness);
-    getTaskPairStore().saveLivenessActivityStamp(pair.project, pair.state.taskId, liveness);
+    // A Brain reply clears the wait and the badge refresh right after it re-arms
+    // the same wait for the same state. Fold the two: only when the net result
+    // differs beyond the activity clocks (a reminder was already sent, a due
+    // flag was set) is this a material change worth a write and a badge pass.
+    const net = foldBrainReply ? this.#scheduler!.brainReplyLiveness!({ ...pair, liveness }, now) : liveness;
+    const material = livenessChangedBeyondActivityTimestamps(pair.liveness, net);
+    getTaskPairStore().saveLivenessActivityStamp(pair.project, pair.state.taskId, net);
     return material;
+  }
+
+  /** A repeated STARTED from the current executor of a working pair whose transition is a strict no-op. */
+  #isIdempotentStarted(input: ApplyMarkerInput, existing: StoredTaskPair, transition: TaskPairTransition, role: string): boolean {
+    if (input.marker.knownVerb !== 'STARTED' || input.source !== 'marker' || role !== 'executor') return false;
+    if (existing.state.status !== 'working') return false;
+    if (transition.effect !== 'status' || transition.fromStatus !== 'working' || transition.toStatus !== 'working') return false;
+    if (transition.unusual || transition.intents.length > 0 || !transition.pair) return false;
+    return JSON.stringify({ ...existing.state, updatedAt: 0 }) === JSON.stringify({ ...transition.pair, updatedAt: 0 });
   }
 
   #livenessAfterMarker(

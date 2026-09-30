@@ -316,7 +316,11 @@ export class TaskPairAutomation implements TaskPairScheduler {
     if (replyText && event.type !== 'agent.status' && event.type !== 'session.state') {
       const at = this.#now();
       for (const stored of pairs) {
-        const next = { ...stored.liveness, brainLastActivityAt: at, brainWaitKey: undefined, brainWaitStartedAt: undefined, brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: at, brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined };
+        // The reply clears the wait and the refresh that follows re-arms it for
+        // the same state: net, only the activity clock moved. Use that end
+        // state so a reply during a wait is one throttled stamp, not a clear
+        // write plus a re-arm write per streamed delta.
+        const next = this.brainReplyLiveness({ ...stored, liveness: { ...stored.liveness, brainLastActivityAt: at } }, at);
         // Once the reminder is resolved, every further reply only moves the
         // activity clock: keep it in memory and rewrite SQLite once per interval.
         getTaskPairStore().saveLivenessActivityStamp(stored.project, stored.state.taskId, next);
@@ -891,9 +895,20 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const next = new Set<string>();
     const mainPairs = new Map<string, StoredTaskPair[]>();
     const now = this.#now();
-    for (const original of getTaskPairStore().listActivePairs()) {
+    // One engine answer per project per call: it walks the session store, and
+    // this loop used to ask it once per open pair.
+    const pairsEngine = new Map<string, boolean>();
+    const isPairsProject = (project: string): boolean => {
+      let value = pairsEngine.get(project);
+      if (value === undefined) { value = isPairsEngineProject(project); pairsEngine.set(project, value); }
+      return value;
+    };
+    // Served from the store's in-memory index (read-only): this runs on every
+    // pair change and session state change, and used to re-read and re-parse
+    // every open pair -- briefs included -- from SQLite each time.
+    for (const original of getTaskPairStore().listActivePairsShared()) {
       const stored = this.#refreshBrainReminder(original, now);
-      if (!TASK_PAIR_OPEN_STATUSES.includes(stored.state.status) || !isPairsEngineProject(stored.project)) continue;
+      if (!TASK_PAIR_OPEN_STATUSES.includes(stored.state.status) || !isPairsProject(stored.project)) continue;
       for (const session of [stored.state.executor, stored.state.auditor]) {
         if (session && session !== TASK_PAIR_NO_AUDITOR) next.add(session);
       }
@@ -1117,13 +1132,48 @@ export class TaskPairAutomation implements TaskPairScheduler {
   }
 
   #refreshBrainReminder(stored: StoredTaskPair, now: number): StoredTaskPair {
+    const next = this.projectBrainReminder(stored, now);
+    if (next === stored.liveness) return stored;
+    getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, next);
+    return { ...stored, liveness: next };
+  }
+
+  /**
+   * The liveness a Brain reply at `at` leaves for this pair. A reply resolves
+   * the current wait and the reminder refresh right after it re-arms the same
+   * wait for the same state; when the wait is already fresh (armed for this
+   * state, nothing reminded yet) that round trip changes nothing but the
+   * activity clocks, so only those move. Otherwise the wait is cleared and
+   * re-armed exactly as before, which is a material change. Pure.
+   */
+  brainReplyLiveness(stored: StoredTaskPair, at: number): TaskPairLiveness {
+    const key = this.#brainWaitKey(stored.state);
+    const live = stored.liveness;
+    if (key && live.brainWaitKey === key && live.brainWaitStartedAt === Math.min(stored.state.updatedAt, at)
+      && (live.brainReminderCount ?? 0) === 0 && live.brainReminderLastAt === undefined
+      && !live.brainReminderDue && live.brainReminderResolvedAt === undefined) {
+      return { ...live, brainLastActivityAt: at, lastMaterialAt: at };
+    }
+    const cleared: TaskPairLiveness = {
+      ...live, brainLastActivityAt: at, lastMaterialAt: at, brainWaitKey: undefined, brainWaitStartedAt: undefined,
+      brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: at,
+      brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined,
+    };
+    return this.projectBrainReminder({ ...stored, liveness: cleared }, at);
+  }
+
+  /**
+   * The liveness a Brain-reminder refresh leaves for this pair: the same object
+   * when nothing changes. Pure, so the per-event paths can ask what a Brain
+   * reply nets out to (clear the wait, then re-arm it for the same state)
+   * without writing the intermediate step or publishing badges for it.
+   */
+  projectBrainReminder(stored: StoredTaskPair, now: number): TaskPairLiveness {
     const key = this.#brainWaitKey(stored.state);
     const current = stored.liveness;
     if (!key) {
-      if (!current.brainWaitKey && !current.brainReminderDue) return stored;
-      const cleared = { ...current, brainWaitKey: undefined, brainWaitStartedAt: undefined, brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: undefined, brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined };
-      getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, cleared);
-      return { ...stored, liveness: cleared };
+      if (!current.brainWaitKey && !current.brainReminderDue) return current;
+      return { ...current, brainWaitKey: undefined, brainWaitStartedAt: undefined, brainReminderCount: 0, brainReminderLastAt: undefined, brainReminderDue: undefined, brainReminderResolvedAt: undefined, brainReminderLastDecisionAt: undefined, brainReminderLastDecisionReason: undefined };
     }
     let next = current;
     if (current.brainWaitKey !== key) {
@@ -1133,7 +1183,6 @@ export class TaskPairAutomation implements TaskPairScheduler {
     }
     const started = next.brainReminderLastAt ?? next.brainWaitStartedAt ?? now;
     const count = next.brainReminderCount ?? 0;
-    const lastBrainTouch = Math.max(next.brainReminderLastAt ?? 0, next.brainLastActivityAt ?? 0);
     const gapElapsed = isTaskPairBrainReminderGapSatisfied(now, next.brainReminderLastAt, next.brainLastActivityAt);
     // A transient provider-capacity hold is not a Brain decision wait.  Keep
     // the durable wait key, but defer its cadence until capacity clears so a
@@ -1147,8 +1196,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
     const due = cadenceEligible && !next.brainReminderResolvedAt && gapElapsed
       && isTaskPairBrainReminderDue(started, now, count) && !next.brainReminderDue;
     if (due) next = { ...next, brainReminderDue: true };
-    if (next !== current) getTaskPairStore().saveLiveness(stored.project, stored.state.taskId, next);
-    return next === current ? stored : { ...stored, liveness: next };
+    return next;
   }
 
   #recordLivenessDecision(stored: StoredTaskPair, verb: 'NUDGE' | 'REMIND', effect: string, reason: string, at: number): void {

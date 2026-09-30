@@ -170,6 +170,33 @@ export function livenessChangedBeyondActivityTimestamps(prev: TaskPairLiveness, 
 interface ActivePairIndex {
   byKey: Map<string, StoredTaskPair>;
   bySession: Map<string, StoredTaskPair[]>;
+  /** Every non-terminal pair in `listActivePairs` order (queue_order, updated_at). */
+  ordered: StoredTaskPair[];
+}
+
+const compareActivePairs = (a: StoredTaskPair, b: StoredTaskPair): number => (
+  a.queueOrder - b.queueOrder || a.state.updatedAt - b.state.updatedAt
+);
+
+let freezeSharedPairsForTests = false;
+/** Tests: deep-freeze what the shared index hands out, so an accidental in-place mutation by a reader throws. */
+export function setTaskPairSharedFreezeForTests(enabled: boolean): void {
+  freezeSharedPairsForTests = enabled;
+}
+function freezeShared(pair: StoredTaskPair): StoredTaskPair {
+  if (!freezeSharedPairsForTests) return pair;
+  const freeze = (value: unknown): void => {
+    if (!value || typeof value !== 'object' || Object.isFrozen(value)) return;
+    Object.freeze(value);
+    for (const inner of Object.values(value as Record<string, unknown>)) freeze(inner);
+  };
+  freeze(pair.state);
+  freeze(pair.liveness);
+  return pair;
+}
+
+function participantsOf(pair: StoredTaskPair): string[] {
+  return [...new Set([pair.state.executor, pair.state.auditor, pair.state.brain])].filter((session): session is string => !!session);
 }
 
 function pairKey(project: string, taskId: string): string {
@@ -188,6 +215,15 @@ export class TaskPairStore {
    */
   #activeIndex: ActivePairIndex | undefined;
   readonly #livenessDbWriteAt = new Map<string, number>();
+  /**
+   * Activity stamps not yet written: the newest liveness of each pair whose
+   * last stamp was deferred. Every read overlays it, so a reader (or a state
+   * change that re-reads the pair) never sees an older stamp than memory has;
+   * a timer flushes it within one interval, and close()/flushPendingLiveness()
+   * flush it on shutdown. A crash loses at most the stamps of one interval.
+   */
+  readonly #pendingLiveness = new Map<string, TaskPairLiveness>();
+  #livenessFlushTimer: ReturnType<typeof setTimeout> | undefined;
   readonly #projectSettingsCache = new Map<string, TaskPairProjectSettings>();
 
   /** Every pair write notifies listeners (badges, task console); a throwing listener is ignored. */
@@ -257,9 +293,48 @@ export class TaskPairStore {
   }
 
   close(): void {
+    try { this.flushPendingLiveness(); } catch { /* the database may already be gone */ }
+    if (this.#livenessFlushTimer) clearTimeout(this.#livenessFlushTimer);
+    this.#livenessFlushTimer = undefined;
     this.#activeIndex = undefined;
     this.#livenessDbWriteAt.clear();
+    this.#pendingLiveness.clear();
     this.#db.close();
+  }
+
+  /** Writes every deferred activity stamp now (shutdown, or before something reads the file directly). */
+  flushPendingLiveness(): number {
+    if (this.#livenessFlushTimer) clearTimeout(this.#livenessFlushTimer);
+    this.#livenessFlushTimer = undefined;
+    let written = 0;
+    for (const [key, liveness] of [...this.#pendingLiveness]) {
+      const [project, taskId] = key.split('\u0000');
+      this.saveLiveness(project!, taskId!, liveness);
+      written += 1;
+    }
+    return written;
+  }
+
+  #scheduleLivenessFlush(minIntervalMs: number): void {
+    if (this.#livenessFlushTimer || this.#pendingLiveness.size === 0) return;
+    const now = Date.now();
+    let due = Infinity;
+    for (const key of this.#pendingLiveness.keys()) {
+      due = Math.min(due, (this.#livenessDbWriteAt.get(key) ?? 0) + minIntervalMs);
+    }
+    const timer = setTimeout(() => {
+      this.#livenessFlushTimer = undefined;
+      try { this.flushPendingLiveness(); } catch { /* closed database: nothing left to write */ }
+    }, Math.max(50, due - now));
+    timer.unref?.();
+    this.#livenessFlushTimer = timer;
+  }
+
+  /** A pair as read from its row, carrying the newest deferred activity stamp. */
+  #hydrate(row: Record<string, unknown>): StoredTaskPair {
+    const pair = rowToPair(row);
+    const pending = this.#pendingLiveness.get(pairKey(pair.project, pair.state.taskId));
+    return pending ? { ...pair, liveness: pending } : pair;
   }
 
   listActiveResourceClaims(now = Date.now()): TaskPairResourceClaim[] {
@@ -288,18 +363,18 @@ export class TaskPairStore {
 
   getPair(project: string, taskId: string): StoredTaskPair | undefined {
     const row = this.#db.prepare('SELECT * FROM task_pairs WHERE project = ? AND task_id = ?').get(project, taskId) as Record<string, unknown> | undefined;
-    return row ? rowToPair(row) : undefined;
+    return row ? this.#hydrate(row) : undefined;
   }
 
   /** Pairs with this task id in any project (a worktree's metadata names only the task). */
   findPairsByTaskId(taskId: string): StoredTaskPair[] {
     const rows = this.#db.prepare('SELECT * FROM task_pairs WHERE task_id = ?').all(taskId) as Array<Record<string, unknown>>;
-    return rows.map(rowToPair);
+    return rows.map((row) => this.#hydrate(row));
   }
 
   getPairByLegacyTaskId(legacyTaskId: string): StoredTaskPair | undefined {
     const row = this.#db.prepare('SELECT * FROM task_pairs WHERE legacy_task_id = ?').get(legacyTaskId) as Record<string, unknown> | undefined;
-    return row ? rowToPair(row) : undefined;
+    return row ? this.#hydrate(row) : undefined;
   }
 
   /** Non-terminal pairs, optionally for one project. */
@@ -311,13 +386,13 @@ export class TaskPairStore {
     const rows = (project
       ? this.#db.prepare(sql).all(...TASK_PAIR_TERMINAL_STATUSES, project)
       : this.#db.prepare(sql).all(...TASK_PAIR_TERMINAL_STATUSES)) as Array<Record<string, unknown>>;
-    return rows.map(rowToPair);
+    return rows.map((row) => this.#hydrate(row));
   }
 
   /** Every pair of a project, newest first (for the console). */
   listPairs(project: string, limit = 200): StoredTaskPair[] {
     const rows = this.#db.prepare('SELECT * FROM task_pairs WHERE project = ? ORDER BY updated_at DESC LIMIT ?').all(project, limit) as Array<Record<string, unknown>>;
-    return rows.map(rowToPair);
+    return rows.map((row) => this.#hydrate(row));
   }
 
   /**
@@ -332,7 +407,7 @@ export class TaskPairStore {
   /** Queued pairs of a project (few); the console recomputes their queue positions. */
   listQueuedPairs(project: string): StoredTaskPair[] {
     const rows = this.#db.prepare("SELECT * FROM task_pairs WHERE project = ? AND status = 'queued'").all(project) as Array<Record<string, unknown>>;
-    return rows.map(rowToPair);
+    return rows.map((row) => this.#hydrate(row));
   }
 
   /** All pairs owned by one Brain, optionally including terminal history. */
@@ -349,7 +424,7 @@ export class TaskPairStore {
       ? (includeFinished ? [brain, project, limit] : [brain, ...TASK_PAIR_TERMINAL_STATUSES, project, limit])
       : values;
     const rows = this.#db.prepare(sql).all(...queryValues) as Array<Record<string, unknown>>;
-    return rows.map(rowToPair);
+    return rows.map((row) => this.#hydrate(row));
   }
 
   /** Ended pairs whose workspace still exists (ended or kept): the workspace sweep's input. */
@@ -358,7 +433,7 @@ export class TaskPairStore {
     const rows = this.#db.prepare(
       `SELECT * FROM task_pairs WHERE status IN (${terminal}) AND json_extract(state_json, '$.workspace.status') IN ('ended', 'kept')`,
     ).all(...TASK_PAIR_TERMINAL_STATUSES) as Array<Record<string, unknown>>;
-    return rows.map(rowToPair);
+    return rows.map((row) => this.#hydrate(row));
   }
 
   /** Non-terminal pairs in which a session takes part. */
@@ -372,23 +447,65 @@ export class TaskPairStore {
     if (this.#activeIndex) return this.#activeIndex;
     const byKey = new Map<string, StoredTaskPair>();
     const bySession = new Map<string, StoredTaskPair[]>();
-    for (const pair of this.listActivePairs()) {
+    const ordered = this.listActivePairs().map(freezeShared);
+    for (const pair of ordered) {
       byKey.set(pairKey(pair.project, pair.state.taskId), pair);
-      for (const session of new Set([pair.state.executor, pair.state.auditor, pair.state.brain])) {
-        if (!session) continue;
+      for (const session of participantsOf(pair)) {
         const bucket = bySession.get(session);
         if (bucket) bucket.push(pair); else bySession.set(session, [pair]);
       }
     }
-    this.#activeIndex = { byKey, bySession };
+    this.#activeIndex = { byKey, bySession, ordered };
     return this.#activeIndex;
+  }
+
+  /**
+   * Re-read ONE pair into the index after it was written. A write used to drop
+   * the whole index, so the next per-event lookup re-read and re-parsed every
+   * open pair (each carrying its full brief); now only the changed row moves.
+   */
+  #refreshIndexEntry(project: string, taskId: string): void {
+    const index = this.#activeIndex;
+    if (!index) return;
+    const key = pairKey(project, taskId);
+    const previous = index.byKey.get(key);
+    if (previous) {
+      index.byKey.delete(key);
+      index.ordered.splice(index.ordered.indexOf(previous), 1);
+      for (const session of participantsOf(previous)) {
+        const bucket = index.bySession.get(session);
+        if (!bucket) continue;
+        const rest = bucket.filter((entry) => entry !== previous);
+        if (rest.length > 0) index.bySession.set(session, rest); else index.bySession.delete(session);
+      }
+    }
+    const row = this.#db.prepare('SELECT * FROM task_pairs WHERE project = ? AND task_id = ?').get(project, taskId) as Record<string, unknown> | undefined;
+    const pair = row ? freezeShared(this.#hydrate(row)) : undefined;
+    if (!pair || TASK_PAIR_TERMINAL_STATUSES.includes(pair.state.status)) return;
+    index.byKey.set(key, pair);
+    index.ordered.push(pair);
+    index.ordered.sort(compareActivePairs);
+    for (const session of participantsOf(pair)) {
+      const bucket = [...(index.bySession.get(session) ?? []), pair].sort(compareActivePairs);
+      index.bySession.set(session, bucket);
+    }
+  }
+
+  /**
+   * The non-terminal pairs from memory, in `listActivePairs` order. The pairs
+   * are shared with the index: read them, never mutate them. For per-event and
+   * per-second callers; everyone else keeps `listActivePairs` (fresh copies).
+   */
+  listActivePairsShared(project?: string): readonly StoredTaskPair[] {
+    const all = this.#ensureActiveIndex().ordered;
+    return project ? all.filter((pair) => pair.project === project) : all;
   }
 
   /** True when a session is reserved by an actively started pair. Queued
    * work is deliberately not a reservation: it is only a scheduling intent
    * and must not block dispatch or REASSIGN of another pair. */
   isParticipantOfOpenPair(sessionName: string, exceptTaskId?: string): boolean {
-    return this.listActivePairs().some((pair) => (
+    return (this.#ensureActiveIndex().bySession.get(sessionName) ?? []).some((pair) => (
       pair.state.taskId !== exceptTaskId
       && TASK_PAIR_PARTICIPANT_STATUSES.includes(pair.state.status)
       && (pair.state.executor === sessionName || pair.state.auditor === sessionName)
@@ -411,8 +528,9 @@ export class TaskPairStore {
       project, state.taskId, state.status, state.brain, state.executor ?? null, state.auditor ?? null,
       queueOrder, legacyTaskId ?? null, JSON.stringify(state), JSON.stringify(liveness), state.updatedAt,
     );
-    this.#activeIndex = undefined;
+    this.#pendingLiveness.delete(pairKey(project, state.taskId));
     this.#livenessDbWriteAt.delete(pairKey(project, state.taskId));
+    this.#refreshIndexEntry(project, state.taskId);
     for (const listener of this.#listeners) {
       try { listener(project, state.taskId); } catch { /* observers never break a write */ }
     }
@@ -424,6 +542,7 @@ export class TaskPairStore {
       .run(JSON.stringify(liveness), project, taskId);
     const key = pairKey(project, taskId);
     this.#livenessDbWriteAt.set(key, Date.now());
+    this.#pendingLiveness.delete(key);
     const cached = this.#activeIndex?.byKey.get(key);
     if (cached) cached.liveness = liveness;
   }
@@ -450,6 +569,8 @@ export class TaskPairStore {
     const last = this.#livenessDbWriteAt.get(key);
     if (!material && last !== undefined && now - last < minIntervalMs) {
       if (cached) cached.liveness = liveness;
+      this.#pendingLiveness.set(key, liveness);
+      this.#scheduleLivenessFlush(minIntervalMs);
       return false;
     }
     this.saveLiveness(project, taskId, liveness);

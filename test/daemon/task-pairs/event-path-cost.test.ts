@@ -178,7 +178,8 @@ describe('task-pair per-event paths', () => {
     );
     expect(stamp(10)).toBe(true); // never written by this process: persisted
     expect(stamp(11)).toBe(false); // pure timestamp inside the interval: memory only
-    expect(store.getPair(key.project, key.taskId)!.liveness.activityExecutorAt).toBe(10);
+    // Every reader sees the newest stamp (the deferred one overlays the row); the row itself is written later.
+    expect(store.getPair(key.project, key.taskId)!.liveness.activityExecutorAt).toBe(11);
     expect(store.pairsForSession(WORKERS[5]!).find((p) => p.state.taskId === key.taskId)!.liveness.activityExecutorAt).toBe(11);
     expect(stamp(12, { silenceExecutor: 3 })).toBe(true); // material change: immediate
     expect(store.getPair(key.project, key.taskId)!.liveness).toMatchObject({ activityExecutorAt: 12, silenceExecutor: 3 });

@@ -1575,8 +1575,14 @@ export async function startup(): Promise<DaemonContext> {
       const timer = setTimeout(() => {
         const flushed = pendingPairRefresh.get(project);
         pendingPairRefresh.delete(project);
-        supervisionConsole?.sessions.pairsChanged(project, taskIds, flushed?.reason ?? reason);
-        taskPairAutomation.publishBadges();
+        const flushReason = flushed?.reason ?? reason;
+        supervisionConsole?.sessions.pairsChanged(project, taskIds, flushReason);
+        // Badges follow pair rows, reminders and session state, and the timeline
+        // observer above already republishes on a session's running/idle change
+        // and on user messages. A flush that only saw streamed activity has
+        // nothing new for them, and this ran a full pass every 250 ms per
+        // project for as long as any session streamed.
+        if (flushReason === 'task_pair_changed') taskPairAutomation.publishBadges();
       }, 250);
       timer.unref?.();
       pendingPairRefresh.set(project, { timer, taskIds, reason });
