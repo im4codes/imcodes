@@ -860,6 +860,12 @@ function ensureDb(): DatabaseSyncInstance {
     repairMaterializationStateForDb(db, { now: Date.now(), pollutedScanLimit: 256, dirtyReferenceScanLimit: 256 });
     materializationRepairRanForPath = dbPath;
   }
+  // A brand-new store has nothing to scan, so its summary-lookup indexes are
+  // created here for free; an existing (large) store gets them from the
+  // cursor-driven maintenance step instead of paying the build at startup.
+  if (!db.prepare('SELECT 1 FROM context_processed_local LIMIT 1').get()) {
+    for (const ddl of SUMMARY_LOOKUP_INDEX_DDL) db.exec(ddl);
+  }
   scheduleArchiveBackfillIfNeeded(db, dbPath);
   return db;
 }
@@ -870,6 +876,10 @@ const SESSION_NAME_EXPR = "json_extract(content_json, '$.sessionName')";
 const TARGET_KIND_EXPR = "json_extract(content_json, '$.targetKind')";
 const PROCESSED_SESSION_SUMMARY_INDEX = 'idx_context_processed_local_session_summary';
 const PROCESSED_TARGET_KIND_SUMMARY_INDEX = 'idx_context_processed_local_target_kind_summary';
+const SUMMARY_LOOKUP_INDEX_DDL = [
+  `CREATE INDEX IF NOT EXISTS ${PROCESSED_SESSION_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${SESSION_NAME_EXPR}, updated_at DESC, status)`,
+  `CREATE INDEX IF NOT EXISTS ${PROCESSED_TARGET_KIND_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${TARGET_KIND_EXPR}, updated_at DESC, status)`,
+] as const;
 const NOT_ARCHIVED_SQL = "status NOT IN ('archived', 'archived_dedup')";
 
 /**
@@ -893,8 +903,7 @@ export function ensureContextStoreMaintenanceIndexes(): { created: number; done:
     // master-summary sweep resolve through these expression indexes instead of
     // json-parsing every summary row of a namespace. `class` leads so the
     // un-namespaced GROUP BY sweep reads one contiguous, already-ordered range.
-    `CREATE INDEX IF NOT EXISTS ${PROCESSED_SESSION_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${SESSION_NAME_EXPR}, updated_at DESC, status)`,
-    `CREATE INDEX IF NOT EXISTS ${PROCESSED_TARGET_KIND_SUMMARY_INDEX} ON context_processed_local(class, namespace_key, ${TARGET_KIND_EXPR}, updated_at DESC, status)`,
+    ...SUMMARY_LOOKUP_INDEX_DDL,
   ];
   const cursorKey = 'maintenance_indexes_cursor';
   const cursor = Number(internalGetContextMeta(database, cursorKey) ?? 0);

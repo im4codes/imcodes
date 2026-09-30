@@ -38,6 +38,25 @@ function seed(rows: Array<{
   }
 }
 
+const LOOKUP_INDEXES = ['idx_context_processed_local_session_summary', 'idx_context_processed_local_target_kind_summary'];
+function indexNames(): string[] {
+  const db = new DatabaseSync(process.env.IMCODES_CONTEXT_DB_PATH!);
+  try {
+    return (db.prepare("SELECT name FROM sqlite_master WHERE type = 'index'").all() as Array<{ name: string }>).map((r) => r.name);
+  } finally {
+    db.close();
+  }
+}
+/** Put the store into the legacy-upgrade state: rows present, new indexes absent. */
+function dropLookupIndexes(): void {
+  const db = new DatabaseSync(process.env.IMCODES_CONTEXT_DB_PATH!);
+  try {
+    for (const name of LOOKUP_INDEXES) db.exec(`DROP INDEX IF EXISTS ${name}`);
+  } finally {
+    db.close();
+  }
+}
+
 function buildIndexes(): void {
   for (let i = 0; i < 40; i += 1) if (store.ensureContextStoreMaintenanceIndexes().done) return;
   throw new Error('maintenance indexes never completed');
@@ -100,12 +119,20 @@ describe('context-store summary lookups', () => {
     expect(store.listLatestRecentSummarySessions(0)).toEqual([]);
   }
 
+  it('creates the lookup indexes up front for a brand-new store', () => {
+    expect(indexNames()).toEqual(expect.arrayContaining(LOOKUP_INDEXES));
+  });
+
   it('resolves per-target / master lookups correctly, and defers the sweep, before the maintenance indexes exist', () => {
+    dropLookupIndexes();
     assertLookups(false);
+    expect(indexNames()).not.toEqual(expect.arrayContaining(LOOKUP_INDEXES));
   });
 
   it('resolves them identically once the maintenance indexes exist', () => {
+    dropLookupIndexes();
     buildIndexes();
+    expect(indexNames()).toEqual(expect.arrayContaining(LOOKUP_INDEXES));
     assertLookups(true);
   });
 
@@ -137,6 +164,7 @@ describe('context-store summary lookups', () => {
     for (let i = 0; i < 8000; i += 1) rows.push({ cls: 'recent_summary', sessionName: `bulk-${i % 40}`, updatedAt: 10_000 + i, summary: `bulk summary ${i} ${'x'.repeat(200)}` });
     rows.push({ cls: 'recent_summary', sessionName: 'target', updatedAt: 50_000 });
     seed(rows);
+    dropLookupIndexes();
     buildIndexes();
 
     const best = (fn: () => unknown): number => {
