@@ -36,12 +36,15 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // active list). The ceiling moves deliberately with roughly the same ~700
 // bytes of reviewable headroom as before.
 // The pair-resource-claim contract brings the measured authored surface to
-// 43,126 bytes; retain a small bounded review headroom.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 43_200;
+// 43,126 bytes; retain a small bounded review headroom. send_message's
+// `command` parameter (exact-text delivery, see shared/send-command-mode.ts) is
+// one 97-character description plus its boolean property: +143 bytes.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 43_350;
 // Raw = authored + the MCP SDK framing. The pair-resource-claim tool adds one
-// intentionally discoverable contract; the current measured 49,234-byte wire
-// payload keeps the same bounded headroom below.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 49_300;
+// intentionally discoverable contract and `command` one published parameter;
+// the current measured 49,377-byte wire payload keeps the same bounded
+// headroom below.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 49_450;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

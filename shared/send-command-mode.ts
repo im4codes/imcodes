@@ -15,7 +15,7 @@ export const SEND_COMMAND_FIELD = 'command' as const;
  * Published parameter description (MCP zod + JSON schema, kept short: the tool
  * surface is byte-budgeted). Wording is the contract agents read.
  */
-export const SEND_COMMAND_DESCRIPTION = 'Deliver exactly message.trim() with no sender line, context, files, reply or task/pair binding; no reply expected. For slash commands or raw input. /stop stops the target.' as const;
+export const SEND_COMMAND_DESCRIPTION = 'Deliver exactly message.trim(): no sender, context, files, reply or task; /stop stops the target.' as const;
 
 /** `imcodes send` flag that selects command mode. */
 export const SEND_COMMAND_CLI_FLAG = '--command' as const;
