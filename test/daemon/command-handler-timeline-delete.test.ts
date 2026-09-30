@@ -216,4 +216,50 @@ describe('timeline.delete (daemon)', () => {
     expect(call![0]).toEqual(expect.objectContaining({ sessionName: SESSION, requested: 2, fromBuffer: 1, tombstonedWithoutOriginal: 1, durationMs: expect.any(Number) }));
     expect(JSON.stringify(loggerMock.info.mock.calls)).not.toContain('CONTENT-MUST-NOT-BE-LOGGED');
   });
+  describe('a delete is bookkeeping, never new activity for local subscribers', () => {
+    it('deleting a streaming message (re-emitted non-streaming) and an unknown hinted id reach NO default subscriber, but the forwarder still gets both', async () => {
+      const defaultSeen: TimelineEvent[] = [];
+      const forwarderSeen: TimelineEvent[] = [];
+      const offDefault = timelineEmitter.on((e) => defaultSeen.push(e));
+      const offForwarder = timelineEmitter.on((e) => forwarderSeen.push(e), { includeUserDeleted: true });
+      try {
+        timelineEmitter.emit(SESSION, 'assistant.text', { text: 'partial', streaming: true }, { eventId: 'evt-act-live' });
+        defaultSeen.length = 0; forwarderSeen.length = 0;
+
+        const id1 = del({ eventId: 'evt-act-live' });
+        const id2 = del({ eventId: 'evt-act-unknown-user', eventTypes: { 'evt-act-unknown-user': 'user.message' } });
+        const id3 = del({ eventId: 'evt-act-unknown-tool', eventTypes: { 'evt-act-unknown-tool': 'tool.call' } });
+        await flushAsync();
+
+        const activity = (list: TimelineEvent[]) => list.filter((e) => e.type === 'assistant.text' || e.type === 'user.message' || e.type === 'tool.call');
+        expect(activity(defaultSeen)).toEqual([]); // memory ingestion / supervision / cron / peer-audit / session-activity see nothing
+        expect(activity(forwarderSeen).map((e) => e.eventId).sort()).toEqual(['evt-act-live', 'evt-act-unknown-tool', 'evt-act-unknown-user']);
+        expect(activity(forwarderSeen).every((e) => e.hidden === true && e.payload[TIMELINE_USER_DELETED_PAYLOAD_KEY] === true)).toBe(true);
+        for (const id of [id1, id2, id3]) expect(acksFor(id)).toEqual([expect.objectContaining({ status: 'accepted' })]);
+        // Still persisted + buffered exactly as before.
+        expect(persisted).toContainEqual(expect.objectContaining({ eventId: 'evt-act-unknown-user', hidden: true }));
+        expect(byId('evt-act-live')?.hidden).toBe(true);
+      } finally { offDefault(); offForwarder(); }
+    });
+
+    it('a normal (non-tombstone) event still reaches default subscribers', () => {
+      const seen: TimelineEvent[] = [];
+      const off = timelineEmitter.on((e) => seen.push(e));
+      try {
+        timelineEmitter.emit(SESSION, 'assistant.text', { text: 'normal', streaming: false }, { eventId: 'evt-act-normal' });
+        expect(seen.map((e) => e.eventId)).toEqual(['evt-act-normal']);
+      } finally { off(); }
+    });
+
+    it('a delete does not reset the same-state idle dedup (it is not visible activity)', () => {
+      timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+      del({ eventId: 'evt-act-idle', eventTypes: { 'evt-act-idle': 'assistant.text' } });
+      const seen: TimelineEvent[] = [];
+      const off = timelineEmitter.on((e) => seen.push(e));
+      try {
+        timelineEmitter.emit(SESSION, 'session.state', { state: 'idle' });
+        expect(seen.filter((e) => e.type === 'session.state')).toEqual([]);
+      } finally { off(); }
+    });
+  });
 });

@@ -24,6 +24,7 @@ import { isP2pParticipantMemoryNoise } from './p2p-memory-filter.js';
 import { handlePreviewBinaryFrame } from './preview-relay.js';
 import { buildSessionList, resolveAuthoritativeSessionListState } from './session-list.js';
 import { timelineEmitter } from './timeline-emitter.js';
+import { isDuplicateTimelineForward } from './timeline-forward-dedup.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { isExecutionClone, sweepExecutionClones, destroyExecutionClone, resolveExecutionCloneRetentionMs } from './execution-clone.js';
@@ -1334,11 +1335,7 @@ export async function startup(): Promise<DaemonContext> {
     };
 
     timelineEmitter.on((event) => {
-      // Transport streaming events reuse the same eventId for in-place replacement
-      // (typewriter effect). Don't dedup them — every delta AND the final event
-      // must reach the browser. The `transport:` prefix identifies these events.
-      const isTransportStream = event.eventId?.startsWith('transport:') ?? false;
-      if (event.eventId && sentEventIds.has(event.eventId) && !isTransportStream) return;
+      if (isDuplicateTimelineForward(event, sentEventIds)) return;
       if (event.eventId) {
         sentEventIds.add(event.eventId);
         if (sentEventIds.size > DEDUP_MAX) {
@@ -1359,7 +1356,9 @@ export async function startup(): Promise<DaemonContext> {
       } else {
         sendTimelineNow(event);
       }
-    });
+    // User-delete tombstones must reach viewers and other devices, so this
+    // forwarder (and only it) opts in.
+    }, { includeUserDeleted: true });
   }
 
   // Set up router context so inbound chat messages can be dispatched to routeMessage

@@ -10,7 +10,7 @@ import { tmpdir } from 'os';
 import { performance } from 'node:perf_hooks';
 import type { TimelineEvent, TimelineEventType, TimelineSource, TimelineConfidence } from './timeline-event.js';
 import { timelineStore } from './timeline-store.js';
-import { preferTimelineEvent } from '../shared/timeline/merge.js';
+import { isUserDeletedTimelineEvent, preferTimelineEvent } from '../shared/timeline/merge.js';
 import { isMemoryNoiseTurn } from '../../shared/memory-noise-patterns.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
 import { getSession } from '../store/session-store.js';
@@ -78,7 +78,8 @@ function signalFingerprintKey(sessionId: string, type: TimelineEventType): strin
 export class TimelineEmitter {
   private seqMap = new Map<string, number>();
   private buffer = new Map<string, TimelineEvent[]>();
-  private handlers = new Set<(e: TimelineEvent) => void>();
+  /** handler -> whether it also receives user-delete tombstones (see `on`). */
+  private handlers = new Map<(e: TimelineEvent) => void, boolean>();
   /** Track last session.state per session to deduplicate repeated idle events */
   private lastSessionState = new Map<string, string>();
   /** Exact payload fingerprints for latest-value signal deduplication. */
@@ -192,12 +193,16 @@ export class TimelineEmitter {
     // paths can emit assistant/tool activity without a fresh user.message or a
     // running transition; if we keep the old `idle` fingerprint, the final idle
     // is swallowed and the UI can stay in a fake-working state until refresh.
+    // A user-delete tombstone is bookkeeping, not agent/user activity.
     if (
-      type === 'user.message'
-      || type === 'assistant.text'
-      || type === 'tool.call'
-      || type === 'tool.result'
-      || (type === 'agent.status' && payload.status)
+      payload.userDeleted !== true
+      && (
+        type === 'user.message'
+        || type === 'assistant.text'
+        || type === 'tool.call'
+        || type === 'tool.result'
+        || (type === 'agent.status' && payload.status)
+      )
     ) {
       this.lastSessionState.delete(sessionId);
       this.lastSignalPayload.delete(signalFingerprintKey(sessionId, 'session.state'));
@@ -422,7 +427,13 @@ export class TimelineEmitter {
 
     // Notify handlers
     const handlersStart = performance.now();
-    for (const h of this.handlers) {
+    // A user-delete tombstone is persisted and broadcast to viewers, but it is
+    // never new agent/user activity: only handlers that opted in (the
+    // server-link forwarder) see it, so memory ingestion, supervision, task
+    // pairs, cron and peer-audit cannot mistake a delete for output.
+    const isTombstone = isUserDeletedTimelineEvent(event);
+    for (const [h, includeUserDeleted] of this.handlers) {
+      if (isTombstone && !includeUserDeleted) continue;
       traceHandlerCount += 1;
       try { h(event); } catch { /* ignore */ }
     }
@@ -432,8 +443,14 @@ export class TimelineEmitter {
     return event;
   }
 
-  on(handler: (e: TimelineEvent) => void): () => void {
-    this.handlers.add(handler);
+  /**
+   * Subscribe to every emitted event. User-delete tombstones
+   * (`isUserDeletedTimelineEvent`) are excluded unless the handler passes
+   * `includeUserDeleted` -- only the consumers that mirror the timeline to
+   * viewers / the server should.
+   */
+  on(handler: (e: TimelineEvent) => void, opts?: { includeUserDeleted?: boolean }): () => void {
+    this.handlers.set(handler, opts?.includeUserDeleted === true);
     return () => { this.handlers.delete(handler); };
   }
 

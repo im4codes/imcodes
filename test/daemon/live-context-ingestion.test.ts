@@ -104,6 +104,26 @@ describe('LiveContextIngestion', () => {
     });
   });
 
+  it('never ingests a user-deleted message as memory, live or through backfill', async () => {
+    const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
+      thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
+      sessionLookup: () => session,
+      resolveBootstrap: async () => ({ namespace, diagnostics: ['test'] }),
+    });
+    // What a delete of a mid-stream message emits: hidden, non-streaming, userDeleted.
+    const tombstone = { ...makeEvent('assistant.text', 110, { text: 'partial text the user deleted', streaming: false, userDeleted: true }), hidden: true };
+    const tombstonedUser = { ...makeEvent('user.message', 120, { text: 'phantom', userDeleted: true }), hidden: true };
+
+    await ingestion.handleTimelineEvent(tombstone);
+    await ingestion.handleTimelineEvent(tombstonedUser);
+    expect(listContextEvents({ namespace, kind: 'session', sessionName: session.name })).toHaveLength(0);
+
+    // Backfill reads persisted rows, which now contain tombstones (and the original before it).
+    const original = makeEvent('assistant.text', 100, { text: 'partial text the user deleted', streaming: false });
+    await ingestion.backfillSessionFromEvents(session.name, [{ ...original, eventId: tombstone.eventId, seq: 100 }, tombstone]);
+    expect(listContextEvents({ namespace, kind: 'session', sessionName: session.name })).toHaveLength(0);
+  });
+
   it('ignores streaming assistant deltas and only records the finalized assistant text', async () => {
     const ingestion = new LiveContextIngestion({ compressor: localOnlyCompressor,
       thresholds: { eventCount: 99, idleMs: 60_000, scheduleMs: 60_000 },
