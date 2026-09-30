@@ -3688,7 +3688,9 @@ describe('TransportSessionRuntime', () => {
       const capture = (level: string) => (...args: unknown[]) => {
         const [fields, text] = args as [Record<string, unknown> | string, string | undefined];
         const ours = typeof fields === 'object' && fields !== null && fields.sessionKey === 'deck_test_brain';
-        if (ours) lines.push(`${level}:${typeof text === 'string' ? text : ''}`);
+        // Only the capacity-retry lines: under CI load an unrelated per-session warning (e.g. the 2.5 s
+        // transport context bootstrap timeout) can land in this window and is not what this test bounds.
+        if (ours && typeof text === 'string' && /capacity retry/.test(text)) lines.push(`${level}:${text}`);
       };
       vi.spyOn(logger, 'warn').mockImplementation(capture('warn') as never);
       vi.spyOn(logger, 'info').mockImplementation(capture('info') as never);
