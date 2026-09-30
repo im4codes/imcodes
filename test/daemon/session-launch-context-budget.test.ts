@@ -17,6 +17,8 @@ const mocks = vi.hoisted(() => ({
   received: [] as string[],
   turnStarts: [] as string[],
   contextStoreDelayMs: 0,
+  /** Store missing/disabled: every call rejects at once. */
+  contextStoreRejects: false,
   contextStoreCalls: [] as string[],
   /** When set, `getCodexRuntimeConfig` (an early step of every codex launch) waits on it. */
   runtimeConfigGate: null as Promise<void> | null,
@@ -89,6 +91,7 @@ vi.mock('../../src/store/context-store-worker-client.js', async (importOriginal)
   const actual = await importOriginal<typeof import('../../src/store/context-store-worker-client.js')>();
   const slow = (op: string): Promise<unknown> => {
     mocks.contextStoreCalls.push(op);
+    if (mocks.contextStoreRejects) return Promise.reject(new Error(`context store unavailable: ${op}`));
     return new Promise((resolve) => {
       const timer = setTimeout(() => resolve(undefined), mocks.contextStoreDelayMs);
       timer.unref?.();
@@ -97,12 +100,12 @@ vi.mock('../../src/store/context-store-worker-client.js', async (importOriginal)
   const slowClient = new Proxy({}, {
     get: (_target, prop) => {
       if (prop === 'run' || prop === 'runBounded' || prop === 'call') return (op: string) => slow(String(op));
-      return (...args: unknown[]) => (mocks.contextStoreDelayMs > 0 ? slow(String(prop)) : (actual.getContextStoreClient() as any)[prop](...args));
+      return (...args: unknown[]) => (mocks.contextStoreDelayMs > 0 || mocks.contextStoreRejects ? slow(String(prop)) : (actual.getContextStoreClient() as any)[prop](...args));
     },
   });
   return {
     ...actual,
-    getContextStoreClient: () => (mocks.contextStoreDelayMs > 0 ? slowClient : actual.getContextStoreClient()),
+    getContextStoreClient: () => (mocks.contextStoreDelayMs > 0 || mocks.contextStoreRejects ? slowClient : actual.getContextStoreClient()),
   };
 });
 
@@ -179,6 +182,7 @@ describe('session launch is never gated by context/memory enrichment', () => {
     mocks.turnStarts.length = 0;
     mocks.contextStoreCalls.length = 0;
     mocks.contextStoreDelayMs = 0;
+    mocks.contextStoreRejects = false;
     mocks.runtimeConfigGate = null;
     clearAllResend();
     resetTransportQueueStoreForTests();
@@ -252,6 +256,16 @@ describe('session launch is never gated by context/memory enrichment', () => {
     expect(record?.contextNamespaceDiagnostics ?? []).not.toContain('context-bootstrap:launch-failed');
     expect(record?.contextNamespace).toEqual(expect.objectContaining({ projectId: expect.any(String) }));
     await stopTransportRuntimeSession('deck_launch_healthy_brain');
+  });
+
+  it('a missing/disabled context store (every call rejects) does not fail or slow the launch', async () => {
+    mocks.contextStoreRejects = true;
+    const startedAt = Date.now();
+    await launchCodexMain('deck_launch_missing_store_brain', projectDir);
+    expect(Date.now() - startedAt).toBeLessThan(2_000);
+    expect(getTransportRuntime('deck_launch_missing_store_brain')?.providerSessionId).toBeTruthy();
+    expect(mocks.store.get('deck_launch_missing_store_brain')?.contextNamespace).toEqual(expect.objectContaining({ projectId: expect.any(String) }));
+    await stopTransportRuntimeSession('deck_launch_missing_store_brain');
   });
 
   it('a hung app-server `initialize` fails the launch with a clear error instead of waiting forever', async () => {
