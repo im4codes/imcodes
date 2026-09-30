@@ -6,14 +6,15 @@
  *    (an existing .gitignore is kept and extended; the block is replaced, never duplicated);
  *  - a size cap on what would be tracked: over it nothing is committed and every change the init made is rolled back;
  *  - line endings are never converted (core.autocrlf=false locally) and the baseline commit skips hooks;
- *  - exactly once per project, even when two pairs start at the same moment (in-process lock, `.git` created atomically), and an
+ *  - exactly once per project, even when two pairs start at the same moment (an in-process lock per project), and an
  *    init that a crash left half-made is detected by its marker and rolled back before starting over.
  * At DONE {@link mergePairIntoProject} brings the pair's commits into the project: it refuses to touch any file the user has
  * uncommitted edits in, and never overwrites.
  */
 import { execFile } from 'node:child_process';
-import { lstat, readFile, rm, writeFile } from 'node:fs/promises';
-import { join, resolve } from 'node:path';
+import { lstat, readFile, realpath, rm, writeFile } from 'node:fs/promises';
+import { homedir } from 'node:os';
+import { dirname, join, resolve, sep } from 'node:path';
 import {
   TASK_PAIR_CLONE_EXCLUDE_DIR_NAMES,
   TASK_PAIR_GITIGNORE_BLOCK_END,
@@ -65,12 +66,22 @@ interface InitMarker {
   /** The project's .gitignore before the init (undefined: there was none), so a rollback restores it exactly. */
   gitignore: { existed: boolean; original?: string };
   stats?: { trackedFiles: number; trackedBytes: number; ignoredLargeFiles: number; ignoredHeavyDirs: string[] };
+  /** The project branch head after the last commit IM.codes itself made (baseline, snapshot, merge): a different head means the user committed. */
+  ownHead?: string;
 }
 
 const markerPath = (root: string): string => join(root, '.git', MARKER_NAME);
 
 async function readMarker(root: string): Promise<InitMarker | undefined> {
   try { return JSON.parse(await readFile(markerPath(root), 'utf8')) as InitMarker; } catch { return undefined; }
+}
+
+/** Remember the head IM.codes itself left the project branch at (best effort). */
+async function recordOwnHead(root: string): Promise<void> {
+  const marker = await readMarker(root);
+  const head = await git(root, ['rev-parse', '--verify', 'HEAD']);
+  if (!marker || !head.ok) return;
+  await writeFile(markerPath(root), JSON.stringify({ ...marker, ownHead: head.stdout.trim() })).catch(() => undefined);
 }
 
 /** The project's repo was created by IM.codes (and completed). */
@@ -107,6 +118,37 @@ export function withGitignoreBlock(existing: string | undefined, block: string):
   return `${existing}${existing.endsWith('\n') ? '' : lineEnd}${block.split('\n').join(lineEnd)}${lineEnd}`;
 }
 
+// ── which directories may become a repo at all ─────────────────────────────
+
+export interface RootRefusal { reason: 'container_root'; detail: string }
+
+async function realOrSelf(path: string): Promise<string> {
+  return realpath(path).catch(() => resolve(path));
+}
+
+/**
+ * A directory that must never be turned into a repo, cloned or edited in place on behalf of one pair: it is not "a project" but a
+ * CONTAINER of other things. Refused: a filesystem/volume root, the user's home directory or any ancestor of it (a home holds every
+ * other project and TCC-protected folders), and any directory that strictly contains another registered session's project directory
+ * (initialising it would make every project below it read as "inside a git work tree", and their pairs would work in a worktree of
+ * the whole container whose work never lands in the project). A refused root falls back to a plain task directory.
+ */
+export async function nonGitRootRefusal(
+  projectRoot: string,
+  options: { home?: string; otherProjectDirs?: readonly string[] } = {},
+): Promise<RootRefusal | undefined> {
+  const root = await realOrSelf(projectRoot);
+  if (dirname(root) === root || /^[A-Za-z]:[\\/]?$/.test(root)) return { reason: 'container_root', detail: `${root} is a filesystem root` };
+  const home = await realOrSelf(options.home ?? homedir());
+  if (root === home) return { reason: 'container_root', detail: `${root} is the home directory` };
+  if (home.startsWith(root.endsWith(sep) ? root : root + sep)) return { reason: 'container_root', detail: `${root} contains the home directory` };
+  for (const other of options.otherProjectDirs ?? []) {
+    const dir = await realOrSelf(other);
+    if (dir !== root && dir.startsWith(root.endsWith(sep) ? root : root + sep)) return { reason: 'container_root', detail: `${root} contains another project (${dir})` };
+  }
+  return undefined;
+}
+
 // ── the init ────────────────────────────────────────────────────────────────
 
 export type GitInitResult =
@@ -119,8 +161,10 @@ export type GitInitResult =
     ignoredLargeFiles: number;
     ignoredHeavyDirs: string[];
     ms: number;
+    /** A later pair's start found the user's current files uncommitted and committed them as "imcodes: snapshot before pair". */
+    snapshot?: { committed: boolean; files: number; skipped?: 'over_cap' | 'not_ours' | 'failed' };
   }
-  | { ok: false; reason: 'disabled' | 'git_unavailable' | 'inside_git' | 'over_cap' | 'foreign_git_dir' | 'init_failed'; detail: string };
+  | { ok: false; reason: 'disabled' | 'git_unavailable' | 'inside_git' | 'over_cap' | 'foreign_git_dir' | 'nested_repo' | 'init_failed'; detail: string };
 
 const locks = new Map<string, Promise<unknown>>();
 
@@ -172,7 +216,10 @@ async function doInit(root: string, options: { taskId: string; env?: NodeJS.Proc
   if (await isInsideGitWorkTree(root)) {
     if (existingMarker?.state === 'ready' && (await lstat(join(root, '.git')).catch(() => undefined))?.isDirectory()) {
       const stats = existingMarker.stats;
-      return { ok: true, created: false, trackedFiles: stats?.trackedFiles ?? 0, trackedBytes: stats?.trackedBytes ?? 0, ignoredLargeFiles: stats?.ignoredLargeFiles ?? 0, ignoredHeavyDirs: stats?.ignoredHeavyDirs ?? [], ms: 0 };
+      // The owner does not use git, so files edited since the baseline are still uncommitted: the next pair's worktree is cut
+      // from HEAD and would start from OUTDATED content (and its merge would then be refused forever). Commit the current state.
+      const snapshot = await commitCurrentState(root, options.taskId, largeBytes, maxTracked);
+      return { ok: true, created: false, trackedFiles: stats?.trackedFiles ?? 0, trackedBytes: stats?.trackedBytes ?? 0, ignoredLargeFiles: stats?.ignoredLargeFiles ?? 0, ignoredHeavyDirs: stats?.ignoredHeavyDirs ?? [], ms: 0, snapshot };
     }
     return { ok: false, reason: 'inside_git', detail: 'the project is inside a git work tree that IM.codes did not create' };
   }
@@ -186,7 +233,8 @@ async function doInit(root: string, options: { taskId: string; env?: NodeJS.Proc
   const original = await readFile(gitignorePath, 'utf8').catch(() => undefined);
   const marker: InitMarker = { state: 'initializing', startedAt: clock(), taskId: options.taskId, gitignore: { existed: original !== undefined, ...(original !== undefined ? { original } : {}) } };
   try {
-    // `.git` is created here, atomically: a concurrent process that gets past the checks above fails right below.
+    // Only the in-process lock serialises two inits of one project (`git init` on an existing .git re-initialises it and succeeds);
+    // two daemons on one project directory are not a supported setup.
     const init = await git(root, ['init', '-q']);
     if (!init.ok) throw new Error(`git init failed: ${init.stderr.trim().slice(0, 200)}`);
     await git(root, ['symbolic-ref', 'HEAD', `refs/heads/${BASELINE_BRANCH}`]);
@@ -202,14 +250,21 @@ async function doInit(root: string, options: { taskId: string; env?: NodeJS.Proc
     const listed = await git(root, ['ls-files', '--others', '--exclude-standard', '-z']);
     if (!listed.ok) throw new Error(`listing the project files failed: ${listed.stderr.trim().slice(0, 200)}`);
     const large: string[] = [];
+    const nested: string[] = [];
     let trackedFiles = 0;
     let trackedBytes = 0;
     for (const rel of listed.stdout.split('\0').filter(Boolean)) {
+      // git lists an embedded repository as "dir/": the sure sign that this directory holds other projects.
+      if (rel.endsWith('/')) { nested.push(rel); continue; }
       const info = await lstat(join(root, ...rel.split('/'))).catch(() => undefined);
       if (!info || info.isDirectory()) continue;
       if (info.isFile() && info.size > largeBytes) { large.push(rel); continue; }
       trackedFiles += 1;
       trackedBytes += info.isFile() ? info.size : 0;
+    }
+    if (nested.length > 0) {
+      await rollbackInit(root, marker);
+      return { ok: false, reason: 'nested_repo', detail: `${root} contains other git repositories (${nested.slice(0, 3).join(', ')}): it is a container, not a project` };
     }
     if (trackedBytes > maxTracked) {
       await rollbackInit(root, marker);
@@ -221,12 +276,55 @@ async function doInit(root: string, options: { taskId: string; env?: NodeJS.Proc
     const commit = await git(root, ['commit', '-q', '--allow-empty', '--no-verify', '-m', `imcodes: baseline before pair ${options.taskId}`]);
     if (!commit.ok) throw new Error(`git commit failed: ${commit.stderr.trim().slice(0, 200)}`);
     const stats = { trackedFiles, trackedBytes, ignoredLargeFiles: large.length, ignoredHeavyDirs: heavy };
-    await writeFile(markerPath(root), JSON.stringify({ ...marker, state: 'ready', stats } satisfies InitMarker));
+    const baselineHead = (await git(root, ['rev-parse', '--verify', 'HEAD'])).stdout.trim();
+    await writeFile(markerPath(root), JSON.stringify({ ...marker, state: 'ready', stats, ownHead: baselineHead } satisfies InitMarker));
     return { ok: true, created: true, ...stats, ms: clock() - started };
   } catch (error) {
     await rollbackInit(root, marker);
     return { ok: false, reason: 'init_failed', detail: (error as Error).message };
   }
+}
+
+/**
+ * A later pair is starting on a repo IM.codes made: if the working tree has uncommitted changes and every commit so far is
+ * IM.codes' own (the owner is not using git in it), commit them as "imcodes: snapshot before pair <id>" so the pair's worktree
+ * starts from what is on disk. Skipped, and said so, when the user has committed themselves (their history is theirs), when the
+ * changes are over the size cap, or when anything fails. New files over the size threshold are added to the ignore block first.
+ */
+async function commitCurrentState(root: string, taskId: string, largeBytes: number, maxTracked: number): Promise<{ committed: boolean; files: number; skipped?: 'over_cap' | 'not_ours' | 'failed' }> {
+  const status = await git(root, ['status', '--porcelain=v1', '-z', '--untracked-files=all']);
+  if (!status.ok) return { committed: false, files: 0, skipped: 'failed' };
+  const entries = status.stdout.split('\0').filter(Boolean);
+  if (entries.length === 0) return { committed: false, files: 0 };
+  // Only while the branch head is still where IM.codes left it: a head somebody else moved means the user uses git here.
+  const marker = await readMarker(root);
+  const head = await git(root, ['rev-parse', '--verify', 'HEAD']);
+  if (!marker?.ownHead || !head.ok || head.stdout.trim() !== marker.ownHead) return { committed: false, files: entries.length, skipped: 'not_ours' };
+  const large: string[] = [];
+  let bytes = 0;
+  for (const entry of entries) {
+    const path = entry.slice(3);
+    if (entry.startsWith('??') && path.endsWith('/')) return { committed: false, files: entries.length, skipped: 'failed' }; // a nested repo appeared
+    const info = await lstat(join(root, ...path.split('/'))).catch(() => undefined);
+    if (!info || info.isDirectory()) continue;
+    if (entry.startsWith('??') && info.isFile() && info.size > largeBytes) { large.push(path); continue; }
+    bytes += info.isFile() ? info.size : 0;
+  }
+  if (bytes > maxTracked) return { committed: false, files: entries.length, skipped: 'over_cap' };
+  if (large.length > 0) {
+    const gitignorePath = join(root, '.gitignore');
+    const current = await readFile(gitignorePath, 'utf8').catch(() => '');
+    const lineEnd = current.includes('\r\n') ? '\r\n' : '\n';
+    const extra = large.map((path) => `/${escapePattern(path)}`).join(lineEnd);
+    const end = current.indexOf(TASK_PAIR_GITIGNORE_BLOCK_END);
+    await writeFile(gitignorePath, end >= 0 ? `${current.slice(0, end)}${extra}${lineEnd}${current.slice(end)}` : `${current}${current && !current.endsWith('\n') ? lineEnd : ''}${extra}${lineEnd}`);
+  }
+  const add = await git(root, ['add', '-A']);
+  if (!add.ok) return { committed: false, files: entries.length, skipped: 'failed' };
+  const commit = await git(root, ['commit', '-q', '--allow-empty', '--no-verify', '-m', `imcodes: snapshot before pair ${taskId}`]);
+  if (!commit.ok) return { committed: false, files: entries.length, skipped: 'failed' };
+  await recordOwnHead(root);
+  return { committed: true, files: entries.length };
 }
 
 // ── DONE: bring the pair's work into the project ────────────────────────────
@@ -292,9 +390,9 @@ async function doMerge(root: string, worktreePath: string, taskId: string): Prom
   const overlap = files.filter((path) => dirty.paths.has(path) || [...dirty.paths].some((dirtyPath) => path.startsWith(`${dirtyPath}/`) || dirtyPath.startsWith(`${path}/`)));
   if (overlap.length > 0) return { status: 'refused_uncommitted', files: overlap, detail: 'the project has uncommitted edits in files the pair changed' };
   const fastForward = await git(root, ['merge', '--ff-only', '-q', head]);
-  if (fastForward.ok) return { status: 'merged', head, fastForward: true, files };
+  if (fastForward.ok) { await recordOwnHead(root); return { status: 'merged', head, fastForward: true, files }; }
   const merged = await git(root, ['merge', '--no-edit', '-q', '-m', `imcodes: merge pair ${taskId}`, head]);
-  if (merged.ok) return { status: 'merged', head, fastForward: false, files };
+  if (merged.ok) { await recordOwnHead(root); return { status: 'merged', head, fastForward: false, files }; }
   const conflicted = await git(root, ['diff', '--name-only', '--diff-filter=U', '-z']);
   await git(root, ['merge', '--abort']);
   return { status: 'conflict', files: conflicted.stdout.split('\0').filter(Boolean), detail: merged.stderr.trim().slice(0, 200) || 'the pair commits conflict with the project branch' };

@@ -589,7 +589,7 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
 /** Brain, once per pair: which way a non-git project is handled, and why not the ones before it. */
 export function buildNonGitModeLine(pair: TaskPairState, nonGit: NonNullable<NonNullable<TaskPairState['workspace']>['nonGit']>): string | undefined {
   const header0 = header(pair);
-  if (nonGit.mode === 'git_init') return undefined; // the repo-created notice is sent once, when it is made
+  if (nonGit.mode === 'git_init' || nonGit.mode === 'plain_dir') return undefined; // git_init: the repo-created notice is sent once, when it is made; plain_dir: the container notice
   const why = nonGit.fallbackReason ? ` (a local git repo was not used: ${nonGit.fallbackReason})` : '';
   if (nonGit.mode === 'cow') {
     const clone = nonGit.clone;

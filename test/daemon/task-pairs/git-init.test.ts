@@ -13,6 +13,7 @@ import {
   initProjectRepo,
   isImcodesInitRepo,
   mergePairIntoProject,
+  nonGitRootRefusal,
   withGitignoreBlock,
 } from '../../../src/daemon/task-pairs/git-init.js';
 import {
@@ -323,5 +324,104 @@ describe('mergePairIntoProject', () => {
     commit(worktree, 'work');
     git(project, 'checkout', '-q', '--detach');
     expect(await mergePairIntoProject(project, worktree, 'T')).toMatchObject({ status: 'failed', detail: expect.stringContaining('detached HEAD') });
+  });
+});
+
+describe('which directories may become a repo at all (a container is never touched)', () => {
+  it('refuses a filesystem root, the home directory, an ancestor of home, and a directory that contains another registered project', async () => {
+    const home = join(base, 'home');
+    mkdirSync(join(home, 'codes', 'app'), { recursive: true });
+    expect(await nonGitRootRefusal('/', { home })).toMatchObject({ reason: 'container_root', detail: expect.stringContaining('filesystem root') });
+    expect(await nonGitRootRefusal(home, { home })).toMatchObject({ reason: 'container_root', detail: expect.stringContaining('home directory') });
+    expect(await nonGitRootRefusal(base, { home })).toMatchObject({ reason: 'container_root', detail: expect.stringContaining('contains the home directory') });
+    // A container of projects: /clawd holds /clawd/agents/emma.
+    const clawd = join(base, 'clawd');
+    mkdirSync(join(clawd, 'agents', 'emma'), { recursive: true });
+    expect(await nonGitRootRefusal(clawd, { home, otherProjectDirs: [join(clawd, 'agents', 'emma')] })).toMatchObject({ reason: 'container_root', detail: expect.stringContaining('contains another project') });
+    // The project itself, its own sessions, a sibling and a child project are all fine.
+    expect(await nonGitRootRefusal(join(clawd, 'agents', 'emma'), { home, otherProjectDirs: [clawd, join(clawd, 'agents', 'emma')] })).toBeUndefined();
+    expect(await nonGitRootRefusal(join(home, 'codes', 'app'), { home, otherProjectDirs: [join(home, 'codes', 'app')] })).toBeUndefined();
+    expect(await nonGitRootRefusal(clawd, { home, otherProjectDirs: [join(base, 'clawd-sibling')] })).toBeUndefined(); // a sibling with the same prefix is not "inside"
+  });
+
+  it('a directory holding a nested repository is refused by the init itself and rolled back: no .git, .gitignore as it was', async () => {
+    write('top.txt', 'x');
+    write('.gitignore', '*.log\n');
+    mkdirSync(join(project, 'other-project'));
+    execFileSync('git', ['-C', join(project, 'other-project'), 'init', '-q']);
+    const before = readFileSync(join(project, '.gitignore'), 'utf8');
+    const result = await initProjectRepo(project, { taskId: 'T' });
+    expect(result).toMatchObject({ ok: false, reason: 'nested_repo' });
+    expect(existsSync(join(project, '.git'))).toBe(false);
+    expect(readFileSync(join(project, '.gitignore'), 'utf8')).toBe(before);
+    expect(existsSync(join(project, 'other-project', '.git'))).toBe(true); // the nested repo is untouched
+  });
+});
+
+describe('a later pair starts from what is on disk (the owner does not commit)', () => {
+  it('uncommitted edits, new files and a new large file since the baseline are committed as a snapshot; the large file stays untracked', async () => {
+    process.env[TASK_PAIR_GIT_INIT_LARGE_FILE_BYTES_ENV] = String(1024);
+    write('src/a.ts', 'a1\n');
+    write('notes.txt', 'n1\n');
+    expect((await initProjectRepo(project, { taskId: 'FIRST' })).ok).toBe(true);
+    write('src/a.ts', 'a2 edited by the owner\n');
+    write('src/new.ts', 'new file\n');
+    rmSync(join(project, 'notes.txt'));
+    write('data/huge.bin', Buffer.alloc(4096, 1));
+    const result = await initProjectRepo(project, { taskId: 'SECOND' });
+    expect(result).toMatchObject({ ok: true, created: false, snapshot: { committed: true } });
+    expect(git(project, 'log', '-1', '--format=%s')).toBe('imcodes: snapshot before pair SECOND');
+    expect(git(project, 'status', '--porcelain')).toBe('');
+    expect(git(project, 'show', 'HEAD:src/a.ts')).toBe('a2 edited by the owner');
+    expect(git(project, 'ls-files').split('\n').sort()).toEqual(['.gitignore', 'src/a.ts', 'src/new.ts']);
+    expect(existsSync(join(project, 'data', 'huge.bin'))).toBe(true);
+    expect(readFileSync(join(project, '.gitignore'), 'utf8')).toContain('/data/huge.bin');
+    expect(git(project, 'rev-list', '--count', 'HEAD')).toBe('2');
+    // A clean tree: no new commit.
+    const again = await initProjectRepo(project, { taskId: 'THIRD' });
+    expect(again).toMatchObject({ ok: true, created: false, snapshot: { committed: false, files: 0 } });
+    expect(git(project, 'rev-list', '--count', 'HEAD')).toBe('2');
+  });
+
+  it('the pair worktree cut after the snapshot holds the owner\'s current files, so its merge is not refused for stale content', async () => {
+    write('src/a.ts', 'a1\n');
+    expect((await initProjectRepo(project, { taskId: 'FIRST' })).ok).toBe(true);
+    write('src/a.ts', 'a-owner\n');
+    expect((await initProjectRepo(project, { taskId: 'SECOND' })).ok).toBe(true);
+    const worktree = join(base, 'wt');
+    git(project, 'worktree', 'add', '-q', '--detach', worktree, 'HEAD');
+    expect(readFileSync(join(worktree, 'src', 'a.ts'), 'utf8')).toBe('a-owner\n');
+    write('src/a.ts', 'a-owner + pair\n', worktree);
+    git(worktree, 'add', '-A');
+    git(worktree, 'commit', '-q', '-m', 'pair');
+    expect((await mergePairIntoProject(project, worktree, 'SECOND')).status).toBe('merged');
+    expect(readFileSync(join(project, 'src', 'a.ts'), 'utf8')).toBe('a-owner + pair\n');
+    // The merge is IM.codes' own commit: a later snapshot still applies.
+    write('src/a.ts', 'a-owner again\n');
+    expect(await initProjectRepo(project, { taskId: 'THIRD' })).toMatchObject({ ok: true, snapshot: { committed: true } });
+  });
+
+  it('when the user has committed themselves, their history is theirs: nothing is committed for them', async () => {
+    write('src/a.ts', 'a1\n');
+    expect((await initProjectRepo(project, { taskId: 'FIRST' })).ok).toBe(true);
+    write('src/a.ts', 'a2\n');
+    git(project, 'add', '-A');
+    git(project, '-c', 'user.name=Me', '-c', 'user.email=me@example.invalid', 'commit', '-q', '-m', 'my own commit');
+    write('src/a.ts', 'a3 uncommitted\n');
+    const count = git(project, 'rev-list', '--count', 'HEAD');
+    const result = await initProjectRepo(project, { taskId: 'SECOND' });
+    expect(result).toMatchObject({ ok: true, created: false, snapshot: { committed: false, skipped: 'not_ours' } });
+    expect(git(project, 'rev-list', '--count', 'HEAD')).toBe(count);
+    expect(git(project, 'status', '--porcelain')).toBe('M src/a.ts');
+  });
+
+  it('changes over the size cap are not committed (and it is said)', async () => {
+    write('a.txt', 'a');
+    expect((await initProjectRepo(project, { taskId: 'FIRST' })).ok).toBe(true);
+    process.env[TASK_PAIR_GIT_INIT_MAX_TRACKED_BYTES_ENV] = '100';
+    write('big.txt', 'x'.repeat(500));
+    const result = await initProjectRepo(project, { taskId: 'SECOND' });
+    expect(result).toMatchObject({ ok: true, snapshot: { committed: false, skipped: 'over_cap' } });
+    expect(git(project, 'rev-list', '--count', 'HEAD')).toBe('1');
   });
 });

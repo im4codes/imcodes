@@ -4,7 +4,7 @@
  */
 import { execFileSync } from 'node:child_process';
 import { copyFile } from 'node:fs/promises';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -46,6 +46,7 @@ const setEnv = (key: string, value: string) => { process.env[key] = value; deps.
 
 const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8' }).trim();
 const plainCopy = (from: string, to: string) => copyFile(from, to);
+const readdirSyncSafe = (dir: string) => readdirSync(dir).filter((name) => !name.startsWith('.'));
 const noClone = async () => { throw Object.assign(new Error('no cow'), { code: 'ENOTSUP' }); };
 
 function session(name: string, role: SessionRecord['role'], projectDir: string): SessionRecord {
@@ -234,6 +235,70 @@ describe('pairs on a non-git project', () => {
       expect(existsSync(join(plain, '.git'))).toBe(false);
       expect(state.workspace?.nonGit).toBeUndefined();
       expect(state.workspace?.kind).toBe('worktree');
+    });
+  });
+
+
+  describe('containers are never made a repo, cloned or edited (plain task dir instead)', () => {
+    it('the pair\'s project root is the HOME directory: no .git ever, a plain task dir, no clone, nothing edited; Brain told once', async () => {
+      deps.homeDir = plain;
+      deps.cloneEngine = plainCopy;
+      const before = statSync(plain).mtimeMs;
+      const state = await opened('H1');
+      expect(existsSync(join(plain, '.git'))).toBe(false);
+      expect(existsSync(join(plain, '.gitignore'))).toBe(false);
+      expect(state.workspace).toMatchObject({ kind: 'dir', path: join(worksRoot, PROJECT, 'H1'), nonGit: { mode: 'plain_dir', fallbackReason: expect.stringContaining('the home directory') } });
+      expect(state.workspace!.workingDir).toBeUndefined();
+      expect(readdirSyncSafe(state.workspace!.path)).toEqual([]); // nothing was cloned into it
+      expect(statSync(plain).mtimeMs).toBe(before);
+      expect(sentTo(BRAIN, 'brain-non-git-mode')).toHaveLength(1);
+      expect(sentTo(BRAIN, 'brain-non-git-mode')[0]!.text).toContain('not a project IM.codes will touch');
+      // Finished, it is an ordinary plain dir: no merge, no copy-back, nothing kept as "unapplied".
+      marker(BRAIN, '<!-- IMCODES_TASK DONE H1 force=true -->');
+      await vi.waitFor(() => expect(pair('H1').status).toBe('done'));
+      await taskPairService.waitForIdle();
+      expect(pair('H1').workspace?.nonGit?.applyBack).toBeUndefined();
+      expect(sentTo(BRAIN, 'brain-non-git-finish')).toHaveLength(0);
+      await taskPairService.sweepWorkspaces(pair('H1').workspace!.endedAt! + 8 * 24 * 60 * 60_000, { force: true });
+      expect(pair('H1').workspace?.status).toBe('removed');
+    });
+
+    it('a directory that CONTAINS another registered project is not inited; a pair on the child project still gets its own repo', async () => {
+      const child = join(plain, 'agents', 'emma');
+      mkdirSync(child, { recursive: true });
+      writeFile(child, 'a.txt', 'a');
+      for (const record of [session(EXEC2, 'w1', child), session(AUD2, 'w2', child)]) upsertSession(record);
+      const parent = await opened('K1');
+      expect(existsSync(join(plain, '.git'))).toBe(false);
+      expect(parent.workspace?.nonGit).toMatchObject({ mode: 'plain_dir', fallbackReason: expect.stringContaining('contains another project') });
+      const childPair = await opened('K2', `auditor=${AUD2}`, EXEC2);
+      expect(existsSync(join(child, '.git'))).toBe(true);
+      expect(childPair.workspace).toMatchObject({ kind: 'worktree', nonGit: { mode: 'git_init', projectRoot: child } });
+      // The parent is still not "inside a git work tree", so a later pair on it is refused again, not sent to the child's repo.
+      expect(existsSync(join(plain, '.git'))).toBe(false);
+    });
+
+    it('a directory holding a nested repository is refused after the listing and rolled back: plain task dir, no .git left', async () => {
+      mkdirSync(join(plain, 'sub-project'));
+      execFileSync('git', ['-C', join(plain, 'sub-project'), 'init', '-q']);
+      const state = await opened('N1');
+      expect(existsSync(join(plain, '.git'))).toBe(false);
+      expect(existsSync(join(plain, '.gitignore'))).toBe(false);
+      expect(state.workspace?.nonGit).toMatchObject({ mode: 'plain_dir', fallbackReason: expect.stringContaining('container_root') });
+    });
+  });
+
+  describe('a later pair starts from the owner\'s current files', () => {
+    it('edits made since the baseline are committed as a snapshot before the next pair\'s worktree is cut, and Brain is told', async () => {
+      await opened('B1');
+      useProject(plain, EXEC2, AUD2);
+      writeFile(plain, 'src/a.ts', 'export const a = "edited by the owner";\n');
+      const second = await opened('B2', `auditor=${AUD2}`, EXEC2);
+      expect(git(plain, 'log', '-1', '--format=%s')).toBe('imcodes: snapshot before pair B2');
+      expect(readFileSync(join(second.workspace!.path, 'src', 'a.ts'), 'utf8')).toBe('export const a = "edited by the owner";\n');
+      expect(git(plain, 'status', '--porcelain')).toBe('');
+      const notices = sentTo(BRAIN, 'brain-non-git-mode').map((entry) => entry.text);
+      expect(notices.some((text) => text.includes('committed them as "imcodes: snapshot before pair B2"'))).toBe(true);
     });
   });
 
@@ -445,5 +510,7 @@ describe('pairs on a non-git project', () => {
     expect(TASK_PAIR_WORKSPACE_RULES).toContain('copy-on-write CLONE');
     expect(TASK_PAIR_WORKSPACE_RULES).toContain('IN-PLACE');
     expect(TASK_PAIR_WORKSPACE_RULES).toContain('parallel=true');
+    expect(TASK_PAIR_WORKSPACE_RULES).toContain('CONTAINER');
+    expect(TASK_PAIR_WORKSPACE_RULES).toContain('snapshot');
   });
 });

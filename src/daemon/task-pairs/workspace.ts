@@ -29,7 +29,7 @@ import { cp, lstat, mkdir, readFile, readdir, readlink, realpath, rm, rmdir, sta
 import { rmSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, dirname, extname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { getSession } from '../../store/session-store.js';
+import { getSession, listSessions } from '../../store/session-store.js';
 import {
   TASK_PAIR_WORKS_DIR,
   TASK_PAIR_WORKS_ROOT_ENV,
@@ -40,7 +40,7 @@ import {
 } from '../../../shared/task-pair.js';
 import { isSessionBusy } from './pool.js';
 import { resolveSupervisionAssignmentWorktree, resolveSupervisionWorktreesRoot } from '../supervision-worktree-inspector.js';
-import { initProjectRepo, isImcodesInitRepo } from './git-init.js';
+import { initProjectRepo, isImcodesInitRepo, nonGitRootRefusal } from './git-init.js';
 import { createCowClone, probeCopyOnWrite, readCowManifest, type CloneEngine, type CloneFile } from './non-git.js';
 import { ensureSupervisionAssignmentWorktree } from '../supervision-worktree-provision.js';
 import {
@@ -192,6 +192,10 @@ export interface TaskPairWorkspaceDeps {
   countCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
   /** Non-git projects: the copy-on-write primitive (tests simulate a filesystem without it). */
   cloneEngine?: CloneEngine | CloneFile;
+  /** Non-git projects: the home directory to refuse as a project root (default os.homedir()). */
+  homeDir?: string;
+  /** Non-git projects: project directories of the OTHER registered sessions (default: the session store). */
+  otherProjectDirs?: readonly string[];
   /** Rehome: is this session mid-turn (or has queued work)? */
   isBusy?: (sessionName: string) => boolean;
   /** Rehome: does any live process have its working directory inside `path`? */
@@ -240,6 +244,24 @@ async function provisionTaskDir(project: string, pair: TaskPairState, env?: Node
   const path = resolveTaskPairTaskDir(project, pair.taskId, env);
   await mkdir(path, { recursive: true });
   return { ok: true, kind: 'dir', path, source: 'directory' };
+}
+
+/**
+ * The project directory is a container (see nonGitRootRefusal): the old behaviour, an empty task directory for results, with the
+ * reason recorded on the pair and told to Brain once per directory.
+ */
+const containerNoticed = new Set<string>();
+async function provisionPlainDir(project: string, pair: TaskPairState, projectRoot: string, deps: TaskPairWorkspaceDeps, reason: string): Promise<TaskPairWorkspaceProvision> {
+  const dir = await provisionTaskDir(project, pair, deps.env);
+  if (!dir.ok) return dir;
+  const key = `${projectRoot}\u0000${reason}`;
+  const first = !containerNoticed.has(key);
+  containerNoticed.add(key);
+  return {
+    ...dir,
+    nonGit: { mode: 'plain_dir', projectRoot, fallbackReason: reason, createdAt: Date.now() },
+    ...(first ? { brainNotice: `${projectRoot} is not a git repository and is not a project IM.codes will touch (${reason}): no repository was created there, nothing was cloned and nothing is edited in place. The pair gets an empty task directory; results come back through DONE output=.` } : {}),
+  };
 }
 
 /**
@@ -302,17 +324,35 @@ export async function provisionTaskPairWorkspace(
   if (pair.workspace?.nonGit && pair.workspace.nonGit.mode !== 'git_init') {
     if (pair.workspace.nonGit.mode === 'cow') return { ok: false, detail: 'the COW workspace is gone; its changes cannot be rebuilt from the project' };
     const scratch = await provisionTaskDir(project, pair, deps.env);
-    return scratch.ok ? { ...scratch, nonGit: pair.workspace.nonGit, workingDir: pair.workspace.nonGit.projectRoot } : scratch;
+    if (!scratch.ok) return scratch;
+    return pair.workspace.nonGit.mode === 'in_place'
+      ? { ...scratch, nonGit: pair.workspace.nonGit, workingDir: pair.workspace.nonGit.projectRoot }
+      : { ...scratch, nonGit: pair.workspace.nonGit };
   }
   const alreadyGit = await isGitWorkTree(projectRoot);
+  if (!alreadyGit) {
+    // A container (home directory, volume root, a directory holding other projects) is never made a repo, cloned or edited in place.
+    const others = deps.otherProjectDirs ?? listSessions().map((record) => record.projectDir).filter((dir): dir is string => Boolean(dir));
+    const refusal = await nonGitRootRefusal(projectRoot, { ...(deps.homeDir ? { home: deps.homeDir } : {}), otherProjectDirs: others });
+    if (refusal) return provisionPlainDir(project, pair, projectRoot, deps, `${refusal.reason}: ${refusal.detail}`);
+  }
   // A project IM.codes turned into a repo for an earlier pair is still a "git_init" project: its pairs merge into it at DONE.
   if (!alreadyGit || (!nonGit && await isImcodesInitRepo(projectRoot))) {
     const init = await initProjectRepo(projectRoot, { taskId: pair.taskId, ...(deps.env ? { env: deps.env } : {}) });
-    if (!init.ok) return provisionNonGit(project, pair, projectRoot, deps, `git_init_${init.reason}: ${init.detail}`);
+    if (!init.ok) {
+      // A directory holding nested repositories is a container too: nothing safe can be done to it for one pair.
+      if (init.reason === 'nested_repo') return provisionPlainDir(project, pair, projectRoot, deps, `container_root: ${init.detail}`);
+      return provisionNonGit(project, pair, projectRoot, deps, `git_init_${init.reason}: ${init.detail}`);
+    }
     nonGit = {
       mode: 'git_init', projectRoot, createdAt: Date.now(),
       gitInit: { created: init.created, trackedFiles: init.trackedFiles, trackedBytes: init.trackedBytes, ignoredLargeFiles: init.ignoredLargeFiles, ignoredHeavyDirs: init.ignoredHeavyDirs, ms: init.ms },
     };
+    if (init.snapshot?.committed) {
+      brainNotice = `The project ${projectRoot} had ${init.snapshot.files} uncommitted change(s) (you do not use git there), so IM.codes committed them as "imcodes: snapshot before pair ${pair.taskId}" and this pair's worktree starts from the files as they are on disk.`;
+    } else if (init.snapshot?.skipped) {
+      brainNotice = `The project ${projectRoot} has ${init.snapshot.files} uncommitted change(s) that IM.codes did not commit before this pair (${init.snapshot.skipped === 'not_ours' ? 'the repository has commits of your own, so the history is yours' : init.snapshot.skipped === 'over_cap' ? 'they are over the size cap' : 'the snapshot commit failed'}): this pair's worktree starts from the last commit, so it may work on older content; commit them if it matters.`;
+    }
     if (init.created) {
       brainNotice = `The project ${projectRoot} was not a git repository. IM.codes created a LOCAL repo in it (repo-local identity, no remote, never pushed) with the baseline commit "imcodes: baseline before pair ${pair.taskId}": `
         + `${init.trackedFiles} files / ${Math.round(init.trackedBytes / 1024 / 1024)} MiB tracked, ${init.ignoredLargeFiles} large file(s) and the heavy directories (${init.ignoredHeavyDirs.slice(0, 6).join(', ')}, ...) ignored via a marked block in .gitignore. `
@@ -365,7 +405,7 @@ export async function releaseTaskPairWorkspace(
   // A finished non-git pair whose work never reached the project (merge refused, copy-back conflicted or failed, not run yet)
   // is kept: this workspace is the only place the work is.
   const landed = ['applied', 'noop', 'undone'].includes(workspace.nonGit?.applyBack?.status ?? '');
-  if (workspace.nonGit && workspace.nonGit.mode !== 'in_place' && pair.status === 'done' && !landed) return { action: 'kept', reason: 'unapplied' };
+  if ((workspace.nonGit?.mode === 'git_init' || workspace.nonGit?.mode === 'cow') && pair.status === 'done' && !landed) return { action: 'kept', reason: 'unapplied' };
   if (workspace.kind === 'dir') {
     const allowed = allowWorkspaceRemoval(deps);
     if (typeof allowed === 'boolean' ? !allowed : !(await allowed)) return { action: 'skipped' };

@@ -1743,7 +1743,7 @@ export class TaskPairService {
     const pair = store.getPair(project, taskId)?.state;
     const workspace = pair?.workspace;
     const nonGit = workspace?.nonGit;
-    if (!pair || !workspace || !nonGit || pair.status !== 'done' || nonGit.mode === 'in_place' || workspace.status === 'removed') return;
+    if (!pair || !workspace || !nonGit || pair.status !== 'done' || (nonGit.mode !== 'git_init' && nonGit.mode !== 'cow') || workspace.status === 'removed') return;
     const previous = nonGit.applyBack?.status;
     if (previous === 'applied' || previous === 'noop' || previous === 'undone') return;
     await this.#withNonGitLock(`${nonGit.mode}:${nonGit.projectRoot}`, async () => {
@@ -1811,7 +1811,7 @@ export class TaskPairService {
     const store = getTaskPairStore();
     for (const stored of store.listEndedWorkspacePairs()) {
       const nonGit = stored.state.workspace?.nonGit;
-      if (!nonGit || nonGit.mode === 'in_place' || stored.state.status !== 'done') continue;
+      if (!nonGit || (nonGit.mode !== 'git_init' && nonGit.mode !== 'cow') || stored.state.status !== 'done') continue;
       const status = nonGit.applyBack?.status;
       if (status === 'applied' || status === 'noop' || status === 'undone') continue;
       await this.finishNonGitWorkspace(stored.project, stored.state.taskId);
