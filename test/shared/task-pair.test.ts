@@ -97,6 +97,7 @@ describe('task-pair marker grammar', () => {
     expect(TASK_PAIR_CHECKLIST_RULE).toContain('on REWORK the auditor unticks failed items');
     expect(buildTaskPairMarkerContract()).toContain('CHECK <taskId> box=implemented|audited');
     expect(buildTaskPairMarkerContract()).toContain('write STARTED once when you begin (never again on later turns');
+    expect(buildTaskPairMarkerContract()).toContain('Your turns start inside that workspace: never write or commit there');
   });
 
   it('nudges an auditor once when REWORK has no concrete proposal', () => {
