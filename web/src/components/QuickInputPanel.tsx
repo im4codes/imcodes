@@ -316,60 +316,65 @@ export interface UseQuickDataResult {
   clearSessionHistory: (sessionName: string) => void;
 }
 
+// The mutators only touch module-level state, so they are module constants: the
+// object useQuickData() returns must keep its identity between renders, or
+// every memoized consumer (panes, windows, cards, composers) re-renders with it.
+const recordHistory = (text: string, sessionName?: string) => {
+  updateQuickData((prev) => recordHistoryEntry(prev, text, sessionName));
+};
+
+const addCommand = (cmd: string) => {
+  const trimmed = cmd.trim();
+  if (!trimmed) return;
+  // Mark pending BEFORE the optimistic mutation so a racing fetcher
+  // (a no-op `set` doesn't trigger one, but defensive ordering keeps
+  // the invariant simple) sees the addition.
+  _pendingCommandAdds.add(trimmed);
+  updateQuickData((prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] });
+};
+
+const addPhrase = (phrase: string) => {
+  const trimmed = phrase.trim();
+  if (!trimmed) return;
+  _pendingPhraseAdds.add(trimmed);
+  updateQuickData((prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] });
+};
+
+const removeCommand = (cmd: string) => {
+  // If the user adds-then-removes inside the debounce window, drop the
+  // pending entry — there is nothing to preserve across a refresh.
+  _pendingCommandAdds.delete(cmd);
+  updateQuickData((prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev);
+};
+const removePhrase = (phrase: string) => {
+  _pendingPhraseAdds.delete(phrase);
+  updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
+};
+const removeHistory = (text: string) => {
+  updateQuickData((prev) => prev.history.includes(text) ? { ...prev, history: prev.history.filter((h) => h !== text) } : prev);
+};
+const removeSessionHistory = (sessionName: string, text: string) => {
+  updateQuickData((prev) => {
+    const sh = prev.sessionHistory[sessionName] ?? [];
+    if (!sh.includes(text)) return prev;
+    return { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
+  });
+};
+const clearHistory = () => {
+  updateQuickData((prev) => prev.history.length === 0 ? prev : { ...prev, history: [] });
+};
+const clearSessionHistory = (sessionName: string) => {
+  updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0 ? prev : { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } });
+};
+
+
+const QUICK_DATA_ACTIONS = { recordHistory, addCommand, addPhrase, removeCommand, removePhrase, removeHistory, removeSessionHistory, clearHistory, clearSessionHistory };
+
 export function useQuickData(): UseQuickDataResult {
   installQuickDataVisibilityListener();
   const snapshot = quickDataResource.use();
-  const data = normalizeQuickData(snapshot.value ?? EMPTY_QUICK_DATA);
-
-  const recordHistory = (text: string, sessionName?: string) => {
-    updateQuickData((prev) => recordHistoryEntry(prev, text, sessionName));
-  };
-
-  const addCommand = (cmd: string) => {
-    const trimmed = cmd.trim();
-    if (!trimmed) return;
-    // Mark pending BEFORE the optimistic mutation so a racing fetcher
-    // (a no-op `set` doesn't trigger one, but defensive ordering keeps
-    // the invariant simple) sees the addition.
-    _pendingCommandAdds.add(trimmed);
-    updateQuickData((prev) => prev.commands.includes(trimmed) ? prev : { ...prev, commands: [...prev.commands, trimmed] });
-  };
-
-  const addPhrase = (phrase: string) => {
-    const trimmed = phrase.trim();
-    if (!trimmed) return;
-    _pendingPhraseAdds.add(trimmed);
-    updateQuickData((prev) => prev.phrases.includes(trimmed) ? prev : { ...prev, phrases: [...prev.phrases, trimmed] });
-  };
-
-  const removeCommand = (cmd: string) => {
-    // If the user adds-then-removes inside the debounce window, drop the
-    // pending entry — there is nothing to preserve across a refresh.
-    _pendingCommandAdds.delete(cmd);
-    updateQuickData((prev) => prev.commands.includes(cmd) ? { ...prev, commands: prev.commands.filter((c) => c !== cmd) } : prev);
-  };
-  const removePhrase = (phrase: string) => {
-    _pendingPhraseAdds.delete(phrase);
-    updateQuickData((prev) => prev.phrases.includes(phrase) ? { ...prev, phrases: prev.phrases.filter((p) => p !== phrase) } : prev);
-  };
-  const removeHistory = (text: string) => {
-    updateQuickData((prev) => prev.history.includes(text) ? { ...prev, history: prev.history.filter((h) => h !== text) } : prev);
-  };
-  const removeSessionHistory = (sessionName: string, text: string) => {
-    updateQuickData((prev) => {
-      const sh = prev.sessionHistory[sessionName] ?? [];
-      if (!sh.includes(text)) return prev;
-      return { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: sh.filter((h) => h !== text) } };
-    });
-  };
-  const clearHistory = () => {
-    updateQuickData((prev) => prev.history.length === 0 ? prev : { ...prev, history: [] });
-  };
-  const clearSessionHistory = (sessionName: string) => {
-    updateQuickData((prev) => (prev.sessionHistory[sessionName] ?? []).length === 0 ? prev : { ...prev, sessionHistory: { ...prev.sessionHistory, [sessionName]: [] } });
-  };
-
-  return { data, loaded: snapshot.loaded, recordHistory, addCommand, addPhrase, removeCommand, removePhrase, removeHistory, removeSessionHistory, clearHistory, clearSessionHistory };
+  const data = useMemo(() => normalizeQuickData(snapshot.value ?? EMPTY_QUICK_DATA), [snapshot.value]);
+  return useMemo(() => ({ data, loaded: snapshot.loaded, ...QUICK_DATA_ACTIONS }), [data, snapshot.loaded]);
 }
 
 export function __resetQuickDataForTests(): void {

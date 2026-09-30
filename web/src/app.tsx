@@ -295,6 +295,7 @@ import {
 } from '@shared/remote-desktop-local-management.js';
 import { looselyEqual, markSessionRunningIfNeeded, updateSessionIfChanged } from './session-state-updates.js';
 import { createMapUpdateBatcher, type MapUpdateBatcher } from './map-update-batcher.js';
+import { useStructuralIdentity } from './hooks/useStructuralIdentity.js';
 import { CapabilityOperationNotice } from './components/CapabilityOperationNotice.js';
 import {
   APP_UPDATE_REQUIRED_EVENT,
@@ -5920,7 +5921,7 @@ export function App() {
 
   // Memoized sub-session mappings — avoids creating new arrays on every render,
   // which would defeat memo() on child components (SessionPane, SessionTree, pinned panels).
-  const quickDelegationSessions = useMemo(() => sessions.map((session) => {
+  const quickDelegationSessions = useStructuralIdentity(useMemo(() => sessions.map((session) => {
     const effectiveModel = resolveQuickAgentDelegationModel(
       session,
       detectedModels.get(session.name),
@@ -5928,8 +5929,8 @@ export function App() {
     return effectiveModel && effectiveModel !== session.activeModel
       ? { ...session, activeModel: effectiveModel }
       : session;
-  }), [detectedModels, sessions]);
-  const subSessionsSlim = useMemo(() => subSessions.map((session) => ({
+  }), [detectedModels, sessions]));
+  const subSessionsSlim = useStructuralIdentity(useMemo(() => subSessions.map((session) => ({
     sessionName: session.sessionName,
     type: session.type,
     label: session.label,
@@ -5940,7 +5941,7 @@ export function App() {
       detectedModels.get(session.sessionName),
       subUsages.get(session.sessionName)?.model,
     ),
-  })), [detectedModels, subSessions, subUsages]);
+  })), [detectedModels, subSessions, subUsages]));
   const peerAuditSettingsSessions = useMemo<PeerAuditSettingsSession[]>(() => subSessions
     .filter((session) => session.executionCloneKind !== EXECUTION_CLONE_KIND && typeof session.parentRunId !== 'string')
     .map((session) => ({
