@@ -1823,6 +1823,7 @@ describe('TransportSessionRuntime', () => {
       })],
     });
     expect(runtime.pendingEntries).toEqual([]);
+    expect(store.readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
     expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
   });
 
