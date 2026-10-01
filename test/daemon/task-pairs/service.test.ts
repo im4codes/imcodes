@@ -4,7 +4,8 @@ import { removeSession, upsertSession } from '../../../src/store/session-store.j
 import { timelineEmitter } from '../../../src/daemon/timeline-emitter.js';
 import { TaskPairStore, setTaskPairStoreForTests, getTaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
-import { TaskPairService, type TaskPairScheduler } from '../../../src/daemon/task-pairs/service.js';
+import { resetTaskPairTerminalStreamRecoveryForTests, TaskPairService, type TaskPairScheduler } from '../../../src/daemon/task-pairs/service.js';
+import { timelineStore } from '../../../src/daemon/timeline-store.js';
 import { resolveTaskPairEngine, resolveTaskPairEngineState, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
@@ -601,6 +602,31 @@ describe('task-pair marker ingestion', () => {
     await say(BRAIN, '<!-- IMCODES_TASK DISPATCH TPARTIAL executor=', { memoryExcluded: true, [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true }, 'partial-stop');
     expect(pair('TFENCED')).toBeUndefined();
     expect(pair('TPARTIAL')).toBeUndefined();
+  });
+
+  it('recovers a terminal marker from the prior daemon epoch exactly once after restart', async () => {
+    await service.dispose();
+    const marker = `<!-- IMCODES_TASK DISPATCH TRECOVER executor=${EXEC} auditor=${AUD} -->`;
+    const readTail = vi.spyOn(timelineStore, 'readCompletedTextTail').mockResolvedValue([{
+      eventId: 'transport:restarted:recover', sessionId: BRAIN, ts: Date.now(), seq: 1,
+      epoch: timelineEmitter.epoch - 1, source: 'daemon', confidence: 'high', type: 'assistant.text',
+      payload: { text: marker, streaming: false, memoryExcluded: true, [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true },
+    }]);
+    resetTaskPairTerminalStreamRecoveryForTests();
+    service = new TaskPairService();
+    service.init();
+    await service.waitForIdle();
+    expect(pair('TRECOVER')).toMatchObject({ executor: EXEC, auditor: AUD });
+    const eventCount = getTaskPairStore().listEvents(PROJECT, 'TRECOVER').length;
+
+    // A second tick/re-init in the same daemon epoch does not replay it.
+    await service.dispose();
+    resetTaskPairTerminalStreamRecoveryForTests();
+    service = new TaskPairService();
+    service.init();
+    await service.waitForIdle();
+    expect(getTaskPairStore().listEvents(PROJECT, 'TRECOVER')).toHaveLength(eventCount);
+    readTail.mockRestore();
   });
 
   it('keeps the turn flowing when the store fails', async () => {

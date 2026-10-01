@@ -422,6 +422,10 @@ function queueAuditRebaseWarning(project: string, pair: TaskPairState, material:
 
 let terminalStreamRecoveryStarted = false;
 
+export function resetTaskPairTerminalStreamRecoveryForTests(): void {
+  terminalStreamRecoveryStarted = false;
+}
+
 export class TaskPairService {
   static readonly TITLE_REQUEST_RETRY_MS = 5 * 60_000;
   #titleRequestFlushes = new Map<string, Promise<void>>();
@@ -530,7 +534,11 @@ export class TaskPairService {
         events = timelineStore.read(session.name, { limit: 50 });
       }
       for (const event of events) {
-        if (event.type !== 'assistant.text' || event.ts < cutoff) continue;
+        // Only replay a snapshot produced by an earlier daemon epoch. This
+        // keeps a service re-init in the same process from re-ingesting a
+        // currently live terminal event while still recovering a pre-restart
+        // cancellation.
+        if (event.type !== 'assistant.text' || event.ts < cutoff || event.epoch === timelineEmitter.epoch) continue;
         const payload = event.payload as Record<string, unknown>;
         if (payload[TASK_PAIR_TERMINAL_FLUSH_FIELD] !== true) continue;
         this.handleTimelineEvent(event);
