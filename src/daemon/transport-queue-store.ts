@@ -1180,6 +1180,36 @@ export class TransportQueueStore {
     now = Date.now(),
     recipient?: QueueRecipientIdentity | null,
   ): boolean {
+    const recorded = this.recordDeliveryTombstone(
+      sessionNameInput,
+      clientMessageIdInput,
+      deliveryFrameId,
+      now,
+      recipient,
+    );
+    // Direct dispatch has no handoff row to finalize. Reconcile any stale row
+    // left by an older build so the public projection cannot retain a ghost.
+    const sessionName = normalizeSessionName(sessionNameInput);
+    this.reconcileDeliveredQueueRows(sessionName, now);
+    return recorded;
+  }
+
+  /**
+   * Record provider acceptance before the caller performs follow-up history
+   * or queue finalization work. This is intentionally separate from
+   * `recordDirectDelivery`: active append/resend dispatches still own a
+   * handoff row at this point, and removing it here would make the normal
+   * finalize path lose its delivery fact. If the daemon dies after provider
+   * acceptance, restart reconciliation sees this tombstone and removes the
+   * old row without rehydrating it for a second provider delivery.
+   */
+  recordDeliveryTombstone(
+    sessionNameInput: string,
+    clientMessageIdInput: string,
+    deliveryFrameId: string = randomUUID(),
+    now = Date.now(),
+    recipient?: QueueRecipientIdentity | null,
+  ): boolean {
     const sessionName = normalizeSessionName(sessionNameInput);
     const clientMessageId = clientMessageIdInput.trim();
     if (!clientMessageId) return false;
@@ -1206,12 +1236,6 @@ export class TransportQueueStore {
       sessionName, queueEpoch, clientMessageId, deliveryFrameId, now, sessionName, sessionName,
       this.deliveryConversationKey(sessionName),
     );
-    // A message that reached the provider is no longer queued. A tombstone with
-    // its queue row left behind is a ghost: the browser keeps showing it as
-    // pending (the projection reads rows), while the runtime never sends it
-    // again (rehydrate skips tombstoned ids), so it sits there forever and
-    // resurfaces after every reconnect/restart.
-    this.reconcileDeliveredQueueRows(sessionName, now);
     return true;
   }
 

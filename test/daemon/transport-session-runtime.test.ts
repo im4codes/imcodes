@@ -1861,6 +1861,39 @@ describe('TransportSessionRuntime', () => {
     expect(store.readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
   });
 
+  it('tombstones active append acceptance before finalization so a crash-window restart cannot replay it', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-acceptance-tombstone');
+    await flushDispatch();
+    expect(runtime.send('accepted before crash window', 'queued-acceptance-tombstone')).toBe('queued');
+
+    const store = getTransportQueueStore();
+    vi.spyOn(store, 'finalizeSentBatch').mockImplementation(() => {
+      throw new Error('sqlite unavailable during crash-window test');
+    });
+    vi.spyOn(store, 'recordDirectDelivery').mockImplementation(() => {
+      throw new Error('repair path unavailable during crash-window test');
+    });
+
+    await expect(runtime.appendPendingMessagesToActiveTurn(
+      ['queued-acceptance-tombstone'],
+      'append-acceptance-tombstone',
+    )).resolves.toMatchObject({ status: 'delivered' });
+    expect(store.hasDeliveryTombstone('deck_test_brain', 'queued-acceptance-tombstone')).toBe(true);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+
+    // Both finalization and the older repair path are unavailable. A fresh
+    // runtime must still reconcile the acceptance tombstone before rehydrate.
+    const restartMock = makeMockProvider();
+    const restarted = new TransportSessionRuntime(restartMock.provider, 'deck_test_brain');
+    await restarted.initialize(defaultConfig);
+    expect(restarted.rehydratePendingFromStore()).toBe(0);
+    expect(restarted.pendingEntries).toEqual([]);
+    expect(store.readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+    expect(restartMock.provider.send).not.toHaveBeenCalled();
+  });
+
   it('restores the original FIFO before messages queued during a rejected append', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn(async () => {

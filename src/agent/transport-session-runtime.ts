@@ -2956,6 +2956,31 @@ export class TransportSessionRuntime implements SessionRuntime {
       };
     }
 
+    // Provider acceptance is irreversible, but queue finalization/history
+    // persistence can still fail or the daemon can crash before either runs.
+    // Record the acceptance while the exact handoff ids are still known. On a
+    // restart, rehydrate skips the tombstoned ids and reconciliation removes
+    // the old handoff rows instead of replaying an already-sent message.
+    for (const clientMessageId of selected.map((entry) => entry.clientMessageId)) {
+      try {
+        store.recordDeliveryTombstone(
+          this.sessionKey,
+          clientMessageId,
+          notificationId,
+          undefined,
+          this.queueRecipient ?? null,
+        );
+      } catch (error) {
+        // Keep the accepted provider turn successful; finalize/reconcile below
+        // remains the normal path and this warning makes the crash window
+        // observable when SQLite is unavailable.
+        logger.warn(
+          { error, sessionKey: this.sessionKey, clientMessageId, notificationId },
+          'transport queue acceptance tombstone failed after active-turn append',
+        );
+      }
+    }
+
     const historyEntries = selected.filter((entry) => !entry.historyCommitted);
     if (historyEntries.length > 0) {
       this._history.push({

@@ -1565,6 +1565,28 @@ describe('delivered-but-still-queued ghost rows', () => {
     expect(ghostStore.readSnapshot(NAME).pendingMessageVersion).toBeGreaterThan(versionBefore);
   });
 
+  it('persists acceptance before handoff finalization so restart reconciliation cannot replay it', () => {
+    queue('accepted-before-finalize', 100);
+    expect(ghostStore.markHandoffInFlight(NAME, ['accepted-before-finalize'], 60_000, 110, RECIPIENT)).toHaveLength(1);
+
+    // Crash window: the provider accepted the message, but the runtime has not
+    // yet deleted its handoff row or emitted the final queue snapshot.
+    expect(ghostStore.recordDeliveryTombstone(
+      NAME,
+      'accepted-before-finalize',
+      'frame-accepted',
+      120,
+      RECIPIENT,
+    )).toBe(true);
+    expect(ghostStore.readSnapshot(NAME).pendingMessageEntries.map((entry) => entry.clientMessageId))
+      .toEqual(['accepted-before-finalize']);
+
+    // Restart reconciliation removes the tombstoned handoff before rehydrate.
+    expect(ghostStore.reconcileDeliveredQueueRows(NAME, 130)).toEqual(['accepted-before-finalize']);
+    expect(ghostStore.readSnapshot(NAME).pendingMessageEntries).toEqual([]);
+    expect(ghostStore.hasDeliveryTombstone(NAME, 'accepted-before-finalize')).toBe(true);
+  });
+
   it('a direct delivery record for an id the queue never held changes nothing', () => {
     queue('m1', 100);
     const before = ghostStore.readSnapshot(NAME).pendingMessageVersion;
