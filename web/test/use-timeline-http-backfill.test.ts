@@ -1912,6 +1912,74 @@ describe('useTimeline — HTTP backfill on WS reconnect', () => {
     }
   });
 
+  it('releases visible HTTP progress after the newest page while older continuation stays background', async () => {
+    const sessionName = `deck_latest_first_visible_${Date.now()}`;
+    const serverId = `srv-latest-first-visible-${Date.now()}`;
+    const newestPage: TimelineEvent[] = Array.from({ length: 200 }, (_, index) => ({
+      eventId: `${sessionName}-new-${index}`,
+      sessionId: sessionName,
+      ts: 20_000 - index,
+      epoch: 1,
+      seq: 2_000 - index,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: `new-${index}` },
+    }));
+    fetchSpy.mockResolvedValueOnce({ events: newestPage, epoch: 1, hasMore: false, nextCursor: null });
+
+    const seed: TimelineEvent = {
+      eventId: `${sessionName}-seed`,
+      sessionId: sessionName,
+      ts: 19_801,
+      epoch: 1,
+      seq: 1,
+      source: 'daemon',
+      confidence: 'high',
+      type: 'assistant.text',
+      payload: { text: 'seed' },
+    };
+    ingestTimelineEventForCache(seed, serverId);
+    const ws: WsClient = {
+      connected: false,
+      onMessage: () => () => {},
+      sendTimelineReplayRequest: vi.fn(() => 'replay-latest-first-visible'),
+      sendTimelineHistoryRequest: vi.fn(() => 'history-latest-first-visible'),
+    } as unknown as WsClient;
+    let timeline: ReturnType<typeof useTimeline> | null = null;
+    function Probe() {
+      timeline = useTimeline(sessionName, ws, serverId, { isActiveSession: false });
+      const { events, refreshing, historyStatus } = timeline;
+      return h('div', {
+        'data-testid': 'probe',
+        'data-refreshing': String(refreshing),
+        'data-http': historyStatus.steps.http,
+        'data-events': String(events.length),
+      }, h('button', { type: 'button', 'data-testid': 'refresh', onClick: timeline.forceRefresh }, 'refresh'));
+    }
+
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    render(h(Probe));
+    await waitFor(() => expect(screen.getByTestId('probe').getAttribute('data-events')).toBe('1'));
+
+    await act(async () => {
+      timeline!.forceRefresh();
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await waitFor(() => expect(fetchSpy).toHaveBeenCalledTimes(1));
+    await waitFor(() => {
+      expect(screen.getByTestId('probe').getAttribute('data-events')).toBe('201');
+      expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+      expect(screen.getByTestId('probe').getAttribute('data-http')).toBe('done');
+    });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(500); });
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId('probe').getAttribute('data-refreshing')).toBe('false');
+    expect(screen.getByTestId('probe').getAttribute('data-http')).toBe('done');
+
+  });
+
   it('15s cooldown coalesces back-to-back activation events for the same session', async () => {
     // Pins the user-reported regression: clicking a session triggered 2-3
     // backfills back-to-back (mount + isActiveSession transition + a stray

@@ -4299,6 +4299,10 @@ export function useTimeline(
     const resumeBeforeTs = opts?._resumeBeforeTs;
     const roundsChained = opts?._roundsChained ?? 0;
     const mode = opts?.mode ?? 'tail';
+    // A visible refresh owns only the first newest page. Older-page
+    // continuation is background work and must not keep the foreground
+    // history stepper/spinner busy after the latest text has been merged.
+    const foregroundRound = visible && roundsChained === 0 && resumeBeforeTs === undefined;
     const backfillSessionId = sessionId;
     const backfillCacheKey = cacheKey;
     const dueAt = Date.now() + Math.max(0, delayMs);
@@ -4310,7 +4314,7 @@ export function useTimeline(
         hasTimer: true,
         inFlight: httpBackfillInFlightRef.current[mode],
       });
-      if (visible) updateHistoryStep('http', 'running', phase);
+      if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
     }
     if (httpBackfillTimerRef.current[mode]) clearHttpBackfillTimer(mode);
@@ -4321,7 +4325,7 @@ export function useTimeline(
         hasTimer: false,
         inFlight: httpBackfillInFlightRef.current[mode],
       });
-      if (visible) updateHistoryStep('http', 'running', phase);
+      if (foregroundRound) updateHistoryStep('http', 'running', phase);
       return;
     }
     httpBackfillTimerDueAtRef.current[mode] = dueAt;
@@ -4334,7 +4338,7 @@ export function useTimeline(
         const lastOk = lastHttpBackfillResponseAt.get(backfillCacheKey);
         if (lastOk !== undefined && Date.now() - lastOk < cooldownMs) {
           backfillDebug('fireHttpBackfill: cooldown skip', { sessionId: backfillSessionId, mode, lastOk, cooldownMs });
-          if (visible) updateHistoryStep('http', 'done', phase);
+          if (foregroundRound) updateHistoryStep('http', 'done', phase);
           return;
         }
       }
@@ -4394,9 +4398,9 @@ export function useTimeline(
       // using eventsRef here would misclassify that cold start as cached and
       // immediately walk the entire historical backlog.
       const hadLocalEvents = localRestoredIdsRef.current.size > 0 || !!roundGap;
-      const maxPages = mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
+      const maxPages = foregroundRound || mode === 'manualLatestWindow' || !hadLocalEvents ? 1 : undefined;
       backfillDebug('fireHttpBackfill: requesting', { sessionId: backfillSessionId, phase, mode, afterTs, retryAttempt });
-      if (visible) {
+      if (foregroundRound) {
         httpBackfillInFlightRef.current[mode] += 1;
         updateHistoryStep('http', 'running', phase);
         setHttpRefreshing(true);
@@ -4534,7 +4538,13 @@ export function useTimeline(
               sessionId: backfillSessionId, roundsChained: roundsChained + 1,
             });
             setTimeout(() => {
-              fireHttpBackfillRef.current(0, { ...opts, _roundsChained: roundsChained + 1, _retryAttempt: 0, _resumeBeforeTs: undefined });
+              fireHttpBackfillRef.current(0, {
+                ...opts,
+                visible: false,
+                _roundsChained: roundsChained + 1,
+                _retryAttempt: 0,
+                _resumeBeforeTs: undefined,
+              });
             }, INCOMPLETE_HOLE_RETRY_DELAY_MS);
           }
           // Transient null on the FIRST page → preserve the legacy retry-with-backoff.
@@ -4573,6 +4583,7 @@ export function useTimeline(
             setTimeout(() => {
               fireHttpBackfillRef.current(0, {
                 ...opts,
+                visible: false,
                 _resumeBeforeTs: outcome.resumeBeforeTs,
                 _roundsChained: roundsChained + 1,
                 _retryAttempt: 0,
@@ -4606,9 +4617,15 @@ export function useTimeline(
               gate.nextAllowedAt = 0;
             }
           }
-          if (visible) {
+          if (foregroundRound) {
             httpBackfillInFlightRef.current[mode] = Math.max(0, httpBackfillInFlightRef.current[mode] - 1);
-            updateHistoryStep('http', terminal === 'caught_up' ? 'done' : 'pending', phase);
+            // The foreground contract ends when the newest page settles.
+            // Continuation rounds are intentionally invisible and must not
+            // leave a permanent spinner on a chat that already has content.
+            const foregroundState = terminal === 'transient_null'
+              ? (retryAttempt >= HTTP_BACKFILL_RETRY_DELAYS_MS.length ? 'offline' : 'pending')
+              : terminal === 'error' ? 'offline' : 'done';
+            updateHistoryStep('http', foregroundState, phase);
             if (totalHttpBackfillInFlight(httpBackfillInFlightRef.current) === 0) setHttpRefreshing(false);
           }
         }
