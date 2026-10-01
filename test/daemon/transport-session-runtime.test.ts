@@ -5989,6 +5989,32 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
   });
 
+  it('drains queued work when STOP meets a stale provider snapshot that still reports active work', async () => {
+    let snapshotStatus: 'current' | 'stale' = 'current';
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      status: snapshotStatus,
+      activeWorkCount: snapshotStatus === 'stale' ? 1 : 0,
+      activeToolCount: 0,
+      busyReasons: snapshotStatus === 'stale' ? ['snapshot_stale'] : [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: snapshotStatus === 'stale' ? 0 : 1 },
+      updatedAt: snapshotStatus === 'stale' ? Date.now() - 60_000 : Date.now(),
+    }));
+
+    runtime.send('first');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('queued after stale stop', 'msg-q-after-stale-stop');
+    snapshotStatus = 'stale';
+
+    await runtime.cancel();
+    await waitForProviderSendCount(mock.provider, 2);
+
+    expect(runtime.pendingCount).toBe(0);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stale stop',
+      assembledMessage: 'queued after stale stop',
+    }));
+  });
+
   it('does not let a locally stopped turn stale provider snapshot block a later send', async () => {
     let snapshotGeneration = 1;
     (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({

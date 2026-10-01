@@ -2046,6 +2046,16 @@ export class TransportSessionRuntime implements SessionRuntime {
     providerSnapshot: ProviderActiveWorkSnapshot,
     evaluationState: ProviderSnapshotEvaluation['state'],
   ): boolean {
+    // A STOP is authoritative for the local dispatch generation. Providers
+    // can answer that generation with a stale snapshot which still reports
+    // active work after the turn has already finished (the same race that
+    // surfaces "The active turn already finished" in the UI). Keep treating a
+    // genuinely current provider turn as blocking, but do not let an explicit
+    // stale/unattributed snapshot pin the durable FIFO forever.
+    if (this._currentActivityGenerationLocallyCancelled
+      && (evaluationState === 'stale' || evaluationState === 'unattributed_clear')) {
+      return true;
+    }
     if (this.hasLocallyCancelledActivityGeneration(providerSnapshot)
       && isProviderSnapshotNonBlockingForStoppedGeneration(providerSnapshot, providerSnapshot.activityGeneration ?? providerSnapshot.generation)) {
       return true;
@@ -2059,12 +2069,6 @@ export class TransportSessionRuntime implements SessionRuntime {
       reason !== 'snapshot_stale' && reason !== 'snapshot_unavailable'
     ));
     if (hasNonSnapshotBusyReasons) return false;
-    // STOP is a local terminal decision for the current dispatch generation;
-    // after STOP, a zero-work stale/unattributed provider snapshot is stale
-    // information, not evidence that should keep queued user messages blocked.
-    if (this._currentActivityGenerationLocallyCancelled && (evaluationState === 'stale' || evaluationState === 'unattributed_clear')) {
-      return true;
-    }
     // If the runtime has already settled the turn locally and has no in-flight
     // dispatch records, a clear provider snapshot from an older generation must
     // not resurrect "working" or prevent the next user message from dispatching.
@@ -2988,6 +2992,22 @@ export class TransportSessionRuntime implements SessionRuntime {
           { error, firstError, sessionKey: this.sessionKey, clientMessageIds: selectedIds, notificationId },
           'transport queue sqlite finalizeSentBatch failed after active-turn append was accepted',
         );
+        // The provider already accepted these messages. Persist an independent
+        // delivery tombstone as a repair path so a restart/reconnect cannot
+        // rehydrate the same rows and show them as old queued messages again.
+        // This is deliberately best-effort: the degraded projection below
+        // still converges the current browser, while a later queue sweep can
+        // retry the tombstone/reconciliation when SQLite recovers.
+        for (const clientMessageId of selectedIds) {
+          try {
+            store.recordDirectDelivery(this.sessionKey, clientMessageId, notificationId, undefined, this.queueRecipient ?? null);
+          } catch (repairError) {
+            logger.warn(
+              { error: repairError, sessionKey: this.sessionKey, clientMessageId, notificationId },
+              'transport queue delivery tombstone repair failed after active-turn append',
+            );
+          }
+        }
         const selectedIdSet = new Set(selectedIds);
         const persisted = store.readSnapshotSafely(this.sessionKey, 'active_turn_append_finalize_failed');
         const pendingMessageVersion = Math.max(this._pendingVersion + 1, persisted.pendingMessageVersion);
