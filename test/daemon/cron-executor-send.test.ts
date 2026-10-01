@@ -73,6 +73,7 @@ function makeSendMsg(): CronDispatchMessage {
     serverId: 'srv-1',
     projectName: 'myapp',
     targetRole: 'brain',
+    cronExpr: '0 9 * * *',
     action: {
       type: 'send',
       target: 'w1',
@@ -237,5 +238,89 @@ describe('executeCronJob structured send actions', () => {
     await executeCronJob(makeSendMsg(), mockServerLink);
 
     expect(dispatchCronSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('defensively defaults omitted idle-only policy for a short schedule', async () => {
+    const dispatchCronSend = vi.fn();
+    __setCronSendDispatcherForTests(dispatchCronSend);
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockImplementation(async (name: string) => (
+      name === 'deck_myapp_brain' ? 'idle' : 'streaming'
+    ));
+
+    await executeCronJob({
+      ...makeSendMsg(),
+      cronExpr: '*/10 * * * *',
+      action: { ...makeSendMsg().action },
+    }, mockServerLink);
+
+    expect(dispatchCronSend).not.toHaveBeenCalled();
+    expect(mockServerLink.send).toHaveBeenLastCalledWith(expect.objectContaining({ status: 'skipped_busy' }));
+  });
+
+  it('lets explicit false override the short-schedule default', async () => {
+    const dispatchCronSend = vi.fn(async () => ({
+      dispatchId: 'send_dispatch_override',
+      status: 'dispatched' as const,
+      deliveries: [{ target: 'deck_myapp_w1', messageId: 'send_message_override', status: 'delivered' as const }],
+    }));
+    __setCronSendDispatcherForTests(dispatchCronSend);
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockImplementation(async (name: string) => (
+      name === 'deck_myapp_brain' ? 'idle' : 'streaming'
+    ));
+
+    await executeCronJob({
+      ...makeSendMsg(),
+      cronExpr: '*/10 * * * *',
+      action: { ...makeSendMsg().action, onlyWhenIdle: false },
+    }, mockServerLink);
+
+    expect(dispatchCronSend).toHaveBeenCalledTimes(1);
+  });
+
+  it('replays after a simulated daemon restart without duplicating an idempotent delivery', async () => {
+    const delivered = new Set<string>();
+    const dispatchCronSend = vi.fn(async (input: CronSendDispatchInput) => {
+      const key = input.idempotencyKey ?? '';
+      if (delivered.has(key)) {
+        return { dispatchId: 'send_dispatch_replay', status: 'dispatched' as const, deliveries: [] };
+      }
+      delivered.add(key);
+      return {
+        dispatchId: 'send_dispatch_once',
+        status: 'dispatched' as const,
+        deliveries: [{ target: 'deck_myapp_w1', messageId: 'send_message_once', status: 'delivered' as const }],
+      };
+    });
+    __setCronSendDispatcherForTests(dispatchCronSend);
+    const msg = { ...makeSendMsg(), action: { ...makeSendMsg().action, onlyWhenIdle: true } };
+
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValueOnce('streaming').mockResolvedValue('idle');
+    await executeCronJob(msg, mockServerLink); // busy occurrence is skipped
+    expect(dispatchCronSend).not.toHaveBeenCalled();
+
+    // Recreate the dispatcher as a fresh daemon process would, while retaining
+    // the durable idempotency key in the request contract.
+    __setCronSendDispatcherForTests(dispatchCronSend);
+    await executeCronJob(msg, mockServerLink);
+    await executeCronJob(msg, mockServerLink);
+    expect(dispatchCronSend).toHaveBeenCalledTimes(2);
+    expect(dispatchCronSend.mock.calls.map((call) => call[0].idempotencyKey)).toEqual(['idem-1', 'idem-1']);
+    expect(delivered).toEqual(new Set(['idem-1']));
+  });
+
+  it('preserves ordinary missing and stopped-recipient handling', async () => {
+    const dispatchCronSend = vi.fn(async () => ({
+      dispatchId: 'send_dispatch_boundary', status: 'dispatched' as const, deliveries: [],
+    }));
+    __setCronSendDispatcherForTests(dispatchCronSend);
+    (listSessions as ReturnType<typeof vi.fn>).mockReturnValue([makeSession()]);
+    await executeCronJob({ ...makeSendMsg(), action: { ...makeSendMsg().action, onlyWhenIdle: true } }, mockServerLink);
+    expect(dispatchCronSend).toHaveBeenCalledTimes(1);
+
+    (listSessions as ReturnType<typeof vi.fn>).mockReturnValue([
+      makeSession(), { ...makeSession(), name: 'deck_myapp_w1', role: 'w1', state: 'stopped' },
+    ]);
+    await executeCronJob({ ...makeSendMsg(), action: { ...makeSendMsg().action, onlyWhenIdle: true } }, mockServerLink);
+    expect(dispatchCronSend).toHaveBeenCalledTimes(2);
   });
 });

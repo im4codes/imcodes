@@ -43,6 +43,9 @@ function makeMockDb() {
         const job = cronJobs.get(params[0] as string);
         return job && job.user_id === params[1] ? job as T : null;
       }
+      if (s.includes('from cron_jobs where id')) {
+        return cronJobs.get(params[0] as string) as T ?? null;
+      }
       if (s.includes('from servers where id')) {
         return { user_id: 'user-1' } as T;
       }
@@ -77,6 +80,12 @@ function makeMockDb() {
           created_at: params[14],
           updated_at: params[14],
         });
+      }
+      if (s.includes('update cron_jobs set') && s.includes('action = $')) {
+        const actionParam = Number(s.match(/action = \$(\d+)/)?.[1] ?? 0) - 1;
+        const jobId = params.at(-1) as string;
+        const row = cronJobs.get(jobId);
+        if (row && actionParam >= 0) row.action = params[actionParam];
       }
       return { changes: 1 };
     },
@@ -245,6 +254,46 @@ describe('cron API structured send actions', () => {
       action: { type: 'p2p', topic: 'audit this', mode: 'review', participants: ['w1'] },
     }));
     expect(p2p.status).toBe(201);
+  });
+
+  it.each([
+    ['14-minute', '*/14 * * * *', true],
+    ['15-minute', '*/15 * * * *', true],
+    ['just-over-15-minute', '*/16 * * * *', false],
+  ])('normalizes omitted idle-only policy for %s structured sends', async (_label, cronExpr, expected) => {
+    const res = await app.request('/api/cron', jsonReq('POST', {
+      name: `Short ${_label}`,
+      cronExpr,
+      serverId: 'srv-1',
+      projectName: 'proj',
+      targetRole: 'brain',
+      action: { type: 'send', target: 'w1', message: 'review' },
+    }));
+    expect(res.status).toBe(201);
+    const body = await res.json() as { action: Record<string, unknown> };
+    expect(body.action.onlyWhenIdle).toBe(expected ? true : undefined);
+  });
+
+  it('preserves explicit overrides and normalizes a legacy omitted action on update', async () => {
+    const explicit = await app.request('/api/cron', jsonReq('POST', {
+      name: 'Explicit override', cronExpr: '*/16 * * * *', serverId: 'srv-1', projectName: 'proj', targetRole: 'brain',
+      action: { type: 'send', target: 'w1', message: 'review', onlyWhenIdle: false },
+    }));
+    expect(explicit.status).toBe(201);
+    const explicitRow = Array.from(dbState.cronJobs.values())[0]!;
+    const explicitUpdate = await app.request(`/api/cron/${explicitRow.id}`, jsonReq('PUT', { cronExpr: '*/14 * * * *' }));
+    expect(explicitUpdate.status).toBe(200);
+    expect(JSON.parse(String(explicitRow.action)).onlyWhenIdle).toBe(false);
+
+    const legacy = await app.request('/api/cron', jsonReq('POST', {
+      name: 'Legacy omitted', cronExpr: '*/16 * * * *', serverId: 'srv-1', projectName: 'proj', targetRole: 'brain',
+      action: { type: 'send', target: 'w1', message: 'review' },
+    }));
+    expect(legacy.status).toBe(201);
+    const legacyRow = Array.from(dbState.cronJobs.values()).find((row) => row.name === 'Legacy omitted')!;
+    const legacyUpdate = await app.request(`/api/cron/${legacyRow.id}`, jsonReq('PUT', { cronExpr: '*/14 * * * *' }));
+    expect(legacyUpdate.status).toBe(200);
+    expect(JSON.parse(String(legacyRow.action)).onlyWhenIdle).toBe(true);
   });
 
   it('rejects invalid structured send actions', async () => {

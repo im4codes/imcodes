@@ -1088,7 +1088,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       projectName: stringSchema('Optional caller project.'),
       targetRole: stringSchema('Optional source role; defaults to brain.'),
       targetSessionName: stringSchema('Optional source session used to resolve the sibling target.'),
-      action: { type: 'object', description: 'Send action: { type: "send", target, message, reply?, broadcast?, idempotencyKey?, onlyWhenIdle? }.', additionalProperties: true },
+      action: { type: 'object', description: 'Send action { type: "send", ... } with optional onlyWhenIdle; omitted defaults true for intervals <=15m.', additionalProperties: true },
       timezone: stringSchema('Optional cron timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
       completionPolicy: stringSchema('Optional lifecycle policy; defaults to recurring.', {
@@ -1116,7 +1116,7 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
       projectName: stringSchema('Optional caller project.'),
       targetRole: stringSchema('Optional source role.'),
       targetSessionName: stringSchema('Optional source session used to resolve the sibling target.'),
-      action: { type: 'object', description: 'Optional replacement send action; onlyWhenIdle skips an occurrence while recipients are busy.', additionalProperties: true },
+      action: { type: 'object', description: 'Optional send action; onlyWhenIdle skips busy recipients; omitted defaults true for intervals <=15m.', additionalProperties: true },
       timezone: stringSchema('Optional replacement timezone.'),
       expiresAt: stringSchema(`Optional epoch-ms or offset-ISO expiration, up to ${MEMORY_MCP_CAPS.CRON_EXPIRES_AT_MAX_DAYS} days ahead; stops future sends only.`),
       completionPolicy: stringSchema('Optional lifecycle policy.', {

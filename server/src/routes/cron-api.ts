@@ -17,6 +17,7 @@ import {
   CRON_STATUS,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
+  normalizeCronSendActionForInterval,
   registerCronControlAction,
   type CronAction,
 } from '../../../shared/cron-types.js';
@@ -461,7 +462,7 @@ function registerSelfManagedCronAction(
 }
 
 /** Validate cron expression and enforce minimum 5-minute interval. Returns next run time or error string. */
-function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number } | { error: string } {
+function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number; intervalMs: number | null } | { error: string } {
   try {
     const opts = timezone ? { timezone } : undefined;
     const job = new Cron(cronExpr, opts);
@@ -471,7 +472,10 @@ function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: num
     if (second && (second.getTime() - first.getTime()) < MIN_INTERVAL_MS) {
       return { error: 'cron_interval_too_short' };
     }
-    return { nextRunAt: first.getTime() };
+    return {
+      nextRunAt: first.getTime(),
+      intervalMs: second ? second.getTime() - first.getTime() : null,
+    };
   } catch {
     return { error: 'invalid_cron_expression' };
   }
@@ -548,7 +552,10 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
   if (!registeredAction.ok) {
     return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
   }
-  const persistedAction = registeredAction.action;
+  const persistedAction = normalizeCronSendActionForInterval(
+    registeredAction.action,
+    validation.intervalMs,
+  );
 
   await c.env.DB.execute(
     `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
@@ -626,6 +633,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
 
   // Re-validate cron expression if changed
   let nextRunAt: number | undefined;
+  let effectiveIntervalMs: number | null | undefined;
   const newCronExpr = updates.cronExpr;
   const effectiveTz = updates.timezone ?? job.timezone ?? undefined;
   const scheduleChanged = (newCronExpr !== undefined && newCronExpr !== job.cron_expr)
@@ -636,12 +644,29 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
       return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
     }
     nextRunAt = validation.nextRunAt;
+    effectiveIntervalMs = validation.intervalMs;
   }
 
   // Build dynamic UPDATE
   const sets: string[] = ['updated_at = $1'];
   const vals: unknown[] = [now];
   let idx = 2;
+
+  if (effectiveIntervalMs === undefined && (updates.action !== undefined || existingAction?.type === 'send')) {
+    const scheduleValidation = validateCronExpr(newCronExpr ?? job.cron_expr, effectiveTz);
+    if (!('error' in scheduleValidation)) effectiveIntervalMs = scheduleValidation.intervalMs;
+  }
+
+  // When an action is omitted, keep the existing action but still apply the
+  // schedule default to legacy rows that predate onlyWhenIdle. Explicit true
+  // and false values remain untouched by the shared normalizer.
+  if (updates.action === undefined && existingAction?.type === 'send') {
+    const normalizedExistingAction = normalizeCronSendActionForInterval(existingAction, effectiveIntervalMs);
+    if (normalizedExistingAction !== existingAction) {
+      sets.push(`action = $${idx++}`);
+      vals.push(JSON.stringify(normalizedExistingAction));
+    }
+  }
 
   if (updates.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(updates.name); }
   if (updates.cronExpr !== undefined) { sets.push(`cron_expr = $${idx++}`); vals.push(updates.cronExpr); }
@@ -658,8 +683,12 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
     if (!registeredAction.ok) {
       return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
     }
+    const normalizedAction = normalizeCronSendActionForInterval(
+      registeredAction.action,
+      effectiveIntervalMs,
+    );
     sets.push(`action = $${idx++}`);
-    vals.push(JSON.stringify(registeredAction.action));
+    vals.push(JSON.stringify(normalizedAction));
   }
   if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }

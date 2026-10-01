@@ -8,6 +8,7 @@ import {
   buildRegisteredCronSystemContract,
   buildLegacyCronControlBlock,
   normalizeCronExecutionDetail,
+  normalizeCronSendActionForInterval,
   registerCronControlAction,
   validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
@@ -44,6 +45,26 @@ describe('normalizeCronExecutionDetail', () => {
     expect(normalizeCronExecutionDetail(markdown)).toBe(markdown);
     expect(normalizeCronExecutionDetail(prefixShapedProse)).toBe(prefixShapedProse);
     expect(normalizeCronExecutionDetail(longerPrefixExample)).toBe(longerPrefixExample);
+  });
+});
+
+describe('cron idle-only schedule default', () => {
+  const send = { type: 'send', target: 'w1', message: 'review' } as const;
+
+  it.each([
+    ['14:59', 14 * 60_000 + 59_000, true],
+    ['15:00', 15 * 60_000, true],
+    ['15:01', 15 * 60_000 + 1_000, false],
+  ])('defaults omitted onlyWhenIdle at the %s boundary', (_label, intervalMs, expected) => {
+    expect(normalizeCronSendActionForInterval(send, intervalMs)).toMatchObject(
+      expected ? { onlyWhenIdle: true } : { type: 'send', target: 'w1', message: 'review' },
+    );
+    if (!expected) expect(normalizeCronSendActionForInterval(send, intervalMs)).not.toHaveProperty('onlyWhenIdle');
+  });
+
+  it('never overrides an explicit true or false choice', () => {
+    expect(normalizeCronSendActionForInterval({ ...send, onlyWhenIdle: true }, 16 * 60_000)).toMatchObject({ onlyWhenIdle: true });
+    expect(normalizeCronSendActionForInterval({ ...send, onlyWhenIdle: false }, 5 * 60_000)).toMatchObject({ onlyWhenIdle: false });
   });
 });
 

@@ -162,6 +162,23 @@ export interface CronSendAction extends MemoryMcpSourceProvenance {
   onlyWhenIdle?: boolean;
 }
 
+/**
+ * Short recurring sends default to idle-only delivery unless the caller made
+ * an explicit choice.  Keep this rule in shared code so server persistence and
+ * older daemons applying the defense-in-depth normalization agree.
+ */
+export const CRON_IDLE_ONLY_DEFAULT_MAX_INTERVAL_MS = 15 * 60 * 1000;
+
+export function normalizeCronSendActionForInterval(
+  action: CronAction,
+  intervalMs: number | null | undefined,
+): CronAction {
+  if (action.type !== 'send' || action.onlyWhenIdle !== undefined) return action;
+  if (typeof intervalMs !== 'number' || !Number.isFinite(intervalMs) || intervalMs <= 0
+    || intervalMs > CRON_IDLE_ONLY_DEFAULT_MAX_INTERVAL_MS) return action;
+  return { ...action, onlyWhenIdle: true };
+}
+
 export type CronAction = CronCommandAction | CronP2pAction | CronSendAction;
 
 export type CronControlValidationReason =
