@@ -1827,6 +1827,40 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
   });
 
+  it('does not replay an accepted append after SQLite finalization fails and the runtime rehydrates', async () => {
+    mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+    mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
+    runtime.send('foreground work', 'foreground-finalize-restart');
+    await flushDispatch();
+    expect(runtime.send('accepted before restart', 'queued-finalize-restart')).toBe('queued');
+    const store = getTransportQueueStore();
+    vi.spyOn(store, 'finalizeSentBatch').mockImplementation(() => {
+      throw new Error('sqlite unavailable during restart test');
+    });
+
+    await expect(runtime.appendPendingMessagesToActiveTurn(
+      ['queued-finalize-restart'],
+      'append-finalize-restart',
+    )).resolves.toMatchObject({
+      status: 'delivered',
+      queueSnapshot: { pendingMessageEntries: [], degraded: true },
+    });
+    expect(store.hasDeliveryTombstone('deck_test_brain', 'queued-finalize-restart')).toBe(true);
+    expect(mock.provider.notifyActiveDelegation).toHaveBeenCalledOnce();
+
+    // Reopen the same SQLite authority with a fresh runtime, exactly as a
+    // daemon restart would. The accepted provider message has a tombstone and
+    // must not return as a queued row or be delivered a second time.
+    const restartMock = makeMockProvider();
+    const restarted = new TransportSessionRuntime(restartMock.provider, 'deck_test_brain');
+    await restarted.initialize(defaultConfig);
+    expect(restarted.rehydratePendingFromStore()).toBe(0);
+    expect(restarted.pendingEntries).toEqual([]);
+    expect(restarted.drainPendingIfIdle('post-finalize-restart')).toBe(false);
+    expect(restartMock.provider.send).not.toHaveBeenCalled();
+    expect(store.readSnapshot('deck_test_brain').pendingMessageEntries).toEqual([]);
+  });
+
   it('restores the original FIFO before messages queued during a rejected append', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn(async () => {
@@ -6014,6 +6048,65 @@ ${PREFERENCE_CONTEXT_END}`;
       userMessage: 'queued after stale stop',
       assembledMessage: 'queued after stale stop',
     }));
+  });
+
+  it('keeps a current active snapshot blocking after STOP, then drains once a stale unattributed snapshot arrives', async () => {
+    let snapshot: {
+      status: 'current' | 'stale';
+      activeWorkCount: number;
+      activeToolCount: number;
+      busyReasons: string[];
+      generation?: { scope: 'session'; sessionName: string; generation: number };
+    } = {
+      status: 'current',
+      activeWorkCount: 0,
+      activeToolCount: 0,
+      busyReasons: [],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 1 },
+    };
+    (mock.provider as TransportProvider).getActiveWorkSnapshot = vi.fn(() => ({
+      ...snapshot,
+      updatedAt: Date.now(),
+    }));
+
+    runtime.send('foreground turn', 'msg-current-active');
+    await waitForProviderSendCount(mock.provider, 1);
+    snapshot = {
+      status: 'current',
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['provider_wait'],
+      generation: { scope: 'session', sessionName: 'deck_test_brain', generation: 2 },
+    };
+
+    await runtime.cancel();
+
+    // A STOP for generation 1 is not permission to ignore a genuinely current
+    // provider turn from generation 2. The new message must remain durable
+    // until that evidence changes.
+    expect(runtime.send('queued after stop', 'msg-current-blocked')).toBe('queued');
+    expect(runtime.drainPendingIfIdle('current-active-after-stop')).toBe(false);
+    expect(mock.provider.send).toHaveBeenCalledTimes(1);
+    expect(runtime.pendingEntries).toEqual([
+      { clientMessageId: 'msg-current-blocked', text: 'queued after stop' },
+    ]);
+
+    // The provider then reports the old generation as stale and cannot
+    // attribute it to the current runtime. This late snapshot must no longer
+    // pin the FIFO after local STOP, even though it still says activeWorkCount=1.
+    snapshot = {
+      status: 'stale',
+      activeWorkCount: 1,
+      activeToolCount: 0,
+      busyReasons: ['snapshot_stale'],
+    };
+    expect(runtime.drainPendingIfIdle('stale-unattributed-after-stop')).toBe(true);
+    await waitForProviderSendCount(mock.provider, 2);
+    expect(mock.provider.send).toHaveBeenNthCalledWith(2, 'sess-1', expect.objectContaining({
+      userMessage: 'queued after stop',
+      assembledMessage: 'queued after stop',
+    }));
+    expect(runtime.pendingCount).toBe(0);
   });
 
   it('does not let a locally stopped turn stale provider snapshot block a later send', async () => {
