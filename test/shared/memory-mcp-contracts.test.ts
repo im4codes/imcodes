@@ -99,6 +99,8 @@ describe('memory MCP shared contracts', () => {
       'send_list_targets',
       'pair_list',
       'pair_get',
+      'pair_create',
+      'pair_dispatch',
       'pair_set_max_concurrency',
       'pair_get_max_concurrency',
       'session_runtime_identity_get',
@@ -128,6 +130,17 @@ describe('memory MCP shared contracts', () => {
     ]);
     expect(Object.keys(MEMORY_MCP_TOOL_CONTRACTS).filter((name) => MEMORY_MCP_TOOL_NAME_LIST.includes(name as never)))
       .toEqual([...MEMORY_MCP_TOOL_NAME_LIST]);
+  });
+
+  it('publishes structured pair lifecycle schemas with assignment and replay fields', () => {
+    const create = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE].inputSchema;
+    const dispatch = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH].inputSchema;
+    expect(create.required).toEqual(['brief', 'executor']);
+    expect(Object.keys(create.properties ?? {})).toEqual(expect.arrayContaining([
+      'taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool', 'idempotencyKey',
+    ]));
+    expect(dispatch.required).toEqual(['taskId']);
+    expect(Object.keys(dispatch.properties ?? {})).toEqual(expect.arrayContaining(['taskId', 'idempotencyKey']));
   });
 
   it('keeps search as a text-query contract and send files as path references', () => {

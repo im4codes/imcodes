@@ -6,6 +6,8 @@ import type { McpRuntimeCaller } from '../../../src/daemon/memory-mcp-caller.js'
 import { createMemoryMcpToolHandlers } from '../../../src/daemon/memory-mcp-tools.js';
 import type { SessionRecord } from '../../../src/store/session-store.js';
 import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../../../src/daemon/task-pairs/store.js';
+import { removeSession, upsertSession } from '../../../src/store/session-store.js';
+import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 
 const PROJECT = 'pair-mcp-project';
 const BRAIN = 'deck_pair_mcp_brain';
@@ -107,4 +109,82 @@ describe('pair MCP projections', () => {
       status: 'error', reason: 'scope_forbidden', message: expect.stringContaining('current pair participant'),
     });
   });
+
+  it('creates a structured pair once and rejects stopped targets before persistence', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const brain = session(BRAIN, 'brain');
+    const exec = session(EXEC, 'w1');
+    const stopped = session('deck_sub_pair_mcp_stopped', 'w3', 'stopped');
+    upsertSession(brain); upsertSession(exec); upsertSession(stopped);
+    const sent: string[] = [];
+    setTaskPairDeliveryDepsForTests({ send: async (target) => { sent.push(target); } });
+    try {
+      const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [brain, exec, stopped] } });
+      const created = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        brief: '# Structured brief\n- [ ][ ] verify replay', executor: EXEC, auditor: 'none',
+        title: '结构化创建', idempotencyKey: 'create-once',
+      });
+      expect(created).toMatchObject({ status: 'ok', idempotentReplay: false, created: true, taskId: expect.any(String) });
+      const taskId = String(created.taskId);
+      expect(getTaskPairStore().getPair(PROJECT, taskId)?.state.brief).toContain('verify replay');
+      const replay = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+        brief: '# Structured brief\n- [ ][ ] verify replay', executor: EXEC, auditor: 'none', idempotencyKey: 'create-once',
+      });
+      expect(replay).toMatchObject({ status: 'ok', taskId, idempotentReplay: true, deliveries: [] });
+      const rejected = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: 'bad', executor: 'deck_sub_pair_mcp_stopped', auditor: 'none', idempotencyKey: 'stopped' });
+      expect(rejected).toMatchObject({ status: 'error', reason: 'control_plane_unavailable' });
+      expect(getTaskPairStore().listActivePairs().some((item) => item.state.executor === 'deck_sub_pair_mcp_stopped')).toBe(false);
+      expect(sent).not.toContain('deck_sub_pair_mcp_stopped');
+    } finally {
+      setTaskPairDeliveryDepsForTests(undefined);
+      removeSession(BRAIN); removeSession(EXEC); removeSession('deck_sub_pair_mcp_stopped');
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
+  it('dispatches an existing queued pair with a durable replay event', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const brain = session(BRAIN, 'brain');
+    const exec = session(EXEC, 'w1');
+    const aud = session(AUD, 'w2');
+    upsertSession(brain); upsertSession(exec); upsertSession(aud);
+    setTaskPairDeliveryDepsForTests({ send: async () => undefined });
+    const taskId = 'queued-structured-dispatch';
+    getTaskPairStore().savePair(PROJECT, { ...pair(taskId, 'queued'), brief: 'queued brief' });
+    try {
+      const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [brain, exec, aud] } });
+      const first = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]({ taskId, idempotencyKey: 'dispatch-once' });
+      expect(first).toMatchObject({ status: 'ok', taskId, idempotentReplay: false });
+      const second = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]({ taskId, idempotencyKey: 'dispatch-once' });
+      expect(second).toMatchObject({ status: 'ok', taskId, idempotentReplay: true, deliveries: [] });
+      expect(getTaskPairStore().listEvents(PROJECT, taskId).filter((event) => event.verb === 'PAIR_DISPATCH')).toHaveLength(1);
+    } finally {
+      setTaskPairDeliveryDepsForTests(undefined);
+      removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
+  it('queues a running target without interrupting its active turn', async () => {
+    const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
+    process.env.IMCODES_SUPERVISION_ENGINE = 'pairs';
+    const brain = session(BRAIN, 'brain');
+    const running = session(EXEC, 'w1', 'running');
+    upsertSession(brain); upsertSession(running);
+    try {
+      const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [brain, running] } });
+      const result = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({ brief: 'do not interrupt', executor: EXEC, auditor: 'none', idempotencyKey: 'busy-queue' });
+      expect(result).toMatchObject({ status: 'ok', state: 'queued' });
+      expect(getTaskPairStore().listActivePairs()[0]?.state.status).toBe('queued');
+    } finally {
+      removeSession(BRAIN); removeSession(EXEC);
+      if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
+      else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
+    }
+  });
+
 });

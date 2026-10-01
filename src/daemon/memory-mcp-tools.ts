@@ -1,11 +1,11 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
-import { projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
+import { projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
-import { taskPairRoleOf } from '../../shared/task-pair.js';
+import { isTerminalTaskPairStatus, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { lstat, readFile, realpath } from 'node:fs/promises';
@@ -1692,6 +1692,31 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       waitingReason: state.flags.includes('waiting_for_capacity') ? (state.capacityWaitReason ?? null) : null,
     };
   };
+  const deliverStructuredPairBriefs = async (project: string, taskId: string, requestEventId: string) => {
+    const store = getTaskPairStore();
+    if (store.getPair(project, taskId)?.state.status === 'queued') return [];
+    const prior = store.listEvents(project, taskId, 200)
+      .filter((event) => event.verb === TASK_PAIR_MCP_DELIVERY_EVENT && event.attrs.requestEventId === requestEventId);
+    const delivered = new Map(prior.map((event) => [event.attrs.role, event.attrs.status]));
+    const retryRoles = new Set<'executor' | 'auditor'>();
+    for (const role of ['executor', 'auditor'] as const) {
+      const status = delivered.get(role);
+      if (!status || (status !== 'sent' && status !== 'queued' && status !== 'skipped_pending')) retryRoles.add(role);
+    }
+    if (retryRoles.size === 0) return [];
+    const receipts = await taskPairService.briefParticipantsWithReceipts(project, taskId, retryRoles);
+    for (const receipt of receipts) {
+      store.recordEvent({
+        id: `${requestEventId}:delivery:${receipt.role}`,
+        project, taskId, writer: 'daemon', role: receipt.role,
+        verb: TASK_PAIR_MCP_DELIVERY_EVENT,
+        attrs: { requestEventId, role: receipt.role, target: receipt.target, status: receipt.status },
+        effect: receipt.status, unusual: receipt.status === 'failed' || receipt.status === 'no_session',
+        source: 'mcp', at: Date.now(),
+      });
+    }
+    return receipts;
+  };
   // Orchestrated path is the production wiring; the legacy `getMemorySources`
   // dep is retained for tests that only want to verify the local SQLite
   // branch without involving cache/cloud resolution.
@@ -2777,6 +2802,124 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
           events: getTaskPairStore().listEvents(context.project, taskId, eventLimit),
         },
       };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_create requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool', 'idempotencyKey']);
+      const executor = stringArg(args, 'executor');
+      const brief = stringArg(args, 'brief');
+      if (!executor || !brief) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'brief and executor are required');
+      const auditor = stringArg(args, 'auditor');
+      if (auditor === executor || executor === caller.sessionName || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && auditor === caller.sessionName)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'executor, auditor, and Brain must be distinct');
+      }
+      const idempotencyKey = stringArg(args, 'idempotencyKey');
+      const taskId = stringArg(args, 'taskId')
+        ?? taskPairService.mintTaskId(context.project, idempotencyKey ? `${caller.sessionName}\0${idempotencyKey}` : undefined);
+      const eventId = `mcp:pair-create:${context.project}:${idempotencyKey ?? taskId}`;
+      const store = getTaskPairStore();
+      if (store.hasEvent(eventId)) {
+        const replay = store.getPair(context.project, taskId);
+        if (!replay) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair create replay has no persisted pair');
+        const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
+        return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, deliveries };
+      }
+      if (store.getPair(context.project, taskId)) {
+        return error(MCP_ERROR_REASONS.REVISION_CONFLICT, 'taskId already belongs to a different persisted pair; use its existing lifecycle');
+      }
+      const byName = new Map(context.sessions.map((session) => [session.name, session]));
+      const executorRecord = byName.get(executor);
+      if (!executorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'executor session not found');
+      if (executorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'executor is outside the caller project');
+      if (executorRecord.state === 'stopped' || executorRecord.state === 'error') {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `executor is ${executorRecord.state}`);
+      }
+      if (auditor && auditor !== TASK_PAIR_NO_AUDITOR) {
+        const auditorRecord = byName.get(auditor);
+        if (!auditorRecord) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'auditor session not found');
+        if (auditorRecord.projectName !== context.project) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'auditor is outside the caller project');
+        if (auditorRecord.state === 'stopped' || auditorRecord.state === 'error') {
+          return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `auditor is ${auditorRecord.state}`);
+        }
+      }
+      const busyTarget = executorRecord.state === 'running'
+        || (auditor && auditor !== TASK_PAIR_NO_AUDITOR && byName.get(auditor)?.state === 'running');
+      const title = stringArg(args, 'title');
+      const executorModel = stringArg(args, 'executorModel');
+      const auditorModel = stringArg(args, 'auditorModel');
+      const executionPool = stringArg(args, 'executionPool') as 'primary' | 'economy' | undefined;
+      const transition = busyTarget
+        ? taskPairService.applyMarker({
+            project: context.project,
+            writer: caller.sessionName,
+            marker: {
+              verb: 'QUEUE', knownVerb: 'QUEUE', taskId,
+              attrs: {
+                executor,
+                ...(auditor ? { auditor } : {}),
+                ...(title ? { title } : {}),
+                ...(executorModel ? { executormodel: executorModel } : {}),
+                ...(auditorModel ? { auditormodel: auditorModel } : {}),
+                ...(executionPool ? { pool: executionPool } : {}),
+              },
+              brief,
+            },
+            source: 'mcp', eventId,
+          })
+        : taskPairService.implicitDispatch({
+            project: context.project,
+            sender: caller.sessionName,
+            target: executor,
+            taskId,
+            auditor,
+            title,
+            titleExplicit: args.title !== undefined,
+            executorModel,
+            auditorModel,
+            executionPool,
+            brief,
+            hasObjective: true,
+            eventId,
+            suppressAutomaticBrief: true,
+          });
+      const stored = store.getPair(context.project, taskId);
+      if (!transition || !stored) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair creation was not persisted');
+      const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
+      return { status: 'ok', taskId, idempotentReplay: false, created: transition.effect === 'created', state: stored.state.status, deliveries };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_dispatch requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['taskId', 'idempotencyKey']);
+      const taskId = stringArg(args, 'taskId');
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const store = getTaskPairStore();
+      const stored = store.getPair(context.project, taskId);
+      if (!stored || stored.state.brain !== caller.sessionName) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'queued task pair not found');
+      if (isTerminalTaskPairStatus(stored.state.status)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot dispatch terminal pair (${stored.state.status})`);
+      const idempotencyKey = stringArg(args, 'idempotencyKey');
+      const eventId = `mcp:pair-dispatch:${context.project}:${idempotencyKey ?? taskId}`;
+      if (store.hasEvent(eventId)) {
+        const replay = store.getPair(context.project, taskId);
+        if (!replay) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair dispatch replay has no persisted pair');
+        const deliveries = await deliverStructuredPairBriefs(context.project, taskId, eventId);
+        return { status: 'ok', taskId, idempotentReplay: true, state: replay.state.status, deliveries };
+      }
+      if (stored.state.status !== 'queued') return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair is not queued (${stored.state.status})`);
+      await taskPairAutomation.runQueue(context.project, caller.sessionName);
+      const after = store.getPair(context.project, taskId);
+      if (!after) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair disappeared during dispatch');
+      const role = taskPairRoleOf(after.state, caller.sessionName);
+      store.recordEvent({ id: eventId, project: context.project, taskId, writer: caller.sessionName, role, verb: TASK_PAIR_MCP_DISPATCH_EVENT, attrs: { idempotencyKey: idempotencyKey ?? taskId }, effect: 'dispatched', unusual: false, source: 'mcp', fromStatus: stored.state.status, toStatus: after.state.status, at: Date.now() });
+      const deliveries = after.state.status === 'queued' ? [] : await deliverStructuredPairBriefs(context.project, taskId, eventId);
+      return { status: 'ok', taskId, idempotentReplay: false, state: after.state.status, deliveries };
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: async (input) => {
       const context = await pairCallerContext();
@@ -4050,6 +4193,21 @@ const schemas = {
   [MEMORY_MCP_TOOL_NAMES.PAIR_GET]: z.object({
     taskId: z.string().min(1),
     eventLimit: z.number().int().min(1).max(200).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]: z.object({
+    taskId: z.string().trim().min(1).optional(),
+    title: z.string().trim().min(1).optional(),
+    brief: z.string().min(1),
+    executor: z.string().trim().min(1),
+    auditor: z.string().trim().min(1).optional(),
+    executorModel: z.string().trim().min(1).optional(),
+    auditorModel: z.string().trim().min(1).optional(),
+    executionPool: z.enum(['primary', 'economy']).optional(),
+    idempotencyKey: z.string().trim().min(1).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: z.object({
+    taskId: z.string().trim().min(1),
+    idempotencyKey: z.string().trim().min(1).optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: z.object({
     maxConcurrency: z.number().int().min(1).max(100).describe('Durable pair concurrency limit.'),

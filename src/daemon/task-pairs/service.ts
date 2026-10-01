@@ -59,7 +59,7 @@ import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared
 import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
-import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf } from './delivery.js';
+import { noteTaskPairFocus, sendTaskPairMessage, taskPairFocusOf, type TaskPairDeliveryResult } from './delivery.js';
 import { checkStaleBaseNotice } from './integration-drift.js';
 import { resolveTaskPairMaterial, verifyTaskPairRoundBase } from './material.js';
 import { formatPossibleSilentRevertWarning, inspectPossibleSilentRevert, isRewrittenHead } from './rebase-revert-guard.js';
@@ -146,6 +146,14 @@ export interface ApplyMarkerInput {
    * an auditor immediately, same as before.
    */
   suppressAutoPickAuditor?: boolean;
+  /** Structured MCP callers await delivery themselves so they can return receipts. */
+  suppressAutomaticBrief?: boolean;
+}
+
+export interface TaskPairBriefDelivery {
+  role: 'executor' | 'auditor';
+  target: string;
+  status: TaskPairDeliveryResult;
 }
 
 /** How long a DISPATCH suppressed by `suppressAutoPickAuditor` waits for a
@@ -831,7 +839,7 @@ export class TaskPairService {
     // A DISPATCH that landed on `queued` (no free slot/window right now, or a
     // brand new pair the queue drain has not resolved yet) has no participant
     // to brief -- the queue runner briefs it once it actually starts.
-    if (stored && input.source !== 'queue' && transition.toStatus !== 'queued'
+    if (stored && !input.suppressAutomaticBrief && input.source !== 'queue' && transition.toStatus !== 'queued'
       && ((input.marker.knownVerb === 'DISPATCH' && (transition.effect === 'created' || transition.effect === 'dispatched'))
         || (input.marker.knownVerb === 'REASSIGN' && !!input.marker.attrs.executor
           && (transition.effect === 'reassigned' || transition.effect === 'reassigned_auditor')))) {
@@ -839,7 +847,7 @@ export class TaskPairService {
     }
     // Brain's explicit marker can still start a queued pair by hand. It must end
     // up exactly like an admitted pair: workspace provisioned, brief delivered.
-    if (stored && input.source !== 'queue' && transition.fromStatus === 'queued'
+    if (stored && !input.suppressAutomaticBrief && input.source !== 'queue' && transition.fromStatus === 'queued'
       && transition.toStatus && transition.toStatus !== 'queued' && !isTerminalTaskPairStatus(transition.toStatus)) {
       this.#track(this.briefParticipants(input.project, stored.state.taskId));
     }
@@ -1053,6 +1061,9 @@ export class TaskPairService {
     message?: string;
     /** Owner rule (design D-pool-sync): a bound `task.requestedExecutionType.model` on the initial send_message dispatch, kept so a later automatic executor replacement still honors it instead of falling back to the allowlist. */
     executorModel?: string;
+    auditorModel?: string;
+    executionPool?: 'primary' | 'economy';
+    suppressAutomaticBrief?: boolean;
     /** True only for a send carrying real task metadata (task.objective).
      *  A pair minted for a plain send_message (no metadata) has none of the
      *  Brain's own task description -- see suppressAutoPickAuditor. */
@@ -1182,11 +1193,14 @@ export class TaskPairService {
           ...(input.auditor ? { auditor: input.auditor } : {}),
           ...(input.title ? { title: input.title } : {}),
           ...(input.executorModel ? { executormodel: input.executorModel } : {}),
+          ...(input.auditorModel ? { auditormodel: input.auditorModel } : {}),
+          ...(input.executionPool ? { pool: input.executionPool } : {}),
         },
         ...(input.brief ? { brief: input.brief } : {}),
       },
       source: 'implicit_dispatch',
       eventId: input.eventId,
+      suppressAutomaticBrief: input.suppressAutomaticBrief,
       // Only when named the auditor is applied immediately as before; a bare
       // dispatch with none holds the auto-pick for the grace window unless
       // this send itself carried a real objective (clearly new work, no
@@ -2179,16 +2193,36 @@ export class TaskPairService {
 
   /** Tell a pair's executor and auditor what the pair is and where the work lives. */
   async briefParticipants(project: string, taskId: string): Promise<void> {
+    await this.briefParticipantsWithReceipts(project, taskId);
+  }
+
+  /** Deliver the canonical pair briefs and expose per-participant outcomes to
+   * structured callers. Existing marker/scheduler callers continue to use the
+   * void wrapper above. */
+  async briefParticipantsWithReceipts(
+    project: string,
+    taskId: string,
+    roles?: ReadonlySet<TaskPairBriefDelivery['role']>,
+  ): Promise<TaskPairBriefDelivery[]> {
+    const deliveries: TaskPairBriefDelivery[] = [];
     try {
       const pair = await this.ensureWorkspace(project, taskId);
-      if (!pair) return;
-      if (pair.executor) await sendTaskPairMessage(pair.executor, pair.taskId, 'pair-brief', buildExecutorPairBrief(pair));
-      if (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) {
-        await sendTaskPairMessage(pair.auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(pair));
+      if (!pair) return deliveries;
+      if (pair.executor && (!roles || roles.has('executor'))) {
+        const status = await sendTaskPairMessage(pair.executor, pair.taskId, 'pair-brief', buildExecutorPairBrief(pair));
+        deliveries.push({ role: 'executor', target: pair.executor, status });
+      }
+      if (pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR && (!roles || roles.has('auditor'))) {
+        const status = await sendTaskPairMessage(pair.auditor, pair.taskId, 'auditor-assigned', buildAuditorAssignmentMessage(pair));
+        deliveries.push({ role: 'auditor', target: pair.auditor, status });
       }
     } catch (error) {
       logger.warn({ err: error, taskId }, 'task-pair: participant brief failed');
+      const state = getTaskPairStore().getPair(project, taskId)?.state;
+      if (state?.executor) deliveries.push({ role: 'executor', target: state.executor, status: 'failed' });
+      if (state?.auditor && state.auditor !== TASK_PAIR_NO_AUDITOR) deliveries.push({ role: 'auditor', target: state.auditor, status: 'failed' });
     }
+    return deliveries;
   }
 
   /**

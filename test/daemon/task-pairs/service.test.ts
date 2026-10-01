@@ -132,6 +132,28 @@ describe('task-pair marker ingestion', () => {
     expect(seen[0]?.payload).toMatchObject({ taskId: 'T1', verb: 'DISPATCH', toStatus: 'queued', role: 'brain', source: 'marker' });
   });
 
+  it('returns one delivery receipt per participant and does not auto-send before the structured caller awaits it', async () => {
+    const transition = service.implicitDispatch({
+      project: PROJECT,
+      sender: BRAIN,
+      target: EXEC,
+      taskId: 'structured-receipts',
+      auditor: AUD,
+      brief: 'A structured pair brief.',
+      hasObjective: true,
+      eventId: 'structured-receipts-create',
+      suppressAutomaticBrief: true,
+    });
+    expect(transition?.effect).toBe('created');
+    expect(sent).toHaveLength(0);
+    const deliveries = await service.briefParticipantsWithReceipts(PROJECT, 'structured-receipts');
+    expect(deliveries).toEqual([
+      { role: 'executor', target: EXEC, status: 'sent' },
+      { role: 'auditor', target: AUD, status: 'sent' },
+    ]);
+    expect(sent.map((item) => item.target)).toEqual([EXEC, AUD]);
+  });
+
   it('keeps named DISPATCH, REASSIGN, and implicit dispatch participants queued when another pair holds them', () => {
     // Keep this test at the service boundary: the real scheduler is covered
     // separately, while this proves every role-binding entry path supplies

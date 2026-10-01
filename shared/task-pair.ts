@@ -42,6 +42,9 @@ export const TASK_PAIR_BRAIN_CONTRACT_ID = 'task_pair_brain_v1' as const;
 export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; a single-box "- [ ]" item has no audit box; number items 1..N in brief order. The executor ticks each implemented box as soon as that item is done and all delivered items before READY_FOR_AUDIT; the auditor ticks each audited box when verified and all verified items before PASS; on REWORK the auditor unticks failed items and names their numbers. Tick only work really done or verified. Use pair_task_get/update/check or the CHECK marker to update the whole brief.';
 export const TASK_PAIR_RESOURCE_CLAIM_RULE = 'Before using a shared machine, directory, port range, or named test stack, claim it with pair_resource_claim or `<!-- IMCODES_TASK CLAIM <taskId> resource=... mode=exclusive|shared ttl=... -->`; renew before the TTL expires. Claims are user-scoped, conflict-checked, persisted across daemon restarts, and released on DONE/CANCEL. Never touch an unclaimed shared resource.';
 export const TASK_PAIR_CHECK_VERB = 'CHECK' as const;
+/** Durable event verb emitted by the structured MCP dispatch surface. */
+export const TASK_PAIR_MCP_DISPATCH_EVENT = 'PAIR_DISPATCH' as const;
+export const TASK_PAIR_MCP_DELIVERY_EVENT = 'PAIR_DELIVERY' as const;
 /** Brain-only: opens the next delivery round on a passed (not yet done) pair. */
 export const TASK_PAIR_NEXT_ROUND_VERB = 'NEXT_ROUND' as const;
 export const TASK_PAIR_CHECKLIST_AUTO_TICK_VERB = 'CHECKLIST_AUTO_TICK' as const;
