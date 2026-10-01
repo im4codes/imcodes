@@ -8,7 +8,7 @@ import { TaskPairService, type TaskPairScheduler } from '../../../src/daemon/tas
 import { resolveTaskPairEngine, resolveTaskPairEngineState, resolveTaskPairMaxConcurrency } from '../../../src/daemon/task-pairs/engine.js';
 import { normalizeSessionSupervisionSnapshot } from '../../../shared/supervision-config.js';
 import { dispatchSendMessage, clearSendIdempotencyCacheForTests } from '../../../src/daemon/send-tool.js';
-import { TASK_PAIR_TIMELINE_EVENT, taskPairBindingId } from '../../../shared/task-pair.js';
+import { TASK_PAIR_TERMINAL_FLUSH_FIELD, TASK_PAIR_TIMELINE_EVENT, taskPairBindingId } from '../../../shared/task-pair.js';
 import {
   DELEGATION_AUTHORITY_MCP_SERVER,
   DELEGATION_CLAIM_METADATA_FIELD,
@@ -563,6 +563,44 @@ describe('task-pair marker ingestion', () => {
     delete process.env.IMCODES_SUPERVISION_ENGINE;
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T4 executor=${EXEC} auditor=${AUD} -->`);
     expect(pair('T4')).toBeUndefined();
+  });
+
+  it('flushes a complete marker from an interrupted terminal stream, but not live chunks', async () => {
+    const marker = `<!-- IMCODES_TASK DISPATCH TSTREAM executor=${EXEC} auditor=${AUD} -->`;
+    const streamEventId = 'transport:pairsproj:stopped-stream';
+
+    // Live chunks are display-only and must never create a pair on their own.
+    timelineEmitter.emit(BRAIN, 'assistant.text', { text: marker, streaming: true }, {
+      source: 'daemon', confidence: 'high', eventId: streamEventId,
+    });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(pair('TSTREAM')).toBeUndefined();
+
+    // A stop/retry terminal replacement carries the last streamed text with an
+    // explicit flush flag. memoryExcluded still protects memory ingestion, but
+    // the pair protocol may safely inspect this one complete terminal snapshot.
+    await say(BRAIN, `${marker}\n\n⚠️ Turn cancelled`, {
+      memoryExcluded: true,
+      [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true,
+    }, streamEventId);
+    expect(pair('TSTREAM')).toMatchObject({ executor: EXEC, auditor: AUD });
+    const eventCountAfterFlush = getTaskPairStore().listEvents(PROJECT, 'TSTREAM').length;
+    expect(eventCountAfterFlush).toBeGreaterThan(0);
+
+    // Replaying the same terminal event is idempotent.
+    await say(BRAIN, `${marker}\n\n⚠️ Turn cancelled`, {
+      memoryExcluded: true,
+      [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true,
+    }, streamEventId);
+    expect(getTaskPairStore().listEvents(PROJECT, 'TSTREAM')).toHaveLength(eventCountAfterFlush);
+  });
+
+  it('does not flush fenced or partial markers from an interrupted stream', async () => {
+    const fenced = ['```', `<!-- IMCODES_TASK DISPATCH TFENCED executor=${EXEC} auditor=${AUD} -->`, '```'].join('\n');
+    await say(BRAIN, fenced, { memoryExcluded: true, [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true }, 'fenced-stop');
+    await say(BRAIN, '<!-- IMCODES_TASK DISPATCH TPARTIAL executor=', { memoryExcluded: true, [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true }, 'partial-stop');
+    expect(pair('TFENCED')).toBeUndefined();
+    expect(pair('TPARTIAL')).toBeUndefined();
   });
 
   it('keeps the turn flowing when the store fails', async () => {

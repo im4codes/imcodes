@@ -21,6 +21,10 @@ import { parseTaskPairChecklist, updateTaskPairChecklist } from './task-pair-che
 
 export const TASK_PAIR_CONTRACT_ID = 'task_pair_markers_v1' as const;
 export const TASK_PAIR_MARKER_TAG = 'IMCODES_TASK' as const;
+/** Payload flag set on a terminal provider event that contains the last
+ * streamed assistant text. Pair ingestion may inspect this text even when
+ * the event is memory-excluded (cancel/retry), but never inspects live chunks. */
+export const TASK_PAIR_TERMINAL_FLUSH_FIELD = 'taskPairTerminalFlush' as const;
 export const TASK_PAIR_BRIEF_END_TAG = 'IMCODES_TASK_END' as const;
 /** Timeline event carrying every applied or recorded marker event. */
 export const TASK_PAIR_TIMELINE_EVENT = 'task_pair.event' as const;

@@ -25,6 +25,7 @@ import {
 } from '../agent/transport-provider.js';
 import type { MessageDelta, AgentMessage, ToolCallEvent } from '../../shared/agent-message.js';
 import { readDelegationClaim } from '../../shared/delegation-claim.js';
+import { TASK_PAIR_TERMINAL_FLUSH_FIELD } from '../../shared/task-pair.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { resolveSessionName, isEphemeralProviderSid } from '../agent/session-manager.js';
 import { timelineEmitter } from './timeline-emitter.js';
@@ -571,6 +572,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
         // Cancelled output is deliberately interrupted — keep it out of memory,
         // but still display + persist it. (Display/replay are unaffected by this flag.)
         memoryExcluded: true,
+        [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true,
         providerErrorCode: error.code,
         providerErrorRecoverable: error.recoverable,
         ...(staleWatchdogRecovery ? {
@@ -587,6 +589,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           type: 'assistant.text',
           sessionId: sessionName,
           text: cancelledText,
+          [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true,
         });
       }
       if (staleWatchdogRecovery && !tracked?.text) {
@@ -609,6 +612,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
           text: tracked.text,
           streaming: false,
           memoryExcluded: true,
+          [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true,
           providerErrorCode: error.code,
           providerErrorRecoverable: true,
         }, {
@@ -631,6 +635,7 @@ export function wireProviderToRelay(provider: TransportProvider): void {
       streaming: false,
       providerErrorCode: error.code,
       providerErrorRecoverable: error.recoverable,
+      ...(tracked ? { [TASK_PAIR_TERMINAL_FLUSH_FIELD]: true } : {}),
       ...(!tracked?.text ? { memoryExcluded: true } : {}),
     }, {
       source: 'daemon',

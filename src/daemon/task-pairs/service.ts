@@ -12,6 +12,7 @@ import { isAbsolute, resolve as resolvePath } from 'node:path';
 import { SUPERVISION_ID_PREFIXES } from '../../../shared/supervision-durable-identity.js';
 import { timelineEmitter } from '../timeline-emitter.js';
 import type { TimelineEvent } from '../timeline-event.js';
+import { timelineStore } from '../timeline-store.js';
 import logger from '../../util/logger.js';
 import {
   TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS,
@@ -33,6 +34,7 @@ import {
   TASK_PAIR_WORKSPACE_REPAIR_STATUSES,
   TASK_PAIR_WORKSPACE_EVENT_VERB,
   TASK_PAIR_WORKSPACE_RETENTION_MS,
+  TASK_PAIR_TERMINAL_FLUSH_FIELD,
   isComplexSupervisionTaskBrief,
   applyTaskPairMarker,
   resolveTaskPairBrainWait,
@@ -418,6 +420,8 @@ function queueAuditRebaseWarning(project: string, pair: TaskPairState, material:
   })().catch((error) => logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: audit rebase advisory failed'));
 }
 
+let terminalStreamRecoveryStarted = false;
+
 export class TaskPairService {
   static readonly TITLE_REQUEST_RETRY_MS = 5 * 60_000;
   #titleRequestFlushes = new Map<string, Promise<void>>();
@@ -470,6 +474,13 @@ export class TaskPairService {
     if (this.#unsubscribe) return;
     // A daemon restarted mid-copy-back / mid-merge: roll back what was half done and run it again.
     this.#track(this.#resumeNonGitFinishes().catch((error: unknown) => logger.warn({ err: error }, 'task-pair: non-git finish resume failed')));
+    // A provider may have emitted a terminal replacement just before this
+    // daemon restarted. Re-scan only the recent, explicitly flagged terminal
+    // stream snapshots; live chunks and ordinary history are never parsed.
+    if (!terminalStreamRecoveryStarted) {
+      terminalStreamRecoveryStarted = true;
+      this.#track(this.#recoverTerminalStreamMarkers().catch((error: unknown) => logger.warn({ err: error }, 'task-pair: terminal stream recovery failed')));
+    }
     this.#unsubscribe = timelineEmitter.on((event) => {
       // Activity is stamped synchronously so a heartbeat cannot race a just
       // emitted message/tool event. Marker parsing remains deferred off the
@@ -502,6 +513,29 @@ export class TaskPairService {
         });
       }
     });
+  }
+
+  async #recoverTerminalStreamMarkers(): Promise<void> {
+    const cutoff = Date.now() - 15 * 60_000;
+    const sessions = listSessions();
+    for (const session of sessions) {
+      const project = projectOfSession(session.name);
+      if (!project || !isPairsEngineProject(project)) continue;
+      let events: TimelineEvent[];
+      try {
+        events = await timelineStore.readCompletedTextTail(session.name, 50);
+      } catch {
+        // Projection startup can lag daemon startup; the JSONL reader is a
+        // bounded fallback and preserves the same explicit-flag filter.
+        events = timelineStore.read(session.name, { limit: 50 });
+      }
+      for (const event of events) {
+        if (event.type !== 'assistant.text' || event.ts < cutoff) continue;
+        const payload = event.payload as Record<string, unknown>;
+        if (payload[TASK_PAIR_TERMINAL_FLUSH_FIELD] !== true) continue;
+        this.handleTimelineEvent(event);
+      }
+    }
   }
 
   /** Unsubscribes first (no new background work starts), then drains whatever was already in flight. */
@@ -570,7 +604,8 @@ export class TaskPairService {
   handleTimelineEvent(event: TimelineEvent): void {
     if (event.type !== 'assistant.text') return;
     const payload = event.payload as Record<string, unknown>;
-    if (payload.streaming === true || payload.automation === true || payload.memoryExcluded === true) return;
+    const terminalFlush = payload[TASK_PAIR_TERMINAL_FLUSH_FIELD] === true;
+    if (payload.streaming === true || ((payload.automation === true || payload.memoryExcluded === true) && !terminalFlush)) return;
     const text = typeof payload.text === 'string' ? payload.text : '';
     const writer = event.sessionId;
     const project = projectOfSession(writer);

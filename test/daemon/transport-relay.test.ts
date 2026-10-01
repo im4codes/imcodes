@@ -1031,6 +1031,7 @@ describe('transport-relay (timeline-emitter based)', () => {
       const texts = emitMock.mock.calls.filter(c => c[1] === 'assistant.text');
       expect(texts).toHaveLength(1);
       expect(texts[0]![2]).toMatchObject({ text: 'partial output', streaming: false, memoryExcluded: true });
+      expect(texts[0]![2].taskPairTerminalFlush).toBe(true);
       expect(texts[0]![2].text).not.toContain('Error');
       expect(appendMock.mock.calls.filter(c => c[1]?.type === 'session.error')).toHaveLength(0);
     });
@@ -1087,6 +1088,7 @@ describe('transport-relay (timeline-emitter based)', () => {
         text: 'partial before stop\n\n⚠️ Turn cancelled',
         streaming: false,
         memoryExcluded: true,
+        taskPairTerminalFlush: true,
       });
       // A clean cancel must NOT emit a session error state.
       expect(emitMock.mock.calls.some(c => c[1] === 'session.state')).toBe(false);
