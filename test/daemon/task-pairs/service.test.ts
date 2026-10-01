@@ -522,6 +522,77 @@ describe('task-pair marker ingestion', () => {
     expect(sends.find((event) => event.effect === 'relay_suppressed')?.unusual).toBe(false);
   });
 
+  it.each([
+    ['PASS → DONE → SEND', true],
+    ['PASS → SEND → DONE', false],
+  ] as const)('records a late executor validation SEND after %s without reopening or executing the pair', async (_order, sendAfterDone) => {
+    const taskId = sendAfterDone ? 'late-send-after-done' : 'late-send-before-done';
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, `Validation report for ${taskId}.\n<!-- IMCODES_TASK READY_FOR_AUDIT ${taskId} worktree=/tmp/${taskId} head=head-${taskId} base=base-${taskId} -->`);
+    await say(AUD, `<!-- IMCODES_TASK PASS ${taskId} blocking=P0 -->`);
+
+    const report = `Validation passed for ${taskId}: focused suite 4/4; no failures.`;
+    if (sendAfterDone) {
+      await say(EXEC, `Committed exact head.\n<!-- IMCODES_TASK DONE ${taskId} -->`);
+      expect(pair(taskId)?.status).toBe('done');
+    }
+
+    const first = service.implicitDispatch({
+      project: PROJECT,
+      sender: EXEC,
+      target: BRAIN,
+      taskId,
+      message: report,
+      eventId: `${taskId}-send-1`,
+    });
+    expect(first).toMatchObject({ effect: 'recorded', unusual: true });
+    expect(pair(taskId)?.status).toBe(sendAfterDone ? 'done' : 'passed');
+
+    if (!sendAfterDone) {
+      await say(EXEC, `Committed exact head.\n<!-- IMCODES_TASK DONE ${taskId} -->`);
+      expect(pair(taskId)?.status).toBe('done');
+    }
+
+    // Replaying the same SEND event id is idempotent: the event ledger keeps
+    // one trace and the terminal pair remains terminal.
+    const duplicate = service.implicitDispatch({
+      project: PROJECT,
+      sender: EXEC,
+      target: BRAIN,
+      taskId,
+      message: report,
+      eventId: `${taskId}-send-1`,
+    });
+    expect(duplicate).toMatchObject({ effect: 'recorded', unusual: true });
+    expect(pair(taskId)?.status).toBe('done');
+    const sends = getTaskPairStore().listEvents(PROJECT, taskId).filter((event) => event.verb === 'SEND');
+    expect(sends).toHaveLength(1);
+    expect(sends[0]).toMatchObject({
+      id: `${taskId}-send-1`,
+      writer: EXEC,
+      unusual: true,
+      fromStatus: sendAfterDone ? 'done' : 'passed',
+      toStatus: sendAfterDone ? 'done' : 'passed',
+      attrs: { target: BRAIN, report: 'true' },
+    });
+
+    // An unknown/non-participant writer is still recorded for auditability,
+    // but cannot wake or reopen a terminal pair.
+    const unknown = service.implicitDispatch({
+      project: PROJECT,
+      sender: PROC,
+      target: BRAIN,
+      taskId,
+      message: 'Validation result copied from an unrelated session.',
+      eventId: `${taskId}-send-unknown`,
+    });
+    expect(unknown).toMatchObject({ effect: 'recorded', unusual: true });
+    expect(pair(taskId)?.status).toBe('done');
+    expect(getTaskPairStore().listEvents(PROJECT, taskId).find((event) => event.id === `${taskId}-send-unknown`)).toMatchObject({
+      role: 'other', unusual: true, fromStatus: 'done', toStatus: 'done',
+    });
+  });
+
   it('tells Brain once when an audited pair PASSes, with the verdict and material, and does not repeat it on DONE', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T63 executor=${EXEC} auditor=${AUD} -->`);
     await say(EXEC, 'Ready.\n<!-- IMCODES_TASK READY_FOR_AUDIT T63 worktree=/tmp/wt63 head=abc1234 base=def5678 -->');
