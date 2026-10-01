@@ -468,13 +468,29 @@ function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: num
     const job = new Cron(cronExpr, opts);
     const first = job.nextRun();
     if (!first) return { error: 'invalid_cron_expression' };
-    const second = job.nextRun(first);
-    if (second && (second.getTime() - first.getTime()) < MIN_INTERVAL_MS) {
+    // Cron step expressions (for example */14) have a short boundary gap
+    // when the step does not divide the hour (56 -> 00 is 4 minutes). Looking
+    // only at the next two occurrences makes validity and the idle-only
+    // default depend on the wall-clock minute at which the request arrives.
+    // Sample a bounded horizon and use the largest observed interval as the
+    // schedule's stable cadence; this preserves the intended nominal period
+    // while still rejecting genuinely sub-five-minute schedules (*/1, */4).
+    const occurrences = [first];
+    let cursor = first;
+    for (let i = 0; i < 7; i++) {
+      const next = job.nextRun(cursor);
+      if (!next) break;
+      occurrences.push(next);
+      cursor = next;
+    }
+    const intervals = occurrences.slice(1).map((next, index) => next.getTime() - occurrences[index]!.getTime());
+    const intervalMs = intervals.length > 0 ? Math.max(...intervals) : null;
+    if (intervalMs !== null && intervalMs < MIN_INTERVAL_MS) {
       return { error: 'cron_interval_too_short' };
     }
     return {
       nextRunAt: first.getTime(),
-      intervalMs: second ? second.getTime() - first.getTime() : null,
+      intervalMs,
     };
   } catch {
     return { error: 'invalid_cron_expression' };

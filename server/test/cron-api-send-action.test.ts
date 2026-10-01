@@ -274,6 +274,27 @@ describe('cron API structured send actions', () => {
     expect(body.action.onlyWhenIdle).toBe(expected ? true : undefined);
   });
 
+  it('keeps a step schedule stable at an hour boundary', async () => {
+    // */14 has a 4-minute boundary gap (56 -> 00). The nominal cadence is
+    // still 14 minutes and must not make the result depend on request time.
+    vi.useFakeTimers({ now: new Date('2026-10-01T14:49:00.000Z') });
+    try {
+      const res = await app.request('/api/cron', jsonReq('POST', {
+        name: 'Boundary-safe short send',
+        cronExpr: '*/14 * * * *',
+        serverId: 'srv-1',
+        projectName: 'proj',
+        targetRole: 'brain',
+        action: { type: 'send', target: 'w1', message: 'review' },
+      }));
+      expect(res.status).toBe(201);
+      const body = await res.json() as { action: Record<string, unknown> };
+      expect(body.action.onlyWhenIdle).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('preserves explicit overrides and normalizes a legacy omitted action on update', async () => {
     const explicit = await app.request('/api/cron', jsonReq('POST', {
       name: 'Explicit override', cronExpr: '*/16 * * * *', serverId: 'srv-1', projectName: 'proj', targetRole: 'brain',
