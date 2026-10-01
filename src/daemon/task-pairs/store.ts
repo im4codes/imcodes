@@ -47,6 +47,10 @@ export interface TaskPairLiveness {
   activityAuditorAt?: number;
   /** Last time the fast both-idle check (scheduler.ts) sent a nudge; dedupes against the ordinary heartbeat tick's own check of the same idle spell. */
   bothIdleNudgedAt?: number;
+  /** Number of both-idle fast nudges in the current idle spell.  This durable
+   * watermark survives an activity timestamp rewrite/race, so a fast poll
+   * cannot reopen the same spell every threshold interval. */
+  bothIdleNudgeCount?: number;
   /** Durable Brain reminder state; survives daemon restart and retries while busy. */
   brainWaitKey?: string;
   brainWaitStartedAt?: number;
@@ -707,6 +711,7 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     activityExecutorAt: Number(raw.activityExecutorAt ?? progressExecutorAt),
     activityAuditorAt: Number(raw.activityAuditorAt ?? progressAuditorAt),
     ...(Number.isFinite(Number(raw.bothIdleNudgedAt)) ? { bothIdleNudgedAt: Number(raw.bothIdleNudgedAt) } : {}),
+    ...(Number.isFinite(Number(raw.bothIdleNudgeCount)) ? { bothIdleNudgeCount: Number(raw.bothIdleNudgeCount) } : {}),
     ...(typeof raw.brainWaitKey === 'string' ? { brainWaitKey: raw.brainWaitKey } : {}),
     ...(Number.isFinite(Number(raw.brainWaitStartedAt)) ? { brainWaitStartedAt: Number(raw.brainWaitStartedAt) } : {}),
     ...(Number.isFinite(Number(raw.brainReminderCount)) ? { brainReminderCount: Number(raw.brainReminderCount) } : {}),

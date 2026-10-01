@@ -567,6 +567,33 @@ describe('task-pair heartbeat, replacement and queue', () => {
       expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
     });
 
+    it('keeps fast idle nudges bounded across a long quiet window', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST_BOUND executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      // Two hours of 30-second polls must not produce one nudge per threshold
+      // interval. The fast path is one nudge per idle spell; the regular
+      // heartbeat still owns the existing silence-limit escalation.
+      await bothIdleCheck(240);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+      expect(getTaskPairStore().listEvents(PROJECT, 'FAST_BOUND').filter((event) => event.verb === 'NUDGE' && event.effect === 'sent')).toHaveLength(1);
+    });
+
+    it('does not treat an automation response as participant activity that reopens the idle spell', async () => {
+      marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST_AUTOMATION executor=${EXEC} auditor=${AUD} -->`);
+      await flush();
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sentTo(EXEC, 'nudge-executor')).toHaveLength(1);
+
+      const activityBeforeAutomation = getTaskPairStore().getPair(PROJECT, 'FAST_AUTOMATION')!.liveness.activityExecutorAt;
+      taskPairService.recordActivity(EXEC, now, { automation: true });
+      expect(getTaskPairStore().getPair(PROJECT, 'FAST_AUTOMATION')!.liveness.activityExecutorAt).toBe(activityBeforeAutomation);
+      sent = [];
+      await bothIdleCheck(4);
+      expect(sent).toHaveLength(0);
+    });
+
     it("nudges the auditor when it is clearly the auditor's turn (in_audit, material delivered)", async () => {
       marker(BRAIN, `<!-- IMCODES_TASK DISPATCH FAST2 executor=${EXEC} auditor=${AUD} -->`);
       marker(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT FAST2 -->');

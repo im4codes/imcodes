@@ -1409,11 +1409,15 @@ export class TaskPairAutomation implements TaskPairScheduler {
       this.#recordLivenessDecision(stored, 'NUDGE', 'skipped', 'participant_held', now);
       return false;
     }
-    // The fast trigger fires once per uninterrupted idle spell. A later
-    // ordinary heartbeat remains responsible for its normal silence cadence.
+    // The fast trigger fires once per uninterrupted idle spell. Keep a
+    // durable count as well as the timestamp: an activity/liveness rewrite
+    // racing this check must not turn the same idle spell into an unbounded
+    // stream of threshold-paced nudges. The ordinary heartbeat remains
+    // responsible for its normal silence cadence and escalation.
     // Equality is a valid re-arm boundary: activity can share the same
     // millisecond as the nudge. Activity normally clears this marker, while
     // the strict comparison is an additional safe guard for older records.
+    if ((liveness.bothIdleNudgeCount ?? 0) > 0) return false;
     if (liveness.bothIdleNudgedAt !== undefined && liveness.bothIdleNudgedAt > idleSince) return false;
     return this.#nudgeBothIdleTarget(stored.project, pair, liveness, now);
   }
@@ -1479,6 +1483,7 @@ export class TaskPairAutomation implements TaskPairScheduler {
       ...liveness,
       notified: [...liveness.notified],
       bothIdleNudgedAt: now,
+      bothIdleNudgeCount: (liveness.bothIdleNudgeCount ?? 0) + 1,
       lastNudgedAt: now,
       ...(target === 'executor' ? { silenceExecutor: silence } : { silenceAuditor: silence }),
     };

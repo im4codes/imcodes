@@ -482,11 +482,17 @@ export class TaskPairService {
         if (event.type === 'tool.call') {
           try { inspectToolCallForPairMainCheckoutWrite(event.sessionId, event.payload); } catch (error) { logger.warn({ err: error, session: event.sessionId }, 'task-pair: main-checkout write check failed'); }
         }
-        if (!(event.type === 'user.message' && (event.payload as Record<string, unknown>).automation === true)) {
-          this.recordActivity(event.sessionId, event.ts ?? Date.now());
-        }
+        this.recordActivity(event.sessionId, event.ts ?? Date.now(), {
+          automation: (event.payload as Record<string, unknown>).automation === true,
+        });
       } else if (event.type === 'assistant.text') {
-        this.recordActivity(event.sessionId, event.ts ?? Date.now());
+        // Daemon-authored automation (including task-pair delivery and
+        // recovery notices) is not participant progress. Counting it as
+        // activity re-arms the both-idle fast poll and can create a new nudge
+        // every threshold interval while both participants remain silent.
+        this.recordActivity(event.sessionId, event.ts ?? Date.now(), {
+          automation: (event.payload as Record<string, unknown>).automation === true,
+        });
         setImmediate(() => {
           try {
             this.handleTimelineEvent(event);
@@ -1224,7 +1230,8 @@ export class TaskPairService {
   }
 
   /** Record non-marker activity for every open pair the participant owns. */
-  recordActivity(writer: string, now: number): void {
+  recordActivity(writer: string, now: number, options: { automation?: boolean } = {}): void {
+    if (options.automation === true) return;
     // Runs for every tool event, user message and streamed delta of every
     // session: pairsForSession is an in-memory lookup and #stampActivity only
     // hits SQLite when something beyond an activity timestamp changed or the
@@ -1262,12 +1269,14 @@ export class TaskPairService {
       liveness.executorEscalationReminderCount = 0;
       liveness.executorEscalationLastAt = undefined;
       liveness.bothIdleNudgedAt = undefined;
+      liveness.bothIdleNudgeCount = undefined;
     }
     if (pair.state.auditor === writer) {
       liveness.progressAuditorAt = now;
       liveness.activityAuditorAt = now;
       liveness.silenceAuditor = 0;
       liveness.bothIdleNudgedAt = undefined;
+      liveness.bothIdleNudgeCount = undefined;
     }
     const nextState = pair.state.executor === writer && pair.state.flags.includes('executor_silent')
       ? { ...pair.state, flags: pair.state.flags.filter((flag) => flag !== 'executor_silent'), updatedAt: now }
@@ -1305,11 +1314,13 @@ export class TaskPairService {
       liveness.executorEscalationReminderCount = 0;
       liveness.executorEscalationLastAt = undefined;
       liveness.bothIdleNudgedAt = undefined;
+      liveness.bothIdleNudgeCount = undefined;
     }
     if (pair.state.auditor === writer) {
       liveness.activityAuditorAt = now;
       liveness.silenceAuditor = 0;
       liveness.bothIdleNudgedAt = undefined;
+      liveness.bothIdleNudgeCount = undefined;
     }
     // Clearing executor_silent is a state change: persist it immediately.
     // Plain activity timestamps go through the throttled stamp path.
@@ -1376,6 +1387,7 @@ export class TaskPairService {
       next.brainReminderLastAt = undefined;
     }
     next.bothIdleNudgedAt = undefined;
+    next.bothIdleNudgeCount = undefined;
     // A finished pair that is worked on again is no longer "integrated" or reminded about: its next DONE starts over.
     if (transition.toStatus !== undefined && transition.toStatus !== 'done') {
       next.integrationKey = undefined;
