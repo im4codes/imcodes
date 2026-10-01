@@ -148,6 +148,7 @@ describe('cron API structured send actions', () => {
         message: 'please review this',
         reply: true,
         idempotencyKey: 'idem-1',
+        onlyWhenIdle: true,
         [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SESSION_NAME]: 'deck_sub_scheduler',
         [MEMORY_MCP_SOURCE_FIELDS.SOURCE_PROJECT_NAME]: 'proj',
         [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SERVER_ID]: 'srv-1',
@@ -162,6 +163,7 @@ describe('cron API structured send actions', () => {
       message: 'please review this',
       reply: true,
       idempotencyKey: 'idem-1',
+      onlyWhenIdle: true,
     });
   });
 

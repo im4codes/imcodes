@@ -90,6 +90,7 @@ const cronActionSchemaRaw = z.discriminatedUnion('type', [
     reply: z.boolean().optional(),
     broadcast: z.boolean().optional(),
     idempotencyKey: z.string().min(1).optional(),
+    onlyWhenIdle: z.boolean().optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SESSION_NAME]: z.string().regex(sourceSessionNamePattern).optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_PROJECT_NAME]: z.string().min(1).max(64).optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SERVER_ID]: z.string().min(1).max(128).optional(),

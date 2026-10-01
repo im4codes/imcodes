@@ -13,7 +13,7 @@ import {
   validateRegisteredCronControlAction,
 } from '../../shared/cron-types.js';
 import { isRawCommandSessionAgentType } from '../../shared/agent-types.js';
-import { getSession } from '../store/session-store.js';
+import { getSession, listSessions, type SessionRecord } from '../store/session-store.js';
 import {
   ensureTransportRuntimeAvailable,
   getTransportRuntime,
@@ -27,6 +27,7 @@ import type { TimelineEvent } from './timeline-event.js';
 import type { ServerLink } from './server-link.js';
 import logger from '../util/logger.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { authorizedDelegationCandidates } from './delegation-admission.js';
 
 /** Default retry budget when daemon admission returns `daemon_busy`. */
 const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
@@ -55,6 +56,59 @@ export interface CronSendDispatchResult {
     status?: 'delivered' | 'failed';
     error?: string;
   }>;
+}
+
+/** Resolve the same ordinary sibling spellings accepted by structured sends. */
+function resolveCronSendRecipients(
+  action: Extract<CronDispatchMessage['action'], { type: 'send' }>,
+  projectName: string,
+  sourceSessionName: string,
+): SessionRecord[] {
+  const sessions = listSessions();
+  const siblings = authorizedDelegationCandidates({
+    userId: 'cron',
+    sessionName: sourceSessionName,
+    projectName,
+    projectRoot: null,
+  }, sessions);
+  if (action.broadcast) {
+    return siblings;
+  }
+  const target = action.target.trim();
+  const exactRole = /^(brain|w\d+)$/.test(target) ? sessionName(projectName, target as 'brain' | `w${number}`) : target;
+  const matches = siblings.filter((session) => (
+    session.name === exactRole
+    || session.label?.toLowerCase() === target.toLowerCase()
+    || session.agentType === target
+  ));
+  return matches.length === 1 ? matches : [];
+}
+
+/** Return a recipient that is not idle, or null when all recipients are idle. */
+async function findBusyCronSendRecipient(
+  action: Extract<CronDispatchMessage['action'], { type: 'send' }>,
+  projectName: string,
+  sourceSessionName: string,
+): Promise<{ sessionName: string; status: string } | null> {
+  const recipients = resolveCronSendRecipients(action, projectName, sourceSessionName);
+  for (const recipient of recipients) {
+    if (recipient.state === 'stopped') continue;
+    if (recipient.runtimeType === 'transport') {
+      const runtime = getTransportRuntime(recipient.name);
+      const status = runtime?.getStatus();
+      if (status && status !== 'idle') return { sessionName: recipient.name, status };
+      continue;
+    }
+    try {
+      const status = await detectStatusAsync(recipient.name, recipient.agentType as AgentType);
+      if (BUSY_STATES.has(status)) return { sessionName: recipient.name, status };
+    } catch (err) {
+      // A failed probe must retain ordinary send behavior rather than turn a
+      // transient tmux error into a dropped occurrence.
+      logger.warn({ sessionName: recipient.name, err }, 'Cron: idle-only recipient status detection failed, proceeding');
+    }
+  }
+  return null;
 }
 
 type CronSendDispatcher = (input: CronSendDispatchInput) => Promise<CronSendDispatchResult>;
@@ -289,6 +343,20 @@ export async function executeCronJob(msg: CronDispatchMessage, serverLink: Serve
   }
 
   if (action.type === 'send') {
+    if (action.onlyWhenIdle === true) {
+      const busyRecipient = await findBusyCronSendRecipient(action, projectName, name);
+      if (busyRecipient) {
+        logger.info({ jobId, sessionName: busyRecipient.sessionName, status: busyRecipient.status }, 'Cron: idle-only recipient busy, skipping');
+        sendCommandResult(serverLink, {
+          type: CRON_MSG.COMMAND_RESULT,
+          jobId,
+          executionId,
+          status: 'skipped_busy',
+          detail: `Cron idle-only recipient is busy: ${busyRecipient.sessionName} (${busyRecipient.status})`,
+        });
+        return;
+      }
+    }
     logger.info({ jobId, jobName, sessionName: name, target: action.target }, 'Cron: dispatching structured send action');
     try {
       const dispatchCronSend = await loadCronSendDispatcher();

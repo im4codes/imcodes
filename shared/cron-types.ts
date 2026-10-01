@@ -158,6 +158,8 @@ export interface CronSendAction extends MemoryMcpSourceProvenance {
   reply?: boolean;
   broadcast?: boolean;
   idempotencyKey?: string;
+  /** Skip this occurrence when any resolved recipient is currently busy. */
+  onlyWhenIdle?: boolean;
 }
 
 export type CronAction = CronCommandAction | CronP2pAction | CronSendAction;

@@ -89,6 +89,25 @@ describe('jobDispatchCron', () => {
     expect(sent.action).toEqual({ type: 'command', command: 'hello' });
   });
 
+  it('persists idle-only structured sends and advances recurring occurrence for the next retry', async () => {
+    dbRows.push({
+      id: 'idle-only', server_id: 's1', user_id: 'u1', name: 'Idle-only send',
+      cron_expr: '*/10 * * * *',
+      action: JSON.stringify({ type: 'send', target: 'w1', message: 'review', onlyWhenIdle: true }),
+      project_name: 'myapp', target_role: 'brain', status: 'active',
+      timezone: 'Asia/Shanghai', last_run_at: null, next_run_at: Date.now() - 1000,
+      expires_at: null, created_at: Date.now(), updated_at: null,
+    });
+
+    await jobDispatchCron(mockEnv);
+
+    const sent = JSON.parse(mockSendToDaemon.mock.calls[0][0]) as CronDispatchMessage;
+    expect(sent.action).toEqual({ type: 'send', target: 'w1', message: 'review', onlyWhenIdle: true });
+    const nextRunUpdate = dbExecutes.find((entry) => entry.sql.includes('next_run_at'));
+    expect(nextRunUpdate).toBeDefined();
+    expect(nextRunUpdate?.params.some((value) => typeof value === 'number' && value > Date.now() - 1000)).toBe(true);
+  });
+
   it('durably migrates a legacy self-managed row before dispatching its registered contract', async () => {
     const legacyCommand = `Inspect progress\n\n${buildLegacyCronControlBlock(
       'legacy-self',
