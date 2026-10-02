@@ -1004,7 +1004,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // provider has started/accepted the send (or emitted side-effect
         // evidence), the outcome is ambiguous and the handoff must be
         // terminalized rather than released back into the durable queue.
-        const capacityRetryEligible = this.canRetryBeforeProviderBoundary()
+        const capacityRetryEligible = this.canRetryBeforeProviderBoundary(error)
           && this.willRetryAsCapacity(error);
         // A capacity failure that is about to be retried logs at debug: the episode start (warn) and the periodic count carry it.
         (capacityRetryEligible ? logger.debug : logger.warn).call(
@@ -4035,7 +4035,19 @@ export class TransportSessionRuntime implements SessionRuntime {
    * to redeliver an old message.  Keep this predicate centralized so callback
    * and promise-rejection paths cannot drift apart.
    */
-  private canRetryBeforeProviderBoundary(): boolean {
+  private canRetryBeforeProviderBoundary(error?: ProviderError): boolean {
+    // Some providers (notably Codex app-server) explicitly report that a
+    // capacity refusal happened before a turn was admitted.  That structured
+    // proof is safe to retry even though the transport call itself already
+    // started; generic/ambiguous late capacity errors remain terminal.
+    const details = error?.details;
+    if (this.isCapacityRetryError(error ?? { code: '', message: '', recoverable: false })
+      && details
+      && typeof details === 'object'
+      && !Array.isArray(details)
+      && (details as { providerAdmission?: unknown }).providerAdmission === 'rejected') {
+      return true;
+    }
     return !this._activeDispatchProviderStarted
       && !this._activeDispatchProviderAccepted
       && !this._activeDispatchHasSideEffectEvidence;
@@ -4635,7 +4647,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           return;
         }
         this.recordProviderError(providerError);
-        const capacityRetryEligible = this.canRetryBeforeProviderBoundary()
+        const capacityRetryEligible = this.canRetryBeforeProviderBoundary(providerError)
           && this.willRetryAsCapacity(providerError);
         (capacityRetryEligible ? logger.debug : logger.warn).call(
           logger,
@@ -4684,7 +4696,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // no-replay tombstone before clearing local state so restart/lease
         // expiry cannot enqueue the same handoff again.
         if (this.isCapacityRetryError(providerError)
-          && !this.canRetryBeforeProviderBoundary()) {
+          && !this.canRetryBeforeProviderBoundary(providerError)) {
           this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
             providerStarted: this._activeDispatchProviderStarted,
             providerAccepted: this._activeDispatchProviderAccepted,

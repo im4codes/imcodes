@@ -6846,7 +6846,14 @@ export class CodexSdkProvider implements TransportProvider {
     if (isCodexThreadHistoryUnreadableError(err) || isCodexThreadNeverMaterializedError(err) || (/resume|thread/i.test(message) && /not found|invalid|unknown/i.test(message))) {
       return this.makeError(PROVIDER_ERROR_CODES.SESSION_NOT_FOUND, message, true, err);
     }
-    return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, err);
+    // A Codex app-server capacity refusal is emitted as a terminal failed
+    // turn before the turn is admitted/executed. Preserve that explicit
+    // provider-boundary fact so the transport can retry it safely while still
+    // terminalizing generic late/ambiguous capacity callbacks.
+    const capacityDetails = /at capacity|capacity (?:limit|exceeded|reached)|no capacity|over capacity|out of capacity/i.test(message)
+      ? { providerAdmission: 'rejected' as const }
+      : err;
+    return this.makeError(PROVIDER_ERROR_CODES.PROVIDER_ERROR, message, false, capacityDetails);
   }
 
   private isCodexAuthError(error: ProviderError): boolean {
