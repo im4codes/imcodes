@@ -921,6 +921,59 @@ describe('DirectFileTransferRouter v2', () => {
     });
   });
 
+  it('admits a fresh attempt after a terminal outcome for the same idempotent upload', () => {
+    const f = fixture();
+    const lease = readyLease(f);
+    expect(f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease))).toBe(true);
+    const first = f.daemonMessages.at(-1)!;
+
+    f.router.handleDaemon({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      serverId: SERVER_ID,
+      browserTabId: TAB_A,
+      leaseId: lease.leaseId,
+      leaseGeneration: lease.leaseGeneration,
+      daemonGeneration: lease.daemonGeneration,
+      requestId: first.requestId,
+      attemptId: ATTEMPT_ID,
+      attempt: 1,
+      direction: DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD,
+      operationId: OPERATION_ID,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+      attachment: {
+        id: 'committed-upload',
+        source: 'upload',
+        serverId: SERVER_ID,
+        daemonPath: '/tmp/committed-upload',
+        size: 9,
+        createdAt: new Date().toISOString(),
+        downloadable: true,
+      },
+    }, lease.daemonGeneration);
+
+    const before = f.daemonMessages.length;
+    expect(f.router.handleBrowser(f.browserA, 'user-a', uploadInit(lease, {
+      requestId: 'attempt-request-2',
+      attemptId: 'attempt-id-2',
+      attempt: 2,
+    }))).toBe(true);
+    expect(f.daemonMessages).toHaveLength(before + 1);
+    expect(f.daemonMessages.at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.PREPARE,
+      requestId: 'attempt-request-2',
+      attemptId: 'attempt-id-2',
+      attempt: 2,
+      operationId: OPERATION_ID,
+    });
+    expect(f.messages(f.browserA).at(-1)).toMatchObject({
+      type: DIRECT_FILE_TRANSFER_MSG.AUTHORIZED,
+      requestId: 'attempt-request-2',
+      attemptId: 'attempt-id-2',
+      attempt: 2,
+    });
+  });
+
   it('propagates a fresh idle deadline on daemon error when its later terminal is dropped', () => {
     vi.useFakeTimers();
     const startedAt = new Date('2025-01-01T00:00:00.000Z').valueOf();

@@ -342,6 +342,10 @@ interface ActiveDirectTransfer {
   downloadPumping: boolean;
   hash: ReturnType<typeof createHash>;
   writeChain: Promise<void>;
+  /** Duplicate START frames are retransmissions; setup must be single-flight. */
+  startPromise: Promise<void> | null;
+  /** Duplicate FINISH frames must join the in-flight durable commit. */
+  finishPromise: Promise<void> | null;
   started: boolean;
   sourceFinished: boolean;
   settled: boolean;
@@ -2115,13 +2119,15 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
       if (parsed.value.authority !== transfer.authority.authority || Date.now() >= transfer.authority.authorityExpiresAt) {
         void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.INVALID_AUTHORITY, false);
       } else if (transfer.authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
-        void startUpload(transfer, parsed.value.resumeOffset ?? 0)
-          .catch((error) => void failTransfer(
+        if (!transfer.startPromise) {
+          transfer.startPromise = startUpload(transfer, parsed.value.resumeOffset ?? 0);
+          void transfer.startPromise.catch((error) => void failTransfer(
             transfer,
             isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
             true,
             errorDetail(error),
           ));
+        }
       } else {
         void startDownload(transfer, parsed.value.resumeOffset ?? 0)
           .catch((error) => void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, false, errorDetail(error)));
@@ -2139,14 +2145,17 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
       return;
     }
     if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.FINISH) {
-      void finishUpload(transfer, parsed.value.totalBytes, parsed.value.sha256).catch((error) => {
-        void failTransfer(
-          transfer,
-          isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
-          true,
-          errorDetail(error),
-        );
-      });
+      if (!transfer.finishPromise) {
+        transfer.finishPromise = finishUpload(transfer, parsed.value.totalBytes, parsed.value.sha256);
+        void transfer.finishPromise.catch((error) => {
+          void failTransfer(
+            transfer,
+            isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
+            true,
+            errorDetail(error),
+          );
+        });
+      }
       return;
     }
     if (parsed.value.type === DIRECT_FILE_TRANSFER_DATA_MSG.DOWNLOAD_COMMITTED) {
@@ -2421,6 +2430,8 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Wo
     downloadPumping: false,
     hash: createHash('sha256'),
     writeChain: Promise.resolve(),
+    startPromise: null,
+    finishPromise: null,
     started: false,
     sourceFinished: false,
     settled: false,

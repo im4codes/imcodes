@@ -1821,6 +1821,61 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('coalesces duplicate FINISH frames while the durable commit is pending', async () => {
+    const { direct, sent, sender } = await readyLease();
+    let releaseCommit!: () => void;
+    const commitPending = new Promise<void>((resolve) => { releaseCommit = resolve; });
+    finalizeDirectUploadedFile.mockImplementationOnce(async (params: { size: number }) => {
+      await commitPending;
+      return {
+        id: 'stored-id', source: 'upload', serverId: '', daemonPath: storedPath,
+        originalName: 'source.bin', size: params.size, createdAt: new Date().toISOString(), downloadable: true,
+      };
+    });
+    const authority = uploadPrepare();
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    const frame = {
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.FINISH,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(),
+      totalBytes: 5,
+    };
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding(), authority: authority.authority,
+    }));
+    await vi.waitFor(() => expect(channel.sent).toContainEqual(expect.stringContaining(DIRECT_FILE_TRANSFER_DATA_MSG.ACCEPTED)));
+    channel.emit(Buffer.from('hello'));
+    channel.emit(JSON.stringify(frame));
+    await vi.waitFor(() => expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce());
+
+    // The browser/RTC layer may retransmit FINISH while the host registry call
+    // is still in flight. It must join the first commit, not race rename and
+    // publish a late FAILED terminal after the successful one.
+    channel.emit(JSON.stringify(frame));
+    await Promise.resolve();
+    expect(finalizeDirectUploadedFile).toHaveBeenCalledOnce();
+    releaseCommit();
+
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      operationId,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+    })));
+    expect(sent.filter((message) => (
+      message.type === DIRECT_FILE_TRANSFER_MSG.TERMINAL
+      && message.operationId === operationId
+      && message.state === DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED
+    ))).toHaveLength(0);
+    expect(channel.sent.filter((message) => (
+      typeof message === 'string' && message.includes(DIRECT_FILE_TRANSFER_DATA_MSG.UPLOAD_COMMITTED)
+    ))).toHaveLength(1);
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('re-prepares an existing live lease at a new daemon generation without stranding its channel or status query', async () => {
     const { direct, sent, sender } = await readyLease();
     finalizeDirectUploadedFile.mockImplementationOnce(async (params: { size: number }) => {

@@ -670,7 +670,7 @@ export class DirectFileTransferRouter {
     const key = operationKey(lease.leaseId, init.operationId);
     const descriptor = operationDescriptor(init);
     const existing = this.operations.get(key);
-    if (existing && (existing.direction !== init.direction || existing.descriptor !== descriptor || existing.terminal)) {
+    if (existing && (existing.direction !== init.direction || existing.descriptor !== descriptor)) {
       this.sendOperationError(socket, init, DIRECT_FILE_TRANSFER_ERROR.INVALID_REQUEST, false);
       return;
     }
@@ -682,6 +682,15 @@ export class DirectFileTransferRouter {
     if (existing) {
       const prior = this.attempts.get(existing.currentRequestId);
       if (prior) this.deleteAttempt(prior);
+      // A terminal outcome is authoritative for that attempt, not a permanent
+      // tombstone for the idempotent operation. The browser can miss both the
+      // data-plane commit and the control terminal (for example across a
+      // WebSocket/daemon reconnect) and then retry the same client upload id.
+      // Re-authorize a fresh attempt so the daemon can answer from its durable
+      // attachment ledger instead of turning a successfully committed upload
+      // into a non-retryable INVALID_REQUEST. Descriptor/direction mismatches
+      // remain rejected above, so this cannot cross operation identities.
+      existing.terminal = false;
     }
     const operation = existing ?? {
       key,
