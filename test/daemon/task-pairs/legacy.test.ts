@@ -339,6 +339,27 @@ describe('one-time legacy import', () => {
     expect(notices).toHaveLength(1);
   });
 
+  it('does not replay the tsk_1m38 placeholder on repeated legacy imports', async () => {
+    const tasks = [task('tsk_1m38', 'planned', [], PROJECT, SUPERVISION_TASK_DEFAULT_OBJECTIVE)];
+    const notices: Array<[string, string]> = [];
+    const registry = { list: () => tasks };
+    expect(importLegacyTasks(registry, 15_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // This wrapper has no recoverable brief, so import must not create a
+    // pair or durable lifecycle event that could be queued or replayed.
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m38')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m38')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.[1]).toContain('tsk_1m38');
+
+    expect(importLegacyTasks(registry, 16_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m38')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m38')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+  });
+
   it('imports one real legacy objective idempotently with title and brief metadata', async () => {
     const objective = 'Restore retry handling\nAcceptance: preserve the last successful attempt';
     const tasks = [
