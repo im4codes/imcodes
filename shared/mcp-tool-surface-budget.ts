@@ -39,15 +39,16 @@ export const MCP_INJECTED_EXECUTION_BLOCK = Object.freeze({ taskSupport: 'forbid
 // 43,126 bytes; retain a small bounded review headroom. send_message's
 // `command` parameter (exact-text delivery, see shared/send-command-mode.ts) is
 // one 97-character description plus its boolean property: +143 bytes. The
-// structured pair_create/pair_dispatch contracts add a bounded ~1.1 KiB of
-// authored schema; keep that growth explicit rather than hiding it from the
-// accounting projection.
-export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 44_600;
+// structured pair_create/pair_dispatch and pair lifecycle contracts add a
+// bounded ~4.3 KiB of authored schema; keep that growth explicit rather than
+// hiding it from the accounting projection.
+export const MCP_TOOL_SURFACE_AUTHORED_BUDGET_BYTES = 48_000;
 // Raw = authored + the MCP SDK framing. The pair-resource-claim tool adds one
 // intentionally discoverable contract and `command` one published parameter;
-// the structured pair_create/pair_dispatch contracts add about 1.3 KiB to
-// that wire payload; retain a bounded ceiling for the resulting surface.
-export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 51_000;
+// the structured pair_create/pair_dispatch and pair lifecycle contracts add
+// about 4.3 KiB to that wire payload; retain a bounded ceiling for the
+// resulting surface.
+export const MCP_TOOL_SURFACE_RAW_BUDGET_BYTES = 55_000;
 /**
  * Default model-visible surface: one discovery tool plus the stable minimal
  * delegation, supervision-task, basic-memory/source-expansion, scheduling,

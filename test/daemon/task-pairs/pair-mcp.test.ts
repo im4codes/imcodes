@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import type { ContextNamespace } from '../../../shared/context-types.js';
 import type { TaskPairState } from '../../../shared/task-pair.js';
 import { MEMORY_MCP_TOOL_NAMES } from '../../../shared/memory-mcp-contracts.js';
+import { MCP_ERROR_REASONS } from '../../../shared/memory-mcp-errors.js';
 import type { McpRuntimeCaller } from '../../../src/daemon/memory-mcp-caller.js';
 import { createMemoryMcpToolHandlers } from '../../../src/daemon/memory-mcp-tools.js';
 import type { SessionRecord } from '../../../src/store/session-store.js';
@@ -231,13 +232,37 @@ describe('pair MCP projections', () => {
     removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
   });
 
+  it('replays reassignment and next-round requests after a later terminal close', async () => {
+    upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2'));
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
+    const replacement = 'deck_sub_pair_mcp_exec2';
+    upsertSession(session(replacement, 'w3'));
+    try {
+      const reassignId = 'structured-reassign-terminal-replay';
+      getTaskPairStore().savePair(PROJECT, pair(reassignId, 'working'));
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({ taskId: reassignId, executor: replacement, idempotencyKey: 'reassign-terminal-replay' })).resolves.toMatchObject({ status: 'ok', effect: 'reassigned', idempotentReplay: false });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: reassignId, action: 'done', force: true, idempotencyKey: 'close-after-reassign' })).resolves.toMatchObject({ status: 'ok', state: 'done' });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({ taskId: reassignId, executor: replacement, idempotencyKey: 'reassign-terminal-replay' })).resolves.toMatchObject({ status: 'ok', state: 'done', idempotentReplay: true });
+      expect(getTaskPairStore().listEvents(PROJECT, reassignId).filter((event) => event.verb === 'REASSIGN')).toHaveLength(1);
+
+      const nextRoundId = 'structured-next-round-terminal-replay';
+      getTaskPairStore().savePair(PROJECT, { ...pair(nextRoundId, 'passed'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, passRound: 1 });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: nextRoundId, base: 'abcdef1', note: 'round two', idempotencyKey: 'next-terminal-replay' })).resolves.toMatchObject({ status: 'ok', effect: 'next_round', idempotentReplay: false });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: nextRoundId, action: 'done', force: true, idempotencyKey: 'close-after-next-round' })).resolves.toMatchObject({ status: 'ok', state: 'done' });
+      await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: nextRoundId, base: 'abcdef1', note: 'round two', idempotencyKey: 'next-terminal-replay' })).resolves.toMatchObject({ status: 'ok', state: 'done', idempotentReplay: true });
+      expect(getTaskPairStore().listEvents(PROJECT, nextRoundId).filter((event) => event.verb === 'NEXT_ROUND')).toHaveLength(1);
+    } finally {
+      removeSession(BRAIN); removeSession(EXEC); removeSession(AUD); removeSession(replacement);
+    }
+  });
+
   it('rejects unknown/terminal or wrong-state lifecycle requests and releases claims once on cancel', async () => {
     upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2'));
     const cancelId = 'structured-cancel';
     getTaskPairStore().savePair(PROJECT, pair(cancelId, 'working'));
     expect(taskPairService.claimResource({ project: PROJECT, taskId: cancelId, owner: EXEC, resource: 'port:43123', mode: 'exclusive', ttlMs: 60000 }).ok).toBe(true);
     const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
-    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'missing', action: 'cancel' })).resolves.toMatchObject({ status: 'error', reason: 'projection_unavailable' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'missing', action: 'cancel' })).resolves.toMatchObject({ status: 'error', reason: MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE });
     await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: cancelId, action: 'cancel', idempotencyKey: 'cancel-once' })).resolves.toMatchObject({ status: 'ok', state: 'cancelled', effect: 'status' });
     expect(getTaskPairStore().getPair(PROJECT, cancelId)?.state.resourceClaims).toEqual([]);
     expect(getTaskPairStore().getPair(PROJECT, cancelId)?.state.resourceCleanup?.resources).toEqual(['port:43123']);

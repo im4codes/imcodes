@@ -1650,6 +1650,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     if (!project) return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'caller project is unavailable') };
     return { status: 'ok', project, sessions };
   };
+  const structuredPairLifecycleEventId = (
+    project: string,
+    taskId: string,
+    verb: 'DONE' | 'CANCEL' | 'REASSIGN' | 'NEXT_ROUND' | 'PASS' | 'REWORK',
+    attrs: Record<string, string>,
+    idempotencyKey?: string,
+  ): string => {
+    const stableAttrs = Object.entries(attrs).sort(([left], [right]) => left.localeCompare(right));
+    const key = idempotencyKey?.trim() || JSON.stringify(stableAttrs);
+    return `mcp:pair-${verb.toLowerCase()}:${project}:${taskId}:${key}`;
+  };
   const applyStructuredPairLifecycle = async (input: {
     project: string;
     taskId: string;
@@ -1663,9 +1674,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
     const authorization = input.authorize(stored);
     if (authorization) return authorization;
-    const stableAttrs = Object.entries(input.attrs).sort(([left], [right]) => left.localeCompare(right));
-    const key = input.idempotencyKey?.trim() || JSON.stringify(stableAttrs);
-    const eventId = `mcp:pair-${input.verb.toLowerCase()}:${input.project}:${input.taskId}:${key}`;
+    const eventId = structuredPairLifecycleEventId(input.project, input.taskId, input.verb, input.attrs, input.idempotencyKey);
     const replay = store.hasEvent(eventId);
     const transition = taskPairService.applyMarker({
       project: input.project,
@@ -3012,9 +3021,11 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       }
       if (Object.keys(attrs).length === 0) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'at least one role, model, or executionPool change is required');
       const stored = getTaskPairStore().getPair(context.project, taskId);
-      if (stored && isTerminalTaskPairStatus(stored.state.status)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot reassign terminal pair (${stored.state.status})`);
+      const idempotencyKey = stringArg(args, 'idempotencyKey');
+      const replay = getTaskPairStore().hasEvent(structuredPairLifecycleEventId(context.project, taskId, 'REASSIGN', attrs, idempotencyKey));
+      if (stored && isTerminalTaskPairStatus(stored.state.status) && !replay) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot reassign terminal pair (${stored.state.status})`);
       return applyStructuredPairLifecycle({
-        project: context.project, taskId, verb: 'REASSIGN', attrs, idempotencyKey: stringArg(args, 'idempotencyKey'),
+        project: context.project, taskId, verb: 'REASSIGN', attrs, idempotencyKey,
         authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_reassign requires the pair Brain'),
       });
     },
@@ -3027,15 +3038,17 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       const args = pickAllowedMcpArgs(input, ['taskId', 'base', 'note', 'idempotencyKey']);
       const taskId = stringArg(args, 'taskId')?.trim();
       if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
-      const stored = getTaskPairStore().getPair(context.project, taskId);
-      if (stored && isTerminalTaskPairStatus(stored.state.status)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot open a round on terminal pair (${stored.state.status})`);
       const attrs: Record<string, string> = {};
       const base = stringArg(args, 'base')?.trim();
       const note = stringArg(args, 'note')?.trim();
       if (base) attrs.base = base;
       if (note) attrs.note = note;
+      const idempotencyKey = stringArg(args, 'idempotencyKey');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      const replay = getTaskPairStore().hasEvent(structuredPairLifecycleEventId(context.project, taskId, 'NEXT_ROUND', attrs, idempotencyKey));
+      if (stored && isTerminalTaskPairStatus(stored.state.status) && !replay) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot open a round on terminal pair (${stored.state.status})`);
       return applyStructuredPairLifecycle({
-        project: context.project, taskId, verb: 'NEXT_ROUND', attrs, idempotencyKey: stringArg(args, 'idempotencyKey'),
+        project: context.project, taskId, verb: 'NEXT_ROUND', attrs, idempotencyKey,
         authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_next_round requires the pair Brain'),
       });
     },
