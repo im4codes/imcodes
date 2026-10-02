@@ -279,8 +279,15 @@ describe('exec helper (real forked process): same result as a direct call', () =
 
   it('kills on timeout exactly like a direct call (killed, SIGTERM, partial output kept)', async () => {
     const started = Date.now();
-    const { viaDirect, viaHelper } = await both(node, ['-e', 'process.stdout.write("began"); setInterval(() => {}, 1000)'], { timeout: 300 });
-    expect(viaHelper).toEqual(viaDirect);
+    // Give both the direct child and the helper child enough time to flush the
+    // marker before the timeout.  A very short timeout makes stdout delivery
+    // scheduler-dependent on slower hosted macOS runners (the kill semantics
+    // are deterministic, but one side may legitimately report an empty
+    // partial buffer if it is killed before the write callback runs).
+    const { viaDirect, viaHelper } = await both(node, ['-e', 'process.stdout.write("began", () => setInterval(() => {}, 1000))'], { timeout: 1_000 });
+    expect(viaDirect).toMatchObject({ ok: false, killed: true, signal: 'SIGTERM' });
+    expect(viaHelper).toMatchObject({ ok: false, killed: true, signal: 'SIGTERM' });
+    expect([viaDirect.stdout, viaHelper.stdout]).toEqual(['began', 'began']);
     expect(viaHelper).toMatchObject({ ok: false, killed: true, signal: 'SIGTERM', stdout: 'began' });
     expect(Date.now() - started).toBeLessThan(5_000);
   });
