@@ -2,9 +2,9 @@
  * E2E: the shipped `pairs` supervision engine, end to end through the real
  * daemon modules.
  *
- * A Brain opens work with an ordinary send_message (new objective, no taskId);
- * the daemon mints the task id, names it on the accepted receipt, opens the
- * pair and picks an allowlisted auditor from the Brain's own sub-sessions.
+ * A Brain opens work with structured pair_create; the daemon mints the task
+ * id, names it on the accepted receipt, opens the pair and picks an allowlisted
+ * auditor from the Brain's own sub-sessions.
  * From then on only markers in final assistant turns drive it: executor
  * READY_FOR_AUDIT -> auditor REWORK (blocking P0) -> executor READY_FOR_AUDIT ->
  * auditor PASS -> executor DONE. The legacy registry is never touched.
@@ -37,22 +37,15 @@ import {
   TASK_PAIR_ENGINE_ENV,
   TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS,
   TASK_PAIR_TIMELINE_EVENT,
-  taskPairBindingId,
   type TaskPairEngine,
 } from '../../shared/task-pair.js';
+import { MEMORY_MCP_TOOL_NAMES } from '../../shared/memory-mcp-contracts.js';
 
 const UNTITLED_TASK_TITLE = TASK_PAIR_GENERIC_TITLE_PLACEHOLDERS[1];
-import {
-  DELEGATION_AUTHORITY_MCP_SERVER,
-  projectDelegationClaim,
-  readDelegationDispatchFact,
-} from '../../shared/delegation-claim.js';
+import { createMemoryMcpToolHandlers } from '../../src/daemon/memory-mcp-tools.js';
 import { timelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import {
   clearSendIdempotencyCacheForTests,
-  dispatchSendMessage,
-  type SendMessageInput,
-  type SendRuntimeCaller,
 } from '../../src/daemon/send-tool.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../src/daemon/task-pairs/store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../src/daemon/task-pairs/delivery.js';
@@ -111,10 +104,6 @@ const PAIR_POOLS = {
   },
 };
 
-function caller(name: string): SendRuntimeCaller {
-  return { userId: name, sessionName: name, projectName: PROJECT, projectRoot: join(env.home, 'repo') };
-}
-
 let root: string;
 let delivered: Array<{ target: string; text: string }>;
 let automation: TaskPairAutomation;
@@ -138,6 +127,24 @@ async function say(sessionName: string, text: string): Promise<void> {
 
 function pairOf(taskId: string) {
   return getTaskPairStore().getPair(PROJECT, taskId)?.state;
+}
+
+async function createPair(input: { brief: string; idempotencyKey: string; title?: string }) {
+  const handlers = createMemoryMcpToolHandlers({
+    userId: BRAIN,
+    sessionName: BRAIN,
+    projectName: PROJECT,
+    projectRoot: join(env.home, 'repo'),
+  }, {
+    sendDeps: { listSessions: () => live.sessions as unknown as SessionRecord[] },
+  });
+  return handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE]({
+    brief: input.brief,
+    executor: EXEC,
+    auditor: AUD,
+    idempotencyKey: input.idempotencyKey,
+    ...(input.title ? { title: input.title } : {}),
+  });
 }
 
 beforeEach(() => {
@@ -193,44 +200,23 @@ afterAll(() => {
 });
 
 describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
-  it('dispatches by send_message, runs a REWORK round and a PASS by markers, and finishes done', async () => {
-    const dispatchMessage = vi.fn().mockResolvedValue('queued');
-    const send = (from: SendRuntimeCaller, input: SendMessageInput) => dispatchSendMessage(from, input, {
-      listSessions: () => live.sessions as unknown as SessionRecord[],
-      dispatchMessage,
-    });
+  it('dispatches by pair_create, runs a REWORK round and a PASS by markers, and finishes done', async () => {
 
     expect(resolveTaskPairEngine(PROJECT)).toBe(PAIRS_ENGINE);
 
-    // 1. The Brain opens the work the legacy way: a new objective, no taskId.
-    const dispatchInput: SendMessageInput = {
-      target: EXEC,
-      message: 'Implement a cross-file README update, add tests, and validate the integration.',
-      reply: true,
+    // 1. The Brain opens the work through the structured pair MCP surface.
+    const created = await createPair({
       idempotencyKey: 'pairs-e2e-readme',
-      task: {
-        classification: 'independent_top_level',
-        objective: 'Implement a cross-file README update, add tests, and validate the integration.',
-        acceptance: ['one audit PASS'],
-        ownedFiles: ['README.md'],
-      },
-    };
-    const created = await send(caller(BRAIN), dispatchInput);
-    if (created.status !== 'accepted' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
+      brief: 'Implement a cross-file README update, add tests, and validate the integration.',
+    });
+    if (created.status !== 'ok' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
     // No explicit title was given, so the pair starts under the neutral
     // placeholder (no UI locale in this test) until the Brain names it; the
     // objective alone is never promoted to a title.
     expect(created).toMatchObject({
-      taskTitle: UNTITLED_TASK_TITLE,
-      assignmentId: taskPairBindingId(taskId, 'executor'),
+      taskId,
     });
-    // The Brain turn's delegation claim is substantiated by this receipt.
-    const fact = readDelegationDispatchFact(DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', dispatchInput, created);
-    expect(projectDelegationClaim(fact ? [fact] : [])).toMatchObject({
-      status: 'substantiated', dispatches: [{ taskId, assignmentId: taskPairBindingId(taskId, 'executor') }],
-    });
-    expect(dispatchMessage).toHaveBeenCalledTimes(1);
     await settle();
 
     // The pair is open with the Brain's target as executor, and the daemon
@@ -268,9 +254,7 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
     const verbs = pairEvents
       .filter((event) => event.session === BRAIN && event.payload.taskId === taskId)
       .map((event) => event.payload.verb);
-    // REASSIGN is the daemon's own auditor pick; TITLE is the neutral
-    // placeholder applied to the untitled pair.
-    expect(verbs).toEqual(['DISPATCH', 'REASSIGN', 'TITLE', 'READY_FOR_AUDIT', 'REWORK', 'READY_FOR_AUDIT', 'PASS', 'DONE']);
+    expect(verbs).toEqual(['DISPATCH', 'READY_FOR_AUDIT', 'REWORK', 'READY_FOR_AUDIT', 'PASS', 'DONE']);
 
     // A closed pair is out of the heartbeat: the next tick nudges nobody.
     const before = delivered.length;
@@ -282,14 +266,11 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
   });
 
   it('delivers in rounds: PASS, Brain NEXT_ROUND x2, each round audited and PASSed by markers, then DONE (only the two deliberate negative markers are unusual)', async () => {
-    const dispatchMessage = vi.fn().mockResolvedValue('queued');
-    const created = await dispatchSendMessage(caller(BRAIN), {
-      target: EXEC,
-      message: 'Deliver the staged change: spinner, console sync, watchdog.',
+    const created = await createPair({
       idempotencyKey: 'pairs-e2e-rounds',
-      task: { objective: 'Deliver the staged change' },
-    }, { listSessions: () => live.sessions as unknown as SessionRecord[], dispatchMessage });
-    if (created.status !== 'accepted' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
+      brief: 'Deliver the staged change: spinner, console sync, watchdog.',
+    });
+    if (created.status !== 'ok' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
     await settle();
 
@@ -346,14 +327,11 @@ describe('E2E: marker-driven task pairs (explicit pairs engine)', () => {
   });
 
   it('holds a REWORK that carries no blocking finding and asks the auditor to correct it', async () => {
-    const dispatchMessage = vi.fn().mockResolvedValue('queued');
-    const created = await dispatchSendMessage(caller(BRAIN), {
-      target: EXEC,
-      message: 'Tidy the README.',
+    const created = await createPair({
       idempotencyKey: 'pairs-e2e-held',
-      task: { objective: 'Tidy the README' },
-    }, { listSessions: () => live.sessions as unknown as SessionRecord[], dispatchMessage });
-    if (created.status !== 'accepted' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
+      brief: 'Tidy the README.',
+    });
+    if (created.status !== 'ok' || !created.taskId) throw new Error(`dispatch failed: ${JSON.stringify(created)}`);
     const taskId = created.taskId;
     await settle();
 

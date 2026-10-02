@@ -309,7 +309,7 @@ describe('buildProviderContextPayload', () => {
     const text = brainSystemText({ automaticSupervisionEnabled: true });
     expect(text).toContain('"automaticSupervision":true');
     expect(text).toContain('"engine":"pairs"');
-    expect(text).toContain('send_message_to_one_worker_opens_the_pair');
+    expect(text).toContain('pair_create_with_brief_and_roles_then_pair_dispatch_if_queued');
     expect(text).toContain('never_ask_or_explain_them');
     // Engine-neutral routing stays.
     expect(text).toContain('coordinate_not_implement');
