@@ -279,6 +279,27 @@ describe('one-time legacy import', () => {
     expect(notices).toHaveLength(1);
   });
 
+  it('does not replay the tsk_1m2e placeholder on repeated legacy imports', async () => {
+    const tasks = [task('tsk_1m2e', 'planned', [], PROJECT, SUPERVISION_TASK_DEFAULT_OBJECTIVE)];
+    const notices: Array<[string, string]> = [];
+    const registry = { list: () => tasks };
+    expect(importLegacyTasks(registry, 7_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Placeholder-only wrappers have no recoverable brief, so they must not
+    // create a pair or durable lifecycle event that a queue can replay.
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m2e')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m2e')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.[1]).toContain('tsk_1m2e');
+
+    importLegacyTasks(registry, 8_000, (brain, text) => { notices.push([brain, text]); return true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m2e')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m2e')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+  });
+
   it('never imports parked blocked/recovered tasks as open or passed pairs, telling Brain once', async () => {
     const tasks = [
       task('tsk_recovered', 'recovered', [['coordinator', BRAIN, 'implementing'], ['implementer', EXEC, 'recovered']]),
