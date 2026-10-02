@@ -835,6 +835,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this._activeDispatchCancelled) {
           this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this.clearStalePendingCancelFallbackTimer();
+          this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+            providerStarted: true,
+            providerAccepted: true,
+            reason: 'provider_complete_after_cancel',
+          });
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
           this._activeTurn = null;
@@ -1014,7 +1019,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         // SDK marked the error non-recoverable. Preserve the failed logical
         // turn and keep the runtime in-progress while the bounded timer owns
         // the next drain; never fail over or switch provider here.
-        if (this.requeueAndScheduleCapacityRetry(error)) {
+        const capacityRetry = this.willRetryAsCapacity(error);
+        if ((capacityRetry || (!this._activeDispatchProviderStarted
+          && !this._activeDispatchProviderAccepted
+          && !this._activeDispatchHasSideEffectEvidence))
+          && this.requeueAndScheduleCapacityRetry(error)) {
           this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this._sending = false;
           this._activeTurn?.reject(error);
@@ -1036,6 +1045,13 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._activeTurn?.reject(error);
         this._activeTurn = null;
         this.clearStalePendingCancelFallbackTimer();
+        const activeEntries = this._activeDispatchEntries;
+        this.settleActiveDispatchHandoffs(activeEntries, {
+          providerStarted: this._activeDispatchProviderStarted,
+          providerAccepted: this._activeDispatchProviderAccepted,
+          sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+          reason: `provider_error:${error.code}`,
+        });
         this._activeDispatchProviderStarted = false;
         this.closeOpenTools(error.code === 'CANCELLED' ? 'cancelled' : 'errored', error.code === 'CANCELLED' ? 'user_cancelled' : 'provider_error');
         if (this._activeDispatchId !== null) {
@@ -1871,6 +1887,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason,
+    });
     this._activeDispatchEntries = [];
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
@@ -2047,6 +2070,68 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
+  /**
+   * Settle the durable handoffs owned by an active dispatch before its local
+   * state is discarded.  A handoff may be returned to the queue only when we
+   * have proof that the provider was never admitted.  Once provider admission,
+   * provider acceptance, or any provider-side effect is observable, the outcome
+   * is ambiguous: retrying after a restart could duplicate an already-delivered
+   * user message.  Mark those rows terminal and leave a delivery tombstone so
+   * lease expiry/restore cannot enqueue them again.  Both operations are
+   * idempotent and therefore safe when a late callback races this settlement.
+   */
+  private settleActiveDispatchHandoffs(
+    entries: PendingTransportMessage[],
+    options: {
+      providerStarted?: boolean;
+      providerAccepted?: boolean;
+      sideEffectEvidence?: boolean;
+      forceTerminal?: boolean;
+      reason?: string;
+    } = {},
+  ): void {
+    if (entries.length === 0) return;
+    const terminal = options.forceTerminal === true
+      || options.providerStarted === true
+      || options.providerAccepted === true
+      || options.sideEffectEvidence === true;
+    if (!terminal) {
+      this.releaseDispatchHandoffs(entries);
+      return;
+    }
+    const store = getTransportQueueStore();
+    const deliveryFrameId = randomUUID();
+    for (const entry of entries) {
+      try {
+        // A tombstone covers both queue-backed and direct dispatch ids.  For a
+        // queue-backed row, markFailed additionally makes the terminal state
+        // visible to queue projection and prevents handoff expiry from
+        // restoring it.  INSERT OR IGNORE/UPDATE-by-id make late callbacks
+        // harmless and keep exactly one durable terminal record.
+        store.recordDeliveryTombstone(
+          this.sessionKey,
+          entry.clientMessageId,
+          deliveryFrameId,
+          undefined,
+          this.queueRecipient ?? null,
+        );
+        if (entry.queueHandoff) {
+          store.markFailed(this.sessionKey, entry.clientMessageId, 'dispatch_failed');
+        }
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            sessionKey: this.sessionKey,
+            clientMessageId: entry.clientMessageId,
+            reason: options.reason ?? 'provider_boundary_unknown',
+          },
+          'runtime: failed to terminalize an ambiguous dispatch handoff',
+        );
+      }
+    }
+  }
+
   private drainPendingIfNoActiveTurn(reason: string): boolean {
     if (this._sending || this._activeTurn) return false;
     if (this._activeDispatchEntries.length > 0) {
@@ -2060,6 +2145,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         },
         'transport runtime cleared stale active dispatch entries before idle/drain reconciliation',
       );
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: `stale_dispatch:${reason}`,
+      });
       this._activeDispatchEntries = [];
       this._activeDispatchId = null;
       this._activeDispatchProviderStarted = false;
@@ -2694,6 +2785,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Reset so the runtime is usable for the next send.
       this._sending = false;
       this._activeTurn = null;
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: 'sync_dispatch_prologue_failure',
+      });
       this._activeDispatchEntries = [];
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
@@ -3409,6 +3506,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.rollbackActiveSummarySyncReservation();
     this._sending = false;
     this._activeTurn = null;
+    this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason: 'session_killed',
+    });
     this._activeDispatchEntries = [];
     this.closeOpenTools('cancelled', 'user_cancelled');
     this.clearStalePendingCancelFallbackTimer();
@@ -3671,6 +3774,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn?.reject(failure);
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason: replayDecision,
+    });
     this._activeDispatchProviderStarted = false;
     this._activeDispatchCancelled = false;
     this._activeDispatchHasSideEffectEvidence = false;
@@ -3702,6 +3812,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: true,
+      forceTerminal: true,
+      reason: replayDecision,
+    });
     this._activeDispatchProviderStarted = false;
     this._activeDispatchCancelled = false;
     this._activeDispatchHasSideEffectEvidence = false;
@@ -3743,6 +3861,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
       return true;
     }
+    // The SDK turn-lost classifier's explicit `safe_replay` decision is a
+    // stronger proof than the transport's send-start hook: the adapter can
+    // invoke that hook before it has accepted a turn, and existing providers
+    // use this path for that pre-acceptance loss.  Only concrete side effects
+    // or an open tool force no-replay here; STOP/onError paths still classify
+    // provider-started work as ambiguous through the shared helper.
     if (this._activeDispatchHasSideEffectEvidence || this._openTools.size > 0) {
       this.settleSdkTurnLostWithoutReplay(metadata, 'unsafe_side_effect');
       return true;
@@ -3779,7 +3903,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
     );
     this._sending = false;
-    this.releaseDispatchHandoffs(this._activeDispatchEntries);
+    this.settleActiveDispatchHandoffs(this._activeDispatchEntries, { reason: 'safe_replay' });
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn.resolve();
     this._activeTurn = null;
@@ -4529,6 +4653,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         // must settle the local turn without putting the accepted ids back into
         // the retry FIFO; only pre-acceptance failures may release/requeue.
         if (this._activeDispatchProviderAccepted) {
+          this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+            providerStarted: true,
+            providerAccepted: true,
+            reason: `accepted_provider_error:${providerError.code}`,
+          });
           this._activeDispatchEntries = [];
           this.setStatus('error');
           return;
@@ -4959,7 +5088,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         { err, providerSessionId: this._providerSessionId, count: messages.length },
         '_drainPending: _dispatchTurn synchronous prologue threw — resetting runtime state',
       );
-      this.releaseDispatchHandoffs(this._activeDispatchEntries);
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: 'sync_dispatch_prologue_failure',
+      });
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
@@ -4992,6 +5126,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: 'user_cancelled_stale',
+      });
       this._activeDispatchEntries = [];
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchCancelled = false;
@@ -5003,7 +5143,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       }
       return;
     }
-    this.releaseDispatchHandoffs(this._activeDispatchEntries);
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason: 'user_cancelled',
+    });
     this._sending = false;
     this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.reject(makeCancelledProviderError());

@@ -6282,6 +6282,106 @@ ${PREFERENCE_CONTEXT_END}`;
     expect(runtime.pendingEntries).toEqual([]);
   });
 
+  it('terminalizes a queued handoff when STOP races a provider send that resolves late', async () => {
+    let resolveLateSend!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { resolveLateSend = resolve; }));
+
+    runtime.send('foreground', 'msg-foreground');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('old queued message', 'msg-stop-late');
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    await runtime.cancel();
+    const store = getTransportQueueStore();
+    expect(store.readSnapshot('deck_test_brain', 'stop-race').failedMessageEntries)
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        clientMessageId: 'msg-stop-late',
+        status: 'failed',
+      })]));
+    expect(store.hasDeliveryTombstone('deck_test_brain', 'msg-stop-late')).toBe(true);
+
+    // The provider may resolve after STOP. That late continuation must not
+    // turn the terminalized row back into queued work.
+    resolveLateSend();
+    await flushDispatch();
+    const restartedProvider = makeMockProvider();
+    const restarted = new TransportSessionRuntime(restartedProvider.provider, 'deck_test_brain');
+    await restarted.initialize(defaultConfig);
+    expect(restarted.rehydratePendingFromStore()).toBe(0);
+    expect(restarted.pendingEntries).toEqual([]);
+    expect(restartedProvider.provider.send).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes a handoff on provider onError after admission so lease expiry cannot replay it', async () => {
+    let resolveLateSend!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { resolveLateSend = resolve; }));
+
+    runtime.send('foreground', 'msg-foreground-error');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('provider-error message', 'msg-provider-error');
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'provider ended after admission',
+      recoverable: false,
+    });
+    await flushDispatch();
+
+    const store = getTransportQueueStore();
+    expect(store.readSnapshot('deck_test_brain', 'provider-error').failedMessageEntries)
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        clientMessageId: 'msg-provider-error',
+        status: 'failed',
+      })]));
+    expect(store.hasDeliveryTombstone('deck_test_brain', 'msg-provider-error')).toBe(true);
+
+    resolveLateSend();
+    await flushDispatch();
+    const restartedProvider = makeMockProvider();
+    const restarted = new TransportSessionRuntime(restartedProvider.provider, 'deck_test_brain');
+    await restarted.initialize(defaultConfig);
+    expect(restarted.rehydratePendingFromStore()).toBe(0);
+    expect(restartedProvider.provider.send).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes unsafe sdk_turn_lost handoffs after side effects instead of replaying on restart', async () => {
+    let resolveLateSend!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { resolveLateSend = resolve; }));
+
+    runtime.send('foreground', 'msg-foreground-lost');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('unsafe lost message', 'msg-unsafe-lost');
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+    mock.fireTool('sess-1', { id: 'tool-unsafe-lost', name: 'Bash', status: 'running' });
+    mock.fireError('sess-1', sdkTurnLostError());
+    await flushDispatch();
+
+    const store = getTransportQueueStore();
+    expect(store.readSnapshot('deck_test_brain', 'unsafe-lost').failedMessageEntries)
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        clientMessageId: 'msg-unsafe-lost',
+        status: 'failed',
+      })]));
+    expect(store.hasDeliveryTombstone('deck_test_brain', 'msg-unsafe-lost')).toBe(true);
+
+    resolveLateSend();
+    await flushDispatch();
+    const restartedProvider = makeMockProvider();
+    const restarted = new TransportSessionRuntime(restartedProvider.provider, 'deck_test_brain');
+    await restarted.initialize(defaultConfig);
+    expect(restarted.rehydratePendingFromStore()).toBe(0);
+    expect(restartedProvider.provider.send).not.toHaveBeenCalled();
+  });
+
   it('can edit and remove queued messages by clientMessageId', async () => {
     runtime.send('first');
     await waitForProviderSendCount(mock.provider, 1);
