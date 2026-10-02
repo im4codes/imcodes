@@ -436,6 +436,40 @@ describe('one-time legacy import', () => {
     expect(notices).toHaveLength(1);
   });
 
+  it('keeps tsk_1m3i placeholder import idempotent while preserving real brief metadata', async () => {
+    const objective = 'Verify retry import metadata\nAcceptance: preserve one participant brief';
+    const tasks = [
+      task('tsk_legacy_metadata_1m3i', 'delegated', [], PROJECT, objective),
+      task('tsk_1m3i', 'planned', [], PROJECT, SUPERVISION_TASK_DEFAULT_OBJECTIVE),
+    ];
+    const notices: Array<[string, string]> = [];
+    const registry = { list: () => tasks };
+
+    expect(importLegacyTasks(registry, 19_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(1);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const imported = getTaskPairStore().getPair(PROJECT, 'tsk_legacy_metadata_1m3i');
+    expect(imported?.state).toMatchObject({
+      status: 'queued',
+      title: '(untitled task)',
+      brief: objective,
+    });
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_legacy_metadata_1m3i')
+      .filter((event) => event.verb === 'IMPORT')).toHaveLength(1);
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m3i')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m3i')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+
+    expect(importLegacyTasks(registry, 20_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_legacy_metadata_1m3i')
+      .filter((event) => event.verb === 'IMPORT')).toHaveLength(1);
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_legacy_metadata_1m3i')?.state)
+      .toMatchObject({ title: '(untitled task)', brief: objective });
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m3i')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m3i')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+  });
+
   it('never imports parked blocked/recovered tasks as open or passed pairs, telling Brain once', async () => {
     const tasks = [
       task('tsk_recovered', 'recovered', [['coordinator', BRAIN, 'implementing'], ['implementer', EXEC, 'recovered']]),
