@@ -363,7 +363,10 @@ describe('TransportSessionRuntime memory provenance', () => {
     // the pairs Brain contract (never a supervision_* one).
     const FULL = `"contractId":"${TASK_PAIR_BRAIN_CONTRACT_ID}"`;
     const REF = `"contractRef":"${TASK_PAIR_BRAIN_CONTRACT_ID}"`;
-    const ON_DUTY = 'send_message_to_one_worker_opens_the_pair';
+    // The pairs engine no longer advertises the retired send_message-only
+    // route. Supervised Brain turns must carry the structured pair_create
+    // route instead.
+    const ON_DUTY = 'pair_create_with_brief_and_roles_then_pair_dispatch_if_queued';
 
     it('re-reads the mode every turn and re-registers the full body whenever the variant changes', async () => {
       const { runtime, nextTurnText } = await brainRuntime('deck_mode_switch_brain');
