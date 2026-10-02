@@ -1,9 +1,10 @@
 /**
  * Legacy supervised-task MCP tools on the `pairs` engine (design D8).
  *
- * Models trained on the old tools keep calling them. On a `pairs` project none
- * of them refuses: each records the closest marker event (source
- * `legacy_tool`), returns `ok`, and names the marker to use instead. Legacy
+ * Models trained on the old tools keep calling them. On a `pairs` project
+ * lifecycle calls on an existing pair record the closest marker event (source
+ * `legacy_tool`) and return `ok`; the coordinator's old new-work start path is
+ * rejected because pair_create is now the only Brain creation route. Legacy
  * tools never change a pair's roles (D2 ²): an executor's call can only move
  * status on a pair that already exists, exactly like its own marker would.
  */
@@ -15,6 +16,7 @@ import {
 } from '../../../shared/audit-convergence.js';
 import {
   TASK_PAIR_CONTRACT_ID,
+  TASK_PAIR_CREATE_REQUIRED_MESSAGE,
   TASK_PAIR_INFER_TASK_ID,
   TASK_PAIR_MARKER_TAG,
   TASK_PAIR_TITLE_RULE,
@@ -25,7 +27,7 @@ import {
   type TaskPairVerb,
 } from '../../../shared/task-pair.js';
 import { getTaskPairStore, type StoredTaskPair } from './store.js';
-import { isPairsEngineSession, projectOfSession } from './engine.js';
+import { isPairsEngineProject, isPairsEngineSession, projectBrainSession, projectOfSession } from './engine.js';
 import { taskPairService } from './service.js';
 import { NO_LEGACY_ARTIFACTS } from './messages.js';
 
@@ -58,13 +60,13 @@ function hint(taskId?: string, role?: TaskPairRole): string {
   const example = role === 'auditor'
     ? `<!-- ${TASK_PAIR_MARKER_TAG} PASS ${id} blocking=P0 --> or <!-- ${TASK_PAIR_MARKER_TAG} REWORK ${id} blocking=P0 p0=<n> -->`
     : role === 'brain'
-      ? `<!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${id} title="..." executor=<session> -->`
+      ? 'pair_create({ brief, executor, auditor, title }) followed by pair_dispatch only when queued'
       : `<!-- ${TASK_PAIR_MARKER_TAG} READY_FOR_AUDIT ${id} worktree=<absolute path> head=<commit> base=<commit> -->`;
   return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). ${TASK_PAIR_TITLE_RULE} Instead of this tool, write a marker line such as ${example} in your reply. ${NO_LEGACY_ARTIFACTS}`;
 }
 
 function coordinatorStartHint(taskId: string): string {
-  return `This project uses marker-driven task pairs (${TASK_PAIR_CONTRACT_ID}). ${TASK_PAIR_TITLE_RULE} Send the brief to the executor with send_message and task: { taskId: "${taskId}" }; that opens the pair and the daemon assigns an auditor unless you name one. Or write <!-- ${TASK_PAIR_MARKER_TAG} DISPATCH ${taskId} title="..." executor=<session> auditor=<session> --> in your reply.`;
+  return `This project uses structured task pairs (${TASK_PAIR_CONTRACT_ID}). ${TASK_PAIR_TITLE_RULE} Do not use this legacy task id to create work. Call pair_create with the brief, executor and auditor (then pair_dispatch only if it returns queued).`;
 }
 
 function str(record: Record<string, unknown>, key: string): string | undefined {
@@ -182,6 +184,15 @@ export async function handleLegacyToolOnPairs(tool: string, callerSession: strin
     const taskId = str(args, 'taskId')
       ?? taskPairService.mintTaskId(project, idempotencyKey ? `${callerSession}\0${idempotencyKey}` : undefined);
     const existing = store.getPair(project, taskId)?.state;
+    if (!existing && isPairsEngineProject(project) && callerSession === projectBrainSession(project)) {
+      return {
+        status: 'error',
+        engine: 'pairs',
+        applied: 'rejected',
+        reason: 'scope_forbidden',
+        error: TASK_PAIR_CREATE_REQUIRED_MESSAGE,
+      };
+    }
     return {
       status: 'ok',
       engine: 'pairs',

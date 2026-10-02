@@ -555,7 +555,7 @@ export function buildNativeCollaborationRerouteNotice(input: {
       requiredRoute: ['continue the assigned work in this session', 'report a structured blocker to the coordinating Brain when another executor or more capacity is needed'],
     } : {
       rule: TASK_PAIR_NATIVE_COLLABORATION_RULE,
-      requiredRoute: ['send_list_targets', 'send_message with task {objective, acceptance}'],
+      requiredRoute: ['send_list_targets', 'pair_create with brief and roles', 'pair_dispatch only when pair_create returns queued'],
     }),
     nativeAgentsMay: 'ephemeral read-only analysis or parallel reasoning only; treat their output as non-authoritative input',
     ...(input.enforcement === NATIVE_COLLABORATION_ENFORCEMENT.ADVISORY

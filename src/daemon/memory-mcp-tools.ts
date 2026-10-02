@@ -1,11 +1,11 @@
 import { withPairsLegacyTools } from './task-pairs/legacy-tools.js';
 import { SEND_COMMAND_DESCRIPTION, SEND_COMMAND_FIELD } from '../../shared/send-command-mode.js';
 import { emitTaskPairDaemonEvent, taskPairService } from './task-pairs/service.js';
-import { projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
+import { isPairsEngineProject, projectBrainSession, projectOfSession, resolveTaskPairMaxConcurrency } from './task-pairs/engine.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { randomUUID } from 'node:crypto';
 import { parseTaskPairChecklist, taskPairChecklistCounts, updateTaskPairChecklist } from '../../shared/task-pair-checklist.js';
-import { isTerminalTaskPairStatus, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
+import { isTerminalTaskPairStatus, TASK_PAIR_CREATE_REQUIRED_MESSAGE, TASK_PAIR_MCP_DELIVERY_EVENT, TASK_PAIR_MCP_DISPATCH_EVENT, TASK_PAIR_NO_AUDITOR, taskPairRoleOf } from '../../shared/task-pair.js';
 import { z } from 'zod';
 import type { CapabilityMcpToolDeps } from './capability-mcp-tools.js';
 import { lstat, readFile, realpath } from 'node:fs/promises';
@@ -2883,6 +2883,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
             executionPool,
             brief,
             hasObjective: true,
+            structuredPairCreate: true,
             eventId,
             suppressAutomaticBrief: true,
           });
@@ -3053,6 +3054,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
         && supervisionIdentityMatches(authoritativeBrain, identity));
       const requestedTaskId = stringArg(args, 'taskId')?.trim();
       const existing = requestedTaskId ? registry.get(requestedTaskId) : undefined;
+      if (!existing && callerIsAuthoritativeBrain && isPairsEngineProject(projectName)) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, TASK_PAIR_CREATE_REQUIRED_MESSAGE);
+      }
       // taskId is a reference, never a create hint. Missing, cross-project and
       // non-participant tasks share one refusal so this tool cannot probe the
       // registry or silently mint a replacement task.
@@ -3068,7 +3072,7 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (callerIsAuthoritativeBrain && (requestedRole === 'implementer' || requestedRole === 'auditor')) {
         return error(
           MCP_ERROR_REASONS.SCOPE_FORBIDDEN,
-          `a project Brain cannot be an implementer or auditor; cannot assign ${requestedRole} work to itself; dispatch it to a non-self IM.codes sub-session with send_message and task`,
+          `a project Brain cannot be an implementer or auditor; cannot assign ${requestedRole} work to itself; create the pair with pair_create and assign a non-self IM.codes sub-session`,
         );
       }
       const classification = typeof args.classification === 'string'

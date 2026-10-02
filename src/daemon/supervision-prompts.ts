@@ -283,11 +283,11 @@ export function buildBrainSupervisedWorkDelegationContract(
  * legacy registry: the task_assignment step, assignment/attempt/lease/revision
  * repair, reuse of the same task assignment, audit-policy selection and the
  * IMCODES_EXEC status markers of a legacy Brain-run. A pairs Brain dispatches
- * with send_message (the daemon opens the pair), resolves pair notices with
- * markers, and has nothing to bind or repair.
+ * with pair_create (and pair_dispatch when queued), resolves pair notices
+ * with markers, and has nothing to bind or repair.
  */
 export const BRAIN_PAIRS_SUPERVISED_WORK = {
-  newWork: 'send_message_to_one_worker_opens_the_pair_executor_is_target_auditor_auto_picked_or_named_with_DISPATCH',
+  newWork: 'pair_create_with_brief_and_roles_then_pair_dispatch_if_queued',
   sameWork: 'append_to_the_same_executor_same_taskId',
   material: 'executor_workspace_on_READY_FOR_AUDIT_relayed_by_daemon_worktree_and_head_or_task_dir_path',
   workspace: 'code_in_git_project_worktree_else_task_dir_DISPATCH_workspace=dir_for_non_code_removed_7d_after_end',
@@ -330,7 +330,7 @@ function buildBrainSupervisedWorkDelegationContractObject() {
     trigger: 'user_requests_supervised_assignment_or_coordination',
     default: {
       route: 'imcodes_supervision_visible_subsession',
-      sequence: ['send_list_targets', 'task_assignment', 'send_message'],
+      sequence: ['send_list_targets', 'pair_create', 'pair_dispatch_if_queued'],
       // Ready is a PREFERENCE, not the definition of eligible. A busy
       // reply-capable transport is already an eligible candidate that queues,
       // and saying otherwise here made "everything is busy" read as "there is
@@ -518,7 +518,7 @@ function buildBrainSupervisedWorkDelegationContractObject() {
 export const BRAIN_MANUAL_AUDITED_WORK = {
   pairs: {
     route: 'task_pair',
-    open: ['IMCODES_TASK DISPATCH <taskId> executor=<session> [auditor=<session>]', 'send_message task.objective'],
+    open: ['pair_create with brief/executor/auditor', 'pair_dispatch only when pair_create returns queued'],
     auditor: 'named_or_daemon_auto_pick',
     heartbeat: 'daemon_pair_heartbeat_until_done_or_cancel',
     brainCronSelf: 'forbidden',

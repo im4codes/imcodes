@@ -137,7 +137,7 @@ describe('task-pair title generation', () => {
     expect(pair('T6')?.title).toBe('Fix login');
   });
 
-  it('creates implicit send_message pairs with a placeholder and batches requests', async () => {
+  it('rejects implicit send_message pair creation; titles are supplied by pair_create', async () => {
     setBrainLocale('zh-CN');
     clearSendIdempotencyCacheForTests();
     const dispatchMessage = vi.fn().mockResolvedValue('sent');
@@ -146,15 +146,14 @@ describe('task-pair title generation', () => {
     const created = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'Please fix login.', task: { taskId: 'T9', objective: 'fix login' },
     } as never, { listSessions, dispatchMessage });
-    expect(created).toMatchObject({ status: 'accepted', taskId: 'T9', taskTitle: '未命名任务' });
-    expect(pair('T9')?.title).toBe('未命名任务');
-    expect(sent.filter((entry) => entry.target === BRAIN)).toHaveLength(1);
+    expect(created).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(pair('T9')).toBeUndefined();
 
     const withExplicitTitle = await dispatchSendMessage(brainCaller, {
       target: AUD, message: 'Please review.', task: { taskId: 'T10', objective: 'review PR', title: 'Human title' },
     } as never, { listSessions, dispatchMessage });
-    expect(withExplicitTitle).toMatchObject({ status: 'accepted', taskId: 'T10', taskTitle: 'Human title' });
-    expect(pair('T10')?.title).toBe('Human title');
+    expect(withExplicitTitle).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(pair('T10')).toBeUndefined();
   });
 
   it('coalesces multiple missing titles in one turn and does not contact an offline Brain', async () => {

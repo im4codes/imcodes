@@ -7,7 +7,7 @@ import {
   resolveProjectAuthoritativeSupervisionSnapshot,
   resolveProjectAuthoritativeSupervisionPools,
 } from './supervision-snapshot.js';
-import { taskPairBindingOf } from '../../shared/task-pair.js';
+import { TASK_PAIR_CREATE_REQUIRED_MESSAGE, taskPairBindingOf } from '../../shared/task-pair.js';
 import { DELEGATION_REACHED_DELIVERY_STATUSES } from '../../shared/delegation-claim.js';
 import path from 'path';
 import { buildAuditSeverityPolicyLines, type AuditSeverity } from '../../shared/audit-convergence.js';
@@ -1331,6 +1331,26 @@ export async function dispatchSendMessage(
   // enriches it, so none of that can ever apply to a command.
   if (input.command === true) {
     return dispatchCommandSend(caller, callerProjectName, allSessions, input, d, deps);
+  }
+  // New pairs-engine work has one authoritative creation route.  In
+  // particular, do not let a Brain accidentally turn an ordinary
+  // send_message task envelope into a second, implicit pair: pair_create owns
+  // idempotency, role validation, queueing, and structured brief delivery.
+  // Existing pair traffic remains valid (including task/audit metadata used by
+  // executors and auditors).
+  if (!input.automaticSupervision
+    && isPairsEngineProject(callerProjectName)
+    && caller.sessionName === projectBrainSession(callerProjectName)
+    && hasLegacyTaskMetadata(input)) {
+    const requestedTaskId = input.task?.taskId?.trim();
+    const existing = requestedTaskId ? getTaskPairStore().getPair(callerProjectName, requestedTaskId) : undefined;
+    if (!existing) {
+      return {
+        status: 'error',
+        reason: MCP_ERROR_REASONS.VALIDATION_FAILED,
+        error: TASK_PAIR_CREATE_REQUIRED_MESSAGE,
+      };
+    }
   }
   // On the `pairs` engine task/audit metadata is advisory: it can create a
   // missing pair (implicit DISPATCH) but never binds a legacy assignment,

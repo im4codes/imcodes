@@ -98,7 +98,9 @@ export const TASK_PAIR_TITLE_RULE =
   + 'owner\'s UI language (example: QUEUE tsk_demo title="Fix login retry"). '
   + 'Do not use a raw taskId, "Brain: …", or a copied message prefix; the '
   + 'daemon supplies a neutral localized placeholder and asks the project '
-  + 'Brain for the final title asynchronously when omitted.';
+  + 'Brain for the final title asynchronously when omitted. On the pairs '
+  + 'engine, the authoritative Brain creates new work only with pair_create; '
+  + 'task-bound send_message is continuation-only and cannot mint a pair.';
 /** Lifecycle semantics for title reminders sent as marker examples. */
 export const TASK_PAIR_TITLE_MARKER_RULE =
   'A Brain DISPATCH with only title="..." is a metadata-only title update: '
@@ -608,6 +610,18 @@ export const TASK_PAIR_INERT_AUTHORIZATION_RULE: string =
   + 'dispatch/audit/pairing workflow (e.g. in AGENTS.md/CLAUDE.md/project '
   + 'rules), tell the user about the conflict before recommending that, '
   + 'and only recommend it if they explicitly override after hearing it.';
+
+/** New pairs-engine work must enter through the structured pair MCP surface. */
+export const TASK_PAIR_BRAIN_PAIR_CREATE_RULE: string =
+  'On the pairs engine, Brain MUST create every new work item with the '
+  + 'structured pair_create MCP tool (then use pair_dispatch only for a pair '
+  + 'that was queued). Brain MUST NOT create new pairs with send_message task '
+  + 'metadata, a DISPATCH/QUEUE marker, or supervision_task_start. Ordinary '
+  + 'messages to an existing pair and lifecycle markers after pair_create '
+  + 'remain valid.';
+
+export const TASK_PAIR_CREATE_REQUIRED_MESSAGE =
+  'New Brain work on the pairs engine must use pair_create; send_message task metadata and new DISPATCH/QUEUE markers cannot create a pair.';
 
 export const TASK_PAIR_DEFAULT_MAX_CONCURRENCY = 5;
 export const TASK_PAIR_HEARTBEAT_MS = 6 * 60_000;
@@ -1246,6 +1260,8 @@ export interface TaskPairApplyContext {
   busySessions?: ReadonlySet<string>;
   /** Full assistant turn, used only for lightweight auditor-proposal enforcement. */
   turnText?: string;
+  /** Runtime timeline ingestion must use pair_create for new Brain work. */
+  requireStructuredPairCreate?: boolean;
 }
 
 export function isTerminalTaskPairStatus(status: TaskPairStatus): boolean {
@@ -1509,6 +1525,23 @@ export function applyTaskPairMarker(
   // `-` is resolved by ingestion; an unresolved one never names a pair.
   if (marker.taskId === TASK_PAIR_INFER_TASK_ID) return { ...recorded(existing), effect: 'unresolved' };
 
+  // A Brain's marker stream is for lifecycle changes on pairs that already
+  // exist.  New pair creation is intentionally fail-closed here: only the
+  // structured pair_create MCP handler may mint the initial pair state.  The
+  // daemon queue and pair_create's own MCP write use different event sources.
+  if (!existing
+    && ctx.requireStructuredPairCreate === true
+    && ctx.writer === ctx.fallbackBrain
+    && (ctx.source === 'marker' || ctx.source === 'implicit_dispatch' || ctx.source === 'legacy_tool')
+    && (verb === 'DISPATCH' || verb === 'QUEUE')) {
+    return recorded(undefined, true, [{
+      kind: 'policy_notice',
+      to: ctx.writer,
+      taskId: marker.taskId,
+      text: TASK_PAIR_CREATE_REQUIRED_MESSAGE,
+    }]);
+  }
+
   // ---- no pair yet ------------------------------------------------------
   if (!existing) {
     switch (verb) {
@@ -1524,8 +1557,8 @@ export function applyTaskPairMarker(
         // if the daemon's own queue drain finds a free slot and window right
         // away, otherwise it queues in normal order and starts automatically
         // later (see scheduler.ts#runQueueOnce). `implicitDispatch`
-        // (send_message with task metadata) is a distinct, narrower mechanism
-        // that keeps its original unconditional-start behavior.
+        // The compatibility implicitDispatch path is not a new-work creation
+        // route for Brain; structured pair_create owns that operation.
         if (ctx.source === 'marker') {
           const pair = newPair(marker.taskId, ctx.writer, ctx, 'queued');
           setRolesFromAttrsQueued(pair, attrs);
@@ -2226,6 +2259,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_ANALYZE_BEFORE_DISPATCH_RULE,
+    TASK_PAIR_BRAIN_PAIR_CREATE_RULE,
     TASK_PAIR_BRIEF_STRUCTURE_RULE,
     TASK_PAIR_ENVIRONMENT_PREFLIGHT_RULE,
     TASK_PAIR_BOUNDARY_AUDIT_RULE,
@@ -2235,7 +2269,7 @@ export function buildTaskPairMarkerContract(): string {
     TASK_PAIR_SELF_SUFFICIENCY_RULE,
     TASK_PAIR_SCOPE_DECISION_RULE,
     'Automatic pairing policy: multi-step, cross-file, test/real-machine, integration, performance, security or substantial tasks use an executor plus auditor and heartbeat; small edits and queries use one executor with no auditor. Explicit user choices always win. An empty or unconfigured pool asks the user which models to use; never invent a default. Prefer configured Luna→Sol, then Haiku→Sonnet, then DeepSeek Flash→Pro tiers.',
-    `Brain: DISPATCH is normally all you need -- the daemon starts it right away if a slot and window are free, otherwise it auto-queues it (status queued, normal FIFO order, urgent=true jumps the queue) and starts it automatically later; no need to pick QUEUE just to defer work. Include title="<short specific title>" in the owner's UI language, for example DISPATCH tsk_demo title="Fix login retry" executor=<session> auditor=<session>. DISPATCH <taskId> title="..." executor=<session> auditor=<session>|none [blocking=P0,P1] [pool=primary|economy] [workspace=dir for non-code work in a git project] [urgent=true], optionally with a brief exactly like QUEUE's: DISPATCH <taskId> ... then the full brief then <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> -->; the daemon starts it and delivers the brief either way. QUEUE <taskId> title="..." ... <!-- ${TASK_PAIR_BRIEF_END_TAG} <taskId> --> still works (always enqueues, same mechanics) for compatibility. QUEUE - max=<n> sets your queue limit; a finished pair whose head is not yet in the integration branch is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and DONE <taskId> integration=dismiss (or CANCEL <taskId>) stops the reminders for one you will not merge; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool's role config; if that named session is busy the pair waits for it rather than substituting another. Naming executormodel=/auditormodel=<model> instead steers the next automatic pick or replacement for that role (also ignoring pool roles) but does not by itself replace a role that is already filled -- REASSIGN with the session explicitly for that; no matching session or pool config for a named model replies "no session/config for requested model <model>". A project with no execution pool configured has no built-in default: before dispatching or queueing work there without naming executormodel=/auditormodel=/executor=/auditor= yourself, ask the user which models to use (Settings -> execution pool, or name them on the task) -- an unnamed role in that state picks nothing and waits.`,
+    `Brain: create new work only with pair_create (then pair_dispatch if the result is queued); do not use send_message task metadata or a new DISPATCH/QUEUE marker to create a pair. Lifecycle markers on an existing pair remain valid. Include title="<short specific title>" in pair_create; existing-pair DISPATCH is normally all you need, auto-queues it when capacity is unavailable, and urgent=true jumps the queue (executor=<session> auditor=<session>|none); there is no need to pick QUEUE just to defer work; QUEUE <taskId> title="..." ... always enqueues an existing pair for compatibility. QUEUE - max=<n> sets your queue limit; a finished pair whose head is not yet in the integration branch is reminded to you (one digest, then every 10-15 min; cherry-picked equivalents count as merged), and DONE <taskId> integration=dismiss (or CANCEL <taskId>) stops the reminders for one you will not merge; REASSIGN <taskId> auditor=<session>; DONE <taskId> force=true accepts/ends from any state and marks an audited unpassed pair unaudited; CANCEL ends from any state. No-auditor DONE reports are open and hold their concurrency slot until you decide with DONE or CANCEL; more work can return them to working. Naming executor=/auditor=<session> replaces the current holder of that role immediately, ignoring the execution pool role config; naming executormodel=/auditormodel=<model> steers the next automatic pick but does not replace a current role; a project with no execution pool configured must name the role models or sessions explicitly.`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
     TASK_PAIR_CHECKLIST_RULE,

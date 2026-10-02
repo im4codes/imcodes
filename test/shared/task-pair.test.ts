@@ -146,6 +146,19 @@ describe('task-pair marker grammar', () => {
     expect(started.flags).not.toContain('no_pool_configured');
   });
 
+  it('rejects a new Brain DISPATCH from the runtime marker stream', () => {
+    const result = applyTaskPairMarker(
+      undefined,
+      marker(`<!-- IMCODES_TASK DISPATCH T-structured executor=${EXEC} auditor=${AUD} -->`),
+      ctx(BRAIN, { requireStructuredPairCreate: true }),
+    );
+    expect(result.pair).toBeUndefined();
+    expect(result.unusual).toBe(true);
+    expect(result.intents).toContainEqual(expect.objectContaining({
+      kind: 'policy_notice', taskId: 'T-structured',
+    }));
+  });
+
   it('never starts a queued pair from participant activity or a Brain send: only admission (source queue) or Brain\'s explicit marker does', () => {
     const queued = applyTaskPairMarker(undefined, marker(`<!-- IMCODES_TASK QUEUE T-guard executor=${EXEC} auditor=${AUD} -->`), ctx(BRAIN, { now: 1_000 })).pair!;
     for (const [writer, line, source] of [

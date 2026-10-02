@@ -148,6 +148,8 @@ export interface ApplyMarkerInput {
   suppressAutoPickAuditor?: boolean;
   /** Structured MCP callers await delivery themselves so they can return receipts. */
   suppressAutomaticBrief?: boolean;
+  /** Runtime assistant-timeline ingestion rejects new Brain pairs unless pair_create was used. */
+  requireStructuredPairCreate?: boolean;
 }
 
 export interface TaskPairBriefDelivery {
@@ -631,15 +633,18 @@ export class TaskPairService {
     this.recordProgress(writer, now, text);
     this.backfillTitlesOnce(project);
     if (!mayContainTaskPairMarker(text)) return;
+    // Marker parsing remains a compatibility lifecycle path; new Brain work
+    // is fail-closed at the pair-aware send_message/MCP entry points.
     this.ingestText(project, writer, text, event.eventId, now);
   }
 
-  ingestText(project: string, writer: string, text: string, turnId: string, now = Date.now()): TaskPairTransition[] {
+  ingestText(project: string, writer: string, text: string, turnId: string, now = Date.now(), requireStructuredPairCreate = false): TaskPairTransition[] {
     const { markers } = scanTaskPairMarkers(text);
     const results: TaskPairTransition[] = [];
     for (const marker of markers) {
       results.push(this.applyMarker({
         project, writer, marker, source: 'marker', eventId: `${turnId}:${marker.markerIndex}`, now, turnText: text,
+        ...(requireStructuredPairCreate ? { requireStructuredPairCreate: true } : {}),
       }));
     }
     return results;
@@ -698,6 +703,7 @@ export class TaskPairService {
           now,
           source: input.source,
           turnText: input.turnText,
+          ...(input.requireStructuredPairCreate ? { requireStructuredPairCreate: true } : {}),
           ...(busySessions.size > 0 ? { busySessions } : {}),
         })
       : { effect: 'unresolved', unusual: true, intents: [] as TaskPairIntent[] } satisfies TaskPairTransition;
@@ -1053,7 +1059,11 @@ export class TaskPairService {
     if (runQueue) this.#track(Promise.resolve(runQueue.call(this.#scheduler, project, brain)));
   }
 
-  /** send_message with task metadata: creates a missing pair, otherwise record only. */
+  /**
+   * Compatibility ingestion for task metadata. The runtime pairs timeline
+   * rejects new Brain pairs through this path; structured pair_create is the
+   * only creation route. Existing-pair continuation remains supported.
+   */
   implicitDispatch(input: {
     project?: string; sender: string; target: string; taskId: string; auditor?: string; title?: string; titleExplicit?: boolean; eventId: string;
     /** Optional report metadata carried by executor -> auditor sends. */
@@ -1064,6 +1074,8 @@ export class TaskPairService {
     auditorModel?: string;
     executionPool?: 'primary' | 'economy';
     suppressAutomaticBrief?: boolean;
+    /** True only for the structured pair_create MCP operation. */
+    structuredPairCreate?: true;
     /** True only for a send carrying real task metadata (task.objective).
      *  A pair minted for a plain send_message (no metadata) has none of the
      *  Brain's own task description -- see suppressAutoPickAuditor. */
@@ -1198,7 +1210,7 @@ export class TaskPairService {
         },
         ...(input.brief ? { brief: input.brief } : {}),
       },
-      source: 'implicit_dispatch',
+      source: input.structuredPairCreate ? 'mcp' : 'implicit_dispatch',
       eventId: input.eventId,
       suppressAutomaticBrief: input.suppressAutomaticBrief,
       // Only when named the auditor is applied immediately as before; a bare

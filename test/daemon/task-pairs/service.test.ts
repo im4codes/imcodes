@@ -874,7 +874,7 @@ describe('task-pair marker ingestion', () => {
     expect(getTaskPairStore().getMaxConcurrency(BRAIN)).toBe(8);
   });
 
-  it('creates a pair from send_message task metadata only when none exists, and never rewrites roles', async () => {
+  it('rejects Brain send_message task metadata when no structured pair exists', async () => {
     clearSendIdempotencyCacheForTests();
     const dispatchMessage = vi.fn().mockResolvedValue('sent');
     const listSessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w2'), session(AUD, 'w3')];
@@ -882,25 +882,11 @@ describe('task-pair marker ingestion', () => {
     const created = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'Please fix login.', task: { taskId: 'T11', objective: 'fix login' },
     } as never, { listSessions, dispatchMessage });
-    expect(created, JSON.stringify(created)).toMatchObject({
-      status: 'accepted', taskId: 'T11', taskTitle: '(untitled task)',
-    });
-    expect(pair('T11')).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: '(untitled task)' });
-
-    // The executor sends its materials to the auditor with task and audit metadata.
-    await say(BRAIN, `<!-- IMCODES_TASK REASSIGN T11 auditor=${AUD} -->`);
-    const execCaller = { userId: 'u', sessionName: EXEC, projectName: PROJECT, projectRoot: `/tmp/${PROJECT}` };
-    const materials = await dispatchSendMessage(execCaller, {
-      target: AUD, message: 'Materials for T11.', reply: true,
-      task: { taskId: 'T11', assignmentId: 'asg_x' },
-      audit: { kind: 'supervision_audit', attemptId: 'att_x', auditedSessionName: EXEC },
-    } as never, { listSessions, dispatchMessage });
-    expect(materials, JSON.stringify(materials)).toMatchObject({ status: "accepted" });
-    expect(pair('T11')).toMatchObject({ executor: EXEC, auditor: AUD, status: 'working' });
-    expect(dispatchMessage).toHaveBeenCalledTimes(2);
+    expect(created, JSON.stringify(created)).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(pair('T11')).toBeUndefined();
   });
 
-  it('mints the taskId of a new objective sent without one and names it on the accepted receipt', async () => {
+  it('rejects a new objective sent without pair_create', async () => {
     clearSendIdempotencyCacheForTests();
     const dispatchMessage = vi.fn().mockResolvedValue('sent');
     const listSessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w2'), session(AUD, 'w3')];
@@ -910,34 +896,8 @@ describe('task-pair marker ingestion', () => {
       task: { classification: 'independent_top_level', objective: 'Add one README sentence', ownedFiles: ['README.md'] },
     };
     const created = await dispatchSendMessage(brainCaller, input as never, { listSessions, dispatchMessage });
-    if (created.status !== 'accepted' || !created.taskId) throw new Error(JSON.stringify(created));
-    expect(created.taskId).toMatch(/^tsk_[0-9a-f]{10}$/);
-    expect(created).toMatchObject({ taskTitle: '(untitled task)' });
-    // The executor slot's pair binding id is the receipt's assignmentId.
-    expect(created.assignmentId).toBe(taskPairBindingId(created.taskId, 'executor'));
-    expect(created.deliveries).toEqual([expect.objectContaining({
-      target: EXEC, taskId: created.taskId, assignmentId: created.assignmentId, taskTitle: '(untitled task)',
-    })]);
-    // So the Brain turn's delegation claim is substantiated, live and after reload.
-    const fact = readDelegationDispatchFact(DELEGATION_AUTHORITY_MCP_SERVER, 'send_message', input, created);
-    expect(fact).toMatchObject({ taskId: created.taskId, assignmentId: created.assignmentId });
-    const claim = projectDelegationClaim([fact!]);
-    expect(claim).toMatchObject({ status: 'substantiated', dispatches: [{ taskId: created.taskId, assignmentId: created.assignmentId }] });
-    expect(readDelegationClaim({ [DELEGATION_CLAIM_METADATA_FIELD]: JSON.parse(JSON.stringify(claim)) })?.status).toBe('substantiated');
-    expect(pair(created.taskId)).toMatchObject({ status: 'working', brain: BRAIN, executor: EXEC, title: '(untitled task)' });
-    // The send's own objective is stored as the pair's brief -- not left
-    // empty -- so pair_task_get and a later REASSIGN/re-dispatch still have
-    // the actual brief, not just the title (tsk_cd_pair_implicit_duplicates).
-    expect(pair(created.taskId)?.brief).toBe('Add one README sentence');
-
-    // A replay of the same send resolves to the same pair; a new key opens a new one.
-    const replay = await dispatchSendMessage(brainCaller, input as never, { listSessions, dispatchMessage });
-    expect(replay).toMatchObject({ status: 'accepted', taskId: created.taskId });
-    const other = await dispatchSendMessage(brainCaller, { ...input, idempotencyKey: 'readme-2' } as never, { listSessions, dispatchMessage });
-    if (other.status !== 'accepted' || !other.taskId) throw new Error(JSON.stringify(other));
-    expect(other.taskId).not.toBe(created.taskId);
-    expect(getTaskPairStore().listActivePairs(PROJECT).map((entry) => entry.state.taskId).sort())
-      .toEqual([created.taskId, other.taskId].sort());
+    expect(created).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(getTaskPairStore().listActivePairs(PROJECT)).toHaveLength(0);
   });
 
   it('gives each recipient the binding of its own slot, and none to a non-participant', async () => {
@@ -972,10 +932,8 @@ describe('task-pair marker ingestion', () => {
     const result = await dispatchSendMessage(brainCaller, {
       broadcast: true, message: 'Whoever is free: fix login.', task: { taskId: 'T20', objective: 'fix login' },
     } as never, { listSessions, dispatchMessage });
-    if (result.status !== 'accepted') throw new Error(JSON.stringify(result));
-    expect(result.deliveries.find((delivery) => delivery.target === EXEC)).toMatchObject({ status: 'failed' });
-    expect(result.deliveries.find((delivery) => delivery.target === EXEC)?.taskId).toBeUndefined();
-    expect(pair('T20')).toMatchObject({ executor: AUD });
+    expect(result).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(pair('T20')).toBeUndefined();
   });
 
   it('opens no pair for task metadata that names neither a taskId nor an objective', async () => {
@@ -986,8 +944,7 @@ describe('task-pair marker ingestion', () => {
     const sentPlain = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'FYI.', task: { ownedFiles: ['README.md'], acceptance: ['none'] },
     } as never, { listSessions, dispatchMessage });
-    expect(sentPlain).toMatchObject({ status: 'accepted' });
-    expect(sentPlain.status === 'accepted' ? sentPlain.taskId : 'error').toBeUndefined();
+    expect(sentPlain).toMatchObject({ status: 'error', reason: 'validation_failed' });
     expect(getTaskPairStore().listActivePairs(PROJECT)).toEqual([]);
   });
 

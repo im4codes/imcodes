@@ -4759,7 +4759,7 @@ class SupervisionAutomation {
       reason: unavailable
         ? 'WAITING refused: IM.codes delegation evidence could not be read, so no pending delegation is proven.'
         : 'WAITING refused: this Brain has no authoritative IM.codes delegation to wait on (no non-self participant with a taskId/assignmentId and no pending IM.codes reply). Provider-native agents and their replies are not delegation facts.',
-      nextAction: 'Dispatch project task work through IM.codes (send_list_targets, then send_message with task {objective, acceptance}); otherwise continue the remaining work yourself, or report NEEDS_INPUT only for a genuine human blocker. Never wait on a provider-native agent.',
+      nextAction: 'Dispatch project task work through IM.codes (send_list_targets, then pair_create with brief and roles, followed by pair_dispatch only when queued); otherwise continue the remaining work yourself, or report NEEDS_INPUT only for a genuine human blocker. Never wait on a provider-native agent.',
       gap: unavailable ? 'delegation_evidence_unavailable' : 'no_authoritative_imcodes_delegation',
     });
     return true;

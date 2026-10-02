@@ -224,7 +224,7 @@ describe('native collaboration task-participation policy', () => {
       policy: NATIVE_COLLABORATION_POLICY_VERSION,
       outcome: 'native_agent_policy_advisory',
       signals: [SIGNAL.IMPLEMENTATION],
-      requiredRoute: ['send_list_targets', 'send_message with task {objective, acceptance}'],
+      requiredRoute: ['send_list_targets', 'pair_create with brief and roles', 'pair_dispatch only when pair_create returns queued'],
     });
     expect(advisory.advisory).toMatch(/allowed/);
   });

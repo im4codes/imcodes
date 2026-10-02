@@ -86,6 +86,18 @@ function sentTo(target: string, reasonPart?: string) {
   return sent.filter((entry) => entry.target === target && (!reasonPart || entry.id.includes(`:${reasonPart}:`)));
 }
 
+/** New work is created through the structured pair path; these tests then
+ * exercise ordinary send_message continuation/relay behavior on that pair. */
+function openStructuredPair(taskId: string, executor = EXEC, auditor: string | undefined = AUD, brief = 'test work') {
+  const transition = taskPairService.implicitDispatch({
+    project: PROJECT, sender: BRAIN, target: executor, taskId, auditor,
+    brief, hasObjective: true, structuredPairCreate: true,
+    suppressAutomaticBrief: true, eventId: `structured-test:${taskId}`,
+  });
+  if (!transition?.pair) throw new Error(`structured pair was not created: ${taskId}`);
+  return transition.pair;
+}
+
 describe('Brain work dispatch opens driven pairs', () => {
   const previousEngine = process.env.IMCODES_SUPERVISION_ENGINE;
 
@@ -126,50 +138,38 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   // ---- auto-audit ON: implicit pairs -------------------------------------------
 
-  it('auto-audit on: a plain Brain dispatch of new work opens a pair whose auditor the daemon picks', async () => {
+  it('auto-audit on: pair_create opens work and ordinary Brain messages continue the pair', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
     expect(resolveProjectAuthoritativeSupervisionSnapshot(PROJECT, sessions).mode).toBe(SUPERVISION_MODE.SUPERVISED_AUDIT);
-    const result = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Transcribe the three m4a files and summarize decisions.', idempotencyKey: 'asr-1', reply: true,
-      task: { objective: 'Transcribe the three m4a files and summarize decisions.' },
-    } as never, deps());
-    if (result.status !== 'accepted' || !result.taskId) throw new Error(JSON.stringify(result));
+    const result = openStructuredPair('asr-1', EXEC, AUD, 'Transcribe the three m4a files and summarize decisions.');
+    const taskId = result.taskId;
     await flush();
     expect(pairs()).toEqual([expect.objectContaining({
-      taskId: result.taskId, brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working',
-      title: '(untitled task)',
+      taskId, brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working',
     })]);
-    expect(result.assignmentId).toBe(`pair:${result.taskId}:executor`);
-    expect(dispatchMessage).toHaveBeenCalledTimes(1);
 
     // Follow-ups to a session already working on a pair continue that pair
     // (bound to it, not a second one).
     const followUp = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Report progress.' } as never, deps());
-    expect(followUp).toMatchObject({ status: 'accepted', taskId: result.taskId });
+    expect(followUp).toMatchObject({ status: 'accepted', taskId });
     // The auditor is a role slot of the SAME open pair (not freshly-dispatch-
     // flagged like the executor above, so this exercises resolveSingleParticipantOpenPair's
     // own participant match rather than the recentBrainDispatch short-circuit):
     // record onto it, never mint a second pair.
     const toAuditor = await dispatchSendMessage(brainCaller, { target: AUD, message: 'Keep auditing.' } as never, deps());
-    expect((toAuditor as { taskId?: string }).taskId).toBe(result.taskId);
+    expect((toAuditor as { taskId?: string }).taskId).toBe(taskId);
     expect(pairs()).toHaveLength(1);
 
     // A replay of the same send names the same pair.
     clearSendIdempotencyCacheForTests();
-    const replay = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Transcribe the three m4a files and summarize decisions.', idempotencyKey: 'asr-1', reply: true,
-    } as never, deps());
-    expect(replay).toMatchObject({ status: 'accepted', taskId: result.taskId });
+    const replay = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Transcribe the three m4a files and summarize decisions.' } as never, deps());
+    expect(replay).toMatchObject({ status: 'accepted', taskId });
     expect(pairs()).toHaveLength(1);
   });
 
   it('continues every non-terminal participant state, including passed and queued, instead of minting an implicit pair', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Initial work.', task: { taskId: 'nonterminal-continue', objective: 'Initial work.' },
-    } as never, deps());
-    expect(opened).toMatchObject({ status: 'accepted', taskId: 'nonterminal-continue' });
-    await flush();
+    openStructuredPair('nonterminal-continue', EXEC, AUD, 'Initial work.');
     const stored = getTaskPairStore().getPair(PROJECT, 'nonterminal-continue')?.state;
     if (!stored) throw new Error('pair was not created');
 
@@ -198,11 +198,7 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   it('command mode is not pair traffic: a Brain command neither binds nor records against a pair, and opens none', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Initial work.', task: { taskId: 'cmd-mode-pair', objective: 'Initial work.' },
-    } as never, deps());
-    expect(opened).toMatchObject({ status: 'accepted', taskId: 'cmd-mode-pair' });
-    await flush();
+    openStructuredPair('cmd-mode-pair', EXEC, AUD, 'Initial work.');
     // Counterexample: an ordinary follow-up to the same participant is recorded onto the pair.
     const ordinary = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Keep going.' } as never, deps());
     expect(ordinary).toMatchObject({ status: 'accepted', taskId: 'cmd-mode-pair' });
@@ -227,33 +223,28 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(getTaskPairStore().listPairs(PROJECT)).toHaveLength(1);
   });
 
-  it('auto-audit on: a Brain-named task opens exactly that pair, and cron sends or worker sends open none', async () => {
+  it('auto-audit on: send_message cannot create a Brain pair; cron and worker sends open none', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    // A Brain-named task id: the pair is that one, never a second daemon-minted one.
     const withTaskId = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-login', objective: 'Fix the login bug' },
     } as never, deps());
-    if (withTaskId.status !== 'accepted') throw new Error(JSON.stringify(withTaskId));
-    expect(pairs().map((entry) => entry.taskId)).toEqual(['T-login']);
+    expect(withTaskId).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(pairs()).toHaveLength(0);
 
     // A worker's plain send to an idle worker is collaboration, not a Brain dispatch.
     const execCaller = { ...brainCaller, sessionName: EXEC };
     await dispatchSendMessage(execCaller, { target: EXEC2, message: 'Could you look at this?' } as never, deps());
-    expect(pairs()).toHaveLength(1);
+    expect(pairs()).toHaveLength(0);
 
     await dispatchCronSend({ fromSessionName: BRAIN, target: EXEC2, message: 'Hourly: report status.' }, deps());
-    expect(pairs()).toHaveLength(1);
+    expect(pairs()).toHaveLength(0);
   });
 
   // ---- 215/jdzj: implicit_dispatch minting duplicate wrapper pairs -----------
 
   it('a relay to a participant whose text names an existing open pair binds to it', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'tsk_send_mention_existing', objective: 'Fix the login bug' },
-    } as never, deps());
-    if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
-    await flush();
+    openStructuredPair('tsk_send_mention_existing', EXEC, AUD, 'Fix the login bug.');
     expect(pairs()).toHaveLength(1);
 
     // A relay to the pair executor remains attached to that pair.
@@ -267,15 +258,8 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   it('a plain mention of another pair stays with the target participant\'s own pair', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    const first = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Work A.', task: { taskId: 'tsk_send_mention_own', objective: 'Work A.' },
-    } as never, deps());
-    const second = await dispatchSendMessage(brainCaller, {
-      target: EXEC2, message: 'Work B.', task: { taskId: 'tsk_send_mention_other', objective: 'Work B.' },
-    } as never, deps());
-    expect(first).toMatchObject({ status: 'accepted', taskId: 'tsk_send_mention_own' });
-    expect(second).toMatchObject({ status: 'accepted', taskId: 'tsk_send_mention_other' });
-    await flush();
+    openStructuredPair('tsk_send_mention_own', EXEC, AUD, 'Work A.');
+    openStructuredPair('tsk_send_mention_other', EXEC2, AUD, 'Work B.');
 
     const status = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'Status update: tsk_send_mention_other is waiting on audit.',
@@ -286,11 +270,7 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   it('does not create a pair for a plain note to an idle target merely because the note mentions another task', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Work A.', task: { taskId: 'tsk_mention_idle_source', objective: 'Work A.' },
-    } as never, deps());
-    expect(opened).toMatchObject({ status: 'accepted', taskId: 'tsk_mention_idle_source' });
-    await flush();
+    openStructuredPair('tsk_mention_idle_source', EXEC, AUD, 'Work A.');
     const note = await dispatchSendMessage(brainCaller, {
       target: EXEC2, message: 'Status only: tsk_mention_idle_source is complete.',
     } as never, deps());
@@ -301,11 +281,7 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   it('an explicit objective that merely mentions another open pair still opens its own pair for a fresh target (CC8 P2)', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'tsk_send_mention_other', objective: 'Fix the login bug' },
-    } as never, deps());
-    if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
-    await flush();
+    openStructuredPair('tsk_send_mention_other', EXEC, AUD, 'Fix the login bug.');
     expect(pairs()).toHaveLength(1);
 
     // Real new work for a target that is NOT part of tsk_send_mention_other: the text
@@ -313,20 +289,13 @@ describe('Brain work dispatch opens driven pairs', () => {
     const newWork = await dispatchSendMessage(brainCaller, {
       target: EXEC2, message: 'Fix Y -- follow-up to tsk_send_mention_other.', task: { objective: 'Fix Y' },
     } as never, deps());
-    if (newWork.status !== 'accepted' || !newWork.taskId) throw new Error(JSON.stringify(newWork));
-    expect(newWork.taskId).not.toBe('tsk_send_mention_other');
-    await flush();
-    expect(pairs().map((entry) => entry.taskId).sort()).toEqual(['tsk_send_mention_other', newWork.taskId].sort());
-    expect(pairs().find((entry) => entry.taskId === newWork.taskId)).toMatchObject({ executor: EXEC2, title: '(untitled task)' });
+    expect(newWork).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(pairs()).toHaveLength(1);
   });
 
   it('a handover message to the reassigned executor of an existing pair binds to it, never opening a second pair', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    const opened = await dispatchSendMessage(brainCaller, {
-      target: EXEC, message: 'Fix the login bug.', task: { taskId: 'T-handover', objective: 'Fix the login bug' },
-    } as never, deps());
-    if (opened.status !== 'accepted') throw new Error(JSON.stringify(opened));
-    await flush();
+    openStructuredPair('T-handover', EXEC, AUD, 'Fix the login bug.');
     await taskPairService.ingestText(PROJECT, BRAIN, `<!-- IMCODES_TASK DISPATCH T-handover executor=${EXEC2} -->`, 'handover-marker', now);
     await flush();
     expect(pairs()[0]).toMatchObject({ taskId: 'T-handover', executor: EXEC2 });
@@ -341,33 +310,14 @@ describe('Brain work dispatch opens driven pairs', () => {
     expect(pairs()).toHaveLength(1);
   });
 
-  it('holds the auditor auto-pick for a bare implicit dispatch so a race-arriving Brain marker still names the intended auditor', async () => {
+  it('rejects a bare implicit Brain dispatch so a late marker cannot create a pair outside pair_create', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.SUPERVISED_AUDIT));
-    process.env.IMCODES_IMPLICIT_AUDITOR_GRACE_MS = '80'; // real grace for this one test, not instant
     const taskId = 'T-race';
-    // Brain's send_message names the taskId explicitly (its own tool call),
-    // but its own DISPATCH marker (naming the intended auditor) hasn't landed
-    // yet -- exactly the 215/jdzj live case (13:33:18: DISPATCH source=
-    // implicit_dispatch with no auditor, then an immediate heartbeat REASSIGN).
     const dispatched = await dispatchSendMessage(brainCaller, {
       target: EXEC, message: 'Starting work.', task: { taskId },
     } as never, deps());
-    if (dispatched.status !== 'accepted') throw new Error(JSON.stringify(dispatched));
-    await flush();
-    expect(pairs()[0]).toMatchObject({ taskId, executor: EXEC });
-    expect(pairs()[0].auditor).toBeFalsy();
-    expect(pairs()[0].flags).toContain('needs_auditor');
-
-    // The Brain's own marker for the SAME taskId lands a moment later, naming AUD.
-    await taskPairService.ingestText(PROJECT, BRAIN, `<!-- IMCODES_TASK DISPATCH ${taskId} executor=${EXEC} auditor=${AUD} -->`, 'race-marker', now);
-    await flush();
-    expect(pairs()[0]).toMatchObject({ taskId, executor: EXEC, auditor: AUD });
-
-    // The grace window elapses; the auto-pick that would otherwise have
-    // fired does not overwrite the auditor Brain actually named.
-    await new Promise((resolve) => setTimeout(resolve, 120));
-    await flush();
-    expect(pairs()[0]).toMatchObject({ taskId, executor: EXEC, auditor: AUD });
+    expect(dispatched).toMatchObject({ status: 'error', reason: 'validation_failed' });
+    expect(pairs()).toHaveLength(0);
   });
 
   it('auto-audit off: a plain Brain send opens no pair (the project chose no automatic audit)', async () => {
@@ -454,26 +404,14 @@ describe('Brain work dispatch opens driven pairs', () => {
 
   // ---- legacy coordinator start ---------------------------------------------------
 
-  it('answers a legacy coordinator start with a task id that the brief send turns into the pair', async () => {
+  it('rejects a legacy coordinator start; new Brain work must use pair_create', async () => {
     useSessions(brainWithMode(SUPERVISION_MODE.OFF));
     const started = await handleLegacyToolOnPairs(MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START, BRAIN, {
       role: 'coordinator', objective: 'Add tenant domain binding', idempotencyKey: 'tenant-1',
     });
-    expect(started).toMatchObject({ status: 'ok', engine: 'pairs', applied: 'task_id' });
-    const taskId = String(started.taskId);
-    expect(taskId).toMatch(/^tsk_[0-9a-f]{10}$/);
-    expect(String(started.hint)).toContain(`taskId: "${taskId}"`);
-    // Same key, same id.
-    const again = await handleLegacyToolOnPairs(MEMORY_MCP_TOOL_NAMES.SUPERVISION_TASK_START, BRAIN, {
-      role: 'coordinator', objective: 'Add tenant domain binding', idempotencyKey: 'tenant-1',
-    });
-    expect(again.taskId).toBe(taskId);
+    expect(started).toMatchObject({ status: 'error', engine: 'pairs', applied: 'rejected', reason: 'scope_forbidden' });
+    expect(String(started.error)).toContain('pair_create');
     expect(pairs()).toHaveLength(0);
-
-    const brief = await dispatchSendMessage(brainCaller, { target: EXEC, message: 'Brief: add tenant domain binding.', task: { taskId } } as never, deps());
-    expect(brief).toMatchObject({ status: 'accepted', taskId });
-    await flush();
-    expect(pairs()).toEqual([expect.objectContaining({ taskId, executor: EXEC, auditor: AUD })]);
   });
 });
 
