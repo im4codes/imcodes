@@ -320,6 +320,25 @@ describe('one-time legacy import', () => {
     expect(notices).toHaveLength(1);
   });
 
+  it('does not replay the tsk_1m2o placeholder on repeated legacy imports', async () => {
+    const tasks = [task('tsk_1m2o', 'planned', [], PROJECT, SUPERVISION_TASK_DEFAULT_OBJECTIVE)];
+    const notices: Array<[string, string]> = [];
+    const registry = { list: () => tasks };
+    expect(importLegacyTasks(registry, 11_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m2o')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m2o')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.[1]).toContain('tsk_1m2o');
+
+    importLegacyTasks(registry, 12_000, (brain, text) => { notices.push([brain, text]); return true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m2o')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m2o')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+  });
+
   it('never imports parked blocked/recovered tasks as open or passed pairs, telling Brain once', async () => {
     const tasks = [
       task('tsk_recovered', 'recovered', [['coordinator', BRAIN, 'implementing'], ['implementer', EXEC, 'recovered']]),
