@@ -372,6 +372,25 @@ describe('one-time legacy import', () => {
     });
     expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m2y')).toBeUndefined();
     expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m2y')).toHaveLength(0);
+  });
+
+  it('does not replay the tsk_1m33 placeholder on repeated legacy imports', async () => {
+    const tasks = [task('tsk_1m33', 'planned', [], PROJECT, SUPERVISION_TASK_DEFAULT_OBJECTIVE)];
+    const notices: Array<[string, string]> = [];
+    const registry = { list: () => tasks };
+    expect(importLegacyTasks(registry, 15_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // The wrapper has no recoverable brief and cannot be replayed as work.
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m33')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m33')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.[1]).toContain('tsk_1m33');
+
+    importLegacyTasks(registry, 16_000, (brain, text) => { notices.push([brain, text]); return true; });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m33')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m33')).toHaveLength(0);
     expect(notices).toHaveLength(1);
   });
 
