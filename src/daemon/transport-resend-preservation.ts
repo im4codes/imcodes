@@ -2,6 +2,7 @@ import type { PendingTransportMessage, TransportSessionRuntime } from '../agent/
 import { isDeepStrictEqual } from 'node:util';
 import { enqueueResend, getResendCount, getResendEntries, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { getSession } from '../store/session-store.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
 
 export interface TransportRuntimeQueuePreservationResult {
   beforeCount: number;
@@ -20,12 +21,27 @@ function preserveEntries(
   existingIds: Set<string>,
   legacyByCommandId: Map<string, ReturnType<typeof getResendEntries>[number]>,
   recipient: ReturnType<typeof recipientFromSessionRecord>,
+  durableStatuses: Map<string, string>,
 ): { preservedCount: number; rejectedCount: number } {
   let preservedCount = 0;
   let rejectedCount = 0;
   for (const entry of entries) {
     if (seenSnapshotIds.has(entry.clientMessageId)) continue;
     seenSnapshotIds.add(entry.clientMessageId);
+    // A dispatching/handoff row is already owned by the previous runtime. It
+    // may have crossed the provider boundary, so copying its active payload to
+    // the resend holder would turn a reconnect into a duplicate delivery. The
+    // durable lease remains quarantined until expiry, when normal recovery can
+    // retry it under the same id if no acceptance tombstone arrived.
+    const durableStatus = durableStatuses.get(entry.clientMessageId);
+    if (durableStatus === 'handoff_inflight' || durableStatus === 'dispatching') continue;
+    if (!durableStatus) {
+      try {
+        if (getTransportQueueStore().hasDeliveryTombstone(sessionName, entry.clientMessageId)) continue;
+      } catch {
+        // Preserve conservatively when the tombstone read is unavailable.
+      }
+    }
     const legacy = legacyByCommandId.get(entry.clientMessageId);
     if (legacy && legacy.clientMessageId !== entry.clientMessageId) {
       const durableShape = {
@@ -124,12 +140,21 @@ export function preserveTransportRuntimeQueuesToResend(
   const legacyByCommandId = new Map(getResendEntries(sessionName)
     .map((entry) => [entry.commandId, entry] as const));
   const recipient = runtime.recipientIdentity ?? recipientFromSessionRecord(getSession(sessionName));
+  const durableStatuses = new Map<string, string>();
+  try {
+    const snapshot = getTransportQueueStore().readSnapshot(sessionName);
+    for (const entry of [...snapshot.pendingMessageEntries, ...snapshot.failedMessageEntries]) {
+      durableStatuses.set(entry.clientMessageId, entry.status);
+    }
+  } catch {
+    // The enqueue path remains the authority when diagnostics are unavailable.
+  }
   const seenSnapshotIds = new Set<string>();
   const active = preserveEntries(
-    sessionName, activeEntries, seenSnapshotIds, existingIds, legacyByCommandId, recipient,
+    sessionName, activeEntries, seenSnapshotIds, existingIds, legacyByCommandId, recipient, durableStatuses,
   );
   const pending = preserveEntries(
-    sessionName, pendingEntries, seenSnapshotIds, existingIds, legacyByCommandId, recipient,
+    sessionName, pendingEntries, seenSnapshotIds, existingIds, legacyByCommandId, recipient, durableStatuses,
   );
   const afterCount = getResendCount(sessionName);
   return {

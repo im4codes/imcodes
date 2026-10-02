@@ -1369,7 +1369,7 @@ describe('sdk transport session restore', () => {
     expect(mocks.codexRuns.filter((run) => run.input.includes('legacy identified restart recovery'))).toHaveLength(1);
   });
 
-  it('restoreTransportSessions reclaims a dead-daemon unexpired handoff before rehydrate', async () => {
+  it('does not replay a dead-daemon unexpired handoff before its lease expires', async () => {
     resetTransportQueueStoreForTests();
     const sessionName = 'deck_sdk_cx_unexpired_handoff_brain';
     mocks.store.set(sessionName, {
@@ -1407,11 +1407,11 @@ describe('sdk transport session restore', () => {
     await connectProvider('codex-sdk', {});
     await restoreTransportSessions('codex-sdk');
 
-    await settleCodexRun(sessionName, 'resume');
-    const deadline = Date.now() + 5_000;
-    while (!codexRunForSession(sessionName, 'resume')?.input?.includes('recover lease owned by dead daemon')
-      && Date.now() < deadline) await flush();
-    expect(codexRunForSession(sessionName, 'resume')?.input).toContain('recover lease owned by dead daemon');
+    await flush();
+    expect(mocks.codexRuns.filter((run) => run.input.includes('recover lease owned by dead daemon'))).toHaveLength(0);
+    expect(getTransportQueueStore().readSnapshot(sessionName).pendingMessageEntries).toEqual([
+      expect.objectContaining({ clientMessageId: 'msg-unexpired-handoff', status: 'handoff_inflight' }),
+    ]);
   });
 
   it('does not attach cancellation errors to authoritative clean-idle lifecycle payloads', async () => {
@@ -1852,6 +1852,9 @@ describe('sdk transport session restore', () => {
     expect(claudePresetAppend(mocks.claudeRuns[0].options)).not.toContain('supervision_brain_work_delegation_v1');
     expect(claudePresetAppend(mocks.claudeRuns[1].options)).not.toContain('supervision_brain_work_delegation_v1');
     expect(mocks.claudeRuns.some((run) => claudePresetAppend(run.options).includes('task_assignment'))).toBe(false);
+    const queueDeadline = Date.now() + 5_000;
+    while (getTransportQueueStore().readSnapshot('deck_sdk_drain_brain').pendingMessageEntries.length > 0
+      && Date.now() < queueDeadline) await flush();
     for (const text of ['offline-msg-1', 'offline-msg-2', 'offline-msg-3']) {
       const matchingUserEvents = timelineEmitterEmitMock.mock.calls.filter((call) => (
         call[0] === 'deck_sdk_drain_brain'

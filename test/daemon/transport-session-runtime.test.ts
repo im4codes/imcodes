@@ -3004,7 +3004,9 @@ describe('TransportSessionRuntime', () => {
     mock.fireComplete('sess-1');
     await flushDispatch();
     expect(runtime.pendingCount).toBe(0);
-    expect(runtime.pendingVersion).toBe(5);
+    // The drain now records the lease transition and the acceptance/finalize
+    // transition separately, so the durable version advances twice.
+    expect(runtime.pendingVersion).toBe(6);
     expect(timelineEmitterEmitMock).toHaveBeenCalledWith(
       'deck_test_brain',
       'transport.queue.delivery',

@@ -143,7 +143,7 @@ describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
     }), 'commandId substitution mutant').toBe(false);
     expect(preservesExactlyOnceTransfer({
       ...sources,
-      runtime: runtime.replace('if (entry.queueHandoff) {', 'if (false) {'),
+      runtime: runtime.replaceAll('if (entry.queueHandoff) {', 'if (false) {'),
     }), 'runtime reinsert mutant').toBe(false);
     expect(preservesExactlyOnceTransfer({
       ...sources,
@@ -167,7 +167,7 @@ describe('drainResend awaited contract (audit cae1de69-826 / R-Drain)', () => {
       source.indexOf('/** Drain control traffic', source.indexOf('async function recoverPersistedTransportQueue')),
     );
     const prove = helper.indexOf('runtime.adoptOrRebindQueueRecipient()');
-    const reclaim = helper.indexOf('restoreExpiredHandoffs(sessionName, Date.now(), { includeUnexpired: true })');
+    const reclaim = helper.indexOf('restoreExpiredHandoffs(sessionName, Date.now())');
     const drain = helper.indexOf('await drainTransportResendQueueIntoRuntime(runtime, sessionName, context)');
 
     expect(canonicalize).toBeGreaterThanOrEqual(0);

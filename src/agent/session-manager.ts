@@ -1917,7 +1917,11 @@ async function recoverPersistedTransportQueue(
       'Transport queue recovery discarded stale recipient ownership instead of blocking session',
     );
   }
-  getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now(), { includeUnexpired: true });
+  // An unexpired handoff may already have crossed the provider boundary in the
+  // previous process.  Reclaiming it eagerly on restart/upgrade replays old
+  // messages; leave it quarantined until its lease expires, when the durable
+  // queue can retry it under the same clientMessageId.
+  getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
   await drainTransportResendQueueIntoRuntime(runtime, sessionName, context);
   // Launch historically relies on the resend holder and may contain queue rows
   // whose ids are not represented identically in older resend records. Reading

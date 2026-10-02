@@ -121,6 +121,7 @@ import type { QueueDeliveryFact, QueuePlacement, QueueSnapshot, QueueSupervision
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
 import { getTransportContextBudgetMs, readBoundedTimeoutMs } from './transport-context-budget.js';
 import { withTimeoutOutcome } from '../util/timeout-outcome.js';
+import { RESEND_EXPIRY_MS } from '../daemon/transport-resend-queue.js';
 
 export { getTransportContextBudgetMs };
 import {
@@ -864,6 +865,14 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._compactionObservedInTurn = false;
         if (compacted) this.reinjectAfterCompaction();
         this.clearStalePendingCancelFallbackTimer();
+        // Some providers emit onComplete synchronously while sendProviderTurn is
+        // still unwinding. In that ordering the acceptance continuation below
+        // observes a cleared dispatch; record the durable delivery boundary
+        // before onComplete releases the active entries instead.
+        if (this._activeDispatchId !== null && !this._activeDispatchProviderAccepted) {
+          this._activeDispatchProviderAccepted = true;
+          this.recordDirectDispatchDelivery(this._activeDispatchId);
+        }
         this._sending = false;
         this._history.push(message);
         const completedEntry = this._activeDispatchEntries.length === 1
@@ -1905,21 +1914,135 @@ export class TransportSessionRuntime implements SessionRuntime {
    * later reader conservative, which is the safe direction.
    */
   private recordDirectDispatchDelivery(dispatchId: number): void {
+    this.recordAcceptedDispatchDelivery(dispatchId);
+  }
+
+  /**
+   * Provider acceptance is the only delivery boundary.  Queue rows are leased
+   * before context assembly/provider admission, but they are not finalized
+   * until this method records acceptance.  A daemon restart in that window can
+   * therefore leave the lease quarantined instead of manufacturing a delivery
+   * tombstone for text the provider never saw.
+   */
+  private recordAcceptedDispatchDelivery(dispatchId: number): void {
     if (this._activeDispatchId !== dispatchId) return;
+    const store = getTransportQueueStore();
+    const deliveryFrameId = randomUUID();
+    const queueClientMessageIds = this._activeDispatchEntries
+      .filter((entry) => !!entry.queueHandoff)
+      .map((entry) => entry.clientMessageId);
+    const clientMessageIds = this._activeDispatchEntries.map((entry) => entry.clientMessageId);
     for (const entry of this._activeDispatchEntries) {
       try {
-        getTransportQueueStore().recordDirectDelivery(
-          this.sessionKey,
-          entry.clientMessageId,
-          undefined,
-          undefined,
-          this.queueRecipient ?? null,
-        );
+        if (entry.queueHandoff) {
+          store.recordDeliveryTombstone(
+            this.sessionKey,
+            entry.clientMessageId,
+            deliveryFrameId,
+            undefined,
+            this.queueRecipient ?? null,
+          );
+        } else {
+          store.recordDirectDelivery(
+            this.sessionKey,
+            entry.clientMessageId,
+            deliveryFrameId,
+            undefined,
+            this.queueRecipient ?? null,
+          );
+        }
       } catch (err) {
         logger.warn(
-          { err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId },
-          'runtime: direct delivery record failed; delivery itself was accepted',
+          { err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId, deliveryFrameId },
+          'runtime: delivery acceptance record failed; delivery itself was accepted',
         );
+      }
+    }
+    if (queueClientMessageIds.length === 0) return;
+    try {
+      const finalized = store.finalizeSentBatch(
+        this.sessionKey,
+        queueClientMessageIds,
+        deliveryFrameId,
+        undefined,
+        this.queueRecipient ?? null,
+      );
+      for (const fact of finalized.deliveryFacts) {
+        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
+          source: 'daemon',
+          confidence: 'high',
+        });
+      }
+      this._pendingVersion = Math.max(this._pendingVersion, finalized.snapshot.pendingMessageVersion);
+    } catch (err) {
+      // The tombstones above make the rows non-replayable; a later reconcile
+      // removes any handoff rows left by a crash or transient SQLite failure.
+      logger.warn(
+        { err, sessionKey: this.sessionKey, clientMessageIds, deliveryFrameId },
+        'runtime: queue finalization failed after provider acceptance; tombstone will reconcile later',
+      );
+    }
+  }
+
+  private acquireDispatchHandoffs(entries: PendingTransportMessage[]): PendingTransportMessage[] | null {
+    const store = getTransportQueueStore();
+    let durableStatuses = new Map<string, string>();
+    try {
+      const snapshot = store.readSnapshot(this.sessionKey, 'dispatch_handoff_probe');
+      durableStatuses = new Map(snapshot.pendingMessageEntries.map((entry) => [entry.clientMessageId, entry.status]));
+    } catch {
+      // Direct runtime retries have no durable row; a read outage must not turn
+      // those in-memory entries into a false handoff failure.
+    }
+    const unleased = entries.filter((entry) => (
+      !entry.queueHandoff && durableStatuses.get(entry.clientMessageId) === 'queued'
+    ));
+    if (unleased.length === 0) return entries.map((entry) => ({ ...entry }));
+    const leased = store.markHandoffInFlight(
+      this.sessionKey,
+      unleased.map((entry) => entry.clientMessageId),
+      RESEND_EXPIRY_MS,
+      Date.now(),
+      this.queueRecipient ?? null,
+    );
+    if (leased.length !== unleased.length) {
+      if (leased.length > 0) {
+        const handoffId = leased[0]?.handoffId;
+        if (handoffId) {
+          try {
+            store.releaseHandoff(this.sessionKey, handoffId, leased.map((item) => item.entry.clientMessageId));
+          } catch (err) {
+            logger.warn({ err, sessionKey: this.sessionKey, handoffId }, 'transport queue handoff release failed after partial admission');
+          }
+        }
+      }
+      return null;
+    }
+    const handoffById = new Map(leased.map((item) => [item.entry.clientMessageId, item.handoffId]));
+    return entries.map((entry) => {
+      const handoffId = handoffById.get(entry.clientMessageId);
+      return handoffId
+        ? { ...entry, queueHandoff: { clientMessageId: entry.clientMessageId, handoffId } }
+        : { ...entry };
+    });
+  }
+
+  private releaseDispatchHandoffs(entries: PendingTransportMessage[]): void {
+    const grouped = new Map<string, string[]>();
+    for (const entry of entries) {
+      const handoff = entry.queueHandoff;
+      if (!handoff) continue;
+      grouped.set(handoff.handoffId, [
+        ...(grouped.get(handoff.handoffId) ?? []),
+        handoff.clientMessageId,
+      ]);
+    }
+    const store = getTransportQueueStore();
+    for (const [handoffId, ids] of grouped) {
+      try {
+        store.releaseHandoff(this.sessionKey, handoffId, ids);
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, handoffId, clientMessageIds: ids }, 'transport queue handoff release failed after provider rejection');
       }
     }
   }
@@ -3656,6 +3779,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
     );
     this._sending = false;
+    this.releaseDispatchHandoffs(this._activeDispatchEntries);
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn.resolve();
     this._activeTurn = null;
@@ -3835,6 +3959,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._capacityRetryError = error.message;
     const entries = this._activeDispatchEntries;
     this._capacityRetryEntryIds = entries.map((entry) => entry.clientMessageId);
+    this.releaseDispatchHandoffs(entries);
     // Durable first: a daemon restart during the retry finds the turn in the queue and resumes it.
     for (const entry of [...entries].reverse()) {
       try {
@@ -3923,6 +4048,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._recoverableRetryEntryIds = this._activeDispatchEntries.map(
       (entry) => entry.clientMessageId,
     );
+    this.releaseDispatchHandoffs(this._activeDispatchEntries);
     this._pendingMessages.unshift(...this._activeDispatchEntries);
     this._pendingVersion++;
     this._activeDispatchEntries = [];
@@ -4399,6 +4525,14 @@ export class TransportSessionRuntime implements SessionRuntime {
           return;
         }
         if (this._activeDispatchEntries.length > 0) this.cancelCapacityRetry(false);
+        // A provider-side acceptance is irreversible.  A late error/completion
+        // must settle the local turn without putting the accepted ids back into
+        // the retry FIFO; only pre-acceptance failures may release/requeue.
+        if (this._activeDispatchProviderAccepted) {
+          this._activeDispatchEntries = [];
+          this.setStatus('error');
+          return;
+        }
         const canDrain = providerError.code === PROVIDER_ERROR_CODES.CANCELLED || providerError.recoverable;
         this._sending = false;
         this._activeTurn.reject(providerError);
@@ -4434,12 +4568,14 @@ export class TransportSessionRuntime implements SessionRuntime {
             // session-manager can preserve them to resend before relaunching the
             // provider runtime. Do NOT drain into the same wedged provider and
             // do NOT drop the active entries.
+            this.releaseDispatchHandoffs(this._activeDispatchEntries);
             this._pendingMessages.unshift(...this._activeDispatchEntries);
             this._pendingVersion++;
             this._activeDispatchEntries = [];
             this.setStatus('error');
             return;
           }
+          this.releaseDispatchHandoffs(this._activeDispatchEntries);
           this._activeDispatchEntries = [];
           if (this._drainPending()) return;
           // Cancellation → idle (the user stopped). Recoverable budget exhausted
@@ -4452,6 +4588,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // listener above so a genuine CONNECTION_LOST can be copied to the
         // resend queue, then clear runtime-local active state. Ordinary
         // dispatch failures must not leave `hasActiveTurnWork()` true forever.
+        this.releaseDispatchHandoffs(this._activeDispatchEntries);
         this._activeDispatchEntries = [];
         // The failed message itself is not retried here — the provider is
         // likely broken for this specific turn — but the queue is
@@ -4750,30 +4887,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._pendingMessages = this._pendingMessages.filter((entry) => !messageIds.has(entry.clientMessageId));
     }
     for (const entry of messages) this._pendingAuthorityRetryAttempts.delete(entry.clientMessageId);
+    // A pending row is leased before it leaves the runtime FIFO.  Finalizing it
+    // here used to create a delivery tombstone before provider.send() had even
+    // started; teardown/upgrade preservation then re-enqueued the active entry
+    // from that false proof and replayed it after reconnect.  Keep the durable
+    // handoff live until the provider acceptance boundary instead.
+    const leasedMessages = this.acquireDispatchHandoffs(messages);
+    if (!leasedMessages) {
+      this._pendingMessages.unshift(...messages);
+      this._pendingVersion++;
+      return false;
+    }
+    messages = leasedMessages;
     const timelineMessages = messages.filter((entry) => !entry.timelineCommitted);
     for (const entry of timelineMessages) entry.timelineCommitted = true;
-    try {
-      const queueResult = getTransportQueueStore().finalizeSentBatch(
-        this.sessionKey,
-        messages.map((entry) => entry.clientMessageId),
-        randomUUID(),
-        undefined,
-        this.queueRecipient ?? null,
-      );
-      for (const fact of queueResult.deliveryFacts) {
-        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
-          source: 'daemon',
-          confidence: 'high',
-        });
-      }
-      this._pendingVersion = Math.max(this._pendingVersion, queueResult.snapshot.pendingMessageVersion);
-    } catch (err) {
-      logger.warn(
-        { err, sessionKey: this.sessionKey, clientMessageIds: messages.map((entry) => entry.clientMessageId) },
-        'transport queue sqlite finalizeSentBatch failed during drain',
-      );
-      this._pendingVersion++;
-    }
+    this._pendingVersion++;
     // Advance the queue version the moment the queue empties. The onDrain
     // callback below emits this new version on both the per-entry
     // `user.message` events and the cleared `session.state`, so a stale
@@ -4831,6 +4959,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         { err, providerSessionId: this._providerSessionId, count: messages.length },
         '_drainPending: _dispatchTurn synchronous prologue threw — resetting runtime state',
       );
+      this.releaseDispatchHandoffs(this._activeDispatchEntries);
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
@@ -4874,6 +5003,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       }
       return;
     }
+    this.releaseDispatchHandoffs(this._activeDispatchEntries);
     this._sending = false;
     this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.reject(makeCancelledProviderError());

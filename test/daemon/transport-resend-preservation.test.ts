@@ -125,6 +125,52 @@ describe('preserveTransportRuntimeQueuesToResend', () => {
     ]);
   });
 
+  it('does not resurrect an accepted active entry after a restart/upgrade preservation pass', () => {
+    const sessionName = 'deck_preserve_accepted';
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName,
+      clientMessageId: 'accepted-active',
+      commandId: 'accepted-active',
+      text: 'already accepted',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'accepted-active', text: 'already accepted' }),
+    });
+    store.finalizeSent(sessionName, 'accepted-active', 'accepted-frame');
+
+    const result = preserveTransportRuntimeQueuesToResend(sessionName, runtimeSnapshot(
+      [{ clientMessageId: 'accepted-active', text: 'already accepted' }],
+      [],
+    ));
+
+    expect(result.preservedCount).toBe(0);
+    expect(getResendEntries(sessionName)).toEqual([]);
+    expect(store.readSnapshot(sessionName).pendingMessageEntries).toEqual([]);
+  });
+
+  it('quarantines an unexpired active handoff instead of copying it into resend memory', () => {
+    const sessionName = 'deck_preserve_inflight';
+    const store = getTransportQueueStore();
+    store.enqueue({
+      sessionName,
+      clientMessageId: 'inflight-active',
+      commandId: 'inflight-active',
+      text: 'provider boundary unknown',
+      privateMaterialJson: JSON.stringify({ clientMessageId: 'inflight-active', text: 'provider boundary unknown' }),
+    });
+    expect(store.markHandoffInFlight(sessionName, ['inflight-active'], 60_000)).toHaveLength(1);
+
+    const result = preserveTransportRuntimeQueuesToResend(sessionName, runtimeSnapshot(
+      [{ clientMessageId: 'inflight-active', text: 'provider boundary unknown' }],
+      [],
+    ));
+
+    expect(result.preservedCount).toBe(0);
+    expect(getResendEntries(sessionName)).toEqual([]);
+    expect(store.readSnapshot(sessionName).pendingMessageEntries[0]).toEqual(
+      expect.objectContaining({ clientMessageId: 'inflight-active', status: 'handoff_inflight' }),
+    );
+  });
+
   it('preserves every private authority field while making peer-audit lifetime explicit', () => {
     const supervisionReference = {
       kind: 'implementation_blocker' as const,
