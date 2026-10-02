@@ -360,6 +360,27 @@ describe('one-time legacy import', () => {
     expect(notices).toHaveLength(1);
   });
 
+  it('does not replay the tsk_1m3d placeholder on repeated legacy imports', async () => {
+    const tasks = [task('tsk_1m3d', 'planned', [], PROJECT, SUPERVISION_TASK_DEFAULT_OBJECTIVE)];
+    const notices: Array<[string, string]> = [];
+    const registry = { list: () => tasks };
+    expect(importLegacyTasks(registry, 17_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // Placeholder wrappers have no recoverable brief, so they must not
+    // create a pair or durable lifecycle event that a queue can replay.
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m3d')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m3d')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+    expect(notices[0]?.[1]).toContain('tsk_1m3d');
+
+    expect(importLegacyTasks(registry, 18_000, (brain, text) => { notices.push([brain, text]); return true; })).toBe(0);
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    expect(getTaskPairStore().getPair(PROJECT, 'tsk_1m3d')).toBeUndefined();
+    expect(getTaskPairStore().listEvents(PROJECT, 'tsk_1m3d')).toHaveLength(0);
+    expect(notices).toHaveLength(1);
+  });
+
   it('imports one real legacy objective idempotently with title and brief metadata', async () => {
     const objective = 'Restore retry handling\nAcceptance: preserve the last successful attempt';
     const tasks = [
