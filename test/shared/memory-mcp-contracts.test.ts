@@ -101,6 +101,10 @@ describe('memory MCP shared contracts', () => {
       'pair_get',
       'pair_create',
       'pair_dispatch',
+      'pair_close',
+      'pair_reassign',
+      'pair_next_round',
+      'pair_verdict',
       'pair_set_max_concurrency',
       'pair_get_max_concurrency',
       'session_runtime_identity_get',
@@ -135,12 +139,20 @@ describe('memory MCP shared contracts', () => {
   it('publishes structured pair lifecycle schemas with assignment and replay fields', () => {
     const create = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_CREATE].inputSchema;
     const dispatch = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH].inputSchema;
+    const close = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE].inputSchema;
+    const reassign = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN].inputSchema;
+    const nextRound = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND].inputSchema;
+    const verdict = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT].inputSchema;
     expect(create.required).toEqual(['brief', 'executor']);
     expect(Object.keys(create.properties ?? {})).toEqual(expect.arrayContaining([
       'taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool', 'idempotencyKey',
     ]));
     expect(dispatch.required).toEqual(['taskId']);
     expect(Object.keys(dispatch.properties ?? {})).toEqual(expect.arrayContaining(['taskId', 'idempotencyKey']));
+    expect(close.required).toEqual(['taskId', 'action']);
+    expect(Object.keys(reassign.properties ?? {})).toEqual(expect.arrayContaining(['executor', 'auditor', 'executorModel', 'auditorModel', 'idempotencyKey']));
+    expect(nextRound.required).toEqual(['taskId']);
+    expect(Object.keys(verdict.properties ?? {})).toEqual(expect.arrayContaining(['verdict', 'blocking', 'p0', 'p1', 'p2', 'p3', 'p4', 'idempotencyKey']));
   });
 
   it('keeps search as a text-query contract and send files as path references', () => {

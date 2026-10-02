@@ -113,6 +113,10 @@ export const MEMORY_MCP_TOOL_NAMES = {
   PAIR_GET: 'pair_get',
   PAIR_CREATE: 'pair_create',
   PAIR_DISPATCH: 'pair_dispatch',
+  PAIR_CLOSE: 'pair_close',
+  PAIR_REASSIGN: 'pair_reassign',
+  PAIR_NEXT_ROUND: 'pair_next_round',
+  PAIR_VERDICT: 'pair_verdict',
   PAIR_SET_MAX_CONCURRENCY: 'pair_set_max_concurrency',
   PAIR_GET_MAX_CONCURRENCY: 'pair_get_max_concurrency',
   SESSION_RUNTIME_IDENTITY_GET: 'session_runtime_identity_get',
@@ -147,6 +151,10 @@ export const MEMORY_MCP_TOOL_NAMES = {
   COMPUTER_USE_CALL: 'computer_use_call',
 } as const;
 
+/** Structured pair close actions; lifecycle semantics are delegated to the marker state machine. */
+export const MEMORY_MCP_PAIR_CLOSE_ACTIONS = ['done', 'cancel'] as const;
+export type MemoryMcpPairCloseAction = typeof MEMORY_MCP_PAIR_CLOSE_ACTIONS[number];
+
 export type MemoryMcpToolName = (typeof MEMORY_MCP_TOOL_NAMES)[keyof typeof MEMORY_MCP_TOOL_NAMES];
 
 export const MEMORY_MCP_TOOL_NAME_LIST = [
@@ -179,6 +187,10 @@ export const MEMORY_MCP_TOOL_NAME_LIST = [
   MEMORY_MCP_TOOL_NAMES.PAIR_GET,
   MEMORY_MCP_TOOL_NAMES.PAIR_CREATE,
   MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH,
+  MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+  MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
+  MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
+  MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT,
   MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY,
   MEMORY_MCP_TOOL_NAMES.PAIR_GET_MAX_CONCURRENCY,
   MEMORY_MCP_TOOL_NAMES.SESSION_RUNTIME_IDENTITY_GET,
@@ -762,6 +774,62 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
     }, ['taskId']),
     outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Dispatched task id.'), state: stringSchema('Current pair state.'), deliveries: { type: 'array', items: { type: 'object' } } }),
   },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE,
+    description: 'Brain-only structured pair close. action=done accepts the audited result (force/accept) and optional output/dest; action=cancel preserves marker semantics. Replays with the same idempotencyKey are idempotent. Brief edits still use pair_task_update and checklist edits use pair_task_check; neither closes a pair.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing task-pair id.', { minLength: 1 }),
+      action: { type: 'string', enum: [...MEMORY_MCP_PAIR_CLOSE_ACTIONS], description: 'Terminal action.' },
+      force: booleanSchema('For done, accept an unaudited or otherwise held audited pair.'),
+      accept: booleanSchema('Alias for force=true on done; explicit Brain acceptance.'),
+      output: stringSchema('Optional deliverable path inside the pair workspace.'),
+      dest: stringSchema('Optional destination path inside the project.'),
+      integration: stringSchema('Optional integration=dismiss compatibility control for an already-done pair.'),
+      idempotencyKey: stringSchema('Stable retry key for this close request.'),
+    }, ['taskId', 'action']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Closed task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN,
+    description: 'Brain-only structured role/model reassignment. Reuses the REASSIGN state machine, queue admission, participant brief delivery, and durable idempotency events.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing task-pair id.', { minLength: 1 }),
+      executor: stringSchema('Exact replacement executor session.'),
+      auditor: stringSchema('Exact replacement auditor session, or none.'),
+      executorModel: stringSchema('Replacement executor model.'),
+      auditorModel: stringSchema('Replacement auditor model.'),
+      executionPool: { type: 'string', enum: ['primary', 'economy'], description: 'Replacement executor pool.' },
+      idempotencyKey: stringSchema('Stable retry key for this reassignment request.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Reassigned task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND,
+    description: 'Brain-only structured NEXT_ROUND. The pair must be passed, terminal pairs are rejected, and base/note are persisted by the marker state machine.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing passed task-pair id.', { minLength: 1 }),
+      base: stringSchema('Optional 7-64 hex commit base.'),
+      note: stringSchema('Optional note for the new delivery round.'),
+      idempotencyKey: stringSchema('Stable retry key for this next-round request.'),
+    }, ['taskId']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.') }),
+  },
+  [MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]: {
+    name: MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT,
+    description: 'Assigned-auditor structured PASS/REWORK verdict for a material-backed in_audit round. blocking and p0..p4 counts reuse the audit-convergence judgement and receipt rules; this never substitutes for READY_FOR_AUDIT material.',
+    inputSchema: objectSchema({
+      taskId: stringSchema('Existing material-backed in-audit task-pair id.', { minLength: 1 }),
+      verdict: { type: 'string', enum: ['PASS', 'REWORK'], description: 'Audit verdict.' },
+      blocking: stringSchema('Optional comma-separated blocking severities, e.g. P0,P1.'),
+      p0: numberSchema('Optional P0 finding count.', { minimum: 0 }),
+      p1: numberSchema('Optional P1 finding count.', { minimum: 0 }),
+      p2: numberSchema('Optional P2 finding count.', { minimum: 0 }),
+      p3: numberSchema('Optional P3 finding count.', { minimum: 0 }),
+      p4: numberSchema('Optional P4 finding count.', { minimum: 0 }),
+      idempotencyKey: stringSchema('Stable retry key for this verdict request.'),
+    }, ['taskId', 'verdict']),
+    outputSchema: objectSchema({ status: stringSchema('ok or error.'), taskId: stringSchema('Task id.'), state: stringSchema('Current pair state.'), effect: stringSchema('State-machine effect.'), idempotentReplay: booleanSchema('Whether this request replayed a durable event.'), judgement: stringSchema('Audit-convergence judgement.'), counts: { type: 'object', additionalProperties: { type: 'number' } } }),
+  },
   [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY,
     description: 'Set the caller Brain\'s durable task-pair concurrency limit. Pair writes otherwise remain marker-driven.',
@@ -913,13 +981,13 @@ export const MEMORY_MCP_TOOL_CONTRACTS: Readonly<Record<MemoryMcpToolName, Memor
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_UPDATE,
-    description: 'Replace pair brief or set a Brain-only title.',
+    description: 'Replace the complete pair brief or set a Brain-only title. Brief edits do not close or advance the pair; use pair_close for terminal lifecycle decisions.',
     inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), markdown: { type: 'string', description: 'Complete Markdown brief.' }, title: { type: 'string', minLength: 1, description: 'Owner-locale title.' } }),
     outputSchema: statusSchema,
   },
   [MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK]: {
     name: MEMORY_MCP_TOOL_NAMES.PAIR_TASK_CHECK,
-    description: 'Update pair checklist.',
+    description: 'Update pair checklist only. Checklist changes never implicitly close or advance a pair; use pair_close or pair_verdict for lifecycle decisions.',
     inputSchema: objectSchema({ taskId: stringSchema('Optional task id.'), items: { type: 'array', items: { type: 'integer', minimum: 1 } }, box: { type: 'string', enum: ['implemented', 'audited'] }, checked: { type: 'boolean' } }, ['items', 'box', 'checked']),
     outputSchema: statusSchema,
   },

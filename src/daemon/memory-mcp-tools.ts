@@ -25,6 +25,7 @@ import {
   MEMORY_MCP_DISABLED_FLAGS,
   MEMORY_MCP_TOOL_CONTRACTS,
   MEMORY_MCP_TOOL_NAME_LIST,
+  MEMORY_MCP_PAIR_CLOSE_ACTIONS,
   RETIRED_SUPERVISION_MCP_TOOL_NAMES,
   MEMORY_MCP_TOOL_NAMES,
   buildMcpDisabledResult,
@@ -1649,6 +1650,46 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
     if (!project) return { status: 'error', result: error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'caller project is unavailable') };
     return { status: 'ok', project, sessions };
   };
+  const applyStructuredPairLifecycle = async (input: {
+    project: string;
+    taskId: string;
+    verb: 'DONE' | 'CANCEL' | 'REASSIGN' | 'NEXT_ROUND' | 'PASS' | 'REWORK';
+    attrs: Record<string, string>;
+    idempotencyKey?: string;
+    authorize: (pair: StoredTaskPair) => ToolResult | undefined;
+  }): Promise<ToolResult> => {
+    const store = getTaskPairStore();
+    const stored = store.getPair(input.project, input.taskId);
+    if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+    const authorization = input.authorize(stored);
+    if (authorization) return authorization;
+    const stableAttrs = Object.entries(input.attrs).sort(([left], [right]) => left.localeCompare(right));
+    const key = input.idempotencyKey?.trim() || JSON.stringify(stableAttrs);
+    const eventId = `mcp:pair-${input.verb.toLowerCase()}:${input.project}:${input.taskId}:${key}`;
+    const replay = store.hasEvent(eventId);
+    const transition = taskPairService.applyMarker({
+      project: input.project,
+      writer: caller.sessionName!,
+      marker: { verb: input.verb, knownVerb: input.verb, taskId: input.taskId, attrs: input.attrs },
+      source: 'mcp',
+      eventId,
+      suppressAutomaticBrief: false,
+    });
+    await taskPairService.waitForIdle();
+    const after = store.getPair(input.project, input.taskId);
+    if (!after) return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, 'pair disappeared during lifecycle operation');
+    if (!replay && transition.unusual && transition.effect === 'recorded') {
+      return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `pair ${input.verb} was rejected by the lifecycle state machine`);
+    }
+    return {
+      status: 'ok',
+      taskId: input.taskId,
+      state: after.state.status,
+      effect: transition.effect,
+      idempotentReplay: replay || transition.effect === 'replayed',
+      ...(transition.verdict ? { judgement: transition.verdict.judgement, counts: transition.verdict.counts } : {}),
+    };
+  };
   const pairParticipant = (sessionName: string | undefined, sessions: SessionRecord[]) => {
     if (!sessionName || sessionName === 'none') return null;
     const record = sessions.find((session) => session.name === sessionName);
@@ -2921,6 +2962,109 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       store.recordEvent({ id: eventId, project: context.project, taskId, writer: caller.sessionName, role, verb: TASK_PAIR_MCP_DISPATCH_EVENT, attrs: { idempotencyKey: idempotencyKey ?? taskId }, effect: 'dispatched', unusual: false, source: 'mcp', fromStatus: stored.state.status, toStatus: after.state.status, at: Date.now() });
       const deliveries = after.state.status === 'queued' ? [] : await deliverStructuredPairBriefs(context.project, taskId, eventId);
       return { status: 'ok', taskId, idempotentReplay: false, state: after.state.status, deliveries };
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_close requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['taskId', 'action', 'force', 'accept', 'output', 'dest', 'integration', 'idempotencyKey']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      const action = stringArg(args, 'action');
+      if (!taskId || !(MEMORY_MCP_PAIR_CLOSE_ACTIONS as readonly string[]).includes(action ?? '')) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId and action=done|cancel are required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      const idempotencyKey = stringArg(args, 'idempotencyKey');
+      const force = boolArg(args, 'force') === true || boolArg(args, 'accept') === true;
+      const attrs: Record<string, string> = {};
+      if (force) attrs.force = 'true';
+      const output = stringArg(args, 'output');
+      const dest = stringArg(args, 'dest');
+      const integration = stringArg(args, 'integration');
+      if (output) attrs.output = output;
+      if (dest) attrs.dest = dest;
+      if (integration) attrs.integration = integration;
+      const verb = action === MEMORY_MCP_PAIR_CLOSE_ACTIONS[0] ? 'DONE' as const : 'CANCEL' as const;
+      const eventKey = idempotencyKey?.trim() || JSON.stringify(Object.entries(attrs).sort());
+      const dismissesDoneIntegration = stored.state.status === 'done' && integration === 'dismiss';
+      if (isTerminalTaskPairStatus(stored.state.status) && !dismissesDoneIntegration && !getTaskPairStore().hasEvent(`mcp:pair-${verb.toLowerCase()}:${context.project}:${taskId}:${eventKey}`)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot ${action} terminal pair (${stored.state.status})`);
+      }
+      return applyStructuredPairLifecycle({
+        project: context.project, taskId, verb, attrs, idempotencyKey,
+        authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_close requires the pair Brain'),
+      });
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_reassign requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['taskId', 'executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool', 'idempotencyKey']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const attrs: Record<string, string> = {};
+      for (const [arg, attr] of [['executor', 'executor'], ['auditor', 'auditor'], ['executorModel', 'executormodel'], ['auditorModel', 'auditormodel'], ['executionPool', 'pool']] as const) {
+        const value = stringArg(args, arg)?.trim();
+        if (value) attrs[attr] = value;
+      }
+      if (Object.keys(attrs).length === 0) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'at least one role, model, or executionPool change is required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (stored && isTerminalTaskPairStatus(stored.state.status)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot reassign terminal pair (${stored.state.status})`);
+      return applyStructuredPairLifecycle({
+        project: context.project, taskId, verb: 'REASSIGN', attrs, idempotencyKey: stringArg(args, 'idempotencyKey'),
+        authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_reassign requires the pair Brain'),
+      });
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
+        return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_next_round requires the authoritative project Brain');
+      }
+      const args = pickAllowedMcpArgs(input, ['taskId', 'base', 'note', 'idempotencyKey']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      if (!taskId) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId is required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (stored && isTerminalTaskPairStatus(stored.state.status)) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, `cannot open a round on terminal pair (${stored.state.status})`);
+      const attrs: Record<string, string> = {};
+      const base = stringArg(args, 'base')?.trim();
+      const note = stringArg(args, 'note')?.trim();
+      if (base) attrs.base = base;
+      if (note) attrs.note = note;
+      return applyStructuredPairLifecycle({
+        project: context.project, taskId, verb: 'NEXT_ROUND', attrs, idempotencyKey: stringArg(args, 'idempotencyKey'),
+        authorize: (pair) => pair.state.brain === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_next_round requires the pair Brain'),
+      });
+    },
+    [MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]: async (input) => {
+      const context = await pairCallerContext();
+      if (context.status === 'error') return context.result;
+      const args = pickAllowedMcpArgs(input, ['taskId', 'verdict', 'blocking', 'p0', 'p1', 'p2', 'p3', 'p4', 'idempotencyKey']);
+      const taskId = stringArg(args, 'taskId')?.trim();
+      const verdict = stringArg(args, 'verdict');
+      if (!taskId || (verdict !== 'PASS' && verdict !== 'REWORK')) return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'taskId and verdict=PASS|REWORK are required');
+      const stored = getTaskPairStore().getPair(context.project, taskId);
+      if (!stored) return error(MCP_ERROR_REASONS.PROJECTION_UNAVAILABLE, 'task pair not found');
+      if (stored.state.auditor !== caller.sessionName) return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_verdict requires the assigned auditor');
+      const attrs: Record<string, string> = {};
+      const blocking = stringArg(args, 'blocking')?.trim();
+      if (blocking) attrs.blocking = blocking;
+      for (const level of ['p0', 'p1', 'p2', 'p3', 'p4'] as const) {
+        const count = numberArg(args, level);
+        if (count !== undefined) attrs[level] = String(count);
+      }
+      const verdictKey = stringArg(args, 'idempotencyKey')?.trim() || JSON.stringify(Object.entries(attrs).sort());
+      const verdictEventId = `mcp:pair-${verdict.toLowerCase()}:${context.project}:${taskId}:${verdictKey}`;
+      if ((stored.state.status !== 'in_audit' || !stored.state.material) && !getTaskPairStore().hasEvent(verdictEventId)) {
+        return error(MCP_ERROR_REASONS.VALIDATION_FAILED, 'pair_verdict requires a material-backed in_audit round');
+      }
+      return applyStructuredPairLifecycle({
+        project: context.project, taskId, verb: verdict, attrs, idempotencyKey: stringArg(args, 'idempotencyKey'),
+        authorize: (pair) => pair.state.auditor === caller.sessionName ? undefined : error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_verdict requires the assigned auditor'),
+      });
     },
     [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: async (input) => {
       const context = await pairCallerContext();
@@ -4211,6 +4355,42 @@ const schemas = {
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_DISPATCH]: z.object({
     taskId: z.string().trim().min(1),
+    idempotencyKey: z.string().trim().min(1).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]: z.object({
+    taskId: z.string().trim().min(1),
+    action: z.enum(MEMORY_MCP_PAIR_CLOSE_ACTIONS),
+    force: z.boolean().optional(),
+    accept: z.boolean().optional(),
+    output: z.string().trim().min(1).optional(),
+    dest: z.string().trim().min(1).optional(),
+    integration: z.string().trim().min(1).optional(),
+    idempotencyKey: z.string().trim().min(1).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]: z.object({
+    taskId: z.string().trim().min(1),
+    executor: z.string().trim().min(1).optional(),
+    auditor: z.string().trim().min(1).optional(),
+    executorModel: z.string().trim().min(1).optional(),
+    auditorModel: z.string().trim().min(1).optional(),
+    executionPool: z.enum(['primary', 'economy']).optional(),
+    idempotencyKey: z.string().trim().min(1).optional(),
+  }).strict().refine((value) => Object.keys(value).some((key) => ['executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool'].includes(key)), { message: 'at least one reassignment field is required' }),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]: z.object({
+    taskId: z.string().trim().min(1),
+    base: z.string().trim().min(1).optional(),
+    note: z.string().trim().min(1).optional(),
+    idempotencyKey: z.string().trim().min(1).optional(),
+  }).strict(),
+  [MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]: z.object({
+    taskId: z.string().trim().min(1),
+    verdict: z.enum(['PASS', 'REWORK']),
+    blocking: z.string().trim().min(1).optional(),
+    p0: z.number().int().nonnegative().optional(),
+    p1: z.number().int().nonnegative().optional(),
+    p2: z.number().int().nonnegative().optional(),
+    p3: z.number().int().nonnegative().optional(),
+    p4: z.number().int().nonnegative().optional(),
     idempotencyKey: z.string().trim().min(1).optional(),
   }).strict(),
   [MEMORY_MCP_TOOL_NAMES.PAIR_SET_MAX_CONCURRENCY]: z.object({

@@ -8,6 +8,7 @@ import type { SessionRecord } from '../../../src/store/session-store.js';
 import { getTaskPairStore, setTaskPairStoreForTests, TaskPairStore } from '../../../src/daemon/task-pairs/store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
+import { taskPairService } from '../../../src/daemon/task-pairs/service.js';
 
 const PROJECT = 'pair-mcp-project';
 const BRAIN = 'deck_pair_mcp_brain';
@@ -185,6 +186,69 @@ describe('pair MCP projections', () => {
       if (previousEngine === undefined) delete process.env.IMCODES_SUPERVISION_ENGINE;
       else process.env.IMCODES_SUPERVISION_ENGINE = previousEngine;
     }
+  });
+
+  it('closes through the shared marker state machine and replays idempotently', async () => {
+    const taskId = 'structured-close';
+    upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1'));
+    getTaskPairStore().savePair(PROJECT, { ...pair(taskId, 'working'), auditor: 'none' });
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1')] } });
+    const first = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId, action: 'done', idempotencyKey: 'close-once' });
+    expect(first).toMatchObject({ status: 'ok', taskId, state: 'done', effect: 'status', idempotentReplay: false });
+    const second = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId, action: 'done', idempotencyKey: 'close-once' });
+    expect(second).toMatchObject({ status: 'ok', taskId, state: 'done', idempotentReplay: true });
+    expect(getTaskPairStore().listEvents(PROJECT, taskId).filter((event) => event.verb === 'DONE')).toHaveLength(1);
+    removeSession(BRAIN); removeSession(EXEC);
+  });
+
+  it('enforces Brain-only reassignment and persists the REASSIGN effect', async () => {
+    const taskId = 'structured-reassign';
+    const replacement = 'deck_sub_pair_mcp_exec2';
+    upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2')); upsertSession(session(replacement, 'w3'));
+    getTaskPairStore().savePair(PROJECT, pair(taskId, 'working'));
+    const sessions = () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2'), session(replacement, 'w3')];
+    const executorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: EXEC }, { sendDeps: { listSessions: sessions } });
+    await expect(executorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({ taskId, executor: replacement })).resolves.toMatchObject({ status: 'error', reason: 'scope_forbidden' });
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: sessions } });
+    const reassigned = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_REASSIGN]({ taskId, executor: replacement, idempotencyKey: 'reassign-once' }); expect(reassigned).toMatchObject({ status: 'ok', taskId, effect: 'reassigned' });
+    expect(getTaskPairStore().getPair(PROJECT, taskId)?.state.executor).toBe(replacement);
+    removeSession(BRAIN); removeSession(EXEC); removeSession(AUD); removeSession(replacement);
+  });
+
+  it('opens only a passed next round and applies auditor verdicts to material-backed rounds', async () => {
+    const nextRoundId = 'structured-next-round';
+    upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2'));
+    getTaskPairStore().savePair(PROJECT, { ...pair(nextRoundId, 'passed'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, passRound: 1 });
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
+    const next = await handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: nextRoundId, base: 'abcdef1', note: 'round two', idempotencyKey: 'next-once' }); expect(next).toMatchObject({ status: 'ok', taskId: nextRoundId, state: 'working', effect: 'next_round' });
+
+    const verdictId = 'structured-verdict';
+    getTaskPairStore().savePair(PROJECT, { ...pair(verdictId, 'in_audit'), material: { path: '/tmp/pair-mcp', head: 'abcdef1', at: 30 }, round: 1 });
+    const auditorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: AUD }, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
+    await expect(auditorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]({ taskId: verdictId, verdict: 'PASS', idempotencyKey: 'verdict-once' })).resolves.toMatchObject({ status: 'ok', taskId: verdictId, state: 'passed', effect: 'verdict', judgement: 'implicit_zero', counts: { P0: 0 } });
+    const replay = await auditorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]({ taskId: verdictId, verdict: 'PASS', idempotencyKey: 'verdict-once' });
+    expect(replay).toMatchObject({ status: 'ok', idempotentReplay: true, state: 'passed' });
+    removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
+  });
+
+  it('rejects unknown/terminal or wrong-state lifecycle requests and releases claims once on cancel', async () => {
+    upsertSession(session(BRAIN, 'brain')); upsertSession(session(EXEC, 'w1')); upsertSession(session(AUD, 'w2'));
+    const cancelId = 'structured-cancel';
+    getTaskPairStore().savePair(PROJECT, pair(cancelId, 'working'));
+    expect(taskPairService.claimResource({ project: PROJECT, taskId: cancelId, owner: EXEC, resource: 'port:43123', mode: 'exclusive', ttlMs: 60000 }).ok).toBe(true);
+    const handlers = createMemoryMcpToolHandlers(caller, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: 'missing', action: 'cancel' })).resolves.toMatchObject({ status: 'error', reason: 'projection_unavailable' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: cancelId, action: 'cancel', idempotencyKey: 'cancel-once' })).resolves.toMatchObject({ status: 'ok', state: 'cancelled', effect: 'status' });
+    expect(getTaskPairStore().getPair(PROJECT, cancelId)?.state.resourceClaims).toEqual([]);
+    expect(getTaskPairStore().getPair(PROJECT, cancelId)?.state.resourceCleanup?.resources).toEqual(['port:43123']);
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_CLOSE]({ taskId: cancelId, action: 'cancel', idempotencyKey: 'cancel-again' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+
+    const wrongState = 'structured-wrong-state';
+    getTaskPairStore().savePair(PROJECT, pair(wrongState, 'working'));
+    const auditorHandlers = createMemoryMcpToolHandlers({ ...caller, sessionName: AUD }, { sendDeps: { listSessions: () => [session(BRAIN, 'brain'), session(EXEC, 'w1'), session(AUD, 'w2')] } });
+    await expect(auditorHandlers[MEMORY_MCP_TOOL_NAMES.PAIR_VERDICT]({ taskId: wrongState, verdict: 'PASS' })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+    await expect(handlers[MEMORY_MCP_TOOL_NAMES.PAIR_NEXT_ROUND]({ taskId: wrongState })).resolves.toMatchObject({ status: 'error', reason: 'validation_failed' });
+    removeSession(BRAIN); removeSession(EXEC); removeSession(AUD);
   });
 
 });
