@@ -718,8 +718,8 @@ export function buildWorkspaceMoveFailedLine(pair: TaskPairState, detail: string
 
 /** Brain: a finished pair's worktree still held unsaved work at removal time, so it was kept. */
 export function buildWorkspaceKeptLine(pair: TaskPairState, reason: string): string {
-  const why = reason === 'unapplied' ? 'holds work that never reached the project (see the merge / copy-back notice)' : reason === 'unpushed' ? 'has commits not yet integrated into dev' : reason === 'dirty' ? 'has uncommitted changes' : reason === 'untracked' ? 'has untracked files' : `could not be checked (${reason})`;
-  return `${header(pair)} The pair ended 7 days ago but its worktree ${pair.workspace?.path ?? ''} ${why}, so it was kept instead of deleted. Have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; it is removed once clean or integrated into dev.`;
+  const why = reason === 'unapplied' ? 'holds work that never reached the project (see the merge / copy-back notice)' : reason === 'unpushed' ? 'has commits not yet integrated into any branch' : reason === 'dirty' ? 'has uncommitted changes' : reason === 'untracked' ? 'has untracked files' : `could not be checked (${reason})`;
+  return `${header(pair)} The pair ended 7 days ago but its worktree ${pair.workspace?.path ?? ''} ${why}, so it was kept instead of deleted. Have ${pair.executor ?? 'the executor'} commit locally what should survive and report its worktree plus HEAD; it is removed once clean or integrated into any branch.`;
 }
 
 const OUTPUT_FAILURES: Record<string, string> = {

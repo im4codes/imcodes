@@ -14,8 +14,9 @@
  * force=true) the workspace is marked ended, a deliverable named on DONE
  * (`output=`) is copied into the project directory, and seven days later the
  * pair sweep removes the workspace -- except a worktree that still holds work
- * existing nowhere else (uncommitted or untracked files, or commits no remote
- * has), which is kept and reported to Brain. The worktree GC is the backstop.
+ * existing nowhere else (uncommitted or untracked files, or commits no local
+ * or remote branch has), which is kept and reported to Brain. The worktree GC
+ * is the backstop.
  *
  * Disk hygiene (workspace-hygiene.ts): at once when the pair ends, and again for
  * any ended pair the hourly sweep finds unstripped, the rebuildable git-ignored
@@ -44,7 +45,7 @@ import { initProjectRepo, isImcodesInitRepo, nonGitRootRefusal } from './git-ini
 import { createCowClone, probeCopyOnWrite, readCowManifest, type CloneEngine, type CloneFile } from './non-git.js';
 import { ensureSupervisionAssignmentWorktree } from '../supervision-worktree-provision.js';
 import {
-  countTaskPairCommitsNotInDev,
+  countTaskPairCommitsNotInAnyBranch,
   inspectSupervisionGitWorktree,
   removeRegisteredGitWorktree,
   type SupervisionWorktreeGitInspection,
@@ -190,6 +191,9 @@ export interface TaskPairWorkspaceDeps {
   inspectGit?: (repoPath: string) => Promise<SupervisionWorktreeGitInspection>;
   /** Re-check ownership/liveness immediately before deleting the workspace. */
   beforeRemove?: () => boolean | Promise<boolean>;
+  /** Count pair commits not integrated into any local or remote branch. */
+  countCommitsNotInAnyBranch?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  /** @deprecated Use countCommitsNotInAnyBranch. */
   countCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
   /** Non-git projects: the copy-on-write primitive (tests simulate a filesystem without it). */
   cloneEngine?: CloneEngine | CloneFile;
@@ -428,16 +432,20 @@ export async function releaseTaskPairWorkspace(
   if (inspection.locked) return { action: 'kept', reason: 'locked' };
   if (inspection.dirty) return { action: 'kept', reason: 'dirty' };
   if (inspection.untracked) return { action: 'kept', reason: 'untracked' };
-  // Commits the executor made that Brain has not integrated into origin/dev
-  // would be lost. A cherry-picked equivalent in dev is safe to remove.
+  // Commits the executor made that Brain has not integrated into any branch
+  // would be lost. A cherry-picked equivalent in any branch is safe to remove.
   // A repo IM.codes made has no dev/origin: the pair's commits stay reachable on their branch after the worktree goes, and a
   // finished pair was merged into the project (or kept above), so only uncommitted work (checked before) is at risk.
-  const notInDev = workspace.nonGit?.mode === 'git_init'
+  const notInAnyBranch = workspace.nonGit?.mode === 'git_init'
     ? 0
     : workspace.base
-      ? await (deps.countCommitsNotInDev ?? countTaskPairCommitsNotInDev)(repoPath, workspace.base)
+      ? await (
+        deps.countCommitsNotInAnyBranch
+        ?? deps.countCommitsNotInDev
+        ?? countTaskPairCommitsNotInAnyBranch
+      )(repoPath, workspace.base)
       : undefined;
-  if (notInDev === undefined || notInDev > 0) return { action: 'kept', reason: 'unpushed' };
+  if (notInAnyBranch === undefined || notInAnyBranch > 0) return { action: 'kept', reason: 'unpushed' };
   if (!(await removalAllowed(deps))) return { action: 'skipped' };
   if (!(await removeRegisteredGitWorktree(inspection, repoPath))) return { action: 'kept', reason: 'unreadable' };
   await rm(assignmentRoot, { recursive: true, force: true });

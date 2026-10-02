@@ -6,7 +6,7 @@
  *   <taskId>/ and is never git-initialised; the path goes to the executor at
  *   dispatch and to the auditor at READY_FOR_AUDIT (no HEAD for a directory);
  * - when the pair ends (DONE, CANCEL, DONE force=true) the workspace is kept
- *   for 7 days, then removed -- a worktree with uncommitted work or commits not yet integrated into dev is
+ *   for 7 days, then removed -- a worktree with uncommitted work or commits not yet integrated into any branch is
  *   kept and Brain is told;
  * - DONE output=<path> copies the deliverable into the project directory and
  *   tells the user where; plain DONE copies nothing.
@@ -371,7 +371,7 @@ describe('pair workspaces', () => {
     expect(pair('N2').workspace).toMatchObject({ status: 'kept', keptReason: 'unpushed' });
   });
 
-  it('keeps a worktree with uncommitted work or commits not yet integrated into dev after the retention, tells Brain once, and the GC reclaims it once saved', async () => {
+  it('keeps a worktree with uncommitted work or commits not yet integrated into any branch after the retention, tells Brain once, and the GC reclaims it once saved', async () => {
     const dirtyPath = await opened('K1');
     writeFileSync(join(dirtyPath, 'wip.txt'), 'unsaved\n');
     marker(BRAIN, '<!-- IMCODES_TASK CANCEL K1 -->');
@@ -422,6 +422,22 @@ describe('pair workspaces', () => {
     git(project, 'push', '-q', 'origin', 'HEAD:refs/heads/dev');
     marker(BRAIN, '<!-- IMCODES_TASK DONE CHERRY force=true -->');
     const ended = await endedAt('CHERRY');
+    await taskPairService.sweepWorkspaces(ended + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
+    expect(existsSync(join(path, '..'))).toBe(false);
+  });
+
+  it('removes a clean worktree once its commit is integrated into any project branch', async () => {
+    const path = await opened('BRANCH_INTEGRATED');
+    writeFileSync(join(path, 'feature.txt'), 'integrated on a release branch\n');
+    git(path, 'add', '-A');
+    git(path, '-c', 'user.email=t@e.invalid', '-c', 'user.name=T', 'commit', '-qm', 'release branch feature');
+    const commit = git(path, 'rev-parse', 'HEAD');
+    // Deliberately do not update origin/dev. A different branch in the same
+    // repository is still durable integration and must make the worktree safe
+    // to remove.
+    git(project, 'branch', 'release/pair-integrated', commit);
+    marker(BRAIN, '<!-- IMCODES_TASK DONE BRANCH_INTEGRATED force=true -->');
+    const ended = await endedAt('BRANCH_INTEGRATED');
     await taskPairService.sweepWorkspaces(ended + TASK_PAIR_WORKSPACE_RETENTION_MS, { force: true });
     expect(existsSync(join(path, '..'))).toBe(false);
   });

@@ -222,6 +222,9 @@ export interface SupervisionWorktreeGcDeps {
     repoPath: string;
   }) => Promise<SupervisionWorktreeRegistryReference> | SupervisionWorktreeRegistryReference;
   countTaskPairUnpushedCommits?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  /** Count pair commits not integrated into any local or remote branch. */
+  countTaskPairCommitsNotInAnyBranch?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
+  /** @deprecated Use countTaskPairCommitsNotInAnyBranch. Kept for test/extension compatibility. */
   countTaskPairCommitsNotInDev?: (repoPath: string, baseRevision: string) => Promise<number | undefined>;
   /** Owner lookup for pair worktrees; without it they are never touched. */
   resolveTaskPairWorktree?: (input: { taskId: string; repoPath: string }) => Promise<TaskPairWorktreeReference> | TaskPairWorktreeReference;
@@ -580,6 +583,51 @@ export async function listTaskPairCommitsNotInIntegration(
     return match ? [match[1]] : [];
   }));
   return hashes.filter((hash) => unique.has(hash));
+}
+
+/**
+ * The executor commits after `baseRevision` that are not represented by any
+ * local or remote branch. A cherry-picked equivalent is considered
+ * integrated. Worktrees are shared with the project repository, so checking
+ * every branch is the safe rule: a pair may be merged to a release or feature
+ * branch instead of the project's preferred integration branch.
+ */
+export async function listTaskPairCommitsNotInAnyBranch(
+  repoPath: string,
+  baseRevision: string,
+  options: { head?: string } = {},
+): Promise<string[] | undefined> {
+  const head = options.head ?? 'HEAD';
+  const commits = await runGit(repoPath, ['rev-list', '--reverse', `${baseRevision}..${head}`]);
+  if (!commits.ok) return undefined;
+  const hashes = commits.stdout.trim().split(/\s+/u).filter(Boolean);
+  if (hashes.length === 0) return [];
+
+  const refs = await runGit(repoPath, [
+    'for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes',
+  ]);
+  if (!refs.ok) return undefined;
+  const branchRefs = refs.stdout.split(/\r?\n/u).map((ref) => ref.trim()).filter(Boolean);
+  if (branchRefs.length === 0) return hashes;
+
+  let best = hashes;
+  for (const ref of branchRefs) {
+    const cherry = await runGit(repoPath, ['cherry', ref, head]);
+    if (!cherry.ok) continue;
+    const unique = new Set(cherry.stdout.split(/\r?\n/u).flatMap((line) => {
+      const match = /^\+\s+([0-9a-f]{40})$/u.exec(line.trim());
+      return match ? [match[1]] : [];
+    }));
+    const uniquePairCommits = hashes.filter((hash) => unique.has(hash));
+    if (uniquePairCommits.length === 0) return [];
+    if (uniquePairCommits.length < best.length) best = uniquePairCommits;
+  }
+  return best;
+}
+
+/** Count executor commits after base that are not integrated into any branch. */
+export async function countTaskPairCommitsNotInAnyBranch(repoPath: string, baseRevision: string): Promise<number | undefined> {
+  return (await listTaskPairCommitsNotInAnyBranch(repoPath, baseRevision))?.length;
 }
 
 /** Count executor commits after base that are not patch-equivalent to origin/dev. */
@@ -1009,8 +1057,12 @@ async function evaluateTaskPairCandidate(
   if (inspection.locked) return retain(SUPERVISION_WORKTREE_GC_REASONS.GIT_LOCKED, taskId);
   if (inspection.dirty) return retain(SUPERVISION_WORKTREE_GC_REASONS.DIRTY, taskId, 'pair_kept');
   if (inspection.untracked) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNTRACKED, taskId, 'pair_kept');
-  const notInDev = await (deps.countTaskPairCommitsNotInDev ?? countTaskPairCommitsNotInDev)(candidate.repoPath, parsed.metadata.baseRevision);
-  if (notInDev === undefined || notInDev > 0) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId, 'pair_kept');
+  const notInAnyBranch = await (
+    deps.countTaskPairCommitsNotInAnyBranch
+    ?? deps.countTaskPairCommitsNotInDev
+    ?? countTaskPairCommitsNotInAnyBranch
+  )(candidate.repoPath, parsed.metadata.baseRevision);
+  if (notInAnyBranch === undefined || notInAnyBranch > 0) return retain(SUPERVISION_WORKTREE_GC_REASONS.UNPUSHED_BRANCH, taskId, 'pair_kept');
   return { entry: deleteEntry('pair_ended'), metadataText: parsed.text, inspection };
 }
 
