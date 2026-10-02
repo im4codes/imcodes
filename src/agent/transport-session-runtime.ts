@@ -1000,8 +1000,14 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         }
         this.recordProviderError(error);
+        // Capacity retry is safe only before provider admission. Once the
+        // provider has started/accepted the send (or emitted side-effect
+        // evidence), the outcome is ambiguous and the handoff must be
+        // terminalized rather than released back into the durable queue.
+        const capacityRetryEligible = this.canRetryBeforeProviderBoundary()
+          && this.willRetryAsCapacity(error);
         // A capacity failure that is about to be retried logs at debug: the episode start (warn) and the periodic count carry it.
-        (this.willRetryAsCapacity(error) ? logger.debug : logger.warn).call(
+        (capacityRetryEligible ? logger.debug : logger.warn).call(
           logger,
           {
             sessionKey: this.sessionKey,
@@ -1019,11 +1025,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // SDK marked the error non-recoverable. Preserve the failed logical
         // turn and keep the runtime in-progress while the bounded timer owns
         // the next drain; never fail over or switch provider here.
-        const capacityRetry = this.willRetryAsCapacity(error);
-        if ((capacityRetry || (!this._activeDispatchProviderStarted
-          && !this._activeDispatchProviderAccepted
-          && !this._activeDispatchHasSideEffectEvidence))
-          && this.requeueAndScheduleCapacityRetry(error)) {
+        if (capacityRetryEligible && this.requeueAndScheduleCapacityRetry(error)) {
           this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this._sending = false;
           this._activeTurn?.reject(error);
@@ -4026,6 +4028,19 @@ export class TransportSessionRuntime implements SessionRuntime {
     return shouldRetryProviderErrorWithBackoff(error);
   }
 
+  /**
+   * Capacity retry is admissible only before the provider boundary.  A send
+   * that has started, been accepted, or produced side-effect evidence has an
+   * unknown outcome; releasing its handoff would allow restart/lease expiry
+   * to redeliver an old message.  Keep this predicate centralized so callback
+   * and promise-rejection paths cannot drift apart.
+   */
+  private canRetryBeforeProviderBoundary(): boolean {
+    return !this._activeDispatchProviderStarted
+      && !this._activeDispatchProviderAccepted
+      && !this._activeDispatchHasSideEffectEvidence;
+  }
+
   /** Would `requeueAndScheduleCapacityRetry` take this failure? (Decided before the per-failure log line, which it must not spam.) */
   private willRetryAsCapacity(error: ProviderError): boolean {
     return this._activeDispatchEntries.length > 0 && this.isCapacityRetryError(error);
@@ -4620,7 +4635,9 @@ export class TransportSessionRuntime implements SessionRuntime {
           return;
         }
         this.recordProviderError(providerError);
-        (this.willRetryAsCapacity(providerError) ? logger.debug : logger.warn).call(
+        const capacityRetryEligible = this.canRetryBeforeProviderBoundary()
+          && this.willRetryAsCapacity(providerError);
+        (capacityRetryEligible ? logger.debug : logger.warn).call(
           logger,
           {
             sessionKey: this.sessionKey,
@@ -4633,7 +4650,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport runtime dispatch failed',
         );
-        if (this.requeueAndScheduleCapacityRetry(providerError)) {
+        if (capacityRetryEligible && this.requeueAndScheduleCapacityRetry(providerError)) {
           this.rollbackActiveSummarySyncReservation(dispatchId);
           this._sending = false;
           this._activeTurn.reject(providerError);
@@ -4659,6 +4676,32 @@ export class TransportSessionRuntime implements SessionRuntime {
             reason: `accepted_provider_error:${providerError.code}`,
           });
           this._activeDispatchEntries = [];
+          this.setStatus('error');
+          return;
+        }
+        // A capacity-class rejection after provider admission is an
+        // ambiguous side effect, not a retryable pre-send failure.  Persist a
+        // no-replay tombstone before clearing local state so restart/lease
+        // expiry cannot enqueue the same handoff again.
+        if (this.isCapacityRetryError(providerError)
+          && !this.canRetryBeforeProviderBoundary()) {
+          this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+            providerStarted: this._activeDispatchProviderStarted,
+            providerAccepted: this._activeDispatchProviderAccepted,
+            sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+            reason: `capacity_provider_error:${providerError.code}`,
+          });
+          this._activeDispatchEntries = [];
+          this._sending = false;
+          this._activeTurn.reject(providerError);
+          this._activeTurn = null;
+          this.clearStalePendingCancelFallbackTimer();
+          this._activeDispatchProviderStarted = false;
+          this._activeDispatchProviderAccepted = false;
+          this._activeDispatchCancelled = false;
+          if (this._activeDispatchId === dispatchId) this._activeDispatchId = null;
+          this._activeDispatchStaleRecoveryStarted = false;
+          this._locallyCancelledDispatchIds.delete(dispatchId);
           this.setStatus('error');
           return;
         }

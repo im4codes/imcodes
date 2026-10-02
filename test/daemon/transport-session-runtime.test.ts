@@ -3654,8 +3654,24 @@ describe('TransportSessionRuntime', () => {
     const sendMock = () => mock.provider.send as ReturnType<typeof vi.fn>;
     const NAMES = { CAPACITY_MS: [1_000, 2_000, 4_000, 8_000, 15_000] as const };
 
+    const markCapacityPreAdmission = () => {
+      const state = runtime as unknown as {
+        _activeDispatchProviderStarted: boolean;
+        _activeDispatchProviderAccepted: boolean;
+        _activeDispatchHasSideEffectEvidence: boolean;
+      };
+      state._activeDispatchProviderStarted = false;
+      state._activeDispatchProviderAccepted = false;
+      state._activeDispatchHasSideEffectEvidence = false;
+    };
+
     /** Fire the capacity error for the turn that is in flight, then let queued microtasks settle. */
     const failWithCapacity = async () => {
+      // Model a capacity rejection before provider admission.  The runtime
+      // now deliberately refuses to requeue capacity errors once provider
+      // work has started/been accepted; these legacy timing tests exercise
+      // the documented pre-admission retry contract.
+      markCapacityPreAdmission();
       mock.fireError('sess-1', { ...CAPACITY });
       await vi.advanceTimersByTimeAsync(0);
     };
@@ -3750,6 +3766,7 @@ describe('TransportSessionRuntime', () => {
       (mock.provider as { onError: unknown }).onError = runtimeOnError;
       const failBoth = async () => {
         const error = { code: PROVIDER_ERROR_CODES.PROVIDER_ERROR, message: 'Selected model is at capacity. Please try a different model.', recoverable: false };
+        markCapacityPreAdmission();
         relayErrorCallbacks.forEach((cb) => cb('sess-1', error)); // the relay's listener sees every failure too
         mock.fireError('sess-1', { ...error });
         await vi.advanceTimersByTimeAsync(0);
@@ -3964,7 +3981,10 @@ describe('TransportSessionRuntime', () => {
       await failWithCapacity();
       for (const minutes of [0, 1, 30, 240]) {
         await vi.advanceTimersByTimeAsync(minutes * 60_000);
-        if (sendMock().mock.calls.length > 0) mock.fireError('sess-1', { ...CAPACITY }); // keep failing
+        if (sendMock().mock.calls.length > 0) {
+          markCapacityPreAdmission();
+          mock.fireError('sess-1', { ...CAPACITY }); // keep failing
+        }
         await vi.advanceTimersByTimeAsync(0);
         const work = describeSessionWork('deck_test_brain', {
           getSession: () => ({ state: 'running' }) as never,
@@ -6343,6 +6363,73 @@ ${PREFERENCE_CONTEXT_END}`;
 
     resolveLateSend();
     await flushDispatch();
+    const restartedProvider = makeMockProvider();
+    const restarted = new TransportSessionRuntime(restartedProvider.provider, 'deck_test_brain');
+    await restarted.initialize(defaultConfig);
+    expect(restarted.rehydratePendingFromStore()).toBe(0);
+    expect(restartedProvider.provider.send).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes a capacity error after provider admission instead of requeueing it on restart', async () => {
+    let resolveLateSend!: () => void;
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => undefined)
+      .mockImplementationOnce(() => new Promise<void>((resolve) => { resolveLateSend = resolve; }));
+
+    runtime.send('foreground', 'msg-foreground-capacity');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('capacity-after-admission', 'msg-capacity-after-admission');
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+
+    mock.fireError('sess-1', {
+      code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+      message: 'Selected model is at capacity after admission',
+      recoverable: false,
+    });
+    await flushDispatch();
+
+    const store = getTransportQueueStore();
+    expect(store.readSnapshot('deck_test_brain', 'capacity-after-admission').failedMessageEntries)
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        clientMessageId: 'msg-capacity-after-admission',
+        status: 'failed',
+      })]));
+    expect(store.hasDeliveryTombstone('deck_test_brain', 'msg-capacity-after-admission')).toBe(true);
+
+    resolveLateSend();
+    await flushDispatch();
+    const restartedProvider = makeMockProvider();
+    const restarted = new TransportSessionRuntime(restartedProvider.provider, 'deck_test_brain');
+    await restarted.initialize(defaultConfig);
+    expect(restarted.rehydratePendingFromStore()).toBe(0);
+    expect(restartedProvider.provider.send).not.toHaveBeenCalled();
+  });
+
+  it('terminalizes a capacity rejection from dispatch after provider admission', async () => {
+    (mock.provider.send as ReturnType<typeof vi.fn>)
+      .mockImplementationOnce(() => undefined)
+      .mockRejectedValueOnce({
+        code: PROVIDER_ERROR_CODES.PROVIDER_ERROR,
+        message: 'Selected model is at capacity after send started',
+        recoverable: false,
+      });
+
+    runtime.send('foreground', 'msg-foreground-capacity-reject');
+    await waitForProviderSendCount(mock.provider, 1);
+    runtime.send('capacity-rejection', 'msg-capacity-rejection');
+    mock.fireComplete('sess-1');
+    await waitForProviderSendCount(mock.provider, 2);
+    await flushDispatch();
+
+    const store = getTransportQueueStore();
+    expect(store.readSnapshot('deck_test_brain', 'capacity-rejection').failedMessageEntries)
+      .toEqual(expect.arrayContaining([expect.objectContaining({
+        clientMessageId: 'msg-capacity-rejection',
+        status: 'failed',
+      })]));
+    expect(store.hasDeliveryTombstone('deck_test_brain', 'msg-capacity-rejection')).toBe(true);
+
     const restartedProvider = makeMockProvider();
     const restarted = new TransportSessionRuntime(restartedProvider.provider, 'deck_test_brain');
     await restarted.initialize(defaultConfig);
