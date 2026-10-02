@@ -306,4 +306,21 @@ describe('task-bound delegation replies across a daemon restart', () => {
     expect(resolveTransportQueueEntryAdmission(brain.sessionName, { clientMessageId: 'plain', text: 'user text' }))
       .toBe('authorized');
   });
+
+  it('drops a queued task-pair nudge after the pair reaches a terminal state', () => {
+    mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
+    pairs.savePair(PROJECT, pairState('tsk_nudge_done', 'done'));
+    pairs.savePair(PROJECT, pairState('tsk_nudge_open', 'working'));
+
+    const queued = (taskId: string) => ({
+      commandId: `task-pair-nudge:${taskId}:nudge-executor:message-1`,
+      clientMessageId: `client-${taskId}`,
+      text: 'continue the pair task',
+    });
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, queued('tsk_nudge_done'))).toBe('stale');
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, queued('tsk_nudge_open'))).toBe('authorized');
+    // Aggregate heartbeat notices do not bind to a pair row and remain
+    // conservative/authorized.
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, queued('__integration__'))).toBe('authorized');
+  });
 });

@@ -64,7 +64,7 @@ describe('supervision prompt custom-instructions merge', () => {
         trigger: 'user_requests_supervised_assignment_or_coordination',
         default: {
           route: 'imcodes_supervision_visible_subsession',
-          sequence: ['send_list_targets', 'task_assignment', 'send_message'],
+          sequence: ['send_list_targets', 'pair_create', 'pair_dispatch_if_queued'],
           eligible: { availability: ['ready', 'busy_queueable'], replyCapable: true, prefer: 'ready' },
           selectBy: ['availability', 'limitGroup', 'replyCapable', 'executionPool', 'providerFamily', 'auditPolicy'],
           mainWindow: 'coordinate_not_implement',
@@ -480,7 +480,7 @@ describe('Brain work-delegation contract placement and budget', () => {
         fallback: { when: string; notWhen: string[]; then: string; record: string };
       };
       expect(contract.default.route).toBe('imcodes_supervision_visible_subsession');
-      expect(contract.default.sequence).toEqual(['send_list_targets', 'task_assignment', 'send_message']);
+      expect(contract.default.sequence).toEqual(['send_list_targets', 'pair_create', 'pair_dispatch_if_queued']);
       expect(contract.default.selectBy).toEqual([
         'availability', 'limitGroup', 'replyCapable', 'executionPool', 'providerFamily', 'auditPolicy',
       ]);

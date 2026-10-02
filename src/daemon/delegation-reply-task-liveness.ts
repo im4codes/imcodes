@@ -1,5 +1,9 @@
 import { isEndedSupervisionTaskStatus } from '../../shared/supervision-config.js';
-import { isTerminalTaskPairStatus, parseTaskPairBindingId } from '../../shared/task-pair.js';
+import {
+  isTerminalTaskPairStatus,
+  parseTaskPairBindingId,
+  TASK_PAIR_NUDGE_ID_PREFIX,
+} from '../../shared/task-pair.js';
 import type { QueueSupervisionAdmission } from '../../shared/transport-queue-types.js';
 import { getSession } from '../store/session-store.js';
 import logger from '../util/logger.js';
@@ -87,6 +91,46 @@ export function resolveQueuedDelegationReplyAdmission(delegationId: string): Que
 }
 
 /**
+ * A pair nudge is durable for the same reason as any other daemon-authored
+ * message, but its task authority is the pair row rather than a delegation
+ * reply.  Before this check, a nudge queued while a pair was open survived a
+ * restart and was delivered after the pair reached DONE/CANCELLED.  The
+ * resulting message looked like an old user prompt and could start work on a
+ * finished task.  Aggregate heartbeat ids (`__...`) have no pair row and stay
+ * conservative/authorized.
+ */
+function taskPairIdFromNudgeId(id: string | undefined): string | undefined {
+  if (!id?.startsWith(TASK_PAIR_NUDGE_ID_PREFIX)) return undefined;
+  const remainder = id.slice(TASK_PAIR_NUDGE_ID_PREFIX.length);
+  const separator = remainder.indexOf(':');
+  if (separator <= 0) return undefined;
+  const taskId = remainder.slice(0, separator).trim();
+  return taskId && !taskId.startsWith('__') ? taskId : undefined;
+}
+
+function resolveQueuedTaskPairNudgeAdmission(
+  sessionName: string,
+  entry: { clientMessageId?: string; commandId?: string },
+): QueueSupervisionAdmission {
+  const taskId = taskPairIdFromNudgeId(entry.commandId)
+    ?? taskPairIdFromNudgeId(entry.clientMessageId);
+  if (!taskId) return 'authorized';
+  const project = getSession(sessionName)?.projectName;
+  if (!project) return 'authorized';
+  try {
+    const pair = getTaskPairStore().getPair(project, taskId);
+    if (!pair || !isTerminalTaskPairStatus(pair.state.status)) return 'authorized';
+    logger.info({ sessionName, taskId, status: pair.state.status }, 'dropping a queued task-pair nudge: pair already ended');
+    return 'stale';
+  } catch (error) {
+    // Unknown/failed lookups remain conservative: never discard a live nudge
+    // solely because the task authority was temporarily unavailable.
+    logger.warn({ error, sessionName, taskId }, 'queued task-pair nudge lookup failed; admitting it');
+    return 'authorized';
+  }
+}
+
+/**
  * One admission for a queued transport entry, shared by the restart resend
  * drain and the runtime's own pending drain. The supervision heartbeat check
  * applies to every entry; a queued delegation reply must additionally still
@@ -99,6 +143,8 @@ export function resolveTransportQueueEntryAdmission(sessionName: string, entry: 
   supervisionReference?: Parameters<typeof resolveQueuedSupervisionHeartbeatDelivery>[0]['supervisionReference'];
   delegationReply?: { delegationId: string };
 }): QueueSupervisionAdmission {
+  const taskPairNudge = resolveQueuedTaskPairNudgeAdmission(sessionName, entry);
+  if (taskPairNudge !== 'authorized') return taskPairNudge;
   const supervision = resolveQueuedSupervisionHeartbeatDelivery({
     targetSessionName: sessionName,
     clientMessageId: entry.clientMessageId ?? entry.commandId ?? '',
