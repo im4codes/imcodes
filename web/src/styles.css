@@ -14546,6 +14546,7 @@ button.quick-agent-delegation-preset.active {
  * status panel and by existing consumers. */
 .task-pair-event-card {
   align-self: flex-start;
+  text-align: left;
   box-sizing: border-box;
   width: 100%;
   max-width: 100%;

@@ -998,6 +998,13 @@ describe('TaskPairEventChip status colours', () => {
     expect(chip.querySelector('.task-pair-chip-status')?.className).toContain('status-unknown');
     expect(chip.getAttribute('data-task-id')).toHaveLength(160);
   });
+
+  it('overrides the chat-system centering rule so every card body remains left aligned', () => {
+    const rule = /\.task-pair-event-card\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(rule).toContain('text-align: left;');
+    expect(rule).toContain('width: 100%;');
+    expect(rule).toContain('max-width: 100%;');
+  });
 });
 
 describe('TaskPairSettingsSection', () => {
