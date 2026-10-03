@@ -33,6 +33,14 @@ interface UpgradeState {
   publicationCallbackRegistered: boolean;
 }
 
+export interface DaemonUpgradeLifecycleSnapshot {
+  upgradeId: string;
+  targetVersion: string;
+  source: DaemonUpgradeSource;
+  status: UpgradeLifecycleState;
+  lastSentAt: number | null;
+}
+
 export interface RequestDaemonUpgradeInput {
   targetVersion?: unknown;
   source: DaemonUpgradeSource;
@@ -57,6 +65,31 @@ export class DaemonUpgradeCoordinator {
   private current: UpgradeState | null = null;
 
   constructor(private readonly publicationGate: DaemonUpgradePublicationGate = daemonUpgradePublicationGate) {}
+
+  snapshot(): DaemonUpgradeLifecycleSnapshot | null {
+    const state = this.current;
+    if (!state) return null;
+    return {
+      upgradeId: state.upgradeId,
+      targetVersion: state.targetVersion,
+      source: state.source,
+      status: state.status,
+      lastSentAt: state.lastSentAt,
+    };
+  }
+
+  /** Keep a sent lifecycle pending after a transient node-side safety gate. */
+  deferAfterTransientBlock(now = Date.now()): boolean {
+    const state = this.current;
+    if (!state || state.status === 'terminal_blocked' || state.status === 'superseded') return false;
+    if (state.timer) clearTimeout(state.timer);
+    state.timer = null;
+    state.status = 'pending_offline';
+    state.updatedAt = now;
+    state.publicationResumeInput = null;
+    state.publicationCallbackRegistered = false;
+    return true;
+  }
 
   request(input: RequestDaemonUpgradeInput): RequestDaemonUpgradeResult {
     let targetVersion: string;

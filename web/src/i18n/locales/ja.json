@@ -3676,7 +3676,13 @@
     "team_error_group_name_required": "名前を入力してください。",
     "team_error_group_name_too_long": "名前が長すぎます。",
     "remote_access_paused": "リモートアクセス一時停止中",
-    "remote_access_paused_hint": "この端末はローカルで再開されるまで、新しい閲覧と操作をすべて拒否します。"
+    "remote_access_paused_hint": "この端末はローカルで再開されるまで、新しい閲覧と操作をすべて拒否します。",
+    "upgrade_status_available": "更新があります",
+    "upgrade_status_upgrading": "更新中…",
+    "upgrade_status_deferred": "アイドル時まで延期",
+    "upgrade_status_failed": "更新失敗",
+    "upgrade_retry": "更新を再試行",
+    "upgrade_retry_failed": "更新を再試行できません。"
   },
   "peerAuditQuick": {
     "iconLabel": "ピア監査",

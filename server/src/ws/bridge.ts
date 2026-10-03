@@ -358,7 +358,12 @@ import {
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_SOURCE,
+  CONTROLLED_NODE_UPGRADE_STATUS,
+  isDaemonUpgradeAvailable,
+  isRetryableDaemonUpgradeBlockReason,
   validateControlledNodeUpgradeBlockedMessage,
+  type ControlledNodeUpgradeStatus,
   type DaemonUpgradeBlockedAckDisposition,
 } from '../../../shared/daemon-upgrade.js';
 import {
@@ -2117,6 +2122,10 @@ export class WsBridge {
    *  experiences the exponential backoff — see resolveLegacyWindowsUpgradeRestartAttempt. */
   private legacyUpgradeRestartThrottle: LegacyWindowsUpgradeRestartThrottle | null = null;
   private daemonUpgradeCoordinator = new DaemonUpgradeCoordinator();
+  private controlledNodeUpgradeStatus: ControlledNodeUpgradeStatus = CONTROLLED_NODE_UPGRADE_STATUS.CURRENT;
+  private controlledNodeUpgradeReason: string | null = null;
+  private controlledNodeUpgradeTargetVersion: string | null = null;
+  private controlledNodeUpgradePersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
@@ -2553,6 +2562,51 @@ export class WsBridge {
       WsBridge.instances.set(serverId, bridge);
     }
     return bridge;
+  }
+
+  /** Read an already-created bridge without manufacturing per-pod state. */
+  static find(serverId: string): WsBridge | undefined {
+    return WsBridge.instances.get(serverId);
+  }
+
+  getControlledNodeUpgradeStatus(): {
+    status: ControlledNodeUpgradeStatus;
+    targetVersion?: string;
+    reason?: string;
+  } {
+    return {
+      status: this.controlledNodeUpgradeStatus,
+      ...(this.controlledNodeUpgradeTargetVersion ? { targetVersion: this.controlledNodeUpgradeTargetVersion } : {}),
+      ...(this.controlledNodeUpgradeReason ? { reason: this.controlledNodeUpgradeReason } : {}),
+    };
+  }
+
+  private setControlledNodeUpgradeState(
+    status: ControlledNodeUpgradeStatus,
+    targetVersion: string | null = this.controlledNodeUpgradeTargetVersion,
+    reason: string | null = null,
+  ): void {
+    this.controlledNodeUpgradeStatus = status;
+    this.controlledNodeUpgradeTargetVersion = targetVersion;
+    this.controlledNodeUpgradeReason = reason;
+    // Discovery is served by any API pod, so persist the bounded state rather
+    // than exposing a process-local WS snapshot as the authority. A stale or
+    // unavailable DB must never block the live daemon transition.
+    if (this.db && this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      const db = this.db;
+      this.controlledNodeUpgradePersistence = this.controlledNodeUpgradePersistence
+        .catch(() => {})
+        .then(() => db.execute(
+          `UPDATE servers
+              SET controlled_upgrade_status = $1,
+                  controlled_upgrade_target_version = $2,
+                  controlled_upgrade_reason = $3
+            WHERE id = $4 AND node_role = $5 AND revoked_at IS NULL`,
+          [status, targetVersion, reason, this.serverId, NODE_ROLE.CONTROLLED],
+        ))
+        .then(() => undefined)
+        .catch((error) => logger.warn({ error, serverId: this.serverId }, 'Controlled upgrade state persistence failed'));
+    }
   }
 
   static getAll(): Map<string, WsBridge> {
@@ -5397,6 +5451,9 @@ export class WsBridge {
           node_role?: string | null;
           revoked_at?: number | null;
           os?: string | null;
+          controlled_upgrade_status?: string | null;
+          controlled_upgrade_target_version?: string | null;
+          controlled_upgrade_reason?: string | null;
         } | null = null;
         try {
           server = await db.queryOne<{
@@ -5467,6 +5524,26 @@ export class WsBridge {
           return;
         }
         this.controlledNodeCapabilities = new Set(controlledCapabilities.value);
+        if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          const persistedStatus = typeof server.controlled_upgrade_status === 'string'
+            && Object.values(CONTROLLED_NODE_UPGRADE_STATUS).includes(
+              server.controlled_upgrade_status as ControlledNodeUpgradeStatus,
+            )
+            ? server.controlled_upgrade_status as ControlledNodeUpgradeStatus
+            : CONTROLLED_NODE_UPGRADE_STATUS.CURRENT;
+          // An UPGRADING marker is only a durable observation of the previous
+          // socket. A fresh auth with the old version must be allowed to retry
+          // once at this new authoritative idle boundary.
+          this.controlledNodeUpgradeStatus = persistedStatus === CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
+            ? CONTROLLED_NODE_UPGRADE_STATUS.AVAILABLE
+            : persistedStatus;
+          this.controlledNodeUpgradeTargetVersion = typeof server.controlled_upgrade_target_version === 'string'
+            ? server.controlled_upgrade_target_version
+            : null;
+          this.controlledNodeUpgradeReason = typeof server.controlled_upgrade_reason === 'string'
+            ? server.controlled_upgrade_reason
+            : null;
+        }
         this.resetLegacyUpgradeRescueForGeneration(connectionGeneration);
         this.authenticated = true;
         this.daemonVersion = typeof msg.daemonVersion === 'string' ? msg.daemonVersion : null;
@@ -5571,11 +5648,12 @@ export class WsBridge {
         this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
         this.flushPendingDaemonUpgrade(ws);
 
-        // Version mismatches are advisory only. The browser receives the
-        // current daemonVersion alongside the server's latest version and the
-        // operator explicitly confirms before a manual upgrade is requested.
-        // Never restart a user's daemon merely because it reconnected.
-        this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
+        // Controlled nodes are passive workers and may converge automatically
+        // at this authenticated, live-socket boundary. Full daemons retain the
+        // operator-confirmed/manual policy and never enter this path.
+        if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED) {
+          this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
+        }
 
         // Replay queued messages, skipping terminal.subscribe/unsubscribe — refs replay below is authoritative
         for (const queued of this.queue) {
@@ -5648,6 +5726,9 @@ export class WsBridge {
             || this.daemonGeneration !== connectionGeneration
             || !this.authenticated
           ) return;
+          if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+            this.maybeAutoUpgradeControlledNode();
+          }
           this.flushPendingDaemonUpgrade(ws);
         });
         return;
@@ -5735,6 +5816,19 @@ export class WsBridge {
           this.handleDaemonUpgradeBlocked(
             blocked.value,
             ws,
+          );
+          return;
+        }
+        if (msg.type === DAEMON_MSG.UPGRADING) {
+          const targetVersion = typeof msg.targetVersion === 'string' ? msg.targetVersion : null;
+          if (!targetVersion) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.setControlledNodeUpgradeState(
+            CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING,
+            targetVersion,
+            null,
           );
           return;
         }
@@ -7303,11 +7397,35 @@ export class WsBridge {
     }
     if (msg.type === 'chat.status' && msg.status === 'idle') {
       this.activeDispatchIds.delete(sessionId);
+      this.scheduleControlledUpgradeFlushAtIdleBoundary();
       return;
     }
     if (msg.type === 'chat.complete' || msg.type === 'chat.error') {
       this.activeDispatchIds.delete(sessionId);
+      this.scheduleControlledUpgradeFlushAtIdleBoundary();
     }
+  }
+
+  /**
+   * A live authenticated socket is necessary but not sufficient for a safe
+   * controlled-node upgrade: an active dispatch must reach its idle/terminal
+   * edge first. The coordinator still deduplicates sends; this hook only
+   * provides the next safe edge for a request that was deferred while busy.
+   */
+  private scheduleControlledUpgradeFlushAtIdleBoundary(): void {
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || !this.authenticated
+      || this.activeDispatchIds.size > 0
+      || !this.daemonWs) return;
+    const ws = this.daemonWs;
+    const generation = this.daemonGeneration;
+    setImmediate(() => {
+      if (this.daemonWs !== ws
+        || this.daemonGeneration !== generation
+        || !this.authenticated
+        || this.activeDispatchIds.size > 0) return;
+      this.flushPendingDaemonUpgrade(ws);
+    });
   }
 
   private firstStringField(msg: Record<string, unknown>, keys: string[]): string | null {
@@ -8071,7 +8189,10 @@ export class WsBridge {
       }
       if (rawEvent.type === 'session.state') {
         const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        if (payload?.state === 'idle') this.activeDispatchIds.delete(sessionId);
+        if (payload?.state === 'idle') {
+          this.activeDispatchIds.delete(sessionId);
+          this.scheduleControlledUpgradeFlushAtIdleBoundary();
+        }
       }
       this.ingestRecentTextFromTimelineEvent(rawEvent);
       if (this.db) {
@@ -8158,6 +8279,10 @@ export class WsBridge {
       // of the cancel/stop push notification — must arrive without queueing
       // behind PTY frames so the browser spinner clears in lockstep with
       // the push.
+      if (type === 'session.idle') {
+        this.activeDispatchIds.delete(sessionName);
+        this.scheduleControlledUpgradeFlushAtIdleBoundary();
+      }
       this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
     }
@@ -8188,7 +8313,10 @@ export class WsBridge {
         });
         if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
         this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
-        if (msg.state === 'idle') this.activeDispatchIds.delete(subSessionName);
+        if (msg.state === 'idle') {
+          this.activeDispatchIds.delete(subSessionName);
+          this.scheduleControlledUpgradeFlushAtIdleBoundary();
+        }
       }
       void (async () => {
         const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
@@ -8732,6 +8860,7 @@ export class WsBridge {
       this.sessionRuntimeTypes.set(name, this.normalizeRuntimeType(runtimeType));
       if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(name);
     }
+    this.scheduleControlledUpgradeFlushAtIdleBoundary();
   }
 
   private pruneMainSessionRecentText(rawSessions: unknown): void {
@@ -9921,6 +10050,7 @@ export class WsBridge {
     const failureUpgradeId = typeof msg.upgradeId === 'string' && msg.upgradeId.length > 0 && msg.upgradeId.length <= 128
       ? msg.upgradeId
       : null;
+    const blockedReason = typeof msg.reason === 'string' ? msg.reason : 'unknown';
     if (!serverVersion || serverVersion === '0.0.0' || !this.daemonVersion || this.daemonVersion === serverVersion) {
       if (failureId) {
         this.sendDaemonUpgradeBlockedAck(
@@ -9942,6 +10072,28 @@ export class WsBridge {
         DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION.OBSOLETE,
       );
       return false;
+    }
+
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+      const targetVersion = failedTargetVersion ?? serverVersion;
+      if (msg.reason === DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED) {
+        this.daemonUpgradeCoordinator.blockTargetAfterTerminalFailure(targetVersion);
+        this.setControlledNodeUpgradeState(
+          CONTROLLED_NODE_UPGRADE_STATUS.FAILED,
+          targetVersion,
+          blockedReason,
+        );
+      } else if (isRetryableDaemonUpgradeBlockReason(blockedReason)) {
+        // A node-side safety gate is recoverable, but must not turn into a
+        // restart loop. Keep the same coordinator lifecycle pending and retry
+        // once after a bounded idle edge/reconnect window.
+        this.daemonUpgradeCoordinator.deferAfterTransientBlock();
+        this.setControlledNodeUpgradeState(
+          CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+          targetVersion,
+          blockedReason,
+        );
+      }
     }
 
     if (msg.reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS) {
@@ -9974,11 +10126,51 @@ export class WsBridge {
       serverId: this.serverId,
       daemonVersion: this.daemonVersion,
       serverVersion,
-      reason: typeof msg.reason === 'string' ? msg.reason : 'unknown',
+      reason: blockedReason,
       failedTargetVersion,
       failureUpgradeId,
     }, 'daemon.upgrade blocked; waiting for explicit manual retry');
     return !duplicate;
+  }
+
+  /** Controlled nodes are passive workers: auth + a live socket is the
+   * authoritative idle/ready boundary. Full daemons intentionally never use
+   * this path and retain the explicit operator-confirmation policy. */
+  private maybeAutoUpgradeControlledNode(): RequestDaemonUpgradeResult | null {
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED || !this.authenticated) return null;
+    const targetVersion = process.env.APP_VERSION;
+    if (!targetVersion || targetVersion === '0.0.0' || !this.daemonVersion) return null;
+    this.controlledNodeUpgradeTargetVersion = targetVersion;
+    if (!isDaemonUpgradeAvailable(this.daemonVersion, targetVersion)) {
+      this.setControlledNodeUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.CURRENT, null, null);
+      this.daemonUpgradeCoordinator.clearIfTargetVersionMatches(this.daemonVersion);
+      return null;
+    }
+    if (this.controlledNodeUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.FAILED) return null;
+    this.setControlledNodeUpgradeState(
+      this.controlledNodeUpgradeStatus === CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+        ? CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED
+        : CONTROLLED_NODE_UPGRADE_STATUS.AVAILABLE,
+      targetVersion,
+      this.controlledNodeUpgradeReason,
+    );
+    const result = this.requestDaemonUpgrade({
+      targetVersion,
+      source: DAEMON_UPGRADE_SOURCE.AUTO,
+    });
+    if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+      this.setControlledNodeUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING, targetVersion, null);
+    } else if (result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
+      || result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF) {
+      this.setControlledNodeUpgradeState(
+        result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF
+          ? CONTROLLED_NODE_UPGRADE_STATUS.FAILED
+          : CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        targetVersion,
+        result.reason ?? null,
+      );
+    }
+    return result;
   }
 
   private sendDaemonUpgradeBlockedAck(
@@ -10031,6 +10223,17 @@ export class WsBridge {
       isStillCurrent: input.isStillCurrent,
       send: (message) => this.sendDirectToDaemon(message),
     });
+    if (this.daemonNodeRole === NODE_ROLE.CONTROLLED && (input.source ?? DAEMON_UPGRADE_SOURCE.MANUAL) === DAEMON_UPGRADE_SOURCE.MANUAL) {
+      this.setControlledNodeUpgradeState(
+        result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT
+          ? CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
+          : result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF
+            ? CONTROLLED_NODE_UPGRADE_STATUS.FAILED
+            : CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED,
+        result.targetVersion ?? this.controlledNodeUpgradeTargetVersion,
+        result.reason ?? null,
+      );
+    }
     if (
       result.ok
       && result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE
@@ -10058,6 +10261,13 @@ export class WsBridge {
       return { ...result, deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PREPARING_RESCUE };
     }
     if (result?.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT) {
+      if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+        this.setControlledNodeUpgradeState(
+          CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING,
+          result.targetVersion ?? this.controlledNodeUpgradeTargetVersion,
+          null,
+        );
+      }
       logger.info({
         serverId: this.serverId,
         targetVersion: result.targetVersion,
@@ -10076,11 +10286,13 @@ export class WsBridge {
   private isDaemonReadyForUpgrade(): boolean {
     const syncReady = this.upgradeBlockedSyncRequiredGeneration !== this.daemonGeneration
       || this.upgradeBlockedSyncCompleteGeneration === this.daemonGeneration;
+    const controlledNodeIdle = this.daemonNodeRole !== NODE_ROLE.CONTROLLED || this.activeDispatchIds.size === 0;
     return Boolean(
       this.daemonWs
       && this.authenticated
       && this.authPromise === null
       && syncReady
+      && controlledNodeIdle
       && !this.needsLegacyWindowsUpgradeRescue(),
     );
   }

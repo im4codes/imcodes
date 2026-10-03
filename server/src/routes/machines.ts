@@ -57,6 +57,12 @@ import {
 import { isControlledNodeId } from '../../../shared/controlled-node-identity.js';
 import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
 import { resolveMachineOperationalUser } from '../share/shared-machine-authority.js';
+import {
+  CONTROLLED_NODE_UPGRADE_STATUS,
+  DAEMON_UPGRADE_DELIVERY_STATUS,
+  DAEMON_UPGRADE_SOURCE,
+  type ControlledNodeUpgradeStatus,
+} from '../../../shared/daemon-upgrade.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -79,6 +85,9 @@ interface ControlledRow {
   os: string | null;
   daemon_version: string | null;
   auto_unlock_configured: boolean;
+  controlled_upgrade_status: string | null;
+  controlled_upgrade_target_version: string | null;
+  controlled_upgrade_reason: string | null;
   host_server_id: string | null;
   remote_desktop_host_id: string | null;
   access_role: MachineAccessRole;
@@ -127,6 +136,19 @@ export async function listControlledMachines(
       && parseImcodesVersion(r.daemon_version) !== null
       ? r.daemon_version.trim()
       : null;
+    const bridge = WsBridge.find(r.id);
+    const liveUpgrade = bridge?.getControlledNodeUpgradeStatus();
+    const persistedUpgradeStatus = Object.values(CONTROLLED_NODE_UPGRADE_STATUS)
+      .includes(r.controlled_upgrade_status as ControlledNodeUpgradeStatus)
+      ? r.controlled_upgrade_status as ControlledNodeUpgradeStatus
+      : null;
+    const upgrade = persistedUpgradeStatus
+      ? {
+        status: persistedUpgradeStatus,
+        ...(r.controlled_upgrade_target_version ? { targetVersion: r.controlled_upgrade_target_version } : {}),
+        ...(r.controlled_upgrade_reason ? { reason: r.controlled_upgrade_reason } : {}),
+      }
+      : liveUpgrade;
     return {
       serverId: r.id,
       nodeId: r.node_id,
@@ -162,6 +184,14 @@ export async function listControlledMachines(
       ...(isImcodesVersionOutdated(daemonVersion, process.env.APP_VERSION)
         ? { updateAvailable: true }
         : {}),
+      // Upgrade lifecycle is process-local to the authenticated WS bridge. It
+      // is additive and bounded; absence means this API pod has not observed a
+      // live socket yet, while the version mismatch remains authoritative.
+      ...(upgrade ? {
+        upgradeStatus: upgrade.status,
+        ...(upgrade.targetVersion ? { upgradeTargetVersion: upgrade.targetVersion } : {}),
+        ...(upgrade.reason ? { upgradeReason: upgrade.reason } : {}),
+      } : {}),
       // Presence of a stored sign-in secret, never the secret itself.
       ...(r.auto_unlock_configured === true ? { autoUnlockConfigured: true } : {}),
       // Same machine as that daemon: the browser keeps one remote-control entry
@@ -221,7 +251,7 @@ machinesRoutes.get('/', requireAuth(), async (c) => {
 // A deprecated legacy `ref_name` remains immutable so historical markers stay valid.
 machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
-  const serverId = c.req.param('serverId');
+  const serverId = c.req.param('serverId') ?? '';
   if (!serverId) return c.json({ error: 'invalid_body' }, 400);
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({ displayName: z.string() }).safeParse(body);
@@ -247,6 +277,52 @@ machinesRoutes.post('/:serverId/display-name', requireAuth(), async (c) => {
     details: { serverId, from: row.previous_name, to: displayName },
   }, c.env.DB).catch(() => {});
   return c.json({ ok: true, displayName });
+});
+
+// POST /api/machines/:serverId/upgrade — explicit retry for a controlled node.
+// Automatic convergence is server-owned; this route is the bounded manual
+// escape hatch after a terminal install failure or a deferred safety gate.
+machinesRoutes.post('/:serverId/upgrade', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId') ?? '';
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const access = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+  if (!access) return c.json({ error: 'not_found' }, 404);
+  const row = await c.env.DB.queryOne<{ node_role: string; revoked_at: number | null }>(
+    'SELECT node_role, revoked_at FROM servers WHERE id = $1',
+    [serverId],
+  );
+  if (!row || row.revoked_at !== null || row.node_role !== NODE_ROLE.CONTROLLED) {
+    return c.json({ error: 'not_found' }, 404);
+  }
+  const result = WsBridge.get(serverId).requestDaemonUpgrade({
+    targetVersion: process.env.APP_VERSION,
+    source: DAEMON_UPGRADE_SOURCE.MANUAL,
+  });
+  if (!result.ok) {
+    return c.json({ error: result.reason ?? 'upgrade_request_failed', deliveryStatus: result.deliveryStatus }, 400);
+  }
+  const persistedStatus = result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.SENT
+    ? CONTROLLED_NODE_UPGRADE_STATUS.UPGRADING
+    : result.deliveryStatus === DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF
+      ? CONTROLLED_NODE_UPGRADE_STATUS.FAILED
+      : CONTROLLED_NODE_UPGRADE_STATUS.DEFERRED;
+  await c.env.DB.execute(
+    `UPDATE servers
+        SET controlled_upgrade_status = $1,
+            controlled_upgrade_target_version = $2,
+            controlled_upgrade_reason = $3
+      WHERE id = $4 AND node_role = $5 AND revoked_at IS NULL`,
+    [persistedStatus, result.targetVersion ?? process.env.APP_VERSION ?? null, result.reason ?? null, serverId, NODE_ROLE.CONTROLLED],
+  );
+  return c.json({
+    ok: true,
+    upgradeId: result.upgradeId,
+    targetVersion: result.targetVersion,
+    deliveryStatus: result.deliveryStatus,
+    ...(result.nextAttemptAt ? { nextAttemptAt: result.nextAttemptAt } : {}),
+    ...(result.reason ? { reason: result.reason } : {}),
+  });
 });
 
 // POST /api/machines/desk-binding?serverId=... — owner binds this machine to

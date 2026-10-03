@@ -3677,7 +3677,13 @@
     "team_error_group_name_required": "请输入名称。",
     "team_error_group_name_too_long": "名称太长了。",
     "remote_access_paused": "远程访问已暂停",
-    "remote_access_paused_hint": "此设备会拒绝所有新的查看和控制，直到在本机恢复远程访问。"
+    "remote_access_paused_hint": "此设备会拒绝所有新的查看和控制，直到在本机恢复远程访问。",
+    "upgrade_status_available": "有可用更新",
+    "upgrade_status_upgrading": "更新中…",
+    "upgrade_status_deferred": "忙碌，空闲后更新",
+    "upgrade_status_failed": "更新失败",
+    "upgrade_retry": "重试更新",
+    "upgrade_retry_failed": "无法重试更新。"
   },
   "peerAuditQuick": {
     "iconLabel": "对等审计",

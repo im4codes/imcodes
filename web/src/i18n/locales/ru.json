@@ -3676,7 +3676,13 @@
     "team_error_group_name_required": "Введите имя.",
     "team_error_group_name_too_long": "Слишком длинное имя.",
     "remote_access_paused": "Удалённый доступ приостановлен",
-    "remote_access_paused_hint": "Устройство отклоняет новые подключения просмотра и управления до локального возобновления доступа."
+    "remote_access_paused_hint": "Устройство отклоняет новые подключения просмотра и управления до локального возобновления доступа.",
+    "upgrade_status_available": "Доступно обновление",
+    "upgrade_status_upgrading": "Обновление…",
+    "upgrade_status_deferred": "Отложено до простоя",
+    "upgrade_status_failed": "Ошибка обновления",
+    "upgrade_retry": "Повторить обновление",
+    "upgrade_retry_failed": "Не удалось повторить обновление."
   },
   "peerAuditQuick": {
     "iconLabel": "Пир-аудит",

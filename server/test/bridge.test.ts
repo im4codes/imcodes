@@ -863,7 +863,7 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(false);
     });
 
-    it('does not auto-upgrade controlled nodes on reconnect', async () => {
+    it('auto-upgrades a controlled node once at the authenticated idle boundary', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.7.1234-dev.5';
       const bridge = WsBridge.get(serverId);
@@ -873,10 +873,40 @@ describe('WsBridge', () => {
       await flushAsync();
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
-      expect(ws.sentStrings.some((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
+      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(1);
     });
 
-    it('does not arm controlled-node rescue without an explicit upgrade request', async () => {
+    it('defers a controlled-node upgrade while a dispatch is active and flushes once at idle', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const activeDispatchIds = (bridge as unknown as { activeDispatchIds: Map<string, string> }).activeDispatchIds;
+      activeDispatchIds.set('main', 'turn-1');
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth',
+        serverId,
+        token: 'my-token',
+        daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
+
+      activeDispatchIds.delete('main');
+      (bridge as unknown as { scheduleControlledUpgradeFlushAtIdleBoundary: () => void })
+        .scheduleControlledUpgradeFlushAtIdleBoundary();
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(1);
+      activeDispatchIds.clear();
+    });
+
+    it('does not arm controlled-node rescue when the controlled node has safe self-upgrade', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.7.1234-dev.5';
       const bridge = WsBridge.get(serverId);
@@ -886,7 +916,7 @@ describe('WsBridge', () => {
       await flushAsync();
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
-      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(true);
       expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(false);
     });
 
@@ -943,7 +973,7 @@ describe('WsBridge', () => {
       expect(ws.closeReason).toBe('invalid_capabilities');
     });
 
-    it('does not prepare a controlled-node rescue on auth mismatch', async () => {
+    it('prepares a legacy Windows rescue before automatic upgrade when no safe capability is advertised', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.7.1234-dev.5';
       const bridge = WsBridge.get(serverId);
@@ -954,10 +984,10 @@ describe('WsBridge', () => {
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
       expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
-      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(false);
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(true);
     });
 
-    it('keeps a legacy Windows node online without automatic rescue retries', async () => {
+    it('keeps legacy Windows rescue bounded while the rescue result is pending', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.7.1234-dev.5';
       const bridge = WsBridge.get(serverId);
@@ -967,11 +997,11 @@ describe('WsBridge', () => {
       await flushAsync();
       await vi.advanceTimersByTimeAsync(60_000);
       await flushAsync();
-      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(false);
-      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
+      expect(ws.sentStrings.filter((message) => message.includes('\"type\":\"machine.exec\"'))).toHaveLength(1);
+      expect(ws.sentStrings.filter((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
     });
 
-    it('does not restart a legacy Windows node from an automatic blocker', async () => {
+    it('defers a legacy Windows node after an automatic blocker without rescue', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.8.3409-dev.3847';
       const bridge = WsBridge.get(serverId);
@@ -1088,7 +1118,7 @@ describe('WsBridge', () => {
         targetVersion: process.env.APP_VERSION,
       }));
       await flushAsync();
-      expect(bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'auto' }))
+      expect(bridge.requestDaemonUpgrade({ targetVersion: process.env.APP_VERSION, source: 'manual' }))
         .toMatchObject({ deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PREPARING_RESCUE });
     });
 

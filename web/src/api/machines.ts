@@ -35,6 +35,7 @@ import {
   MACHINE_IDENTITY_UNAVAILABLE,
 } from '@shared/machine-reference.js';
 import { isControlledNodeId } from '@shared/controlled-node-identity.js';
+import { CONTROLLED_NODE_UPGRADE_STATUS, type ControlledNodeUpgradeStatus } from '@shared/daemon-upgrade.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
 import {
@@ -93,6 +94,9 @@ export interface MachineListItem {
   daemonVersion?: string;
   /** Server-computed: that release is older than the Server's target. */
   updateAvailable?: boolean;
+  upgradeStatus?: ControlledNodeUpgradeStatus;
+  upgradeTargetVersion?: string;
+  upgradeReason?: string;
   /** The node holds a sign-in secret for auto unlock. Never the secret itself. */
   autoUnlockConfigured?: boolean;
   /**
@@ -338,6 +342,15 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
     ...(capabilities.ok && capabilities.value.length > 0 ? { capabilities: capabilities.value } : {}),
     ...(typeof raw.daemonVersion === 'string' && raw.daemonVersion ? { daemonVersion: raw.daemonVersion } : {}),
     ...(raw.updateAvailable === true ? { updateAvailable: true } : {}),
+    ...(Object.values(CONTROLLED_NODE_UPGRADE_STATUS).includes(raw.upgradeStatus as ControlledNodeUpgradeStatus)
+      ? { upgradeStatus: raw.upgradeStatus as ControlledNodeUpgradeStatus }
+      : {}),
+    ...(typeof raw.upgradeTargetVersion === 'string' && raw.upgradeTargetVersion
+      ? { upgradeTargetVersion: raw.upgradeTargetVersion }
+      : {}),
+    ...(typeof raw.upgradeReason === 'string' && raw.upgradeReason
+      ? { upgradeReason: raw.upgradeReason }
+      : {}),
     ...(raw.autoUnlockConfigured === true ? { autoUnlockConfigured: true } : {}),
     ...(typeof raw.hostServerId === 'string' && raw.hostServerId
       ? { hostServerId: raw.hostServerId }
@@ -383,6 +396,13 @@ export async function setMachineExecEnabled(serverId: string, enabled: boolean):
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ enabled }),
+  });
+}
+
+/** Retry a controlled-node upgrade after a terminal or deferred state. */
+export async function upgradeControlledMachine(serverId: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/upgrade`, {
+    method: 'POST',
   });
 }
 

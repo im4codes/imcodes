@@ -138,6 +138,7 @@ describe('controlled-node access-role normalization', () => {
         {
           serverId: 'stale', refName: 'stale', online: true, execEnabled: true,
           daemonVersion: '2026.8.3400-dev.3800', updateAvailable: true,
+          upgradeStatus: 'deferred', upgradeTargetVersion: '2026.8.3447-dev.3884', upgradeReason: 'session_busy',
         },
         { serverId: 'silent', refName: 'silent', online: true, execEnabled: true },
         {
@@ -155,7 +156,12 @@ describe('controlled-node access-role normalization', () => {
       // A non-string version and a truthy-but-not-true flag both fall away
       // rather than reaching the row as `42` or a bogus upgrade badge.
       ['malformed', undefined, undefined],
-    ]);
+      ]);
+    expect(machines[1]).toMatchObject({
+      upgradeStatus: 'deferred',
+      upgradeTargetVersion: '2026.8.3447-dev.3884',
+      upgradeReason: 'session_busy',
+    });
   });
 
   it('keeps only an exact, known remote-desktop capability list', async () => {

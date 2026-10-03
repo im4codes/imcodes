@@ -45,7 +45,29 @@ export function isDaemonUpgradeAvailable(
 export const DAEMON_UPGRADE_BLOCK_REASON = {
   ALREADY_IN_PROGRESS: 'already_in_progress',
   INSTALL_FAILED: 'install_failed',
+  TRANSPORT_BUSY: 'transport_busy',
+  SESSION_BUSY: 'session_busy',
+  COOLDOWN_ACTIVE: 'cooldown_active',
+  TOOLCHAIN_UNAVAILABLE: 'toolchain_unavailable',
 } as const;
+
+export const CONTROLLED_NODE_UPGRADE_STATUS = {
+  CURRENT: 'current',
+  AVAILABLE: 'available',
+  DEFERRED: 'deferred',
+  UPGRADING: 'upgrading',
+  FAILED: 'failed',
+} as const;
+
+export type ControlledNodeUpgradeStatus =
+  (typeof CONTROLLED_NODE_UPGRADE_STATUS)[keyof typeof CONTROLLED_NODE_UPGRADE_STATUS];
+
+export function isRetryableDaemonUpgradeBlockReason(reason: string): boolean {
+  return reason === DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS
+    || reason === DAEMON_UPGRADE_BLOCK_REASON.TRANSPORT_BUSY
+    || reason === DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY
+    || reason === DAEMON_UPGRADE_BLOCK_REASON.COOLDOWN_ACTIVE;
+}
 
 export interface ControlledNodeUpgradeBlockedMessage {
   [key: string]: unknown;

@@ -3677,7 +3677,13 @@
     "team_error_group_name_required": "Enter a name.",
     "team_error_group_name_too_long": "That name is too long.",
     "remote_access_paused": "Remote access paused",
-    "remote_access_paused_hint": "This device rejects all new viewing and control until remote access is resumed locally."
+    "remote_access_paused_hint": "This device rejects all new viewing and control until remote access is resumed locally.",
+    "upgrade_status_available": "Update available",
+    "upgrade_status_upgrading": "Updating…",
+    "upgrade_status_deferred": "Update deferred until idle",
+    "upgrade_status_failed": "Update failed",
+    "upgrade_retry": "Retry update",
+    "upgrade_retry_failed": "Could not retry update."
   },
   "peerAuditQuick": {
     "iconLabel": "Peer audit",

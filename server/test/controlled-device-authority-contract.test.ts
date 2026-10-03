@@ -27,6 +27,7 @@ const MACHINE_ACTION_PATHS = [
   '/:serverId/remote-desktop-permissions',
   '/:serverId/remote-desktop-worker',
   '/:serverId/revoke',
+  '/:serverId/upgrade',
 ] as const;
 
 describe('controlled-device centralized authority contract', () => {

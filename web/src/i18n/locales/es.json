@@ -3677,7 +3677,13 @@
     "team_error_group_name_required": "Escribe un nombre.",
     "team_error_group_name_too_long": "Ese nombre es demasiado largo.",
     "remote_access_paused": "Acceso remoto en pausa",
-    "remote_access_paused_hint": "Este dispositivo rechaza nuevas conexiones de visualización y control hasta que se reanude localmente."
+    "remote_access_paused_hint": "Este dispositivo rechaza nuevas conexiones de visualización y control hasta que se reanude localmente.",
+    "upgrade_status_available": "Actualización disponible",
+    "upgrade_status_upgrading": "Actualizando…",
+    "upgrade_status_deferred": "Pospuesta hasta estar inactivo",
+    "upgrade_status_failed": "Actualización fallida",
+    "upgrade_retry": "Reintentar actualización",
+    "upgrade_retry_failed": "No se pudo reintentar."
   },
   "peerAuditQuick": {
     "iconLabel": "Auditoría de pares",

@@ -21,6 +21,9 @@ export interface ControlledMachineAccessRow {
   access_role: MachineAccessRole;
   access_expires_at: number | null;
   controlled_capabilities: ControlledNodeCapability[] | null;
+  controlled_upgrade_status: string | null;
+  controlled_upgrade_target_version: string | null;
+  controlled_upgrade_reason: string | null;
   /** `controlled` for a controlled node; `full`/NULL for a normal daemon. */
   node_role: string | null;
   /** The daemon this node was enrolled from, when it shares that machine. */
@@ -63,6 +66,7 @@ const CONTROLLED_MACHINE_ACCESS_SELECT = `
   SELECT s.id, s.user_id, s.node_id, s.ref_name, s.display_name, s.status, s.node_role, s.host_server_id,
          s.last_heartbeat_at, s.exec_enabled, s.os, s.daemon_version, s.revoked_at,
          s.auto_unlock_configured, s.controlled_capabilities,
+         s.controlled_upgrade_status, s.controlled_upgrade_target_version, s.controlled_upgrade_reason,
          rdhe.host_id AS remote_desktop_host_id,
          (
            SELECT COALESCE(array_agg(g.team_id ORDER BY gt.name), '{}')

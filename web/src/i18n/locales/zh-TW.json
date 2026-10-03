@@ -3677,7 +3677,13 @@
     "team_error_group_name_required": "請輸入名稱。",
     "team_error_group_name_too_long": "名稱太長了。",
     "remote_access_paused": "遠端存取已暫停",
-    "remote_access_paused_hint": "此裝置會拒絕所有新的檢視和控制，直到在本機恢復遠端存取。"
+    "remote_access_paused_hint": "此裝置會拒絕所有新的檢視和控制，直到在本機恢復遠端存取。",
+    "upgrade_status_available": "有可用更新",
+    "upgrade_status_upgrading": "更新中…",
+    "upgrade_status_deferred": "忙碌，閒置後更新",
+    "upgrade_status_failed": "更新失敗",
+    "upgrade_retry": "重試更新",
+    "upgrade_retry_failed": "無法重試更新。"
   },
   "peerAuditQuick": {
     "iconLabel": "對等稽核",

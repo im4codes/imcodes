@@ -2,6 +2,7 @@ import { DAEMON_MSG } from './daemon-events.js';
 import { DAEMON_COMMAND_TYPES } from './daemon-command-types.js';
 import type { ControlledNodeCapability } from './controlled-node-capabilities.js';
 import type { WindowsAuthenticodeEnrollmentRestore } from './windows-authenticode-enrollment.js';
+import type { ControlledNodeUpgradeStatus } from './daemon-upgrade.js';
 
 // Remote-exec / controlled-node protocol shared by daemon (source + controlled
 // node), server relay, and the exe build pipeline.
@@ -118,6 +119,7 @@ export function pickDaemonMachineListItem<T extends object>(machine: T): Partial
 export const DAEMON_MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
   'serverId', 'nodeId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs',
   'accessRole', 'daemonVersion', 'updateAvailable', 'autoUnlockConfigured', 'teamIds', 'teamNames', 'hostServerId',
+  'upgradeStatus', 'upgradeTargetVersion', 'upgradeReason',
 ]);
 /** Envelope input bounds (server is the trust boundary; both ends validate). */
 export const REMOTE_EXEC_MAX_COMMAND_BYTES = 64 * 1024;
@@ -200,6 +202,10 @@ export interface MachineSummary {
   daemonVersion?: string;
   /** Present only when that reported release is older than the Server's target. */
   updateAvailable?: boolean;
+  /** Server-observed controlled-node upgrade lifecycle. */
+  upgradeStatus?: ControlledNodeUpgradeStatus;
+  upgradeTargetVersion?: string;
+  upgradeReason?: string;
   /**
    * Present only when the node confirmed it holds a sign-in secret for auto
    * unlock. The secret itself is never readable from anywhere.

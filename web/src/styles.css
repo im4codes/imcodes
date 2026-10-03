@@ -3911,6 +3911,11 @@ html.native-ios-mac .chat-dl-btn {
   transition: border-color 0.16s, background 0.16s, color 0.16s, box-shadow 0.16s;
 }
 .controlled-nodes-machine-actions button:disabled { cursor: wait; opacity: 0.48; }
+.controlled-nodes-upgrade-action { display: inline-flex; align-items: center; gap: 6px; }
+.controlled-nodes-upgrade-status { font-size: 11px; color: var(--text-muted); white-space: nowrap; }
+.controlled-nodes-upgrade-status.is-upgrading { color: #fbbf24; }
+.controlled-nodes-upgrade-status.is-failed { color: #fb7185; }
+.controlled-nodes-upgrade-status.is-deferred { color: #fbbf24; }
 /* Owner actions on desktop: two rows, three equal columns, so every button
    lines up with the one above/below it across all machines regardless of which
    optional actions (install, auto-unlock) a given machine has -- the ones it

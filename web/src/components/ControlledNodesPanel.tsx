@@ -18,6 +18,7 @@ import {
   revokeMachine,
   setMachineAutoUnlock,
   setMachineExecEnabled,
+  upgradeControlledMachine,
   type ControlledNodeArtifactMetadata,
   type ControlledNodeArtifactSelection,
   type ControlledNodeOs,
@@ -504,6 +505,19 @@ export function ControlledNodesPanel({
     setBusyServerId(null);
   };
 
+  const onRetryUpgrade = async (serverId: string) => {
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await upgradeControlledMachine(serverId);
+      await refreshPresence();
+    } catch {
+      setActionError(t('controlled_nodes.upgrade_retry_failed'));
+    } finally {
+      setBusyServerId(null);
+    }
+  };
+
   /**
    * Ask the machine to put its permission dialog on screen.
    *
@@ -635,6 +649,40 @@ export function ControlledNodesPanel({
       </button>
     )
   );
+
+  const renderUpgradeAction = (machine: MachineListItem, inMobileMenu: boolean) => {
+    if (!machine.updateAvailable || machineAccessRole(machine) === 'viewer') return null;
+    const status = machine.upgradeStatus;
+    const statusKey = status === 'upgrading'
+      ? 'controlled_nodes.upgrade_status_upgrading'
+      : status === 'deferred'
+        ? 'controlled_nodes.upgrade_status_deferred'
+        : status === 'failed'
+          ? 'controlled_nodes.upgrade_status_failed'
+          : 'controlled_nodes.upgrade_status_available';
+    return (
+      <div class="controlled-nodes-upgrade-action">
+        <span class={`controlled-nodes-upgrade-status is-${status ?? 'available'}`}>
+          {t(statusKey)}
+        </span>
+        {status !== 'upgrading' && (
+          <button
+            type="button"
+            class="controlled-nodes-upgrade"
+            disabled={busyServerId === machine.serverId}
+            onClick={() => {
+              if (inMobileMenu) closeMobileActionMenu();
+              void onRetryUpgrade(machine.serverId);
+            }}
+          >
+            {busyServerId === machine.serverId
+              ? t('controlled_nodes.upgrade_status_upgrading')
+              : t('controlled_nodes.upgrade_retry')}
+          </button>
+        )}
+      </div>
+    );
+  };
 
   const renderManagementActions = (machine: MachineListItem, inMobileMenu: boolean) => {
     const closeAfterAction = (): void => {
@@ -959,6 +1007,7 @@ export function ControlledNodesPanel({
               </div>
               <div class={`controlled-nodes-machine-actions ${mobileActions ? `is-mobile is-${machineAccessRole(m)}` : `is-desktop is-${machineAccessRole(m)}`}`}>
                 {!mobileActions && renderInstallAction(m, false)}
+                {!mobileActions && renderUpgradeAction(m, false)}
                 {canOpenRemoteDesktopMachine(m) ? (
                   // Split button: the left two thirds open the remote desktop
                   // here, the right third opens it in its own browser window.
@@ -1034,6 +1083,7 @@ export function ControlledNodesPanel({
                         aria-label={t('controlled_nodes.more_actions')}
                       >
                         {renderInstallAction(m, true)}
+                        {renderUpgradeAction(m, true)}
                         {renderManagementActions(m, true)}
                       </div>
                     )}
