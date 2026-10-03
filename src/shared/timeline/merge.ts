@@ -1,5 +1,6 @@
 import type { TimelineEvent } from './types.js';
 import {
+  TIMELINE_USER_DELETED_PAYLOAD_KEY,
   TIMELINE_DETAIL_FIELD_PATHS as SHARED_TIMELINE_DETAIL_FIELD_PATHS,
   type TimelineDetailFieldPath,
 } from '../../../shared/timeline-protocol.js';
@@ -7,12 +8,19 @@ import {
   usageContextWindowSourceRank,
   type UsageContextWindowSource,
 } from '../../../shared/usage-context-window.js';
+import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '../../../shared/agent-delegation.js';
+import { isPeerAuditVerdict } from '../../../shared/peer-audit.js';
 
 export const TIMELINE_DETAIL_FIELD_PATHS = Object.values(SHARED_TIMELINE_DETAIL_FIELD_PATHS) as TimelineDetailFieldPath[];
 export type { TimelineDetailFieldPath };
 
 function isStreaming(event: TimelineEvent): boolean {
   return event.payload.streaming === true;
+}
+
+/** True for the durable tombstone a user delete writes (see TIMELINE_USER_DELETED_PAYLOAD_KEY). */
+export function isUserDeletedTimelineEvent(event: TimelineEvent): boolean {
+  return event.payload?.[TIMELINE_USER_DELETED_PAYLOAD_KEY] === true;
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -54,6 +62,13 @@ function compareNumbers(a: number | undefined, b: number | undefined): number {
   const right = typeof b === 'number' ? b : Number.NEGATIVE_INFINITY;
   if (left === right) return 0;
   return left > right ? 1 : -1;
+}
+
+function isAuthoritativeDelegationAuditVerdict(event: TimelineEvent): boolean {
+  return event.type === AGENT_DELEGATION_REPLY_TIMELINE_EVENT
+    && event.source === 'daemon'
+    && event.confidence === 'high'
+    && isPeerAuditVerdict(event.payload.verdict);
 }
 
 const USAGE_SNAPSHOT_PAYLOAD_KEYS = [
@@ -115,6 +130,14 @@ function supplementUsageSnapshot(
 }
 
 function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  // A user delete is final. It outranks streaming/terminal, completeness (a
+  // hydrated copy is "fuller" than the tombstone) and seq (a stream delta or
+  // stale cache row arriving later has a higher seq): otherwise the message
+  // reappears on that client and the delete looks like it did nothing.
+  const existingDeleted = isUserDeletedTimelineEvent(existing);
+  const incomingDeleted = isUserDeletedTimelineEvent(incoming);
+  if (existingDeleted !== incomingDeleted) return incomingDeleted ? incoming : existing;
+
   const existingStreaming = isStreaming(existing);
   const incomingStreaming = isStreaming(incoming);
 
@@ -124,6 +147,18 @@ function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: Timelin
   // snapshot outranked the very event that settled it.
   if (existingStreaming !== incomingStreaming) {
     return incomingStreaming ? existing : incoming;
+  }
+
+  // One exact supervised audit can first project as released free-form prose
+  // and later as its daemon-authenticated PASS/REWORK receipt under the SAME
+  // stable event id. A history preview of the exact receipt may be ranked as
+  // truncated, but its structured verdict/round authority must still replace
+  // the non-authoritative prose card. A later hydrated receipt will then win
+  // normally among two structured verdict generations.
+  const existingAuditVerdict = isAuthoritativeDelegationAuditVerdict(existing);
+  const incomingAuditVerdict = isAuthoritativeDelegationAuditVerdict(incoming);
+  if (existingAuditVerdict !== incomingAuditVerdict) {
+    return incomingAuditVerdict ? incoming : existing;
   }
 
   // Then freshness, but only while the message is still in flight.
@@ -184,6 +219,33 @@ function choosePreferredTimelineEvent(existing: TimelineEvent, incoming: Timelin
  * previous version of this comment described the old order and would have
  * talked the next reader into restoring it.
  */
+/**
+ * Winner between two LAST-VALUE signals.
+ *
+ * `preferTimelineEvent` exists to merge revisions of ONE event (same eventId),
+ * where ranking a hydrated payload above a truncated one is right. Last-value
+ * signals are different: they compete across different eventIds and the whole
+ * contract is "the newest value is the current value". Reusing the same-eventId
+ * comparator let an OLDER hydrated row outrank the newer current one — and the
+ * drain deletes the row it just replayed, so that stale value became permanent.
+ *
+ * Freshness therefore decides first. Completeness is only a tiebreak once
+ * epoch, seq and ts are all equal, where there is no freshness signal left and
+ * the richer payload is the better of two equals.
+ */
+export function preferLastValueSignal(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
+  const epochCmp = compareNumbers(incoming.epoch, existing.epoch);
+  if (epochCmp !== 0) return epochCmp > 0 ? incoming : existing;
+
+  const seqCmp = compareNumbers(incoming.seq, existing.seq);
+  if (seqCmp !== 0) return seqCmp > 0 ? incoming : existing;
+
+  const tsCmp = compareNumbers(incoming.ts, existing.ts);
+  if (tsCmp !== 0) return tsCmp > 0 ? incoming : existing;
+
+  return preferTimelineEvent(existing, incoming);
+}
+
 export function preferTimelineEvent(existing: TimelineEvent, incoming: TimelineEvent): TimelineEvent {
   const preferred = choosePreferredTimelineEvent(existing, incoming);
   const alternate = preferred === existing ? incoming : existing;

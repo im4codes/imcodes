@@ -11,6 +11,7 @@ import type { Env } from '../env.js';
 import { createUser, getUserById, getUserByUsername } from '../db/queries.js';
 import { randomHex, sha256Hex, signJwt, verifyJwt, hashPassword } from '../security/crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { issueAuthNonce, logAuthAudit, scheduleAuthNonceCleanup } from './auth.js';
 import { z } from 'zod';
 import logger from '../util/logger.js';
@@ -235,7 +236,7 @@ passkeyRoutes.post('/register/begin', async (c) => {
     const { getSetting } = await import('../db/queries.js');
     const regEnabled = await getSetting(c.env.DB, 'registration_enabled');
     if (regEnabled === 'false') {
-      return c.json({ error: 'registration_disabled' }, 403);
+      return c.json({ error: AUTH_ERROR_CODES.REGISTRATION_DISABLED }, 403);
     }
   }
   const body = await c.req.json().catch(() => ({})) as Record<string, unknown>;
@@ -247,7 +248,7 @@ passkeyRoutes.post('/register/begin', async (c) => {
     existingUser = await getUserById(c.env.DB, existingUserId);
     if (!existingUser) return c.json({ error: 'user_not_found' }, 404);
     if (existingUser.status !== 'active') {
-      return c.json({ error: existingUser.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+      return c.json({ error: existingUser.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
     }
   }
 
@@ -295,7 +296,7 @@ passkeyRoutes.post('/verify/begin', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const allowCredentials = await listUserCredentialIds(c.env.DB, userId);
@@ -374,7 +375,7 @@ passkeyRoutes.post('/register/complete', async (c) => {
     const user = await getUserById(c.env.DB, userId);
     if (!user) return c.json({ error: 'user_not_found' }, 404);
     if (user.status !== 'active') {
-      return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+      return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
     }
   }
 
@@ -472,7 +473,7 @@ passkeyRoutes.post('/login/complete', async (c) => {
 
   // Reject disabled/pending users
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const now = Date.now();
@@ -552,18 +553,18 @@ passkeyRoutes.post('/password/setup', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
   if (user.password_hash) return c.json({ error: 'password_already_set' }, 400);
 
   const normalizedUsername = username.trim().toLowerCase();
   if (!/^[a-z0-9](?:[a-z0-9._-]{1,30}[a-z0-9])?$/.test(normalizedUsername)) {
-    return c.json({ error: 'invalid_username_format' }, 400);
+    return c.json({ error: AUTH_ERROR_CODES.INVALID_USERNAME_FORMAT }, 400);
   }
 
   const existingUser = await getUserByUsername(c.env.DB, normalizedUsername);
   if (existingUser && existingUser.id !== userId) {
-    return c.json({ error: 'username_taken' }, 409);
+    return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
   }
 
   const pending = await getChallenge(c.env.DB, challengeId);
@@ -623,7 +624,7 @@ passkeyRoutes.post('/password/setup', async (c) => {
       return c.json({ error: 'challenge_expired' }, 400);
     }
     if (isUniqueViolation(err)) {
-      return c.json({ error: 'username_taken' }, 409);
+      return c.json({ error: AUTH_ERROR_CODES.USERNAME_TAKEN }, 409);
     }
     throw err;
   }
@@ -668,7 +669,7 @@ passkeyRoutes.get('/credentials', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const rows = await c.env.DB.query<{ id: string; device_name: string | null; created_at: number; last_used_at: number | null }>(
@@ -774,7 +775,7 @@ passkeyRoutes.delete('/credentials/:credId', async (c) => {
   const user = await getUserById(c.env.DB, userId);
   if (!user) return c.json({ error: 'user_not_found' }, 404);
   if (user.status !== 'active') {
-    return c.json({ error: user.status === 'pending' ? 'account_pending' : 'account_disabled' }, 403);
+    return c.json({ error: user.status === 'pending' ? AUTH_ERROR_CODES.ACCOUNT_PENDING : AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
   }
 
   const credId = c.req.param('credId');

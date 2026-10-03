@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'preact/hooks';
 import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import { fetchUsageSummary, type UsageSummaryResponse } from '../api/usage-summary.js';
-import { formatUsageNumber, formatUsageCost } from '../util/usage-format.js';
+import { formatUsageNumber, formatUsageCost, formatUsageSharePercent } from '../util/usage-format.js';
 import { bucketRowsByWeek, mergeUsageRowsBySession } from '../util/usage-group.js';
 import { watchProjectionStore } from '../watch-projection.js';
 
@@ -107,11 +107,16 @@ export function SessionUsagePanel({ targetSessionName, onClose }: Props) {
             <div style={headlineStyle}>
               <div style={{ fontSize: 11, color: '#94a3b8' }}>{t('sessionUsage.group')}</div>
               <div style={{ fontSize: 26, fontWeight: 700, color: '#f8fafc' }}>{formatUsageNumber(total.totalTokens)}</div>
-              <div style={{ fontSize: 12, color: '#94a3b8' }}>
-                {formatUsageCost(total.costUsdMicros, unknown)}
-                {' · '}{t('sessionUsage.input')} {formatUsageNumber(total.inputTokens)}
-                {' · '}{t('sessionUsage.cache')} {formatUsageNumber(total.cacheTokens)}
-                {' · '}{t('sessionUsage.output')} {formatUsageNumber(total.outputTokens)}
+              <div style={{ fontSize: 12, color: '#94a3b8', marginBottom: 8 }}>{formatUsageCost(total.costUsdMicros, unknown)}</div>
+              {/* input/cache/output as separate tiles (each its own count +
+                  share of the total) instead of one crammed inline line --
+                  that line ran all three together with no visual separation
+                  and no percentage, which made it hard to tell at a glance
+                  how much of the total was cache vs fresh input. */}
+              <div style={breakdownGridStyle}>
+                <UsageBreakdownTile label={t('sessionUsage.input')} tokens={total.inputTokens} total={total.totalTokens} />
+                <UsageBreakdownTile label={t('sessionUsage.cache')} tokens={total.cacheTokens} total={total.totalTokens} />
+                <UsageBreakdownTile label={t('sessionUsage.output')} tokens={total.outputTokens} total={total.totalTokens} />
               </div>
             </div>
 
@@ -191,6 +196,17 @@ function RowList({ rows, unknown, emptyLabel }: {
           </span>
         </div>
       ))}
+    </div>
+  );
+}
+
+/** One input/cache/output tile: label, raw count, and its share of the total. */
+function UsageBreakdownTile({ label, tokens, total }: { label: string; tokens: number; total: number }) {
+  return (
+    <div style={breakdownTileStyle}>
+      <div style={{ fontSize: 11, color: '#64748b' }}>{label}</div>
+      <div style={{ fontSize: 15, fontWeight: 700, color: '#e2e8f0' }}>{formatUsageNumber(tokens)}</div>
+      <div style={{ fontSize: 11, color: '#94a3b8' }}>{formatUsageSharePercent(tokens, total)}</div>
     </div>
   );
 }
@@ -275,4 +291,12 @@ const rowStyle = {
   borderRadius: 6,
   padding: '8px 10px',
   background: '#111827',
+} as const;
+const breakdownGridStyle = { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 6 } as const;
+const breakdownTileStyle = {
+  border: '1px solid #1f2937',
+  borderRadius: 6,
+  padding: '6px 4px',
+  background: '#111827',
+  textAlign: 'center',
 } as const;

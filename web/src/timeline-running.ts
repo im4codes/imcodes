@@ -110,3 +110,29 @@ export function hasActiveTimelineTurn(
   }
   return false;
 }
+
+/** Events that say nothing about whether a turn ran; they must not re-arm an idle edge. */
+const IDLE_EDGE_NEUTRAL_EVENT_TYPES = new Set<string>(['agent.status', 'usage.update', 'mode.state', 'terminal.snapshot', 'memory.context']);
+
+/**
+ * Track live idle edges per session.
+ *
+ * Returns true when `event` is an idle `session.state` for a session whose last
+ * signal was already idle -- a repeat of the same idle edge, which must not
+ * flash the tab / raise an alert / re-render the app again. Anything that
+ * shows real activity (a non-idle state, a message, a tool call, streaming
+ * text) re-arms the edge, so the next genuine idle still fires.
+ */
+export function noteLiveIdleSignal(idleSessions: Set<string>, event: { sessionId: string } & TimelineTailEvent): boolean {
+  if (event.type === 'session.state') {
+    if (!isIdleSessionStateTimelineEvent(event)) {
+      idleSessions.delete(event.sessionId);
+      return false;
+    }
+    const repeated = idleSessions.has(event.sessionId);
+    idleSessions.add(event.sessionId);
+    return repeated;
+  }
+  if (!IDLE_EDGE_NEUTRAL_EVENT_TYPES.has(event.type)) idleSessions.delete(event.sessionId);
+  return false;
+}

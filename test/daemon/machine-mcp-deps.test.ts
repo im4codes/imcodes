@@ -1,12 +1,160 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createDaemonMachineToolDeps } from '../../src/daemon/machine-mcp-deps.js';
 import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
+import { CONTROLLED_NODE_ID_MIN, CONTROLLED_NODE_ID_MAX } from '../../shared/controlled-node-identity.js';
 
 const creds = { serverUrl: 'https://relay.example', serverId: 's1', token: 't1' };
-type ClientMachine = { serverId: string; name: string; refName: string; displayName: string; os?: string; online: boolean; nodeRole: 'controlled'; execEnabled: boolean };
-const m = (over: Partial<ClientMachine>): ClientMachine => ({ serverId: 'x', name: 'x', refName: 'x', displayName: 'X', online: true, nodeRole: 'controlled', execEnabled: true, ...over });
+type ClientMachine = { serverId: string; nodeId: string; name: string; refName: string; displayName: string; os?: string; online: boolean; nodeRole: 'controlled'; execEnabled: boolean };
+const m = (over: Partial<ClientMachine>): ClientMachine => ({ serverId: 'x', nodeId: CONTROLLED_NODE_ID_MIN, name: 'x', refName: 'x', displayName: 'X', online: true, nodeRole: 'controlled', execEnabled: true, ...over });
 
 describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', () => {
+  it('loads and forwards the active shared-turn authority once for exec and computer use', async () => {
+    const loadAuthority = vi.fn(async () => 'signed-shared-turn');
+    const list = vi.fn(async () => [m({ serverId: 'target' })]);
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const computerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: loadAuthority,
+      listMachines: list,
+      execRemote: exec,
+      computerUseCall: computerUse as never,
+    });
+    await deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'whoami' });
+    expect(exec).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(loadAuthority).toHaveBeenCalledTimes(1);
+    await deps.computerUseCall?.({ machine: CONTROLLED_NODE_ID_MIN, tool: 'list_apps' });
+    expect(computerUse).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(list).toHaveBeenLastCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(loadAuthority).toHaveBeenCalledTimes(2);
+  });
+
+  it('applies the same active shared-turn authority to discovery and both file capability families', async () => {
+    const list = vi.fn(async () => [m({ serverId: 'target' })]);
+    const sendFile = vi.fn(async () => ({ size: 1, attachmentId: 'a'.repeat(32), transport: 'relay' as const }));
+    const fetchFile = vi.fn(async (input: { destinationPath: string }) => ({
+      size: 1, attachmentId: 'b'.repeat(32), transport: 'relay' as const, destinationPath: input.destinationPath,
+    }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => 'signed-shared-turn',
+      listMachines: list,
+      sendFileToMachine: sendFile as never,
+      fetchFileFromMachine: fetchFile as never,
+    });
+
+    await deps.listMachines({ includeOffline: true });
+    await deps.sendFileToMachine?.({ machine: CONTROLLED_NODE_ID_MIN, sourcePath: '/tmp/a' });
+    await deps.fetchFileFromMachine?.({ machine: CONTROLLED_NODE_ID_MIN, sourcePath: 'C:\\a', destinationPath: '/tmp/a' });
+
+    expect(list).toHaveBeenCalledTimes(3);
+    for (const call of list.mock.calls) {
+      expect(call[0]).toEqual(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    }
+    expect(sendFile).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+    expect(fetchFile).toHaveBeenCalledWith(expect.objectContaining({ sharedMachineAuthority: 'signed-shared-turn' }));
+  });
+
+  it('never dispatches if active shared-turn authority cannot be proved', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => { throw new Error('shared_machine_authority_unavailable'); },
+      listMachines: async () => [m({ serverId: 'target' })],
+      execRemote: exec,
+    });
+    await expect(deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'must-not-run' }))
+      .rejects.toThrow('shared_machine_authority_unavailable');
+    expect(exec).not.toHaveBeenCalled();
+  });
+
+  it.each(['local', 'localhost', 'self', 'this', creds.serverId])(
+    'loads required shared authority before local Computer Use for %s',
+    async (machine) => {
+      const localComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+      const listMachines = vi.fn(async () => [m({ serverId: 'target' })]);
+      const deps = createDaemonMachineToolDeps({
+        loadCredential: async () => creds,
+        loadSharedMachineAuthority: async () => { throw new Error('shared_machine_authority_unavailable'); },
+        listMachines,
+        localComputerUseCall: localComputerUse as never,
+      });
+
+      await expect(deps.computerUseCall?.({ machine, tool: 'list_apps' }))
+        .rejects.toThrow('shared_machine_authority_unavailable');
+      expect(listMachines).not.toHaveBeenCalled();
+      expect(localComputerUse).not.toHaveBeenCalled();
+    },
+  );
+
+  it('snapshots the exact fail-closed result when the required authority loader throws', async () => {
+    const localComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => { throw new Error('shared_machine_authority_unavailable'); },
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    let rejection: unknown;
+    try {
+      await deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' });
+    } catch (error) {
+      rejection = error;
+    }
+    expect(rejection).toMatchInlineSnapshot('[Error: shared_machine_authority_unavailable]');
+    expect(localComputerUse).not.toHaveBeenCalled();
+  });
+
+  it('live-revalidates a participant turn before dispatching local Computer Use', async () => {
+    const order: string[] = [];
+    const listMachines = vi.fn(async (input: { sharedMachineAuthority?: string }) => {
+      order.push(`revalidate:${input.sharedMachineAuthority ?? 'owner'}`);
+      return [m({ serverId: 'target' })];
+    });
+    const localComputerUse = vi.fn(async () => {
+      order.push('local-dispatch');
+      return { outcome: 'completed' as const };
+    });
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => 'signed-shared-turn',
+      listMachines: listMachines as never,
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    await expect(deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' }))
+      .resolves.toMatchObject({ outcome: 'completed' });
+    expect(order).toEqual(['revalidate:signed-shared-turn', 'local-dispatch']);
+    expect(listMachines).toHaveBeenCalledWith(expect.objectContaining({
+      sourceServerId: creds.serverId,
+      sourceToken: creds.token,
+      sharedMachineAuthority: 'signed-shared-turn',
+      includeOffline: true,
+    }));
+  });
+
+  it('denies a stale delegated turn before local Computer Use when live revalidation rejects it', async () => {
+    const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
+    const localComputerUse = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      loadSharedMachineAuthority: async () => 'stale-shared-turn',
+      listMachines: async () => { throw new MachineControlPlaneError('http_status', 'machines API returned http_403'); },
+      localComputerUseCall: localComputerUse as never,
+    });
+
+    await expect(deps.computerUseCall?.({ machine: 'self', tool: 'get_app_state' }))
+      .resolves.toMatchInlineSnapshot(`
+        {
+          "error": "machine control plane: http_status",
+          "outcome": "not_dispatched",
+          "reason": "control_plane_unavailable",
+        }
+      `);
+    expect(localComputerUse).not.toHaveBeenCalled();
+  });
+
   it('unbound daemon: exec → FEATURE_DISABLED, list throws an unbound-kind control-plane error (not an empty list)', async () => {
     const { MachineControlPlaneError } = await import('../../src/daemon/machine-exec-client.js');
     const deps = createDaemonMachineToolDeps({ loadCredential: async () => null });
@@ -16,13 +164,46 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
     void MachineControlPlaneError;
   });
 
-  it('maps client machines to ref_name-keyed summaries', async () => {
+  it('maps client machines to canonical nodeId-keyed summaries', async () => {
     const deps = createDaemonMachineToolDeps({
       loadCredential: async () => creds,
       listMachines: async () => [m({ serverId: 'srvA', refName: 'mac-a1b2', displayName: 'My Mac', os: 'darwin' })],
       execRemote: async () => ({ outcome: 'completed' }),
     });
-    expect(await deps.listMachines({ includeOffline: true })).toEqual([{ name: 'mac-a1b2', displayName: 'My Mac', os: 'darwin', online: true, execEnabled: true, role: 'controlled' }]);
+    expect(await deps.listMachines({ includeOffline: true })).toEqual([{ name: CONTROLLED_NODE_ID_MIN, displayName: 'My Mac', os: 'darwin', online: true, execEnabled: true, role: 'controlled' }]);
+  });
+
+  it('resolves canonical nodeId directly and never falls back to a colliding legacy alias', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [
+        m({ serverId: 'canonical', nodeId: CONTROLLED_NODE_ID_MIN, refName: 'legacy-canonical' }),
+        m({ serverId: 'legacy-collision', nodeId: CONTROLLED_NODE_ID_MAX, refName: CONTROLLED_NODE_ID_MIN }),
+      ],
+      execRemote: exec,
+    });
+    await deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'x' });
+    expect(exec).toHaveBeenCalledWith(expect.objectContaining({ targetServerId: 'canonical' }));
+  });
+
+  it('matches a post-migration node by canonical nodeId while its empty alias never resolves', async () => {
+    const exec = vi.fn(async () => ({ outcome: 'completed' as const }));
+    const deps = createDaemonMachineToolDeps({
+      loadCredential: async () => creds,
+      listMachines: async () => [
+        m({ serverId: 'post-migration', nodeId: CONTROLLED_NODE_ID_MIN, refName: '' }),
+        m({ serverId: 'legacy', nodeId: CONTROLLED_NODE_ID_MAX, refName: 'legacy-node' }),
+      ],
+      execRemote: exec,
+    });
+
+    expect(await deps.execRemote({ machine: CONTROLLED_NODE_ID_MIN, command: 'canonical' }))
+      .toMatchObject({ outcome: 'completed' });
+    expect(exec).toHaveBeenLastCalledWith(expect.objectContaining({ targetServerId: 'post-migration' }));
+    expect(await deps.execRemote({ machine: '', command: 'must-not-dispatch' }))
+      .toMatchObject({ outcome: 'not_dispatched', reason: MCP_ERROR_REASONS.MACHINE_NOT_FOUND });
+    expect(exec).toHaveBeenCalledTimes(1);
   });
 
   it('a control-plane failure during exec name-resolution surfaces as control_plane_unavailable, NOT machine_not_found', async () => {
@@ -68,6 +249,9 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
   });
 
   it('computer-use resolves ref_name → serverId and forwards to the client, preserving the outcome', async () => {
+    const resourceOwner = {
+      sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
+    };
     const computerUse = vi.fn(async (opts: { targetServerId: string; tool: string }) => ({
       outcome: 'completed' as const,
       result: {
@@ -83,6 +267,7 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
       listMachines: async () => [m({ serverId: 'srv-win', refName: 'win-1' })],
       execRemote: async () => ({ outcome: 'completed' }),
       computerUseCall: computerUse as never,
+      resourceOwner,
     });
     const r = await deps.computerUseCall?.({
       machine: 'win-1',
@@ -96,12 +281,16 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
       arguments: { app: 'msedge' },
       timeoutMs: 3000,
       sourceServerId: 's1',
+      resourceOwner,
     }));
     expect(r).toMatchObject({ outcome: 'completed', result: { ok: true, content: [{ text: 'ran:get_app_state@srv-win' }] } });
   });
 
 
   it('computer-use local target runs on the imcodes daemon host even when unbound', async () => {
+    const resourceOwner = {
+      sessionName: 'deck_alpha_w1', sessionInstanceId: 'instance-1', runtimeEpoch: 'epoch-1',
+    };
     const localComputerUse = vi.fn(async ({ tool }: { tool: string }) => ({
       outcome: 'completed' as const,
       result: {
@@ -117,9 +306,10 @@ describe('daemon machine tool deps — fail-closed resolution (10.12 / 10.11)', 
       loadCredential: async () => null,
       computerUseCall: remoteComputerUse as never,
       localComputerUseCall: localComputerUse as never,
+      resourceOwner,
     });
     const r = await deps.computerUseCall?.({ machine: 'local', tool: 'list_apps' });
-    expect(localComputerUse).toHaveBeenCalledWith(expect.objectContaining({ tool: 'list_apps' }));
+    expect(localComputerUse).toHaveBeenCalledWith(expect.objectContaining({ tool: 'list_apps', resourceOwner }));
     expect(remoteComputerUse).not.toHaveBeenCalled();
     expect(r).toMatchObject({ outcome: 'completed', result: { content: [{ text: 'local:list_apps' }] } });
   });

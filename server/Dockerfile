@@ -1,5 +1,11 @@
+# The Node base image for every stage. CI passes the first registry that is
+# currently reachable (authenticated Docker Hub, then mirror.gcr.io, then
+# public.ecr.aws): anonymous public.ecr.aws pulls hit "toomanyrequests: Data
+# limit exceeded" and blocked releases. Local builds keep this default.
+ARG NODE_BASE_IMAGE=public.ecr.aws/docker/library/node:24-bookworm-slim
+
 # ── Stage 1: Build ────────────────────────────────────────────────────────────
-FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS builder
+FROM ${NODE_BASE_IMAGE} AS builder
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends zip python3 make g++ \
@@ -29,6 +35,8 @@ COPY shared/ ./shared/
 # Build web (BUILD_TIME arg ensures cache is busted on each CI run)
 ARG BUILD_TIME
 ENV BUILD_TIME=${BUILD_TIME}
+ARG IMC_PERF_SOURCEMAP=0
+ENV IMC_PERF_SOURCEMAP=$IMC_PERF_SOURCEMAP
 RUN cd web && npm run build
 
 # Generate OTA update bundle + manifest
@@ -52,7 +60,7 @@ RUN cd server && npm run build
 #   • HF_TRANSFORMERS_VERSION (pinned here in lock-step with server/package.json)
 #   • server/scripts/preload-embedding-model.mjs
 #   • shared/embedding-config.ts (model name / dtype)
-FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS embedding-model
+FROM ${NODE_BASE_IMAGE} AS embedding-model
 
 WORKDIR /app
 
@@ -80,7 +88,7 @@ RUN mkdir -p /app/embedding-cache \
  && if [ "$PRELOAD_EMBEDDING_MODEL" = "1" ]; then node ./scripts/preload-embedding-model.mjs; fi
 
 # ── Stage 2: Runtime ──────────────────────────────────────────────────────────
-FROM public.ecr.aws/docker/library/node:24-bookworm-slim AS runtime
+FROM ${NODE_BASE_IMAGE} AS runtime
 
 WORKDIR /app
 
@@ -108,6 +116,7 @@ COPY --from=builder /app/web/dist ./web/dist
 COPY server/controlled-node-artifacts/ ./controlled-node-executables/
 COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs
 COPY scripts/remote-desktop-worker-artifacts.mjs ./scripts/remote-desktop-worker-artifacts.mjs
+COPY shared/remote-desktop-macos-identity.json ./shared/remote-desktop-macos-identity.json
 COPY shared/remote-desktop-native-pins.json ./shared/remote-desktop-native-pins.json
 
 # Copy landing page

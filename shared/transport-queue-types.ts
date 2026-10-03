@@ -13,8 +13,34 @@ export type QueueEntryStatus =
 
 export type QueuePlacement = 'normal' | 'front';
 
+/**
+ * Daemon-authored lifecycle identity for supervision control traffic.
+ *
+ * This is persisted independently from the human-readable message. Queue
+ * authority must never be reconstructed by parsing that message.
+ */
+export type QueueSupervisionReference =
+  | {
+      kind: 'exact_integration';
+      taskId: string;
+      assignmentId: string;
+      revision: string;
+    }
+  | {
+      kind: 'implementation_blocker';
+      taskId: string;
+      assignmentId: string;
+      revision: string;
+      exactError: string;
+    };
+
+/** Final daemon authority decision for a supervision queue row. */
+export type QueueSupervisionAdmission = 'authorized' | 'stale' | 'retry';
+
 export type QueueDropReason =
   | 'expired'
+  | 'stale_expired'
+  | 'superseded'
   | 'capacity_evicted'
   | 'user_cleared'
   | 'user_stopped'
@@ -60,6 +86,16 @@ export interface QueuePrivateDispatchMaterial {
   providerRouting?: Record<string, unknown>;
   timelineCommitted?: boolean;
   historyCommitted?: boolean;
+  /** Daemon-owned lifecycle authority revalidated at every delivery edge. */
+  supervisionReference?: QueueSupervisionReference;
+  /** Runtime-private active-turn routing; never inferred from visible text. */
+  activeTurnDeliveryKind?: 'delegation_reply' | 'queued_message' | 'mcp_message';
+  /** Private delegation completion ownership retained across relaunch/restart. */
+  delegationReply?: {
+    delegationId: string;
+  };
+  /** Command-mode send (shared/send-command-mode.ts): delivered verbatim, no per-turn enrichment. */
+  commandMode?: true;
   /** Private peer-audit ownership marker. Never expose through queue projections. */
   peerAudit?: {
     contractVersion: string;
@@ -100,6 +136,7 @@ export interface QueueStoredEntry {
   handoffExpiresAt?: number;
   handoffAttempt?: number;
   privateMaterialRef?: string;
+  supervisionReference?: QueueSupervisionReference;
 }
 
 export interface QueueProjectionEntry {
@@ -114,8 +151,10 @@ export interface QueueProjectionEntry {
   activityGeneration?: number | string;
   replacesClientMessageId?: string;
   failureReason?: QueueFailureReason;
+  dropReason?: QueueDropReason;
   attachments?: QueueAttachmentProjection[];
   sharedActor?: QueueSharedActorProjection;
+  supervisionReference?: QueueSupervisionReference;
 }
 
 export interface QueueSnapshot {
@@ -198,6 +237,17 @@ export const TRANSPORT_QUEUE_COMMANDS = {
 /** Bound one append request even if a malformed client sends an oversized id list. */
 export const TRANSPORT_QUEUE_APPEND_MAX_ENTRIES = 200;
 
+/** Durable transport liveness backstops. Override the stale threshold in tests or deployments. */
+export const TRANSPORT_QUEUE_DEFAULT_STALE_THRESHOLD_MS = 2 * 60 * 60 * 1000;
+export const TRANSPORT_QUEUE_SWEEP_INTERVAL_MS = 5_000;
+
+export function transportQueueStaleThresholdMs(env: { readonly [key: string]: string | undefined } = {}): number {
+  const configured = Number(env.IMCODES_TRANSPORT_QUEUE_STALE_THRESHOLD_MS);
+  return Number.isFinite(configured) && configured > 0
+    ? Math.max(1_000, Math.floor(configured))
+    : TRANSPORT_QUEUE_DEFAULT_STALE_THRESHOLD_MS;
+}
+
 export const LIVE_QUEUE_ENTRY_STATUSES = new Set<QueueEntryStatus>([
   'queued',
   'handoff_inflight',
@@ -220,6 +270,8 @@ export const QUEUE_RESET_REASONS = new Set<QueueResetReason>([
 
 export const QUEUE_DROP_REASONS = new Set<QueueDropReason>([
   'expired',
+  'stale_expired',
+  'superseded',
   'capacity_evicted',
   'user_cleared',
   'user_stopped',

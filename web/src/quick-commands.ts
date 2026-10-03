@@ -9,6 +9,8 @@ import {
   CODEX_FAST_ON_COMMAND,
   CODEX_FAST_STATUS_COMMAND,
 } from '@shared/codex-service-tier.js';
+import { CODEBUDDY_PROVIDER_IDS } from '@shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '@shared/hermes-agent.js';
 
 const DEFAULT_QUICK_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   'claude-code': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, '/usage', '/cost', '/status', '/help'],
@@ -30,8 +32,11 @@ const DEFAULT_QUICK_COMMANDS: Readonly<Record<string, readonly string[]>> = {
   qwen: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/thinking'],
   'grok-sdk': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
   'kimi-sdk': [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
+  [HERMES_AGENT_PROVIDER_ID]: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/steer', '/queue', '/tools', '/context'],
   'deepseek-harness': [SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
   pi: [SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND, '/thinking'],
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, SESSION_MODEL_COMMAND],
   openclaw: [SESSION_COMPACT_COMMAND, SESSION_CLEAR_COMMAND, '/thinking'],
 };
 
@@ -77,7 +82,12 @@ export function matchSlashCommandTrigger(text: string): string | null {
 /** Match a quick phrase query only when `#` is the first composer character. */
 export function matchQuickPhraseTrigger(text: string): string | null {
   const match = /^#([^\r\n]*)$/u.exec(text);
-  return match ? match[1] : null;
+  if (!match) return null;
+  const query = match[1];
+  // Composer attachments use `#<sequence>:(<path>)`. A colon-bearing partial
+  // or complete attachment reference is data, not a quick-phrase trigger.
+  if (/^\d+:/u.test(query)) return null;
+  return query;
 }
 
 /** Match the second level of `/model`, including its initial trailing space. */

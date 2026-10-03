@@ -3,13 +3,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
-  macosComputerUseDoctorArgs,
-  macosUserSessionHelperArgs,
+  installMacosAideskAppFromArchive,
+  MACOS_AIDESK_APP_NAME,
+  macosComputerUseAppBundleForExecutable,
   prepareMacosComputerUseRuntime,
   validateMacosComputerUseArchiveEntries,
+  verifyMacosComputerUseExecutable,
   type MacosComputerUseRuntime,
   type MacosConsoleUser,
 } from '../../src/node/macos-computer-use.js';
+import { macosUserSessionLaunchctlArgs } from '../../src/node/user-session-launcher.js';
 
 const dirs: string[] = [];
 
@@ -28,11 +31,109 @@ async function writeExtractedApp(destinationRoot: string, executableBytes: strin
   await writeFile(join(app, 'Contents', 'MacOS', 'OpenComputerUse'), executableBytes, { mode: 0o755 });
 }
 
+async function writeExtractedAiDesk(destinationRoot: string, executableBytes: string): Promise<void> {
+  const app = join(destinationRoot, MACOS_AIDESK_APP_NAME);
+  await mkdir(join(app, 'Contents', 'MacOS'), { recursive: true });
+  await mkdir(join(app, 'Contents', '_CodeSignature'), { recursive: true });
+  await writeFile(join(app, 'Contents', 'Info.plist'), '<plist>aidesk-signed</plist>');
+  await writeFile(join(app, 'Contents', '_CodeSignature', 'CodeResources'), 'imcodes-developer-id-seal');
+  await writeFile(join(app, 'Contents', 'MacOS', 'aidesk-agent'), executableBytes, { mode: 0o755 });
+}
+
 afterEach(async () => {
   await Promise.all(dirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
 describe('macOS Computer Use runtime boundary', () => {
+  it('accepts only the exact executable inside a regular verified supported app bundle', async () => {
+    const dir = await tempDir();
+    await writeExtractedApp(dir, 'ocu-v1');
+    const app = join(dir, 'Open Computer Use.app');
+    const executable = join(app, 'Contents', 'MacOS', 'OpenComputerUse');
+    const other = join(app, 'Contents', 'MacOS', 'other');
+    await writeFile(other, 'not-the-authorized-entrypoint', { mode: 0o755 });
+    const verify = vi.fn(async () => {});
+
+    expect(macosComputerUseAppBundleForExecutable(executable)).toBe(app);
+    await expect(verifyMacosComputerUseExecutable(executable, verify)).resolves.toBeUndefined();
+    expect(verify).toHaveBeenCalledWith(app);
+    await expect(verifyMacosComputerUseExecutable(other, verify))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+  });
+
+  it('rejects a missing, corrupt, or symlinked packaged app helper', async () => {
+    const dir = await tempDir();
+    await writeExtractedApp(dir, 'ocu-v1');
+    const app = join(dir, 'Open Computer Use.app');
+    const executable = join(app, 'Contents', 'MacOS', 'OpenComputerUse');
+
+    await expect(verifyMacosComputerUseExecutable(executable, async () => {
+      throw new Error('bad signature');
+    })).rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+    await rm(executable);
+    await expect(verifyMacosComputerUseExecutable(executable, async () => {}))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+
+    await rm(app, { recursive: true, force: true });
+    await writeExtractedApp(join(dir, 'real'), 'ocu-v2');
+    await symlink(join(dir, 'real', 'Open Computer Use.app'), app);
+    await expect(verifyMacosComputerUseExecutable(executable, async () => {}))
+      .rejects.toThrow('signed_macos_open_computer_use_helper_authenticity_failed');
+  });
+
+  it('migrates the legacy OCU runtime to the unified aiDesk.to application', async () => {
+    const dir = await tempDir();
+    const sourceNode = join(dir, 'source-node');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
+    const runtimeRoot = join(dir, 'runtime');
+    await writeFile(sourceNode, 'node-v1', { mode: 0o755 });
+    await writeFile(sourceArchive, 'aidesk-archive', { mode: 0o644 });
+    await writeExtractedApp(runtimeRoot, 'legacy-ocu');
+    const runtime = await prepareMacosComputerUseRuntime(sourceNode, sourceArchive, {
+      runtimeRoot,
+      extractAppArchive: async (_archive, destination) => writeExtractedAiDesk(destination, 'aidesk-v1'),
+      verifyCodeSignature: async () => {},
+      verifyAppBundle: async () => {},
+    });
+    expect(runtime.openComputerUseExecutable).toBe(
+      join(runtimeRoot, MACOS_AIDESK_APP_NAME, 'Contents', 'MacOS', 'aidesk-agent'),
+    );
+    expect(await readFile(runtime.openComputerUseExecutable, 'utf8')).toBe('aidesk-v1');
+    await expect(lstat(join(runtimeRoot, 'Open Computer Use.app'))).rejects.toMatchObject({ code: 'ENOENT' });
+  });
+
+  it('installs the delivered aiDesk.to app once per archive and does nothing without one', async () => {
+    const dir = await tempDir();
+    const installRoot = join(dir, 'aidesk');
+    const sourceArchive = join(dir, 'open-computer-use.app.zip');
+    const extractAppArchive = vi.fn(async (_archive: string, destination: string) => {
+      await writeExtractedAiDesk(destination, 'aidesk-store-launcher');
+    });
+    const verifyAppBundle = vi.fn(async () => {});
+
+    await expect(installMacosAideskAppFromArchive(sourceArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    })).resolves.toBeNull();
+    expect(extractAppArchive).not.toHaveBeenCalled();
+
+    await writeFile(sourceArchive, 'aidesk-archive-v1', { mode: 0o644 });
+    const installed = await installMacosAideskAppFromArchive(sourceArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    });
+    expect(installed).toBe(join(installRoot, MACOS_AIDESK_APP_NAME));
+    expect(await readFile(join(installed!, 'Contents', 'MacOS', 'aidesk-agent'), 'utf8'))
+      .toBe('aidesk-store-launcher');
+    expect(((await lstat(installRoot)).mode & 0o777)).toBe(0o755);
+
+    await expect(installMacosAideskAppFromArchive(sourceArchive, installRoot, {
+      extractAppArchive,
+      verifyAppBundle,
+    })).resolves.toBe(installed);
+    expect(extractAppArchive).toHaveBeenCalledOnce();
+  });
+
   it('publishes the complete upstream-signed app without rebuilding or re-signing it', async () => {
     const dir = await tempDir();
     const sourceNode = join(dir, 'source-node');
@@ -172,7 +273,11 @@ describe('macOS Computer Use runtime boundary', () => {
       openComputerUseExecutable: '/Library/Application Support/imcodes-node-computer-use/Open Computer Use.app/Contents/MacOS/OpenComputerUse',
     };
 
-    const args = macosUserSessionHelperArgs(user, runtime, '/tmp/private.sock');
+    const args = macosUserSessionLaunchctlArgs(user, {
+      executable: runtime.helperExecutable,
+      args: ['--computer-use-helper', '--pipe', '/tmp/private.sock'],
+      environment: [['IMCODES_COMPUTER_USE_EXE', runtime.openComputerUseExecutable]],
+    });
 
     expect(args.slice(0, 7)).toEqual([
       'asuser',
@@ -188,7 +293,10 @@ describe('macOS Computer Use runtime boundary', () => {
     expect(args).toContain(`IMCODES_COMPUTER_USE_EXE=${runtime.openComputerUseExecutable}`);
     expect(args).toContain(runtime.helperExecutable);
     expect(args).not.toContain('/Library/Application Support/imcodes-node/credential.json');
-    expect(macosComputerUseDoctorArgs(user, runtime)).toEqual([
+    expect(macosUserSessionLaunchctlArgs(user, {
+      executable: runtime.openComputerUseExecutable,
+      args: ['doctor'],
+    })).toEqual([
       'asuser',
       '501',
       '/usr/bin/sudo',

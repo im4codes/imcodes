@@ -90,8 +90,200 @@ jobs:
           $sha256 = [System.Security.Cryptography.SHA256]::Create()
           try { $signerSha256 = [BitConverter]::ToString($sha256.ComputeHash($certificate.RawData)).Replace('-', '').ToLowerInvariant() } finally { $sha256.Dispose() }
           "IMCODES_WINDOWS_SIGNING_CERT_SHA256=$signerSha256" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+      - name: Import macOS release-signing identity
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_SIGNING_P12_BASE64: ${{ secrets.IMCODES_MACOS_SIGNING_P12_BASE64 }}
+          IMCODES_MACOS_SIGNING_P12_PASSWORD: ${{ secrets.IMCODES_MACOS_SIGNING_P12_PASSWORD }}
+          IMCODES_MACOS_KEYCHAIN_PASSWORD: ${{ secrets.IMCODES_MACOS_KEYCHAIN_PASSWORD }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          IDENTITY="$(node scripts/macos-release-signing.mjs import)"
+          # The fingerprint, not the common name: a name can match several
+          # certificates, and the build plan pins the exact one it signed with.
+          echo "IMCODES_MACOS_SIGNING_IDENTITY=$(printf '%s' "$IDENTITY" | node -e 'process.stdin.on("data",(d)=>process.stdout.write(JSON.parse(d).sha1))')" >> "$GITHUB_ENV"
+      - name: Write macOS notary API key
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_BASE64: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [ -z "${IMCODES_MACOS_NOTARY_KEY_BASE64:-}" ]; then
+            echo 'macOS notary API key is required.' >&2
+            exit 1
+          fi
+          KEY_PATH="$RUNNER_TEMP/imcodes-macos-notary.p8"
+          printf '%s' "$IMCODES_MACOS_NOTARY_KEY_BASE64" | base64 --decode > "$KEY_PATH"
+          chmod 600 "$KEY_PATH"
+          echo "IMCODES_MACOS_NOTARY_KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
       - name: Build controlled-node executable
         run: npm run build:node-exe
+      - name: Notarize macOS controlled-node executable
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          node scripts/macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos
+      - name: Prove the signed macOS executable still runs
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          codesign --verify --strict --verbose=2 dist-node-exe/imcodes-node-macos
+          ./dist-node-exe/imcodes-node-macos --version
+      - name: Build and notarize the aiDesk application bundle
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # One signed bundle holding every helper that needs a permission, so
+          # macOS attributes Screen Recording and Accessibility to the app the
+          # person chose rather than to whatever launched a helper. Unlike the
+          # bare executable this one CAN carry its notarization ticket, so it
+          # verifies with no network.
+          # Built during `build:node-exe`, before the manifest recorded the
+          # helper archive's hash -- swapping the archive afterwards makes
+          # every consumer reject the set as tampered with.
+          APP="dist-node-exe/aiDesk.to by IM.codes.app"
+          node scripts/macos-release-signing.mjs notarize "$APP"
+          xcrun stapler validate "$APP"
+      - name: Build, sign and notarize the aiDesk disk image
+        if: runner.os == 'macOS'
+        env:
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+        run: |
+          set -euo pipefail
+          # Built from the app as it now stands, which already carries its own
+          # stapled ticket -- so the app keeps verifying offline after being
+          # dragged out of the image. A disk image rather than a package: both
+          # can be stapled, but one is a drag and the other is a wizard.
+          DMG="$(node scripts/build-aidesk-app.mjs dmg dist-node-exe)"
+          node scripts/macos-release-signing.mjs notarize "$DMG"
+          xcrun stapler validate "$DMG"
+      # The macOS remote-desktop components, built from the published
+      # immutable SDK. Both architectures are produced here because each ships
+      # thin -- the build plan sets universalBinary = false and the runtime
+      # verifier rejects a fat Mach-O -- and both SDKs carry an arm64
+      # toolchain, so this must run on an Apple silicon runner.
+      - name: Build, sign and notarize the macOS remote-desktop components
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # IMCODES_MACOS_SIGNING_IDENTITY and IMCODES_MACOS_NOTARY_KEY_PATH
+          # are already in the job environment, written by the import and
+          # notary-key steps above; these are the two the driver additionally
+          # needs, under the same names macos-release-signing.mjs uses.
+          IMCODES_MACOS_NOTARY_KEY_ID: ${{ secrets.IMCODES_MACOS_NOTARY_KEY_ID }}
+          IMCODES_MACOS_NOTARY_ISSUER: ${{ secrets.IMCODES_MACOS_NOTARY_ISSUER }}
+          IMCODES_MACOS_TEAM_ID: ${{ secrets.IMCODES_MACOS_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          for arch in arm64 x64; do
+            lock="native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json"
+            tag="$(node -p "require('./$lock').releaseTag")"
+            asset="$(node -p "require('./$lock').assetName")"
+            repository="$(node -p "require('./$lock').repository")"
+            download="$RUNNER_TEMP/libwebrtc-sdk-download-$arch"
+            sdk="$RUNNER_TEMP/libwebrtc-sdk-$arch"
+            mkdir -p "$download"
+            gh release download "$tag" --repo "$repository" --pattern "$asset" \
+              --dir "$download" --clobber
+            node scripts/install-libwebrtc-sdk.mjs --target "macos-$arch" \
+              "$download/$asset" "$sdk"
+            node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+              --target "macos-$arch" "$lock" "$sdk"
+            # The driver, not the build script: it also signs each component
+            # with its own entitlements, notarizes each one, runs the guards the
+            # daemon applies on a user's Mac, and writes the manifest.
+            node scripts/build-macos-remote-desktop-release.mjs \
+              --arch "$arch" \
+              --sdk-root "$sdk" \
+              --artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch" \
+              --worker-version "$IMCODES_BUILD_VERSION" \
+              --jobs 3
+            # Reclaimed immediately: two extracted SDKs are ~1.7GB, and the
+            # runner still has the signing and packaging steps to do.
+            rm -rf "$download" "$sdk"
+          done
+      # The Linux remote-desktop worker, from the same published, locked SDK
+      # build-libwebrtc-sdk.sh produces once. See ci.yml's own copy of this
+      # block for the full rationale; kept in sync with it deliberately.
+      - name: Install X11 development libraries, Xvfb, and pulseaudio
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libx11-dev libxext-dev libxtst-dev libxfixes-dev libxrandr-dev xvfb pulseaudio
+      - name: Build and test the Linux remote-desktop worker from the SDK
+        if: runner.os == 'Linux'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          lock="native/linux-remote-desktop/libwebrtc-sdk.lock.json"
+          tag="$(node -p "require('./$lock').releaseTag")"
+          asset="$(node -p "require('./$lock').assetName")"
+          repository="$(node -p "require('./$lock').repository")"
+          download="$RUNNER_TEMP/libwebrtc-sdk-archives-linux"
+          sdk="$RUNNER_TEMP/libwebrtc-sdk-linux"
+          mkdir -p "$download"
+          gh release download "$tag" --repo "$repository" --pattern "$asset" \
+            --dir "$download" --clobber
+          node scripts/install-libwebrtc-sdk.mjs --target linux-x64 \
+            "$download/$asset" "$sdk"
+          node scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock \
+            --target linux-x64 "$lock" "$sdk"
+          Xvfb :99 -screen 0 1920x1080x24 &
+          echo $! > "$RUNNER_TEMP/xvfb.pid"
+          export DISPLAY=:99
+          for _ in $(seq 1 50); do
+            [ -e /tmp/.X11-unix/X99 ] && break
+            sleep 0.1
+          done
+          # A bare CI runner has no /proc/asound/cards entry at all (no sound
+          # card, real or virtual), which makes WebRTC's
+          # AudioDeviceModule::Init() hard-abort at session start ("Fatal
+          # error ... Check failed: 0 == adm->Init()") even though the
+          # qualification test never asked for audio -- there was simply
+          # nothing to open. Same fix as install-linux-desktop-environment.sh
+          # uses for a real headless server: pulseaudio gives it a real, if
+          # silent, device.
+          pulseaudio --start --exit-idle-time=-1 || true
+          bash native/linux-remote-desktop/build-worker-from-sdk.sh \
+            --sdk-root "$sdk" \
+            --artifact-root dist-node-exe/remote-desktop-worker/linux-x64 \
+            --worker-version "$IMCODES_BUILD_VERSION" \
+            --run-native-tests
+          kill "$(cat "$RUNNER_TEMP/xvfb.pid")" 2>/dev/null || true
+          rm -rf "$download" "$sdk"
+      - name: Verify the Linux remote-desktop worker artifact
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          ARTIFACT="dist-node-exe/remote-desktop-worker/linux-x64/imcodes-linux-remote-desktop-worker"
+          MANIFEST="$ARTIFACT.manifest.json"
+          [ -f "$ARTIFACT" ] || { echo "missing $ARTIFACT" >&2; exit 1; }
+          [ -x "$ARTIFACT" ] || { echo "$ARTIFACT is not executable" >&2; exit 1; }
+          [ -f "$MANIFEST" ] || { echo "missing $MANIFEST" >&2; exit 1; }
+          node -e "
+            const fs = require('node:fs');
+            const crypto = require('node:crypto');
+            const manifest = JSON.parse(fs.readFileSync('$MANIFEST', 'utf8'));
+            const bytes = fs.readFileSync('$ARTIFACT');
+            const sha256 = crypto.createHash('sha256').update(bytes).digest('hex');
+            if (manifest.artifact.fileName !== 'imcodes-linux-remote-desktop-worker') throw new Error('manifest fileName mismatch');
+            if (manifest.artifact.os !== 'linux' || manifest.artifact.arch !== 'x64') throw new Error('manifest os/arch mismatch');
+            if (manifest.artifact.size !== bytes.length) throw new Error('manifest size mismatch: ' + manifest.artifact.size + ' vs ' + bytes.length);
+            if (manifest.artifact.sha256 !== sha256) throw new Error('manifest sha256 mismatch');
+            console.log('Linux remote-desktop worker manifest matches artifact:', sha256);
+          "
       - name: Resolve fixed libwebrtc SDK release
         if: runner.os == 'Windows'
         id: libwebrtc_sdk
@@ -142,6 +334,18 @@ jobs:
             RunNativeTests = $true
           }
           & .\native\windows-remote-desktop\build-worker-from-sdk.ps1 @buildArguments
+      - name: Verify the produced macOS remote-desktop component sets
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Per architecture and as a SET: the per-component guards already ran
+          # inside the driver, but this is what checks the manifest describes
+          # exactly the files present, at the version this build claims.
+          for arch in arm64 x64; do
+            node scripts/remote-desktop-worker-artifacts.mjs verify \
+              dist-node-exe "$IMCODES_BUILD_VERSION" darwin "$arch"
+          done
       - name: Verify production remote-desktop worker artifact
         if: runner.os == 'Windows'
         run: node scripts/remote-desktop-worker-artifacts.mjs verify dist-node-exe "${{ env.IMCODES_BUILD_VERSION }}"
@@ -178,9 +382,13 @@ jobs:
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
             dist-node-exe/computer-use-helper/**
+            dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
           if-no-files-found: error
           retention-days: 30
+      - name: Remove macOS release-signing material
+        if: always() && runner.os == 'macOS'
+        run: node scripts/macos-release-signing.mjs cleanup
       - name: Remove Windows release-signing material
         if: always() && runner.os == 'Windows'
         shell: powershell

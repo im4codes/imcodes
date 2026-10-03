@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import type { ContextTargetRef, LocalContextEvent } from '../../shared/context-types.js';
 import type { TimelineEvent } from '../daemon/timeline-event.js';
-import { preferTimelineEvent } from '../shared/timeline/merge.js';
+import { isUserDeletedTimelineEvent, preferTimelineEvent } from '../shared/timeline/merge.js';
 import type { SessionRecord } from '../store/session-store.js';
 import { ContextStoreError, getContextStoreClient } from '../store/context-store-worker-client.js';
 import { CONTEXT_STORE_RPC_ERROR, CONTEXT_STORE_RPC_SELF_HEAL, CONTEXT_STORE_RPC_TIMEOUT_MS } from '../../shared/context-store-rpc.js';
@@ -649,6 +649,8 @@ function toSessionTarget(sessionName: string, bootstrap: TransportContextBootstr
 }
 
 function mapTimelineEvent(event: TimelineEvent): Pick<LocalContextEvent, 'eventType' | 'content' | 'metadata'> | null {
+  // A message the user deleted must never become memory, live or via backfill.
+  if (isUserDeletedTimelineEvent(event)) return null;
   switch (event.type) {
     case 'user.message': {
       if (event.payload.memoryExcluded === true) return null;

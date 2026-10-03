@@ -4,6 +4,8 @@
 // See openspec/changes/alias-quick-insert (design D9/D10, tasks 8.1/8.2/8.4).
 
 import { SESSION_AGENT_TYPES, type SessionAgentType } from './agent-types.js';
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 import {
   ALIAS_NOTE_HARD_MAX,
   ALIAS_LEGEND_DIRECTIVE,
@@ -42,8 +44,11 @@ export const ALIAS_EXPANSION_MODE_BY_AGENT: Record<SessionAgentType, AliasExpans
   'qwen': 'legend',
   'openclaw': 'legend',
   'kimi-sdk': 'legend',
+  [HERMES_AGENT_PROVIDER_ID]: 'legend',
   'deepseek-harness': 'legend',
   'pi': 'legend',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'legend',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'legend',
   'shell': 'inline',
   'script': 'inline',
 };

@@ -14,7 +14,17 @@ import { chmod, lstat, mkdir, mkdtemp, open, readFile, rename, rm, unlink, write
 import { tmpdir } from 'node:os';
 import { dirname, join, win32 } from 'node:path';
 import type { ServiceReceipt } from './install-journal.js';
-import { CONTROLLED_NODE_SERVICE } from '../../shared/controlled-node-service.js';
+import {
+  CONTROLLED_NODE_SERVICE,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE,
+  CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION,
+} from '../../shared/controlled-node-service.js';
+import {
+  CONTROLLED_NODE_HEALTH_LEASE_FILE,
+  CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE,
+} from './health-lease.js';
 
 /** Controlled-node service identities — distinct from the full daemon's. */
 export { CONTROLLED_NODE_SERVICE } from '../../shared/controlled-node-service.js';
@@ -62,11 +72,27 @@ export function isProcessElevated(options: PrivilegeCheckOptions = {}): boolean 
     const runCommand = options.runCommand ?? ((file: string, args: readonly string[]) => (
       execFileSync(file, [...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] })
     ));
-    try {
-      return String(runCommand('powershell.exe', WINDOWS_ADMIN_CHECK)).trim().toLowerCase() === 'true';
-    } catch {
-      return false;
+    // Absolute path, not a bare name: a downloaded installer can be started
+    // from Explorer with a PATH that does not contain System32, and resolving
+    // `powershell.exe` through PATH would then throw ENOENT. The catch below
+    // reports "not elevated", so a PATH problem would masquerade as the user
+    // having failed to run as administrator — the single most misleading
+    // outcome this check can produce.
+    const candidates = [windowsPowerShellExecutablePath(), 'powershell.exe'];
+    let lastError: unknown = null;
+    for (const candidate of candidates) {
+      try {
+        return String(runCommand(candidate, WINDOWS_ADMIN_CHECK)).trim().toLowerCase() === 'true';
+      } catch (error) {
+        lastError = error;
+      }
     }
+    // Every probe failed to *run*, which is not evidence about privilege. Say
+    // so, rather than silently denying an administrator.
+    throw new Error(
+      'unable to determine Windows privilege level: PowerShell could not be executed '
+      + `(${lastError instanceof Error ? lastError.message : String(lastError)})`,
+    );
   }
   return false;
 }
@@ -89,14 +115,34 @@ const WINDOWS_WATCHDOG_INTERVAL = 'PT1M';
 const WINDOWS_WATCHDOG_SCRIPT_NAME = 'imcodes-node-health-watchdog.ps1';
 const WINDOWS_HEALTH_LEASE_NAME = 'health-lease.json';
 const WINDOWS_HEALTH_STALE_SECONDS = 180;
-export const WINDOWS_UPGRADE_MARKER_NAME = 'upgrade-in-progress.json';
+export const WINDOWS_UPGRADE_MARKER_NAME = CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_FILE;
 const WINDOWS_UPGRADE_MARKER_MAX_AGE_MS = 15 * 60 * 1000;
 
-export function windowsPowerShellExecutablePath(
-  env: { WINDIR?: string } = process.env,
+function windowsSystemRoot(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
 ): string {
-  const windowsDirectory = env.WINDIR?.trim() || 'C:\\Windows';
+  return env.SystemRoot?.trim() || env.WINDIR?.trim() || 'C:\\Windows';
+}
+
+export function windowsPowerShellExecutablePath(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
+): string {
+  const windowsDirectory = windowsSystemRoot(env);
   return win32.join(windowsDirectory, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+}
+
+/**
+ * Resolve Task Scheduler from the trusted Windows system directory.
+ *
+ * The controlled-node executable is commonly launched by a downloaded
+ * PowerShell bootstrap whose PATH is not guaranteed to contain System32. A
+ * bare `schtasks` therefore fails during process creation (for example with
+ * spawnSync EPERM/ENOENT) before Task Scheduler can report a useful error.
+ */
+export function windowsSchtasksExecutablePath(
+  env: { SystemRoot?: string; WINDIR?: string } = process.env,
+): string {
+  return win32.join(windowsSystemRoot(env), 'System32', 'schtasks.exe');
 }
 
 function windowsWatchdogStartBoundary(now: Date): string {
@@ -166,6 +212,7 @@ function powershellSingleQuoted(value: string): string {
 export function windowsControlledNodeHealthPaths(exePath: string): {
   scriptPath: string;
   leasePath: string;
+  statePath: string;
   logPath: string;
   upgradeMarkerPath: string;
 } {
@@ -173,6 +220,7 @@ export function windowsControlledNodeHealthPaths(exePath: string): {
   return {
     scriptPath: win32.join(baseDir, WINDOWS_WATCHDOG_SCRIPT_NAME),
     leasePath: win32.join(baseDir, WINDOWS_HEALTH_LEASE_NAME),
+    statePath: win32.join(baseDir, CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE),
     logPath: win32.join(baseDir, 'health-watchdog.log'),
     upgradeMarkerPath: win32.join(baseDir, WINDOWS_UPGRADE_MARKER_NAME),
   };
@@ -194,19 +242,37 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `$nodePath = ${powershellSingleQuoted(exePath)}\r\n`
     + `$nodeTask = ${powershellSingleQuoted(CONTROLLED_NODE_SERVICE.WINDOWS_TASK)}\r\n`
     + `$leasePath = ${powershellSingleQuoted(paths.leasePath)}\r\n`
+    + `$statePath = ${powershellSingleQuoted(paths.statePath)}\r\n`
     + `$logPath = ${powershellSingleQuoted(paths.logPath)}\r\n`
     + `$upgradeMarkerPath = ${powershellSingleQuoted(paths.upgradeMarkerPath)}\r\n`
     + `$upgradeMarkerMaxAgeMs = ${WINDOWS_UPGRADE_MARKER_MAX_AGE_MS}\r\n`
     + `$staleSeconds = ${WINDOWS_HEALTH_STALE_SECONDS}\r\n`
+    + `$minimumConfirmMs = 45000\r\n`
+    + `$resumeGapMs = 120000\r\n`
     + `function Write-HealthLog([string]$message) {\r\n`
     + `  if ((Test-Path -LiteralPath $logPath) -and (Get-Item -LiteralPath $logPath).Length -gt 2MB) { Move-Item -Force -LiteralPath $logPath -Destination ($logPath + '.1') }\r\n`
     + `  Add-Content -LiteralPath $logPath -Encoding UTF8 -Value (('{0} {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $message))\r\n`
     + `}\r\n`
+    + `function Write-WatchdogState([string]$reason, [int]$processId, [int64]$observedAt) {\r\n`
+    + `  $stateTempPath = $statePath + '.' + $PID + '.tmp'\r\n`
+    + `  @{ version = 1; reason = $reason; pid = $processId; observedAt = $observedAt } | ConvertTo-Json -Compress | Set-Content -LiteralPath $stateTempPath -Encoding UTF8\r\n`
+    + `  Move-Item -Force -LiteralPath $stateTempPath -Destination $statePath\r\n`
+    + `}\r\n`
+    + `$nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()\r\n`
+    + `$previousState = $null\r\n`
+    + `if (Test-Path -LiteralPath $statePath) { try { $previousState = Get-Content -LiteralPath $statePath -Raw | ConvertFrom-Json } catch { Remove-Item -Force -LiteralPath $statePath -ErrorAction SilentlyContinue } }\r\n`
     + `$process = Get-CimInstance Win32_Process -Filter \"Name='imcodes-node.exe'\" -ErrorAction SilentlyContinue | Where-Object { $_.ExecutablePath -eq $nodePath -and $_.CommandLine -notmatch '--computer-use-helper' } | Select-Object -First 1\r\n`
     + `if (Test-Path -LiteralPath $upgradeMarkerPath) {\r\n`
     + `  try {\r\n`
     + `    $upgradeMarker = Get-Content -LiteralPath $upgradeMarkerPath -Raw | ConvertFrom-Json\r\n`
-    + `    $upgradeAgeMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$upgradeMarker.startedAt\r\n`
+    + `    $upgradeAgeMs = $nowMs - [int64]$upgradeMarker.startedAt\r\n`
+    + `    if ([int]$upgradeMarker.version -eq ${CONTROLLED_NODE_WINDOWS_UPGRADE_TRANSACTION_VERSION} -and [string]$upgradeMarker.product -ceq ${powershellSingleQuoted(CONTROLLED_NODE_WINDOWS_UPGRADE_PRODUCT)} -and [string]$upgradeMarker.taskName -clike ${powershellSingleQuoted(`${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}*`)}) {\r\n`
+    + `      $upgradeTask = Get-ScheduledTask -TaskName ([string]$upgradeMarker.taskName) -ErrorAction SilentlyContinue\r\n`
+    + `      if ($upgradeTask) {\r\n`
+    + `        if ([int]$upgradeTask.State -notin @(2,4)) { Start-ScheduledTask -TaskName ([string]$upgradeMarker.taskName) -ErrorAction SilentlyContinue; Write-HealthLog ('upgrade_recovery_requested task={0}' -f [string]$upgradeMarker.taskName) }\r\n`
+    + `        exit 0\r\n`
+    + `      }\r\n`
+    + `    }\r\n`
     + `    if ([int]$upgradeMarker.version -eq 1 -and $upgradeAgeMs -ge -60000 -and $upgradeAgeMs -le $upgradeMarkerMaxAgeMs) { exit 0 }\r\n`
     + `  } catch { }\r\n`
     + `  Remove-Item -Force -LiteralPath $upgradeMarkerPath -ErrorAction SilentlyContinue\r\n`
@@ -218,21 +284,34 @@ export function windowsControlledNodeHealthWatchdogScript(exePath: string): stri
     + `  if (Test-Path -LiteralPath $leasePath) {\r\n`
     + `    try {\r\n`
     + `      $lease = Get-Content -LiteralPath $leasePath -Raw | ConvertFrom-Json\r\n`
-    + `      $ageMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$lease.updatedAt\r\n`
-    + `      if ([int]$lease.version -eq 1 -and [int]$lease.pid -eq [int]$process.ProcessId -and $ageMs -ge -60000 -and $ageMs -le ($staleSeconds * 1000)) { $healthy = $true } else { $reason = 'lease_stale_or_pid_mismatch' }\r\n`
+    + `      $ageMs = $nowMs - [int64]$lease.updatedAt\r\n`
+    + `      if ([int]$lease.version -ne 1) { $reason = 'lease_invalid' } elseif ([int]$lease.pid -ne [int]$process.ProcessId) { $reason = 'lease_pid_mismatch' } elseif ($ageMs -lt -60000) { $reason = 'lease_future' } elseif ($ageMs -le ($staleSeconds * 1000)) { $healthy = $true } else { $reason = 'lease_stale' }\r\n`
     + `    } catch { $reason = 'lease_invalid' }\r\n`
     + `  }\r\n`
     + `  if (-not $healthy) {\r\n`
     + `    $processAgeSeconds = ((Get-Date) - $process.CreationDate).TotalSeconds\r\n`
-    + `    if ($processAgeSeconds -lt $staleSeconds) { exit 0 }\r\n`
+    + `    if ($processAgeSeconds -lt $staleSeconds) { Write-WatchdogState 'process_start_grace' ([int]$process.ProcessId) $nowMs; exit 0 }\r\n`
     + `  }\r\n`
     + `}\r\n`
-    + `if ($healthy) { exit 0 }\r\n`
+    + `$previousValid = $previousState -and [int]$previousState.version -eq 1 -and $null -ne $previousState.observedAt\r\n`
+    + `$observationGapMs = $(if ($previousValid) { $nowMs - [int64]$previousState.observedAt } else { 0 })\r\n`
+    + `$clockDiscontinuity = $previousValid -and ($observationGapMs -lt -60000 -or $observationGapMs -gt $resumeGapMs)\r\n`
+    + `if ($clockDiscontinuity) { Write-HealthLog ('resume_or_clock_change gap_ms={0}' -f $observationGapMs) }\r\n`
+    + `if ($healthy) { Write-WatchdogState 'healthy' ([int]$process.ProcessId) $nowMs; exit 0 }\r\n`
+    + `if ($process) {\r\n`
+    + `  $sameFailureObservedLongEnough = $previousValid -and -not $clockDiscontinuity -and [string]$previousState.reason -eq $reason -and [int]$previousState.pid -eq [int]$process.ProcessId -and $observationGapMs -ge $minimumConfirmMs\r\n`
+    + `  if (-not $sameFailureObservedLongEnough) {\r\n`
+    + `    Write-WatchdogState $reason ([int]$process.ProcessId) $nowMs\r\n`
+    + `    Write-HealthLog ('grace_begin reason={0} pid={1}' -f $reason, $process.ProcessId)\r\n`
+    + `    exit 0\r\n`
+    + `  }\r\n`
+    + `}\r\n`
     + `Write-HealthLog ('restart_begin reason={0} pid={1}' -f $reason, $(if ($process) { $process.ProcessId } else { 0 }))\r\n`
     + `Stop-ScheduledTask -TaskName $nodeTask -ErrorAction SilentlyContinue\r\n`
     + `if ($process) { Stop-Process -Id $process.ProcessId -Force -ErrorAction SilentlyContinue }\r\n`
     + `Start-Sleep -Seconds 2\r\n`
     + `Start-ScheduledTask -TaskName $nodeTask\r\n`
+    + `Remove-Item -Force -LiteralPath $statePath -ErrorAction SilentlyContinue\r\n`
     + `Write-HealthLog 'restart_requested'\r\n`;
 }
 
@@ -285,6 +364,38 @@ export function windowsHealthWatchdogTaskArgs(taskXmlPath: string): string[] {
   return [
     '/Create', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK,
     '/XML', taskXmlPath, '/F',
+  ];
+}
+
+export function windowsStaleUpgradeTaskCleanupArgs(): string[] {
+  const pattern = `${CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX}*`;
+  const prefix = CONTROLLED_NODE_WINDOWS_UPGRADE_TASK_PREFIX;
+  // The legacy-rescue infrastructure (rescue/restart tasks, registered and
+  // lifecycle-managed separately by windows-controlled-node-upgrade-rescue.ts)
+  // shares this same name prefix with the one-shot per-attempt upgrader tasks
+  // this sweep exists to clean up. Both are legitimately idle (no NextRunTime)
+  // between triggers, so without this exclusion a reinstall/upgrade deletes the
+  // rescue infrastructure itself, permanently breaking legacy restart recovery.
+  const preservedNames = [
+    CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESCUE_TASK,
+    CONTROLLED_NODE_SERVICE.WINDOWS_LEGACY_UPGRADE_RESTART_TASK,
+  ].map((name) => `'${name}'`).join(', ');
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `$ErrorActionPreference = 'Stop'; $now = Get-Date; $preserved = @(${preservedNames}); Get-ScheduledTask -TaskName '${pattern}' -ErrorAction SilentlyContinue | Where-Object { $_.TaskName.StartsWith('${prefix}', [StringComparison]::OrdinalIgnoreCase) -and [int]$_.State -notin @(2,4) -and $preserved -notcontains $_.TaskName } | ForEach-Object { $info = Get-ScheduledTaskInfo -TaskName $_.TaskName -ErrorAction Stop; if (-not $info.NextRunTime -or $info.NextRunTime -le $now) { Unregister-ScheduledTask -InputObject $_ -Confirm:$false -ErrorAction Stop } }`,
+  ];
+}
+
+export function windowsStopControlledNodeGenerationArgs(exePath: string): string[] {
+  const nodePath = powershellSingleQuoted(exePath);
+  const taskName = powershellSingleQuoted(CONTROLLED_NODE_SERVICE.WINDOWS_TASK);
+  return [
+    '-NoProfile',
+    '-NonInteractive',
+    '-Command',
+    `$ErrorActionPreference = 'Stop'; $nodePath = ${nodePath}; Stop-ScheduledTask -TaskName ${taskName} -ErrorAction SilentlyContinue; Get-CimInstance Win32_Process -Filter "Name='imcodes-node.exe'" -ErrorAction Stop | Where-Object { [string]::Equals([string]$_.ExecutablePath, $nodePath, [StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -notmatch '--computer-use-helper' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop }; for ($attempt = 0; $attempt -lt 20; $attempt++) { $remaining = @(Get-CimInstance Win32_Process -Filter "Name='imcodes-node.exe'" -ErrorAction Stop | Where-Object { [string]::Equals([string]$_.ExecutablePath, $nodePath, [StringComparison]::OrdinalIgnoreCase) -and $_.CommandLine -notmatch '--computer-use-helper' }); if ($remaining.Count -eq 0) { exit 0 }; Start-Sleep -Milliseconds 250 }; throw 'controlled node previous generation did not stop'`,
   ];
 }
 
@@ -493,11 +604,20 @@ async function installWindowsTaskDefinition(
   const artifactPath = join(artifactDir, 'task.xml');
   const watchdogArtifactPath = join(artifactDir, 'watchdog-task.xml');
   try {
+    // A crashed/self-terminated one-shot upgrader can remain registered with a
+    // terminal LastTaskResult forever. Reinstallation is an explicit recovery
+    // boundary: stop and remove every product-owned helper before publishing
+    // the new main/watchdog definitions so none can later replay stale bytes.
+    runCommand(windowsPowerShellExecutablePath(), windowsStaleUpgradeTaskCleanupArgs());
     await writeWatchdogScript(healthPaths.scriptPath, watchdogScript);
+    // An in-place reinstall is a new watchdog generation. Never let a stale
+    // pre-install failure observation authorize killing the fresh process.
+    await rm(healthPaths.statePath, { force: true });
     await writeFile(artifactPath, encodeWindowsScheduledTaskXml(xml), { mode: 0o600 });
     await writeFile(watchdogArtifactPath, encodeWindowsScheduledTaskXml(watchdogXml), { mode: 0o600 });
-    runCommand('schtasks', windowsScheduledTaskArgs(artifactPath));
-    runCommand('schtasks', windowsHealthWatchdogTaskArgs(watchdogArtifactPath));
+    const schtasksPath = windowsSchtasksExecutablePath();
+    runCommand(schtasksPath, windowsScheduledTaskArgs(artifactPath));
+    runCommand(schtasksPath, windowsHealthWatchdogTaskArgs(watchdogArtifactPath));
   } finally {
     await rm(artifactDir, { recursive: true, force: true });
   }
@@ -831,8 +951,9 @@ export async function inspectDefinition(
   const runCommand = runCommandFromOptions(options);
   if (platform === 'win32') {
     // SIDE-EFFECT-FREE: only query, never re-install or run.
-    runCommand('schtasks', ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
-    runCommand('schtasks', ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]);
+    const schtasksPath = windowsSchtasksExecutablePath();
+    runCommand(schtasksPath, ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
+    runCommand(schtasksPath, ['/Query', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]);
     return receipt;
   }
   if (receipt.definitionPath && receipt.definitionSha256) {
@@ -878,9 +999,10 @@ export async function inspectServiceState(
     // with the install-time action.
     let queryOut = '';
     let watchdogQueryOut = '';
+    const schtasksPath = windowsSchtasksExecutablePath();
     try {
       queryOut = String(
-        runCommand('schtasks', ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]),
+        runCommand(schtasksPath, ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]),
       );
     } catch (err) {
       errors.push(`schtasks_query_failed:${(err as Error).message}`);
@@ -888,7 +1010,7 @@ export async function inspectServiceState(
     }
     try {
       watchdogQueryOut = String(
-        runCommand('schtasks', ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]),
+        runCommand(schtasksPath, ['/Query', '/XML', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_WATCHDOG_TASK]),
       );
     } catch (err) {
       errors.push(`watchdog_task_query_failed:${(err as Error).message}`);
@@ -1097,7 +1219,26 @@ export async function startService(
   const platform = options.platform ?? receipt.platform;
   const runCommand = runCommandFromOptions(options);
   if (platform === 'win32') {
-    runCommand('schtasks', ['/Run', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
+    const schtasks = windowsSchtasksExecutablePath();
+    if (!receipt.action) throw new Error('Windows controlled node service action is missing');
+    // `/Run` with MultipleInstancesPolicy=IgnoreNew reports success while an
+    // old, disconnected process keeps running. Stop both the scheduler owner
+    // and the exact installed executable generation, then verify it is gone.
+    // Unlike `schtasks /End`, an absent first-install process is success while
+    // permission/query/termination failures remain visible.
+    runCommand(
+      windowsPowerShellExecutablePath(),
+      windowsStopControlledNodeGenerationArgs(receipt.action),
+    );
+    if (receipt.action) {
+      const baseDir = win32.dirname(receipt.action);
+      // Online success must be proven by the new process generation. An old
+      // fresh-looking lease would otherwise make a reinstall claim success
+      // before `/Run` had started or authenticated anything.
+      await rm(win32.join(baseDir, CONTROLLED_NODE_HEALTH_LEASE_FILE), { force: true });
+      await rm(win32.join(baseDir, CONTROLLED_NODE_HEALTH_WATCHDOG_STATE_FILE), { force: true });
+    }
+    runCommand(schtasks, ['/Run', '/TN', CONTROLLED_NODE_SERVICE.WINDOWS_TASK]);
     return;
   }
   if (platform === 'darwin') {

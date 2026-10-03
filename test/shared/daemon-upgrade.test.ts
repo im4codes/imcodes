@@ -66,3 +66,32 @@ describe('controlled-node upgrade blocker validation', () => {
     });
   });
 });
+
+describe('controlled upgrade rollback envelope', () => {
+  it('accepts only a bounded concrete target version with the controlled blocker', () => {
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      targetVersion: '2026.9.4544-dev.5197',
+    })).toEqual({ ok: true, value: {
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      targetVersion: '2026.9.4544-dev.5197',
+    } });
+    expect(validateControlledNodeUpgradeBlockedMessage({
+      type: DAEMON_MSG.UPGRADE_BLOCKED,
+      reason: DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED,
+      targetVersion: 'latest',
+    })).toEqual({ ok: false });
+  });
+});
+
+describe('resolveDaemonUpgradeSource', () => {
+  it('treats a missing or unknown source (older servers) as auto so the opt-out still holds', async () => {
+    const { resolveDaemonUpgradeSource, DAEMON_UPGRADE_SOURCE } = await import('../../shared/daemon-upgrade.js');
+    expect(resolveDaemonUpgradeSource(undefined)).toBe(DAEMON_UPGRADE_SOURCE.AUTO);
+    expect(resolveDaemonUpgradeSource('bogus')).toBe(DAEMON_UPGRADE_SOURCE.AUTO);
+    expect(resolveDaemonUpgradeSource(DAEMON_UPGRADE_SOURCE.MANUAL)).toBe(DAEMON_UPGRADE_SOURCE.MANUAL);
+    expect(resolveDaemonUpgradeSource(DAEMON_UPGRADE_SOURCE.REPLAY)).toBe(DAEMON_UPGRADE_SOURCE.REPLAY);
+  });
+});

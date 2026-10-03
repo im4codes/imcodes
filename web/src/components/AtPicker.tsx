@@ -15,6 +15,8 @@ import { useP2pCustomCombos } from './p2p-combos.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
 import { useAliases } from '../hooks/useAliases.js';
 import { useMachines } from '../hooks/useMachines.js';
+import { useListboxNavigation } from '../hooks/useListboxNavigation.js';
+import { MACHINE_IDENTITY_UNAVAILABLE } from '@shared/machine-reference.js';
 
 interface SessionEntry {
   name: string;
@@ -47,8 +49,8 @@ interface AtPickerProps {
   onSelectDelegateAgent: (session: string) => void;
   /** Insert the `;;(name)` marker for the chosen alias (never the value). */
   onSelectAlias?: (name: string) => void;
-  /** Insert the stable machine marker plus its human-readable display note. */
-  onSelectMachine?: (refName: string, displayName: string) => void;
+  /** Insert the canonical nodeId marker plus its human-readable display note. */
+  onSelectMachine?: (nodeId: string, displayName: string) => void;
   onSelectAllConfig?: (config: P2pSavedConfig, rounds: number, modeOverride: string) => void;
   /** Launch a Team discussion directly with the chosen combo/mode and round count. */
   onLaunchTeam?: (modeKey: string, rounds: number) => void;
@@ -237,6 +239,35 @@ export function AtPicker({
       .sort((a, b) => Number(a.disabled) - Number(b.disabled));
   }, [sessions, query, rootSession]);
 
+  const navigationItemCount = category === 'choose'
+    ? CHOOSER_ROW_COUNT
+    : category === 'aliases'
+      ? aliasResults.length
+      : category === 'machines'
+        ? machineResults.length
+        : category === 'team'
+          ? teamComboOptions.length
+          : category === 'files'
+            ? fileResults.length
+            : delegateAgents.length;
+  const navigationSelectableIndices = useMemo(
+    () => category === 'agents'
+      ? delegateAgents.flatMap((agent, index) => agent.disabled ? [] : [index])
+      : undefined,
+    [category, delegateAgents],
+  );
+  const {
+    activeIndex: activeNavigationIndex,
+    handleNavigationKey,
+  } = useListboxNavigation({
+    activeIndex: highlightIdx,
+    containerRef,
+    itemCount: navigationItemCount,
+    open: visible,
+    selectableIndices: navigationSelectableIndices,
+    setActiveIndex: setHighlightIdx,
+  });
+
   // Debounced file search — only when in files category
   useEffect(() => {
     if (!visible || category !== 'files' || !query || query.length < 1) {
@@ -334,14 +365,13 @@ export function AtPicker({
       // Category chooser
       if (category === 'choose') {
         if (e.key === 'Escape') { consumeEscapeKey(e); onClose(); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => (h + 1) % CHOOSER_ROW_COUNT); return; }
-        if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => (h + CHOOSER_ROW_COUNT - 1) % CHOOSER_ROW_COUNT); return; }
+        if (handleNavigationKey(e)) return;
         if (e.key === 'Enter') {
           e.preventDefault(); e.stopPropagation();
-          if (highlightIdx === 1) { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }
-          else if (highlightIdx === 3) { setCategory('aliases'); setHighlightIdx(0); }
-          else if (highlightIdx === 4) { setCategory('machines'); setHighlightIdx(0); }
-          else { setCategory(highlightIdx === 0 ? 'files' : 'agents'); setHighlightIdx(0); }
+          if (activeNavigationIndex === 1) { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }
+          else if (activeNavigationIndex === 3) { setCategory('aliases'); setHighlightIdx(0); }
+          else if (activeNavigationIndex === 4) { setCategory('machines'); setHighlightIdx(0); }
+          else { setCategory(activeNavigationIndex === 0 ? 'files' : 'agents'); setHighlightIdx(0); }
           return;
         }
         return;
@@ -351,11 +381,10 @@ export function AtPicker({
       if (category === 'aliases') {
         const count = aliasResults.length;
         if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(3); return; }
-        if (e.key === 'ArrowUp') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h - 1 + count) % count); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h + 1) % count); return; }
+        if (handleNavigationKey(e)) return;
         if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
           e.preventDefault(); e.stopPropagation();
-          const a = aliasResults[highlightIdx];
+          const a = aliasResults[activeNavigationIndex];
           if (a) onSelectAlias?.(a.name);
           return;
         }
@@ -367,12 +396,11 @@ export function AtPicker({
       if (category === 'machines') {
         const count = machineResults.length;
         if (e.key === 'Escape') { consumeEscapeKey(e); setCategory('choose'); setHighlightIdx(4); return; }
-        if (e.key === 'ArrowUp') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h - 1 + count) % count); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); if (count > 0) setHighlightIdx((h) => (h + 1) % count); return; }
+        if (handleNavigationKey(e)) return;
         if ((e.key === 'Enter' || e.key === 'Tab') && count > 0) {
           e.preventDefault(); e.stopPropagation();
-          const m = machineResults[Math.min(highlightIdx, count - 1)];
-          if (m) onSelectMachine?.(m.refName, m.displayName);
+          const m = machineResults[activeNavigationIndex];
+          if (m?.nodeId) onSelectMachine?.(m.nodeId, m.displayName);
           return;
         }
         return;
@@ -380,16 +408,14 @@ export function AtPicker({
 
       // Team discussion: ↑↓ pick combo, ←→ pick rounds, Enter launches directly.
       if (category === 'team') {
-        const count = teamComboOptions.length;
         if (e.key === 'Escape') { consumeEscapeKey(e); onClose(); return; }
         if (e.key === 'Backspace') { e.preventDefault(); setCategory('choose'); setHighlightIdx(1); return; }
-        if (e.key === 'ArrowUp') { e.preventDefault(); setHighlightIdx((h) => Math.max(0, h - 1)); return; }
-        if (e.key === 'ArrowDown') { e.preventDefault(); setHighlightIdx((h) => Math.min(Math.max(0, count - 1), h + 1)); return; }
+        if (handleNavigationKey(e)) return;
         if (e.key === 'ArrowLeft') { e.preventDefault(); setTeamRoundsIdx((i) => Math.max(0, i - 1)); return; }
         if (e.key === 'ArrowRight') { e.preventDefault(); setTeamRoundsIdx((i) => Math.min(CONFIG_ROUNDS_OPTIONS.length - 1, i + 1)); return; }
         if (e.key === 'Enter') {
           e.preventDefault(); e.stopPropagation();
-          const key = teamComboOptions[highlightIdx];
+          const key = teamComboOptions[activeNavigationIndex];
           if (key) onLaunchTeam?.(key, CONFIG_ROUNDS_OPTIONS[teamRoundsIdx]);
           return;
         }
@@ -403,28 +429,19 @@ export function AtPicker({
         setHighlightIdx(0);
         return;
       }
-      if (e.key === 'ArrowUp') {
-        e.preventDefault();
-        if (count > 0) setHighlightIdx((h) => (h - 1 + count) % count);
-        return;
-      }
-      if (e.key === 'ArrowDown') {
-        e.preventDefault();
-        if (count > 0) setHighlightIdx((h) => (h + 1) % count);
-        return;
-      }
+      if (handleNavigationKey(e)) return;
       if (e.key === 'Enter' && count > 0) {
         e.preventDefault(); e.stopPropagation();
         if (category === 'files') {
-          const f = fileResults[highlightIdx];
+          const f = fileResults[activeNavigationIndex];
           if (f) onSelectFile(f.path);
         } else {
-          const a = delegateAgents[highlightIdx];
+          const a = delegateAgents[activeNavigationIndex];
           if (a && !a.disabled) onSelectDelegateAgent(a.session);
         }
       }
     },
-    [visible, category, highlightIdx, fileResults, delegateAgents, aliasResults, machineResults, teamRoundsIdx, teamComboOptions, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onLaunchTeam],
+    [visible, category, activeNavigationIndex, fileResults, delegateAgents, aliasResults, machineResults, teamRoundsIdx, teamComboOptions, handleNavigationKey, onClose, onSelectFile, onSelectDelegateAgent, onSelectAlias, onSelectMachine, onLaunchTeam],
   );
 
   // Keep one capture listener for the lifetime of the open picker. Rebinding a
@@ -441,13 +458,6 @@ export function AtPicker({
     return () => document.removeEventListener('keydown', listener, true);
   }, [visible]);
 
-  // Scroll highlighted item into view
-  useEffect(() => {
-    if (!containerRef.current) return;
-    const el = containerRef.current.querySelector('[data-hl="true"]');
-    if (el) (el as HTMLElement).scrollIntoView({ block: 'nearest' });
-  }, [highlightIdx]);
-
   if (!visible) return null;
 
   // ── Category chooser ──
@@ -455,8 +465,8 @@ export function AtPicker({
     return (
       <div ref={containerRef} style={containerStyle}>
         <div
-          data-hl={highlightIdx === 0 ? 'true' : undefined}
-          style={highlightIdx === 0 ? categoryHighlightStyle : categoryStyle}
+          data-hl={activeNavigationIndex === 0 ? 'true' : undefined}
+          style={activeNavigationIndex === 0 ? categoryHighlightStyle : categoryStyle}
           onClick={() => { setCategory('files'); setHighlightIdx(0); }}
           onMouseEnter={() => setHighlightIdx(0)}
         >
@@ -465,8 +475,8 @@ export function AtPicker({
           <span style={dimStyle}>{t('p2p.picker.search_project_files')}</span>
         </div>
         <div
-          data-hl={highlightIdx === 1 ? 'true' : undefined}
-          style={highlightIdx === 1 ? categoryHighlightStyle : categoryStyle}
+          data-hl={activeNavigationIndex === 1 ? 'true' : undefined}
+          style={activeNavigationIndex === 1 ? categoryHighlightStyle : categoryStyle}
           onClick={() => { setCategory('team'); setHighlightIdx(0); setTeamRoundsIdx(0); }}
           onMouseEnter={() => setHighlightIdx(1)}
         >
@@ -475,8 +485,8 @@ export function AtPicker({
           <span style={dimStyle}>{t('p2p.picker.team_desc')}</span>
         </div>
         <div
-          data-hl={highlightIdx === 2 ? 'true' : undefined}
-          style={highlightIdx === 2 ? categoryHighlightStyle : categoryStyle}
+          data-hl={activeNavigationIndex === 2 ? 'true' : undefined}
+          style={activeNavigationIndex === 2 ? categoryHighlightStyle : categoryStyle}
           onClick={() => { setCategory('agents'); setHighlightIdx(0); }}
           onMouseEnter={() => setHighlightIdx(2)}
         >
@@ -485,8 +495,8 @@ export function AtPicker({
           <span style={dimStyle}>{t('delegation.picker.delegate_to_agent')}</span>
         </div>
         <div
-          data-hl={highlightIdx === 3 ? 'true' : undefined}
-          style={highlightIdx === 3 ? categoryHighlightStyle : categoryStyle}
+          data-hl={activeNavigationIndex === 3 ? 'true' : undefined}
+          style={activeNavigationIndex === 3 ? categoryHighlightStyle : categoryStyle}
           onClick={() => { setCategory('aliases'); setHighlightIdx(0); }}
           onMouseEnter={() => setHighlightIdx(3)}
         >
@@ -495,8 +505,8 @@ export function AtPicker({
           <span style={dimStyle}>{t('alias.category_desc')}</span>
         </div>
         <div
-          data-hl={highlightIdx === 4 ? 'true' : undefined}
-          style={highlightIdx === 4 ? categoryHighlightStyle : categoryStyle}
+          data-hl={activeNavigationIndex === 4 ? 'true' : undefined}
+          style={activeNavigationIndex === 4 ? categoryHighlightStyle : categoryStyle}
           onClick={() => { setCategory('machines'); setHighlightIdx(0); }}
           onMouseEnter={() => setHighlightIdx(4)}
         >
@@ -522,7 +532,7 @@ export function AtPicker({
           </div>
         )}
         {aliasResults.map((a, idx) => {
-          const hl = idx === highlightIdx;
+          const hl = idx === activeNavigationIndex;
           return (
             <div
               key={a.name}
@@ -542,7 +552,6 @@ export function AtPicker({
 
   // ── Machines list ── Online state is informational; every row is selectable.
   if (category === 'machines') {
-    const effHighlight = Math.min(highlightIdx, Math.max(0, machineResults.length - 1));
     return (
       <div ref={containerRef} style={containerStyle}>
         <div style={backBtnStyle} onClick={() => { setCategory('choose'); setHighlightIdx(4); }}>← {t('p2p.picker.back')}</div>
@@ -555,13 +564,13 @@ export function AtPicker({
           </div>
         )}
         {machineResults.map((m, idx) => {
-          const hl = idx === effHighlight;
+          const hl = idx === activeNavigationIndex;
           return (
             <div
               key={m.serverId}
               data-hl={hl ? 'true' : undefined}
               style={hl ? itemHighlightStyle : itemStyle}
-              onClick={() => onSelectMachine?.(m.refName, m.displayName)}
+              onClick={() => { if (m.nodeId) onSelectMachine?.(m.nodeId, m.displayName); }}
               onMouseEnter={() => setHighlightIdx(idx)}
             >
               <span
@@ -575,7 +584,7 @@ export function AtPicker({
                 title={m.online ? undefined : t('machine.offline')}
               />
               <span style={{ fontWeight: 500, color: '#e2e8f0' }}>{m.displayName}</span>
-              <span style={dimStyle}>{m.refName}</span>
+              <span style={dimStyle}>{m.nodeId ?? MACHINE_IDENTITY_UNAVAILABLE}</span>
               {!m.online && <span style={dimStyle}>{t('machine.offline_hint')}</span>}
             </div>
           );
@@ -595,7 +604,7 @@ export function AtPicker({
         </div>
         {teamComboOptions.map((key, idx) => {
           const adjustedIdx = idx;
-          const hl = adjustedIdx === highlightIdx;
+          const hl = adjustedIdx === activeNavigationIndex;
           return (
             <div
               key={key}
@@ -627,7 +636,7 @@ export function AtPicker({
           </div>
         )}
         {fileResults.map((f, idx) => {
-          const hl = idx === highlightIdx;
+          const hl = idx === activeNavigationIndex;
           return (
             <div
               key={f.path}
@@ -656,7 +665,7 @@ export function AtPicker({
 
       {/* Individual delegation agents only. */}
       {delegateAgents.map((a, idx) => {
-        const hl = idx === highlightIdx;
+        const hl = idx === activeNavigationIndex;
         const disabled = !!a.disabled;
         return (
           <div

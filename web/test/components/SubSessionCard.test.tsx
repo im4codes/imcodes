@@ -137,6 +137,40 @@ describe('SubSessionCard', () => {
     });
   });
 
+  it('passes quota and heartbeat metadata into the compact SessionControls without restoring the removed ChatView status props', () => {
+    render(
+      <SubSessionCard
+        sub={makeSubSession({
+          type: 'codex-sdk',
+          quotaLabel: '7d 55% 5d05h 9/26 18:39',
+          quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+          supervisionMode: 'supervised_audit',
+          supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+        } as any)}
+        ws={null}
+        connected={true}
+        quickData={{ data: [], recordHistory: vi.fn() } as any}
+        isOpen={false}
+        isFocused={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0].activeSession).toMatchObject({
+      quotaLabel: '7d 55% 5d05h 9/26 18:39',
+      quotaMeta: { primary: { usedPercent: 55, windowDurationMins: 10_080 } },
+      supervisionMode: 'supervised_audit',
+      supervisionHeartbeat: { state: 'armed', kind: 'audit', nextHeartbeatAt: 12_000, updatedAt: 2_000 },
+    });
+    const chatViewProps = chatViewPropsSpy.mock.calls.at(-1)?.[0];
+    expect(chatViewProps).toMatchObject({ preview: true });
+    expect(chatViewProps).not.toHaveProperty('quotaLabel');
+    expect(chatViewProps).not.toHaveProperty('quotaMeta');
+    expect(chatViewProps).not.toHaveProperty('supervisionHeartbeat');
+  });
+
   it('attaches the live timeline before closed preview hydration', async () => {
     vi.useFakeTimers();
     render(
@@ -156,6 +190,7 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: false,
+      subscriptionMode: 'summary',
     });
 
     await act(async () => {
@@ -165,11 +200,12 @@ describe('SubSessionCard', () => {
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: false,
       isVisible: true,
+      subscriptionMode: 'summary',
     });
   });
 
 
-  it('treats an open but unfocused card as an active timeline consumer', () => {
+  it('keeps an open but unfocused card passive while remaining visible', () => {
     render(
       <SubSessionCard
         sub={makeSubSession()}
@@ -184,8 +220,47 @@ describe('SubSessionCard', () => {
     );
 
     expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
+      isVisible: true,
+      subscriptionMode: 'summary',
+    });
+  });
+
+  it('lets the focused preview own recovery only when no floating window owns the session', () => {
+    const view = render(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={false}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
       isActiveSession: true,
       isVisible: true,
+      subscriptionMode: 'summary',
+    });
+
+    view.rerender(
+      <SubSessionCard
+        sub={makeSubSession()}
+        ws={null}
+        connected={true}
+        isOpen={true}
+        isFocused={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(useTimelineSpy).toHaveBeenLastCalledWith('deck_sub_sub-card-1', null, undefined, {
+      isActiveSession: false,
+      isVisible: true,
+      subscriptionMode: 'summary',
     });
   });
 
@@ -416,14 +491,17 @@ describe('SubSessionCard', () => {
         text: 'echo hi',
         commandId: expect.any(String),
       }));
-      expect(terminalScrollBottomSpy).toHaveBeenCalled();
+      // Closed shell cards keep only the lightweight preview placeholder; the
+      // terminal is mounted when the card/window is actually opened.
+      expect(terminalScrollBottomSpy).not.toHaveBeenCalled();
     });
     expect(addOptimisticUserMessageSpy).not.toHaveBeenCalled();
   });
 
   it('keeps shell cards in raw terminal preview mode', async () => {
     const releaseRaw = vi.fn();
-    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), subscribeTerminal: vi.fn() } as any;
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), onTerminalRaw: vi.fn(() => vi.fn()), subscribeTerminal: vi.fn() } as any;
+    const historyApplyers: Array<(content: string) => void> = [];
     const view = render(
       <SubSessionCard
         sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
@@ -432,7 +510,7 @@ describe('SubSessionCard', () => {
         isOpen={false}
         onOpen={vi.fn()}
         onDiff={vi.fn()}
-        onHistory={vi.fn()}
+        onHistory={(_session, apply) => { historyApplyers.push(apply); }}
       />,
     );
 
@@ -440,13 +518,55 @@ describe('SubSessionCard', () => {
       expect(ws.holdTerminalRaw).toHaveBeenCalledWith('deck_sub_sub-card-1');
     });
 
-    const props = terminalViewPropsSpy.mock.calls.at(-1)?.[0];
-    expect(props.preview).toBe(true);
-    expect(props.mobileInput).toBe(true);
+    expect(terminalViewPropsSpy).not.toHaveBeenCalled();
     expect(ws.subscribeTerminal).not.toHaveBeenCalled();
 
     view.unmount();
     expect(releaseRaw).toHaveBeenCalledOnce();
+  });
+
+  it('keeps recent shell output visible in a closed card without mounting xterm', async () => {
+    const releaseRaw = vi.fn();
+    const ws = { holdTerminalRaw: vi.fn(() => releaseRaw), onTerminalRaw: vi.fn(() => vi.fn()) } as any;
+    const historyApplyers: Array<(content: string) => void> = [];
+    const { container } = render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={false}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={(_session, apply) => { historyApplyers.push(apply); }}
+      />,
+    );
+
+    await waitFor(() => expect(historyApplyers.length).toBeGreaterThan(0));
+    historyApplyers.at(-1)?.('\u001b[32mrecent output\u001b[0m\nsecond line');
+    await waitFor(() => {
+      expect(container.querySelector('.subcard-terminal-text-preview')?.textContent).toContain('recent output');
+      expect(container.querySelector('.subcard-terminal-text-preview')?.textContent).toContain('second line');
+    });
+    expect(terminalViewPropsSpy).not.toHaveBeenCalled();
+  });
+
+  it('mounts the live terminal immediately when a shell card opens', () => {
+    const ws = { holdTerminalRaw: vi.fn(() => vi.fn()), onTerminalRaw: vi.fn(() => vi.fn()) } as any;
+    render(
+      <SubSessionCard
+        sub={makeSubSession({ type: 'shell', shellBin: '/bin/bash' })}
+        ws={ws}
+        connected={true}
+        isOpen={true}
+        onOpen={vi.fn()}
+        onDiff={vi.fn()}
+        onHistory={vi.fn()}
+      />,
+    );
+    expect(terminalViewPropsSpy).toHaveBeenCalledWith(expect.objectContaining({
+      sessionName: 'deck_sub_sub-card-1',
+      preview: true,
+    }));
   });
 
   it('fallback shell card cleanup unsubscribes instead of entering passive mode', async () => {

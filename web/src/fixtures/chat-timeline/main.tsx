@@ -120,6 +120,8 @@ export interface ChatTimelineHarnessApi {
   /** True once the first mount's effects have run. */
   ready: boolean;
   eventCount(): number;
+  /** Replaces the live event list (used by deterministic integration probes). */
+  setEvents(events: TimelineEvent[]): void;
   /** Appends one new event under a fresh `eventId`. Returns that id. */
   appendEvent(options?: { type?: string; text?: string }): string;
   /**
@@ -127,6 +129,14 @@ export interface ChatTimelineHarnessApi {
    * Returns the id and the new text length.
    */
   appendStreamingChunk(chunk?: string): { eventId: string; length: number };
+  /**
+   * Turns on backward pagination like the real timeline hook: each `onLoadOlder`
+   * shows the loading state, then after `delayMs` prepends the next page (newest
+   * page first) and clears it. `hasOlderHistory` is true while pages remain.
+   */
+  setOlderPages(pages: TimelineEvent[][], delayMs?: number): void;
+  /** Older pages not yet prepended (a page counts as taken when its request starts). */
+  olderPagesRemaining(): number;
   /** Restores the generated fixture events (new array identity). */
   reset(): void;
   /** Times `buildViewItems` over the current events. */
@@ -136,6 +146,14 @@ export interface ChatTimelineHarnessApi {
 const query = readQuery();
 const { events: initialEvents, label: fixtureLabel } = resolveEvents(query);
 const windowCount = query.get('windows') === '4' ? 4 : 1;
+const fixturePinsEnabled = query.get('pins') === '1';
+/**
+ * `chrome=1` adds a stand-in for the bottom chrome the real app stacks under
+ * the chat (context progress bar, agent status row, control row, composer,
+ * queue chip, sub-session bar; ~300 CSS px on a phone) so layout checks can
+ * measure against the elements a chat overlay must never reach.
+ */
+const fixtureChromeEnabled = query.get('chrome') === '1';
 /** Live events array. Replaced (never mutated) on every harness update. */
 let currentEvents: TimelineEvent[] = initialEvents;
 let publishEvents: ((next: TimelineEvent[]) => void) | null = null;
@@ -144,6 +162,26 @@ let harnessCounter = 0;
 function publish(next: TimelineEvent[]): void {
   currentEvents = next;
   publishEvents?.(next);
+}
+
+/** Backward-pagination state (see `setOlderPages`). */
+let olderPages: TimelineEvent[][] = [];
+let olderDelayMs = 250;
+let olderLoading = false;
+let publishOlderState: ((state: { loading: boolean; hasMore: boolean }) => void) | null = null;
+function publishOlder(): void {
+  publishOlderState?.({ loading: olderLoading, hasMore: olderPages.length > 0 });
+}
+function loadOlderPage(): void {
+  if (olderLoading || olderPages.length === 0) return;
+  olderLoading = true;
+  publishOlder();
+  setTimeout(() => {
+    const page = olderPages.shift();
+    if (page) publish([...page, ...currentEvents]);
+    olderLoading = false;
+    publishOlder();
+  }, olderDelayMs);
 }
 
 /**
@@ -187,6 +225,9 @@ const harness: ChatTimelineHarnessApi = {
   renderStartMs: 0,
   ready: false,
   eventCount: () => currentEvents.length,
+  setEvents(events) {
+    publish([...events]);
+  },
   appendEvent(options = {}) {
     const type = options.type ?? 'assistant.text';
     const text = options.text ?? `Harness appended message ${harnessCounter + 1}.`;
@@ -214,6 +255,13 @@ const harness: ChatTimelineHarnessApi = {
     publish(next);
     return { eventId: grown.eventId, length: text.length };
   },
+  olderPagesRemaining: () => olderPages.length,
+  setOlderPages(pages, delayMs = 250) {
+    olderPages = pages.map((page) => [...page]);
+    olderDelayMs = delayMs;
+    olderLoading = false;
+    publishOlder();
+  },
   reset() {
     harnessCounter = 0;
     publish([...initialEvents]);
@@ -235,13 +283,33 @@ const harness: ChatTimelineHarnessApi = {
 
 (window as unknown as { __chatTimelineHarness?: ChatTimelineHarnessApi }).__chatTimelineHarness = harness;
 
+const FIXTURE_CHROME_ROWS: ReadonlyArray<readonly [string, number]> = [
+  ['progress-bar', 12], ['agent-row', 56], ['control-row', 50], ['composer', 64], ['queue-chip', 40], ['session-bar', 80],
+];
+
+function FixtureBottomChrome() {
+  return (
+    <div data-testid="fixture-bottom-chrome" style={{ flex: '0 0 auto', display: 'flex', flexDirection: 'column' }}>
+      {FIXTURE_CHROME_ROWS.map(([name, height]) => (
+        <div
+          key={name}
+          data-testid={`fixture-${name}`}
+          style={{ height, flex: '0 0 auto', boxSizing: 'border-box', borderTop: '1px solid #334155', background: '#0f172a', color: '#94a3b8', font: '11px monospace' }}
+        >{name}</div>
+      ))}
+    </div>
+  );
+}
+
 function FixtureHarness() {
   const [events, setEvents] = useState<TimelineEvent[]>(initialEvents);
   publishEvents = setEvents;
+  const [older, setOlder] = useState({ loading: false, hasMore: false });
+  publishOlderState = setOlder;
   useEffect(() => {
     harness.ready = true;
     document.documentElement.setAttribute('data-chat-timeline-harness', 'ready');
-    return () => { publishEvents = null; };
+    return () => { publishEvents = null; publishOlderState = null; };
   }, []);
 
   const cellStyle = windowCount === 4
@@ -261,7 +329,32 @@ function FixtureHarness() {
     >
       {Array.from({ length: windowCount }, (_, i) => (
         <div key={i} class="chat-timeline-fixture-window" data-window-index={i} style={cellStyle}>
-          <ChatView events={events} loading={false} sessionId={`fixture-window-${i}`} />
+          {fixtureChromeEnabled ? (
+            <div style={{ flex: '1 1 auto', minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+              <ChatView
+                events={events}
+                loading={false}
+                loadingOlder={older.loading}
+                hasOlderHistory={older.hasMore}
+                onLoadOlder={loadOlderPage}
+                sessionId={`fixture-window-${i}`}
+                serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
+                messagePinsEnabled={fixturePinsEnabled}
+              />
+            </div>
+          ) : (
+            <ChatView
+              events={events}
+              loading={false}
+              loadingOlder={older.loading}
+              hasOlderHistory={older.hasMore}
+              onLoadOlder={loadOlderPage}
+              sessionId={`fixture-window-${i}`}
+              serverId={fixturePinsEnabled ? 'fixture-server' : undefined}
+              messagePinsEnabled={fixturePinsEnabled}
+            />
+          )}
+          {fixtureChromeEnabled && <FixtureBottomChrome />}
         </div>
       ))}
     </div>

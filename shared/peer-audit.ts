@@ -1,4 +1,6 @@
 import { redactSensitiveText } from './redact-secrets.js';
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 // Single shared source of truth for the lightweight peer-supervision-audit
 // contract (design "One shared peer-audit contract"). Owns contract/reply
@@ -22,6 +24,13 @@ export const PEER_AUDIT_REPLY_VERSION = 'peer_audit_reply_v1' as const;
 /** Umbrella contract version for candidate/result/command payloads. */
 export const PEER_AUDIT_CONTRACT_VERSION = 'peer_audit_v1' as const;
 export const PEER_AUDIT_COMPLETED_TURN_PAYLOAD_FIELD = 'peerAuditCompletedTurn' as const;
+/** Trusted result status delivered to the coordinating session for manual audits. */
+export const PEER_AUDIT_DELEGATED_REPLY_STATUS = 'peer_audit_completed' as const;
+/** Public audit-round projection bound to final registry receipts. */
+export const PEER_AUDIT_ROUND_MAX = 9_999;
+export function isPeerAuditRound(value: unknown): value is number {
+  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= PEER_AUDIT_ROUND_MAX;
+}
 export const PEER_AUDIT_MESSAGES = {
   CANDIDATES: 'peer_audit.candidates',
   QUICK_RESULT: 'peer_audit.quick_result',
@@ -90,7 +99,10 @@ export function parsePeerAuditOrchestratedResult(text: string): PeerAuditVerdict
   return matches[0]?.[1] === 'PASS' ? 'PASS' : matches[0]?.[1] === 'REWORK' ? 'REWORK' : null;
 }
 
-export const PEER_AUDIT_VALIDATION_KINDS = ['test', 'typecheck', 'lint', 'build', 'tool', 'device', 'environment'] as const;
+export const PEER_AUDIT_VALIDATION_KINDS = [
+  'test', 'typecheck', 'lint', 'build', 'tool', 'device', 'environment',
+  'accepted_implementer_validation',
+] as const;
 export type PeerAuditValidationKind = (typeof PEER_AUDIT_VALIDATION_KINDS)[number];
 export function isPeerAuditValidationKind(v: unknown): v is PeerAuditValidationKind {
   return typeof v === 'string' && (PEER_AUDIT_VALIDATION_KINDS as readonly string[]).includes(v);
@@ -111,8 +123,8 @@ export function isPeerAuditPhase(v: unknown): v is PeerAuditPhase {
 
 // ── Exact v1 limits (all UTF-8 bytes unless a *_COUNT) ────────────────────────
 
-export const PEER_AUDIT_DEADLINE_MS = 360_000;
-export const PEER_AUDIT_BRIEF_TOTAL_BYTES = 32 * 1024;
+export const PEER_AUDIT_DEADLINE_MS = 15 * 60_000;
+export const PEER_AUDIT_BRIEF_TOTAL_BYTES = 64 * 1024;
 export const PEER_AUDIT_BRIEF_REQUEST_BYTES = 8 * 1024;
 export const PEER_AUDIT_BRIEF_RESULT_BYTES = 8 * 1024;
 export const PEER_AUDIT_PATH_COUNT = 128;
@@ -122,15 +134,11 @@ export const PEER_AUDIT_VALIDATION_ITEM_BYTES = 512;
 export const PEER_AUDIT_REPLY_TOTAL_BYTES = 24 * 1024;
 export const PEER_AUDIT_FINDINGS_BYTES = 16 * 1024;
 export const PEER_AUDIT_TIMELINE_PREVIEW_BYTES = 4 * 1024;
-export const PEER_AUDIT_REWORK_INPUT_BYTES = 8 * 1024;
+/** Preserve the auditor's complete bounded findings in repair/re-audit turns. */
+export const PEER_AUDIT_REWORK_INPUT_BYTES = PEER_AUDIT_FINDINGS_BYTES;
 export const PEER_AUDIT_TOMBSTONE_CAPACITY = 1024;
 export const PEER_AUDIT_TOMBSTONE_TTL_MS = 30 * 60_000;
 
-/** Minimum reply-capability entropy: ≥ 192 random bits (base64url, 6 bits/char → 32 chars). */
-export const PEER_AUDIT_CAPABILITY_MIN_BITS = 192;
-export const PEER_AUDIT_CAPABILITY_MIN_CHARS = Math.ceil(PEER_AUDIT_CAPABILITY_MIN_BITS / 6); // 32
-/** Upper bound so a decoder never accepts an unbounded "capability" string. */
-export const PEER_AUDIT_CAPABILITY_MAX_CHARS = 512;
 /** Defensive cap on the daemon→Web candidate list (not a peer-controlled inbound frame). */
 export const PEER_AUDIT_CANDIDATE_COUNT = 256;
 /** Bound for identity strings (names/instances/epochs/ids) inside inbound frames. */
@@ -190,12 +198,20 @@ export const PEER_AUDIT_REPLY_ERRORS = {
   INVALID_VERSION: 'invalid_version',
   UNKNOWN_FIELD: 'unknown_field',
   INVALID_ATTEMPT_ID: 'invalid_attempt_id',
-  INVALID_CAPABILITY: 'invalid_capability',
+  INVALID_TASK_ID: 'invalid_task_id',
+  INVALID_ASSIGNMENT_ID: 'invalid_assignment_id',
+  INVALID_REVISION: 'invalid_revision',
+  INVALID_RECEIPT_KIND: 'invalid_receipt_kind',
   INVALID_VERDICT: 'invalid_verdict',
   INVALID_FINDINGS: 'invalid_findings',
   INVALID_VALIDATIONS: 'invalid_validations',
   INSUFFICIENT_VALIDATION_EVIDENCE: 'insufficient_validation_evidence',
   IDENTITY_MISMATCH: 'identity_mismatch',
+  ATTEMPT_MISMATCH: 'attempt_mismatch',
+  ASSIGNMENT_MISMATCH: 'assignment_mismatch',
+  REVISION_MISMATCH: 'revision_mismatch',
+  RECEIPT_CLOSED: 'receipt_closed',
+  CONFLICTING_REPLAY: 'conflicting_replay',
   DEADLINE_EXPIRED: 'deadline_expired',
   RATE_LIMITED: 'rate_limited',
 } as const;
@@ -291,6 +307,7 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   qwen: 'alibaba',
   moonshot: 'moonshot',
   'kimi-sdk': 'moonshot',
+  [HERMES_AGENT_PROVIDER_ID]: 'hermes',
   github: 'github',
   'copilot-sdk': 'github',
   cursor: 'cursor',
@@ -303,6 +320,8 @@ const PEER_AUDIT_PROVIDER_FAMILY_BY_ID: Readonly<Record<string, string>> = {
   deepseek: 'deepseek',
   'deepseek-harness': 'deepseek',
   pi: 'pi',
+  [CODEBUDDY_PROVIDER_IDS.CHINA]: 'codebuddy',
+  [CODEBUDDY_PROVIDER_IDS.INTERNATIONAL]: 'codebuddy',
 };
 
 /** Provider family is independent of model normalization. Authoritative
@@ -345,12 +364,29 @@ export interface PeerAuditValidationItem {
   summary: string;
 }
 
-/** The auditor's one strict reply envelope. */
+export const PEER_AUDIT_RECEIPT_KINDS = ['progress', 'final'] as const;
+export type PeerAuditReceiptKind = typeof PEER_AUDIT_RECEIPT_KINDS[number];
+export function isPeerAuditReceiptKind(value: unknown): value is PeerAuditReceiptKind {
+  return typeof value === 'string' && (PEER_AUDIT_RECEIPT_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * Authenticated, append-only auditor receipt.
+ *
+ * `taskId`/`assignmentId`/`revision`/`receiptKind` are optional only while
+ * decoding historical pre-registry Quick Audit payloads. The public MCP and
+ * CLI require all four for new supervision receipts. `replyCapability` is
+ * intentionally absent: the daemon-authenticated current session plus the
+ * durable registry binding is the authority.
+ */
 export interface PeerAuditReplyEnvelope {
   version: PeerAuditReplyVersion;
   attemptId: string;
-  replyCapability: string;
-  verdict: PeerAuditVerdict;
+  taskId?: string;
+  assignmentId?: string;
+  revision?: string;
+  receiptKind?: PeerAuditReceiptKind;
+  verdict?: PeerAuditVerdict;
   findings: string;
   validations: PeerAuditValidationItem[];
 }
@@ -376,6 +412,8 @@ export interface PeerAuditResultEvent {
   disposition?: PeerAuditRuntimeDisposition;
   findingsPreview?: string;
   reason?: string;
+  /** 1-based final audit attempt ordinal for a formal supervised task. */
+  round?: number;
 }
 
 /** Daemon-internal authority evidence emitted only at a clean transport idle
@@ -433,14 +471,6 @@ export function peerAuditByteLength(s: string): number {
 }
 
 const BASE64URL_RE = /^[A-Za-z0-9_-]+$/;
-
-/** A reply capability must be base64url with ≥ 192 bits of entropy and bounded length. */
-export function isPeerAuditCapability(v: unknown): v is string {
-  return typeof v === 'string'
-    && v.length >= PEER_AUDIT_CAPABILITY_MIN_CHARS
-    && v.length <= PEER_AUDIT_CAPABILITY_MAX_CHARS
-    && BASE64URL_RE.test(v);
-}
 
 /** A human-readable identifier/name of nonzero, bounded byte length. */
 export function isPeerAuditIdString(v: unknown): v is string {
@@ -578,24 +608,43 @@ export function parsePeerAuditValidationList(raw: unknown): PeerAuditParse<PeerA
 }
 
 /**
- * Evidence-shape policy (NOT truthfulness): a PASS verdict must carry evidence —
- * at least one `passed` item, OR (when nothing executable could run) all items
- * `unavailable`. An empty or static-only PASS is `insufficient_validation_evidence`.
- * REWORK has no evidence requirement.
+ * Evidence-shape policy (NOT truthfulness): a PASS verdict must carry evidence.
+ * The daemon may authorize `accepted_implementer_validation` only after it has
+ * bound the report to this exact task/source assignment/revision. This keeps a
+ * caller-supplied claim from manufacturing authority while allowing auditors
+ * to record the normal code + submitted-report path without rerunning tests.
  */
 export function validatePeerAuditPassEvidence(
-  verdict: PeerAuditVerdict,
+  verdict: PeerAuditVerdict | undefined,
   validations: readonly PeerAuditValidationItem[],
+  context: {
+    acceptedImplementerValidation?: boolean;
+    /** Legacy task-less session audits historically allow a fully explained unavailable-only PASS. */
+    allowUnavailableOnly?: boolean;
+  } = {},
 ): PeerAuditParse<true> {
   if (verdict !== 'PASS') return { ok: true, value: true };
   if (validations.length === 0) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
-  const hasPassed = validations.some((v) => v.outcome === 'passed');
-  const allUnavailable = validations.every((v) => v.outcome === 'unavailable');
-  if (!hasPassed && !allUnavailable) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
+  const hasPassed = validations.some((v) => v.outcome === 'passed' && (
+    v.kind !== 'accepted_implementer_validation'
+    || context.acceptedImplementerValidation === true
+  ));
+  const allowedUnavailableOnly = context.allowUnavailableOnly === true
+    && validations.length > 0
+    && validations.every((v) => v.outcome === 'unavailable');
+  if (!hasPassed && !allowedUnavailableOnly) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INSUFFICIENT_VALIDATION_EVIDENCE };
+  }
   return { ok: true, value: true };
 }
 
-const REPLY_ENVELOPE_KEYS: ReadonlySet<string> = new Set(['version', 'attemptId', 'replyCapability', 'verdict', 'findings', 'validations']);
+const REPLY_ENVELOPE_KEYS: ReadonlySet<string> = new Set([
+  'version', 'attemptId', 'taskId', 'assignmentId', 'revision', 'receiptKind',
+  'verdict', 'findings', 'validations',
+  // Migration-only: old payloads remain readable, but this value is discarded
+  // before authority evaluation and is never required or checked.
+  'replyCapability',
+]);
 
 /** Strict schema decode without applying verdict evidence policy. This is used
  * by daemon ingress so capability/identity checks happen before policy errors
@@ -606,8 +655,18 @@ export function decodePeerAuditReplyEnvelopeStructure(raw: unknown): PeerAuditPa
   if (unknown) return { ok: false, error: unknown };
   if (raw.version !== PEER_AUDIT_REPLY_VERSION) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_VERSION };
   if (!isPeerAuditOpaqueId(raw.attemptId)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_ATTEMPT_ID };
-  if (!isPeerAuditCapability(raw.replyCapability)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_CAPABILITY };
-  if (!isPeerAuditVerdict(raw.verdict)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_VERDICT };
+  const taskId = raw.taskId === undefined ? undefined : String(raw.taskId).trim();
+  const assignmentId = raw.assignmentId === undefined ? undefined : String(raw.assignmentId).trim();
+  const revision = raw.revision === undefined ? undefined : String(raw.revision).trim();
+  const receiptKind = raw.receiptKind === undefined ? undefined : raw.receiptKind;
+  if (raw.taskId !== undefined && !isPeerAuditOpaqueId(taskId)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_TASK_ID };
+  if (raw.assignmentId !== undefined && !isPeerAuditOpaqueId(assignmentId)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_ASSIGNMENT_ID };
+  if (raw.revision !== undefined && (!revision || peerAuditByteLength(revision) > 512)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_REVISION };
+  if (receiptKind !== undefined && !isPeerAuditReceiptKind(receiptKind)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_RECEIPT_KIND };
+  if (raw.verdict !== undefined && !isPeerAuditVerdict(raw.verdict)) return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_VERDICT };
+  if ((receiptKind ?? 'final') === 'final' && !isPeerAuditVerdict(raw.verdict)) {
+    return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_VERDICT };
+  }
   if (typeof raw.findings !== 'string' || peerAuditByteLength(raw.findings) > PEER_AUDIT_FINDINGS_BYTES) {
     return { ok: false, error: PEER_AUDIT_REPLY_ERRORS.INVALID_FINDINGS };
   }
@@ -618,8 +677,11 @@ export function decodePeerAuditReplyEnvelopeStructure(raw: unknown): PeerAuditPa
     value: {
       version: PEER_AUDIT_REPLY_VERSION,
       attemptId: raw.attemptId,
-      replyCapability: raw.replyCapability,
-      verdict: raw.verdict,
+      ...(taskId ? { taskId } : {}),
+      ...(assignmentId ? { assignmentId } : {}),
+      ...(revision ? { revision } : {}),
+      ...(receiptKind ? { receiptKind } : {}),
+      ...(isPeerAuditVerdict(raw.verdict) ? { verdict: raw.verdict } : {}),
       findings: raw.findings,
       validations: validations.value,
     },

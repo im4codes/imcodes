@@ -236,17 +236,21 @@ describe('batched queuing', () => {
     expect(drainLog).toEqual([{ merged: 'second\n\nthird', count: 2 }]);
   });
 
-  it('on unrecoverable error, pending messages are NOT drained (prevents error loop)', async () => {
+  it('on unrecoverable error, pending messages still drain into the next turn (the session queue is not bound to any one turn)', async () => {
     runtime.send('first');
     await flushDispatch();
     runtime.send('retry-me');
 
-    // Unrecoverable error (recoverable: false) — don't drain
+    // Unrecoverable error (recoverable: false) — the failed turn's own
+    // message is not retried, but anything queued behind it must still get
+    // a chance to run instead of leaving the queue (and the UI) stuck
+    // waiting on a turn that will never complete.
     mock.fireError('sess-1');
+    await flushDispatch();
 
-    expect(mock.provider.send).toHaveBeenCalledTimes(1);
-    expect(runtime.pendingCount).toBe(1); // message preserved, not consumed
-    expect(runtime.getStatus()).toBe('error');
+    expect(mock.provider.send).toHaveBeenCalledTimes(2);
+    expect(runtime.pendingCount).toBe(0);
+    expect(runtime.getStatus()).not.toBe('error');
   });
 
   it('on recoverable error, pending messages drain into next turn', async () => {

@@ -15,11 +15,13 @@ import {
   REMOTE_EXEC_MAX_TIMEOUT_MS,
 } from '../../shared/remote-exec.js';
 import {
-  MACHINE_NAME_PATTERN,
-  MACHINE_REF_NAME_MAX,
   MACHINE_TARGET_MAX,
   MACHINE_TARGET_PATTERN,
 } from '../../shared/machine-reference.js';
+import {
+  CONTROLLED_NODE_ID_LENGTH,
+  CONTROLLED_NODE_ID_PATTERN_SOURCE,
+} from '../../shared/controlled-node-identity.js';
 
 describe('machine MCP tools join the contract surface (10.12)', () => {
   it('both tools are in the name list and have contracts', () => {
@@ -41,7 +43,7 @@ describe('machine MCP tools join the contract surface (10.12)', () => {
     expect(timeout?.description).toContain('3600000');
   });
 
-  it('treats list_machines as discovery only and publishes bounded direct ref_name inputs', () => {
+  it('treats list_machines as discovery only and publishes canonical nodeId output with bounded direct inputs', () => {
     const list = MEMORY_MCP_TOOL_CONTRACTS[MEMORY_MCP_TOOL_NAMES.LIST_MACHINES];
     expect(list.description).toContain('do not call it as a preflight');
     expect(list.description).toContain('advisory availability');
@@ -56,12 +58,19 @@ describe('machine MCP tools join the contract surface (10.12)', () => {
       const machine = contract.inputSchema.properties?.machine;
       expect(contract.description).toMatch(/without (calling )?list_machines|do not call list_machines/i);
       expect(machine).toMatchObject({ minLength: 1, maxLength: MACHINE_TARGET_MAX, pattern: MACHINE_TARGET_PATTERN.source });
-      expect(machine?.description).toMatch(/bare stable ref_name/i);
-      expect(machine?.description).toMatch(/complete \^\^\(ref_name\) marker/i);
+      expect(machine?.description).toMatch(/canonical nodeId/i);
+      expect(machine?.description).toMatch(/complete \^\^\(nodeId\) marker/i);
+      expect(machine?.description).toMatch(/legacy ref_name/i);
+      expect(contract.description).toMatch(/canonical 10-digit nodeId/i);
+      expect(contract.description).toMatch(/deprecated noncanonical legacy ref_name/i);
     }
 
     const listMachine = list.outputSchema.properties?.machines?.items?.properties?.name;
-    expect(listMachine).toMatchObject({ maxLength: MACHINE_REF_NAME_MAX, pattern: MACHINE_NAME_PATTERN.source });
+    expect(listMachine).toMatchObject({
+      minLength: CONTROLLED_NODE_ID_LENGTH,
+      maxLength: CONTROLLED_NODE_ID_LENGTH,
+      pattern: CONTROLLED_NODE_ID_PATTERN_SOURCE,
+    });
   });
 
   it('the shared error enum carries the machine reasons', () => {

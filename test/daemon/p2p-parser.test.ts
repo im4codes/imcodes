@@ -746,6 +746,7 @@ describe('structured P2P routing via WS fields', () => {
 
   it('rewrites #N:(~/.imcodes upload path) references into project refs for sandboxed agents', async () => {
     const originalHome = process.env.HOME;
+    const originalImcodesHome = process.env.IMCODES_HOME;
     const originalRefsDir = process.env.IMCODES_TEST_REFS_DIR;
     const homeDir = await mkdtemp(join(tmpdir(), 'imcodes-parser-home-'));
     const uploadDir = join(homeDir, '.imcodes', 'uploads');
@@ -756,6 +757,7 @@ describe('structured P2P routing via WS fields', () => {
     await mkdir(refsDir, { recursive: true });
     await writeFile(sourcePath, 'fake image bytes', 'utf8');
     process.env.HOME = homeDir;
+    process.env.IMCODES_HOME = join(homeDir, '.imcodes');
     process.env.IMCODES_TEST_REFS_DIR = refsDir;
 
     try {
@@ -779,6 +781,8 @@ describe('structured P2P routing via WS fields', () => {
     } finally {
       if (originalHome === undefined) delete process.env.HOME;
       else process.env.HOME = originalHome;
+      if (originalImcodesHome === undefined) delete process.env.IMCODES_HOME;
+      else process.env.IMCODES_HOME = originalImcodesHome;
       if (originalRefsDir === undefined) delete process.env.IMCODES_TEST_REFS_DIR;
       else process.env.IMCODES_TEST_REFS_DIR = originalRefsDir;
       await rm(homeDir, { recursive: true, force: true });

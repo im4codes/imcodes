@@ -2,6 +2,7 @@
  * useSubSessions — loads sub-session list from PG, handles create/close,
  * and triggers daemon rebuild on connect.
  */
+import { replaceAtIfChanged } from '../session-state-updates.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import {
   listSubSessions,
@@ -11,6 +12,7 @@ import {
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
+import { isOlderActivityGeneration, type ActivityGenerationLike } from '@shared/session-activity-types.js';
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
   buildTransportQueueEventPatch,
@@ -22,20 +24,30 @@ import {
 import { getSessionRuntimeType, isTransportSessionAgentType } from '@shared/agent-types.js';
 import { getAutoSessionLabelPrefix } from '../agent-display.js';
 import { EXECUTION_CLONE_KIND } from '@shared/execution-clone.js';
+import {
+  parseSupervisionHeartbeatSnapshot,
+  type SupervisionHeartbeatSnapshot,
+} from '@shared/supervision-heartbeat.js';
 import { TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE, type QueueEvent } from '@shared/transport-queue-types.js';
 import { isValidTransportQueueWireEvent } from '@shared/transport-queue-wire.js';
+import { isActiveTurnFinishedError } from '../session-live-status.js';
 
 export interface SubSession extends SubSessionData {
   sessionName: string;
   /** runtime state from daemon */
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'starting' | 'unknown';
+  /** Local proof that a stale-turn acknowledgement observed the provider idle. */
+  authoritativeIdleAt?: number;
   transportPendingMessages?: string[] | null;
   transportPendingMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
   queueEpoch?: string | null;
   queueAuthorityId?: string | null;
   failedMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
+  transportPendingSettledMessageIds?: string[] | null;
   /** Newest pending-queue version applied. Drops stale snapshots. */
   transportPendingMessageVersion?: number | null;
+  supervisionHeartbeat?: SupervisionHeartbeatSnapshot | null;
+  activityGeneration?: ActivityGenerationLike;
 }
 
 /**
@@ -76,7 +88,11 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
     queueEpoch: existing.queueEpoch ?? base.queueEpoch,
     queueAuthorityId: existing.queueAuthorityId ?? base.queueAuthorityId,
     failedMessageEntries: existing.failedMessageEntries ?? base.failedMessageEntries,
+    transportPendingSettledMessageIds: existing.transportPendingSettledMessageIds ?? base.transportPendingSettledMessageIds,
     transportPendingMessageVersion: existing.transportPendingMessageVersion ?? base.transportPendingMessageVersion,
+    supervisionHeartbeat: existing.supervisionHeartbeat !== undefined
+      ? existing.supervisionHeartbeat
+      : base.supervisionHeartbeat,
     ...(preserveCodexDisplay ? {
       codexAvailableModels: base.codexAvailableModels ?? existing.codexAvailableModels ?? null,
       requestedModel: base.requestedModel ?? existing.requestedModel ?? null,
@@ -123,31 +139,8 @@ export function useSubSessions(
   const [subSessions, setSubSessions] = useState<SubSession[]>([]);
   const [loadedServerId, setLoadedServerId] = useState<string | null>(null);
   const rebuiltRef = useRef(false);
-
-  // A half-open WebSocket that gets healed by a ping/pong probe surfaces as a
-  // `connected` event with reason `probe_recovered` — WITHOUT the app's
-  // `connected` boolean ever flipping to false and back (only a real socket
-  // `close` dispatches `disconnected`). Main sessions resync regardless because
-  // app.tsx calls `requestSessionList()` directly on that event, but the
-  // sub-session reload/rebuild effects below are keyed on the `connected`
-  // boolean, so after a probe recovery they would never re-run — leaving each
-  // sub-session's `state` stuck at whatever it was before the frontend went
-  // away (e.g. a perpetual running pulse / sweep even though the agent has
-  // since gone idle). Bump a nonce on probe recovery so the reload — and its
-  // cascading rebuild → `subsession.sync` — re-fires and pulls fresh state.
-  const [reconnectTick, setReconnectTick] = useState(0);
-  useEffect(() => {
-    if (!ws) return;
-    return ws.onMessage((msg) => {
-      if (msg.type === 'session.event' && msg.event === 'connected' && msg.reason === 'probe_recovered') {
-        setReconnectTick((n) => n + 1);
-      }
-    });
-  }, [ws]);
-
   // Load from PG — retries indefinitely with backoff until successful.
-  // Re-triggers when serverId changes, the WS (re)connects, or a probe
-  // recovery bumps `reconnectTick` (the API key / network may now be ready).
+  // Re-triggers when serverId changes or the WS performs a real reconnect.
   const loadGenRef = useRef(0);
   const loadedGenRef = useRef(0);
   useEffect(() => {
@@ -193,13 +186,14 @@ export function useSubSessions(
     load();
 
     return () => { if (timer) clearTimeout(timer); };
-  }, [serverId, connected, reconnectTick, disableHttpLoad]);
+  }, [serverId, connected, disableHttpLoad]);
 
   const hydrateShared = useCallback((serverIdForShare: string, list: Array<{
     subSessionId: string;
     title: string;
     type: string;
     parentSessionName: string | null;
+    supervisionMode?: SubSessionData['supervisionMode'];
   }>) => {
     const now = Date.now();
     setSubSessions((prev) => {
@@ -222,6 +216,7 @@ export function useSubSessions(
         parentSession: item.parentSessionName,
         description: null,
         ccPresetId: null,
+        supervisionMode: item.supervisionMode ?? null,
       }, previousById.get(item.subSessionId)));
     });
     setLoadedServerId(serverIdForShare);
@@ -262,11 +257,16 @@ export function useSubSessions(
           const idx = prev.findIndex((s) => s.sessionName === subSessionName);
           if (idx === -1) return prev;
           const existing = prev[idx];
+          const queueGeneration = 'activityGeneration' in queueEvent ? queueEvent.activityGeneration : undefined;
+          if (isOlderActivityGeneration(queueGeneration, existing.activityGeneration)) return prev;
           const transportPendingPatch = buildTransportQueueEventPatch(existing, queueEvent, subSessionName);
           if (Object.keys(transportPendingPatch).length === 0) return prev;
           const next = [...prev];
           next[idx] = {
             ...existing,
+            ...(queueGeneration !== undefined
+              ? { activityGeneration: queueGeneration as ActivityGenerationLike }
+              : {}),
             ...(queueEvent.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE
               && existing.state === 'queued'
               && (transportPendingPatch.transportPendingMessageEntries?.length ?? existing.transportPendingMessageEntries?.length ?? 0) === 0
@@ -281,6 +281,22 @@ export function useSubSessions(
 
       if (isValidTransportQueueWireEvent(msg) && applyStructuredQueueEvent(msg)) return;
 
+      // A stale append/stop acknowledgement is itself authoritative: the
+      // daemon has already observed that no turn is active. Reconcile the
+      // sub-session immediately instead of waiting for a session.state frame
+      // that may have been coalesced while this window was hidden/reconnecting.
+      if (msg.type === 'command.ack'
+        && msg.status === 'error'
+        && isActiveTurnFinishedError(msg.error)
+        && typeof msg.session === 'string'
+        && msg.session.startsWith('deck_sub_')) {
+        const id = msg.session.slice('deck_sub_'.length);
+        setSubSessions((prev) => prev.map((s) => s.id === id
+          ? { ...s, state: 'idle', authoritativeIdleAt: Date.now() }
+          : s));
+        return;
+      }
+
       let sessionName: string | undefined;
       let state: string | undefined;
 
@@ -294,6 +310,7 @@ export function useSubSessions(
             if (existingIdx !== -1) {
               const updated = [...prev];
               const existing = updated[existingIdx];
+              if (isOlderActivityGeneration(m.activityGeneration, existing.activityGeneration)) return prev;
               const preserveQuota = isCodexFamily(existing.type);
               const transportPendingPatch = buildTransportPendingSyncPatch(
                 existing,
@@ -301,6 +318,7 @@ export function useSubSessions(
                 existing.sessionName,
               );
               updated[existingIdx] = { ...updated[existingIdx],
+                ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
                 ...(m.state != null && { state: m.state as SubSession['state'] }),
                 ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
                 ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
@@ -324,6 +342,10 @@ export function useSubSessions(
                     m.transportConfig,
                     updated[existingIdx].transportConfig,
                   ),
+                }),
+                ...(m.supervisionMode !== undefined && { supervisionMode: m.supervisionMode }),
+                ...(m.supervisionHeartbeat !== undefined && {
+                  supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
                 }),
                 ...transportPendingPatch,
                 ...(m.qwenModel != null && { qwenModel: m.qwenModel }),
@@ -354,6 +376,7 @@ export function useSubSessions(
               createdAt: now,
               updatedAt: now,
               state: (m.state || 'idle') as SubSession['state'],
+              ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
               qwenModel: m.qwenModel ?? null,
               requestedModel: m.requestedModel ?? null,
               activeModel: m.activeModel ?? m.modelDisplay ?? null,
@@ -371,6 +394,8 @@ export function useSubSessions(
               executionCloneKind: m.executionCloneKind ?? null,
               parentRunId: m.parentRunId ?? null,
               transportConfig: m.transportConfig ?? null,
+              supervisionMode: m.supervisionMode ?? null,
+              supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
               ...transportPendingPatch,
             }];
           });
@@ -393,9 +418,11 @@ export function useSubSessions(
         if (m.id) {
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
+            if (isOlderActivityGeneration(m.activityGeneration, s.activityGeneration)) return s;
             const preserveQuota = isCodexFamily(s.type);
             const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
+              ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
               ...(m.sessionInstanceId !== undefined ? { sessionInstanceId: m.sessionInstanceId } : {}),
               ...(m.runtimeEpoch !== undefined ? { runtimeEpoch: m.runtimeEpoch } : {}),
@@ -422,6 +449,10 @@ export function useSubSessions(
                   s.transportConfig,
                 ),
               } : {}),
+              ...(m.supervisionMode !== undefined ? { supervisionMode: m.supervisionMode } : {}),
+              ...(m.supervisionHeartbeat !== undefined ? {
+                supervisionHeartbeat: parseSupervisionHeartbeatSnapshot(m.supervisionHeartbeat),
+              } : {}),
               ...transportPendingPatch,
             };
           }));
@@ -445,6 +476,10 @@ export function useSubSessions(
             const idx = prev.findIndex((s) => s.sessionName === subSessionName);
             if (idx === -1) return prev;
             const existing = prev[idx];
+            if (isOlderActivityGeneration(
+              (payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike,
+              existing.activityGeneration,
+            )) return prev;
             if (existing.queueEpoch && queueEpoch && existing.queueEpoch !== queueEpoch) return prev;
             if (existing.queueAuthorityId && queueAuthorityId && existing.queueAuthorityId !== queueAuthorityId) return prev;
             const nextQueue = removeTransportPendingEntryForUserMessage(
@@ -454,10 +489,20 @@ export function useSubSessions(
               subSessionName,
             );
             const advancedVersion = nextTransportQueueVersion(existing.transportPendingMessageVersion ?? undefined, incomingVersion);
+            const settledIds = [...new Set([...(existing.transportPendingSettledMessageIds ?? []), clientMessageId])].sort();
             if (!nextQueue.changed) {
-              if (advancedVersion === (existing.transportPendingMessageVersion ?? undefined)) return prev;
+              if (advancedVersion === (existing.transportPendingMessageVersion ?? undefined)
+                && settledIds.length === (existing.transportPendingSettledMessageIds?.length ?? 0)
+                && settledIds.every((id, index) => id === existing.transportPendingSettledMessageIds?.[index])) return prev;
               const nextSame = [...prev];
-              nextSame[idx] = { ...existing, transportPendingMessageVersion: advancedVersion };
+              nextSame[idx] = {
+                ...existing,
+                transportPendingMessageVersion: advancedVersion,
+                transportPendingSettledMessageIds: settledIds,
+                ...((payload as Record<string, unknown>).activityGeneration !== undefined
+                  ? { activityGeneration: (payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                  : {}),
+              };
               return nextSame;
             }
             const next = [...prev];
@@ -467,6 +512,10 @@ export function useSubSessions(
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
               transportPendingMessageVersion: advancedVersion,
+              transportPendingSettledMessageIds: settledIds,
+              ...((payload as Record<string, unknown>).activityGeneration !== undefined
+                ? { activityGeneration: (payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                : {}),
             };
             return next;
           });
@@ -479,6 +528,10 @@ export function useSubSessions(
           setSubSessions((prev) => {
             const idx = prev.findIndex((s) => s.sessionName === subSessionName);
             if (idx === -1) return prev;
+            if (isOlderActivityGeneration(
+              (ev.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike,
+              prev[idx].activityGeneration,
+            )) return prev;
             const nextQueue = removeTransportPendingEntryForUserMessage(
               prev[idx].transportPendingMessageEntries,
               prev[idx].transportPendingMessages,
@@ -490,10 +543,22 @@ export function useSubSessions(
               subSessionName,
             );
             const advancedVersion = nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingVersion);
+            const settledId = typeof ev.payload.clientMessageId === 'string' ? ev.payload.clientMessageId.trim() : '';
+            const settledIds = settledId
+              ? [...new Set([...(prev[idx].transportPendingSettledMessageIds ?? []), settledId])].sort()
+              : prev[idx].transportPendingSettledMessageIds;
             if (!nextQueue.changed) {
-              if (advancedVersion === (prev[idx].transportPendingMessageVersion ?? undefined)) return prev;
+              if (advancedVersion === (prev[idx].transportPendingMessageVersion ?? undefined)
+                && settledIds === prev[idx].transportPendingSettledMessageIds) return prev;
               const nextSame = [...prev];
-              nextSame[idx] = { ...nextSame[idx], transportPendingMessageVersion: advancedVersion };
+              nextSame[idx] = {
+                ...nextSame[idx],
+                transportPendingMessageVersion: advancedVersion,
+                ...((ev.payload as Record<string, unknown>).activityGeneration !== undefined
+                  ? { activityGeneration: (ev.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                  : {}),
+                ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
+              };
               return nextSame;
             }
             const next = [...prev];
@@ -503,6 +568,10 @@ export function useSubSessions(
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
               transportPendingMessageVersion: advancedVersion,
+              ...((ev.payload as Record<string, unknown>).activityGeneration !== undefined
+                ? { activityGeneration: (ev.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                : {}),
+              ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
             };
             return next;
           });
@@ -526,19 +595,29 @@ export function useSubSessions(
 
       if (!sessionName || !sessionName.startsWith('deck_sub_')) return;
       if (state === 'queued' || state === 'running' || state === 'idle') {
+        // Streaming text, tool calls and repeated session.state frames say
+        // "running"/"idle" again and again: keep the same array when nothing
+        // changed so App (and every mounted window) is not re-rendered for it.
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
-          const next = [...prev];
+          const statePayload = msg.type === 'timeline.event' && msg.event.payload && typeof msg.event.payload === 'object'
+            ? msg.event.payload as Record<string, unknown>
+            : undefined;
+          if (isOlderActivityGeneration(statePayload?.activityGeneration as ActivityGenerationLike, prev[idx].activityGeneration)) {
+            return prev;
+          }
           const transportPendingPatch = msg.type === 'timeline.event' && msg.event.type === 'session.state'
-            ? buildTransportPendingSyncPatch(prev[idx], msg.event.payload as Record<string, unknown>, sessionName)
+            ? buildTransportPendingSyncPatch(prev[idx], statePayload!, sessionName)
             : {};
-          next[idx] = {
-            ...next[idx],
+          return replaceAtIfChanged(prev, idx, {
+            ...prev[idx],
             state: state as SubSession['state'],
+            ...(statePayload?.activityGeneration !== undefined
+              ? { activityGeneration: statePayload.activityGeneration as ActivityGenerationLike }
+              : {}),
             ...transportPendingPatch,
-          };
-          return next;
+          });
         });
         return;
       }
@@ -691,7 +770,10 @@ export function useSubSessions(
   }, [serverId]);
 
   /** Update local state for a sub-session (does NOT write to DB — caller handles that). */
-  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession, 'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'transportConfig'>>) => {
+  const updateLocal = useCallback((id: string, fields: Partial<Pick<SubSession,
+    'type' | 'runtimeType' | 'label' | 'description' | 'cwd' | 'state' | 'authoritativeIdleAt' | 'transportConfig'
+    | 'requestedModel' | 'activeModel' | 'modelDisplay'
+  >>) => {
     setSubSessions((prev) => prev.map((s) =>
       s.id === id ? { ...s, ...fields } : s,
     ));

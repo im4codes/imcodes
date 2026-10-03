@@ -91,6 +91,8 @@ export interface MemorySearchResultItem {
   projectionClass?: ProcessedContextClass;
   /** Session whose timeline produced this projection, when provenance is known. */
   sourceSessionName?: string;
+  /** Daemon that owns the projection's raw sources, when remotely replicated. */
+  originServerId?: string;
   summary: string;
   content?: string;
   createdAt: number;

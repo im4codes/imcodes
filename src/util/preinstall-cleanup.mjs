@@ -106,7 +106,9 @@ function clearAtomicRenameLeftovers(globalNodeModules) {
 // primitive, not npm's — but a stale one signals a previous killed
 // upgrade, which often comes paired with the npm-side leftovers above.
 function clearStaleUpgradeLock() {
-  const lockDir = join(homedir(), '.imcodes', 'upgrade.lock.d');
+  // IMCODES_HOME is the state directory itself (this script runs alone at npm-install time: no imports from the daemon).
+  const stateDir = process.env.IMCODES_HOME?.trim() || join(homedir(), '.imcodes');
+  const lockDir = join(stateDir, 'upgrade.lock.d');
   if (!existsSync(lockDir)) return;
   let started = '';
   const startedFile = join(lockDir, 'started');

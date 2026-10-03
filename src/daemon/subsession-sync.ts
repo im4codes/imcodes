@@ -10,6 +10,7 @@ import { EXECUTION_CLONE_KIND, type ExecutionCloneMetadata } from '../../shared/
 import logger from '../util/logger.js';
 import type { QueueSnapshot } from '../../shared/transport-queue-types.js';
 import { buildTransportQueueSnapshotPayload, type TransportQueueSnapshotPayload } from './transport-queue-projection.js';
+import { getSupervisionHeartbeatProjectionForWire } from './supervision-heartbeat-projection.js';
 
 /**
  * Runtime-identity fields that MUST NOT replicate to Postgres for an execution
@@ -77,7 +78,7 @@ export async function buildSubSessionSyncPayload(
     return null;
   }
 
-  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta'>> = isQwenSession(r.agentType)
+  const freshDisplay: Partial<Pick<SessionRecord, 'modelDisplay' | 'codexAvailableModels' | 'planLabel' | 'quotaLabel' | 'quotaUsageLabel' | 'quotaMeta' | 'codexCreditsBalance' | 'codexCreditsHasCredits' | 'codexCreditsUnlimited'>> = isQwenSession(r.agentType)
     ? getQwenDisplayMetadata({
         model: r.qwenModel,
         authType: r.qwenAuthType,
@@ -139,6 +140,7 @@ export async function buildSubSessionSyncPayload(
     contextRetryExhausted: r.contextRetryExhausted ?? null,
     contextSharedPolicyOverride: r.contextSharedPolicyOverride ?? null,
     transportConfig: r.transportConfig ?? null,
+    supervisionHeartbeat: getSupervisionHeartbeatProjectionForWire(sessionName) ?? null,
     qwenModel: r.qwenModel ?? null,
     qwenAuthType: r.qwenAuthType ?? null,
     qwenAuthLimit: r.qwenAuthLimit ?? null,
@@ -149,6 +151,9 @@ export async function buildSubSessionSyncPayload(
     quotaLabel: usageQuota?.quotaLabel ?? freshDisplay.quotaLabel ?? r.quotaLabel ?? null,
     quotaUsageLabel: freshDisplay.quotaUsageLabel ?? r.quotaUsageLabel ?? null,
     quotaMeta: usageQuota?.quotaMeta ?? freshDisplay.quotaMeta ?? r.quotaMeta ?? null,
+    codexCreditsBalance: freshDisplay.codexCreditsBalance ?? r.codexCreditsBalance ?? null,
+    codexCreditsHasCredits: freshDisplay.codexCreditsHasCredits ?? r.codexCreditsHasCredits ?? null,
+    codexCreditsUnlimited: freshDisplay.codexCreditsUnlimited ?? r.codexCreditsUnlimited ?? null,
     effort: r.effort ?? null,
     ...(transportQueue ?? {}),
   };

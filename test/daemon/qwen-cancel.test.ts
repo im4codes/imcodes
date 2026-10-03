@@ -17,14 +17,24 @@ class MockChild extends EventEmitter {
   readonly stderr = new EventEmitter();
   private signals: string[] = [];
 
+  /**
+   * Opt in to modelling a WELL-BEHAVED process: one that honours SIGTERM and
+   * exits within the grace window. Left null, this mock ignores SIGTERM
+   * entirely, which is the stubborn process the escalation exists for.
+   */
+  exitOnSigtermAfterMs: number | null = null;
+
   kill(signal?: string): boolean {
-    this.signals.push(signal ?? 'SIGTERM');
+    const delivered = signal ?? 'SIGTERM';
+    this.signals.push(delivered);
     // Match Node's ChildProcess semantics: `child.killed` becomes true as soon
     // as a signal is sent, even if the process ignores SIGTERM and never exits.
     this.killed = true;
-    if (signal === 'SIGKILL') {
+    if (delivered === 'SIGKILL') {
       // SIGKILL always works — schedule close
       setTimeout(() => this.emit('close', null, 'SIGKILL'), 0);
+    } else if (delivered === 'SIGTERM' && this.exitOnSigtermAfterMs !== null) {
+      setTimeout(() => this.exit(null, 'SIGTERM'), this.exitOnSigtermAfterMs);
     }
     return true;
   }
@@ -120,37 +130,40 @@ describe('Qwen provider cancel', () => {
     await sendPromise;
   });
 
-  it('escalates to SIGKILL after 2 seconds if SIGTERM is ignored', async () => {
+  it('escalates a SIGTERM-ignoring process to SIGKILL before cancel resolves', async () => {
     const sessionId = await provider.createSession({ sessionKey: 'test-2', cwd: '/tmp' });
 
     const sendPromise = provider.send(sessionId, 'hello').catch(() => {});
     const child = await waitForSpawn(0);
 
+    // This mock ignores SIGTERM, so the grace window must elapse and the
+    // escalation must run. `cancel` AWAITS that lifecycle now, so both signals
+    // have already been delivered by the time it resolves — teardown is no
+    // longer fire-and-forget, and a caller that awaits it is entitled to assume
+    // the process is really gone.
     await provider.cancel(sessionId);
-    expect(child.getSignals()).toEqual(['SIGTERM']);
 
-    // Process ignores SIGTERM — advance past the 2s escalation
-    await vi.advanceTimersByTimeAsync(2100);
-
-    expect(child.getSignals()).toContain('SIGKILL');
+    expect(child.getSignals()).toEqual(['SIGTERM', 'SIGKILL']);
+    // Order is the contract: graceful first, escalation only after.
+    expect(child.getSignals().indexOf('SIGTERM'))
+      .toBeLessThan(child.getSignals().indexOf('SIGKILL'));
 
     await sendPromise;
   });
 
-  it('does not SIGKILL if process exits before 2s timeout', async () => {
+  it('does not SIGKILL a process that exits inside the grace window', async () => {
     const sessionId = await provider.createSession({ sessionKey: 'test-3', cwd: '/tmp' });
 
     const sendPromise = provider.send(sessionId, 'hello').catch(() => {});
     const child = await waitForSpawn(0);
+    // A well-behaved process: it honours SIGTERM well inside the 2s window.
+    child.exitOnSigtermAfterMs = 10;
 
     await provider.cancel(sessionId);
-    expect(child.getSignals()).toEqual(['SIGTERM']);
 
-    // Process exits gracefully within 2s
-    child.exit(null, 'SIGTERM');
-    await vi.advanceTimersByTimeAsync(2100);
-
-    // Only SIGTERM was sent — no SIGKILL
+    // The escalation must be skipped entirely, not merely deferred: teardown
+    // observed the exit and stopped. If it ever stops observing, it would sit
+    // out the full window and SIGKILL something that had already died.
     expect(child.getSignals()).toEqual(['SIGTERM']);
 
     await sendPromise;

@@ -1,5 +1,7 @@
 import { PROVIDER_STATUS_REASON } from './provider-status-reasons.js';
 import { MCP_ERROR_REASONS } from './memory-mcp-errors.js';
+import { CODEBUDDY_PROVIDER_IDS } from './codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from './hermes-agent.js';
 
 export const MEMORY_WS = {
   SEARCH: 'memory.search',
@@ -70,6 +72,7 @@ export const MEMORY_MCP_PROVIDER_ID = {
   GEMINI_SDK: 'gemini-sdk',
   GROK_SDK: 'grok-sdk',
   KIMI_SDK: 'kimi-sdk',
+  HERMES_AGENT: HERMES_AGENT_PROVIDER_ID,
   COPILOT_SDK: 'copilot-sdk',
   CODEX_SDK: 'codex-sdk',
   QODER_SDK: 'qoder-sdk',
@@ -78,6 +81,8 @@ export const MEMORY_MCP_PROVIDER_ID = {
   QWEN: 'qwen',
   DEEPSEEK_HARNESS: 'deepseek-harness',
   PI: 'pi',
+  CODEBUDDY_CHINA: CODEBUDDY_PROVIDER_IDS.CHINA,
+  CODEBUDDY_INTERNATIONAL: CODEBUDDY_PROVIDER_IDS.INTERNATIONAL,
 } as const;
 
 export const MEMORY_MCP_PROVIDER_IDS = [
@@ -85,6 +90,7 @@ export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.GEMINI_SDK,
   MEMORY_MCP_PROVIDER_ID.GROK_SDK,
   MEMORY_MCP_PROVIDER_ID.KIMI_SDK,
+  MEMORY_MCP_PROVIDER_ID.HERMES_AGENT,
   MEMORY_MCP_PROVIDER_ID.COPILOT_SDK,
   MEMORY_MCP_PROVIDER_ID.CODEX_SDK,
   MEMORY_MCP_PROVIDER_ID.QODER_SDK,
@@ -93,6 +99,8 @@ export const MEMORY_MCP_PROVIDER_IDS = [
   MEMORY_MCP_PROVIDER_ID.QWEN,
   MEMORY_MCP_PROVIDER_ID.DEEPSEEK_HARNESS,
   MEMORY_MCP_PROVIDER_ID.PI,
+  MEMORY_MCP_PROVIDER_ID.CODEBUDDY_CHINA,
+  MEMORY_MCP_PROVIDER_ID.CODEBUDDY_INTERNATIONAL,
 ] as const;
 
 export type MemoryMcpProviderId = (typeof MEMORY_MCP_PROVIDER_IDS)[number];

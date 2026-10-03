@@ -44,6 +44,16 @@ export default defineConfig({
     timeout: 180_000,
   },
   projects: [
+    // Correctness specs. The comment above has always described this split, but
+    // the project and its `test:browser` script were missing, so `web/e2e` could
+    // only ever run the perf spec. Restored here; `testIgnore` is what keeps the
+    // two commands disjoint, so a perf spec can never be pulled into a
+    // correctness run (and `test:browser:perf` still selects only `performance`).
+    {
+      name: 'correctness',
+      testIgnore: /.*\.perf\.spec\.ts/,
+      use: { ...devices['Desktop Chrome'], viewport: { width: 1280, height: 720 } },
+    },
     {
       name: 'performance',
       testMatch: /.*\.perf\.spec\.ts/,

@@ -1,0 +1,354 @@
+import { useCallback, useRef, useState } from 'preact/hooks';
+import { useTranslation } from 'react-i18next';
+import type { MachineListItem } from '../api/machines.js';
+import type { WsClient } from '../ws-client.js';
+import {
+  RemoteDesktopConnectionManager,
+  remoteDesktopHostKey,
+} from '../remote-desktop-connection-manager.js';
+import {
+  REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS,
+  REMOTE_DESKTOP_WORKSPACE_WINDOW_ID,
+  remoteDesktopWorkspaceHosts,
+  type RemoteDesktopWorkspaceMachine,
+  type RemoteDesktopWorkspaceState,
+  type RemoteDesktopWorkspaceTabId,
+} from '../remote-desktop-workspace-state.js';
+import { canOpenRemoteDesktopMachine } from '../remote-desktop-profile.js';
+import { openRemoteDesktopWindow } from '../remote-desktop-window.js';
+import { useFullscreen } from '../hooks/useFullscreen.js';
+import { FloatingPanel } from './FloatingPanel.js';
+import { RemoteDesktopPanel } from './RemoteDesktopPanel.js';
+import {
+  RemoteDesktopMinimizedDock,
+  rememberMinimizeOrigin,
+  type RemoteDesktopMinimizeOrigin,
+} from './RemoteDesktopMinimizedDock.js';
+import type { UseQuickDataResult } from './QuickInputPanel.js';
+import { ControlledNodeMachineMenu } from './ControlledNodeMachineMenu.js';
+import './remote-desktop-workspace.css';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
+
+export interface RemoteDesktopWorkspaceProps {
+  state: RemoteDesktopWorkspaceState;
+  manager: RemoteDesktopConnectionManager;
+  ws?: WsClient | null;
+  minimized?: boolean;
+  zIndex?: number;
+  onFocus?(): void;
+  onMinimize?(): void;
+  onRestore?(): void;
+  onOpenHost(machine: RemoteDesktopWorkspaceMachine): void;
+  onActivateTab(tabId: RemoteDesktopWorkspaceTabId): void;
+  onCloseHost(hostKey: string): void;
+  onReorderHost(hostKey: string, direction: -1 | 1): void;
+  onCloseWorkspace(): void;
+  wallHostKeys?: ReadonlySet<string>;
+  /**
+   * Whether a host may be torn off into its own browser window. Off by
+   * default, and off on mobile, where a popup either never opens or opens as a
+   * tab you cannot get back from.
+   */
+  allowStandaloneWindow?: boolean;
+  /**
+   * The workspace is its own browser window: fill it edge to edge instead of
+   * floating a remembered-size panel inside it. Mirrors RemoteDesktopWall's
+   * own `standalone`.
+   */
+  standalone?: boolean;
+  quickData?: UseQuickDataResult;
+}
+
+export function RemoteDesktopWorkspace({
+  state,
+  manager,
+  ws = null,
+  minimized = false,
+  zIndex,
+  onFocus,
+  onMinimize,
+  onRestore,
+  onOpenHost,
+  onActivateTab,
+  onCloseHost,
+  onReorderHost,
+  onCloseWorkspace,
+  wallHostKeys = new Set(),
+  allowStandaloneWindow = false,
+  standalone = false,
+  quickData,
+}: RemoteDesktopWorkspaceProps) {
+  const { t } = useTranslation();
+  const workspaceRef = useRef<HTMLDivElement | null>(null);
+  const minimizeOriginRef = useRef<RemoteDesktopMinimizeOrigin | null>(null);
+  // Fullscreen on the workspace, not on the active panel: the tab bar has to
+  // come with it, or fullscreen becomes a one-way door out of every other
+  // machine you had open.
+  const fullscreen = useFullscreen(workspaceRef);
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const addButtonRef = useRef<HTMLButtonElement | null>(null);
+  const tabButtonsRef = useRef(new Map<RemoteDesktopWorkspaceTabId, HTMLButtonElement>());
+  const hosts = remoteDesktopWorkspaceHosts(state);
+
+  const atHostLimit = hosts.length >= REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS;
+  const hostLimitNotice = t('remote_desktop.workspace_limit', { count: REMOTE_DESKTOP_WORKSPACE_MAX_HOSTS });
+  const closePicker = useCallback(() => setPickerOpen(false), []);
+  // A host already open is always pickable: picking it just brings it forward.
+  // At the limit, only those remain pickable.
+  const isPickable = useCallback((machine: MachineListItem) => canOpenRemoteDesktopMachine(machine)
+    && (!atHostLimit || !!state.hosts[remoteDesktopHostKey(machine)]), [atHostLimit, state.hosts]);
+  const pickDisabledReason = useCallback((machine: MachineListItem) => (
+    canOpenRemoteDesktopMachine(machine) ? hostLimitNotice : undefined
+  ), [hostLimitNotice]);
+
+  const activate = useCallback((tabId: RemoteDesktopWorkspaceTabId) => {
+    if (tabId === state.activeTabId) return;
+    manager.releaseInput(state.activeTabId);
+    onActivateTab(tabId);
+  }, [manager, onActivateTab, state.activeTabId]);
+
+  const closeHost = useCallback((hostKey: string) => {
+    if (!wallHostKeys.has(hostKey)) {
+      manager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_HOST_CLOSE);
+    }
+    onCloseHost(hostKey);
+  }, [manager, onCloseHost, wallHostKeys]);
+
+  const closeWorkspace = useCallback(() => {
+    if (state.orderedHostKeys.length > 1 && !window.confirm(t(
+      'remote_desktop.workspace_close_confirm',
+      { count: state.orderedHostKeys.length },
+    ))) return;
+    for (const hostKey of state.orderedHostKeys) {
+      if (!wallHostKeys.has(hostKey)) {
+        manager.stop(hostKey, REMOTE_DESKTOP_STOP_ORIGIN.WORKSPACE_CLOSE);
+      }
+    }
+    onCloseWorkspace();
+  }, [manager, onCloseWorkspace, state.orderedHostKeys, t, wallHostKeys]);
+
+  /**
+   * Move the active host into its own window.
+   *
+   * The tab closes here once the window is actually open. Leaving it would
+   * keep a second live session on the same machine, and the two would fight
+   * over control of it. If the popup was blocked, nothing is closed -- losing
+   * the session to a blocker you cannot see would be the worst of both.
+   */
+  const openActiveInWindow = useCallback(() => {
+    const hostKey = state.activeTabId;
+    const machine = state.hosts[hostKey]?.machine;
+    if (!machine) return;
+    if (openRemoteDesktopWindow(machine.serverId)) closeHost(hostKey);
+  }, [closeHost, state.activeTabId, state.hosts]);
+
+  const selectHost = useCallback((machine: RemoteDesktopWorkspaceMachine) => {
+    setPickerOpen(false);
+    onOpenHost(machine);
+  }, [onOpenHost]);
+
+  const tabIds = [...state.orderedHostKeys];
+  const handleTabKeyDown = (event: KeyboardEvent, tabId: RemoteDesktopWorkspaceTabId) => {
+    const index = tabIds.indexOf(tabId);
+    let nextIndex: number | null = null;
+    if (event.altKey && event.key === 'ArrowLeft') {
+      event.preventDefault();
+      onReorderHost(tabId, -1);
+      return;
+    }
+    if (event.altKey && event.key === 'ArrowRight') {
+      event.preventDefault();
+      onReorderHost(tabId, 1);
+      return;
+    }
+    if (event.key === 'ArrowLeft') nextIndex = (index - 1 + tabIds.length) % tabIds.length;
+    if (event.key === 'ArrowRight') nextIndex = (index + 1) % tabIds.length;
+    if (event.key === 'Home') nextIndex = 0;
+    if (event.key === 'End') nextIndex = tabIds.length - 1;
+    if (event.key === 'Delete') {
+      event.preventDefault();
+      closeHost(tabId);
+      return;
+    }
+    if (nextIndex === null) return;
+    event.preventDefault();
+    const nextTabId = tabIds[nextIndex];
+    activate(nextTabId);
+    requestAnimationFrame(() => tabButtonsRef.current.get(nextTabId)?.focus());
+  };
+
+  const content = (
+    <div
+      class="remote-desktop-workspace"
+      ref={workspaceRef}
+      data-active-tab={state.activeTabId}
+      // Machine names and window chrome are controls, not selectable page
+      // text. This also fences the native Copy/Translate menu if a WebView
+      // emits contextmenu despite the CSS callout suppression.
+      onContextMenu={(event) => event.preventDefault()}
+      onDragStart={(event) => event.preventDefault()}
+    >
+      <div class="remote-desktop-workspace-tabbar">
+        <div role="tablist" aria-label={t('remote_desktop.workspace_tabs')}>
+          {hosts.map(({ hostKey, machine }) => (
+            <span
+              class={`remote-desktop-workspace-host-tab${state.activeTabId === hostKey ? ' is-active' : ''}`}
+              key={hostKey}
+            >
+              <button
+                class="remote-desktop-workspace-tab"
+                type="button"
+                role="tab"
+                ref={(element) => {
+                  if (element) tabButtonsRef.current.set(hostKey, element);
+                  else tabButtonsRef.current.delete(hostKey);
+                }}
+                aria-selected={state.activeTabId === hostKey}
+                tabIndex={state.activeTabId === hostKey ? 0 : -1}
+                onClick={() => activate(hostKey)}
+                onKeyDown={(event) => handleTabKeyDown(event, hostKey)}
+              >{machine.displayName}</button>
+              <button
+                class="remote-desktop-workspace-tab-close"
+                type="button"
+                onClick={() => closeHost(hostKey)}
+                aria-label={t('remote_desktop.workspace_close_tab', { machine: machine.displayName })}
+              ><svg width="16" height="16" viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
+            </span>
+          ))}
+        </div>
+        <button
+          type="button"
+          class="remote-desktop-workspace-add remote-desktop-workspace-icon-button"
+          ref={addButtonRef}
+          aria-haspopup="menu"
+          aria-expanded={pickerOpen}
+          aria-label={t('remote_desktop.workspace_add')}
+          onClick={() => setPickerOpen((current) => !current)}
+        ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12" /></svg></button>
+        <div class="remote-desktop-workspace-actions">
+          {allowStandaloneWindow && hosts.length > 0 && (
+            <button
+              class="remote-desktop-workspace-chrome-button remote-desktop-workspace-open-window"
+              type="button"
+              onClick={openActiveInWindow}
+              aria-label={t('remote_desktop.workspace_open_new_window')}
+              title={t('remote_desktop.workspace_open_new_window')}
+            ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M11 4h5v5M16 4l-7 7M14 11v5H4V6h5" /></svg></button>
+          )}
+          {fullscreen.supported && (
+            <button
+              class="remote-desktop-workspace-chrome-button remote-desktop-workspace-fullscreen"
+              type="button"
+              aria-pressed={fullscreen.active}
+              onClick={() => { void fullscreen.toggle(); }}
+              aria-label={t(fullscreen.active
+                ? 'remote_desktop.workspace_exit_fullscreen'
+                : 'remote_desktop.workspace_fullscreen')}
+              title={t(fullscreen.active
+                ? 'remote_desktop.workspace_exit_fullscreen'
+                : 'remote_desktop.workspace_fullscreen')}
+            >{fullscreen.active
+              ? <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M8 3v5H3M12 17v-5h5" /></svg>
+              : <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M4 8V4h4M16 12v4h-4M16 8V4h-4M4 12v4h4" /></svg>}</button>
+          )}
+          {onMinimize && (
+            <button
+              class="remote-desktop-workspace-chrome-button"
+              type="button"
+              onClick={(event) => {
+                rememberMinimizeOrigin(minimizeOriginRef, event.currentTarget);
+                onMinimize();
+              }}
+              aria-label={t('window.minimize')}
+              title={t('window.minimize')}
+            ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 13h10" /></svg></button>
+          )}
+          <button
+            class="remote-desktop-workspace-chrome-button is-danger"
+            type="button"
+            onClick={closeWorkspace}
+            aria-label={t('remote_desktop.workspace_close')}
+            title={t('remote_desktop.workspace_close')}
+          ><svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 6 8 8M14 6l-8 8" /></svg></button>
+        </div>
+      </div>
+
+      <label class="remote-desktop-workspace-mobile-selector">
+        <span>{t('remote_desktop.workspace_select')}</span>
+        <select value={state.activeTabId} onInput={(event) => activate(event.currentTarget.value)}>
+          {hosts.map(({ hostKey, machine }) => (
+            <option value={hostKey} key={hostKey}>{machine.displayName}</option>
+          ))}
+        </select>
+      </label>
+
+      <ControlledNodeMachineMenu
+        anchorRef={addButtonRef}
+        open={pickerOpen}
+        onClose={closePicker}
+        onSelect={selectHost}
+        onOpenInWindow={allowStandaloneWindow
+          ? (machine) => { openRemoteDesktopWindow(machine.serverId); }
+          : undefined}
+        isSelectable={isPickable}
+        disabledReason={pickDisabledReason}
+        label={t('remote_desktop.workspace_picker')}
+        emptyText={t('remote_desktop.workspace_picker_empty')}
+        errorText={t('remote_desktop.workspace_picker_failed')}
+        notice={atHostLimit ? hostLimitNotice : undefined}
+      />
+
+      {hosts.map(({ hostKey, machine }) => (
+        <RemoteDesktopPanel
+          key={hostKey}
+          machine={machine}
+          connectionManager={manager}
+          ws={ws}
+          embedded
+          active={state.activeTabId === hostKey}
+          inputActive={state.activeTabId === hostKey}
+          quickData={quickData}
+          onClose={() => closeHost(hostKey)}
+          onAuthorityLost={() => closeHost(hostKey)}
+        />
+      ))}
+    </div>
+  );
+
+  if (standalone) {
+    return <div class="remote-desktop-workspace-standalone">{content}</div>;
+  }
+
+  return (
+    <>
+      <div class="remote-desktop-workspace-window" hidden={minimized}>
+        <FloatingPanel
+          id={REMOTE_DESKTOP_WORKSPACE_WINDOW_ID}
+          title={t('remote_desktop.workspace_title')}
+          onClose={closeWorkspace}
+          zIndex={zIndex ?? 10020}
+          onFocus={onFocus}
+          defaultW={1240}
+          defaultH={800}
+          minW={680}
+          minH={460}
+          className="remote-desktop-workspace-shell"
+          hideTitleBar
+          dragHandleSelector=".remote-desktop-workspace-tabbar"
+        >{content}</FloatingPanel>
+      </div>
+      {minimized && (
+        <RemoteDesktopMinimizedDock
+          originRef={minimizeOriginRef}
+          onRestore={() => {
+            onRestore?.();
+            onFocus?.();
+          }}
+          ariaLabel={t('remote_desktop.workspace_restore', { count: hosts.length })}
+          label={`${t('remote_desktop.workspace_title')} · ${hosts.length}`}
+        />
+      )}
+    </>
+  );
+}

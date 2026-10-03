@@ -1,0 +1,441 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_DB: imcodes_perf
+      POSTGRES_USER: imcodes_perf
+      POSTGRES_PASSWORD: perf-only-password
+    tmpfs: /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U imcodes_perf -d imcodes_perf"]
+      interval: 2s
+      timeout: 2s
+      retries: 20
+    cpus: 1.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
+    mem_limit: 512m
+    pids_limit: 128
+
+  server:
+    build:
+      context: ../../..
+      dockerfile: server/Dockerfile
+      args:
+        IMC_PERF_SOURCEMAP: ${IMC_PERF_SOURCEMAP:-1}
+        PRELOAD_EMBEDDING_MODEL: "0"
+    environment:
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+      JWT_SIGNING_KEY: perf-only-jwt-jwt-signing-key-32-bytes-minimum
+      NODE_ENV: production
+      PORT: 19138
+      SERVER_URL: http://server:19138
+      # The harness opens the real SPA from the server origin so browser WS
+      # upgrades are same-origin; retain web:4300 for the optional fixture.
+      # Remote-OS matrix runs point a browser at the server's published host
+      # port. Keep the in-network defaults, while allowing an isolated run to
+      # add its externally visible origin without editing the fixture.
+      ALLOWED_ORIGINS: ${IMC_PERF_ALLOWED_ORIGINS:-http://web:4300,http://server:19138}
+      HOME: /tmp/imc-perf-home
+      IMCODES_HOME: /tmp/imc-perf-home/.imcodes
+      IMCODES_PERF_DEBUG: "1"
+      # Unset (default) in every profile except identity: readTurnServiceConfig
+      # (server/src/ws/turn-credentials.ts) requires TURN_ENABLED=true, so this
+      # is a pure no-op everywhere else. TURN_HOST is the docker-network
+      # service name -- resolved by Docker's own DNS from inside the harness
+      # container, never a real public host. TURN_EXTERNAL_IP is validated
+      # (must be a syntactically valid IPv4) but never placed in the ICE
+      # server URL actually sent to clients, so a same-network coturn with no
+      # NAT to traverse does not need its own real external IP here.
+      TURN_ENABLED: ${TURN_ENABLED:-}
+      TURN_HOST: ${TURN_HOST:-}
+      TURN_PORT: ${TURN_PORT:-}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
+      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:-}
+      TURN_RELAY_MIN_PORT: ${TURN_RELAY_MIN_PORT:-}
+      TURN_RELAY_MAX_PORT: ${TURN_RELAY_MAX_PORT:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Host port is configurable so base/dev/Part-B runs can run in parallel;
+    # containers continue using server:19138 on their private network.
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_PORT_BASE:-19138}:19138"]
+    cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
+    mem_limit: 1g
+    pids_limit: 256
+
+  web:
+    image: node:24-bookworm-slim
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+    command: ["bash", "-lc", "cd web && npm ci --ignore-scripts --no-audit --no-fund && npm run build:fixtures && npm run serve:fixtures -- --host 0.0.0.0"]
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_WEB_PORT_BASE:-4300}:4300"]
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4300/src/fixtures/chat-timeline/index.html').then(() => process.exit(0)).catch(() => process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      start_period: 30s
+      retries: 180
+    cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
+    mem_limit: 4g
+    shm_size: 1g
+    pids_limit: 512
+
+  daemon:
+    image: browser-server
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - perf_home:/tmp/imc-perf-home
+      - perf_uploads:/tmp/imc-perf-uploads
+    environment:
+      HOME: /tmp/imc-perf-home
+      IMCODES_HOME: /tmp/imc-perf-home/.imcodes
+      IMCODES_PERF_SERVER_URL: ws://server:19138
+      IMCODES_PERF_MODE: "1"
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+      IMC_PERF_SERVER_URL: ws://server:19138
+      IMC_PERF_DAEMON_TOKEN: imc-perf-daemon-token
+      NODE_PATH: /app/node_modules
+      IMC_PERF_VARIANT: ${IMC_PERF_VARIANT:-baseline}
+      IMC_PERF_SESSIONS: ${IMC_PERF_SESSIONS:-20}
+      IMC_PERF_STREAM_HZ: ${IMC_PERF_STREAM_HZ:-25}
+      IMC_PERF_STREAM_MODE: ${IMC_PERF_STREAM_MODE:-}
+      IMC_PERF_STREAM_CONTENT: ${IMC_PERF_STREAM_CONTENT:-}
+      IMC_PERF_STREAM_CADENCE: ${IMC_PERF_STREAM_CADENCE:-}
+      IMC_PERF_STREAMING_SESSIONS: ${IMC_PERF_STREAMING_SESSIONS:-5}
+      IMC_PERF_UPLOAD_ROOT: /tmp/imc-perf-uploads
+      # Stale-window scenario (opt-in, see stale-window-open.spec.mjs); all inert unless set.
+      IMC_PERF_HISTORY_FAITHFUL: ${IMC_PERF_HISTORY_FAITHFUL:-0}
+      IMC_PERF_HISTORY_LATENCY_MS: ${IMC_PERF_HISTORY_LATENCY_MS:-0}
+      IMC_PERF_STALE_SESSION: ${IMC_PERF_STALE_SESSION:-0}
+      IMC_PERF_STALE_EVENTS: ${IMC_PERF_STALE_EVENTS:-6000}
+      IMC_PERF_STALE_CACHED: ${IMC_PERF_STALE_CACHED:-150}
+    command: ["node", "/repo/test/perf/browser/daemon-client.mjs"]
+    depends_on:
+      server:
+        condition: service_started
+    cpus: 1.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
+    mem_limit: 768m
+    pids_limit: 256
+
+  harness:
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - type: bind
+        source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
+        target: /repo/perf-results
+      - perf_uploads:/tmp/imc-perf-uploads:ro
+    environment:
+      HOME: /tmp/imc-perf-home
+      IMCODES_HOME: /tmp/imc-perf-home/.imcodes
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_FIXTURE_URL: http://web:4300
+      IMC_PERF_REVISION: ${IMC_PERF_REVISION:-unknown}
+      IMC_PERF_JWT_SIGNING_KEY: perf-only-jwt-jwt-signing-key-32-bytes-minimum
+      IMC_PERF_DURATION_MS: ${IMC_PERF_DURATION_MS:-10000}
+      IMC_PERF_SESSIONS: ${IMC_PERF_SESSIONS:-20}
+      IMC_PERF_LONG_CHATS: ${IMC_PERF_LONG_CHATS:-1}
+      IMC_PERF_SUB_WINDOWS: ${IMC_PERF_SUB_WINDOWS:-19}
+      IMC_PERF_OPEN_TIMEOUT_MS: ${IMC_PERF_OPEN_TIMEOUT_MS:-120000}
+      IMC_PERF_WINDOW_TIMEOUT_MS: ${IMC_PERF_WINDOW_TIMEOUT_MS:-90000}
+      IMC_PERF_VARIANT: ${IMC_PERF_VARIANT:-baseline}
+      IMC_PERF_STREAMING_SESSIONS: ${IMC_PERF_STREAMING_SESSIONS:-5}
+      IMC_PERF_SEED_MINIMIZED: ${IMC_PERF_SEED_MINIMIZED:-1}
+      IMC_PERF_NO_TRACING: ${IMC_PERF_NO_TRACING:-0}
+      IMC_PERF_KEYPRESS: ${IMC_PERF_KEYPRESS:-0}
+      IMC_PERF_CPU: ${IMC_PERF_CPU:-0}
+      IMC_PERF_LEAN: ${IMC_PERF_LEAN:-0}
+      IMC_PERF_CARD_LATENCY: ${IMC_PERF_CARD_LATENCY:-0}
+      IMC_PERF_FLICKER: ${IMC_PERF_FLICKER:-0}
+      IMC_PERF_STREAM_HZ: ${IMC_PERF_STREAM_HZ:-25}
+      IMC_PERF_STREAM_MODE: ${IMC_PERF_STREAM_MODE:-}
+      IMC_PERF_STREAM_CONTENT: ${IMC_PERF_STREAM_CONTENT:-}
+      IMC_PERF_STREAM_CADENCE: ${IMC_PERF_STREAM_CADENCE:-}
+      IMC_PERF_HARNESS_SHA: ${IMC_PERF_HARNESS_SHA:-unknown}
+      IMC_PERF_HARNESS_DIRTY: ${IMC_PERF_HARNESS_DIRTY:-unknown}
+      IMC_PERF_LOCK_WAIT_MS: ${IMC_PERF_LOCK_WAIT_MS:-0}
+      IMC_PERF_LOADAVG_BEFORE: ${IMC_PERF_LOADAVG_BEFORE:-unknown}
+      IMC_PERF_RENDER_DEBUG: ${IMC_PERF_RENDER_DEBUG:-0}
+      IMC_PERF_UPLOAD_ROOT: /tmp/imc-perf-uploads
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/run.mjs"]
+    depends_on:
+      web:
+        condition: service_healthy
+      server:
+        condition: service_started
+    cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
+    mem_limit: 4g
+    shm_size: 1g
+    pids_limit: 512
+
+  # Stale chat window opened on a phone-shaped browser: latest messages first, then the gap newest -> oldest.
+  # Kept behind the stale profile; the shared `daemon` service must run with IMC_PERF_HISTORY_FAITHFUL=1 and
+  # IMC_PERF_STALE_SESSION=1 (run-stale-window.sh sets both).
+  stale-harness:
+    profiles: ["stale"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - type: bind
+        source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
+        target: /repo/perf-results
+      # read-write: the spec drops the flip file that turns the fake daemon's stale session from "as the phone last saw
+      # it" into its full live history, and reads the request log the daemon writes here
+      - perf_uploads:/tmp/imc-perf-uploads
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_REVISION: ${IMC_PERF_REVISION:-unknown}
+      IMC_PERF_JWT_SIGNING_KEY: perf-only-jwt-jwt-signing-key-32-bytes-minimum
+      IMC_PERF_STALE_EVENTS: ${IMC_PERF_STALE_EVENTS:-6000}
+      IMC_PERF_STALE_CACHED: ${IMC_PERF_STALE_CACHED:-150}
+      IMC_PERF_STALE_CPU_RATE: ${IMC_PERF_STALE_CPU_RATE:-4}
+      IMC_PERF_STALE_MODES: ${IMC_PERF_STALE_MODES:-pinned,reading,fling,pinned-stream,reading-stream,reload}
+      IMC_PERF_STALE_MIN_FLINGS: ${IMC_PERF_STALE_MIN_FLINGS:-8}
+      IMC_PERF_STALE_EXPECT_HEAD: ${IMC_PERF_STALE_EXPECT_HEAD:-1}
+      IMC_PERF_STALE_SAMPLE_MS: ${IMC_PERF_STALE_SAMPLE_MS:-20000}
+      IMC_PERF_STALE_OUT: /repo/perf-results/stale-window
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/stale-window-open.spec.mjs"]
+    depends_on:
+      server:
+        condition: service_started
+      daemon:
+        condition: service_started
+    cpus: 2.0
+    cpuset: ${IMC_PERF_CPUSET:-0-3}
+    mem_limit: 4g
+    shm_size: 1g
+    pids_limit: 512
+
+  # Real tmux-backed daemon/browser scenario. Kept behind the shell profile so
+  # the timeline performance harness remains deterministic and isolated.
+  shell-daemon:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/real-daemon.Dockerfile
+    working_dir: /repo
+    volumes:
+      - shell_perf_home:/tmp/imc-shell-home
+    environment:
+      HOME: /tmp/imc-shell-home
+      IMCODES_HOME: /tmp/imc-shell-home/.imcodes
+      IMC_PERF_WORKER_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_DAEMON_TOKEN: imc-shell-real-daemon-token
+      IMCODES_TEST_DAEMON: "1"
+      IMCODES_CORE_LINK_WORKER: ${IMCODES_CORE_LINK_WORKER:-1}
+      IMCODES_CORE_LANE_TEST_BLOCK_MS: ${IMC_PERF_CORE_LANE_BLOCK_MS:-30000}
+      IMCODES_CORE_LANE_TEST_BLOCK_CONTROL_FILE: /tmp/imc-shell-home/.imcodes/core-lane-block.request
+      IMCODES_CORE_LANE_TEST_BLOCK_MARKER_FILE: /tmp/imc-shell-home/.imcodes/core-lane-block.request.marker
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_SHELL_CONTROL_PORT:-19139}:19139"]
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 256
+
+  shell-harness:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - shell_perf_results:/repo/perf-results
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_API_KEY: imc_shell_perf_browser_key
+      IMC_PERF_SHELL_SESSION: deck_shell_perf_brain
+      IMC_SHELL_FOCUSED: ${IMC_SHELL_FOCUSED:-0}
+      IMC_PERF_SHELL_MOUNT_TIMEOUT_MS: ${IMC_PERF_SHELL_MOUNT_TIMEOUT_MS:-180000}
+      IMC_PERF_SHELL_SCREENSHOT: ${IMC_PERF_SHELL_SCREENSHOT:-/repo/perf-results/shell-desktop.png}
+      IMC_PERF_SHELL_MOBILE_SCREENSHOT: ${IMC_PERF_SHELL_MOBILE_SCREENSHOT:-/repo/perf-results/shell-mobile.png}
+      IMC_PERF_FAULT: ${IMC_PERF_FAULT:-0}
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/shell-stream.spec.mjs"]
+    depends_on:
+      shell-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+      web:
+        condition: service_healthy
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
+  # Real WebRTC identity-over-lease scenario (tsk_cd_identity_p2p_phase2).
+  # Kept behind the identity profile for the same reason shell is: isolated,
+  # opt-in, and never part of the default timeline-perf run.
+  coturn:
+    profiles: ["identity"]
+    image: coturn/coturn:4.15.0-alpine
+    command:
+      - "-n"
+      - "--listening-ip=0.0.0.0"
+      - "--listening-port=3479"
+      - "--realm=imcodes-identity-perf"
+      - "--use-auth-secret"
+      - "--static-auth-secret=${TURN_SHARED_SECRET:-0000000000000000000000000000000000000000000000000000000000000000}"
+      - "--no-cli"
+      - "--min-port=65436"
+      - "--max-port=65535"
+      # Client, TURN server, and relay peer are all on the same docker-bridge
+      # private subnet here -- coturn's default anti-SSRF peer-IP checks
+      # otherwise silently drop relayed data to a private-range peer even
+      # after a successful Allocate/CreatePermission handshake.
+      - "--allow-loopback-peers"
+    ports:
+      - "3479:3479/udp"
+      - "3479:3479/tcp"
+      - "65436-65535:65436-65535/udp"
+    cpus: 0.5
+    mem_limit: 256m
+    pids_limit: 64
+
+  identity-daemon:
+    profiles: ["identity"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/identity-daemon.Dockerfile
+    working_dir: /repo
+    volumes:
+      - identity_perf_home:/tmp/imc-identity-home
+    environment:
+      HOME: /tmp/imc-identity-home
+      IMCODES_HOME: /tmp/imc-identity-home/.imcodes
+      LOG_LEVEL: ${IMC_PERF_IDENTITY_LOG_LEVEL:-info}
+      IMC_PERF_WORKER_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_identity_real_server
+      IMC_PERF_DAEMON_TOKEN: imc-identity-real-daemon-token
+      IMC_PERF_API_KEY: imc_identity_perf_browser_key
+      DATABASE_URL: postgresql://imcodes_perf:perf-only-password@postgres:5432/imcodes_perf
+    depends_on:
+      postgres:
+        condition: service_healthy
+      server:
+        condition: service_started
+    ports: ["${IMC_PERF_BIND_HOST:-127.0.0.1}:${IMC_PERF_IDENTITY_CONTROL_PORT:-19140}:19139"]
+    cpus: 1.0
+    mem_limit: 1g
+    pids_limit: 256
+
+  identity-harness:
+    profiles: ["identity"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - identity_perf_results:/repo/perf-results
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_identity_real_server
+      IMC_PERF_API_KEY: imc_identity_perf_browser_key
+      IMC_PERF_IDENTITY_SESSION: deck_identity_perf_brain
+      IMC_PERF_IDENTITY_PROJECT_ID: identity-perf-org/identity-perf-repo
+      IMC_PERF_IDENTITY_CONTROL_URL: http://identity-daemon:19139
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/identity-p2p.spec.mjs"]
+    depends_on:
+      identity-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+      web:
+        condition: service_healthy
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
+  # Real-machine proof that a link-worker heartbeat never blanks the daemon
+  # status card (the shell profile's daemon runs the core-lane worker).
+  stats-harness:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_API_KEY: imc_shell_perf_browser_key
+      IMC_PERF_SHELL_SESSION: deck_shell_perf_brain
+      IMC_PERF_SHELL_CONTROL_URL: http://shell-daemon:19139
+      IMC_PERF_STATS_DURATION_MS: ${IMC_PERF_STATS_DURATION_MS:-150000}
+      IMC_PERF_STATS_EXPECT_FAILURE: ${IMC_PERF_STATS_EXPECT_FAILURE:-0}
+      IMC_PERF_STATS_OUT: /repo/perf-results/daemon-stats
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/daemon-stats-card.spec.mjs"]
+    depends_on:
+      shell-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
+  # "Click Send -> spinner ends" on the real daemon (profile `shell`), with a
+  # controlled daemon main-thread block. See send-latency.spec.mjs / run-send-latency.sh.
+  latency-harness:
+    profiles: ["shell"]
+    build:
+      context: ../../..
+      dockerfile: test/perf/browser/Dockerfile
+    working_dir: /repo
+    volumes:
+      - ../../..:/repo
+      - type: bind
+        source: ${IMC_PERF_RESULTS_HOST:-./perf-results}
+        target: /repo/perf-results
+    environment:
+      IMC_PERF_BASE_URL: http://server:19138
+      IMC_PERF_SERVER_ID: imc_shell_real_server
+      IMC_PERF_LATENCY_SESSION: deck_latency_qwen_brain
+      IMC_PERF_SHELL_CONTROL_URL: http://shell-daemon:19139
+      IMC_PERF_REVISION: ${IMC_PERF_REVISION:-unknown}
+      IMC_PERF_BLOCK_MS: ${IMC_PERF_BLOCK_MS:-8000}
+      IMC_PERF_IDLE_TRIALS: ${IMC_PERF_IDLE_TRIALS:-12}
+      IMC_PERF_BLOCK_SENDS: ${IMC_PERF_BLOCK_SENDS:-5}
+      IMC_PERF_LATENCY_OUT: /repo/perf-results/send-latency.json
+    command: ["bash", "-lc", "cd web && if [ ! -d node_modules/@playwright/test ]; then npm ci --ignore-scripts --no-audit --no-fund; fi && cd /repo && node test/perf/browser/send-latency.spec.mjs"]
+    depends_on:
+      shell-daemon:
+        condition: service_started
+      server:
+        condition: service_started
+    cpus: 2.0
+    mem_limit: 2g
+    shm_size: 1g
+    pids_limit: 256
+
+volumes:
+  perf_home:
+  perf_results:
+  shell_perf_home:
+  shell_perf_results:
+  perf_uploads:
+  identity_perf_home:
+  identity_perf_results:

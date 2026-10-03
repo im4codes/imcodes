@@ -1,10 +1,10 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
-import { homedir } from 'node:os';
 import logger from '../util/logger.js';
 
-const STORE_DIR = join(homedir(), '.imcodes');
-const STORE_PATH = join(STORE_DIR, 'temp-files.json');
+function storeDir(): string { return resolveImcodesHome(); }
+function storePath(): string { return join(storeDir(), 'temp-files.json'); }
 const DEBOUNCE_MS = 500;
 const CLEANUP_SWEEP_MS = 5 * 60_000;
 
@@ -27,9 +27,11 @@ let store: TempFileStore = { files: {} };
 
 async function ensureLoaded(): Promise<void> {
   if (loaded) return;
-  await mkdir(STORE_DIR, { recursive: true });
+  const dir = storeDir();
+  const path = storePath();
+  await mkdir(dir, { recursive: true });
   try {
-    const raw = await readFile(STORE_PATH, 'utf8');
+    const raw = await readFile(path, 'utf8');
     store = JSON.parse(raw) as TempFileStore;
   } catch {
     store = { files: {} };
@@ -40,8 +42,10 @@ async function ensureLoaded(): Promise<void> {
 function scheduleWrite(): void {
   if (writeTimer) clearTimeout(writeTimer);
   writeTimer = setTimeout(async () => {
-    await mkdir(STORE_DIR, { recursive: true });
-    await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+    const dir = storeDir();
+    const path = storePath();
+    await mkdir(dir, { recursive: true });
+    await writeFile(path, JSON.stringify(store, null, 2), 'utf8');
     writeTimer = null;
   }, DEBOUNCE_MS);
 }
@@ -51,8 +55,10 @@ export async function flushTempFileStore(): Promise<void> {
     clearTimeout(writeTimer);
     writeTimer = null;
   }
-  await mkdir(STORE_DIR, { recursive: true });
-  await writeFile(STORE_PATH, JSON.stringify(store, null, 2), 'utf8');
+  const dir = storeDir();
+  const path = storePath();
+  await mkdir(dir, { recursive: true });
+  await writeFile(path, JSON.stringify(store, null, 2), 'utf8');
 }
 
 function clearEntryTimer(filePath: string): void {

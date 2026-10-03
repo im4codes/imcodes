@@ -135,6 +135,8 @@ vi.mock('fs', async (importOriginal) => {
   return {
     ...actual,
     writeFileSync: vi.fn(captureWriteFileSync),
+    // The staged POSIX upgrade copies its installer into the (mocked, never created) script dir.
+    copyFileSync: vi.fn(),
     mkdtempSync: vi.fn(() => '/tmp/imcodes-upgrade-gate-test'),
   };
 });
@@ -144,6 +146,8 @@ vi.mock('node:fs', async (importOriginal) => {
   return {
     ...actual,
     writeFileSync: vi.fn(captureWriteFileSync),
+    // The staged POSIX upgrade copies its installer into the (mocked, never created) script dir.
+    copyFileSync: vi.fn(),
     mkdtempSync: vi.fn(() => '/tmp/imcodes-upgrade-gate-test'),
   };
 });
@@ -187,6 +191,7 @@ vi.mock('../../src/agent/tmux.js', () => ({
 }));
 
 vi.mock('../../src/daemon/jsonl-watcher.js', () => ({
+  reserveSessionFile: vi.fn(), reassignSessionFile: vi.fn(),
   startWatching: vi.fn(),
   startWatchingFile: vi.fn(),
   stopWatching: vi.fn(),
@@ -654,8 +659,10 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     // Regression: `npm cache clean --force` made the next successful
     // install redownload the whole SDK dependency graph.
     expect(sh).not.toMatch(/eval "\$NPM_RUN cache clean --force"/);
-    // --prefer-online forces revalidation on the first attempt too.
-    expect(sh).toMatch(/install -g --ignore-scripts --prefer-online/);
+    // The install itself is the staged helper (it runs `npm install -g --ignore-scripts --prefer-online --prefix <stage>`,
+    // pinned in posix-atomic-upgrade.test.ts); it is never the in-place `npm install -g` any more.
+    expect(sh).toContain('"$ATOMIC_INSTALLER" stage');
+    expect(sh).not.toMatch(/eval "\$NPM_RUN install -g/);
   });
 
   it('retries transient network failures and tails non-retryable npm output', async () => {
@@ -671,7 +678,8 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     const sh = await captureUpgradeScript();
 
     const cleanupIdx = sh.indexOf('cleanup_stale_imcodes_staging_dirs "$GLOBAL_ROOT"');
-    const installIdx = sh.indexOf('install -g --ignore-scripts --prefer-online');
+    // The install is now a STAGED one, done by staged-package-install.mjs (its npm flags are pinned in posix-atomic-upgrade.test.ts).
+    const installIdx = sh.indexOf('"$ATOMIC_INSTALLER" stage');
     expect(cleanupIdx).toBeGreaterThan(-1);
     expect(installIdx).toBeGreaterThan(-1);
     expect(cleanupIdx).toBeLessThan(installIdx);
@@ -722,12 +730,17 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     const sh = await captureUpgradeScript();
 
     const lockIdx = sh.indexOf('if mkdir "$UPGRADE_LOCK_DIR"');
-    const installIdx = sh.indexOf('install -g --ignore-scripts --prefer-online');
+    const installIdx = sh.indexOf('"$ATOMIC_INSTALLER" stage');
     const restartIdx = sh.indexOf('log "[step 4] running restart command"');
 
-    expect(sh).toContain('UPGRADE_LOCK_DIR="$HOME/.imcodes/upgrade.lock.d"');
+    // The state directory is resolved by the daemon (IMCODES_HOME aware) and handed to the script, never guessed from $HOME.
+    expect(sh).toMatch(/^IMCODES_STATE_DIR='[^']+'$/m);
+    expect(sh).toContain('UPGRADE_LOCK_DIR="$IMCODES_STATE_DIR/upgrade.lock.d"');
+    expect(sh).not.toContain('$HOME/.imcodes');
     expect(sh).toContain('another upgrade is already running');
-    expect(sh).toContain('trap release_upgrade_lock EXIT');
+    // The EXIT trap releases the lock (and writes the result file the CLI waits for).
+    expect(sh).toContain('trap finish_upgrade EXIT');
+    expect(sh).toMatch(/finish_upgrade\(\) \{[\s\S]*?release_upgrade_lock/);
     expect(sh).toContain('mv "$UPGRADE_LOCK_DIR" "$STALE_LOCK"');
     expect(lockIdx).toBeGreaterThan(-1);
     expect(installIdx).toBeGreaterThan(-1);
@@ -750,7 +763,7 @@ skipOnWindows('daemon.upgrade — Linux/macOS upgrade.sh contract', () => {
     const sh = await captureUpgradeScript();
 
     const repairFnIdx = sh.indexOf('repair_cli_wrappers()');
-    const noRestartIdx = sh.indexOf('installed $INSTALLED_VER matches current — repairing CLI wrappers without restart');
+    const noRestartIdx = sh.indexOf('installed $INSTALLED_VER matches current and the live package verifies — repairing CLI wrappers without restart');
     const launchIdx = sh.indexOf('log "[step 3.5] regenerating launch chain"');
     const repairIdx = sh.indexOf('log "[step 3.6] repairing CLI wrappers"', launchIdx);
     const restartIdx = sh.indexOf('log "[step 4] running restart command"');

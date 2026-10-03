@@ -1,46 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import {
-  buildWindowsCleanupScript,
-  buildWindowsCleanupVbs,
   buildWindowsUpgradeRunnerVbs,
   resolveWindowsUpgradeRunnerPath,
 } from '../../src/util/windows-upgrade-script.js';
 
-describe('buildWindowsCleanupScript', () => {
-  it('generates a standalone cleanup cmd script', () => {
-    const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
-    expect(script).toContain('@echo off');
-    expect(script).toContain('chcp 65001 >nul 2>&1');
-    // ping-based sleep — `timeout` fails under wscript-spawned cmd
-    // because there's no console for stdin.
-    expect(script).toContain('ping -n 121 127.0.0.1 >nul 2>&1');
-    expect(script).toContain('for %%I in ("%~dp0.") do set "SCRIPT_DIR=%%~fI"');
-    expect(script).toContain('rmdir /s /q "%SCRIPT_DIR%"');
-  });
-
-  it('NEVER uses `timeout /t` (regression: fails when launched via wscript)', () => {
-    const script = buildWindowsCleanupScript('C:\\Temp\\imcodes-upgrade-123');
-    expect(script).not.toMatch(/timeout \/t \d+/);
-  });
-});
-
-describe('buildWindowsCleanupVbs', () => {
-  it('generates a VBS that runs cleanup hidden (window style 0)', () => {
-    const vbs = buildWindowsCleanupVbs('C:\\Temp\\cleanup.cmd');
-    expect(vbs).toContain('CreateObject("WScript.Shell")');
-    expect(vbs).toContain('"C:\\Temp\\cleanup.cmd"');
-    expect(vbs).toContain(', 0, False');
-  });
-
-  it('uses On Error Resume Next so wscript never pops up an error dialog', () => {
-    const vbs = buildWindowsCleanupVbs('C:\\Temp\\cleanup.cmd');
-    expect(vbs).toContain('On Error Resume Next');
-  });
-
-  it('handles non-ASCII paths in the cleanup target', () => {
-    const vbs = buildWindowsCleanupVbs('C:\\Users\\测试用户A\\Temp\\cleanup.cmd');
-    expect(vbs).toContain('测试用户A');
+describe('launchWindowsUpgrade leaves the scratch directory to the runner', () => {
+  it('has no fixed-delay cleanup of its own (it deleted the runner, its helper and its log mid-install)', () => {
+    const source = readFileSync(resolve(__dirname, '..', '..', 'src', 'util', 'windows-upgrade-script.ts'), 'utf8');
+    expect(source).not.toMatch(/cleanup\.(cmd|vbs)|rmdir \/s|ping -n \d+/);
   });
 });
 

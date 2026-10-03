@@ -1,12 +1,14 @@
 import type { Database } from '../db/client.js';
 import { getSubSessionById, isExecutionCloneRow } from '../db/queries.js';
 import { listActiveSharesForUser, resolveEffectiveShareCoverage, type ShareTarget } from '../db/tab-sharing.js';
-import { resolveServerRole, type ServerRole } from '../security/authorization.js';
+import { resolveServerMembershipRole, resolveServerRole, type ServerRole } from '../security/authorization.js';
 import { resolveEffectiveActor, type ResolveEffectiveActorResult } from '../../../shared/tab-sharing.js';
 
 export interface HttpShareAccess {
   membership: ServerRole;
   actor: ResolveEffectiveActorResult;
+  /** Grant class supplying participant write authority for this request. */
+  shareProvenance?: 'server' | 'session' | null;
 }
 
 export type ServerMemberAccessOrShareDeny =
@@ -18,11 +20,16 @@ export async function resolveHttpShareAccess(
   params: { serverId: string; userId: string; target: ShareTarget; now?: number },
 ): Promise<HttpShareAccess> {
   const now = params.now ?? Date.now();
-  const membership = await resolveServerRole(db, params.serverId, params.userId);
+  // Preserve share provenance. `resolveServerRole` deliberately maps a whole-
+  // server participant to owner-equivalent operational authority, but doing
+  // that here would erase the shared-server actor before command stamping and
+  // would make a delegated action indistinguishable from the real owner.
+  const membership = await resolveServerMembershipRole(db, params.serverId, params.userId);
   if (membership !== 'none') {
     return {
       membership,
       actor: resolveEffectiveActor(membership, null),
+      shareProvenance: null,
     };
   }
   // The WS path refuses a target belonging to another server before resolving
@@ -32,12 +39,15 @@ export async function resolveHttpShareAccess(
   // request body would turn that into cross-server access with no guard here
   // to stop it.
   if (params.target.serverId && params.target.serverId !== params.serverId) {
-    return { membership, actor: resolveEffectiveActor(null, null) };
+    return { membership, actor: resolveEffectiveActor(null, null), shareProvenance: null };
   }
   const coverage = await resolveEffectiveShareCoverage(db, { userId: params.userId, target: params.target, now });
   return {
     membership,
     actor: resolveEffectiveActor(null, coverage),
+    shareProvenance: coverage
+      ? (coverage.serverParticipantAuthority === true ? 'server' : 'session')
+      : null,
   };
 }
 

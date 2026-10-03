@@ -2,11 +2,13 @@ import { describe, expect, it } from 'vitest';
 import {
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_DIRECTION,
+  DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_ERROR,
   DIRECT_FILE_TRANSFER_ERROR_SCOPE,
   DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_LIMITS,
+  uploadDirectConnectFallbackMs,
   DIRECT_FILE_TRANSFER_MSG,
   DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY,
   DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
@@ -22,6 +24,9 @@ import {
   validateDirectFileTransferDataMessage,
   validateDirectFileTransferResumeTicketClaims,
   validateDirectFileTransferServerMessage,
+  DIRECT_FILE_TRANSFER_OPERATION_STATE,
+  isDirectFileTransferOperationDischarged,
+  isDirectFileTransferTerminalShapedOperationMessage,
 } from '../../shared/direct-file-transfer.js';
 
 const serverId = 'server-12345678';
@@ -71,10 +76,52 @@ function downloadInit() {
 }
 
 describe('direct file transfer v2 shared protocol', () => {
+  describe('upload direct-connect fallback deadline', () => {
+    const { UPLOAD_DIRECT_CONNECT_FALLBACK_MS, UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS } = DIRECT_FILE_TRANSFER_LIMITS;
+
+    it('gives a small cross-region upload time to finish ICE and DTLS without waiting the full ceiling', () => {
+      // Measured on a real device: a 14.7 kB upload spent the whole 20 s
+      // ceiling in the connecting state, failed having moved zero bytes, and
+      // the HTTP fallback then delivered it in about 300 ms. Waiting twenty
+      // seconds to maybe save a fraction of one is not a trade.
+      const small = uploadDirectConnectFallbackMs(14_700);
+      expect(small).toBe(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
+      // 26+ 300 ms RTTs leave room for signalling, TURN allocation, ICE and
+      // DTLS on an international path. Replacing the floor with the old 2.5 s
+      // value kills this causal boundary.
+      expect(Math.floor(small / 300)).toBeGreaterThanOrEqual(26);
+      expect(small).toBeLessThan(UPLOAD_DIRECT_CONNECT_FALLBACK_MS / 3);
+    });
+
+    it('still spends the full budget when a direct path is actually worth winning', () => {
+      expect(uploadDirectConnectFallbackMs(200 * 1024 * 1024)).toBe(UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
+    });
+
+    it('scales between the floor and the ceiling with payload size', () => {
+      const oneMb = uploadDirectConnectFallbackMs(1024 * 1024);
+      const fourMb = uploadDirectConnectFallbackMs(4 * 1024 * 1024);
+      expect(oneMb).toBe(10_000);
+      expect(oneMb).toBeGreaterThan(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
+      expect(fourMb).toBeGreaterThan(oneMb);
+      expect(fourMb).toBeLessThanOrEqual(UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
+    });
+
+    it('never returns a nonsensical deadline for a nonsensical size', () => {
+      // A missing or bogus size must not disable the direct path outright, nor
+      // hand it an unbounded wait.
+      for (const size of [0, -1, Number.NaN, Number.POSITIVE_INFINITY]) {
+        const ms = uploadDirectConnectFallbackMs(size);
+        expect(ms).toBeGreaterThanOrEqual(UPLOAD_DIRECT_CONNECT_MIN_FALLBACK_MS);
+        expect(ms).toBeLessThanOrEqual(UPLOAD_DIRECT_CONNECT_FALLBACK_MS);
+      }
+    });
+  });
+
   it('advertises independent v2 lease, upload recovery, and preview-download capabilities', () => {
     expect(DIRECT_FILE_TRANSFER_LEASE_CAPABILITY).toBe('file.transfer.direct.lease.v2');
     expect(DIRECT_FILE_TRANSFER_UPLOAD_RECOVERY_CAPABILITY).toBe('file.transfer.direct.upload_recovery.v2');
     expect(DIRECT_FILE_TRANSFER_PREVIEW_DOWNLOAD_CAPABILITY).toBe('file.transfer.direct.preview_download.v2');
+    expect(DIRECT_FILE_TRANSFER_DIRECTORY_UPLOAD_CAPABILITY).toBe('file.transfer.direct.directory_upload.v1');
     expect(DIRECT_FILE_TRANSFER_LIMITS.MAX_ATTEMPTS).toBe(3);
     expect(DIRECT_FILE_TRANSFER_LIMITS.RETRY_BACKOFF_MS).toEqual([250, 1_000]);
     expect(DIRECT_FILE_TRANSFER_LIMITS.LEASE_IDLE_TTL_MS).toBe(5 * 60 * 1_000);
@@ -135,6 +182,14 @@ describe('direct file transfer v2 shared protocol', () => {
 
   it('separates upload metadata from handle-only download authorization', () => {
     expect(validateDirectFileTransferBrowserMessage(uploadInit())).toMatchObject({ ok: true });
+    expect(validateDirectFileTransferBrowserMessage({
+      ...uploadInit(),
+      destinationDirectory: 'C:\\Users\\admin\\Desktop',
+    })).toMatchObject({ ok: true });
+    expect(validateDirectFileTransferBrowserMessage({
+      ...uploadInit(),
+      destinationDirectory: `C:\\${'x'.repeat(5_000)}`,
+    })).toMatchObject({ ok: false });
     expect(validateDirectFileTransferBrowserMessage(downloadInit())).toMatchObject({ ok: true });
 
     for (const forbidden of [
@@ -339,5 +394,51 @@ describe('direct file transfer v2 shared protocol', () => {
       .toBe(DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL);
     expect(classifyDirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.PREVIEW_POLICY_DENIED, 3))
       .toBe(DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL);
+  });
+});
+
+describe('operation discharge vs terminal wire shape', () => {
+  // The consumer-impact checklist made concrete: these two predicates answer
+  // different questions and must differ on EXACTLY one state. Conflating them
+  // is what appended idleExpiresAt to a not_found frame and got it discarded.
+  const status = (state: string) => ({ type: DIRECT_FILE_TRANSFER_MSG.STATUS, state });
+
+  it('differ on exactly not_found, and agree everywhere else', () => {
+    const disagreements = Object.values(DIRECT_FILE_TRANSFER_OPERATION_STATE).filter((state) => (
+      isDirectFileTransferOperationDischarged(status(state))
+        !== isDirectFileTransferTerminalShapedOperationMessage(status(state))
+    ));
+    expect(disagreements).toEqual([DIRECT_FILE_TRANSFER_OPERATION_STATE.NOT_FOUND]);
+  });
+
+  it('the shape predicate matches what the validator will actually accept', () => {
+    // The reverse assertion: for every state, "terminal-shaped" must agree with
+    // whether the shared validator requires idleExpiresAt on that STATUS.
+    for (const state of Object.values(DIRECT_FILE_TRANSFER_OPERATION_STATE)) {
+      const base = {
+        type: DIRECT_FILE_TRANSFER_MSG.STATUS,
+        protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+        serverId: 'daemon-0001',
+        browserTabId: 'browser-tab-0001',
+        leaseId: 'lease-0001',
+        leaseGeneration: 1,
+        daemonGeneration: 1,
+        requestId: 'request-0001',
+        attemptId: 'attempt-0001',
+        attempt: 1,
+        direction: 'upload',
+        operationId: 'operation-0001',
+        state,
+      };
+      const shaped = isDirectFileTransferTerminalShapedOperationMessage(base);
+      expect(
+        validateDirectFileTransferServerMessage({ ...base, idleExpiresAt: Date.now() + 60_000 }).ok,
+        `idleExpiresAt is accepted for ${state} iff it is terminal-shaped`,
+      ).toBe(shaped);
+      expect(
+        validateDirectFileTransferServerMessage(base).ok,
+        `omitting idleExpiresAt is accepted for ${state} iff it is NOT terminal-shaped`,
+      ).toBe(!shaped);
+    }
   });
 });

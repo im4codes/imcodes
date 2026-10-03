@@ -7,6 +7,7 @@ import es from './locales/es.json';
 import ru from './locales/ru.json';
 import ja from './locales/ja.json';
 import ko from './locales/ko.json';
+import { installTranslationCache } from './translation-cache.js';
 
 const savedLang = (() => {
   try { return localStorage.getItem('imcodes_lang') ?? undefined; } catch { return undefined; }
@@ -39,5 +40,7 @@ i18n
     fallbackLng: 'en',
     interpolation: { escapeValue: false },
   });
+
+installTranslationCache(i18n);
 
 export default i18n;

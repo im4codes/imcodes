@@ -101,6 +101,19 @@ describe('cron MCP client', () => {
     expect(JSON.stringify(body.action)).not.toContain('srv-forged');
   });
 
+  it('preserves the structured send onlyWhenIdle option in the MCP request', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ id: 'job-idle-only' }));
+
+    await cronMcpCreate(makeCreateInput({
+      action: { type: 'send', target: 'w1', message: 'please review', onlyWhenIdle: true },
+    }), { ...boundIdentity, fetchImpl });
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      action: { type: 'send', target: 'w1', message: 'please review', onlyWhenIdle: true },
+    });
+  });
+
   it('creates a direct command job for the runtime-resolved current session', async () => {
     const fetchImpl = vi.fn(async () => okJson({ id: 'job-self' }));
 
@@ -236,6 +249,21 @@ describe('cron MCP client', () => {
     expect(updateBody.userId).toBeUndefined();
     expect(updateBody.token).toBeUndefined();
     expect(updateBody.actorId).toBeUndefined();
+  });
+
+  it('preserves the structured send onlyWhenIdle option on updates', async () => {
+    const fetchImpl = vi.fn(async () => okJson({ ok: true }));
+
+    await cronMcpUpdate({
+      id: 'job-idle-update',
+      projectName: 'proj',
+      action: { type: 'send', target: 'w2', message: 'updated', onlyWhenIdle: true },
+    }, { ...boundIdentity, fetchImpl });
+
+    const [, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(String(init.body))).toMatchObject({
+      action: { type: 'send', target: 'w2', message: 'updated', onlyWhenIdle: true },
+    });
   });
 
   it('propagates lifecycle updates and force only on explicit deletion', async () => {

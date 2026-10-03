@@ -1,0 +1,55 @@
+source_set("remote_desktop_common") {
+  sources = [
+    "aidesk_product_name.h",
+    "data_channel_payload.cc",
+    "data_channel_payload.h",
+    "clipboard_paste_assembler.h",
+    "input_ledger.cc",
+    "input_ledger.h",
+    "json_protocol.cc",
+    "json_protocol.h",
+    "latched_modifiers.h",
+    "local_management_types.h",
+    "local_management_ipc.cc",
+    "local_management_ipc.h",
+    "local_indicator_visuals.h",
+    "data_channel_constants.h",
+    "platform_interfaces.h",
+    "protocol_contracts.h",
+    "quality_ladder.cc",
+    "quality_ladder.h",
+    "session_core.cc",
+    "session_core.h",
+    "signaling_types.h",
+    "transport_session_core.cc",
+    "transport_session_core.h",
+    "value_types.cc",
+    "value_types.h",
+    "video_sender_bitrate.h",
+  ]
+
+  public = [
+    "aidesk_product_name.h",
+    "data_channel_constants.h",
+    "data_channel_payload.h",
+    "clipboard_paste_assembler.h",
+    "input_ledger.h",
+    "json_protocol.h",
+    "latched_modifiers.h",
+    "local_management_types.h",
+    "local_management_ipc.h",
+    "local_indicator_visuals.h",
+    "platform_interfaces.h",
+    "protocol_contracts.h",
+    "quality_ladder.h",
+    "session_core.h",
+    "signaling_types.h",
+    "transport_session_core.h",
+    "value_types.h",
+    "video_sender_bitrate.h",
+  ]
+
+  # json_protocol.h exposes Json::Value in the preserved Windows v2 API, so
+  # downstream compatibility headers need jsoncpp's include config as well.
+  public_deps = [ "//third_party/jsoncpp" ]
+}

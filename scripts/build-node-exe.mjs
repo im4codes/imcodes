@@ -15,6 +15,7 @@
 // blob into the official arm64 and x64 Node binaries, then combines them into a
 // single Universal 2 executable.
 import { build } from 'esbuild';
+import { rawTextImportsPlugin } from './esbuild-raw-text-plugin.mjs';
 import { execFileSync } from 'node:child_process';
 import { mkdir, rm, copyFile, writeFile, chmod, stat, readFile, rename } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
@@ -46,6 +47,46 @@ const workDir = join(tmpdir(), `imcodes-node-build-${platform}-${arch}`);
 const require = createRequire(import.meta.url);
 
 function sh(file, args, opts = {}) { return execFileSync(file, args, { stdio: 'inherit', ...opts }); }
+
+/**
+ * Sign a macOS artifact for release, or ad-hoc when no release identity is set.
+ *
+ * Mirrors `runWindowsReleaseSigning`: a developer building locally gets the
+ * ad-hoc signature the SEA needs to run at all, and CI -- where
+ * `IMCODES_MACOS_SIGNING_IDENTITY` is exported by the signing step -- gets a
+ * Developer ID signature under the hardened runtime, which is what
+ * notarization requires.
+ *
+ * The entitlements are not optional decoration. V8 writes and executes machine
+ * code, so without them the binary signs and notarizes cleanly and then dies on
+ * launch, on a user's machine rather than in the build.
+ */
+function runMacosReleaseSigning(artifactPath) {
+  if (platform !== 'darwin') return;
+  const identity = process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim() ?? '';
+  if (!identity) {
+    // Ad-hoc. A macOS SEA must carry some signature or the loader refuses it.
+    sh('codesign', ['--force', '--sign', '-', artifactPath]);
+    return;
+  }
+  if (!/^[A-F0-9]{40}$/i.test(identity)) {
+    // The fingerprint, never a common name: a name can match several
+    // certificates and the release must pin the exact one.
+    throw new Error('IMCODES_MACOS_SIGNING_IDENTITY must be a SHA-1 fingerprint');
+  }
+  sh('codesign', [
+    '--force',
+    '--timestamp',
+    '--options', 'runtime',
+    '--entitlements', join(root, 'native', 'macos-node', 'imcodes-node.entitlements'),
+    '--sign', identity,
+    artifactPath,
+  ]);
+  // Verify here rather than trusting the exit code: a signature that does not
+  // satisfy its own designated requirement is rejected by notarization, and
+  // finding that out now costs seconds instead of a round trip to Apple.
+  sh('codesign', ['--verify', '--strict', '--verbose=2', artifactPath]);
+}
 
 function runWindowsReleaseSigning(mode, artifactPath, expectedSignerSha256 = '') {
   if (!isWin) return;
@@ -146,6 +187,7 @@ async function main() {
     entryPoints: [join(root, 'src/node/index.ts')],
     bundle: true, platform: 'node', format: 'cjs', outfile: bundlePath,
     external: ['bufferutil', 'utf8-validate'],
+    plugins: [rawTextImportsPlugin],
     define: {
       'process.env.IMCODES_BUILD_VERSION': JSON.stringify(buildVersion),
       // `ws` probes these optional native accelerators with a caught
@@ -217,7 +259,7 @@ async function main() {
       slices.push(slicePath);
     }
     sh('lipo', ['-create', ...slices, '-output', outPath]);
-    sh('codesign', ['--force', '--sign', '-', outPath]);
+    runMacosReleaseSigning(outPath);
   } else {
     await inject(officialNode.nodeBin, outPath);
   }
@@ -241,6 +283,17 @@ async function main() {
     );
   }
 
+  // Raise the UAC level before signing, never after.
+  //
+  // The artifact otherwise inherits official node.exe's `asInvoker`, so a
+  // double-clicked installer starts unelevated, trips its own Administrator
+  // precondition and dies with its console. mt.exe rewrites the resource
+  // section and drops the certificate table as a side effect, so doing this
+  // after Sign would silently ship an unsigned release; the ordering here is
+  // the mitigation. Unlike 'Sign', this runs even without signing credentials,
+  // so local developer builds get the same elevation behaviour as CI.
+  runWindowsReleaseSigning('Manifest', outPath);
+
   // postject changes the official node.exe bytes and therefore invalidates its
   // Microsoft signature. Sign the final SEA executable before hashing it into
   // the release manifest. Formal Windows CI always supplies both signer values;
@@ -251,6 +304,27 @@ async function main() {
     ? 'computer-use-helper/darwin-universal/open-computer-use.app.zip'
     : `computer-use-helper/${platform}-${arch}/open-computer-use${isWin ? '.exe' : ''}`;
   const helperPath = join(buildDir, ...helperRelativePath.split('/'));
+
+  // On macOS the helper archive carries our own application bundle rather than
+  // the upstream one, so that permissions are granted to `to.aidesk.app` once
+  // instead of to a bundle signed by someone else. It is built HERE, before the
+  // manifest is written, because the manifest records the archive's hash: swap
+  // the archive afterwards and every consumer rejects the set as tampered with.
+  //
+  // Only when a release identity is present. An ad-hoc bundle is refused by the
+  // runtime's own verifier, so a local build keeps the upstream archive that
+  // actually works instead of a replacement that cannot.
+  if (platform === 'darwin' && process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim()) {
+    const { buildAideskApp, publishAideskHelperSidecar, AIDESK_APP_NAME } =
+      await import('./build-aidesk-app.mjs');
+    const appPath = await buildAideskApp({
+      outDir: buildDir,
+      computerUseArchive: helperPath,
+      version: buildVersion,
+    });
+    publishAideskHelperSidecar({ appPath, sidecarPath: helperPath });
+    console.log(`✅ published ${AIDESK_APP_NAME} as the Computer Use helper archive`);
+  }
 
   const manifestPath = `${outPath}${NODE_EXE_MANIFEST_SUFFIX}`;
   const manifest = await createNodeExeManifest({

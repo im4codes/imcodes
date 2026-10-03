@@ -55,6 +55,18 @@ function powershellStdinCommand(value: string): string {
  * No credential/token is inherited by the child; only the explicit command line
  * and the active user's environment are supplied.
  */
+/**
+ * The one line of a PowerShell failure that names the cause.
+ *
+ * PowerShell surrounds it with a positional dump of the script text, which
+ * would bury the sentence someone actually needs inside an error message.
+ */
+export function summariseLauncherFailure(stderr: string): string {
+  const lines = stderr.split(/\r?\n/u).map((line) => line.trim()).filter(Boolean);
+  const named = lines.find((line) => /Exception|Win32Exception|error|refus|denied|elevation/iu.test(line));
+  return (named ?? lines[0] ?? '').slice(0, 300);
+}
+
 export function launchWindowsActiveUserCommand(
   executable: string,
   argsLine: string,
@@ -62,6 +74,16 @@ export function launchWindowsActiveUserCommand(
   preferLinkedElevatedToken = false,
   allowSecureDesktopFallback = false,
   forceSecureConsole = false,
+  /**
+   * Called with the launcher's own words when it fails.
+   *
+   * This used to be discarded: stderr was 'ignore' and both error handlers were
+   * empty, so a CreateProcessAsUser refusal left no trace anywhere and the only
+   * symptom was whatever timed out 15 seconds later. That is how "the helper
+   * never connects" stayed unexplained -- the one sentence naming the cause was
+   * thrown away at the moment it was produced.
+   */
+  onLaunchFailure?: (detail: string) => void,
 ): void {
   const exe64 = Buffer.from(executable, 'utf8').toString('base64');
   const args64 = Buffer.from(argsLine, 'utf8').toString('base64');
@@ -104,6 +126,9 @@ public static class ImcodesUserProc {
   const int TokenElevationTypeLimited = 3;
   const int TokenSessionId = 12;
   const uint CREATE_UNICODE_ENVIRONMENT = 0x00000400;
+  const uint CREATE_NO_WINDOW = 0x08000000;
+  const int STARTF_USESHOWWINDOW = 0x00000001;
+  const short SW_HIDE = 0;
   const uint LOGON_WITH_PROFILE = 0x00000001;
   const int ERROR_PRIVILEGE_NOT_HELD = 1314;
   static bool HasUserToken(int sessionId) {
@@ -198,12 +223,21 @@ public static class ImcodesUserProc {
     IntPtr env;
     if (!CreateEnvironmentBlock(out env, primary, false)) env = IntPtr.Zero;
     try {
-      STARTUPINFO si = new STARTUPINFO(); si.cb = Marshal.SizeOf(typeof(STARTUPINFO)); si.lpDesktop = desktop;
+      STARTUPINFO si = new STARTUPINFO();
+      si.cb = Marshal.SizeOf(typeof(STARTUPINFO));
+      si.lpDesktop = desktop;
+      // Every process launched through this helper is an IM.codes background
+      // worker. CreateProcessAsUser otherwise allocates a visible console for
+      // console-subsystem executables such as cmd.exe/imcodes-node.exe, which
+      // made every remote Computer Use probe pop up a blank terminal window.
+      si.dwFlags = STARTF_USESHOWWINDOW;
+      si.wShowWindow = SW_HIDE;
       PROCESS_INFORMATION pi;
       string cmd = "\"" + exe + "\" " + argsLine;
-      if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) {
+      uint creationFlags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW;
+      if (!CreateProcessAsUser(primary, exe, cmd, IntPtr.Zero, IntPtr.Zero, false, creationFlags, env, null, ref si, out pi)) {
         int error = Marshal.GetLastWin32Error();
-        if (!allowTokenFallback || error != ERROR_PRIVILEGE_NOT_HELD || !CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, cmd, CREATE_UNICODE_ENVIRONMENT, env, null, ref si, out pi)) {
+        if (!allowTokenFallback || error != ERROR_PRIVILEGE_NOT_HELD || !CreateProcessWithTokenW(primary, LOGON_WITH_PROFILE, exe, cmd, creationFlags, env, null, ref si, out pi)) {
           if (allowTokenFallback && error == ERROR_PRIVILEGE_NOT_HELD) error = Marshal.GetLastWin32Error();
           throw new System.ComponentModel.Win32Exception(error);
         }
@@ -300,7 +334,10 @@ Add-Type -TypeDefinition $src
     // command-line limit. Feeding it through stdin keeps argv bounded while
     // preserving the same immutable script and avoids exposing its arguments
     // through process inspection.
-    stdio: ['pipe', 'ignore', 'ignore'],
+    //
+    // stderr is captured only when someone asked to hear about failures, so the
+    // fire-and-forget callers keep exactly the stdio shape they had.
+    stdio: ['pipe', 'ignore', onLaunchFailure ? 'pipe' : 'ignore'],
     windowsHide: true,
   };
   const child = spawnImpl(
@@ -308,7 +345,22 @@ Add-Type -TypeDefinition $src
     ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', '-'],
     options,
   );
-  child.on('error', () => {});
+  if (onLaunchFailure) {
+    let stderr = '';
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      // Bounded: this is diagnostic text that ends up in an error message, and
+      // a runaway launcher must not be able to grow it without limit.
+      if (stderr.length < 4096) stderr += String(chunk);
+    });
+    child.on('error', (err) => onLaunchFailure(err instanceof Error ? err.message : String(err)));
+    child.on('exit', (code) => {
+      if (code === 0) return;
+      const detail = summariseLauncherFailure(stderr) || `powershell exited with ${String(code)}`;
+      onLaunchFailure(detail);
+    });
+  } else {
+    child.on('error', () => {});
+  }
   child.stdin?.on('error', () => {});
   child.stdin?.end(powershellStdinCommand(linkedTokenScript), 'utf8');
   child.unref();
@@ -324,8 +376,9 @@ export function launchWindowsActiveUserElevatedCommand(
   executable: string,
   argsLine: string,
   spawnImpl: typeof spawn = spawn,
+  onLaunchFailure?: (detail: string) => void,
 ): void {
-  launchWindowsActiveUserCommand(executable, argsLine, spawnImpl, true);
+  launchWindowsActiveUserCommand(executable, argsLine, spawnImpl, true, false, false, onLaunchFailure);
 }
 
 /**

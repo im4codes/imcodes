@@ -49,8 +49,16 @@ const CRITICAL_DEPS = [
   '@huggingface/transformers',
 ];
 
+function resolveImcodesStateDir() {
+  const configured = process.env.IMCODES_HOME?.trim();
+  if (configured) return resolve(configured);
+  const home = process.env.HOME?.trim() || process.env.USERPROFILE?.trim() || homedir();
+  return resolve(join(home, '.imcodes'));
+}
+
+const IMCODES_HOME = resolveImcodesStateDir();
 const REPAIR_LOG = process.env.IMCODES_LAUNCH_REPAIR_LOG
-  ?? join(process.env.IMCODES_HOME ?? homedir(), '.imcodes', 'launch-repair.log');
+  ?? join(IMCODES_HOME, 'launch-repair.log');
 
 function log(line) {
   // Emit to stderr so the watchdog's `>> watchdog.log 2>&1` captures it,
@@ -93,8 +101,8 @@ function readPinnedVersion() {
 // re-created right after watchdog's cleanup, or upgrade.lock.d/ from
 // the Unix-style bash upgrade ended up here cross-platform).
 function clearStaleUpgradeLock() {
-  const lockDir = join(process.env.IMCODES_HOME ?? homedir(), '.imcodes', 'upgrade.lock.d');
-  const lockFile = join(process.env.IMCODES_HOME ?? homedir(), '.imcodes', 'upgrade.lock');
+  const lockDir = join(IMCODES_HOME, 'upgrade.lock.d');
+  const lockFile = join(IMCODES_HOME, 'upgrade.lock');
   const stalenessSec = parseInt(
     process.env.IMCODES_LAUNCH_LOCK_STALE_AFTER_SEC ?? '1800',
     10,

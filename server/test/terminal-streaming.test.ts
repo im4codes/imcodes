@@ -13,6 +13,7 @@ import { WsBridge } from '../src/ws/bridge.js';
 
 class MockWs extends EventEmitter {
   sent: string[] = [];
+  sentBinary: Buffer[] = [];
   closed = false;
   readyState = 1; // WebSocket.OPEN — required by safeSend
 
@@ -22,7 +23,8 @@ class MockWs extends EventEmitter {
       if (callback) { callback(err); return; }
       throw err;
     }
-    this.sent.push(typeof data === 'string' ? data : data.toString('utf8'));
+    if (typeof data === 'string') this.sent.push(data);
+    else this.sentBinary.push(Buffer.from(data));
     callback?.();
   }
 
@@ -203,6 +205,39 @@ describe('Terminal streaming integration', () => {
     const msg = JSON.parse(browserWs.sent[0]) as { type: string; diff: unknown };
     expect(msg.type).toBe('terminal.diff');
     expect(msg.diff).toBeTruthy();
+  });
+
+  it('relays raw PTY bytes even when the same browser has a summary timeline subscription', async () => {
+    const { daemonWs, browserWs } = await setupStreamingBridge();
+    const session = 'deck_myapp_brain';
+
+    // Timeline mode is independent from the terminal data plane. This is the
+    // normal browser state while a terminal is visible beside a compact chat.
+    browserWs.emit('message', JSON.stringify({
+      type: 'timeline.subscribe',
+      sessionName: session,
+      mode: 'summary',
+    }));
+    browserWs.emit('message', JSON.stringify({
+      type: 'terminal.subscribe',
+      session,
+      raw: true,
+    }));
+    await flush();
+    browserWs.sent.length = 0;
+    browserWs.sentBinary.length = 0;
+
+    const sessionBytes = Buffer.from(session, 'utf8');
+    const frame = Buffer.concat([
+      Buffer.from([1, (sessionBytes.length >>> 8) & 0xff, sessionBytes.length & 0xff]),
+      sessionBytes,
+      Buffer.from('PTY_RAW_MARKER', 'utf8'),
+    ]);
+    daemonWs.emit('message', frame, true);
+    await flush();
+
+    expect(browserWs.sentBinary).toHaveLength(1);
+    expect(browserWs.sentBinary[0].equals(frame)).toBe(true);
   });
 
   it('daemon reconnect drains queued browser messages', async () => {

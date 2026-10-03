@@ -8,6 +8,7 @@
  * "/stop isn't available in this environment." while the turn kept going,
  * violating the transport command liveness mandate (CLAUDE.md).
  */
+import { CHAT_MESSAGE_ORIGINS, USER_MESSAGE_ORIGIN_FIELDS } from '../../shared/chat-message-origin.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import http from 'http';
 
@@ -41,6 +42,7 @@ vi.mock('../../src/util/logger.js', () => ({
 }));
 
 import { clearQueues, startHookServer } from '../../src/daemon/hook-server.js';
+import { buildAgentDelegationSenderLine } from '../../shared/agent-delegation.js';
 
 function makeSession(overrides: Record<string, unknown>) {
   return {
@@ -150,6 +152,10 @@ describe('hook-server /send with "/stop" text', () => {
     expect(res.status).toBe(200);
     expect(res.body).toMatchObject({ ok: true, delivered: true, target: 'deck_alpha_w1' });
     expect(stopSessionNowMock).not.toHaveBeenCalled();
-    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith('deck_alpha_w1', '请解释 /stop 命令的作用');
+    expect(sendProcessSessionMessageForAutomationMock).toHaveBeenCalledWith(
+      'deck_alpha_w1',
+      `${buildAgentDelegationSenderLine('deck_alpha_brain')}\n\n请解释 /stop 命令的作用`,
+      { userMessageMetadata: { [USER_MESSAGE_ORIGIN_FIELDS.ORIGIN]: CHAT_MESSAGE_ORIGINS.AGENT } },
+    );
   });
 });

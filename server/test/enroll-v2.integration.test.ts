@@ -15,12 +15,12 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vites
 import { Hono } from 'hono';
 import { randomBytes, createHash } from 'node:crypto';
 import { gunzipSync } from 'node:zlib';
-import { mkdtemp, writeFile, mkdir, rm, readdir, rename, symlink } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, mkdir, rm, readdir, rename, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDatabase, type Database } from '../src/db/client.js';
 import { runMigrations } from '../src/db/migrate.js';
-import { createUser, createServer } from '../src/db/queries.js';
+import { createUser as createUserRow, createServer } from '../src/db/queries.js';
 import { createEnrollRoutes, runEnrollmentRetention } from '../src/routes/enroll.js';
 import {
   createArtifactCatalog,
@@ -28,6 +28,14 @@ import {
   type ArtifactCatalog,
 } from '../src/services/controlled-node-artifact-catalog.js';
 import { NODE_ROLE, decodeEnrollmentTrailer, decodeEnrollmentTrailerWithRange } from '../../shared/remote-exec.js';
+import {
+  CONTROLLED_NODE_ID_MIN,
+  isControlledNodeId,
+} from '../../shared/controlled-node-identity.js';
+import {
+  generateControlledNodeId,
+  type SecureRandomBytes,
+} from '../src/services/controlled-node-identity.js';
 import { inspectWindowsAuthenticodeEnrollmentContainer } from '../../shared/windows-authenticode-enrollment.js';
 import {
   ACCEPT_ENCODING_HEADER,
@@ -35,12 +43,31 @@ import {
   EXPECTED_USER_ID_HEADER,
 } from '../../shared/http-header-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../shared/auth-identity.js';
+import { appleDesignatedRequirement } from '../../shared/macos-code-requirement.js';
 import {
   CONTROLLED_NODE_ARTIFACT_COMPRESSION_ENCODING,
+  CONTROLLED_NODE_ARTIFACT_ASSETS,
   CONTROLLED_NODE_ARTIFACT_HEADERS,
+  CONTROLLED_NODE_TICKET_DELIVERY,
+  CONTROLLED_NODE_TICKET_MAX_CONSUMES,
+  CONTROLLED_NODE_TICKET_TTL_MS,
+  isControlledNodeInstallCode,
 } from '../../shared/controlled-node-artifacts.js';
+import { controlledNodeInstallCommandRoutes } from '../src/routes/controlled-node-install.js';
 import {
   REMOTE_DESKTOP_LEGACY_UPGRADE_PROTOCOL_VERSION,
+  REMOTE_DESKTOP_MACOS_COMPONENT_ORDER,
+  REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME,
+  REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME,
+  REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME,
+  REMOTE_DESKTOP_MACOS_TEAM_ID,
+  REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME,
+  REMOTE_DESKTOP_MACOS_WORKER_ARTIFACT_KIND,
+  REMOTE_DESKTOP_MACOS_WORKER_FILENAME,
+  REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION,
+  decodeRemoteDesktopMacosComponentSetPrefix,
+  REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES,
+  remoteDesktopMacosComponentSetFilename,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
 } from '../../shared/remote-desktop-worker.js';
@@ -148,6 +175,106 @@ async function writeRemoteDesktopRelease(workerVersion: string): Promise<{
   return { workerBytes, virtualDisplayBytes, workerManifest, workerManifestBytes };
 }
 
+type MacosComponentKind = typeof REMOTE_DESKTOP_MACOS_COMPONENT_ORDER[number];
+
+async function writeMacosRemoteDesktopRelease(
+  arch: 'arm64' | 'x64',
+  workerVersion = '2026.7.1234-dev.5',
+): Promise<{ manifestBytes: Buffer; components: Record<MacosComponentKind, Buffer> }> {
+  const directory = join(exeDir, 'remote-desktop-worker', `darwin-${arch}`);
+  await mkdir(directory, { recursive: true });
+  // EVERY map below is typed against the shared canonical order, so omitting a
+  // component is a COMPILE error rather than a `join(directory, undefined)` at
+  // runtime. That is exactly how this fixture drifted to three components while
+  // the shared runtime already required four.
+  const components: Record<MacosComponentKind, Buffer> = {
+    worker: Buffer.from(`signed-${arch}-worker`),
+    launchAgent: Buffer.from(`signed-${arch}-launch-agent`),
+    disclosure: Buffer.from(`signed-${arch}-disclosure`),
+    virtualDisplayHelper: Buffer.from(`signed-${arch}-virtual-display-helper`),
+  };
+  const fileNames: Record<MacosComponentKind, string> = {
+    worker: REMOTE_DESKTOP_MACOS_WORKER_FILENAME,
+    launchAgent: REMOTE_DESKTOP_MACOS_LAUNCH_AGENT_FILENAME,
+    disclosure: REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME,
+    virtualDisplayHelper: REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME,
+  };
+  // Use the same pinned release identity as the production validator. A
+  // shape-valid foreign Team ID is intentionally rejected by that boundary.
+  const teamId = REMOTE_DESKTOP_MACOS_TEAM_ID;
+  const bundleIdentifiers: Record<MacosComponentKind, string> = {
+    worker: 'cc.imcodes.node.remote-desktop-worker',
+    launchAgent: 'cc.imcodes.node.remote-desktop-agent',
+    disclosure: 'cc.imcodes.node.remote-desktop-disclosure',
+    virtualDisplayHelper: 'cc.imcodes.node.remote-desktop-virtual-display-helper',
+  };
+  const notarizationSeeds: Record<MacosComponentKind, string> = {
+    worker: 'a', launchAgent: 'b', disclosure: 'c', virtualDisplayHelper: 'd',
+  };
+  const component = (kind: MacosComponentKind, seed: string) => ({
+    fileName: fileNames[kind],
+    size: components[kind].length,
+    sha256: sha256(components[kind]),
+    notarization: {
+      status: 'accepted',
+      submissionId: '123e4567-e89b-42d3-a456-426614174000',
+      ticketSha256: seed.repeat(64),
+      stapled: true,
+      stapleValidated: true,
+    },
+  });
+  const manifest = {
+    manifestVersion: REMOTE_DESKTOP_MACOS_WORKER_MANIFEST_VERSION,
+    artifactKind: REMOTE_DESKTOP_MACOS_WORKER_ARTIFACT_KIND,
+    workerVersion,
+    protocolVersion: 2,
+    ipcVersion: 1,
+    os: 'darwin',
+    arch,
+    // Built FROM the shared canonical order. A second hand-written list here is
+    // what allowed the three/four split in the first place.
+    components: Object.fromEntries(REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map(
+      (kind) => [kind, component(kind, notarizationSeeds[kind])],
+    )) as Record<MacosComponentKind, ReturnType<typeof component>>,
+    libwebrtcRevision: WINDOWS_REMOTE_DESKTOP_QUALIFICATION_PLAN.mediaStackDecision.libwebrtcRevision,
+    minimumOsVersion: '13.0',
+    codeSignature: {
+      teamId,
+      bundles: Object.fromEntries(REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map((kind) => [kind, {
+        bundleIdentifier: bundleIdentifiers[kind],
+        // Built, not spelled. This fixture hand-wrote the requirement and got
+        // two things wrong at once: it quoted a team ID that codesign leaves
+        // bare, and it omitted the two Developer ID marker OIDs entirely -- so
+        // it described a signature no component could ever carry, and the
+        // manifest was refused with a 503 that named nothing.
+        designatedRequirement: appleDesignatedRequirement(bundleIdentifiers[kind], teamId),
+        hardenedRuntime: true,
+      }])),
+    },
+    toolchain: { xcode: '16.4', macosSdk: '15.5', clang: '17.0.0' },
+  };
+  // LOAD-BEARING anti-drift guard. The two failures this fixture caused were
+  // `join(directory, undefined)` -- a fixture that silently wrote three files
+  // while the shared runtime demanded four. Assert the produced manifest and
+  // the files about to be written both cover the canonical set EXACTLY, so a
+  // future component addition fails here with a readable message instead of an
+  // undefined path deep inside writeFile.
+  expect(Object.keys(manifest.components).sort())
+    .toEqual([...REMOTE_DESKTOP_MACOS_COMPONENT_ORDER].sort());
+  expect(Object.keys(fileNames).sort())
+    .toEqual([...REMOTE_DESKTOP_MACOS_COMPONENT_ORDER].sort());
+  expect(new Set(Object.values(fileNames)).size)
+    .toBe(REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.length);
+  const manifestBytes = Buffer.from(JSON.stringify(manifest));
+  await Promise.all([
+    writeFile(join(directory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME), manifestBytes),
+    ...REMOTE_DESKTOP_MACOS_COMPONENT_ORDER.map((kind) => (
+      writeFile(join(directory, fileNames[kind]), components[kind])
+    )),
+  ]);
+  return { manifestBytes, components };
+}
+
 beforeAll(async () => {
   process.env.NODE_ENV = 'development'; // default for HTTPS-off tests; per-test overrides
   db = createDatabase(process.env.TEST_DATABASE_URL!);
@@ -189,7 +316,11 @@ beforeEach(async () => {
   process.env.NODE_ENV = 'development';
 });
 
-function buildApp(options: { serverUrl?: string | null; artifactCatalog?: ArtifactCatalog } = {}) {
+function buildApp(options: {
+  serverUrl?: string | null;
+  artifactCatalog?: ArtifactCatalog;
+  controlledNodeIdRandomBytes?: SecureRandomBytes;
+} = {}) {
   const app = new Hono();
   app.use('*', async (c, next) => {
     const serverUrl = options.serverUrl === undefined ? 'http://localhost' : options.serverUrl;
@@ -203,7 +334,9 @@ function buildApp(options: { serverUrl?: string | null; artifactCatalog?: Artifa
     };
     await next();
   });
-  app.route('/api/enroll', createEnrollRoutes(options.artifactCatalog ?? artifactCatalog));
+  app.route('/api/enroll', createEnrollRoutes(options.artifactCatalog ?? artifactCatalog, {
+    controlledNodeIdRandomBytes: options.controlledNodeIdRandomBytes,
+  }));
   return app;
 }
 
@@ -212,6 +345,31 @@ async function owner(userId: string): Promise<{ serverId: string; token: string 
   const serverId = hex(8);
   await createServer(db, serverId, userId, 'full-box', sha256(token));
   return { serverId, token };
+}
+
+/**
+ * Desk scope: a controlled node is now created with an explicit, membership-
+ * checked Desk or not at all, so every enroll test user owns one. The id is
+ * derived from the user id so a ticket body can name it without threading extra
+ * state through ~60 call sites.
+ */
+function deskOf(userId: string): string {
+  return `desk-${userId}`;
+}
+
+async function createUser(dbArg: Database, userId: string) {
+  const created = await createUserRow(dbArg, userId);
+  await dbArg.execute(
+    `INSERT INTO teams (id, name, owner_id, plan, created_at)
+     VALUES ($1, $2, $3, 'free', $4) ON CONFLICT DO NOTHING`,
+    [deskOf(userId), 'AI Desk', userId, Date.now()],
+  );
+  await dbArg.execute(
+    `INSERT INTO team_members (team_id, user_id, role, joined_at)
+     VALUES ($1, $2, 'owner', $3) ON CONFLICT DO NOTHING`,
+    [deskOf(userId), userId, Date.now()],
+  );
+  return created;
 }
 
 function ticketHeaders(userId: string, auth: { serverId: string; token: string }): Record<string, string> {
@@ -235,7 +393,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const missing = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: { 'content-type': 'application/json', 'X-Server-Id': o.serverId, authorization: `Bearer ${o.token}` },
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(missing.status).toBe(428);
     expect(await missing.json()).toEqual({ error: AUTH_IDENTITY_ERRORS.EXPECTATION_REQUIRED });
@@ -248,13 +406,509 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
         authorization: `Bearer ${o.token}`,
         [EXPECTED_USER_ID_HEADER]: 'different-user',
       },
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(changed.status).toBe(409);
     expect(await changed.json()).toEqual({ error: AUTH_IDENTITY_ERRORS.CHANGED });
 
     const count = await db.queryOne<{ n: string }>('SELECT COUNT(*)::text AS n FROM controlled_node_enrollments_v2');
     expect(count?.n).toBe('0');
+  });
+
+  it('returns one stable no-expiry link for concurrent copies of the same owner binding', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const copies = await Promise.all(Array.from({ length: 8 }, async () => {
+      const response = await app.request('/api/enroll/v2/ticket', {
+        method: 'POST',
+        headers: ticketHeaders(userId, o),
+        body: JSON.stringify({
+          version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+          delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+        }),
+      });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{
+        ticketId: string; ticket: string; expiresAt: null;
+        delivery: string; maxConsumes: number | null;
+      }>;
+    }));
+    expect(new Set(copies.map(({ ticketId }) => ticketId)).size).toBe(1);
+    expect(new Set(copies.map(({ ticket }) => ticket)).size).toBe(1);
+    expect(copies.every(({ expiresAt }) => expiresAt === null)).toBe(true);
+    expect(copies.every(({ delivery }) => delivery === CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK)).toBe(true);
+    expect(copies.every(({ maxConsumes }) => maxConsumes === null)).toBe(true);
+
+    const row = await db.queryOne<{
+      ticket_expires_at: string | null; max_consumes: number | null;
+      encrypted_ticket: string | null; delivery: string; matching_rows: string;
+    }>(
+      `SELECT ticket_expires_at, max_consumes, encrypted_ticket, delivery,
+              (SELECT COUNT(*)::text FROM controlled_node_enrollments_v2
+                WHERE owner_user_id = $2 AND os = 'linux' AND arch = 'x64'
+                  AND delivery = 'remote_link' AND revoked_at IS NULL) AS matching_rows
+         FROM controlled_node_enrollments_v2 WHERE id = $1`,
+      [copies[0]!.ticketId, userId],
+    );
+    expect(row?.ticket_expires_at).toBeNull();
+    expect(row?.max_consumes).toBeNull();
+    expect(row?.encrypted_ticket).toEqual(expect.any(String));
+    expect(row?.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK);
+    expect(row?.matching_rows).toBe('1');
+
+    let mintAudits: Array<{ action: string; details: unknown }> = [];
+    await vi.waitFor(async () => {
+      mintAudits = await db.query<{ action: string; details: unknown }>(
+        `SELECT action, details FROM audit_log
+          WHERE user_id = $1 AND action = 'enroll.v2.ticket.mint'`,
+        [userId],
+      );
+      expect(mintAudits.length).toBeGreaterThan(0);
+    });
+    const serializedAudit = JSON.stringify(mintAudits);
+    expect(serializedAudit).not.toContain(copies[0]!.ticket);
+    expect(serializedAudit).not.toContain(row!.encrypted_ticket!);
+  });
+
+  it('keys stable links by the exact owner, canonical platform, and optional host binding', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const authHost = await owner(userId);
+    const otherHost = await owner(userId);
+    const mint = async (hostServerId?: string) => {
+      const response = await app.request('/api/enroll/v2/ticket', {
+        method: 'POST', headers: ticketHeaders(userId, authHost),
+        body: JSON.stringify({
+          version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+          delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+          ...(hostServerId ? { hostServerId } : {}),
+        }),
+      });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{ ticketId: string; ticket: string }>;
+    };
+
+    const unbound = await mint();
+    expect(await mint()).toEqual(unbound);
+    const boundToAuthHost = await mint(authHost.serverId);
+    expect(await mint(authHost.serverId)).toEqual(boundToAuthHost);
+    const boundToOtherHost = await mint(otherHost.serverId);
+    expect(await mint(otherHost.serverId)).toEqual(boundToOtherHost);
+    expect(new Set([
+      unbound.ticketId, boundToAuthHost.ticketId, boundToOtherHost.ticketId,
+    ])).toHaveLength(3);
+    expect(new Set([
+      unbound.ticket, boundToAuthHost.ticket, boundToOtherHost.ticket,
+    ])).toHaveLength(3);
+  });
+
+  it('streams the currently verified artifact through an existing stable link after an upgrade', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const minted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }),
+    });
+    expect(minted.status).toBe(200);
+    const { ticket } = await minted.json() as { ticket: string };
+
+    const upgraded = Buffer.from('IMCODES_FAKE_EXECUTABLE_BINARY_v2');
+    await writeFile(join(exeDir, 'imcodes-node-linux'), upgraded);
+    await writeManifest('imcodes-node-linux', 'linux', 'x64', upgraded);
+    artifactCatalog.invalidate(exeDir, 'linux', 'x64');
+
+    const response = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(response.status).toBe(200);
+    const bytes = Buffer.from(await response.arrayBuffer());
+    expect(bytes.subarray(0, upgraded.length)).toEqual(upgraded);
+  });
+
+  it('migration upgrades only active reusable rows with the exact historical remote-link shape', async () => {
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const createdAt = Date.now();
+    const insertFixture = async (input: {
+      ttlMs: number;
+      reusable: boolean;
+      installCodeHash?: string;
+      revokedAt?: number;
+    }): Promise<string> => {
+      const row = await db.queryOne<{ id: string }>(
+        `INSERT INTO controlled_node_enrollments_v2
+           (ticket_hash, code_hash, owner_user_id, os, arch, artifact_sha256,
+            encrypted_code, consumed_count, max_consumes, ticket_expires_at,
+            expires_at, reusable, created_at, install_code_hash, revoked_at)
+         VALUES ($1, $2, $3, 'linux', 'x64', $4, 'enc', 0, 3, $5, NULL, $6, $7, $8, $9)
+         RETURNING id`,
+        [
+          sha256(hex(16)), sha256(hex(16)), userId, sha256(hex(32)),
+          createdAt + input.ttlMs, input.reusable, createdAt,
+          input.installCodeHash ?? null, input.revokedAt ?? null,
+        ],
+      );
+      return row!.id;
+    };
+
+    const historicalRemoteTtl = 24 * 60 * 60 * 1000;
+    const remote = await insertFixture({
+      ttlMs: historicalRemoteTtl,
+      reusable: true,
+    });
+    const browser = await insertFixture({
+      ttlMs: CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER],
+      reusable: true,
+    });
+    const installCommand = await insertFixture({
+      // Even an accidentally remote-sized interval cannot override the
+      // install-code discriminator.
+      ttlMs: historicalRemoteTtl,
+      reusable: true,
+      installCodeHash: sha256(hex(16)),
+    });
+    const legacy = await insertFixture({
+      ttlMs: historicalRemoteTtl,
+      reusable: false,
+    });
+    const revoked = await insertFixture({
+      ttlMs: historicalRemoteTtl,
+      reusable: true,
+      revokedAt: createdAt,
+    });
+
+    const migration = await readFile(
+      new URL('../src/db/migrations/087_controlled_node_remote_link_unlimited.sql', import.meta.url),
+      'utf8',
+    );
+    await db.exec(migration);
+    const rows = await db.query<{ id: string; max_consumes: number | null }>(
+      `SELECT id, max_consumes
+         FROM controlled_node_enrollments_v2
+        WHERE id = ANY($1::uuid[])`,
+      [[remote, browser, installCommand, legacy, revoked]],
+    );
+    const budgets = new Map(rows.map((row) => [row.id, row.max_consumes]));
+    expect(budgets.get(remote)).toBeNull();
+    expect(budgets.get(browser)).toBe(3);
+    expect(budgets.get(installCommand)).toBe(3);
+    expect(budgets.get(legacy)).toBe(3);
+    expect(budgets.get(revoked)).toBe(3);
+  });
+
+  it('lets one live remote link concurrently download and enroll more than ten independent machines', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const minted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }),
+    });
+    expect(minted.status).toBe(200);
+    const { ticket, ticketId } = await minted.json() as { ticket: string; ticketId: string };
+    const enrollment = await db.queryOne<{ encrypted_code: string; max_consumes: number | null }>(
+      'SELECT encrypted_code, max_consumes FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [ticketId],
+    );
+    expect(enrollment?.max_consumes).toBeNull();
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const enrollCode = decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode;
+
+    const machineCount = 12;
+    const downloads = await Promise.all(Array.from({ length: machineCount }, async () => {
+      const response = await app.request('/api/enroll/v2/download', {
+        headers: { authorization: `Bearer ${ticket}` },
+      });
+      const bytes = Buffer.from(await response.arrayBuffer());
+      return { status: response.status, trailer: decodeEnrollmentTrailer(bytes) };
+    }));
+    expect(downloads.every(({ status }) => status === 200)).toBe(true);
+    expect(downloads.every(({ trailer }) => trailer?.serverUrl === 'http://localhost')).toBe(true);
+
+    const redemptions = await Promise.all(Array.from({ length: machineCount }, async (_, index) => {
+      const nodeTokenHash = sha256(`remote-link-node-${index}-${hex(8)}`);
+      const response = await app.request('/api/enroll/v2/redeem', {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          version: 2,
+          enrollToken: enrollCode,
+          installId: `remote-link-install-${index}`,
+          nodeTokenHash,
+          hostname: `remote-link-host-${index}`,
+          os: 'linux',
+          arch: 'x64',
+        }),
+      });
+      return { response, nodeTokenHash };
+    }));
+    expect(redemptions.every(({ response }) => response.status === 200)).toBe(true);
+    const identities = await Promise.all(redemptions.map(async ({ response }) => (
+      await response.json() as { serverId: string; nodeId: string }
+    )));
+    expect(new Set(identities.map(({ serverId }) => serverId)).size).toBe(machineCount);
+    expect(new Set(identities.map(({ nodeId }) => nodeId)).size).toBe(machineCount);
+
+    const row = await db.queryOne<{ consumed_count: number; consumed_at: number | null; installs: string }>(
+      `SELECT enrollment.consumed_count, enrollment.consumed_at,
+              COUNT(install.id)::text AS installs
+         FROM controlled_node_enrollments_v2 AS enrollment
+         LEFT JOIN controlled_node_enrollment_installs AS install
+           ON install.enrollment_id = enrollment.id
+        WHERE enrollment.id = $1
+        GROUP BY enrollment.consumed_count, enrollment.consumed_at`,
+      [ticketId],
+    );
+    expect(row).toEqual({ consumed_count: machineCount, consumed_at: null, installs: String(machineCount) });
+  });
+
+  it('keeps a remote link until owner revocation, then mints a different replacement', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const mintRemote = async (): Promise<{ ticket: string; ticketId: string }> => {
+      const response = await app.request('/api/enroll/v2/ticket', {
+        method: 'POST', headers: ticketHeaders(userId, o),
+        body: JSON.stringify({
+          version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+          delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+        }),
+      });
+      expect(response.status).toBe(200);
+      return response.json() as Promise<{ ticket: string; ticketId: string }>;
+    };
+
+    const original = await mintRemote();
+    expect(await mintRemote()).toEqual(original);
+    const originalDownload = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${original.ticket}` },
+    });
+    expect(originalDownload.status).toBe(200);
+    await originalDownload.arrayBuffer();
+
+    const otherUserId = `u_${hex(4)}`;
+    await createUser(db, otherUserId);
+    const otherOwner = await owner(otherUserId);
+    const foreignRevoke = await app.request('/api/enroll/v2/ticket', {
+      method: 'DELETE', headers: ticketHeaders(otherUserId, otherOwner),
+      body: JSON.stringify({
+        version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }),
+    });
+    expect(foreignRevoke.status).toBe(200);
+    expect(await foreignRevoke.json()).toEqual({ revoked: false });
+    const stillLive = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${original.ticket}` },
+    });
+    expect(stillLive.status).toBe(200);
+    await stillLive.arrayBuffer();
+
+    const revoke = await app.request('/api/enroll/v2/ticket', {
+      method: 'DELETE', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.REMOTE_LINK,
+      }),
+    });
+    expect(revoke.status).toBe(200);
+    expect(await revoke.json()).toEqual({ revoked: true });
+    const revoked = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${original.ticket}` },
+    });
+    expect(revoked.status).toBe(401);
+
+    const replacement = await mintRemote();
+    expect(replacement.ticketId).not.toBe(original.ticketId);
+    expect(replacement.ticket).not.toBe(original.ticket);
+    const replacementDownload = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${replacement.ticket}` },
+    });
+    expect(replacementDownload.status).toBe(200);
+    await replacementDownload.arrayBuffer();
+  });
+
+  it('keeps browser at three downloads and install-command at five hundred', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const browser = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
+    });
+    const browserTicket = (await browser.json() as { ticket: string }).ticket;
+    for (let index = 0; index < 3; index += 1) {
+      const response = await app.request('/api/enroll/v2/download', {
+        headers: { authorization: `Bearer ${browserTicket}` },
+      });
+      expect(response.status).toBe(200);
+      await response.arrayBuffer();
+    }
+    expect((await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${browserTicket}` },
+    })).status).toBe(401);
+
+    const command = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+      }),
+    });
+    const commandBody = await command.json() as { ticket: string; ticketId: string; maxConsumes: number };
+    expect(commandBody.maxConsumes).toBe(500);
+    await db.execute(
+      'UPDATE controlled_node_enrollments_v2 SET consumed_count = 499 WHERE id = $1',
+      [commandBody.ticketId],
+    );
+    const fiveHundredth = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${commandBody.ticket}` },
+    });
+    expect(fiveHundredth.status).toBe(200);
+    await fiveHundredth.arrayBuffer();
+    expect((await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${commandBody.ticket}` },
+    })).status).toBe(401);
+  });
+
+  /**
+   * The pasted one-liner, end to end.
+   *
+   * The pieces are covered separately elsewhere; what is only provable here is
+   * that they compose: minting must actually persist a code, `/i/:code` must
+   * find that row and render a script naming it, and the code must then work as
+   * a download credential against the real artifact. A direct row INSERT would
+   * skip the mint wiring entirely, which is where a silent break would live.
+   */
+  it('mints an install command whose code fetches a script and then downloads the artifact', async () => {
+    const app = buildApp();
+    // The short path is mounted at the root in production, not under /api/enroll.
+    app.route('/i', controlledNodeInstallCommandRoutes);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const minted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({
+        version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64',
+        delivery: CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND,
+      }),
+    });
+    expect(minted.status).toBe(200);
+    const body = await minted.json() as {
+      ticketId: string; delivery: string; maxConsumes: number;
+      installCode?: string; installCommand?: string;
+    };
+
+    expect(body.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND);
+    expect(isControlledNodeInstallCode(body.installCode)).toBe(true);
+    // A fleet-sized budget, not the three attempts a single enrolment gets.
+    expect(body.maxConsumes).toBe(
+      CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND],
+    );
+    const row = await db.queryOne<{ max_consumes: number; install_code_hash: string | null }>(
+      'SELECT max_consumes, install_code_hash FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [body.ticketId],
+    );
+    // Persisted as a hash; the plaintext code exists only in the response.
+    expect(row?.install_code_hash).toBe(sha256(body.installCode!));
+    expect(Number(row?.max_consumes)).toBe(
+      CONTROLLED_NODE_TICKET_MAX_CONSUMES[CONTROLLED_NODE_TICKET_DELIVERY.INSTALL_COMMAND],
+    );
+
+    // The command is the literal line the operator pastes.
+    expect(body.installCommand).toContain(`/i/${body.installCode}`);
+    expect(body.installCommand).toMatch(/^curl -fsSL /);
+    expect(body.installCommand).toContain('sudo sh');
+    // The minted command is what the operator pastes into a root shell. A test
+    // that only required `^curl -fsSL ` codified the unpinned form and would
+    // have accepted a transport that follows a cross-scheme redirect.
+    //
+    // The pin must match the origin's own scheme; this harness mints against
+    // http://localhost, so asserting a literal `=https` would only prove the
+    // test knew the harness, not that the command is pinned at all.
+    const mintedScheme = body.installCommand!.includes('https://') ? 'https' : 'http';
+    expect(body.installCommand).toContain(`--proto '=${mintedScheme}'`);
+    expect(body.installCommand).toContain(`--proto-redir '=${mintedScheme}'`);
+
+    // 1. The pasted command fetches its script.
+    const script = await app.request(`/i/${body.installCode}`);
+    expect(script.status).toBe(200);
+    const scriptBody = await script.text();
+    expect(scriptBody).toContain(body.installCode!);
+    expect(scriptBody).toContain("imcodes_expect_os='linux'");
+    // Rendering must not spend a download slot, or probing would exhaust it.
+    const afterRender = await db.queryOne<{ consumed_count: number }>(
+      'SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id = $1', [body.ticketId],
+    );
+    expect(Number(afterRender?.consumed_count)).toBe(0);
+
+    // 2. That same code is what the script posts to download the binary.
+    const download = await app.request('/api/enroll/v2/download', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ ticket: body.installCode! }).toString(),
+    });
+    expect(download.status).toBe(200);
+    const bytes = Buffer.from(await download.arrayBuffer());
+    // A real personalized artifact, carrying the enrolment trailer.
+    expect(bytes.length).toBeGreaterThan(FAKE_BINARY.length);
+    expect(decodeEnrollmentTrailer(bytes)).not.toBeNull();
+
+    const afterDownload = await db.queryOne<{ consumed_count: number }>(
+      'SELECT consumed_count FROM controlled_node_enrollments_v2 WHERE id = $1', [body.ticketId],
+    );
+    expect(Number(afterDownload?.consumed_count)).toBe(1);
+  });
+
+  it('keeps the default and every unknown delivery on the short browser window', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    const browserTtl = CONTROLLED_NODE_TICKET_TTL_MS[CONTROLLED_NODE_TICKET_DELIVERY.BROWSER];
+
+    // Omitted: historical callers must be unaffected.
+    const omitted = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
+    });
+    expect(omitted.status).toBe(200);
+    const omittedBody = await omitted.json() as { ticketId: string; delivery: string };
+    expect(omittedBody.delivery).toBe(CONTROLLED_NODE_TICKET_DELIVERY.BROWSER);
+    const omittedRow = await db.queryOne<{ ticket_expires_at: string; created_at: string }>(
+      'SELECT ticket_expires_at, created_at FROM controlled_node_enrollments_v2 WHERE id = $1',
+      [omittedBody.ticketId],
+    );
+    expect(Number(omittedRow?.ticket_expires_at) - Number(omittedRow?.created_at)).toBe(browserTtl);
+
+    // A bogus value must be refused outright, never silently widened: the body
+    // schema is strict precisely so an attacker cannot invent a longer window.
+    const bogus = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST',
+      headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64', delivery: 'forever' }),
+    });
+    expect(bogus.status).toBe(400);
+    expect(await bogus.json()).toEqual({ error: 'invalid_body' });
   });
 
   it('records the daemon a login-screen enrolment was started from, and refuses another user\'s', async () => {
@@ -271,7 +925,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const forbidden = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64', hostServerId: stranger.serverId }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'win', arch: 'x64', hostServerId: stranger.serverId }),
     });
     expect(forbidden.status).toBe(403);
     expect(await forbidden.json()).toEqual({ error: 'invalid_host_server' });
@@ -279,7 +933,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const minted = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64', hostServerId: o.serverId }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'win', arch: 'x64', hostServerId: o.serverId }),
     });
     expect(minted.status).toBe(200);
     const { ticketId } = await minted.json() as { ticketId: string };
@@ -298,7 +952,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(200);
     const { ticketId } = await r.json() as { ticketId: string };
@@ -318,7 +972,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(200);
     const body = await r.json() as { version: number; ticketId: string; ticket: string; os: string; arch: string; filename: string; sizeBytes: number; sha256: string; maxConsumes: number; expiresAt: number; ownerUserId: string };
@@ -373,7 +1027,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
 
     const r2 = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux' }),
     });
     expect(r2.status).toBe(400);
   });
@@ -385,7 +1039,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(200);
     const body = await r.json() as { sha256: string };
@@ -404,7 +1058,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(503);
   });
@@ -427,7 +1081,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(503);
   });
@@ -444,7 +1098,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       const o = await owner(userId);
       const r = await app.request('/api/enroll/v2/ticket', {
         method: 'POST', headers: ticketHeaders(userId, o),
-        body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+        body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
       });
       expect(r.status).toBe(503);
     } finally {
@@ -466,7 +1120,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
       const o = await owner(userId);
       const r = await app.request('/api/enroll/v2/ticket', {
         method: 'POST', headers: ticketHeaders(userId, o),
-        body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+        body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
       });
       expect(r.status).toBe(503);
     } finally {
@@ -483,7 +1137,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(503);
     await writeFile(join(exeDir, 'imcodes-node-linux'), FAKE_BINARY);
@@ -499,7 +1153,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     try {
       const r = await app.request('/api/enroll/v2/ticket', {
         method: 'POST', headers: ticketHeaders(userId, o),
-        body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+        body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
       });
       expect(r.status).toBe(503);
     } finally {
@@ -515,7 +1169,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const o = await owner(userId);
     const r = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(r.status).toBe(403);
   });
@@ -529,7 +1183,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const response = await app.request('https://request-host.example/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(response.status).toBe(403);
   });
@@ -544,7 +1198,7 @@ describe('POST /api/enroll/v2/ticket (artifact manifest → enrollments_v2 row)'
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
     const { ticket } = await mint.json() as { ticket: string };
@@ -572,7 +1226,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
     const { ticket } = await mint.json() as { ticket: string };
@@ -601,7 +1255,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'win', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'win', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
     const { ticket } = await mint.json() as { ticket: string };
@@ -635,7 +1289,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
 
@@ -670,7 +1324,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     const response = await app.request('/api/enroll/v2/download', {
@@ -699,7 +1353,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     const verified = await artifactCatalog.ensureVerified(exeDir, 'linux', 'x64');
@@ -741,7 +1395,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     await db.exec(`
@@ -786,7 +1440,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
 
@@ -824,7 +1478,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     for (let i = 0; i < 3; i++) {
@@ -843,7 +1497,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     const r = await app.request('/api/enroll/v2/download', {
@@ -878,7 +1532,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     await db.execute('UPDATE controlled_node_enrollments_v2 SET ticket_expires_at = $1', [Date.now() - 1]);
@@ -893,7 +1547,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     await writeFile(join(exeDir, 'imcodes-node-linux'), Buffer.from('tampered-after-mint'));
@@ -912,7 +1566,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     const response = await app.request('/api/enroll/v2/download', {
@@ -942,7 +1596,7 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const mint = await app.request('https://mint-host.invalid/api/enroll/v2/ticket', {
       method: 'POST',
       headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     expect(mint.status).toBe(200);
     const { ticket } = await mint.json() as { ticket: string };
@@ -958,15 +1612,27 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
     const app = buildApp();
     const page = await app.request('/api/enroll/v2/bootstrap');
     expect(page.status).toBe(200);
-    expect(page.headers.get('content-security-policy')).toContain("default-src 'none'");
-    expect(await page.text()).toContain("location.hash.slice(1)");
+    const csp = page.headers.get('content-security-policy');
+    expect(csp).toContain("default-src 'none'");
+    expect(csp).toContain("connect-src 'self'");
+    expect(csp).toContain("navigate-to 'self' blob:");
+    expect(page.headers.get('cache-control')).toContain('no-store');
+    expect(page.headers.get('referrer-policy')).toBe('no-referrer');
+    const html = await page.text();
+    expect(html).toContain("location.hash.slice(1)");
+    expect(html).toContain("history.replaceState(null,'',location.pathname+location.search)");
+    expect(html).toContain("xhr.open('POST',downloadPath,true)");
+    expect(html).toContain("xhr.responseType='blob'");
+    expect(html).toContain('event.lengthComputable');
+    expect(html).toContain("new Intl.NumberFormat(undefined");
+    expect(html).not.toContain('ticket_secret');
 
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket } = await mint.json() as { ticket: string };
     const download = await app.request('/api/enroll/v2/download', {
@@ -983,6 +1649,26 @@ describe('GET|POST /api/enroll/v2/download (ticket + streaming)', () => {
 // ─────────────────────────── POST /v2/redeem ───────────────────────────
 
 describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 409)', () => {
+  it('rejects caller-supplied nodeId instead of allowing a claim', async () => {
+    const app = buildApp();
+    const r = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: `missing-${hex(8)}`,
+        installId: `inst-${hex(4)}`,
+        nodeTokenHash: sha256(hex(16)),
+        hostname: 'caller-host',
+        os: 'linux',
+        arch: 'x64',
+        nodeId: '1234567890',
+      }),
+    });
+    expect(r.status).toBe(400);
+    expect(await r.json()).toEqual({ error: 'invalid_body' });
+  });
+
   it('unknown enroll token returns the same generic redeem failure', async () => {
     const app = buildApp();
     const r = await app.request('/api/enroll/v2/redeem', {
@@ -1009,7 +1695,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { ticket: _t } = await mint.json() as { ticket: string };
 
@@ -1038,10 +1724,17 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
       }),
     });
     expect(r.status).toBe(200);
-    const body = await r.json() as { serverId: string; version: number; nodeRole: string; token?: string };
+    const body = await r.json() as { serverId: string; nodeId: string; refName?: string; version: number; nodeRole: string; token?: string };
     expect(body.version).toBe(2);
     expect(body.token).toBeUndefined(); // audit: no raw token returned
     expect(body.nodeRole).toBe('controlled');
+    expect(isControlledNodeId(body.nodeId)).toBe(true);
+    expect(body.refName).toBeUndefined();
+    const storedIdentity = await db.queryOne<{ ref_name: string | null; display_name: string | null }>(
+      'SELECT ref_name, display_name FROM servers WHERE id = $1',
+      [body.serverId],
+    );
+    expect(storedIdentity).toEqual({ ref_name: null, display_name: 'h (linux)' });
 
     const installer = await db.queryOne<{ reusable: boolean; expires_at: string | null; used_at: string | null }>(
       'SELECT reusable, expires_at, used_at FROM controlled_node_enrollments_v2 LIMIT 1',
@@ -1057,14 +1750,14 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     expect(bound?.redeemed_server_id).toBe(body.serverId);
   });
 
-  it('idempotent: same installId + same nodeTokenHash replay returns same serverId', async () => {
+  it('keeps nodeId independent of hostname, never mints/reuses an alias, and replays the same identity', async () => {
     const app = buildApp();
     const userId = `u_${hex(4)}`;
     await createUser(db, userId);
     const o = await owner(userId);
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
@@ -1072,29 +1765,198 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
 
     const installId = `inst-${hex(4)}`;
     const nodeTokenHash = sha256(hex(16));
+    const legacyServerId = hex(8);
+    await db.execute(
+      `INSERT INTO servers
+         (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled,
+          os, arch, node_id, ref_name, display_name)
+       VALUES ($1, $2, 'legacy-controlled', $3, 'offline', $4, $5, TRUE,
+               'linux', 'x64', $6, 'h', 'Legacy H')`,
+      [legacyServerId, userId, sha256(hex(16)), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
     const payload = {
       version: 2 as const, enrollToken: enrollCode, installId, nodeTokenHash,
       hostname: 'h', os: 'linux', arch: 'x64',
     };
 
     const r1 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-    const r2 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
-    const r3 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload) });
+    const changedHostnamePayload = { ...payload, hostname: 'completely-different-host' };
+    const r2 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(changedHostnamePayload) });
+    const r3 = await app.request('/api/enroll/v2/redeem', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ ...payload, hostname: '另一台机器' }) });
     expect(r1.status).toBe(200);
     expect(r2.status).toBe(200);
     expect(r3.status).toBe(200);
-    const b1 = await r1.json() as { serverId: string };
-    const b2 = await r2.json() as { serverId: string };
-    const b3 = await r3.json() as { serverId: string };
+    const b1 = await r1.json() as { serverId: string; nodeId: string; refName?: string; displayName: string };
+    const b2 = await r2.json() as { serverId: string; nodeId: string; refName?: string; displayName: string };
+    const b3 = await r3.json() as { serverId: string; nodeId: string; refName?: string; displayName: string };
     expect(b2.serverId).toBe(b1.serverId);
     expect(b3.serverId).toBe(b1.serverId);
+    expect(isControlledNodeId(b1.nodeId)).toBe(true);
+    expect(b2.nodeId).toBe(b1.nodeId);
+    expect(b3.nodeId).toBe(b1.nodeId);
+    expect([b1.refName, b2.refName, b3.refName]).toEqual([undefined, undefined, undefined]);
+    expect([b1.displayName, b2.displayName, b3.displayName]).toEqual(['h (linux)', 'h (linux)', 'h (linux)']);
 
-    // Only ONE controlled server exists for this user.
+    const identities = await db.query<{ id: string; node_id: string; ref_name: string | null }>(
+      `SELECT id, node_id, ref_name FROM servers
+        WHERE user_id = $1 AND node_role = 'controlled'
+        ORDER BY id`,
+      [userId],
+    );
+    expect(identities.find((row) => row.id === legacyServerId)?.ref_name).toBe('h');
+    expect(identities.find((row) => row.id === b1.serverId)?.ref_name).toBeNull();
+
+    // A pre-migration alias is read-only compatibility data: replay may report
+    // it, but the caller's new hostname neither replaces nor retargets it.
+    await db.execute('UPDATE servers SET ref_name = $2 WHERE id = $1', [b1.serverId, 'old-host-alias']);
+    const legacyReplay = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ ...payload, hostname: 'caller-cannot-retarget-alias' }),
+    });
+    expect(legacyReplay.status).toBe(200);
+    expect(await legacyReplay.json()).toMatchObject({
+      serverId: b1.serverId,
+      nodeId: b1.nodeId,
+      refName: 'old-host-alias',
+    });
+    expect(await db.queryOne<{ ref_name: string | null }>(
+      'SELECT ref_name FROM servers WHERE id = $1',
+      [b1.serverId],
+    )).toEqual({ ref_name: 'old-host-alias' });
+
+    // Replays created only one new server alongside the seeded legacy node.
     const count = await db.queryOne<{ n: string }>(
       "SELECT COUNT(*)::text AS n FROM servers WHERE user_id = $1 AND node_role = 'controlled'",
       [userId],
     );
-    expect(count?.n).toBe('1');
+    expect(count?.n).toBe('2');
+  });
+
+  it('fails closed when an idempotent replay encounters a NULL or malformed stored nodeId', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const enrollment = await db.queryOne<{ encrypted_code: string }>(
+      'SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1',
+    );
+    const payload = {
+      version: 2 as const,
+      enrollToken: decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode,
+      installId: `corrupt-${hex(4)}`,
+      nodeTokenHash: sha256(hex(16)),
+      hostname: 'corrupt-replay-host',
+      os: 'linux',
+      arch: 'x64',
+    };
+    const created = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+    });
+    expect(created.status).toBe(200);
+    const identity = await created.json() as { serverId: string; nodeId: string };
+    const migration086 = await readFile(
+      new URL('../src/db/migrations/086_controlled_node_identity_not_null.sql', import.meta.url),
+      'utf8',
+    );
+
+    // Simulate a database serving between deployed 085 and 086. The production
+    // invariant is restored in finally; the route must reject both corrupt
+    // representations rather than echoing equality-to-self as a valid replay.
+    await db.execute('ALTER TABLE servers DROP CONSTRAINT servers_controlled_node_id_check');
+    try {
+      for (const storedNodeId of [null, 'not-a-node-id']) {
+        await db.execute('UPDATE servers SET node_id = $2 WHERE id = $1', [identity.serverId, storedNodeId]);
+        const replay = await app.request('/api/enroll/v2/redeem', {
+          method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
+        });
+        expect(replay.status).toBe(500);
+        expect(await replay.json()).toEqual({ error: 'redeem_failed' });
+      }
+    } finally {
+      await db.execute('UPDATE servers SET node_id = $2 WHERE id = $1', [identity.serverId, identity.nodeId]);
+      await db.execute(migration086);
+    }
+  });
+
+  it('rolls back the real redeem transaction when all bounded nodeId attempts collide', async () => {
+    const normalApp = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await normalApp.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
+    });
+    const { decryptBotConfig } = await import('../src/security/crypto.js');
+    const enrollment = await db.queryOne<{
+      id: string;
+      encrypted_code: string;
+      used_at: string | null;
+      install_id: string | null;
+      node_token_hash: string | null;
+      redeemed_server_id: string | null;
+    }>(
+      `SELECT id, encrypted_code, used_at, install_id, node_token_hash, redeemed_server_id
+         FROM controlled_node_enrollments_v2 LIMIT 1`,
+    );
+    await db.execute(
+      `INSERT INTO servers
+         (id, user_id, name, token_hash, status, created_at, node_role, node_id)
+       VALUES ($1, $2, 'collision-sentinel', 'hash', 'offline', $3, $4, $5)`,
+      [`collision_${hex(6)}`, userId, Date.now(), NODE_ROLE.CONTROLLED, CONTROLLED_NODE_ID_MIN],
+    );
+    const beforeServers = await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM servers WHERE user_id = $1', [userId],
+    );
+    const beforeInstalls = await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
+      [enrollment!.id],
+    );
+    const collidingApp = buildApp({
+      controlledNodeIdRandomBytes: (size) => new Uint8Array(size),
+    });
+    const response = await collidingApp.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: decryptBotConfig(enrollment!.encrypted_code, TEST_ENCRYPTION_KEY).enrollCode,
+        installId: `exhaust-${hex(4)}`,
+        nodeTokenHash: sha256(hex(16)),
+        hostname: 'collision-host',
+        os: 'linux',
+        arch: 'x64',
+      }),
+    });
+    expect(response.status).toBe(500);
+    expect(await response.json()).toEqual({ error: 'redeem_failed' });
+    expect(await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM servers WHERE user_id = $1', [userId],
+    )).toEqual(beforeServers);
+    expect(await db.queryOne<{ count: number }>(
+      'SELECT count(*)::int AS count FROM controlled_node_enrollment_installs WHERE enrollment_id = $1',
+      [enrollment!.id],
+    )).toEqual(beforeInstalls);
+    expect(await db.queryOne<{
+      used_at: string | null;
+      install_id: string | null;
+      node_token_hash: string | null;
+      redeemed_server_id: string | null;
+    }>(
+      `SELECT used_at, install_id, node_token_hash, redeemed_server_id
+         FROM controlled_node_enrollments_v2 WHERE id = $1`,
+      [enrollment!.id],
+    )).toEqual({
+      used_at: enrollment!.used_at,
+      install_id: enrollment!.install_id,
+      node_token_hash: enrollment!.node_token_hash,
+      redeemed_server_id: enrollment!.redeemed_server_id,
+    });
   });
 
   it('serializes concurrent redemption of the same installer/install identity', async () => {
@@ -1104,7 +1966,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
@@ -1121,10 +1983,14 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
       method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(payload),
     })));
     expect(responses.every((response) => response.status === 200)).toBe(true);
-    const serverIds = new Set(await Promise.all(responses.map(async (response) => (
-      (await response.json() as { serverId: string }).serverId
-    ))));
+    const identities = await Promise.all(responses.map(async (response) => (
+      await response.json() as { serverId: string; nodeId: string }
+    )));
+    const serverIds = new Set(identities.map((identity) => identity.serverId));
+    const nodeIds = new Set(identities.map((identity) => identity.nodeId));
     expect(serverIds.size).toBe(1);
+    expect(nodeIds.size).toBe(1);
+    expect(isControlledNodeId(identities[0]?.nodeId)).toBe(true);
     const count = await db.queryOne<{ n: string }>(
       'SELECT COUNT(*)::text AS n FROM controlled_node_enrollment_installs',
     );
@@ -1138,7 +2004,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
@@ -1167,7 +2033,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
@@ -1206,7 +2072,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
@@ -1232,7 +2098,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string; reusable: boolean; expires_at: string | null }>(
@@ -1268,7 +2134,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ id: string; encrypted_code: string }>(
@@ -1302,7 +2168,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
@@ -1344,7 +2210,7 @@ describe('POST /api/enroll/v2/redeem (atomic claim + idempotent + mismatch → 4
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ encrypted_code: string }>('SELECT encrypted_code FROM controlled_node_enrollments_v2 LIMIT 1');
@@ -1465,13 +2331,13 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const mint = await app.request('/api/enroll/v2/ticket', {
       method: 'POST',
       headers: { ...headers, 'content-type': 'application/json' },
-      body: JSON.stringify({ version: 2, os: 'mac', arch: 'universal' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'mac', arch: 'universal' }),
     });
     expect(mint.status).toBe(200);
     const { ticket } = await mint.json() as { ticket: string };
     const bootstrap = await app.request(`/api/enroll/v2/bootstrap#ticket=${ticket}`);
     expect(bootstrap.status).toBe(200);
-    expect(await bootstrap.text()).toContain("f.method='POST'");
+    expect(await bootstrap.text()).toContain("xhr.open('POST',downloadPath,true)");
     const download = await app.request('/api/enroll/v2/download', {
       method: 'POST',
       headers: { 'content-type': 'application/x-www-form-urlencoded' },
@@ -1571,7 +2437,7 @@ describe('GET /api/enroll/v2/availability + retention', () => {
     const o = await owner(userId);
     await app.request('/api/enroll/v2/ticket', {
       method: 'POST', headers: ticketHeaders(userId, o),
-      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
     });
     const { decryptBotConfig } = await import('../src/security/crypto.js');
     const row = await db.queryOne<{ id: string; encrypted_code: string }>(
@@ -1643,6 +2509,262 @@ describe('GET /api/enroll/v2/availability + retention', () => {
 // ─────────────────────────── GET /v2/node-artifact ───────────────────────────
 
 describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () => {
+  /**
+   * A revoked credential must be indistinguishable from an unknown one.
+   *
+   * This route authenticates independently of the central daemon-token
+   * resolver, because it is one of the two HTTP calls a controlled node
+   * legitimately makes (`src/node/self-upgrade.ts`). It used to answer a
+   * revoked credential with 403 `revoked`, which confirmed to whoever held it
+   * that the credential had once been real, and contradicted the policy the
+   * central resolver enforces everywhere else.
+   */
+  it('answers a revoked credential exactly as it answers an unknown one', async () => {
+    const app = buildApp();
+    await writeFile(join(exeDir, 'imcodes-node-linux'), FAKE_BINARY);
+    await writeManifest('imcodes-node-linux', 'linux', 'x64', FAKE_BINARY);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+    const path = `/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64`;
+    const headers = { authorization: `Bearer ${token}`, 'X-Server-Id': serverId };
+
+    // Live: the upgrade path a controlled node depends on must keep working.
+    // The body MUST be consumed. This route streams from an open FileHandle that
+    // production closes only at EOF, on error, or on cancel
+    // (`server/src/routes/enroll.ts` bare-stream close path). Asserting only the
+    // status leaves the descriptor pinned until GC finalizes it, which Node now
+    // raises as ERR_INVALID_STATE — an unhandled error that fails the run while
+    // every assertion still reports as passing.
+    const live = await app.request(path, { headers });
+    expect(live.status).toBe(200);
+    expect(Buffer.from(await live.arrayBuffer()).equals(FAKE_BINARY)).toBe(true);
+
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), serverId]);
+
+    const revoked = await app.request(path, { headers });
+    const unknown = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${hex(8)}&os=linux&arch=x64`,
+      { headers: { authorization: `Bearer ${hex(16)}`, 'X-Server-Id': hex(8) } },
+    );
+    expect(revoked.status).toBe(401);
+    expect(unknown.status).toBe(401);
+    expect(await revoked.text()).toBe(await unknown.text());
+  });
+
+  it('serves the components a Mac asks for even when it enrolled as the other architecture', async () => {
+    // The exact failure this was written for. The macOS controlled-node
+    // executable is universal, so the arch recorded at enrollment is
+    // `process.arch` of whichever slice ran the installer -- under Rosetta
+    // that is `x64` on an Apple Silicon Mac, and nothing ever corrects it.
+    //
+    // Gating the component download on that value barred an M3 machine from
+    // the only components it can run, permanently, on the basis of something
+    // that is not a property of the machine: it is a property of how the
+    // installer happened to launch months earlier. The node knows its own CPU
+    // when it asks, and the set it receives names its architecture and is
+    // refused by the node's own verification if it does not match.
+    const app = buildApp();
+    await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
+    await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal', FAKE_BINARY);
+    const release = await writeMacosRemoteDesktopRelease('arm64');
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'apple-silicon-enrolled-under-rosetta', $3, 'online', $4, $5, TRUE, 'mac', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+    const response = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${serverId}&os=mac&arch=arm64`
+      + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`,
+      {
+        headers: {
+          authorization: `Bearer ${token}`,
+          'X-Server-Id': serverId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+    );
+    expect(response.status).toBe(200);
+    const archive = Buffer.from(await response.arrayBuffer());
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME))
+      .toBe(remoteDesktopMacosComponentSetFilename('arm64'));
+    // And it is the arm64 set, not a differently-named copy of something else.
+    const decoded = decodeRemoteDesktopMacosComponentSetPrefix(
+      archive.subarray(0, REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES),
+    );
+    expect(decoded).not.toBeNull();
+    expect(archive.subarray(
+      REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES,
+      REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES + decoded!.manifestSize,
+    )).toEqual(release.manifestBytes);
+  });
+
+  it('streams one exact authenticated macOS component set and rejects revocation, cross-arch, and mixed releases', async () => {
+    const app = buildApp();
+    await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
+    await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal', FAKE_BINARY);
+    const release = await writeMacosRemoteDesktopRelease('arm64');
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+    const headers = {
+      authorization: `Bearer ${token}`,
+      'X-Server-Id': serverId,
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+    };
+    const requestPath = (arch: 'arm64' | 'x64') => (
+      `/api/enroll/v2/node-artifact?serverId=${serverId}&os=mac&arch=${arch}`
+      + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`
+    );
+
+    const response = await app.request(requestPath('arm64'), { headers });
+    expect(response.status).toBe(200);
+    const archive = Buffer.from(await response.arrayBuffer());
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.FILENAME))
+      .toBe(remoteDesktopMacosComponentSetFilename('arm64'));
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION))
+      .toBe('2026.7.1234-dev.5');
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SIZE_BYTES))
+      .toBe(String(archive.length));
+    expect(response.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.SHA256))
+      .toBe(sha256(archive));
+
+    const decoded = decodeRemoteDesktopMacosComponentSetPrefix(
+      archive.subarray(0, REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES),
+    );
+    expect(decoded).not.toBeNull();
+    let offset = REMOTE_DESKTOP_MACOS_COMPONENT_SET_PREFIX_BYTES;
+    expect(archive.subarray(offset, offset + decoded!.manifestSize)).toEqual(release.manifestBytes);
+    offset += decoded!.manifestSize;
+    for (const kind of REMOTE_DESKTOP_MACOS_COMPONENT_ORDER) {
+      const component = release.components[kind];
+      expect(archive.subarray(offset, offset + component.length)).toEqual(component);
+      offset += component.length;
+    }
+    expect(offset).toBe(archive.length);
+
+    // Asking for the architecture this release did not build is answered
+    // "not built", not "forbidden". The enrolled arch is NOT consulted -- see
+    // the Rosetta case below for why it cannot be.
+    const crossArch = await app.request(requestPath('x64'), { headers });
+    expect(crossArch.status).toBe(503);
+    expect(await crossArch.json()).toMatchObject({ error: 'remote_desktop_worker_not_built' });
+
+    await db.execute('UPDATE servers SET revoked_at = $1 WHERE id = $2', [Date.now(), serverId]);
+    const revoked = await app.request(requestPath('arm64'), { headers });
+    const unknownId = hex(8);
+    const unknown = await app.request(
+      `/api/enroll/v2/node-artifact?serverId=${unknownId}&os=mac&arch=arm64`
+        + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`,
+      {
+        headers: {
+          authorization: `Bearer ${hex(16)}`,
+          'X-Server-Id': unknownId,
+          [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+        },
+      },
+    );
+    expect(revoked.status).toBe(401);
+    expect(unknown.status).toBe(401);
+    expect(await revoked.text()).toBe(await unknown.text());
+
+    await db.execute('UPDATE servers SET revoked_at = NULL WHERE id = $1', [serverId]);
+    await writeMacosRemoteDesktopRelease('arm64', '2026.7.1234-dev.6');
+    const mixedVersion = await app.request(requestPath('arm64'), { headers });
+    expect(mixedVersion.status).toBe(503);
+    expect(await mixedVersion.json()).toEqual({ error: 'macos_release_version_mismatch' });
+  });
+
+  it('fails closed for missing, extra, duplicate-name, or hash-mismatched macOS component sets', async () => {
+    const app = buildApp();
+    await rm(join(exeDir, 'imcodes-node-macos'), { recursive: true, force: true });
+    await writeFile(join(exeDir, 'imcodes-node-macos'), FAKE_BINARY);
+    await writeManifest('imcodes-node-macos', 'darwin', 'universal', FAKE_BINARY);
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const token = hex(16);
+    const serverId = hex(8);
+    await db.execute(
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
+    );
+    const path = `/api/enroll/v2/node-artifact?serverId=${serverId}&os=mac&arch=arm64`
+      + `&asset=${CONTROLLED_NODE_ARTIFACT_ASSETS.REMOTE_DESKTOP_MACOS_COMPONENT_SET}`;
+    const headers = {
+      authorization: `Bearer ${token}`,
+      [CONTROLLED_NODE_ARTIFACT_HEADERS.REMOTE_DESKTOP_PROTOCOL_VERSION]: '2',
+    };
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await rm(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_DISCLOSURE_FILENAME),
+    );
+    const missing = await app.request(path, { headers });
+    expect(missing.status).toBe(503);
+    await missing.arrayBuffer();
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await rm(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_VIRTUAL_DISPLAY_HELPER_FILENAME),
+    );
+    const missingFourthComponent = await app.request(path, { headers });
+    expect(missingFourthComponent.status).toBe(503);
+    await missingFourthComponent.arrayBuffer();
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await writeFile(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', 'unexpected-component'),
+      Buffer.from('not-in-the-canonical-set'),
+    );
+    const extra = await app.request(path, { headers });
+    expect(extra.status).toBe(503);
+    await extra.arrayBuffer();
+    await rm(join(exeDir, 'remote-desktop-worker', 'darwin-arm64', 'unexpected-component'));
+
+    const duplicateRelease = await writeMacosRemoteDesktopRelease('arm64');
+    const duplicateManifest = JSON.parse(duplicateRelease.manifestBytes.toString('utf8')) as {
+      components: Record<MacosComponentKind, { fileName: string }>;
+    };
+    duplicateManifest.components.virtualDisplayHelper.fileName =
+      duplicateManifest.components.disclosure.fileName;
+    await writeFile(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME),
+      JSON.stringify(duplicateManifest),
+    );
+    const duplicate = await app.request(path, { headers });
+    expect(duplicate.status).toBe(503);
+    await duplicate.arrayBuffer();
+
+    await writeMacosRemoteDesktopRelease('arm64');
+    await writeFile(
+      join(exeDir, 'remote-desktop-worker', 'darwin-arm64', REMOTE_DESKTOP_MACOS_WORKER_FILENAME),
+      Buffer.from('tampered-worker'),
+    );
+    const mismatched = await app.request(path, { headers });
+    expect(mismatched.status).toBe(503);
+    await mismatched.arrayBuffer();
+  });
+
   it('gzip-encodes self-upgrade bytes on demand while retaining decoded size and digest metadata', async () => {
     const app = buildApp();
     await writeFile(join(exeDir, 'imcodes-node-linux'), COMPRESSIBLE_FAKE_BINARY);
@@ -1652,9 +2774,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const token = hex(16);
     const serverId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
-      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
 
     const response = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=linux&arch=x64`, {
@@ -1679,9 +2801,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const token = hex(16);
     const serverId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-win', $3, 'online', $4, $5, TRUE, 'win', 'x64')`,
-      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-win', $3, 'online', $4, $5, TRUE, 'win', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
 
     const missingWorkerResponse = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
@@ -1776,9 +2898,9 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const macToken = hex(16);
     const macServerId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64')`,
-      [macServerId, userId, sha256(macToken), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-mac-arm', $3, 'online', $4, $5, TRUE, 'mac', 'arm64', $6)`,
+      [macServerId, userId, sha256(macToken), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const macArchiveBytes = Buffer.from('SIGNED_OPEN_COMPUTER_USE_APP_ARCHIVE');
     await mkdir(join(exeDir, 'computer-use-helper', 'darwin-universal'), { recursive: true });
@@ -1828,13 +2950,130 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     const token = hex(16);
     const serverId = hex(8);
     await db.execute(
-      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch)
-       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64')`,
-      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED],
+      `INSERT INTO servers (id, user_id, name, token_hash, status, created_at, node_role, exec_enabled, os, arch, node_id)
+       VALUES ($1, $2, 'controlled-linux', $3, 'online', $4, $5, TRUE, 'linux', 'x64', $6)`,
+      [serverId, userId, sha256(token), Date.now(), NODE_ROLE.CONTROLLED, generateControlledNodeId()],
     );
     const mismatch = await app.request(`/api/enroll/v2/node-artifact?serverId=${serverId}&os=win&arch=x64`, {
       headers: { authorization: `Bearer ${token}` },
     });
     expect(mismatch.status).toBe(403);
   });
+});
+
+describe('controlled-node Desk scope at enrollment', () => {
+  it('mints a link with no group and REDEEMS it, end to end', async () => {
+    // The gap that shipped: the mint stopped requiring a group, but the redeem
+    // transaction still denied any ticket without one, so every freshly minted
+    // link answered 401 on the machine. The old tests checked that minting
+    // returned 200 and stored a NULL group -- neither of them ever redeemed,
+    // which is the half where the install actually happens.
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    const { ticket } = await mint.json() as { ticket: string };
+
+    const download = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(download.status).toBe(200);
+    const trailer = decodeEnrollmentTrailer(Buffer.from(await download.arrayBuffer()));
+
+    const redeem = await app.request('/api/enroll/v2/redeem', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        version: 2,
+        enrollToken: trailer!.enrollToken,
+        installId: `inst-${hex(4)}`,
+        nodeTokenHash: sha256(hex(16)),
+        hostname: 'no-group-host',
+        os: 'linux',
+        arch: 'x64',
+      }),
+    });
+    expect(redeem.status, 'a link with no group must still install').toBe(200);
+
+    // And the machine it created belongs to its owner and to no group, which is
+    // the narrowest reachable state rather than a gap.
+    const created = await db.queryOne<{ user_id: string; team_id: string | null }>(
+      'SELECT user_id, team_id FROM servers WHERE user_id = $1 AND node_role = $2',
+      [userId, NODE_ROLE.CONTROLLED],
+    );
+    expect(created).toEqual({ user_id: userId, team_id: null });
+  });
+
+  it('names the OWNER in the installer trailer, bounded and degrading safely', async () => {
+    // The consent screen says whose account this machine is joining. The
+    // nickname, never the username: someone deciding whether to trust an
+    // install recognises a person, not a login handle. It used to carry a group
+    // name, which described neither the person nor what the install does.
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+    await db.execute('UPDATE users SET display_name = $2 WHERE id = $1', [userId, '老孙']);
+
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    const { ticket } = await mint.json() as { ticket: string };
+    const download = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${ticket}` },
+    });
+    expect(download.status).toBe(200);
+    const trailer = decodeEnrollmentTrailer(Buffer.from(await download.arrayBuffer()));
+    expect(trailer).toMatchObject({ ownerName: '老孙' });
+
+    // A very long name is truncated rather than overflowing the bounded trailer
+    // body, which would otherwise fail the whole download.
+    await db.execute('UPDATE users SET display_name = $2 WHERE id = $1', [userId, 'D'.repeat(400)]);
+    const longMint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, os: 'linux', arch: 'x64' }),
+    });
+    expect(longMint.status).toBe(200);
+    const longDownload = await app.request('/api/enroll/v2/download', {
+      headers: { authorization: `Bearer ${(await longMint.json() as { ticket: string }).ticket}` },
+    });
+    expect(longDownload.status).toBe(200);
+    const longTrailer = decodeEnrollmentTrailer(Buffer.from(await longDownload.arrayBuffer()));
+    expect(longTrailer?.ownerName?.length).toBe(64);
+    // Whatever happens to the name, the credential fields still arrive intact.
+    expect(longTrailer?.serverUrl).toBeTruthy();
+    expect(longTrailer?.enrollToken).toBeTruthy();
+  });
+
+  it('accepts a group id from an older client and stores none', async () => {
+    // Nothing sends this any more. The body schema is strict, so rejecting it
+    // would 400 every browser still running the previous bundle -- the server
+    // ships before the tab is reloaded, and that ordering is how the last
+    // install outage happened. Accepted, and then ignored: a machine belongs to
+    // whoever installs it.
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const o = await owner(userId);
+
+    const mint = await app.request('/api/enroll/v2/ticket', {
+      method: 'POST', headers: ticketHeaders(userId, o),
+      body: JSON.stringify({ version: 2, teamId: deskOf(userId), os: 'linux', arch: 'x64' }),
+    });
+    expect(mint.status).toBe(200);
+    expect(await db.queryOne<{ desk_team_id: string | null }>(
+      `SELECT desk_team_id FROM controlled_node_enrollments_v2
+        WHERE owner_user_id = $1 ORDER BY created_at DESC LIMIT 1`,
+      [userId],
+    )).toEqual({ desk_team_id: null });
+  });
+
 });

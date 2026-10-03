@@ -91,74 +91,77 @@ describe('UsageFooter', () => {
     expect(container.querySelector('.session-usage-backdrop')).toBeNull();
   });
 
-  it('renders the execution-clone launcher and calls its handler', () => {
+  it('hides the execution-clone launcher and puts history refresh before stats', () => {
     const onRunExecutionClones = vi.fn();
-    render(
+    const onRefreshHistory = vi.fn();
+    const { container } = render(
       <UsageFooter
         usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
         sessionName="deck_test_brain"
         onRunExecutionClones={onRunExecutionClones}
         runExecutionClonesTitle="Run clones"
         runExecutionClonesCount={3}
+        onRefreshHistory={onRefreshHistory}
       />,
     );
 
-    const cloneButton = screen.getByLabelText('Run clones');
-    expect(cloneButton.textContent).toContain('🤖');
-    expect(cloneButton.textContent).toContain('×3');
+    expect(screen.queryByLabelText('Run clones')).toBeNull();
+    expect(container.querySelector('.shortcut-btn-execution-clones')).toBeNull();
+    const refreshButton = screen.getByLabelText('chat.sync_history');
+    const statsButton = screen.getByLabelText('sessionUsage.open');
+    expect(refreshButton.compareDocumentPosition(statsButton) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
 
-    fireEvent.click(cloneButton);
-    expect(onRunExecutionClones).toHaveBeenCalledTimes(1);
+    fireEvent.click(refreshButton);
+    expect(onRefreshHistory).toHaveBeenCalledTimes(1);
+    expect(onRunExecutionClones).not.toHaveBeenCalled();
   });
 
-  it('disables the execution-clone launcher when requested', () => {
-    const onRunExecutionClones = vi.fn();
-    render(
+  it('disables history refresh and shows a spinner while its timeline is refreshing', () => {
+    const onRefreshHistory = vi.fn();
+    const { container } = render(
       <UsageFooter
         usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
         sessionName="deck_test_brain"
-        onRunExecutionClones={onRunExecutionClones}
-        runExecutionClonesTitle="No task"
-        runExecutionClonesDisabled
+        onRefreshHistory={onRefreshHistory}
+        historyRefreshing
       />,
     );
 
-    const cloneButton = screen.getByLabelText('No task') as HTMLButtonElement;
-    expect(cloneButton.disabled).toBe(true);
+    const refreshButton = screen.getByLabelText('chat.refreshing_history') as HTMLButtonElement;
+    expect(refreshButton.disabled).toBe(true);
+    expect(refreshButton.classList.contains('is-refreshing')).toBe(true);
+    expect(container.querySelector('.shortcut-btn-history-refresh-glyph')).toBeTruthy();
+    fireEvent.click(refreshButton);
+    expect(onRefreshHistory).not.toHaveBeenCalled();
   });
 
-  it('shows pending, success, and error feedback next to the execution-clone launcher', () => {
-    const baseProps = {
-      usage: { inputTokens: 0, cacheTokens: 0, contextWindow: 0 },
-      sessionName: 'deck_test_brain',
-      onRunExecutionClones: vi.fn(),
-      runExecutionClonesCount: 3,
-    };
-    const view = render(
+  it('surfaces the timeline refresh error without replacing the refresh action', () => {
+    const onRefreshHistory = vi.fn();
+    const { container } = render(
       <UsageFooter
-        {...baseProps}
-        runExecutionClonesBusy
-        runExecutionClonesFeedback={{ phase: 'pending', requestedCount: 3 }}
+        usage={{ inputTokens: 0, cacheTokens: 0, contextWindow: 0 }}
+        sessionName="deck_test_brain"
+        onRefreshHistory={onRefreshHistory}
+        historyStatus={{
+          phase: 'idle',
+          steps: { cache: 'skipped', textTail: 'skipped', daemon: 'skipped', http: 'skipped', older: 'skipped' },
+          counts: {},
+          response: {
+            state: 'error',
+            i18nKey: 'chat.timelineStatus.error',
+            localizedMessage: 'History service unavailable',
+            recoverable: true,
+          },
+        }}
       />,
     );
-    expect(screen.getByRole('status').textContent).toBe('chat.execution_clone_launch_pending');
-    expect(view.container.querySelector('.shortcut-btn-execution-clones.is-busy')).toBeTruthy();
 
-    view.rerender(
-      <UsageFooter
-        {...baseProps}
-        runExecutionClonesFeedback={{ phase: 'success', requestedCount: 3 }}
-      />,
-    );
-    expect(screen.getByRole('status').textContent).toBe('chat.execution_clone_launch_success');
-
-    view.rerender(
-      <UsageFooter
-        {...baseProps}
-        runExecutionClonesFeedback={{ phase: 'error', requestedCount: 3, error: 'capacity_full' }}
-      />,
-    );
-    expect(screen.getByRole('alert').textContent).toBe('chat.execution_clone_launch_failed');
+    const refreshButton = screen.getByLabelText('chat.sync_history: History service unavailable');
+    expect(refreshButton.getAttribute('title')).toBe('chat.sync_history: History service unavailable');
+    expect(refreshButton.classList.contains('is-error')).toBe(true);
+    expect(container.querySelector('[role="alert"]')?.getAttribute('aria-label')).toBe('History service unavailable');
+    fireEvent.click(refreshButton);
+    expect(onRefreshHistory).toHaveBeenCalledTimes(1);
   });
 
   it('keeps the robot status row visible without hosting the repo branch summary', () => {
@@ -583,7 +586,7 @@ describe('UsageFooter', () => {
   });
 
   it('renders explicit quota label inline in the ctx footer', () => {
-    render(
+    const { container } = render(
       <UsageFooter
         usage={{
           inputTokens: 2000,
@@ -602,6 +605,9 @@ describe('UsageFooter', () => {
     expect(screen.getByText('gpt-5')).toBeDefined();
     expect(screen.getByText(/5h 43% 2h03m 4\/6 14:40/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d04h 4\/8 15:48/)).toBeDefined();
+    const quotaLines = container.querySelectorAll('.session-usage-codex-line-compact');
+    expect(quotaLines).toHaveLength(1);
+    expect(quotaLines[0]?.textContent).toBe('5h 43% 2h03m 4/6 14:40 · 7d 34% 1d04h 4/8 15:48');
   });
 
   it('does not render stale codexStatus data when no explicit quota label is present', () => {
@@ -632,7 +638,7 @@ describe('UsageFooter', () => {
   });
 
   it('recomputes codex quota countdown from quotaMeta', () => {
-    render(
+    const { container } = render(
       <UsageFooter
         usage={{
           inputTokens: 2000,
@@ -663,6 +669,52 @@ describe('UsageFooter', () => {
     expect(screen.queryByText('stale quota text')).toBeNull();
     expect(screen.getByText(/5h 43% 2m/)).toBeDefined();
     expect(screen.getByText(/7d 34% 1d02h/)).toBeDefined();
+    expect(container.querySelectorAll('.session-usage-codex-line-compact')).toHaveLength(1);
+  });
+
+  it('renders a codex 7d-only quota beside the reset-credit badge', () => {
+    const { container } = render(
+      <UsageFooter
+        usage={{
+          inputTokens: 190_000,
+          cacheTokens: 0,
+          contextWindow: 258_400,
+          model: 'gpt-5.6-terra',
+        }}
+        sessionName="deck_jdzj_brain"
+        agentType="codex-sdk"
+        quotaLabel="7d 55% 5d05h 9/26 18:39"
+        quotaMeta={{
+          primary: {
+            usedPercent: 55,
+            windowDurationMins: 7 * 24 * 60,
+            resetsAt: 1_790_419_157,
+          },
+        }}
+        now={1_789_979_157_000}
+        wsClient={{} as never}
+      />,
+    );
+
+    expect(container.querySelector('.codex-credits-trigger')).toBeTruthy();
+    expect(screen.getByText(/7d 55%/)).toBeDefined();
+    expect(container.querySelectorAll('.session-usage-codex-line-compact')).toHaveLength(1);
+  });
+
+  it('does not hide a 7d-only quota merely because its reset timestamp has elapsed', () => {
+    render(
+      <UsageFooter
+        usage={{ inputTokens: 190_000, cacheTokens: 0, contextWindow: 258_400 }}
+        sessionName="deck_jdzj_brain"
+        agentType="codex-sdk"
+        quotaMeta={{
+          secondary: { usedPercent: 55, windowDurationMins: 10_080, resetsAt: 1_700_000_000 },
+        }}
+        now={1_800_000_000_000}
+      />,
+    );
+
+    expect(screen.getByText(/7d 55% 0m/)).toBeDefined();
   });
 
   it('uses provider-sourced context window before model-family inference', () => {

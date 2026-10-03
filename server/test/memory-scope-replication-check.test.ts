@@ -41,14 +41,12 @@ function makeMockDb(options: { userPrefs?: Record<string, string> } = {}) {
         const value = options.userPrefs?.[`${String(params[0])}:${String(params[1])}`];
         return value == null ? null : ({ value } as T);
       }
-      if (s.includes('select id, user_id from servers where token_hash = $1 and id = $2')) {
-        return params[0] === tokenHash && params[1] === 'srv-1'
-          ? ({ id: 'srv-1', user_id: 'owner-1' } as T)
-          : null;
-      }
-      if (s.includes('select id, team_id, user_id from servers where token_hash = $1 and id = $2')) {
-        return params[0] === tokenHash && params[1] === 'srv-1'
-          ? ({ id: 'srv-1', team_id: 'ent-1', user_id: 'owner-1' } as T)
+      // The daemon-token guard reads role and revocation together with the row,
+      // and matches on id first. A stub that omits node_role/revoked_at would
+      // make a controlled or revoked credential look like a full daemon.
+      if (s.includes('from servers where id = $1 and token_hash = $2')) {
+        return params[0] === 'srv-1' && params[1] === tokenHash
+          ? ({ id: 'srv-1', team_id: 'ent-1', user_id: 'owner-1', node_role: 'full', revoked_at: null } as T)
           : null;
       }
       return null;

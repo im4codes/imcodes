@@ -1,12 +1,10 @@
-import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { promisify } from 'node:util';
 import logger from '../util/logger.js';
 import type { TimelineEvent } from './timeline-event.js';
 import { TIMELINE_EVENT_FILE_CHANGE } from '../../shared/file-change.js';
 import { normalizeOpenCodeFileChange } from './file-change-normalizer.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 
-const execFileAsync = promisify(execFile);
 const DEFAULT_TIMEOUT_MS = 15_000;
 const DEFAULT_MAX_BUFFER = 8 * 1024 * 1024;
 

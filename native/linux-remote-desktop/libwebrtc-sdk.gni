@@ -1,0 +1,55 @@
+# Dependency-only variables shared by the product checkout and the immutable
+# SDK producer. GN imports may define variables but not instantiate targets, so
+# the SDK targets live in sdk.BUILD.gn while product targets stay in BUILD.gn --
+# an ordinary worker change must never invalidate the fixed SDK.
+#
+# A curated label list, the same shape Windows uses -- not `//:webrtc`. Linux
+# has no Apple-style monolithic root target and no reason to fight that
+# target's narrow `visibility` list. The X11 adapters already supply capture,
+# input and clipboard; libwebrtc supplies ICE, DTLS-SRTP, RTP/RTCP, pacing,
+# congestion control, and -- unlike macOS/Windows, which inject an OS-native
+# HARDWARE H.264 bitstream and therefore need no encoder factory of their
+# own -- the video ENCODER too: the initial Linux worker has no bespoke
+# hardware encoder, so it registers libwebrtc's own builtin factory and lets
+# VP8 (always available; H.264 only if OpenH264 is enabled at GN-arg time)
+# encode frames captured off X11. That is why this list carries
+# builtin_video_encoder_factory where the Windows list only carries the
+# decoder one.
+imcodes_linux_remote_desktop_defines = []
+
+imcodes_linux_remote_desktop_deps = [
+  "//api:create_modular_peer_connection_factory",
+  "//api:data_channel_interface",
+  "//api:enable_media",
+  "//api/audio_codecs:builtin_audio_decoder_factory",
+  "//api/audio_codecs:builtin_audio_encoder_factory",
+  "//api/environment",
+  "//api/environment:environment_factory",
+  "//api:jsep",
+  "//api:make_ref_counted",
+  "//api:media_stream_interface",
+  "//api:peer_connection_interface",
+  "//api:rtc_error",
+  "//api:rtc_stats_api",
+  "//api:rtp_sender_interface",
+  "//api:scoped_refptr",
+  "//api:set_local_description_observer_interface",
+  "//api:set_remote_description_observer_interface",
+  "//api/video:video_frame",
+  "//api/video:encoded_image",
+  "//api/video_codecs:scalability_mode",
+  "//api/video_codecs:builtin_video_decoder_factory",
+  "//api/video_codecs:builtin_video_encoder_factory",
+  "//api/video_codecs:video_codecs_api",
+  "//media:rtc_audio_video",
+  "//media:rtc_media_base",
+  "//modules/video_coding:video_codec_interface",
+  "//pc:video_track_source",
+  "//rtc_base:buffer",
+  "//rtc_base:logging",
+  "//rtc_base:ssl_adapter",
+  "//rtc_base:threading",
+  "//system_wrappers",
+  "//third_party/jsoncpp",
+  "//third_party/libyuv",
+]

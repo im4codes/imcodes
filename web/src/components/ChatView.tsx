@@ -1,10 +1,51 @@
+import { itemKeysUnchanged, snapshotItemKeys, type ItemKeySnapshot } from './chat-view-item-keys.js';
+import { HISTORY_GAP_MARKER_KEY, insertHistoryGapMarker, placeHistoryGapMarker } from './chat-history-gap.js';
+import {
+  isNeverRenderedTimelineEventType,
+  projectAssistantTextForDisplay,
+} from '../../../src/shared/timeline/types.js';
+import {
+  SUPERVISION_AUTOMATION_KIND_PREFIX,
+  SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_EXECUTION_STATES,
+  SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND,
+  SUPERVISION_USER_PROMPT_LABEL_KEYS,
+  SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND,
+  type SupervisionExecutionState,
+} from '@shared/supervision-config.js';
+import { SUPERVISION_HEARTBEAT_GLYPH } from '@shared/supervision-heartbeat.js';
+import {
+  CRON_COMPLETION_POLICY,
+  CRON_RUN_TIMELINE,
+  readCronRunTimelineProjection,
+  type CronRunTimelineProjection,
+} from '@shared/cron-types.js';
+import { localizeDaemonUserNoticeEvent } from '../daemon-user-notice-i18n.js';
+import { recordPerfRender } from '../perf-render-debug.js';
+import { localizeChatDownloadError } from '../chat-download-error.js';
 /**
  * ChatView — renders TimelineEvent[] as a chat-style view.
  * Merges consecutive streaming assistant.text events into single blocks.
  * Supports basic Markdown rendering (code blocks, inline code, bold).
  */
+import { loadFsLocalImagePreview } from '../fs-local-image-preview.js';
+import {
+  downloadPreviewWithDirectFallback,
+  isDirectFileTransferStaleHandleError,
+  isFileUploadCanceled,
+  selectPreviewDownloadDestination,
+  type DirectPreviewDownloadDestination,
+} from '../direct-file-transfer.js';
+import {
+  beginDownloadTransfer,
+  failDownloadTransfer,
+  isDownloadTransferPaused,
+  setDownloadTransferRetry,
+} from '../download-transfer-store.js';
+import { createDownloadTransferWiring } from '../download-transfer-wiring.js';
 import { h } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState, useMemo, useCallback } from 'preact/hooks';
+import { useCoalescedFrame } from '../hooks/useCoalescedFrame.js';
 import { memo, createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type {
@@ -17,6 +58,7 @@ import type {
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
+import { attachmentDisplayName, attachmentDownloadId, isAbsoluteAttachmentPath } from '../attachment-refs.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatToolDuration } from '../util/tool-duration.js';
 import {
@@ -28,6 +70,7 @@ import {
   SDK_SUBAGENT_TASK_TYPES,
 } from '@shared/sdk-subagent-status.js';
 import { parseUnifiedDiff } from '@shared/unified-diff.js';
+
 import { isHtmlPreviewPath, type HtmlPreviewViewMode } from '@shared/html-preview.js';
 import { FileBrowser, type FileBrowserPreviewRequest } from './file-browser-lazy.js';
 import { ChatMarkdown } from './ChatMarkdown.js';
@@ -36,9 +79,19 @@ import {
   type ChatLocalWebPreviewOpenHandler,
 } from './ChatLoopbackLink.js';
 import { AgentTodoList } from './AgentTodoList.js';
+import { DelegationClaimBadge, readDelegationClaimMetadata } from './DelegationClaimBadge.js';
+import { DelegationReplyInstructionCardView, DelegationSenderCardView } from './DelegationProtocolCard.js';
+import { parseDelegationProtocolMessage } from '@shared/agent-delegation-markers.js';
+import { CHAT_MESSAGE_ORIGINS, classifyUserMessageOrigin } from '@shared/chat-message-origin.js';
+import { TIMELINE_DELETE_ERROR_CODES } from '@shared/timeline-protocol.js';
+import { requestTimelineMessageDelete, resolveTimelineDeleteTargets, timelineDeleteErrorKey, TimelineDeleteError } from '../timeline-delete.js';
+import { claimRunKey } from './chat-run-keys.js';
+import { computeMeasuredScrollCorrection, computeReaderAnchorDelta, pickReaderAnchor, reconcileTopOffset, topOffsetStyle, type ReaderAnchor } from '../chat-scroll-anchoring.js';
+import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
 import {
   CHAT_MOUNT_SETTLE_MS,
   CHAT_MOUNT_SETTLE_TICK_MS,
+  CHAT_USER_SCROLL_UP_HOLD_MS,
   computeFollowThresholds,
 } from './chat-follow-thresholds.js';
 import type { ChatLocalImagePreviewLoader, ChatLocalImagePreviewResult } from './ChatLocalImagePreview.js';
@@ -64,9 +117,20 @@ import { ZoomedTextDialog } from './ZoomedTextDialog.js';
 import { formatSharedActorLabel } from '../tab-sharing-ui.js';
 import { deriveSessionLiveStatus } from '../session-live-status.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
-import { isPeerAuditRuntimeDisposition } from '@shared/peer-audit.js';
-import { AGENT_DELEGATION_REPLY_TIMELINE_EVENT } from '@shared/agent-delegation.js';
+import {
+  PEER_AUDIT_VERDICTS,
+  isPeerAuditRound,
+  isPeerAuditRuntimeDisposition,
+  isPeerAuditVerdict,
+} from '@shared/peer-audit.js';
+import {
+  AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
+  readAgentDelegationSupervisionTaskProjection,
+} from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
+import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
+import { TaskPairEventChip } from './TaskPairEventChip.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -86,6 +150,11 @@ import {
   type SdkSubagentDiagnostic,
   type SdkSubagentStatusRow,
 } from '../timeline/sdk-subagent-aggregator.js';
+import {
+  deriveLiveAssignmentStatuses,
+  liveAssignmentStatusesKey,
+  type LiveAssignmentStatus,
+} from '../timeline/supervision-assignment-status.js';
 import { resizeHandleHoverEvents } from './window-resize.js';
 
 interface Props {
@@ -104,14 +173,20 @@ interface Props {
   loadingOlder?: boolean;
   /** False when no more history is available */
   hasOlderHistory?: boolean;
+  /** The hole between a stale local cache and the newest block, while it is still being filled newest→oldest. */
+  historyGap?: { lowerTs: number; upperTs: number | null } | null;
   /** Called when user wants to load older messages */
   onLoadOlder?: () => void;
   sessionState?: string;
   sessionId?: string | null;
+  /** Session labels used by task-pair status rows when the event omits one. */
+  sessions?: readonly { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null }[];
   /** Receives a function that forces the chat list to scroll to the bottom. */
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
   preview?: boolean;
+  /** False for retained/collapsed windows: keep data cached but pause all chat timers. */
+  visible?: boolean;
   /** When provided, clicking file paths opens the shared floating preview host. */
   onPreviewFile?: (request: FileBrowserPreviewRequest) => void;
   /** When provided, the right-side file panel is available. */
@@ -139,6 +214,8 @@ interface Props {
   onLoadMessageContext?: (eventId: string, eventTs: number) => Promise<boolean>;
   /** Compact pinned panels reuse ChatView but intentionally omit message-pin chrome. */
   messagePinsEnabled?: boolean;
+  /** Sub-session windows scope the task-pair panel to their own assignments. */
+  scopeTaskPairs?: boolean;
 }
 
 function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null {
@@ -148,17 +225,28 @@ function parseMessagePinPreviewMode(raw: unknown): MessagePinPreviewMode | null 
 /** A merged view item — a single event, assistant text, or a tool presentation. */
 interface ViewItem {
   key: string;
-  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity';
+  type: 'event' | 'assistant-block' | 'tool-group' | 'tool-activity' | 'supervision-status-run' | 'history-gap';
   event?: TimelineEvent;
   /** Merged text for assistant-block */
   text?: string;
   /** Source event ids represented by an assistant block (for old-pin locate). */
   eventIds?: string[];
   assistantAutomation?: boolean;
+  assistantStreaming?: boolean;
+  /** Active final execution marker from a completed source event. */
+  executionState?: SupervisionExecutionState;
+  /** Metadata record of the block's completed assistant message, when it
+   *  carries the structured delegation-claim projection. Passed through by
+   *  reference so the memoized AssistantBlock keeps a stable prop identity. */
+  delegationMetadata?: Record<string, unknown>;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
   linkedEvents?: TimelineEvent[];
+  /** Original presentation items represented by a repeated supervision-status row. */
+  statusItems?: ViewItem[];
+  heartbeatCount?: number;
+  waitingCount?: number;
   ts?: number;
   lastTs?: number;
 }
@@ -170,7 +258,14 @@ type ChatHtmlFullscreenPreviewState =
 interface AssistantBlockProps {
   text: string;
   automation?: boolean;
+  streaming?: boolean;
+  executionState?: SupervisionExecutionState;
   ts: number;
+  /** Completed assistant message metadata carrying the delegation-claim
+   *  projection, when the runtime attached one. */
+  delegationMetadata?: Record<string, unknown>;
+  /** Daemon-announced per-assignment lifecycle status for the dispatch card. */
+  liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
   /** Stable identifier for this merged block. Wired through to a
    *  `data-event-id` attribute so the mobile double-tap detector can pair
    *  taps by event id instead of HTMLElement reference — DOM nodes are
@@ -187,26 +282,43 @@ interface AssistantBlockProps {
 
 const USER_MESSAGE_COLLAPSE_LINE_LIMIT = 10;
 const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT = 256;
-const chatLocalImagePreviewCache = new Map<string, Promise<ChatLocalImagePreviewResult>>();
+/**
+ * tsk_5rf R2: a streamed preview caches a download-handle URL, and that handle
+ * expires server-side (4h). An LRU with no TTL therefore served dead URLs
+ * indefinitely. This bound is deliberately well under the handle lifetime so a
+ * cached entry can never outlive the handle it points at.
+ */
+const CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS = 30 * 60 * 1000;
+interface ChatLocalImagePreviewCacheEntry {
+  promise: Promise<ChatLocalImagePreviewResult>;
+  createdAt: number;
+}
+const chatLocalImagePreviewCache = new Map<string, ChatLocalImagePreviewCacheEntry>();
+
+function invalidateChatLocalImagePreview(cacheKey: string): void {
+  chatLocalImagePreviewCache.delete(cacheKey);
+}
 
 function getCachedChatLocalImagePreview(
   cacheKey: string,
   load: () => Promise<ChatLocalImagePreviewResult>,
+  now: number = Date.now(),
 ): Promise<ChatLocalImagePreviewResult> {
   const existing = chatLocalImagePreviewCache.get(cacheKey);
-  if (existing) {
+  if (existing && now - existing.createdAt <= CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS) {
     chatLocalImagePreviewCache.delete(cacheKey);
     chatLocalImagePreviewCache.set(cacheKey, existing);
-    return existing;
+    return existing.promise;
   }
+  if (existing) chatLocalImagePreviewCache.delete(cacheKey);
 
   const pending = load().catch((err) => {
-    if (chatLocalImagePreviewCache.get(cacheKey) === pending) {
+    if (chatLocalImagePreviewCache.get(cacheKey)?.promise === pending) {
       chatLocalImagePreviewCache.delete(cacheKey);
     }
     throw err;
   });
-  chatLocalImagePreviewCache.set(cacheKey, pending);
+  chatLocalImagePreviewCache.set(cacheKey, { promise: pending, createdAt: now });
   while (chatLocalImagePreviewCache.size > CHAT_LOCAL_IMAGE_PREVIEW_CACHE_LIMIT) {
     const oldestKey = chatLocalImagePreviewCache.keys().next().value;
     if (typeof oldestKey !== 'string') break;
@@ -218,6 +330,13 @@ function getCachedChatLocalImagePreview(
 export function __clearChatLocalImagePreviewCacheForTests() {
   chatLocalImagePreviewCache.clear();
 }
+
+/** Test seam for the streamed-URL cache boundary (tsk_5rf R2). */
+export const __chatLocalImagePreviewCacheInternals = {
+  get: getCachedChatLocalImagePreview,
+  invalidate: invalidateChatLocalImagePreview,
+  ttlMs: CHAT_LOCAL_IMAGE_PREVIEW_CACHE_TTL_MS,
+};
 
 /** Extract a chat event's visible text while preserving block/list/code
  *  formatting. Uses `domNodeToPlainText` rather than `textContent` so that
@@ -300,6 +419,74 @@ export function formatChatDateTime(ts: number, now = Date.now(), locale?: string
     && date.getMonth() === today.getMonth()
     && date.getDate() === today.getDate();
   return chatDateTimeFormatter(locale, !isToday).format(date);
+}
+
+const PINNED_MEMORY_SUMMARY_PREVIEW_MAX = 240;
+const MEMORY_PROBLEM_HEADING_RE = /^#{1,6}\s*(?:user\s+problem|problem|issue|问题|問題)\s*[:：]?\s*$/i;
+const MEMORY_PROBLEM_INLINE_RE = /^(?:user\s+problem|problem|issue|问题|問題)\s*[:：]\s*(.+)$/i;
+const MARKDOWN_HEADING_RE = /^#{1,6}\s+/;
+
+function compactMemorySummaryPreview(text: string): string | null {
+  const cleaned = text
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/\*\*([^*]+)\*\*/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .split('\n')
+    .map((line) => line.trim().replace(/^[-*]\s+/, '').replace(/^\d+\.\s+/, ''))
+    .filter(Boolean)
+    .join(' · ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!cleaned) return null;
+  return cleaned.length > PINNED_MEMORY_SUMMARY_PREVIEW_MAX
+    ? `${cleaned.slice(0, PINNED_MEMORY_SUMMARY_PREVIEW_MAX - 1).trimEnd()}…`
+    : cleaned;
+}
+
+function extractMemoryProblemPreview(summary: string): string | null {
+  const normalized = summary.replace(/\r\n?/g, '\n').trim();
+  if (!normalized) return null;
+  const lines = normalized.split('\n');
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    const inline = MEMORY_PROBLEM_INLINE_RE.exec(line);
+    if (inline?.[1]?.trim()) return compactMemorySummaryPreview(inline[1]);
+    if (!MEMORY_PROBLEM_HEADING_RE.test(line)) continue;
+    const body: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const nextLine = lines[j].trim();
+      if (MARKDOWN_HEADING_RE.test(nextLine)) break;
+      body.push(lines[j]);
+    }
+    const preview = compactMemorySummaryPreview(body.join('\n'));
+    if (preview) return preview;
+  }
+  return compactMemorySummaryPreview(
+    lines.filter((line) => !MARKDOWN_HEADING_RE.test(line.trim())).join('\n'),
+  );
+}
+
+function getLatestRecentMemoryProblemPreview(
+  events: TimelineEvent[],
+  sessionId: string | null | undefined,
+  relatedToEventId: string | null | undefined,
+): string | null {
+  if (!sessionId || !relatedToEventId) return null;
+  for (let i = events.length - 1; i >= 0; i--) {
+    const event = events[i];
+    if (event.type !== 'memory.context') continue;
+    const payload = event.payload as unknown as Partial<MemoryContextTimelinePayload>;
+    if (payload.relatedToEventId !== relatedToEventId) continue;
+    if (!Array.isArray(payload.items)) continue;
+    for (const item of payload.items) {
+      if (item?.projectionClass !== 'recent_summary') continue;
+      if (item.sourceSessionName !== sessionId) continue;
+      const preview = extractMemoryProblemPreview(String(item.summary ?? ''));
+      if (preview) return preview;
+    }
+  }
+  return null;
 }
 
 type MemoryContextSection =
@@ -732,6 +919,25 @@ const TOOL_LIKE_EVENT_TYPES = new Set<string>([
   'assistant.thinking',
 ]);
 
+/**
+ * Types that reach `ChatEvent` and always come back as `null`:
+ * `assistant.thinking` returns null outright, and the `transport.queue.*`
+ * family has no case at all and falls through to `default`.
+ *
+ * They must not become ViewItems. A ViewItem that draws nothing still counts
+ * towards `viewItems.length`, which gates BOTH the "load earlier messages"
+ * button and the suppression of the empty-state placeholder — so a window made
+ * only of these rendered as a button floating above an empty scroller, with no
+ * spinner and no "no messages" text.
+ *
+ * They are deliberately NOT removed by `isVisibleChatTimelineEvent`: they still
+ * have to flow through `buildViewItems`, where `assistant.thinking` is a
+ * grouping boundary that flushes pending text and tool runs. Filtering them out
+ * earlier would silently merge assistant blocks that are currently separate.
+ * Only the item PUSH is suppressed; every grouping side effect still happens.
+ */
+
+
 function isVisibleChatTimelineEvent(event: TimelineEvent, showToolCalls: boolean): boolean {
   // Filter out transient/noisy event types that don't belong in the chat log:
   // - agent.status, usage.update: stats, not chat content
@@ -809,6 +1015,41 @@ function getFinalVisibleEventIds(events: TimelineEvent[], showToolCalls: boolean
  */
 const mergedToolEventCache = new WeakMap<TimelineEvent, WeakMap<TimelineEvent, TimelineEvent>>();
 
+// Stable source identities let the incremental view-model preserve unaffected
+// items across an append/update. The expensive group is rebuilt only when one
+// of its source event objects changes; Preact then skips those unchanged rows.
+const timelineObjectIds = new WeakMap<object, number>();
+let nextTimelineObjectId = 1;
+const incrementalViewItemCache = new Map<string, { signature: string; item: ViewItem }>();
+function timelineObjectId(value: object): number {
+  const hit = timelineObjectIds.get(value);
+  if (hit) return hit;
+  const id = nextTimelineObjectId++;
+  timelineObjectIds.set(value, id);
+  return id;
+}
+function stabilizeViewItems(items: ViewItem[]): ViewItem[] {
+  const next = items.map((item) => {
+    const sources = item.toolEvents ?? (item.event ? [item.event] : []);
+    const sourceIds = sources.map((event) => timelineObjectId(event)).join(',');
+    const signature = [item.type, item.text ?? '', item.lastTs ?? item.ts ?? '', item.executionState ?? '', item.eventIds?.join(',') ?? '', sourceIds, item.heartbeatCount ?? ''].join('|');
+    const cached = incrementalViewItemCache.get(item.key);
+    if (cached?.signature === signature) return cached.item;
+    incrementalViewItemCache.set(item.key, { signature, item });
+    return item;
+  });
+  while (incrementalViewItemCache.size > 4096) {
+    const first = incrementalViewItemCache.keys().next().value;
+    if (first === undefined) break;
+    incrementalViewItemCache.delete(first);
+  }
+  return next;
+}
+
+export function __resetIncrementalViewModelCacheForTests(): void {
+  incrementalViewItemCache.clear();
+}
+
 function cacheMergedToolEvent(
   call: TimelineEvent,
   result: TimelineEvent,
@@ -868,24 +1109,48 @@ const VIEW_TAIL_MARGIN_ITEMS = 24;
 /** First guess at events-per-item. Tool groups collapse many events into one. */
 const VIEW_TAIL_EVENTS_PER_ITEM = 4;
 
+/**
+ * Passes before giving up and deriving everything.
+ *
+ * Each pass quadruples the window, so four billion events are covered in
+ * sixteen. Reaching this cap means the arithmetic below is wrong, and the
+ * correct response is a slow full derivation rather than another pass.
+ */
+const VIEW_TAIL_MAX_WIDENING_PASSES = 16;
+
 function buildViewItemsTail(
   events: TimelineEvent[],
   showToolCalls: boolean,
   wantItems: number,
 ): DerivedViewTail {
-  const target = wantItems + VIEW_TAIL_MARGIN_ITEMS;
+  // Every exit below is a numeric comparison, and every comparison against NaN
+  // is false — a non-finite want would therefore loop forever, on the main
+  // thread, wedging the tab past the point where even a reload can run. The
+  // callers pass finite numbers today; this does not depend on them continuing
+  // to.
+  const want = Number.isFinite(wantItems) && wantItems > 0
+    ? Math.floor(wantItems)
+    : CHAT_INITIAL_RENDER_ITEM_LIMIT;
+  const target = want + VIEW_TAIL_MARGIN_ITEMS;
   let windowSize = Math.min(events.length, Math.max(target * VIEW_TAIL_EVENTS_PER_ITEM, 200));
-  for (;;) {
+  for (let pass = 0; pass < VIEW_TAIL_MAX_WIDENING_PASSES; pass += 1) {
     const startIndex = Math.max(0, events.length - windowSize);
     const items = buildViewItems(startIndex === 0 ? events : events.slice(startIndex), showToolCalls);
+    // A folded run touching the left edge may have started before this window.
+    // Widen until the first visible item is not foldable (or history begins),
+    // otherwise a 700-row restored run would display only the last 200 count.
+    const foldRunTouchesWindowStart = startIndex > 0
+      && items.length > 0
+      && (items[0].type === 'supervision-status-run' || supervisionStatusCandidate(items[0]) !== null);
     // Enough, or there is nothing older to widen into.
-    if (items.length >= target || startIndex === 0) {
+    if ((items.length >= target && !foldRunTouchesWindowStart) || startIndex === 0) {
       return { items, windowStartIndex: startIndex };
     }
     // A tool-heavy stretch can collapse hundreds of events into a handful of
     // items, so widening by a constant factor rather than a constant count.
     windowSize = Math.min(events.length, windowSize * 4);
   }
+  return { items: buildViewItems(events, showToolCalls), windowStartIndex: 0 };
 }
 
 /** Test seam for the windowed derivation; production goes through the memo. */
@@ -1081,23 +1346,35 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingKey = '';
   let pendingEventIds: string[] = [];
   let pendingAssistantAutomation = false;
+  let pendingAssistantStreaming = false;
+  let pendingExecutionState: SupervisionExecutionState | undefined;
+  let pendingDelegationMetadata: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
+  // Keys claimed by merged runs in this derivation (see chat-run-keys.ts).
+  const usedRunKeys = new Set<string>();
+
   const flushPending = () => {
-    if (pendingText.length > 0) {
+    if (pendingEventIds.length > 0) {
       items.push({
-        key: pendingKey,
+        key: claimRunKey('assistant-block', pendingKey, pendingEventIds, usedRunKeys),
         type: 'assistant-block',
         text: pendingText.join('\n'),
         eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
+        assistantStreaming: pendingAssistantStreaming,
+        ...(pendingExecutionState ? { executionState: pendingExecutionState } : {}),
+        ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
       pendingText = [];
       pendingEventIds = [];
       pendingAssistantAutomation = false;
+      pendingAssistantStreaming = false;
+      pendingExecutionState = undefined;
+      pendingDelegationMetadata = undefined;
     }
   };
 
@@ -1105,7 +1382,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     if (pendingTools.length === 0) return;
     if (!showToolCalls) {
       items.push({
-        key: `ta_${pendingTools[0].eventId}`,
+        key: claimRunKey('tool-activity', `ta_${pendingTools[0].eventId}`, pendingTools.map((tool) => tool.eventId), usedRunKeys),
         type: 'tool-activity',
         toolEvents: [...pendingTools],
       });
@@ -1114,14 +1391,17 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     } else {
       // 2+ consecutive tool events → collapsible group
       items.push({
-        key: `tg_${pendingTools[0].eventId}`,
+        key: claimRunKey('tool-group', `tg_${pendingTools[0].eventId}`, pendingTools.map((tool) => tool.eventId), usedRunKeys),
         type: 'tool-group',
         toolEvents: [...pendingTools],
       });
     }
     pendingTools = [];
     // Flush any session.state events that were deferred to avoid breaking the group
-    for (const ev of deferredEvents) items.push({ key: ev.eventId, type: 'event', event: ev });
+    for (const ev of deferredEvents) {
+      if (isNeverRenderedTimelineEventType(ev.type)) continue;
+      items.push({ key: ev.eventId, type: 'event', event: ev });
+    }
     deferredEvents = [];
   };
 
@@ -1132,19 +1412,33 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
-      const text = String(event.payload.text ?? '').trim().replace(/\n{3,}/g, '\n\n');
-      if (!text) continue;
+      const projection = projectAssistantTextForDisplay(event.payload.text);
+      const text = projection.text;
+      const executionState = event.payload.streaming === true || event.payload.pending === true
+        ? null
+        : projection.executionState;
+      if (!text && !executionState) continue;
       const assistantAutomation = event.payload.automation === true;
-      if (pendingText.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
+      if (pendingEventIds.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
         flushPending();
       }
-      if (pendingText.length === 0) {
+      if (pendingEventIds.length === 0) {
         pendingKey = event.eventId;
         pendingFirstTs = event.ts;
         pendingAssistantAutomation = assistantAutomation;
       }
+      // The newest event is authoritative: a terminal assistant.text must
+      // clear streaming even when earlier deltas in this merged block were
+      // marked streaming/pending. This lets the markdown renderer finalize
+      // immediately and freeze its parsed AST.
+      pendingAssistantStreaming = event.payload.streaming === true || event.payload.pending === true;
+      // Only the turn's completed message carries the delegation-claim
+      // projection, so the newest event that has one wins for the block.
+      const delegationMetadata = readDelegationClaimMetadata(event.payload);
+      if (delegationMetadata) pendingDelegationMetadata = delegationMetadata;
+      if (executionState) pendingExecutionState = executionState;
       pendingLastTs = event.ts;
-      pendingText.push(text);
+      if (text) pendingText.push(text);
       pendingEventIds.push(event.eventId);
     } else if (event.type === 'tool.call' || event.type === 'tool.result') {
       flushPending();
@@ -1159,6 +1453,9 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     } else {
       flushPending();
       if (showToolCalls || event.type === 'user.message') flushTools();
+      // Flushing above is the grouping contract and still runs; only the
+      // unrenderable item itself is withheld.
+      if (isNeverRenderedTimelineEventType(event.type)) continue;
       items.push({
         key: event.eventId,
         type: 'event',
@@ -1172,7 +1469,83 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   flushPending();
   flushTools();
 
-  return items;
+  return stabilizeViewItems(foldSupervisionStatusRuns(items));
+}
+
+type SupervisionStatusCandidate = {
+  kind: 'heartbeat' | 'waiting';
+  count: number;
+};
+
+/**
+ * Identify only the two machine-only rows authorized for compact presentation.
+ * Real assistant text, NEEDS_INPUT, audit/implementation heartbeats and every
+ * other visible row deliberately return null and therefore break the run.
+ */
+function supervisionStatusCandidate(item: ViewItem): SupervisionStatusCandidate | null {
+  if (
+    item.type === 'event'
+    && item.event?.type === 'user.message'
+    && (item.linkedEvents?.length ?? 0) === 0
+    && item.event.payload.automation === true
+    && item.event.payload.automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+  ) {
+    return { kind: 'heartbeat', count: 1 };
+  }
+  if (
+    item.type === 'assistant-block'
+    && item.executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    && (item.text ?? '').trim().length === 0
+  ) {
+    return { kind: 'waiting', count: Math.max(1, item.eventIds?.length ?? 0) };
+  }
+  return null;
+}
+
+function foldSupervisionStatusRuns(items: ViewItem[]): ViewItem[] {
+  const folded: ViewItem[] = [];
+  let run: ViewItem[] = [];
+  let heartbeatCount = 0;
+  let waitingCount = 0;
+
+  const flush = () => {
+    const sourceCount = heartbeatCount + waitingCount;
+    if (sourceCount < 2) {
+      folded.push(...run);
+    } else {
+      const first = run[0];
+      const last = run[run.length - 1];
+      folded.push({
+        // The first source event owns the run identity. A live append changes
+        // the summary revision/count but not its key, so Preact preserves the
+        // disclosure node, focus and expanded state without a flicker.
+        key: `supervision-status-run:${first.key}`,
+        type: 'supervision-status-run',
+        statusItems: run,
+        heartbeatCount,
+        waitingCount,
+        ts: first.ts ?? first.event?.ts ?? 0,
+        lastTs: last.lastTs ?? last.ts ?? last.event?.ts ?? 0,
+      });
+    }
+    run = [];
+    heartbeatCount = 0;
+    waitingCount = 0;
+  };
+
+  for (const item of items) {
+    const candidate = supervisionStatusCandidate(item);
+    if (!candidate) {
+      flush();
+      folded.push(item);
+      continue;
+    }
+    run.push(item);
+    if (candidate.kind === 'heartbeat') heartbeatCount += candidate.count;
+    else waitingCount += candidate.count;
+  }
+  flush();
+  return folded;
 }
 
 /** Return the source text represented by a pinnable timeline event.
@@ -1209,6 +1582,7 @@ function eventRevision(event: TimelineEvent): string {
     event.seq,
     event.payload.streaming === true ? 'streaming' : '',
     event.payload.pending === true ? 'pending' : '',
+    event.payload.queued === true ? 'queued' : '',
     event.payload.failed === true ? 'failed' : '',
     state,
     text,
@@ -1216,6 +1590,11 @@ function eventRevision(event: TimelineEvent): string {
 }
 
 function viewItemRevision(item: ViewItem): string {
+  if (item.type === 'history-gap') return `${item.key}:history-gap`;
+  if (item.type === 'supervision-status-run') {
+    return `${item.key}:supervision-status-run:${item.heartbeatCount ?? 0}:${item.waitingCount ?? 0}:`
+      + (item.statusItems ?? []).map(viewItemRevision).join('|');
+  }
   if (item.type === 'assistant-block') {
     return [
       item.key,
@@ -1223,6 +1602,7 @@ function viewItemRevision(item: ViewItem): string {
       item.ts ?? 0,
       item.lastTs ?? 0,
       item.assistantAutomation === true ? 'automation' : '',
+      item.executionState ?? '',
       textRevision(item.text),
     ].join(':');
   }
@@ -1700,10 +2080,487 @@ function SdkAgentsDiagnosticRow({ diagnostic }: { diagnostic: SdkSubagentDiagnos
   );
 }
 
-function ChatViewImpl({ events, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, onLoadOlder, sessionState, sessionId, onScrollBottomFn, preview, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, onQuote, agentType: _agentType, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+export function __computeVirtualChatRangeForTests(
+  heights: readonly number[],
+  scrollTop: number,
+  viewportHeight: number,
+  overscan = 6,
+): { start: number; end: number; totalHeight: number; topSpacer: number; bottomSpacer: number } {
+  const offsets = new Array<number>(heights.length + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < heights.length; i += 1) offsets[i + 1] = offsets[i] + Math.max(1, heights[i] || 0);
+  // A foreground restore can briefly retain the old scrollTop while the
+  // cache-backed list is replaced with a shorter tail. Clamp before choosing
+  // a range; otherwise start can equal length and the virtualizer renders only
+  // spacers, producing the empty black chat region reported on iOS.
+  const maxScrollTop = Math.max(0, offsets[heights.length] - Math.max(1, viewportHeight));
+  const top = Math.min(maxScrollTop, Math.max(0, scrollTop));
+  const bottom = top + Math.max(1, viewportHeight);
+  let start = 0;
+  while (start < heights.length && offsets[start + 1] < top) start += 1;
+  let end = start;
+  while (end < heights.length && offsets[end] < bottom) end += 1;
+  const rangeStart = Math.max(0, start - overscan);
+  const rangeEnd = Math.min(heights.length, end + overscan);
+  return {
+    start: rangeStart,
+    end: rangeEnd,
+    totalHeight: offsets[heights.length],
+    topSpacer: offsets[rangeStart],
+    bottomSpacer: Math.max(0, offsets[heights.length] - offsets[rangeEnd]),
+  };
+}
+
+/** Return the measured/estimated scroll offset needed to reveal an item. */
+export function __computeVirtualChatRevealScrollTopForTests(
+  heights: readonly number[],
+  index: number,
+): number {
+  const end = Math.max(0, Math.min(heights.length, Math.floor(index)));
+  let offset = 0;
+  for (let i = 0; i < end; i += 1) offset += Math.max(1, heights[i] ?? 72);
+  return offset;
+}
+
+/** Tail size required to include an event-backed presentation item. */
+export function __computeRevealRenderItemLimitForTests(
+  items: ReadonlyArray<{ key: string; event?: { eventId: string }; eventIds?: readonly string[] }>,
+  eventId: string,
+  currentLimit: number,
+): number {
+  const index = items.findIndex((item) => (
+    item.key === eventId
+    || item.event?.eventId === eventId
+    || item.eventIds?.includes(eventId)
+  ));
+  return index < 0 ? currentLimit : Math.max(currentLimit, items.length - index);
+}
+
+interface VirtualizedViewItemsProps {
+  items: ViewItem[];
+  scrollRef: { current: HTMLDivElement | null };
+  enabled: boolean;
+  /** A pinned/search target that must be mounted before its caller locates it. */
+  revealKey?: string;
+  /**
+   * Called after every commit / row measurement. The virtualizer only reports
+   * that layout may have changed; ChatView remains the single owner of scroll
+   * policy (re-pin a follower, re-align a reader's anchor row).
+   */
+  onMeasuredLayout?: (root: HTMLDivElement, wasAtBottom: boolean) => void;
+  /**
+   * Filled by the virtualizer: absorbs a layout shift ABOVE the reader into its top
+   * offset (no scrollTop write) and returns the part it could not absorb (all of it
+   * when the list is not virtualized). See `topOffsetStyle`.
+   */
+  absorbTopShiftRef?: { current: ((delta: number) => number) | null };
+  /** After the idle reconcile moved content (ChatView re-records its reader anchor). */
+  onTopOffsetReconciled?: () => void;
+  /** Identity of the conversation shown; a change drops the recorded offset/anchor. */
+  resetKey?: string;
+  /** True while the viewport follows the tail: pin writes own scrollTop then, so the idle reconcile stands down. */
+  isFollowing?: () => boolean;
+  renderItem: (item: ViewItem) => h.JSX.Element;
+}
+
+/** How long the scroller must be still (no scroll events, no finger) before the
+ * virtual list may move its content with a single compensated scrollTop write. */
+const VIRTUAL_IDLE_RECONCILE_MS = 160;
+/** Unmeasured rows are estimated below the measured mean on purpose: a low
+ * estimate only hides content above the scroll origin (invisible, reconciled when
+ * idle), a high one would show a blank gap. */
+const VIRTUAL_ESTIMATE_FLOOR = 72;
+const VIRTUAL_ESTIMATE_MEAN_FACTOR = 0.75;
+const VIRTUAL_ESTIMATE_CEIL = 1200;
+const VIRTUAL_ESTIMATE_MIN_SAMPLES = 6;
+
+/**
+ * Viewport virtualization for the chat list. Heights are measured after mount
+ * and retained by stable item key; unknown rows use a conservative estimate.
+ * The top/bottom spacers preserve the scroll range, while the parent ChatView
+ * remains the owner of follow/anchor policy and therefore streaming and history
+ * prepend semantics stay unchanged.
+ */
+function VirtualizedViewItems({ items, scrollRef, enabled, revealKey, onMeasuredLayout, absorbTopShiftRef, onTopOffsetReconciled, resetKey, isFollowing, renderItem }: VirtualizedViewItemsProps) {
+  const heightsRef = useRef(new Map<string, number>());
+  const [layoutVersion, setLayoutVersion] = useState(0);
+  const scrollTopRef = useRef(0);
+  const viewportRef = useRef(0);
+  const rafRef = useRef<number | null>(null);
+  const wasAtBottomRef = useRef(true);
+  const itemKeysRef = useRef<ItemKeySnapshot | null>(null);
+  const resumeSnapshotRef = useRef<{ scrollTop: number; atBottom: boolean } | null>(null);
+  const [resumeGeneration, setResumeGeneration] = useState(0);
+  // Height of a row nobody has measured yet. Starts at the floor and follows the
+  // measured mean (re-derived each time the sample count doubles, so it does not
+  // churn the offsets on every commit).
+  const estimateRef = useRef(VIRTUAL_ESTIMATE_FLOOR);
+  const measuredSumRef = useRef(0);
+  const nextEstimateAtRef = useRef(VIRTUAL_ESTIMATE_MIN_SAMPLES);
+  const getHeight = (item: ViewItem) => heightsRef.current.get(item.key) ?? estimateRef.current;
+  // Layout shifts above the reader are absorbed here instead of by scrollTop: the
+  // rendered top offset is `range.topSpacer + biasRef.current`.
+  const biasRef = useRef(0);
+  const topSpacerElRef = useRef<HTMLDivElement | null>(null);
+  const topSpacerBaseRef = useRef(0);
+  const atTopRef = useRef(false);
+  // Which mounted row sits at the viewport top, and where. The mounted range is
+  // derived from THIS (DOM truth) rather than from scrollTop, so absorbing a layout
+  // shift into `biasRef` can never move the range and flip a boundary row in and
+  // out of the DOM (which would shift the layout again and loop).
+  const viewportAnchorRef = useRef<{ key: string; top: number } | null>(null);
+  const resetKeyRef = useRef(resetKey);
+  const touchingRef = useRef(false);
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onTopOffsetReconciledRef = useRef(onTopOffsetReconciled);
+  onTopOffsetReconciledRef.current = onTopOffsetReconciled;
+  const isFollowingRef = useRef(isFollowing);
+  isFollowingRef.current = isFollowing;
+
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    scrollTopRef.current = root.scrollTop;
+    viewportRef.current = root.clientHeight;
+    setLayoutVersion((v) => v + 1);
+    const onScroll = () => {
+      scrollTopRef.current = root.scrollTop;
+      viewportRef.current = root.clientHeight;
+      wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
+      captureViewportAnchor();
+      scheduleIdleReconcile();
+      if (rafRef.current !== null) return;
+      rafRef.current = requestAnimationFrame(() => {
+        rafRef.current = null;
+        setLayoutVersion((v) => v + 1);
+      });
+    };
+    const onTouchStart = () => { touchingRef.current = true; };
+    const onTouchEnd = () => { touchingRef.current = false; scheduleIdleReconcile(); };
+    root.addEventListener('scroll', onScroll, { passive: true });
+    root.addEventListener('touchstart', onTouchStart, { passive: true });
+    root.addEventListener('touchend', onTouchEnd, { passive: true });
+    root.addEventListener('touchcancel', onTouchEnd, { passive: true });
+    return () => {
+      root.removeEventListener('scroll', onScroll);
+      root.removeEventListener('touchstart', onTouchStart);
+      root.removeEventListener('touchend', onTouchEnd);
+      root.removeEventListener('touchcancel', onTouchEnd);
+      if (rafRef.current !== null) cancelAnimationFrame(rafRef.current);
+      rafRef.current = null;
+      if (idleTimerRef.current !== null) clearTimeout(idleTimerRef.current);
+      idleTimerRef.current = null;
+      touchingRef.current = false;
+    };
+  }, [enabled, scrollRef]);
+
+  const captureViewportAnchor = () => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const rootTop = root.getBoundingClientRect().top;
+    viewportAnchorRef.current = null;
+    for (const node of root.querySelectorAll<HTMLElement>('[data-virtual-key]')) {
+      const rect = node.getBoundingClientRect();
+      if (rect.bottom <= rootTop + 1) continue;
+      const key = node.dataset.virtualKey;
+      if (key) viewportAnchorRef.current = { key, top: rect.top - rootTop };
+      break;
+    }
+  };
+
+  const patchTopSpacer = (x: number) => {
+    const el = topSpacerElRef.current;
+    if (!el) return;
+    const style = topOffsetStyle(x);
+    el.style.height = `${style.height}px`;
+    el.style.marginTop = `${style.marginTop}px`;
+  };
+  // A shift the top offset absorbed can leave content above the scroll origin (or a
+  // gap above the first row). Once the viewport is idle - no finger, no scroll event
+  // for a moment, so there is no momentum to cancel - move it back with ONE write
+  // that is exactly compensated in the same task, so nothing moves on screen.
+  const reconcileIdle = () => {
+    idleTimerRef.current = null;
+    const root = scrollRef.current;
+    if (!root) return;
+    if (touchingRef.current) { scheduleIdleReconcile(); return; }
+    // A follower's scrollTop belongs to the pin (rows keep growing at the tail); the
+    // offset is reconciled when the reader next scrolls and comes to rest.
+    if (isFollowingRef.current?.()) return;
+    const x = topSpacerBaseRef.current + biasRef.current;
+    const result = reconcileTopOffset(x, atTopRef.current, root.scrollTop);
+    if (!result) return;
+    biasRef.current += result.x - x;
+    patchTopSpacer(result.x);
+    root.scrollTop += result.scrollTopDelta;
+    scrollTopRef.current = root.scrollTop;
+    captureViewportAnchor();
+    setLayoutVersion((v) => v + 1);
+    onTopOffsetReconciledRef.current?.();
+  };
+  const scheduleIdleReconcile = () => {
+    if (idleTimerRef.current !== null) clearTimeout(idleTimerRef.current);
+    idleTimerRef.current = setTimeout(reconcileIdle, VIRTUAL_IDLE_RECONCILE_MS);
+  };
+
+  useEffect(() => {
+    if (!absorbTopShiftRef || !enabled) return undefined;
+    absorbTopShiftRef.current = (delta: number) => {
+      if (!topSpacerElRef.current) return delta;
+      biasRef.current -= delta;
+      patchTopSpacer(topSpacerBaseRef.current + biasRef.current);
+      setLayoutVersion((v) => v + 1);
+      scheduleIdleReconcile();
+      return 0;
+    };
+    return () => { absorbTopShiftRef.current = null; };
+  }, [enabled, absorbTopShiftRef]);
+
+  // iOS may reset the nested scrollTop while the WebView is backgrounded,
+  // without a useful scroll event when it becomes visible again. Capture the
+  // logical position before hiding and reconcile it on pageshow/visibility
+  // resume, rather than letting the old virtual range point at empty space.
+  useEffect(() => {
+    if (!enabled) return undefined;
+    const capture = () => {
+      if (document.visibilityState !== 'hidden') return;
+      resumeSnapshotRef.current = {
+        scrollTop: scrollTopRef.current,
+        atBottom: wasAtBottomRef.current,
+      };
+    };
+    const resume = () => {
+      if (document.visibilityState === 'hidden') return;
+      if (!resumeSnapshotRef.current) {
+        const root = scrollRef.current;
+        if (root) resumeSnapshotRef.current = {
+          scrollTop: scrollTopRef.current,
+          atBottom: wasAtBottomRef.current,
+        };
+      }
+      setResumeGeneration((generation) => generation + 1);
+    };
+    document.addEventListener('visibilitychange', capture);
+    document.addEventListener('visibilitychange', resume);
+    window.addEventListener('pageshow', resume);
+    return () => {
+      document.removeEventListener('visibilitychange', capture);
+      document.removeEventListener('visibilitychange', resume);
+      window.removeEventListener('pageshow', resume);
+    };
+  }, [enabled, scrollRef]);
+
+  // Resume/cache replay can replace the children without dispatching a scroll
+  // event. Reconcile the real viewport before the next paint: keep a viewer
+  // who was following at the bottom, and clamp an old offset if the restored
+  // content became shorter. This prevents a stale high scrollTop from making
+  // the computed virtual range empty while preserving readers' numeric anchor.
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    const root = scrollRef.current;
+    if (!root) return;
+    if (itemKeysUnchanged(itemKeysRef.current, resumeGeneration, items)) return;
+    itemKeysRef.current = snapshotItemKeys(resumeGeneration, items);
+    const maxScrollTop = Math.max(0, root.scrollHeight - root.clientHeight);
+    const resumeSnapshot = resumeSnapshotRef.current;
+    if (resumeSnapshot?.atBottom || (!resumeSnapshot && wasAtBottomRef.current)) {
+      root.scrollTop = root.scrollHeight;
+    } else {
+      const preferredTop = resumeSnapshot?.scrollTop ?? root.scrollTop;
+      if (preferredTop > maxScrollTop) root.scrollTop = maxScrollTop;
+      else if (resumeSnapshot && Math.abs(root.scrollTop - preferredTop) > 1) root.scrollTop = preferredTop;
+    }
+    resumeSnapshotRef.current = null;
+    viewportAnchorRef.current = null;
+    scrollTopRef.current = root.scrollTop;
+    viewportRef.current = root.clientHeight;
+    wasAtBottomRef.current = root.scrollHeight - root.scrollTop - root.clientHeight < 24;
+    setLayoutVersion((version) => version + 1);
+  }, [enabled, items, scrollRef, resumeGeneration]);
+
+  // Pin/search navigation can target an item outside the mounted overscan
+  // range. Move the real scroll viewport to its measured offset first; the
+  // next render then mounts the target and the existing locator can highlight
+  // it without rendering the entire history.
+  useEffect(() => {
+    if (!enabled || !revealKey) return undefined;
+    const root = scrollRef.current;
+    const index = items.findIndex((item) => (
+      item.key === revealKey || item.event?.eventId === revealKey || item.eventIds?.includes(revealKey)
+    ));
+    if (!root || index < 0) return undefined;
+    const heights = items.map(getHeight);
+    const targetTop = __computeVirtualChatRevealScrollTopForTests(heights, index) + biasRef.current;
+    if (Math.abs(root.scrollTop - targetTop) > 1) root.scrollTop = targetTop;
+    scrollTopRef.current = targetTop;
+    viewportAnchorRef.current = null;
+    setLayoutVersion((v) => v + 1);
+    return undefined;
+  }, [enabled, revealKey, items, scrollRef]);
+
+  // One measurement rule for both the synchronous post-commit pass and the
+  // ResizeObserver, so they can never disagree (a disagreement would make every
+  // render flip a row between two heights). Reports whether any row changed;
+  // ChatView (the single scroll owner) decides what to do about the viewport.
+  const commitMeasuredRows = (nodes: Iterable<HTMLElement>): boolean => {
+    let changed = false;
+    for (const node of nodes) {
+      const key = node.dataset.virtualKey;
+      if (!key) continue;
+      // A ResizeObserver also reports rows that were just unmounted (their box
+      // collapses to 0x0). Measuring a detached node would overwrite the row's
+      // real height with the 1px floor, so its spacer share would vanish and the
+      // list below would jump by the whole row every time it left the window.
+      if (!node.isConnected) continue;
+      const height = Math.max(1, Math.ceil(node.getBoundingClientRect().height));
+      const known = heightsRef.current.get(key);
+      if (known === height) continue;
+      // First sight of a row is recorded (it feeds the estimate) even when it happens
+      // to match the estimate; only a real difference is a layout change.
+      if ((known ?? estimateRef.current) !== height) changed = true;
+      heightsRef.current.set(key, height);
+      measuredSumRef.current += height - (known ?? 0);
+    }
+    if (heightsRef.current.size >= nextEstimateAtRef.current) {
+      nextEstimateAtRef.current = heightsRef.current.size * 2;
+      const mean = measuredSumRef.current / heightsRef.current.size;
+      const next = Math.min(VIRTUAL_ESTIMATE_CEIL, Math.max(VIRTUAL_ESTIMATE_FLOOR, Math.round(mean * VIRTUAL_ESTIMATE_MEAN_FACTOR)));
+      if (next !== estimateRef.current) { estimateRef.current = next; changed = true; }
+    }
+    return changed;
+  };
+
+  // Post-commit, PRE-PAINT pass. A commit can change the scroll range without
+  // any ResizeObserver delivery yet (new/streaming rows, a range swap that
+  // trades estimated spacer heights for measured rows). Measuring the mounted
+  // rows here - and re-pinning a pinned viewport in the same task, after the
+  // layout that the commit produced - means the browser never paints the
+  // stale range. The previous flow measured in a ResizeObserver AFTER the
+  // paint, re-rendered in a later task and never re-pinned after that render:
+  // that frame showed a 15-42px gap/reverse jump.
+  const lastCommitSignatureRef = useRef('');
+  const lastCommitClientHeightRef = useRef(0);
+  useLayoutEffect(() => {
+    if (!enabled) return;
+    const root = scrollRef.current;
+    if (!root) return;
+    const wasAtBottom = wasAtBottomRef.current;
+    const changed = commitMeasuredRows(root.querySelectorAll<HTMLElement>('[data-virtual-key]'));
+    // Only a commit that can have changed the scroll range acts: a row height
+    // changed, the row set changed (first/last key, length), the viewport itself
+    // resized (a banner/composer mounting beside the list in the same commit), or
+    // this render was our own layout re-render. A render that changed nothing
+    // visible (a non-rendered status/usage update) must leave the viewport alone.
+    // (A 0 -> N height is a pane becoming measurable, not a resize.)
+    const clientHeight = root.clientHeight;
+    const viewportResized = lastCommitClientHeightRef.current > 0 && clientHeight !== lastCommitClientHeightRef.current;
+    lastCommitClientHeightRef.current = clientHeight;
+    const signature = `${layoutVersion}:${items.length}:${items[0]?.key ?? ''}:${items[items.length - 1]?.key ?? ''}`;
+    const layoutMayHaveChanged = changed || viewportResized || signature !== lastCommitSignatureRef.current;
+    lastCommitSignatureRef.current = signature;
+    if (!layoutMayHaveChanged) return;
+    onMeasuredLayout?.(root, wasAtBottom);
+    scrollTopRef.current = root.scrollTop;
+    captureViewportAnchor();
+    // A measurement change alters the spacers: re-render (still before paint,
+    // Preact flushes it in a microtask) so the pin below runs on final geometry.
+    if (changed) setLayoutVersion((v) => v + 1);
+  });
+
+  useEffect(() => {
+    if (!enabled || typeof ResizeObserver === 'undefined') return undefined;
+    const root = scrollRef.current;
+    if (!root) return undefined;
+    const observer = new ResizeObserver((entries) => {
+      const wasAtBottom = wasAtBottomRef.current;
+      const changed = commitMeasuredRows(entries.map((entry) => entry.target as HTMLElement));
+      // Do not infer pin state from the post-growth geometry: with
+      // `overflow-anchor: none`, a row growing at the bottom makes the current
+      // distance non-zero even though the user was pinned immediately before
+      // the measurement. That used to classify a pinned stream as a reader
+      // anchor, then fight ChatView's follow pass on the next frame.
+      if (!changed) return;
+      onMeasuredLayout?.(root, wasAtBottom);
+      scrollTopRef.current = root.scrollTop;
+      captureViewportAnchor();
+      setLayoutVersion((v) => v + 1);
+    });
+    root.querySelectorAll<HTMLElement>('[data-virtual-key]').forEach((node) => observer.observe(node));
+    return () => observer.disconnect();
+  }, [enabled, items, layoutVersion, onMeasuredLayout, scrollRef]);
+
+  // Hidden/jsdom panes have no measurable viewport; do not drop rows until a
+  // real viewport exists, preserving deterministic rendering and accessibility.
+  if (!enabled || items.length <= 24 || viewportRef.current <= 0) {
+    // Not virtualized (short list, hidden pane): there is no spacer to carry an offset.
+    biasRef.current = 0;
+    viewportAnchorRef.current = null;
+    return <>{items.map(renderItem)}</>;
+  }
+  if (resetKeyRef.current !== resetKey) {
+    // A different conversation: nothing recorded about the previous one applies.
+    resetKeyRef.current = resetKey;
+    biasRef.current = 0;
+    viewportAnchorRef.current = null;
+  }
+  // Keep the arithmetic local and deterministic; no O(n) DOM work occurs.
+  const heights = items.map(getHeight);
+  // Viewport top in offset space: from the anchor row when it is still in the list
+  // (immune to bias / estimate / prepend changes), else from scrollTop (a jump past
+  // every mounted row).
+  let viewportTop = scrollTopRef.current - biasRef.current;
+  const viewportAnchor = viewportAnchorRef.current;
+  if (viewportAnchor) {
+    const anchorIndex = items.findIndex((item) => item.key === viewportAnchor.key);
+    if (anchorIndex >= 0) {
+      let offset = 0;
+      for (let i = 0; i < anchorIndex; i += 1) offset += Math.max(1, heights[i] || 0);
+      viewportTop = offset - viewportAnchor.top;
+    }
+  }
+  const range = __computeVirtualChatRangeForTests(heights, viewportTop, viewportRef.current);
+  topSpacerBaseRef.current = range.topSpacer;
+  atTopRef.current = range.start === 0;
+  const topStyle = topOffsetStyle(range.topSpacer + biasRef.current);
+  return <>
+    <div aria-hidden="true" ref={topSpacerElRef} style={{ height: `${topStyle.height}px`, marginTop: `${topStyle.marginTop}px`, flexShrink: 0 }} />
+    {items.slice(range.start, range.end).map((item) => (
+      <div class="chat-virtual-item" data-virtual-key={item.key} key={item.key}>
+        {renderItem(item)}
+      </div>
+    ))}
+    <div aria-hidden="true" style={{ height: `${range.bottomSpacer}px`, flexShrink: 0 }} />
+  </>;
+}
+
+const EMPTY_ID_SET: ReadonlySet<string> = new Set();
+
+function ChatViewImpl({ events: eventsProp, loading, refreshing = false, historyStatus, loadingOlder, hasOlderHistory = true, historyGap, onLoadOlder, sessionState, sessionId, sessions, onScrollBottomFn, preview, visible = true, onPreviewFile, ws, onInsertPath, workdir, onViewRepo, serverId, onOpenLocalWebPreview, readOnlyFiles = false, scopeFilesToSession = false, scopeTaskPairs = false, onQuote, onResendFailed, onForceSync, onLoadMessageContext, messagePinsEnabled = false }: Props) {
+  recordPerfRender('ChatView');
   const { t, i18n } = useTranslation();
   const locale = resolveI18nLocale(i18n);
-  const fileScopeSessionName = scopeFilesToSession ? (sessionId ?? undefined) : undefined;
+  // Optimistic delete: ids the user just deleted are hidden at once, before the daemon
+  // answers. A failed delete removes them again (message restored + visible error).
+  const [locallyDeletedIds, setLocallyDeletedIds] = useState<ReadonlySet<string>>(EMPTY_ID_SET);
+  const [deleteErrorKey, setDeleteErrorKey] = useState<string | null>(null);
+  const events = useMemo(
+    () => (locallyDeletedIds.size === 0 ? eventsProp : eventsProp.filter((event) => !locallyDeletedIds.has(event.eventId))),
+    [eventsProp, locallyDeletedIds],
+  );
+  useEffect(() => {
+    if (!deleteErrorKey) return undefined;
+    const timer = setTimeout(() => setDeleteErrorKey(null), 8_000);
+    return () => clearTimeout(timer);
+  }, [deleteErrorKey]);
+  // Sent on every chatFileReference:true request (path click, preview, download).
+  // The daemon needs the viewed session's identity to find its own in-project
+  // root and its own assistant-published grants (session-file-read-grants.ts);
+  // without it every chat file link is refused as forbidden_path, even ones the
+  // session itself just published. This is unrelated to scopeFilesToSession,
+  // which restricts *unscoped* file-browser access for shared/guest viewers --
+  // that stays wired separately into the embedded FileBrowser panel below.
+  const fileScopeSessionName = sessionId ?? undefined;
   const [syncDisabled, setSyncDisabled] = useState(false);
   const handleForceSync = useCallback(() => {
     if (syncDisabled || !onForceSync) return;
@@ -1727,6 +2584,9 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   const [ctxMenu, setCtxMenu] = useState<SelectionMenu | null>(null);
   const ctxMenuRef = useRef<HTMLDivElement>(null);
   const [pendingPinnedLocate, setPendingPinnedLocate] = useState<MessagePin | null>(null);
+  // The virtualizer uses this key to mount and scroll an offscreen navigation
+  // target before the locator/highlighter inspects the DOM.
+  const [virtualRevealKey, setVirtualRevealKey] = useState<string | undefined>();
   const pendingPinnedLocateIdRef = useRef<string | null>(null);
   const timelineEventsRef = useRef(events);
   timelineEventsRef.current = events;
@@ -1793,21 +2653,37 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // as the bubble comes back into view.
   const [pinnedAboveViewport, setPinnedAboveViewport] = useState(false);
   const [pinnedExpanded, setPinnedExpanded] = useState(false);
+  // Mobile task status is portaled into this titlebar so its collapsed strip
+  // shares the pinned-message row instead of overlaying the conversation.
+  const chatTitlebarRef = useRef<HTMLDivElement>(null);
+  const chatTopActionsRef = useRef<HTMLDivElement>(null);
   const lastSentUserMessage = useMemo(() => {
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
       if (e.type !== 'user.message') continue;
       const p = e.payload as Record<string, unknown>;
       if (p.pending === true || p.failed === true) continue;
+      // The banner pins what the human sent, not an agent delivery or injection.
+      if (classifyUserMessageOrigin(p) !== CHAT_MESSAGE_ORIGINS.USER) continue;
       const text = typeof p.text === 'string' ? p.text : '';
       if (!text.trim()) continue;
       return { eventId: e.eventId, text, ts: e.ts, actorLabel: formatSharedActorLabel(t, p.sharedActor) };
     }
     return null;
   }, [events, t]);
-  // Reset the expand state whenever the pinned target changes so a new
+  const recentMemoryProblemPreview = useMemo(
+    () => getLatestRecentMemoryProblemPreview(events, sessionId, lastSentUserMessage?.eventId),
+    [events, sessionId, lastSentUserMessage?.eventId],
+  );
+  const pinnedPreviewText = recentMemoryProblemPreview ?? lastSentUserMessage?.text ?? '';
+  const pinnedCompactPreviewText = useMemo(() => {
+    const compact = pinnedPreviewText.replace(/\s+/g, ' ').trim();
+    return compact.length > 180 ? `${compact.slice(0, 177)}…` : compact;
+  }, [pinnedPreviewText]);
+  const pinnedPreviewUsesMemory = !!recentMemoryProblemPreview;
+  // Reset the expand state whenever the pinned target/summary changes so a new
   // message never inherits the expanded state of an older one.
-  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId]);
+  useEffect(() => { setPinnedExpanded(false); }, [lastSentUserMessage?.eventId, recentMemoryProblemPreview]);
 
   const suppressLoadOlder = useCallback((durationMs = 1200) => {
     suppressLoadOlderUntilRef.current = Date.now() + durationMs;
@@ -1932,26 +2808,25 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [t]);
 
   const handleHtmlPreview = useCallback((path: string) => {
-    const resolvedPath = resolvePreviewPath(path, workdir);
     if (!ws || typeof ws.fsReadFile !== 'function') {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: t('file_browser.preview_error'),
       });
       return;
     }
     try {
-      const requestId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
-      setHtmlFullscreenPreview({ status: 'loading', path: resolvedPath, requestId });
+      const requestId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
+      setHtmlFullscreenPreview({ status: 'loading', path, requestId });
     } catch (err) {
       setHtmlFullscreenPreview({
         status: 'error',
-        path: resolvedPath,
+        path,
         error: mapPreviewDispatchError(err),
       });
     }
-  }, [fileScopeSessionName, mapPreviewDispatchError, t, workdir, ws]);
+  }, [fileScopeSessionName, mapPreviewDispatchError, t, ws]);
 
   const closeHtmlFullscreenPreview = useCallback(() => {
     setHtmlFullscreenPreview(null);
@@ -1969,7 +2844,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             : t('file_browser.preview_error', 'Preview unavailable');
           return { status: 'error', path: current.path, error };
         }
-        const next = { status: 'ok' as const, path: current.path, content: msg.content ?? '' };
+        const next = { status: 'ok' as const, path: msg.resolvedPath ?? current.path, content: msg.content ?? '' };
         return openHtmlPreviewInNewWindow(next) ? null : next;
       });
     });
@@ -1979,15 +2854,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setPendingUrl(url);
   }, []);
 
-  const mapDownloadError = useCallback((err: unknown): string => {
-    const msg = err instanceof Error ? err.message : String(err);
-    if (msg.includes('daemon_offline') || msg.includes('503')) return t('upload.daemon_offline');
-    if (msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404')) return t('upload.download_expired');
-    if (msg.includes('504') || msg.includes('timeout')) return t('upload.download_timeout');
-    return t('upload.download_failed');
-  }, [t]);
+  const mapDownloadError = useCallback((err: unknown, pathRequest = false): string => (
+    localizeChatDownloadError(err, t, { pathRequest })
+  ), [t]);
 
-  const requestPathDownloadId = useCallback((path: string): Promise<string> => (
+  const requestPathDownloadId = useCallback((path: string): Promise<{
+    downloadId: string;
+    resolvedPath: string;
+    matchCount: number;
+  }> => (
     new Promise((resolve, reject) => {
       if (!ws) {
         reject(new Error(t('upload.daemon_offline')));
@@ -2000,7 +2875,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
         unsub?.();
       };
       try {
-        const reqId = fileScopeSessionName ? ws.fsReadFile(path, fileScopeSessionName) : ws.fsReadFile(path);
+        const reqId = ws.fsReadFile(path, fileScopeSessionName, { chatFileReference: true });
         timer = setTimeout(() => {
           cleanup();
           reject(new Error(t('upload.download_timeout')));
@@ -2009,91 +2884,150 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
           cleanup();
           if (typeof msg.downloadId === 'string' && msg.downloadId.trim()) {
-            resolve(msg.downloadId);
+            resolve({
+              downloadId: msg.downloadId,
+              resolvedPath: typeof msg.resolvedPath === 'string' ? msg.resolvedPath : path,
+              matchCount: typeof msg.resolutionMatchCount === 'number' ? msg.resolutionMatchCount : 1,
+            });
             return;
           }
           if (msg.status === 'error') {
-            reject(new Error(mapDownloadError(new Error(String(msg.error ?? 'download_failed')))));
+            const cause = Object.assign(new Error(String(msg.error ?? 'download_failed')), {
+              attemptedLocations: msg.attemptedLocations,
+            });
+            reject(new Error(mapDownloadError(cause, true)));
             return;
           }
           reject(new Error(t('upload.download_failed')));
         });
       } catch (err) {
         cleanup();
-        reject(new Error(mapDownloadError(err)));
+        reject(new Error(mapDownloadError(err, true)));
       }
     })
   ), [fileScopeSessionName, mapDownloadError, t, ws]);
 
-  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => (
-    new Promise((resolve, reject) => {
-      if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
-        reject(new Error(t('file_browser.preview_error')));
-        return;
-      }
-
-      let unsub: (() => void) | undefined;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const resolvedPath = resolvePreviewPath(path, workdir);
-      const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
-      const cacheKey = `${cacheScope}\0${resolvedPath}`;
-      const cleanup = () => {
-        if (timer) clearTimeout(timer);
-        unsub?.();
-      };
-
-      getCachedChatLocalImagePreview(cacheKey, () => new Promise<ChatLocalImagePreviewResult>((resolveCached, rejectCached) => {
-        try {
-          const reqId = fileScopeSessionName ? ws.fsReadFile(resolvedPath, fileScopeSessionName) : ws.fsReadFile(resolvedPath);
-          timer = setTimeout(() => {
-            cleanup();
-            rejectCached(new Error(t('upload.download_timeout')));
-          }, 30_000);
-          unsub = ws.onMessage((msg) => {
-            if (msg.type !== 'fs.read_response' || msg.requestId !== reqId) return;
-            cleanup();
-            if (msg.status === 'error') {
-              rejectCached(new Error(t('file_browser.preview_error')));
-              return;
-            }
-            if (msg.encoding === 'base64' && typeof msg.mimeType === 'string' && msg.mimeType.startsWith('image/')) {
-              resolveCached({
-                dataUrl: `data:${msg.mimeType};base64,${msg.content ?? ''}`,
-                alt: resolvedPath.split(/[/\\]/).pop() || resolvedPath,
-              });
-              return;
-            }
-            rejectCached(new Error(t('file_browser.preview_error')));
-          });
-        } catch (err) {
-          cleanup();
-          rejectCached(err instanceof Error ? err : new Error(String(err)));
-        }
-      })).then(resolve, reject);
-    })
-  ), [fileScopeSessionName, serverId, sessionId, t, workdir, ws]);
+  // tsk_5rf: this used to carry its own copy of the fs.read_response loader and
+  // accepted ONLY base64. After 6a169ad3c the daemon answers image previews with
+  // metadata plus a download handle, so that copy rejected every streamed image
+  // and the chat thumbnail vanished while FileBrowser (the other copy) kept
+  // working. There is now one shared loader, so a contract change cannot fix one
+  // surface and silently break the other.
+  const handleImagePreview = useCallback<ChatLocalImagePreviewLoader>((path: string) => {
+    if (!ws || typeof ws.fsReadFile !== 'function' || typeof ws.onMessage !== 'function') {
+      return Promise.reject(new Error(t('file_browser.preview_error')));
+    }
+    const cacheScope = serverId ? `server:${serverId}` : `session:${sessionId ?? 'unknown'}`;
+    const cacheKey = `${cacheScope}\0${path}`;
+    return getCachedChatLocalImagePreview(cacheKey, () => loadFsLocalImagePreview(ws, path, {
+      sessionName: fileScopeSessionName,
+      serverId: serverId ?? undefined,
+      chatFileReference: true,
+      timeoutMs: 30_000,
+      errorMessage: t('file_browser.preview_error'),
+      timeoutMessage: t('upload.download_timeout'),
+    }).then((result) => ({
+      ...result,
+      // Evict on a real <img> failure so the retry calls fsReadFile again for a
+      // fresh handle instead of replaying a dead URL.
+      onLoadFailed: () => invalidateChatLocalImagePreview(cacheKey),
+    })));
+  }, [fileScopeSessionName, serverId, sessionId, t, ws]);
 
   const handleDownload = useCallback<ChatPathDownloadHandler>(async (path: string) => {
-    if (!serverId) throw new Error(t('upload.daemon_offline'));
-    const resolvedPath = resolvePreviewPath(path, workdir);
-    let downloadId = await requestPathDownloadId(resolvedPath);
-    const { downloadAttachment } = await import('../api.js');
+    if (!serverId || !ws) throw new Error(t('upload.daemon_offline'));
+    const fileName = path.replace(/:\d+(?::\d+)?$/, '').split(/[/\\]/).pop() || undefined;
+    // The save dialog must open first, inside the click that asked for it; any
+    // await in front of it lets the browser refuse the picker. Choosing where
+    // the file goes is also what lets the finished row offer "Show in folder"
+    // — the same path the file browser downloads through.
+    let destination: DirectPreviewDownloadDestination | null;
     try {
-      if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-      else await downloadAttachment(serverId, downloadId);
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      const isStaleHandle = msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
-      if (!isStaleHandle) throw new Error(mapDownloadError(err));
-      downloadId = await requestPathDownloadId(resolvedPath);
-      try {
-        if (sessionId) await downloadAttachment(serverId, downloadId, sessionId);
-        else await downloadAttachment(serverId, downloadId);
-      } catch (retryErr) {
-        throw new Error(mapDownloadError(retryErr));
-      }
+      destination = await selectPreviewDownloadDestination(fileName);
+    } catch (error) {
+      if (isFileUploadCanceled(error)) return;
+      throw new Error(t('upload.download_failed'));
     }
-  }, [mapDownloadError, requestPathDownloadId, serverId, sessionId, t, workdir]);
+    const { downloadAttachment } = await import('../api.js');
+    const transfer = beginDownloadTransfer(fileName ?? path);
+    const attempt = async (downloadId: string, signal: AbortSignal) => {
+      const wiring = createDownloadTransferWiring(transfer.id);
+      await downloadPreviewWithDirectFallback({
+        ws,
+        serverId,
+        previewHandle: downloadId,
+        suggestedName: fileName,
+        sessionName: fileScopeSessionName,
+        destination,
+        httpFallback: () => (sessionId
+          ? downloadAttachment(serverId, downloadId, sessionId, signal)
+          : downloadAttachment(serverId, downloadId, undefined, signal)),
+        signal,
+        onSaveReady: wiring.onSaveReady,
+        onProgress: wiring.onProgress,
+        onMode: wiring.onMode,
+      });
+      wiring.complete(destination);
+    };
+    // requestPathDownloadId already rejects with a user-facing message; mapping
+    // it again would turn e.g. a timeout into a generic failure.
+    const alreadyMapped = new WeakSet<object>();
+    const requestDownloadId = async () => {
+      try {
+        return await requestPathDownloadId(path);
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        alreadyMapped.add(error);
+        throw error;
+      }
+    };
+    const isStaleHandle = (err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      return isDirectFileTransferStaleHandleError(err)
+        || msg.includes('410') || msg.includes('expired') || msg.includes('not_found') || msg.includes('404');
+    };
+    // A retry requests a fresh path handle, but keeps the same destination and
+    // the direct/HTTP resume prefix owned by the transfer operation.
+    setDownloadTransferRetry(transfer.id, async (signal) => {
+      const next = await requestDownloadId();
+      await attempt(next.downloadId, signal);
+    });
+    try {
+      try {
+        const first = await requestDownloadId();
+        await attempt(first.downloadId, transfer.signal);
+        if (first.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: first.resolvedPath,
+            count: first.matchCount,
+          });
+        }
+        if (first.resolvedPath !== path) {
+          return t('upload.download_resolved_to', { path: first.resolvedPath });
+        }
+      } catch (err) {
+        // A preview handle can expire between the request and the transfer:
+        // fetch a fresh one once, keeping the same chosen destination.
+        if (!isStaleHandle(err) || transfer.signal.aborted) throw err;
+        const retry = await requestDownloadId();
+        await attempt(retry.downloadId, transfer.signal);
+        if (retry.matchCount > 1) {
+          return t('upload.download_resolved_multiple', {
+            path: retry.resolvedPath,
+            count: retry.matchCount,
+          });
+        }
+        if (retry.resolvedPath !== path) return t('upload.download_resolved_to', { path: retry.resolvedPath });
+      }
+    } catch (err) {
+      if (isDownloadTransferPaused(transfer.id)) return;
+      const canceled = isFileUploadCanceled(err) || transfer.signal.aborted;
+      failDownloadTransfer(transfer.id, canceled);
+      if (canceled) return;
+      if (err instanceof Error && alreadyMapped.has(err)) throw err;
+      throw new Error(mapDownloadError(err));
+    }
+  }, [fileScopeSessionName, mapDownloadError, requestPathDownloadId, serverId, sessionId, t, ws]);
 
   const pathClickHandler = ws && !preview ? handlePathClick : undefined;
   const htmlPreviewHandler = ws && typeof ws.fsReadFile === 'function' && !preview ? handleHtmlPreview : undefined;
@@ -2161,6 +3095,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   }, [showToolCallsPref]);
   const [sdkAgentsNow, setSdkAgentsNow] = useState(() => Date.now());
   const hasSdkAgentEvents = useMemo(() => hasSdkSubagentTimelineEvent(events), [events]);
+  // Keyed by content so assistant blocks re-render only when a status changes.
+  const liveAssignmentStatusesSignature = useMemo(
+    () => liveAssignmentStatusesKey(deriveLiveAssignmentStatuses(events)),
+    [events],
+  );
+  const liveAssignmentStatuses = useMemo(
+    () => new Map<string, LiveAssignmentStatus>(JSON.parse(liveAssignmentStatusesSignature) as Array<[string, LiveAssignmentStatus]>),
+    [liveAssignmentStatusesSignature],
+  );
   useEffect(() => {
     if (!hasSdkAgentEvents) return;
     setSdkAgentsNow(Date.now());
@@ -2171,10 +3114,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   );
   const hasAgentsStatusRows = sdkAgentsStatus.rows.length > 0 || sdkAgentsStatus.diagnostics.length > 0;
   useEffect(() => {
-    if (!hasAgentsStatusRows) return undefined;
+    if (!visible || !hasAgentsStatusRows) return undefined;
     const timer = window.setInterval(() => setSdkAgentsNow(Date.now()), 1_000);
     return () => window.clearInterval(timer);
-  }, [hasAgentsStatusRows]);
+  }, [hasAgentsStatusRows, visible]);
   // Preview cards reuse the existing Agents panel when background work exists.
   // The aggregator only accepts sdkSubagent events, so ordinary Bash tool calls
   // never make this control or panel appear.
@@ -2184,6 +3127,18 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // a provider diagnostic) makes the entire list disappear even though the
   // aggregator still has authoritative status to show.
   const showAgentsPane = canShowAgentsControl && desiredAgentsOpen && hasAgentsStatusRows;
+  const canShowFilePanel = !preview && !!ws;
+  useLayoutEffect(() => {
+    const titlebar = chatTitlebarRef.current;
+    const actions = chatTopActionsRef.current;
+    if (!titlebar || !actions) return undefined;
+    const update = () => titlebar.style.setProperty('--chat-top-actions-reserve', `${Math.ceil(actions.getBoundingClientRect().width) + 8}px`);
+    update();
+    const observer = typeof ResizeObserver === 'undefined' ? undefined : new ResizeObserver(update);
+    observer?.observe(actions);
+    window.addEventListener('resize', update);
+    return () => { observer?.disconnect(); window.removeEventListener('resize', update); };
+  }, [canShowAgentsControl, canShowFilePanel, onForceSync]);
 
   // Preview cards (SubSessionCard) are small thumbnails; slice events to a
   // bounded tail BEFORE buildViewItems so it doesn't walk thousands of items
@@ -2191,11 +3146,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // session pane / sub-session window) keeps the full list so "load older"
   // and infinite scroll-back continue to work — only the rendered slice is
   // capped further down (`renderedViewItems`).
-  const sourceEvents = useMemo(
+  const rawSourceEvents = useMemo(
     () => (preview && events.length > PREVIEW_EVENT_TAIL_LIMIT
       ? events.slice(-PREVIEW_EVENT_TAIL_LIMIT)
       : events),
     [preview, events],
+  );
+  const sourceEvents = useMemo(
+    () => rawSourceEvents.map((event) => localizeDaemonUserNoticeEvent(event, t)),
+    [rawSourceEvents, t, i18n?.resolvedLanguage],
   );
   const effectiveRenderLimit = preview ? PREVIEW_RENDER_ITEM_LIMIT : renderItemLimit;
   // Derived from a window of recent events, not the whole session: the renderer
@@ -2252,17 +3211,87 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     () => (hiddenRenderedItemCount > 0 ? viewItems.slice(-effectiveRenderLimit) : viewItems),
     [hiddenRenderedItemCount, effectiveRenderLimit, viewItems],
   );
-  const renderedRevision = useMemo(
-    () => getRenderedViewRevision(renderedViewItems),
-    [renderedViewItems],
+  // The "earlier messages are still loading" row lives IN the list (between the older cached block and the
+  // stitched newest block), so its arrival and removal take the same layout/anchor path as any other row.
+  const historyGapPlacement = useMemo(
+    () => (preview ? { kind: 'none' as const } : placeHistoryGapMarker(renderedViewItems, historyGap)),
+    [preview, renderedViewItems, historyGap],
   );
+  const displayViewItems = useMemo(
+    () => insertHistoryGapMarker(renderedViewItems, historyGapPlacement, { key: HISTORY_GAP_MARKER_KEY, type: 'history-gap' }) as ViewItem[],
+    [renderedViewItems, historyGapPlacement],
+  );
+  const renderedRevision = useMemo(
+    () => getRenderedViewRevision(displayViewItems),
+    [displayViewItems],
+  );
+  const viewItemsRef = useRef(viewItems);
+  viewItemsRef.current = viewItems;
+  const hasOlderOutsideWindowRef = useRef(hasOlderOutsideWindow);
+  hasOlderOutsideWindowRef.current = hasOlderOutsideWindow;
   const resolvePinnedMessageText = useCallback((pin: MessagePin): string => {
     if (pin.sessionName !== sessionId) return pin.text;
     const sourceEvent = events.find((event) => event.eventId === pin.eventId);
     return sourceEvent ? (messagePinSourceText(sourceEvent, viewItems) ?? pin.text) : pin.text;
   }, [events, sessionId, viewItems]);
 
-  const locatePinnedMessage = useCallback(async (pin: MessagePin) => {
+  /**
+   * Reveal an event through the virtualizer and retry DOM lookup until the
+   * measured target is mounted. All message-navigation entry points use this
+   * helper so an offscreen target cannot leave a pending jump stuck.
+   */
+  const revealEvent = useCallback((
+    eventId: string,
+    onFound: (root: HTMLElement, target: HTMLElement) => void,
+    onTimeout?: () => void,
+    eventTs?: number,
+  ): (() => void) => {
+    setVirtualRevealKey(eventId);
+    let cancelled = false;
+    let attempts = 0;
+    let loadingContext = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const attempt = async () => {
+      if (cancelled) return;
+      const currentItems = viewItemsRef.current;
+      const presentationItem = currentItems.find((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ));
+      const presentationKey = presentationItem?.key ?? eventId;
+      setVirtualRevealKey(presentationKey);
+      const root = scrollRef.current;
+      const target = root ? findEventElement(root, presentationKey) : null;
+      if (root && target) {
+        setVirtualRevealKey(undefined);
+        onFound(root, target);
+        return;
+      }
+      const sourceHasEvent = timelineEventsRef.current.some((event) => event.eventId === eventId);
+      if (!sourceHasEvent && eventTs !== undefined && onLoadMessageContext && !loadingContext) {
+        loadingContext = true;
+        await onLoadMessageContext(eventId, eventTs);
+        loadingContext = false;
+      }
+      const requiredLimit = __computeRevealRenderItemLimitForTests(currentItems, eventId, effectiveRenderLimit);
+      if (requiredLimit > effectiveRenderLimit) setRenderItemLimit(requiredLimit);
+      else if (hasOlderOutsideWindowRef.current && !currentItems.some((item) => (
+        item.key === eventId || item.event?.eventId === eventId || item.eventIds?.includes(eventId)
+      ))) setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
+      if (attempts++ >= 30) {
+        setVirtualRevealKey(undefined);
+        onTimeout?.();
+        return;
+      }
+      timer = setTimeout(attempt, 16);
+    };
+    timer = setTimeout(() => { void attempt(); }, 0);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+    };
+  }, [effectiveRenderLimit, onLoadMessageContext]);
+
+  const locatePinnedMessage = useCallback((pin: MessagePin) => {
     if (!sessionId || pin.sessionName !== sessionId) {
       requestMessagePinNavigation(pin, sessionId);
       return;
@@ -2271,14 +3300,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     pendingPinnedLocateIdRef.current = pin.id;
     setPinnedLocateError(false);
     setPendingPinnedLocate(pin);
-    if (timelineEventsRef.current.some((event) => event.eventId === pin.eventId)) return;
-    if (!onLoadMessageContext || !await onLoadMessageContext(pin.eventId, pin.eventTs)) {
-      clearPendingMessagePin(pin.id);
-      pendingPinnedLocateIdRef.current = null;
-      setPendingPinnedLocate(null);
-      setPinnedLocateError(true);
-    }
-  }, [onLoadMessageContext, sessionId]);
+  }, [sessionId]);
 
   useEffect(() => {
     if (!pinsEnabled || !sessionId) return undefined;
@@ -2292,34 +3314,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
   useEffect(() => {
     if (!pendingPinnedLocate) return undefined;
-    if (!events.some((event) => event.eventId === pendingPinnedLocate.eventId)) return undefined;
-    const targetItemIndex = viewItems.findIndex((item) => (
-      item.key === pendingPinnedLocate.eventId
-      || item.event?.eventId === pendingPinnedLocate.eventId
-      || item.eventIds?.includes(pendingPinnedLocate.eventId)
-    ));
-    if (targetItemIndex < 0) {
-      // The event is in the session but older than the derivation window, so it
-      // has no presentation item yet. Widening the render limit widens the
-      // window with it, and this effect re-runs on the rebuilt list — without
-      // this the navigation would silently do nothing for any message older
-      // than the window, which is precisely the ones a pin is used for.
-      if (hasOlderOutsideWindow) {
-        setRenderItemLimit((current) => current + CHAT_RENDER_ITEM_INCREMENT);
-      }
-      return undefined;
-    }
-    const targetDomEventId = viewItems[targetItemIndex]!.key;
-    // The renderer is tail-limited. Reveal only enough tail items to include
-    // the target instead of mounting a previously expanded 2,000-item history
-    // in one task (which would revive the multi-window freeze this UI avoids).
-    const requiredTailItems = viewItems.length - targetItemIndex;
-    setRenderItemLimit((current) => Math.max(current, requiredTailItems));
-    const frame = requestAnimationFrame(() => {
-      const root = scrollRef.current;
-      if (!root) return;
-      const target = findEventElement(root, targetDomEventId);
-      if (!target) return;
+    return revealEvent(pendingPinnedLocate.eventId, (root, target) => {
       const reducedMotion = typeof window.matchMedia === 'function'
         && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
       scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
@@ -2328,9 +3323,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       clearPendingMessagePin(pendingPinnedLocate.id);
       pendingPinnedLocateIdRef.current = null;
       setPendingPinnedLocate(null);
-    });
-    return () => cancelAnimationFrame(frame);
-  }, [events, pendingPinnedLocate, renderedRevision, viewItems.length]);
+    }, () => {
+      clearPendingMessagePin(pendingPinnedLocate.id);
+      pendingPinnedLocateIdRef.current = null;
+      setPendingPinnedLocate(null);
+      setPinnedLocateError(true);
+    }, pendingPinnedLocate.eventTs);
+  }, [pendingPinnedLocate, revealEvent, renderedRevision]);
 
   useEffect(() => {
     if (revealingOlderTimerRef.current) {
@@ -2400,8 +3399,15 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // follow/suppress policy stays synchronous so ordering against callers that
   // set state right after is unchanged.
   const pendingScrollFrameRef = useRef<number | null>(null);
+  // Single-flight frame for every "follow the bottom" request in this view.
+  // These fire from timeline updates, scroll handling and ResizeObserver — all
+  // of which keep running while the display is asleep and frames are not
+  // produced. A raw rAF per request therefore builds an unbounded backlog that
+  // the browser executes in one post-unlock frame. See useCoalescedFrame.
+  const scheduleFollowFrame = useCoalescedFrame();
 
   const scrollToBottom = (engageFollow: boolean = true) => {
+    if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el) return;
     if (engageFollow) {
@@ -2416,6 +3422,10 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       pendingScrollFrameRef.current = null;
       const node = scrollRef.current;
       if (!node) return;
+      // A wheel/touch scroll-away can land between scheduling and this frame.
+      // Follow intent is re-checked HERE (not only when scheduled) so a reader
+      // is never snapped back down by a pin that was queued before they moved.
+      if (!engageFollow && !preview && !autoScrollRef.current) return;
       // Armed here rather than at call time: it is a 200ms one-shot guard
       // against the synthetic scroll event fired by the write below.
       markProgrammaticScroll();
@@ -2423,6 +3433,92 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       lastScrollTopRef.current = node.scrollTop;
     });
   };
+
+  // The reading anchor: the first row that reaches into the viewport and where its
+  // top edge sits in SCROLL-CONTENT coordinates (which do not change while the
+  // reader scrolls, only when layout above the row changes). Recorded on every user
+  // scroll event while the reader is NOT following. Whatever later changes layout
+  // above it (virtual rows measured, a page of older history prepended, a banner
+  // mounting, an image loading) is undone by moving that row back: the DOM position
+  // is the truth, so there is no estimate to get wrong and no way to apply a
+  // correction twice.
+  //
+  // HOW it is undone matters on a phone. A scrollTop write while a finger or its
+  // momentum owns the scroller stops the momentum and jumps the content (iOS has no
+  // scroll anchoring to lean on), so a virtualized list absorbs the shift in its top
+  // offset instead (`absorbTopShiftRef`): nothing on screen moves and no write is
+  // made. Only a list that is not virtualized falls back to scrollTop.
+  const readerAnchorRef = useRef<ReaderAnchor | null>(null);
+  const absorbTopShiftRef = useRef<((delta: number) => number) | null>(null);
+  const captureReaderAnchor = () => {
+    const root = scrollRef.current;
+    if (!root) return;
+    const rootTop = root.getBoundingClientRect().top;
+    // Stop at the first row that reaches into the viewport: rows above it are not
+    // measured, so a long normal-flow list costs O(rows above the viewport) reads
+    // of already-clean layout, not a scan of the whole history.
+    const rows: Array<{ id: string; top: number; bottom: number }> = [];
+    for (const node of root.querySelectorAll<HTMLElement>('[data-event-id]')) {
+      const id = node.getAttribute('data-event-id');
+      if (!id) continue;
+      const rect = node.getBoundingClientRect();
+      rows.push({ id, top: rect.top, bottom: rect.bottom });
+      if (rect.bottom > rootTop + 1) break;
+    }
+    readerAnchorRef.current = pickReaderAnchor(rows, rootTop, root.scrollTop);
+  };
+  const restoreReaderAnchor = () => {
+    const root = scrollRef.current;
+    const anchor = readerAnchorRef.current;
+    if (!root || !anchor) return;
+    // Attribute lookup by iteration: ids are opaque strings, and this avoids
+    // building a selector from them (no escaping rules to get wrong).
+    let node: HTMLElement | null = null;
+    for (const candidate of root.querySelectorAll<HTMLElement>('[data-event-id]')) {
+      if (candidate.getAttribute('data-event-id') === anchor.id) { node = candidate; break; }
+    }
+    // The anchor row left the DOM (virtualized out): pick the row now in view.
+    if (!node) { captureReaderAnchor(); return; }
+    const contentTop = node.getBoundingClientRect().top - root.getBoundingClientRect().top + root.scrollTop;
+    const delta = computeReaderAnchorDelta(anchor.contentTop, contentTop);
+    if (delta === 0) return;
+    const remainder = absorbTopShiftRef.current ? absorbTopShiftRef.current(delta) : delta;
+    if (remainder === 0) return; // absorbed: the row is back where it was, nothing was written
+    markProgrammaticScroll();
+    root.scrollTop += remainder;
+    // Content moved by `remainder`, the viewport followed it: re-record the row.
+    readerAnchorRef.current = { ...anchor, contentTop: anchor.contentTop + remainder };
+  };
+
+  // Virtualized row measurements are the only layout correction that may
+  // adjust the viewport outside the normal content-follow effects. Keep that
+  // correction here so one owner decides whether the user is pinned or
+  // reading an older anchor. In particular, use the pre-measurement pin bit:
+  // after a streaming row grows, the post-growth distance is necessarily
+  // non-zero when `overflow-anchor` is disabled and must not be mistaken for a
+  // user scroll-away.
+  // Single owner of the viewport after a commit / row measurement: a follower is
+  // re-pinned using the PRE-change pin bit (after a row grows the post-growth
+  // distance is non-zero even though the user was pinned - `overflow-anchor: none`
+  // means nothing else compensates); a reader's anchor row is re-aligned.
+  const applyMeasuredLayoutScroll = useCallback((root: HTMLDivElement, wasAtBottom: boolean) => {
+    if (!autoScrollRef.current) {
+      restoreReaderAnchor();
+      return;
+    }
+    const correction = computeMeasuredScrollCorrection({
+      wasAtBottom,
+      autoFollow: true,
+      currentTop: root.scrollTop,
+      scrollHeight: root.scrollHeight,
+      clientHeight: root.clientHeight,
+      anchorDelta: 0,
+    });
+    if (correction?.kind === 'pin') {
+      markProgrammaticScroll();
+      root.scrollTop = correction.targetTop;
+    }
+  }, []);
 
   // (No `followIfEngaged` helper: the two callsites that need it are also
   // preview-aware, and inlining `if (preview || autoScrollRef.current)`
@@ -2439,8 +3535,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     setShowScrollBtn(false);
     // Force scroll to bottom on tab switch — the auto-scroll effect may not fire
     // if no new events arrived while this tab was inactive.
-    requestAnimationFrame(() => scrollToBottom(true));
-  }, [sessionId]);
+    scheduleFollowFrame(() => scrollToBottom(true));
+  }, [sessionId, scheduleFollowFrame]);
 
   // On mobile: when keyboard opens, viewport shrinks and scrollTop can reset to 0.
   // Save the relative bottom offset on focusin, then restore against the new layout
@@ -2465,7 +3561,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       if (vv.height !== prevHeight) {
         suppressLoadOlder();
         if (savedWasNearBottom || autoScrollRef.current) {
-          requestAnimationFrame(() => scrollToBottom());
+          scheduleFollowFrame(() => scrollToBottom());
         } else if (vv.height < prevHeight) {
           const targetTop = Math.max(0, el.scrollHeight - el.clientHeight - savedBottomOffset);
           el.scrollTop = targetTop;
@@ -2679,13 +3775,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     prevVisibleTsRef.current = lastVisibleTs;
     if (!changed && !preview) return;
     if (layoutHandledVisibleTsRef.current === lastVisibleTs) return;
-    requestAnimationFrame(() => {
+    scheduleFollowFrame(() => {
       // Re-check inside the rAF callback so a state flip during the frame
       // window (e.g. a user scroll-up that lands between schedule and fire)
       // is honoured. Preview always follows by design.
       if (preview || autoScrollRef.current) scrollToBottom(false);
     });
-  }, [lastVisibleTs, preview]);
+  }, [lastVisibleTs, preview, scheduleFollowFrame]);
 
   const lastScrollActivityRef = useRef(Date.now());
   // (Previously SCROLL_IDLE_RESUME_MS = 60_000 drove a setInterval that
@@ -2719,6 +3815,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
 
   // Pause "stick to bottom" follow mode. Shared by handleScroll's distance
   // threshold and the explicit wheel/touch up-gesture handlers below.
+  const userScrollUpUntilRef = useRef(0);
   const disengageFollow = () => {
     if (!autoScrollRef.current) return;
     autoScrollRef.current = false;
@@ -2727,6 +3824,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     setShowScrollBtn(true);
     lastScrollActivityRef.current = Date.now();
+    captureReaderAnchor();
   };
 
   // An explicit upward wheel/touch gesture is unambiguous "stop following"
@@ -2738,6 +3836,11 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // These events are never synthesised by scrollToBottom, so they can't
   // false-trigger. Re-engagement stays distance-based (scroll back to bottom).
   const handleUserScrollUpIntent = () => {
+    // Record the intent even when follow is already off: while the reader is
+    // still dragging/wheeling toward older content, handleScroll must not
+    // re-engage follow just because they are (briefly) still within the
+    // re-engage band of the bottom - the next stream pin would snap them back.
+    userScrollUpUntilRef.current = Date.now() + CHAT_USER_SCROLL_UP_HOLD_MS;
     if (preview || !autoScrollRef.current) return;
     const el = scrollRef.current;
     if (!el) return;
@@ -2784,7 +3887,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       && Date.now() < suppressLoadOlderUntilRef.current;
     if (transientTopJump) {
       setShowScrollBtn(false);
-      requestAnimationFrame(() => scrollToBottom(true));
+      scheduleFollowFrame(() => scrollToBottom(true));
       return;
     }
     // Adaptive + hysteresis thresholds (avoid boundary flicker during streaming
@@ -2796,14 +3899,17 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     const { disengageThreshold, reengageThreshold } = computeFollowThresholds(clientHeight, scrollHeight);
     if (wasAutoFollowing && distance > disengageThreshold) {
       disengageFollow();
-    } else if (!wasAutoFollowing && distance < reengageThreshold) {
+    } else if (!wasAutoFollowing && distance < reengageThreshold && Date.now() >= userScrollUpUntilRef.current) {
       autoScrollRef.current = true;
       newSinceUnfollowRef.current = 0;
       setNewSinceUnfollow(0);
       countedFinalEventIdsRef.current = new Set(finalVisibleEventIds);
     }
     setShowScrollBtn(!autoScrollRef.current);
-    if (!autoScrollRef.current) lastScrollActivityRef.current = Date.now();
+    if (!autoScrollRef.current) {
+      lastScrollActivityRef.current = Date.now();
+      captureReaderAnchor();
+    }
     lastScrollTopRef.current = scrollTop;
     // Auto-trigger load older when scrolled near top. Skip in preview mode —
     // preview cards have a fixed render tail (PREVIEW_RENDER_ITEM_LIMIT) and
@@ -2828,6 +3934,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // Keep the active chat pinned to bottom when layout changes reduce available height
   // (for example, when the sub-session bar appears after tab switch).
   useEffect(() => {
+    if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
 
@@ -2846,14 +3953,39 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       // Re-check follow state INSIDE the rAF: a user scroll-up that disengages
       // during the frame gap must still win, or we'd snap them back against
       // their intent.
-      requestAnimationFrame(() => {
+      scheduleFollowFrame(() => {
         if (autoScrollRef.current) scrollToBottom();
       });
     });
 
     ro.observe(el);
     return () => ro.disconnect();
-  }, [preview]);
+  }, [preview, scheduleFollowFrame, visible]);
+
+  // Local DOM growth that no ChatView render owns (a tool card / thinking block
+  // expanding, code block or image settling) changes scrollHeight in a commit
+  // that never reaches the pin effects above. A MutationObserver callback is a
+  // microtask, so it runs right after that commit and BEFORE the next animation
+  // frame: pin here (only while follow is engaged) and the viewport is at the
+  // bottom in the first frame that can observe the new height. Coalesced by the
+  // browser per microtask checkpoint, reads scrollHeight once, no per-frame work.
+  useEffect(() => {
+    if (!visible || preview) return undefined;
+    const el = scrollRef.current;
+    if (!el || typeof MutationObserver === 'undefined') return undefined;
+    const observer = new MutationObserver(() => {
+      if (loadingOlderRef.current || scrollAnchorRef.current) return;
+      // A reader's anchor row is re-aligned; only a follower is pinned.
+      if (!autoScrollRef.current) { restoreReaderAnchor(); return; }
+      const target = el.scrollHeight - el.clientHeight;
+      if (target - el.scrollTop <= 1) return;
+      markProgrammaticScroll();
+      el.scrollTop = target;
+      lastScrollTopRef.current = el.scrollTop;
+    });
+    observer.observe(el, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'open', 'hidden', 'aria-expanded'] });
+    return () => observer.disconnect();
+  }, [preview, visible]);
 
   // Hold the bottom through the post-mount layout settle.
   //
@@ -2876,6 +4008,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // never engages follow itself, it stays out of the way of the load-older anchor,
   // and it only fires on an actual height change so a quiet mount costs nothing.
   useEffect(() => {
+    if (!visible) return undefined;
     const el = scrollRef.current;
     if (!el) return;
     let lastScrollHeight = el.scrollHeight;
@@ -2901,7 +4034,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       scrollToBottom(false);
     }, CHAT_MOUNT_SETTLE_TICK_MS);
     return () => clearInterval(timer);
-  }, [sessionId, preview]);
+  }, [sessionId, preview, visible]);
 
   // Touch gesture mode is based on pointer coarseness only. Narrow desktop
   // windows still need native selection and the Copy/Quote popup.
@@ -3127,7 +4260,6 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
     };
   }, [isTouchDevice, preview, openCtxMenu]);
 
-  const canShowFilePanel = !preview && !!ws;
   const hasRightPanel = showAgentsPane || (canShowFilePanel && showFilePanel);
   // Per-machine chat-window font preference (family + size). Stored in
   // localStorage under `imcodes_fontPrefs:chat`; not synced across devices,
@@ -3163,6 +4295,29 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   // `empty` is terminal like `done` — a cold local cache is not still working.
   const showHistoryProgress = !preview && historySteps.some((step) => step.state === 'pending' || step.state === 'running');
   const showRefreshOverlay = !preview && (showHistoryProgress || refreshing);
+  // Delete = hide at once (optimistic), then ask the daemon. Every stored event of the
+  // rendered block is named (assistant text segments merge into one bubble), and the
+  // outcome is never silent: an error/timeout restores the message and shows why.
+  const deleteMessage = (eventId: string, pin: MessagePin | undefined): void => {
+    if (!ws || !sessionId) return;
+    const targets = resolveTimelineDeleteTargets(viewItems, eventsProp, eventId);
+    setLocallyDeletedIds((prev) => new Set([...prev, ...targets.eventIds]));
+    requestTimelineMessageDelete(ws, sessionId, targets).then(
+      () => {
+        // A pinned message that is deleted for everyone must not linger as a ghost pin.
+        if (pin) void messagePins.unpinMessage(pin);
+      },
+      (err: unknown) => {
+        console.warn('delete timeline message failed', err);
+        setLocallyDeletedIds((prev) => {
+          const next = new Set(prev);
+          for (const id of targets.eventIds) next.delete(id);
+          return next;
+        });
+        setDeleteErrorKey(timelineDeleteErrorKey(err instanceof TimelineDeleteError ? err.code : TIMELINE_DELETE_ERROR_CODES.FAILED));
+      },
+    );
+  };
   const contextMenuEvent = ctxMenu?.eventId
     ? events.find((event) => event.eventId === ctxMenu.eventId)
     : undefined;
@@ -3179,7 +4334,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
   return (
     <div class={`chat-view-wrap${hasRightPanel ? ' chat-split' : ''}`}>
       {(canShowAgentsControl || onForceSync || canShowFilePanel) && (
-        <div class="chat-top-actions">
+        <div ref={chatTopActionsRef} class="chat-top-actions">
           {onForceSync && (
             <button
               class={`chat-panel-toggle chat-sync-btn${refreshing ? ' spinning' : ''}`}
@@ -3226,6 +4381,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
       <div class="chat-main">
         {!preview && (
           <div
+            ref={chatTitlebarRef}
             class="chat-titlebar"
             style={{
               display: 'flex',
@@ -3238,7 +4394,6 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               padding: '4px 8px',
               minHeight: 30,
               flexShrink: 0,
-              position: 'relative',
               borderBottom: '1px solid rgba(51,65,85,0.5)',
               background: 'rgba(15,23,42,0.35)',
             }}
@@ -3277,6 +4432,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             )}
           </div>
         )}
+        {!!sessionId && <TaskPairStatusPanelHost events={events} sessions={sessions} serverId={serverId} scopeSessionId={scopeTaskPairs ? sessionId : undefined} mobileAnchorRef={chatTitlebarRef} />}
         {showRefreshOverlay && (
           <div
             class={`chat-history-overlay${showHistoryProgress ? ' has-steps' : ''}`}
@@ -3313,36 +4469,36 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
             class={`chat-pinned-last-sent${pinnedExpanded ? ' chat-pinned-expanded' : ''}`}
             role="button"
             tabIndex={0}
-            aria-label={t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
+            aria-label={pinnedPreviewUsesMemory
+              ? t('chat.pinned_recent_summary_aria', 'Show recent summary and jump to your last sent message')
+              : t('chat.pinned_last_sent_aria', 'Jump to your last sent message')}
             onClick={() => {
               // Tap once → toggle 2-line clamp; tap again (while expanded)
               // behaves like a jump-to-message. Holds the expand state so a
               // long message can be read without hunting for it.
               if (!pinnedExpanded) { setPinnedExpanded(true); return; }
-              const root = scrollRef.current;
-              if (!root) return;
-              const target = findEventElement(root, lastSentUserMessage.eventId);
-              if (target) {
-                // Respect the OS reduced-motion preference — smooth scrolling
-                // is a vestibular-trigger axis for some users.
+              // The last-sent bubble may be outside the virtualizer's mounted
+              // range. Reveal it first, then perform the same centered jump.
+              revealEvent(lastSentUserMessage.eventId, (root, target) => {
                 const reducedMotion = typeof window !== 'undefined'
                   && window.matchMedia
                   && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-                target.scrollIntoView({
-                  behavior: reducedMotion ? 'auto' : 'smooth',
-                  block: 'center',
-                });
-              }
+                scrollEventWithinChat(root, target, reducedMotion ? 'auto' : 'smooth');
+              });
             }}
           >
             <span class="chat-pinned-last-sent-meta">
-              <span class="chat-pinned-last-sent-label">{t('chat.pinned_last_sent_label', 'Last sent')}</span>
+              <span class="chat-pinned-last-sent-label">
+                {pinnedPreviewUsesMemory
+                  ? t('chat.pinned_recent_summary_label', 'Recent summary')
+                  : t('chat.pinned_last_sent_label', 'Last sent')}
+              </span>
               {lastSentUserMessage.actorLabel && (
                 <span class="chat-pinned-last-sent-actor">{lastSentUserMessage.actorLabel}</span>
               )}
               <span class="chat-pinned-last-sent-time">{formatChatDateTime(lastSentUserMessage.ts, Date.now(), locale)}</span>
             </span>
-            <span class="chat-pinned-last-sent-text">{lastSentUserMessage.text}</span>
+            <span class="chat-pinned-last-sent-text">{pinnedExpanded ? pinnedPreviewText : pinnedCompactPreviewText}</span>
           </div>
         )}
         <div class={`chat-view${preview ? ' chat-view-preview' : ''}`} ref={scrollRef} style={chatFontStyle} onScroll={preview ? undefined : handleScroll}
@@ -3368,7 +4524,13 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           } : undefined}
         >
           {!preview && <AgentTodoList events={events} sessionState={sessionState} />}
-          {loading ? (
+          {/* The spinner is for an EMPTY pane only. It used to be an exclusive
+           *  branch on `loading` alone, which — together with the `!loading`
+           *  guard on the message list below — blanked a pane whose cached
+           *  events were already in state, purely because a background
+           *  refresh was in flight. Cached history must stay on screen while
+           *  the network catches up. */}
+          {loading && viewItems.length === 0 ? (
             <div class="chat-loading">{t('chat.loading')}</div>
           ) : viewItems.length === 0 ? (
             // Suppress the "no events" placeholder while history bootstrap
@@ -3425,6 +4587,14 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               <div class="chat-tool-chooser-footnote">{t('chat.tool_chooser_footnote')}</div>
             </div>
           )}
+          {/* The hole lies above everything rendered: the same marker as the inline one, as a plain row at the top
+              (outside the virtualized list, so it is always in the DOM while the hole is open). */}
+          {historyGapPlacement.kind === 'above' && (
+            <div className="chat-history-gap-marker" role="status" data-testid="chat-history-gap-marker">
+              <span className="chat-refreshing-spinner" aria-hidden="true" />
+              <span>{t('chat.history_gap_loading')}</span>
+            </div>
+          )}
           {!loading && !preview && viewItems.length > 0 && (loadingOlder || revealingOlder) && (
             <div class="chat-load-older-status" role="status" aria-live="polite">
               <span class="chat-refreshing-spinner" aria-hidden="true" />
@@ -3450,14 +4620,42 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               </button>
             </div>
           )}
-          {!loading && renderedViewItems.map((item) => {
+          {/* No `loading` guard: whatever is already restored renders now. */}
+          <VirtualizedViewItems
+            items={displayViewItems}
+            scrollRef={scrollRef}
+            enabled={!preview}
+            revealKey={virtualRevealKey}
+            onMeasuredLayout={applyMeasuredLayoutScroll}
+            absorbTopShiftRef={absorbTopShiftRef}
+            resetKey={sessionId ?? undefined}
+            isFollowing={() => autoScrollRef.current}
+            onTopOffsetReconciled={() => { if (!autoScrollRef.current) captureReaderAnchor(); }}
+            renderItem={(item) => {
+            if (item.type === 'history-gap') {
+              return (
+                <div key={item.key} className="chat-history-gap-marker" role="status" data-testid="chat-history-gap-marker">
+                  <span className="chat-refreshing-spinner" aria-hidden="true" />
+                  <span>{t('chat.history_gap_loading')}</span>
+                </div>
+              );
+            }
+            if (item.type === 'supervision-status-run') {
+              return <SupervisionStatusRun key={item.key} item={item} />;
+            }
             if (item.type === 'assistant-block') {
               return (
                 <AssistantBlock
                   key={item.key}
-                  eventId={item.key}
+                  // The row key is stable across the run losing its oldest event; the DOM
+                  // marker stays a real, current event id (the run's first).
+                  eventId={item.eventIds?.[0] ?? item.key}
                   text={item.text!}
                   automation={item.assistantAutomation === true}
+                  streaming={item.assistantStreaming === true}
+                  executionState={item.executionState}
+                  delegationMetadata={item.delegationMetadata}
+                  liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
                   onUrlClick={urlClickHandler}
@@ -3472,7 +4670,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
               return <ToolCallGroup key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             if (item.type === 'tool-activity') {
-              return <ToolActivitySummary key={item.key} events={item.toolEvents!} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
+              return <ToolActivitySummary key={item.key} events={item.toolEvents!} visible={visible} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} />;
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
@@ -3499,7 +4697,8 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                 ))}
               </div>
             );
-          })}
+            }}
+          />
           {!loading && <div ref={bottomRef} />}
         </div>
         {!preview && showScrollBtn && (
@@ -3628,11 +4827,7 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
                   if (!eid || !sessionId || !ws) return;
                   // Destructive + global → keep an explicit confirmation (no click-to-delete).
                   if (!window.confirm(t('chat.delete_message_confirm'))) return;
-                  try {
-                    ws.deleteTimelineMessage(sessionId, eid);
-                  } catch (err) {
-                    console.warn('delete timeline message failed', err);
-                  }
+                  deleteMessage(eid, contextMenuPin);
                   setCtxMenu(null);
                   if (highlightEl) { highlightEl.classList.remove('chat-highlight'); setHighlightEl(null); }
                 }}
@@ -3643,6 +4838,12 @@ function ChatViewImpl({ events, loading, refreshing = false, historyStatus, load
           </div>
         )}
       </div>
+      {deleteErrorKey && (
+        <div class="chat-toast chat-toast-error" role="alert" data-chat-delete-error>
+          <span>{t(deleteErrorKey)}</span>
+          <button type="button" class="chat-toast-close" aria-label={t('common.close')} onClick={() => setDeleteErrorKey(null)}>✕</button>
+        </div>
+      )}
       {showAgentsPane && (
         <SdkAgentsPanel
           rows={sdkAgentsStatus.rows}
@@ -3995,6 +5196,7 @@ function ToolActivityPeek({
 /** One-line live tool telemetry for Simple view; expands details on demand. */
 function ToolActivitySummary({
   events,
+  visible = true,
   onPathClick,
   onUrlClick,
   onDownload,
@@ -4004,6 +5206,7 @@ function ToolActivitySummary({
   serverId,
 }: {
   events: TimelineEvent[];
+  visible?: boolean;
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onDownload?: ChatPathDownloadHandler;
@@ -4029,7 +5232,7 @@ function ToolActivitySummary({
   const counts = getToolActivityCounts(events);
   // Tick only while something is actually running: a settled group must not keep
   // a timer alive, and the shared ticker stops once its last listener leaves.
-  const nowMs = useNowTicker(counts.running > 0);
+  const nowMs = useNowTicker(visible && counts.running > 0);
   const last = getLastToolActivity(events, nowMs);
   const lastDuration = last?.durationMs != null ? formatToolDuration(last.durationMs) : null;
   // Same one-line preview the full row shows, so this reads as a miniature of it
@@ -4249,8 +5452,12 @@ function ToolCallGroup({
 const AssistantBlock = memo(function AssistantBlock({
   text,
   automation,
+  streaming,
+  executionState,
   ts,
   eventId,
+  delegationMetadata,
+  liveAssignmentStatuses,
   onPathClick,
   onUrlClick,
   onDownload,
@@ -4258,13 +5465,36 @@ const AssistantBlock = memo(function AssistantBlock({
   onImagePreview,
   onOpenLocalWebPreview,
 }: AssistantBlockProps) {
+  const { t } = useTranslation();
+  const status = executionState === SUPERVISION_EXECUTION_STATES.WAITING
+    ? { className: 'waiting', glyph: SUPERVISION_HEARTBEAT_GLYPH.WAITING, label: t('chat.execution_status.waiting') }
+    : executionState === SUPERVISION_EXECUTION_STATES.NEEDS_INPUT
+      ? { className: 'needs-input', glyph: SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT, label: t('chat.execution_status.needs_input') }
+      : null;
+  const statusOnly = text.length === 0 && status !== null;
   return (
     <div
-      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}`}
+      class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
       data-event-id={eventId}
     >
-      <ChatMarkdown text={parseTimelineDisplayText(text)} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />
-      <ChatTime ts={ts} />
+      {text && <ChatMarkdown text={parseTimelineDisplayText(text)} cacheKey={eventId} streaming={streaming} onPathClick={onPathClick} onUrlClick={onUrlClick} onDownload={onDownload} onHtmlPreview={onHtmlPreview} onImagePreview={onImagePreview} onOpenLocalWebPreview={onOpenLocalWebPreview} />}
+      {status && (
+        <span
+          class={`chat-execution-status-chip ${status.className}`}
+          role="status"
+          aria-label={status.label}
+          title={status.label}
+        >
+          <span class="chat-execution-status-glyph" aria-hidden="true">{status.glyph}</span>
+          {status.label}
+        </span>
+      )}
+      {!statusOnly && (
+        <>
+          <DelegationClaimBadge metadata={delegationMetadata} liveAssignmentStatuses={liveAssignmentStatuses} messageTs={ts} />
+          <ChatTime ts={ts} />
+        </>
+      )}
     </div>
   );
 });
@@ -4276,7 +5506,7 @@ function AttachmentDownloadButton({
   onHtmlPreview,
   sessionName,
 }: {
-  att: { id: string; originalName?: string; size?: number; daemonPath?: string };
+  att: { id?: string; originalName?: string; size?: number; daemonPath?: string };
   serverId: string;
   onPathClick?: (p: string) => void;
   onHtmlPreview?: (p: string) => void;
@@ -4284,7 +5514,8 @@ function AttachmentDownloadButton({
 }) {
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
-  const label = att.originalName || att.id;
+  const downloadId = attachmentDownloadId(att.id, att.daemonPath);
+  const label = attachmentDisplayName(att.id, att.originalName, att.daemonPath);
   const sizeLabel = att.size ? ` (${(att.size / 1024).toFixed(0)}KB)` : '';
 
   const handleError = (err: unknown) => {
@@ -4303,15 +5534,21 @@ function AttachmentDownloadButton({
         class="chat-attachment-dl"
         onClick={() => {
           setError(null);
-          // If file has a daemon path, open in file browser floating panel
-          if (att.daemonPath && onPathClick) {
+          // Relative source references are still opened in the file browser.
+          // Uploaded attachments use their opaque download handle; never send
+          // a host absolute path to the browser or to the download route.
+          if (!downloadId && att.daemonPath && !isAbsoluteAttachmentPath(att.daemonPath) && onPathClick) {
             onPathClick(att.daemonPath);
+            return;
+          }
+          if (!downloadId) {
+            handleError(new Error('invalid_attachment_id'));
             return;
           }
           import('../api.js').then(({ previewAttachment }) => {
             const request = sessionName
-              ? previewAttachment(serverId, att.id, sessionName)
-              : previewAttachment(serverId, att.id);
+              ? previewAttachment(serverId, downloadId, sessionName)
+              : previewAttachment(serverId, downloadId);
             request.catch(handleError);
           });
         }}
@@ -4323,10 +5560,14 @@ function AttachmentDownloadButton({
         class="chat-attachment-dl-btn"
         onClick={() => {
           setError(null);
+          if (!downloadId) {
+            handleError(new Error('invalid_attachment_id'));
+            return;
+          }
           import('../api.js').then(({ downloadAttachment }) => {
             const request = sessionName
-              ? downloadAttachment(serverId, att.id, sessionName)
-              : downloadAttachment(serverId, att.id);
+              ? downloadAttachment(serverId, downloadId, sessionName)
+              : downloadAttachment(serverId, downloadId);
             request.catch(handleError);
           });
         }}
@@ -4335,7 +5576,7 @@ function AttachmentDownloadButton({
       >
         ⬇
       </button>
-      {att.daemonPath && onHtmlPreview && isHtmlPreviewPath(att.daemonPath) && (
+      {!downloadId && att.daemonPath && onHtmlPreview && isHtmlPreviewPath(att.daemonPath) && (
         <button
           type="button"
           class="chat-attachment-dl-btn chat-html-preview-btn"
@@ -4349,6 +5590,134 @@ function AttachmentDownloadButton({
           👁
         </button>
       )}
+    </span>
+  );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function supervisionUserPromptLabelKey(payload: Record<string, unknown>): string | null {
+  if (payload.automation !== true || typeof payload.automationKind !== 'string') return null;
+  const kind = payload.automationKind;
+  const known = (SUPERVISION_USER_PROMPT_LABEL_KEYS as Readonly<Record<string, string>>)[kind];
+  if (known) return known;
+  return kind.startsWith(SUPERVISION_AUTOMATION_KIND_PREFIX)
+    ? 'chat.supervision_prompt.generic'
+    : null;
+}
+
+function SupervisionAutomationPrompt({
+  text,
+  label,
+  automationKind,
+  showDetailsLabel,
+  hideDetailsLabel,
+}: {
+  text: string;
+  label: string;
+  automationKind: string;
+  showDetailsLabel: string;
+  hideDetailsLabel: string;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const actionLabel = expanded ? hideDetailsLabel : showDetailsLabel;
+  const heartbeat = automationKind === SUPERVISION_WAITING_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_AUDIT_HEARTBEAT_AUTOMATION_KIND
+    || automationKind === SUPERVISION_IMPLEMENTATION_HEARTBEAT_AUTOMATION_KIND;
+  return (
+    <div class={`chat-supervision-prompt${heartbeat ? ' is-heartbeat' : ''}`}>
+      <button
+        type="button"
+        class="chat-supervision-prompt-toggle"
+        aria-expanded={expanded}
+        aria-label={`${label}: ${actionLabel}`}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {heartbeat && <span class="chat-supervision-heartbeat-glyph" aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>}
+        {label}
+      </button>
+      {expanded && (
+        <pre class="chat-supervision-prompt-details">{text}</pre>
+      )}
+    </div>
+  );
+}
+
+function CronRunCard({ run, locale }: { run: CronRunTimelineProjection; locale?: string }) {
+  const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const detailsId = `cron-run-${run.scheduleId}-${run.executionId ?? 'dispatch'}`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+  const formatTime = (value: number | undefined) => value === undefined
+    ? t('cron.run_card.not_available')
+    : new Intl.DateTimeFormat(locale, { dateStyle: 'medium', timeStyle: 'short' }).format(new Date(value));
+  const completionLabel = run.completionPolicy === CRON_COMPLETION_POLICY.UNTIL_COMPLETE
+    ? t('cron.completion_until_complete')
+    : t('cron.completion_recurring');
+  return (
+    <section class="chat-cron-run" aria-label={t('cron.run_card.aria_label', { name: run.name })}>
+      <div class="chat-cron-run-header">
+        <strong class="chat-cron-run-title">{run.name}</strong>
+        <div class="chat-cron-run-chips">
+          {run.cronExpr && <span class="chat-cron-run-chip" title={t('cron.run_card.schedule')}>{run.cronExpr}</span>}
+          <span class="chat-cron-run-chip">{completionLabel}</span>
+          <span class="chat-cron-run-chip is-status">{t('cron.run_card.status_dispatched')}</span>
+        </div>
+      </div>
+      <div class="chat-cron-run-next">
+        <span>{t('cron.run_card.next_run')}</span>
+        <time>{formatTime(run.nextRunAt)}</time>
+        {run.timezone && <span class="chat-cron-run-timezone">{run.timezone}</span>}
+      </div>
+      <button
+        type="button"
+        class="chat-cron-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {expanded ? t('cron.run_card.hide_details') : t('cron.run_card.show_details')}
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-cron-run-details">
+          <div class="chat-cron-run-detail-row">
+            <span>{t('cron.run_card.previous_run')}</span>
+            <time>{formatTime(run.previousRunAt)}</time>
+          </div>
+          <div class="chat-cron-run-contract">
+            {t('cron.run_card.contract_summary', {
+              id: run.contractId,
+              version: run.contractVersion,
+              count: Object.keys(run.constraints).length,
+            })}
+          </div>
+          <div class="chat-cron-run-task-label">{t('cron.run_card.task_body')}</div>
+          <pre class="chat-cron-run-task">{run.taskBody}</pre>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function PeerAuditRoundChip({
+  round,
+  outcomeLabel,
+}: {
+  round: unknown;
+  outcomeLabel: string;
+}) {
+  const { t } = useTranslation();
+  if (!isPeerAuditRound(round)) return null;
+  const roundAria = t('peerAuditResult.roundAria', { round, outcome: outcomeLabel });
+  return (
+    <span
+      class="peer-audit-round-chip"
+      aria-label={roundAria}
+      title={roundAria}
+    >
+      {t('peerAuditResult.roundChip', { round })}
     </span>
   );
 }
@@ -4385,16 +5754,54 @@ const ChatEvent = memo(function ChatEvent({
   switch (event.type) {
     case 'user.message': {
       const rawUserText = String(event.payload.text ?? '');
+      // Only the human's own input sits on the right; agent deliveries and
+      // daemon injections are incoming messages and sit on the left.
+      const origin = classifyUserMessageOrigin(event.payload);
+      const originClass = ` chat-user-origin-${origin}`;
+      const cronRun = event.source === 'daemon' && event.confidence === 'high'
+        ? readCronRunTimelineProjection(event.payload[CRON_RUN_TIMELINE.PAYLOAD_KEY])
+        : undefined;
+      if (cronRun) {
+        return (
+          <div class={`chat-event chat-user chat-user-cron-run${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+            <CronRunCard run={cronRun} locale={locale} />
+            <ChatTime ts={event.ts} />
+          </div>
+        );
+      }
+      const supervisionPromptLabelKey = supervisionUserPromptLabelKey(event.payload);
+      if (supervisionPromptLabelKey) {
+        return (
+          <div class={`chat-event chat-user chat-user-supervision-prompt${originClass}`} data-event-id={event.eventId} data-message-origin={origin}>
+            <SupervisionAutomationPrompt
+              text={rawUserText}
+              label={t(supervisionPromptLabelKey)}
+              automationKind={String(event.payload.automationKind)}
+              showDetailsLabel={t('chat.supervision_prompt.show_details')}
+              hideDetailsLabel={t('chat.supervision_prompt.hide_details')}
+            />
+          </div>
+        );
+      }
       let userText = parseTimelineDisplayText(rawUserText);
-      const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
+      const attachments = event.payload.attachments as Array<{ id?: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
       // Strip @path references from text when they're shown as attachment badges
       if (attachments && attachments.length > 0) {
         for (const att of attachments) {
-          if (att.daemonPath) userText = userText.split(`@${att.daemonPath}`).join('').trim();
+          if (att.daemonPath) {
+            const path = escapeRegExp(att.daemonPath);
+            // Attachment references are model-facing metadata.  Do not paint
+            // the daemon's absolute host path into the browser history.
+            userText = userText
+              .replace(new RegExp(`#\\d+:\\(${path}\\)`, 'g'), '')
+              .replace(new RegExp(`@${path}`, 'g'), '')
+              .trim();
+          }
         }
       }
       const isPending = !!event.payload.pending;
       const isFailed = !!event.payload.failed;
+      const isQueued = event.payload.queued === true && !isFailed && !isPending;
       const failureReason = typeof event.payload.failureReason === 'string' ? event.payload.failureReason : undefined;
       const commandId = typeof event.payload.commandId === 'string' ? event.payload.commandId : undefined;
       const stateClass = isPending ? ' chat-pending' : isFailed ? ' chat-failed' : '';
@@ -4403,7 +5810,7 @@ const ChatEvent = memo(function ChatEvent({
         // data-event-id lets the pinned-last-message banner target this bubble
         // with an IntersectionObserver so the banner only shows when the real
         // bubble has scrolled off the top of the viewport.
-        <div class={`chat-event chat-user${stateClass}`} data-event-id={event.eventId}>
+        <div class={`chat-event chat-user${originClass}${stateClass}`} data-event-id={event.eventId} data-message-origin={origin}>
           {sharedActorLabel && (
             <div class="chat-shared-actor-label" title={sharedActorLabel}>
               {sharedActorLabel}
@@ -4429,6 +5836,13 @@ const ChatEvent = memo(function ChatEvent({
               aria-label={t('chat.sendingLabel', 'Sending')}
               title={t('chat.sendingLabel', 'Sending')}
             />
+          )}
+          {isQueued && (
+            <span
+              class="chat-user-status chat-user-status-queued"
+              aria-label={t('chat.messageQueuedLabel', 'Queued')}
+              title={t('chat.messageQueuedLabel', 'Queued')}
+            >{t('chat.messageQueuedLabel', 'Queued')}</span>
           )}
           {isFailed && (
             <div class="chat-user-status chat-user-status-failed">
@@ -4464,6 +5878,7 @@ const ChatEvent = memo(function ChatEvent({
             : outcome === 'cancelled'
               ? 'result_cancelled'
               : 'result_unavailable';
+      const outcomeLabel = t(`peerAuditQuick.${outcomeKey}`);
       const auditor = String(event.payload.auditorLabel ?? event.payload.auditorSessionName ?? '—');
       const elapsedMs = typeof event.payload.elapsedMs === 'number' ? event.payload.elapsedMs : 0;
       const findingsPreview = typeof event.payload.findingsPreview === 'string'
@@ -4472,12 +5887,35 @@ const ChatEvent = memo(function ChatEvent({
       const disposition = isPeerAuditRuntimeDisposition(event.payload.disposition)
         ? event.payload.disposition
         : null;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
-        <section class="chat-event chat-system peer-audit-result-card" data-event-id={event.eventId}>
-          <strong>{t('peerAuditResult.title')}</strong>
+        <section
+          class="chat-event chat-system peer-audit-result-card"
+          data-event-id={event.eventId}
+          {...(supervisionTask ? {
+            'data-task-id': supervisionTask.taskId,
+            'data-assignment-id': supervisionTask.assignmentId,
+          } : {})}
+        >
+          {supervisionTask?.title ? (
+            <div class="delegation-reply-card-heading peer-audit-result-heading">
+              <span class="delegation-reply-card-kicker">{t('peerAuditResult.title')}</span>
+              <ExpandableTaskObjective
+                text={supervisionTask.objective ?? supervisionTask.title}
+                textClassName="peer-audit-result-objective"
+              />
+            </div>
+          ) : (
+            <strong>{t('peerAuditResult.title')}</strong>
+          )}
           <div>{t('peerAuditResult.attributionAuditor', { auditor })}</div>
           <div>{t('peerAuditResult.elapsedMs', { seconds: Math.round(elapsedMs / 1000) })}</div>
-          <div>{t(`peerAuditQuick.${outcomeKey}`)}</div>
+          <div class="peer-audit-result-verdict-row">
+            <span class={`peer-audit-result-outcome peer-audit-result-outcome--${outcome}`}>{outcomeLabel}</span>
+            <PeerAuditRoundChip round={event.payload.round} outcomeLabel={outcomeLabel} />
+          </div>
           {disposition && (
             <div>{t(`peerAuditQuick.disposition.${disposition}`)}</div>
           )}
@@ -4495,25 +5933,97 @@ const ChatEvent = memo(function ChatEvent({
     case 'peer_audit.status':
       return null;
 
+    case TASK_PAIR_TIMELINE_EVENT:
+      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} />;
+
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');
       const result = typeof event.payload.result === 'string' ? event.payload.result : '';
+      const verdict = isPeerAuditVerdict(event.payload.verdict) ? event.payload.verdict : undefined;
+      const verdictClass = verdict ? ` delegation-reply-card--${verdict.toLowerCase()}` : '';
+      const verdictLabel = verdict
+        ? t(verdict === PEER_AUDIT_VERDICTS[0]
+          ? 'peerAuditQuick.result_pass'
+          : 'peerAuditQuick.result_rework')
+        : undefined;
+      const supervisionTask = event.source === 'daemon' && event.confidence === 'high'
+        ? readAgentDelegationSupervisionTaskProjection(event.payload.supervisionTask)
+        : undefined;
       return (
-        <section class="chat-event chat-system delegation-reply-card" data-event-id={event.eventId}>
+        <section
+          class={`chat-event chat-system delegation-reply-card${verdictClass}`}
+          data-event-id={event.eventId}
+          {...(verdict ? { 'data-verdict': verdict } : {})}
+        >
           <div class="delegation-reply-card-head">
-            <strong>{t('delegation.reply_title')}</strong>
-            <span>{t('delegation.reply_from', { source })}</span>
+            <div class="delegation-reply-card-heading">
+              {supervisionTask?.title ? (
+                <>
+                  <span class="delegation-reply-card-kicker">{t('delegation.reply_title')}</span>
+                  <ExpandableTaskObjective
+                    text={supervisionTask.objective ?? supervisionTask.title}
+                    textClassName="delegation-reply-card-objective"
+                  />
+                </>
+              ) : (
+                <strong>{t('delegation.reply_title')}</strong>
+              )}
+            </div>
+            <div class="delegation-reply-card-meta">
+              {verdict && (
+                <span class="delegation-reply-verdict" aria-label={verdictLabel}>{verdict}</span>
+              )}
+              {verdict && (
+                <PeerAuditRoundChip round={event.payload.round} outcomeLabel={verdictLabel ?? verdict} />
+              )}
+              <span>{t('delegation.reply_from', { source })}</span>
+            </div>
           </div>
+          {supervisionTask && (
+            <div
+              class={`delegation-reply-task${supervisionTask.title ? '' : ' is-fallback'}`}
+              data-testid="delegation-reply-task"
+              data-task-id={supervisionTask.taskId}
+              data-assignment-id={supervisionTask.assignmentId}
+              {...(supervisionTask.attemptId ? { 'data-attempt-id': supervisionTask.attemptId } : {})}
+              {...(supervisionTask.revision ? { 'data-revision': supervisionTask.revision } : {})}
+            >
+              <span class="delegation-reply-task-ids">
+                <span aria-label={`${t('delegation.claim.task_id')}: ${supervisionTask.taskId}`}>{supervisionTask.taskId}</span>
+                <span aria-hidden="true">·</span>
+                <span aria-label={`${t('delegation.claim.assignment_id')}: ${supervisionTask.assignmentId}`}>{supervisionTask.assignmentId}</span>
+              </span>
+            </div>
+          )}
           {result && (
-            <ChatMarkdown
-              text={result}
-              onPathClick={onPathClick}
-              onUrlClick={onUrlClick}
-              onDownload={onDownload}
-              onHtmlPreview={onHtmlPreview}
-              onImagePreview={onImagePreview}
-              onOpenLocalWebPreview={onOpenLocalWebPreview}
-            />
+            verdict ? (
+              <details class="delegation-reply-card-findings">
+                <summary>{t('peerAuditResult.findingsPreview')}</summary>
+                <div class="delegation-reply-card-body">
+                  <ChatMarkdown
+                    text={result}
+                    onPathClick={onPathClick}
+                    onUrlClick={onUrlClick}
+                    onDownload={onDownload}
+                    onHtmlPreview={onHtmlPreview}
+                    onImagePreview={onImagePreview}
+                    onOpenLocalWebPreview={onOpenLocalWebPreview}
+                  />
+                </div>
+              </details>
+            ) : (
+              <div class="delegation-reply-card-body">
+                <ChatMarkdown
+                  text={result}
+                  onPathClick={onPathClick}
+                  onUrlClick={onUrlClick}
+                  onDownload={onDownload}
+                  onHtmlPreview={onHtmlPreview}
+                  onImagePreview={onImagePreview}
+                  onOpenLocalWebPreview={onOpenLocalWebPreview}
+                />
+              </div>
+            )
           )}
           <ChatTime ts={event.ts} />
         </section>
@@ -4698,6 +6208,79 @@ const ChatEvent = memo(function ChatEvent({
       return null;
   }
 });
+
+function SupervisionStatusRun({ item }: { item: ViewItem }) {
+  const { t, i18n } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
+  const heartbeatCount = item.heartbeatCount ?? 0;
+  const waitingCount = item.waitingCount ?? 0;
+  const heartbeatLabel = heartbeatCount > 0
+    ? t('chat.supervision_status_run.heartbeats', { count: heartbeatCount })
+    : '';
+  const waitingLabel = waitingCount > 0
+    ? t('chat.supervision_status_run.waiting', { count: waitingCount })
+    : '';
+  const statusLabel = [heartbeatLabel, waitingLabel].filter(Boolean).join(' · ');
+  const locale = resolveI18nLocale(i18n);
+  const now = Date.now();
+  const firstTime = formatChatDateTime(item.ts ?? 0, now, locale);
+  const lastTime = formatChatDateTime(item.lastTs ?? item.ts ?? 0, now, locale);
+  const timeRange = firstTime === lastTime ? firstTime : `${firstTime}–${lastTime}`;
+  const actionLabel = expanded
+    ? t('chat.supervision_status_run.collapse')
+    : t('chat.supervision_status_run.expand');
+  const detailsId = `${item.key}:details`.replace(/[^a-zA-Z0-9_-]/gu, '-');
+
+  return (
+    <div class={`chat-supervision-status-run${expanded ? ' is-expanded' : ''}`}>
+      <button
+        type="button"
+        class="chat-supervision-status-run-toggle"
+        aria-expanded={expanded}
+        aria-controls={detailsId}
+        aria-label={t('chat.supervision_status_run.aria', { status: statusLabel, timeRange, action: actionLabel })}
+        title={actionLabel}
+        onClick={() => setExpanded((value) => !value)}
+      >
+        {heartbeatCount > 0 && (
+          <span class="chat-supervision-status-run-part is-heartbeat">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.ARMED}</span>
+            {heartbeatLabel}
+          </span>
+        )}
+        {heartbeatCount > 0 && waitingCount > 0 && <span aria-hidden="true">·</span>}
+        {waitingCount > 0 && (
+          <span class="chat-supervision-status-run-part is-waiting">
+            <span aria-hidden="true">{SUPERVISION_HEARTBEAT_GLYPH.WAITING}</span>
+            {waitingLabel}
+          </span>
+        )}
+        <span aria-hidden="true">·</span>
+        <span class="chat-supervision-status-run-time">{timeRange}</span>
+        <span class="chat-supervision-status-run-chevron" aria-hidden="true">{expanded ? '▴' : '▾'}</span>
+      </button>
+      {expanded && (
+        <div id={detailsId} class="chat-supervision-status-run-details">
+          {(item.statusItems ?? []).map((source) => {
+            if (source.type === 'assistant-block') {
+              return (
+                <AssistantBlock
+                  key={source.key}
+                  eventId={source.key}
+                  text={source.text ?? ''}
+                  automation={source.assistantAutomation === true}
+                  executionState={source.executionState}
+                  ts={source.lastTs ?? source.ts ?? 0}
+                />
+              );
+            }
+            return <ChatEvent key={source.key} event={source.event!} />;
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
 
 function groupFileChangePatches(batch: FileChangeBatch): GroupedFileChange[] {
   const groups = new Map<string, GroupedFileChange>();
@@ -5069,6 +6652,27 @@ function countHardLines(text: string): number {
   return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n').length;
 }
 
+/**
+ * Measure visual line overflow from the browser's rendered box. `scrollHeight`
+ * includes soft-wrapped content even while the element is capped, so this
+ * catches long paragraphs without guessing from character count.
+ */
+export function renderedUserMessageExceedsLineLimit(
+  element: HTMLElement,
+  lineLimit = USER_MESSAGE_COLLAPSE_LINE_LIMIT,
+): boolean | null {
+  const style = window.getComputedStyle(element);
+  const fontSize = Number.parseFloat(style.fontSize);
+  const rawLineHeight = Number.parseFloat(style.lineHeight);
+  const lineHeight = style.lineHeight.endsWith('px')
+    ? rawLineHeight
+    : Number.isFinite(rawLineHeight) && Number.isFinite(fontSize)
+      ? rawLineHeight * fontSize
+      : Number.NaN;
+  if (!Number.isFinite(lineHeight) || lineHeight <= 0 || element.scrollHeight <= 0) return null;
+  return element.scrollHeight > (lineHeight * lineLimit) + 0.5;
+}
+
 function UserMessageText({
   text,
   onPathClick,
@@ -5087,15 +6691,56 @@ function UserMessageText({
   onOpenLocalWebPreview?: ChatLocalWebPreviewOpenHandler;
 }) {
   const { t } = useTranslation();
-  const lineCount = countHardLines(text);
-  const shouldFold = lineCount > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const contentRef = useRef<HTMLDivElement>(null);
+  const { prose, leadingSender, trailingReply } = parseDelegationProtocolMessage(text);
+  const hardLineOverflow = countHardLines(prose) > USER_MESSAGE_COLLAPSE_LINE_LIMIT;
+  const [renderedOverflow, setRenderedOverflow] = useState<boolean | null>(
+    hardLineOverflow ? true : null,
+  );
   const [expanded, setExpanded] = useState(false);
+  const shouldFold = renderedOverflow === true;
+  const measuring = renderedOverflow === null;
   const folded = shouldFold && !expanded;
 
+  useLayoutEffect(() => {
+    const content = contentRef.current;
+    if (!content) return;
+    let active = true;
+    const measure = () => {
+      const measured = renderedUserMessageExceedsLineLimit(content);
+      const next = hardLineOverflow || measured;
+      if (!active || next === null) return;
+      setRenderedOverflow((current) => current === next ? current : next);
+    };
+
+    measure();
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(measure);
+    observer?.observe(content);
+    if (content.parentElement) observer?.observe(content.parentElement);
+    window.addEventListener('resize', measure);
+
+    const fonts = document.fonts;
+    fonts?.addEventListener?.('loadingdone', measure);
+    void fonts?.ready.then(() => {
+      if (active) measure();
+    });
+
+    return () => {
+      active = false;
+      observer?.disconnect();
+      window.removeEventListener('resize', measure);
+      fonts?.removeEventListener?.('loadingdone', measure);
+    };
+  }, [hardLineOverflow, prose]);
+
   return (
-    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}`}>
-      <div class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}`}>
-        {splitPathsAndUrls(text, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
+    <div class={`chat-user-message-fold${shouldFold ? ' is-foldable' : ''}${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}>
+      {leadingSender && <DelegationSenderCardView card={leadingSender} />}
+      <div
+        ref={contentRef}
+        class={`chat-bubble-content chat-user-message-fold-content${folded ? ' is-folded' : ''}${measuring ? ' is-measuring' : ''}`}
+      >
+        {splitPathsAndUrls(prose, onPathClick, onUrlClick, onDownload, onHtmlPreview, onImagePreview, t('upload.download_file'), t('chat.html_preview', 'Render HTML'), onOpenLocalWebPreview)}
       </div>
       {shouldFold && (
         <button
@@ -5107,6 +6752,7 @@ function UserMessageText({
           {expanded ? t('chat.user_message_collapse') : t('chat.user_message_expand')}
         </button>
       )}
+      {trailingReply && <DelegationReplyInstructionCardView card={trailingReply} />}
     </div>
   );
 }
@@ -5184,3 +6830,10 @@ function splitPathsAndUrls(
 
   return parts.length ? parts : [<span>{text}</span>];
 }
+
+/**
+ * Test seam: the renderer itself, so a contract test can measure what a type
+ * ACTUALLY draws instead of trusting the classification it is meant to check.
+ * Same convention as `__buildViewItemsForTests` above.
+ */
+export const __ChatEventForTests = ChatEvent;

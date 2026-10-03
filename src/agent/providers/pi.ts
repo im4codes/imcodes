@@ -8,6 +8,12 @@
  * conversation state all remain warm across turns.
  */
 import { spawn, type ChildProcess } from 'node:child_process';
+import {
+  agentResourceOwner,
+  bindAgentProcessResource,
+  type AgentProcessResource,
+} from './agent-process-resource.js';
+import type { SessionResourceOwner } from '../../daemon/session-resource-registry.js';
 import { randomUUID } from 'node:crypto';
 import { StringDecoder } from 'node:string_decoder';
 import type {
@@ -61,6 +67,7 @@ import {
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../../shared/memory-mcp-server-name.js';
 import { composeMessageSideProviderPrompt, getProviderSystemTextParts } from '../provider-context-routing.js';
 import { getDefaultMcpServers } from './getDefaultMcpServers.js';
+import { MCP_TOOL_CATALOG_MODES } from '../../../shared/mcp-tool-discovery.js';
 import { normalizeTransportCwd, resolveExecutableForSpawn } from '../transport-paths.js';
 import { killProcessTree } from '../../util/kill-process-tree.js';
 import {
@@ -69,6 +76,7 @@ import {
   resolvePiBinary,
 } from './pi/runtime.js';
 import logger from '../../util/logger.js';
+import { NATIVE_AGENT_ADMISSION_MODES } from '../../../shared/native-collaboration-policy.js';
 
 const RPC_TIMEOUT_MS = 30_000;
 const SHUTDOWN_GRACE_MS = 3_000;
@@ -92,6 +100,10 @@ interface PiSessionState {
   effort?: TransportEffortLevel;
   llmConfig?: PiLlmConfig;
   child: ChildProcess | null;
+  /** Owner identity for the registry lease on the spawned agent CLI. */
+  resourceOwner?: SessionResourceOwner | null;
+  /** Registry lease for `child`; released when the child exits or is reaped. */
+  agentResource?: AgentProcessResource;
   decoder: StringDecoder;
   outputBuffer: string;
   startPromise: Promise<void> | null;
@@ -165,6 +177,8 @@ export class PiProvider implements TransportProvider {
     supportedEffortLevels: PI_EFFORT_LEVELS,
     contextSupport: 'degraded-message-side-context-mapping',
     activeDelegationNotification: AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE,
+    // Pi has no provider-native agent tool.
+    nativeAgentAdmission: NATIVE_AGENT_ADMISSION_MODES.NO_NATIVE_AGENT_TOOLS,
   };
 
   private config: ProviderConfig | null = null;
@@ -202,6 +216,7 @@ export class PiProvider implements TransportProvider {
       routeId,
       piSessionId,
       sessionName: config.sessionName ?? existing?.sessionName,
+      resourceOwner: agentResourceOwner(config) ?? existing?.resourceOwner ?? null,
       projectName: config.projectName ?? existing?.projectName,
       cwd: normalizeTransportCwd(config.cwd) ?? existing?.cwd ?? normalizeTransportCwd(process.cwd())!,
       env: config.env ?? existing?.env,
@@ -389,7 +404,11 @@ export class PiProvider implements TransportProvider {
   }
 
   private buildMemoryMcp(config: SessionConfig): PiSessionState['memoryMcp'] {
-    const server = getDefaultMcpServers(config)[IMCODES_MEMORY_MCP_SERVER_NAME];
+    const server = getDefaultMcpServers(config, {
+      // Pi owns the complete paginated refresh + generation proof and can
+      // therefore consume standard tools/list_changed without stale schemas.
+      toolCatalogMode: MCP_TOOL_CATALOG_MODES.DYNAMIC,
+    })[IMCODES_MEMORY_MCP_SERVER_NAME];
     return server ? { command: server.command, args: server.args, env: server.env } : undefined;
   }
 
@@ -419,9 +438,17 @@ export class PiProvider implements TransportProvider {
         },
         stdio: ['pipe', 'pipe', 'pipe'],
         windowsHide: true,
+        // Own process group and session on POSIX. A reparented descendant keeps
+        // its PGID but loses its PPID, so after the agent parent dies this is the
+        // only ownership token teardown still has. Without it the eight vitest
+        // workers of the incident were unreachable on PPID=1.
+        detached: process.platform !== 'win32',
       },
     );
     state.child = child;
+    // Crash coverage: if the daemon dies without running teardown, the startup
+    // sweep reaps this group using the registry's process-start fingerprint.
+    state.agentResource = bindAgentProcessResource(state.resourceOwner ?? null, child);
     state.decoder = new StringDecoder('utf8');
     state.outputBuffer = '';
     child.stdin?.on('error', (error) => {
@@ -438,9 +465,11 @@ export class PiProvider implements TransportProvider {
 
     const startPromise = this.request(state, { type: PI_RPC_COMMAND.GET_STATE })
       .then((response) => this.applyStateResponse(state, response.data))
-      .catch((error) => {
+      .catch(async (error) => {
         if (state.child === child) this.detachChild(state);
-        void killProcessTree(child).catch(() => {});
+        // Awaited, not discarded: `startPromise` below is awaited, so the full
+        // SIGTERM->SIGKILL window completes before this failure propagates.
+        await killProcessTree(child, { ownsProcessGroup: true }).catch(() => {});
         throw error;
       });
     state.startPromise = startPromise;
@@ -451,7 +480,7 @@ export class PiProvider implements TransportProvider {
     const child = explicit ?? state.child;
     if (!child) return;
     if (state.child === child) this.detachChild(state);
-    await killProcessTree(child, { gracefulMs: SHUTDOWN_GRACE_MS }).catch(() => {});
+    await killProcessTree(child, { gracefulMs: SHUTDOWN_GRACE_MS, ownsProcessGroup: true }).catch(() => {});
   }
 
   private detachChild(state: PiSessionState): void {

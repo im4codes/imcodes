@@ -4,6 +4,9 @@
 import type { TransportProvider, ProviderConfig } from './transport-provider.js';
 import { wireProviderToRelay, broadcastProviderStatus } from '../daemon/transport-relay.js';
 import logger from '../util/logger.js';
+import { CODEBUDDY_PROVIDER_IDS } from '../../shared/codebuddy.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { clearTransportRestoreBackoffForProvider } from './transport-restore-backoff.js';
 
 const providers = new Map<string, TransportProvider>();
 
@@ -37,6 +40,8 @@ export async function connectProvider(id: string, config: ProviderConfig): Promi
   const provider = await createProvider(id);
   await provider.connect(config);
   providers.set(id, provider);
+  // A reconnected provider may now be able to do what it could not before.
+  clearTransportRestoreBackoffForProvider(id);
   wireProviderToRelay(provider);
 
   // Materialize OC sessions before broadcasting status (sessions appear before catalog)
@@ -96,6 +101,10 @@ async function createProvider(id: string): Promise<TransportProvider> {
       const { KimiSdkProvider } = await import('./providers/kimi-sdk.js');
       return new KimiSdkProvider();
     }
+    case HERMES_AGENT_PROVIDER_ID: {
+      const { HermesAcpProvider } = await import('./providers/hermes-acp.js');
+      return new HermesAcpProvider();
+    }
     case 'grok-sdk': {
       const { GrokSdkProvider } = await import('./providers/grok-sdk.js');
       return new GrokSdkProvider();
@@ -131,6 +140,14 @@ async function createProvider(id: string): Promise<TransportProvider> {
     case 'pi': {
       const { PiProvider } = await import('./providers/pi.js');
       return new PiProvider();
+    }
+    case CODEBUDDY_PROVIDER_IDS.CHINA: {
+      const { CodeBuddyChinaProvider } = await import('./providers/codebuddy.js');
+      return new CodeBuddyChinaProvider();
+    }
+    case CODEBUDDY_PROVIDER_IDS.INTERNATIONAL: {
+      const { CodeBuddyInternationalProvider } = await import('./providers/codebuddy.js');
+      return new CodeBuddyInternationalProvider();
     }
     default:
       throw new Error(`Unknown provider: ${id}`);

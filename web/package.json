@@ -15,11 +15,13 @@
     "test:watch": "vitest",
     "build:fixtures": "vite build --mode fixtures --outDir dist-fixtures --emptyOutDir",
     "serve:fixtures": "vite preview --outDir dist-fixtures --port 4300 --strictPort",
+    "test:browser": "playwright test --project=correctness",
     "test:browser:install": "playwright install --with-deps chromium",
     "test:browser:perf": "playwright test --project=performance",
     "postinstall": "npx patch-package"
   },
   "dependencies": {
+    "@capacitor-community/keep-awake": "^8.0.1",
     "@capacitor/android": "^8.2.0",
     "@capacitor/app": "^8.0.1",
     "@capacitor/browser": "^8.0.2",

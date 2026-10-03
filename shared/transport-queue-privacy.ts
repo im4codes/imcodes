@@ -58,8 +58,10 @@ export function buildQueueProjectionEntry(entry: QueueStoredEntry): QueueProject
     ...(entry.activityGeneration !== undefined ? { activityGeneration: entry.activityGeneration } : {}),
     ...(entry.replacesClientMessageId ? { replacesClientMessageId: entry.replacesClientMessageId } : {}),
     ...(entry.failureReason ? { failureReason: entry.failureReason } : {}),
+    ...(entry.dropReason ? { dropReason: entry.dropReason } : {}),
     ...(entry.attachments?.length ? { attachments: entry.attachments.map(buildQueueAttachmentProjection).filter((item): item is QueueAttachmentProjection => !!item) } : {}),
     ...(entry.sharedActor ? { sharedActor: buildQueueSharedActorProjection(entry.sharedActor) } : {}),
+    ...(entry.supervisionReference ? { supervisionReference: entry.supervisionReference } : {}),
   };
 }
 
@@ -78,6 +80,7 @@ export function containsProhibitedQueueProjectionField(value: unknown): boolean 
     'rawSessionHistory',
     'rawSharedActorEnvelope',
     'sharedActorEnvelope',
+    'sharedMachineAuthority',
     'fullChildTranscript',
     'timelineCommitted',
     'historyCommitted',

@@ -1,12 +1,14 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { createWriteStream, existsSync, mkdirSync, renameSync, statSync, unlinkSync, type WriteStream } from 'node:fs';
 import { dirname, join } from 'node:path';
-import { homedir, loadavg } from 'node:os';
+import { loadavg } from 'node:os';
 import { PerformanceObserver, monitorEventLoopDelay, performance } from 'node:perf_hooks';
 import logger from '../util/logger.js';
 import { MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
 import { TRANSPORT_EVENT, TRANSPORT_MSG } from '../../shared/transport-events.js';
+import { recordDaemonEventLoopStall } from '../util/daemon-status.js';
 
 type JsonRecord = Record<string, unknown>;
 
@@ -15,6 +17,7 @@ interface CommandReceipt {
   receivedAt: number;
   commandId: string;
   sessionName?: string;
+  eventLoopLagMs?: number;
 }
 
 interface RecentSpan {
@@ -38,6 +41,7 @@ interface RecentCommand {
   requestId?: string;
   sessionName?: string;
   commandBytes?: number;
+  eventLoopLagMs?: number;
 }
 
 interface RecentServerSend {
@@ -49,20 +53,21 @@ interface RecentServerSend {
   wsSendMs: number;
   plane: ServerSendPlane;
   outboundQueueDepth?: number;
+  outboundQueueBytes?: number;
   outboundQueueAgeMs?: number;
   sendBacklogAgeMs?: number;
 }
 
 const TRUE_RE = /^(1|true|yes|on|debug)$/i;
-const DEFAULT_LOG_DIR = join(homedir(), '.imcodes', 'logs');
-const DEFAULT_FLAG_FILE = join(homedir(), '.imcodes', 'latency-trace.enabled');
-const DEFAULT_LOG_FILE = join(DEFAULT_LOG_DIR, 'latency-trace.ndjson');
+function defaultLogDir(): string { return join(resolveImcodesHome(), 'logs'); }
+function defaultFlagFile(): string { return join(resolveImcodesHome(), 'latency-trace.enabled'); }
+function defaultLogFile(): string { return join(defaultLogDir(), 'latency-trace.ndjson'); }
 const MAX_LOG_SIZE = 100 * 1024 * 1024;
 const MAX_OLD_LOGS = 3;
 const COMMAND_RECEIPT_TTL_MS = 60_000;
 const COMMAND_RECEIPT_MAX = 2_000;
 
-let enabled = envFlag('IMCODES_DAEMON_LATENCY_TRACE') || existsSync(process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? DEFAULT_FLAG_FILE);
+let enabled = false;
 let stream: WriteStream | null = null;
 let started = false;
 let sampleTimer: ReturnType<typeof setInterval> | null = null;
@@ -73,6 +78,8 @@ let lastCpu = process.cpuUsage();
 let lastCpuAt = performance.now();
 let lastElu = performance.eventLoopUtilization();
 let expectedDriftAt = 0;
+let latestEventLoopLagMs = 0;
+let lastPersistedStallAt = 0;
 const commandReceipts = new Map<string, CommandReceipt>();
 const activeSpanStack: RecentSpan[] = [];
 const recentSpans: RecentSpan[] = [];
@@ -97,7 +104,7 @@ function numberEnv(name: string, fallback: number, min: number): number {
 }
 
 function logFilePath(): string {
-  return process.env.IMCODES_DAEMON_LATENCY_TRACE_FILE || DEFAULT_LOG_FILE;
+  return process.env.IMCODES_DAEMON_LATENCY_TRACE_FILE || defaultLogFile();
 }
 
 function spanThresholdMs(): number {
@@ -310,12 +317,14 @@ export function isLatencyTracerEnabled(): boolean {
 export function startLatencyTracer(): void {
   if (started) return;
   started = true;
+  enabled = envFlag('IMCODES_DAEMON_LATENCY_TRACE')
+    || existsSync(process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? defaultFlagFile());
   if (!enabled) return;
 
   ensureStream();
   writeTrace('tracer_start', {
     logFile: logFilePath(),
-    flagFile: process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? DEFAULT_FLAG_FILE,
+    flagFile: process.env.IMCODES_DAEMON_LATENCY_TRACE_FLAG ?? defaultFlagFile(),
     sampleIntervalMs: sampleIntervalMs(),
     driftThresholdMs: driftThresholdMs(),
     spanThresholdMs: spanThresholdMs(),
@@ -402,6 +411,7 @@ export function startLatencyTracer(): void {
     const now = performance.now();
     const drift = now - expectedDriftAt;
     expectedDriftAt = now + driftMs;
+    latestEventLoopLagMs = Math.max(0, drift);
     if (drift < driftThresholdMs()) return;
     const active = activeSpanStack.at(-1) ?? null;
     const recent = findRecentSpan(now);
@@ -410,10 +420,16 @@ export function startLatencyTracer(): void {
     const recentCommand = findRecentCommand(now);
     const commandBurst = summarizeRecentCommandBurst(now);
     const reason = active ? 'active_span' : recent ? 'recent_span' : recentSend ? 'recent_server_send' : recentGc ? 'gc' : recentCommand ? 'recent_command' : 'unknown';
+    const phase = active?.name ?? recent?.name ?? recentSend?.msgType ?? reason;
+    if (now - lastPersistedStallAt >= 1_000) {
+      lastPersistedStallAt = now;
+      recordDaemonEventLoopStall({ stallMs: drift, phase });
+    }
     writeTrace('event_loop_block', {
       driftMs: roundMs(drift),
       thresholdMs: driftThresholdMs(),
       attributionReason: reason,
+      phase,
       attributed: reason !== 'unknown',
       ...(active ? {
         likelyActiveSpan: active.name,
@@ -488,7 +504,11 @@ export async function traceAsync<T>(name: string, meta: JsonRecord | undefined, 
 }
 
 export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
-  if (!enabled) return;
+  // Receipt timestamps are kept even when file tracing is disabled so the
+  // server-link send path can measure ordinary ack latency without requiring a
+  // diagnostic flag. The bounded map is cheap; avoid JSON work unless tracing
+  // is enabled so instrumentation never becomes the hot-path blocker.
+  const receivedAt = performance.now();
   const type = typeof cmd.type === 'string' ? cmd.type : '<non-string>';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim() ? cmd.commandId.trim() : undefined;
   const requestId = typeof cmd.requestId === 'string' && cmd.requestId.trim() ? cmd.requestId.trim() : undefined;
@@ -498,10 +518,15 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
   if (commandId) {
     commandReceipts.set(commandId, {
       type,
-      receivedAt: performance.now(),
+      receivedAt,
       commandId,
       ...(sessionName ? { sessionName } : {}),
+      eventLoopLagMs: roundMs(latestEventLoopLagMs),
     });
+  }
+  if (!enabled) {
+    cleanupCommandReceipts(receivedAt);
+    return;
   }
   let commandBytes: number | undefined;
   try {
@@ -511,11 +536,12 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
   }
   rememberRecentCommand({
     type,
-    receivedAt: performance.now(),
+    receivedAt,
     ...(commandId ? { commandId } : {}),
     ...(requestId ? { requestId } : {}),
     ...(sessionName ? { sessionName } : {}),
     ...(commandBytes !== undefined ? { commandBytes } : {}),
+    eventLoopLagMs: roundMs(latestEventLoopLagMs),
   });
   writeTrace('web_command_received', {
     type,
@@ -523,7 +549,9 @@ export function traceWebCommandReceived(cmd: Record<string, unknown>): void {
     ...(requestId ? { requestId } : {}),
     ...(sessionName ? { sessionName } : {}),
     ...(commandBytes !== undefined ? { commandBytes } : {}),
+    eventLoopLagMs: roundMs(latestEventLoopLagMs),
   });
+  cleanupCommandReceipts(receivedAt);
 }
 
 export function traceCommandAsync(cmd: Record<string, unknown>, name: string, fn: () => Promise<void>): Promise<void> {
@@ -566,25 +594,42 @@ export function recordServerSend(input: {
   bufferedAmountAfter?: number;
   sendBacklogAgeMs?: number;
   outboundQueueDepth?: number;
+  outboundQueueBytes?: number;
   outboundQueueAgeMs?: number;
   recipientCount?: number;
   success: boolean;
 }): void {
-  if (!enabled) return;
   const sendTotalMs = input.stringifyMs + input.wsSendMs;
   const isAck = input.msgType === MSG_COMMAND_ACK;
   const plane = classifyServerSendPlane(input.msgType);
   let ackLatencyMs: number | undefined;
   let commandType: string | undefined;
   let sessionName: string | undefined;
+  let receipt: CommandReceipt | undefined;
   if (isAck && input.commandId) {
-    const receipt = commandReceipts.get(input.commandId);
+    receipt = commandReceipts.get(input.commandId);
     if (receipt) {
       ackLatencyMs = performance.now() - receipt.receivedAt;
       commandType = receipt.type;
       sessionName = receipt.sessionName;
       commandReceipts.delete(input.commandId);
     }
+  }
+
+  // Keep the production path observable without enabling file tracing. Only
+  // slow acks are logged; normal receipts remain silent and allocation-light.
+  if (!enabled) {
+    if (ackLatencyMs !== undefined && ackLatencyMs >= ackSlowMs()) {
+      logger.warn({
+        commandId: input.commandId,
+        sessionName,
+        commandType,
+        ackLatencyMs: roundMs(ackLatencyMs),
+        ackSlowThresholdMs: ackSlowMs(),
+        ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
+      }, 'command.ack latency exceeded threshold');
+    }
+    return;
   }
 
   const slow = sendTotalMs >= sendThresholdMs()
@@ -606,6 +651,7 @@ export function recordServerSend(input: {
       wsSendMs: roundMs(input.wsSendMs),
       plane,
       ...(input.outboundQueueDepth !== undefined ? { outboundQueueDepth: input.outboundQueueDepth } : {}),
+      ...(input.outboundQueueBytes !== undefined ? { outboundQueueBytes: input.outboundQueueBytes } : {}),
       ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
       ...(input.sendBacklogAgeMs !== undefined ? { sendBacklogAgeMs: roundMs(input.sendBacklogAgeMs) } : {}),
     });
@@ -617,6 +663,7 @@ export function recordServerSend(input: {
     ...(input.commandId ? { commandId: input.commandId } : {}),
     ...(commandType ? { commandType } : {}),
     ...(sessionName ? { sessionName } : {}),
+    ...(receipt?.eventLoopLagMs !== undefined ? { eventLoopLagMsAtReceive: receipt.eventLoopLagMs } : {}),
     jsonBytes: input.jsonBytes,
     stringifyMs: roundMs(input.stringifyMs),
     wsSendMs: roundMs(input.wsSendMs),
@@ -628,6 +675,7 @@ export function recordServerSend(input: {
     ...(input.bufferedAmountAfter !== undefined ? { bufferedAmountAfter: input.bufferedAmountAfter } : {}),
     ...(input.sendBacklogAgeMs !== undefined ? { sendBacklogAgeMs: roundMs(input.sendBacklogAgeMs) } : {}),
     ...(input.outboundQueueDepth !== undefined ? { outboundQueueDepth: input.outboundQueueDepth } : {}),
+    ...(input.outboundQueueBytes !== undefined ? { outboundQueueBytes: input.outboundQueueBytes } : {}),
     ...(input.outboundQueueAgeMs !== undefined ? { outboundQueueAgeMs: roundMs(input.outboundQueueAgeMs) } : {}),
     ...(input.recipientCount !== undefined ? { recipientCount: input.recipientCount } : {}),
     success: input.success,

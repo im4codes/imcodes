@@ -1,6 +1,16 @@
 export const TIMELINE_MESSAGES = {
+  /** Browser → server: subscribe one socket to one session's live timeline. */
+  SUBSCRIBE: 'timeline.subscribe',
+  /** Browser → server: stop live timeline delivery for one session/socket. */
+  UNSUBSCRIBE: 'timeline.unsubscribe',
+  /** Server → browser: a bounded live queue/coalescing gap needs history backfill. */
+  SEQ_GAP: 'timeline.seq_gap',
   HISTORY_REQUEST: 'timeline.history_request',
   HISTORY: 'timeline.history',
+  /** Server → daemon: the server abandoned this history/page request (timeout
+   *  or requester gone). The daemon drops its reply if still queued unsent.
+   *  Only sent to daemons advertising TIMELINE_HISTORY_CANCEL_CAPABILITY. */
+  HISTORY_CANCEL: 'timeline.history_cancel',
   REPLAY_REQUEST: 'timeline.replay_request',
   REPLAY: 'timeline.replay',
   PAGE_REQUEST: 'timeline.page_request',
@@ -14,6 +24,98 @@ export const TIMELINE_MESSAGES = {
 } as const;
 
 export type TimelineMessageType = (typeof TIMELINE_MESSAGES)[keyof typeof TIMELINE_MESSAGES];
+
+/**
+ * Payload flag stamped on the durable tombstone a user delete writes. It is
+ * STICKY in the timeline merge (src/shared/timeline/merge.ts): a same-eventId
+ * revision carrying it beats any revision without it, whatever their
+ * streaming/completeness/seq, so a later stream delta, a hydrated (full) copy
+ * or a stale cache row can never resurrect a deleted message. `hidden` alone
+ * cannot do this - the daemon also uses `hidden` for its own internal rows.
+ */
+export const TIMELINE_USER_DELETED_PAYLOAD_KEY = 'userDeleted' as const;
+
+/** A delete may name every event of one rendered block (assistant text segments merge into one bubble). */
+export const TIMELINE_DELETE_MAX_EVENT_IDS = 200;
+export const TIMELINE_DELETE_MAX_EVENT_ID_LENGTH = 512;
+/** How long the web waits for the daemon's ack before it restores the message and says so. */
+export const TIMELINE_DELETE_ACK_TIMEOUT_MS = 10_000;
+
+/** Stable ack `error` codes for `timeline.delete` (the web maps them to localized text). */
+export const TIMELINE_DELETE_ERROR_CODES = {
+  INVALID_REQUEST: 'invalid_request',
+  SESSION_NOT_FOUND: 'session_not_found',
+  TOO_MANY_TARGETS: 'too_many_targets',
+  FAILED: 'delete_failed',
+  /** Client-side only: no ack arrived in time. */
+  TIMEOUT: 'timeout',
+} as const;
+export type TimelineDeleteErrorCode = (typeof TIMELINE_DELETE_ERROR_CODES)[keyof typeof TIMELINE_DELETE_ERROR_CODES];
+
+/** Web -> daemon. `eventId` stays for daemons that predate `eventIds`. */
+export interface TimelineDeleteRequest {
+  type: typeof TIMELINE_MESSAGES.DELETE;
+  sessionName: string;
+  eventId: string;
+  /** Every stored event the deleted block is made of (includes `eventId`). */
+  eventIds?: string[];
+  /** Optional per-id event type, used only when the daemon no longer holds the event. */
+  eventTypes?: Record<string, string>;
+  commandId: string;
+}
+
+/** Delivery quality for a browser socket/session pair. */
+export const TIMELINE_SUBSCRIPTION_MODES = {
+  /** Visible/pinned window: all timeline frames, including streaming deltas.
+   * A healthy full subscriber is never coalesced or delayed for load. */
+  FULL: 'full',
+  /** Hidden/minimized window: durable events and latest-value summaries only. */
+  SUMMARY: 'summary',
+} as const;
+
+export type TimelineSubscriptionMode =
+  (typeof TIMELINE_SUBSCRIPTION_MODES)[keyof typeof TIMELINE_SUBSCRIPTION_MODES];
+
+/**
+ * Latest-value timeline signals are presentation snapshots, not a history of
+ * every meter tick. Keep one bounded coalescing window shared by daemon/server
+ * implementations so hidden and visible sockets have the same latency bound.
+ */
+/** Full/visible sockets remain at an animation-frame-scale cadence. */
+export const TIMELINE_FULL_LATEST_VALUE_COALESCE_WINDOW_MS = 50 as const;
+/** Hidden sockets trade intermediate meter freshness for the byte budget. */
+export const TIMELINE_SUMMARY_LATEST_VALUE_COALESCE_WINDOW_MS = 250 as const;
+
+/** States that must bypass latest-value coalescing and reach the browser now. */
+export const TIMELINE_TERMINAL_SESSION_STATES = ['idle', 'error', 'stopped'] as const;
+export type TimelineTerminalSessionState = (typeof TIMELINE_TERMINAL_SESSION_STATES)[number];
+
+export interface TimelineSubscribeRequest {
+  type: typeof TIMELINE_MESSAGES.SUBSCRIBE;
+  sessionName: string;
+  mode: TimelineSubscriptionMode;
+  /** Optional cursor used when switching mode or reconnecting. */
+  epoch?: number;
+  afterSeq?: number;
+  requestId?: string;
+}
+
+export interface TimelineUnsubscribeRequest {
+  type: typeof TIMELINE_MESSAGES.UNSUBSCRIBE;
+  sessionName: string;
+  requestId?: string;
+}
+
+export interface TimelineSeqGap {
+  type: typeof TIMELINE_MESSAGES.SEQ_GAP;
+  sessionId: string;
+  epoch: number;
+  fromSeq: number;
+  toSeq: number;
+  reason: 'backpressure' | 'coalesced' | 'transport' | string;
+  /** Client should issue HISTORY_REQUEST with cursor.afterSeq = toSeq. */
+  backfill: true;
+}
 
 export const TIMELINE_RESPONSE_STATUS = {
   OK: 'ok',
@@ -59,6 +161,8 @@ export interface TimelineCursor {
 
 export const TIMELINE_PROTOCOL_REVISION = 1 as const;
 export const TIMELINE_PROTOCOL_CAPABILITY = 'timeline.protocol.v1' as const;
+/** Daemon understands TIMELINE_MESSAGES.HISTORY_CANCEL. */
+export const TIMELINE_HISTORY_CANCEL_CAPABILITY = 'timeline.history_cancel.v1' as const;
 
 export interface TimelineProtocolCapability {
   capability: typeof TIMELINE_PROTOCOL_CAPABILITY;
@@ -122,6 +226,33 @@ export interface TimelineDetailRequestV1 {
 
 export type TimelineDetailRequest = TimelineDetailRequestLegacy | TimelineDetailRequestV1;
 
+/**
+ * Optional content filter on a history/page request. `text` narrows the window to the readable
+ * messages (`TIMELINE_TEXT_HISTORY_EVENT_TYPES`) and skips state rows, so a tool-heavy session's
+ * newest few messages are not buried under tool events and the reply stays small. A daemon that
+ * predates the field ignores it and answers the unfiltered window, which callers must tolerate
+ * (it is a superset of what they asked for).
+ */
+export const TIMELINE_HISTORY_CONTENT_FILTERS = {
+  TEXT: 'text',
+} as const;
+
+export type TimelineHistoryContentFilter =
+  (typeof TIMELINE_HISTORY_CONTENT_FILTERS)[keyof typeof TIMELINE_HISTORY_CONTENT_FILTERS];
+
+export function isTimelineHistoryContentFilter(value: unknown): value is TimelineHistoryContentFilter {
+  return value === TIMELINE_HISTORY_CONTENT_FILTERS.TEXT;
+}
+
+/** The event types a `text` content filter selects. */
+export const TIMELINE_TEXT_HISTORY_EVENT_TYPES = ['user.message', 'assistant.text'] as const;
+
+/**
+ * How many of the newest messages the stale-window "peek" asks for before anything else, so a
+ * window that has not been opened for a long time shows the conversation's latest state at once.
+ */
+export const TIMELINE_STALE_WINDOW_TAIL_PEEK_LIMIT = 30;
+
 export interface TimelineHistoryRequest {
   type: typeof TIMELINE_MESSAGES.HISTORY_REQUEST;
   sessionName: string;
@@ -132,6 +263,7 @@ export interface TimelineHistoryRequest {
   cursor?: TimelineCursor | null;
   includeDetails?: boolean;
   budgetBytes?: number;
+  contentFilter?: TimelineHistoryContentFilter;
 }
 
 export interface TimelineReplayRequest {
@@ -147,6 +279,8 @@ export interface TimelinePageRequest extends Omit<TimelineHistoryRequest, 'type'
 }
 
 export type TimelineProtocolClientRequest =
+  | TimelineSubscribeRequest
+  | TimelineUnsubscribeRequest
   | TimelineHistoryRequest
   | TimelineReplayRequest
   | TimelinePageRequest

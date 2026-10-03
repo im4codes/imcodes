@@ -30,6 +30,7 @@ function blobResponse(body = 'file', headers: Record<string, string> = {}): Resp
 class MockXmlHttpRequest {
   static instances: MockXmlHttpRequest[] = [];
   static autoComplete = true;
+  static sendHook: ((xhr: MockXmlHttpRequest) => boolean) | null = null;
 
   method = '';
   url = '';
@@ -70,6 +71,7 @@ class MockXmlHttpRequest {
 
   send(body: unknown) {
     this.body = body;
+    if (MockXmlHttpRequest.sendHook?.(this)) return;
     if (!MockXmlHttpRequest.autoComplete) return;
     this.upload.onprogress?.({ lengthComputable: true, loaded: 6, total: 12 } as ProgressEvent);
     this.upload.onprogress?.({ lengthComputable: true, loaded: 12, total: 12 } as ProgressEvent);
@@ -110,6 +112,7 @@ describe('shared-context and file API contracts', () => {
     browserOpenMock.mockReset();
     MockXmlHttpRequest.instances = [];
     MockXmlHttpRequest.autoComplete = true;
+    MockXmlHttpRequest.sendHook = null;
     document.body.innerHTML = '';
     document.cookie = 'rcc_csrf=csrf-token';
   });
@@ -265,6 +268,132 @@ describe('shared-context and file API contracts', () => {
     expect(MockXmlHttpRequest.instances[0].aborted).toBe(true);
   });
 
+  it('retries an upload whose XHR never fires load after the daemon already finished it', async () => {
+    // Reproduces a live relay hang: the daemon completes the upload and the
+    // server closes its response, but the browser's XHR never observes
+    // `load` (an intermediate proxy held the connection open). Without a
+    // stall timeout this sat at 100% forever with nothing to retry.
+    vi.useFakeTimers();
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      if (call === 1) {
+        // Browser finished sending; daemon "completed" server-side, but the
+        // XHR never fires load/error/progress again -- a true hang.
+        xhr.upload.onprogress?.({ lengthComputable: true, loaded: 5, total: 5 } as ProgressEvent);
+        return true;
+      }
+      xhr.responseText = JSON.stringify({
+        ok: true,
+        attachment: {
+          id: 'att-stall-recovered', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/stalled.txt',
+          createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+        },
+      });
+      queueMicrotask(() => xhr.onload?.());
+      return true;
+    };
+    const { uploadFile } = await import('../src/api.js');
+    const pending = uploadFile('srv-1', new File(['hello'], 'stalled.txt'), undefined, 'client-stall-1234');
+    let settled = false;
+    void pending.finally(() => { settled = true; }).catch(() => undefined);
+    for (let step = 0; step < 10 && !settled; step += 1) {
+      await vi.advanceTimersByTimeAsync(5_000);
+    }
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'att-stall-recovered' } });
+
+    expect(MockXmlHttpRequest.instances).toHaveLength(2);
+    expect(MockXmlHttpRequest.instances[0]!.aborted).toBe(true);
+  });
+
+  it('retries a failed browser upload chunk at the server-confirmed offset', async () => {
+    vi.useFakeTimers();
+    const { FILE_TRANSFER_RESUMABLE_UPLOAD } = await import('@shared/transport/file-transfer.js');
+    const size = FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES + 2;
+    const file = new File([new Uint8Array(size)], 'large.bin', {
+      type: 'application/octet-stream',
+      lastModified: 1234,
+    });
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      if (call === 1) {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          complete: false,
+          committedBytes: FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES,
+        });
+        queueMicrotask(() => xhr.onload?.());
+      } else if (call === 2) {
+        queueMicrotask(() => xhr.onerror?.());
+      } else {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          attachment: {
+            id: 'att-resumed', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/large.bin',
+            createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+          },
+        });
+        queueMicrotask(() => xhr.onload?.());
+      }
+      return true;
+    };
+    const { uploadFile } = await import('../src/api.js');
+    const pending = uploadFile('srv-1', file, undefined, 'client-resume-1234');
+    let settled = false;
+    void pending.finally(() => { settled = true; }).catch(() => undefined);
+    for (let step = 0; step < 20 && !settled; step += 1) {
+      await vi.advanceTimersByTimeAsync(500);
+    }
+    await expect(pending).resolves.toMatchObject({ attachment: { id: 'att-resumed' } });
+
+    expect(MockXmlHttpRequest.instances).toHaveLength(3);
+    const offsets = MockXmlHttpRequest.instances.map((xhr) => (
+      (xhr.body as FormData).get('uploadOffset')
+    ));
+    expect(offsets).toEqual([
+      '0',
+      String(FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES),
+      String(FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES),
+    ]);
+    expect((MockXmlHttpRequest.instances[1]!.body as FormData).get('clientUploadId')).toBe('client-resume-1234');
+  });
+
+  it('adopts a receiver-owned offset after a lost browser upload response', async () => {
+    const { FILE_TRANSFER_RESUMABLE_UPLOAD } = await import('@shared/transport/file-transfer.js');
+    const size = FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES + 2;
+    const file = new File([new Uint8Array(size)], 'large.bin', { lastModified: 5678 });
+    let call = 0;
+    MockXmlHttpRequest.sendHook = (xhr) => {
+      call += 1;
+      if (call === 1) {
+        xhr.status = 409;
+        xhr.responseText = JSON.stringify({
+          error: 'upload_offset_mismatch',
+          committedBytes: FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES,
+        });
+      } else {
+        xhr.responseText = JSON.stringify({
+          ok: true,
+          attachment: {
+            id: 'att-reconciled', source: 'upload', serverId: 'srv-1', daemonPath: '/tmp/large.bin',
+            createdAt: '2026-05-11T00:00:00Z', downloadable: true,
+          },
+        });
+      }
+      queueMicrotask(() => xhr.onload?.());
+      return true;
+    };
+    const { uploadFile } = await import('../src/api.js');
+
+    await expect(uploadFile('srv-1', file, undefined, 'client-reconcile-1234')).resolves.toMatchObject({
+      attachment: { id: 'att-reconciled' },
+    });
+    expect(MockXmlHttpRequest.instances.map((xhr) => (
+      (xhr.body as FormData).get('uploadOffset')
+    ))).toEqual(['0', String(FILE_TRANSFER_RESUMABLE_UPLOAD.CHUNK_BYTES)]);
+  });
+
   it('deletes uploaded attachments through the dedicated server route', async () => {
     const fetchMock = vi.mocked(fetch);
     fetchMock.mockResolvedValueOnce(jsonResponse({ ok: true }));
@@ -306,6 +435,22 @@ describe('shared-context and file API contracts', () => {
       'https://api.example/api/server/srv-1/uploads/att-delete?sessionName=deck_project_brain',
       'https://api.example/api/server/srv-1/uploads/att-preview/download?sessionName=deck_project_brain',
     ]);
+  });
+
+  it('previews through the configured API origin and never sends a daemon path', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(blobResponse('image-bytes', { 'Content-Type': 'image/png' }));
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:image') });
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const { configure, previewAttachment } = await import('../src/api.js');
+    configure('https://215.example/proxy');
+
+    await previewAttachment('srv-1', 'f670d9589bc3d1b2647a7cd4a98efdeb', 'deck_215');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://215.example/proxy/api/server/srv-1/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/download?sessionName=deck_215',
+      expect.objectContaining({ credentials: 'include' }),
+    );
   });
 
   it('downloads and previews attachments through desktop and native paths', async () => {

@@ -2,6 +2,21 @@
  * Handle commands from the web UI and inbound chat messages via ServerLink.
  * Commands arrive as JSON objects with a `type` field.
  */
+import type { ChatMessageOrigin } from '../../shared/chat-message-origin.js';
+import { isPairsEngineSession } from './task-pairs/engine.js';
+import { AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
+import { AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
+import type { CronRunTimelineProjection } from '../../shared/cron-types.js';
+import { handleAgentMcpCommand } from './agent-mcp.js';
+import { handleAgentSkillsCommand } from './agent-skills.js';
+import {
+  SESSION_MODEL_APPLIED,
+  SESSION_MODEL_CONTROL_ERROR,
+  type SessionModelControlError,
+  type SessionModelListResult,
+  type SessionModelSwitchResult,
+  type SessionThinkingSwitchResult,
+} from '../../shared/session-model-control.js';
 import { startProject, stopProject, teardownProject, getTransportRuntime, launchTransportSession, isProviderSessionBound, persistSessionRecord, relaunchSessionWithSettings, stopTransportRuntimeSession, type ProjectConfig } from '../agent/session-manager.js';
 import { buildTransportResumeLaunchOpts } from '../agent/transport-resume-opts.js';
 import { isTransportAgent, type AgentType } from '../agent/detect.js';
@@ -10,15 +25,25 @@ import { ALIAS_REASONS } from '../../shared/alias-types.js';
 import { classifyCodexFastCommand, isCodexFastServiceTier } from '../../shared/codex-service-tier.js';
 import type { AliasSendAudit, SendAliasNotes, SendAliasResolution } from '../../shared/alias-types.js';
 import { buildAliasSendAudit } from './alias-audit.js';
-import { sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
+import { BACKEND, sendKeys, sendKeysDelayedEnter, sendRawInput, resizeSession, sendKey, getPaneStartCommand, preparePrivateInputWriter } from '../agent/tmux.js';
 import { listSessions, getSession, upsertSession, removeSession, type SessionRecord } from '../store/session-store.js';
 import { routeMessage, type InboundMessage, type RouterContext } from '../router/message-router.js';
 import { terminalStreamer, type StreamSubscriber } from './terminal-streamer.js';
+import { terminalInputNeedsSessionMutex } from './terminal-input.js';
 import type { ServerLink } from './server-link.js';
 import { timelineEmitter } from './timeline-emitter.js';
-import { emitTransportUserMessage as emitTransportUserMessageEvent } from './transport-relay.js';
+import { bindProcessSharedMachineAuthority } from './shared-machine-authority-context.js';
+import {
+  emitTransportUserMessage as emitTransportUserMessageEvent,
+  persistTransportUserMessage,
+} from './transport-relay.js';
 import { TimelinePreferredReadError, timelineStore } from './timeline-store.js';
 import { hasAssistantFileReadGrant } from './session-file-read-grants.js';
+import {
+  resolveChatFileReference,
+  resolveGitWorktreeRoot,
+  type ChatFileReferenceResolutionResult,
+} from './session-file-reference-resolver.js';
 import {
   recordFsWorkerMetric,
   recordTimelineBudgetShape,
@@ -33,14 +58,18 @@ import { scanFsListSnapshot } from './fs-list-worker.js';
 import { FsGitStatusPoolError, getDefaultFsGitStatusWorkerPool, shouldUseFsGitStatusWorkerPool, __resetFsGitStatusWorkerPoolForTests } from './fs-git-status-pool.js';
 import { scanFsGitStatusSnapshot } from './fs-git-status-worker.js';
 import { shapeTimelineDetailValueForTransport, shapeTimelineEventsForTransport } from './timeline-response-shaper.js';
+import { getSupervisionTaskRegistry } from './supervision-state-store.js';
 import { getDefaultTimelineDetailStore } from './timeline-detail-store.js';
-import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent } from '../shared/timeline/types.js';
+import { isUserDeletedTimelineEvent } from '../shared/timeline/merge.js';
+import { TIMELINE_HISTORY_CONTENT_TYPES, TIMELINE_HISTORY_STATE_TYPES, type MemoryContextTimelinePayload, type TimelineEvent, type TimelineEventType } from '../shared/timeline/types.js';
 import { emitSessionInlineError } from './session-error.js';
-import { enqueueResend, getResendEntries, clearResend } from './transport-resend-queue.js';
+import { attachDaemonUserNotice, DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
+import { enqueueResend, getResendEntries, clearResend, recipientFromSessionRecord } from './transport-resend-queue.js';
 import { preserveTransportRuntimeQueuesToResend } from './transport-resend-preservation.js';
 import { buildTransportQueueSnapshotPayload, transportQueueSnapshotToPayload } from './transport-queue-projection.js';
 import { observeTransportQueueRevision, getTransportQueueRevision } from './transport-queue-revision.js';
 import { getTransportQueueStore } from './transport-queue-store.js';
+import type { QueueRecipientIdentity } from './transport-queue-store.js';
 import {
   startSubSession,
   stopSubSession,
@@ -53,6 +82,7 @@ import {
 import { resolveSubSessionCwd } from './subsession-cwd.js';
 import { sendSubSessionSync } from './subsession-sync.js';
 import logger from '../util/logger.js';
+import { terminalStageTrace } from '../util/terminal-stage-trace.js';
 import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
@@ -70,13 +100,22 @@ import {
 } from '../../shared/agent-delegation.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-budget.js';
+import { TIMELINE_HISTORY_LIMITS, clampTimelineHistoryLimit, clampTimelineHistoryBudget } from '../../shared/timeline-history-limits.js';
 import { hashSessionName } from '../../shared/session-hash.js';
 import { TIMELINE_DETAIL_ERROR_REASONS, TIMELINE_HISTORY_ERROR_REASONS, TIMELINE_REQUEST_ERROR_REASONS, type TimelineRequestErrorReason } from '../../shared/timeline-history-errors.js';
 import {
   TIMELINE_CURSOR_DIRECTIONS,
+  TIMELINE_TEXT_HISTORY_EVENT_TYPES,
+  isTimelineHistoryContentFilter,
+  type TimelineHistoryContentFilter,
+  TIMELINE_DELETE_ERROR_CODES,
+  TIMELINE_DELETE_MAX_EVENT_IDS,
+  TIMELINE_DELETE_MAX_EVENT_ID_LENGTH,
   TIMELINE_MESSAGES,
   TIMELINE_RESPONSE_SOURCES,
   TIMELINE_RESPONSE_STATUS,
+  TIMELINE_USER_DELETED_PAYLOAD_KEY,
+  type TimelineDeleteErrorCode,
   type TimelinePayloadMetadata,
   type TimelineResponseSource,
   type TimelineResponseStatus,
@@ -84,10 +123,9 @@ import {
 import { homedir } from 'os';
 import { lstat as fsLstat, open as fsOpen, readdir as fsReaddir, realpath as fsRealpath, readFile as fsReadFileRaw, rename as fsRename, rm as fsRm, stat as fsStat, unlink as fsUnlink, writeFile as fsWriteFile } from 'node:fs/promises';
 import * as nodePath from 'node:path';
-import { exec as execCb, execFile as execFileCb } from 'node:child_process';
+import { exec as execCb } from 'node:child_process';
 import { promisify } from 'node:util';
 const execAsync = promisify(execCb);
-const execFileAsync = promisify(execFileCb);
 import { startP2pRun, cancelP2pRun, getP2pRun, listP2pRuns, serializeP2pRun, type P2pTarget, type SharedP2pRunScope } from './p2p-orchestrator.js';
 import {
   expandP2pTargets as expandP2pTargetsShared,
@@ -98,9 +136,28 @@ import { buildSessionList } from './session-list.js';
 import { setClaudeUsageQuotaOptIn, recordClaudeQuotaActivity } from '../agent/claude-usage-quota.js';
 import { CLAUDE_QUOTA_MSG } from '../../shared/claude-quota.js';
 import { CODEX_RESET_CREDITS_MSG } from '../../shared/codex-reset-credits.js';
+import { CODEX_CREDIT_HISTORY_MSG, type CodexCreditSnapshot } from '../../shared/codex-credit-history.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../shared/hermes-agent.js';
+import { PROVIDER_ERROR_CODES } from '../agent/transport-provider.js';
 import { refreshCodexQuotaMetadataForSessions } from './codex-quota-refresh.js';
 import { fetchCodexResetCredits, consumeCodexResetCredit } from '../agent/codex-reset-credits.js';
 import { supervisionAutomation } from './supervision-automation.js';
+import { refreshSupervisorDefaultsCache } from './supervisor-defaults-cache.js';
+import { syncSessionIdentitiesForCommand } from './session-identity-sync.js';
+import { SESSION_IDENTITY_WS } from '../../shared/session-identity-ws.js';
+import {
+  handleSessionIdentityLocalRequest,
+  handleSessionIdentityMigrateResponse,
+  handleSessionIdentityPush,
+} from './session-identity-server-sync.js';
+import {
+  normalizeSessionIdentityContent,
+  sessionIdentityContentError,
+} from '../../shared/session-identity.js';
+import {
+  buildSupervisedAuditExecutionPreamble,
+  buildSupervisionExecutionPreamble,
+} from './supervision-prompts.js';
 import {
   getEnabledP2pMemberNames,
   isP2pMemberEligibleSession,
@@ -125,22 +182,14 @@ import { TRANSPORT_MSG } from '../../shared/transport-events.js';
 import { copyFile } from 'node:fs/promises';
 import { randomUUID } from 'node:crypto';
 import { ensureImcDir, imcSubDir } from '../util/imc-dir.js';
+import { launchWindowsUpgrade } from '../util/windows-upgrade-script.js';
+import { buildPosixRestartCommand, launchPosixUpgrade } from '../util/posix-upgrade-script.js';
 import {
-  buildWindowsCleanupScript,
-  buildWindowsCleanupVbs,
-  buildWindowsUpgradeRunnerVbs,
-  resolveWindowsUpgradeRunnerPath,
-} from '../util/windows-upgrade-script.js';
-import { buildBashSharpRepair } from '../util/sharp-repair-script.js';
-import { buildBashNodeDatachannelRepair } from '../util/node-datachannel-repair-script.js';
-import {
-  buildPosixUpgradeLayoutRecoveryScript,
   parsePosixUpgradeFailureStatus,
   POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE,
 } from '../util/posix-upgrade-layout-recovery.js';
 import { warnOncePerHour } from '../util/rate-limited-warn.js';
 import { getDefaultUpgradeBlockedOutbox } from './upgrade-blocked-outbox.js';
-import { encodeVbsAsUtf16, encodeCmdAsUtf8Bom } from '../util/windows-launch-artifacts.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
 import { sanitizeProjectName } from '../../shared/sanitize-project-name.js';
 import { isTemplatePrompt, isTemplateOriginSummary, isImperativeCommand } from '../../shared/template-prompt-patterns.js';
@@ -162,15 +211,26 @@ import {
   fingerprintRecentSummary,
 } from '../context/summary-sync.js';
 import { CLAUDE_CODE_MODEL_IDS, CODEX_MODEL_IDS, GEMINI_MODEL_IDS, normalizeClaudeCodeModelId } from '../shared/models/options.js';
+import type { TransportSessionRuntime } from '../agent/transport-session-runtime.js';
 import { getClaudeSdkRuntimeConfig, normalizeClaudeSdkModelForProvider } from '../agent/sdk-runtime-config.js';
 import { getCodexRuntimeConfig } from '../agent/codex-runtime-config.js';
 import { mergeCodexDisplayMetadata } from '../agent/codex-display.js';
 import { P2P_TERMINAL_RUN_STATUSES } from '../../shared/p2p-status.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
+  CODEBUDDY_CHINA_DEFAULT_MODEL,
+  CODEBUDDY_CHINA_MODEL_FALLBACK,
+  CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK,
+  CODEBUDDY_PROVIDER_IDS,
+  isCodeBuddyProviderId,
+} from '../../shared/codebuddy.js';
+import {
   DAEMON_UPGRADE_BLOCK_REASON,
+  DAEMON_UPGRADE_SOURCE,
   DAEMON_UPGRADE_TARGET_LATEST,
   normalizeDaemonUpgradeTargetVersion,
+  resolveDaemonUpgradeSource,
+  type DaemonUpgradeSource,
 } from '../../shared/daemon-upgrade.js';
 import { CC_PRESET_MSG, CUSTOM_PROVIDER_SDK_AGENT_TYPES, normalizeCcPresetName, type CcPreset } from '../../shared/cc-presets.js';
 import {
@@ -243,7 +303,9 @@ import {
   CODEX_SDK_EFFORT_LEVELS,
   COPILOT_SDK_EFFORT_LEVELS,
   DEFAULT_TRANSPORT_EFFORT,
+  clampTransportEffort,
   OPENCLAW_THINKING_LEVELS,
+  PI_EFFORT_LEVELS,
   QWEN_EFFORT_LEVELS,
   isTransportEffortLevel,
   type TransportEffortLevel,
@@ -260,6 +322,7 @@ import type {
   WriteProcessedProjectionInput,
 } from '../store/context-store.js';
 import { getContextStoreClient } from '../store/context-store-worker-client.js';
+import { CONTEXT_STORE_RPC_ERROR } from '../../shared/context-store-rpc.js';
 import { serializeContextNamespace } from '../context/context-keys.js';
 import {
   isKnownTestProjectName,
@@ -283,8 +346,16 @@ import { detectRepo, parseRemotes } from '../repo/detector.js';
 import { GitOriginRepositoryIdentityService } from '../agent/repository-identity-service.js';
 import {
   SUPERVISION_MODE,
+  canSessionRoleOwnAutomaticSupervision,
   extractSessionSupervisionSnapshot,
+  hasInvalidSessionSupervisionSnapshot,
+  isAutomaticSupervisionEnabled,
   isSupportedSupervisionTargetSessionType,
+  normalizeSupervisionUiLocale,
+  patchTransportConfigUiLocale,
+  readTransportConfigUiLocale,
+  evaluateAutomaticSupervisionEnablement,
+  type AutomaticSupervisionEnablementGate,
 } from '../../shared/supervision-config.js';
 import {
   PREFERENCE_FEATURE_FLAG,
@@ -355,7 +426,9 @@ import {
 } from '../store/memory-feature-config-store.js';
 import {
   MEMORY_MCP_DISABLED_FLAGS,
+  MEMORY_MCP_SEND_DELIVERY_MODES,
   MEMORY_MCP_TOOL_NAMES,
+  type MemoryMcpSendDeliveryMode,
 } from '../../shared/memory-mcp-contracts.js';
 import {
   MCP_FEATURE_FLAGS_BY_NAME,
@@ -457,6 +530,27 @@ async function waitForSelectedSessionSends(
     if (runtime) {
       const queuedIds = new Set((runtime.pendingEntries ?? []).map((entry) => entry.clientMessageId));
       if (ids.every((id) => queuedIds.has(id))) return;
+    }
+    // After a daemon restart the browser may be rendering an authoritative
+    // SQLite snapshot while the new runtime has not rehydrated that row yet.
+    // Match the exact projected clientMessageId under the persisted recipient
+    // identity; do not burn the full optimistic-send wait budget for a row the
+    // authority already proves exists. The append handler will reconcile the
+    // queue generation and rehydrate it under the session mutex immediately
+    // after this barrier.
+    const recipient = recipientFromSessionRecord(getSession(sessionName));
+    if (recipient) {
+      try {
+        const durableIds = new Set(
+          getTransportQueueStore()
+            .readSnapshotForRecipient(sessionName, recipient, 'append_wait_authority')
+            .pendingMessageEntries
+            .map((entry) => entry.clientMessageId),
+        );
+        if (ids.every((id) => durableIds.has(id))) return;
+      } catch {
+        // The bounded polling path below remains the safe degraded fallback.
+      }
     }
 
     const pending = [...new Set(ids.flatMap((clientMessageId) => {
@@ -756,19 +850,10 @@ function schedulePreferencePersistence(input: {
 }
 
 /**
- * Reliable `command.ack` emission — enqueue into the on-disk outbox BEFORE the
- * network send so that a transient serverLink outage doesn't silently drop the
- * ack. The outbox flushes on the next successful reconnect + auth; the server's
- * seenCommandAcks LRU dedups replays so the browser sees the ack exactly once.
- *
- * Replaces the original `try { serverLink.send({ type: 'command.ack', ... }) }
- * catch {}` pattern that existed in ~15 sites across handleSessionSend's
- * transport/P2P/queue paths. Keeping it all funnelled through one helper makes
- * it impossible to forget the outbox hook on a new code path.
- *
- * Does NOT emit the corresponding `timelineEmitter.emit(..., 'command.ack', ...)`
- * — call sites still do that explicitly so they can choose whether the ack is
- * timeline-visible (process path) or not (some P2P internal paths).
+ * Reliable `command.ack` emission. The wire receipt is sent first so that
+ * durable outbox/timeline work cannot delay the daemon-receipt contract.
+ * Failed sends are persisted for retry; successful sends are marked acked
+ * after enqueue completes.
  */
 function emitCommandAckReliable(
   serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
@@ -780,21 +865,6 @@ function emitCommandAckReliable(
     [key: string]: unknown;
   },
 ): void {
-  const outbox = getDefaultAckOutbox();
-  outbox
-    .enqueue({
-      commandId: params.commandId,
-      sessionName: params.sessionName,
-      status: params.status,
-      ...(params.error ? { error: params.error } : {}),
-      extras: Object.fromEntries(Object.entries(params).filter(([key, value]) => (
-        !['commandId', 'sessionName', 'status', 'error'].includes(key) && value !== undefined
-      ))),
-      ts: Date.now(),
-    })
-    .catch((err) =>
-      logger.error({ commandId: params.commandId, err }, 'ackOutbox.enqueue failed'),
-    );
   const sent = trySendCommandAck(serverLink, {
     commandId: params.commandId,
     sessionName: params.sessionName,
@@ -802,13 +872,24 @@ function emitCommandAckReliable(
     error: params.error,
     ...Object.fromEntries(Object.entries(params).filter(([key]) => !['commandId', 'sessionName', 'status', 'error'].includes(key))),
   });
-  if (sent) {
-    outbox
-      .markAcked(params.commandId)
-      .catch((err) =>
-        logger.warn({ commandId: params.commandId, err }, 'ackOutbox.markAcked failed'),
-      );
-  } else {
+  const outbox = getDefaultAckOutbox();
+  const enqueue = outbox.enqueue({
+    commandId: params.commandId,
+    sessionName: params.sessionName,
+    status: params.status,
+    ...(params.error ? { error: params.error } : {}),
+    extras: Object.fromEntries(Object.entries(params).filter(([key, value]) => (
+      !['commandId', 'sessionName', 'status', 'error'].includes(key) && value !== undefined
+    ))),
+    ts: Date.now(),
+  });
+  enqueue.then(() => {
+    if (!sent) return;
+    return outbox.markAcked(params.commandId);
+  }).catch((err) => {
+    logger.error({ commandId: params.commandId, err }, 'ackOutbox enqueue/ack failed');
+  });
+  if (!sent) {
     logger.warn(
       { commandId: params.commandId },
       'command.ack not sent, queued for retry via outbox',
@@ -876,6 +957,16 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
     return;
   }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    logger.warn({ sessionName }, 'session.update_transport_config: invalid supervision snapshot — ignoring');
+    return;
+  }
+  const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
+  if (isAutomaticSupervisionEnabled(nextSupervision)
+    && !canSessionRoleOwnAutomaticSupervision(record.role)) {
+    logger.warn({ sessionName, role: record.role }, 'session.update_transport_config: automatic supervision requires Brain session — ignoring');
+    return;
+  }
   const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
@@ -886,7 +977,7 @@ async function handleSessionTransportConfigUpdate(cmd: Record<string, unknown>, 
   // The server persist callback is a no-op when not yet wired; the next `persistSessionToWorker`
   // loop in lifecycle will retry from the local store.
   persistSessionRecord(nextRecord, sessionName);
-  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  supervisionAutomation.applySnapshotUpdate(sessionName, nextSupervision);
   invalidateTransportListModelsCache('session_transport_config_update');
   await handleGetSessions(serverLink);
 }
@@ -907,6 +998,15 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
     return;
   }
   const nextTransportConfig = normalizeTransportConfigUpdate(cmd.transportConfig);
+  if (hasInvalidSessionSupervisionSnapshot(nextTransportConfig ?? null)) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: invalid supervision snapshot — ignoring');
+    return;
+  }
+  const nextSupervision = extractSessionSupervisionSnapshot(nextTransportConfig ?? null);
+  if (isAutomaticSupervisionEnabled(nextSupervision)) {
+    logger.warn({ sessionName }, 'subsession.update_transport_config: automatic supervision requires Brain session — ignoring');
+    return;
+  }
   const nextRecord: SessionRecord = {
     ...record,
     transportConfig: nextTransportConfig,
@@ -914,7 +1014,7 @@ async function handleSubSessionTransportConfigUpdate(cmd: Record<string, unknown
   };
   upsertSession(nextRecord);
   persistSessionRecord(nextRecord, sessionName);
-  supervisionAutomation.applySnapshotUpdate(sessionName, extractSessionSupervisionSnapshot(nextTransportConfig ?? null));
+  supervisionAutomation.applySnapshotUpdate(sessionName, nextSupervision);
   invalidateTransportListModelsCache('subsession_transport_config_update');
   const id = sessionName.replace(/^deck_sub_/, '');
   try {
@@ -933,7 +1033,8 @@ function supportsEffort(agentType: string | undefined): agentType is 'claude-cod
     || agentType === 'qwen';
 }
 
-function supportsTransportClear(agentType: string | undefined): agentType is 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi' {
+/** Does this transport agent start a fresh conversation for `/clear`? */
+export function supportsTransportClear(agentType: string | undefined): boolean {
   return agentType === 'claude-code-sdk'
     || agentType === 'codex-sdk'
     || agentType === 'copilot-sdk'
@@ -942,9 +1043,11 @@ function supportsTransportClear(agentType: string | undefined): agentType is 'cl
     || agentType === 'openclaw'
     || agentType === 'qwen'
     || agentType === 'kimi-sdk'
+    || agentType === HERMES_AGENT_PROVIDER_ID
     || agentType === 'grok-sdk'
     || agentType === 'deepseek-harness'
-    || agentType === 'pi';
+    || agentType === 'pi'
+    || isCodeBuddyProviderId(agentType);
 }
 
 // `/compact` is provider-dispatched, not daemon-synthesized. Provider adapters
@@ -958,13 +1061,44 @@ function supportsProcessClear(agentType: string | undefined): agentType is 'clau
   return agentType === 'claude-code' || agentType === 'codex' || agentType === 'opencode';
 }
 
+/**
+ * `/clear` for a transport session: a fresh provider conversation. Shared by the
+ * browser send path and daemon-side delivery (agent sends, cron, supervision),
+ * which used to hand "/clear" to the model as ordinary text -- the context was
+ * never cleared (seen live: a Codex session kept its 214k-token context).
+ * `serverLink` only pushes the refreshed session list to browsers now; without
+ * it the change still persists and reaches them through the normal sync.
+ */
+export async function clearTransportConversation(record: SessionRecord, serverLink?: ServerLink): Promise<void> {
+  const sessionName = record.name;
+  // Fresh conversation must not replay stale queued messages from the prior
+  // offline window — drop anything we had buffered for resend.
+  clearResend(sessionName);
+  await runExclusiveSessionRelaunch(sessionName, async () => {
+    await relaunchFreshTransportConversation(record);
+  });
+  // Reset per-session memory injection history — fresh conversation should be
+  // allowed to re-inject previously-shown memories again.
+  clearRecentInjectionHistory(sessionName);
+  clearSummarySyncHistory(sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    await syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
 async function relaunchFreshTransportConversation(record: SessionRecord): Promise<void> {
   await stopTransportRuntimeSession(record.name);
   await launchTransportSession({
     name: record.name,
     projectName: record.projectName,
     role: record.role,
-    agentType: record.agentType as 'claude-code-sdk' | 'codex-sdk' | 'copilot-sdk' | 'cursor-headless' | 'opencode-sdk' | 'openclaw' | 'qwen' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi',
+    agentType: record.agentType as AgentType,
     projectDir: record.projectDir,
     label: record.label,
     description: record.description,
@@ -1021,7 +1155,91 @@ function getSupportedEffortLevels(agentType: string | undefined): readonly Trans
           ? QWEN_EFFORT_LEVELS
           : agentType === 'openclaw'
             ? OPENCLAW_THINKING_LEVELS
-            : [];
+            : agentType === 'pi'
+              ? PI_EFFORT_LEVELS
+              : [];
+}
+
+async function resolveSupportedEffortLevels(
+  record: SessionRecord,
+  agentType: string,
+): Promise<readonly TransportEffortLevel[]> {
+  const fallback = getSupportedEffortLevels(agentType);
+  if (agentType !== 'codex-sdk') return fallback;
+  try {
+    const provider = getProvider(agentType);
+    const catalog = await provider?.listModels?.(false);
+    const modelId = record.activeModel?.trim() || record.requestedModel?.trim();
+    const model = modelId ? catalog?.models.find((entry) => entry.id === modelId) : undefined;
+    if (model?.supportedEffortLevels?.length) return model.supportedEffortLevels;
+    // Idle sessions may not have a provider instance yet. Reuse the daemon's
+    // passive app-server catalog rather than silently falling back to a stale
+    // global list when model/list metadata is already cached on disk.
+    if (!model && modelId) {
+      const runtimeConfig = await getCodexRuntimeConfig({ probe: false }).catch(() => undefined);
+      const cachedModel = runtimeConfig?.models?.find((entry) => entry.id === modelId);
+      if (cachedModel?.supportedEffortLevels?.length) return cachedModel.supportedEffortLevels;
+    }
+    return fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+async function applyTransportEffortSwitch(
+  record: SessionRecord,
+  transportRuntime: TransportSessionRuntime | undefined,
+  requested: string,
+  serverLink?: ServerLink,
+): Promise<SessionThinkingSwitchResult> {
+  const sessionName = record.name;
+  const agentType = record.agentType ?? '';
+  const allowed = await resolveSupportedEffortLevels(record, agentType);
+  if (!allowed.length) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${agentType || 'this session'}` };
+  }
+  if (!isTransportEffortLevel(requested) || !allowed.includes(requested)) {
+    const supported = allowed.join(', ');
+    timelineEmitter.emit(sessionName, 'assistant.text', {
+      ...attachDaemonUserNotice(
+        DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED,
+        `⚠️ Unsupported thinking level: ${requested}. Supported: ${supported}`,
+        { level: requested, supported, detail: `Supported: ${supported}` },
+      ),
+      streaming: false,
+      memoryExcluded: true,
+    }, { source: 'daemon', confidence: 'high' });
+    return {
+      ok: false,
+      sessionName,
+      code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_THINKING_LEVEL,
+      error: `Unsupported thinking level: ${requested}. Supported: ${supported}`,
+      availableThinkingLevels: [...allowed],
+    };
+  }
+  const previousThinking = record.effort;
+  transportRuntime?.setEffort(requested);
+  const nextRecord = { ...record, effort: requested, updatedAt: Date.now() };
+  upsertSession(nextRecord);
+  persistSessionRecord(nextRecord, sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_SWITCHED, `Switched thinking level to ${requested}`, { level: requested }),
+    streaming: false,
+    automation: true,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+  return {
+    ok: true,
+    sessionName,
+    agentType,
+    thinking: requested,
+    ...(previousThinking ? { previousThinking } : {}),
+    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+  };
 }
 
 function getDefaultThinkingLevel(agentType: string | undefined): TransportEffortLevel | undefined {
@@ -1061,7 +1279,7 @@ async function rewritePathsForSandbox(sessionName: string, text: string): Promis
   const projectDir = record?.projectDir;
   if (!projectDir) return text;
 
-  const imcodesDir = nodePath.join(homedir(), '.imcodes');
+  const imcodesDir = imcodesStateDir();
   const escapedImcodesDir = imcodesDir.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const legacyAtPathRegex = new RegExp(`@(${escapedImcodesDir}[/\\\\][^\\s)]+)`, 'g');
   const taggedPathRegex = new RegExp(`#\\d+:\\((${escapedImcodesDir}[/\\\\][^)]+)\\)`, 'g');
@@ -1129,8 +1347,9 @@ import { isRemoteDesktopMessageType } from '../../shared/remote-desktop.js';
 import { REMOTE_DESKTOP_INSTALL_MSG } from '../../shared/remote-desktop-install.js';
 import { REMOTE_DESKTOP_LOGIN_SCREEN_MSG } from '../../shared/remote-desktop-login-screen.js';
 import { handleDaemonRemoteDesktopMessage } from './remote-desktop-registry.js';
-import { handleDirectFileTransferCommand } from './direct-file-transfer.js';
+import { handleDirectFileTransferCommand, quiesceDirectFileTransferNative } from './direct-file-transfer.js';
 import { REPO_MSG } from '../shared/repo-types.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../shared/supervision-task-console.js';
 import { handlePreviewCommand } from './preview-relay.js';
 import { PREVIEW_MSG } from '../../shared/preview-types.js';
 import type { TransportAttachment } from '../../shared/transport-attachments.js';
@@ -1140,10 +1359,12 @@ import { QWEN_MODEL_IDS } from '../../shared/qwen-models.js';
 import { getQwenRuntimeConfig } from '../agent/qwen-runtime-config.js';
 import { getQwenDisplayMetadata } from '../agent/provider-display.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getQwenOAuthQuotaUsageLabel, recordQwenOAuthRequest } from '../agent/provider-quota.js';
 import { listProviderSessions as listProviderSessionsImpl } from './provider-sessions.js';
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from './memory-context-timeline.js';
+import { TERMINAL_CONTROL } from '../../shared/terminal-protocol.js';
 
 function describeTransportSendError(err: unknown): string {
   if (err && typeof err === 'object') {
@@ -1154,6 +1375,7 @@ function describeTransportSendError(err: unknown): string {
 }
 
 const pendingSessionRelaunches = new Map<string, Promise<void>>();
+const pendingMcpSessionRestarts = new Map<string, { reset: boolean; result: Promise<boolean> }>();
 const shellBootstrapRecoveryAttempts = new Map<string, number[]>();
 const SHELL_BOOTSTRAP_RECOVERY_WINDOW_MS = 60_000;
 const SHELL_BOOTSTRAP_RECOVERY_MAX_ATTEMPTS = 2;
@@ -1643,6 +1865,29 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SESSION_UPDATE_TRANSPORT_CONFIG:
       void handleSessionTransportConfigUpdate(cmd, serverLink);
       break;
+    case DAEMON_COMMAND_TYPES.SESSION_IDENTITY_REFRESH:
+      void syncSessionIdentitiesForCommand(cmd).then((ack) => {
+        if (!ack) return;
+        if (ack.status === 'error') logger.warn({ error: ack.error }, 'session identity refresh failed');
+        emitCommandAckReliable(serverLink, {
+          commandId: ack.commandId,
+          sessionName: ack.sessionName,
+          status: ack.status,
+          ...(ack.error ? { error: ack.error } : {}),
+        });
+      }).catch((err) => {
+        logger.warn({ err }, 'legacy session identity refresh failed');
+      });
+      break;
+    case SESSION_IDENTITY_WS.LOCAL_REQUEST:
+      void handleSessionIdentityLocalRequest(cmd, serverLink);
+      break;
+    case SESSION_IDENTITY_WS.PUSH:
+      void handleSessionIdentityPush(cmd);
+      break;
+    case SESSION_IDENTITY_WS.MIGRATE_RESPONSE:
+      void handleSessionIdentityMigrateResponse(cmd, serverLink);
+      break;
     case 'session.send':
       dispatchSessionSend(cmd, serverLink);
       break;
@@ -1659,7 +1904,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void handleDeleteTimelineMessage(cmd, serverLink);
       break;
     case 'session.input':
-      void handleInput(cmd);
+      void handleInput(cmd, serverLink);
       break;
     case 'session.resize':
       void handleResize(cmd);
@@ -1688,6 +1933,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case TIMELINE_MESSAGES.PAGE_REQUEST:
       void traceCommandAsync(cmd, 'web_command.timeline_page', () => handleTimelineHistory(cmd, serverLink));
+      break;
+    case TIMELINE_MESSAGES.HISTORY_CANCEL:
+      if (typeof cmd.requestId === 'string') serverLink.cancelQueuedDataPlaneRequest(cmd.requestId);
       break;
     case TIMELINE_MESSAGES.DETAIL_REQUEST:
       traceSync('web_command.timeline_detail', {
@@ -1726,6 +1974,9 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case CODEX_RESET_CREDITS_MSG.CONSUME:
       void handleCodexResetCreditsConsume(cmd, serverLink);
+      break;
+    case CODEX_CREDIT_HISTORY_MSG.REQUEST:
+      void handleCodexCreditHistoryRequest(cmd, serverLink);
       break;
     case 'subsession.detect_shells':
       void handleSubSessionDetectShells(serverLink);
@@ -1822,16 +2073,27 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
     case DAEMON_COMMAND_TYPES.SERVER_DELETE:
       void handleServerDelete();
       break;
+    case DAEMON_COMMAND_TYPES.SUPERVISOR_DEFAULTS_CHANGED:
+      // Best-effort, same as the periodic poll this preempts: a fetch
+      // failure here just leaves the existing cache in place until the
+      // next scheduled refresh.
+      void refreshSupervisorDefaultsCache().catch((err) => {
+        logger.debug({ err }, 'supervisor defaults changed push: refresh failed');
+      });
+      break;
     case DAEMON_COMMAND_TYPES.DAEMON_UPGRADE:
       try {
         const normalizedTarget = normalizeDaemonUpgradeTargetVersion(cmd.targetVersion);
         const upgradeId = typeof cmd.upgradeId === 'string' && cmd.upgradeId.length > 0 && cmd.upgradeId.length <= 128
           ? cmd.upgradeId
           : undefined;
-        void handleDaemonUpgrade(
+        const source = resolveDaemonUpgradeSource(cmd.source);
+      void handleDaemonUpgrade(
           normalizedTarget === DAEMON_UPGRADE_TARGET_LATEST ? undefined : normalizedTarget,
           serverLink,
           upgradeId,
+          typeof cmd.registry === 'string' ? cmd.registry : undefined,
+          source,
         );
       } catch {
         logger.warn({ targetVersion: cmd.targetVersion }, 'daemon.upgrade rejected invalid targetVersion');
@@ -1863,6 +2125,14 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case MEMORY_WS.GET_SOURCES_REQUEST:
       void handleMemoryGetSourcesRequest(cmd, serverLink);
+      break;
+    case AGENT_SKILLS_MSG.LIST_REQUEST:
+    case AGENT_SKILLS_MSG.RUN_REQUEST:
+      void handleAgentSkillsCommand(cmd, (message) => serverLink.send(message));
+      break;
+    case AGENT_MCP_MSG.LIST_REQUEST:
+    case AGENT_MCP_MSG.RUN_REQUEST:
+      void handleAgentMcpCommand(cmd, (message) => serverLink.send(message));
       break;
     case 'fs.ls':
       void traceCommandAsync(cmd, 'web_command.fs_ls', () => handleFsList(cmd, serverLink));
@@ -1901,7 +2171,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       void traceCommandAsync(cmd, 'web_command.openspec_auto_deliver', () => handleOpenSpecAutoDeliverCommand(cmd, serverLink));
       break;
     case CC_PRESET_MSG.LIST:
-      void handleCcPresetsList(serverLink);
+      void handleCcPresetsList(cmd, serverLink);
       break;
     case CC_PRESET_MSG.SAVE:
       void handleCcPresetsSave(cmd, serverLink).catch((err) => {
@@ -2020,6 +2290,22 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       break;
     case TRANSPORT_MSG.LIST_MODELS:
       void traceCommandAsync(cmd, 'web_command.transport_list_models', () => handleTransportListModels(cmd, serverLink));
+      break;
+    case SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE:
+    case SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE:
+    case SUPERVISION_TASK_CONSOLE_MSG.ACK:
+    case SUPERVISION_TASK_CONSOLE_MSG.BRIEF_REQUEST:
+      // Already handled: createProductionSupervisionConsoleBinding (wired in
+      // lifecycle.ts) registers its OWN serverLink.onMessage handler, and
+      // ServerLink.onMessage is multi-subscriber -- every handler, including
+      // this switch's caller, receives the exact same message. Reproduced
+      // live (test/daemon/supervision-console-dispatch-wiring.test.ts): the
+      // browser genuinely gets its SNAPSHOT/ACK/UNSUBSCRIBE reply through
+      // that path today. The ONLY real gap was this switch having no case for
+      // these 3 types, so every legitimate subscribe/ack/unsubscribe also
+      // fell through to the generic "Unknown web command type" warning below
+      // -- noise indistinguishable from an actually-broken console, which is
+      // what prompted this fix. Nothing to dispatch here; just stop warning.
       break;
     case REPO_MSG.DETECT:
       void traceCommandAsync(cmd, 'web_command.repo_detect', async () => { handleRepoCommand(cmd, serverLink); });
@@ -2143,6 +2429,28 @@ async function handleCodexResetCreditsConsume(cmd: Record<string, unknown>, serv
     : { type: CODEX_RESET_CREDITS_MSG.CONSUME_RESPONSE, requestId, ok: false, error: result.error });
 }
 
+/**
+ * Recorded Codex pay-as-you-go credit-balance history (codex_credit_snapshots,
+ * populated by getCodexRuntimeConfig on every real quota refresh). Read via
+ * the async context-store worker client — never the synchronous
+ * context-store.js export directly (see scripts/lint-no-sync-context-store.mjs).
+ */
+async function handleCodexCreditHistoryRequest(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
+  if (!requestId) return;
+  const limit = typeof cmd.limit === 'number' ? cmd.limit : undefined;
+  try {
+    const snapshots = await getContextStoreClient().run<CodexCreditSnapshot[]>(
+      'listCodexCreditSnapshots',
+      [{ limit }],
+    );
+    serverLink?.send({ type: CODEX_CREDIT_HISTORY_MSG.RESPONSE, requestId, ok: true, snapshots });
+  } catch (err) {
+    logger.warn({ err }, 'codex.credit_history.request failed');
+    serverLink?.send({ type: CODEX_CREDIT_HISTORY_MSG.RESPONSE, requestId, ok: false, error: FS_GENERIC_ERROR_CODES.INTERNAL_ERROR });
+  }
+}
+
 async function handleInbound(cmd: Record<string, unknown>): Promise<void> {
   const msg = cmd.msg as InboundMessage | undefined;
   if (!msg) {
@@ -2170,16 +2478,33 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
   const ccInitPrompt = cmd.ccInitPrompt as string | undefined;
   const requestedModel = (cmd.requestedModel as string | undefined) ?? (cmd.model as string | undefined);
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
-  const effort = isTransportEffortLevel(requestedEffort)
-    ? requestedEffort
-    : getDefaultThinkingLevel(agentType);
 
   if (!rawProject) {
     logger.warn('session.start: missing project name');
     return;
   }
   const project = sanitizeProjectName(rawProject);
+  const rawIdentityPrompt = cmd.identityPrompt;
+  if (rawIdentityPrompt !== undefined && (
+    typeof rawIdentityPrompt !== 'string'
+    || sessionIdentityContentError(rawIdentityPrompt) !== null
+  )) {
+    const message = 'session.start: invalid Agent identity';
+    logger.warn({ project, agentType }, message);
+    try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
+    return;
+  }
+  const identityPrompt = typeof rawIdentityPrompt === 'string'
+    ? normalizeSessionIdentityContent(rawIdentityPrompt)
+    : undefined;
   const sessionName = `deck_${project}_brain`;
+  // An explicit effort is authoritative.  When a session is being restored or
+  // relaunched without one, retain the persisted value instead of silently
+  // resetting it to the transport default (normally "high").
+  const existingMain = getSession(sessionName);
+  const effort = isTransportEffortLevel(requestedEffort)
+    ? requestedEffort
+    : existingMain?.effort ?? getDefaultThinkingLevel(agentType);
   // Preserve original name as label when sanitization changes it (e.g. Chinese characters)
   const label = project !== rawProject.trim().toLowerCase() ? rawProject.trim() : undefined;
   if (isKnownTestSessionName(sessionName) || isKnownTestProjectName(rawProject)) {
@@ -2211,8 +2536,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       targetDir: requestedDir,
     });
 
-    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk') {
+    if (agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk') {
       logger.info({ project, agentType }, 'SDK fresh session.start removing stale main-session store record');
+      // The fresh session starts under the SAME name, so its predecessor's
+      // durable queue must be cleared and its authority rotated first.
+      clearResend(`deck_${project}_brain`, 'session_removed');
       removeSession(`deck_${project}_brain`);
     }
     const config: ProjectConfig = {
@@ -2221,10 +2549,11 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
       brainType: agentType as ProjectConfig['brainType'],
       workerTypes: [],
       label,
-      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk',
+      fresh: agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || isCodeBuddyProviderId(agentType),
       extraEnv,
       ccPreset: ccPresetName,
       effort,
+      identityPrompt,
     };
     if (agentType === 'claude-code-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Claude SDK main session');
@@ -2241,6 +2570,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'codex-sdk') {
       logger.info({ project }, 'SDK fresh session.start launching new Codex SDK main session');
@@ -2254,6 +2584,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'copilot-sdk' || agentType === 'cursor-headless') {
       logger.info({ project, agentType }, 'SDK fresh session.start launching new transport main session');
@@ -2267,8 +2598,9 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
-    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi') {
+    } else if (agentType === 'opencode-sdk' || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi' || isCodeBuddyProviderId(agentType)) {
       // Transport providers share the codex-sdk launch shape. DSH/Pi additionally
       // receive ccPreset so their adapters can bind the selected third-party
       // provider and model atomically before the first turn.
@@ -2277,13 +2609,14 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         name: `deck_${project}_brain`,
         projectName: project,
         role: 'brain',
-        agentType: agentType as 'opencode-sdk' | 'gemini-sdk' | 'kimi-sdk' | 'grok-sdk' | 'deepseek-harness' | 'pi',
+        agentType: agentType as AgentType,
         projectDir: dir,
         fresh: true,
         ...((agentType === 'deepseek-harness' || agentType === 'pi') && ccPresetName ? { ccPreset: ccPresetName } : {}),
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else if (agentType === 'qwen') {
       logger.info({ project }, 'SDK fresh session.start launching new Qwen main session');
@@ -2298,6 +2631,7 @@ async function handleStart(cmd: Record<string, unknown>, serverLink: ServerLink)
         ...(requestedModel ? { requestedModel } : {}),
         label,
         effort,
+        identityPrompt,
       });
     } else {
       await startProject(config);
@@ -2404,6 +2738,416 @@ async function handleRestart(cmd: Record<string, unknown>, serverLink: ServerLin
     emitSessionInlineError(brain.name, message);
     try { serverLink.send({ type: 'session.error', project, message }); } catch { /* ignore */ }
   }
+}
+
+/**
+ * Daemon-authoritative MCP restart entry point. `reset` maps to the existing
+ * `fresh` relaunch contract; omission/default is an ordinary continuity-
+ * preserving restart. The exact-name lookup guarantees this can never create
+ * a previously unknown main or sub-session.
+ */
+/** Agent types whose model switches in place on a live transport runtime. */
+function isGenericModelSwitchAgent(agentType: string | undefined): boolean {
+  return agentType === 'copilot-sdk' || agentType === 'cursor-headless' || agentType === 'opencode-sdk'
+    || agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID
+    || agentType === 'grok-sdk' || agentType === 'deepseek-harness' || agentType === 'pi'
+    || isCodeBuddyProviderId(agentType);
+}
+
+function isModelSwitchAgent(agentType: string | undefined): boolean {
+  return agentType === 'qwen' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk'
+    || agentType === 'qoder-sdk' || isGenericModelSwitchAgent(agentType);
+}
+
+function emitModelSwitchRefusal(sessionName: string, code: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE], text: string, model: string, detail?: string): void {
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(code, text, { model, ...(detail ? { detail } : {}) }),
+    streaming: false,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+}
+
+/**
+ * The models `/model` / `session_model` accept for a session whose provider
+ * validates ids -- one source for both the check and the listing, so the list
+ * never offers what the switch refuses. `null` for providers that take any id.
+ */
+async function resolveValidatedModelList(record: SessionRecord): Promise<{ models: string[]; qwenRuntime?: Awaited<ReturnType<typeof getQwenRuntimeConfig>> | null } | null> {
+  switch (record.agentType) {
+    case 'qwen': {
+      const qwenRuntime = await getQwenRuntimeConfig(true).catch(() => null);
+      // Priority: session list (may include preset models) > runtime > built-in.
+      const sessionModels = record.qwenAvailableModels ?? [];
+      const runtimeModels = qwenRuntime?.availableModels ?? [];
+      const models = sessionModels.length ? sessionModels : (runtimeModels.length ? runtimeModels : [...QWEN_MODEL_IDS]);
+      return { models: [...models], qwenRuntime };
+    }
+    case 'claude-code-sdk': {
+      if (!record.ccPreset) return { models: [...CLAUDE_CODE_MODEL_IDS] };
+      const { getPreset, getPresetAvailableModelIds } = await import('./cc-presets.js');
+      const preset = await getPreset(record.ccPreset);
+      return { models: preset ? getPresetAvailableModelIds(preset) : [] };
+    }
+    case 'codex-sdk': {
+      const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+      const models = sdkRuntime.availableModels?.length
+        ? sdkRuntime.availableModels
+        : record.codexAvailableModels?.length ? record.codexAvailableModels : [...CODEX_MODEL_IDS];
+      return { models: [...models] };
+    }
+    case 'grok-sdk': {
+      const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
+      return { models: grokModels?.models.map((model) => model.id) ?? [] };
+    }
+    default:
+      return null;
+  }
+}
+
+/**
+ * Switch a live transport session's model. The single implementation behind
+ * both `/model X` from the browser and the `session_model_set` MCP tool.
+ * Validates against the same per-agent model sources, applies it to the
+ * runtime, persists the record and posts the switched/refused notice into the
+ * session's own timeline. The caller owns the per-session mutex and acks.
+ */
+async function applyTransportModelSwitch(
+  record: SessionRecord,
+  /** Absent for an idle session not loaded yet: the stored model applies at its next start. */
+  transportRuntime: TransportSessionRuntime | undefined,
+  requestedModel: string,
+  serverLink?: ServerLink,
+): Promise<SessionModelSwitchResult> {
+  const sessionName = record.name;
+  const agentType = record.agentType;
+  const previousModel = record.activeModel ?? record.requestedModel;
+  const refuse = (
+    code: SessionModelControlError,
+    error: string,
+    noticeCode: typeof DAEMON_USER_NOTICE_CODE[keyof typeof DAEMON_USER_NOTICE_CODE],
+    availableModels?: readonly string[],
+    detail?: string,
+  ): SessionModelSwitchResult => {
+    emitModelSwitchRefusal(sessionName, noticeCode, `⚠️ ${error}`, requestedModel, detail);
+    return { ok: false, sessionName, code, error, ...(availableModels?.length ? { availableModels: [...availableModels] } : {}) };
+  };
+  let nextRecord: SessionRecord;
+  let contextWindow: number | undefined;
+
+  const validated = await resolveValidatedModelList(record);
+  if (agentType === 'qwen') {
+    const runtimeConfig = validated?.qwenRuntime ?? null;
+    const sessionModels = record.qwenAvailableModels ?? [];
+    const runtimeModels = runtimeConfig?.availableModels ?? [];
+    const allowedModels = validated?.models ?? [];
+    const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
+    if (!allowedModels.includes(requestedModel)) {
+      const authHint = qwenAuthType === 'qwen-oauth' ? ' (current tier only allows coder-model)' : '';
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Qwen model: ${requestedModel}${authHint}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        allowedModels,
+        authHint ? authHint.trim().replace(/^\(|\)$/g, '') : undefined,
+      );
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    // Merge runtime models INTO the session's list (union) so preset models
+    // survive future switches. Never overwrite with only runtime models.
+    const mergedAvailableModels = [...new Set([...sessionModels, ...runtimeModels])];
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      qwenModel: requestedModel,
+      ...(qwenAuthType ? { qwenAuthType } : {}),
+      ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
+      ...(mergedAvailableModels.length ? { qwenAvailableModels: mergedAvailableModels } : {}),
+      ...getQwenDisplayMetadata({
+        model: requestedModel,
+        authType: qwenAuthType,
+        authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
+        quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
+      }),
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else if (agentType === 'claude-code-sdk') {
+    let presetContextWindow = record.presetContextWindow;
+    let selectedModel: string | undefined;
+    const presetModels = validated?.models ?? [];
+    if (record.ccPreset) {
+      const { getPresetTransportOverrides } = await import('./cc-presets.js');
+      selectedModel = presetModels.find((model) => model === requestedModel);
+      if (selectedModel) {
+        const presetOverrides = await getPresetTransportOverrides(record.ccPreset, selectedModel);
+        presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
+        transportRuntime?.setSystemPrompt(presetOverrides.systemPrompt ?? '');
+      }
+    } else {
+      selectedModel = normalizeClaudeCodeModelId(requestedModel);
+    }
+    if (!selectedModel) {
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Claude model: ${requestedModel}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        presetModels,
+      );
+    }
+    transportRuntime?.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
+    const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
+    nextRecord = {
+      ...record,
+      requestedModel: selectedModel,
+      activeModel: selectedModel,
+      modelDisplay: selectedModel,
+      ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
+      updatedAt: Date.now(),
+    };
+    requestedModel = selectedModel;
+    contextWindow = resolveContextWindow(presetContextWindow, selectedModel);
+  } else if (agentType === 'codex-sdk') {
+    const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
+    const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
+    const availableModels = validated?.models ?? [];
+    if (!availableModels.includes(requestedModel)) {
+      return refuse(
+        SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+        `Unknown Codex model: ${requestedModel}`,
+        DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+        availableModels,
+      );
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
+      ...sdkDisplay,
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else if (agentType === 'qoder-sdk') {
+    return refuse(
+      SESSION_MODEL_CONTROL_ERROR.PROOF_GATED,
+      `Qoder model switching is proof-gated in IM.codes v1: ${requestedModel}`,
+      DAEMON_USER_NOTICE_CODE.MODEL_SWITCH_PROOF_GATED,
+    );
+  } else if (isGenericModelSwitchAgent(agentType)) {
+    if (agentType === 'grok-sdk') {
+      const availableModels = validated?.models ?? [];
+      if (!availableModels.includes(requestedModel)) {
+        return refuse(
+          SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL,
+          `Unknown Grok model: ${requestedModel}`,
+          DAEMON_USER_NOTICE_CODE.UNKNOWN_MODEL,
+          availableModels,
+        );
+      }
+    }
+    transportRuntime?.setAgentId(requestedModel);
+    nextRecord = {
+      ...record,
+      requestedModel,
+      activeModel: requestedModel,
+      modelDisplay: requestedModel,
+      updatedAt: Date.now(),
+    };
+    contextWindow = resolveContextWindow(undefined, requestedModel);
+  } else {
+    return {
+      ok: false,
+      sessionName,
+      code: SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT,
+      error: `Model switching is not available for ${agentType ?? 'this session'}`,
+    };
+  }
+
+  upsertSession(nextRecord);
+  persistSessionRecord(nextRecord, sessionName);
+  if (serverLink) {
+    await handleGetSessions(serverLink);
+    syncSubSessionIfNeeded(sessionName, serverLink);
+  }
+  timelineEmitter.emit(sessionName, 'usage.update', { model: requestedModel, contextWindow }, { source: 'daemon', confidence: 'high' });
+  timelineEmitter.emit(sessionName, 'assistant.text', {
+    ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.MODEL_SWITCHED, `Switched model to ${requestedModel}`, { model: requestedModel }),
+    streaming: false,
+    automation: true,
+    memoryExcluded: true,
+  }, { source: 'daemon', confidence: 'high' });
+  return {
+    ok: true,
+    sessionName,
+    agentType: agentType ?? '',
+    model: requestedModel,
+    ...(previousModel ? { previousModel } : {}),
+    applied: transportRuntime ? SESSION_MODEL_APPLIED.LIVE : SESSION_MODEL_APPLIED.NEXT_START,
+  };
+}
+
+function resolveModelControlTarget(sessionName: string):
+  | { ok: true; record: SessionRecord; runtime: TransportSessionRuntime | undefined }
+  | { ok: false; code: SessionModelControlError; error: string } {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const isTransport = record.runtimeType === 'transport'
+    || (typeof record.agentType === 'string' && isTransportAgent(record.agentType));
+  if (!isTransport || !isModelSwitchAgent(record.agentType)) {
+    return {
+      ok: false,
+      code: isTransport ? SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT : SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_RUNTIME,
+      error: `Model switching is not available for ${record.agentType ?? 'this session'}${isTransport ? '' : ' (terminal session: use its own /model)'}`,
+    };
+  }
+  // An idle session is often not loaded (restored lazily on its next message):
+  // the switch then updates the stored model, which that start uses.
+  return { ok: true, record, runtime: getTransportRuntime(sessionName) };
+}
+
+/**
+ * `session_model_set`: switch any session's model by exact name, no text
+ * involved -- session-to-session messages are wrapped, so `/model X` sent by
+ * another session never matched. Deliberately no caller/ownership check: the
+ * exact session name is the only requirement.
+ */
+export async function switchSessionModelNow(sessionName: string, model?: string, thinking?: string): Promise<SessionModelSwitchResult | SessionThinkingSwitchResult> {
+  const requested = model?.trim();
+  const target = resolveModelControlTarget(sessionName);
+  if (requested && !target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
+  if (requested && /\s/.test(requested)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.UNKNOWN_MODEL, error: 'model must be a single model id' };
+  }
+  if (!requested) return switchSessionThinkingNow(sessionName, thinking ?? '');
+  if (!target.ok) return { ok: false, sessionName, code: target.code, error: target.error };
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const latest = getSession(sessionName) ?? target.record;
+    const switched = await applyTransportModelSwitch(latest, target.runtime, requested);
+    if (!switched.ok) return switched;
+    if (!thinking?.trim()) {
+      const switchedRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
+      const allowed = await resolveSupportedEffortLevels(switchedRecord, switchedRecord.agentType ?? '');
+      const clamped = clampTransportEffort(switchedRecord.effort, allowed);
+      if (switchedRecord.effort && clamped && clamped !== switchedRecord.effort) {
+        const effort = await applyTransportEffortSwitch(switchedRecord, target.runtime, clamped);
+        if (!effort.ok) return effort;
+        return { ...switched, thinking: effort.thinking, previousThinking: effort.previousThinking, thinkingApplied: effort.applied };
+      }
+      return switched;
+    }
+    const effortRecord = getSession(sessionName) ?? { ...latest, requestedModel: switched.model, activeModel: switched.model };
+    const effort = await applyTransportEffortSwitch(effortRecord, target.runtime, thinking.trim());
+    if (!effort.ok) return effort;
+    return { ...switched, thinking: effort.thinking, ...(effort.previousThinking ? { previousThinking: effort.previousThinking } : {}), thinkingApplied: effort.applied };
+  } finally {
+    release();
+  }
+}
+
+export async function switchSessionThinkingNow(sessionName: string, thinking: string): Promise<SessionThinkingSwitchResult> {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const isTransport = record.runtimeType === 'transport' || isTransportAgent(record.agentType);
+  if (!isTransport || !supportsEffort(record.agentType)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.THINKING_UNSUPPORTED, error: `Thinking control is not available for ${record.agentType ?? 'this session'}` };
+  }
+  const release = await getMutex(sessionName).acquire();
+  try {
+    const latest = getSession(sessionName) ?? record;
+    return await applyTransportEffortSwitch(latest, getTransportRuntime(sessionName), thinking.trim());
+  } finally {
+    release();
+  }
+}
+
+/**
+ * `session_model` without a model: the session's current model and what it can
+ * switch to -- the same live, cached list the browser's model picker shows.
+ */
+export async function listSessionModelsNow(sessionName: string): Promise<SessionModelListResult> {
+  const record = getSession(sessionName);
+  if (!record) return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.SESSION_NOT_FOUND, error: `No session named ${sessionName}` };
+  const agentType = record.agentType ?? '';
+  if (!isModelSwitchAgent(agentType)) {
+    return { ok: false, sessionName, code: SESSION_MODEL_CONTROL_ERROR.UNSUPPORTED_AGENT, error: `Model switching is not available for ${agentType || 'this session'}` };
+  }
+  const currentModel = record.activeModel ?? record.requestedModel ?? undefined;
+  const validated = await resolveValidatedModelList(record);
+  if (validated) {
+    return {
+      ok: true,
+      sessionName,
+      agentType,
+      ...(currentModel ? { currentModel } : {}),
+      ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
+      models: validated.models,
+      thinkingLevels: [...await resolveSupportedEffortLevels(record, agentType)],
+      acceptsAnyModel: false,
+      ...(record.ccPreset && agentType === 'claude-code-sdk' ? { note: `preset ${record.ccPreset}` } : {}),
+    };
+  }
+  const listed = await getTransportListModels({
+    agentType,
+    sessionName,
+    ...(record.ccPreset ? { ccPreset: record.ccPreset } : {}),
+  }, agentType, false).catch((err: unknown) => ({
+    models: [] as TransportListModelsResult['models'],
+    error: err instanceof Error ? err.message : String(err),
+  }));
+  const note = agentType === 'qoder-sdk'
+    ? 'Qoder model switching is proof-gated in IM.codes v1'
+    : listed.error;
+  return {
+    ok: true,
+    sessionName,
+    agentType,
+    ...(currentModel ? { currentModel } : {}),
+    ...(record.effort ?? getDefaultThinkingLevel(agentType) ? { currentThinking: record.effort ?? getDefaultThinkingLevel(agentType) } : {}),
+    models: listed.models.map((model) => model.id),
+    thinkingLevels: [...await resolveSupportedEffortLevels(record, agentType)],
+    // Providers without a validated list take any id; this is their picker list.
+    acceptsAnyModel: isGenericModelSwitchAgent(agentType),
+    ...(note ? { note } : {}),
+  };
+}
+
+export async function restartSessionNow(
+  sessionName: string,
+  options: { reset: boolean } = { reset: false },
+): Promise<boolean> {
+  const currentMcpRestart = pendingMcpSessionRestarts.get(sessionName);
+  if (currentMcpRestart) {
+    if (currentMcpRestart.reset === options.reset) return currentMcpRestart.result;
+    await currentMcpRestart.result;
+    return restartSessionNow(sessionName, options);
+  }
+
+  const result = (async () => {
+    // A browser/settings relaunch may already own the shared per-session lane.
+    // Wait for it rather than letting runExclusive coalesce a semantically
+    // different reset into that restart and then falsely reporting success.
+    await pendingSessionRelaunches.get(sessionName);
+    const existing = getSession(sessionName);
+    if (!existing) return false;
+    await runExclusiveSessionRelaunch(sessionName, async () => {
+      const latest = getSession(sessionName) ?? existing;
+      await relaunchSessionWithSettings(latest, { fresh: options.reset });
+    });
+    logger.info({ sessionName, reset: options.reset }, 'Session relaunched through MCP control');
+    return true;
+  });
+  const tracked = result().finally(() => {
+    if (pendingMcpSessionRestarts.get(sessionName)?.result === tracked) {
+      pendingMcpSessionRestarts.delete(sessionName);
+    }
+  });
+  pendingMcpSessionRestarts.set(sessionName, { reset: options.reset, result: tracked });
+  return tracked;
 }
 
 async function handleStop(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -2519,7 +3263,7 @@ function cancelTransportTurnNow(
     } catch (err) {
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.cancel (transport) failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Stop failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_STOP_FAILED, `⚠️ Stop failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       markTransportCancelIdle(sessionName, errMsg);
     }
   })();
@@ -2843,6 +3587,8 @@ import {
   loadDaemonP2pStaticPolicy,
   readCachedHelloSnapshot,
 } from './p2p-workflow-static-policy.js';
+import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
+import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
 function makeBindRuntimeContext(
   options: {
@@ -3209,6 +3955,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const sessionName = (cmd.sessionName ?? cmd.session) as string | undefined;
   const text = cmd.text as string | undefined;
   const commandId = cmd.commandId as string | undefined;
+  const requestedUiLocale = normalizeSupervisionUiLocale(cmd.uiLocale);
+  // This is the browser's human composer path, not an inter-session send.
+  // Preserve its ordinary provider send semantics; node-to-node callers use
+  // the session-dispatch boundary, whose omission default is append.
+  const requestedDeliveryMode = cmd.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    ? MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+    : undefined;
   const inboundClientMessageId = typeof cmd.clientMessageId === 'string' && cmd.clientMessageId.trim()
     ? cmd.clientMessageId.trim()
     : undefined;
@@ -3216,6 +3969,9 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   const directTargetMode = ((cmd as any).directTargetMode as string | undefined) ?? 'discuss';
   const sharedActor = cmd.sharedActor && typeof cmd.sharedActor === 'object'
     ? cmd.sharedActor as SharedActorEnvelope
+    : undefined;
+  const sharedMachineAuthority = typeof cmd.sharedMachineAuthority === 'string' && cmd.sharedMachineAuthority.trim()
+    ? cmd.sharedMachineAuthority.trim()
     : undefined;
   const shareScope = cmd.shareScope && typeof cmd.shareScope === 'object'
     ? cmd.shareScope as SharedP2pRunScope
@@ -3335,13 +4091,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       allowDuplicate: true,
       commandId: effectiveId,
       ...(sharedActor ? { sharedActor } : {}),
+      ...(requestedUiLocale ? { uiLocale: requestedUiLocale } : {}),
     };
+    const payload = { ...base, ...(extra ?? {}) };
     timelineEmitter.emit(
       sessionName,
       'user.message',
-      { ...base, ...(extra ?? {}) },
+      payload,
       eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
     );
+    persistTransportUserMessage(sessionName, payloadText, payload);
   };
 
   const emitDelegationError = (error: AgentDelegationErrorCode | 'delegation_dispatch_failed', detail?: string, targetSession?: string): void => {
@@ -3404,6 +4163,39 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
   if (!wantsStructuredP2pRouting && !wantsLegacyP2pRouting && !isDaemonHandledControlSend) {
     emitAcceptedReceiptAck();
+  }
+
+  // Persist UI locale only after the daemon-receipt ack has reached the client.
+  // This metadata write is best-effort and must not delay ordinary session.send.
+  // The web sends `uiLocale` on every send, not through a separate settings
+  // save. Persist it onto the session record here (best-effort, synchronous,
+  // debounced-write only -- see session-store.ts) so it durably outlives this
+  // one turn: background work unrelated to any live prompt (e.g. task-pair
+  // title generation, src/daemon/task-pairs/engine.ts's `brainUiLocale`) reads
+  // it from the record later, not from the in-request overlay further below
+  // that exists only to steer this turn's own prompts.
+  if (requestedUiLocale && sessionName) {
+    queueMicrotask(() => {
+      try {
+        const existingRecord = getSession(sessionName);
+        // patchTransportConfigUiLocale stores this under its own sibling
+        // transportConfig key, never inside transportConfig.supervision: that
+        // object is a strictly validated snapshot that may be intentionally
+        // absent, invalid, or legacy-repair-only, and either rebuilding it
+        // through the normalizer or merely adding a field to it here would
+        // silently change what every other reader sees (lost config, or an
+        // unconfigured/repair-pending session on an ordinary send).
+        if (existingRecord && isSupportedSupervisionTargetSessionType(existingRecord.agentType)
+          && readTransportConfigUiLocale(existingRecord.transportConfig ?? null) !== requestedUiLocale) {
+          upsertSession({
+            ...existingRecord,
+            transportConfig: patchTransportConfigUiLocale(existingRecord.transportConfig ?? null, requestedUiLocale),
+          });
+        }
+      } catch (error) {
+        logger.warn({ err: error, sessionName }, 'session.send: failed to persist uiLocale');
+      }
+    });
   }
 
   if (trimmedText === '/stop') {
@@ -3777,6 +4569,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Transport sessions — route directly to the provider runtime, bypassing tmux.
   const transportRuntime = getTransportRuntime(sessionName);
   const record = (await import('../store/session-store.js')).getSession(sessionName);
+  bindProcessSharedMachineAuthority(
+    sessionName,
+    record?.sessionInstanceId && record.runtimeEpoch
+      ? { sessionInstanceId: record.sessionInstanceId, runtimeEpoch: record.runtimeEpoch }
+      : null,
+    sharedMachineAuthority,
+    sharedActor?.effectiveActorRole === 'participant',
+  );
 
   // F4 fix (audit f395d49c-78c) — fail closed when the session record is missing.
   //
@@ -3869,7 +4669,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       sessionName,
       'assistant.text',
       {
-        text: `⚠️ Message not delivered: unresolved alias marker${aliasExpansion.unresolved.length === 1 ? '' : 's'} ${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED}). Define the alias or remove the marker, then resend.`,
+        ...attachDaemonUserNotice(
+          DAEMON_USER_NOTICE_CODE.ALIAS_UNRESOLVED,
+          `⚠️ Message not delivered: unresolved alias marker${aliasExpansion.unresolved.length === 1 ? '' : 's'} ${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED}). Define the alias or remove the marker, then resend.`,
+          { count: aliasExpansion.unresolved.length, detail: `${markerList} (${aliasExpansion.reason ?? ALIAS_REASONS.UNRESOLVED_FAILCLOSED})` },
+        ),
         streaming: false,
         memoryExcluded: true,
       },
@@ -3912,9 +4716,45 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     currentRecords: preferenceIngest.records,
   });
   const attachmentRetentionPreamble = buildAttachmentRetentionPreamble(displayText);
+  const persistedSupervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
+    ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
+    : null;
+  const supervisionSnapshot = persistedSupervisionSnapshot && requestedUiLocale
+    ? { ...persistedSupervisionSnapshot, uiLocale: requestedUiLocale }
+    : persistedSupervisionSnapshot;
+  // No legacy Brain-run on a `pairs` project: the pair engine owns supervision
+  // there (see isBrainOwnedAutomaticSupervision in supervision-automation.ts).
+  // The legacy Brain-run supervision path is retired. Pair projects are
+  // marker-driven, while inert projects deliberately receive no supervision
+  // contract or automatic task run even if an old snapshot survives upgrade.
+  const supervisionRunRequested = false;
+  // Fail closed on execution pools at START as well as at save. A session
+  // persisted before the save gate existed can still be carrying
+  // legacy_unconfigured pools, and starting an automatic run on it would be
+  // exactly the silent legacy fallback the gate exists to prevent.
+  const supervisionPoolGate = supervisionRunRequested
+    ? evaluateAutomaticSupervisionEnablement(supervisionSnapshot)
+    : ({ ok: true } as AutomaticSupervisionEnablementGate);
+  if (!supervisionPoolGate.ok) {
+    // Failing closed silently would look identical to supervision quietly not
+    // working. Say why on the operator-visible supervision-warning channel,
+    // reusing the same shared reason and guidance the UI and the authoritative
+    // save use, so all three entry points speak with one voice.
+    supervisionAutomation.warnExecutionPoolUnconfigured(
+      sessionName,
+      supervisionPoolGate.reason,
+      supervisionPoolGate.guidance,
+    );
+  }
+  const shouldTrackSupervisionTaskRun = supervisionRunRequested && supervisionPoolGate.ok;
   const agentMessagePreamble = mergeAgentMessagePreambles(
     preferenceMessagePreamble,
     attachmentRetentionPreamble,
+    shouldTrackSupervisionTaskRun && supervisionSnapshot
+      ? supervisionSnapshot.mode === SUPERVISION_MODE.SUPERVISED_AUDIT
+        ? buildSupervisedAuditExecutionPreamble(supervisionSnapshot.uiLocale)
+        : buildSupervisionExecutionPreamble(supervisionSnapshot.uiLocale)
+      : undefined,
   );
   schedulePreferencePersistence({
     userId: preferenceUserId,
@@ -3922,12 +4762,6 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     records: preferenceIngest.records,
     sendOrigin: normalizeSendOrigin(cmd.origin),
   });
-  const supervisionSnapshot = isSupportedSupervisionTargetSessionType(record?.agentType)
-    ? extractSessionSupervisionSnapshot(record?.transportConfig ?? null)
-    : null;
-  const shouldTrackSupervisionTaskRun = supervisionSnapshot != null
-    && supervisionSnapshot.mode !== SUPERVISION_MODE.OFF
-    && isEligibleSupervisionTaskText(displayText);
   const attachments: TransportAttachment[] = [];
   const transportUserEventId = (clientMessageId: string) => `transport-user:${clientMessageId}`;
   const isTransportSession = record?.runtimeType === 'transport'
@@ -3951,6 +4785,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport session has no runtime — queuing for resend after reconnect',
     );
     const enqueueResult = enqueueResend(sessionName, {
+      ...(recipientFromSessionRecord(record) ? { recipient: recipientFromSessionRecord(record) } : {}),
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       // The anchor travels with the expansion it describes. Without it an
@@ -3959,8 +4794,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
+      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
+      ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
       queuedAt: Date.now(),
     });
     if (!enqueueResult.accepted) {
@@ -3980,14 +4817,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         sessionName,
         'assistant.text',
         {
-          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.QUEUE_OVERFLOW, '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。', { limit: 10 }),
           streaming: false,
           memoryExcluded: true,
         },
         { source: 'daemon', confidence: 'high' },
       );
     }
-    if (shouldTrackSupervisionTaskRun) {
+    if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
@@ -3995,7 +4832,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: infoMsg, streaming: false, memoryExcluded: true },
+      {
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING, infoMsg, { count: queued.length, detail: `Agent ${providerLabel} is restoring` }),
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     timelineEmitter.emit(
@@ -4018,7 +4859,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         timelineEmitter.emit(
           sessionName,
           'assistant.text',
-          { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+          { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_AUTO_RESUME_FAILED, `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, { detail: resumeErr }), streaming: false, memoryExcluded: true },
           { source: 'daemon', confidence: 'high' },
         );
       }
@@ -4042,6 +4883,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       'session.send: transport runtime missing provider session id — queuing and auto-resuming',
     );
     const enqueueResultMissingSid = enqueueResend(sessionName, {
+      ...(recipientFromSessionRecord(record) ? { recipient: recipientFromSessionRecord(record) } : {}),
       text: displayText,
       ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
       // Same reason as the no-runtime branch above: the anchor must accompany
@@ -4049,8 +4891,10 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       ...(aliasAudit ? { aliasAudit } : {}),
       ...(agentMessagePreamble ? { messagePreamble: agentMessagePreamble } : {}),
       ...(sharedActor ? { sharedActor } : {}),
+      ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
       commandId: effectiveId,
       ...(inboundClientMessageId ? { clientMessageId: inboundClientMessageId } : {}),
+      ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
       queuedAt: Date.now(),
     });
     if (!enqueueResultMissingSid.accepted) {
@@ -4065,14 +4909,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         sessionName,
         'assistant.text',
         {
-          text: '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。',
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.QUEUE_OVERFLOW, '⚠️ 排队消息已满（上限 10 条），最旧消息已被丢弃。请稍后重新发送。', { limit: 10 }),
           streaming: false,
           memoryExcluded: true,
         },
         { source: 'daemon', confidence: 'high' },
       );
     }
-    if (shouldTrackSupervisionTaskRun) {
+    if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
       supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
     }
     const queued = getResendEntries(sessionName);
@@ -4080,7 +4924,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     timelineEmitter.emit(
       sessionName,
       'assistant.text',
-      { text: infoMsg, streaming: false, memoryExcluded: true },
+      {
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.TRANSPORT_RECOVERING, infoMsg, { count: queued.length, detail: `Provider ${providerLabel} runtime is recovering` }),
+        streaming: false,
+        memoryExcluded: true,
+      },
       { source: 'daemon', confidence: 'high' },
     );
     timelineEmitter.emit(
@@ -4104,7 +4952,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           timelineEmitter.emit(
             sessionName,
             'assistant.text',
-            { text: `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, streaming: false, memoryExcluded: true },
+            { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SESSION_AUTO_RESUME_FAILED, `⚠️ Auto-resume failed: ${resumeErr}. Restart the session manually to recover.`, { detail: resumeErr }), streaming: false, memoryExcluded: true },
             { source: 'daemon', confidence: 'high' },
           );
         }
@@ -4115,31 +4963,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   if (transportRuntime) {
     if (isSessionControlCommandText(trimmedText, 'clear') && supportsTransportClear(record?.agentType)) {
       emitTransportUserMessage(text);
-      // Fresh conversation must not replay stale queued messages from the prior
-      // offline window — drop anything we had buffered for resend.
-      clearResend(sessionName);
       try {
-        await runExclusiveSessionRelaunch(sessionName, async () => {
-          await relaunchFreshTransportConversation(record);
-        });
-        // Reset per-session memory injection history — fresh conversation
-        // should be allowed to re-inject previously-shown memories again.
-        clearRecentInjectionHistory(sessionName);
-        clearSummarySyncHistory(sessionName);
-        await handleGetSessions(serverLink);
-        await syncSubSessionIfNeeded(sessionName, serverLink);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: 'Started a fresh conversation',
-          streaming: false,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
+        await clearTransportConversation(record!, serverLink);
         const clearStatus = isLegacy ? 'accepted_legacy' : 'accepted';
         timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: clearStatus });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: clearStatus });
       } catch (err) {
         const errMsg = describeTransportSendError(err);
         logger.error({ sessionName, err }, 'session.clear (transport) failed');
-        timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+        timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
         timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
       }
@@ -4164,7 +4996,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
           const reason = err instanceof Error ? err.message : 'service_tier_failed';
           emitTransportUserMessage(text);
           timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `⚠️ Could not change the service tier: ${reason}`,
+            ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.SERVICE_TIER_CHANGE_FAILED, `⚠️ Could not change the service tier: ${reason}`, { detail: reason }),
             streaming: false,
             memoryExcluded: true,
           }, { source: 'daemon', confidence: 'high' });
@@ -4179,9 +5011,14 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: isCodexFastServiceTier(requestedServiceTier)
-            ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
-            : 'Fast mode is off for this session.',
+          ...attachDaemonUserNotice(
+            isCodexFastServiceTier(requestedServiceTier)
+              ? DAEMON_USER_NOTICE_CODE.FAST_MODE_ON
+              : DAEMON_USER_NOTICE_CODE.FAST_MODE_OFF,
+            isCodexFastServiceTier(requestedServiceTier)
+              ? 'Fast mode is on for this session (1.5x speed, increased plan usage).'
+              : 'Fast mode is off for this session.',
+          ),
           streaming: false,
           automation: true,
           memoryExcluded: true,
@@ -4190,219 +5027,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'accepted' });
         return;
       }
-      if (record?.agentType === 'qwen' && modelMatch) {
-        const nextModel = modelMatch[1];
-          const runtimeConfig = await getQwenRuntimeConfig(true).catch(() => null);
-          // Priority: session qwenAvailableModels (may include preset models) >
-          // runtimeConfig.availableModels (from Qwen CLI, may not know about preset
-          // models) > hardcoded QWEN_MODEL_IDS fallback. Session record is
-          // authoritative because it was populated with preset models at launch.
-          const sessionModels = record.qwenAvailableModels ?? [];
-          const runtimeModels = runtimeConfig?.availableModels ?? [];
-          const allowedModels = sessionModels.length
-            ? sessionModels
-            : (runtimeModels.length ? runtimeModels : QWEN_MODEL_IDS);
-          if (!allowedModels.includes(nextModel)) {
-            const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-            const authHint = qwenAuthType === 'qwen-oauth'
-              ? ' (current tier only allows coder-model)'
-              : '';
-            emitTransportUserMessage(text);
-            timelineEmitter.emit(sessionName, 'assistant.text', {
-              text: `⚠️ Unknown Qwen model: ${nextModel}${authHint}`,
-              streaming: false,
-              memoryExcluded: true,
-            }, { source: 'daemon', confidence: 'high' });
-            timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Qwen model: ${nextModel}${authHint}` });
-            return;
-          }
-          transportRuntime.setAgentId(nextModel);
-          const qwenAuthType = runtimeConfig?.authType ?? record.qwenAuthType;
-          // Merge runtime models INTO session's existing list (union) so preset
-          // models survive future switches. Never overwrite with only runtime models.
-          const mergedAvailableModels = [...new Set([...sessionModels, ...runtimeModels])];
-          const nextRecord = {
-            ...record,
-            requestedModel: nextModel,
-            activeModel: nextModel,
-            modelDisplay: nextModel,
-            qwenModel: nextModel,
-            ...(qwenAuthType ? { qwenAuthType } : {}),
-            ...(runtimeConfig?.authLimit ? { qwenAuthLimit: runtimeConfig.authLimit } : {}),
-            ...(mergedAvailableModels.length ? { qwenAvailableModels: mergedAvailableModels } : {}),
-            ...getQwenDisplayMetadata({
-              model: nextModel,
-              authType: qwenAuthType,
-              authLimit: runtimeConfig?.authLimit ?? record.qwenAuthLimit,
-              quotaUsageLabel: qwenAuthType === 'qwen-oauth' ? getQwenOAuthQuotaUsageLabel() : undefined,
-            }),
-            updatedAt: Date.now(),
-          };
-          upsertSession(nextRecord);
-          persistSessionRecord(nextRecord, sessionName);
-          await handleGetSessions(serverLink);
-          syncSubSessionIfNeeded(sessionName, serverLink);
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'usage.update', {
-            model: nextModel,
-            contextWindow: resolveContextWindow(undefined, nextModel),
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `Switched model to ${nextModel}`,
-            streaming: false,
-            automation: true,
-            memoryExcluded: true,
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-          return;
-      }
-      if (record?.agentType === 'claude-code-sdk' && modelMatch) {
-        const requestedModel = modelMatch[1];
-        let presetContextWindow = record.presetContextWindow;
-        let selectedModel: string | undefined;
-        if (record.ccPreset) {
-          const { getPreset, getPresetAvailableModelIds, getPresetTransportOverrides } = await import('./cc-presets.js');
-          const preset = await getPreset(record.ccPreset);
-          const presetModels = preset ? getPresetAvailableModelIds(preset) : [];
-          selectedModel = presetModels.find((model) => model === requestedModel);
-          if (selectedModel) {
-            const presetOverrides = await getPresetTransportOverrides(record.ccPreset, selectedModel);
-            presetContextWindow = presetOverrides.contextWindow ?? presetContextWindow;
-            transportRuntime.setSystemPrompt(presetOverrides.systemPrompt ?? '');
-          }
+      if (record && modelMatch && isModelSwitchAgent(record.agentType)) {
+        emitTransportUserMessage(text);
+        const result = await applyTransportModelSwitch(record, transportRuntime, modelMatch[1], serverLink);
+        if (result.ok) {
+          const status = isLegacy ? 'accepted_legacy' : 'accepted';
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status });
         } else {
-          selectedModel = normalizeClaudeCodeModelId(requestedModel);
+          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: result.error });
+          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: result.error });
         }
-        if (!selectedModel) {
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Claude model: ${requestedModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Claude model: ${requestedModel}` });
-          return;
-        }
-        transportRuntime.setAgentId(normalizeClaudeSdkModelForProvider(selectedModel));
-        const sdkDisplay = await getClaudeSdkRuntimeConfig(true).catch(() => ({}) as import('../agent/sdk-runtime-config.js').SdkRuntimeConfig);
-        const nextRecord = {
-          ...record,
-          requestedModel: selectedModel,
-          activeModel: selectedModel,
-          modelDisplay: selectedModel,
-          ...(sdkDisplay.planLabel ? { planLabel: sdkDisplay.planLabel } : {}),
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', {
-          model: selectedModel,
-          contextWindow: resolveContextWindow(presetContextWindow, selectedModel),
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${selectedModel}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        return;
-      }
-      if (record?.agentType === 'codex-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const sdkRuntime = await getCodexRuntimeConfig(true).catch(() => ({}) as import('../agent/codex-runtime-config.js').CodexRuntimeConfig);
-        const sdkDisplay = mergeCodexDisplayMetadata(sdkRuntime, record);
-        const availableModels = sdkRuntime.availableModels?.length
-          ? sdkRuntime.availableModels
-          : record.codexAvailableModels?.length
-            ? record.codexAvailableModels
-            : [...CODEX_MODEL_IDS];
-        if (!availableModels.includes(nextModel)) {
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Unknown Codex model: ${nextModel}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unknown Codex model: ${nextModel}` });
-          return;
-        }
-        transportRuntime.setAgentId(nextModel);
-        const nextRecord = {
-          ...record,
-          requestedModel: nextModel,
-          activeModel: nextModel,
-          modelDisplay: nextModel,
-          ...(availableModels.length ? { codexAvailableModels: availableModels } : {}),
-          ...sdkDisplay,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${nextModel}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        return;
-      }
-      if (record?.agentType === 'qoder-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const errMsg = `Qoder model switching is proof-gated in IM.codes v1: ${nextModel}`;
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `⚠️ ${errMsg}`,
-          streaming: false,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: errMsg });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
-        return;
-      }
-      if (record?.agentType === 'grok-sdk' && modelMatch) {
-        const nextModel = modelMatch[1];
-        const grokModels = await getProvider('grok-sdk')?.listModels?.().catch(() => ({ models: [] }));
-        const availableModels = grokModels?.models.map((model) => model.id) ?? [];
-        if (!availableModels.includes(nextModel)) {
-          const error = `Unknown Grok model: ${nextModel}`;
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${error}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error });
-          return;
-        }
-      }
-      if ((record?.agentType === 'copilot-sdk' || record?.agentType === 'cursor-headless' || record?.agentType === 'opencode-sdk' || record?.agentType === 'gemini-sdk' || record?.agentType === 'kimi-sdk' || record?.agentType === 'grok-sdk' || record?.agentType === 'deepseek-harness' || record?.agentType === 'pi') && modelMatch) {
-        const nextModel = modelMatch[1];
-        transportRuntime.setAgentId(nextModel);
-        const nextRecord = {
-          ...record,
-          requestedModel: nextModel,
-          activeModel: nextModel,
-          modelDisplay: nextModel,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
-        emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'usage.update', { model: nextModel, contextWindow: resolveContextWindow(undefined, nextModel) }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched model to ${nextModel}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
         return;
       }
       if (record?.agentType === 'qoder-sdk' && effortMatch) {
@@ -4410,7 +5045,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
         const errMsg = `Qoder thinking/effort controls are proof-gated in IM.codes v1: ${nextEffort}`;
         emitTransportUserMessage(text);
         timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `⚠️ ${errMsg}`,
+          ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.THINKING_LEVEL_UNSUPPORTED, `⚠️ ${errMsg}`, { level: nextEffort }),
           streaming: false,
           memoryExcluded: true,
         }, { source: 'daemon', confidence: 'high' });
@@ -4420,38 +5055,11 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       }
       if (supportsEffort(record?.agentType) && effortMatch) {
         const nextEffort = effortMatch[1];
-        const allowed = getSupportedEffortLevels(record?.agentType);
-        if (!isTransportEffortLevel(nextEffort) || !allowed.includes(nextEffort)) {
-          const supported = allowed.join(', ');
-          emitTransportUserMessage(text);
-          timelineEmitter.emit(sessionName, 'assistant.text', {
-            text: `⚠️ Unsupported thinking level: ${nextEffort}. Supported: ${supported}`,
-            streaming: false,
-            memoryExcluded: true,
-          }, { source: 'daemon', confidence: 'high' });
-          timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: `Unsupported thinking level: ${nextEffort}` });
-          return;
-        }
-        transportRuntime.setEffort(nextEffort);
-        const nextRecord = {
-          ...record,
-          effort: nextEffort,
-          updatedAt: Date.now(),
-        };
-        upsertSession(nextRecord);
-        persistSessionRecord(nextRecord, sessionName);
-        await handleGetSessions(serverLink);
-        syncSubSessionIfNeeded(sessionName, serverLink);
         emitTransportUserMessage(text);
-        timelineEmitter.emit(sessionName, 'assistant.text', {
-          text: `Switched thinking level to ${nextEffort}`,
-          streaming: false,
-          automation: true,
-          memoryExcluded: true,
-        }, { source: 'daemon', confidence: 'high' });
-        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status: isLegacy ? 'accepted_legacy' : 'accepted' });
-        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: isLegacy ? 'accepted_legacy' : 'accepted' });
+        const result = await applyTransportEffortSwitch(record, transportRuntime, nextEffort, serverLink);
+        const status = result.ok ? (isLegacy ? 'accepted_legacy' : 'accepted') : 'error';
+        timelineEmitter.emit(sessionName, 'command.ack', { commandId: effectiveId, status, ...(!result.ok ? { error: result.error } : {}) });
+        emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status, ...(!result.ok ? { error: result.error } : {}) });
         return;
       }
       if (record?.agentType === 'qwen' && record.qwenAuthType === 'qwen-oauth') {
@@ -4468,11 +5076,13 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       // `aliasAudit` must ride the metadata, not just the immediate emit: a
       // queued/resent message emits its user.message later from session-manager,
       // which can only anchor what the entry carries.
-      const sendMetadata = (sharedActor || aliasProviderText || aliasAudit)
+      const sendMetadata = (sharedActor || sharedMachineAuthority || aliasProviderText || aliasAudit || requestedDeliveryMode)
         ? {
             ...(sharedActor ? { sharedActor } : {}),
+            ...(sharedMachineAuthority ? { sharedMachineAuthority } : {}),
             ...(aliasProviderText ? { providerText: aliasProviderText } : {}),
             ...(aliasAudit ? { aliasAudit } : {}),
+            ...(requestedDeliveryMode ? { deliveryMode: requestedDeliveryMode } : {}),
           }
         : undefined;
       const result = agentMessagePreamble
@@ -4497,8 +5107,15 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
             : (sendMetadata
                 ? transportRuntime.send(displayText, effectiveId, undefined, undefined, sendMetadata)
                 : transportRuntime.send(displayText, effectiveId)));
-      if (shouldTrackSupervisionTaskRun) {
-        if (result === 'queued') {
+      if (shouldTrackSupervisionTaskRun && supervisionSnapshot) {
+        // A busy-turn Append is an extension of the task already being
+        // supervised, not a queued replacement task. queueTaskIntent() clears
+        // the current run before recording the future one; doing that here
+        // leaves the trailing queueAppended timeline row intentionally unable
+        // to seed either run, so the eventual idle edge never gets audited.
+        // If native append later falls back to an ordinary turn, its normal
+        // user.message projection will seed implicit supervision at dispatch.
+        if (result === 'queued' && requestedDeliveryMode !== MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
           supervisionAutomation.queueTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
         } else if (result === 'sent') {
           supervisionAutomation.registerTaskIntent(sessionName, effectiveId, displayText, supervisionSnapshot);
@@ -4534,7 +5151,17 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       const errMsg = describeTransportSendError(err);
       logger.error({ sessionName, err }, 'session.send (transport) failed');
       const failureLabel = isSessionControlCommandText(displayText, 'compact') ? 'Compact failed' : 'Send failed';
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ ${failureLabel}: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', {
+        ...attachDaemonUserNotice(
+          isSessionControlCommandText(displayText, 'compact')
+            ? DAEMON_USER_NOTICE_CODE.COMPACT_FAILED
+            : DAEMON_USER_NOTICE_CODE.MESSAGE_SEND_FAILED,
+          `⚠️ ${failureLabel}: ${errMsg}`,
+          { detail: errMsg },
+        ),
+        streaming: false,
+        memoryExcluded: true,
+      }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       if (!receiptAcked) {
         emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
@@ -4575,7 +5202,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       await handleGetSessions(serverLink);
       await syncSubSessionIfNeeded(sessionName, serverLink);
       timelineEmitter.emit(sessionName, 'assistant.text', {
-        text: 'Started a fresh conversation',
+        ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_STARTED, 'Started a fresh conversation'),
         streaming: false,
         memoryExcluded: true,
       }, { source: 'daemon', confidence: 'high' });
@@ -4585,7 +5212,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       logger.error({ sessionName, err }, 'session.clear failed');
-      timelineEmitter.emit(sessionName, 'assistant.text', { text: `⚠️ Clear failed: ${errMsg}`, streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'assistant.text', { ...attachDaemonUserNotice(DAEMON_USER_NOTICE_CODE.CONVERSATION_CLEAR_FAILED, `⚠️ Clear failed: ${errMsg}`, { detail: errMsg }), streaming: false, memoryExcluded: true }, { source: 'daemon', confidence: 'high' });
       timelineEmitter.emit(sessionName, 'session.state', { state: 'idle', error: errMsg }, { source: 'daemon', confidence: 'high' });
       emitCommandAckReliable(serverLink, { commandId: effectiveId, sessionName, status: 'error', error: errMsg });
     }
@@ -4626,7 +5253,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   }
 }
 
-/** Emit command.ack to local timeline + outbox + server. Idempotent per commandId. */
+/** Emit command.ack to the wire first, then local timeline and durable outbox. */
 function emitCommandAck(
   sessionName: string,
   commandId: string,
@@ -4634,25 +5261,25 @@ function emitCommandAck(
   error: string | undefined,
   serverLink: (Pick<ServerLink, 'send'> & Partial<Pick<ServerLink, 'trySend'>>) | undefined,
 ): void {
+  const sent = trySendCommandAck(serverLink, { commandId, sessionName, status, error });
   const ackPayload: Record<string, unknown> = { commandId, status };
   if (error) ackPayload.error = error;
   timelineEmitter.emit(sessionName, 'command.ack', ackPayload);
   const outbox = getDefaultAckOutbox();
-  outbox.enqueue({
+  const enqueue = outbox.enqueue({
     commandId,
     sessionName,
     status,
     error,
     ts: Date.now(),
-  }).catch((err) => {
-    logger.error({ commandId, err }, 'ackOutbox.enqueue failed');
   });
-  const sent = trySendCommandAck(serverLink, { commandId, sessionName, status, error });
-  if (sent) {
-    outbox.markAcked(commandId).catch((err) => {
-      logger.warn({ commandId, err }, 'ackOutbox.markAcked failed');
-    });
-  } else {
+  enqueue.then(() => {
+    if (!sent) return;
+    return outbox.markAcked(commandId);
+  }).catch((err) => {
+    logger.error({ commandId, err }, 'ackOutbox enqueue/ack failed');
+  });
+  if (!sent) {
     logger.warn({ commandId }, 'command.ack not sent, queued for retry');
   }
 }
@@ -4671,6 +5298,10 @@ async function sendProcessSessionMessage(
     aliasAudit?: AliasSendAudit;
     /** Per-turn agent-only context that must never be projected to the timeline. */
     agentMessagePreamble?: string;
+    /** Daemon-owned control turn already represented by its lifecycle event. */
+    suppressTimeline?: boolean;
+    /** Command mode: deliver `finalText` byte-for-byte (no sandbox rewrite, memory recall or preamble). */
+    verbatim?: boolean;
     /** Trusted daemon-owned metadata for automation surfaces such as P2P.
      * Values are projected only to the local user.message event. */
     userMessageMetadata?: Readonly<{
@@ -4679,6 +5310,9 @@ async function sendProcessSessionMessage(
       p2pRunId?: string;
       p2pDiscussionId?: string;
       p2pPhase?: string;
+      cronRun?: CronRunTimelineProjection;
+      /** Author of a non-human message (shared/chat-message-origin.ts). */
+      messageOrigin?: ChatMessageOrigin;
     }>;
   },
 ): Promise<void> {
@@ -4694,7 +5328,9 @@ async function sendProcessSessionMessage(
   // carries only referenced names + a hash of resolved values, never plaintext.
   if (options?.aliasAudit) payload.aliasAudit = options.aliasAudit;
   if (options?.userMessageMetadata) Object.assign(payload, options.userMessageMetadata);
-  const userEvent = timelineEmitter.emit(sessionName, 'user.message', payload);
+  const userEvent = options?.suppressTimeline
+    ? undefined
+    : timelineEmitter.emit(sessionName, 'user.message', payload);
   if (options?.commandId && !options.ackAlreadySent) {
     const status = options.isLegacy ? 'accepted_legacy' : 'accepted';
     emitCommandAck(sessionName, options.commandId, status, undefined, options.serverLink);
@@ -4708,7 +5344,7 @@ async function sendProcessSessionMessage(
   // They must not block earlier queued tmux writes any longer than necessary.
   let sendText = finalText;
   try {
-    if (agentType === 'gemini' || agentType === 'codex') {
+    if (!options?.verbatim && (agentType === 'gemini' || agentType === 'codex')) {
       sendText = await rewritePathsForSandbox(sessionName, finalText);
     }
   } catch (rewriteErr) {
@@ -4719,16 +5355,18 @@ async function sendProcessSessionMessage(
   let memoryContext: Awaited<ReturnType<typeof prependLocalMemory>> = { text: sendText };
   let memoryRecallCancelled = false;
   try {
-    const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
-    memoryContext = await withDeadline(
-      prependLocalMemory(sendText, sessionName, {
-        deadlineAt,
-        isCancelled: () => memoryRecallCancelled,
-      }),
-      PROCESS_MEMORY_RECALL_DEADLINE_MS,
-      'memory_recall_timeout',
-    );
-    sendText = memoryContext.text;
+    if (!options?.verbatim) {
+      const deadlineAt = Date.now() + PROCESS_MEMORY_RECALL_DEADLINE_MS;
+      memoryContext = await withDeadline(
+        prependLocalMemory(sendText, sessionName, {
+          deadlineAt,
+          isCancelled: () => memoryRecallCancelled,
+        }),
+        PROCESS_MEMORY_RECALL_DEADLINE_MS,
+        'memory_recall_timeout',
+      );
+      sendText = memoryContext.text;
+    }
   } catch (recallErr) {
     memoryRecallCancelled = true;
     rollbackSummarySyncReservation(memoryContext.summaryReservation);
@@ -4783,17 +5421,26 @@ export async function sendProcessSessionMessageForAutomation(
   sessionName: string,
   text: string,
   options?: {
+    deliveryMode?: MemoryMcpSendDeliveryMode;
+    suppressTimeline?: boolean;
+    /** Command mode (shared/send-command-mode.ts): no memory recall, sandbox path rewrite or preamble. */
+    verbatim?: boolean;
     userMessageMetadata?: Readonly<{
       allowDuplicate?: boolean;
       memoryExcluded?: boolean;
       p2pRunId?: string;
       p2pDiscussionId?: string;
       p2pPhase?: string;
+      cronRun?: CronRunTimelineProjection;
+      /** Author of a non-human message (shared/chat-message-origin.ts). */
+      messageOrigin?: ChatMessageOrigin;
     }>;
   },
 ): Promise<void> {
   await sendProcessSessionMessage(sessionName, text, [], {
     originalText: text,
+    ...(options?.verbatim ? { verbatim: true } : {}),
+    ...(options?.suppressTimeline ? { suppressTimeline: true } : {}),
     ...(options?.userMessageMetadata ? { userMessageMetadata: options.userMessageMetadata } : {}),
   });
 }
@@ -4835,6 +5482,24 @@ async function resolveProcessRecallQueryContext(
     namespace: { scope: 'personal', projectId },
     repo: projectId,
   };
+}
+
+function discardStaleTransportQueueOwnership(
+  sessionName: string,
+  runtime: {
+    recipientIdentity?: QueueRecipientIdentity;
+    discardDurableQueueStateForRecipientConflict?: () => unknown;
+  },
+  context: string,
+): void {
+  const recipient = runtime.recipientIdentity ?? null;
+  const discarded = typeof runtime.discardDurableQueueStateForRecipientConflict === 'function'
+    ? runtime.discardDurableQueueStateForRecipientConflict()
+    : getTransportQueueStore().discardSessionQueueState(sessionName, recipient);
+  logger.warn(
+    { sessionName, context, discarded },
+    'Transport queue command discarded stale recipient ownership instead of leaving queue unavailable',
+  );
 }
 
 async function handleEditQueuedTransportMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -4919,6 +5584,24 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
   }
   const release = await getMutex(sessionName).acquire();
   try {
+    // A pre-recipient-identity row may belong to this exact persisted session,
+    // but name equality alone is never authority. Let the runtime prove and
+    // complete its bounded adoption before any status or private-data mutation.
+    if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
+      discardStaleTransportQueueOwnership(sessionName, runtime, 'undo_queued_message_adopt_failed');
+      const queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+        sessionName,
+        runtime.recipientIdentity,
+        'undo_queued_message_stale_discard',
+      );
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...transportQueueSnapshotToPayload(queueSnapshot),
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+      return;
+    }
     const removed = runtime.removePendingMessage(clientMessageId);
     // The SQLite queue authority — not the runtime's in-memory queue — is what
     // keeps the UI queued bubble alive. After a daemon restart the row can still
@@ -4928,26 +5611,73 @@ async function handleUndoQueuedTransportMessage(cmd: Record<string, unknown>, se
     // undeletable ("daemon queue is empty but the frontend can't delete it").
     // Treat the entry as deletable whenever it is a live `queued` row in the
     // store, independent of runtime membership; `drop` itself is idempotent.
+    // Bounded, idempotent recovery at the AUTHORITATIVE entry point.
+    // `restoreExpiredHandoffs` already existed but its only caller was the
+    // automatic-audit path, so a lease that expired while the daemon was down
+    // stayed `handoff_inflight` forever. Because the check below counts only
+    // `queued` rows, such a row was invisible to delete: the ack claimed success
+    // while the row survived and the UI bubble came back. Healing here (rather
+    // than in the UI) also means a daemon restart recovers it on first touch.
+    try {
+      getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
+    } catch (err) {
+      logger.warn({ err, sessionName, clientMessageId }, 'expired handoff recovery failed before undo');
+    }
     let queueSnapshot = getTransportQueueStore().readSnapshotSafely(sessionName, 'undo_queued_message_before');
-    const queuedInStore = queueSnapshot.pendingMessageEntries.some(
-      (entry) => entry.clientMessageId === clientMessageId && entry.status === 'queued',
+    // Deletability is a property of the ROW EXISTING in the authority, not of one
+    // particular status value. The previous fix here only counted `queued`, so a
+    // row parked in `handoff_inflight` (its lease long expired) plus an empty
+    // runtime made BOTH `removed` and this flag false: the handler took the
+    // "already absent" success path, never called drop, and the next snapshot
+    // resurrected the bubble the user had just deleted. Field case: an entry
+    // whose handoff lease expired two days earlier and had no delivery tombstone.
+    const storeEntry = queueSnapshot.pendingMessageEntries.find(
+      (entry) => entry.clientMessageId === clientMessageId,
     );
-    if (!removed && !queuedInStore) {
-      // Deleting a queued message is IDEMPOTENT: if it is already gone the goal
-      // is met, so ack success. The frontend now always sends the undo — even for
-      // an entry that only ever existed optimistically (never reached the store)
-      // — so an "error: not found" here would spuriously roll the deleted bubble
-      // back into the UI. "Already absent" is a successful delete.
-      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
-      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+    const queuedInStore = storeEntry !== undefined;
+    // ...but an ACTIVE handoff is genuinely mid-delivery. Dropping it would be
+    // the opposite failure: the provider may already have the text while the UI
+    // reports a successful delete. Only an EXPIRED lease is reclaimable here;
+    // a live one is reported as too_late so the caller sees the truth instead of
+    // a false success or a UI-only tombstone.
+    const handoffStillLive = storeEntry?.status === 'handoff_inflight'
+      && getTransportQueueStore().hasLiveHandoff(sessionName, clientMessageId);
+    if (handoffStillLive) {
+      timelineEmitter.emit(sessionName, 'command.ack', {
+        commandId, status: 'error', error: 'too_late: message is already being delivered',
+      });
+      emitCommandAckReliable(serverLink, {
+        commandId, sessionName, status: 'error', error: 'too_late: message is already being delivered',
+      });
       return;
     }
+    // Even an apparently absent id must pass through atomic cancellation. The
+    // matching send handler can still be awaiting context/runtime work on this
+    // ordered socket; accepting here without a tombstone lets its later enqueue
+    // resurrect a deletion that the user was told succeeded.
     supervisionAutomation.removeQueuedTaskIntent(sessionName, clientMessageId);
     peerAuditService.invalidateQueuedEdit(sessionName);
     try {
-      queueSnapshot = getTransportQueueStore().drop(sessionName, clientMessageId, 'user_cleared');
+      // Prove the LIVE runtime identity. The atomic cancellation also leaves a
+      // durable tombstone, so an async send/recovery callback that arrives after
+      // this point cannot resurrect the same logical message.
+      const cancellation = getTransportQueueStore().cancelQueuedMessage(
+        sessionName,
+        clientMessageId,
+        (runtime as { recipientIdentity?: QueueRecipientIdentity }).recipientIdentity ?? null,
+      );
+      if (cancellation.status === 'identity_mismatch') {
+        discardStaleTransportQueueOwnership(sessionName, runtime, 'undo_queued_message_identity_mismatch');
+        queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+          sessionName,
+          runtime.recipientIdentity ?? null,
+          'undo_queued_message_identity_discard',
+        );
+      } else {
+        queueSnapshot = cancellation.snapshot;
+      }
     } catch (err) {
-      // The SQLite row is the queue authority. If the drop threw, the row is
+      // The SQLite row is the queue authority. If cancellation threw, the row is
       // STILL THERE — the delete did NOT happen — so we must NOT ack success
       // (that would leave the message queued on the backend while the UI claims
       // it is deleted). Ack an error so the frontend rolls the bubble back and
@@ -4978,9 +5708,12 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
         typeof value === 'string' && value.trim() ? [value.trim()] : []
       )))]
     : [];
-  const reject = (error: string): void => {
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
-    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
+  // `extras` ride the RELIABLE ack: emitCommandAckReliable persists them in the
+  // ack outbox and replays them verbatim, so a browser that never received the
+  // best-effort timeline broadcast can still reconcile from the ack alone.
+  const reject = (error: string, extras: Record<string, unknown> = {}): void => {
+    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error, ...extras });
+    emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error, ...extras });
   };
   if (!sessionName || clientMessageIds.length === 0 || clientMessageIds.length > TRANSPORT_QUEUE_APPEND_MAX_ENTRIES) {
     reject('Invalid queued message selection');
@@ -5001,7 +5734,53 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
 
   const release = await getMutex(sessionName).acquire();
   try {
-    const result = await runtime.appendPendingMessagesToActiveTurn(clientMessageIds, commandId);
+    if (runtime.recipientIdentity && runtime.adoptLegacyQueueRecipient?.() === false) {
+      discardStaleTransportQueueOwnership(sessionName, runtime, 'append_queued_messages_adopt_failed');
+      const queueSnapshot = getTransportQueueStore().readSnapshotSafelyForRecipient(
+        sessionName,
+        runtime.recipientIdentity,
+        'append_queued_messages_stale_discard',
+      );
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...transportQueueSnapshotToPayload(queueSnapshot),
+      }, { source: 'daemon', confidence: 'high' });
+      reject('Queued message state was stale and discarded');
+      return;
+    }
+    // Same bounded recovery boundary as the delete path: append reads the
+    // runtime's pending list, so a row stranded in an EXPIRED handoff (or one
+    // that only survives in SQLite after a restart) was unreachable here too.
+    // Recovering first makes it `queued` again and rehydrate brings it into the
+    // runtime; a still-ACTIVE handoff stays out and is correctly not appended.
+    try {
+      getTransportQueueStore().restoreExpiredHandoffs(sessionName, Date.now());
+      runtime.rehydratePendingFromStore?.();
+    } catch (err) {
+      logger.warn({ err, sessionName }, 'expired handoff recovery failed before append');
+    }
+    // This is the external, user-initiated append/append-all entry point:
+    // opt into the "no active turn -> dispatch the queue as a fresh turn"
+    // fallback (the internal scheduled active-append-flush loop does not).
+    const result = await runtime.appendPendingMessagesToActiveTurn(
+      clientMessageIds, commandId, undefined, { allowDispatchAsNewTurn: true },
+    );
+    if (result.status === 'dispatched_as_new_turn') {
+      // No turn was active by the time the runtime looked; the pending queue
+      // was dispatched as a fresh turn instead of appended in-place. This is
+      // success from the caller's point of view — the queued messages are on
+      // their way — so ack normally and broadcast the now-accurate state
+      // (the drain already flipped `sending`/`pendingCount`) instead of the
+      // stale "already finished" error this closure used to return.
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...queuePayload,
+      }, { source: 'daemon', confidence: 'high' });
+      timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'accepted' });
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
+      return;
+    }
     if (result.status !== 'delivered') {
       const error = result.status === 'unsupported'
         ? 'Active-turn append is not supported by this provider'
@@ -5012,28 +5791,85 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
             : result.status === 'stale'
               ? 'The active turn already finished'
               : 'Queued message not found';
-      reject(error);
+      if (result.status === 'not_found') {
+        // A bounded ownership recovery may have retired a pre-session ghost.
+        // The browser must be able to retire the stale card instead of
+        // restoring it from optimistic local state -- and it must be able to do
+        // so from the ONE frame this closure delivers reliably.
+        //
+        // The timeline broadcast below is kept so other subscribers of this
+        // session still converge, but correctness no longer depends on its
+        // delivery or its ordering: the same recipient-gated authority is
+        // attached to the reliable, replayable ack. `queueSnapshot` and
+        // `pendingCount` are deliberately left off the ack -- the former would
+        // duplicate the whole projection into every persisted outbox record,
+        // and the latter is a legacy live-queue field the wire validator
+        // rejects. The browser reduces the flat fields it already knows.
+        const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+        timelineEmitter.emit(sessionName, 'session.state', {
+          state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+          ...queuePayload,
+          queueReconcilesCommandId: commandId,
+        }, { source: 'daemon', confidence: 'high' });
+        reject(error, {
+          queueEpoch: queuePayload.queueEpoch,
+          queueAuthorityId: queuePayload.queueAuthorityId,
+          pendingMessageVersion: queuePayload.pendingMessageVersion,
+          pendingMessageEntries: queuePayload.pendingMessageEntries,
+          failedMessageEntries: queuePayload.failedMessageEntries,
+          queueReconcilesCommandId: commandId,
+          ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
+          ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
+        });
+        return;
+      }
+      // Every other failure here (most concretely 'stale': the turn this
+      // tried to append to already finished by the time the daemon looked)
+      // can ALSO mean the browser's belief about "is a turn still active" is
+      // now wrong. Previously this branch rejected with no state update at
+      // all, so a browser that thought a turn was running had nothing to
+      // ever correct it: it kept showing "working" with a live Stop control,
+      // and kept queueing behind a turn that would never resume -- exactly
+      // the stuck-forever state this closure exists to prevent for
+      // 'not_found'. The queued messages themselves are untouched by any of
+      // these statuses (none of them consume from the pending queue), so
+      // only the state fields are needed here, not a card-retirement ack.
+      const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
+      timelineEmitter.emit(sessionName, 'session.state', {
+        state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),
+        ...queuePayload,
+      }, { source: 'daemon', confidence: 'high' });
+      reject(error, {
+        queueEpoch: queuePayload.queueEpoch,
+        queueAuthorityId: queuePayload.queueAuthorityId,
+        pendingMessageVersion: queuePayload.pendingMessageVersion,
+        ...(queuePayload.degraded !== undefined ? { degraded: queuePayload.degraded } : {}),
+        ...(queuePayload.degradedReason ? { degradedReason: queuePayload.degradedReason } : {}),
+      });
       return;
     }
 
     for (const entry of result.entries) {
       supervisionAutomation.removeQueuedTaskIntent(sessionName, entry.clientMessageId);
+      const payload = {
+        text: entry.text,
+        commandId: entry.clientMessageId,
+        clientMessageId: entry.clientMessageId,
+        allowDuplicate: true,
+        // This row records an in-turn queue steer. It extends the currently
+        // supervised task and must not seed a second implicit run at idle.
+        queueAppended: true,
+        pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
+        ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+      };
       timelineEmitter.emit(
         sessionName,
         'user.message',
-        {
-          text: entry.text,
-          clientMessageId: entry.clientMessageId,
-          allowDuplicate: true,
-          // This row records an in-turn queue steer. It extends the currently
-          // supervised task and must not seed a second implicit run at idle.
-          queueAppended: true,
-          pendingMessageVersion: result.queueSnapshot.pendingMessageVersion,
-          ...(entry.sharedActor ? { sharedActor: entry.sharedActor } : {}),
-          ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-        },
+        payload,
         { source: 'daemon', confidence: 'high', eventId: `transport-user:${entry.clientMessageId}` },
       );
+      persistTransportUserMessage(sessionName, entry.text, payload);
     }
     for (const fact of result.deliveryFacts) {
       timelineEmitter.emit(sessionName, 'transport.queue.delivery', { ...fact }, {
@@ -5056,31 +5892,63 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
 }
 
 /**
- * Globally delete (hide) one timeline message. Initiated by a right-click in the
- * web UI; the deletion is durable and propagates to every viewer.
+ * Globally delete (hide) timeline messages. Initiated by a right-click in the web UI;
+ * the deletion is durable and propagates to every viewer.
  *
- * Mechanism: re-emit the exact target event with `hidden: true`. The stable-eventId
+ * One rendered bubble can be several stored events (consecutive assistant.text
+ * segments merge into one block), so the request names every stored event id of
+ * the block (`eventIds`; `eventId` alone still works for older web builds).
+ *
+ * Mechanism per id: re-emit the event with `hidden: true` plus the sticky
+ * `userDeleted` payload flag (TIMELINE_USER_DELETED_PAYLOAD_KEY). The stable-eventId
  * path in `timelineEmitter.emit` replaces it in the ring buffer and re-broadcasts to
- * all viewers; the re-emit's fresh (higher) `seq` wins the same-eventId merge
- * (`preferTimelineEvent`) on BOTH the daemon and every web client; the renderer drops
- * `hidden` events (ChatView filters them); and the JSONL append + SQLite `hidden`
- * column make it durable across refresh/restart. The agent's already-processed
- * conversation context is intentionally untouched — this removes the message from the
- * timeline view, it does not rewrite history the model already saw.
+ * all viewers; the flag makes the tombstone win every same-eventId merge on the daemon
+ * AND every web client (a later stream delta, a hydrated copy or a stale cache row
+ * cannot resurrect it); the JSONL append + SQLite `hidden` column make it durable
+ * across refresh/restart. `streaming` is forced false so a message deleted mid-stream
+ * is persisted (streaming deltas are deliberately not).
  *
- * Double-insurance write path: the server pod-routes the command by serverId, and the
- * daemon independently re-checks that it actually owns `sessionName` before mutating.
+ * An id the daemon no longer holds (older than the JSONL retention window, or only in
+ * a web cache/history page) is NOT an error: the user can see it, so it gets a
+ * tombstone too, typed by the client's hint. No store read happens on this path - the
+ * old handler tail-scanned 5000 JSONL events synchronously on the main thread and
+ * answered "Message not found" for everything older, which the web then ignored.
+ *
+ * The agent's already-processed conversation context is intentionally untouched -
+ * this removes the message from the timeline view, it does not rewrite history the
+ * model already saw. Double-insurance write path: the server pod-routes the command
+ * by serverId, and the daemon independently re-checks that it owns `sessionName`.
  */
+const DELETABLE_TOMBSTONE_TYPES: ReadonlySet<string> = new Set([
+  'user.message', 'assistant.text', 'assistant.thinking', 'tool.call', 'tool.result',
+]);
+
+function readTimelineDeleteTargets(cmd: Record<string, unknown>): { ids: string[]; tooMany: boolean } {
+  const seen = new Set<string>();
+  const add = (value: unknown): void => {
+    if (typeof value !== 'string') return;
+    const id = value.trim();
+    if (id && id.length <= TIMELINE_DELETE_MAX_EVENT_ID_LENGTH) seen.add(id);
+  };
+  add(cmd.eventId);
+  if (Array.isArray(cmd.eventIds)) {
+    if (cmd.eventIds.length > TIMELINE_DELETE_MAX_EVENT_IDS) return { ids: [], tooMany: true };
+    for (const value of cmd.eventIds) add(value);
+  }
+  return { ids: [...seen], tooMany: false };
+}
+
 async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
+  const startedAt = performance.now();
   const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : '';
-  const eventId = typeof cmd.eventId === 'string' ? cmd.eventId.trim() : '';
   const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim()
     ? cmd.commandId.trim()
     : `delete-msg-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  if (!sessionName || !eventId) return;
+  const { ids, tooMany } = readTimelineDeleteTargets(cmd);
 
-  const ackError = (error: string): void => {
-    timelineEmitter.emit(sessionName, 'command.ack', { commandId, status: 'error', error });
+  const ackError = (error: TimelineDeleteErrorCode, detail?: Record<string, unknown>): void => {
+    logger.warn({ sessionName, commandId, error, requested: ids.length, durationMs: Math.round(performance.now() - startedAt), ...detail }, 'timeline delete rejected');
+    timelineEmitter.emit(sessionName || '_unknown', 'command.ack', { commandId, status: 'error', error });
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error });
   };
   const ackAccepted = (): void => {
@@ -5088,40 +5956,77 @@ async function handleDeleteTimelineMessage(cmd: Record<string, unknown>, serverL
     emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'accepted' });
   };
 
+  // Every failure path answers: a silent return is what left the web with no feedback.
+  if (!sessionName || (ids.length === 0 && !tooMany)) {
+    ackError(TIMELINE_DELETE_ERROR_CODES.INVALID_REQUEST);
+    return;
+  }
+  if (tooMany) {
+    ackError(TIMELINE_DELETE_ERROR_CODES.TOO_MANY_TARGETS);
+    return;
+  }
   // Authorize: this daemon must actually own the session before touching its timeline.
   if (!getSession(sessionName)) {
-    ackError('Session not found');
+    ackError(TIMELINE_DELETE_ERROR_CODES.SESSION_NOT_FOUND);
     return;
   }
 
-  // Locate the target event: in-memory ring buffer first (covers recently-visible
-  // messages), then a bounded tail read of the persisted JSONL for older ones.
-  let target = timelineEmitter.getBufferedEvents(sessionName).find((e) => e.eventId === eventId);
-  if (!target) {
-    try {
-      target = timelineStore.read(sessionName, { limit: 5000 }).find((e) => e.eventId === eventId);
-    } catch { /* fall through to not-found */ }
-  }
-  if (!target) {
-    ackError('Message not found');
+  const typeHints = cmd.eventTypes && typeof cmd.eventTypes === 'object' && !Array.isArray(cmd.eventTypes)
+    ? cmd.eventTypes as Record<string, unknown>
+    : {};
+  let fromBuffer = 0;
+  let unknownToDaemon = 0;
+  let alreadyDeleted = 0;
+  try {
+    const buffered = new Map<string, TimelineEvent>();
+    for (const event of timelineEmitter.getBufferedEvents(sessionName)) buffered.set(event.eventId, event);
+    for (const id of ids) {
+      const target = buffered.get(id);
+      if (target && isUserDeletedTimelineEvent(target)) {
+        alreadyDeleted += 1; // Idempotent - already deleted.
+        continue;
+      }
+      if (target) {
+        fromBuffer += 1;
+        timelineEmitter.emit(sessionName, target.type, {
+          ...target.payload,
+          streaming: false,
+          [TIMELINE_USER_DELETED_PAYLOAD_KEY]: true,
+        }, {
+          eventId: target.eventId,
+          hidden: true,
+          source: target.source,
+          confidence: target.confidence,
+        });
+        continue;
+      }
+      unknownToDaemon += 1;
+      const hinted = typeof typeHints[id] === 'string' ? typeHints[id] as string : '';
+      timelineEmitter.emit(sessionName, (DELETABLE_TOMBSTONE_TYPES.has(hinted) ? hinted : 'assistant.text') as TimelineEvent['type'], {
+        [TIMELINE_USER_DELETED_PAYLOAD_KEY]: true,
+      }, {
+        eventId: id,
+        hidden: true,
+      });
+    }
+  } catch (err) {
+    logger.error({ err, sessionName, commandId, requested: ids.length }, 'timeline delete failed');
+    ackError(TIMELINE_DELETE_ERROR_CODES.FAILED);
     return;
   }
-  if (target.hidden) {
-    ackAccepted(); // Idempotent — already deleted.
-    return;
-  }
-
-  // Re-emit verbatim with hidden:true (see function doc for why this is the delete).
-  timelineEmitter.emit(sessionName, target.type, target.payload, {
-    eventId: target.eventId,
-    hidden: true,
-    source: target.source,
-    confidence: target.confidence,
-  });
   ackAccepted();
+  logger.info({
+    sessionName,
+    commandId,
+    requested: ids.length,
+    fromBuffer,
+    tombstonedWithoutOriginal: unknownToDaemon,
+    alreadyDeleted,
+    durationMs: Math.round((performance.now() - startedAt) * 100) / 100,
+  }, 'timeline delete handled');
 }
 
-async function handleInput(cmd: Record<string, unknown>): Promise<void> {
+async function handleInput(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const sessionName = cmd.sessionName as string | undefined;
   const data = cmd.data as string | undefined;
 
@@ -5133,6 +6038,25 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
   if (transportRuntime) {
     if (data === '\x1b') {
       cancelTransportTurnNow(sessionName, undefined, undefined);
+    }
+    return;
+  }
+
+  // node-pty writes are synchronous once the ConPTY module is loaded.  Do not
+  // queue browser keystrokes behind the process-send mutex on Windows: that
+  // mutex is also held while agent commands perform network/filesystem work,
+  // which made a shell echo wait hundreds of milliseconds under load.  The WS
+  // dispatcher already invokes messages in arrival order and node-pty preserves
+  // write ordering, so the fast path keeps input ordering without coupling it
+  // to the long-running process command lane.
+  if (!terminalInputNeedsSessionMutex(BACKEND)) {
+    const stageStartedAt = Date.now();
+    terminalStageTrace('browser_input_received', sessionName, stageStartedAt);
+    try {
+      await sendRawInput(sessionName, data);
+      terminalStageTrace('sendRawInput_complete', sessionName, stageStartedAt);
+    } catch (err) {
+      logger.error({ sessionName, err }, 'session.input failed');
     }
     return;
   }
@@ -5151,6 +6075,32 @@ async function handleInput(cmd: Record<string, unknown>): Promise<void> {
     }
   } catch (err) {
     logger.error({ sessionName, err }, 'session.input failed');
+    const record = getSession(sessionName);
+    const message = err instanceof Error ? err.message.toLowerCase() : String(err).toLowerCase();
+    const tmuxGone = record?.agentType === 'shell'
+      && (message.includes('no server running')
+        || message.includes("can't find pane")
+        || message.includes("can't find session")
+        || message.includes("can't find window"));
+    if (tmuxGone && record) {
+      // Preserve keystrokes that arrive while the tmux server is being
+      // recreated. Concurrent failures share one bounded relaunch, then retry
+      // their original byte in order instead of dropping input.
+      try {
+        await runExclusiveSessionRelaunch(sessionName, async () => {
+          await relaunchSessionWithSettings(record, {
+            agentType: record.agentType as AgentType,
+            projectDir: record.projectDir,
+            label: record.label ?? null,
+            description: record.description ?? null,
+          });
+          handleSubscribe({ session: sessionName, raw: true }, serverLink);
+        });
+        await sendRawInput(sessionName, data);
+      } catch (recoveryError) {
+        logger.warn({ sessionName, recoveryError }, 'session.input recovery failed');
+      }
+    }
   } finally {
     release();
   }
@@ -5275,6 +6225,13 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
       if (latestRecord?.agentType !== 'shell' && latestRecord?.agentType !== 'script') return;
       if (!canAttemptShellBootstrapRecovery(session)) {
         logger.warn({ session, reason }, 'Shell terminal bootstrap recovery suppressed by restart limit');
+        try {
+          subscriber.sendControl?.({
+            type: TERMINAL_CONTROL.RECOVERY_EXHAUSTED,
+            session,
+            reason: 'restart_limit',
+          });
+        } catch { /* best effort */ }
         return;
       }
       logger.warn({ session, reason, agentType: latestRecord.agentType }, 'Shell terminal bootstrap stalled — auto-restarting session');
@@ -5286,6 +6243,10 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
             label: latestRecord.label ?? null,
             description: latestRecord.description ?? null,
           });
+          // A dead tmux pane tears down the old pipe subscription. Reattach
+          // the raw terminal stream after relaunch so the browser can resume
+          // both output and input without requiring a page refresh.
+          handleSubscribe({ session, raw: true }, serverLink);
           await handleGetSessions(serverLink);
           if (session.startsWith('deck_sub_')) {
             try {
@@ -5295,6 +6256,20 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
         } catch (err) {
           logger.error({ session, err }, 'Shell terminal bootstrap auto-restart failed');
           const message = err instanceof Error ? err.message : String(err);
+          // A live different owner is a real conflict and must be surfaced as
+          // an actionable terminal error.  A stale/dead owner is accepted by
+          // SessionResourceRegistry, so this path is reserved for genuine
+          // contention and does not burn the crash-loop budget.
+          if (message.includes('session_resource_owner_conflict')) {
+            shellBootstrapRecoveryAttempts.delete(session);
+            try {
+              subscriber.sendControl?.({
+                type: TERMINAL_CONTROL.RECOVERY_EXHAUSTED,
+                session,
+                reason: 'resource_conflict',
+              });
+            } catch { /* best effort */ }
+          }
           emitSessionInlineError(session, `Shell auto-reconnect failed: ${message}`);
           try { serverLink.send({ type: 'session.error', project: latestRecord.projectName, message }); } catch { /* ignore */ }
           throw err;
@@ -5355,6 +6330,10 @@ function optionalFiniteNumber(value: unknown): number | undefined {
 function timelineHistoryResponseTypeForRequest(cmd: Record<string, unknown>): typeof TIMELINE_MESSAGES.HISTORY | typeof TIMELINE_MESSAGES.PAGE {
   return cmd.type === TIMELINE_MESSAGES.PAGE_REQUEST ? TIMELINE_MESSAGES.PAGE : TIMELINE_MESSAGES.HISTORY;
 }
+
+/** Per-reply ceiling for timeline history/page responses while the server
+ *  link reports uplink congestion (see ServerLink.isUplinkCongested). */
+const CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES = 64 * 1024;
 
 function resolveTimelineHistoryBudgetBytes(cmd: Record<string, unknown>): number {
   const requested = optionalFiniteNumber(cmd.budgetBytes);
@@ -5563,6 +6542,9 @@ interface TimelineReplayBuildResult {
 
 const timelineReplayInflight = new Map<string, Promise<TimelineReplayBuildResult>>();
 
+const resolveTimelineSupervisionTaskProjection = (taskId: string, assignmentId: string) =>
+  getSupervisionTaskRegistry().getSupervisionTaskProjection(taskId, assignmentId);
+
 function timelineReplayInflightKey(params: TimelineReplayRequestParams): string {
   return JSON.stringify({
     sessionName: params.sessionName,
@@ -5586,7 +6568,7 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     const events = await timelineStore.readPreferred(params.sessionName, { limit: replayEpochResetLimit });
     const shaped = shapeTimelineEventsForTransport(events, {
       detailSink: getDefaultTimelineDetailStore(),
-    });
+    }, resolveTimelineSupervisionTaskProjection);
     const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
     return {
       events: shaped.events,
@@ -5605,17 +6587,25 @@ async function buildTimelineReplay(params: TimelineReplayRequestParams): Promise
     };
   }
 
-  const { events, truncated, source = TIMELINE_RESPONSE_SOURCES.RING_BUFFER } = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  const replay = timelineEmitter.replay(params.sessionName, params.afterSeq);
+  // Replay is a gap-fill path, but it can span the whole in-memory ring when
+  // a browser reconnects after a busy SDK turn. Keep it on the same bounded
+  // 200-event wire contract as history/page responses; the newer cursor lets
+  // the client request another page when more events remain.
+  const events = replay.events.length > TIMELINE_HISTORY_LIMITS.MAX_EVENTS
+    ? replay.events.slice(-TIMELINE_HISTORY_LIMITS.MAX_EVENTS)
+    : replay.events;
+  const truncated = replay.truncated || events.length < replay.events.length;
   const shaped = shapeTimelineEventsForTransport(events, {
     detailSink: getDefaultTimelineDetailStore(),
-  });
+  }, resolveTimelineSupervisionTaskProjection);
   const payloadTruncated = shaped.droppedEvents > 0 || shaped.truncatedEvents > 0;
   return {
     events: shaped.events,
     truncated,
     epoch: timelineEmitter.epoch,
     status: timelineStatusFromPayload(shaped.droppedEvents, shaped.truncatedEvents),
-    source,
+    source: replay.source,
     payloadBytes: shaped.payloadBytes,
     payloadTruncated,
     hasMore: shaped.droppedEvents > 0,
@@ -5829,6 +6819,19 @@ interface TimelineHistoryRequestParams {
   afterTs?: number;
   beforeTs?: number;
   maxResponseBytes: number;
+  /** `text`: only user.message/assistant.text rows (no tool/state rows) — see TIMELINE_HISTORY_CONTENT_FILTERS. */
+  contentFilter?: TimelineHistoryContentFilter;
+}
+
+/** Which event types one history request reads: the whole chat window, or only its readable messages. */
+function timelineHistoryTypesForFilter(contentFilter: TimelineHistoryContentFilter | undefined): {
+  contentTypes: TimelineEventType[];
+  stateTypes: TimelineEventType[];
+} {
+  if (contentFilter === undefined) {
+    return { contentTypes: [...TIMELINE_HISTORY_CONTENT_TYPES], stateTypes: [...TIMELINE_HISTORY_STATE_TYPES] };
+  }
+  return { contentTypes: [...TIMELINE_TEXT_HISTORY_EVENT_TYPES], stateTypes: [] };
 }
 
 interface TimelineHistoryBuildResult {
@@ -5845,12 +6848,38 @@ interface TimelineHistoryBuildResult {
   status: TimelineResponseStatus;
   errorReason?: TimelineRequestErrorReason | string;
   cursorReset?: boolean;
+  /**
+   * The established wire signal for "momentary, come back" -- read by the web
+   * client in shouldRetryTimelineHistoryResponse. Named `recoverable` because
+   * that is the field the client actually consumes; an invented `retryable`
+   * field would have travelled the wire and been ignored, which is a fix only
+   * in appearance.
+   */
+  recoverable?: boolean;
   detailRefs: TimelinePayloadMetadata['detailRefs'];
 }
 
 const timelineHistoryInflight = new Map<string, Promise<TimelineHistoryBuildResult>>();
 
-function timelineHistoryErrorResult(source: string, errorReason: TimelineRequestErrorReason | string): TimelineHistoryBuildResult {
+/**
+ * Reasons that mean "the projection could not answer right now".
+ *
+ * These must never reach buildTimelineHistoryOnMain. Running the heavy path on
+ * the event loop is the worst available response to saturation, and it is what
+ * turned a worker timeout into a blocked main thread in production.
+ */
+const TIMELINE_HISTORY_TRANSIENT_REASONS = new Set<string>([
+  TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_BUSY,
+  TIMELINE_HISTORY_ERROR_REASONS.TIMEOUT,
+  TIMELINE_HISTORY_ERROR_REASONS.DEADLINE_EXCEEDED,
+  TIMELINE_HISTORY_ERROR_REASONS.QUEUE_FULL,
+]);
+
+function timelineHistoryErrorResult(
+  source: string,
+  errorReason: TimelineRequestErrorReason | string,
+  options?: { recoverable: true },
+): TimelineHistoryBuildResult {
   return {
     events: [],
     eventsRead: 0,
@@ -5864,6 +6893,7 @@ function timelineHistoryErrorResult(source: string, errorReason: TimelineRequest
     source,
     status: TIMELINE_RESPONSE_STATUS.ERROR,
     errorReason,
+    ...(options?.recoverable ? { recoverable: true } : {}),
     detailRefs: [],
   };
 }
@@ -5875,6 +6905,7 @@ function timelineHistoryInflightKey(params: TimelineHistoryRequestParams): strin
     afterTs: params.afterTs ?? null,
     beforeTs: params.beforeTs ?? null,
     maxResponseBytes: params.maxResponseBytes,
+    contentFilter: params.contentFilter ?? null,
   });
 }
 
@@ -5883,9 +6914,22 @@ function buildTimelineHistory(params: TimelineHistoryRequestParams): Promise<Tim
   if (shouldUseTimelineHistoryWorkerPool() && initialRecord?.agentType !== 'opencode') {
     return buildTimelineHistoryWithWorker(params).catch(async (err) => {
       const reason = err instanceof TimelineHistoryPoolError ? err.reason : 'unknown';
+      // Genuine, durable absence is the ONLY case that may run on the main
+      // thread: the projection cannot serve this session at all, so there is no
+      // worker path to wait for. Everything transient is refused here.
       if (reason === TIMELINE_HISTORY_ERROR_REASONS.PROJECTION_UNAVAILABLE) {
         logger.debug({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker unavailable; falling back to projection client');
         return await buildTimelineHistoryOnMain(params);
+      }
+      if (TIMELINE_HISTORY_TRANSIENT_REASONS.has(reason)) {
+        // Saturation: answer determinately and cheaply. Doing the work here
+        // would add main-thread SQLite, synthesize and sanitize to a process
+        // that is already behind, which is exactly how a slow worker became a
+        // blocked event loop.
+        logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history projection saturated; returning retryable response without main-thread work');
+        // No retry-after hint: nothing in the timeline bridge or client carries
+        // or consumes one, so emitting it would be a second unread field.
+        return timelineHistoryErrorResult(`worker_${reason}`, reason, { recoverable: true });
       }
       logger.warn({ sessionName: params.sessionName, requestId: params.requestId, reason }, 'timeline.history worker failed; returning terminal error response');
       return timelineHistoryErrorResult(`worker_${reason}`, reason);
@@ -5914,12 +6958,13 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   // O(requested rows) instead of decoding thousands of unrelated state events.
   // Do NOT filter by epoch — history should include events across daemon restarts.
   const tRead0 = Date.now();
+  const historyTypes = timelineHistoryTypesForFilter(params.contentFilter);
   let substantive: TimelineEvent[];
   let stateEvents: TimelineEvent[] = [];
   try {
     substantive = await timelineStore.readByTypesPreferred(
       params.sessionName,
-      [...TIMELINE_HISTORY_CONTENT_TYPES],
+      historyTypes.contentTypes,
       { limit: params.limit + 1, afterTs: params.afterTs, beforeTs: params.beforeTs },
     );
   } catch (err) {
@@ -5928,13 +6973,13 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     }
     throw err;
   }
-  if (substantive.length > 0) {
+  if (substantive.length > 0 && historyTypes.stateTypes.length > 0) {
     const cutoffTs = substantive[0]!.ts;
     const stateAfterTs = params.afterTs === undefined ? cutoffTs - 1 : Math.max(params.afterTs, cutoffTs - 1);
     try {
       stateEvents = await timelineStore.readByTypesPreferred(
         params.sessionName,
-        [...TIMELINE_HISTORY_STATE_TYPES],
+        historyTypes.stateTypes,
         { limit: Math.max(params.limit * 2, 100), afterTs: stateAfterTs, beforeTs: params.beforeTs },
       );
     } catch (err) {
@@ -5995,11 +7040,24 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     }
   }
 
+  // The content-aware query may add state rows around the selected content.
+  // Enforce the hard page count after that merge as well, otherwise a page of
+  // 200 substantive events could retain hundreds of additional state rows and
+  // recreate the large-history retention spike at the bridge.
+  if (trimmed.length > TIMELINE_HISTORY_LIMITS.MAX_EVENTS) {
+    const contentTypes = historyTypes.contentTypes;
+    const content = trimmed.filter((event) => contentTypes.includes(event.type));
+    const state = trimmed.filter((event) => !contentTypes.includes(event.type));
+    const stateBudget = Math.max(0, TIMELINE_HISTORY_LIMITS.MAX_EVENTS - content.length);
+    trimmed = [...content, ...state.slice(Math.max(0, state.length - stateBudget))].sort(compareTimelineEventsForReplay);
+    hasMoreHistory = true;
+  }
+
   const tSanitize = Date.now();
   const sanitized = shapeTimelineEventsForTransport(trimmed, {
     maxResponseBytes: params.maxResponseBytes,
     detailSink: getDefaultTimelineDetailStore(),
-  });
+  }, resolveTimelineSupervisionTaskProjection);
   const status = timelineStatusFromPayload(sanitized.droppedEvents, sanitized.truncatedEvents);
   return {
     events: sanitized.events,
@@ -6026,25 +7084,34 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
     afterTs: params.afterTs,
     beforeTs: params.beforeTs,
     maxResponseBytes: params.maxResponseBytes,
-    contentTypes: [...TIMELINE_HISTORY_CONTENT_TYPES],
-    stateTypes: [...TIMELINE_HISTORY_STATE_TYPES],
+    ...timelineHistoryTypesForFilter(params.contentFilter),
   }, { deadlineAt: Date.now() + 4_500 });
   const detailRefs = (result.detailCandidates ?? [])
     .map((candidate) => getDefaultTimelineDetailStore().put(candidate))
     .filter((ref): ref is NonNullable<typeof ref> => ref !== undefined);
+  // The worker intentionally owns no supervision registry connection. Refresh
+  // the small set of returned task cards on the main thread, then re-apply the
+  // response budget because a legacy concise title may gain a bounded 4 KiB
+  // objective here.
+  const refreshed = shapeTimelineEventsForTransport(result.events, {
+    maxResponseBytes: params.maxResponseBytes,
+    detailSink: getDefaultTimelineDetailStore(),
+  }, resolveTimelineSupervisionTaskProjection);
+  const droppedEvents = result.droppedEvents + refreshed.droppedEvents;
+  const truncatedEvents = result.truncatedEvents + refreshed.truncatedEvents;
   return {
-    events: result.events,
+    events: refreshed.events,
     eventsRead: result.eventsRead,
-    payloadBytes: result.payloadBytes,
-    droppedEvents: result.droppedEvents,
-    truncatedEvents: result.truncatedEvents,
-    hasMore: result.hasMore === true || result.droppedEvents > 0,
+    payloadBytes: refreshed.payloadBytes,
+    droppedEvents,
+    truncatedEvents,
+    hasMore: result.hasMore === true || droppedEvents > 0,
     readMs: result.readMs,
     synthesizeMs: 0,
     sanitizeMs: result.sanitizeMs,
     source: result.source ?? TIMELINE_RESPONSE_SOURCES.WORKER_SQLITE,
-    status: timelineStatusFromPayload(result.droppedEvents, result.truncatedEvents),
-    detailRefs,
+    status: timelineStatusFromPayload(droppedEvents, truncatedEvents),
+    detailRefs: [...detailRefs, ...refreshed.detailRefs],
   };
 }
 
@@ -6052,13 +7119,20 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   const sessionName = cmd.sessionName as string | undefined;
   const requestId = cmd.requestId as string | undefined;
   const rawLimit = cmd.limit;
-  const limit = typeof rawLimit === 'number' && Number.isFinite(rawLimit) && rawLimit > 0 ? Math.min(rawLimit, 2000) : 500;
+  const limit = clampTimelineHistoryLimit(rawLimit);
   const cursor = cmd.cursor && typeof cmd.cursor === 'object' && !Array.isArray(cmd.cursor)
     ? cmd.cursor as Record<string, unknown>
     : undefined;
   const afterTs = optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
   const beforeTs = optionalFiniteNumber(cmd.beforeTs) ?? optionalFiniteNumber(cursor?.beforeTs);
-  const maxResponseBytes = resolveTimelineHistoryBudgetBytes(cmd);
+  // On a congested uplink one full-budget reply (up to 1 MiB) occupies the
+  // socket for minutes and every heartbeat/ack/session.state queues behind
+  // it. Serve a smaller page instead; the response already reports
+  // hasMore/droppedEvents, so the client pages for the rest.
+  const boundedBudgetBytes = clampTimelineHistoryBudget(cmd.budgetBytes);
+  const maxResponseBytes = serverLink.isUplinkCongested?.()
+    ? Math.min(boundedBudgetBytes, CONGESTED_TIMELINE_RESPONSE_BUDGET_BYTES)
+    : Math.min(resolveTimelineHistoryBudgetBytes(cmd), TIMELINE_HISTORY_LIMITS.MAX_BYTES);
 
   if (!sessionName) {
     logger.warn({ requestId }, 'timeline.history_request: missing sessionName');
@@ -6082,7 +7156,11 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     return;
   }
 
-  const params: TimelineHistoryRequestParams = { sessionName, requestId, limit, afterTs, beforeTs, maxResponseBytes };
+  const contentFilter = isTimelineHistoryContentFilter(cmd.contentFilter) ? cmd.contentFilter : undefined;
+  const params: TimelineHistoryRequestParams = {
+    sessionName, requestId, limit, afterTs, beforeTs, maxResponseBytes,
+    ...(contentFilter ? { contentFilter } : {}),
+  };
   const tStart = Date.now();
   try {
     const result = await getTimelineHistoryResult(params);
@@ -6101,6 +7179,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       hasMore,
       nextCursor: buildTimelineNextCursor(result.events, timelineEmitter.epoch),
       cursorReset: result.cursorReset,
+      recoverable: result.recoverable,
       droppedEvents: result.droppedEvents,
       truncatedEvents: result.truncatedEvents,
       detailRefs: result.detailRefs && result.detailRefs.length > 0 ? result.detailRefs : undefined,
@@ -6115,6 +7194,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
       limit,
       afterTs,
       beforeTs,
+      ...(contentFilter ? { contentFilter } : {}),
       includeDetails: cmd.includeDetails === true,
       ...(requestedBudgetBytes !== undefined ? { requestedBudgetBytes } : {}),
       maxResponseBytes,
@@ -6196,10 +7276,11 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
     parentSession ? getSession(parentSession)?.projectDir : undefined,
   );
   const requestedEffort: unknown = cmd.thinking ?? cmd.effort;
+  const sessionName = subSessionName(id);
+  const existingSub = getSession(sessionName);
   const effort = isTransportEffortLevel(requestedEffort)
     ? requestedEffort
-    : getDefaultThinkingLevel(type);
-  const sessionName = subSessionName(id);
+    : existingSub?.effort ?? getDefaultThinkingLevel(type);
   const projectName = parentSession
     ? (getSession(parentSession)?.projectName ?? parentSession)
     : sessionName;
@@ -6232,7 +7313,7 @@ async function handleSubSessionStart(cmd: Record<string, unknown>, serverLink: S
         bindExistingKey,
         ...(ccPreset ? { ccPreset } : {}),
         ...(type === 'claude-code-sdk' ? { ccSessionId: randomUUID(), fresh: true } : {}),
-        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === 'grok-sdk' || type === 'deepseek-harness' || type === 'pi' ? { fresh: true } : {}),
+        ...(type === 'codex-sdk' || type === 'opencode-sdk' || type === 'kimi-sdk' || type === HERMES_AGENT_PROVIDER_ID || type === 'grok-sdk' || type === 'deepseek-harness' || type === 'pi' || isCodeBuddyProviderId(type) ? { fresh: true } : {}),
         ...(effort ? { effort } : {}),
         userCreated: true,
         parentSession: parentSession || undefined,
@@ -7253,12 +8334,12 @@ export function checkUpgradeToolchain(opts: {
 async function resolveUpgradeRegistry(): Promise<{ base: string; explicit: boolean }> {
   const { readFileSync } = await import('fs');
   const { join } = await import('path');
-  const { homedir } = await import('os');
   const { execFile } = await import('child_process');
+  const { resolveImcodesHome } = await import('../util/windows-daemon-lock.js');
 
   let configRegistry: unknown;
   try {
-    const raw = readFileSync(join(homedir(), '.imcodes', INSTALLER_CONFIG_BASENAME), 'utf8');
+    const raw = readFileSync(join(resolveImcodesHome(), INSTALLER_CONFIG_BASENAME), 'utf8');
     const parsed = JSON.parse(raw) as InstallerConfig;
     configRegistry = parsed?.npmRegistry;
   } catch { /* no install.json (or unreadable) — fall through to ambient */ }
@@ -7283,21 +8364,21 @@ async function handleDaemonUpgrade(
   targetVersion?: string,
   serverLink?: ServerLink,
   upgradeId?: string,
+  registryOverride?: string,
+  source: DaemonUpgradeSource = DAEMON_UPGRADE_SOURCE.MANUAL,
 ): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
-  // ── Opt-out: forcibly disable the daemon's self-upgrade ───────────────────
-  // Set `daemon.autoUpgrade: false` in ~/.imcodes/config.yaml (or the env
-  // IMCODES_DISABLE_AUTO_UPGRADE=1) to stop the daemon from replacing itself —
-  // e.g. when running a local source build you don't want clobbered by the
-  // published npm release. The manual `imcodes upgrade` CLI is unaffected.
+  // ── Opt-out: server-driven automatic upgrades are disabled by default. ────
+  // Explicitly confirmed manual upgrades and replay of an existing manual
+  // lifecycle remain allowed; only legacy source:auto is gated here.
   const envDisabled = process.env.IMCODES_DISABLE_AUTO_UPGRADE === '1'
     || process.env.IMCODES_DISABLE_AUTO_UPGRADE === 'true';
   // Read the already-cached config synchronously — no await before the
   // active-turn / cooldown checks below (an extra async hop would delay them
   // past their awaiters). Null (config not yet loaded) is treated as enabled.
   const configDisabled = getLoadedConfig()?.daemon?.autoUpgrade === false;
-  if (envDisabled || configDisabled) {
+  if (source === DAEMON_UPGRADE_SOURCE.AUTO && (envDisabled || configDisabled)) {
     logger.info(
       { targetVersion, reason: envDisabled ? 'env' : 'config' },
       'daemon.upgrade: auto-upgrade disabled — skipping',
@@ -7403,10 +8484,9 @@ async function handleDaemonUpgrade(
   // must report their specific block reason rather than being preempted by a
   // recent-upgrade cooldown.
   try {
-    const { homedir: _homedir } = await import('os');
     const { join: _join } = await import('path');
     const { readFileSync: _readFile } = await import('fs');
-    const sentinelPath = _join(_homedir(), '.imcodes', 'last-upgrade-at');
+    const sentinelPath = _join(imcodesStateDir(), 'last-upgrade-at');
     const verdict = evaluateAutoUpgradeCooldown({
       targetVersion,
       cooldownMs: parseInt(
@@ -7464,7 +8544,10 @@ async function handleDaemonUpgrade(
   // Resolve the registry ONCE here and reuse it for both the pre-flight probe
   // and the install command baked into the upgrade script, so they never
   // diverge (this is the fix for the prior hard-coded-official-registry probe).
-  const upgradeRegistry = await resolveUpgradeRegistry();
+  const normalizedRegistryOverride = normalizeRegistryBase(registryOverride);
+  const upgradeRegistry = normalizedRegistryOverride
+    ? { base: normalizedRegistryOverride, explicit: normalizedRegistryOverride !== INSTALLER_OFFICIAL_NPM_REGISTRY }
+    : await resolveUpgradeRegistry();
   if (!targetVersion || targetVersion === 'latest') {
     try {
       const res = await fetch(`${upgradeRegistry.base}imcodes/latest`, {
@@ -7533,6 +8616,39 @@ async function handleDaemonUpgrade(
     }
   }
 
+  // ── Native transport quiesce (BOTH platforms, before any spawn/install) ───
+  // The detached upgrade replaces the global package — and therefore
+  // node_datachannel.node — IN PLACE while this process still has the addon
+  // mapped. The daemon then restarts and its shutdown finally runs the
+  // direct-transfer cleanup, by which point the pages behind that live mapping
+  // belong to a different file. Both production crashes were SIGBUS at the same
+  // relative offset, addr2line landing in rtc::Description::Media::RtpMap.
+  //
+  // So the addon must be drained and cleaned up while its file is still the
+  // original one, and the acknowledgement must be awaited — not slept on —
+  // before anything is spawned or installed. A refused or timed-out quiesce
+  // means peers may still be live, so nothing is spawned and no package is
+  // touched: the daemon keeps running and direct transfer degrades to relay.
+  //
+  // Deliberately NOT released on abort, unlike the memory freeze below: a
+  // native runtime cannot be un-cleaned, so the safe direction is to stay
+  // degraded until the next restart rather than re-enter a replaced mapping.
+  const nativeQuiesce = await quiesceDirectFileTransferNative();
+  if (!nativeQuiesce.ok) {
+    logger.error({
+      targetVersion,
+      reason: nativeQuiesce.reason,
+    }, 'daemon.upgrade: ABORTING — direct-transfer native runtime did not quiesce, so replacing the package could fault a live mapping. Keeping the current version running; direct transfer is degraded to relay.');
+    try {
+      serverLink?.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: 'native_quiesce_failed',
+        detail: nativeQuiesce.reason ?? 'quiesce_refused',
+      });
+    } catch { /* ignore */ }
+    return;
+  }
+
   let upgradeScriptSpawned = false;
   const releaseUpgradeMemoryFreeze = (() => {
     closeLiveContextMaterializationAdmission('upgrade-pending');
@@ -7587,100 +8703,33 @@ async function handleDaemonUpgrade(
   const scriptDir = mkdtempSync(join(tmpdir(), 'imcodes-upgrade-'));
   const logFile = join(scriptDir, 'upgrade.log');
   const statusFile = join(scriptDir, 'upgrade-status.json');
-  const scriptPath = join(scriptDir, 'upgrade.sh');
   // Build the platform-specific restart command.
   // We always restart regardless of whether npm install succeeded, so the daemon
   // is never left permanently dead.
   let restartCmd: string;
-  if (process.platform === 'linux') {
-    const userSvc = join(homedir(), '.config/systemd/user/imcodes.service');
-    if (existsSync(userSvc)) {
-      restartCmd = 'systemctl --user restart imcodes';
-    } else {
-      restartCmd = 'echo "No user service found. Run: imcodes bind" && exit 1';
-    }
-  } else if (process.platform === 'darwin') {
-    const plist = join(homedir(), 'Library/LaunchAgents/imcodes.daemon.plist');
-    const pidFile = join(homedir(), '.imcodes', 'daemon.pid');
-    restartCmd = `launchctl unload "${plist}" 2>/dev/null || true
-# Kill any lingering daemon processes after unload
-STALE_PID=$(cat "${pidFile}" 2>/dev/null)
-if [ -n "$STALE_PID" ] && kill -0 "$STALE_PID" 2>/dev/null; then
-  kill "$STALE_PID" 2>/dev/null; sleep 2
-  kill -0 "$STALE_PID" 2>/dev/null && kill -9 "$STALE_PID" 2>/dev/null
-fi
-launchctl load -w "${plist}"`;
+  if (process.platform === 'linux' || process.platform === 'darwin') {
+    restartCmd = buildPosixRestartCommand({ platform: process.platform, home: homedir(), stateDir: imcodesStateDir() });
   } else if (process.platform === 'win32') {
-    // Windows: drive the upgrade with a Node.js runner instead of a
-    // cmd.exe batch.  The batch was the source of every Windows
-    // auto-upgrade outage we shipped (paren-counting in if-blocks,
-    // timeout-needs-stdin, del silent failures, codepage issues with
-    // non-ASCII %TEMP% / %USERPROFILE% paths).  Node fs APIs use the
-    // Windows wide-char API natively, so Chinese / Cyrillic / etc.
-    // paths round-trip transparently.
-    //
-    // Layout: copy the bundled runner to %TEMP%/imcodes-upgrade-X/upgrade.mjs
-    // BEFORE spawning, so the in-flight `npm install -g` doesn't
-    // overwrite the runner's source under itself when the new
-    // package's files land at the same global path.
-    const npmBin = join(dirname(process.execPath), 'npm.cmd');
-    const npmCmd = existsSync(npmBin) ? npmBin : 'npm';
-    const pkgSpec = targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest';
-    const targetVer = targetVersion ?? 'latest';
-
-    const runnerSrc = resolveWindowsUpgradeRunnerPath();
-    const runnerCopy = join(scriptDir, 'upgrade.mjs');
+    // Windows: the Node.js runner (never a cmd.exe batch: paren-counting, timeout
+    // needing stdin, codepage trouble with non-ASCII paths). The launcher is shared
+    // with `imcodes upgrade`; it stages the runner with its import closure first,
+    // because the in-flight install replaces the package it would otherwise run from.
     try {
-      // Read+write rather than cpSync so a broken runnerSrc fails loud.
-      writeFileSync(runnerCopy, readFileSync(runnerSrc));
+      const launched = launchWindowsUpgrade({
+        scriptDir,
+        logFile,
+        pkgSpec: targetVersion ? `imcodes@${targetVersion}` : 'imcodes@latest',
+        targetVer: targetVersion ?? 'latest',
+        // '-' when official/default, so no redundant --registry is added.
+        registryArg: upgradeRegistry.explicit ? upgradeRegistry.base : '-',
+        // Lets the runner apply the post-install downgrade guard for `latest`.
+        currentVer: DAEMON_VERSION,
+      });
+      logger.info({ log: logFile, runnerCopy: launched.runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     } catch (err) {
-      logger.error({ err, runnerSrc }, 'daemon.upgrade: failed to stage upgrade runner — cannot proceed');
+      logger.error({ err }, 'daemon.upgrade: failed to stage upgrade runner — cannot proceed');
       return;
     }
-
-    // Cleanup .cmd is still cmd.exe — but it's a 4-line idempotent rmdir
-    // with NO control flow.  No parens, no timeout, no del — just one
-    // ping sleep and one rmdir.  Kept because the runner self-cleans via
-    // its own deferred rmSync, but this is a belt-and-suspenders for
-    // the case where the runner crashes before reaching the finally block.
-    const cleanupPath = join(scriptDir, 'cleanup.cmd');
-    const cleanupVbsPath = join(scriptDir, 'cleanup.vbs');
-    writeFileSync(cleanupPath, encodeCmdAsUtf8Bom(buildWindowsCleanupScript(scriptDir)));
-    writeFileSync(cleanupVbsPath, encodeVbsAsUtf16(buildWindowsCleanupVbs(cleanupPath)));
-
-    // VBS launcher — runs the JS runner via `node upgrade.mjs <args>`
-    // hidden + detached.  Bake all paths as args so the runner doesn't
-    // depend on env-var expansion or working directory.
-    const upgradeVbsPath = join(scriptDir, 'upgrade.vbs');
-    // Pass the resolved registry (sentinel '-' when official/default so we
-    // don't add a redundant --registry) and the current daemon version so the
-    // runner can apply a post-install downgrade guard for `latest` (Linux/macOS
-    // do this in-script; Windows had no such guard before).
-    const winRegistryArg = upgradeRegistry.explicit ? upgradeRegistry.base : '-';
-    const upgradeVbs = buildWindowsUpgradeRunnerVbs({
-      nodeExe: process.execPath,
-      runnerPath: runnerCopy,
-      args: [logFile, npmCmd, pkgSpec, targetVer, scriptDir, winRegistryArg, DAEMON_VERSION],
-    });
-    writeFileSync(upgradeVbsPath, encodeVbsAsUtf16(upgradeVbs));
-
-    // Launch via wscript: hidden + fully detached, survives our exit.
-    const child = spawn('wscript', [upgradeVbsPath], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    });
-    child.unref();
-
-    // Also kick off cleanup deferred 120 s — the runner cleans up too,
-    // but if it crashes before its finally block we still want %TEMP% tidy.
-    spawn('wscript', [cleanupVbsPath], {
-      detached: true,
-      stdio: 'ignore',
-      windowsHide: true,
-    }).unref();
-
-    logger.info({ log: logFile, runnerCopy }, 'daemon.upgrade: Windows JS upgrade runner spawned');
     upgradeScriptSpawned = true;
     announceUpgrading();
     scheduleUpgradeMemoryFreezeRelease();
@@ -7748,663 +8797,20 @@ launchctl load -w "${plist}"`;
   // resolved registry is the official default (preserves prior behavior exactly
   // — no --registry flag, npm uses its ambient config).
   const registryArg = upgradeRegistry.explicit ? `--registry ${upgradeRegistry.base}` : '';
-  const script = `#!/bin/bash
-# imcodes daemon-upgrade script. Generated by daemon.upgrade.
-# Runs detached, outlives the parent daemon process.
-# Logs every step to "$LOG" — keep the file for 24 h after exit so a
-# stuck or failed restart can be diagnosed post-hoc.
-
-LOG="${logFile}"
-SCRIPT_DIR="${scriptDir}"
-UPGRADE_STATUS_FILE="${statusFile}"
-CLEANUP_AFTER_SEC=${CLEANUP_AFTER_SEC}
-REGISTRY_ARG="${registryArg}"
-log() { echo "[$(date '+%Y-%m-%dT%H:%M:%S%z')] $*" >> "$LOG"; }
-
-${buildPosixUpgradeLayoutRecoveryScript()}
-
-write_install_failure_status() {
-  local retry_reason="$1"
-  local attempts="$2"
-  local exit_code="$3"
-  local status_tmp="$UPGRADE_STATUS_FILE.tmp.$$"
-  printf '{"state":"blocked","reason":"${DAEMON_UPGRADE_BLOCK_REASON.INSTALL_FAILED}","retryReason":"%s","attempts":%s,"exitCode":%s}\\n' \
-    "$retry_reason" "$attempts" "$exit_code" > "$status_tmp" 2>>"$LOG" || return 1
-  mv "$status_tmp" "$UPGRADE_STATUS_FILE" 2>>"$LOG"
-}
-
-schedule_self_cleanup() {
-  if [ -z "$SCRIPT_DIR" ] || [ ! -d "$SCRIPT_DIR" ]; then
-    return 0
-  fi
-
-  if [ "$(uname)" = "Linux" ]; then
-    if command -v systemd-run >/dev/null 2>&1; then
-      CLEANUP_LABEL=$(printf '%s' "$(basename "$SCRIPT_DIR")" | tr -c 'A-Za-z0-9_.-' '-')
-      CLEANUP_UNIT="imcodes-upgrade-cleanup-$CLEANUP_LABEL"
-      if systemd-run --user --unit="$CLEANUP_UNIT" --collect --quiet /bin/sh -c 'sleep "$1"; rm -rf "$2"' imcodes-upgrade-cleanup "$CLEANUP_AFTER_SEC" "$SCRIPT_DIR" >> "$LOG" 2>&1; then
-        log "[cleanup] scheduled via systemd-run user unit: $CLEANUP_UNIT"
-        return 0
-      fi
-      log "[cleanup] systemd-run scheduling failed (non-fatal); leaving $SCRIPT_DIR for manual cleanup"
-    else
-      log "[cleanup] systemd-run unavailable; leaving $SCRIPT_DIR for manual cleanup"
-    fi
-    log "[cleanup] skipped background sleeper on Linux to avoid leaking into imcodes.service cgroup"
-    return 0
-  fi
-
-  (sleep "$CLEANUP_AFTER_SEC" && rm -rf "$SCRIPT_DIR") >/dev/null 2>&1 &
-  log "[cleanup] scheduled via background sleeper"
-}
-
-log "=== imcodes upgrade started ==="
-log "[step 0] daemon PID at gen time: ${oldDaemonPid}"
-log "[step 0] node bin: ${nodeBin}"
-log "[step 0] target: ${pkgSpec} (current daemon version: ${currentVer})"
-log "[step 0] registry: \${REGISTRY_ARG:-<npm default>}"
-
-# ── Single-flight guard ─────────────────────────────────────────────────
-#
-# npm global installs are NOT atomic: a failed or concurrent
-# \`npm install -g imcodes@...\` can remove/replace the global package while a
-# second upgrade has already installed a good copy.  Keep the old daemon
-# serving while the install runs, but allow only ONE upgrade script to touch
-# the global install / service restart path at a time.
-UPGRADE_LOCK_DIR="$HOME/.imcodes/upgrade.lock.d"
-UPGRADE_LOCK_PID="$UPGRADE_LOCK_DIR/pid"
-UPGRADE_LOCK_STARTED="$UPGRADE_LOCK_DIR/started"
-UPGRADE_LOCK_STALE_AFTER_SEC=1800
-UPGRADE_LOCK_HELD=0
-
-lock_age_seconds() {
-  local started now
-  started=$(cat "$UPGRADE_LOCK_STARTED" 2>/dev/null || true)
-  now=$(date +%s)
-  case "$started" in
-    ''|*[!0-9]*)
-      # If a prior process crashed between mkdir and writing the started
-      # file, fall back to the lock directory's mtime so it can still expire.
-      started=$(stat -c %Y "$UPGRADE_LOCK_DIR" 2>/dev/null || stat -f %m "$UPGRADE_LOCK_DIR" 2>/dev/null || echo "$now")
-      case "$started" in
-        ''|*[!0-9]*) echo 0 ;;
-        *) echo $((now - started)) ;;
-      esac
-      ;;
-    *) echo $((now - started)) ;;
-  esac
-}
-
-acquire_upgrade_lock() {
-  mkdir -p "$HOME/.imcodes" 2>/dev/null || true
-  while true; do
-    if mkdir "$UPGRADE_LOCK_DIR" 2>/dev/null; then
-      echo "$$" > "$UPGRADE_LOCK_PID" 2>/dev/null || true
-      date +%s > "$UPGRADE_LOCK_STARTED" 2>/dev/null || true
-      UPGRADE_LOCK_HELD=1
-      log "[step 0.5] acquired upgrade lock: $UPGRADE_LOCK_DIR"
-      return 0
-    fi
-
-    LOCK_OWNER=$(cat "$UPGRADE_LOCK_PID" 2>/dev/null || true)
-    LOCK_AGE=$(lock_age_seconds)
-    if [ -n "$LOCK_OWNER" ] && kill -0 "$LOCK_OWNER" 2>/dev/null; then
-      log "[step 0.5] another upgrade is already running (pid $LOCK_OWNER, age \${LOCK_AGE}s) — exiting without touching npm/service"
-      return 1
-    fi
-    if [ -z "$LOCK_OWNER" ] && [ "$LOCK_AGE" -lt "$UPGRADE_LOCK_STALE_AFTER_SEC" ]; then
-      log "[step 0.5] upgrade lock exists without owner (age \${LOCK_AGE}s) — treating as active, exiting"
-      return 1
-    fi
-
-    STALE_LOCK="\${UPGRADE_LOCK_DIR}.stale.$$"
-    log "[step 0.5] removing stale upgrade lock (owner: \${LOCK_OWNER:-unknown}, age \${LOCK_AGE}s)"
-    if mv "$UPGRADE_LOCK_DIR" "$STALE_LOCK" 2>/dev/null; then
-      rm -rf "$STALE_LOCK"
-      # Loop back and acquire with mkdir; if another process won the race,
-      # mkdir will fail and we'll re-check the new owner.
-      continue
-    fi
-
-    log "[step 0.5] lost race while clearing stale upgrade lock — exiting"
-    return 1
-  done
-}
-
-release_upgrade_lock() {
-  if [ "$UPGRADE_LOCK_HELD" = "1" ]; then
-    OWNER=$(cat "$UPGRADE_LOCK_PID" 2>/dev/null || true)
-    if [ "$OWNER" = "$$" ]; then
-      rm -rf "$UPGRADE_LOCK_DIR"
-      log "[step 0.5] released upgrade lock"
-    else
-      log "[step 0.5] not releasing upgrade lock; owner changed to \${OWNER:-unknown}"
-    fi
-  fi
-}
-
-if ! acquire_upgrade_lock; then
-  log "=== upgrade skipped: another upgrade is in progress ==="
-  schedule_self_cleanup
-  exit 0
-fi
-trap release_upgrade_lock EXIT
-
-# Make node visible to everything we spawn (npm post-install scripts,
-# node-gyp, the freshly-installed imcodes --version probe, etc).
-# Critical on nvm/fnm/volta where node lives outside system PATH.
-export PATH="${nodeDir}:$PATH"
-log "[step 0] PATH=$PATH"
-
-# Discover npm-cli.js dynamically — works for any node install method
-# (Homebrew, nvm, fnm, volta, system pkg, snap, plain tarball, custom).
-# Strategy ordering: most reliable first, fall through on failure.
-NODE="${nodeBin}"
-NPM_CLI=""
-
-# Strategy 1: ask npm itself where it's installed. The shebang in
-# <nodeDir>/npm will find node (we just exported PATH), so this works
-# regardless of how the user installed node.
-if [ -z "$NPM_CLI" ]; then
-  NPM_PREFIX=$(npm prefix -g 2>>"$LOG")
-  if [ -n "$NPM_PREFIX" ] && [ -f "$NPM_PREFIX/lib/node_modules/npm/bin/npm-cli.js" ]; then
-    NPM_CLI="$NPM_PREFIX/lib/node_modules/npm/bin/npm-cli.js"
-    log "[step 0] npm-cli.js via npm prefix -g: $NPM_CLI"
-  fi
-fi
-
-# Strategy 2: realpath the npm sibling next to node. Handles symlink-
-# based installs (Homebrew, nvm, fnm — even when their layouts diverge).
-if [ -z "$NPM_CLI" ] && [ -e "${nodeDir}/npm" ]; then
-  RESOLVED=$(readlink -f "${nodeDir}/npm" 2>/dev/null || readlink "${nodeDir}/npm" 2>/dev/null)
-  case "$RESOLVED" in
-    *npm-cli.js)
-      if [ -f "$RESOLVED" ]; then
-        NPM_CLI="$RESOLVED"
-        log "[step 0] npm-cli.js via realpath \\\${nodeDir}/npm: $NPM_CLI"
-      fi
-      ;;
-  esac
-fi
-
-# Strategy 3: probe known relative-from-nodeDir layouts.
-if [ -z "$NPM_CLI" ]; then
-  for CANDIDATE in \
-    "${nodeDir}/../lib/node_modules/npm/bin/npm-cli.js" \
-    "${nodeDir}/../../../lib/node_modules/npm/bin/npm-cli.js" \
-    "${nodeDir}/node_modules/npm/bin/npm-cli.js" \
-  ; do
-    if [ -f "$CANDIDATE" ]; then
-      NPM_CLI="$CANDIDATE"
-      log "[step 0] npm-cli.js via candidate probe: $NPM_CLI"
-      break
-    fi
-  done
-fi
-
-# Strategy 4: fall back to bare \`npm\` on PATH (PATH already includes nodeDir).
-# The shebang chain still works because node is on PATH from our export.
-if [ -z "$NPM_CLI" ]; then
-  log "[step 0] npm-cli.js NOT located via any strategy — using bare 'npm' from PATH"
-  NPM_RUN='npm'
-else
-  NPM_RUN="\\"$NODE\\" \\"$NPM_CLI\\""
-fi
-log "[step 0] npm runner: $NPM_RUN"
-
-# Give the running daemon a moment to finish in-flight responses.
-sleep 3
-
-log "[step 1] discover global package root"
-GLOBAL_ROOT=$(eval "$NPM_RUN root -g" 2>>"$LOG")
-log "[step 1] global root: $GLOBAL_ROOT"
-GLOBAL_PKG="$GLOBAL_ROOT/imcodes"
-
-# npm's rename destination is created before the incoming package's
-# preinstall hook can run, so the package-level cleanup cannot heal this
-# failure. Remove interrupted reify leftovers here, before npm starts.
-cleanup_stale_imcodes_staging_dirs "$GLOBAL_ROOT" "$UPGRADE_LOCK_STALE_AFTER_SEC" \
-  || log "[step 1.5] stale npm staging cleanup was incomplete; install may retry targeted recovery"
-
-# Remove existing npm link if any — it shadows install and prevents real upgrade.
-if [ -L "$GLOBAL_PKG" ]; then
-  log "[step 1] removing pre-existing npm link: $GLOBAL_PKG -> $(readlink "$GLOBAL_PKG")"
-  eval "$NPM_RUN uninstall -g imcodes" >> "$LOG" 2>&1 || log "[step 1] uninstall returned non-zero (ignored)"
-fi
-
-log "[step 2] installing ${pkgSpec}"
-# --ignore-scripts: \`scripts/strip-onnxruntime-gpu.mjs\` strips
-# \`node_modules/sharp/\` from the published tarball so npm re-resolves it on
-# the user's actual platform (otherwise the Linux-built bundle ships a
-# Linux-only sharp wrapper that can't load on macOS/Windows). When npm
-# re-resolves sharp during a global install, sharp's \`install\` hook
-# (\`node install/check.js || npm run build\`) fails with MODULE_NOT_FOUND
-# in a way we couldn't reproduce in nested project installs — npm seems
-# to half-extract sharp under \`<global>/imcodes/node_modules/sharp/\` (the
-# install/ directory ends up missing) and then runs the hook anyway. The
-# fallback \`npm run build\` then walks UP into imcodes's package.json,
-# tries to run imcodes's \`tsc\` build, and exits 127 because tsc isn't on
-# the global PATH. Net effect: every auto-upgrade since the strip-sharp
-# change has been failing with exit 127 and operators were getting
-# \`Cannot find module .../sharp/install/check.js\` in upgrade.log.
-#
-# Skipping install scripts is safe here because (a) sharp 0.34's runtime
-# binary is the prebuilt \`@img/sharp-<platform>-<arch>\` package (which
-# npm STILL fetches and unpacks because it's a regular optionalDependency
-# of sharp — no install script involvement), and (b) the only thing
-# install/check.js does is dlopen-test that prebuilt; if it fails
-# check.js falls back to compiling from source (npm run build), which
-# we never want on a user machine anyway.
-#
-# After the install we probe \`sharp/package.json\`. If npm left an empty
-# placeholder dir (the half-extract pathology above), do a one-shot
-# \`npm install\` from inside the global package to repopulate it. Run with
-# --ignore-scripts again for the same reason.
-#
-# ── Retry on publish propagation / transient network failures ──────────
-# Real-world failure mode caught on a production daemon: server publishes a
-# new dev release to npm and broadcasts \`daemon.upgrade { targetVersion }\`
-# almost immediately. npm origin has the version but the regional CDN
-# edge serving this daemon hasn't replicated yet — so the packument
-# response is a 200 missing the new version → npm exits with ETARGET.
-# Pre-fix this either killed the upgrade for that release or, worse, ran
-# \`npm cache clean --force\`, deleting every cached dependency on the box.
-# The eventual successful install then had to redownload 200+ packages and
-# took minutes. We now use a cheap \`npm view\` precheck for pinned versions,
-# avoid full-cache wipes, and retry transient network failures like
-# ECONNRESET/ETIMEDOUT/EAI_AGAIN.
-INSTALL_OUT="${scriptDir}/install-attempt.log"
-INSTALL_RC=1
-ATTEMPT=0
-MAX_ATTEMPTS=5
-RETRY_REASON="not-classified"
-# Indexed sequentially with $ATTEMPT (1-based), so element 0 is unused.
-# 15s / 30s / 60s / 120s keeps the common npm publish-CDN window quick
-# without stretching a bad target into a 10-minute local stall.
-RETRY_DELAYS=(0 15 30 60 120)
-
-is_etarget_output() {
-  grep -qiE 'code ETARGET|No matching version found' "$1" 2>/dev/null
-}
-
-is_transient_npm_output() {
-  grep -qiE 'code (ECONNRESET|ETIMEDOUT|EAI_AGAIN|ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH)|network aborted|socket timeout|fetch failed|network socket disconnected|5[0-9][0-9]' "$1" 2>/dev/null
-}
-
-while [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; do
-  ATTEMPT=$((ATTEMPT + 1))
-  log "[step 2] install attempt $ATTEMPT/$MAX_ATTEMPTS"
-  : > "$INSTALL_OUT"
-
-  if [ "${targetVer}" != "latest" ]; then
-    log "[step 2] registry visibility precheck for ${pkgSpec}"
-    eval "$NPM_RUN view --prefer-online \${REGISTRY_ARG} ${pkgSpec} version" >> "$INSTALL_OUT" 2>&1
-    VIEW_RC=$?
-    cat "$INSTALL_OUT" >> "$LOG"
-    if [ "$VIEW_RC" -ne 0 ] && is_etarget_output "$INSTALL_OUT"; then
-      RETRY_REASON="target-not-visible"
-      log "[step 2] ${pkgSpec} not visible in registry yet"
-      if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-        log "[step 2] target never became visible across $MAX_ATTEMPTS attempts — giving up before heavyweight install"
-        INSTALL_RC=$VIEW_RC
-        break
-      fi
-      DELAY=\${RETRY_DELAYS[$ATTEMPT]}
-      log "[step 2] waiting \${DELAY}s for npm publish propagation"
-      sleep "$DELAY"
-      continue
-    fi
-    if [ "$VIEW_RC" -ne 0 ]; then
-      log "[step 2] registry precheck failed (exit $VIEW_RC); trying install anyway"
-    fi
-    : > "$INSTALL_OUT"
-  fi
-
-  # --prefer-online: tell npm to revalidate cached packument metadata
-  # rather than serve potentially-stale entries. Do NOT use \`npm cache
-  # clean --force\` here: it wipes cached dependency tarballs too, which is
-  # exactly what made upgrades on large SDK dependency sets feel glacial.
-  eval "$NPM_RUN install -g --ignore-scripts --prefer-online \${REGISTRY_ARG} ${pkgSpec}" >> "$INSTALL_OUT" 2>&1
-  INSTALL_RC=$?
-  # Always tee the attempt's output into the main log for forensics.
-  cat "$INSTALL_OUT" >> "$LOG"
-  if [ "$INSTALL_RC" -eq 0 ]; then
-    log "[step 2] install attempt $ATTEMPT succeeded"
-    break
-  fi
-  log "[step 2] install attempt $ATTEMPT failed (exit $INSTALL_RC)"
-  IS_RETRYABLE=0
-  RETRY_REASON="non-retryable"
-  if is_etarget_output "$INSTALL_OUT"; then
-    IS_RETRYABLE=1
-    RETRY_REASON="target-not-visible"
-  elif is_transient_npm_output "$INSTALL_OUT"; then
-    IS_RETRYABLE=1
-    RETRY_REASON="transient-network"
-  elif is_recoverable_layout_output "$INSTALL_OUT" "$GLOBAL_ROOT"; then
-    IS_RETRYABLE=1
-    RETRY_REASON="stale-staging-dir"
-    if ! recover_stale_layout_from_output "$INSTALL_OUT" "$GLOBAL_ROOT"; then
-      log "[step 2] targeted stale staging cleanup failed; retrying remains bounded"
-    fi
-  fi
-  if [ "$IS_RETRYABLE" -ne 1 ]; then
-    log "[step 2] non-retryable npm failure — not retrying. Tail of npm output:"
-    tail -20 "$INSTALL_OUT" | while IFS= read -r line; do log "[step 2]   $line"; done
-    break
-  fi
-  if [ "$ATTEMPT" -ge "$MAX_ATTEMPTS" ]; then
-    log "[step 2] retryable npm failure ($RETRY_REASON) persisted across $MAX_ATTEMPTS attempts"
-    break
-  fi
-  DELAY=\${RETRY_DELAYS[$ATTEMPT]}
-  log "[step 2] retryable npm failure ($RETRY_REASON) — retrying in \${DELAY}s"
-  sleep "$DELAY"
-done
-if [ "$INSTALL_RC" -ne 0 ]; then
-  log "[step 2] install FAILED after $ATTEMPT attempts (final exit $INSTALL_RC) — keeping current daemon running"
-  write_install_failure_status "$RETRY_REASON" "$ATTEMPT" "$INSTALL_RC" \
-    || log "[step 2] failed to write upgrade status marker: $UPGRADE_STATUS_FILE"
-  log "=== upgrade aborted ==="
-  schedule_self_cleanup
-  exit ${POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE}
-fi
-log "[step 2] install succeeded after $ATTEMPT attempt(s)"
-
-${buildBashSharpRepair()}
-
-${buildBashNodeDatachannelRepair()}
-
-# Read installed version directly from package.json — bypasses the
-# freshly-installed imcodes shebang (which can fail under the same
-# PATH issues that motivated this whole bypass).
-GLOBAL_ROOT=$(eval "$NPM_RUN root -g" 2>/dev/null)
-INSTALLED_VER=$("$NODE" -e "try{process.stdout.write(require('$GLOBAL_ROOT/imcodes/package.json').version)}catch(e){process.exit(1)}" 2>/dev/null || echo "unknown")
-log "[step 3] installed version: $INSTALLED_VER, target: ${targetVer}"
-if [ "${targetVer}" != "latest" ] && [ "$INSTALLED_VER" != "${targetVer}" ]; then
-  log "[step 3] version mismatch — keeping current daemon running"
-  log "=== upgrade aborted ==="
-  schedule_self_cleanup
-  exit 0
-fi
-
-NEW_IMCODES_SCRIPT="$GLOBAL_ROOT/imcodes/dist/src/index.js"
-NEW_LAUNCHER="$GLOBAL_ROOT/imcodes/bin/imcodes-launch.sh"
-
-repair_cli_wrappers() {
-  if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
-    log "[step 3.6] $NEW_IMCODES_SCRIPT not found — skipping CLI wrapper repair"
-    return 0
-  fi
-
-  WRAPPER_TMP="$SCRIPT_DIR/imcodes-cli-wrapper"
-  {
-    printf '%s\\n' '#!/bin/sh'
-    printf 'exec "%s" "%s" "$@"\\n' "$NODE" "$NEW_IMCODES_SCRIPT"
-  } > "$WRAPPER_TMP" || {
-    log "[step 3.6] failed to write temporary CLI wrapper (non-fatal)"
-    return 0
-  }
-  chmod 755 "$WRAPPER_TMP" 2>/dev/null || true
-
-  USER_BIN="$HOME/.local/bin"
-  USER_SHIM="$USER_BIN/imcodes"
-  if mkdir -p "$USER_BIN" 2>/dev/null; then
-    if rm -f "$USER_SHIM" 2>/dev/null && cp "$WRAPPER_TMP" "$USER_SHIM" 2>/dev/null && chmod 755 "$USER_SHIM" 2>/dev/null; then
-      log "[step 3.6] refreshed CLI wrapper: $USER_SHIM"
-    else
-      log "[step 3.6] failed to refresh $USER_SHIM (non-fatal)"
-    fi
-  else
-    log "[step 3.6] failed to create $USER_BIN (non-fatal)"
-  fi
-
-  case "$(uname)" in
-    Linux|Darwin)
-      GLOBAL_SHIM="/usr/local/bin/imcodes"
-      if [ ! -d "/usr/local/bin" ]; then
-        log "[step 3.6] /usr/local/bin absent — skipped global CLI wrapper"
-      elif rm -f "$GLOBAL_SHIM" 2>/dev/null && cp "$WRAPPER_TMP" "$GLOBAL_SHIM" 2>/dev/null && chmod 755 "$GLOBAL_SHIM" 2>/dev/null; then
-        log "[step 3.6] refreshed CLI wrapper: $GLOBAL_SHIM"
-      elif command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1; then
-        if sudo install -m 755 "$WRAPPER_TMP" "$GLOBAL_SHIM" >> "$LOG" 2>&1; then
-          log "[step 3.6] refreshed CLI wrapper with sudo: $GLOBAL_SHIM"
-        else
-          log "[step 3.6] sudo install failed for $GLOBAL_SHIM (non-fatal)"
-        fi
-      else
-        log "[step 3.6] skipped $GLOBAL_SHIM: not writable and passwordless sudo unavailable"
-      fi
-      ;;
-  esac
-}
-
-# Downgrade guard — refuse to restart if installed < current daemon.
-# Catches: server broadcasts \`latest\` but npm's "latest" dist-tag
-# resolves to an older release than the operator's local dev build.
-CURRENT_VER="${currentVer}"
-"$NODE" -e "
-  const a = process.argv[1], b = process.argv[2];
-  const parse = v => { const i = v.indexOf('-'); return { rel: (i<0?v:v.slice(0,i)).split('.').map(n => parseInt(n,10)||0), pre: i<0 ? null : v.slice(i+1).split('.') }; };
-  const A = parse(a), B = parse(b);
-  const len = Math.max(A.rel.length, B.rel.length);
-  for (let i = 0; i < len; i++) { const da = A.rel[i]||0, db = B.rel[i]||0; if (da !== db) process.exit(da < db ? 1 : 2); }
-  if (A.pre === null && B.pre === null) process.exit(0);
-  if (A.pre === null) process.exit(2);
-  if (B.pre === null) process.exit(1);
-  const plen = Math.max(A.pre.length, B.pre.length);
-  for (let i = 0; i < plen; i++) {
-    const pa = A.pre[i]||'', pb = B.pre[i]||'';
-    const na = /^\\d+\$/.test(pa) ? parseInt(pa,10) : null;
-    const nb = /^\\d+\$/.test(pb) ? parseInt(pb,10) : null;
-    if (na !== null && nb !== null) { if (na !== nb) process.exit(na < nb ? 1 : 2); }
-    else if (pa !== pb) process.exit(pa < pb ? 1 : 2);
-  }
-  process.exit(0);
-" "$INSTALLED_VER" "$CURRENT_VER"
-CMP=$?
-# Exit codes: 0=equal, 1=installed<current (downgrade), 2=installed>current (upgrade)
-if [ "$CMP" = "1" ]; then
-  log "[step 3] installed $INSTALLED_VER is OLDER than current $CURRENT_VER — refusing to downgrade"
-  log "=== upgrade aborted ==="
-  schedule_self_cleanup
-  exit 0
-fi
-if [ "$CMP" = "0" ]; then
-  log "[step 3] installed $INSTALLED_VER matches current — repairing CLI wrappers without restart"
-  log "[step 3.6] repairing CLI wrappers"
-  repair_cli_wrappers
-  log "=== upgrade complete (no-op) ==="
-  schedule_self_cleanup
-  exit 0
-fi
-log "[step 3] version comparator: installed > current → restart"
-
-# ── Step 3.5: Regenerate launch chain with the new binary's paths ──────
-#
-# Why this exists: on Linux the systemd unit at
-# ~/.config/systemd/user/imcodes.service hard-codes ExecStart with the
-# absolute path to \`node\` and the imcodes entry script as they existed at
-# \`imcodes bind\` time. Any of these scenarios leaves it pointing at a
-# bin that no longer exists / no longer resolves correctly:
-#
-#   * user switches node via nvm/fnm/volta — \`/.../node/v22.x.x/bin/imcodes\`
-#     still resolves but a fresh \`npm i -g\` populated the new version's
-#     prefix instead, so the old absolute path is stale.
-#   * \`npm uninstall -g imcodes\` followed by reinstall under a different
-#     prefix (homebrew vs nvm vs system) leaves the symlink dangling.
-#   * any reorg of node versions where the bin sits at a new absolute path.
-#
-# Real-world hit: a production daemon stuck on an older dev build because the
-# unit's ExecStart pointed at /home/k/.nvm/versions/node/v22.22.2/bin/imcodes
-# from a prior install — \`systemctl restart imcodes\` succeeds in the
-# upgrade script's eyes but the spawned process crashes "Cannot find
-# module '/home/k/.../bin/imcodes'" (988 recorded crashes in daemon.log
-# before one of them finally caught a working state by lucky races).
-#
-# Windows already does the equivalent (Step 5 "Regenerate daemon launch
-# chain" in windows-upgrade-script.ts).  This mirrors that behavior for
-# Linux + macOS so a successful npm install is always followed by a
-# launch-chain pointing at the freshly-installed binary.
-#
-# Safe-by-design: we only touch ExecStart on Linux and ProgramArguments
-# on macOS. Other Environment= / Restart= / KillMode= settings the user
-# may have customised are preserved verbatim. If the unit / plist file
-# doesn't exist, we skip silently — the user may run via \`imcodes start\`
-# directly or have a non-standard launcher, neither of which we should
-# clobber.
-log "[step 3.5] regenerating launch chain"
-
-# Prefer the self-healing launcher (bin/imcodes-launch.sh) when the
-# freshly-installed package ships it. Older installs (pre-launcher) fall
-# back to the direct node ExecStart so we never break versions that
-# don't ship the file. Either way the resulting unit/plist points at
-# absolute paths from THIS install — consistent with the rest of step
-# 3.5's contract.
-if [ -f "$NEW_LAUNCHER" ]; then
-  LINUX_EXEC="ExecStart=$NEW_LAUNCHER start --foreground"
-  DARWIN_PROGRAM_ARGS="[\\"$NEW_LAUNCHER\\",\\"start\\",\\"--foreground\\"]"
-  log "[step 3.5] using self-healing launcher: $NEW_LAUNCHER"
-else
-  LINUX_EXEC="ExecStart=$NODE $NEW_IMCODES_SCRIPT start --foreground"
-  DARWIN_PROGRAM_ARGS="[\\"$NODE\\",\\"$NEW_IMCODES_SCRIPT\\",\\"start\\",\\"--foreground\\"]"
-  log "[step 3.5] $NEW_LAUNCHER not present in this version — using direct node ExecStart"
-fi
-
-if [ ! -f "$NEW_IMCODES_SCRIPT" ]; then
-  log "[step 3.5] $NEW_IMCODES_SCRIPT not found — skipping (will rely on existing launch chain)"
-elif [ "$(uname)" = "Linux" ]; then
-  SVC="$HOME/.config/systemd/user/imcodes.service"
-  if [ -f "$SVC" ]; then
-    NEW_EXEC="$LINUX_EXEC"
-    OLD_EXEC=$(grep -m1 '^ExecStart=' "$SVC" || echo '(none)')
-    if [ "$OLD_EXEC" = "$NEW_EXEC" ]; then
-      log "[step 3.5] systemd ExecStart already current"
-    else
-      log "[step 3.5] rewriting ExecStart"
-      log "[step 3.5]   from: $OLD_EXEC"
-      log "[step 3.5]   to:   $NEW_EXEC"
-      # Use awk for portability — sed -i's in-place behavior differs
-      # between BSD (mac) and GNU (linux), and quoting the replacement
-      # gets thorny with paths that may contain '/'. awk on a temp
-      # file is unambiguous on every Unix.
-      if awk -v new="$NEW_EXEC" '
-        BEGIN { done = 0 }
-        /^ExecStart=/ { if (!done) { print new; done = 1; next } }
-        { print }
-      ' "$SVC" > "$SVC.new" && mv "$SVC.new" "$SVC"; then
-        systemctl --user daemon-reload >> "$LOG" 2>&1 && log "[step 3.5] systemd daemon-reload OK" || log "[step 3.5] systemd daemon-reload FAILED (non-fatal)"
-      else
-        log "[step 3.5] awk rewrite FAILED — keeping old unit (non-fatal)"
-        rm -f "$SVC.new"
-      fi
-    fi
-  else
-    log "[step 3.5] $SVC absent — nothing to rewrite"
-  fi
-elif [ "$(uname)" = "Darwin" ]; then
-  PLIST="$HOME/Library/LaunchAgents/imcodes.daemon.plist"
-  if [ -f "$PLIST" ]; then
-    if command -v plutil >/dev/null 2>&1; then
-      log "[step 3.5] rewriting plist ProgramArguments"
-      if plutil -replace ProgramArguments -json "$DARWIN_PROGRAM_ARGS" "$PLIST" >> "$LOG" 2>&1; then
-        log "[step 3.5] plutil rewrite OK"
-      else
-        log "[step 3.5] plutil rewrite FAILED (non-fatal)"
-      fi
-    else
-      log "[step 3.5] plutil not available — skipping plist regen"
-    fi
-  else
-    log "[step 3.5] $PLIST absent — nothing to rewrite"
-  fi
-fi
-
-log "[step 3.6] repairing CLI wrappers"
-repair_cli_wrappers
-
-log "[step 4] running restart command"
-# Wrap restartCmd in a subshell so its multi-line content captures all
-# stdout/stderr to LOG. The previous template-literal interpolation
-# attached >>$LOG to only the LAST line of restartCmd, swallowing
-# everything before launchctl load (silent unload failures, kill exit
-# codes, etc).
-{
-${restartCmd}
-} >> "$LOG" 2>&1
-RC=$?
-log "[step 4] restart command exit code: $RC"
-
-# Verify the old daemon process is actually gone — surfacing platform-
-# specific restart failures (launchctl unload silently no-op'd, systemd
-# returned 0 without restarting, etc).
-sleep 2
-if kill -0 ${oldDaemonPid} 2>/dev/null; then
-  log "[step 4] WARN: old daemon PID ${oldDaemonPid} still alive after restart command"
-else
-  log "[step 4] old daemon PID ${oldDaemonPid} terminated as expected"
-fi
-
-# ── Step 5: Health check — verify a NEW daemon is actually running ─────
-#
-# Why: a successful step 4 (e.g. "systemctl --user restart imcodes" returns 0
-# when the unit transitions to "activating") doesn't guarantee the new
-# daemon survives. systemd returns success once the spawned process forks,
-# but if its ExecStart fails (e.g. node crashes immediately on a stale
-# module path that survived step 3.5), Restart=always immediately re-spawns
-# it, and the failure repeats invisibly. The new daemon's PID is recorded
-# in ~/.imcodes/daemon.pid AFTER successful startup, so we can use the pid
-# file as a positive-liveness signal: read it 5–15 s after restart and
-# kill -0 it.
-#
-# If the daemon failed to come up after restart, we surface the symptom in
-# upgrade.log loudly so operators see "daemon NOT running after restart"
-# instead of a silent dead service.
-log "[step 5] post-restart health check"
-sleep 5
-HEALTH_PID=""
-for i in 1 2 3; do
-  if [ -f "$HOME/.imcodes/daemon.pid" ]; then
-    HEALTH_PID=$(cat "$HOME/.imcodes/daemon.pid" 2>/dev/null || true)
-    if [ -n "$HEALTH_PID" ] && kill -0 "$HEALTH_PID" 2>/dev/null && [ "$HEALTH_PID" != "${oldDaemonPid}" ]; then
-      log "[step 5] new daemon healthy: PID $HEALTH_PID (after \${i}x check)"
-      break
-    fi
-  fi
-  HEALTH_PID=""
-  sleep 3
-done
-if [ -z "$HEALTH_PID" ]; then
-  log "[step 5] WARN: no live new daemon after 14s — service unit may have a stale path or the new binary crashes on startup"
-  log "[step 5] WARN: check 'systemctl --user status imcodes' (linux) or 'log show --predicate \"subsystem == \\\"imcodes\\\"\"' (macos)"
-  log "[step 5] WARN: if path-stale, manually fix ExecStart in $HOME/.config/systemd/user/imcodes.service then 'systemctl --user daemon-reload && systemctl --user restart imcodes'"
-else
-  # Drop the auto-upgrade cooldown sentinel — handleDaemonUpgrade
-  # consults this on the new daemon's next auto-upgrade attempt to
-  # rate-limit dev-tag-poll-driven restarts. Survives restart by
-  # design (the very transition we are throttling against).
-  # Epoch ms (matches Date.now in JS). MUST stay portable: BSD/macOS \`date\`
-  # has no %N, so \`date +%s%3N\` emits a bogus "<seconds>3N" there and corrupts
-  # the sentinel — which made the cooldown never apply and drove a macOS
-  # auto-upgrade thrash loop (stuck upgrade.sh + endless daemon restarts).
-  # seconds*1000 is ms-granular enough for a multi-minute cooldown and works on
-  # both GNU and BSD date. Best-effort: a missing sentinel means no cooldown.
-  printf '%s\n' "$(( $(date +%s) * 1000 ))" > "$HOME/.imcodes/last-upgrade-at" 2>/dev/null || true
-  log "[step 5] cooldown sentinel updated: $HOME/.imcodes/last-upgrade-at"
-fi
-
-log "=== upgrade script done ==="
-
-# Self-cleanup after 24 h so failures stay debuggable.
-schedule_self_cleanup
-`;
-
-  writeFileSync(scriptPath, script, { mode: 0o755 });
-
-  // Spawn fully detached — this process must NOT wait for the child
-  const child = spawn('/bin/bash', [scriptPath], {
-    detached: true,
-    stdio: 'ignore',
+  // One install path for the daemon and the CLI: the script (lock, retries, staged
+  // install + verify + switch, restart, health check with rollback) is shared.
+  const { child } = launchPosixUpgrade({
+    scriptDir,
+    registryArg,
+    pkgSpec,
+    targetVer,
+    currentVer,
+    oldDaemonPid,
+    nodeBin,
+    nodeDir,
+    stateDir: imcodesStateDir(),
+    restartCmd,
+    cleanupAfterSec: CLEANUP_AFTER_SEC,
   });
   child.on('exit', (code, signal) => {
     if (code !== POSIX_UPGRADE_INSTALL_FAILURE_EXIT_CODE) return;
@@ -8490,7 +8896,7 @@ async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<strin
   const entry = lookupAttachment(rawPath);
   if (!entry || entry.source !== 'upload' || Date.now() > entry.expiresAt) return null;
 
-  const uploadRoot = nodePath.resolve(homedir(), '.imcodes', 'uploads');
+  const uploadRoot = nodePath.resolve(imcodesStateDir(), 'uploads');
   const registeredPath = nodePath.resolve(entry.daemonPath);
   if (registeredPath === uploadRoot || !isSameOrInsidePath(uploadRoot, registeredPath)) return null;
 
@@ -8514,28 +8920,41 @@ async function resolveRegisteredUploadReadTarget(rawPath: string): Promise<strin
  * not another root: directory listing/search and every write path continue to
  * use the session project root exclusively.
  */
-async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<string | null> {
+async function resolveAssistantPublishedReadTarget(sessionName: string, rawPath: string): Promise<
+  | { granted: false }
+  | { granted: true; resolution: ChatFileReferenceResolutionResult }
+> {
   let granted = false;
   try {
     granted = await hasAssistantFileReadGrant(sessionName, rawPath, async () => (
-      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 500 })
+      await timelineStore.readByTypesPreferred(sessionName, ['assistant.text'], { limit: 5_000 })
     ));
   } catch {
     // Projection/history unavailable must fail closed.
-    return null;
+    return { granted: false };
   }
-  if (!granted) return null;
+  if (!granted) return { granted: false };
 
-  const requestedPath = nodePath.resolve(rawPath);
-  try {
-    const linkStats = await fsLstat(requestedPath);
-    if (linkStats.isSymbolicLink() || !linkStats.isFile()) return null;
-    const realTarget = await fsRealpath(requestedPath);
-    if (realTarget !== requestedPath || !isPathAllowed(realTarget)) return null;
-    return realTarget;
-  } catch {
-    return null;
+  const session = getSession(sessionName);
+  if (!session?.projectDir) {
+    return {
+      granted: true,
+      resolution: { ok: false, error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH, attemptedLocations: [] },
+    };
   }
+  const projectRoot = listSessions().find((candidate) => (
+    candidate.projectName === session.projectName && candidate.role === 'brain' && !!candidate.projectDir
+  ))?.projectDir ?? session.projectDir;
+  const worktreeRoot = await resolveGitWorktreeRoot(session.projectDir);
+  return {
+    granted: true,
+    resolution: await resolveChatFileReference({
+      reference: rawPath,
+      cwd: session.projectDir,
+      worktreeRoot,
+      projectRoot,
+    }),
+  };
 }
 
 async function resolveFsSessionRoot(cmd: Record<string, unknown>): Promise<
@@ -9418,19 +9837,89 @@ async function handleFsRead(cmd: Record<string, unknown>, serverLink: ServerLink
     try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: sessionRoot.error }); } catch { /* ignore */ }
     return;
   }
+  if (cmd.chatFileReference === true) {
+    // A file that already resolves inside the session's own project root has
+    // always been downloadable without any assistant grant -- this predates
+    // chatFileReference and must not regress. ChatView marks EVERY download
+    // and preview click chatFileReference:true now, including clicks on
+    // paths that its own tool.call/tool.result renderer (splitPathsAndUrls)
+    // extracted; those never mint a grant by design (session-file-read-grants
+    // only ingests assistant.text), so without this check an in-project file
+    // mentioned only in tool output, or a plain path a user pasted, would be
+    // wrongly refused with forbidden_path where it used to just work.
+    if (sessionRoot.realRoot) {
+      const inProject = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
+      if (inProject.ok) {
+        getDefaultPreviewReadCoordinator().handle(inProject.real, requestId, (message) => serverLink.send({
+          ...message,
+          path: rawPath,
+          resolvedPath: inProject.real,
+          resolutionMatchCount: 1,
+        }));
+        return;
+      }
+    }
+    const sessionName = typeof cmd.sessionName === 'string'
+      ? cmd.sessionName
+      : typeof cmd.session === 'string'
+        ? cmd.session
+        : '';
+    if (!sessionName) {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    const registeredUpload = await resolveRegisteredUploadReadTarget(rawPath);
+    if (registeredUpload) {
+      getDefaultPreviewReadCoordinator().handle(registeredUpload, requestId, (message) => serverLink.send({
+        ...message,
+        path: rawPath,
+        resolvedPath: registeredUpload,
+        resolutionMatchCount: 1,
+      }));
+      return;
+    }
+    const published = await resolveAssistantPublishedReadTarget(sessionName, rawPath);
+    if (!published.granted) {
+      try { serverLink.send({ type: 'fs.read_response', requestId, path: rawPath, status: 'error', error: FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH }); } catch { /* ignore */ }
+      return;
+    }
+    if (!published.resolution.ok) {
+      try {
+        serverLink.send({
+          type: 'fs.read_response',
+          requestId,
+          path: rawPath,
+          status: 'error',
+          error: published.resolution.error,
+          attemptedLocations: published.resolution.attemptedLocations,
+        });
+      } catch { /* ignore */ }
+      return;
+    }
+    const { realPath, attemptedLocations, matchCount } = published.resolution;
+    getDefaultPreviewReadCoordinator().handle(realPath, requestId, (message) => serverLink.send({
+      ...message,
+      path: rawPath,
+      resolvedPath: realPath,
+      attemptedLocations,
+      resolutionMatchCount: matchCount,
+    }));
+    return;
+  }
   if (sessionRoot.realRoot) {
     const target = await resolveExistingFsMutationTarget(rawPath, sessionRoot.realRoot);
     if (!target.ok) {
       const registeredUpload = target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveRegisteredUploadReadTarget(rawPath)
         : null;
-      const assistantPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
+      const legacyPublished = !registeredUpload && target.error === FS_GENERIC_ERROR_CODES.FORBIDDEN_PATH
         ? await resolveAssistantPublishedReadTarget(
           typeof cmd.sessionName === 'string' ? cmd.sessionName : typeof cmd.session === 'string' ? cmd.session : '',
           rawPath,
         )
         : null;
-      const exactReadTarget = registeredUpload ?? assistantPublished;
+      const exactReadTarget = registeredUpload
+        ?? (legacyPublished?.granted && legacyPublished.resolution.ok ? legacyPublished.resolution.realPath : null);
       if (exactReadTarget) {
         getDefaultPreviewReadCoordinator().handle(exactReadTarget, requestId, (message) => serverLink.send(message));
         return;
@@ -10580,7 +11069,8 @@ async function handleServerDelete(): Promise<void> {
 
   logger.info('server.delete received — self-destructing daemon');
 
-  const credsPath = join(homedir(), '.imcodes', 'server.json');
+  const { resolveImcodesHome } = await import('../util/windows-daemon-lock.js');
+  const credsPath = join(resolveImcodesHome(), 'server.json');
   try { await unlink(credsPath); } catch { /* already gone */ }
 
   // Uninstall system service so daemon doesn't restart
@@ -10671,7 +11161,7 @@ async function handleTransportListModels(
   const requestId = typeof cmd.requestId === 'string' ? cmd.requestId : undefined;
   const force = cmd.force === true;
   const reply = (payload: {
-    models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+    models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean; supportedEffortLevels?: readonly TransportEffortLevel[] }>;
     defaultModel?: string;
     isAuthenticated?: boolean;
     error?: string;
@@ -10702,7 +11192,7 @@ const TRANSPORT_LIST_MODELS_MAX_TTL_MS = 60_000;
 const TRANSPORT_LIST_MODELS_TTL_ENV = 'IMCODES_TRANSPORT_LIST_MODELS_CACHE_TTL_MS';
 
 type TransportListModelsResult = {
-  models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean }>;
+  models: Array<{ id: string; name?: string; supportsReasoningEffort?: boolean; supportedEffortLevels?: readonly TransportEffortLevel[] }>;
   defaultModel?: string;
   isAuthenticated?: boolean;
   error?: string;
@@ -10756,10 +11246,20 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
   // caller explicitly forces a live probe.
   if (!provider && !force) return await loadPassiveTransportListModels(agentType);
 
-  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless')) {
+  if (!provider && force && (agentType === 'gemini-sdk' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk' || agentType === 'opencode-sdk' || agentType === 'claude-code-sdk' || agentType === 'codex-sdk' || agentType === 'copilot-sdk' || agentType === 'cursor-headless' || isCodeBuddyProviderId(agentType))) {
     try {
       provider = await ensureProviderConnected(agentType, {});
     } catch (err) {
+      if (agentType === HERMES_AGENT_PROVIDER_ID) {
+        // Provider/spawn errors may contain tokens, command lines, environment
+        // values, or local paths. Hermes failures cross an anonymous model
+        // picker boundary, so persist only a bounded classification in logs.
+        logger.debug({
+          provider: agentType,
+          failureClass: classifyHermesModelDiscoveryFailure(err),
+        }, 'Hermes Agent auto-connect for model listing failed');
+        return hermesModelDiscoveryFailure(err);
+      }
       logger.debug({ provider: agentType, err }, 'Auto-connect for model listing failed');
     }
   }
@@ -10768,6 +11268,57 @@ async function loadTransportListModels(agentType: string, force: boolean): Promi
     return await provider.listModels(force);
   }
   return { models: [], error: `Unsupported agentType: ${agentType || '(missing)'}` };
+}
+
+type HermesModelDiscoveryFailureClass =
+  | 'authentication'
+  | 'rate_limited'
+  | 'cli_unavailable_or_incompatible'
+  | 'provider_failure';
+
+function classifyHermesModelDiscoveryFailure(error: unknown): HermesModelDiscoveryFailureClass {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : '';
+  if (code === PROVIDER_ERROR_CODES.AUTH_FAILED) return 'authentication';
+  if (code === PROVIDER_ERROR_CODES.RATE_LIMITED) return 'rate_limited';
+  if (code === PROVIDER_ERROR_CODES.CONFIG_ERROR || code === 'ENOENT') {
+    return 'cli_unavailable_or_incompatible';
+  }
+  return 'provider_failure';
+}
+
+function hermesModelDiscoveryFailure(error: unknown): TransportListModelsResult {
+  const failureClass = classifyHermesModelDiscoveryFailure(error);
+  if (failureClass === 'authentication') {
+    return {
+      models: [],
+      isAuthenticated: false,
+      error: 'Hermes Agent authentication is required. Run `hermes model`, complete an official provider login, then refresh.',
+    };
+  }
+  if (failureClass === 'rate_limited') {
+    return {
+      models: [],
+      isAuthenticated: false,
+      error: 'Hermes Agent model discovery is temporarily rate limited. Retry shortly.',
+    };
+  }
+  if (failureClass === 'cli_unavailable_or_incompatible') {
+    return {
+      models: [],
+      isAuthenticated: false,
+      error: 'Hermes Agent CLI is unavailable or incompatible. Install or upgrade the official Hermes Agent, run `hermes model`, then refresh.',
+    };
+  }
+  // Do not echo arbitrary provider/spawn text here: it can contain command
+  // lines, paths or environment material. Hermes uses this bounded public
+  // message and logs only the bounded failure classification above.
+  return {
+    models: [],
+    isAuthenticated: false,
+    error: 'Hermes Agent model discovery failed. Run `hermes model` to verify provider setup, then refresh.',
+  };
 }
 
 function modelIdsToTransportModels(ids: readonly string[]): TransportListModelsResult['models'] {
@@ -10782,6 +11333,7 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
         id: model.id,
         ...(model.name ? { name: model.name } : {}),
         ...(model.supportsReasoningEffort ? { supportsReasoningEffort: true } : {}),
+        ...(model.supportedEffortLevels?.length ? { supportedEffortLevels: model.supportedEffortLevels } : {}),
       }))
       : modelIdsToTransportModels(CODEX_MODEL_IDS);
     return {
@@ -10809,7 +11361,19 @@ async function loadPassiveTransportListModels(agentType: string): Promise<Transp
       defaultModel: COPILOT_FALLBACK_MODEL_IDS[0],
     };
   }
-  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === 'grok-sdk'
+  if (agentType === CODEBUDDY_PROVIDER_IDS.CHINA) {
+    return {
+      models: modelIdsToTransportModels(CODEBUDDY_CHINA_MODEL_FALLBACK),
+      defaultModel: CODEBUDDY_CHINA_DEFAULT_MODEL,
+    };
+  }
+  if (agentType === CODEBUDDY_PROVIDER_IDS.INTERNATIONAL) {
+    return {
+      models: modelIdsToTransportModels(CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK),
+      defaultModel: CODEBUDDY_INTERNATIONAL_MODEL_FALLBACK[0],
+    };
+  }
+  if (agentType === 'cursor-headless' || agentType === 'kimi-sdk' || agentType === HERMES_AGENT_PROVIDER_ID || agentType === 'grok-sdk'
     || agentType === 'deepseek-harness' || agentType === 'pi') {
     // DeepSeek Harness resolves provider routes and model catalogues from its
     // own `~/.dsh` configuration; IM.codes advertises no static list.
@@ -10931,10 +11495,17 @@ export async function listProviderSessions(providerId: string): Promise<Array<{ 
 
 // ── CC env presets ────────────────────────────────────────────────────────
 
-async function handleCcPresetsList(serverLink: ServerLink): Promise<void> {
+async function handleCcPresetsList(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
   const { loadPresets } = await import('./cc-presets.js');
   const presets = await loadPresets();
-  serverLink.send({ type: CC_PRESET_MSG.LIST_RESPONSE, presets });
+  const requestId = typeof cmd.requestId === 'string' ? cmd.requestId.trim() : '';
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName.trim() : '';
+  serverLink.send({
+    type: CC_PRESET_MSG.LIST_RESPONSE,
+    ...(requestId ? { requestId } : {}),
+    ...(sessionName ? { sessionName } : {}),
+    presets,
+  });
 }
 
 async function handleCcPresetsSave(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
@@ -11093,14 +11664,73 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   const query = typeof cmd.query === 'string' ? cmd.query.trim() : '';
   const limit = Math.max(1, Math.min(100, typeof cmd.limit === 'number' ? cmd.limit : 20));
   const includeArchived = cmd.includeArchived === true;
-  const baseStats = await getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
+  const pendingArgs = {
+    scope: 'personal' as const,
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    query: query || undefined,
+    limit,
+  };
+  const summaryArgs: ProcessedProjectionQuery = {
     scope: 'personal',
     userId: ownerUserId,
     includeLegacyPersonalOwner: true,
     projectId: projectId || undefined,
     projectionClass,
     includeArchived,
-  }]);
+  };
+
+  // These four context-store reads are independent of each other's results —
+  // each only references another's value in its OWN error-fallback response,
+  // never as an input — so fire them concurrently instead of one at a time.
+  // Awaiting them in sequence was turning a request that just fills in two
+  // count badges into up to 4 back-to-back worker RPC round-trips.
+  const statsPromise = getContextStoreClient().run<ProcessedProjectionStats>('getProcessedProjectionStats', [{
+    scope: 'personal',
+    userId: ownerUserId,
+    includeLegacyPersonalOwner: true,
+    projectId: projectId || undefined,
+    projectionClass,
+    includeArchived,
+  }], { priority: 'high' });
+  const recordsPromise: Promise<unknown> = query
+    ? searchLocalMemorySemanticForManagement({
+      query,
+      scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
+      repo: projectId || undefined,
+      // `projectionClass` is already validated to the 3 classes at its declaration.
+      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
+      limit,
+      includeArchived,
+    })
+    : getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [{
+      scope: 'personal',
+      userId: ownerUserId,
+      includeLegacyPersonalOwner: true,
+      projectId: projectId || undefined,
+      projectionClass,
+      limit,
+      includeArchived,
+    } satisfies ProcessedProjectionQuery], { priority: 'high' });
+  const pendingPromise = getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs], { priority: 'high' });
+  const projectsPromise = getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs], { priority: 'high' });
+  // An early return below (e.g. stats fails) must not leave a sibling
+  // rejection unobserved — that crashes the daemon on Node's default
+  // unhandledRejection policy. This does not affect the real `await`s below;
+  // a promise's rejection is delivered to every handler attached to it.
+  for (const settled of [statsPromise, recordsPromise, pendingPromise, projectsPromise]) settled.catch(() => {});
+
+  let baseStats: ProcessedProjectionStats;
+  try {
+    baseStats = await statsPromise;
+  } catch (error) {
+    logger.warn({ error }, 'personal memory stats unavailable');
+    sendPersonalMemoryUnavailable(serverLink, requestId, emptyMemoryStatsView(), error);
+    return;
+  }
 
   let records: Array<{
     id: string;
@@ -11120,34 +11750,16 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
   let matchedRecords: number;
 
   if (query) {
-    const semanticQuery: Parameters<typeof searchLocalMemorySemanticForManagement>[0] = {
-      query,
-      scope: 'personal',
-      userId: ownerUserId,
-      includeLegacyPersonalOwner: true,
-      repo: projectId || undefined,
-      // `projectionClass` is already validated to the 3 classes at its declaration.
-      projectionClass: projectionClass as Parameters<typeof searchLocalMemorySemanticForManagement>[0]['projectionClass'],
-      limit,
-      includeArchived,
-    };
     // R5 management semantic read goes through the worker (bounded L3 RPC) too,
     // off the daemon main thread. Unlike R1, unavailable/timeout errors are
     // reported explicitly to the management surface instead of becoming a
     // successful empty recall.
     let semantic: Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
     try {
-      semantic = await searchLocalMemorySemanticForManagement(semanticQuery);
+      semantic = await recordsPromise as Awaited<ReturnType<typeof searchLocalMemorySemanticForManagement>>;
     } catch (error) {
       logger.warn({ error }, 'personal memory semantic query unavailable');
-      serverLink.send({
-        type: MEMORY_WS.PERSONAL_RESPONSE,
-        requestId,
-        stats: { ...baseStats, matchedRecords: 0, localUnavailable: true },
-        records: [],
-        pendingRecords: [],
-        projects: [],
-      });
+      sendPersonalMemoryUnavailable(serverLink, requestId, { ...baseStats, matchedRecords: 0 }, error);
       return;
     }
     records = semantic.items
@@ -11167,33 +11779,30 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
       }));
     matchedRecords = records.length;
   } else {
-    const queryArgs: ProcessedProjectionQuery = {
-      scope: 'personal',
-      userId: ownerUserId,
-      includeLegacyPersonalOwner: true,
-      projectId: projectId || undefined,
-      projectionClass,
-      limit,
-      includeArchived,
-    };
-    records = (await getContextStoreClient().run<ProcessedContextProjection[]>('queryProcessedProjections', [queryArgs])).map((projection) => ({
-      id: projection.id,
-      scope: projection.namespace.scope as 'personal',
-      projectId: projection.namespace.projectId ?? '',
-      ownerUserId: recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
-      createdByUserId: recordCreatedByUserIdFromContent(
-        projection.content,
-        recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
-      ),
-      updatedByUserId: recordUpdatedByUserIdFromContent(projection.content),
-      summary: projection.summary,
-      projectionClass: projection.class,
-      sourceEventCount: projection.sourceEventIds.length,
-      updatedAt: projection.updatedAt,
-      hitCount: projection.hitCount ?? 0,
-      lastUsedAt: projection.lastUsedAt,
-      status: projection.status ?? 'active' as const,
-    }));
+    try {
+      records = (await recordsPromise as ProcessedContextProjection[]).map((projection) => ({
+        id: projection.id,
+        scope: projection.namespace.scope as 'personal',
+        projectId: projection.namespace.projectId ?? '',
+        ownerUserId: recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+        createdByUserId: recordCreatedByUserIdFromContent(
+          projection.content,
+          recordOwnerUserIdFromContent(projection.content, projection.namespace) ?? ownerUserId,
+        ),
+        updatedByUserId: recordUpdatedByUserIdFromContent(projection.content),
+        summary: projection.summary,
+        projectionClass: projection.class,
+        sourceEventCount: projection.sourceEventIds.length,
+        updatedAt: projection.updatedAt,
+        hitCount: projection.hitCount ?? 0,
+        lastUsedAt: projection.lastUsedAt,
+        status: projection.status ?? 'active' as const,
+      }));
+    } catch (error) {
+      logger.warn({ error }, 'personal memory records unavailable');
+      sendPersonalMemoryUnavailable(serverLink, requestId, baseStats, error);
+      return;
+    }
     matchedRecords = baseStats.matchedRecords;
   }
 
@@ -11201,24 +11810,15 @@ async function handlePersonalMemoryQuery(cmd: Record<string, unknown>, serverLin
     ...baseStats,
     matchedRecords,
   };
-  const pendingArgs = {
-    scope: 'personal' as const,
-    userId: ownerUserId,
-    includeLegacyPersonalOwner: true,
-    projectId: projectId || undefined,
-    query: query || undefined,
-    limit,
-  };
-  const pendingRecords = await getContextStoreClient().run<ContextPendingEventView[]>('queryPendingContextEvents', [pendingArgs]);
-  const summaryArgs: ProcessedProjectionQuery = {
-    scope: 'personal',
-    userId: ownerUserId,
-    includeLegacyPersonalOwner: true,
-    projectId: projectId || undefined,
-    projectionClass,
-    includeArchived,
-  };
-  const projects = await getContextStoreClient().run<ContextMemoryProjectView[]>('listMemoryProjectSummaries', [summaryArgs]);
+  let pendingRecords: ContextPendingEventView[];
+  let projects: ContextMemoryProjectView[];
+  try {
+    [pendingRecords, projects] = await Promise.all([pendingPromise, projectsPromise]);
+  } catch (error) {
+    logger.warn({ error }, 'personal memory supplemental views unavailable');
+    sendPersonalMemoryUnavailable(serverLink, requestId, stats, error);
+    return;
+  }
   // Any caller requesting short refs must consume handles issued by the daemon,
   // never values derived independently in UI code. Keep ordinary management-list
   // reads side-effect free; only an explicit includeShortRefs request registers
@@ -11505,8 +12105,43 @@ function emptyMemoryStatsView(): ContextMemoryStatsView {
   };
 }
 
+function sendPersonalMemoryUnavailable(
+  serverLink: ServerLink,
+  requestId: string,
+  stats: ContextMemoryStatsView = emptyMemoryStatsView(),
+  error?: unknown,
+): void {
+  serverLink.send({
+    type: MEMORY_WS.PERSONAL_RESPONSE,
+    requestId,
+    stats: { ...stats, localUnavailable: true },
+    records: [],
+    pendingRecords: [],
+    projects: [],
+    ...memoryManagementFailure(error),
+  });
+}
+
 function memoryManagementError(code: MemoryManagementErrorCode): { errorCode: MemoryManagementErrorCode; error: string } {
   return { errorCode: code, error: code };
+}
+
+function memoryManagementFailure(error: unknown): { errorCode: MemoryManagementErrorCode; error: string } {
+  const code = error && typeof error === 'object' && 'code' in error
+    ? String((error as { code?: unknown }).code ?? '')
+    : '';
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  const unavailable = new Set<string>([
+    CONTEXT_STORE_RPC_ERROR.unavailable,
+    CONTEXT_STORE_RPC_ERROR.timeout,
+    CONTEXT_STORE_RPC_ERROR.workerExit,
+    CONTEXT_STORE_RPC_ERROR.workerError,
+    CONTEXT_STORE_RPC_ERROR.overloaded,
+    CONTEXT_STORE_RPC_ERROR.indeterminate,
+  ]);
+  return memoryManagementError(unavailable.has(code) || /context[- ]store (?:worker )?(?:unavailable|timeout|overloaded)/i.test(message)
+    ? MEMORY_MANAGEMENT_ERROR_CODES.STORE_UNAVAILABLE
+    : MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED);
 }
 
 function memoryManagementContextError(): { errorCode: MemoryManagementErrorCode; error: string } {
@@ -11892,11 +12527,26 @@ async function handleMemoryPreferencesQuery(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_RESPONSE, requestId, records: [], featureEnabled: true, ...memoryManagementContextError() });
     return;
   }
-  const records = (await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
-    scope: PREFERENCE_INGEST_SCOPE,
-    class: PREFERENCE_INGEST_OBSERVATION_CLASS,
-  }]))
-    .filter((observation) => observation.state === PREFERENCE_INGEST_OBSERVATION_STATE)
+  let observations: ContextObservationRow[];
+  try {
+    observations = await getContextStoreClient().run<ContextObservationRow[]>('listContextObservations', [{
+      scope: PREFERENCE_INGEST_SCOPE,
+      class: PREFERENCE_INGEST_OBSERVATION_CLASS,
+      state: PREFERENCE_INGEST_OBSERVATION_STATE,
+    }]);
+  } catch (error) {
+    logger.warn({ error }, 'memory preference query unavailable');
+    serverLink.send({
+      type: MEMORY_WS.PREF_RESPONSE,
+      requestId,
+      records: [],
+      featureEnabled: true,
+      localUnavailable: true,
+      ...memoryManagementFailure(error),
+    });
+    return;
+  }
+  const records = observations
     .map((observation) => {
       const userId = preferenceOwnerFromObservation(observation);
       const createdByUserId = recordCreatedByUserIdFromContent(observation.content, userId);
@@ -11965,7 +12615,7 @@ async function handleMemoryPreferenceCreate(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: true, id: row.id });
   } catch (error) {
     logger.warn({ error }, 'memory preference management create failed');
-    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.PREF_CREATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12024,7 +12674,7 @@ async function handleMemoryPreferenceUpdate(cmd: Record<string, unknown>, server
     serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: true, id: row.id });
   } catch (error) {
     logger.warn({ error }, 'memory preference management update failed');
-    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.PREF_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12149,7 +12799,7 @@ async function handleMemorySkillsRebuild(cmd: Record<string, unknown>, serverLin
     });
   } catch (error) {
     logger.warn({ error }, 'memory skill registry rebuild failed');
-    serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.SKILL_REBUILD_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12198,7 +12848,7 @@ async function handleMemorySkillRead(cmd: Record<string, unknown>, serverLink: S
     serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: true, key, layer, content });
   } catch (error) {
     logger.warn({ error }, 'memory skill preview failed');
-    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.SKILL_READ_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12268,7 +12918,7 @@ async function handleMemorySkillDelete(cmd: Record<string, unknown>, serverLink:
     serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: true });
   } catch (error) {
     logger.warn({ error }, 'memory skill delete failed');
-    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.SKILL_DELETE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12318,7 +12968,7 @@ async function handleMemoryMarkdownIngestRun(cmd: Record<string, unknown>, serve
     serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: true, featureEnabled: true, ...result });
   } catch (error) {
     logger.warn({ error }, 'manual markdown memory ingest failed');
-    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.MD_INGEST_RUN_RESPONSE, requestId, success: false, featureEnabled: true, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12336,19 +12986,34 @@ async function handleMemoryObservationsQuery(cmd: Record<string, unknown>, serve
     return;
   }
   const limit = Math.max(1, Math.min(200, typeof cmd.limit === 'number' ? cmd.limit : 50));
-  const observationsArgs = {
-    scope,
-    class: isObservationClass(observationClass) ? observationClass : undefined,
-  };
   const client = getContextStoreClient();
-  const observations = await client.run<ContextObservationRow[]>('listContextObservations', [observationsArgs]);
   const namespacesById = new Map<string, ContextNamespaceRow>();
-  for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
-    namespacesById.set(namespace.id, namespace);
+  let observations: ContextObservationRow[];
+  try {
+    for (const namespace of await client.run<ContextNamespaceRow[]>('listContextNamespaces', [])) {
+      if (managementContextCanAccessNamespace(namespace, ctx)) {
+        namespacesById.set(namespace.id, namespace);
+      }
+    }
+    observations = await client.run<ContextObservationRow[]>('listContextObservations', [{
+      namespaceIds: [...namespacesById.keys()],
+      scope,
+      class: isObservationClass(observationClass) ? observationClass : undefined,
+      limit,
+    }]);
+  } catch (error) {
+    logger.warn({ error }, 'memory observation query unavailable');
+    serverLink.send({
+      type: MEMORY_WS.OBSERVATION_RESPONSE,
+      requestId,
+      records: [],
+      featureEnabled: true,
+      localUnavailable: true,
+      ...memoryManagementFailure(error),
+    });
+    return;
   }
   const records = observations
-    .filter((observation) => managementContextCanAccessNamespace(namespacesById.get(observation.namespaceId), ctx))
-    .slice(0, limit)
     .map((observation) => {
       const namespace = namespacesById.get(observation.namespaceId);
       const ownerUserId = trustedRecordOwnerUserIdFromContent(observation.content, namespace);
@@ -12442,7 +13107,7 @@ async function handleMemoryObservationUpdate(cmd: Record<string, unknown>, serve
     serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: true, id: row.id });
   } catch (error) {
     logger.warn({ error }, 'memory observation update failed');
-    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_UPDATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12493,7 +13158,7 @@ async function handleMemoryObservationDelete(cmd: Record<string, unknown>, serve
     serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success });
   } catch (error) {
     logger.warn({ error }, 'memory observation delete failed');
-    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.OBSERVATION_DELETE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12750,7 +13415,7 @@ async function handleMemoryCreate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: true, id: projection.id });
   } catch (error) {
     logger.warn({ error }, 'manual memory create failed');
-    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.CREATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12802,7 +13467,7 @@ async function handleMemoryUpdate(cmd: Record<string, unknown>, serverLink: Serv
     serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: true, id });
   } catch (error) {
     logger.warn({ error }, 'manual memory update failed');
-    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.UPDATE_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -12843,7 +13508,7 @@ async function handleMemoryPin(cmd: Record<string, unknown>, serverLink: ServerL
     serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: true, id: pinned.id });
   } catch (error) {
     logger.warn({ error }, 'manual memory pin failed');
-    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementError(MEMORY_MANAGEMENT_ERROR_CODES.ACTION_FAILED) });
+    serverLink.send({ type: MEMORY_WS.PIN_RESPONSE, requestId, success: false, ...memoryManagementFailure(error) });
   }
 }
 
@@ -13018,6 +13683,9 @@ async function prependLocalMemory(
   if (!semanticSkipReason && isImperativeCommand(prompt)) semanticSkipReason = 'skipped_control_message';
   try {
     const recallContext = await resolveProcessRecallQueryContext(sessionName);
+    if (recallContext.namespace && !(await isMemoryInjectionEnabled(recallContext.namespace).catch(() => true))) {
+      return { text: prompt };
+    }
     // Broaden the candidate pool — the cap rule trims to 3 (or up to 5 for
     // all-strong results). We need enough candidates to survive filtering.
     const recallQuery = {

@@ -9,15 +9,16 @@ import { sha256Hex, verifyJwt } from './crypto.js';
 import { COOKIE_SESSION } from '../../../shared/cookie-names.js';
 import { AUTH_IDENTITY_ERRORS } from '../../../shared/auth-identity.js';
 import { EXPECTED_USER_ID_HEADER } from '../../../shared/http-header-names.js';
-import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
+import { NODE_ROLE, type NodeRole, NODE_ROLE_REFUSAL } from '../../../shared/remote-exec.js';
 import {
-  canOperateControlledMachine,
-  resolveControlledMachineAccess,
+  resolveControlledMachineOperatorAccess,
 } from '../share/machine-access.js';
+import { resolveEffectiveShareCoverage } from '../db/tab-sharing.js';
+import { SHARED_MACHINE_AUTHORITY_TYPE } from '../../../shared/shared-machine-authority.js';
 
 export type Role = 'owner' | 'admin' | 'member' | 'unauthenticated';
 
-interface AuthContext {
+export interface AuthContext {
   userId: string;
   role: Role;
   keyId?: string;
@@ -37,11 +38,25 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   const cookieToken = getCookieFromHeader(c.req.header('Cookie'), COOKIE_SESSION);
   if (cookieToken && c.env.JWT_SIGNING_KEY) {
     const payload = verifyJwt(cookieToken, c.env.JWT_SIGNING_KEY);
-    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket' && payload.type !== 'share-ws-ticket') {
+    if (payload && typeof payload.sub === 'string' && payload.type !== 'ws-ticket'
+      && payload.type !== 'share-ws-ticket' && payload.type !== SHARED_MACHINE_AUTHORITY_TYPE) {
       return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
     }
   }
 
+  return resolveBearerAuth(c);
+}
+
+/**
+ * Resolve only the Authorization bearer supplied by the request.
+ *
+ * Account-sensitive routes use this after observing an Authorization header so
+ * an invalid bearer can never fall back to a valid browser cookie. Keep the
+ * credential parsing in one place with the ordinary authorization middleware.
+ */
+export async function resolveBearerAuth(
+  c: Pick<Context<{ Bindings: Env }>, 'req' | 'env'>,
+): Promise<AuthContext | null> {
   const authHeader = c.req.header('Authorization');
   if (!authHeader?.startsWith('Bearer ')) return null;
 
@@ -86,7 +101,8 @@ export async function resolveAuth(c: Pick<Context<{ Bindings: Env }>, 'req' | 'e
   const payload = verifyJwt(token, c.env.JWT_SIGNING_KEY);
   if (!payload) return null;
   if (typeof payload.sub !== 'string') return null;
-  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket') return null; // reject special-purpose WebSocket tickets
+  if (payload.type === 'ws-ticket' || payload.type === 'share-ws-ticket'
+    || payload.type === SHARED_MACHINE_AUTHORITY_TYPE) return null; // reject special-purpose capability tickets
   return { userId: payload.sub, role: (payload.role as Role) ?? 'member' };
 }
 
@@ -152,7 +168,7 @@ export function requireAuth() {
     // Global default-deny: a controlled-node credential may ONLY reach the WS
     // presence/heartbeat + MACHINE_EXEC_RESULT surface, never a normal REST API (10.2).
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
-      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+      return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
     }
 
     c.set('userId' as never, auth.userId);
@@ -178,7 +194,7 @@ export function requireRole(minRole: Role) {
     const identityMismatch = rejectChangedClientIdentity(c, auth.userId);
     if (identityMismatch) return identityMismatch;
     if (auth.nodeRole === NODE_ROLE.CONTROLLED) {
-      return c.json({ error: 'forbidden', reason: 'controlled_node' }, 403);
+      return c.json({ error: 'forbidden', reason: NODE_ROLE_REFUSAL.CONTROLLED_NODE }, 403);
     }
 
     if (!canPerform(auth.role, minPerm)) {
@@ -248,13 +264,13 @@ export type ServerWebSocketAccess =
  * Resolve the user's role for a specific server.
  * Checks server ownership first, then team membership.
  */
-export async function resolveServerRole(
+export async function resolveServerMembershipRole(
   db: Database,
   serverId: string,
   userId: string,
 ): Promise<ServerRole> {
-  const server = await db.queryOne<{ team_id: string | null; user_id: string }>(
-    'SELECT team_id, user_id FROM servers WHERE id = $1',
+  const server = await db.queryOne<{ user_id: string }>(
+    'SELECT user_id FROM servers WHERE id = $1',
     [serverId],
   );
 
@@ -263,20 +279,44 @@ export async function resolveServerRole(
   // Direct owner
   if (server.user_id === userId) return 'owner';
 
-  // Team membership
-  if (server.team_id) {
-    const member = await db.queryOne<{ role: string }>(
-      'SELECT role FROM team_members WHERE team_id = $1 AND user_id = $2',
-      [server.team_id, userId],
-    );
-    if (member) {
-      if (member.role === 'owner') return 'admin'; // team owner → admin on server
-      if (member.role === 'admin') return 'admin';
-      return 'member';
-    }
+  // Through any group this machine is in. A machine can be in several, so the
+  // strongest role across all of them decides -- being a plain member of one
+  // group must not cancel out running another that holds the same machine.
+  const member = await db.queryOne<{ role: string }>(
+    `SELECT tm.role FROM machine_groups mg
+       JOIN team_members tm ON tm.team_id = mg.team_id
+      WHERE mg.server_id = $1 AND tm.user_id = $2
+      ORDER BY CASE tm.role WHEN 'owner' THEN 0 WHEN 'admin' THEN 1 ELSE 2 END
+      LIMIT 1`,
+    [serverId, userId],
+  );
+  if (member) {
+    if (member.role === 'owner' || member.role === 'admin') return 'admin';
+    return 'member';
   }
 
   return 'none';
+}
+
+/**
+ * Operational server authority. An active whole-server Participant is the
+ * owner's delegated operator for that server; a main/sub-session grant is not.
+ * Grant management must use resolveServerMembershipRole instead so delegated
+ * operators can never re-share or escalate access.
+ */
+export async function resolveServerRole(
+  db: Database,
+  serverId: string,
+  userId: string,
+): Promise<ServerRole> {
+  const membership = await resolveServerMembershipRole(db, serverId, userId);
+  if (membership !== 'none') return membership;
+  const coverage = await resolveEffectiveShareCoverage(db, {
+    userId,
+    target: { kind: 'server', serverId },
+    now: Date.now(),
+  });
+  return coverage?.effectiveRole === 'participant' ? 'owner' : 'none';
 }
 
 /**
@@ -297,13 +337,14 @@ export async function resolveServerWebSocketAccess(
   );
   if (!target) return null;
   if (target.node_role === NODE_ROLE.CONTROLLED) {
-    const controlled = await resolveControlledMachineAccess(db, userId, serverId, now);
+    const controlled = await resolveControlledMachineOperatorAccess(db, userId, serverId, now);
     if (!controlled) return null;
-    return canOperateControlledMachine(controlled.access_role)
-      ? { kind: 'controlled', role: controlled.access_role }
-      : null;
+    return { kind: 'controlled', role: controlled.access_role };
   }
-  const role = await resolveServerRole(db, serverId, userId);
+  // Shared operators must enter through a share ticket so their provenance is
+  // retained and every relayed action is stamped. Never let the ordinary WS
+  // endpoint erase that authority boundary by treating them as a member.
+  const role = await resolveServerMembershipRole(db, serverId, userId);
   return role === 'none' ? null : { kind: 'standard', role };
 }
 

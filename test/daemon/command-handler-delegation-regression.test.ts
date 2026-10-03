@@ -1,4 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
+import {
+  clearProcessSharedMachineAuthoritiesForTests,
+  readProcessSharedMachineAuthority,
+} from '../../src/daemon/shared-machine-authority-context.js';
 
 const {
   dispatchDelegatedSessionSendMock,
@@ -88,6 +92,7 @@ function serverLink() {
 describe('command-handler delegation routing behavior', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    clearProcessSharedMachineAuthoritiesForTests();
     getSessionMock.mockReturnValue({
       name: 'deck_proj_brain',
       projectName: 'proj',
@@ -103,6 +108,60 @@ describe('command-handler delegation routing behavior', () => {
       dispatchId: 'snd_dispatch_test',
       messageId: 'snd_msg_test',
     });
+  });
+
+  it('binds a participant session.send authority to the exact process runtime before agent dispatch', async () => {
+    const identity = { sessionInstanceId: 'instance-shared-1', runtimeEpoch: 'epoch-shared-1' };
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_brain',
+      projectName: 'proj',
+      projectDir: '/repo',
+      role: 'brain',
+      agentType: 'codex',
+      runtimeType: 'process',
+      state: 'idle',
+      ...identity,
+    });
+
+    handleWebCommand({
+      type: 'session.send',
+      session: 'deck_proj_brain',
+      text: 'use Computer Use locally',
+      commandId: 'shared-local-1',
+      sharedActor: {
+        actorUserId: 'participant-1',
+        effectiveActorRole: 'participant',
+        actionId: 'action-1',
+      },
+      sharedMachineAuthority: 'server-minted-shared-authority',
+    }, serverLink() as any);
+    await flushAsync();
+
+    expect(readProcessSharedMachineAuthority('deck_proj_brain', identity)).toEqual({
+      required: true,
+      authority: 'server-minted-shared-authority',
+    });
+    expect(readProcessSharedMachineAuthority('deck_proj_brain', {
+      ...identity,
+      runtimeEpoch: 'epoch-stale',
+    })).toEqual({ required: true, authority: null });
+  });
+
+  it('retains a deny marker when participant session.send loses its minted authority', async () => {
+    const identity = { sessionInstanceId: 'instance-shared-2', runtimeEpoch: 'epoch-shared-2' };
+    getSessionMock.mockReturnValue({
+      name: 'deck_proj_brain', projectName: 'proj', projectDir: '/repo', role: 'brain',
+      agentType: 'codex', runtimeType: 'process', state: 'idle', ...identity,
+    });
+
+    handleWebCommand({
+      type: 'session.send', session: 'deck_proj_brain', text: 'must fail closed', commandId: 'shared-local-2',
+      sharedActor: { actorUserId: 'participant-1', effectiveActorRole: 'participant', actionId: 'action-2' },
+    }, serverLink() as any);
+    await flushAsync();
+
+    expect(readProcessSharedMachineAuthority('deck_proj_brain', identity))
+      .toEqual({ required: true, authority: null });
   });
 
   it('dispatches valid delegation once and emits delegated ack metadata through timeline and reliable ack', async () => {

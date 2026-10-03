@@ -23,7 +23,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     );
   });
 
-  it('does not send daemon.upgrade until the target tarball is published, then caches the success', async () => {
+  it('does not send a manual daemon.upgrade until the target tarball is published, then caches the success', async () => {
     vi.useFakeTimers();
     const targetVersion = '2026.4.905-dev.877';
     const probe = vi.fn<[], Promise<DaemonUpgradePublicationProbeResult>>()
@@ -38,7 +38,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
 
     const result = coordinator.request({
       targetVersion,
-      source: 'auto',
+      source: 'manual',
       isDaemonReady: () => true,
       isStillCurrent: () => true,
       send: (message) => sent.push(message),
@@ -59,14 +59,12 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     await vi.advanceTimersByTimeAsync(100);
     await flushPromises();
     expect(probe).toHaveBeenCalledTimes(2);
-    expect(sent).toEqual([]);
 
-    await vi.advanceTimersByTimeAsync(5_000);
-    await flushPromises();
     expect(sent).toEqual([{
       type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
       upgradeId: expect.any(String),
       targetVersion,
+      source: 'manual',
     }]);
 
     const nextCoordinator = new DaemonUpgradeCoordinator(gate);
@@ -136,19 +134,19 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
       type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
       upgradeId: expect.any(String),
       targetVersion: '2026.7.1234-dev.5',
+      source: 'manual',
     }]);
     expect(probe).not.toHaveBeenCalled();
   });
 
-  it('retries the current auto upgrade after a transient daemon block without 15-minute suppression', async () => {
-    vi.useFakeTimers();
+  it('does not retry a blocked upgrade without a new explicit request', async () => {
     const coordinator = new DaemonUpgradeCoordinator();
     const sent: Record<string, unknown>[] = [];
     const daemonReady = vi.fn(() => true);
     const stillCurrent = vi.fn(() => true);
 
     const result = coordinator.request({
-      source: 'auto',
+      source: 'manual',
       isDaemonReady: daemonReady,
       isStillCurrent: stillCurrent,
       send: (message) => sent.push(message),
@@ -156,29 +154,9 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     });
 
     expect(result.deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
-    await vi.advanceTimersByTimeAsync(5_000);
-    await flushPromises();
     expect(sent).toHaveLength(1);
-
-    const retry = coordinator.retryAutoAfterBlocked({
-      retryDelayMs: 1_000,
-      isDaemonReady: daemonReady,
-      isStillCurrent: stillCurrent,
-      send: (message) => sent.push(message),
-      now: 5_000,
-    });
-
-    expect(retry).toMatchObject({
-      ok: true,
-      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
-    });
-    await vi.advanceTimersByTimeAsync(999);
-    await flushPromises();
-    expect(sent).toHaveLength(1);
-
-    await vi.advanceTimersByTimeAsync(1);
-    await flushPromises();
-    expect(sent).toHaveLength(2);
+    expect(coordinator.request({ source: 'manual', isDaemonReady: daemonReady, isStillCurrent: stillCurrent, send: (message) => sent.push(message) }).deliveryStatus)
+      .toBe(DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS);
   });
 
   it('keeps the same lifecycle pending and retries immediately after a legacy daemon restart', async () => {
@@ -188,7 +166,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     let ready = true;
     const base = {
       targetVersion: '2026.8.3409-dev.3847',
-      source: 'auto' as const,
+      source: 'manual' as const,
       skipPublicationGate: true,
       isDaemonReady: () => ready,
       isStillCurrent: () => true,
@@ -196,8 +174,6 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     };
 
     const first = coordinator.request({ ...base, now: 0 });
-    await vi.advanceTimersByTimeAsync(5_000);
-    await flushPromises();
     expect(sent).toHaveLength(1);
     for (let cycle = 0; cycle < 4; cycle += 1) {
       expect(coordinator.prepareRetryAfterDaemonRestart(5_001 + cycle)).toBe(true);
@@ -221,20 +197,17 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
         upgradeId: first.upgradeId,
         deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.SENT,
       });
-      await vi.advanceTimersByTimeAsync(5_000);
-      await flushPromises();
       expect(sent).toHaveLength(cycle + 2);
     }
   });
 
-  it('cancels a scheduled auto send and terminally blocks only that target until manual override', async () => {
-    vi.useFakeTimers();
+  it('terminally blocks only that target until manual override', async () => {
     const coordinator = new DaemonUpgradeCoordinator();
     const sent: Record<string, unknown>[] = [];
     const targetVersion = '2026.7.3192-dev.3593';
     const request = {
       targetVersion,
-      source: 'auto' as const,
+      source: 'manual' as const,
       skipPublicationGate: true,
       isDaemonReady: () => true,
       isStillCurrent: () => true,
@@ -245,10 +218,8 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     expect(coordinator.request(request).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
     expect(coordinator.blockTargetAfterTerminalFailure(targetVersion, 1)).toBe(true);
 
-    await vi.advanceTimersByTimeAsync(5_000);
-    await flushPromises();
-    expect(sent).toEqual([]);
-    expect(coordinator.request({ ...request, now: 5_001 })).toMatchObject({
+    expect(sent).toHaveLength(1);
+    expect(coordinator.request({ ...request, source: 'auto', now: 5_001 })).toMatchObject({
       deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF,
       reason: 'terminal_install_failure',
     });
@@ -258,7 +229,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
       source: 'manual',
       now: 5_002,
     }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
-    expect(sent).toHaveLength(1);
+    expect(sent).toHaveLength(2);
   });
 
   it('keeps an offline manual lifecycle authoritative over reconnect auto traffic', () => {
@@ -280,7 +251,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     const authAuto = coordinator.request({ ...base, source: 'auto' });
     expect(authAuto).toMatchObject({
       upgradeId: manual.upgradeId,
-      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.ALREADY_IN_PROGRESS,
+      deliveryStatus: DAEMON_UPGRADE_DELIVERY_STATUS.PENDING_OFFLINE,
     });
 
     ready = true;
@@ -298,6 +269,7 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
       type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE,
       upgradeId: manual.upgradeId,
       targetVersion,
+      source: 'manual',
     }]);
   });
 
@@ -319,15 +291,14 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
     expect(coordinator.hasManualLifecycleForTarget(targetVersion)).toBe(true);
   });
 
-  it('allows a fresh auto lifecycle when the requested target version changes', async () => {
-    vi.useFakeTimers();
+  it('allows a fresh manual lifecycle when the requested target version changes', async () => {
     const coordinator = new DaemonUpgradeCoordinator();
     const sent: Record<string, unknown>[] = [];
     coordinator.blockTargetAfterTerminalFailure('2026.7.3192-dev.3593', 0);
 
     expect(coordinator.request({
       targetVersion: '2026.7.3193-dev.3594',
-      source: 'auto',
+      source: 'manual',
       skipPublicationGate: true,
       isDaemonReady: () => true,
       isStillCurrent: () => true,
@@ -335,8 +306,6 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
       now: 1,
     }).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
 
-    await vi.advanceTimersByTimeAsync(5_000);
-    await flushPromises();
     expect(sent).toHaveLength(1);
   });
 });

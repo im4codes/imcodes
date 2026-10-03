@@ -12,9 +12,14 @@ import { randomHex } from '../security/crypto.js';
 import { logAudit } from '../security/audit.js';
 import {
   CRON_COMPLETION_POLICY,
+  CRON_CONTROL_CONTRACT,
+  LEGACY_CRON_CONTROL_CONTRACT_V1,
   CRON_STATUS,
   normalizeCronCompletionPolicy,
   normalizeCronExecutionDetail,
+  normalizeCronSendActionForInterval,
+  registerCronControlAction,
+  type CronAction,
 } from '../../../shared/cron-types.js';
 import { MEMORY_MCP_CAPS } from '../../../shared/memory-mcp-contracts.js';
 import { MEMORY_MCP_SOURCE_FIELDS, stripMemoryMcpSourceProvenance } from '../../../shared/memory-mcp-provenance.js';
@@ -41,8 +46,44 @@ const cronParticipantSchema = z.discriminatedUnion('type', [
   z.object({ type: z.literal('session'), value: z.string().regex(sessionNamePattern) }),
 ]);
 
+const currentCronControlRegistrationSchema = z.object({
+  contractId: z.literal(CRON_CONTROL_CONTRACT.contractId), version: z.literal(CRON_CONTROL_CONTRACT.version), scheduleId: z.string().min(1),
+  constraints: z.object({
+    authorization: z.literal(CRON_CONTROL_CONTRACT.constraints.authorization),
+    executeTaskBody: z.literal(CRON_CONTROL_CONTRACT.constraints.executeTaskBody),
+    scope: z.literal(CRON_CONTROL_CONTRACT.constraints.scope),
+    secrets: z.literal(CRON_CONTROL_CONTRACT.constraints.secrets),
+    updateSelf: z.literal(CRON_CONTROL_CONTRACT.constraints.updateSelf),
+    cancelRecurring: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelRecurring),
+    cancelUntilComplete: z.literal(CRON_CONTROL_CONTRACT.constraints.cancelUntilComplete),
+    silent: z.literal(CRON_CONTROL_CONTRACT.constraints.silent),
+    network: z.literal(CRON_CONTROL_CONTRACT.constraints.network),
+    finalResponse: z.literal(CRON_CONTROL_CONTRACT.constraints.finalResponse),
+  }).strict(),
+}).strict();
+
+const legacyCronControlRegistrationSchema = z.object({
+  contractId: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.contractId), version: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.version), scheduleId: z.string().min(1),
+  constraints: z.object({
+    updateSelf: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.updateSelf),
+    cancelRecurring: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelRecurring),
+    cancelUntilComplete: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.cancelUntilComplete),
+    silent: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.silent),
+    network: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.network),
+    finalResponse: z.literal(LEGACY_CRON_CONTROL_CONTRACT_V1.constraints.finalResponse),
+  }).strict(),
+}).strict();
+
+const cronControlRegistrationSchema = z.union([
+  currentCronControlRegistrationSchema,
+  legacyCronControlRegistrationSchema,
+]);
+
 const cronActionSchemaRaw = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional() }),
+  z.object({
+    type: z.literal('command'), command: z.string().min(1), selfManaged: z.boolean().optional(),
+    cronControl: cronControlRegistrationSchema.optional(),
+  }),
   z.object({
     type: z.literal('send'),
     target: z.string().min(1),
@@ -50,6 +91,7 @@ const cronActionSchemaRaw = z.discriminatedUnion('type', [
     reply: z.boolean().optional(),
     broadcast: z.boolean().optional(),
     idempotencyKey: z.string().min(1).optional(),
+    onlyWhenIdle: z.boolean().optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SESSION_NAME]: z.string().regex(sourceSessionNamePattern).optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_PROJECT_NAME]: z.string().min(1).max(64).optional(),
     [MEMORY_MCP_SOURCE_FIELDS.SOURCE_SERVER_ID]: z.string().min(1).max(128).optional(),
@@ -407,18 +449,49 @@ function normalizeCronActionForPersistence<T extends z.infer<typeof cronActionSc
   return stripMemoryMcpSourceProvenance(action) as T;
 }
 
+function registerSelfManagedCronAction(
+  action: z.infer<typeof cronActionSchema>,
+  scheduleId: string,
+  completionPolicy: z.infer<typeof cronJobCreateSchema>['completionPolicy'],
+): { ok: true; action: CronAction } | { ok: false; reason: string } {
+  if (action.type !== 'command' || action.selfManaged !== true) return { ok: true, action };
+  const registered = registerCronControlAction(action, scheduleId, completionPolicy);
+  return registered.ok
+    ? { ok: true, action: registered.action }
+    : { ok: false, reason: registered.reason };
+}
+
 /** Validate cron expression and enforce minimum 5-minute interval. Returns next run time or error string. */
-function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number } | { error: string } {
+function validateCronExpr(cronExpr: string, timezone?: string): { nextRunAt: number; intervalMs: number | null } | { error: string } {
   try {
     const opts = timezone ? { timezone } : undefined;
     const job = new Cron(cronExpr, opts);
     const first = job.nextRun();
     if (!first) return { error: 'invalid_cron_expression' };
-    const second = job.nextRun(first);
-    if (second && (second.getTime() - first.getTime()) < MIN_INTERVAL_MS) {
+    // Cron step expressions (for example */14) have a short boundary gap
+    // when the step does not divide the hour (56 -> 00 is 4 minutes). Looking
+    // only at the next two occurrences makes validity and the idle-only
+    // default depend on the wall-clock minute at which the request arrives.
+    // Sample a bounded horizon and use the largest observed interval as the
+    // schedule's stable cadence; this preserves the intended nominal period
+    // while still rejecting genuinely sub-five-minute schedules (*/1, */4).
+    const occurrences = [first];
+    let cursor = first;
+    for (let i = 0; i < 7; i++) {
+      const next = job.nextRun(cursor);
+      if (!next) break;
+      occurrences.push(next);
+      cursor = next;
+    }
+    const intervals = occurrences.slice(1).map((next, index) => next.getTime() - occurrences[index]!.getTime());
+    const intervalMs = intervals.length > 0 ? Math.max(...intervals) : null;
+    if (intervalMs !== null && intervalMs < MIN_INTERVAL_MS) {
       return { error: 'cron_interval_too_short' };
     }
-    return { nextRunAt: first.getTime() };
+    return {
+      nextRunAt: first.getTime(),
+      intervalMs,
+    };
   } catch {
     return { error: 'invalid_cron_expression' };
   }
@@ -476,7 +549,7 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
     expiresAt,
     completionPolicy,
   } = parsed.data;
-  const persistedAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
+  const unboundAction = normalizeCronActionForPersistence(action, isDaemonCronRequest(c, routeServerId));
 
   const access = await resolveCronScope(c, { serverId, userId, requestedProjectName: projectName, mode: 'write' });
   if (!access.ok) return c.json({ error: 'forbidden', reason: access.reason }, 403);
@@ -491,6 +564,14 @@ cronApiRoutes.post('/', requireCronAuth(), async (c) => {
 
   const id = randomHex(16);
   const now = Date.now();
+  const registeredAction = registerSelfManagedCronAction(unboundAction, id, completionPolicy);
+  if (!registeredAction.ok) {
+    return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
+  }
+  const persistedAction = normalizeCronSendActionForInterval(
+    registeredAction.action,
+    validation.intervalMs,
+  );
 
   await c.env.DB.execute(
     `INSERT INTO cron_jobs (id, server_id, user_id, name, cron_expr, project_name, target_role, target_session_name, action, timezone, status, next_run_at, expires_at, completion_policy, created_at, updated_at)
@@ -523,6 +604,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const routeServerId = getPodStickyServerId(c);
   const jobId = c.req.param('id');
+  if (!jobId) return c.json({ error: 'not_found' }, 404);
   const body = await c.req.json().catch(() => null);
   const parsed = cronJobUpdateSchema.safeParse(await withDefaultCronTimezone(c, userId, body));
   if (!parsed.success) return c.json({ error: 'invalid_body', issues: parsed.error.issues }, 400);
@@ -567,6 +649,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
 
   // Re-validate cron expression if changed
   let nextRunAt: number | undefined;
+  let effectiveIntervalMs: number | null | undefined;
   const newCronExpr = updates.cronExpr;
   const effectiveTz = updates.timezone ?? job.timezone ?? undefined;
   const scheduleChanged = (newCronExpr !== undefined && newCronExpr !== job.cron_expr)
@@ -577,6 +660,7 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
       return c.json({ error: validation.error, ...(validation.error === 'cron_interval_too_short' ? { minIntervalMinutes: 5 } : {}) }, 400);
     }
     nextRunAt = validation.nextRunAt;
+    effectiveIntervalMs = validation.intervalMs;
   }
 
   // Build dynamic UPDATE
@@ -584,14 +668,43 @@ cronApiRoutes.put('/:id', requireCronAuth(), async (c) => {
   const vals: unknown[] = [now];
   let idx = 2;
 
+  if (effectiveIntervalMs === undefined && (updates.action !== undefined || existingAction?.type === 'send')) {
+    const scheduleValidation = validateCronExpr(newCronExpr ?? job.cron_expr, effectiveTz);
+    if (!('error' in scheduleValidation)) effectiveIntervalMs = scheduleValidation.intervalMs;
+  }
+
+  // When an action is omitted, keep the existing action but still apply the
+  // schedule default to legacy rows that predate onlyWhenIdle. Explicit true
+  // and false values remain untouched by the shared normalizer.
+  if (updates.action === undefined && existingAction?.type === 'send') {
+    const normalizedExistingAction = normalizeCronSendActionForInterval(existingAction, effectiveIntervalMs);
+    if (normalizedExistingAction !== existingAction) {
+      sets.push(`action = $${idx++}`);
+      vals.push(JSON.stringify(normalizedExistingAction));
+    }
+  }
+
   if (updates.name !== undefined) { sets.push(`name = $${idx++}`); vals.push(updates.name); }
   if (updates.cronExpr !== undefined) { sets.push(`cron_expr = $${idx++}`); vals.push(updates.cronExpr); }
   if (updates.projectName !== undefined) { sets.push(`project_name = $${idx++}`); vals.push(updates.projectName); }
   if (updates.targetRole !== undefined) { sets.push(`target_role = $${idx++}`); vals.push(updates.targetRole); }
   if (updates.targetSessionName !== undefined) { sets.push(`target_session_name = $${idx++}`); vals.push(updates.targetSessionName); }
   if (updates.action !== undefined) {
+    const unboundAction = normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId));
+    const registeredAction = registerSelfManagedCronAction(
+      unboundAction,
+      jobId,
+      updates.completionPolicy ?? normalizeCronCompletionPolicy(job.completion_policy),
+    );
+    if (!registeredAction.ok) {
+      return c.json({ error: 'invalid_cron_control', reason: registeredAction.reason }, 400);
+    }
+    const normalizedAction = normalizeCronSendActionForInterval(
+      registeredAction.action,
+      effectiveIntervalMs,
+    );
     sets.push(`action = $${idx++}`);
-    vals.push(JSON.stringify(normalizeCronActionForPersistence(updates.action, isDaemonCronRequest(c, routeServerId))));
+    vals.push(JSON.stringify(normalizedAction));
   }
   if (updates.timezone !== undefined) { sets.push(`timezone = $${idx++}`); vals.push(updates.timezone); }
   if (updates.expiresAt !== undefined) { sets.push(`expires_at = $${idx++}`); vals.push(updates.expiresAt); }

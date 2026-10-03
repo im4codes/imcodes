@@ -5,15 +5,16 @@
  * inference as synchronous native CPU work. Running it on the daemon main thread
  * froze the event loop for tens of seconds on session-heavy / loaded hosts (211:
  * event-loop drift up to 52s), which starved the server-link heartbeat and drove
- * a reconnect storm. This worker moves that CPU off the main thread; the host
- * (`embedding.ts`) talks to it over a tiny request/response protocol and keeps
+ * a reconnect storm. This dedicated child process moves that CPU and native
+ * heap out of the daemon; the host (`embedding.ts`) talks to it over a tiny
+ * request/response protocol and keeps
  * all the sticky-failure / server-fallback / status policy.
  *
  * Protocol: host posts { id, type, payload }, worker replies
  *   { id, ok: true, result } | { id, ok: false, error, code }.
- * Embedding vectors are returned as Float32Array and transferred (zero-copy).
+ * Embedding vectors are returned as Float32Array over advanced IPC serialization.
  */
-import { parentPort, workerData } from 'node:worker_threads';
+import { resolveWorkerRuntime } from '../util/worker-runtime-port.js';
 import { EMBEDDING_MODEL, EMBEDDING_DTYPE } from '../../shared/embedding-config.js';
 
 export type EmbeddingWorkerRequest =
@@ -25,8 +26,7 @@ export type EmbeddingWorkerResponse =
   | { id: number; ok: true; result: true | Float32Array | (Float32Array | null)[] }
   | { id: number; ok: false; error: string; code: string | null };
 
-const port = parentPort;
-if (!port) throw new Error('embedding-worker must run as a worker thread');
+const { port, data: workerData } = resolveWorkerRuntime();
 
 let pipelineInstance: ((text: string, opts: unknown) => Promise<{ data: ArrayLike<number> }>) | null = null;
 let loadingPromise: Promise<typeof pipelineInstance> | null = null;
@@ -36,7 +36,12 @@ async function getPipeline(): Promise<NonNullable<typeof pipelineInstance>> {
   if (!loadingPromise) {
     loadingPromise = (async () => {
       const { pipeline, env } = await import('@huggingface/transformers');
-      const cacheDir = typeof workerData?.cacheDir === 'string' ? workerData.cacheDir : '';
+      const runtimeData = workerData && typeof workerData === 'object'
+        ? workerData as { cacheDir?: unknown }
+        : undefined;
+      const cacheDir = typeof runtimeData?.cacheDir === 'string'
+        ? runtimeData.cacheDir
+        : process.env.IMCODES_EMBEDDING_CACHE_DIR?.trim() ?? '';
       if (cacheDir) env.cacheDir = cacheDir;
       const p = await pipeline('feature-extraction', EMBEDDING_MODEL, {
         dtype: EMBEDDING_DTYPE,

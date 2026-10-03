@@ -227,6 +227,19 @@ describe('DeepseekHarnessProvider', () => {
     expect(child.commands().some((command) => command.type === 'follow_up')).toBe(false);
   });
 
+  it('does not acknowledge an append after the active bridge stdin is destroyed', async () => {
+    const sessionId = await startSession();
+    await provider.send(sessionId, 'first task');
+    await flush();
+    child.stdin.destroyed = true;
+
+    await expect(provider.notifyActiveDelegation(sessionId, {
+      text: 'must remain queued',
+      sourceSession: 'deck_sub_source',
+    })).resolves.toBe('stale');
+    expect(child.commands().filter((command) => command.type === DSH_BRIDGE_COMMAND.STEER)).toEqual([]);
+  });
+
   it('reuses one child across turns instead of respawning', async () => {
     const sessionId = await startSession();
     await provider.send(sessionId, 'first');

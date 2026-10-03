@@ -35,6 +35,7 @@ vi.mock('../src/api.js', async (importOriginal) => {
 import { SessionControls } from '../src/components/SessionControls.js';
 import { __resetAliasesForTests } from '../src/hooks/useAliases.js';
 import { ApiError } from '../src/api.js';
+import { selectQueueDeliveryMode } from './fixtures/delivery-mode.js';
 
 function entry(name: string, value: string, description = ''): AliasEntry {
   return { name, value, description, tags: [], createdAt: '', updatedAt: '', source: 'web' };
@@ -189,6 +190,7 @@ describe('SessionControls alias send (real useAliases, apiFetch mocked)', () => 
     apiFetchMock.mockResolvedValue({ aliases: [entry('deploy', 'ssh root@host', 'prod only')] });
     const { ws, editor } = renderControls({ activeSession: transportSession as any });
     await waitFor(() => expect(apiFetchMock).toHaveBeenCalled());
+    selectQueueDeliveryMode();
 
     // Make the first send fail so the entry lands in the queue as retryable.
     ws.sendSessionCommand.mockImplementationOnce(() => { throw new Error('socket down'); });
@@ -217,6 +219,7 @@ describe('SessionControls alias send (real useAliases, apiFetch mocked)', () => 
     apiFetchMock.mockResolvedValue({ aliases: [entry('deploy', 'ssh root@host')] });
     const { ws, editor } = renderControls({ activeSession: transportSession as any });
     await waitFor(() => expect(apiFetchMock).toHaveBeenCalled());
+    selectQueueDeliveryMode();
 
     typeInto(editor, 'plain first send');
     fireEvent.keyDown(editor, { key: 'Enter' });

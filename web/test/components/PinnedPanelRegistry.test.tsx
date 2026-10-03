@@ -88,6 +88,7 @@ describe('pinned cron manager panel', () => {
     expect(screen.getByTestId('mock-cron-manager')).toBeTruthy();
     expect(cronManagerProps).toHaveLength(1);
     expect(cronManagerProps[0].ws).toBe(ws);
+    expect(cronManagerProps[0].portalSubPanels).toBe(true);
   });
 });
 

@@ -125,6 +125,7 @@ IM.codes can drive supported agent sessions turn by turn — a supervisor with y
 
 - **Per-session Auto modes.** Configure `off`, `supervised`, or `supervised_audit` per session instead of forcing one policy everywhere.
 - **Completion checks at the idle boundary.** When a turn finishes, IM.codes can classify it as `complete`, `continue`, or `ask_human`, then dispatch the next continue prompt inside the same session.
+- **Non-blocking resource telemetry.** Transient daemon memory or system pressure is recorded for diagnostics and does not block an otherwise valid supervision transition.
 - **Fail-closed automation.** Auto supervision stays visible in the timeline/footer, uses structured decisions, and returns control to you on timeout, invalid output, or bad config instead of silently guessing.
 - **Optional audit → rework loop.** In `supervised_audit`, a completed turn can automatically enter an audit pipeline and send a rework brief back into the same session before control returns.
 - **Global defaults seed new sessions.** Set your default supervisor backend, model, and timeout once. New `supervised` / `supervised_audit` sessions snapshot them at enable time, and each session can still override backend/model/timeout and audit mode individually.

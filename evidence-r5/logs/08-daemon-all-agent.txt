@@ -1,0 +1,108 @@
+
+ RUN  v3.2.7 /Users/k/.imcodes/worktrees/imcodes/deck_sub_0610320z/asg_nbp/repo
+
+ ✓ |daemon| test/agent/qoder-sdk-provider.test.ts (28 tests) 557ms
+ ✓ |daemon| test/agent/runtime-context-bootstrap.test.ts (19 tests) 439ms
+ ✓ |daemon| test/agent/qwen-provider.test.ts (46 tests) 835ms
+   ✓ QwenProvider > retries a transient Premature close once before surfacing an error  359ms
+ ✓ |daemon| test/agent/provider-process-group-contract.test.ts (7 tests) 350ms
+ ✓ |daemon| test/agent/transport-runtime-background-work.test.ts (7 tests) 355ms
+ ✓ |daemon| test/agent/shared-context-continuity.test.ts (3 tests) 585ms
+   ✓ shared-agent-context continuity integration > preserves personal multi-machine continuity from processed local to processed remote authority  348ms
+ ✓ |daemon| test/agent/signal-file.test.ts (4 tests) 400ms
+   ✓ signal file handling > writeIdleSignal creates a file atomically  386ms
+ ✓ |daemon| test/agent/providers/list-models.test.ts (15 tests) 351ms
+ ✓ |daemon| test/agent/machine-exec-client.test.ts (22 tests) 86ms
+ ✓ |daemon| test/agent/claude-code-sdk-provider.test.ts (73 tests) 239ms
+ ✓ |daemon| test/agent/restored-session-agent-lease.test.ts (4 tests) 45ms
+ ✓ |daemon| test/agent/hermes-acp-provider.test.ts (18 tests) 62ms
+ ✓ |daemon| test/agent/copilot-streaming.test.ts (5 tests) 59ms
+ ✓ |daemon| test/agent/transport-session-runtime.test.ts (5 tests) 48ms
+ ✓ |daemon| test/agent/codex-sdk-rollout-incremental.test.ts (7 tests) 53ms
+ ✓ |daemon| test/agent/conpty.test.ts (51 tests) 35ms
+ ✓ |daemon| test/agent/claude-subagent-idle-send.test.ts (21 tests) 2193ms
+   ✓ claude-code-sdk — sending while only a subagent runs > falls back to one retained-query wake for duplicate stale terminals that emit no native continuation  1126ms
+ ✓ |daemon| test/agent/repository-identity-service.test.ts (7 tests) 3ms
+ ✓ |daemon| test/agent/transport-runtime-assembly.test.ts (41 tests) 33ms
+ ✓ |daemon| test/agent/deepseek-harness-provider.test.ts (36 tests) 64ms
+ ✓ |daemon| test/agent/codex-sdk-rollout-backstop.test.ts (20 tests) 112ms
+ ✓ |daemon| test/agent/providers/copilot-sdk.test.ts (17 tests) 17ms
+ ✓ |daemon| test/agent/grok-sdk-provider.test.ts (21 tests) 18ms
+ ✓ |daemon| test/agent/providers/cursor-headless.test.ts (8 tests) 18ms
+ ✓ |daemon| test/agent/authored-context.test.ts (5 tests) 10ms
+ ✓ |daemon| test/agent/deepseek-harness-runtime.test.ts (5 tests) 20ms
+ ✓ |daemon| test/agent/transport-paths.test.ts (16 tests) 10ms
+ ✓ |daemon| test/agent/deepseek-harness-bridge.test.ts (15 tests) 25ms
+ ✓ |daemon| test/agent/cursor-streaming.test.ts (3 tests) 12ms
+ ✓ |daemon| test/agent/mcp-tool-catalog.test.ts (5 tests) 9ms
+ ✓ |daemon| test/agent/pi-provider.test.ts (3 tests) 7ms
+ ✓ |daemon| test/agent/drivers/drivers.test.ts (27 tests) 4011ms
+   ✓ ClaudeCodeDriver > captureLastResponse uses /copy and deleteBuffer  2004ms
+   ✓ ClaudeCodeDriver > captureLastResponse falls back to capture-pane if buffer empty  2001ms
+ ✓ |daemon| test/agent/codebuddy-provider.test.ts (13 tests) 11ms
+ ✓ |daemon| test/agent/providers/memory-mcp-registration.test.ts (12 tests) 6ms
+ ✓ |daemon| test/agent/kimi-streaming.test.ts (7 tests) 10ms
+ ✓ |daemon| test/agent/provider-registry.test.ts (38 tests) 12ms
+ ✓ |daemon| test/agent/detect.test.ts (17 tests) 6ms
+ ✓ |daemon| test/agent/opencode-sdk-provider.test.ts (27 tests) 3909ms
+   ✓ OpenCodeSdkProvider > recovers once when OpenCode becomes idle after tools without a final response  307ms
+   ✓ OpenCodeSdkProvider > reports an explicit failure when bounded missing-final recovery remains empty  1275ms
+   ✓ OpenCodeSdkProvider > does not attach a replacement OpenCode runtime after cancellation wins the reconnect race  1335ms
+ ✓ |daemon| test/agent/acp-json-filter.test.ts (5 tests) 5ms
+ ✓ |daemon| test/agent/codex-runtime-config.test.ts (5 tests) 5ms
+ ✓ |daemon| test/agent/brain-dispatcher.test.ts (17 tests) 9ms
+ ✓ |daemon| test/agent/priority-preserving-context-cap.test.ts (23 tests) 8ms
+ ✓ |daemon| test/agent/pi-extension.test.ts (4 tests) 8ms
+ ✓ |daemon| test/agent/providers/cursor-headless-stream.test.ts (3 tests) 3ms
+ ✓ |daemon| test/agent/startup-test-session-cleanup.test.ts (1 test) 8ms
+ ✓ |daemon| test/agent/pending-question-registry.test.ts (8 tests) 17ms
+ ✓ |daemon| test/agent/copilot-runtime-config.test.ts (6 tests) 12ms
+ ✓ |daemon| test/agent/status-poller-contract.test.ts (4 tests) 5ms
+ ✓ |daemon| test/agent/context-authority.test.ts (10 tests) 3ms
+ ✓ |daemon| test/agent/transport-resume-opts.test.ts (20 tests) 6ms
+ ✓ |daemon| test/agent/transport-runtime-codex-backstop.test.ts (7 tests) 14ms
+ ✓ |daemon| test/agent/session-manager-state-resync.test.ts (9 tests) 5ms
+ ✓ |daemon| test/agent/gemini-sdk-provider.test.ts (3 tests) 4ms
+ ✓ |daemon| test/agent/detect-transport.test.ts (28 tests) 9ms
+ ✓ |daemon| test/agent/cursor-runtime-config.test.ts (10 tests) 3ms
+ ✓ |daemon| test/agent/mcp-tool-distribution-contract.test.ts (3 tests) 6ms
+ ✓ |daemon| test/agent/codex-service-tier.test.ts (6 tests) 4ms
+ ✓ |daemon| test/agent/codex-reset-credits.test.ts (8 tests) 4ms
+ ✓ |daemon| test/agent/provider-context-routing.test.ts (8 tests) 4ms
+ ✓ |daemon| test/agent/process-session-runtime.test.ts (12 tests) 5ms
+ ✓ |daemon| test/agent/provider-diagnostics.test.ts (7 tests) 9ms
+ ✓ |daemon| test/agent/qoder-sdk-import-failure.test.ts (1 test) 4ms
+ ✓ |daemon| test/agent/qwen-runtime-config.test.ts (5 tests) 3ms
+ ✓ |daemon| test/agent/codebuddy-registry.test.ts (2 tests) 3ms
+ ✓ |daemon| test/agent/context-diagnostics.test.ts (4 tests) 3ms
+ ✓ |daemon| test/agent/transport-provider.test.ts (3 tests) 3ms
+ ✓ |daemon| test/agent/codex-todo.test.ts (3 tests) 3ms
+ ✓ |daemon| test/agent/codex-custom-tool.test.ts (5 tests) 2ms
+ ↓ |daemon| test/agent/wezterm.test.ts (28 tests | 28 skipped)
+ ✓ |daemon| test/agent/gemini-plan.test.ts (3 tests) 2ms
+ ✓ |daemon| test/agent/providers/compact-capabilities.test.ts (4 tests) 2ms
+ ✓ |daemon| test/agent/cc-copy.test.ts (5 tests) 8011ms
+   ✓ ClaudeCodeDriver.captureLastResponse > sends /copy command and reads tmux buffer  2004ms
+   ✓ ClaudeCodeDriver.captureLastResponse > calls deleteBuffer after reading clipboard (task 12.15 cleanup)  2002ms
+   ✓ ClaudeCodeDriver.captureLastResponse > does NOT call deleteBuffer if deleteBuffer is not provided  2002ms
+   ✓ ClaudeCodeDriver.captureLastResponse > falls back to capture-pane if buffer is empty  2001ms
+ ✓ |daemon| test/agent/codex-sdk-provider.test.ts (186 tests) 8885ms
+   ✓ CodexSdkProvider > polls the Codex rollout briefly for raw update_plan calls without waiting for token usage  2017ms
+   ✓ CodexSdkProvider > merges a task_name-only spawn with its child thread rollout instead of duplicating the UI row  2019ms
+   ✓ CodexSdkProvider > discovers child rollout sub-agents by IM.codes session identity when Codex parent id differs  2016ms
+   ✓ CodexSdkProvider > settles a turn from rollout task_complete when the app-server sends only idle/completed hints  342ms
+   ✓ CodexSdkProvider > terminalizes a WebSearch started event when rollout settles a turn without turn/completed  344ms
+   ✓ CodexSdkProvider > settles from rollout task_complete when turn/start response never returns and ignores its late response  348ms
+   ✓ CodexSdkProvider > ignores a late id-less interrupted notification from a previous stop and still settles the newer turn  347ms
+
+ Test Files  72 passed | 1 skipped (73)
+      Tests  1106 passed | 28 skipped (1134)
+   Start at  01:58:28
+   Duration  10.06s (transform 3.92s, setup 767ms, collect 15.40s, tests 32.09s, environment 8ms, prepare 3.13s)
+
+npm notice
+npm notice New minor version of npm available! 11.8.0 -> 11.19.1
+npm notice Changelog: https://github.com/npm/cli/releases/tag/v11.19.1
+npm notice To update run: npm install -g npm@11.19.1
+npm notice
+exit=0

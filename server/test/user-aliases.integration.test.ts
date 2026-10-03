@@ -84,7 +84,7 @@ describe('user_aliases migration', () => {
 });
 
 describe('alias-queries roundtrip', () => {
-  it('upsert / get-by-name returns canonical fields (ISO timestamps, no id/user_id)', async () => {
+  it('upsert / get-by-name returns canonical fields with stable id and no user_id', async () => {
     const userId = await freshUser();
     const created = await upsertAlias(db, {
       id: randomHex(16),
@@ -101,7 +101,7 @@ describe('alias-queries roundtrip', () => {
     expect(created.tags).toEqual(['infra', 'prod']);
     expect(created.source).toBe('web');
     expect(new Date(created.createdAt).toISOString()).toBe(created.createdAt);
-    expect(created).not.toHaveProperty('id');
+    expect(created.id).toMatch(/^[a-f0-9]{32}$/u);
     expect(created).not.toHaveProperty('user_id');
 
     const got = await getAliasByName(db, userId, 'server');

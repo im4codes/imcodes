@@ -6,11 +6,12 @@
  * Extracted from app.tsx as part of the sidebar-redesign refactor (task 1.5).
  */
 
+import { recordPerfRender } from '../perf-render-debug.js';
 import { useState, useEffect, useCallback, useRef, useMemo } from 'preact/hooks';
 import { useTranslation } from 'react-i18next';
 import { TerminalView } from './TerminalView.js';
 import { ChatView } from './ChatView.js';
-import { SessionControls } from './SessionControls.js';
+import { StableSessionControls as SessionControls } from './StableSessionControls.js';
 import { UsageFooter } from './UsageFooter.js';
 import { requestActiveTimelineRefreshAfterUserAction, useTimeline } from '../hooks/useTimeline.js';
 import { findTrailingAskQuestion, type TrailingAskQuestion } from '../find-pending-question.js';
@@ -101,6 +102,8 @@ export interface SessionPaneProps {
 
   // ── Action callbacks ────────────────────────────────────────────────────────
   onStopProject?: (project: string) => void;
+  /** Restart this session when terminal recovery is exhausted. */
+  onRestart?: () => void;
   onRenameSession?: () => void;
   onSettings?: (intent?: SessionSettingsOpenIntent) => void;
   onShareSession?: (session: SessionInfo, subSessionId?: string | null) => void;
@@ -148,6 +151,7 @@ export function SessionPane({
   onDiff,
   onHistory,
   onStopProject,
+  onRestart,
   onRenameSession,
   onSettings,
   onShareSession,
@@ -165,6 +169,7 @@ export function SessionPane({
   onPendingPrefillApplied,
   onVersionSensitiveAction,
 }: SessionPaneProps) {
+  recordPerfRender(isActive ? 'SessionPane:active' : 'SessionPane:hidden');
   const { t } = useTranslation();
   const sessionName = session.name;
   const hasChatTimeline = session.agentType !== 'shell' && session.agentType !== 'script';
@@ -190,12 +195,20 @@ export function SessionPane({
     hasOlderHistory: timelineHasOlderHistory,
     addOptimisticUserMessage,
     markOptimisticFailed,
+    removeOptimisticMessage,
     retryOptimisticMessage,
     loadOlderEvents,
+    historyGap: timelineHistoryGap,
     loadMessageContext,
     forceRefresh: timelineForceRefresh,
   } = useTimeline(sessionName, ws, serverId, {
-    isActiveSession: isActive,
+    // A focused sub-session window owns keyboard/recovery focus while it is
+    // open. Keep this main pane mounted and subscribed, but do not let it join
+    // the same global resume broadcast and double the foreground work.
+    isActiveSession: keyboardActive ?? isActive,
+    isVisible: isActive,
+    subscriptionMode: isActive ? 'full' : 'summary',
+    bootstrapWhenVisible: true,
     disableHistory: !hasChatTimeline,
     authoritativeSessionState: session.state,
   });
@@ -280,12 +293,18 @@ export function SessionPane({
   const activeThinkingTs = useMemo(() => getActiveThinkingTs(timelineEvents), [timelineEvents]);
   const statusText = useMemo(() => getActiveStatusText(timelineEvents), [timelineEvents]);
   const activeToolCall = useMemo(() => hasActiveToolCall(timelineEvents), [timelineEvents]);
-  const activeTimelineTurn = useMemo(() => hasActiveTimelineTurn(timelineEvents), [timelineEvents]);
   const pendingUserSend = useMemo(() => hasPendingUserSend(timelineEvents), [timelineEvents]);
   const transportActivityDetail = useMemo(() => getLatestTransportActivityDetail(timelineEvents), [timelineEvents]);
   const timelineSessionStateInfo = useMemo(() => getTailSessionStateInfo(timelineEvents), [timelineEvents]);
   const timelineLastEventTs =
     timelineEvents.length > 0 ? (timelineEvents[timelineEvents.length - 1]?.ts ?? null) : null;
+  const activeTimelineTurn = useMemo(() => (
+    session.authoritativeIdleAt != null
+      && timelineLastEventTs != null
+      && timelineLastEventTs <= session.authoritativeIdleAt
+      ? false
+      : hasActiveTimelineTurn(timelineEvents)
+  ), [session.authoritativeIdleAt, timelineEvents, timelineLastEventTs]);
   const timelineSessionState = timelineSessionStateInfo.state;
   const liveSessionState = useMemo(
     () => resolveTimelineBackedSessionState({
@@ -294,10 +313,11 @@ export function SessionPane({
       activeThinking: !!activeThinkingTs,
       activeToolCall,
       activeTransportTurn: activeTimelineTurn,
+      authoritativeIdleAt: session.authoritativeIdleAt,
       timelineStateTs: timelineSessionStateInfo.ts,
       timelineLastEventTs,
     }),
-    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
+    [activeThinkingTs, activeTimelineTurn, activeToolCall, session.authoritativeIdleAt, session.state, timelineLastEventTs, timelineSessionState, timelineSessionStateInfo.ts],
   );
   // shell / script sessions have no agent state, no token usage, no quota —
   // suppress the footer entirely so they don't see misleading "Agent
@@ -413,23 +433,25 @@ export function SessionPane({
         key={`term-${sessionName}`}
         style={{ display: terminalVisible ? 'flex' : 'none', flex: 1, overflow: 'hidden' }}
       >
-        <TerminalView
-          sessionName={sessionName}
-          ws={ws}
-          connected={connected}
-          active={terminalVisible}
-          onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
-          onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
-          onFocusFn={onFocusFn}
-          onFitFn={onFitFn}
-          onScrollBottomFn={handleTermScrollFn}
-          mobileInput={session.agentType === 'shell'}
-        />
+        {terminalVisible && <TerminalView
+            sessionName={sessionName}
+            ws={ws}
+            connected={connected}
+            active={terminalVisible}
+            onDiff={onDiff ? (apply) => onDiff(apply) : undefined}
+            onHistory={onHistory ? (apply) => onHistory(apply) : undefined}
+            onFocusFn={onFocusFn}
+            onFitFn={onFitFn}
+            onScrollBottomFn={handleTermScrollFn}
+            mobileInput={session.agentType === 'shell'}
+            onRestart={onRestart}
+          />}
       </div>
 
       {/* Chat view: only rendered when active + in chat mode */}
       {chatVisible && (
         <ChatView
+          visible={isActive}
           events={timelineEvents}
           loading={timelineLoading}
           refreshing={timelineRefreshing}
@@ -438,8 +460,10 @@ export function SessionPane({
           loadingOlder={timelineLoadingOlder}
           hasOlderHistory={timelineHasOlderHistory}
           onLoadOlder={loadOlderEvents}
+          historyGap={timelineHistoryGap}
           onLoadMessageContext={loadMessageContext}
           sessionId={sessionName}
+          sessions={sessions}
           sessionState={liveSessionState ?? undefined}
           onScrollBottomFn={setChatScrollFn}
           workdir={session.projectDir}
@@ -471,6 +495,8 @@ export function SessionPane({
           quotaLabel={session.quotaLabel}
           quotaUsageLabel={session.quotaUsageLabel}
           quotaMeta={session.quotaMeta}
+          codexCreditsBalance={session.codexCreditsBalance}
+          codexCreditsUnlimited={session.codexCreditsUnlimited}
           showCost={!!lastCostEvent}
           activeThinkingTs={activeThinkingTs}
           statusText={statusText}
@@ -492,6 +518,9 @@ export function SessionPane({
           runExecutionClonesTitle={runExecutionClonesTitle}
           runExecutionClonesCount={executionCloneCount}
           runExecutionClonesFeedback={executionCloneLaunchState}
+          onRefreshHistory={timelineForceRefresh}
+          historyRefreshing={timelineRefreshing}
+          historyStatus={timelineHistoryStatus}
         />
       )}
 
@@ -528,12 +557,14 @@ export function SessionPane({
             addOptimisticUserMessage(text, meta?.commandId, {
               ...(meta?.attachments ? { attachments: meta.attachments } : {}),
               ...(meta?.extra ? { resendExtra: meta.extra } : {}),
+              ...(meta?.queueAppend ? { queueAppend: true } : {}),
             });
             if (meta?.commandId && meta.localFailure) {
               markOptimisticFailed(meta.commandId, meta.localFailure);
             }
             scrollToBottom();
           }}
+          onRemoveOptimisticMessage={removeOptimisticMessage}
           onStopProject={onStopProject}
           onRenameSession={onRenameSession}
           onSettings={onSettings}

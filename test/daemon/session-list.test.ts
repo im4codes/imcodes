@@ -268,7 +268,7 @@ describe('buildSessionList', () => {
 
   it('surfaces resend queue entries when a transport runtime is missing', async () => {
     const store = await import('../../src/store/session-store.js');
-    const { enqueueResend } = await import('../../src/daemon/transport-resend-queue.js');
+    const { enqueueResend, recipientFromSessionRecord } = await import('../../src/daemon/transport-resend-queue.js');
     store.upsertSession({
       name: 'deck_codex_missing_runtime_brain',
       projectName: 'demo',
@@ -284,6 +284,7 @@ describe('buildSessionList', () => {
       updatedAt: Date.now(),
     });
     enqueueResend('deck_codex_missing_runtime_brain', {
+      recipient: recipientFromSessionRecord(store.getSession('deck_codex_missing_runtime_brain')),
       commandId: 'cmd-offline',
       text: 'queued while offline',
       queuedAt: Date.now(),
@@ -319,7 +320,7 @@ describe('buildSessionList', () => {
 
   it('does not surface expired resend queue entries as pending work', async () => {
     const store = await import('../../src/store/session-store.js');
-    const { enqueueResend, RESEND_EXPIRY_MS } = await import('../../src/daemon/transport-resend-queue.js');
+    const { enqueueResend, recipientFromSessionRecord, RESEND_EXPIRY_MS } = await import('../../src/daemon/transport-resend-queue.js');
     store.upsertSession({
       name: 'deck_codex_expired_resend_brain',
       projectName: 'demo',
@@ -335,6 +336,7 @@ describe('buildSessionList', () => {
       updatedAt: Date.now(),
     });
     enqueueResend('deck_codex_expired_resend_brain', {
+      recipient: recipientFromSessionRecord(store.getSession('deck_codex_expired_resend_brain')),
       commandId: 'cmd-expired',
       text: 'expired queued while offline',
       queuedAt: Date.now() - RESEND_EXPIRY_MS - 1,
@@ -502,5 +504,41 @@ describe('buildSessionList', () => {
         }),
       }),
     });
+  });
+
+  it('replays the daemon-owned heartbeat deadline in a fresh session_list snapshot', async () => {
+    const store = await import('../../src/store/session-store.js');
+    store.upsertSession({
+      name: 'deck_heartbeat_brain',
+      projectName: 'heartbeat',
+      role: 'brain',
+      agentType: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+    });
+    const projection = await import('../../src/daemon/supervision-heartbeat-projection.js');
+    projection.setSupervisionHeartbeatProjection('deck_heartbeat_brain', {
+      state: 'armed',
+      kind: 'waiting',
+      nextHeartbeatAt: 20_000,
+      updatedAt: 10_000,
+    });
+
+    const { buildSessionList } = await import('../../src/daemon/session-list.js');
+    expect(await buildSessionList()).toEqual([
+      expect.objectContaining({
+        name: 'deck_heartbeat_brain',
+        supervisionHeartbeat: {
+          state: 'armed',
+          kind: 'waiting',
+          nextHeartbeatAt: 20_000,
+          updatedAt: expect.any(Number),
+        },
+      }),
+    ]);
   });
 });

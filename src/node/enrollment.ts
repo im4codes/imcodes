@@ -1,8 +1,8 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { constants as fsConstants, type Stats } from 'node:fs';
-import { chmod, chown, lstat, mkdir, open, readFile, rename, unlink } from 'node:fs/promises';
+import { chmod, chown, lstat, mkdir, open, readdir, readFile, rename, unlink } from 'node:fs/promises';
 import os from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
   NODE_ROLE,
   ENROLLMENT_REDEEM_VERSION_V2,
@@ -18,6 +18,7 @@ import {
   type EnrollmentBlob,
   type EnrollmentTrailerRange,
 } from '../../shared/remote-exec.js';
+import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
 import {
   inspectWindowsAuthenticodeEnrollmentContainer,
   WINDOWS_AUTHENTICODE_ENROLLMENT_OVERHEAD_MAX,
@@ -32,6 +33,8 @@ import {
 
 export interface ControlledNodeCredential {
   serverId: string;
+  /** Server-minted public identity. Optional only for pre-migration credentials. */
+  nodeId?: string;
   token: string;
   serverUrl: string;
   nodeRole: typeof NODE_ROLE.CONTROLLED;
@@ -111,6 +114,7 @@ export interface EnrollmentStagingFs {
   openDestination(path: string, flags: string, mode: number): Promise<StagingFileHandle>;
   rename(from: string, to: string): Promise<void>;
   unlink(path: string): Promise<void>;
+  readdir(path: string): Promise<string[]>;
   lstat(path: string): Promise<Stats>;
   fsyncParentDirectory(path: string): Promise<void>;
   openSourceWritable(path: string): Promise<NodeFileHandle>;
@@ -122,6 +126,7 @@ const DEFAULT_ENROLLMENT_STAGING_FS: EnrollmentStagingFs = {
   openDestination: (path, flags, mode) => open(path, flags, mode),
   rename,
   unlink,
+  readdir,
   lstat,
   fsyncParentDirectory,
   openSourceWritable: (path) => openNoFollow(path, true),
@@ -294,7 +299,7 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
       await dst.close();
       dst = null;
       if (process.platform !== 'win32') await this.stagingFs.chmod(temp, 0o755);
-      await this.stagingFs.rename(temp, destPath);
+      await this.replaceDestination(temp, destPath);
       renamed = true;
       if (process.platform === 'win32') {
         applyWindowsAclCommands(windowsExecutableFileAclCommands(destPath));
@@ -316,6 +321,51 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
       sourceIdentity: this.identity,
       stagedIdentity: fileIdentityFromStat(stagedStat),
     };
+  }
+
+  /**
+   * Publish the freshly written copy over the stable service path.
+   *
+   * Windows keeps a running image locked, so renaming *onto* the executing
+   * service copy fails with EACCES/EPERM even for SYSTEM. It does allow the
+   * running image to be renamed *away*, so displace the incumbent and take its
+   * name. The running process keeps its open handle and its own bytes; only the
+   * next launch sees the new copy. A failed second rename puts the incumbent
+   * back, so an interrupted re-stage can never leave the stable path missing.
+   */
+  private async replaceDestination(temp: string, destPath: string): Promise<void> {
+    try {
+      await this.stagingFs.rename(temp, destPath);
+      return;
+    } catch (error) {
+      if (process.platform !== 'win32' || !isLockedDestinationError(error)) throw error;
+    }
+    // Sweep what earlier runs had to leave behind. The image displaced by THIS
+    // run is still executing, so Windows will refuse to delete it below; by the
+    // next install the service has restarted onto the new copy and the old one
+    // finally goes. Without this each re-install strands another ~80MB copy in
+    // the protected directory forever.
+    await this.removeDisplacedPredecessors(destPath);
+    const displaced = `${destPath}.replaced-${randomUUID()}`;
+    await this.stagingFs.rename(destPath, displaced);
+    try {
+      await this.stagingFs.rename(temp, destPath);
+    } catch (error) {
+      await this.stagingFs.rename(displaced, destPath).catch(() => {});
+      throw error;
+    }
+    await this.stagingFs.unlink(displaced).catch(() => {});
+  }
+
+  /** Delete displaced copies from earlier installs; a running one simply stays. */
+  private async removeDisplacedPredecessors(destPath: string): Promise<void> {
+    const directory = dirname(destPath);
+    const prefix = `${basename(destPath)}.replaced-`;
+    const entries = await this.stagingFs.readdir(directory).catch(() => [] as string[]);
+    for (const entry of entries) {
+      if (!entry.startsWith(prefix)) continue;
+      await this.stagingFs.unlink(join(directory, entry)).catch(() => {});
+    }
   }
 
   async cleanupEnrollmentSource(trailerStart: number, trailerLength: number): Promise<SourceCleanupStatus> {
@@ -397,6 +447,12 @@ class VerifiedEnrollmentSourceImpl implements VerifiedEnrollmentSource {
 
 function isTextFileBusyError(error: unknown): boolean {
   return (error as NodeJS.ErrnoException | undefined)?.code === 'ETXTBSY';
+}
+
+/** Windows refuses to overwrite an executable that is currently running. */
+function isLockedDestinationError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === 'EACCES' || code === 'EPERM' || code === 'EBUSY';
 }
 
 export async function openVerifiedEnrollmentSource(
@@ -493,7 +549,9 @@ export async function readEnrollmentBlobWithRange(executablePath = process.execP
   let source: VerifiedEnrollmentSource | null = null;
   try {
     source = await openVerifiedEnrollmentSource(executablePath);
-    return source.readEnrollmentBlobWithRange();
+    // `await` before returning, or `finally` closes the handle while the read
+    // is still in flight and the call dies with EBADF "file closed".
+    return await source.readEnrollmentBlobWithRange();
   } catch {
     return null;
   } finally {
@@ -567,7 +625,8 @@ export async function loadCredential(
     // On Windows tool absence or malformed ACL output rejects the load.
     await assertSecretPathProtected(path, 'credential', options);
     const value = JSON.parse(await readFile(path, 'utf8')) as Partial<ControlledNodeCredential>;
-    if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !value.token || !value.serverUrl) {
+  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !value.token || !value.serverUrl
+    || (value.nodeId !== undefined && !isControlledNodeId(value.nodeId))) {
       throw new Error('credential_invalid');
     }
     return value as ControlledNodeCredential;
@@ -640,9 +699,12 @@ export async function redeemEnrollmentV2(
   if (!response.ok) throw new Error(`enrollment_redeem_failed:${response.status}`);
   const value = await response.json() as EnrollRedeemV2Response & { token?: string };
   if ('token' in value && value.token) throw new Error('enrollment_redeem_v2_returned_raw_token');
-  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId) throw new Error('enrollment_redeem_invalid_response');
+  if (value.nodeRole !== NODE_ROLE.CONTROLLED || !value.serverId || !isControlledNodeId(value.nodeId)) {
+    throw new Error('enrollment_redeem_invalid_response');
+  }
   return {
     serverId: value.serverId,
+    nodeId: value.nodeId,
     token: identity.nodeToken,
     serverUrl: expectedOrigin,
     nodeRole: NODE_ROLE.CONTROLLED,

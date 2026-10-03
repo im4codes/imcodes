@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { SUPPORTED_LOCALES } from '../src/i18n/locales/index.js';
+import { TASK_PAIR_FLAGS } from '@shared/task-pair.js';
 
 const WEB_ROOT = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
 const OPENSPEC_AUTO_DELIVER_KEYS = [
@@ -357,6 +358,10 @@ const COMPOSER_TARGET_KEYS = [
   'session.composer_target_label',
   'session.composer_target_aria',
 ] as const;
+const DELEGATION_OBJECTIVE_TOGGLE_KEYS = [
+  'delegation.objective_expand',
+  'delegation.objective_collapse',
+] as const;
 
 function readPath(value: unknown, path: string): unknown {
   return path.split('.').reduce<unknown>((current, key) => (
@@ -365,6 +370,19 @@ function readPath(value: unknown, path: string): unknown {
 }
 
 describe('generic i18n coverage guard', () => {
+  it('keeps delegation objective expand/collapse controls localized in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(
+        readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8'),
+      ) as unknown;
+      for (const key of DELEGATION_OBJECTIVE_TOGGLE_KEYS) {
+        const value = readPath(messages, key);
+        expect(value, `${locale}:${key}`).toEqual(expect.any(String));
+        expect((value as string).trim().length, `${locale}:${key}`).toBeGreaterThan(0);
+      }
+    }
+  });
+
   it('keeps composer target labels localized in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(
@@ -555,6 +573,19 @@ describe('generic i18n coverage guard', () => {
     }
   });
 
+  it('keeps the Hermes Agent and managed MCP labels present in every locale', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      const label = readPath(messages, 'session.agentType.hermes_agent');
+      const mcpLabel = readPath(messages, 'sharedContext.management.mcpProviderHermesAcp');
+      const prerequisiteError = readPath(messages, 'new_session.hermes_prerequisite_error');
+      expect(label, `${locale}:session.agentType.hermes_agent`).toBe('Hermes Agent');
+      expect(mcpLabel, `${locale}:sharedContext.management.mcpProviderHermesAcp`).toBe('Hermes ACP');
+      expect(prerequisiteError, `${locale}:new_session.hermes_prerequisite_error`).toEqual(expect.any(String));
+      expect((prerequisiteError as string).trim().length).toBeGreaterThan(0);
+    }
+  });
+
   it('keeps the DeepSeek Harness agent label present in every locale', () => {
     for (const locale of SUPPORTED_LOCALES) {
       const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
@@ -564,6 +595,17 @@ describe('generic i18n coverage guard', () => {
       // The runtime is a brand name, so every locale intentionally keeps the
       // English spelling rather than transliterating it.
       expect(label, `${locale}:session.agentType.deepseek_harness`).toBe('DeepSeek Harness');
+    }
+  });
+
+  it('keeps a taskPair.flag.<flag> label for every TASK_PAIR_FLAGS entry in every locale (a new flag must never ship without one)', () => {
+    for (const locale of SUPPORTED_LOCALES) {
+      const messages = JSON.parse(readFileSync(join(WEB_ROOT, 'src/i18n/locales', `${locale}.json`), 'utf8')) as unknown;
+      for (const flag of TASK_PAIR_FLAGS) {
+        const value = readPath(messages, `taskPair.flag.${flag}`);
+        expect(value, `${locale}:taskPair.flag.${flag}`).toEqual(expect.any(String));
+        expect((value as string | undefined)?.trim().length, `${locale}:taskPair.flag.${flag}`).toBeGreaterThan(0);
+      }
     }
   });
 });

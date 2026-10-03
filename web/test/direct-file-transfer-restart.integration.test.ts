@@ -3,8 +3,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { EventEmitter } from 'node:events';
 import type WebSocket from 'ws';
 import {
+  DIRECT_FILE_CONNECTION_STATUS,
   DIRECT_FILE_TRANSFER_DATA_MSG,
   DIRECT_FILE_TRANSFER_LEASE_CAPABILITY,
   DIRECT_FILE_TRANSFER_MSG,
@@ -30,6 +32,7 @@ const storageMocks = vi.hoisted(() => ({
 vi.mock('../src/api.js', () => apiMocks);
 vi.mock('../../src/daemon/file-transfer-handler.js', () => ({
   initFileTransfer: vi.fn(),
+  ensureUploadDirectory: vi.fn(async () => {}),
   createDirectUploadFilename: () => 'integrated-upload.bin',
   resolveUploadPath: () => storageMocks.storedPath,
   lookupAttachmentByClientUploadId: storageMocks.lookup,
@@ -94,6 +97,7 @@ class IntegratedNodeDataChannel {
   constructor(private readonly label: string) {}
 
   getLabel = () => this.label;
+  isOpen = () => this.browser?.readyState === 'open';
   bufferedAmount = () => 0;
   setBufferedAmountLowThreshold = vi.fn();
   onMessage = (handler: (message: string | Buffer | ArrayBuffer) => void) => { this.messageHandler = handler; };
@@ -203,8 +207,35 @@ type Harness = {
   direct: DirectModule;
 };
 
-async function createHarness(): Promise<Harness> {
+async function createHarness(options: { operationPrepareDelayMs?: number } = {}): Promise<Harness> {
   const direct = await import('../../src/daemon/direct-file-transfer.js');
+  const workerRuntime = await import('../../src/daemon/direct-file-transfer-worker.js');
+  class InProcessWorker extends EventEmitter {
+    constructor(generation: number) {
+      super();
+      queueMicrotask(() => {
+        void workerRuntime.__startDirectFileTransferWorkerInProcessForTests(
+          generation,
+          (envelope) => this.emit('message', envelope),
+        ).catch((error: unknown) => this.emit('error', error));
+      });
+    }
+
+    postMessage(raw: unknown): void {
+      queueMicrotask(() => {
+        void workerRuntime.__dispatchDirectFileTransferWorkerInProcessForTests(raw)
+          .catch((error: unknown) => this.emit('error', error));
+      });
+    }
+
+    terminate(): Promise<number> {
+      queueMicrotask(() => this.emit('exit', 0));
+      return Promise.resolve(0);
+    }
+  }
+  direct.__setDirectFileTransferWorkerFactoryForTests((_url, workerOptions) => (
+    new InProcessWorker(workerOptions.workerData.generation) as never
+  ));
   const { DirectFileTransferRouter } = await import('../../server/src/ws/direct-file-transfer-router.js');
   expect(await direct.initializeDirectFileTransfer()).toBe(true);
 
@@ -228,7 +259,11 @@ async function createHarness(): Promise<Harness> {
     resumeTicketSigningKey: () => 'integrated-persistent-resume-ticket-signing-key',
     sendDaemon: (message, generation) => {
       expect(generation).toBe(1);
-      void direct.handleDirectFileTransferCommand(message, sender);
+      if (message.type === DIRECT_FILE_TRANSFER_MSG.PREPARE && options.operationPrepareDelayMs) {
+        setTimeout(() => void direct.handleDirectFileTransferCommand(message, sender), options.operationPrepareDelayMs);
+      } else {
+        void direct.handleDirectFileTransferCommand(message, sender);
+      }
       return true;
     },
     sendBrowser: (_socket, message) => {
@@ -238,6 +273,10 @@ async function createHarness(): Promise<Harness> {
   });
   router = makeRouter();
 
+  const routeBrowserControl = (message: Record<string, unknown>) => {
+    controls.push(message);
+    router.handleBrowser(browserSocket, USER_ID, message);
+  };
   const ws = {
     getDaemonCapabilitySnapshot: () => ({
       daemonId: 'integrated-daemon-1', capabilities: CAPABILITIES,
@@ -251,10 +290,8 @@ async function createHarness(): Promise<Harness> {
       handlers.add(handler);
       return () => handlers.delete(handler);
     },
-    send: (message: Record<string, unknown>) => {
-      controls.push(message);
-      router.handleBrowser(browserSocket, USER_ID, message);
-    },
+    send: routeBrowserControl,
+    sendUrgent: routeBrowserControl,
   } as unknown as WsClient;
 
   return {
@@ -362,6 +399,38 @@ describe('browser↔daemon direct file transfer across Server restart', () => {
     expect(storageMocks.finalize).toHaveBeenCalledOnce();
     expect(await readFile(storageMocks.storedPath)).toEqual(Buffer.from(bytes));
     expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+  });
+
+  it('uploads on a prewarmed peer when its channel reaches daemon before PREPARE', async () => {
+    const harness = await createHarness({ operationPrepareDelayMs: 50 });
+    direct = harness.direct;
+    const {
+      prewarmDirectFileLease,
+      subscribeDirectFileConnectionStatus,
+      uploadFileDirect,
+    } = await import('../src/direct-file-transfer.js');
+    let status = DIRECT_FILE_CONNECTION_STATUS.NONE;
+    const unsubscribe = subscribeDirectFileConnectionStatus(harness.ws, SERVER_ID, (next) => { status = next; });
+    const release = prewarmDirectFileLease(harness.ws, SERVER_ID);
+    await vi.waitFor(() => expect(status).toBe(DIRECT_FILE_CONNECTION_STATUS.DIRECT));
+
+    const bytes = new TextEncoder().encode('warm-channel-before-prepare');
+    await expect(uploadFileDirect(
+      harness.ws,
+      makeFile(bytes),
+      crypto.randomUUID(),
+      undefined,
+      undefined,
+      undefined,
+      undefined,
+      SERVER_ID,
+    )).resolves.toMatchObject({ attachment: { id: 'integrated-attachment' } });
+
+    expect(operationAttempts(harness.controls)).toEqual([1]);
+    expect(await readFile(storageMocks.storedPath)).toEqual(Buffer.from(bytes));
+    expect(apiMocks.uploadFile).not.toHaveBeenCalled();
+    release();
+    unsubscribe();
   });
 
   it('survives a mid-stream restart without duplicate commit or retry-budget loss', async () => {

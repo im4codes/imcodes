@@ -1,6 +1,7 @@
 import type { ContextNamespace, ProcessedContextClass } from '../../shared/context-types.js';
 import type { MemorySearchResultItem } from './memory-search.js';
 import type { BackendAuthoredContextCredentials } from './backend-authored-context.js';
+import { backendContextFetchSignal } from './backend-fetch-timeout.js';
 
 interface BackendStartupMemorySearchResponse {
   sourceSessionExclusionApplied?: boolean;
@@ -10,6 +11,10 @@ interface BackendStartupMemorySearchResponse {
     class?: string;
     preview?: string;
     projectId?: string;
+    userId?: string;
+    workspaceId?: string;
+    enterpriseId?: string;
+    originServerId?: string;
     updatedAt?: number;
   }>;
 }
@@ -29,6 +34,8 @@ export async function fetchBackendStartupMemoryItems(
   options: {
     fetchImpl?: typeof fetch;
     excludeSourceSessionName?: string;
+    /** Abort the request (headers and body) after this long; defaults to the backend-context fetch default. */
+    timeoutMs?: number;
   } = {},
 ): Promise<MemorySearchResultItem[]> {
   if (!credentials.workerUrl || !credentials.serverId || !credentials.token) return [];
@@ -49,6 +56,7 @@ export async function fetchBackendStartupMemoryItems(
       limit,
       ...(excludeSourceSessionName ? { excludeSourceSessionName } : {}),
     }),
+    signal: backendContextFetchSignal(options.timeoutMs),
   });
   if (!response.ok) return [];
   const body = await response.json().catch(() => null) as BackendStartupMemorySearchResponse | null;
@@ -77,6 +85,7 @@ export async function fetchBackendStartupMemoryItems(
         ...(namespace.enterpriseId ? { enterpriseId: namespace.enterpriseId } : {}),
         ...(namespace.workspaceId ? { workspaceId: namespace.workspaceId } : {}),
         ...(namespace.userId ? { userId: namespace.userId } : {}),
+        ...(item.originServerId ? { originServerId: item.originServerId } : {}),
         projectionClass,
         summary: item.preview,
         createdAt: item.updatedAt ?? 0,

@@ -4,6 +4,8 @@ export const DAEMON_COMMAND_TYPES = {
   SESSION_CANCEL: 'session.cancel',
   SESSION_EXECUTION_CLONES: 'session.execution_clones',
   SESSION_UPDATE_TRANSPORT_CONFIG: 'session.update_transport_config',
+  /** Browser/server → daemon: fetch online identity profiles and refresh live runtimes. */
+  SESSION_IDENTITY_REFRESH: 'session.identity.refresh',
   SUBSESSION_UPDATE_TRANSPORT_CONFIG: 'subsession.update_transport_config',
   /** Server → controlled node: run a one-shot command locally (RemoteExecRequest). */
   MACHINE_EXEC: 'machine.exec',
@@ -23,6 +25,12 @@ export const DAEMON_COMMAND_TYPES = {
   PEER_AUDIT_CANCEL: 'peer_audit.cancel',
   /** Auditor → daemon (daemon-only, no terminal-key fallback): submit the one structured reply. */
   PEER_AUDIT_REPLY: 'peer_audit.reply',
+  /**
+   * Server → daemon: the account-level supervisor defaults (backend/model,
+   * timeout, execution pools, ...) were just saved in PostgreSQL. Refresh the
+   * in-memory/disk cache now rather than waiting for the next periodic poll.
+   */
+  SUPERVISOR_DEFAULTS_CHANGED: 'supervisor_defaults.changed',
 } as const;
 
 export type DaemonCommandType =

@@ -307,6 +307,17 @@ describe('CronManager', () => {
           id: 'bounded-job',
           name: 'Bounded work',
           completion_policy: 'until_complete',
+          action: JSON.stringify({
+            type: 'command',
+            command: 'hello',
+            selfManaged: true,
+            cronControl: {
+              contractId: 'supervision_cron_control_v2',
+              version: 2,
+              scheduleId: 'bounded-job',
+              constraints: { authorization: 'user_authorized_scheduled_execution' },
+            },
+          }),
         })],
       })
       .mockResolvedValueOnce({ ok: true })
@@ -346,6 +357,12 @@ describe('CronManager', () => {
       action: {
         type: 'command',
         selfManaged: true,
+        cronControl: {
+          contractId: 'supervision_cron_control_v2',
+          version: 2,
+          scheduleId: 'bounded-job',
+          constraints: { authorization: 'user_authorized_scheduled_execution' },
+        },
       },
     });
   });

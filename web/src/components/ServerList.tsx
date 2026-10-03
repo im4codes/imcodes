@@ -4,6 +4,7 @@ interface ServerInfo {
   status: string;
   lastHeartbeatAt: number | null;
   daemonVersion?: string | null;
+  latestDaemonVersion?: string | null;
   createdAt: number;
 }
 

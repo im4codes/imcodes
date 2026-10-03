@@ -30,10 +30,8 @@ import {
   type RemoteExecOutcome,
   type RemoteExecResult,
 } from '../../../shared/remote-exec.js';
-import {
-  canOperateControlledMachine,
-  resolveControlledMachineAccess,
-} from '../share/machine-access.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../../shared/shared-machine-authority.js';
+import { resolveMachineOperationalAccess } from '../share/shared-machine-authority.js';
 
 /** Extra time the relay waits beyond the node's own timeout before giving up (F: deadline ≥ node timeout). */
 const DEFAULT_RELAY_DEADLINE_BUFFER_MS = 30_000;
@@ -202,12 +200,17 @@ export function createMachineExecRoutes(
     });
     if (!v.ok) return c.json(preDispatchEnvelope('invalid_request'), 400);
 
-    const target = await resolveControlledMachineAccess(c.env.DB, userId, targetId, Date.now());
-    // Return 403 (not 404) for absent, cross-account, expired/revoked, Viewer,
-    // non-controlled and revoked targets to avoid existence/role enumeration.
-    if (!target || !canOperateControlledMachine(target.access_role)) {
-      return c.json(preDispatchEnvelope('target_forbidden'), 403);
-    }
+    const now = Date.now();
+    const operational = await resolveMachineOperationalAccess(c.env.DB, {
+      token: c.req.header(SHARED_MACHINE_AUTHORITY_HEADER),
+      signingKey: c.env.JWT_SIGNING_KEY,
+      authenticatedSourceServerId: sourceServerId,
+      sourceOwnerUserId: userId,
+      targetServerId: targetId,
+      now,
+    });
+    if (!operational) return c.json(preDispatchEnvelope('target_forbidden'), 403);
+    const target = operational.target;
     if (!target.exec_enabled) return c.json(preDispatchEnvelope('exec_disabled'), 403);
 
     const commandSha256 = sha256Hex(v.value.command);
@@ -222,7 +225,7 @@ export function createMachineExecRoutes(
     if (intentStore) {
       try {
         await intentStore.record(c.env.DB, {
-          correlationId, userId, sourceServerId, targetServerId: targetId,
+          correlationId, userId: operational.delegatedActorUserId ?? userId, sourceServerId, targetServerId: targetId,
           shell: v.value.shell ?? 'default', commandSha256, commandLengthBytes,
         });
       } catch (err) {

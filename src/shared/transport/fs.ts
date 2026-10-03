@@ -18,6 +18,13 @@ export interface FsEntry {
   downloadId?: string;
   /** OpenSpec task checkbox summary, only when explicitly requested for openspec/changes. */
   openSpecTaskStats?: OpenSpecTaskStats;
+  /**
+   * Capacity of the volume this entry IS, populated only for volume roots.
+   * Measuring per entry would be one syscall per row for a value identical
+   * across every row in the listing.
+   */
+  totalBytes?: number;
+  freeBytes?: number;
 }
 
 export interface OpenSpecTaskStats {
@@ -65,6 +72,10 @@ export interface FsReadResponse extends FsBaseResponse {
   mtime?: number;
   /** File size in bytes when the daemon returns stream/download metadata. */
   size?: number;
+  /** Redacted daemon-side candidate labels for a chat file reference. */
+  attemptedLocations?: string[];
+  /** Number of bounded filename-search matches; newest mtime is selected. */
+  resolutionMatchCount?: number;
 }
 
 export interface FsWriteRequest {

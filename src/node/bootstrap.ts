@@ -2,6 +2,7 @@
 // D-A v2 identity pre-persist, stable trailer-free executable staging, real
 // platform installer wiring, and crash-loop backoff (N5).
 import { createHash } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import { constants as fsConstants } from 'node:fs';
 import { lstat, open, realpath } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
@@ -30,6 +31,7 @@ import {
   inspectServiceState,
   secureWindowsCredentialDir,
   startService,
+  windowsSchtasksExecutablePath,
 } from './installer.js';
 import {
   InstallJournalCorruptError,
@@ -39,15 +41,33 @@ import {
   type InstallJournal,
   type InstallPhase,
   type ServiceReceipt,
+  type SourceArtifactIdentity,
 } from './install-journal.js';
 import {
   WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
   installWindowsReleasePublisherTrust,
+  verifyWindowsAuthenticodeSigners,
 } from './windows-artifact-trust.js';
+import {
+  finalizeWindowsUpgradeTransaction,
+  recoverWindowsUpgradeJournalBackup,
+  recoverWindowsUpgradeTransaction,
+} from './upgrade-transaction.js';
 
 /** Install journal lives beside the credential in the protected directory. */
 export function journalPathFor(credentialPath = defaultCredentialPath()): string {
   return join(dirname(credentialPath), 'install-journal.json');
+}
+
+function cleanupWindowsUpgradeTask(taskName: string): void {
+  try {
+    execFileSync(windowsSchtasksExecutablePath(), ['/Delete', '/TN', taskName, '/F'], {
+      windowsHide: true,
+      stdio: 'ignore',
+    });
+  } catch {
+    // A completed one-shot may already have removed itself.
+  }
 }
 
 /**
@@ -88,6 +108,12 @@ export interface ControlledNodeBootstrapDeps {
   isStableRuntime: (journal: InstallJournal) => Promise<boolean>;
   assertElevated: () => void | Promise<void>;
   ensureReleasePublisherTrust: (executablePath: string) => Promise<void>;
+  /**
+   * Content identity of the installer the human launched. Injected so the
+   * bootstrap can be exercised without a real executable on disk; production
+   * reads it from the same verified inspection the staging path uses.
+   */
+  inspectSourceArtifact: (executablePath: string) => Promise<SourceArtifactIdentity>;
   prepareCredentialDir: () => Promise<void>;
   loadInstallJournal: (path: string) => Promise<InstallJournal>;
   writeInstallPhase: typeof writeInstallPhase;
@@ -97,6 +123,12 @@ export interface ControlledNodeBootstrapDeps {
   sourceExecutablePath: string;
   now: number;
   warn: (message: string) => void;
+  recoverInterruptedUpgrade?: (journal: InstallJournal) => Promise<{
+    journal: InstallJournal;
+    handoff: boolean;
+    outcome: string;
+  }>;
+  recoverCorruptInstallJournal?: () => Promise<InstallJournal | null>;
 }
 
 export type BootstrapDisposition = 'handoff_complete' | 'run_runtime';
@@ -105,6 +137,12 @@ export interface BootstrapResult {
   credential: ControlledNodeCredential;
   disposition: BootstrapDisposition;
   journal: InstallJournal;
+  /**
+   * Set when the release publisher certificate could not be installed. The node
+   * is enrolled and reachable; the native sidecars that require the trust
+   * anchor will refuse to launch until it is.
+   */
+  publisherTrustError?: string;
 }
 
 /** Production deps wired to the real enrollment/installer/journal + fs. */
@@ -125,11 +163,22 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     startService: (receipt) => startService(receipt),
     verifyStagedExecutable: (receipt) => verifyStagedExecutableReceipt(receipt),
     isStableRuntime: (journal) => isCurrentExecutableStable(journal, sourceExecutablePath),
+    inspectSourceArtifact: async (executablePath) => {
+      const inspected = await inspectVerifiedExecutable(executablePath);
+      return { sha256: inspected.sha256, size: inspected.size };
+    },
     assertElevated: assertProcessElevated,
     ensureReleasePublisherTrust: async (executablePath) => {
       if (process.platform !== 'win32' || !/^[a-f0-9]{64}$/.test(WINDOWS_COMPILED_RELEASE_SIGNER_SHA256)) return;
-      if (!await installWindowsReleasePublisherTrust(executablePath)) {
-        throw new Error('Windows release publisher trust installation failed');
+      // Carry PowerShell's own reason. The script distinguishes six causes —
+      // wrong signer, missing Code Signing EKU, store import refused, and so on
+      // — and collapsing them into one sentence leaves the operator, and
+      // whoever they forward it to, with nothing to act on.
+      const trust = await installWindowsReleasePublisherTrust(executablePath);
+      if (!trust.ok) {
+        throw new Error(
+          `Windows release publisher trust installation failed${trust.detail ? `: ${trust.detail}` : ''}`,
+        );
       }
     },
     prepareCredentialDir: () => prepareCredentialDir(credentialPath),
@@ -141,7 +190,47 @@ export function defaultBootstrapDeps(now: number): ControlledNodeBootstrapDeps {
     sourceExecutablePath,
     now,
     warn: (message) => process.stderr.write(`imcodes-node: ${message}\n`),
+    recoverInterruptedUpgrade: async (journal) => {
+      if (process.platform !== 'win32' || !journal.stagedReceipt) {
+        return { journal, handoff: false, outcome: 'none' };
+      }
+      const schtasks = windowsSchtasksExecutablePath();
+      return recoverWindowsUpgradeTransaction({
+        journal,
+        journalPath: journalPathFor(credentialPath),
+        // The transaction governs the installed service image. During an
+        // explicit reinstall `process.execPath` is the freshly downloaded
+        // installer, not the image whose receipt may be stale.
+        executablePath: journal.stagedReceipt.path,
+        now,
+        verifyTrustedExecutable: (path) => verifyWindowsAuthenticodeSigners(
+          [path], WINDOWS_COMPILED_RELEASE_SIGNER_SHA256,
+        ),
+        resumeTask: (taskName) => {
+          execFileSync(schtasks, ['/Run', '/TN', taskName], { windowsHide: true, stdio: 'ignore' });
+        },
+        cleanupTask: (taskName) => {
+          cleanupWindowsUpgradeTask(taskName);
+        },
+      });
+    },
+    recoverCorruptInstallJournal: () => process.platform === 'win32'
+      ? recoverWindowsUpgradeJournalBackup(journalPathFor(credentialPath))
+      : Promise.resolve(null),
   };
+}
+
+/**
+ * The phase label to write for a step that is being re-run as a repair.
+ *
+ * Phases are monotonic, so an enrolled or healthy machine re-running staging or
+ * enrollment must not stamp the journal back down to that earlier label — the
+ * journal refuses the backward transition and the repair dies. The step still
+ * records its data; the label simply stays at the furthest point the install
+ * has actually reached.
+ */
+function repairPhase(journal: Pick<InstallJournal, 'phase'>, step: InstallPhase): InstallPhase {
+  return phaseIndex(journal.phase) > phaseIndex(step) ? journal.phase : step;
 }
 
 export async function isCurrentExecutableStable(
@@ -226,6 +315,35 @@ export async function verifyStagedExecutableReceipt(receipt: StagedExecutableRec
   assertReceiptMatchesInspection(receipt, inspected);
 }
 
+/**
+ * Install publisher trust, but never let its failure cost the machine.
+ *
+ * The trust anchor gates native sidecars — the remote-desktop worker and the
+ * Computer Use helper both re-verify the signer before launching. It does not
+ * gate enrolment, terminal access, exec or file transfer.
+ *
+ * Refusing to enrol on a trust failure therefore trades a degraded node for an
+ * unreachable one: the operator cannot open a session to inspect the group
+ * policy or antivirus that blocked the import, and on a machine in another
+ * building there is no second channel to fix it from. That is the deadlock this
+ * product exists to remove, so the failure is reported and carried instead of
+ * thrown. The stable-runtime path already reasoned this way; the install paths
+ * now agree with it.
+ */
+async function tryReleasePublisherTrust(
+  deps: ControlledNodeBootstrapDeps,
+  context: string,
+): Promise<string | undefined> {
+  try {
+    await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
+    return undefined;
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    deps.warn(`${context}: ${detail}`);
+    return detail;
+  }
+}
+
 async function ensureElevated(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
@@ -243,6 +361,11 @@ async function loadJournalOrThrow(deps: ControlledNodeBootstrapDeps): Promise<In
     return await deps.loadInstallJournal(deps.journalPath);
   } catch (err) {
     if (err instanceof InstallJournalCorruptError) {
+      const recovered = await deps.recoverCorruptInstallJournal?.();
+      if (recovered) {
+        deps.warn('controlled node restored a validated install-journal backup after an interrupted upgrade');
+        return recovered;
+      }
       throw new Error('controlled node install journal is corrupt; refusing to continue — manual recovery required');
     }
     throw err;
@@ -272,9 +395,59 @@ async function ensureIdentityPrepared(
   if (journal.nodeTokenHash !== undefined && journal.nodeTokenHash !== identity.nodeTokenHash) {
     throw new Error('controlled node install identity does not match journal nodeTokenHash');
   }
-  if (journal.sourceExePath !== undefined && journal.sourceExePath !== identity.sourceExePath) {
-    throw new Error('controlled node install identity does not match journal sourceExePath');
+
+  // Identify the installer the human launched by its CONTENT. The path it was
+  // downloaded to legitimately differs on a retry; the bytes do not. This exe
+  // has already passed release publisher trust and verified-source checks
+  // before reaching here, so the digest below is taken from a trusted artifact.
+  const sourceArtifact = await deps.inspectSourceArtifact(deps.sourceExecutablePath);
+
+  // P0-1. Compare the running executable against the pinned artifact on EVERY
+  // boot, before any phase advances, whether or not the path changed.
+  //
+  // Checking only when the path moved left the worst case open: drop different
+  // bytes at the SAME path the journal already trusts and nothing ever looked.
+  // The path is not the identity; these bytes are.
+  if (journal.sourceArtifact !== undefined
+    && (journal.sourceArtifact.sha256 !== sourceArtifact.sha256
+      || journal.sourceArtifact.size !== sourceArtifact.size)) {
+    throw new Error('controlled node install source executable does not match the journal source artifact');
   }
+
+  // A journal written before `sourceArtifact` existed carries no content
+  // identity yet. Adopt one — but only inside the pre-enrollment retry window,
+  // and only here, after publisher trust and the verified enrollment source
+  // have already vouched for these bytes. From `enrolled` onwards nothing is
+  // adopted: an unpinned journal stays unpinned rather than being pinned to
+  // whatever happens to be running now.
+  const adoptingLegacyArtifact = journal.sourceArtifact === undefined
+    && phaseIndex(journal.phase) >= phaseIndex('credential_prepared')
+    && phaseIndex(journal.phase) <= phaseIndex('files_staged');
+  const migratingSourcePath = journal.sourceExePath !== undefined
+    && journal.sourceExePath !== deps.sourceExecutablePath;
+
+  // P0-2. The JOURNAL is the single authority for the source path.
+  //
+  // The journal is written and fsynced first; the durable identity is a cache
+  // of it. A crash in between used to leave the journal on the new path and the
+  // identity on the old one with nothing to reconcile them. Now the next boot
+  // simply re-derives the identity from the journal, which is idempotent, can
+  // only move forward, and needs no separate recovery mode.
+  if (migratingSourcePath || adoptingLegacyArtifact) {
+    journal = await deps.writeInstallPhase(deps.journalPath, journal.phase, {
+      now: deps.now,
+      previous: journal,
+      sourceExePath: deps.sourceExecutablePath,
+      sourceArtifact,
+    });
+  }
+  if (journal.sourceExePath !== undefined && identity.sourceExePath !== journal.sourceExePath) {
+    // Converge the cache onto the authority. Reached both in the same boot as
+    // the write above and on any later boot that finds the pair torn.
+    identity.sourceExePath = journal.sourceExePath;
+    await deps.persistInstallIdentity(identity);
+  }
+
   if (phaseIndex(journal.phase) < phaseIndex('credential_prepared')) {
     journal = await deps.writeInstallPhase(deps.journalPath, 'credential_prepared', {
       now: deps.now,
@@ -282,6 +455,7 @@ async function ensureIdentityPrepared(
       installId: identity.installId,
       nodeTokenHash: identity.nodeTokenHash,
       sourceExePath: identity.sourceExePath,
+      sourceArtifact,
     });
   }
   return { journal, identity };
@@ -298,15 +472,38 @@ async function ensureExecutableStaged(
     if (journal.stagedReceipt.path !== journal.stagedExePath) {
       throw new Error('controlled node staged executable receipt path mismatch; manual recovery required');
     }
-    await deps.verifyStagedExecutable(journal.stagedReceipt);
-    return journal;
+    // The receipt resumes an interrupted staging of THIS package; it is not an
+    // upgrade gate. A staged copy that no longer matches it means the receipt is
+    // stale -- the node replaced its own image, or an operator swapped the file
+    // -- not that the machine is unrecoverable. Re-stage from this installer's
+    // signature-verified bytes instead of stranding the operator with a failure
+    // that no reinstall can clear, which is exactly the deadlock this product
+    // exists to remove.
+    try {
+      await deps.verifyStagedExecutable(journal.stagedReceipt);
+      return journal;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      deps.warn(`staged executable no longer matches its install receipt (${detail}); re-staging from this package`);
+    }
   }
   const stagedReceipt: StagedExecutableReceipt = await source.stageTrailerFreeExecutable(
     deps.stagedExecutablePath,
     trailerRange.trailerStart,
     trailerRange.windowsAuthenticode,
   );
-  return deps.writeInstallPhase(deps.journalPath, 'files_staged', {
+  // Record the refreshed receipt at the phase the install is ALREADY in.
+  //
+  // Re-staging is a repair, not a rewind. An enrolled or healthy machine whose
+  // service copy drifted still needs a fresh receipt, but forcing the label
+  // back to `files_staged` is a backward transition the journal rightly
+  // refuses — which left exactly those machines with no way back. The staged
+  // target is still pinned, so this refreshes the bytes at that target and
+  // nothing else.
+  const restagePhase = phaseIndex(journal.phase) > phaseIndex('files_staged')
+    ? journal.phase
+    : 'files_staged';
+  return deps.writeInstallPhase(deps.journalPath, restagePhase, {
     now: deps.now,
     previous: journal,
     stagedExePath: deps.stagedExecutablePath,
@@ -334,7 +531,7 @@ async function ensureEnrolled(
     await deps.persistCredential(credential);
   } catch (err) {
     if (!recovering) {
-      await deps.writeInstallPhase(deps.journalPath, 'enrolled', {
+      await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
         now: deps.now,
         previous: journal,
         installId: identity.installId,
@@ -357,7 +554,7 @@ async function ensureEnrolled(
     ? journal.cleanupStatus
     : 'skipped';
 
-  journal = await deps.writeInstallPhase(deps.journalPath, 'enrolled', {
+  journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
     now: deps.now,
     previous: journal,
     installId: identity.installId,
@@ -376,7 +573,16 @@ async function ensureServiceRegistered(
 ): Promise<InstallJournal> {
   if (phaseIndex(journal.phase) >= phaseIndex('files_staged')) {
     if (!journal.stagedReceipt) throw new Error('controlled node staged executable receipt is missing; manual recovery required');
-    await deps.verifyStagedExecutable(journal.stagedReceipt);
+    // Report drift, never refuse on it. This runs on the service's own start
+    // path too, so throwing here turns a stale receipt into a crash loop on a
+    // machine that is otherwise serving fine -- and the installer, the one
+    // repair a person has, is re-staged before it ever reaches this point.
+    try {
+      await deps.verifyStagedExecutable(journal.stagedReceipt);
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      deps.warn(`staged executable no longer matches its install receipt (${detail}); continuing with the image on disk`);
+    }
   }
   const stagedPath = journal.stagedExePath ?? deps.stagedExecutablePath;
   if (phaseIndex(journal.phase) >= phaseIndex('service_registered') && journal.serviceName) {
@@ -399,7 +605,7 @@ async function ensureServiceRegistered(
     });
   }
   const serviceReceipt = await deps.inspectDefinition(await deps.installDefinition(stagedPath));
-  return deps.writeInstallPhase(deps.journalPath, 'service_registered', {
+  return deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'service_registered'), {
     now: deps.now,
     previous: journal,
     serviceName: serviceReceipt.name,
@@ -469,6 +675,49 @@ async function reconcileStableServicePersistence(
   return journal;
 }
 
+/**
+ * Stage this installer's own executable over the stable copy, unconditionally.
+ *
+ * Not the resume shortcut: a person who re-runs the installer is asking for
+ * these bytes to be the ones that run, so a receipt that happens to still match
+ * is not a reason to keep an older image. A package with no enrollment trailer
+ * is not an installer and is left alone.
+ */
+async function restageFromInstallerPackage(
+  deps: ControlledNodeBootstrapDeps,
+  journal: InstallJournal,
+): Promise<InstallJournal> {
+  let source: VerifiedEnrollmentSource | null = null;
+  try {
+    source = await deps.openVerifiedEnrollmentSource(deps.sourceExecutablePath);
+    const trailerRange = await source.readEnrollmentBlobWithRange();
+    if (!trailerRange) return journal;
+    const stagedReceipt = await source.stageTrailerFreeExecutable(
+      deps.stagedExecutablePath,
+      trailerRange.trailerStart,
+      trailerRange.windowsAuthenticode,
+    );
+    // Re-running the same package restages identical bytes. Rewriting the
+    // journal for that would churn the phase log and blur the one-phase-at-a-
+    // time crash-recovery reasoning for no gain.
+    const previous = journal.stagedReceipt;
+    if (previous
+      && previous.path === stagedReceipt.path
+      && previous.size === stagedReceipt.size
+      && previous.sha256 === stagedReceipt.sha256) {
+      return journal;
+    }
+    return await deps.writeInstallPhase(deps.journalPath, journal.phase, {
+      now: Math.max(deps.now, journal.updatedAt),
+      previous: journal,
+      stagedExePath: deps.stagedExecutablePath,
+      stagedReceipt,
+    });
+  } finally {
+    if (source) await source.close().catch(() => {});
+  }
+}
+
 async function ensureServiceStartRequested(
   deps: ControlledNodeBootstrapDeps,
   journal: InstallJournal,
@@ -477,7 +726,7 @@ async function ensureServiceStartRequested(
   journal = await ensureServiceRegistered(deps, journal);
   const receipt = receiptFromJournal(journal);
   if (phaseIndex(journal.phase) < phaseIndex('service_start_requested')) {
-    journal = await deps.writeInstallPhase(deps.journalPath, 'service_start_requested', {
+    journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'service_start_requested'), {
       now: deps.now,
       previous: journal,
       serviceStartRequestedAt: deps.now,
@@ -503,31 +752,40 @@ async function ensureServiceStartRequested(
 export async function bootstrapControlledNodeWithDisposition(deps: ControlledNodeBootstrapDeps): Promise<BootstrapResult> {
   const existing = await deps.loadCredential();
   let journal = await loadJournalOrThrow(deps);
+  if (existing && deps.recoverInterruptedUpgrade) {
+    const recovery = await deps.recoverInterruptedUpgrade(journal);
+    journal = recovery.journal;
+    if (recovery.outcome !== 'none') {
+      deps.warn(`controlled node interrupted upgrade recovery: ${recovery.outcome}`);
+    }
+    if (recovery.handoff) {
+      return { credential: existing, disposition: 'handoff_complete', journal };
+    }
+  }
   const stableRuntime = await deps.isStableRuntime(journal);
 
   if (existing && stableRuntime && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
-    try {
-      await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
-    } catch (error) {
-      // Publisher trust is installed and enforced during the elevated install
-      // and upgrade paths. A transient maintenance failure on an already
-      // healthy stable runtime must not turn the node into a watchdog crash
-      // loop; keep serving and retry on the next process start.
-      deps.warn(`Windows release publisher trust maintenance failed; continuing stable runtime and retrying later: ${String(error)}`);
-    }
+    // A transient maintenance failure on an already healthy stable runtime must
+    // not turn the node into a watchdog crash loop; keep serving and retry on
+    // the next process start.
+    const publisherTrustError = await tryReleasePublisherTrust(
+      deps,
+      'Windows release publisher trust maintenance failed; continuing stable runtime and retrying later',
+    );
     journal = await ensureServiceStartRequested(deps, journal, { startService: false });
     journal = await reconcileStableServicePersistence(deps, journal);
-    return { credential: existing, disposition: 'run_runtime', journal };
+    return { credential: existing, disposition: 'run_runtime', journal, publisherTrustError };
   }
 
-  if (existing && phaseIndex(journal.phase) >= phaseIndex('service_registered')) {
-    await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
-    journal = await ensureServiceStartRequested(deps, journal, { startService: !stableRuntime });
-    return { credential: existing, disposition: stableRuntime ? 'run_runtime' : 'handoff_complete', journal };
-  }
-
+  // Anything left here is the downloaded installer, not the service: the stable
+  // runtime returned above. It continues through elevation and staging so that
+  // re-running it installs ITS bytes -- previously this returned early, which is
+  // how an enrolled machine could never be re-installed at all.
   journal = await ensureElevated(deps, journal);
-  await deps.ensureReleasePublisherTrust(deps.sourceExecutablePath);
+  const publisherTrustError = await tryReleasePublisherTrust(
+    deps,
+    'Windows release publisher trust installation failed; enrolling anyway so the machine stays reachable',
+  );
 
   if (existing) {
     if (phaseIndex(journal.phase) < phaseIndex('files_staged')) {
@@ -536,14 +794,26 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
     // Legitimate crash window: the credential fsync completed, but the enrolled
     // journal write did not. Reconcile exactly one phase before service install.
     if (journal.phase === 'files_staged') {
-      journal = await deps.writeInstallPhase(deps.journalPath, 'enrolled', {
+      journal = await deps.writeInstallPhase(deps.journalPath, repairPhase(journal, 'enrolled'), {
         now: deps.now,
         previous: journal,
         serverId: existing.serverId,
       });
     }
+    // Re-running the downloaded installer means installing ITS bytes. Skipping
+    // that is how an enrolled machine whose stable image had drifted became
+    // permanently un-installable: staging was never reached, and the receipt
+    // check downstream refused every attempt with nothing left to try. Only the
+    // installer does this; the service must never rewrite the image it is
+    // executing from.
+    if (!stableRuntime) journal = await restageFromInstallerPackage(deps, journal);
     journal = await ensureServiceStartRequested(deps, journal);
-    return { credential: existing, disposition: stableRuntime ? 'run_runtime' : 'handoff_complete', journal };
+    return {
+      credential: existing,
+      disposition: stableRuntime ? 'run_runtime' : 'handoff_complete',
+      journal,
+      publisherTrustError,
+    };
   }
 
   let source: VerifiedEnrollmentSource | null = null;
@@ -569,7 +839,7 @@ export async function bootstrapControlledNodeWithDisposition(deps: ControlledNod
 
     journal = await ensureServiceStartRequested(deps, journal);
 
-    return { credential, disposition: 'handoff_complete', journal };
+    return { credential, disposition: 'handoff_complete', journal, publisherTrustError };
   } finally {
     if (source) await source.close().catch(() => {});
   }
@@ -599,6 +869,7 @@ export async function markServiceHealthy(
   options: {
     isStableRuntime?: (journal: InstallJournal) => boolean | Promise<boolean>;
     inspectServiceState?: (receipt: ServiceReceipt) => Promise<import('./installer.js').ServiceInspection>;
+    finalizeInterruptedUpgrade?: (journal: InstallJournal) => Promise<void>;
   } = {},
 ): Promise<void> {
   const journal = await loadInstallJournal(journalPath);
@@ -617,7 +888,19 @@ export async function markServiceHealthy(
       `controlled node service_healthy refused: inspection reported installed=${insp.installed} loaded=${insp.loaded} bootEnabled=${insp.bootEnabled} principal=${insp.principal ?? 'unknown'} restartPolicy=${insp.restartPolicy ?? 'unknown'} runState=${insp.runState} definitionMatches=${insp.definitionMatches} loadedActionMatches=${insp.loadedActionMatches} errors=${insp.errors.join(',')}`,
     );
   }
-  if (journal.phase === 'service_healthy') return;
+  const finalize = options.finalizeInterruptedUpgrade ?? (async (healthyJournal: InstallJournal) => {
+    if (process.platform !== 'win32' || !healthyJournal.stagedReceipt) return;
+    await finalizeWindowsUpgradeTransaction({
+      journal: healthyJournal,
+      journalPath,
+      executablePath: healthyJournal.stagedReceipt.path,
+      cleanupTask: cleanupWindowsUpgradeTask,
+    });
+  });
+  if (journal.phase === 'service_healthy') {
+    await finalize(journal);
+    return;
+  }
   let previous = journal;
   if (journal.phase === 'service_registered') {
     previous = await writeInstallPhase(journalPath, 'service_start_requested', {
@@ -628,11 +911,12 @@ export async function markServiceHealthy(
       serviceReceipt: journal.serviceReceipt,
     });
   }
-  await writeInstallPhase(journalPath, 'service_healthy', {
+  const healthyJournal = await writeInstallPhase(journalPath, 'service_healthy', {
     now,
     previous,
     healthyAt: now,
   });
+  await finalize(healthyJournal);
 }
 
 export { InstallJournalCorruptError, type InstallPhase };

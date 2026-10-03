@@ -67,7 +67,9 @@ function isProjectionEntry(value: unknown, statusSet: Set<string>): boolean {
     && typeof value.createdAt === 'number'
     && Number.isFinite(value.createdAt)
     && typeof value.updatedAt === 'number'
-    && Number.isFinite(value.updatedAt);
+    && Number.isFinite(value.updatedAt)
+    && (value.dropReason === undefined
+      || (typeof value.dropReason === 'string' && QUEUE_DROP_REASONS.has(value.dropReason as never)));
 }
 
 export function isValidTransportQueueWireEvent(value: unknown): value is QueueEvent {

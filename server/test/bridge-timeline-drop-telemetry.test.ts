@@ -16,7 +16,7 @@
 import { EventEmitter } from 'node:events';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { WsBridge } from '../src/ws/bridge.js';
-import { TIMELINE_MESSAGES } from '../../shared/timeline-protocol.js';
+import { TIMELINE_MESSAGES, TIMELINE_SUBSCRIPTION_MODES } from '../../shared/timeline-protocol.js';
 import { TIMELINE_DELIVERY_METRICS } from '../../shared/timeline-delivery-telemetry.js';
 import { getCounter, resetMetricsForTests } from '../src/util/metrics.js';
 
@@ -47,6 +47,26 @@ class MockWs extends EventEmitter {
 
   get sentStrings(): string[] {
     return this.sent.filter((s): s is string => typeof s === 'string');
+  }
+}
+
+class SlowWs extends MockWs {
+  bufferedAmount = 32 * 1024 * 1024;
+
+  override send(data: string | Buffer, _opts?: unknown, _callback?: (err?: Error) => void): void {
+    if (this.closed) return;
+    this.sent.push(data);
+    // Deliberately never acknowledge: this models a browser whose event loop
+    // stopped reading. The bounded timeline queue must emit a seq gap rather
+    // than growing without limit.
+  }
+}
+
+class AsyncHealthyWs extends MockWs {
+  override send(data: string | Buffer, _opts?: unknown, callback?: (err?: Error) => void): void {
+    if (this.closed) { callback?.(new Error('socket closed')); return; }
+    this.sent.push(data);
+    setImmediate(() => callback?.());
   }
 }
 
@@ -118,7 +138,7 @@ describe('WsBridge timeline drop telemetry', () => {
   });
 
   it('delivers live timeline events to a same-user companion without its own transient session subscription', async () => {
-    const { bridge, daemon } = await setupAuthedDaemon();
+    const { daemon, bridge } = await setupAuthedDaemon();
     const subscribed = new MockWs();
     const companion = new MockWs();
     bridge.handleBrowserConnection(subscribed as never, 'user-1', makeDb());
@@ -171,5 +191,589 @@ describe('WsBridge timeline drop telemetry', () => {
     await flushAsync();
 
     expect(bridge.timelineNoSubscriberDropCount).toBe(3);
+  });
+
+  it('filters streaming deltas per socket while summary still receives the final assistant text and tool summary', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const full = new MockWs();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    full.emit('message', JSON.stringify({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: SESSION, mode: TIMELINE_SUBSCRIPTION_MODES.FULL }));
+    summary.emit('message', JSON.stringify({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: SESSION, mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY }));
+    await flushAsync();
+    full.sent.length = 0;
+    summary.sent.length = 0;
+
+    const emit = (type: string, payload: Record<string, unknown>, seq: number) => daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { eventId: `evt-${seq}`, sessionId: SESSION, ts: Date.now(), seq, epoch: 1, type, payload },
+    }));
+    emit('assistant.text', { text: 'partial', streaming: true }, 1);
+    emit('tool.result', { name: 'shell', status: 'ok', output: 'a very long body that summary must bound' }, 2);
+    emit('assistant.text', { text: 'complete answer', streaming: false }, 3);
+    await flushAsync();
+
+    const fullEvents = full.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT);
+    const summaryEvents = summary.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT);
+    expect(fullEvents.map((msg) => msg.event.payload.text)).toContain('partial');
+    expect(fullEvents.map((msg) => msg.event.payload.text)).toContain('complete answer');
+    expect(summaryEvents.map((msg) => msg.event.payload.text)).not.toContain('partial');
+    expect(summaryEvents.map((msg) => msg.event.payload.text)).toContain('complete answer');
+    const tool = summaryEvents.find((msg) => msg.event.type === 'tool.result');
+    expect(tool?.event.summary).toBe(true);
+    expect(tool?.event.detailAvailable).toBe(true);
+    expect(tool?.event.payload.output).toBeUndefined();
+  });
+
+  it('does not copy an explicit timeline stream to a companion socket without its own subscription', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const active = new MockWs();
+    const companion = new MockWs();
+    bridge.handleBrowserConnection(active as never, 'user-1', makeDb());
+    bridge.handleBrowserConnection(companion as never, 'user-1', makeDb());
+    active.emit('message', JSON.stringify({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: SESSION, mode: TIMELINE_SUBSCRIPTION_MODES.FULL }));
+    await flushAsync();
+    active.sent.length = 0;
+    companion.sent.length = 0;
+    daemon.emit('message', timelineEvent('assistant.text', 'only active saw this'));
+    await flushAsync();
+    expect(active.sentStrings.some((raw) => JSON.parse(raw).type === TIMELINE_MESSAGES.EVENT)).toBe(true);
+    expect(companion.sentStrings.some((raw) => JSON.parse(raw).type === TIMELINE_MESSAGES.EVENT)).toBe(false);
+  });
+
+  it('coalesces healthy summary-mode latest-value updates while retaining the newest frame', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const full = new MockWs();
+    bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
+    full.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    full.sent.length = 0;
+    for (let seq = 1; seq <= 4; seq += 1) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `status-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 1,
+          type: 'agent.status',
+          payload: { status: `step-${seq}` },
+        },
+      }));
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 300));
+    const statuses = full.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT && msg.event?.type === 'agent.status');
+    expect(statuses).toHaveLength(1);
+    expect(statuses[0]?.event.seq).toBe(4);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+      eventType: 'agent.status',
+    })).toBe(3);
+  });
+
+  it('keeps healthy full-mode latest-value updates live', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const full = new MockWs();
+    bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
+    full.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+    }));
+    await flushAsync();
+    full.sent.length = 0;
+    for (let seq = 1; seq <= 4; seq += 1) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `full-status-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 1,
+          type: 'agent.status',
+          payload: { status: `step-${seq}` },
+        },
+      }));
+    }
+    await flushAsync();
+    const statuses = full.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT && msg.event?.type === 'agent.status');
+    expect(statuses.map((msg) => msg.event.seq)).toEqual([1, 2, 3, 4]);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      eventType: 'agent.status',
+    })).toBe(0);
+  });
+
+  it('flushes a terminal state immediately after coalescing and never loses the final', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    const emit = (type: string, payload: Record<string, unknown>, seq: number) => daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { eventId: `terminal-${seq}`, sessionId: SESSION, ts: Date.now(), seq, epoch: 1, type, payload },
+    }));
+
+    emit('agent.status', { status: 'working', label: 'token 1' }, 1);
+    emit('agent.status', { status: 'working', label: 'token 2' }, 2);
+    emit('session.state', { state: 'idle' }, 3);
+    await flushAsync();
+
+    const events = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+      .map((msg) => msg.event);
+    expect(events.map((event) => [event.type, event.seq])).toEqual([
+      ['agent.status', 2],
+      ['session.state', 3],
+    ]);
+  });
+
+  it('delivers repeated idle transitions to both full and summary subscribers', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const full = new MockWs();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(full as never, 'user-1', makeDb());
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    full.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+    }));
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    full.sent.length = 0;
+    summary.sent.length = 0;
+
+    for (const seq of [1, 2]) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: { eventId: `idle-${seq}`, sessionId: SESSION, ts: Date.now(), seq, epoch: 1, type: 'session.state', payload: { state: 'idle' } },
+      }));
+    }
+    await flushAsync();
+
+    for (const socket of [full, summary]) {
+      const seqs = socket.sentStrings
+        .map((raw) => JSON.parse(raw))
+        .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT && msg.event?.type === 'session.state')
+        .map((msg) => msg.event.seq);
+      expect(seqs).toEqual([1, 2]);
+    }
+  });
+
+  it('suppresses unchanged latest-value payloads per socket before coalescing', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    const emit = (type: string, payload: Record<string, unknown>, seq: number) => daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: { eventId: `unchanged-${seq}`, sessionId: SESSION, ts: Date.now(), seq, epoch: 1, type, payload },
+    }));
+
+    emit('agent.status', { status: 'working' }, 1);
+    emit('agent.status', { status: 'working' }, 2);
+    emit('session.state', { state: 'idle' }, 3);
+    emit('session.state', { state: 'idle' }, 4);
+    await flushAsync();
+
+    const events = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.EVENT)
+      .map((msg) => msg.event);
+    expect(events.map((event) => [event.type, event.seq])).toEqual([
+      ['agent.status', 1],
+      ['session.state', 3],
+      ['session.state', 4],
+    ]);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_COALESCED, {
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+      eventType: 'agent.status',
+    })).toBe(0);
+    expect(bridge.timelineQueueStatsForTests(summary as never)).toEqual({ bytes: 0, pending: 0, pendingGaps: 0 });
+  });
+
+  it('projects replay backfill for a summary request without leaking streaming text', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.REPLAY_REQUEST,
+      sessionName: SESSION,
+      requestId: 'summary-replay-1',
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.REPLAY,
+      sessionName: SESSION,
+      requestId: 'summary-replay-1',
+      epoch: 1,
+      events: [
+        { eventId: 'replay-stream', sessionId: SESSION, seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'partial', streaming: true } },
+        { eventId: 'replay-final', sessionId: SESSION, seq: 2, epoch: 1, type: 'assistant.final', payload: { text: 'complete', streaming: false } },
+      ],
+    }));
+    await flushAsync();
+    const response = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .find((msg) => msg.type === TIMELINE_MESSAGES.REPLAY && msg.requestId === 'summary-replay-1');
+    expect(response?.events).toHaveLength(1);
+    expect(response?.events[0]?.eventId).toBe('replay-final');
+    expect(JSON.stringify(response)).not.toContain('partial');
+  });
+
+  it('delivers a non-empty terminal history page to a summary request', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new MockWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: SESSION,
+      requestId: 'summary-history-terminal-1',
+      limit: 200,
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: SESSION,
+      requestId: 'summary-history-terminal-1',
+      epoch: 1,
+      events: [
+        { eventId: 'history-stream', sessionId: SESSION, seq: 1, epoch: 1, type: 'assistant.text', payload: { text: 'partial', streaming: true } },
+        { eventId: 'history-final', sessionId: SESSION, seq: 2, epoch: 1, type: 'assistant.text', payload: { text: 'authoritative final', streaming: false } },
+      ],
+      hasMore: true,
+      nextCursor: { epoch: 1, afterSeq: 2, direction: 'newer' },
+    }));
+    await flushAsync();
+    const response = summary.sentStrings
+      .map((raw) => JSON.parse(raw))
+      .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY && msg.requestId === 'summary-history-terminal-1');
+    expect(response?.events).toHaveLength(1);
+    expect(response?.events[0]?.eventId).toBe('history-final');
+    expect(response?.events[0]?.payload?.text).toBe('authoritative final');
+    expect(response?.hasMore).toBe(true);
+    expect(response?.nextCursor).toEqual({ epoch: 1, afterSeq: 2, direction: 'newer' });
+  });
+
+  it('keeps a healthy summary socket gap-free under realistic status/tool load', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new AsyncHealthyWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    for (let seq = 1; seq <= 125; seq += 1) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `load-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 1,
+          type: seq % 5 === 0 ? 'tool.result' : 'agent.status',
+          payload: { status: `step-${seq}`, output: seq % 5 === 0 ? 'x'.repeat(1024) : undefined },
+        },
+      }));
+    }
+    await flushAsync();
+    const gaps = summary.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps).toHaveLength(0);
+    expect(getCounter(TIMELINE_DELIVERY_METRICS.SERVER_SOCKET_GAP)).toBe(0);
+  });
+
+  it('compacts large summary status payloads while preserving renderable scalar fields', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const summary = new AsyncHealthyWs();
+    bridge.handleBrowserConnection(summary as never, 'user-1', makeDb());
+    summary.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    summary.sent.length = 0;
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'summary-status-large', sessionId: SESSION, ts: Date.now(), seq: 1, epoch: 1,
+        type: 'agent.status',
+        payload: {
+          status: 'working', model: 'codex', nestedDiagnostics: { trace: 'x'.repeat(200_000) },
+          details: ['large', 'array'], progress: 0.5,
+        },
+      },
+    }));
+    await new Promise<void>((resolve) => setTimeout(resolve, 300));
+    const event = summary.sentStrings.map((raw) => JSON.parse(raw))
+      .find((msg) => msg.type === TIMELINE_MESSAGES.EVENT)?.event;
+    expect(event?.payload).toEqual({ status: 'working', model: 'codex', progress: 0.5 });
+    expect(JSON.stringify(event)).not.toContain('nestedDiagnostics');
+  });
+
+  it('keeps cumulative healthy traffic gap-free after more than 64 MiB', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const healthy = new AsyncHealthyWs();
+    bridge.handleBrowserConnection(healthy as never, 'user-1', makeDb());
+    healthy.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    healthy.sent.length = 0;
+    for (let seq = 1; seq <= 20_000; seq += 1) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `cumulative-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 1,
+          type: 'agent.status',
+          payload: { status: 'x'.repeat(4096) },
+        },
+      }));
+    }
+    await flushAsync();
+    const gaps = healthy.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps).toHaveLength(0);
+    expect(bridge.timelineQueueStatsForTests(healthy as never)).toEqual({ bytes: 0, pending: 0, pendingGaps: 0 });
+  }, 20_000);
+
+  it('mode switch with a cursor reuses timeline.history_request for backfill', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const browser = new MockWs();
+    bridge.handleBrowserConnection(browser as never, 'user-1', makeDb());
+    browser.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      epoch: 7,
+      afterSeq: 42,
+      requestId: 'backfill-1',
+    }));
+    await flushAsync();
+    const request = daemon.sentStrings.map((raw) => JSON.parse(raw)).find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY_REQUEST);
+    expect(request).toMatchObject({
+      type: TIMELINE_MESSAGES.HISTORY_REQUEST,
+      sessionName: SESSION,
+      requestId: 'backfill-1',
+      cursor: { epoch: 7, afterSeq: 42, direction: 'newer' },
+    });
+  });
+
+  it('filters history backfill for summary sockets and restores full content after a mode switch', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const browser = new MockWs();
+    bridge.handleBrowserConnection(browser as never, 'user-1', makeDb());
+
+    const events = [
+      {
+        eventId: 'stream-1', sessionId: SESSION, ts: 1, seq: 43, epoch: 7,
+        type: 'assistant.text', payload: { text: 'partial', streaming: true },
+      },
+      {
+        eventId: 'final-1', sessionId: SESSION, ts: 2, seq: 44, epoch: 7,
+        type: 'assistant.text', payload: { text: 'complete', streaming: false },
+      },
+    ];
+
+    browser.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+      epoch: 7,
+      afterSeq: 42,
+      requestId: 'summary-history-1',
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: SESSION,
+      requestId: 'summary-history-1',
+      epoch: 7,
+      events,
+    }));
+    await flushAsync();
+
+    let history = browser.sentStrings
+      .map((raw) => JSON.parse(raw) as { type: string; events?: Array<Record<string, unknown>> })
+      .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+    expect(history?.events?.map((event) => event.eventId)).toEqual(['final-1']);
+
+    browser.sent.length = 0;
+    browser.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.FULL,
+      epoch: 7,
+      afterSeq: 42,
+      requestId: 'full-history-1',
+    }));
+    await flushAsync();
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.HISTORY,
+      sessionName: SESSION,
+      requestId: 'full-history-1',
+      epoch: 7,
+      events,
+    }));
+    await flushAsync();
+
+    history = browser.sentStrings
+      .map((raw) => JSON.parse(raw) as { type: string; events?: Array<Record<string, unknown>> })
+      .find((msg) => msg.type === TIMELINE_MESSAGES.HISTORY);
+    expect(history?.events?.map((event) => event.eventId)).toEqual(['stream-1', 'final-1']);
+  });
+
+  it('closes a stalled socket before trimming durable events and keeps queue memory bounded', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const slow = new SlowWs();
+    bridge.handleBrowserConnection(slow as never, 'user-1', makeDb());
+    slow.emit('message', JSON.stringify({ type: TIMELINE_MESSAGES.SUBSCRIBE, sessionName: SESSION, mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY }));
+    await flushAsync();
+    slow.sent.length = 0;
+    // Use fewer, larger durable frames so the test exercises the 64 MiB
+    // ceiling without spending tens of seconds parsing 70k tiny events on
+    // resource-constrained CI workers.
+    for (let seq = 1; seq <= 10_000; seq += 1) {
+      daemon.emit('message', timelineEvent('user.message', `message-${seq}-${'x'.repeat(8192)}`));
+    }
+    await flushAsync();
+    expect(slow.closed).toBe(true);
+    const stats = bridge.timelineQueueStatsForTests(slow as never);
+    expect(stats.bytes).toBeLessThanOrEqual(64 * 1024 * 1024);
+    expect(stats.pending).toBe(0);
+    expect(stats.pendingGaps).toBe(0);
+  }, 20_000);
+
+  it('emits seq_gap metadata when a slow socket coalesces a latest-value frame', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const slow = new SlowWs();
+    bridge.handleBrowserConnection(slow as never, 'user-1', makeDb());
+    slow.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.SUBSCRIBE,
+      sessionName: SESSION,
+      mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+    }));
+    await flushAsync();
+    slow.sent.length = 0;
+    daemon.emit('message', JSON.stringify({
+      type: TIMELINE_MESSAGES.EVENT,
+      event: {
+        eventId: 'durable-10',
+        sessionId: SESSION,
+        ts: Date.now(),
+        seq: 10,
+        epoch: 2,
+        type: 'user.message',
+        payload: { text: 'hold the queue open' },
+      },
+    }));
+    for (const seq of [11, 12, 13]) {
+      daemon.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.EVENT,
+        event: {
+          eventId: `status-${seq}`,
+          sessionId: SESSION,
+          ts: Date.now(),
+          seq,
+          epoch: 2,
+          type: 'agent.status',
+          payload: { status: `step-${seq}` },
+        },
+      }));
+    }
+    await flushAsync();
+    const gaps = slow.sentStrings.map((raw) => JSON.parse(raw))
+      .filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sessionId: SESSION, epoch: 2, fromSeq: 11, toSeq: 12, backfill: true }),
+    ]));
+    expect(gaps).toHaveLength(1);
+  });
+
+  it('caps gap-control frames per congested socket', async () => {
+    const { bridge, daemon } = await setupAuthedDaemon();
+    const slow = new SlowWs();
+    bridge.handleBrowserConnection(slow as never, 'user-1', makeDb());
+    const sessions = Array.from({ length: 20 }, (_, index) => `${SESSION}_${index}`);
+    for (const sessionName of sessions) {
+      slow.emit('message', JSON.stringify({
+        type: TIMELINE_MESSAGES.SUBSCRIBE,
+        sessionName,
+        mode: TIMELINE_SUBSCRIPTION_MODES.SUMMARY,
+      }));
+    }
+    await flushAsync();
+    slow.sent.length = 0;
+    for (const sessionName of sessions) {
+      for (const seq of [100, 101, 102, 103]) {
+        daemon.emit('message', JSON.stringify({
+          type: TIMELINE_MESSAGES.EVENT,
+          event: {
+            eventId: `${sessionName}-${seq}`,
+            sessionId: sessionName,
+            ts: Date.now(),
+            seq,
+            epoch: 1,
+            type: seq === 100 ? 'user.message' : 'agent.status',
+            payload: { status: `step-${seq}` },
+          },
+        }));
+      }
+    }
+    await flushAsync();
+    const gaps = slow.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === TIMELINE_MESSAGES.SEQ_GAP);
+    expect(gaps.length).toBeLessThanOrEqual(16);
   });
 });

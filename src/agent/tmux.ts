@@ -1,12 +1,12 @@
-import { execFile as execFileCb, execFileSync, spawn } from 'child_process';
+import { execFileSync, spawn } from 'child_process';
 import { createHash } from 'crypto';
 import { createRequire } from 'module';
-import { promisify } from 'util';
 import * as fs from 'fs';
 import * as fsp from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import type { Readable } from 'stream';
+import { SESSION_RESOURCE_OWNER_ENV } from '../../shared/session-resource-lifecycle.js';
 
 import {
   weztermNewSession,
@@ -31,8 +31,10 @@ import {
   registerPane,
 } from './wezterm.js';
 import { registerTempFile, removeTrackedTempFile } from '../store/temp-file-store.js';
+import { terminalStageTrace } from '../util/terminal-stage-trace.js';
+import { shellQuote } from '../util/shell-quote.js';
+import { execFileOffMain as execFile, execFileOffMainIdempotent as execFileRead } from '../util/exec-helper.js';
 
-const execFile = promisify(execFileCb);
 
 // ── Backend detection ───────────────────────────────────────────────────────────
 
@@ -215,14 +217,52 @@ async function ensureTmuxServer(): Promise<void> {
   }
 }
 
+/**
+ * Identical read-only queries issued while one is already running share its
+ * spawn (many windows poll the same `list-sessions` / `display-message` in the
+ * same tick). A read joins only while no non-read command has started or
+ * finished since the in-flight one began, so read-after-write callers (send
+ * keys, then capture the pane) never receive a snapshot taken before their
+ * own write.
+ */
+let tmuxMutationGeneration = 0;
+const tmuxReadsInFlight = new Map<string, { generation: number; promise: Promise<string> }>();
+
+function isCoalescableTmuxRead(args: readonly string[]): boolean {
+  const command = args[0];
+  if (command === 'display-message' || command === 'capture-pane') return args.includes('-p');
+  return command === 'list-sessions' || command === 'list-panes';
+}
+
 /** Run a tmux command with array args (no shell — safe from injection). */
 async function tmuxRun(...args: string[]): Promise<string> {
+  if (!isCoalescableTmuxRead(args)) {
+    tmuxMutationGeneration += 1;
+    try {
+      return await tmuxRunSpawn(args);
+    } finally {
+      tmuxMutationGeneration += 1;
+    }
+  }
+  const key = args.join('\0');
+  const shared = tmuxReadsInFlight.get(key);
+  if (shared && shared.generation === tmuxMutationGeneration) return shared.promise;
+  const entry = { generation: tmuxMutationGeneration, promise: tmuxRunSpawn(args) };
+  tmuxReadsInFlight.set(key, entry);
+  try {
+    return await entry.promise;
+  } finally {
+    if (tmuxReadsInFlight.get(key) === entry) tmuxReadsInFlight.delete(key);
+  }
+}
+
+async function tmuxRunSpawn(args: string[]): Promise<string> {
   let lastError: unknown;
   const attempts = 3;
   for (let attempt = 0; attempt < attempts; attempt++) {
     await ensureTmuxServer();
     try {
-      const { stdout } = await execFile('tmux', args);
+      const { stdout } = await (isCoalescableTmuxRead(args) ? execFileRead : execFile)('tmux', args);
       return stdout.trim();
     } catch (error) {
       if (!isRecoverableTmuxServerError(error)) throw error;
@@ -288,7 +328,10 @@ export async function capturePaneVisible(session: string): Promise<string> {
   if (BACKEND === 'wezterm') {
     return weztermCapturePaneVisible(session);
   }
-  return tmuxRun('capture-pane', '-e', '-p', '-t', session);
+  // -J joins wrapped physical rows.  Without it, copying a long URL from a
+  // snapshot inserts a space at every visual wrap and the next stream frame
+  // starts from a different logical line than xterm's buffer.
+  return tmuxRun('capture-pane', '-e', '-J', '-p', '-t', session);
 }
 
 /**
@@ -297,7 +340,7 @@ export async function capturePaneVisible(session: string): Promise<string> {
  */
 export async function capturePaneHistory(session: string, lines = 1000): Promise<string> {
   requireTmux('capturePaneHistory');
-  return tmuxRun('capture-pane', '-e', '-p', '-t', session, '-S', `-${lines}`, '-E', '-1');
+  return tmuxRun('capture-pane', '-e', '-J', '-p', '-t', session, '-S', `-${lines}`, '-E', '-1');
 }
 
 /**
@@ -495,7 +538,7 @@ export async function newSession(name: string, command?: string, opts?: NewSessi
 export async function killSession(name: string): Promise<void> {
   if (BACKEND === 'conpty') {
     const c = await conpty();
-    c.conptyKillSession(name);
+    await c.conptyKillSession(name);
     return;
   }
   if (BACKEND === 'wezterm') {
@@ -550,6 +593,73 @@ export async function isPaneAlive(name: string): Promise<boolean> {
   } catch {
     return false;
   }
+}
+
+/** Existence and pane liveness for a periodic sweep over many sessions. */
+export interface TmuxHealthProbe {
+  exists(name: string): Promise<boolean>;
+  paneAlive(name: string): Promise<boolean>;
+}
+
+/** Per session name: the `pane_dead` values of its current window's panes (what `list-panes -t <name>` reports). */
+async function listSessionPaneHealth(): Promise<Map<string, string[]> | null> {
+  let raw: string;
+  try {
+    raw = await tmuxRun('list-panes', '-a', '-F', '#{window_active} #{pane_dead} #{session_name}');
+  } catch (e: any) {
+    const err = String(e?.stderr || e?.message || '');
+    if (err.includes('no sessions') || isRecoverableTmuxServerError(e)) return new Map();
+    return null;
+  }
+  const sessions = new Map<string, string[]>();
+  for (const line of raw.split('\n')) {
+    const match = /^(\d+) (\d+) (.+)$/.exec(line);
+    if (!match) continue;
+    const panes = sessions.get(match[3]) ?? [];
+    if (match[1] === '1') panes.push(match[2]);
+    sessions.set(match[3], panes);
+  }
+  return sessions;
+}
+
+/**
+ * One `list-panes -a` per sweep tick answers "does it exist" and "is its pane
+ * alive" for every session, instead of a `list-sessions` plus a `list-panes`
+ * spawn per session.
+ *
+ * Only positive answers come from the snapshot. A session the snapshot does
+ * not show, or a pane it shows dead, is re-verified with the live per-session
+ * query before the caller acts (restart / respawn), so a snapshot that went
+ * stale during a long tick can never trigger a spurious relaunch. A snapshot
+ * older than `maxAgeMs` is refetched; a failed snapshot falls back to the
+ * per-session queries, i.e. the previous behaviour.
+ */
+export function createTmuxHealthProbe(maxAgeMs = 1_000): TmuxHealthProbe {
+  let snapshot: { at: number; sessions: Map<string, string[]> } | null = null;
+  let inflight: Promise<Map<string, string[]> | null> | null = null;
+  const current = async (): Promise<Map<string, string[]> | null> => {
+    if (snapshot && Date.now() - snapshot.at <= maxAgeMs) return snapshot.sessions;
+    if (!inflight) {
+      inflight = listSessionPaneHealth().then((sessions) => {
+        snapshot = sessions ? { at: Date.now(), sessions } : null;
+        return sessions;
+      }).finally(() => { inflight = null; });
+    }
+    return inflight;
+  };
+  return {
+    async exists(name) {
+      if (BACKEND !== 'tmux') return sessionExists(name);
+      if ((await current())?.has(name)) return true;
+      return sessionExists(name);
+    },
+    async paneAlive(name) {
+      if (BACKEND !== 'tmux') return isPaneAlive(name);
+      const panes = (await current())?.get(name);
+      if (panes && panes.join('\n') === '0') return true;
+      return isPaneAlive(name);
+    },
+  };
 }
 
 /**
@@ -640,6 +750,166 @@ export async function getPaneId(session: string): Promise<string> {
   }
   if (BACKEND === 'wezterm') return weztermGetPaneId(session);
   return tmuxRun('display-message', '-p', '-t', session, '#{pane_id}');
+}
+
+/**
+ * Pane id plus the owning session's creation time -- tmux's own `%N` pane-id
+ * counter is scoped to the server and gets REUSED once every other session
+ * is gone (a lone kill-session + new-session with the same name routinely
+ * reallocates the exact same `%0`). A staleness check that compares only
+ * `pane_id` can therefore silently pass for a pane that was actually
+ * destroyed and replaced -- session_created (a tmux-native, always-available
+ * unix timestamp, no daemon-side env-var injection required) changes on
+ * every fresh session even when the pane id coincidentally repeats, so
+ * comparing the pair reliably detects "this session was replaced".
+ * tmux-only: conpty/wezterm sessions are not recreated under the same
+ * session name in the way this guards against.
+ */
+export async function getPaneIdentity(session: string): Promise<{ paneId: string; sessionCreated: string } | undefined> {
+  if (BACKEND !== 'tmux') return undefined;
+  try {
+    // Two separate queries, not one joined by a literal tab/delimiter:
+    // tmux's `display-message -p` format engine is a status-line renderer and
+    // mangles embedded control characters (an inline tab silently became a
+    // stray `_` in testing), so a single combined-format call cannot be
+    // parsed back apart reliably.
+    const [paneId, sessionCreated] = await Promise.all([
+      tmuxRun('display-message', '-p', '-t', session, '#{pane_id}'),
+      tmuxRun('display-message', '-p', '-t', session, '#{session_created}'),
+    ]);
+    const trimmedPaneId = paneId.trim();
+    const trimmedSessionCreated = sessionCreated.trim();
+    return trimmedPaneId && trimmedSessionCreated ? { paneId: trimmedPaneId, sessionCreated: trimmedSessionCreated } : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+export interface TmuxSessionResourceIdentity {
+  paneId: string;
+  sessionInstanceId: string;
+  runtimeEpoch: string;
+  /** Stable only for the lifetime of one tmux server process. */
+  serverId?: string;
+}
+
+/**
+ * Read the live tmux pane and the owner tuple injected when that session was
+ * launched. This deliberately bypasses tmuxRun's startup retries: conflict
+ * recovery must be a bounded observation and must never hold the resource
+ * registry lock while an unhealthy tmux server retries indefinitely.
+ */
+export async function getTmuxSessionResourceIdentity(
+  session: string,
+  timeoutMs: number,
+): Promise<TmuxSessionResourceIdentity | null | undefined> {
+  if (BACKEND === 'conpty') {
+    try {
+      const c = await conpty();
+      return c.conptyGetSessionResourceIdentity(session);
+    } catch {
+      return null;
+    }
+  }
+  if (BACKEND !== 'tmux') return null;
+  try {
+    // tmux does not expose arbitrary pane environment variables as bare
+    // format tokens. Read the pane id and the session environment separately;
+    // using #{VAR} silently returns an empty string and made every relaunch
+    // look like an unknown live owner (the original black-shell regression).
+    const readFormat = async (format: string): Promise<string> => {
+      const { stdout } = await execFile('tmux', ['display-message', '-p', '-t', session, format], {
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024,
+      });
+      return stdout.trim();
+    };
+    const [paneId, serverPid, serverStart] = await Promise.all([
+      readFormat('#{pane_id}'),
+      readFormat('#{pid}'),
+      readFormat('#{start_time}'),
+    ]);
+    const readEnv = async (name: string): Promise<string> => {
+      const { stdout } = await execFile('tmux', ['show-environment', '-t', session, name], {
+        timeout: timeoutMs,
+        maxBuffer: 4 * 1024,
+      });
+      return stdout.trimEnd();
+    };
+    const [instanceLine, epochLine] = await Promise.all([
+      readEnv(SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID),
+      readEnv(SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH),
+    ]);
+    const parseEnv = (line: string, name: string): string => line.startsWith(`${name}=`) ? line.slice(name.length + 1) : '';
+    const sessionInstanceId = parseEnv(instanceLine, SESSION_RESOURCE_OWNER_ENV.SESSION_INSTANCE_ID);
+    const runtimeEpoch = parseEnv(epochLine, SESSION_RESOURCE_OWNER_ENV.RUNTIME_EPOCH);
+    const serverId = serverPid && serverStart ? `${serverPid}:${serverStart}` : undefined;
+    return paneId && sessionInstanceId && runtimeEpoch
+      ? { paneId, sessionInstanceId, runtimeEpoch, ...(serverId ? { serverId } : {}) }
+      : null;
+  } catch (error) {
+    const output = `${(error as { stderr?: unknown }).stderr ?? ''} ${(error as Error).message ?? ''}`.toLowerCase();
+    // tmux's explicit missing-session/pane diagnostics are proof that the
+    // old owner is dead.  Timeouts, permission errors, and malformed owner
+    // metadata are deliberately reported as unknown (null) so registration
+    // cannot steal a live resource during a transient probe failure.
+    if (output.includes("can't find session")
+      || output.includes("can't find pane")
+      || output.includes("can't find window")
+      || output.includes('no server running')) return undefined;
+    return null;
+  }
+}
+
+/**
+ * Probe a concrete pane handle for stale-owner reclamation. Unlike the
+ * identity probe above this also checks the pane process: remain-on-exit
+ * keeps a dead tmux pane (and ConPTY keeps an exited entry) addressable by the
+ * same name, so a name-only check cannot prove that the old owner is live.
+ * `null` is reserved for an inconclusive/foreign live pane and callers must
+ * fail closed rather than deleting its registry row.
+ */
+export async function isTmuxSessionResourceHandleCurrent(
+  session: string,
+  paneId: string,
+  timeoutMs = 2_000,
+): Promise<boolean | null> {
+  if (BACKEND === 'conpty') {
+    try {
+      const c = await conpty();
+      if (!c.conptySessionExists(session) || !c.conptyIsPaneAlive(session)) return false;
+      const currentPaneId = String(c.conptyGetPid(session));
+      if (currentPaneId === paneId) return true;
+      // A restart may have already created the successor ConPTY, so the
+      // registry's old pane id no longer appears in the live-session map. In
+      // that case distinguish a dead old process (safe stale-owner reclaim)
+      // from a genuinely live foreign owner (fail closed). Numeric ConPTY
+      // pane ids are process ids; an inconclusive/non-numeric id remains null.
+      const oldPid = Number.parseInt(paneId, 10);
+      if (!Number.isInteger(oldPid) || oldPid <= 0) return null;
+      try {
+        process.kill(oldPid, 0);
+        return null;
+      } catch {
+        return false;
+      }
+    } catch {
+      return null;
+    }
+  }
+  if (BACKEND !== 'tmux') return null;
+  try {
+    const identity = await getTmuxSessionResourceIdentity(session, timeoutMs);
+    if (identity === undefined) return false;
+    if (identity === null || identity.paneId !== paneId) return null;
+    const { stdout } = await execFile('tmux', ['list-panes', '-t', session, '-F', '#{pane_dead}'], {
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024,
+    });
+    return stdout.trim() === '0';
+  } catch {
+    return null;
+  }
 }
 
 /** Get the current working directory of the first pane of a session. */
@@ -755,6 +1025,7 @@ export async function sendRawInput(session: string, data: string): Promise<void>
   if (BACKEND === 'conpty') {
     const c = await conpty();
     c.conptySendText(session, data);
+    terminalStageTrace('conpty_write', session);
     return;
   }
 
@@ -788,11 +1059,6 @@ export async function sendRawInput(session: string, data: string): Promise<void>
 }
 
 // ── pipe-pane streaming (tmux-only) ─────────────────────────────────────────────
-
-/** Shell-quote a string using single-quote wrapping. */
-function shellQuote(str: string): string {
-  return "'" + str.replace(/'/g, "'\\''") + "'";
-}
 
 /** Validates the FIFO path against strict character whitelist. */
 function validateFifoPath(p: string): boolean {

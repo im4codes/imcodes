@@ -123,6 +123,10 @@ describe('controlled-node executable release wiring', () => {
       'utf8',
     );
     const peerSession = readFileSync('native/windows-remote-desktop/peer_session.cc', 'utf8');
+    const windowsPlatformAdapters = readFileSync(
+      'native/windows-remote-desktop/windows_platform_adapters.cc',
+      'utf8',
+    );
     const virtualDisplayController = readFileSync(
       'native/windows-remote-desktop/virtual_display_controller.cc',
       'utf8',
@@ -130,14 +134,14 @@ describe('controlled-node executable release wiring', () => {
     expect(displayPreferences).toContain('schema != kPreferenceSchema');
     expect(displayPreferences).toContain('IsAllowedRemoteDisplayMode');
     expect(displayPreferences).toContain('IsAllowedRemoteDisplayScale');
-    expect(peerSession).toContain('CDS_UPDATEREGISTRY');
-    expect(peerSession).toContain('SaveVirtualDisplayPreferences');
+    expect(windowsPlatformAdapters).toContain('CDS_UPDATEREGISTRY');
+    expect(windowsPlatformAdapters).toContain('SaveVirtualDisplayPreferences');
     const setDisplayMode = peerSession.slice(
       peerSession.indexOf('bool PeerSession::SetDisplayMode('),
       peerSession.indexOf('bool PeerSession::SetDisplayScale('),
     );
     expect(setDisplayMode).not.toContain('SetDisplayDpiScale(');
-    expect(setDisplayMode).toContain('SaveVirtualDisplayPreferences');
+    expect(setDisplayMode).toContain('display_adapter_->SetMode(');
     expect(virtualDisplayController).toContain('LoadVirtualDisplayPreferences');
     expect(sdkConsumer.indexOf('$TestSdk,'))
       .toBeLessThan(sdkConsumer.lastIndexOf('$ProductionSdk,'));
@@ -248,22 +252,123 @@ describe('controlled-node executable release wiring', () => {
     expect(sdkPublishScript).not.toContain("'-Command'");
   });
 
+  it('builds the macOS remote-desktop components into the image, and proves they are there', () => {
+    const workflow = readFileSync('.github/workflows/ci.yml', 'utf8');
+
+    // The gap this closes: every remote-desktop build step in this job was
+    // guarded `if: runner.os == 'Windows'`, so the image shipped a macOS node
+    // that self-upgrades and then finds nothing to fetch -- the server answers
+    // `remote_desktop_worker_not_built` and macOS remote desktop is simply
+    // unavailable.
+    const componentBuild = workflow.indexOf(
+      'name: Build, sign and notarize the macOS remote-desktop components',
+    );
+    expect(componentBuild).toBeGreaterThan(-1);
+    // Bounded at the NEXT step, not by a character count. A fixed-length
+    // window ran past the end of this step and matched the platform guard of
+    // the one after it, so flipping this step back to Windows -- the exact
+    // regression being guarded -- still passed.
+    const nextStep = workflow.indexOf('\n      - name:', componentBuild);
+    expect(nextStep).toBeGreaterThan(componentBuild);
+    const buildStep = workflow.slice(componentBuild, nextStep);
+    expect(buildStep).toContain("if: runner.os == 'macOS'");
+    expect(buildStep).toContain('scripts/build-macos-remote-desktop-release.mjs');
+    // Both architectures, from the shell loop that drives them -- not a
+    // per-arch assertion, because the workflow spells `$arch` once and lets
+    // the loop supply the values.
+    expect(buildStep).toContain('for arch in arm64 x64; do');
+    expect(buildStep).toContain('native/macos-remote-desktop/libwebrtc-sdk-$arch.lock.json');
+    expect(buildStep).toContain('--artifact-root "dist-node-exe/remote-desktop-worker/darwin-$arch"');
+
+    // Built from the PUBLISHED, locked SDK. Rebuilding it here would take
+    // hours and would not be the SDK the lock names.
+    expect(buildStep).toContain('scripts/install-libwebrtc-sdk.mjs');
+    expect(buildStep).toContain('scripts/libwebrtc-sdk-artifacts.mjs verify-sdk-lock');
+
+    // And the image assembly must CHECK for them. This verifier defaults to
+    // the Windows target when none is named, so the missing macOS sets were
+    // never a failure -- naming every target is what makes their absence one.
+    const imageVerify = workflow.indexOf(
+      'name: Verify remote-desktop worker artifacts for every target',
+    );
+    expect(imageVerify).toBeGreaterThan(-1);
+    const nextVerifyStep = workflow.indexOf('\n      - name:', imageVerify);
+    expect(nextVerifyStep).toBeGreaterThan(imageVerify);
+    const verifyStep = workflow.slice(imageVerify, nextVerifyStep);
+    expect(verifyStep).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" win32 x64');
+    expect(verifyStep).toContain('server/controlled-node-artifacts "$IMCODES_BUILD_VERSION" darwin "$arch"');
+
+    // And the image ITSELF must be checked, which is a separate gate from the
+    // directory the image is built from -- and the one that actually proves
+    // the components shipped. It defaulted to the Windows target too.
+    const smoke = workflow.indexOf('/app/controlled-node-executables');
+    expect(smoke).toBeGreaterThan(-1);
+    const smokeStep = workflow.slice(smoke, workflow.indexOf('\n      - name:', smoke));
+    expect(smokeStep).toContain('"${{ needs.release_version.outputs.app_version }}" win32 x64');
+    expect(smokeStep).toContain('"${{ needs.release_version.outputs.app_version }}" darwin "$arch"');
+
+    // The upload has to carry them, or the Docker job downloads a set that
+    // never left the build runner.
+    expect(workflow).toContain('dist-node-exe/remote-desktop-worker/**');
+  });
+
   it('exposes the embedded runtime version without bootstrapping or installing', () => {
     const entry = readFileSync('src/node/index.ts', 'utf8');
     expect(entry).toContain("process.argv[2] === '--version'");
     expect(entry).toContain('process.stdout.write(`${DAEMON_VERSION}\\n`)');
   });
 
-  it('keeps first-run Windows installation output quiet and user-facing', () => {
+  it('keeps first-run installation output user-facing on every platform', () => {
     const entry = readFileSync('src/node/index.ts', 'utf8');
-    const installUi = readFileSync('src/node/windows-install-ui.ts', 'utf8');
+    const installUi = readFileSync('src/node/install-report.ts', 'utf8');
     const buildScript = readFileSync('scripts/build-node-exe.mjs', 'utf8');
 
     expect(installUi).toContain("'IM.codes 安装中，请稍候...'");
-    expect(entry).toContain('isWindowsInstallerLaunch(process.platform, deps.sourceExecutablePath, deps.stagedExecutablePath)');
+    expect(entry).toContain('isInstallerLaunch(');
+    // Neither terminal outcome may be silent.
+    expect(entry).toContain('formatInstallSuccess(');
+    expect(entry).toContain('formatInstallFailure(');
+    expect(entry).toContain('waitForControlledNodeOnlineLease(');
+    expect(entry.indexOf('waitForControlledNodeOnlineLease('))
+      .toBeLessThan(entry.indexOf('formatInstallSuccess('));
     expect(buildScript).toContain("'process.env.WS_NO_BUFFER_UTIL': JSON.stringify('1')");
     expect(buildScript).toContain("'process.env.WS_NO_UTF_8_VALIDATE': JSON.stringify('1')");
     expect(buildScript).not.toContain("execArgv: ['--no-warnings']");
+  });
+
+  it('raises the UAC level after postject and strictly before signing', () => {
+    const buildScript = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    const manifestAt = buildScript.indexOf("runWindowsReleaseSigning('Manifest'");
+    const signAt = buildScript.indexOf("runWindowsReleaseSigning('Sign', outPath");
+    const injectAt = buildScript.indexOf('await inject(officialNode.nodeBin, outPath)');
+    expect(manifestAt).toBeGreaterThan(-1);
+    expect(signAt).toBeGreaterThan(-1);
+    expect(injectAt).toBeGreaterThan(-1);
+    // mt.exe rewrites the resource section and drops the Authenticode
+    // certificate table while doing so (measured: 81,471,184 -> 81,463,296
+    // bytes, exactly the 7,888-byte table, Valid -> NotSigned). Raising the
+    // manifest after signing would therefore ship an unsigned release without
+    // failing the build, which is why this ordering is asserted rather than
+    // merely commented.
+    expect(injectAt).toBeLessThan(manifestAt);
+    expect(manifestAt).toBeLessThan(signAt);
+  });
+
+  it('accepts the Manifest mode and defaults it to requireAdministrator', () => {
+    const signScript = readFileSync('scripts/windows-sign-release-artifact.ps1', 'utf8');
+    expect(signScript).toContain("[ValidateSet('Remove', 'Sign', 'Verify', 'Manifest')]");
+    expect(signScript).toContain("[string]$RequestedExecutionLevel = 'requireAdministrator'");
+    // Signing credentials gate 'Sign' only, so unsigned developer builds still
+    // get the same elevation behaviour as CI.
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    expect(build).toContain("runWindowsReleaseSigning('Manifest', outPath)");
+    // Both SDK tools must resolve through one shared discovery path.
+    expect(signScript).toContain('function Resolve-WindowsSdkTool');
+    expect(signScript).toContain("Resolve-WindowsSdkTool -ToolName 'mt.exe'");
+    expect(signScript).toContain("Resolve-WindowsSdkTool -ToolName 'signtool.exe'");
+    // The written level is read back out of the artifact, not trusted from the
+    // tool's exit code.
+    expect(signScript).toContain('Reading back the updated PE application manifest failed.');
   });
 
   it('copies the artifacts into the image and configures the serving directory', () => {
@@ -272,6 +377,23 @@ describe('controlled-node executable release wiring', () => {
     expect(dockerfile).toContain('COPY server/controlled-node-artifacts/ ./controlled-node-executables/');
     expect(dockerfile).toContain('COPY scripts/node-exe-artifacts.mjs ./scripts/node-exe-artifacts.mjs');
     expect(dockerfile).toContain('COPY scripts/remote-desktop-worker-artifacts.mjs ./scripts/remote-desktop-worker-artifacts.mjs');
+
+    // DERIVED, not hand-listed. The previous version asserted a fixed set of COPY
+    // lines, so when remote-desktop-worker-artifacts.mjs gained an import of
+    // shared/remote-desktop-macos-identity.json nothing noticed, and the runtime
+    // image failed at startup with ERR_MODULE_NOT_FOUND. Every relative import of
+    // a script we copy must itself be copied.
+    const copiedScripts = [...dockerfile.matchAll(/^COPY (scripts\/[\w.-]+\.mjs) /gmu)].map((m) => m[1]);
+    expect(copiedScripts.length).toBeGreaterThan(0);
+    for (const script of copiedScripts) {
+      const body = readFileSync(script, 'utf8');
+      const relativeImports = [...body.matchAll(/from '(\.\.?\/[^']+)'/gu)].map((m) => m[1]);
+      for (const spec of relativeImports) {
+        const resolved = spec.replace(/^\.\.\//u, '').replace(/^\.\//u, '');
+        expect(dockerfile, `${script} imports ${spec}; the runtime stage must COPY ${resolved}`)
+          .toContain(`COPY ${resolved} ./${resolved}`);
+      }
+    }
     expect(dockerfile).toContain('COPY shared/remote-desktop-native-pins.json ./shared/remote-desktop-native-pins.json');
     expect(dockerfile).toContain('ENV IMCODES_NODE_EXE_DIR=/app/controlled-node-executables');
   });
@@ -343,10 +465,23 @@ describe('controlled-node executable release wiring', () => {
   it('self-hosts the Computer Use helper from a pinned npm package during CI builds', () => {
     const packageJson = JSON.parse(readFileSync('package.json', 'utf8')) as { devDependencies?: Record<string, string> };
     const copyScript = readFileSync('scripts/copy-computer-use-helper.mjs', 'utf8');
+    const runner = readFileSync('src/node/computer-use-runner.ts', 'utf8');
     const workflow = readFileSync('.github/workflows/build-node-exe.yml', 'utf8');
 
-    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.2.0');
+    expect(packageJson.devDependencies?.['open-computer-use']).toBe('0.3.3');
+    const packageLock = JSON.parse(readFileSync('package-lock.json', 'utf8')) as {
+      packages?: Record<string, { version?: string; integrity?: string }>;
+    };
+    expect(packageLock.packages?.['node_modules/open-computer-use']).toMatchObject({
+      version: '0.3.3',
+      integrity: 'sha512-A4xCoXgu+Mwi2OdhL15FHY/VcnhhxIJwRgSmC2LwX9mTya85VO2NZN8PNholvgQeTeOlPpej+eEucHXtPhhVrA==',
+    });
     expect(copyScript).toContain("require.resolve('open-computer-use/package.json')");
+    expect(copyScript).toContain('open-computer-use must use an exact semver pin');
+    expect(copyScript).toContain('npm package manifest must be a regular non-symlink file');
+    expect(copyScript).toContain('manifest.version !== pinnedOpenComputerUseVersion');
+    expect(runner).not.toContain('fileURLToPath(import.meta.url)');
+    expect(runner).toContain('entryFilePath = options.entryFilePath === undefined ? process.argv[1]');
     expect(copyScript).toContain('Open Computer Use.app');
     expect(copyScript).toContain('open-computer-use.app.zip');
     expect(copyScript).toContain("['--verify', '--deep', '--strict', appPath]");
@@ -356,5 +491,153 @@ describe('controlled-node executable release wiring', () => {
     expect(copyScript).not.toContain("'--force', '--sign', '-'");
     expect(workflow).toContain("IMCODES_REQUIRE_COMPUTER_USE_HELPER: '1'");
     expect(workflow).toContain('echo "IMCODES_BUILD_VERSION=$VERSION" >> "$GITHUB_ENV"');
+  });
+
+  it('signs, notarizes and proves the macOS executable, in that order', () => {
+    // The chain used to be half-built: the release workflow imported a signing
+    // identity and cleaned it up afterwards, with nothing in between that
+    // signed or notarized anything. Every macOS artifact shipped ad-hoc signed
+    // and was refused by Gatekeeper on download, and nothing failed to say so.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      const importIdentity = workflow.indexOf('node scripts/macos-release-signing.mjs import');
+      const notaryKey = workflow.indexOf('IMCODES_MACOS_NOTARY_KEY_BASE64');
+      const build = workflow.indexOf('run: npm run build:node-exe');
+      const notarize = workflow.indexOf('macos-release-signing.mjs notarize dist-node-exe/imcodes-node-macos');
+      const runs = workflow.indexOf('./dist-node-exe/imcodes-node-macos --version');
+      const cleanup = workflow.indexOf('node scripts/macos-release-signing.mjs cleanup');
+
+      expect([importIdentity, notaryKey, build, notarize, runs, cleanup].every((at) => at >= 0), file).toBe(true);
+      // The identity has to exist before the build, because the build is what
+      // signs; notarizing has to follow the build, for the obvious reason.
+      expect(importIdentity, file).toBeLessThan(build);
+      expect(notaryKey, file).toBeLessThan(build);
+      expect(build, file).toBeLessThan(notarize);
+      expect(notarize, file).toBeLessThan(cleanup);
+      // Launching the signed binary is the only step that catches a wrong
+      // entitlement set: such a binary signs and notarizes perfectly and then
+      // dies for the user instead.
+      expect(runs, file).toBeLessThan(cleanup);
+    }
+  });
+
+  it('keeps the signing material out of the artifact and removes it even on failure', () => {
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      expect(workflow, file).toContain("if: always() && runner.os == 'macOS'");
+      // The private key reaches the runner as a secret and must never be
+      // reachable from the published artifact set.
+      expect(workflow, file).not.toContain('dist-node-exe/imcodes-macos-notary.p8');
+    }
+  });
+
+  it('signs with the pinned fingerprint and the entitlements the runtime needs', () => {
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    expect(build).toContain("'--options', 'runtime'");
+    expect(build).toContain("'native', 'macos-node', 'imcodes-node.entitlements'");
+    // A common name can match several certificates; a release pins one.
+    expect(build).toContain('IMCODES_MACOS_SIGNING_IDENTITY must be a SHA-1 fingerprint');
+    // Without an identity the build still has to produce a runnable binary, or
+    // every local macOS build breaks.
+    expect(build).toContain("sh('codesign', ['--force', '--sign', '-', artifactPath]);");
+
+    const entitlements = readFileSync('native/macos-node/imcodes-node.entitlements', 'utf8');
+    expect(entitlements).toContain('com.apple.security.cs.allow-jit');
+    expect(entitlements).toContain('com.apple.security.cs.allow-unsigned-executable-memory');
+    // Would let the process load a dylib signed by anyone, and the SEA is
+    // native-free by construction.
+    expect(entitlements).not.toContain('disable-library-validation');
+    // codesign's entitlements parser rejects XML comments outright, while
+    // `plutil -lint` accepts them -- so the failure lands at signing time.
+    expect(entitlements).not.toContain('<!--');
+  });
+
+  it('builds, notarizes and staples the aiDesk bundle, and ships it', () => {
+    // The bundle is what macOS attributes permissions to, and unlike the bare
+    // executable it can carry its own notarization ticket -- so an unstapled
+    // one that shipped would silently need the network on first launch.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      const build = workflow.indexOf('run: npm run build:node-exe');
+      const notarize = workflow.indexOf('macos-release-signing.mjs notarize "$APP"');
+      const validate = workflow.indexOf('xcrun stapler validate "$APP"');
+      // Uploaded only inside containers that keep permissions -- see the
+      // test below for why the bare directory must not be one of them.
+      const upload = workflow.indexOf('dist-node-exe/*.dmg');
+
+      expect([build, notarize, validate, upload].every((at) => at >= 0), file).toBe(true);
+      expect(build, file).toBeLessThan(notarize);
+      // Validating is the only step that proves the ticket actually attached;
+      // `stapler staple` reports failure in ways a successful-looking run can
+      // hide.
+      expect(notarize, file).toBeLessThan(validate);
+    }
+  });
+
+  it('wraps the app in a stapled disk image, built after the app is stapled', () => {
+    // Order matters for a reason a user feels: the image is built from the app
+    // as it stands, so an app stapled afterwards would ship inside an image
+    // holding an unstapled copy -- and dragging it out would need the network.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      const stapleApp = workflow.indexOf('xcrun stapler validate "$APP"');
+      const buildDmg = workflow.indexOf('node scripts/build-aidesk-app.mjs dmg dist-node-exe');
+      const notarizeDmg = workflow.indexOf('macos-release-signing.mjs notarize "$DMG"');
+      const validateDmg = workflow.indexOf('xcrun stapler validate "$DMG"');
+      const upload = workflow.indexOf('dist-node-exe/*.dmg');
+
+      expect([stapleApp, buildDmg, notarizeDmg, validateDmg, upload].every((at) => at >= 0), file).toBe(true);
+      expect(stapleApp, file).toBeLessThan(buildDmg);
+      expect(buildDmg, file).toBeLessThan(notarizeDmg);
+      expect(notarizeDmg, file).toBeLessThan(validateDmg);
+    }
+  });
+
+  it('never uploads the bundle as a bare directory', () => {
+    // Measured on a Mac, not assumed: GitHub artifacts normalise every file to
+    // 644, so an app uploaded as a directory comes back with its executables
+    // stripped of `+x` and dies with "permission denied". The signature
+    // survives, which makes the corpse look healthy. It travels inside the
+    // sidecar archive and the disk image instead, both of which keep the
+    // permission bits.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      expect(workflow, file).not.toContain('dist-node-exe/aiDesk.to by IM.codes.app/**');
+      expect(workflow, file).toContain('dist-node-exe/*.dmg');
+      // The archive that carries it is produced by the build, not by a step
+      // here -- see the manifest-ordering test below.
+      expect(workflow, file).toContain('dist-node-exe/computer-use-helper/**');
+    }
+  });
+
+  it('builds the helper archive before the manifest records its hash', () => {
+    // The manifest records the archive's size and sha256. Replacing the
+    // archive afterwards makes every consumer reject the whole artifact set as
+    // tampered with -- which is exactly how CI failed, with a message about
+    // the helper being "missing or empty" while the file sat there intact.
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    const publish = build.indexOf('publishAideskHelperSidecar');
+    const manifest = build.indexOf('await createNodeExeManifest(');
+    expect(publish, 'the bundle is published during the build').toBeGreaterThanOrEqual(0);
+    expect(publish).toBeLessThan(manifest);
+
+    // And CI must not put it back afterwards.
+    for (const file of ['.github/workflows/ci.yml', '.github/workflows/build-node-exe.yml']) {
+      const workflow = readFileSync(file, 'utf8');
+      expect(workflow, file).not.toContain('build-aidesk-app.mjs sidecar');
+    }
+  });
+
+  it('leaves a local build with the upstream archive that actually works', () => {
+    // Without a release identity the bundle is ad-hoc signed, and the runtime's
+    // own verifier requires a Developer ID authority -- so replacing the
+    // archive on a developer machine would hand the daemon a helper it refuses.
+    // Better the upstream one, which works.
+    const build = readFileSync('scripts/build-node-exe.mjs', 'utf8');
+    expect(build).toContain("process.env.IMCODES_MACOS_SIGNING_IDENTITY?.trim()");
+    const guard = build.indexOf("if (platform === 'darwin' && process.env.IMCODES_MACOS_SIGNING_IDENTITY");
+    const publish = build.indexOf('publishAideskHelperSidecar');
+    expect(guard, 'the replacement is guarded').toBeGreaterThanOrEqual(0);
+    expect(guard).toBeLessThan(publish);
   });
 });

@@ -1,12 +1,17 @@
+import { resolveImcodesHome } from '../util/windows-daemon-lock.js';
 import { mkdir, readFile, rename, rm, stat, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { homedir } from 'node:os';
 import logger from '../util/logger.js';
-import { IMCODES_MEMORY_MCP_ARGS, IMCODES_MEMORY_MCP_COMMAND } from '../agent/providers/getDefaultMcpServers.js';
+import {
+  IMCODES_MEMORY_MCP_LAUNCH_ARGS,
+  IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+  isImcodesMemoryMcpLaunch,
+} from '../agent/providers/getDefaultMcpServers.js';
 import { IMCODES_MEMORY_MCP_SERVER_NAME } from '../../shared/memory-mcp-server-name.js';
 
 const DAEMON_CONFLICT_SERVER_NAME = `${IMCODES_MEMORY_MCP_SERVER_NAME}-daemon`;
-const NOTICE_MARKER = join(homedir(), '.imcodes', 'cursor-mcp-notice-shown');
+function noticeMarker(): string { return join(resolveImcodesHome(), 'cursor-mcp-notice-shown'); }
 
 export interface CursorMcpEnsureOptions {
   configPath?: string;
@@ -29,18 +34,15 @@ function defaultConfigPath(): string {
 
 function daemonEntry(): Record<string, unknown> {
   return {
-    command: IMCODES_MEMORY_MCP_COMMAND,
-    args: [...IMCODES_MEMORY_MCP_ARGS],
+    command: IMCODES_MEMORY_MCP_LAUNCH_COMMAND,
+    args: [...IMCODES_MEMORY_MCP_LAUNCH_ARGS],
   };
 }
 
 function isSameDaemonEntry(value: unknown): boolean {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
-  return record.command === IMCODES_MEMORY_MCP_COMMAND
-    && Array.isArray(record.args)
-    && record.args.length === IMCODES_MEMORY_MCP_ARGS.length
-    && record.args.every((arg, index) => arg === IMCODES_MEMORY_MCP_ARGS[index]);
+  return isImcodesMemoryMcpLaunch(record.command, record.args);
 }
 
 async function pathExists(path: string): Promise<boolean> {
@@ -135,7 +137,7 @@ export async function ensureCursorMcpJsonHasImcodesEntry(options: CursorMcpEnsur
       backupPath ? `Restore the previous file from ${backupPath}.` : 'No previous file existed, so no backup was needed.',
       'IM.codes supplies MCP identity through the daemon-spawned cursor-agent process environment for each managed session.',
     ].join(' ');
-    await writeNoticeOnce(options.noticeMarkerPath ?? NOTICE_MARKER, message);
+    await writeNoticeOnce(options.noticeMarkerPath ?? noticeMarker(), message);
     return {
       serverName,
       configPath,

@@ -3,6 +3,7 @@ import { FS_READ_PREVIEW_REASONS } from '../../shared/fs-read-error-codes.js';
 import {
   BINARY_DETECTION_SAMPLE_BYTES,
   FS_READ_SIZE_LIMIT,
+  FS_READ_INLINE_SIZE_LIMIT,
   MISSING_FILE_SIGNATURE,
   areFileSignaturesEqual,
   bytesContainNulByte,
@@ -25,7 +26,7 @@ describe('file preview classifier', () => {
       previewKind: 'text',
       extension: 'md',
       size: 42,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
       mimeType: 'text/markdown',
     });
   });
@@ -34,6 +35,7 @@ describe('file preview classifier', () => {
     expect(classifyPreviewByPath('/repo/image.PNG', 10)).toMatchObject({
       previewType: 'image',
       previewKind: 'image',
+      previewMode: 'stream',
       extension: 'png',
       size: 10,
       sizeLimitBytes: FS_READ_SIZE_LIMIT,
@@ -82,14 +84,19 @@ describe('file preview classifier', () => {
   });
 
   it('classifies too-large files before inline preview type', () => {
-    expect(classifyPreviewByPath('/repo/huge.png', FS_READ_SIZE_LIMIT + 1)).toMatchObject({
+    // Inline (text) kinds are the only ones still bounded by the inline cap.
+    expect(classifyPreviewByPath('/repo/huge.txt', FS_READ_INLINE_SIZE_LIMIT + 1)).toMatchObject({
       previewType: 'too_large',
       previewKind: 'too_large',
-      extension: 'png',
-      size: FS_READ_SIZE_LIMIT + 1,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
-      mimeType: 'image/png',
+      extension: 'txt',
+      size: FS_READ_INLINE_SIZE_LIMIT + 1,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
       previewReason: FS_READ_PREVIEW_REASONS.TOO_LARGE,
+    });
+    // A large image is NOT rejected: it streams over the download channel.
+    expect(classifyPreviewByPath('/repo/huge.png', FS_READ_INLINE_SIZE_LIMIT + 1)).toMatchObject({
+      previewType: 'image',
+      previewMode: 'stream',
     });
   });
 
@@ -99,10 +106,35 @@ describe('file preview classifier', () => {
       previewKind: 'text',
       extension: 'unknownext',
       size: 10,
-      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+      sizeLimitBytes: FS_READ_INLINE_SIZE_LIMIT,
       mimeType: undefined,
     });
     expect(lookupPreviewMimeByExtension('unknownext')).toBeUndefined();
+  });
+
+  it('streams large office/image previews instead of inlining them into a WS frame', () => {
+    // Regression: a 31MB .docx was classified as 'office', then read whole and
+    // base64-encoded synchronously, stalling the event loop for seconds. That
+    // missed ServerLink heartbeats and dropped the daemon WS (UI showed the
+    // daemon offline), which also broke P2P downloads that need WS signalling.
+    const thirtyOneMb = 31 * 1024 * 1024;
+    // It must NOT be inlined (that stalled the loop and dropped the WS), and it
+    // must NOT be refused either: it streams over the chunked download channel.
+    expect(classifyPreviewByPath('/case/final.docx', thirtyOneMb)).toMatchObject({
+      previewType: 'office',
+      previewKind: 'office',
+      previewMode: 'stream',
+    });
+    expect(classifyPreviewByPath('/case/scan.png', thirtyOneMb)).toMatchObject({
+      previewType: 'image',
+      previewMode: 'stream',
+    });
+    // Streamed media must NOT regress: it never buffers the whole file.
+    expect(classifyPreviewByPath('/case/clip.mp4', thirtyOneMb)).toMatchObject({
+      previewType: 'video',
+      previewMode: 'stream',
+      sizeLimitBytes: FS_READ_SIZE_LIMIT,
+    });
   });
 
   it('looks up MIME types and extensions consistently', () => {

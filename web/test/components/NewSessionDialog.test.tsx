@@ -6,6 +6,24 @@ import { h } from 'preact';
 import { render, screen, fireEvent, cleanup, waitFor, act } from '@testing-library/preact';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../../shared/git-remote-url.js';
 import { DEFAULT_CODEX_SESSION_MODEL } from '../../../src/shared/models/options.js';
+import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
+
+const {
+  fetchSessionIdentityProfileMock,
+  saveSessionIdentityProfileMock,
+  clearSessionIdentityProfileMock,
+} = vi.hoisted(() => ({
+  fetchSessionIdentityProfileMock: vi.fn(async () => null),
+  saveSessionIdentityProfileMock: vi.fn(),
+  clearSessionIdentityProfileMock: vi.fn(),
+}));
+
+vi.mock('../../src/api.js', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../src/api.js')>(),
+  fetchSessionIdentityProfile: (...args: unknown[]) => fetchSessionIdentityProfileMock(...args),
+  saveSessionIdentityProfile: (...args: unknown[]) => saveSessionIdentityProfileMock(...args),
+  clearSessionIdentityProfile: (...args: unknown[]) => clearSessionIdentityProfileMock(...args),
+}));
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -25,11 +43,16 @@ vi.mock('../../src/components/FileBrowser.js', () => ({
 
 vi.mock('../../src/components/file-browser-lazy.js', () => ({
   FileBrowser: (props: {
-    onConfirm?: (paths: string[]) => void;
+    mode?: string;
+    onConfirm?: (paths: string[], preview?: unknown) => void;
     onDirectoryCreated?: (path: string) => void;
   }) => (
     <div data-testid="mock-file-browser">
       <button onClick={() => props.onConfirm?.(['/home/user/selected'])}>mock-select-dir</button>
+      {props.mode === 'file-single' && <button onClick={() => props.onConfirm?.(
+        ['/home/user/agent-identity.md'],
+        { status: 'ok', path: '/home/user/agent-identity.md', content: 'Identity loaded from a selected file.' },
+      )}>mock-select-identity-file</button>}
       <button onClick={() => props.onDirectoryCreated?.('/home/user/new-project')}>mock-create-folder</button>
     </div>
   ),
@@ -92,6 +115,33 @@ describe('NewSessionDialog', () => {
     expect(screen.getByPlaceholderText('~/projects/my-project')).toBeDefined();
   });
 
+  it('renders one user/project/session identity editor while creating a session', async () => {
+    render(<NewSessionDialog serverId="srv-1" ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    expect(await screen.findAllByRole('tab')).toHaveLength(3);
+    expect(screen.getByRole('tab', { name: 'identityScope_user' })).toBeDefined();
+    expect(screen.getByRole('tab', { name: 'identityScope_project' })).toBeDefined();
+    expect(screen.getByRole('tab', { name: 'identityScope_session' })).toBeDefined();
+    expect(screen.getAllByLabelText('session-identity-content')).toHaveLength(1);
+  });
+
+  it('sends selected identity file content in session.start so the first SDK system prompt has it', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog serverId="srv-1" ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'identity-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '/tmp/identity-app' } });
+    const identity = await screen.findByLabelText('session-identity-content') as HTMLTextAreaElement;
+    await waitFor(() => expect(identity.disabled).toBe(false));
+    fireEvent.click(screen.getByRole('button', { name: 'identityChooseFile' }));
+    fireEvent.click(screen.getByText('mock-select-identity-file'));
+    expect(identity.value).toBe('Identity loaded from a selected file.');
+
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      project: 'identity-app',
+      identityPrompt: 'Identity loaded from a selected file.',
+    }));
+  });
+
   it('uses a newly created folder from the directory picker as the working directory', async () => {
     render(<NewSessionDialog ws={makeWs() as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
 
@@ -116,7 +166,7 @@ describe('NewSessionDialog', () => {
     const groups = Array.from(document.querySelectorAll('.session-agent-group'));
     expect(groups.map((group) => group.querySelector('.session-agent-group-title')?.textContent)).toEqual(['SDK', 'CLI']);
     const options = groups.flatMap((group) => Array.from(group.querySelectorAll<HTMLButtonElement>('[data-agent-type]')).map((button) => button.dataset.agentType));
-    expect(options.slice(0, 13)).toEqual([
+    expect(options.slice(0, 16)).toEqual([
       'claude-code-sdk',
       'codex-sdk',
       'qoder-sdk',
@@ -126,12 +176,15 @@ describe('NewSessionDialog', () => {
       'gemini-sdk',
       'grok-sdk',
       'kimi-sdk',
+      HERMES_AGENT_PROVIDER_ID,
       'deepseek-harness',
       'pi',
+      'codebuddy-cn',
+      'codebuddy-international',
       'qwen',
       'openclaw',
     ]);
-    expect(options.slice(13)).toEqual([
+    expect(options.slice(16)).toEqual([
       'claude-code',
       'codex',
       'opencode',
@@ -883,6 +936,83 @@ describe('NewSessionDialog', () => {
       agentType: 'kimi-sdk',
       requestedModel: 'moonshot-v1-auto,thinking',
     }));
+  });
+
+  it('actively discovers Hermes models and starts with the selected model', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    selectAgent(HERMES_AGENT_PROVIDER_ID);
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models'
+        && call[0]?.agentType === HERMES_AGENT_PROVIDER_ID
+        && call[0]?.force === true
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === HERMES_AGENT_PROVIDER_ID
+    ))?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestId: request?.requestId,
+      models: [
+        { id: 'nous-free', name: 'Nous Free' },
+        { id: 'minimax-oauth', name: 'MiniMax OAuth' },
+      ],
+      defaultModel: 'nous-free',
+      isAuthenticated: true,
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'minimax-oauth' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[0], { target: { value: 'minimax-oauth' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: HERMES_AGENT_PROVIDER_ID,
+      requestedModel: 'minimax-oauth',
+    }));
+  });
+
+  it('starts the China CodeBuddy provider with its Hy3 model independently from International', async () => {
+    const ws = makeWs();
+    render(<NewSessionDialog ws={ws as any} onClose={vi.fn()} onSessionStarted={vi.fn()} isProviderConnected={() => false} />);
+
+    fireEvent.input(screen.getByPlaceholderText('my-project'), { target: { value: 'my-app' } });
+    fireEvent.input(screen.getByPlaceholderText('~/projects/my-project'), { target: { value: '~/projects/my-app' } });
+    selectAgent('codebuddy-cn');
+
+    await waitFor(() => {
+      expect(ws.send.mock.calls.some((call) => (
+        call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'codebuddy-cn'
+      ))).toBe(true);
+    });
+    const request = ws.send.mock.calls.find((call) => (
+      call[0]?.type === 'transport.list_models' && call[0]?.agentType === 'codebuddy-cn'
+    ))?.[0];
+    act(() => ws.emit({
+      type: 'transport.models_response',
+      agentType: 'codebuddy-cn',
+      requestId: request?.requestId,
+      models: [{ id: 'hy3', name: 'Hy3' }],
+      defaultModel: 'hy3',
+    }));
+
+    await waitFor(() => expect(screen.getByRole('option', { name: 'hy3' })).toBeDefined());
+    const selects = screen.getAllByRole('combobox') as HTMLSelectElement[];
+    fireEvent.input(selects[0], { target: { value: 'hy3' } });
+    fireEvent.click(screen.getByRole('button', { name: /start/i }));
+
+    expect(ws.sendSessionCommand).toHaveBeenCalledWith('start', expect.objectContaining({
+      agentType: 'codebuddy-cn',
+      requestedModel: 'hy3',
+    }));
+    expect(getAgentButton('codebuddy-international')).toBeDefined();
   });
 
   it('offers a free-text model input for deepseek-harness and starts with the typed model', async () => {

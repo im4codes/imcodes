@@ -5,7 +5,7 @@ import {
   listMemoryShortRefsByRef,
   upsertMemoryShortRefs,
 } from '../../src/store/context-store.js';
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
   loadMemoryShortRefsFromStore,
@@ -30,6 +30,7 @@ describe('memory short refs — durable store persistence', () => {
   let tempDir: string;
   let priorPath: string | undefined;
   let priorLegacyPath: string | undefined;
+  let priorRecoveryPath: string | undefined;
 
   beforeEach(async () => {
     // Unset so the store (not the JSON file) is the persistence target.
@@ -39,6 +40,8 @@ describe('memory short refs — durable store persistence', () => {
     // does not exist so these assertions never read the developer's real file.
     priorLegacyPath = process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
     process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = '/nonexistent/imcodes-test/legacy-short-refs.json';
+    priorRecoveryPath = process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH;
+    delete process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH;
     tempDir = await createIsolatedSharedContextDb('memory-short-ref-store');
     resetMemoryShortRefsForTests();
   });
@@ -50,6 +53,8 @@ describe('memory short refs — durable store persistence', () => {
     else process.env.IMCODES_MEMORY_SHORT_REF_PATH = priorPath;
     if (priorLegacyPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH;
     else process.env.IMCODES_MEMORY_SHORT_REF_LEGACY_PATH = priorLegacyPath;
+    if (priorRecoveryPath === undefined) delete process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH;
+    else process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH = priorRecoveryPath;
     await cleanupIsolatedSharedContextDb(tempDir);
   });
 
@@ -76,6 +81,29 @@ describe('memory short refs — durable store persistence', () => {
       kind: 'projection',
       id: 'fb7a7af3-3185-45a4-ac47-b26a57142353',
     });
+  });
+
+  it('replays a real atomic recovery journal into SQLite and removes it after catch-up', async () => {
+    const recoveryPath = join(tempDir, 'memory-short-refs.pending.json');
+    process.env.IMCODES_MEMORY_SHORT_REF_RECOVERY_PATH = recoveryPath;
+    const id = 'durable-during-worker-self-heal';
+    const ref = makeMemoryShortRef('projection', id);
+    writeFileSync(recoveryPath, JSON.stringify({
+      schemaVersion: 2,
+      rows: [{
+        ref,
+        kind: 'projection',
+        id,
+        namespaceKey: JSON.stringify(['personal', 'user-1', 'repo-1', '', '']),
+        namespaceJson: JSON.stringify(namespace),
+        lastSeenAt: Date.now(),
+      }],
+    }), { encoding: 'utf8', mode: 0o600 });
+
+    await expect(loadMemoryShortRefsFromStore()).resolves.toBe(1);
+    expect(resolveMemoryShortRef(ref, namespace)).toMatchObject({ id });
+    await expect.poll(() => listMemoryShortRefsByRef(ref)).toHaveLength(1);
+    await expect.poll(() => existsSync(recoveryPath)).toBe(false);
   });
 
   it('re-registering the same memory upserts instead of accumulating rows', async () => {

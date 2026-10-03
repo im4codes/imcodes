@@ -34,4 +34,25 @@ describe('ordinary send daemon-receipt ack contract', () => {
     // to prove the ack still happens first.
     expect(source).not.toMatch(/from ['"].*(md-ingest|skill-store|skill-review-scheduler|memory-telemetry)['"]/);
   });
+
+
+  it('keeps synchronous UI-locale persistence after the receipt ack', () => {
+    const source = readFileSync('src/daemon/command-handler.ts', 'utf8');
+    const start = source.indexOf('async function handleSend');
+    const end = source.indexOf('/** Emit command.ack', start);
+    const handleSend = source.slice(start, end);
+    const ackCall = handleSend.indexOf('emitAcceptedReceiptAck();');
+    expect(ackCall).toBeGreaterThanOrEqual(0);
+    expect(handleSend.indexOf('upsertSession({', ackCall)).toBeGreaterThan(ackCall);
+  });
+
+  it('writes the receipt to the wire before timeline and outbox persistence', () => {
+    const source = readFileSync('src/daemon/command-handler.ts', 'utf8');
+    const start = source.indexOf('/** Emit command.ack to the wire first');
+    const end = source.indexOf('\nasync function sendProcessSessionMessage', start);
+    const emit = source.slice(start, end);
+    expect(emit.indexOf('trySendCommandAck(')).toBeLessThan(emit.indexOf("timelineEmitter.emit("));
+    expect(emit.indexOf('trySendCommandAck(')).toBeLessThan(emit.indexOf('getDefaultAckOutbox()'));
+  });
+
 });

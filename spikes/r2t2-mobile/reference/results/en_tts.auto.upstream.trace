@@ -1,0 +1,32 @@
+[llama] audio_samples=5120 max_tokens=4 text=language English<asr_text>The
+[llama] audio_samples=7680 max_tokens=4 text=The|
+[llama] audio_samples=10240 max_tokens=4 text=The quarterly
+[llama] audio_samples=12800 max_tokens=2 text= quarterly|
+[llama] audio_samples=15360 max_tokens=3 text= quarterly|
+[llama] audio_samples=17920 max_tokens=4 text= quarterly report is
+[llama] audio_samples=20480 max_tokens=2 text= is|
+[llama] audio_samples=23040 max_tokens=3 text= is due|
+[llama] audio_samples=25600 max_tokens=2 text= due on
+[llama] audio_samples=28160 max_tokens=2 text= on|
+[llama] audio_samples=30720 max_tokens=3 text= on|
+[llama] audio_samples=33280 max_tokens=4 text= on Friday.
+[llama] audio_samples=35840 max_tokens=2 text=.
+[llama] audio_samples=38400 max_tokens=3 text=.
+[llama] audio_samples=40960 max_tokens=4 text=,|
+[llama] audio_samples=43520 max_tokens=4 text=, so|
+[llama] audio_samples=46080 max_tokens=2 text= so|
+[llama] audio_samples=48640 max_tokens=3 text= so please|
+[llama] audio_samples=51200 max_tokens=2 text= please send
+[llama] audio_samples=53760 max_tokens=2 text= send me
+[llama] audio_samples=56320 max_tokens=2 text= me your
+[llama] audio_samples=58880 max_tokens=2 text= your|
+[llama] audio_samples=61440 max_tokens=3 text= your numbers
+[llama] audio_samples=64000 max_tokens=2 text= numbers by
+[llama] audio_samples=66560 max_tokens=2 text= by
+[llama] audio_samples=69120 max_tokens=3 text= by|
+[llama] audio_samples=71680 max_tokens=4 text= by Wednesday.
+[llama] audio_samples=74240 max_tokens=2 text=
+[llama] audio_samples=76800 max_tokens=3 text= Wednesday|
+[llama] audio_samples=79360 max_tokens=4 text= Wednesday|
+[llama] audio_samples=81920 max_tokens=4 text= Wednesday afternoon.
+[llama] audio_samples=83042 max_tokens=4 text=.

@@ -13,6 +13,7 @@ vi.mock('../../src/daemon/timeline-store.js', () => ({
 
 import { TimelineEmitter } from '../../src/daemon/timeline-emitter.js';
 import { timelineStore } from '../../src/daemon/timeline-store.js';
+import { emitSessionStateProbeCorrection } from '../../src/store/session-state-probe-events.js';
 import { TIMELINE_RESPONSE_SOURCES } from '../../shared/timeline-protocol.js';
 
 describe('TimelineEmitter — seq counter', () => {
@@ -74,6 +75,36 @@ describe('TimelineEmitter — seq counter', () => {
     emitter.emit('session-a', 'user.message', { text: 'hi' });
     emitter.emit('session-a', 'assistant.text', { text: 'hello' });
     expect(timelineStore.append).toHaveBeenCalledTimes(2);
+  });
+
+  it('emits latest-value signals only when their payload changes, except terminal state edges', () => {
+    const firstStatus = emitter.emit('session-a', 'agent.status', { status: 'working', label: 'token 1' });
+    const duplicateStatus = emitter.emit('session-a', 'agent.status', { label: 'token 1', status: 'working' });
+    const changedStatus = emitter.emit('session-a', 'agent.status', { status: 'working', label: 'token 2' });
+    const firstUsage = emitter.emit('session-a', 'usage.update', { inputTokens: 10, outputTokens: 2 });
+    const duplicateUsage = emitter.emit('session-a', 'usage.update', { outputTokens: 2, inputTokens: 10 });
+    const firstState = emitter.emit('session-a', 'session.state', { state: 'idle' });
+    const duplicateState = emitter.emit('session-a', 'session.state', { state: 'idle' });
+
+    expect(firstStatus?.seq).toBe(1);
+    expect(duplicateStatus?.seq).toBe(0);
+    expect(changedStatus?.seq).toBe(2);
+    expect(firstUsage?.seq).toBe(3);
+    expect(duplicateUsage?.seq).toBe(0);
+    expect(firstState?.seq).toBe(4);
+    expect(duplicateState?.seq).toBe(5);
+    expect(timelineStore.append).toHaveBeenCalledTimes(5);
+  });
+
+  it('forwards one startup-probe correction through the registered timeline bridge', () => {
+    emitSessionStateProbeCorrection('deck_probe_bridge_brain', 'idle');
+
+    expect(timelineStore.append).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(timelineStore.append).mock.calls[0]?.[0]).toMatchObject({
+      sessionId: 'deck_probe_bridge_brain',
+      type: 'session.state',
+      payload: { state: 'idle' },
+    });
   });
 
   it('preserves repeated user messages when allowDuplicate is set', () => {
@@ -313,8 +344,9 @@ describe('TimelineEmitter — on/off handlers', () => {
  * frozen at pendingCount=1.
  *
  * These tests pin the fixed contract:
- *   T1 — structured queue fields MUST all reach handlers.
- *   T2 — plain idle/running events (no payload mutation) ARE still deduped.
+ *   T1 — complete structured queue authority snapshots MUST reach handlers.
+ *   T2 — terminal idle events are always delivered; non-terminal running
+ *        snapshots (with no payload mutation) remain deduped.
  *   T2b — events with `error` payload are NEVER deduped.
  */
 describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression)', () => {
@@ -325,9 +357,20 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
       if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>);
     });
 
-    emitter.emit('session-q', 'session.state', { state: 'queued', pendingCount: 1, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }] });
-    emitter.emit('session-q', 'session.state', { state: 'queued', pendingCount: 2, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }, { clientMessageId: 'b', text: 'b' }] });
-    emitter.emit('session-q', 'session.state', { state: 'queued', pendingCount: 3, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }, { clientMessageId: 'b', text: 'b' }, { clientMessageId: 'c', text: 'c' }] });
+    emitter.emit('session-q', 'session.state', {
+      state: 'queued', queueEpoch: 'epoch-1', queueAuthorityId: 'authority-1', pendingMessageVersion: 1,
+      pendingCount: 1, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }], failedMessageEntries: [],
+    });
+    emitter.emit('session-q', 'session.state', {
+      state: 'queued', queueEpoch: 'epoch-1', queueAuthorityId: 'authority-1', pendingMessageVersion: 2,
+      pendingCount: 2, pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }, { clientMessageId: 'b', text: 'b' }], failedMessageEntries: [],
+    });
+    emitter.emit('session-q', 'session.state', {
+      state: 'queued', queueEpoch: 'epoch-1', queueAuthorityId: 'authority-1', pendingMessageVersion: 3,
+      pendingCount: 3,
+      pendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }, { clientMessageId: 'b', text: 'b' }, { clientMessageId: 'c', text: 'c' }],
+      failedMessageEntries: [],
+    });
 
     expect(received).toHaveLength(3);
     expect(received[0].pendingCount).toBe(1);
@@ -356,7 +399,7 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     expect(received[0].pendingCount).toBe(1);
   });
 
-  it('T2: successive idle (or running) events with no payload mutation are still deduped (avoid UI flicker)', () => {
+  it('T2: terminal idle events always reach handlers while running snapshots remain deduped', () => {
     const emitter = new TimelineEmitter();
     const received: Array<Record<string, unknown>> = [];
     emitter.on((e) => {
@@ -366,9 +409,10 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     emitter.emit('session-i', 'session.state', { state: 'idle' });
     emitter.emit('session-i', 'session.state', { state: 'idle' });
     emitter.emit('session-i', 'session.state', { state: 'idle' });
-    // Only the first idle reaches the handler — original dedup intact for
-    // payloads that don't carry a queue snapshot or error.
-    expect(received).toHaveLength(1);
+    // Idle is an authoritative transition boundary, even when the payload is
+    // byte-for-byte identical. A missed idle is what leaves the web queue
+    // waiting forever on a stale running flag.
+    expect(received.filter((p) => p.state === 'idle')).toHaveLength(3);
 
     emitter.emit('session-r', 'session.state', { state: 'running' });
     emitter.emit('session-r', 'session.state', { state: 'running' });
@@ -406,27 +450,51 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
     expect(received[2].error).toBe('transient');
   });
 
-  it('T2c: pendingMessageEntries as empty array is still treated as a snapshot (drain-to-zero broadcast)', () => {
-    // After a drain, daemon emits `session.state {state:'running',
-    // pendingMessageEntries:[]}` to tell the UI the queue is empty. The dedup
-    // gate must NOT silently swallow that just because `state` happens to
-    // match the previous one.
+  it('T2c: an authoritative empty pendingMessageEntries snapshot broadcasts drain-to-zero', () => {
+    // After a drain, daemon emits a complete queue authority snapshot whose
+    // pendingMessageEntries is empty. The dedup gate must not silently swallow
+    // that just because `state` happens to match the previous one.
     const emitter = new TimelineEmitter();
     const received: Array<Record<string, unknown>> = [];
     emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
 
     emitter.emit('session-d', 'session.state', { state: 'running' });
-    emitter.emit('session-d', 'session.state', { state: 'running', pendingMessageEntries: [] });
+    emitter.emit('session-d', 'session.state', {
+      state: 'running',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [],
+      failedMessageEntries: [],
+    });
     expect(received).toHaveLength(2);
     expect(received[1].pendingMessageEntries).toEqual([]);
   });
 
-  it('T2d: structured queue epoch/version fields bypass same-state dedup', () => {
+  it('T2d: only a complete structured queue authority bypasses same-state dedup', () => {
     const emitter = new TimelineEmitter();
     const received: Array<Record<string, unknown>> = [];
     emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
 
     emitter.emit('session-newq', 'session.state', { state: 'running' });
+    emitter.emit('session-newq', 'session.state', {
+      state: 'running',
+      transportPendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }],
+    });
+    emitter.emit('session-newq', 'session.state', {
+      state: 'running', queueEpoch: 'epoch-1', queueAuthorityId: 'authority-1',
+    });
+    emitter.emit('session-newq', 'session.state', {
+      state: 'running', queueEpoch: 'epoch-1', transportPendingMessageVersion: 1,
+    });
+    emitter.emit('session-newq', 'session.state', {
+      state: 'running', queueAuthorityId: 'authority-1', transportPendingMessageVersion: 1,
+    });
+    emitter.emit('session-newq', 'session.state', {
+      state: 'running', resetReason: 'runtime_recreated',
+    });
+    expect(received).toHaveLength(1);
+
     emitter.emit('session-newq', 'session.state', {
       state: 'running',
       queueEpoch: 'epoch-1',
@@ -435,19 +503,45 @@ describe('TimelineEmitter — session.state queue snapshot dedup (NF1 regression
       transportPendingMessageEntries: [{ clientMessageId: 'a', text: 'a' }],
       failedMessageEntries: [],
     });
-    emitter.emit('session-newq', 'session.state', {
+
+    expect(received).toHaveLength(2);
+    expect(received[1].transportPendingMessageVersion).toBe(1);
+    expect(received[1].transportPendingMessageEntries).toEqual([{ clientMessageId: 'a', text: 'a' }]);
+  });
+
+  it('T2f: non-finite queue versions cannot impersonate complete authority', () => {
+    const emitter = new TimelineEmitter();
+    const received: Array<Record<string, unknown>> = [];
+    emitter.on((e) => { if (e.type === 'session.state') received.push(e.payload as Record<string, unknown>); });
+
+    emitter.emit('session-finite-version', 'session.state', { state: 'running' });
+    for (const pendingMessageVersion of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      emitter.emit('session-finite-version', 'session.state', {
+        state: 'running',
+        queueEpoch: 'epoch-1',
+        queueAuthorityId: 'authority-1',
+        pendingMessageVersion,
+        pendingMessageEntries: [],
+        failedMessageEntries: [],
+      });
+    }
+
+    // Epoch + authority id are insufficient when the version is not finite:
+    // both hostile frames remain subject to same-state dedup.
+    expect(received).toHaveLength(1);
+
+    emitter.emit('session-finite-version', 'session.state', {
       state: 'running',
       queueEpoch: 'epoch-1',
       queueAuthorityId: 'authority-1',
-      transportPendingMessageVersion: 2,
-      transportPendingMessageEntries: [],
-      failedMessageEntries: [{ clientMessageId: 'a', text: 'failed' }],
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [],
+      failedMessageEntries: [],
     });
 
-    expect(received).toHaveLength(3);
-    expect(received[1].transportPendingMessageVersion).toBe(1);
-    expect(received[2].transportPendingMessageVersion).toBe(2);
-    expect(received[2].failedMessageEntries).toEqual([{ clientMessageId: 'a', text: 'failed' }]);
+    // The complete finite tuple is still authoritative and must broadcast.
+    expect(received).toHaveLength(2);
+    expect(received[1].pendingMessageVersion).toBe(1);
   });
 });
 

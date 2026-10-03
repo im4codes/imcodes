@@ -6,7 +6,10 @@ const mockGetServersByUserId = vi.fn();
 const mockGetFullServersByUserId = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockRequestDaemonUpgrade = vi.fn();
+const mockDaemonUpgradeStatus = vi.fn();
 const mockDeleteServer = vi.fn();
+const mockResolveServerRole = vi.fn();
+const mockGetServerById = vi.fn();
 
 vi.mock('../src/security/authorization.js', () => ({
   requireAuth: () => async (c: { set: (key: string, value: string) => void }, next: () => Promise<void>) => {
@@ -14,11 +17,13 @@ vi.mock('../src/security/authorization.js', () => ({
     c.set('role', 'member');
     await next();
   },
+  resolveServerRole: (...args: unknown[]) => mockResolveServerRole(...args),
 }));
 
 vi.mock('../src/db/queries.js', () => ({
   getFullServersByUserId: (...args: unknown[]) => mockGetFullServersByUserId(...args),
   getServersByUserId: (...args: unknown[]) => mockGetServersByUserId(...args),
+  getServerById: (...args: unknown[]) => mockGetServerById(...args),
   updateServerHeartbeat: vi.fn(),
   updateServerName: vi.fn(),
   deleteServer: (...args: unknown[]) => mockDeleteServer(...args),
@@ -30,6 +35,7 @@ vi.mock('../src/ws/bridge.js', () => ({
     get: () => ({
       sendToDaemon: (...args: unknown[]) => mockSendToDaemon(...args),
       requestDaemonUpgrade: (...args: unknown[]) => mockRequestDaemonUpgrade(...args),
+      daemonUpgradeStatus: (...args: unknown[]) => mockDaemonUpgradeStatus(...args),
     }),
   },
 }));
@@ -74,7 +80,16 @@ describe('server routes', () => {
       targetVersion: 'latest',
       deliveryStatus: 'sent',
     });
+    mockDaemonUpgradeStatus.mockReturnValue({
+      currentVersion: '2026.4.904-dev.876',
+      upgrade: {
+        upgradeId: 'upgrade-1', targetVersion: '2026.4.905-dev.877', source: 'manual',
+        status: 'pending_offline', createdAt: 10, updatedAt: 20, lastSentAt: null,
+      },
+    });
     mockDeleteServer.mockResolvedValue(true);
+    mockResolveServerRole.mockResolvedValue('owner');
+    mockGetServerById.mockResolvedValue({ id: 'srv-1', user_id: 'owner-user', name: 'Alpha' });
     delete process.env.APP_VERSION;
   });
 
@@ -99,7 +114,30 @@ describe('server routes', () => {
         status: 'online',
         lastHeartbeatAt: 123,
         daemonVersion: '2026.5.2047-dev.2025',
+        latestDaemonVersion: null,
         createdAt: 99,
+      }],
+    });
+  });
+
+  it('GET /api/server exposes the configured latest daemon version', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    mockGetFullServersByUserId.mockResolvedValue([{
+      id: 'srv-1',
+      name: 'Alpha',
+      daemon_version: '2026.4.904-dev.876',
+    }]);
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server');
+
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      servers: [{
+        id: 'srv-1',
+        name: 'Alpha',
+        daemonVersion: '2026.4.904-dev.876',
+        latestDaemonVersion: '2026.4.905-dev.877',
       }],
     });
   });
@@ -130,6 +168,28 @@ describe('server routes', () => {
     expect(mockSendToDaemon).not.toHaveBeenCalled();
   });
 
+  it('returns authoritative upgrade status and latest version for an authorized operator', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/upgrade');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      currentVersion: '2026.4.904-dev.876',
+      latestVersion: '2026.4.905-dev.877',
+      upgrade: expect.objectContaining({ status: 'pending_offline', upgradeId: 'upgrade-1' }),
+    });
+    expect(mockDaemonUpgradeStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not expose upgrade status to an unauthorized viewer', async () => {
+    mockResolveServerRole.mockResolvedValueOnce('none');
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/upgrade');
+    expect(res.status).toBe(404);
+    expect(mockDaemonUpgradeStatus).not.toHaveBeenCalled();
+  });
+
   it('requests latest only when APP_VERSION is unavailable', async () => {
     const app = await buildTestApp();
 
@@ -140,6 +200,16 @@ describe('server routes', () => {
       targetVersion: undefined,
       source: 'manual',
     });
+  });
+
+  it('rejects a user with neither membership nor a shared-server operator grant', async () => {
+    mockResolveServerRole.mockResolvedValueOnce('none');
+    const app = await buildTestApp();
+
+    const res = await app.request('/api/server/srv-1/upgrade', { method: 'POST' });
+
+    expect(res.status).toBe(404);
+    expect(mockRequestDaemonUpgrade).not.toHaveBeenCalled();
   });
 
   it('returns 400 when the upgrade target is invalid', async () => {
@@ -193,7 +263,7 @@ describe('server routes', () => {
 
     expect(res.status).toBe(404);
     expect(await res.json()).toEqual({ error: 'not_found' });
-    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'owner-user');
     expect(mockSendToDaemon).not.toHaveBeenCalled();
   });
 
@@ -205,7 +275,7 @@ describe('server routes', () => {
 
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
-    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'user-1');
+    expect(mockDeleteServer).toHaveBeenCalledWith(expect.anything(), 'srv-1', 'owner-user');
     expect(mockSendToDaemon).toHaveBeenCalledWith(JSON.stringify({ type: 'server.delete' }));
   });
 });

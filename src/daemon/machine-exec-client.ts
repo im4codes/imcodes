@@ -31,14 +31,19 @@ import {
   type RemoteExecOutputChunk,
   type RemoteExecShell,
   type MachineExecHttpEnvelope,
+  type MachineExecHttpReason,
   type MachineSummary,
+  DAEMON_MACHINE_LIST_ITEM_KEYS,
 } from '../../shared/remote-exec.js';
 import { isValidMachineName } from '../../shared/machine-reference.js';
+import { isControlledNodeId } from '../../shared/controlled-node-identity.js';
+import { SHARED_MACHINE_AUTHORITY_HEADER } from '../../shared/shared-machine-authority.js';
 
 export interface ExecRemoteOptions {
   serverUrl: string;
   sourceServerId: string;
   sourceToken: string;
+  sharedMachineAuthority?: string;
   targetServerId: string;
   command: string;
   shell?: RemoteExecShell;
@@ -50,6 +55,7 @@ export interface ExecRemoteOptions {
 
 export interface ExecRemoteResult {
   outcome: RemoteExecOutcome;
+  reason?: MachineExecHttpReason;
   ok?: boolean;
   exitCode?: number | null;
   stdout?: string;
@@ -74,8 +80,12 @@ export class MachineControlPlaneError extends Error {
 /** List responses are small JSON; bound independently of the exec output envelope. */
 const MAX_LIST_RESPONSE_BYTES = 1_000_000;
 
-function authHeaders(sourceServerId: string, sourceToken: string): Record<string, string> {
-  return { 'X-Server-Id': sourceServerId, authorization: `Bearer ${sourceToken}` };
+function authHeaders(sourceServerId: string, sourceToken: string, sharedMachineAuthority?: string): Record<string, string> {
+  return {
+    'X-Server-Id': sourceServerId,
+    authorization: `Bearer ${sourceToken}`,
+    ...(sharedMachineAuthority ? { [SHARED_MACHINE_AUTHORITY_HEADER]: sharedMachineAuthority } : {}),
+  };
 }
 
 /**
@@ -122,6 +132,7 @@ async function readBoundedText(res: Response, maxBytes: number): Promise<string 
 function resultFromEnvelope(e: MachineExecHttpEnvelope): ExecRemoteResult {
   return {
     outcome: e.outcome,
+    reason: e.reason,
     ...(e.ok !== undefined ? { ok: e.ok } : {}),
     ...(e.exitCode !== undefined ? { exitCode: e.exitCode } : {}),
     ...(e.stdout !== undefined ? { stdout: e.stdout } : {}),
@@ -209,7 +220,7 @@ export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteRes
     res = await doFetch(url, {
       method: 'POST',
       headers: {
-        ...authHeaders(opts.sourceServerId, opts.sourceToken),
+        ...authHeaders(opts.sourceServerId, opts.sourceToken, opts.sharedMachineAuthority),
         'content-type': 'application/json',
         ...(opts.onOutput ? { accept: MACHINE_EXEC_HTTP_STREAM_CONTENT_TYPE } : {}),
       },
@@ -237,21 +248,17 @@ export async function execRemote(opts: ExecRemoteOptions): Promise<ExecRemoteRes
   return resultFromEnvelope(decoded.value);
 }
 
-type MachineListItem = MachineSummary & { refName: string; displayName: string; execEnabled: boolean };
-
-const MACHINE_LIST_ITEM_KEYS: ReadonlySet<string> = new Set([
-  'serverId', 'name', 'refName', 'displayName', 'online', 'nodeRole', 'execEnabled', 'os', 'lastSeenMs', 'accessRole',
-  'daemonVersion', 'updateAvailable', 'autoUnlockConfigured',
-]);
+export type MachineListItem = MachineSummary & { nodeId: string; refName: string; displayName: string; execEnabled: boolean };
 
 /** Strict per-item validation: known keys only, controlled role, canonical OS (or absent). */
 function isValidMachineListItem(v: unknown): v is MachineListItem {
   if (!v || typeof v !== 'object' || Array.isArray(v)) return false;
   const m = v as Record<string, unknown>;
-  for (const key of Object.keys(m)) if (!MACHINE_LIST_ITEM_KEYS.has(key)) return false;
+  for (const key in m) if (!DAEMON_MACHINE_LIST_ITEM_KEYS.has(key)) return false;
   if (typeof m.serverId !== 'string' || m.serverId.length === 0
+    || !isControlledNodeId(m.nodeId)
     || typeof m.name !== 'string' || m.name.length === 0
-    || typeof m.refName !== 'string' || !isValidMachineName(m.refName)
+    || typeof m.refName !== 'string' || (m.refName.length > 0 && !isValidMachineName(m.refName))
     || typeof m.displayName !== 'string') return false;
   if (typeof m.online !== 'boolean' || typeof m.execEnabled !== 'boolean') return false;
   if (m.nodeRole !== NODE_ROLE.CONTROLLED) return false;
@@ -263,6 +270,16 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
   if (m.daemonVersion !== undefined && typeof m.daemonVersion !== 'string') return false;
   if (m.updateAvailable !== undefined && typeof m.updateAvailable !== 'boolean') return false;
   if (m.autoUnlockConfigured !== undefined && typeof m.autoUnlockConfigured !== 'boolean') return false;
+  // Which daemon owns this machine's desktop. Emitted once a controlled node has
+  // a canonical host; omitting it here rejected the WHOLE list and took the
+  // control plane down with `malformed`. Presentation only, like the fields
+  // above: access is re-resolved server-side on every request.
+  if (m.hostServerId !== undefined && (typeof m.hostServerId !== 'string' || m.hostServerId.length === 0)) return false;
+  // Which groups the machine is in. Presentation only; access is always
+  // resolved server-side per request, never from anything this node was told.
+  const groupList = (value: unknown): boolean =>
+    value === undefined || (Array.isArray(value) && value.every((entry) => typeof entry === 'string'));
+  if (!groupList(m.teamIds) || !groupList(m.teamNames)) return false;
   return true;
 }
 
@@ -272,13 +289,15 @@ function isValidMachineListItem(v: unknown): v is MachineListItem {
  * only a valid, bounded `{machines:[...]}` is a real (possibly empty) list.
  */
 export async function listMachines(opts: {
-  serverUrl: string; sourceServerId: string; sourceToken: string; includeOffline?: boolean; fetchImpl?: typeof fetch;
+  serverUrl: string; sourceServerId: string; sourceToken: string; sharedMachineAuthority?: string; includeOffline?: boolean; fetchImpl?: typeof fetch;
 }): Promise<MachineListItem[]> {
   const doFetch = opts.fetchImpl ?? fetch;
   const base = opts.serverUrl.replace(/\/+$/, '');
   let res: Response;
   try {
-    res = await doFetch(`${base}/api/machines`, { headers: authHeaders(opts.sourceServerId, opts.sourceToken) });
+    res = await doFetch(`${base}/api/machines`, {
+      headers: authHeaders(opts.sourceServerId, opts.sourceToken, opts.sharedMachineAuthority),
+    });
   } catch (err) {
     throw new MachineControlPlaneError('transport', `machines API unreachable: ${(err as Error).message}`);
   }

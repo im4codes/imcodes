@@ -5,6 +5,7 @@
 import { Hono } from 'hono';
 import type { Env } from '../env.js';
 import { getUserById, listAllUsers, updateUserStatus, deleteUser, countActiveAdmins, getAllSettings, setSetting } from '../db/queries.js';
+import { AUTH_ERROR_CODES } from '../../../shared/auth-error-codes.js';
 import { logAudit } from '../security/audit.js';
 import { requireAuth } from '../security/authorization.js';
 
@@ -17,7 +18,7 @@ adminRoutes.use('*', async (c, next) => {
   const userId = c.get('userId' as never) as string;
   const user = await getUserById(c.env.DB, userId);
   if (!user || !user.is_admin) return c.json({ error: 'forbidden' }, 403);
-  if (user.status !== 'active') return c.json({ error: 'account_disabled' }, 403);
+  if (user.status !== 'active') return c.json({ error: AUTH_ERROR_CODES.ACCOUNT_DISABLED }, 403);
 
   c.set('adminUserId' as never, userId);
   return next();

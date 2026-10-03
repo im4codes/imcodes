@@ -6,6 +6,8 @@ import { h } from 'preact';
 import { cleanup, fireEvent, render } from '@testing-library/preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import { isUserVisible } from '../../src/util/isUserVisible.js';
+import { AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES } from '@shared/agent-delegation.js';
+import { deriveSupervisionTaskTitle } from '@shared/supervision-task-identity.js';
 
 const fileBrowserProps: any[] = [];
 
@@ -42,10 +44,19 @@ vi.mock('react-i18next', () => ({
         'peerAuditResult.attributionAuditor': `Reviewed by ${vars?.auditor ?? ''}`,
         'peerAuditResult.elapsedMs': `Took ${vars?.seconds ?? 0}s`,
         'peerAuditResult.findingsPreview': 'Findings',
+        'peerAuditResult.roundChip': `R${vars?.round ?? ''}`,
+        'peerAuditResult.roundAria': `Audit round ${vars?.round ?? ''}: ${vars?.outcome ?? ''}`,
         'peerAuditQuick.result_unavailable': 'Peer auditor unavailable.',
+        'peerAuditQuick.result_pass': 'Peer audit passed.',
+        'peerAuditQuick.result_rework': 'Peer audit requires rework.',
         'peerAuditQuick.disposition.sent_unrevocable': 'sent (cannot revoke)',
         'delegation.reply_title': 'Delegation reply',
         'delegation.reply_from': `From ${vars?.source ?? ''}`,
+        'delegation.reply_objective_details': 'Full task objective',
+        'delegation.objective_expand': 'Expand',
+        'delegation.objective_collapse': 'Collapse',
+        'delegation.claim.task_id': 'Task ID',
+        'delegation.claim.assignment_id': 'Assignment ID',
       };
       return map[key] ?? key;
     },
@@ -98,9 +109,33 @@ function makeEvent(type: TimelineEvent['type'], payload: Record<string, unknown>
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   localStorage.clear();
   fileBrowserProps.length = 0;
 });
+
+function installObjectiveGeometry(): void {
+  vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockReturnValue(48);
+  vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockImplementation(function (this: HTMLElement) {
+    return (this.textContent?.length ?? 0) > 500 ? 240 : 32;
+  });
+}
+
+function expectExpandableObjective(container: HTMLElement, selector: string, objective: string): void {
+  const text = container.querySelector<HTMLElement>(selector);
+  expect(text?.textContent).toBe(objective);
+  expect(text?.classList.contains('is-clamped')).toBe(true);
+  const expand = container.querySelector<HTMLButtonElement>('.expandable-task-objective-toggle');
+  expect(expand?.getAttribute('aria-expanded')).toBe('false');
+  expect(expand?.getAttribute('aria-controls')).toBe(text?.id);
+  fireEvent.click(expand!);
+  expect(text?.classList.contains('is-expanded')).toBe(true);
+  const collapse = container.querySelector<HTMLButtonElement>('.expandable-task-objective-toggle');
+  expect(collapse?.getAttribute('aria-expanded')).toBe('true');
+  expect(collapse?.textContent).toContain('Collapse');
+  fireEvent.click(collapse!);
+  expect(text?.classList.contains('is-clamped')).toBe(true);
+}
 
 describe('ChatView file-change cards', () => {
   it('routes right-side file panel previews to the shared preview host', () => {
@@ -178,7 +213,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'diff',
       preview: { status: 'loading', path: '/repo/src/app.tsx' },
       rootPath: '/repo',
-      sessionName: undefined,
+      sessionName: 'session-a',
       sourcePreviewLive: false,
     });
   });
@@ -346,7 +381,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'diff',
       preview: { status: 'loading', path: '/repo/src/diff.ts' },
       rootPath: '/repo',
-      sessionName: undefined,
+      sessionName: 'session-a',
       sourcePreviewLive: false,
     });
   });
@@ -422,7 +457,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'source',
       preview: { status: 'loading', path: '/repo/src/new-name.ts' },
       rootPath: '/repo',
-      sessionName: undefined,
+      sessionName: 'session-a',
       sourcePreviewLive: false,
     });
     expect(onPreviewFile).toHaveBeenNthCalledWith(2, {
@@ -431,7 +466,7 @@ describe('ChatView file-change cards', () => {
       previewViewMode: 'source',
       preview: { status: 'loading', path: '/repo/src/deleted.ts' },
       rootPath: '/repo',
-      sessionName: undefined,
+      sessionName: 'session-a',
       sourcePreviewLive: false,
     });
   });
@@ -452,6 +487,68 @@ describe('isUserVisible', () => {
 });
 
 describe('ChatView peer-audit result cards', () => {
+  it('renders selected-locale task objectives verbatim on both audit-result card surfaces', () => {
+    const objective = '修复前端配额显示，并保留完整任务上下文。';
+    const supervisionTask = {
+      version: 1, taskId: 'tsk_zh', assignmentId: 'asg_zh',
+      title: deriveSupervisionTaskTitle(objective), objective,
+    };
+    const peer = makeEvent('peer_audit.result', {
+      outcome: 'pass', auditorLabel: 'CC11', elapsedMs: 500, supervisionTask,
+    }, { eventId: 'peer-zh' });
+    const reply = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS', verdict: 'PASS', supervisionTask,
+    }, { eventId: 'reply-zh' });
+    const { container } = render(
+      <ChatView events={[peer, reply]} loading={false} sessionId="session-a" />,
+    );
+
+    expect(container.querySelector('[data-event-id="peer-zh"] .peer-audit-result-objective')?.textContent)
+      .toBe(objective);
+    expect(container.querySelector('[data-event-id="reply-zh"] .delegation-reply-card-objective')?.textContent)
+      .toBe(objective);
+  });
+
+  it.each([
+    ['live append', true],
+    ['history reload', false],
+  ] as const)('keeps the audit card but never renders the floating participant bar after %s', (_label, live) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Exact audit findings.',
+      verdict: 'PASS',
+      round: 4,
+    }, { eventId: 'participant-pass-r4' });
+    const commonProps = { loading: false, sessionId: 'session-a' } as const;
+    const view = render(<ChatView {...commonProps} events={live ? [] : [event]} />);
+    if (live) view.rerender(<ChatView {...commonProps} events={[event]} />);
+
+    expect(view.container.querySelector('[data-testid="chat-participant-status"]')).toBeNull();
+    const card = view.container.querySelector('[data-event-id="participant-pass-r4"]');
+    expect(card?.classList.contains('delegation-reply-card--pass')).toBe(true);
+    expect(card?.querySelector('.delegation-reply-verdict')?.textContent).toBe('PASS');
+    expect(card?.querySelector('.peer-audit-round-chip')?.textContent).toBe('R4');
+  });
+
+  it('renders an accessible round chip and leaves legacy results unchanged', () => {
+    const roundEvent = makeEvent('peer_audit.result', {
+      outcome: 'pass', auditorLabel: 'Peer CC', elapsedMs: 500, round: 3,
+    }, { eventId: 'peer-result-round-3' });
+    const legacyEvent = makeEvent('peer_audit.result', {
+      outcome: 'rework', auditorLabel: 'Peer DD', elapsedMs: 700,
+    }, { eventId: 'peer-result-legacy' });
+    const { container } = render(
+      <ChatView events={[roundEvent, legacyEvent]} loading={false} sessionId="session-a" />,
+    );
+    const roundCard = container.querySelector('[data-event-id="peer-result-round-3"]');
+    const roundChip = roundCard?.querySelector('.peer-audit-round-chip');
+    expect(roundChip?.textContent).toBe('R3');
+    expect(roundChip?.getAttribute('aria-label')).toBe('Audit round 3: Peer audit passed.');
+    expect(roundChip?.getAttribute('title')).toBe('Audit round 3: Peer audit passed.');
+    expect(container.querySelector('[data-event-id="peer-result-legacy"] .peer-audit-round-chip')).toBeNull();
+  });
+
   it('renders stable localized outcome/disposition text without exposing wire codes', () => {
     const event = makeEvent('peer_audit.result', {
       outcome: 'target_unavailable',
@@ -471,9 +568,110 @@ describe('ChatView peer-audit result cards', () => {
     expect(card?.textContent).toContain('Peer CC');
     expect(card?.textContent).not.toContain('target_unavailable');
   });
+
+  it('renders the authoritative peer-audit objective with the same three-line expandable header', () => {
+    installObjectiveGeometry();
+    const objective = `Repair the peer audit result title. ${'Preserve every authoritative task detail. '.repeat(28)}`.trim();
+    const event = makeEvent('peer_audit.result', {
+      outcome: 'rework', auditorLabel: 'Peer CC', elapsedMs: 2_100,
+      supervisionTask: {
+        version: 1, taskId: 'tsk_peer', assignmentId: 'asg_peer',
+        attemptId: 'attempt-peer', revision: 'revision-peer',
+        title: deriveSupervisionTaskTitle(objective), objective,
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expect(container.querySelector('.peer-audit-result-card')?.getAttribute('data-task-id')).toBe('tsk_peer');
+    expectExpandableObjective(container, '.peer-audit-result-objective', objective);
+    expect(container.textContent?.split(objective)).toHaveLength(2);
+  });
 });
 
 describe('ChatView delegation reply cards', () => {
+  it.each([
+    ['main/full window', false],
+    ['sub-session preview card', true],
+  ] as const)('renders the original PASS/REWORK card in a %s', (_label, preview) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Exact audit findings.',
+      verdict: 'REWORK',
+      round: 3,
+    }, { eventId: `original-verdict-${preview ? 'preview' : 'full'}` });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" preview={preview} />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card--rework');
+    expect(card?.querySelector('.delegation-reply-verdict')?.textContent).toBe('REWORK');
+    expect(card?.querySelector('.peer-audit-round-chip')?.textContent).toBe('R3');
+  });
+
+  it.each([
+    ['live', true],
+    ['reloaded history', false],
+  ] as const)('renders the authoritative audit round on a %s verdict card', (_label, arrivesLive) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      sourceLabel: 'CC10',
+      result: 'Exact audit findings.',
+      verdict: 'PASS',
+      round: 4,
+    }, { eventId: 'audit-result-round-4' });
+    const view = render(
+      <ChatView events={arrivesLive ? [] : [event]} loading={false} sessionId="session-a" />,
+    );
+    if (arrivesLive) {
+      view.rerender(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    }
+
+    const roundChip = view.container.querySelector('.delegation-reply-card .peer-audit-round-chip');
+    expect(roundChip?.textContent).toBe('R4');
+    expect(roundChip?.getAttribute('aria-label')).toBe('Audit round 4: Peer audit passed.');
+    expect(roundChip?.getAttribute('title')).toBe('Audit round 4: Peer audit passed.');
+  });
+
+  it.each([
+    ['legacy audit reply', { verdict: 'REWORK' }],
+    ['non-audit delegation reply', { round: 2 }],
+    ['invalid round', { verdict: 'PASS', round: 0 }],
+  ])('leaves a %s without a round chip', (_label, extraPayload) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Existing reply rendering.',
+      ...extraPayload,
+    });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    expect(container.querySelector('.delegation-reply-card .peer-audit-round-chip')).toBeNull();
+  });
+
+  it('renders authoritative audit findings as markdown in one collapsed card, not JSON escapes', () => {
+    const findings = 'VERDICT: PASS\n\n- exact evidence\n- role="status"';
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      sourceLabel: 'CC10',
+      result: findings,
+      verdict: 'PASS',
+    }, { eventId: 'audit-result-markdown' });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card');
+    expect(card?.querySelector('details')).toBeTruthy();
+    expect(card?.querySelector('.delegation-reply-card-body')?.textContent).toBe(findings);
+    expect(card?.textContent).toContain('role="status"');
+    expect(card?.textContent).not.toContain('\\n');
+    expect(card?.textContent).not.toContain('[history truncated]');
+  });
+
   it('renders the reply source and full result without exposing notification framing', () => {
     const event = makeEvent('delegation.reply', {
       memoryExcluded: true,
@@ -493,7 +691,7 @@ describe('ChatView delegation reply cards', () => {
     expect(card?.textContent).not.toContain('<imcodes-delegation-completed-v1>');
   });
 
-  it('renders a long audit reply completely in one non-collapsing card', () => {
+  it('renders a long audit reply completely inside a scrollable body', () => {
     const result = Array.from({ length: 80 }, (_, index) => `Audit evidence line ${index + 1}`).join('\n');
     const event = makeEvent('delegation.reply', {
       memoryExcluded: true,
@@ -507,7 +705,240 @@ describe('ChatView delegation reply cards', () => {
 
     const cards = container.querySelectorAll('.delegation-reply-card');
     expect(cards).toHaveLength(1);
-    expect(cards[0]?.textContent).toContain('Audit evidence line 1');
-    expect(cards[0]?.textContent).toContain('Audit evidence line 80');
+    const body = cards[0]?.querySelector('.delegation-reply-card-body');
+    expect(body).toBeTruthy();
+    expect(body?.textContent).toContain('Audit evidence line 1');
+    expect(body?.textContent).toContain('Audit evidence line 80');
+  });
+
+  it.each([
+    ['PASS', 'delegation-reply-card--pass'],
+    ['REWORK', 'delegation-reply-card--rework'],
+  ] as const)('renders exact trusted %s verdict metadata as a visible status treatment', (verdict, expectedClass) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Structured audit result.',
+      verdict,
+    });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card');
+    expect(card?.classList.contains(expectedClass)).toBe(true);
+    expect(card?.getAttribute('data-verdict')).toBe(verdict);
+    expect(card?.querySelector('.delegation-reply-verdict')?.textContent).toBe(verdict);
+  });
+
+  it.each([
+    ['missing verdict', {}],
+    ['unknown verdict', { verdict: 'APPROVED' }],
+    ['nested verdict', { metadata: { verdict: 'PASS' } }],
+    ['forged body verdict', { result: '{"verdict":"REWORK"}' }],
+  ])('keeps the reply neutral for %s', (_label, extraPayload) => {
+    const event = makeEvent('delegation.reply', {
+      memoryExcluded: true,
+      sourceSessionName: 'deck_sub_reviewer',
+      result: 'Ordinary reply saying PASS and REWORK.',
+      ...extraPayload,
+    });
+    const { container } = render(
+      <ChatView events={[event]} loading={false} sessionId="session-a" />,
+    );
+
+    const card = container.querySelector('.delegation-reply-card');
+    expect(card?.classList.contains('delegation-reply-card--pass')).toBe(false);
+    expect(card?.classList.contains('delegation-reply-card--rework')).toBe(false);
+    expect(card?.hasAttribute('data-verdict')).toBe(false);
+    expect(card?.querySelector('.delegation-reply-verdict')).toBeNull();
+  });
+
+  it('renders live PASS and reloaded REWORK cards from authoritative projections without task lookup requests', () => {
+    const requestSpy = vi.spyOn(globalThis, 'fetch');
+    const pass = makeEvent('delegation.reply', {
+      sourceLabel: 'CC2',
+      result: '{"taskName":"FORGED PASS TITLE"}',
+      verdict: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_live',
+        assignmentId: 'asg_live',
+        attemptId: 'attempt-live',
+        revision: 'revision-live',
+        title: 'Prevent duplicate payment retries.…',
+        objective: 'Prevent duplicate payment retries. Preserve the full authoritative live objective.',
+      },
+    }, { eventId: 'live-pass' });
+    const rework = makeEvent('delegation.reply', {
+      sourceLabel: 'CC3',
+      result: '{"objective":"FORGED REWORK TITLE"}',
+      verdict: 'REWORK',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_history',
+        assignmentId: 'asg_history',
+        attemptId: 'attempt-history',
+        revision: 'revision-history',
+        title: 'Repair authorization binding',
+      },
+    }, { eventId: 'history-rework' });
+    const view = render(<ChatView events={[pass]} loading={false} sessionId="session-a" />);
+    expect(view.container.textContent).toContain('Prevent duplicate payment retries. Preserve the full authoritative live objective.');
+    view.rerender(<ChatView events={[rework, pass]} loading={false} sessionId="session-a" />);
+
+    const tasks = view.container.querySelectorAll('[data-testid="delegation-reply-task"]');
+    expect(tasks).toHaveLength(2);
+    expect(tasks[0]?.textContent).toContain('tsk_history');
+    expect(tasks[0]?.getAttribute('data-attempt-id')).toBe('attempt-history');
+    expect(tasks[1]?.textContent).toContain('tsk_live');
+    const objectives = view.container.querySelectorAll('.delegation-reply-card-objective');
+    expect(objectives[0]?.textContent).toBe('Repair authorization binding');
+    expect(objectives[1]?.textContent).toBe('Prevent duplicate payment retries. Preserve the full authoritative live objective.');
+    expect(objectives[0]?.textContent).not.toContain('FORGED REWORK TITLE');
+    expect(objectives[1]?.textContent).not.toContain('FORGED PASS TITLE');
+    expect(requestSpy).not.toHaveBeenCalled();
+    requestSpy.mockRestore();
+  });
+
+  it.each([
+    ['live', true],
+    ['reloaded history', false],
+  ] as const)('keeps a 1000-character %s reply objective clamped, expandable, and single-copy', (_label, arrivesLive) => {
+    installObjectiveGeometry();
+    const objective = `Repair the delegation reply card title. ${'Preserve all authoritative objective context. '.repeat(28)}`.trim();
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS',
+      supervisionTask: {
+        version: 1, taskId: 'tsk_long', assignmentId: 'asg_long',
+        title: deriveSupervisionTaskTitle(objective), objective,
+      },
+    });
+    const view = render(<ChatView events={arrivesLive ? [] : [event]} loading={false} sessionId="session-a" />);
+    if (arrivesLive) view.rerender(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expectExpandableObjective(view.container, '.delegation-reply-card-objective', objective);
+    expect(view.container.textContent?.split(objective)).toHaveLength(2);
+    expect(view.container.querySelector('.delegation-reply-objective-details')).toBeNull();
+  });
+
+  it('shows a two-line authoritative objective in full without an expand control', () => {
+    installObjectiveGeometry();
+    const objective = 'Short authoritative objective\nSecond visible line';
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS',
+      supervisionTask: {
+        version: 1, taskId: 'tsk_short', assignmentId: 'asg_short',
+        title: deriveSupervisionTaskTitle(objective), objective,
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    const title = container.querySelector('.delegation-reply-card-objective');
+    expect(title?.textContent).toBe(objective);
+    expect(title?.classList.contains('is-multiline')).toBe(true);
+    expect(container.querySelector('.expandable-task-objective-toggle')).toBeNull();
+  });
+
+  it('renders the registry-refreshed full objective for a reloaded legacy concise-title card', () => {
+    installObjectiveGeometry();
+    const storedTitle = 'Delegation-reply card title is now cut far too short.…';
+    const objective = `Delegation-reply card title is now cut far too short. ${'Keep the authoritative history objective visible. '.repeat(9)}`.trim();
+    expect(objective.length).toBeGreaterThan(400);
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11', result: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_legacy_history',
+        assignmentId: 'asg_legacy_history',
+        title: storedTitle,
+        objective,
+      },
+    });
+
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+
+    expectExpandableObjective(container, '.delegation-reply-card-objective', objective);
+    expect(container.textContent).not.toContain(storedTitle);
+    expect(container.textContent?.split(objective)).toHaveLength(2);
+  });
+
+  it('shows a 1000-character objective once in the expandable card title', () => {
+    const objective = `Repair the delegation reply card title. ${'Preserve all authoritative objective context. '.repeat(24)}`.trim();
+    expect(objective.length).toBeGreaterThan(1000);
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC11',
+      result: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_long',
+        assignmentId: 'asg_long',
+        title: 'Repair the delegation reply card title.…',
+        objective,
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expect(container.querySelector('.delegation-reply-card-objective')?.textContent).toBe(objective);
+    expect(container.querySelector('.delegation-reply-objective-details')).toBeNull();
+    expect(container.textContent?.split(objective)).toHaveLength(2);
+  });
+
+  it.each([
+    ['missing projection', undefined],
+    ['malformed projection', { version: 1, taskId: '', assignmentId: 'asg_bad', title: 'LEAKED TITLE' }],
+    ['oversized title', { version: 1, taskId: 'tsk_fallback', assignmentId: 'asg_fallback', title: 'x'.repeat(AGENT_DELEGATION_SUPERVISION_TASK_OBJECTIVE_MAX_BYTES + 1) }],
+  ])('uses a privacy-safe fallback for %s', (_label, supervisionTask) => {
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC4',
+      result: 'Sender result remains visible.',
+      verdict: 'REWORK',
+      ...(supervisionTask ? { supervisionTask } : {}),
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    const task = container.querySelector('[data-testid="delegation-reply-task"]');
+    if (supervisionTask && supervisionTask.taskId) {
+      expect(task?.textContent).toContain(supervisionTask.taskId);
+      expect(container.querySelector('.delegation-reply-card-objective')).toBeNull();
+    } else {
+      expect(task).toBeNull();
+    }
+    expect(container.textContent).not.toContain('LEAKED TITLE');
+  });
+
+  it('exposes secondary task ids to assistive technology without making them the title', () => {
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC5',
+      result: 'Accessible result.',
+      verdict: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_a11y',
+        assignmentId: 'asg_a11y',
+        title: 'Accessible supervision objective',
+      },
+    });
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    const task = container.querySelector('[data-testid="delegation-reply-task"]');
+    expect(container.querySelector('.delegation-reply-card-objective')?.textContent).toBe('Accessible supervision objective');
+    expect(task?.querySelector('[aria-label="Task ID: tsk_a11y"]')).toBeTruthy();
+    expect(task?.querySelector('[aria-label="Assignment ID: asg_a11y"]')).toBeTruthy();
+  });
+
+  it.each([
+    ['non-daemon source', { source: 'provider' }],
+    ['non-high confidence', { confidence: 'medium' }],
+  ])('does not trust task title metadata from a %s timeline event', (_label, eventOverride) => {
+    const event = makeEvent('delegation.reply', {
+      sourceLabel: 'CC6',
+      result: 'Untrusted event result.',
+      verdict: 'PASS',
+      supervisionTask: {
+        version: 1,
+        taskId: 'tsk_untrusted',
+        assignmentId: 'asg_untrusted',
+        title: 'UNTRUSTED PROJECTED TITLE',
+      },
+    }, eventOverride as Partial<TimelineEvent>);
+    const { container } = render(<ChatView events={[event]} loading={false} sessionId="session-a" />);
+    expect(container.querySelector('[data-testid="delegation-reply-task"]')).toBeNull();
+    expect(container.textContent).not.toContain('UNTRUSTED PROJECTED TITLE');
   });
 });

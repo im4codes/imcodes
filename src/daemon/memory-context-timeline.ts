@@ -37,21 +37,27 @@ export function buildMemoryContextTimelinePayload(
   // drop `type`, which made observation evidence look like a projection in the
   // reconstructed injectedText and left the web card with no ref at all.
   const referencedItems = attachMemoryShortRefs(items);
-  const timelineItems: MemoryContextTimelineItem[] = referencedItems.map((item) => ({
-    id: item.id,
-    ...(item.ref ? { ref: item.ref } : {}),
-    projectId: item.projectId,
-    ...('scope' in item && item.scope ? { scope: item.scope } : {}),
-    ...('enterpriseId' in item && item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
-    ...('workspaceId' in item && item.workspaceId ? { workspaceId: item.workspaceId } : {}),
-    ...('userId' in item && item.userId ? { userId: item.userId } : {}),
-    summary: item.summary,
-    projectionClass: item.projectionClass,
-    hitCount: item.hitCount,
-    lastUsedAt: item.lastUsedAt,
-    status: item.status,
-    relevanceScore: item.relevanceScore,
-  }));
+  const timelineItems: MemoryContextTimelineItem[] = referencedItems.map((item) => {
+    const sourceSessionName = 'sourceSessionName' in item
+      ? item.sourceSessionName?.trim()
+      : undefined;
+    return {
+      id: item.id,
+      ...(item.ref ? { ref: item.ref } : {}),
+      projectId: item.projectId,
+      ...(sourceSessionName ? { sourceSessionName } : {}),
+      ...('scope' in item && item.scope ? { scope: item.scope } : {}),
+      ...('enterpriseId' in item && item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
+      ...('workspaceId' in item && item.workspaceId ? { workspaceId: item.workspaceId } : {}),
+      ...('userId' in item && item.userId ? { userId: item.userId } : {}),
+      summary: item.summary,
+      projectionClass: item.projectionClass,
+      hitCount: item.hitCount,
+      lastUsedAt: item.lastUsedAt,
+      status: item.status,
+      relevanceScore: item.relevanceScore,
+    };
+  });
   const injectedText = options?.injectedText
     ?? (referencedItems.length > 0 ? buildRelatedPastWorkText(referencedItems) : undefined);
   return {

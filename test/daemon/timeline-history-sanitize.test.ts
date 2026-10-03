@@ -76,6 +76,20 @@ describe('timeline history transport sanitization', () => {
     expect(result.detailRefs).toEqual([]);
   });
 
+  it('preserves complete bounded audit findings for the collapsed delegation result card', () => {
+    const findings = `VERDICT: PASS\n${'- exact audit evidence\n'.repeat(350)}`;
+    const result = sanitizeTimelineHistoryEventsForTransport([
+      event({
+        eventId: 'delegation-audit-result',
+        type: 'delegation.reply',
+        payload: { result: findings, verdict: 'PASS' },
+      }),
+    ]);
+
+    expect(result.events[0]?.payload.result).toBe(findings);
+    expect(JSON.stringify(result.events[0])).not.toContain('[history truncated]');
+  });
+
   it('caps large tool payloads before history responses leave the daemon', () => {
     const huge = 'x'.repeat(2 * 1024 * 1024);
     const result = sanitizeTimelineHistoryEventsForTransport([

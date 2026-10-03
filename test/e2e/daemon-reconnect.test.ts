@@ -151,7 +151,7 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
     // Belt-and-suspenders cleanup — kill any leftover sessions matching our prefix
     const live = await listSessions();
     for (const name of live) {
-      if (name.startsWith(PREFIX)) {
+      if (name.startsWith(PREFIX) || name.startsWith(PERSIST_PREFIX)) {
         await killSession(name).catch(() => {});
       }
     }
@@ -209,6 +209,7 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
 
   it('session store persists and reloads correctly', async () => {
     const name = persistSessionName('w2');
+    createdSessions.push(name);
 
     const record = makePersistableRecord('w2', { state: 'idle' });
     upsertSession(record);
@@ -378,6 +379,7 @@ describe.skipIf(SKIP)('Daemon reconnect resilience (e2e)', () => {
       const role = `w${i + 10}` as `w${number}`;
       const name = persistSessionName(role);
       names.push(name);
+      createdSessions.push(name);
       upsertSession(makePersistableRecord(role));
     }
 

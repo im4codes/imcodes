@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from 'preact/hooks';
+import { memo } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { SessionInfo } from '../types.js';
 import { useSyncedPreference } from '../hooks/useSyncedPreference.js';
@@ -7,6 +8,7 @@ import { getAgentBadgeConfig } from '../agent-display.js';
 import { SessionActionMenuIcon } from './SessionActionMenuIcon.js';
 import { SharedStateIndicator } from './SharedStateIndicator.js';
 import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { recordPerfRender } from '../perf-render-debug.js';
 
 interface Props {
   sessions: SessionInfo[];
@@ -19,8 +21,10 @@ interface Props {
   p2pSessionLabels?: Set<string>;
   onAlertDismiss?: (sessionName: string) => void;
   onSelect: (name: string) => void;
-  onNewSession: () => void;
+  onNewSession?: () => void;
   onStopProject: (project: string) => void;
+  /** Whole-project stop is owner/server-share authority, never tab-share authority. */
+  canStopProject?: boolean;
   onRestartProject: (project: string, fresh?: boolean) => void;
   onCloneSession?: (session: SessionInfo) => void;
   onOpenSessionSettings?: (session: SessionInfo) => void;
@@ -72,7 +76,8 @@ function readLegacyOrder(): string[] {
   try { return JSON.parse(localStorage.getItem(LEGACY_LS_ORDER) ?? '[]'); } catch { return []; }
 }
 
-export function SessionTabs({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+function SessionTabsImpl({ sessions, activeSession, connected, latencyMs, idleAlerts, p2pSessionLabels, onAlertDismiss, onSelect, onNewSession, onStopProject, canStopProject = true, onRestartProject, onCloneSession, onOpenSessionSettings, onShareSession, renameRequest, onRenameHandled, onRenameSession, sessionsLoaded, pinned, setPinnedArr }: Props) {
+  recordPerfRender('SessionTabs');
   const { t } = useTranslation();
   const [ctx, setCtx] = useState<CtxMenu | null>(null);
   const [stopConfirmProject, setStopConfirmProject] = useState<string | null>(null);
@@ -199,7 +204,11 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
       }
     });
     return () => cancelAnimationFrame(frame);
-  }, [activeSession, orderedSessions]);
+  // Session activity updates replace the session objects frequently, but do
+  // not affect which tab should be scrolled into view. Re-running this DOM
+  // measurement for every status frame creates a cross-window layout pass;
+  // only the active tab or tab-count change can require it.
+  }, [activeSession, orderedSessions.length]);
 
   // Mouse-wheel → horizontal scroll for the tab bar. On Windows/Linux a plain
   // mouse wheel only emits vertical `deltaY`, and the browser will NOT translate
@@ -523,6 +532,16 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
                 {isPinned && <span class="tab-pin">📌</span>}
                 {agentBadge(s.agentType)}
                 {getLabel(s)}
+                {s.state === 'error' && (
+                  <span
+                    class="tab-session-error"
+                    role="img"
+                    aria-label={s.error ?? t('session.state_error')}
+                    title={s.error ?? t('session.state_error')}
+                  >
+                    ⚠️
+                  </span>
+                )}
                 {p2pSessionLabels?.has(s.name) && <span class="p2p-tag">{t('session.p2p_tag')}</span>}
                 <SharedStateIndicator state={s.sharedState} compact iconOnly />
                 {/* tool call indicator removed — too flashy */}
@@ -537,7 +556,9 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
         );
       })}
 
-      <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
+      {onNewSession && (
+        <button class="tab-add-btn" onClick={onNewSession} title={t('session.new_btn', 'New session')}>＋</button>
+      )}
 
       {ctx && (() => {
         // Pinned tabs can't be stopped — user must unpin first. Check both the
@@ -584,21 +605,25 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
               <span class="session-action-menu-label">{t('share.menu.shareTab')}</span>
             </button>
           )}
-          <div class="menu-divider" />
-          <button
-            class="menu-item session-action-menu-item menu-item-danger"
-            disabled={projectHasPinned}
-            title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
-            onClick={() => {
-              if (projectHasPinned) return;
-              setStopConfirmProject(ctx.session.project);
-              setStopConfirmLevel(0);
-              setCtx(null);
-            }}
-          >
-            <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
-            <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
-          </button>
+          {canStopProject && (
+            <>
+              <div class="menu-divider" />
+              <button
+                class="menu-item session-action-menu-item menu-item-danger"
+                disabled={projectHasPinned}
+                title={projectHasPinned ? t('session.unpin_to_stop') : undefined}
+                onClick={() => {
+                  if (projectHasPinned) return;
+                  setStopConfirmProject(ctx.session.project);
+                  setStopConfirmLevel(0);
+                  setCtx(null);
+                }}
+              >
+                <SessionActionMenuIcon kind={projectHasPinned ? 'unpin' : 'stop'} />
+                <span class="session-action-menu-label">{projectHasPinned ? t('session.unpin_to_stop') : t('session.stop_plain', 'Stop')}</span>
+              </button>
+            </>
+          )}
         </div>
         );
       })()}
@@ -639,3 +664,34 @@ export function SessionTabs({ sessions, activeSession, connected, latencyMs, idl
     </div>
   );
 }
+
+function sameTabSessions(a: SessionInfo[], b: SessionInfo[]): boolean {
+  if (a === b) return true;
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    const left = a[i];
+    const right = b[i];
+    if (left.name !== right.name
+      || left.project !== right.project
+      || left.role !== right.role
+      || left.state !== right.state
+      || left.label !== right.label
+      || left.agentType !== right.agentType
+      || left.runtimeType !== right.runtimeType) return false;
+  }
+  return true;
+}
+
+export const SessionTabs = memo(SessionTabsImpl, (prev, next) => (
+  sameTabSessions(prev.sessions, next.sessions)
+  && prev.activeSession === next.activeSession
+  && prev.connected === next.connected
+  && prev.latencyMs === next.latencyMs
+  && prev.idleAlerts === next.idleAlerts
+  && prev.p2pSessionLabels === next.p2pSessionLabels
+  && prev.canStopProject === next.canStopProject
+  && prev.renameRequest === next.renameRequest
+  && prev.sessionsLoaded === next.sessionsLoaded
+  && prev.pinned === next.pinned
+  && prev.setPinnedArr === next.setPinnedArr
+));

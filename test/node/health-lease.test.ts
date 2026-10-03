@@ -9,6 +9,7 @@ import {
   createControlledNodeHealthLeasePublisher,
   createSystemdWatchdogNotifier,
   runMacosControlledNodeHealthWatchdog,
+  waitForControlledNodeOnlineLease,
   writeControlledNodeHealthLease,
 } from '../../src/node/health-lease.js';
 
@@ -83,6 +84,57 @@ describe('controlled-node authenticated health lease', () => {
     publisher.recordAuthenticatedHeartbeat();
     await publisher.flush();
     expect(writeLease).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps lease throttling monotonic when the wall clock moves backward after resume', async () => {
+    let wallNow = 1_000_000;
+    let monotonicNow = 10_000;
+    const writeLease = vi.fn(async () => {});
+    const publisher = createControlledNodeHealthLeasePublisher('lease.json', {
+      now: () => wallNow,
+      monotonicNow: () => monotonicNow,
+      intervalMs: 15_000,
+      writeLease,
+    });
+
+    publisher.recordAuthenticatedHeartbeat();
+    await publisher.flush();
+    wallNow -= 60 * 60_000;
+    monotonicNow += 15_000;
+    publisher.recordAuthenticatedHeartbeat();
+    await publisher.flush();
+
+    expect(writeLease).toHaveBeenCalledTimes(2);
+    expect(writeLease).toHaveBeenLastCalledWith('lease.json', wallNow, process.pid);
+  });
+
+  it('accepts install success only after the new service generation publishes an authenticated lease', async () => {
+    let monotonicNow = 0;
+    let reads = 0;
+    await expect(waitForControlledNodeOnlineLease('lease.json', {
+      timeoutMs: 1_000,
+      pollMs: 100,
+      wallNow: () => 50_000,
+      monotonicNow: () => monotonicNow,
+      sleep: async (ms) => { monotonicNow += ms; },
+      processExists: (pid) => pid === 88,
+      readLease: async () => {
+        reads += 1;
+        return reads < 3 ? null : { version: 1, pid: 88, updatedAt: 50_000 };
+      },
+    })).resolves.toEqual({ version: 1, pid: 88, updatedAt: 50_000 });
+  });
+
+  it('fails visibly instead of reporting reinstall success without an authenticated lease', async () => {
+    let monotonicNow = 0;
+    await expect(waitForControlledNodeOnlineLease('lease.json', {
+      timeoutMs: 200,
+      pollMs: 100,
+      wallNow: () => 50_000,
+      monotonicNow: () => monotonicNow,
+      sleep: async (ms) => { monotonicNow += ms; },
+      readLease: async () => null,
+    })).rejects.toThrow('did not authenticate after installation');
   });
 
   it('accepts a fresh PID-bound macOS lease and clears an old failure window', async () => {

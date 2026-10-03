@@ -1,0 +1,446 @@
+import { describe, expect, it } from 'vitest';
+import {
+  SUPERVISION_TASK_CONSOLE_MSG,
+  SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+  supervisionConsoleStatusGroup,
+  type SupervisionTaskConsoleDelta,
+  type SupervisionTaskConsoleScope,
+  type SupervisionTaskConsoleSnapshot,
+} from '../../shared/supervision-task-console.js';
+import {
+  SUPERVISION_TASK_LIFECYCLE_STATUSES,
+  SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+} from '../../shared/supervision-config.js';
+import {
+  SUPERVISION_TASK_CONSOLE_PHASE,
+  createSupervisionTaskConsoleState,
+  supervisionTaskConsoleReducer,
+} from '../src/supervision-task-console-reducer.js';
+
+const SCOPE: SupervisionTaskConsoleScope = {
+  projectName: 'alpha',
+  coordinatorSessionName: 'deck_alpha_brain',
+};
+
+// These are pair-console statuses that can cross the supervision boundary when
+// the web and daemon are on different contract versions. They must remain
+// visible as neutral rows rather than being treated as lifecycle work.
+const PAIR_CONSOLE_STATUSES = [
+  'queued',
+  'working',
+  'in_audit',
+  'rework',
+  'passed',
+  'done',
+  'awaiting_brain_decision',
+] as const;
+
+function snapshot(
+  overrides: Partial<SupervisionTaskConsoleSnapshot> = {},
+): SupervisionTaskConsoleSnapshot {
+  return {
+    type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
+    schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+    statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+    projectionVersion: 3,
+    lastDurableEventId: 3,
+    projectionEpoch: 'epoch-1',
+    subscriptionId: 'subscription-1',
+    generatedAt: 30,
+    scope: SCOPE,
+    tasks: [{
+      taskId: 'task-1',
+      semanticKey: 'semantic-1',
+      title: 'Build console',
+      status: 'implementing',
+      phase: 'active',
+      validationState: 'pending',
+      updatedAt: 30,
+      lastEventId: 3,
+    }],
+    assignments: [{
+      assignmentId: 'assignment-1',
+      taskId: 'task-1',
+      status: 'implementing', phase: 'active', validationState: 'pending',
+      updatedAt: 30,
+      lastEventId: 3,
+    }],
+    pools: [{ poolId: 'primary', label: 'Primary', activeCount: 1, capacity: 2 }],
+    ...overrides,
+  };
+}
+
+function readyState() {
+  return supervisionTaskConsoleReducer(subscribingState(),
+    { type: 'snapshot_received', payload: snapshot() },
+  );
+}
+
+function subscribingState() {
+  return supervisionTaskConsoleReducer(
+    createSupervisionTaskConsoleState(SCOPE),
+    { type: 'subscribe_started', subscriptionId: 'subscription-1' },
+  );
+}
+
+function delta(overrides: Partial<SupervisionTaskConsoleDelta> = {}): SupervisionTaskConsoleDelta {
+  return {
+    type: SUPERVISION_TASK_CONSOLE_MSG.DELTA,
+    schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
+    statusContractVersion: SUPERVISION_TASK_STATUS_CONTRACT_VERSION,
+    projectionVersion: 4,
+    lastDurableEventId: 4,
+    projectionEpoch: 'epoch-1',
+    subscriptionId: 'subscription-1',
+    eventId: 4,
+    scope: SCOPE,
+    op: 'task_upsert',
+    task: {
+      taskId: 'task-1',
+      semanticKey: 'semantic-1',
+      title: 'Build console',
+      status: 'validated',
+      phase: 'active',
+      validationState: 'passed',
+      updatedAt: 40,
+      lastEventId: 4,
+    },
+    ...overrides,
+  };
+}
+
+describe('supervision task console reducer', () => {
+  it('accepts an authoritative empty snapshot as a completed initial load', () => {
+    const empty = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({
+        projectionVersion: 0,
+        lastDurableEventId: null,
+        tasks: [],
+        assignments: [],
+        pools: [],
+      }),
+    });
+    expect(empty.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(empty.tasks).toEqual({});
+  });
+
+  it('turns a transport disconnect into a terminal visible error state', () => {
+    const disconnected = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'transport_disconnected',
+    });
+    expect(disconnected).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR,
+      syncState: 'error',
+      error: 'transport_disconnected',
+    });
+  });
+
+  it('marks cached authoritative rows stale on disconnect and fresh on the next snapshot', () => {
+    const current = readyState();
+    const stale = supervisionTaskConsoleReducer(current, { type: 'transport_disconnected' });
+    expect(stale).toMatchObject({
+      phase: SUPERVISION_TASK_CONSOLE_PHASE.READY,
+      syncState: 'stale',
+      lastSyncedAt: 30,
+    });
+    expect(stale.tasks).toEqual(current.tasks);
+
+    const reconnecting = supervisionTaskConsoleReducer(stale, {
+      type: 'subscribe_started', subscriptionId: 'subscription-1',
+    });
+    const synced = supervisionTaskConsoleReducer(reconnecting, {
+      type: 'snapshot_received', payload: snapshot(), receivedAt: 99,
+    });
+    expect(synced).toMatchObject({ syncState: 'synced', lastSyncedAt: 99 });
+  });
+
+  it('hydrates an authoritative snapshot and replaces it after daemon restart', () => {
+    const first = readyState();
+    const restarted = supervisionTaskConsoleReducer(first, {
+      type: 'snapshot_received',
+      payload: snapshot({
+        projectionVersion: 9,
+        lastDurableEventId: 9,
+        tasks: [{
+          taskId: 'task-recovered',
+          title: 'Recovered task',
+          status: 'recovered',
+          phase: 'active',
+          validationState: 'passed',
+          updatedAt: 90,
+          lastEventId: 9,
+        }],
+        assignments: [],
+      }),
+    });
+    expect(restarted.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(restarted.projectionVersion).toBe(9);
+    expect(Object.keys(restarted.tasks)).toEqual(['task-recovered']);
+  });
+
+  it('preserves revision authority without deriving task state from assignments', () => {
+    const next = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({
+        tasks: [{ ...snapshot().tasks[0]!, status: 'ready_for_integration', phase: 'integration', currentRevision: 'r2' }],
+        assignments: [{
+          ...snapshot().assignments[0]!, status: 'implementing', phase: 'active', auditRevision: 'r1',
+        }],
+      }),
+    });
+    expect(next.tasks['task-1']).toMatchObject({ status: 'ready_for_integration', currentRevision: 'r2' });
+    expect(next.assignments['assignment-1']).toMatchObject({ status: 'implementing', auditRevision: 'r1' });
+  });
+
+  it('applies only the next monotonic delta and ignores duplicate delivery', () => {
+    const applied = supervisionTaskConsoleReducer(readyState(), { type: 'delta_received', payload: delta() });
+    expect(applied.projectionVersion).toBe(4);
+    expect(applied.tasks['task-1']?.status).toBe('validated');
+    expect(applied.eventsByTask['task-1']).toEqual([{ eventId: 4, projectionVersion: 4, op: 'task_upsert' }]);
+    expect(supervisionTaskConsoleReducer(applied, { type: 'delta_received', payload: delta() })).toBe(applied);
+  });
+
+  it('refreshes the aggregate task row carried by an assignment-only event', () => {
+    const applied = supervisionTaskConsoleReducer(readyState(), {
+      type: 'delta_received',
+      payload: delta({
+        op: 'assignment_upsert',
+        assignment: {
+          ...snapshot().assignments[0]!, heartbeatAt: 404, lastEventId: 4,
+        },
+        task: {
+          ...snapshot().tasks[0]!, heartbeatAt: 404, lastEventId: 4,
+        },
+      }),
+    });
+    expect(applied.assignments['assignment-1']?.heartbeatAt).toBe(404);
+    expect(applied.tasks['task-1']?.heartbeatAt).toBe(404);
+  });
+
+  it('keeps the last authoritative rows visible while requesting a full resync for a version gap', () => {
+    const gapped = supervisionTaskConsoleReducer(readyState(), {
+      type: 'delta_received',
+      payload: delta({ projectionVersion: 5, lastDurableEventId: 5, eventId: 5 }),
+    });
+    expect(gapped.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(gapped.syncing).toBe(true);
+    expect(gapped.tasks).toEqual(readyState().tasks);
+    expect(gapped.resyncReason).toBe('version_gap');
+  });
+
+  it('rejects the wrong project or coordinator scope without changing rows', () => {
+    const current = readyState();
+    const wrongScope = supervisionTaskConsoleReducer(current, {
+      type: 'delta_received',
+      payload: delta({ scope: { ...SCOPE, coordinatorSessionName: 'deck_other_brain' } }),
+    });
+    expect(wrongScope.resyncReason).toBe('scope_mismatch');
+    expect(wrongScope.tasks).toEqual(current.tasks);
+  });
+
+  it('drops a delayed projection from a replaced subscription', () => {
+    const current = supervisionTaskConsoleReducer(readyState(), {
+      type: 'subscribe_started',
+      subscriptionId: 'subscription-2',
+    });
+    const delayed = supervisionTaskConsoleReducer(current, {
+      type: 'snapshot_received',
+      payload: snapshot({ subscriptionId: 'subscription-1' }),
+    });
+    expect(delayed).toBe(current);
+    expect(delayed.subscriptionId).toBe('subscription-2');
+  });
+
+  it('accepts every fixed lifecycle status', () => {
+    for (const status of SUPERVISION_TASK_LIFECYCLE_STATUSES) {
+      const next = supervisionTaskConsoleReducer(subscribingState(), {
+        type: 'snapshot_received',
+        payload: snapshot({
+          tasks: [{ taskId: status, title: status, status, phase: supervisionConsoleStatusGroup(status), validationState: 'unknown', updatedAt: 1, lastEventId: 3 }],
+          assignments: [],
+        }),
+      });
+      expect(next.phase, status).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    }
+  });
+
+  it('keeps unknown-status rows as neutral rows instead of rejecting the snapshot', () => {
+    const base = snapshot();
+    const payload = {
+      ...base,
+      tasks: [...base.tasks, {
+        taskId: 'task-unknown',
+        title: 'Unknown',
+        status: 'future_status',
+        phase: 'active',
+        validationState: 'unknown',
+        updatedAt: 1,
+        lastEventId: 3,
+      }],
+      assignments: [...base.assignments, {
+        assignmentId: 'assignment-of-unknown-task',
+        taskId: 'task-unknown',
+        status: 'implementing', phase: 'active', validationState: 'pending',
+        updatedAt: 1,
+        lastEventId: 3,
+      }, {
+        assignmentId: 'assignment-unknown',
+        taskId: 'task-1',
+        status: 'future_status', phase: 'active', validationState: 'pending',
+        updatedAt: 1,
+        lastEventId: 3,
+      }],
+    } as unknown as SupervisionTaskConsoleSnapshot;
+    const next = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload,
+    });
+    expect(next.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(next.syncing).toBe(false);
+    expect(next.resyncReason).toBeNull();
+    expect(next.resyncGeneration).toBe(subscribingState().resyncGeneration);
+    expect(Object.keys(next.tasks)).toEqual(['task-1', 'task-unknown']);
+    expect(next.tasks['task-unknown']).toMatchObject({ status: 'planned', phase: 'active', unknownStatus: 'future_status' });
+    expect(Object.keys(next.assignments)).toEqual(['assignment-1', 'assignment-of-unknown-task', 'assignment-unknown']);
+    expect(next.assignments['assignment-unknown']).toMatchObject({ status: 'planned', phase: 'active', unknownStatus: 'future_status' });
+  });
+
+  it('keeps a delta carrying an unknown status and advances the cursor', () => {
+    const ready = readyState();
+    const unknownTask = supervisionTaskConsoleReducer(ready, {
+      type: 'delta_received',
+      payload: delta({ task: { ...delta().task!, status: 'future_status' as never } }),
+    });
+    expect(unknownTask.phase).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+    expect(unknownTask.resyncGeneration).toBe(ready.resyncGeneration);
+    expect(unknownTask.tasks['task-1']).toMatchObject({ status: 'planned', unknownStatus: 'future_status' });
+    expect(unknownTask.lastDurableEventId).toBe(4);
+
+    const unknownAssignment = supervisionTaskConsoleReducer(ready, {
+      type: 'delta_received',
+      payload: delta({
+        op: 'assignment_upsert',
+        task: undefined,
+        assignment: {
+          assignmentId: 'assignment-1', taskId: 'task-1', status: 'future_status' as never,
+          phase: 'active', validationState: 'pending', updatedAt: 40, lastEventId: 4,
+        },
+      }),
+    });
+    expect(unknownAssignment.resyncGeneration).toBe(ready.resyncGeneration);
+    expect(unknownAssignment.tasks['task-1']).toBeDefined();
+    expect(unknownAssignment.assignments['assignment-1']).toMatchObject({ status: 'planned', unknownStatus: 'future_status' });
+    expect(unknownAssignment.lastDurableEventId).toBe(4);
+  });
+
+  it('quarantines every pair-console status in a snapshot without a resync', () => {
+    for (const status of PAIR_CONSOLE_STATUSES) {
+      const next = supervisionTaskConsoleReducer(subscribingState(), {
+        type: 'snapshot_received',
+        payload: snapshot({
+          tasks: [...snapshot().tasks, {
+            taskId: `pair-${status}`,
+            title: `Pair ${status}`,
+            status: status as never,
+            phase: status === 'rework' ? 'rework' : status === 'passed' ? 'audit' : 'active',
+            validationState: 'unknown',
+            updatedAt: 1,
+            lastEventId: 3,
+          }],
+          assignments: snapshot().assignments,
+        }),
+      });
+      expect(next.phase, status).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+      expect(next.resyncReason, status).toBeNull();
+      const row = next.tasks[`pair-${status}`];
+      if (status === 'rework' || status === 'passed') {
+        expect(row, status).toMatchObject({ status });
+      } else {
+        expect(row, status).toMatchObject({ status: 'planned', phase: 'active', unknownStatus: status });
+      }
+      expect(next.tasks['task-1'], status).toBeDefined();
+    }
+  });
+
+  it('quarantines every pair-console status in a delta while advancing the cursor', () => {
+    for (const status of PAIR_CONSOLE_STATUSES) {
+      const next = supervisionTaskConsoleReducer(readyState(), {
+        type: 'delta_received',
+        payload: delta({
+          task: {
+            ...delta().task!,
+            taskId: `pair-${status}`,
+            status: status as never,
+            phase: status === 'rework' ? 'rework' : status === 'passed' ? 'audit' : 'active',
+          },
+          eventId: 4,
+          lastDurableEventId: 4,
+        }),
+      });
+      expect(next.phase, status).toBe(SUPERVISION_TASK_CONSOLE_PHASE.READY);
+      expect(next.resyncReason, status).toBeNull();
+      const row = next.tasks[`pair-${status}`];
+      if (status === 'rework' || status === 'passed') {
+        expect(row, status).toMatchObject({ status });
+      } else {
+        expect(row, status).toMatchObject({ status: 'planned', unknownStatus: status });
+      }
+      expect(next.lastDurableEventId, status).toBe(4);
+    }
+  });
+
+  it('drops malformed delayed frames before validating a replaced subscription', () => {
+    const current = supervisionTaskConsoleReducer(readyState(), {
+      type: 'subscribe_started',
+      subscriptionId: 'subscription-2',
+    });
+    const delayed = supervisionTaskConsoleReducer(current, {
+      type: 'delta_received',
+      payload: {
+        type: SUPERVISION_TASK_CONSOLE_MSG.DELTA,
+        subscriptionId: 'subscription-1',
+        status: 'future_status',
+      },
+    });
+    expect(delayed).toBe(current);
+  });
+
+  it('keeps multiple assignments for one task and two execution pools', () => {
+    const next = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({
+        assignments: [
+          { assignmentId: 'a-primary', taskId: 'task-1', status: 'implementing', phase: 'active', validationState: 'pending', poolId: 'primary', updatedAt: 2, lastEventId: 3 },
+          { assignmentId: 'a-economy', taskId: 'task-1', status: 'auditing', phase: 'audit', validationState: 'passed', poolId: 'economy', updatedAt: 3, lastEventId: 3 },
+        ],
+        pools: [
+          { poolId: 'primary', label: 'Primary', activeCount: 1, capacity: 2 },
+          { poolId: 'economy', label: 'Economy', activeCount: 1, capacity: 4 },
+        ],
+      }),
+    });
+    expect(Object.keys(next.assignments)).toEqual(['a-primary', 'a-economy']);
+    expect(next.pools.map((pool) => pool.poolId)).toEqual(['primary', 'economy']);
+  });
+
+  it('rejects orphan assignments, duplicate ids, and mismatched durable ids', () => {
+    const orphan = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({ assignments: [{ assignmentId: 'orphan', taskId: 'missing', status: 'implementing', phase: 'active', validationState: 'pending', updatedAt: 1, lastEventId: 3 }] }),
+    });
+    expect(orphan.resyncReason).toBe('cursor_unknown');
+
+    const duplicate = supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({ tasks: [snapshot().tasks[0], snapshot().tasks[0]] }),
+    });
+    expect(duplicate.resyncReason).toBe('cursor_unknown');
+
+    const mismatched = supervisionTaskConsoleReducer(readyState(), {
+      type: 'delta_received',
+      payload: delta({ eventId: 99 }),
+    });
+    expect(mismatched.resyncReason).toBe('cursor_unknown');
+  });
+});

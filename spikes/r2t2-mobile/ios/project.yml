@@ -1,0 +1,44 @@
+# XcodeGen spec for the throwaway R2T2 harness app. Generate with
+#   scripts/build-ios-app.sh   (runs `xcodegen generate` then xcodebuild)
+name: R2T2Harness
+options:
+  bundleIdPrefix: com.im.codes.spike
+  deploymentTarget:
+    iOS: "16.4"   # official llama.xcframework b10950 minimum; see README (iOS 15 finding)
+  createIntermediateGroups: true
+settings:
+  base:
+    DEVELOPMENT_TEAM: M675E26Q67
+    CODE_SIGN_STYLE: Automatic
+    SWIFT_VERSION: "5.0"
+    CLANG_CXX_LANGUAGE_STANDARD: c++17
+    ENABLE_BITCODE: NO
+    GCC_OPTIMIZATION_LEVEL: s
+    SWIFT_OPTIMIZATION_LEVEL: -O
+targets:
+  R2T2Harness:
+    type: application
+    platform: iOS
+    supportedDestinations: [iOS]
+    sources:
+      - path: R2T2Harness
+      - path: ../core
+        excludes: ["*.md"]
+      - path: ../samples
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - framework: ${R2T2_XCFRAMEWORK}
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.im.codes.spike.r2t2harness
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_OBJC_BRIDGING_HEADER: R2T2Harness/R2T2Harness-Bridging-Header.h
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/../core
+          - ${R2T2_XCFRAMEWORK}/ios-arm64/llama.framework/Headers
+        OTHER_CPLUSPLUSFLAGS: $(inherited) -fexceptions
+        INFOPLIST_FILE: R2T2Harness/Info.plist
+        # Large model files live in Documents; keep them out of iCloud backup.
+        ENABLE_USER_SCRIPT_SANDBOXING: NO

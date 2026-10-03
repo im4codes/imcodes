@@ -1,17 +1,29 @@
+import { isChatMessageOrigin, type ChatMessageOrigin } from '../../shared/chat-message-origin.js';
 import { randomUUID } from 'node:crypto';
+import type { SessionRecord } from '../store/session-store.js';
 import type { AliasSendAudit } from '../../shared/alias-types.js';
 import type { SessionRuntime } from './session-runtime.js';
 import { RUNTIME_TYPES } from './session-runtime.js';
 import type { AgentStatus } from './detect.js';
 import type { AgentMessage, MessageDelta } from '../../shared/agent-message.js';
-import type { TransportProvider, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
+import type { TransportProvider, ProviderActiveTurnDeliveryKind, ProviderDelegationNotification, ProviderError, ProviderRolloutCompletionReconcileOptions, SessionConfig, SessionInfoUpdate, ProviderStatusUpdate, ProviderUsageUpdate, ToolCallEvent, SdkTurnLostRecoveryPhase, SdkTurnLostReplayDecision } from './transport-provider.js';
 import { BACKGROUND_SUBAGENT_WAKE_MODES, PROVIDER_ACTIVE_TURN_DELIVERY_KINDS, PROVIDER_CANCEL_ORIGINS, PROVIDER_ERROR_CODES, SDK_TURN_LOST_RECOVERY_PHASES, SDK_TURN_LOST_RECOVERY_STATUS } from './transport-provider.js';
+import { shouldRetryProviderErrorWithBackoff } from '../../shared/provider-error-classifier.js';
+import { CAPACITY_RETRY_LOG_EVERY_ATTEMPTS, CAPACITY_RETRY_SUCCESS_AFTER_MS, capacityRetryDelayMs } from '../../shared/capacity-retry.js';
 import type { ApprovalRequest } from './transport-provider.js';
+import {
+  NATIVE_AGENT_ADMISSION_MODES,
+  NATIVE_AGENT_FENCES,
+  readNativeAgentAdmissionMode,
+  type NativeAgentAdmissionMode,
+  type NativeAgentFence,
+} from '../../shared/native-collaboration-policy.js';
 import type { TransportEffortLevel } from '../../shared/effort-levels.js';
 import {
   SESSION_CONTROL_TIMELINE_REASON_USER_COMPACT,
   SESSION_CONTROL_TIMELINE_STATE_COMPACTING,
   SESSION_CONTROL_METADATA_COMMAND_FIELD,
+  SESSION_COMPACT_COMMAND,
   isSessionCompactCommandText,
   shouldResetTransportPreferenceContextForSessionControl,
 } from '../../shared/session-control-commands.js';
@@ -50,6 +62,7 @@ import type { MemoryContextTimelinePayload, MemoryContextTimelinePreferenceItem 
 import { buildMemoryContextTimelinePayload, buildMemoryContextStatusPayload } from '../daemon/memory-context-timeline.js';
 import { appendTransportEvent } from '../daemon/transport-history.js';
 import { timelineEmitter } from '../daemon/timeline-emitter.js';
+import { resolveSessionContextWindow } from '../daemon/session-context-window.js';
 import {
   buildSdkSubagentWakePrompt,
   isBackgroundedSdkSubagentTool,
@@ -81,9 +94,18 @@ import {
   resolveSummarySyncSourceKind,
 } from '../context/summary-sync.js';
 import { buildRelatedPastWorkText, buildStartupProjectMemoryText } from '../../shared/memory-recall-format.js';
+import { isMemoryInjectionEnabled } from '../context/memory-injection-toggle.js';
 import { attachMemoryShortRefs } from '../context/memory-recall-refs.js';
 import { getContextModelConfig } from '../context/context-model-config.js';
+import { CROSS_VENDOR_HANDOFF_DEFAULTS, type CrossVendorHandoffPack } from '../../shared/cross-vendor-handoff.js';
 import { PREFERENCE_CONTEXT_END, PREFERENCE_CONTEXT_START } from '../../shared/preference-ingest.js';
+import {
+  SUPERVISION_CONTRACT_PREAMBLE_END,
+  SUPERVISION_CONTRACT_PREAMBLE_START,
+  SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE,
+  isAutomaticSupervisionEnabled,
+  type SessionSupervisionSnapshot,
+} from '../../shared/supervision-config.js';
 import { clampUserSessionText } from '../../shared/user-session-text-caps.js';
 import { resolveRuntimeAuthoredContext } from '../context/shared-context-runtime.js';
 import { buildTransportStartupMemory, type TransportContextBootstrap } from './runtime-context-bootstrap.js';
@@ -91,13 +113,27 @@ import logger from '../util/logger.js';
 import { incrementCounter } from '../util/metrics.js';
 import type { SharedActorEnvelope } from '../../shared/tab-sharing.js';
 import { getTransportQueueStore } from '../daemon/transport-queue-store.js';
-import type { QueueDeliveryFact, QueueSnapshot } from '../../shared/transport-queue-types.js';
+import { projectOfSession, resolveTaskPairEngineState } from '../daemon/task-pairs/engine.js';
+import { resolveTaskPairTurnCwd } from '../daemon/task-pairs/turn-cwd.js';
+import { type TaskPairEngineState } from '../../shared/task-pair.js';
+import type { DiscardTransportQueueStateResult, LegacyQueueOwnershipEvidence, QueueRecipientIdentity } from '../daemon/transport-queue-store.js';
+import type { QueueDeliveryFact, QueuePlacement, QueueSnapshot, QueueSupervisionAdmission, QueueSupervisionReference } from '../../shared/transport-queue-types.js';
 import type { PeerAuditCompletedTurnEvidence } from '../../shared/peer-audit.js';
+import { getTransportContextBudgetMs, readBoundedTimeoutMs } from './transport-context-budget.js';
+import { withTimeoutOutcome } from '../util/timeout-outcome.js';
+import { RESEND_EXPIRY_MS } from '../daemon/transport-resend-queue.js';
+
+export { getTransportContextBudgetMs };
 import {
   AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES,
   AGENT_DELEGATION_NOTIFICATION_RESULTS,
+  isDelegationUnsupportedControlText,
   type AgentDelegationNotificationResult,
 } from '../../shared/agent-delegation.js';
+import {
+  MEMORY_MCP_SEND_DELIVERY_MODES,
+  type MemoryMcpSendDeliveryMode,
+} from '../../shared/memory-mcp-contracts.js';
 
 export interface PendingTransportMessage {
   clientMessageId: string;
@@ -117,15 +153,27 @@ export interface PendingTransportMessage {
    * without it, only immediately-sent messages were auditable.
    */
   aliasAudit?: AliasSendAudit;
+  /**
+   * Who authored this message (shared/chat-message-origin.ts). Rides the queued
+   * entry like `aliasAudit`, so a daemon or agent message projected after a
+   * drain, a reconnect or a restart is not rendered as the human's input.
+   */
+  messageOrigin?: ChatMessageOrigin;
   /** Provider-visible per-turn context rendered through the shared context preamble path. */
   messagePreamble?: string;
   attachments?: TransportAttachment[];
   /** Server-authored share actor for attribution only; never injected into provider prompts. */
   sharedActor?: SharedActorEnvelope;
+  /** @internal: opaque server-signed device authority; never exposed in public projections/prompts. */
+  sharedMachineAuthority?: string;
   /** @internal: this logical user event has already been written to the timeline. */
   timelineCommitted?: boolean;
   /** @internal: this logical user event has already been written to runtime history. */
   historyCommitted?: boolean;
+  /** @internal: retain provider-native append intent across the pre-send startup window. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
+  /** @internal: distinguishes a human queue steer from an MCP append. */
+  activeTurnDeliveryKind?: ProviderActiveTurnDeliveryKind;
   /** @internal: private peer-audit queue ownership; excluded from public snapshots. */
   peerAudit?: {
     contractVersion: string;
@@ -135,6 +183,34 @@ export interface PendingTransportMessage {
   delegationReply?: {
     delegationId: string;
   };
+  /**
+   * @internal: command-mode send (shared/send-command-mode.ts). Delivered as
+   * exactly this text: no per-turn memory/identity/preamble enrichment, and it
+   * is dispatched alone rather than merged with neighbouring queued messages.
+   */
+  commandMode?: true;
+  /** @internal: daemon-owned lifecycle authority, never inferred from text. */
+  supervisionReference?: QueueSupervisionReference;
+  /** @internal: exact resend lease already transferred into this runtime. */
+  queueHandoff?: TransportQueueHandoffOwnership;
+  /** @internal: dynamic system contract registration; never exposed publicly. */
+  registeredSystemContract?: {
+    contractId: string;
+    signature: string;
+    body: string;
+  };
+}
+
+export type ExternalAppendResult = 'sent' | 'appended' | 'stale' | 'retry' | 'unsupported';
+
+export type TransportQueueAdmissionDecision = QueueSupervisionAdmission;
+
+function normalizeQueueAdmissionDecision(
+  decision: boolean | TransportQueueAdmissionDecision,
+): TransportQueueAdmissionDecision {
+  if (decision === true || decision === 'authorized') return 'authorized';
+  if (decision === 'retry') return 'retry';
+  return 'stale';
 }
 
 export type AppendQueuedMessagesResult =
@@ -144,7 +220,14 @@ export type AppendQueuedMessagesResult =
       queueSnapshot: QueueSnapshot;
       deliveryFacts: QueueDeliveryFact[];
     }
-  | { status: 'stale' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
+  // No turn was actually active (it already settled — completed, failed, hit
+  // the send-start timeout, was stopped, or the provider crashed/restarted)
+  // by the time this append was processed. The session-level queue is not
+  // bound to any one turn: rather than fail with a stale "already finished"
+  // error and leave the queue stuck, the pending queue was dispatched as a
+  // fresh turn instead.
+  | { status: 'dispatched_as_new_turn' }
+  | { status: 'stale' | 'rejected' | 'retry' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
 
 type SdkTurnLostRecoveryAttemptStatus =
   | 'detected'
@@ -168,6 +251,8 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   const publicEntry: PendingTransportMessage = { ...entry };
   delete publicEntry.timelineCommitted;
   delete publicEntry.historyCommitted;
+  delete publicEntry.deliveryMode;
+  delete publicEntry.activeTurnDeliveryKind;
   // RV-B: the expanded alias value (`providerText`) and the per-turn
   // `messagePreamble` are secret agent-bound material. The public projection
   // feeds diagnostics / status snapshots / UI / the onDrain callback — none of
@@ -175,15 +260,22 @@ function publicPendingEntry(entry: PendingTransportMessage): PendingTransportMes
   // full material for internal resend preservation only.
   delete publicEntry.providerText;
   delete publicEntry.messagePreamble;
+  delete publicEntry.sharedMachineAuthority;
   // `aliasAudit` deliberately survives: it holds only referenced names and a
   // hash, and the onDrain consumer needs it to anchor the final user.message.
   delete publicEntry.peerAudit;
   delete publicEntry.delegationReply;
+  delete publicEntry.commandMode;
+  delete publicEntry.supervisionReference;
+  delete publicEntry.queueHandoff;
+  delete publicEntry.registeredSystemContract;
   return publicEntry;
 }
 
 export interface TransportSendMetadata {
   sharedActor?: SharedActorEnvelope;
+  /** @internal: opaque server-signed device authority for this exact shared turn. */
+  sharedMachineAuthority?: string;
   /**
    * Agent-bound text after alias expansion (A′). When present the provider (and
    * runtime history) receive this text while the timeline keeps the ORIGINAL
@@ -192,6 +284,8 @@ export interface TransportSendMetadata {
   providerText?: string;
   /** Alias send audit anchor to project onto this message's timeline event. */
   aliasAudit?: AliasSendAudit;
+  /** Author of a non-human message, projected onto its eventual timeline event. */
+  messageOrigin?: ChatMessageOrigin;
   /**
    * Where to place this message when a provider turn is already active.
    * `front` is reserved for out-of-band dialog answers (ask.answer):
@@ -204,6 +298,10 @@ export interface TransportSendMetadata {
   timelineCommitted?: boolean;
   /** @internal: set when replaying entries that already exist in runtime history. */
   historyCommitted?: boolean;
+  /** @internal: provider-native delivery requested before the live query exists. */
+  deliveryMode?: MemoryMcpSendDeliveryMode;
+  /** @internal: exact provider notification kind for a native active-turn append. */
+  activeTurnDeliveryKind?: ProviderActiveTurnDeliveryKind;
   /** @internal: marks a persisted queued row as an ephemeral peer-audit brief. */
   peerAudit?: {
     contractVersion: string;
@@ -213,6 +311,23 @@ export interface TransportSendMetadata {
   delegationReply?: {
     delegationId: string;
   };
+  /** @internal: command-mode send, delivered verbatim (see PendingTransportMessage.commandMode). */
+  commandMode?: true;
+  /** @internal: daemon-owned lifecycle authority revalidated before provider admission. */
+  supervisionReference?: QueueSupervisionReference;
+  /** @internal: existing durable lease transferred by drainResend. */
+  queueHandoff?: TransportQueueHandoffOwnership;
+  /** @internal: full contract body retained only for provider-thread registration/replay. */
+  registeredSystemContract?: {
+    contractId: string;
+    signature: string;
+    body: string;
+  };
+}
+
+export interface TransportQueueHandoffOwnership {
+  clientMessageId: string;
+  handoffId: string;
 }
 
 export interface TransportRuntimeDiagnosticSnapshot {
@@ -240,15 +355,14 @@ export interface TransportRuntimeDiagnosticSnapshot {
   backgroundWorkCount: number;
   activeToolCount: number;
   busyReasons: SessionActivityBusyReason[];
+  /** Present for the whole episode (from the first capacity failure until the turn goes through, STOP, or a permanent error). */
+  capacityRetry?: { attempt: number; /** 0 while an attempt is in flight */ retryAt: number; since: number; error: string };
 }
 
-const DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS = 2_500;
 const DEFAULT_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 60_000;
 const DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS = 10_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_RECOVERY_MS = 300_000;
 const DEFAULT_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 5_000;
-const MIN_TRANSPORT_CONTEXT_BUDGET_MS = 50;
-const MAX_TRANSPORT_CONTEXT_BUDGET_MS = 30_000;
 const MIN_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 50;
 const MAX_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS = 10 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_RECOVERY_MS = 10_000;
@@ -267,6 +381,15 @@ const MAX_RECOVERABLE_DISPATCH_RETRIES = 15;
 // full generic retry budget (≈2 minutes): preserve the turn and let
 // session-manager relaunch the provider after a few confirmations.
 const MAX_RECOVERABLE_BUSY_DISPATCH_RETRIES = 3;
+// Provider capacity/overload is transient: the same session keeps the same turn queued and retries it until the provider
+// accepts it (shared/capacity-retry.ts: 1s, 2s, 4s, 8s, then every 15s, no give-up window). Only success, STOP or a permanent
+// error ends the episode.
+// A final-edge supervision authority check can fail transiently while the
+// session registry/runtime projection catches up. Retry with a small capped
+// backoff, but never spin forever and never make the control row a FIFO lock.
+const PENDING_AUTHORITY_RETRY_BASE_MS = 100;
+const PENDING_AUTHORITY_RETRY_MAX_MS = 2_000;
+const MAX_PENDING_AUTHORITY_RETRIES = 6;
 const MAX_TRANSPORT_STALE_PENDING_RECOVERY_MS = 30 * 60_000;
 const MIN_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 50;
 const MAX_TRANSPORT_STALE_PENDING_CANCEL_FALLBACK_MS = 60_000;
@@ -300,37 +423,6 @@ function isRecoverableProviderBusyError(error: ProviderError): boolean {
     && /already busy|session is busy|provider is busy/i.test(error.message);
 }
 
-type TimeoutOutcome<T> =
-  | { timedOut: false; value: T }
-  | { timedOut: true };
-
-function readBoundedTimeoutMs(
-  envName: string,
-  fallbackMs: number,
-  minMs: number,
-  maxMs: number,
-  options?: { allowZero?: boolean },
-): number {
-  const raw = process.env[envName];
-  if (raw === undefined || raw.trim() === '') return fallbackMs;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || !Number.isInteger(parsed)) return fallbackMs;
-  if (options?.allowZero && parsed === 0) return 0;
-  if (parsed < minMs) return minMs;
-  if (parsed > maxMs) return maxMs;
-  return parsed;
-}
-
-export function getTransportContextBudgetMs(): number {
-  return readBoundedTimeoutMs(
-    'IMCODES_TRANSPORT_CONTEXT_BUDGET_MS',
-    DEFAULT_TRANSPORT_CONTEXT_BUDGET_MS,
-    MIN_TRANSPORT_CONTEXT_BUDGET_MS,
-    MAX_TRANSPORT_CONTEXT_BUDGET_MS,
-    { allowZero: false },
-  );
-}
-
 export function getTransportProviderSendTimeoutMs(): number {
   return readBoundedTimeoutMs(
     'IMCODES_TRANSPORT_PROVIDER_SEND_TIMEOUT_MS',
@@ -361,32 +453,40 @@ export function getTransportStalePendingCancelFallbackMs(): number {
   );
 }
 
-function withTimeoutOutcome<T>(
-  promise: Promise<T>,
-  timeoutMs: number,
-): Promise<TimeoutOutcome<T>> {
-  if (!timeoutMs || timeoutMs <= 0 || !Number.isFinite(timeoutMs)) {
-    return promise.then((value) => ({ timedOut: false, value }));
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  return new Promise<TimeoutOutcome<T>>((resolve, reject) => {
-    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
-    timer.unref?.();
-    promise.then(
-      (value) => {
-        if (timer) clearTimeout(timer);
-        resolve({ timedOut: false, value });
-      },
-      (err) => {
-        if (timer) clearTimeout(timer);
-        reject(err);
-      },
-    );
-  });
+interface ActiveDelegationNotificationAdmission {
+  notification: ProviderDelegationNotification;
+  promise: Promise<AgentDelegationNotificationResult>;
+  status: 'pending' | 'delivered';
+}
+
+const MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS = 512;
+
+function sameDelegationNotification(
+  left: ProviderDelegationNotification,
+  right: ProviderDelegationNotification,
+): boolean {
+  return left.notificationId === right.notificationId
+    && left.delegationId === right.delegationId
+    && left.sourceSessionName === right.sourceSessionName
+    && left.text === right.text;
 }
 
 function isTransportSlashControl(message: string | undefined): boolean {
   return message?.trim().startsWith('/') === true;
+}
+
+/**
+ * The entries one drained turn takes from the pending FIFO. Ordinary messages
+ * are merged into a single turn; a command-mode entry must reach the provider as
+ * exactly its own text, so it is never merged with a neighbour: the turn is the
+ * run of ordinary entries before the first command entry, or that command entry
+ * alone when it is at the head. Order is preserved; the rest drain next turn.
+ */
+function takeDrainBatch(entries: PendingTransportMessage[]): PendingTransportMessage[] {
+  const firstCommand = entries.findIndex((entry) => entry.commandMode === true);
+  if (firstCommand < 0) return entries;
+  if (firstCommand === 0) return [entries[0]!];
+  return entries.slice(0, firstCommand);
 }
 
 function makeCancelledProviderError(): ProviderError {
@@ -414,6 +514,28 @@ function makeCancelledProviderError(): ProviderError {
  *
  * onStatusChange fires on every transition (deduplicated).
  */
+/**
+ * Automatic compaction threshold: share of the model's context window a
+ * finished turn may use before the runtime compacts. Above 1 the threshold is
+ * unreachable, so the runtime's own automatic compaction is effectively off;
+ * that is the default until compaction queueing is proven. 0.75 was the
+ * previous default (Codex's own auto-compact fired too late).
+ */
+export const TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO = 1.1;
+
+/** `IMCODES_TRANSPORT_AUTO_COMPACT_RATIO` (0.05-1.5) overrides the ratio; e.g. 0.75 re-enables it. */
+export function transportAutoCompactRatio(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.IMCODES_TRANSPORT_AUTO_COMPACT_RATIO);
+  return Number.isFinite(raw) && raw >= 0.05 && raw <= 1.5 ? raw : TRANSPORT_AUTO_COMPACT_CONTEXT_RATIO;
+}
+/** At most one automatic compaction per session in this window. */
+export const TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS = 10 * 60 * 1000;
+
+/** One registration per Brain contract variant: supervision mode and engine. */
+function brainContractVariantKey(automaticSupervision: boolean, taskPairEngine: TaskPairEngineState): string {
+  return `${automaticSupervision ? 'automatic' : 'manual'}:${taskPairEngine}`;
+}
+
 export class TransportSessionRuntime implements SessionRuntime {
   readonly type = RUNTIME_TYPES.TRANSPORT;
 
@@ -443,6 +565,7 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _lastProviderOutputAt = 0;
   private _description: string | undefined;
   private _systemPrompt: string | undefined;
+  private _identityPrompt: string | undefined;
   /**
    * Session-stable IM.codes identity (exact session name + display label).
    * Injected at assembly-time into `sessionSystemText`, peer-level with
@@ -450,7 +573,22 @@ export class TransportSessionRuntime implements SessionRuntime {
    * `USER_SESSION_TEXT_MAX_CHARS` cap that bounds user-authored
    * `_description` / `_systemPrompt`. See p2p audit 37bfbb85-430 N-A.
    */
-  private _sessionIdentity: { sessionName: string; label: string | null } | undefined;
+  private _sessionIdentity: { sessionName: string; label: string | null; role?: SessionRecord['role'] } | undefined;
+  /**
+   * Which Brain work-delegation contract VARIANT has its full body registered on
+   * the CURRENT thread: the variant (supervision mode and engine) it was built for, or null
+   * when none is. Reset on thread (re)creation and on compaction, because those
+   * are exactly the points where the registered text no longer exists. Keyed by
+   * variant because a registration of one never stands in for the other.
+   */
+  private _brainContractRegisteredVariant: string | null = null;
+  /**
+   * Reads the session's CURRENT supervision snapshot. Consulted on every turn,
+   * so a mode change takes effect on the next turn without a restart.
+   */
+  private _supervisionSnapshotResolver:
+    (() => Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined) | null = null;
+  private _registeredSystemContractSignatures = new Map<string, string>();
   private _agentId: string | undefined;
   private _effort: TransportEffortLevel | undefined;
   private _contextNamespace: ContextNamespace | undefined;
@@ -465,12 +603,29 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _startupMemory: TransportMemoryRecallArtifact | null = null;
   private _startupMemoryTimelineEmitted = false;
   private _startupMemoryInjected = false;
+  private _pendingHandoff: CrossVendorHandoffPack | null = null;
+  private _pendingHandoffReady: Promise<CrossVendorHandoffPack | undefined> | undefined;
+  private _pendingHandoffWaitMs: number = CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs;
+  private _onPendingHandoffConsumed?: () => void;
   /** Last provider-visible preference context block injected into this provider conversation.
    *  Preferences are stable session context, not per-turn recall; repeat injection
    *  bloats SDK prompt windows and can trigger provider auto-compaction. */
   private _lastInjectedPreferenceContextSignature: string | null = null;
   private _preferenceContextInjectionAttempt: { previous: string | null } | null = null;
+  /** Last full standing-contract preamble accepted by this provider conversation. */
+  private _lastInjectedSupervisionContractSignature: string | null = null;
+  private _supervisionContractInjectionAttempt: { previous: string | null } | null = null;
   private _contextBootstrapResolver: (() => Promise<TransportContextBootstrap>) | undefined;
+  /** Bumped by every applied bootstrap; lets a late result recognise that something newer already landed. */
+  private _contextBootstrapGeneration = 0;
+  /**
+   * A launch-time bootstrap that outlived the launch's context budget and is still running. The
+   * launch does not wait for it (see `deferContextBootstrap`); the first dispatch(es) reuse it
+   * instead of starting a second copy against a store that is already backed up.
+   */
+  private _deferredContextBootstrap: Promise<TransportContextBootstrap> | undefined;
+  /** `_contextBootstrapGeneration` when the deferred bootstrap was last (re)based; only an unchanged generation accepts its late result. */
+  private _deferredContextBootstrapBase = 0;
   private _unsubscribes: Array<() => void> = [];
   private _onStatusChange?: (status: AgentStatus) => void;
 
@@ -504,6 +659,24 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _activeDispatchCancelled = false;
   /** True once the active dispatch has crossed into provider.send(). */
   private _activeDispatchProviderStarted = false;
+  /**
+   * True only after provider.send() fulfils its send-start/admission contract.
+   * This is deliberately separate from `ProviderStarted`: several adapters do
+   * asynchronous session/bootstrap work before the original user message is
+   * accepted.  Appending during that gap can either return a false STALE or,
+   * worse, put B ahead of A at the provider.
+   */
+  private _activeDispatchProviderAccepted = false;
+  /** One serialized native-append flush; new rows are picked up by its loop. */
+  private _activeAppendFlush: Promise<void> | null = null;
+  /** Runtime-level authority for active delegation admissions. Provider state
+   *  can settle before its serialized write does; keeping the same Promise and
+   *  delivered tombstone here prevents a timeout retry from falling through
+   *  to a second idle turn while the first write can still succeed. */
+  private readonly _activeDelegationNotificationAdmissions = new Map<
+    string,
+    ActiveDelegationNotificationAdmission
+  >();
   private _activeDispatchId: number | null = null;
   /** Summary delivery ownership for the active provider turn. A provider
    * accepting send() is not proof that the model consumed the context: the
@@ -520,6 +693,10 @@ export class TransportSessionRuntime implements SessionRuntime {
   // Consecutive recoverable dispatch-failure count for the current run of
   // retries; reset to 0 on any provider activity / successful send.
   private _recoverableDispatchRetries = 0;
+  /** When this runtime last compacted on its own (see maybeAutoCompact). */
+  private _lastAutoCompactAt = 0;
+  /** The provider reported compacting during the current turn. */
+  private _compactionObservedInTurn = false;
   // Pending backoff timer for the next auto-retry drain. While set, the session
   // counts as having active turn work (so new sends queue in order behind the
   // message being retried) and presents an in-progress status, not idle.
@@ -529,6 +706,17 @@ export class TransportSessionRuntime implements SessionRuntime {
   // must remain a separate turn or they would change provider-level delivery
   // identity and could replay already-accepted side effects.
   private _recoverableRetryEntryIds: string[] = [];
+  private _capacityRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private _capacityRetryEntryIds: string[] = [];
+  private _capacityRetryAttempt = 0;
+  private _capacityRetryStartedAt = 0;
+  private _capacityRetryAt = 0;
+  private _capacityRetryError = '';
+  private _capacityRetrySuccessTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Fired when a capacity-retry episode starts or ends, so the UI notice shows once per episode and clears on success. */
+  onCapacityRetryChange: ((active: boolean) => void) | null = null;
+  private _pendingAuthorityRetryTimer: ReturnType<typeof setTimeout> | null = null;
+  private readonly _pendingAuthorityRetryAttempts = new Map<string, number>();
   private _nextDispatchId = 0;
   private _activityGeneration = 0;
   private readonly _openTools = new Map<string, { generation: number; name: string; status: 'running' }>();
@@ -546,9 +734,19 @@ export class TransportSessionRuntime implements SessionRuntime {
   private _cancelledProviderErrorsToIgnore = 0;
   private _codexRolloutBackstopTimer: ReturnType<typeof setTimeout> | null = null;
   private _codexRolloutBackstopInFlight = false;
+  /**
+   * True when this runtime normalized or purged durable rows while proving
+   * queue ownership. Session-manager uses this to rehydrate SQLite-only rows
+   * even when canonicalization had to run before SessionRecord epoch rotation.
+   */
+  private _queueRecipientRecoveryChanged = false;
 
   /** Callback fired when pending messages are drained into a new turn. */
   private _onDrain?: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void;
+  /** Synchronous authority check run immediately before a queued entry drains. */
+  private _pendingDrainAdmission?: (message: PendingTransportMessage) => boolean | TransportQueueAdmissionDecision;
+  /** Callback fired when composer rows are admitted into the current provider turn. */
+  private _onActiveAppend?: (messages: PendingTransportMessage[], snapshot: QueueSnapshot) => void;
   private _onSessionInfoChange?: (info: SessionInfoUpdate) => void;
   /** Fired when the provider session binds (a non-null providerSessionId is
    *  established) and the runtime is fully configured. The daemon uses this to
@@ -564,6 +762,15 @@ export class TransportSessionRuntime implements SessionRuntime {
   constructor(
     private readonly provider: TransportProvider,
     private readonly sessionKey: string,
+    /**
+     * The identity of the instance THIS runtime serves, captured at construction.
+     * It is deliberately not looked up later: after a same-named session takes
+     * over, a late lookup would return the successor and hand it the previous
+     * instance's durable queue.
+     */
+    private queueRecipient?: QueueRecipientIdentity,
+    /** Persisted-record evidence used only to recover pre-identity queue rows. */
+    private readonly queueOwnershipEvidence?: LegacyQueueOwnershipEvidence,
   ) {
     this._unsubscribes.push(
       this.provider.onDelta((sid: string, _delta: MessageDelta) => {
@@ -586,9 +793,23 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
         this._lastProviderOutputAt = this._lastActivityAt;
+        const hadLocalActiveTurn = this.hasLocalActiveTurnWork();
+        // Provider callbacks are not dispatch-scoped. A completion belonging
+        // to the turn that just failed with capacity must not clear the
+        // pending retry owned by this runtime, or it would bypass backoff (and
+        // could strand the preserved entry when no active turn remains).
+        if (!hadLocalActiveTurn
+          && (this._capacityRetryTimer !== null || this._capacityRetryEntryIds.length > 0)) {
+          logger.warn(
+            { sessionKey: this.sessionKey, pendingCount: this._pendingMessages.length },
+            'transport runtime ignored late completion while capacity retry is pending',
+          );
+          return;
+        }
         // A completed turn means the provider is responsive and queued work is
         // about to drain — clear any recoverable-retry streak.
         this._recoverableDispatchRetries = 0;
+        if (hadLocalActiveTurn) this.cancelCapacityRetry(false);
         if (this._externalCompletionSettlementsToIgnore > 0) {
           this._externalCompletionSettlementsToIgnore--;
           logger.warn(
@@ -614,6 +835,11 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this._activeDispatchCancelled) {
           this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
           this.clearStalePendingCancelFallbackTimer();
+          this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+            providerStarted: true,
+            providerAccepted: true,
+            reason: 'provider_complete_after_cancel',
+          });
           this._sending = false;
           this._activeTurn?.reject(makeCancelledProviderError());
           this._activeTurn = null;
@@ -634,10 +860,24 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (!this._activeDispatchCancelled && this.hasActiveTurnWork()) {
           this.markSdkTurnLostRecoveredOnProviderActivity();
         }
-        if (isTransportCompactionCompletion(message)) {
-          this._lastInjectedPreferenceContextSignature = null;
-        }
+        // Compaction is recognized three ways: the provider tagged the
+        // completion; the turn answered a `/compact` the runtime dispatched
+        // (Claude's slash command completes untagged); or the provider
+        // reported compacting during the turn (its own auto-compaction).
+        const compacted = isTransportCompactionCompletion(message)
+          || this.activeDispatchIsCompactCommand()
+          || this._compactionObservedInTurn;
+        this._compactionObservedInTurn = false;
+        if (compacted) this.reinjectAfterCompaction();
         this.clearStalePendingCancelFallbackTimer();
+        // Some providers emit onComplete synchronously while sendProviderTurn is
+        // still unwinding. In that ordering the acceptance continuation below
+        // observes a cleared dispatch; record the durable delivery boundary
+        // before onComplete releases the active entries instead.
+        if (this._activeDispatchId !== null && !this._activeDispatchProviderAccepted) {
+          this._activeDispatchProviderAccepted = true;
+          this.recordDirectDispatchDelivery(this._activeDispatchId);
+        }
         this._sending = false;
         this._history.push(message);
         const completedEntry = this._activeDispatchEntries.length === 1
@@ -672,6 +912,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         // If there are queued messages, merge and send — status stays running.
         if (!this._drainPending()) {
           this.setStatus('idle');
+          if (!compacted) this.maybeAutoCompact(message);
         }
       }),
       this.provider.onError((sid: string, error: ProviderError) => {
@@ -724,6 +965,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         if (this.handleSdkTurnLostRecovery(error)) {
           return;
         }
+        if (!this.hasLocalActiveTurnWork() && this._capacityRetryTimer !== null && this._capacityRetryEntryIds.length > 0) {
+          // A duplicate/late error notification for the turn that already failed with capacity: the retry timer owns the
+          // queued turn. Surfacing it as a session error would look like the retry had died (and the pair heartbeat would react).
+          logger.debug({ sessionKey: this.sessionKey, errorCode: error.code }, 'transport runtime absorbed a late provider error while a capacity retry is pending');
+          return;
+        }
         if (!this.hasActiveTurnWork()) {
           // Late/out-of-band error with no active turn to reject. If there is no
           // queued work, keep the already-settled session idle instead of
@@ -753,7 +1000,15 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         }
         this.recordProviderError(error);
-        logger.warn(
+        // Capacity retry is safe only before provider admission. Once the
+        // provider has started/accepted the send (or emitted side-effect
+        // evidence), the outcome is ambiguous and the handoff must be
+        // terminalized rather than released back into the durable queue.
+        const capacityRetryEligible = this.canRetryBeforeProviderBoundary(error)
+          && this.willRetryAsCapacity(error);
+        // A capacity failure that is about to be retried logs at debug: the episode start (warn) and the periodic count carry it.
+        (capacityRetryEligible ? logger.debug : logger.warn).call(
+          logger,
           {
             sessionKey: this.sessionKey,
             provider: this.provider.id,
@@ -766,11 +1021,39 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport runtime provider error',
         );
+        // Capacity/overload is retryable on this exact session, even when the
+        // SDK marked the error non-recoverable. Preserve the failed logical
+        // turn and keep the runtime in-progress while the bounded timer owns
+        // the next drain; never fail over or switch provider here.
+        if (capacityRetryEligible && this.requeueAndScheduleCapacityRetry(error)) {
+          this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
+          this._sending = false;
+          this._activeTurn?.reject(error);
+          this._activeTurn = null;
+          this.clearStalePendingCancelFallbackTimer();
+          this._activeDispatchProviderStarted = false;
+          this._activeDispatchProviderAccepted = false;
+          this._activeDispatchCancelled = false;
+          this.closeOpenTools('errored', 'provider_error');
+          this._activeDispatchId = null;
+          this._activeDispatchStaleRecoveryStarted = false;
+          this.setStatus('thinking');
+          return;
+        }
+        // Not retryable (permanent, or unclassified): a capacity episode that was in progress ends here.
+        if (this._activeDispatchEntries.length > 0) this.cancelCapacityRetry(false);
         this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
         this._sending = false;
         this._activeTurn?.reject(error);
         this._activeTurn = null;
         this.clearStalePendingCancelFallbackTimer();
+        const activeEntries = this._activeDispatchEntries;
+        this.settleActiveDispatchHandoffs(activeEntries, {
+          providerStarted: this._activeDispatchProviderStarted,
+          providerAccepted: this._activeDispatchProviderAccepted,
+          sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+          reason: `provider_error:${error.code}`,
+        });
         this._activeDispatchProviderStarted = false;
         this.closeOpenTools(error.code === 'CANCELLED' ? 'cancelled' : 'errored', error.code === 'CANCELLED' ? 'user_cancelled' : 'provider_error');
         if (this._activeDispatchId !== null) {
@@ -799,6 +1082,13 @@ export class TransportSessionRuntime implements SessionRuntime {
           // so non-relaunch errors cannot wedge future sends behind a phantom
           // dispatch.
           this._activeDispatchEntries = [];
+          // The session-level queue is not tied to this one turn: a genuinely
+          // unrecoverable provider error (crash, auth failure, restart) must
+          // not leave anything queued behind it waiting forever for a turn
+          // that will never resume. Drain it as a fresh turn; if the provider
+          // really is down, the next attempt fails fast the same way instead
+          // of the session sitting stuck in a permanent "working" state.
+          this._drainPending();
         }
       }),
       ...(this.provider.onSessionInfo ? [this.provider.onSessionInfo((sid: string, info: SessionInfoUpdate) => {
@@ -806,9 +1096,13 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._lastActivityAt = Date.now();
         this._onSessionInfoChange?.(info);
       })] : []),
-      ...(this.provider.onStatus ? [this.provider.onStatus((sid: string, _status: ProviderStatusUpdate) => {
+      ...(this.provider.onStatus ? [this.provider.onStatus((sid: string, status: ProviderStatusUpdate) => {
         if (sid !== this._providerSessionId) return;
         this._lastActivityAt = Date.now();
+        // Providers also compact on their own mid-turn (Claude's
+        // compact_boundary, Codex's inline auto-compaction). Remember it so the
+        // turn's completion re-injects what compaction may have summarized.
+        if (status?.status === 'compacting') this._compactionObservedInTurn = true;
       })] : []),
       ...(this.provider.onUsage ? [this.provider.onUsage((sid: string, _update: ProviderUsageUpdate) => {
         if (sid !== this._providerSessionId) return;
@@ -851,6 +1145,8 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   /** Register a callback for when pending messages are drained into a new turn. */
   set onDrain(cb: (messages: PendingTransportMessage[], mergedMessage: string, count: number, metadata: ActivityDrainMetadata) => void) { this._onDrain = cb; }
+  set pendingDrainAdmission(cb: (message: PendingTransportMessage) => boolean | TransportQueueAdmissionDecision) { this._pendingDrainAdmission = cb; }
+  set onActiveAppend(cb: (messages: PendingTransportMessage[], snapshot: QueueSnapshot) => void) { this._onActiveAppend = cb; }
   /** Register a callback fired exactly once when startup memory reaches the provider. */
   set onStartupMemoryInjected(cb: () => void) { this._onStartupMemoryInjected = cb; }
   /** Register a callback for provider session metadata updates. */
@@ -882,15 +1178,82 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
   setDescription(desc: string): void { this._description = clampUserSessionText(desc); }
   setSystemPrompt(prompt: string): void { this._systemPrompt = clampUserSessionText(prompt); }
+  setIdentityPrompt(prompt: string | undefined): void {
+    this._identityPrompt = prompt?.trim() || undefined;
+  }
+  refreshIdentityPrompt(): void {
+    if (this._providerSessionId) this.provider.refreshSessionSystemText?.(this._providerSessionId);
+  }
   /**
    * Update the session-stable IM.codes identity injected into every
    * transport turn's `sessionSystemText`. Daemon-injected and NOT subject
    * to `USER_SESSION_TEXT_MAX_CHARS` — see p2p audit 37bfbb85-430 N-A.
    */
-  setSessionIdentity(sessionName: string, label: string | null | undefined): void {
+  setSessionIdentity(
+    sessionName: string,
+    label: string | null | undefined,
+    role?: SessionRecord['role'],
+  ): void {
     const exact = sessionName.trim();
     if (!exact) return;
-    this._sessionIdentity = { sessionName: exact, label: label?.trim() || null };
+    // `role` is the authoritative session-record value. It gates the per-turn
+    // Brain delegation contract, so it must never be derived from sessionName.
+    this._sessionIdentity = {
+      sessionName: exact,
+      label: label?.trim() || null,
+      ...(role ? { role } : {}),
+    };
+  }
+  setSupervisionSnapshotResolver(
+    resolver: (() => Pick<SessionSupervisionSnapshot, 'mode'> | null | undefined) | null,
+  ): void {
+    this._supervisionSnapshotResolver = resolver;
+  }
+
+  /**
+   * This turn's answer from the single supervision mode authority. Anything that
+   * prevents establishing the mode -- no resolver, a throwing resolver, an
+   * unknown mode -- answers false: automatic supervision fails closed.
+   */
+  private resolveAutomaticSupervisionEnabled(): boolean {
+    const resolver = this._supervisionSnapshotResolver;
+    if (!resolver) return false;
+    try {
+      return isAutomaticSupervisionEnabled(resolver() ?? null);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'supervision mode unavailable; treating automatic supervision as off');
+      return false;
+    }
+  }
+  /**
+   * Which task-pair engine state governs this session's manual-audited-work
+   * contract: `pairs`, `legacy`, or `off` (no engine explicitly configured,
+   * or the project is unknown -- neither pairs nor legacy automation may
+   * run, so the contract must not fall back to `pairs` or `legacy` just
+   * because it isn't the other one).
+   */
+  private resolveTaskPairEngine(): TaskPairEngineState {
+    // No `!project` short-circuit: resolveTaskPairEngineState already checks
+    // the env override before it needs a project, and an override must win
+    // even for a session whose project cannot be resolved.
+    try {
+      return resolveTaskPairEngineState(projectOfSession(this.sessionKey));
+    } catch {
+      return 'off';
+    }
+  }
+  /**
+   * The pair workspace this turn must run in (an open pair's executor/auditor),
+   * resolved from live pair state on every turn so nothing needs reverting when
+   * the pair ends. Never throws: a turn must not fail because of a lookup.
+   */
+  private resolvePairTurnCwd(): string | undefined {
+    try {
+      return resolveTaskPairTurnCwd(this.sessionKey)?.cwd;
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'pair turn cwd unavailable; the turn runs in the session cwd');
+      return undefined;
+    }
   }
   setAgentId(agentId: string): void {
     this._agentId = agentId;
@@ -919,6 +1282,27 @@ export class TransportSessionRuntime implements SessionRuntime {
     await this.provider.setServiceTier(this._providerSessionId, tier);
   }
 
+  /**
+   * How the provider serving this runtime keeps native agent tools out of
+   * managed work, and for a `session_fence` provider the fence of THIS
+   * runtime's provider session. Anything the provider cannot state or answer
+   * is reported as an unproven default, never as a fence.
+   */
+  async resolveNativeAgentAdmission(): Promise<{ mode: NativeAgentAdmissionMode; fence?: NativeAgentFence }> {
+    const mode = readNativeAgentAdmissionMode(this.provider.capabilities?.nativeAgentAdmission);
+    if (mode !== NATIVE_AGENT_ADMISSION_MODES.SESSION_FENCE) return { mode };
+    const providerSessionId = this._providerSessionId;
+    if (!providerSessionId || !this.provider.getNativeAgentFence) {
+      return { mode, fence: NATIVE_AGENT_FENCES.PROVIDER_DEFAULT };
+    }
+    try {
+      return { mode, fence: await this.provider.getNativeAgentFence(providerSessionId) };
+    } catch (error) {
+      logger.warn({ provider: this.provider.id, providerSessionId, error }, 'native agent fence query failed; treating as unproven');
+      return { mode, fence: NATIVE_AGENT_FENCES.PROVIDER_DEFAULT };
+    }
+  }
+
   get providerSessionId(): string | null { return this._providerSessionId; }
   get sending(): boolean { return this._sending; }
   get lastProviderError(): { code: string; message: string; recoverable: boolean; at: number } | null {
@@ -944,6 +1328,18 @@ export class TransportSessionRuntime implements SessionRuntime {
   get activeDispatchEntries(): PendingTransportMessage[] { return this._activeDispatchEntries.map(publicPendingEntry); }
   /** Snapshot of active entries for internal resend preservation, including idempotency markers. */
   get activeDispatchEntriesForResend(): PendingTransportMessage[] { return this._activeDispatchEntries.map((entry) => ({ ...entry })); }
+
+  /** Opaque authority for the active turn only; ambiguity fails closed. */
+  getActiveSharedMachineAuthority(): string | null {
+    if (this._activeDispatchEntries.length === 0
+      || this._activeDispatchEntries.some((entry) => !entry.sharedMachineAuthority)) return null;
+    const tokens = new Set(this._activeDispatchEntries.map((entry) => entry.sharedMachineAuthority!));
+    return tokens.size === 1 ? [...tokens][0]! : null;
+  }
+
+  requiresSharedMachineAuthority(): boolean {
+    return this._activeDispatchEntries.some((entry) => entry.sharedActor?.effectiveActorRole === 'participant');
+  }
 
   getDiagnosticSnapshot(nowMs: number = Date.now()): TransportRuntimeDiagnosticSnapshot {
     let providerDiagnostics: Record<string, unknown> | null | undefined;
@@ -979,6 +1375,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       backgroundWorkCount: activitySnapshot.backgroundWorkCount,
       activeToolCount: activitySnapshot.activeToolCount,
       busyReasons: activitySnapshot.busyReasons,
+      ...(this._capacityRetryStartedAt > 0
+        ? { capacityRetry: { attempt: this._capacityRetryAttempt, retryAt: this._capacityRetryAt, since: this._capacityRetryStartedAt, error: this._capacityRetryError } }
+        : {}),
     };
   }
 
@@ -1108,9 +1507,118 @@ export class TransportSessionRuntime implements SessionRuntime {
    *     `readSnapshot`). Does NOT itself dispatch; the caller kicks a drain.
    * Returns the number of entries recovered into `_pendingMessages`.
    */
+  /** The identity this runtime serves; rotation is allowed only within the same logical instance. */
+  get recipientIdentity(): QueueRecipientIdentity | undefined { return this.queueRecipient; }
+
+  /** Whether ownership recovery changed durable rows during this runtime launch. */
+  get queueRecipientRecoveryChanged(): boolean { return this._queueRecipientRecoveryChanged; }
+
+  /**
+   * Resume a bounded legacy-row migration. True means recipient-sensitive
+   * reads are safe now; false leaves the queue quarantined.
+   */
+  adoptLegacyQueueRecipient(): boolean {
+    const store = getTransportQueueStore();
+    if (!this.queueRecipient) return false;
+    if (this.queueOwnershipEvidence) {
+      for (let batch = 0; batch < 8; batch++) {
+        const result = store.adoptLegacyRecipientIdentity(
+          this.sessionKey,
+          this.queueRecipient,
+          this.queueOwnershipEvidence,
+        );
+        if (result.status === 'adopted' || result.migrated > 0 || (result.purged ?? 0) > 0) {
+          this._queueRecipientRecoveryChanged = true;
+        }
+        if (result.status === 'adopted' || result.status === 'already_bound') return true;
+        if (result.status === 'identity_conflict'
+          || (result.migrated === 0 && (result.purged ?? 0) === 0)) return false;
+      }
+      return false;
+    }
+    return store.queueBelongsTo(this.sessionKey, this.queueRecipient);
+  }
+
+  /**
+   * Ownership recovery that repairs before it destroys.
+   *
+   * `adoptLegacyQueueRecipient` only migrates pre-identity NULL rows; every
+   * other mismatch fell straight through to discarding the whole durable queue.
+   * But a queue one epoch behind THIS SAME instance is not a foreign queue --
+   * it is this session's own work, left behind because the epoch rotated on a
+   * path that never called `rebindQueueRecipient`. Daemon restart is exactly
+   * that path: it rebuilds the runtime directly from the already-rotated
+   * persisted record, so the store is still bound to the previous epoch and the
+   * user's queued messages were silently deleted on every restart.
+   *
+   * The INSTANCE dimension stays absolute. A same-named successor instance is
+   * refused here and still falls through to the destructive path, so a
+   * replacement session can never inherit its predecessor's queue.
+   */
+  adoptOrRebindQueueRecipient(): boolean {
+    if (this.adoptLegacyQueueRecipient()) return true;
+    const mine = this.queueRecipient;
+    if (!mine) return false;
+    const store = getTransportQueueStore();
+    const bound = store.boundRecipient(this.sessionKey);
+    if (!bound
+      || bound.sessionInstanceId !== mine.sessionInstanceId
+      || bound.runtimeEpoch === mine.runtimeEpoch) return false;
+    if (!store.rebindRecipientRuntimeEpoch(this.sessionKey, bound, mine)) return false;
+    this._queueRecipientRecoveryChanged = true;
+    return true;
+  }
+
+  /**
+   * Destructive self-heal for a same-name queue bound to a different canonical
+   * recipient. This preserves the ownership invariant by never draining stale
+   * rows into this runtime; it clears them and binds an empty durable queue so
+   * the session can reconnect/send instead of remaining permanently unavailable.
+   */
+  discardDurableQueueStateForRecipientConflict(
+    recipient?: QueueRecipientIdentity,
+  ): DiscardTransportQueueStateResult | undefined {
+    const targetRecipient = recipient ?? this.queueRecipient;
+    if (!targetRecipient) return undefined;
+    const discarded = getTransportQueueStore().discardSessionQueueState(this.sessionKey, targetRecipient);
+    this.queueRecipient = targetRecipient;
+    this._queueRecipientRecoveryChanged = true;
+    return discarded;
+  }
+
+  /** Update the live runtime after the store rotated only its runtime epoch. */
+  rebindQueueRecipient(expected: QueueRecipientIdentity, next: QueueRecipientIdentity): boolean {
+    if (!this.queueRecipient
+      || this.queueRecipient.sessionInstanceId !== expected.sessionInstanceId
+      || this.queueRecipient.runtimeEpoch !== expected.runtimeEpoch) return false;
+    if (!getTransportQueueStore().rebindRecipientRuntimeEpoch(this.sessionKey, expected, next)) return false;
+    this.queueRecipient = next;
+    return true;
+  }
+
   rehydratePendingFromStore(): number {
     if (!this._providerSessionId) return 0; // not bound yet — caller retries post-initialize
     const store = getTransportQueueStore();
+    // The durable queue under this NAME may belong to a previous instance. A
+    // same-named successor must not recover it; legacy rows carrying no identity
+    // are quarantined by the same gate.
+    if (this.queueRecipient && !store.queueBelongsTo(this.sessionKey, this.queueRecipient)) {
+      if (!this.adoptOrRebindQueueRecipient()) {
+        const discarded = this.discardDurableQueueStateForRecipientConflict();
+        logger.warn({ session: this.sessionKey, discarded }, 'Discarded stale transport queue state during rehydrate ownership recovery');
+        return 0;
+      }
+    }
+    // A callback that died with the previous runtime leaves a leased row. Once
+    // that lease expires it becomes retryable under the SAME clientMessageId;
+    // the store caps attempts and projects `failed` on exhaustion.
+    store.restoreExpiredHandoffs(this.sessionKey);
+    // Rows the provider already received must not be replayed or displayed.
+    try {
+      store.reconcileDeliveredQueueRows(this.sessionKey);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'rehydratePendingFromStore: delivered-row reconcile failed');
+    }
     // Peer-audit capabilities and controller state are intentionally daemon-memory
     // only. After restart no attempt can still own a queued audit brief, so scrub
     // those rows before ordinary queue rehydration while preserving user traffic.
@@ -1143,17 +1651,26 @@ export class TransportSessionRuntime implements SessionRuntime {
       } catch { /* treat missing tombstone table as "no tombstone" */ }
       let entry: PendingTransportMessage | null = null;
       try {
-        const materialJson = store.readPrivateDispatchMaterial(this.sessionKey, clientMessageId);
+        const materialJson = store.readPrivateDispatchMaterial(this.sessionKey, clientMessageId, this.queueRecipient ?? null);
         if (materialJson) {
           const material = JSON.parse(materialJson) as {
             text?: unknown;
             providerText?: unknown;
             aliasAudit?: unknown;
+            messageOrigin?: unknown;
             messagePreamble?: unknown;
             attachmentRefs?: unknown;
             sharedActorEnvelope?: unknown;
+            sharedMachineAuthority?: unknown;
             timelineCommitted?: unknown;
             historyCommitted?: unknown;
+            deliveryMode?: unknown;
+            activeTurnDeliveryKind?: unknown;
+            peerAudit?: unknown;
+            delegationReply?: unknown;
+            commandMode?: unknown;
+            supervisionReference?: unknown;
+            registeredSystemContract?: unknown;
           };
           if (typeof material.text === 'string') {
             entry = {
@@ -1163,11 +1680,38 @@ export class TransportSessionRuntime implements SessionRuntime {
               ...(material.aliasAudit && typeof material.aliasAudit === 'object'
                 ? { aliasAudit: material.aliasAudit as AliasSendAudit }
                 : {}),
+              ...(isChatMessageOrigin(material.messageOrigin) ? { messageOrigin: material.messageOrigin } : {}),
               ...(typeof material.messagePreamble === 'string' && material.messagePreamble ? { messagePreamble: material.messagePreamble } : {}),
               ...(Array.isArray(material.attachmentRefs) && material.attachmentRefs.length ? { attachments: material.attachmentRefs as TransportAttachment[] } : {}),
               ...(material.sharedActorEnvelope ? { sharedActor: material.sharedActorEnvelope as SharedActorEnvelope } : {}),
+              ...(typeof material.sharedMachineAuthority === 'string' && material.sharedMachineAuthority
+                ? { sharedMachineAuthority: material.sharedMachineAuthority }
+                : {}),
               ...(material.timelineCommitted === true ? { timelineCommitted: true } : {}),
               ...(material.historyCommitted === true ? { historyCommitted: true } : {}),
+              ...(material.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+                ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND }
+                : {}),
+              ...(Object.values(PROVIDER_ACTIVE_TURN_DELIVERY_KINDS).includes(
+                material.activeTurnDeliveryKind as ProviderActiveTurnDeliveryKind,
+              )
+                ? { activeTurnDeliveryKind: material.activeTurnDeliveryKind as ProviderActiveTurnDeliveryKind }
+                : {}),
+              ...(material.peerAudit && typeof material.peerAudit === 'object'
+                ? { peerAudit: material.peerAudit as PendingTransportMessage['peerAudit'] }
+                : {}),
+              ...(material.delegationReply && typeof material.delegationReply === 'object'
+                ? { delegationReply: material.delegationReply as PendingTransportMessage['delegationReply'] }
+                : {}),
+              ...(material.commandMode === true ? { commandMode: true as const } : {}),
+              ...((material.supervisionReference && typeof material.supervisionReference === 'object'
+                ? material.supervisionReference
+                : projection.supervisionReference)
+                ? { supervisionReference: (material.supervisionReference ?? projection.supervisionReference) as QueueSupervisionReference }
+                : {}),
+              ...(material.registeredSystemContract && typeof material.registeredSystemContract === 'object'
+                ? { registeredSystemContract: material.registeredSystemContract as PendingTransportMessage['registeredSystemContract'] }
+                : {}),
             };
           }
         }
@@ -1345,6 +1889,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason,
+    });
     this._activeDispatchEntries = [];
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
@@ -1380,6 +1931,209 @@ export class TransportSessionRuntime implements SessionRuntime {
     return true;
   }
 
+  /**
+   * Durably record provider acceptance for the entries of a direct dispatch.
+   *
+   * Best effort and non-fatal: the turn HAS been accepted by the provider, so a
+   * bookkeeping failure must not fail the send. A missing record only makes a
+   * later reader conservative, which is the safe direction.
+   */
+  private recordDirectDispatchDelivery(dispatchId: number): void {
+    this.recordAcceptedDispatchDelivery(dispatchId);
+  }
+
+  /**
+   * Provider acceptance is the only delivery boundary.  Queue rows are leased
+   * before context assembly/provider admission, but they are not finalized
+   * until this method records acceptance.  A daemon restart in that window can
+   * therefore leave the lease quarantined instead of manufacturing a delivery
+   * tombstone for text the provider never saw.
+   */
+  private recordAcceptedDispatchDelivery(dispatchId: number): void {
+    if (this._activeDispatchId !== dispatchId) return;
+    const store = getTransportQueueStore();
+    const deliveryFrameId = randomUUID();
+    const queueClientMessageIds = this._activeDispatchEntries
+      .filter((entry) => !!entry.queueHandoff)
+      .map((entry) => entry.clientMessageId);
+    const clientMessageIds = this._activeDispatchEntries.map((entry) => entry.clientMessageId);
+    for (const entry of this._activeDispatchEntries) {
+      try {
+        if (entry.queueHandoff) {
+          store.recordDeliveryTombstone(
+            this.sessionKey,
+            entry.clientMessageId,
+            deliveryFrameId,
+            undefined,
+            this.queueRecipient ?? null,
+          );
+        } else {
+          store.recordDirectDelivery(
+            this.sessionKey,
+            entry.clientMessageId,
+            deliveryFrameId,
+            undefined,
+            this.queueRecipient ?? null,
+          );
+        }
+      } catch (err) {
+        logger.warn(
+          { err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId, deliveryFrameId },
+          'runtime: delivery acceptance record failed; delivery itself was accepted',
+        );
+      }
+    }
+    if (queueClientMessageIds.length === 0) return;
+    try {
+      const finalized = store.finalizeSentBatch(
+        this.sessionKey,
+        queueClientMessageIds,
+        deliveryFrameId,
+        undefined,
+        this.queueRecipient ?? null,
+      );
+      for (const fact of finalized.deliveryFacts) {
+        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
+          source: 'daemon',
+          confidence: 'high',
+        });
+      }
+      this._pendingVersion = Math.max(this._pendingVersion, finalized.snapshot.pendingMessageVersion);
+    } catch (err) {
+      // The tombstones above make the rows non-replayable; a later reconcile
+      // removes any handoff rows left by a crash or transient SQLite failure.
+      logger.warn(
+        { err, sessionKey: this.sessionKey, clientMessageIds, deliveryFrameId },
+        'runtime: queue finalization failed after provider acceptance; tombstone will reconcile later',
+      );
+    }
+  }
+
+  private acquireDispatchHandoffs(entries: PendingTransportMessage[]): PendingTransportMessage[] | null {
+    const store = getTransportQueueStore();
+    let durableStatuses = new Map<string, string>();
+    try {
+      const snapshot = store.readSnapshot(this.sessionKey, 'dispatch_handoff_probe');
+      durableStatuses = new Map(snapshot.pendingMessageEntries.map((entry) => [entry.clientMessageId, entry.status]));
+    } catch {
+      // Direct runtime retries have no durable row; a read outage must not turn
+      // those in-memory entries into a false handoff failure.
+    }
+    const unleased = entries.filter((entry) => (
+      !entry.queueHandoff && durableStatuses.get(entry.clientMessageId) === 'queued'
+    ));
+    if (unleased.length === 0) return entries.map((entry) => ({ ...entry }));
+    const leased = store.markHandoffInFlight(
+      this.sessionKey,
+      unleased.map((entry) => entry.clientMessageId),
+      RESEND_EXPIRY_MS,
+      Date.now(),
+      this.queueRecipient ?? null,
+    );
+    if (leased.length !== unleased.length) {
+      if (leased.length > 0) {
+        const handoffId = leased[0]?.handoffId;
+        if (handoffId) {
+          try {
+            store.releaseHandoff(this.sessionKey, handoffId, leased.map((item) => item.entry.clientMessageId));
+          } catch (err) {
+            logger.warn({ err, sessionKey: this.sessionKey, handoffId }, 'transport queue handoff release failed after partial admission');
+          }
+        }
+      }
+      return null;
+    }
+    const handoffById = new Map(leased.map((item) => [item.entry.clientMessageId, item.handoffId]));
+    return entries.map((entry) => {
+      const handoffId = handoffById.get(entry.clientMessageId);
+      return handoffId
+        ? { ...entry, queueHandoff: { clientMessageId: entry.clientMessageId, handoffId } }
+        : { ...entry };
+    });
+  }
+
+  private releaseDispatchHandoffs(entries: PendingTransportMessage[]): void {
+    const grouped = new Map<string, string[]>();
+    for (const entry of entries) {
+      const handoff = entry.queueHandoff;
+      if (!handoff) continue;
+      grouped.set(handoff.handoffId, [
+        ...(grouped.get(handoff.handoffId) ?? []),
+        handoff.clientMessageId,
+      ]);
+    }
+    const store = getTransportQueueStore();
+    for (const [handoffId, ids] of grouped) {
+      try {
+        store.releaseHandoff(this.sessionKey, handoffId, ids);
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, handoffId, clientMessageIds: ids }, 'transport queue handoff release failed after provider rejection');
+      }
+    }
+  }
+
+  /**
+   * Settle the durable handoffs owned by an active dispatch before its local
+   * state is discarded.  A handoff may be returned to the queue only when we
+   * have proof that the provider was never admitted.  Once provider admission,
+   * provider acceptance, or any provider-side effect is observable, the outcome
+   * is ambiguous: retrying after a restart could duplicate an already-delivered
+   * user message.  Mark those rows terminal and leave a delivery tombstone so
+   * lease expiry/restore cannot enqueue them again.  Both operations are
+   * idempotent and therefore safe when a late callback races this settlement.
+   */
+  private settleActiveDispatchHandoffs(
+    entries: PendingTransportMessage[],
+    options: {
+      providerStarted?: boolean;
+      providerAccepted?: boolean;
+      sideEffectEvidence?: boolean;
+      forceTerminal?: boolean;
+      reason?: string;
+    } = {},
+  ): void {
+    if (entries.length === 0) return;
+    const terminal = options.forceTerminal === true
+      || options.providerStarted === true
+      || options.providerAccepted === true
+      || options.sideEffectEvidence === true;
+    if (!terminal) {
+      this.releaseDispatchHandoffs(entries);
+      return;
+    }
+    const store = getTransportQueueStore();
+    const deliveryFrameId = randomUUID();
+    for (const entry of entries) {
+      try {
+        // A tombstone covers both queue-backed and direct dispatch ids.  For a
+        // queue-backed row, markFailed additionally makes the terminal state
+        // visible to queue projection and prevents handoff expiry from
+        // restoring it.  INSERT OR IGNORE/UPDATE-by-id make late callbacks
+        // harmless and keep exactly one durable terminal record.
+        store.recordDeliveryTombstone(
+          this.sessionKey,
+          entry.clientMessageId,
+          deliveryFrameId,
+          undefined,
+          this.queueRecipient ?? null,
+        );
+        if (entry.queueHandoff) {
+          store.markFailed(this.sessionKey, entry.clientMessageId, 'dispatch_failed');
+        }
+      } catch (err) {
+        logger.warn(
+          {
+            err,
+            sessionKey: this.sessionKey,
+            clientMessageId: entry.clientMessageId,
+            reason: options.reason ?? 'provider_boundary_unknown',
+          },
+          'runtime: failed to terminalize an ambiguous dispatch handoff',
+        );
+      }
+    }
+  }
+
   private drainPendingIfNoActiveTurn(reason: string): boolean {
     if (this._sending || this._activeTurn) return false;
     if (this._activeDispatchEntries.length > 0) {
@@ -1393,6 +2147,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         },
         'transport runtime cleared stale active dispatch entries before idle/drain reconciliation',
       );
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: `stale_dispatch:${reason}`,
+      });
       this._activeDispatchEntries = [];
       this._activeDispatchId = null;
       this._activeDispatchProviderStarted = false;
@@ -1502,6 +2262,16 @@ export class TransportSessionRuntime implements SessionRuntime {
     providerSnapshot: ProviderActiveWorkSnapshot,
     evaluationState: ProviderSnapshotEvaluation['state'],
   ): boolean {
+    // A STOP is authoritative for the local dispatch generation. Providers
+    // can answer that generation with a stale snapshot which still reports
+    // active work after the turn has already finished (the same race that
+    // surfaces "The active turn already finished" in the UI). Keep treating a
+    // genuinely current provider turn as blocking, but do not let an explicit
+    // stale/unattributed snapshot pin the durable FIFO forever.
+    if (this._currentActivityGenerationLocallyCancelled
+      && (evaluationState === 'stale' || evaluationState === 'unattributed_clear')) {
+      return true;
+    }
     if (this.hasLocallyCancelledActivityGeneration(providerSnapshot)
       && isProviderSnapshotNonBlockingForStoppedGeneration(providerSnapshot, providerSnapshot.activityGeneration ?? providerSnapshot.generation)) {
       return true;
@@ -1515,12 +2285,6 @@ export class TransportSessionRuntime implements SessionRuntime {
       reason !== 'snapshot_stale' && reason !== 'snapshot_unavailable'
     ));
     if (hasNonSnapshotBusyReasons) return false;
-    // STOP is a local terminal decision for the current dispatch generation;
-    // after STOP, a zero-work stale/unattributed provider snapshot is stale
-    // information, not evidence that should keep queued user messages blocked.
-    if (this._currentActivityGenerationLocallyCancelled && (evaluationState === 'stale' || evaluationState === 'unattributed_clear')) {
-      return true;
-    }
     // If the runtime has already settled the turn locally and has no in-flight
     // dispatch records, a clear provider snapshot from an older generation must
     // not resurrect "working" or prevent the next user message from dispatching.
@@ -1593,6 +2357,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (this._sending || this._activeTurn) add('runtime_dispatch');
     add('active_dispatch_entry', this._activeDispatchEntries.length);
     if (this._recoverableRetryTimer !== null) add('recoverable_retry');
+    if (this._capacityRetryTimer !== null) add('capacity_retry');
     const openToolCount = this._openTools.size;
     add('open_tool_call', openToolCount);
 
@@ -1610,11 +2375,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           // behind it. Providers that do not report backgroundWorkCount get
           // `background === 0`, which reduces to the original expression — their
           // blocking/idle behaviour is bit-for-bit unchanged.
-          const background = Math.max(0, providerSnapshot.backgroundWorkCount ?? 0);
-          const total = providerSnapshot.activeWorkCount || providerSnapshot.activeToolCount || 0;
-          backgroundWorkCount = Math.min(total, background);
-          const turnWork = Math.max(0, total - background);
-          if (turnWork > 0 || background === 0) {
+          const providerWork = this.providerWorkBreakdown(providerSnapshot);
+          backgroundWorkCount = providerWork.backgroundWorkCount;
+          const turnWork = providerWork.turnWorkCount;
+          if (turnWork > 0 || providerWork.reportedBackgroundWorkCount === 0) {
             add(evaluation.reason, Math.max(1, turnWork || providerSnapshot.activeToolCount || 0));
           }
           // Background work still surfaces its busy reasons so the UI can show
@@ -1632,6 +2396,21 @@ export class TransportSessionRuntime implements SessionRuntime {
       activeToolCount: Math.max(openToolCount, Math.max(0, providerSnapshot?.activeToolCount ?? 0)),
       busyReasons,
       providerSnapshot,
+    };
+  }
+
+  private providerWorkBreakdown(snapshot: ProviderActiveWorkSnapshot): {
+    reportedBackgroundWorkCount: number;
+    backgroundWorkCount: number;
+    turnWorkCount: number;
+  } {
+    const total = snapshot.activeWorkCount || snapshot.activeToolCount || 0;
+    const reportedBackgroundWorkCount = Math.max(0, snapshot.backgroundWorkCount ?? 0);
+    const backgroundWorkCount = Math.min(total, reportedBackgroundWorkCount);
+    return {
+      reportedBackgroundWorkCount,
+      backgroundWorkCount,
+      turnWorkCount: Math.max(0, total - backgroundWorkCount),
     };
   }
 
@@ -1738,7 +2517,32 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._contextBootstrapResolver = resolver;
   }
 
+  /**
+   * The launch gave up waiting for `pending` (context budget spent) and is going ahead without
+   * it. Keep it: `initialize` skips its own bounded refresh (it would only burn the budget a
+   * second time), a result that arrives before anything newer was applied is applied late, and
+   * refreshes that start while it is still running wait on it rather than piling a duplicate
+   * on the same backed-up store.
+   */
+  deferContextBootstrap(pending: Promise<TransportContextBootstrap>): void {
+    this._deferredContextBootstrap = pending;
+    this._deferredContextBootstrapBase = this._contextBootstrapGeneration;
+    pending.then(
+      (bootstrap) => {
+        const stillCurrent = this._deferredContextBootstrap === pending;
+        if (stillCurrent) this._deferredContextBootstrap = undefined;
+        if (this._contextBootstrapGeneration !== this._deferredContextBootstrapBase) return;
+        incrementCounter('transport.context.bootstrap_late_applied', { provider: this.provider.id });
+        this.applyContextBootstrap(bootstrap);
+      },
+      () => {
+        if (this._deferredContextBootstrap === pending) this._deferredContextBootstrap = undefined;
+      },
+    );
+  }
+
   async initialize(config: SessionConfig): Promise<void> {
+    this._pendingHandoff = config.pendingHandoff ?? null;
     // When resuming/restoring an existing conversation, mark startup memory
     // injected BEFORE applyContextBootstrap runs so the bootstrap's
     // `if (!this._startupMemoryInjected) this._startupMemory = …` guard
@@ -1754,6 +2558,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._initializingProviderSessionId = config.bindExistingKey ?? config.sessionKey;
     try {
       this._providerSessionId = await this.provider.createSession(config);
+      this._brainContractRegisteredVariant = null;
+      this._registeredSystemContractSignatures.clear();
     } finally {
       this._initializingProviderSessionId = null;
     }
@@ -1762,6 +2568,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     // every model call. See `shared/user-session-text-caps.ts`.
     this._description = clampUserSessionText(config.description);
     this._systemPrompt = clampUserSessionText(config.systemPrompt);
+    this._identityPrompt = config.identityPrompt?.trim() || undefined;
     // Capture identity for assembly-time injection. Daemon-injected and
     // NOT subject to the user-authored cap — see p2p audit 37bfbb85-430 N-A.
     if (config.sessionName) {
@@ -1780,7 +2587,10 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextLanguage: config.contextAuthoredContextLanguage,
       authoredContextFilePath: config.contextAuthoredContextFilePath,
     });
-    await this.refreshContextBootstrap({ phase: 'initialize' });
+    // A launch that already spent its context budget without an answer must not spend it again.
+    // The config values applied above are the baseline its late result is measured against.
+    this._deferredContextBootstrapBase = this._contextBootstrapGeneration;
+    if (!this._deferredContextBootstrap) await this.refreshContextBootstrap({ phase: 'initialize' });
 
     if (!alreadyInjected) {
       // Fresh conversation — reset the gate so the next turn will build and
@@ -1804,6 +2614,25 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._notifyProviderSessionReady();
   }
 
+  /** Install a bounded one-shot handoff; it is rendered message-side only. */
+  setPendingHandoff(pack: CrossVendorHandoffPack | undefined): void {
+    this._pendingHandoff = pack ?? null;
+    this._pendingHandoffReady = undefined;
+  }
+
+  setPendingHandoffReady(
+    ready: Promise<CrossVendorHandoffPack | undefined>,
+    providerWaitMs: number = CROSS_VENDOR_HANDOFF_DEFAULTS.providerWaitMs,
+  ): void {
+    this._pendingHandoffReady = ready;
+    this._pendingHandoffWaitMs = Math.max(0, providerWaitMs);
+  }
+
+  /** Called once after a provider accepts the turn carrying the handoff. */
+  setPendingHandoffConsumedHandler(handler: (() => void) | undefined): void {
+    this._onPendingHandoffConsumed = handler;
+  }
+
   /**
    * Send a message to the provider.
    *
@@ -1823,13 +2652,28 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
     }
+    // A message sent while a capacity retry is pending is ordinary queued work: it lands behind the retried turn (the activity
+    // snapshot reports `capacity_retry`), so the failed turn is never dropped and never sent twice.
     if (isSessionCompactCommandText(message) && this.provider.capabilities.compact?.execution === 'unsupported') {
       const reason = this.provider.capabilities.compact.reason?.trim();
       throw new Error(reason || `${this.provider.id} does not support /compact`);
     }
 
+    const resolvedClientMessageId = clientMessageId ?? randomUUID();
+    const queueHandoff = metadata?.queueHandoff;
+    if (queueHandoff && (
+      !queueHandoff.handoffId.trim()
+      || queueHandoff.clientMessageId !== resolvedClientMessageId
+    )) {
+      throw new Error('Transport queue handoff does not match clientMessageId');
+    }
+    const nativeAppendRequested = metadata?.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+      && this.provider.capabilities.activeDelegationNotification === AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+      && !!this.provider.notifyActiveDelegation
+      && (attachments?.length ?? 0) === 0
+      && !message.trim().startsWith('/');
     const entry: PendingTransportMessage = {
-      clientMessageId: clientMessageId ?? randomUUID(),
+      clientMessageId: resolvedClientMessageId,
       text: message,
       // Only carry providerText when it actually differs — keeps the common
       // (no-alias) path byte-identical and avoids persisting redundant material.
@@ -1837,47 +2681,84 @@ export class TransportSessionRuntime implements SessionRuntime {
         ? { providerText: metadata.providerText }
         : {}),
       ...(metadata?.aliasAudit ? { aliasAudit: metadata.aliasAudit } : {}),
+      ...(metadata?.messageOrigin ? { messageOrigin: metadata.messageOrigin } : {}),
       ...(messagePreamble?.trim() ? { messagePreamble: messagePreamble.trim() } : {}),
       ...(attachments?.length ? { attachments } : {}),
       ...(metadata?.sharedActor ? { sharedActor: metadata.sharedActor } : {}),
+      ...(metadata?.sharedMachineAuthority ? { sharedMachineAuthority: metadata.sharedMachineAuthority } : {}),
       ...(metadata?.timelineCommitted ? { timelineCommitted: true } : {}),
       ...(metadata?.historyCommitted ? { historyCommitted: true } : {}),
+      ...(nativeAppendRequested ? { deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND } : {}),
+      ...(nativeAppendRequested && metadata?.activeTurnDeliveryKind
+        ? { activeTurnDeliveryKind: metadata.activeTurnDeliveryKind }
+        : {}),
       ...(metadata?.peerAudit ? { peerAudit: { ...metadata.peerAudit } } : {}),
       ...(metadata?.delegationReply ? { delegationReply: { ...metadata.delegationReply } } : {}),
+      ...(metadata?.commandMode ? { commandMode: true as const } : {}),
+      ...(metadata?.supervisionReference
+        ? { supervisionReference: { ...metadata.supervisionReference } }
+        : {}),
+      ...(queueHandoff ? { queueHandoff: { ...queueHandoff } } : {}),
+      ...(metadata?.registeredSystemContract
+        ? { registeredSystemContract: { ...metadata.registeredSystemContract } }
+        : {}),
     };
 
-    if (this.hasActiveTurnWork()) {
+    // Revalidate daemon-owned control messages at the last synchronous edge
+    // before either direct provider dispatch or durable FIFO admission. The
+    // callback admits ordinary traffic, but a heartbeat whose identity or
+    // revision changed after scheduling is rejected without touching provider
+    // or queue state.
+    if (this._pendingDrainAdmission) {
+      const admission = normalizeQueueAdmissionDecision(this._pendingDrainAdmission(entry));
+      if (admission !== 'authorized') {
+        throw new Error(admission === 'retry'
+          ? 'transport message authority temporarily unavailable before dispatch'
+          : 'transport message authority rejected before dispatch');
+      }
+    }
+
+    const activity = this.getActivitySnapshot();
+    if (activity.blockingWorkCount > 0) {
       if (metadata?.queuePlacement === 'front') {
         this._pendingMessages.unshift(entry);
       } else {
         this._pendingMessages.push(entry);
       }
       try {
-        getTransportQueueStore().enqueue({
-          sessionName: this.sessionKey,
-          clientMessageId: entry.clientMessageId,
-          commandId: entry.clientMessageId,
-          text: entry.text,
-          placement: metadata?.queuePlacement ?? 'normal',
-          activityGeneration: normalizeActivityGeneration(this.currentActivityGeneration()) ?? undefined,
-          privateMaterialJson: JSON.stringify({
-            clientMessageId: entry.clientMessageId,
-            text: entry.text,
-            ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
-            ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
-            ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
-            ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
-            ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
-            ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
-            ...(entry.historyCommitted ? { historyCommitted: true } : {}),
-            ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
-            ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
-          }),
-        });
+        // drainResend already owns this durable row under queueHandoff.  Inserting
+        // the same id again would either violate the primary key or, after an
+        // eager release, make restore/rehydrate see a second queued copy.  The
+        // runtime now owns the original lease and will finalize or release it.
+        if (entry.queueHandoff) {
+          this._pendingVersion++;
+        } else {
+          const persisted = this.enqueueEntryDurably(entry, metadata?.queuePlacement ?? 'normal');
+          if (persisted.cancelled) {
+            this._pendingMessages = this._pendingMessages.filter(
+              (candidate) => candidate.clientMessageId !== entry.clientMessageId,
+            );
+          }
+        }
       } catch (err) {
         logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed; preserving runtime-local queue');
       }
-      this._pendingVersion++;
+      if (!entry.queueHandoff) this._pendingVersion++;
+      if (entry.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND) {
+        if (this._activeDispatchId !== null) {
+          if (this._activeDispatchProviderAccepted) {
+            this.scheduleActiveAppendFlush(this._activeDispatchId);
+          }
+        } else if (this.providerSnapshotHasAppendableTurn(activity.providerSnapshot)) {
+          // A provider-owned query may legitimately outlive the daemon's
+          // tracked dispatch (Claude tool/subagent work is the field case).
+          // The active-work snapshot is the authority that made send() queue;
+          // use the same durable reservation + native admission path as the
+          // manual Append button instead of leaving the row waiting for a
+          // dispatch id that will never reappear.
+          this.scheduleActiveAppendFlush(null);
+        }
+      }
       return 'queued';
     }
 
@@ -1906,6 +2787,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       // Reset so the runtime is usable for the next send.
       this._sending = false;
       this._activeTurn = null;
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: 'sync_dispatch_prologue_failure',
+      });
       this._activeDispatchEntries = [];
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
@@ -1915,6 +2802,61 @@ export class TransportSessionRuntime implements SessionRuntime {
       throw err;
     }
     return 'sent';
+  }
+
+  /**
+   * Deliver one node-to-node MCP message without entering IM.codes' ordinary
+   * pending FIFO. An idle target starts a normal turn; a busy target uses the
+   * provider's native next-boundary/steer primitive. Providers that cannot
+   * append return `unsupported`; the dispatch boundary then preserves the
+   * message through the ordinary durable FIFO.
+   */
+  async appendExternalMessageToActiveTurn(
+    message: string,
+    clientMessageId: string,
+    supervisionReference?: QueueSupervisionReference,
+    queueHandoff?: TransportQueueHandoffOwnership,
+    privateMetadata?: Pick<
+      TransportSendMetadata,
+      'activeTurnDeliveryKind' | 'peerAudit' | 'delegationReply' | 'commandMode'
+    >,
+  ): Promise<ExternalAppendResult> {
+    if (!this._providerSessionId) return 'stale';
+    if (!this.hasActiveTurnWork()) {
+      try {
+        return this.send(message, clientMessageId, undefined, undefined, {
+          ...(supervisionReference ? { supervisionReference } : {}),
+          ...(queueHandoff ? { queueHandoff } : {}),
+          ...privateMetadata,
+        }) === 'sent' ? 'sent' : 'stale';
+      } catch (error) {
+        return error instanceof Error && error.message.includes('temporarily unavailable') ? 'retry' : 'stale';
+      }
+    }
+    if (this.provider.capabilities.activeDelegationNotification
+        !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
+      || !this.provider.notifyActiveDelegation) {
+      return 'unsupported';
+    }
+    // Always stage through the same durable queue used by the human Append
+    // mode.  This preserves A -> B -> C order across both context assembly and
+    // provider-specific bootstrap.  The provider is touched only after its
+    // send-start Promise proves A was accepted; an unsupported provider was
+    // rejected above and therefore never gets a misleading append receipt.
+    const staged = this.send(message, clientMessageId, undefined, undefined, {
+      timelineCommitted: true,
+      deliveryMode: MEMORY_MCP_SEND_DELIVERY_MODES.APPEND,
+      activeTurnDeliveryKind: privateMetadata?.activeTurnDeliveryKind
+        ?? PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE,
+      ...(privateMetadata?.peerAudit ? { peerAudit: privateMetadata.peerAudit } : {}),
+      ...(privateMetadata?.delegationReply
+        ? { delegationReply: privateMetadata.delegationReply }
+        : {}),
+      ...(privateMetadata?.commandMode ? { commandMode: true as const } : {}),
+      ...(supervisionReference ? { supervisionReference } : {}),
+      ...(queueHandoff ? { queueHandoff } : {}),
+    });
+    return staged === 'queued' ? 'appended' : 'stale';
   }
 
   /**
@@ -1928,17 +2870,85 @@ export class TransportSessionRuntime implements SessionRuntime {
   ): Promise<AgentDelegationNotificationResult> {
     if (!this._providerSessionId) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
 
+    const existingAdmission = this._activeDelegationNotificationAdmissions.get(notification.notificationId);
+    if (existingAdmission) {
+      if (!sameDelegationNotification(existingAdmission.notification, notification)) {
+        logger.warn({
+          sessionKey: this.sessionKey,
+          notificationId: notification.notificationId,
+        }, 'active delegation notification id was reused with different immutable content');
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      const existingOutcome = await withTimeoutOutcome(
+        existingAdmission.promise,
+        DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
+      );
+      if (existingOutcome.timedOut) return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      if (existingOutcome.value === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED;
+      }
+      if (this._activeDelegationNotificationAdmissions.get(notification.notificationId) === existingAdmission) {
+        this._activeDelegationNotificationAdmissions.delete(notification.notificationId);
+      }
+      // The previous admission reached a terminal non-delivery result. It is
+      // now safe for this same invocation to retry against current runtime
+      // state, including the ordinary idle continuation path below.
+    }
+
     if (this.hasActiveTurnWork()) {
       if (this.provider.capabilities.activeDelegationNotification
           !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
         || !this.provider.notifyActiveDelegation) {
         return AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED;
       }
-      const outcome = await withTimeoutOutcome(
-        this.provider.notifyActiveDelegation(this._providerSessionId, {
+      // Runtime ownership starts before the provider has admitted the original
+      // prompt. Never launch a non-cancellable notify Promise in that window:
+      // timing it out locally while it later succeeds is a duplicate-delivery
+      // bug. The durable delegation outbox will retry once send-start resolves.
+      if (this._activeDispatchId !== null && !this._activeDispatchProviderAccepted) {
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      this.pruneActiveDelegationNotificationAdmissions(
+        MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS - 1,
+      );
+      if (this._activeDelegationNotificationAdmissions.size
+          >= MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS) {
+        logger.warn({
+          sessionKey: this.sessionKey,
+          notificationId: notification.notificationId,
+          pendingAdmissions: this._activeDelegationNotificationAdmissions.size,
+        }, 'active delegation notification admission limit reached; retaining durable retry');
+        return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
+      }
+      const providerNotification: ProviderDelegationNotification = {
           ...notification,
           deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.DELEGATION_REPLY,
-        }),
+      };
+      const admission = Promise.resolve().then(() => this.provider.notifyActiveDelegation!(
+        this._providerSessionId!,
+        providerNotification,
+      ));
+      const trackedAdmission: ActiveDelegationNotificationAdmission = {
+        notification: { ...notification },
+        promise: admission,
+        status: 'pending',
+      };
+      this._activeDelegationNotificationAdmissions.set(notification.notificationId, trackedAdmission);
+      void admission.then((result) => {
+        if (this._activeDelegationNotificationAdmissions.get(notification.notificationId) !== trackedAdmission) return;
+        if (result === AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
+          trackedAdmission.status = 'delivered';
+          this.pruneActiveDelegationNotificationAdmissions();
+        } else {
+          this._activeDelegationNotificationAdmissions.delete(notification.notificationId);
+        }
+      }, () => {
+        if (this._activeDelegationNotificationAdmissions.get(notification.notificationId) === trackedAdmission) {
+          this._activeDelegationNotificationAdmissions.delete(notification.notificationId);
+        }
+      });
+      const outcome = await withTimeoutOutcome(
+        admission,
         DEFAULT_ACTIVE_DELEGATION_NOTIFICATION_TIMEOUT_MS,
       );
       // Admission must be a short control-plane operation. A provider adapter
@@ -1979,6 +2989,20 @@ export class TransportSessionRuntime implements SessionRuntime {
     return AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE;
   }
 
+  private pruneActiveDelegationNotificationAdmissions(
+    limit = MAX_ACTIVE_DELEGATION_NOTIFICATION_ADMISSIONS,
+  ): void {
+    if (this._activeDelegationNotificationAdmissions.size <= limit) return;
+    for (const [notificationId, admission] of this._activeDelegationNotificationAdmissions) {
+      if (this._activeDelegationNotificationAdmissions.size <= limit) break;
+      // Pending admissions are irreversible-capable writes. Never evict one
+      // merely to satisfy a bound; reject new work until it reaches terminal.
+      if (admission.status === 'delivered') {
+        this._activeDelegationNotificationAdmissions.delete(notificationId);
+      }
+    }
+  }
+
   /**
    * Insert selected ordinary queued messages at the provider's next safe
    * in-turn boundary. Providers receive an explicit queued-message delivery
@@ -1989,10 +3013,29 @@ export class TransportSessionRuntime implements SessionRuntime {
   async appendPendingMessagesToActiveTurn(
     clientMessageIds: string[],
     notificationId: string,
+    deliveryKind: ProviderActiveTurnDeliveryKind = PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+    options: { allowDispatchAsNewTurn?: boolean } = {},
   ): Promise<AppendQueuedMessagesResult> {
     const ids = [...new Set(clientMessageIds.map((id) => id.trim()).filter(Boolean))];
     if (ids.length === 0 || !this._providerSessionId) return { status: 'not_found' };
-    if (!this.hasActiveTurnWork()) return { status: 'stale' };
+    if (!this.hasActiveTurnWork()) {
+      // No turn is actually running — it already settled (completion, error,
+      // send-start timeout, stop, provider crash/restart) by the time this
+      // append reached the runtime. `allowDispatchAsNewTurn` is opt-in and set
+      // only by the EXTERNAL command-handler entry point: per the
+      // session-level queue contract, an explicit user append/append-all must
+      // never error out and leave the queue stuck, so dispatch the pending
+      // queue as a fresh turn instead of reporting a stale "already finished"
+      // failure. The INTERNAL scheduled active-append-flush loop
+      // (flushAcceptedProviderActiveAppends) calls this same method with its
+      // own careful authority/ownership checks and must keep its existing
+      // "stale means defer to the normal idle-drain path" behavior unchanged
+      // — it must not force an immediate out-of-turn dispatch.
+      if (options.allowDispatchAsNewTurn && this._drainPending()) {
+        return { status: 'dispatched_as_new_turn' };
+      }
+      return { status: 'stale' };
+    }
     if (this.provider.capabilities.activeDelegationNotification
         !== AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE
       || !this.provider.notifyActiveDelegation) {
@@ -2003,21 +3046,82 @@ export class TransportSessionRuntime implements SessionRuntime {
     const originalQueue = [...this._pendingMessages];
     const selected = originalQueue.filter((entry) => idSet.has(entry.clientMessageId));
     if (selected.length !== ids.length) return { status: 'not_found' };
+    // Authority can change while an APPEND waits behind an active provider
+    // turn. Revalidate before handoff reservation/provider admission and drop
+    // only the stale control rows. A distinct status lets the automatic flush
+    // continue to the next valid FIFO entry instead of parking it behind a
+    // removed head.
+    const decisions = this._pendingDrainAdmission
+      ? selected.map((entry) => ({
+          entry,
+          admission: normalizeQueueAdmissionDecision(this._pendingDrainAdmission!(entry)),
+        }))
+      : selected.map((entry) => ({ entry, admission: 'authorized' as const }));
+    for (const { entry, admission } of decisions) {
+      if (admission !== 'retry') this._pendingAuthorityRetryAttempts.delete(entry.clientMessageId);
+    }
+    const retryEntries = decisions.filter(({ admission }) => admission === 'retry').map(({ entry }) => entry);
+    if (retryEntries.length > 0) {
+      // Authority storage/runtime visibility may converge on a later tick. Keep
+      // the durable rows byte-for-byte, schedule bounded backoff, and let the
+      // append flush examine later rows instead of creating head-of-line lock.
+      this.schedulePendingAuthorityRetry(retryEntries);
+      return { status: 'retry' };
+    }
+    const rejected = decisions.filter(({ admission }) => admission === 'stale');
+    if (rejected.length > 0) {
+      for (const { entry } of rejected) this.removePendingMessage(entry.clientMessageId);
+      return { status: 'rejected' };
+    }
     if (selected.some((entry) => (entry.attachments?.length ?? 0) > 0)) {
       return { status: 'attachments_unsupported' };
     }
-    if (selected.some((entry) => entry.text.trim().startsWith('/'))) {
+    if (selected.some((entry) => isDelegationUnsupportedControlText(entry.text))) {
+      return { status: 'control_unsupported' };
+    }
+    // A command-mode message must reach the provider as exactly its own text.
+    // Native append joins the selected rows, so a command may only ride alone;
+    // otherwise it stays in the FIFO, where `_drainPending` delivers it alone.
+    if (selected.length > 1 && selected.some((entry) => entry.commandMode === true)) {
       return { status: 'control_unsupported' };
     }
 
     const store = getTransportQueueStore();
-    const handoffs = store.markHandoffInFlight(this.sessionKey, selected.map((entry) => entry.clientMessageId));
-    if (handoffs.length !== selected.length) {
-      const handoffId = handoffs[0]?.handoffId;
-      if (handoffId) store.releaseHandoff(this.sessionKey, handoffId, handoffs.map((entry) => entry.entry.clientMessageId));
-      return { status: 'not_found' };
+    // Some rows arrive from drainResend with an already-committed lease.  Adopt
+    // those exact capabilities and reserve only ordinary runtime-created rows.
+    // A mixed append may therefore own several handoff ids; release/finalize is
+    // always grouped by the id that actually owns each clientMessageId.
+    const reservationGroups = new Map<string, string[]>();
+    const addReservation = (handoffId: string, clientMessageId: string): void => {
+      reservationGroups.set(handoffId, [
+        ...(reservationGroups.get(handoffId) ?? []),
+        clientMessageId,
+      ]);
+    };
+    for (const entry of selected) {
+      if (entry.queueHandoff) addReservation(entry.queueHandoff.handoffId, entry.clientMessageId);
     }
-    const handoffId = handoffs[0]!.handoffId;
+    const unreserved = selected.filter((entry) => !entry.queueHandoff);
+    if (unreserved.length > 0) {
+      const handoffs = store.markHandoffInFlight(
+        this.sessionKey, unreserved.map((entry) => entry.clientMessageId), undefined, undefined,
+        this.queueRecipient ?? null,
+      );
+      if (handoffs.length !== unreserved.length) {
+        const acquiredHandoffId = handoffs[0]?.handoffId;
+        if (acquiredHandoffId) {
+          store.releaseHandoff(
+            this.sessionKey,
+            acquiredHandoffId,
+            handoffs.map((entry) => entry.entry.clientMessageId),
+          );
+        }
+        return { status: 'not_found' };
+      }
+      for (const handoff of handoffs) {
+        addReservation(handoff.handoffId, handoff.entry.clientMessageId);
+      }
+    }
     const reservedVersion = this._pendingVersion + 1;
     this._pendingMessages = originalQueue.filter((entry) => !idSet.has(entry.clientMessageId));
     this._pendingVersion = reservedVersion;
@@ -2035,16 +3139,20 @@ export class TransportSessionRuntime implements SessionRuntime {
         // only the selected rows would reorder a failed partial append.
         this._pendingMessages = [...originalQueue, ...entriesAddedWhileAwaitingAdmission];
       }
-      try {
-        const snapshot = store.releaseHandoff(
-          this.sessionKey,
-          handoffId,
-          selected.map((entry) => entry.clientMessageId),
-        );
-        this._pendingVersion = Math.max(this._pendingVersion + 1, snapshot.pendingMessageVersion);
-      } catch (error) {
-        this._pendingVersion++;
-        logger.warn({ error, sessionKey: this.sessionKey, handoffId }, 'active-turn queue append handoff release failed');
+      for (const [handoffId, clientMessageIds] of reservationGroups) {
+        try {
+          const snapshot = store.releaseHandoff(this.sessionKey, handoffId, clientMessageIds);
+          this._pendingVersion = Math.max(this._pendingVersion + 1, snapshot.pendingMessageVersion);
+          for (const entry of selected) {
+            if (entry.queueHandoff?.handoffId === handoffId) delete entry.queueHandoff;
+          }
+        } catch (error) {
+          this._pendingVersion++;
+          logger.warn(
+            { error, sessionKey: this.sessionKey, handoffId, clientMessageIds },
+            'active-turn queue append handoff release failed',
+          );
+        }
       }
     };
 
@@ -2052,10 +3160,12 @@ export class TransportSessionRuntime implements SessionRuntime {
     try {
       admission = await this.provider.notifyActiveDelegation(this._providerSessionId, {
         notificationId,
-        delegationId: `queue-append:${notificationId}`,
+        delegationId: deliveryKind === PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.MCP_MESSAGE
+          ? `mcp-append:${notificationId}`
+          : `queue-append:${notificationId}`,
         sourceSessionName: this.sessionKey,
         text: selected.map((entry) => entry.providerText ?? entry.text).join('\n\n'),
-        deliveryKind: PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+        deliveryKind,
       });
     } catch (error) {
       restoreReservation();
@@ -2066,6 +3176,31 @@ export class TransportSessionRuntime implements SessionRuntime {
       return {
         status: admission === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED ? 'unsupported' : 'stale',
       };
+    }
+
+    // Provider acceptance is irreversible, but queue finalization/history
+    // persistence can still fail or the daemon can crash before either runs.
+    // Record the acceptance while the exact handoff ids are still known. On a
+    // restart, rehydrate skips the tombstoned ids and reconciliation removes
+    // the old handoff rows instead of replaying an already-sent message.
+    for (const clientMessageId of selected.map((entry) => entry.clientMessageId)) {
+      try {
+        store.recordDeliveryTombstone(
+          this.sessionKey,
+          clientMessageId,
+          notificationId,
+          undefined,
+          this.queueRecipient ?? null,
+        );
+      } catch (error) {
+        // Keep the accepted provider turn successful; finalize/reconcile below
+        // remains the normal path and this warning makes the crash window
+        // observable when SQLite is unavailable.
+        logger.warn(
+          { error, sessionKey: this.sessionKey, clientMessageId, notificationId },
+          'transport queue acceptance tombstone failed after active-turn append',
+        );
+      }
     }
 
     const historyEntries = selected.filter((entry) => !entry.historyCommitted);
@@ -2085,13 +3220,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     const selectedIds = selected.map((entry) => entry.clientMessageId);
     let finalized: { snapshot: QueueSnapshot; deliveryFacts: QueueDeliveryFact[] };
     try {
-      finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+      finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId, undefined, this.queueRecipient ?? null);
     } catch (firstError) {
       try {
         // The transaction is idempotent (replace tombstone + delete by id), so
         // one bounded retry safely repairs transient SQLite failures and the
         // ambiguous "commit succeeded, snapshot read failed" case.
-        finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId);
+        finalized = store.finalizeSentBatch(this.sessionKey, selectedIds, notificationId, undefined, this.queueRecipient ?? null);
       } catch (error) {
         // Provider admission is irreversible. Once the provider accepts the
         // text, a bookkeeping failure must not be reported as delivery
@@ -2104,6 +3239,22 @@ export class TransportSessionRuntime implements SessionRuntime {
           { error, firstError, sessionKey: this.sessionKey, clientMessageIds: selectedIds, notificationId },
           'transport queue sqlite finalizeSentBatch failed after active-turn append was accepted',
         );
+        // The provider already accepted these messages. Persist an independent
+        // delivery tombstone as a repair path so a restart/reconnect cannot
+        // rehydrate the same rows and show them as old queued messages again.
+        // This is deliberately best-effort: the degraded projection below
+        // still converges the current browser, while a later queue sweep can
+        // retry the tombstone/reconciliation when SQLite recovers.
+        for (const clientMessageId of selectedIds) {
+          try {
+            store.recordDirectDelivery(this.sessionKey, clientMessageId, notificationId, undefined, this.queueRecipient ?? null);
+          } catch (repairError) {
+            logger.warn(
+              { error: repairError, sessionKey: this.sessionKey, clientMessageId, notificationId },
+              'transport queue delivery tombstone repair failed after active-turn append',
+            );
+          }
+        }
         const selectedIdSet = new Set(selectedIds);
         const persisted = store.readSnapshotSafely(this.sessionKey, 'active_turn_append_finalize_failed');
         const pendingMessageVersion = Math.max(this._pendingVersion + 1, persisted.pendingMessageVersion);
@@ -2188,8 +3339,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     const index = this._pendingMessages.findIndex((item) => item.clientMessageId === clientMessageId);
     if (index < 0) return null;
     const [removed] = this._pendingMessages.splice(index, 1);
+    this._pendingAuthorityRetryAttempts.delete(clientMessageId);
     try {
-      getTransportQueueStore().drop(this.sessionKey, clientMessageId, 'user_cleared');
+      getTransportQueueStore().drop(this.sessionKey, clientMessageId, 'user_cleared', undefined, this.queueRecipient ?? null);
     } catch (err) {
       logger.warn({ err, sessionKey: this.sessionKey, clientMessageId }, 'transport queue sqlite drop failed; preserving runtime-local removal');
     }
@@ -2210,6 +3362,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     if (removed.length > 0) {
       this._pendingMessages = kept;
+      for (const entry of removed) this._pendingAuthorityRetryAttempts.delete(entry.clientMessageId);
       this._pendingVersion++;
     }
     return removed;
@@ -2218,6 +3371,13 @@ export class TransportSessionRuntime implements SessionRuntime {
   async cancel(): Promise<void> {
     if (!this._providerSessionId) {
       throw new Error('TransportSessionRuntime not initialized — call initialize() first');
+    }
+    if ((this._capacityRetryTimer || this._capacityRetryEntryIds.length > 0)
+      && !this._activeTurn && !this._sending) {
+      this.cancelCapacityRetry();
+      this.markCurrentActivityGenerationLocallyCancelled();
+      if (!this._drainPending()) this.setStatus('idle');
+      return;
     }
     // A recoverable auto-retry is mid-flight (re-queued message waiting on
     // backoff, no active provider turn). STOP must halt it deterministically:
@@ -2330,6 +3490,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._backgroundSubagentWakeTimer = null;
     this._activeBackgroundSubagents.clear();
     this._pendingBackgroundSubagentWake.clear();
+    this._activeDelegationNotificationAdmissions.clear();
     for (const unsub of this._unsubscribes) unsub();
     this._unsubscribes = [];
 
@@ -2347,11 +3508,18 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.rollbackActiveSummarySyncReservation();
     this._sending = false;
     this._activeTurn = null;
+    this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason: 'session_killed',
+    });
     this._activeDispatchEntries = [];
     this.closeOpenTools('cancelled', 'user_cancelled');
     this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
+    this._activeDispatchProviderAccepted = false;
     this._activeDispatchId = null;
     this._activeDispatchStaleRecoveryStarted = false;
     this._locallyCancelledDispatchIds.clear();
@@ -2360,6 +3528,9 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._externalCompletionSettlementsToIgnore = 0;
     this._cancelledProviderErrorsToIgnore = 0;
     this.clearRecoverableRetryTimer();
+    this.cancelCapacityRetry(false);
+    this.clearPendingAuthorityRetryTimer();
+    this._pendingAuthorityRetryAttempts.clear();
     this._recoverableDispatchRetries = 0;
     this._recoverableRetryEntryIds = [];
     if (this._pendingMessages.length > 0) {
@@ -2605,6 +3776,13 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn?.reject(failure);
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason: replayDecision,
+    });
     this._activeDispatchProviderStarted = false;
     this._activeDispatchCancelled = false;
     this._activeDispatchHasSideEffectEvidence = false;
@@ -2636,6 +3814,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._activeTurn?.resolve();
     this._activeTurn = null;
     this.clearStalePendingCancelFallbackTimer();
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: true,
+      forceTerminal: true,
+      reason: replayDecision,
+    });
     this._activeDispatchProviderStarted = false;
     this._activeDispatchCancelled = false;
     this._activeDispatchHasSideEffectEvidence = false;
@@ -2677,6 +3863,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.failSdkTurnLostRecovery(metadata, 'unsafe_ambiguous');
       return true;
     }
+    // The SDK turn-lost classifier's explicit `safe_replay` decision is a
+    // stronger proof than the transport's send-start hook: the adapter can
+    // invoke that hook before it has accepted a turn, and existing providers
+    // use this path for that pre-acceptance loss.  Only concrete side effects
+    // or an open tool force no-replay here; STOP/onError paths still classify
+    // provider-started work as ambiguous through the shared helper.
     if (this._activeDispatchHasSideEffectEvidence || this._openTools.size > 0) {
       this.settleSdkTurnLostWithoutReplay(metadata, 'unsafe_side_effect');
       return true;
@@ -2713,6 +3905,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       'transport runtime accepted sdk turn lost recovery; re-queueing original dispatch for safe replay',
     );
     this._sending = false;
+    this.settleActiveDispatchHandoffs(this._activeDispatchEntries, { reason: 'safe_replay' });
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn.resolve();
     this._activeTurn = null;
@@ -2742,6 +3935,248 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._recoverableRetryTimer = null;
   }
 
+  /** Durable (SQLite) admission of one pending entry, exactly as `send()` queues it. Throws like the store does. */
+  private enqueueEntryDurably(
+    entry: PendingTransportMessage,
+    placement: QueuePlacement,
+    evictSameId = false,
+  ) {
+    return getTransportQueueStore().enqueueWithCapacityEviction({
+      sessionName: this.sessionKey,
+      ...(this.queueRecipient ? { recipient: this.queueRecipient } : {}),
+      clientMessageId: entry.clientMessageId,
+      commandId: entry.clientMessageId,
+      text: entry.text,
+      placement,
+      activityGeneration: normalizeActivityGeneration(this.currentActivityGeneration()) ?? undefined,
+      privateMaterialJson: JSON.stringify({
+        clientMessageId: entry.clientMessageId,
+        text: entry.text,
+        ...(entry.providerText != null ? { providerText: entry.providerText } : {}),
+        ...(entry.aliasAudit ? { aliasAudit: entry.aliasAudit } : {}),
+        ...(entry.messageOrigin ? { messageOrigin: entry.messageOrigin } : {}),
+        ...(entry.messagePreamble ? { messagePreamble: entry.messagePreamble } : {}),
+        ...(entry.attachments?.length ? { attachmentRefs: entry.attachments } : {}),
+        ...(entry.sharedActor ? { sharedActorEnvelope: entry.sharedActor } : {}),
+        ...(entry.sharedMachineAuthority ? { sharedMachineAuthority: entry.sharedMachineAuthority } : {}),
+        ...(entry.timelineCommitted ? { timelineCommitted: true } : {}),
+        ...(entry.historyCommitted ? { historyCommitted: true } : {}),
+        ...(entry.deliveryMode ? { deliveryMode: entry.deliveryMode } : {}),
+        ...(entry.activeTurnDeliveryKind
+          ? { activeTurnDeliveryKind: entry.activeTurnDeliveryKind }
+          : {}),
+        ...(entry.peerAudit ? { peerAudit: entry.peerAudit } : {}),
+        ...(entry.delegationReply ? { delegationReply: entry.delegationReply } : {}),
+        ...(entry.commandMode ? { commandMode: true } : {}),
+        ...(entry.supervisionReference ? { supervisionReference: entry.supervisionReference } : {}),
+        ...(entry.registeredSystemContract ? { registeredSystemContract: entry.registeredSystemContract } : {}),
+      }),
+      ...(entry.supervisionReference
+        ? { supervisionReference: entry.supervisionReference }
+        : {}),
+    }, evictSameId ? entry.clientMessageId : undefined);
+  }
+
+  private clearCapacityRetryTimer(): void {
+    if (this._capacityRetryTimer) clearTimeout(this._capacityRetryTimer);
+    this._capacityRetryTimer = null;
+    this._capacityRetryAt = 0;
+    if (this._capacityRetrySuccessTimer) clearTimeout(this._capacityRetrySuccessTimer);
+    this._capacityRetrySuccessTimer = null;
+  }
+
+  /**
+   * End the capacity-retry episode: the turn went through, the user stopped it, or the failure turned permanent. With
+   * `dropEntries` the retried turn is abandoned too (STOP): removed from memory AND from the durable queue, so a restart cannot
+   * resurrect it.
+   */
+  private cancelCapacityRetry(dropEntries = true): void {
+    const wasActive = this._capacityRetryStartedAt > 0;
+    this.clearCapacityRetryTimer();
+    if (dropEntries && this._capacityRetryEntryIds.length > 0) {
+      const ids = new Set(this._capacityRetryEntryIds);
+      this._pendingMessages = this._pendingMessages.filter((entry) => !ids.has(entry.clientMessageId));
+      for (const id of ids) {
+        try {
+          getTransportQueueStore().drop(this.sessionKey, id, 'user_cleared', undefined, this.queueRecipient ?? null);
+        } catch (err) {
+          logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: id }, 'transport queue sqlite drop failed while cancelling capacity retry');
+        }
+      }
+      this._pendingVersion++;
+    }
+    this._capacityRetryEntryIds = [];
+    this._capacityRetryAttempt = 0;
+    this._capacityRetryStartedAt = 0;
+    this._capacityRetryError = '';
+    if (wasActive) {
+      logger.info({ sessionKey: this.sessionKey }, 'transport provider capacity retry episode ended');
+      this.notifyCapacityRetryChange(false);
+    }
+  }
+
+  private notifyCapacityRetryChange(active: boolean): void {
+    if (!this.onCapacityRetryChange) return;
+    try {
+      this.onCapacityRetryChange(active);
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'onCapacityRetryChange listener threw');
+    }
+  }
+
+  private isCapacityRetryError(error: ProviderError): boolean {
+    return shouldRetryProviderErrorWithBackoff(error);
+  }
+
+  /**
+   * Capacity retry is admissible only before the provider boundary.  A send
+   * that has started, been accepted, or produced side-effect evidence has an
+   * unknown outcome; releasing its handoff would allow restart/lease expiry
+   * to redeliver an old message.  Keep this predicate centralized so callback
+   * and promise-rejection paths cannot drift apart.
+   */
+  private canRetryBeforeProviderBoundary(error?: ProviderError): boolean {
+    // Some providers (notably Codex app-server) explicitly report that a
+    // capacity refusal happened before a turn was admitted.  That structured
+    // proof is safe to retry even though the transport call itself already
+    // started; generic/ambiguous late capacity errors remain terminal.
+    const details = error?.details;
+    if (this.isCapacityRetryError(error ?? { code: '', message: '', recoverable: false })
+      && details
+      && typeof details === 'object'
+      && !Array.isArray(details)
+      && (details as { providerAdmission?: unknown }).providerAdmission === 'rejected') {
+      return true;
+    }
+    return !this._activeDispatchProviderStarted
+      && !this._activeDispatchProviderAccepted
+      && !this._activeDispatchHasSideEffectEvidence;
+  }
+
+  /** Would `requeueAndScheduleCapacityRetry` take this failure? (Decided before the per-failure log line, which it must not spam.) */
+  private willRetryAsCapacity(error: ProviderError): boolean {
+    return this._activeDispatchEntries.length > 0 && this.isCapacityRetryError(error);
+  }
+
+  private scheduleCapacityRetryTimer(): void {
+    this.clearCapacityRetryTimer();
+    const delay = capacityRetryDelayMs(this._capacityRetryAttempt);
+    this._capacityRetryAt = Date.now() + delay;
+    this._capacityRetryTimer = setTimeout(() => this.runCapacityRetry(), delay);
+    this._capacityRetryTimer.unref?.();
+  }
+
+  /** The retry timer fired: send the retried turn again, or keep waiting if the runtime is not free to take it yet. */
+  private runCapacityRetry(): void {
+    this._capacityRetryTimer = null;
+    this._capacityRetryAt = 0;
+    if (this._capacityRetryEntryIds.length === 0) return;
+    const queued = new Set(this._pendingMessages.map((entry) => entry.clientMessageId));
+    this._capacityRetryEntryIds = this._capacityRetryEntryIds.filter((id) => queued.has(id));
+    if (this._capacityRetryEntryIds.length === 0) {
+      // The user removed the retried turn from the queue: nothing left to retry.
+      this.cancelCapacityRetry(false);
+      if (!this._drainPending()) this.setStatus('idle');
+      return;
+    }
+    if (!this._sending && !this._activeTurn && this._drainPending()) {
+      // Sent again. If it survives without another capacity failure it has gone through: end the episode (clears the notice).
+      this._capacityRetrySuccessTimer = setTimeout(() => {
+        this._capacityRetrySuccessTimer = null;
+        if (this._capacityRetryEntryIds.length === 0 && !this._capacityRetryTimer) this.cancelCapacityRetry(false);
+      }, CAPACITY_RETRY_SUCCESS_AFTER_MS);
+      this._capacityRetrySuccessTimer.unref?.();
+      return;
+    }
+    // Blocked (other work still open, or a drain deferred): keep the same attempt count and try again shortly. This never
+    // gives up and never waits more than the cap.
+    this.scheduleCapacityRetryTimer();
+  }
+
+  /**
+   * A capacity/overload failure of the active dispatch: keep the turn, queue it again (durably, in front) and retry it with
+   * the shared 1 → 2 → 4 → 8 → 15 s backoff. There is deliberately no give-up window.
+   */
+  private requeueAndScheduleCapacityRetry(error: ProviderError): boolean {
+    if (!this.isCapacityRetryError(error) || this._activeDispatchEntries.length === 0) return false;
+    const now = Date.now();
+    const newEpisode = this._capacityRetryStartedAt === 0;
+    if (newEpisode) {
+      this._capacityRetryAttempt = 0;
+      this._capacityRetryStartedAt = now;
+    }
+    const attempt = this._capacityRetryAttempt + 1;
+    this._capacityRetryAttempt = attempt;
+    this._capacityRetryError = error.message;
+    const entries = this._activeDispatchEntries;
+    this._capacityRetryEntryIds = entries.map((entry) => entry.clientMessageId);
+    this.releaseDispatchHandoffs(entries);
+    // Durable first: a daemon restart during the retry finds the turn in the queue and resumes it.
+    for (const entry of [...entries].reverse()) {
+      try {
+        getTransportQueueStore().clearDeliveryTombstone(this.sessionKey, entry.clientMessageId);
+        this.enqueueEntryDurably(entry, 'front', true);
+      } catch (err) {
+        logger.warn({ err, sessionKey: this.sessionKey, clientMessageId: entry.clientMessageId }, 'transport queue sqlite enqueue failed for capacity retry; keeping the runtime-local queue');
+      }
+    }
+    this._pendingMessages.unshift(...entries);
+    this._pendingVersion++;
+    this._activeDispatchEntries = [];
+    this.scheduleCapacityRetryTimer();
+    if (newEpisode) {
+      logger.warn(
+        { sessionKey: this.sessionKey, attempt, error: error.message },
+        'transport provider capacity retry episode started (retrying every <=15s until the provider accepts, STOP, or a permanent error)',
+      );
+      this.notifyCapacityRetryChange(true);
+    } else if (attempt % CAPACITY_RETRY_LOG_EVERY_ATTEMPTS === 0) {
+      logger.info(
+        { sessionKey: this.sessionKey, attempt, sinceMs: now - this._capacityRetryStartedAt, error: error.message },
+        'transport provider capacity retry still failing',
+      );
+    }
+    return true;
+  }
+
+  private clearPendingAuthorityRetryTimer(): void {
+    if (!this._pendingAuthorityRetryTimer) return;
+    clearTimeout(this._pendingAuthorityRetryTimer);
+    this._pendingAuthorityRetryTimer = null;
+  }
+
+  private schedulePendingAuthorityRetry(entries: PendingTransportMessage[]): void {
+    let nextAttempt: number | undefined;
+    for (const entry of entries) {
+      const previous = this._pendingAuthorityRetryAttempts.get(entry.clientMessageId) ?? 0;
+      if (previous >= MAX_PENDING_AUTHORITY_RETRIES) continue;
+      const attempt = previous + 1;
+      this._pendingAuthorityRetryAttempts.set(entry.clientMessageId, attempt);
+      nextAttempt = Math.min(nextAttempt ?? attempt, attempt);
+    }
+    if (nextAttempt === undefined || this._pendingAuthorityRetryTimer) return;
+    const delayMs = Math.min(
+      PENDING_AUTHORITY_RETRY_BASE_MS * 2 ** (nextAttempt - 1),
+      PENDING_AUTHORITY_RETRY_MAX_MS,
+    );
+    this._pendingAuthorityRetryTimer = setTimeout(() => {
+      this._pendingAuthorityRetryTimer = null;
+      if (!this._providerSessionId || this._pendingMessages.length === 0) return;
+      if (this.hasActiveTurnWork()) {
+        const hasAppendRetry = this._pendingMessages.some((entry) => (
+          entry.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          && this._pendingAuthorityRetryAttempts.has(entry.clientMessageId)
+        ));
+        if (hasAppendRetry) {
+          this.scheduleActiveAppendFlush(this._activeDispatchId);
+        }
+        return;
+      }
+      this._drainPending();
+    }, delayMs);
+    this._pendingAuthorityRetryTimer.unref?.();
+  }
+
   /**
    * Recoverable dispatch failure → DO NOT drop the turn. Re-queue the failed
    * message(s) at the FRONT of the pending queue (order preserved) and schedule
@@ -2764,6 +4199,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._recoverableRetryEntryIds = this._activeDispatchEntries.map(
       (entry) => entry.clientMessageId,
     );
+    this.releaseDispatchHandoffs(this._activeDispatchEntries);
     this._pendingMessages.unshift(...this._activeDispatchEntries);
     this._pendingVersion++;
     this._activeDispatchEntries = [];
@@ -2860,6 +4296,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this._lastProviderErrorAt = 0;
     this._activeDispatchCancelled = false;
     this._activeDispatchProviderStarted = false;
+    this._activeDispatchProviderAccepted = false;
     this._activeDispatchHasSideEffectEvidence = false;
     this._activeDispatchId = dispatchId;
     this._activeDispatchStaleRecoveryStarted = false;
@@ -2870,6 +4307,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     }]).map((entry) => ({ ...entry }));
     const isPrivateControlDispatch = this._activeDispatchEntries.length > 0
       && this._activeDispatchEntries.every((entry) => !!entry.peerAudit || !!entry.delegationReply);
+    // A command-mode turn is byte-clean exactly like a provider slash control:
+    // no startup/recall memory, preamble, identity, authored context or handoff.
+    // `_drainPending` dispatches a command entry alone, so `every` is `some`.
+    const isCommandDispatch = this._activeDispatchEntries.length > 0
+      && this._activeDispatchEntries.every((entry) => entry.commandMode === true);
     this.bindSdkTurnLostReplacementDispatch(dispatchId, this._activeDispatchEntries);
 
     // Alias expansion (A′): the provider (and runtime history) receive the
@@ -2909,6 +4351,7 @@ export class TransportSessionRuntime implements SessionRuntime {
 
     if (shouldResetTransportPreferenceContextForSessionControl(message)) {
       this._lastInjectedPreferenceContextSignature = null;
+      this._lastInjectedSupervisionContractSignature = null;
     }
 
     if (isSessionCompactCommandText(message)) {
@@ -2919,12 +4362,27 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
 
     void (async () => {
+      if (!isTransportSlashControl(message) && !isCommandDispatch && !this._pendingHandoff && this._pendingHandoffReady) {
+        // The first target turn must carry the cross-vendor context whenever
+        // the worker pack is ready, but session.send itself remains an immediate
+        // acknowledgement. Wait only the bounded providerWaitMs window; a slow
+        // build is adopted by the guarded launch callback for a later turn.
+        const ready = this._pendingHandoffReady;
+        this._pendingHandoffReady = undefined;
+        const waitMs = this._pendingHandoffWaitMs;
+        const timeout = new Promise<undefined>((resolve) => {
+          const timer = setTimeout(() => resolve(undefined), waitMs);
+          timer.unref?.();
+        });
+        const pack = await Promise.race([ready.catch(() => undefined), timeout]);
+        if (pack && !this._pendingHandoff) this._pendingHandoff = pack;
+      }
       await this.refreshContextBootstrap({ phase: 'dispatch' });
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
-      const isSlashControl = isTransportSlashControl(message);
+      const isSlashControl = isTransportSlashControl(message) || isCommandDispatch;
       const authority = resolveTransportDispatchAuthority(this.provider, {
         namespace: this._contextNamespace,
         remoteProcessedFreshness: this._contextRemoteProcessedFreshness,
@@ -2937,11 +4395,23 @@ export class TransportSessionRuntime implements SessionRuntime {
       // recall: both can contain recent summaries and both emit public
       // memory.context evidence after provider acceptance.
       const suppressMemoryContext = isSlashControl || isPrivateControlDispatch;
-      const startupMemory = suppressMemoryContext ? null : (this._startupMemory ?? (
-        !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
-          ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
-          : null
-      ));
+      // The toggle is re-read here, not only at bootstrap: a session whose
+      // first-turn memory was assembled before injection was turned off must
+      // still honor the switch without a restart. Managed Skills stay.
+      const startupInjectionDisabled = !suppressMemoryContext
+        && !this._startupMemoryInjected
+        && !!this._contextNamespace
+        && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true));
+      const startupMemory = suppressMemoryContext ? null : startupInjectionDisabled
+        ? (await buildTransportStartupMemory(this._contextNamespace!, {
+          projectDir: this._projectDir,
+          managedSkillsOnly: true,
+        })) ?? null
+        : (this._startupMemory ?? (
+          !this._startupMemoryInjected && authority.authoritySource === 'processed_local' && this._contextNamespace
+            ? await buildTransportStartupMemory(this._contextNamespace, { projectDir: this._projectDir })
+            : null
+        ));
       const memoryRecallResult = isPrivateControlDispatch
         ? { artifact: null }
         : isSlashControl
@@ -2962,36 +4432,63 @@ export class TransportSessionRuntime implements SessionRuntime {
           );
       summarySyncReservation = memoryRecallResult.summaryReservation;
       const memoryRecall = memoryRecallResult.artifact;
-      const messagePreamble = isSlashControl ? undefined : this.mergeMessagePreambles(dispatchedEntries, message);
+      const handoffPreamble = !isSlashControl && this._pendingHandoff
+        ? `[${this._pendingHandoff.sourceAgentType} handoff — ${this._pendingHandoff.cutoff.ts}]\n${this._pendingHandoff.text}`
+        : undefined;
+      const messagePreamble = isSlashControl
+        ? undefined
+        : this.mergeMessagePreambles(dispatchedEntries, message, handoffPreamble);
+      const registeredSystemContractText = this._activeDispatchEntries
+        .map((entry) => entry.registeredSystemContract)
+        .filter((contract): contract is NonNullable<typeof contract> => !!contract)
+        .filter((contract, index, contracts) => (
+          contracts.findIndex((candidate) => candidate.contractId === contract.contractId) === index
+        ))
+        .filter((contract) => (
+          this._registeredSystemContractSignatures.get(contract.contractId) !== contract.signature
+        ))
+        .map((contract) => contract.body)
+        .join('\n\n') || undefined;
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         rollbackSummarySyncReservation(summarySyncReservation);
         summarySyncReservation = undefined;
         this.cancelActiveDispatchLocally(dispatchId);
         return;
       }
-      // Daemon-injected identity is stable session metadata — same on
-      // every turn, NOT user-authored — so we always pass it through.
-      // Slash control commands still get it: it is cheap, reinforces the
-      // model's identity for control replies, and skipping it on `/foo`
-      // would leak the exact session name out of the model's awareness
-      // on follow-up turns when the cached system text is rebuilt from
-      // a slash-only tail. The 300-char user-authored cap stays in
-      // force on `description` / `systemPrompt`; identity is peer-level.
-      // Shared runtime guidance (memory/progress/file-path) is suppressed
-      // for raw slash controls so the provider receives the control text
-      // exactly, without unrelated system context.
+      // Daemon-injected identity is stable session metadata — same on every
+      // ordinary turn and NOT subject to the 300-char user-authored cap.
+      // Provider-native slash controls remain byte-clean; after `/compact`,
+      // the completion path invalidates provider-side stable-text state and
+      // the next ordinary turn reasserts the identity.
       // Generated Image Reporting is now appended in Codex SDK's own
       // `baseInstructions` tail (Codex-only, once per thread/start) —
       // it does NOT ride the per-turn payload at all.
       this.bindActiveSummarySyncReservation(dispatchId, summarySyncReservation);
       summarySyncReservation = undefined;
+      // Decided once per turn and used for both the assembly and the
+      // registration below, so the variant sent is the variant recorded.
+      const automaticSupervisionEnabled = this.resolveAutomaticSupervisionEnabled();
+      const taskPairEngine = this.resolveTaskPairEngine();
+      const brainContractVariant = brainContractVariantKey(automaticSupervisionEnabled, taskPairEngine);
+      // Provider-native slash controls stay byte-clean, like the identity above.
+      const pairTurnCwd = isSlashControl ? undefined : this.resolvePairTurnCwd();
+      const providerTakesTurnCwd = this.provider.capabilities?.turnCwd === true;
       const dispatchResult = await dispatchSharedContextSend(this.provider, this._providerSessionId!, {
         userMessage: providerMessage,
         deliveryId: this._activeDispatchEntries.map((entry) => entry.clientMessageId).join('\n'),
         activityGeneration: this.currentActivityGeneration(),
-        messagePreamble,
+        // A provider that cannot start a turn in another directory is told the
+        // workspace on one line instead (see task-pairs/turn-cwd.ts).
+        messagePreamble: pairTurnCwd && !providerTakesTurnCwd
+          ? [`cwd: ${pairTurnCwd}`, messagePreamble].filter(Boolean).join('\n')
+          : messagePreamble,
+        ...(pairTurnCwd && providerTakesTurnCwd ? { turnCwd: pairTurnCwd } : {}),
         description: isSlashControl ? undefined : this._description,
         systemPrompt: isSlashControl ? undefined : this._systemPrompt,
+        // Provider-native slash controls must remain byte-clean. The stable
+        // identity is deliberately reasserted on the next ordinary turn after
+        // /compact rather than being prepended to the control itself.
+        identityPrompt: isSlashControl ? undefined : this._identityPrompt,
         suppressMcpMemorySearchGuidance: isSlashControl,
         suppressAgentProgressGuidance: isSlashControl,
         suppressFilePathReportingGuidance: isSlashControl,
@@ -3006,6 +4503,10 @@ export class TransportSessionRuntime implements SessionRuntime {
         authoredContextLanguage: isSlashControl ? undefined : this._contextAuthoredContextLanguage,
         authoredContextFilePath: isSlashControl ? undefined : this._contextAuthoredContextFilePath,
         ...(this._sessionIdentity ? { sessionIdentity: this._sessionIdentity } : {}),
+        automaticSupervisionEnabled,
+        taskPairEngine,
+        brainContractRegistered: this._brainContractRegisteredVariant === brainContractVariant,
+        registeredSystemContractText,
         ...(startupMemory ? { startupMemory } : {}),
         ...(memoryRecall ? { memoryRecall } : {}),
       }, {
@@ -3027,6 +4528,17 @@ export class TransportSessionRuntime implements SessionRuntime {
           }
         },
       });
+      // Provider acceptance is the durability boundary for a one-shot handoff.
+      // STOP may race with an already accepted send, so consume it before the
+      // cancellation branch to prevent duplicate injection on the next retry.
+      if (handoffPreamble && this._pendingHandoff) {
+        this._pendingHandoff = null;
+        try {
+          this._onPendingHandoffConsumed?.();
+        } catch (err) {
+          logger.warn({ err, sessionKey: this.sessionKey }, 'failed to persist consumed cross-vendor handoff');
+        }
+      }
       if (this.isDispatchLocallyCancelled(dispatchId)) {
         this.rollbackActiveSummarySyncReservation(dispatchId);
         await this.provider.cancel?.(this._providerSessionId!).catch((err: unknown) => {
@@ -3036,7 +4548,25 @@ export class TransportSessionRuntime implements SessionRuntime {
       }
       // Provider accepted the send — the turn was delivered. Resolve any
       // recoverable-retry streak so a later failure starts with a full budget.
+      if (this._activeDispatchId === dispatchId) {
+        this._activeDispatchProviderAccepted = true;
+        // A direct dispatch never passed through the durable queue, so nothing
+        // else records that it arrived. Without this, "has this message been
+        // delivered?" is unanswerable for the ordinary idle send, and a caller
+        // that must not re-send has no way to tell an accepted message from one
+        // that died with the runtime.
+        this.recordDirectDispatchDelivery(dispatchId);
+        this.scheduleActiveAppendFlush(dispatchId);
+      }
       this._recoverableDispatchRetries = 0;
+      // This variant's contract body (or its reference, when it was already
+      // registered) reached the provider on this turn, so later turns on the
+      // same thread re-assert it by reference -- until the mode changes.
+      this._brainContractRegisteredVariant = brainContractVariant;
+      for (const entry of this._activeDispatchEntries) {
+        const contract = entry.registeredSystemContract;
+        if (contract) this._registeredSystemContractSignatures.set(contract.contractId, contract.signature);
+      }
       this.markSdkTurnLostReplacementProviderAccepted(dispatchId);
       if (dispatchResult.payload?.memoryRecall) {
         const hitIds = dispatchResult.payload.memoryRecall.items.map((item) => item.id);
@@ -3051,6 +4581,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this.emitMemoryContextStatusEvent(memoryRecallResult.statusPayload, clientMessageId);
       }
       this._preferenceContextInjectionAttempt = null;
+      this._supervisionContractInjectionAttempt = null;
       if (!this._startupMemoryInjected && dispatchResult.payload?.startupMemory) {
         this._startupMemoryInjected = true;
         recordSyncedSummaryFingerprints(
@@ -3086,6 +4617,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._lastInjectedPreferenceContextSignature = this._preferenceContextInjectionAttempt.previous;
           this._preferenceContextInjectionAttempt = null;
         }
+        if (this._supervisionContractInjectionAttempt) {
+          this._lastInjectedSupervisionContractSignature = this._supervisionContractInjectionAttempt.previous;
+          this._supervisionContractInjectionAttempt = null;
+        }
         if (this._activeDispatchId !== dispatchId || !this._sending || !this._activeTurn) {
           this._locallyCancelledDispatchIds.delete(dispatchId);
           return;
@@ -3112,7 +4647,10 @@ export class TransportSessionRuntime implements SessionRuntime {
           return;
         }
         this.recordProviderError(providerError);
-        logger.warn(
+        const capacityRetryEligible = this.canRetryBeforeProviderBoundary(providerError)
+          && this.willRetryAsCapacity(providerError);
+        (capacityRetryEligible ? logger.debug : logger.warn).call(
+          logger,
           {
             sessionKey: this.sessionKey,
             provider: this.provider.id,
@@ -3124,6 +4662,61 @@ export class TransportSessionRuntime implements SessionRuntime {
           },
           'transport runtime dispatch failed',
         );
+        if (capacityRetryEligible && this.requeueAndScheduleCapacityRetry(providerError)) {
+          this.rollbackActiveSummarySyncReservation(dispatchId);
+          this._sending = false;
+          this._activeTurn.reject(providerError);
+          this._activeTurn = null;
+          this.clearStalePendingCancelFallbackTimer();
+          this._activeDispatchProviderStarted = false;
+          this._activeDispatchProviderAccepted = false;
+          this._activeDispatchCancelled = false;
+          this._activeDispatchId = null;
+          this._activeDispatchStaleRecoveryStarted = false;
+          this._locallyCancelledDispatchIds.delete(dispatchId);
+          this.setStatus('thinking');
+          return;
+        }
+        if (this._activeDispatchEntries.length > 0) this.cancelCapacityRetry(false);
+        // A provider-side acceptance is irreversible.  A late error/completion
+        // must settle the local turn without putting the accepted ids back into
+        // the retry FIFO; only pre-acceptance failures may release/requeue.
+        if (this._activeDispatchProviderAccepted) {
+          this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+            providerStarted: true,
+            providerAccepted: true,
+            reason: `accepted_provider_error:${providerError.code}`,
+          });
+          this._activeDispatchEntries = [];
+          this.setStatus('error');
+          return;
+        }
+        // A capacity-class rejection after provider admission is an
+        // ambiguous side effect, not a retryable pre-send failure.  Persist a
+        // no-replay tombstone before clearing local state so restart/lease
+        // expiry cannot enqueue the same handoff again.
+        if (this.isCapacityRetryError(providerError)
+          && !this.canRetryBeforeProviderBoundary(providerError)) {
+          this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+            providerStarted: this._activeDispatchProviderStarted,
+            providerAccepted: this._activeDispatchProviderAccepted,
+            sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+            reason: `capacity_provider_error:${providerError.code}`,
+          });
+          this._activeDispatchEntries = [];
+          this._sending = false;
+          this._activeTurn.reject(providerError);
+          this._activeTurn = null;
+          this.clearStalePendingCancelFallbackTimer();
+          this._activeDispatchProviderStarted = false;
+          this._activeDispatchProviderAccepted = false;
+          this._activeDispatchCancelled = false;
+          if (this._activeDispatchId === dispatchId) this._activeDispatchId = null;
+          this._activeDispatchStaleRecoveryStarted = false;
+          this._locallyCancelledDispatchIds.delete(dispatchId);
+          this.setStatus('error');
+          return;
+        }
         const canDrain = providerError.code === PROVIDER_ERROR_CODES.CANCELLED || providerError.recoverable;
         this._sending = false;
         this._activeTurn.reject(providerError);
@@ -3159,12 +4752,14 @@ export class TransportSessionRuntime implements SessionRuntime {
             // session-manager can preserve them to resend before relaunching the
             // provider runtime. Do NOT drain into the same wedged provider and
             // do NOT drop the active entries.
+            this.releaseDispatchHandoffs(this._activeDispatchEntries);
             this._pendingMessages.unshift(...this._activeDispatchEntries);
             this._pendingVersion++;
             this._activeDispatchEntries = [];
             this.setStatus('error');
             return;
           }
+          this.releaseDispatchHandoffs(this._activeDispatchEntries);
           this._activeDispatchEntries = [];
           if (this._drainPending()) return;
           // Cancellation → idle (the user stopped). Recoverable budget exhausted
@@ -3177,9 +4772,146 @@ export class TransportSessionRuntime implements SessionRuntime {
         // listener above so a genuine CONNECTION_LOST can be copied to the
         // resend queue, then clear runtime-local active state. Ordinary
         // dispatch failures must not leave `hasActiveTurnWork()` true forever.
+        this.releaseDispatchHandoffs(this._activeDispatchEntries);
         this._activeDispatchEntries = [];
-        // Don't drain on async send failure — the provider is likely broken.
+        // The failed message itself is not retried here — the provider is
+        // likely broken for this specific turn — but the queue is
+        // SESSION-level, not bound to this one turn: anything queued behind
+        // it must still get a chance to run instead of waiting forever on a
+        // turn that will never complete. A genuinely down provider fails the
+        // next attempt fast (settling the same way), instead of the session
+        // sitting stuck in "working" with the queue never draining.
+        this._drainPending();
       });
+  }
+
+  private providerSnapshotHasAppendableTurn(snapshot: ProviderActiveWorkSnapshot | null): boolean {
+    if (!snapshot) return false;
+    const expectedGeneration = this._activityGeneration > 0
+      ? this.currentActivityGeneration()
+      : undefined;
+    const evaluation = evaluateProviderSnapshot(snapshot, expectedGeneration);
+    if (!evaluation.blocking || this.shouldIgnoreZeroWorkProviderSnapshot(snapshot, evaluation.state)) {
+      return false;
+    }
+    return this.providerWorkBreakdown(snapshot).turnWorkCount > 0;
+  }
+
+  private ownsActiveAppendFlush(dispatchId: number | null): boolean {
+    return dispatchId === null
+      ? this._activeDispatchId === null
+        && !this.hasInFlightDispatchWork()
+        && this._recoverableRetryTimer === null
+        && this._recoverableRetryEntryIds.length === 0
+        && this._sdkTurnLostRecoveryAttempt === null
+      : this._activeDispatchId === dispatchId && this._activeDispatchProviderAccepted;
+  }
+
+  /**
+   * Owner of the flush currently in `_activeAppendFlush`, and the single
+   * transition request that arrived while that flush still held it.
+   *
+   * A native admission can outlive the dispatch that started it. When it does,
+   * the running flush is owned by a dispatch id that is no longer authoritative,
+   * so it exits without draining -- and a request that arrived meanwhile used to
+   * be dropped for the sole reason that a flush was in flight. The append then
+   * sat in BOTH the runtime list and the durable queue forever while the
+   * provider was still working: not a lost race, silence.
+   *
+   * Deterministic rule: only a request for a DIFFERENT owner is retained (the
+   * running loop re-finds entries for its own owner by itself), the newest such
+   * request wins because an older one is superseded by definition, it is
+   * consumed exactly once, and it only starts if `ownsActiveAppendFlush` still
+   * holds at consume time -- so a request whose generation, dispatch or queue
+   * authority has moved on is discarded rather than started. Nothing reschedules
+   * from provider activity alone, which is what would spin on a stale or
+   * unsupported admission.
+   */
+  private _activeAppendFlushOwner: number | null | undefined = undefined;
+  private _pendingAppendFlushTransition: { dispatchId: number | null } | null = null;
+
+  private scheduleActiveAppendFlush(dispatchId: number | null): void {
+    if (!this.ownsActiveAppendFlush(dispatchId)) return;
+    if (this._activeAppendFlush) {
+      // Same owner needs nothing: that loop re-reads the pending list itself.
+      if (this._activeAppendFlushOwner !== dispatchId) {
+        this._pendingAppendFlushTransition = { dispatchId };
+      }
+      return;
+    }
+    const flush = this.flushAcceptedProviderActiveAppends(dispatchId);
+    this._activeAppendFlush = flush;
+    this._activeAppendFlushOwner = dispatchId;
+    void flush.catch((err) => {
+      logger.warn(
+        { err, sessionKey: this.sessionKey, dispatchId },
+        'transport accepted-provider active append flush failed; retaining durable FIFO fallback',
+      );
+    }).finally(() => {
+      if (this._activeAppendFlush !== flush) return;
+      this._activeAppendFlush = null;
+      this._activeAppendFlushOwner = undefined;
+      const pending = this._pendingAppendFlushTransition;
+      // Cleared BEFORE dispatching it, so a request that is no longer
+      // authoritative is discarded here rather than retried on the next
+      // completion. The authority re-check itself lives in exactly one place --
+      // the `ownsActiveAppendFlush` guard at the top of the method below -- so a
+      // request whose generation, dispatch or queue authority has moved on
+      // simply does not start. Re-checking here as well compiles and passes but
+      // is dead weight: a mutant that deletes it changes no observable
+      // behaviour, which is the definition of a safeguard that can rot unseen.
+      this._pendingAppendFlushTransition = null;
+      if (pending) this.scheduleActiveAppendFlush(pending.dispatchId);
+    });
+  }
+
+  private async flushAcceptedProviderActiveAppends(dispatchId: number | null): Promise<void> {
+    const deferredRetryIds = new Set<string>();
+    for (;;) {
+      if (!this.ownsActiveAppendFlush(dispatchId)) return;
+      const entry = this._pendingMessages.find(
+        (candidate) => candidate.deliveryMode === MEMORY_MCP_SEND_DELIVERY_MODES.APPEND
+          && !deferredRetryIds.has(candidate.clientMessageId),
+      );
+      if (!entry) return;
+
+      const result = await this.appendPendingMessagesToActiveTurn(
+        [entry.clientMessageId],
+        entry.clientMessageId,
+        entry.activeTurnDeliveryKind ?? PROVIDER_ACTIVE_TURN_DELIVERY_KINDS.QUEUED_MESSAGE,
+      );
+      if (result.status === 'rejected') continue;
+      if (result.status === 'retry') {
+        deferredRetryIds.add(entry.clientMessageId);
+        continue;
+      }
+      if (result.status !== 'delivered') {
+        logger.info(
+          {
+            sessionKey: this.sessionKey,
+            clientMessageId: entry.clientMessageId,
+            status: result.status,
+          },
+          'transport active append was not admitted; retaining durable idle fallback',
+        );
+        return;
+      }
+      const timelineEntries = result.entries.filter((candidate) => !candidate.timelineCommitted);
+      for (const candidate of timelineEntries) candidate.timelineCommitted = true;
+      if (timelineEntries.length > 0) {
+        try {
+          this._onActiveAppend?.(timelineEntries, result.queueSnapshot);
+        } catch (error) {
+          logger.warn({ error, sessionKey: this.sessionKey }, 'transport active append projection callback failed');
+        }
+      }
+      for (const fact of result.deliveryFacts) {
+        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
+          source: 'daemon',
+          confidence: 'high',
+        });
+      }
+    }
   }
 
   private resolveAuthoredContextRepository(): string | undefined {
@@ -3192,8 +4924,95 @@ export class TransportSessionRuntime implements SessionRuntime {
    * Drain all pending messages into a single merged turn.
    * Called after onComplete/onError. Returns true if a new turn was started.
    */
+  private activeDispatchIsCompactCommand(): boolean {
+    return this._activeDispatchEntries.length > 0
+      && this._activeDispatchEntries.every((entry) => isSessionCompactCommandText(entry.text));
+  }
+
+  /**
+   * After any compaction the conversation prefix may be a summary. Everything
+   * IM.codes injects must come back whole on the next turn rather than survive
+   * as a paraphrase: the stable session system text (merged user/project/
+   * session identity, runtime instructions), preference context, and the
+   * bodies of registered system contracts that later messages reference by id.
+   */
+  private reinjectAfterCompaction(): void {
+    this._lastInjectedPreferenceContextSignature = null;
+    this._lastInjectedSupervisionContractSignature = null;
+    // Codex resumes the SAME thread with fresh baseInstructions; message-side
+    // adapters clear their "already injected" marker.
+    if (this._providerSessionId) this.provider.refreshSessionSystemText?.(this._providerSessionId);
+    this._brainContractRegisteredVariant = null;
+    this._registeredSystemContractSignatures.clear();
+  }
+
+  /**
+   * Compact a session whose context is nearly full, before the model degrades.
+   *
+   * Seen live: a Codex session at 214k of a 258k window stopped doing work --
+   * 0-2 tool calls per turn, then a one-line status and the turn ended -- and
+   * the provider's own auto-compaction had not fired. Checked only when a turn
+   * ends with nothing queued (the drain would merge a queued `/compact` into
+   * user text), and only for providers that compact natively AND re-send the
+   * complete session system text afterwards, so identity, runtime instructions
+   * and registered contracts are re-injected in full rather than summarized.
+   * Runs the exact `/compact` path a user would, including the post-compaction
+   * re-injection in the completion handler above.
+   */
+  private maybeAutoCompact(completed: AgentMessage): void {
+    const compact = this.provider.capabilities.compact;
+    if (compact?.execution === 'unsupported' || !compact?.verified || !compact.reassertsSessionSystemText) return;
+    if (this._status !== 'idle' || this._pendingMessages.length > 0) return;
+    const usage = completed.metadata?.usage as {
+      input_tokens?: number;
+      cache_read_input_tokens?: number;
+      cache_creation_input_tokens?: number;
+      model_context_window?: number;
+    } | undefined;
+    if (!usage) return;
+    // The same window the usage display shows: provider-reported, else the
+    // session preset's, else the model's (Claude reports none).
+    const model = typeof completed.metadata?.model === 'string' ? completed.metadata.model : undefined;
+    const window = resolveSessionContextWindow(this.sessionKey, usage.model_context_window, model).contextWindow;
+    if (!(window > 0)) return;
+    const used = (usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0);
+    if (used < window * transportAutoCompactRatio()) return;
+    const now = Date.now();
+    // A compaction that could not bring usage down must not become a loop.
+    if (now - this._lastAutoCompactAt < TRANSPORT_AUTO_COMPACT_MIN_INTERVAL_MS) return;
+    this._lastAutoCompactAt = now;
+    logger.info(
+      { sessionKey: this.sessionKey, usedTokens: used, contextWindow: window },
+      'transport runtime auto-compacting a nearly full context',
+    );
+    try {
+      this.send(SESSION_COMPACT_COMMAND, `auto-compact:${randomUUID()}`, undefined, undefined, { timelineCommitted: true });
+    } catch (err) {
+      logger.warn({ err, sessionKey: this.sessionKey }, 'transport runtime auto-compaction could not start');
+    }
+  }
+
   private _drainPending(): boolean {
     if (this._pendingMessages.length === 0 || !this._providerSessionId) return false;
+    // Durable rows can outlive the scheduler decision that created them. Re-run
+    // the daemon authority predicate at the final delivery edge; rejected rows
+    // are removed before any provider turn can observe them.
+    let authorizedIds: Set<string> | undefined;
+    if (this._pendingDrainAdmission) {
+      const decisions = this._pendingMessages.map((entry) => ({
+        entry,
+        admission: normalizeQueueAdmissionDecision(this._pendingDrainAdmission!(entry)),
+      }));
+      const rejected = decisions.filter(({ admission }) => admission === 'stale');
+      for (const { entry } of rejected) this.removePendingMessage(entry.clientMessageId);
+      const retryEntries = decisions.filter(({ admission }) => admission === 'retry').map(({ entry }) => entry);
+      this.schedulePendingAuthorityRetry(retryEntries);
+      authorizedIds = new Set(
+        decisions.filter(({ admission }) => admission === 'authorized').map(({ entry }) => entry.clientMessageId),
+      );
+      for (const clientMessageId of authorizedIds) this._pendingAuthorityRetryAttempts.delete(clientMessageId);
+      if (authorizedIds.size === 0) return false;
+    }
     const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount > 0) {
       logger.warn(
@@ -3213,7 +5032,11 @@ export class TransportSessionRuntime implements SessionRuntime {
     // Draining now supersedes any pending recoverable-retry backoff.
     this.clearRecoverableRetryTimer();
 
-    const retryEntryIds = this._recoverableRetryEntryIds;
+    const retryEntryIds = this._capacityRetryEntryIds.length > 0
+      ? this._capacityRetryEntryIds
+      : this._recoverableRetryEntryIds;
+    const capacityRetry = this._capacityRetryEntryIds.length > 0;
+    if (capacityRetry) this._capacityRetryEntryIds = [];
     this._recoverableRetryEntryIds = [];
     let messages: PendingTransportMessage[];
     if (retryEntryIds.length > 0) {
@@ -3222,7 +5045,9 @@ export class TransportSessionRuntime implements SessionRuntime {
       );
       messages = retryEntryIds
         .map((clientMessageId) => retryEntriesById.get(clientMessageId))
-        .filter((entry): entry is PendingTransportMessage => entry !== undefined);
+        .filter((entry): entry is PendingTransportMessage => (
+          entry !== undefined && (!authorizedIds || authorizedIds.has(entry.clientMessageId))
+        ));
       if (messages.length > 0) {
         const retryEntryIdSet = new Set(retryEntryIds);
         this._pendingMessages = this._pendingMessages.filter(
@@ -3230,34 +5055,37 @@ export class TransportSessionRuntime implements SessionRuntime {
         );
       } else {
         // The user removed the whole retried turn during backoff. Its timer no
-        // longer owns the queue; drain whatever remains as an ordinary turn.
-        messages = this._pendingMessages.splice(0);
+        // longer owns the queue; drain every currently authorized ordinary
+        // entry while leaving transient supervision rows durable in place.
+        messages = authorizedIds
+          ? this._pendingMessages.filter((entry) => authorizedIds!.has(entry.clientMessageId))
+          : [...this._pendingMessages];
+        const messageIds = new Set(messages.map((entry) => entry.clientMessageId));
+        this._pendingMessages = this._pendingMessages.filter((entry) => !messageIds.has(entry.clientMessageId));
       }
     } else {
-      messages = this._pendingMessages.splice(0);
+      messages = takeDrainBatch(authorizedIds
+        ? this._pendingMessages.filter((entry) => authorizedIds!.has(entry.clientMessageId))
+        : [...this._pendingMessages]);
+      const messageIds = new Set(messages.map((entry) => entry.clientMessageId));
+      this._pendingMessages = this._pendingMessages.filter((entry) => !messageIds.has(entry.clientMessageId));
     }
+    for (const entry of messages) this._pendingAuthorityRetryAttempts.delete(entry.clientMessageId);
+    // A pending row is leased before it leaves the runtime FIFO.  Finalizing it
+    // here used to create a delivery tombstone before provider.send() had even
+    // started; teardown/upgrade preservation then re-enqueued the active entry
+    // from that false proof and replayed it after reconnect.  Keep the durable
+    // handoff live until the provider acceptance boundary instead.
+    const leasedMessages = this.acquireDispatchHandoffs(messages);
+    if (!leasedMessages) {
+      this._pendingMessages.unshift(...messages);
+      this._pendingVersion++;
+      return false;
+    }
+    messages = leasedMessages;
     const timelineMessages = messages.filter((entry) => !entry.timelineCommitted);
     for (const entry of timelineMessages) entry.timelineCommitted = true;
-    try {
-      const queueResult = getTransportQueueStore().finalizeSentBatch(
-        this.sessionKey,
-        messages.map((entry) => entry.clientMessageId),
-        randomUUID(),
-      );
-      for (const fact of queueResult.deliveryFacts) {
-        timelineEmitter.emit(this.sessionKey, 'transport.queue.delivery', { ...fact }, {
-          source: 'daemon',
-          confidence: 'high',
-        });
-      }
-      this._pendingVersion = Math.max(this._pendingVersion, queueResult.snapshot.pendingMessageVersion);
-    } catch (err) {
-      logger.warn(
-        { err, sessionKey: this.sessionKey, clientMessageIds: messages.map((entry) => entry.clientMessageId) },
-        'transport queue sqlite finalizeSentBatch failed during drain',
-      );
-      this._pendingVersion++;
-    }
+    this._pendingVersion++;
     // Advance the queue version the moment the queue empties. The onDrain
     // callback below emits this new version on both the per-entry
     // `user.message` events and the cleared `session.state`, so a stale
@@ -3315,6 +5143,12 @@ export class TransportSessionRuntime implements SessionRuntime {
         { err, providerSessionId: this._providerSessionId, count: messages.length },
         '_drainPending: _dispatchTurn synchronous prologue threw — resetting runtime state',
       );
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: 'sync_dispatch_prologue_failure',
+      });
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
@@ -3347,6 +5181,12 @@ export class TransportSessionRuntime implements SessionRuntime {
       this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
       this.closeOpenTools('cancelled', 'user_cancelled');
       if (dispatchId !== null) this._locallyCancelledDispatchIds.delete(dispatchId);
+      this.settleActiveDispatchHandoffs(this._activeDispatchEntries, {
+        providerStarted: this._activeDispatchProviderStarted,
+        providerAccepted: this._activeDispatchProviderAccepted,
+        sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+        reason: 'user_cancelled_stale',
+      });
       this._activeDispatchEntries = [];
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchCancelled = false;
@@ -3358,6 +5198,13 @@ export class TransportSessionRuntime implements SessionRuntime {
       }
       return;
     }
+    const activeEntries = this._activeDispatchEntries;
+    this.settleActiveDispatchHandoffs(activeEntries, {
+      providerStarted: this._activeDispatchProviderStarted,
+      providerAccepted: this._activeDispatchProviderAccepted,
+      sideEffectEvidence: this._activeDispatchHasSideEffectEvidence,
+      reason: 'user_cancelled',
+    });
     this._sending = false;
     this.rollbackActiveSummarySyncReservation(dispatchId ?? undefined);
     this._activeTurn?.reject(makeCancelledProviderError());
@@ -3374,25 +5221,42 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
   }
 
-  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string): string | undefined {
-    if (!entries || entries.length === 0) return undefined;
+  private mergeMessagePreambles(entries: PendingTransportMessage[] | undefined, userMessage?: string, extraPreamble?: string): string | undefined {
+    if (!entries || entries.length === 0) return extraPreamble?.trim() || undefined;
     const seen = new Set<string>();
     const parts: string[] = [];
+    let lastSupervisionContractBlock: string | undefined;
     const isControlMessage = userMessage?.trim().startsWith('/') === true;
     if (userMessage && shouldResetTransportPreferenceContextForSessionControl(userMessage)) {
       // The compact control command must stay raw, and the next real turn
       // should re-seed stable preferences because the provider may have
       // discarded prior context during compaction.
       this._lastInjectedPreferenceContextSignature = null;
+      this._lastInjectedSupervisionContractSignature = null;
     }
     for (const entry of entries) {
       const preamble = entry.messagePreamble?.trim();
       if (!preamble) continue;
-      const filtered = this.filterOneShotPreferenceContext(preamble, isControlMessage);
-      if (!filtered || seen.has(filtered)) continue;
-      seen.add(filtered);
-      parts.push(filtered);
+      const preferenceFiltered = this.filterOneShotPreferenceContext(preamble, isControlMessage);
+      if (!preferenceFiltered) continue;
+      const extracted = extractDelimitedBlocks(
+        preferenceFiltered,
+        SUPERVISION_CONTRACT_PREAMBLE_START,
+        SUPERVISION_CONTRACT_PREAMBLE_END,
+      );
+      if (extracted.blocks.length > 0) {
+        lastSupervisionContractBlock = extracted.blocks.at(-1);
+      }
+      const retained = extracted.withoutBlocks;
+      if (!retained || seen.has(retained)) continue;
+      seen.add(retained);
+      parts.push(retained);
     }
+    const supervisionContract = lastSupervisionContractBlock
+      ? this.filterOneShotSupervisionContractBlock(lastSupervisionContractBlock, isControlMessage)
+      : undefined;
+    if (supervisionContract && !seen.has(supervisionContract)) parts.push(supervisionContract);
+    if (extraPreamble?.trim() && !seen.has(extraPreamble.trim())) parts.push(extraPreamble.trim());
     return parts.join('\n\n') || undefined;
   }
 
@@ -3413,6 +5277,21 @@ export class TransportSessionRuntime implements SessionRuntime {
     return preamble;
   }
 
+  private filterOneShotSupervisionContractBlock(contractBlock: string, isControlMessage: boolean): string | undefined {
+    if (isControlMessage) return undefined;
+    const signature = normalizeStableContextSignature([contractBlock]);
+    if (signature && signature === this._lastInjectedSupervisionContractSignature) {
+      return SUPERVISION_CONTRACTS_IN_FORCE_REFERENCE;
+    }
+    if (signature) {
+      this._supervisionContractInjectionAttempt ??= {
+        previous: this._lastInjectedSupervisionContractSignature,
+      };
+      this._lastInjectedSupervisionContractSignature = signature;
+    }
+    return contractBlock;
+  }
+
   private async refreshContextBootstrap(options?: {
     phase?: 'initialize' | 'dispatch';
     timeoutMs?: number;
@@ -3422,7 +5301,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     const timeoutMs = options?.timeoutMs ?? getTransportContextBudgetMs();
     let bootstrapPromise: Promise<TransportContextBootstrap>;
     try {
-      bootstrapPromise = Promise.resolve(this._contextBootstrapResolver());
+      bootstrapPromise = this._deferredContextBootstrap ?? Promise.resolve(this._contextBootstrapResolver());
     } catch (err) {
       incrementCounter('transport.context.bootstrap_failed', { phase });
       logger.warn({ err, sessionKey: this.sessionKey, phase }, 'transport context bootstrap failed before dispatch; continuing with existing context');
@@ -3458,6 +5337,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       authoredContextFilePath?: string;
     },
   ): void {
+    this._contextBootstrapGeneration += 1;
     this._contextNamespace = bootstrap.namespace;
     this._contextNamespaceDiagnostics = [...(bootstrap.diagnostics ?? [])];
     this._contextRemoteProcessedFreshness = bootstrap.remoteProcessedFreshness;
@@ -3555,6 +5435,9 @@ export class TransportSessionRuntime implements SessionRuntime {
           sourceKind: 'local_processed',
         }),
       };
+    }
+    if (this._contextNamespace && !(await isMemoryInjectionEnabled(this._contextNamespace).catch(() => true))) {
+      return { artifact: null };
     }
     let semanticSkipReason: 'skipped_short_prompt' | 'skipped_template_prompt' | 'skipped_control_message' | undefined;
     if (trimmed.length < 10) semanticSkipReason = 'skipped_short_prompt';
@@ -3774,6 +5657,7 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
     id: item.id,
     type: item.type,
     projectId: item.projectId,
+    ...(item.sourceSessionName?.trim() ? { sourceSessionName: item.sourceSessionName.trim() } : {}),
     scope: item.scope,
     ...(item.enterpriseId ? { enterpriseId: item.enterpriseId } : {}),
     ...(item.workspaceId ? { workspaceId: item.workspaceId } : {}),
@@ -3789,23 +5673,27 @@ function toTransportMemoryRecallItem(item: MemorySearchResultItem): TransportMem
   };
 }
 
-function extractPreferenceContextBlocks(text: string): { blocks: string[]; withoutBlocks: string } {
+function extractDelimitedBlocks(
+  text: string,
+  startMarker: string,
+  endMarker: string,
+): { blocks: string[]; withoutBlocks: string } {
   const blocks: string[] = [];
   const retained: string[] = [];
   let cursor = 0;
   while (cursor < text.length) {
-    const start = text.indexOf(PREFERENCE_CONTEXT_START, cursor);
+    const start = text.indexOf(startMarker, cursor);
     if (start < 0) {
       retained.push(text.slice(cursor));
       break;
     }
-    const end = text.indexOf(PREFERENCE_CONTEXT_END, start + PREFERENCE_CONTEXT_START.length);
+    const end = text.indexOf(endMarker, start + startMarker.length);
     if (end < 0) {
       retained.push(text.slice(cursor));
       break;
     }
     retained.push(text.slice(cursor, start));
-    const blockEnd = end + PREFERENCE_CONTEXT_END.length;
+    const blockEnd = end + endMarker.length;
     blocks.push(text.slice(start, blockEnd).trim());
     cursor = blockEnd;
   }
@@ -3813,6 +5701,10 @@ function extractPreferenceContextBlocks(text: string): { blocks: string[]; witho
     blocks,
     withoutBlocks: retained.join('').replace(/\n{3,}/g, '\n\n').trim(),
   };
+}
+
+function extractPreferenceContextBlocks(text: string): { blocks: string[]; withoutBlocks: string } {
+  return extractDelimitedBlocks(text, PREFERENCE_CONTEXT_START, PREFERENCE_CONTEXT_END);
 }
 
 function extractPreferenceContextTimelineItems(text: string | undefined): MemoryContextTimelinePreferenceItem[] {
@@ -3838,21 +5730,26 @@ function extractPreferenceContextTimelineItems(text: string | undefined): Memory
 }
 
 function normalizePreferenceContextSignature(blocks: readonly string[]): string {
+  return normalizeStableContextSignature(blocks);
+}
+
+function normalizeStableContextSignature(blocks: readonly string[]): string {
   return blocks.map((block) => block.replace(/\s+/g, ' ').trim()).filter(Boolean).join('\n');
 }
 
 function isTransportCompactionCompletion(message: AgentMessage): boolean {
   const metadata = message.metadata;
+  const command = typeof metadata === 'object' && metadata !== null
+    ? (metadata as Record<string, unknown>)[SESSION_CONTROL_METADATA_COMMAND_FIELD]
+    : undefined;
   const event = typeof metadata === 'object' && metadata !== null
     ? (metadata as Record<string, unknown>).event
     : undefined;
+  // Slash-command adapters such as Qoder/Kimi can only annotate their normal
+  // assistant completion. The daemon-authored command metadata is sufficient
+  // proof even when the provider cannot emit a synthetic system message.
+  if (command === 'compact') return true;
   return message.kind === 'system'
     && message.role === 'system'
-    && (
-      (typeof metadata === 'object'
-        && metadata !== null
-        && (metadata as Record<string, unknown>)[SESSION_CONTROL_METADATA_COMMAND_FIELD] === 'compact')
-      || event === 'thread/compacted'
-      || event === 'session.history.compact'
-    );
+    && (event === 'thread/compacted' || event === 'session.history.compact');
 }

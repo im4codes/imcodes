@@ -1,7 +1,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mkdtemp, open, readdir, rm, readFile, stat, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, open, readdir, rename, rm, readFile, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, join } from 'node:path';
 import {
   buildEnrollRedeemV2Request,
   allowedEnrollmentServerOrigin,
@@ -14,11 +14,20 @@ import {
   openVerifiedEnrollmentSource,
   parseEnrollmentBlob,
   persistInstallIdentity,
+  readEnrollmentBlob,
   readExactly,
   redeemEnrollmentV2,
   writeExactly,
 } from '../../src/node/enrollment.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
+
+// Staging applies Windows ACLs through `icacls`, which does not exist on the
+// machines this suite runs on. Only that one export is replaced; everything
+// else in the module stays real.
+vi.mock('../../src/node/installer.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../src/node/installer.js')>()),
+  applyWindowsAclCommands: vi.fn(),
+}));
 import {
   buildWindowsAuthenticodeEnrollmentPlan,
   inspectWindowsAuthenticodeEnrollmentContainer,
@@ -98,10 +107,11 @@ describe('controlled node enrollment v2', () => {
   it('redeemEnrollmentV2 builds credential from local nodeToken when response has no token', async () => {
     const blob = { serverUrl: 'https://im.example', enrollToken: 'tok' };
     const identity = generateInstallIdentity();
-    const fetchFn = vi.fn(async () => redeemResponse({ serverId: 's1', nodeRole: NODE_ROLE.CONTROLLED, refName: 'box-1234' })) as unknown as typeof fetch;
+    const fetchFn = vi.fn(async () => redeemResponse({ serverId: 's1', nodeId: '1234567890', nodeRole: NODE_ROLE.CONTROLLED, refName: 'box-1234' })) as unknown as typeof fetch;
     const cred = await redeemEnrollmentV2(blob, identity, fetchFn);
     expect(cred.token).toBe(identity.nodeToken);
     expect(cred.serverId).toBe('s1');
+    expect(cred.nodeId).toBe('1234567890');
     expect(fetchFn).toHaveBeenCalledOnce();
     expect(fetchFn.mock.calls[0]?.[0]).toBe('https://im.example/api/enroll/v2/redeem');
     const body = JSON.parse(String((fetchFn.mock.calls[0] as [string, RequestInit])[1]?.body));
@@ -109,6 +119,18 @@ describe('controlled node enrollment v2', () => {
     expect(body.nodeTokenHash).toBe(identity.nodeTokenHash);
     expect(body.version).toBe(2);
     expect((fetchFn.mock.calls[0] as [string, RequestInit])[1].redirect).toBe('error');
+  });
+
+  it.each([1234567890, '0123456789', '0000000001', '１２３４５６７８９０'])
+  ('rejects a non-canonical redeem nodeId %j', async (nodeId) => {
+    const fetchFn = vi.fn(async () => redeemResponse({
+      serverId: 's1', nodeId, nodeRole: NODE_ROLE.CONTROLLED,
+    })) as unknown as typeof fetch;
+    await expect(redeemEnrollmentV2(
+      { serverUrl: 'https://im.example', enrollToken: 'tok' },
+      generateInstallIdentity(),
+      fetchFn,
+    )).rejects.toThrow(/invalid_response/);
   });
 
   it('permits HTTP only for explicitly enabled local development origins', () => {
@@ -172,6 +194,90 @@ describe('controlled node enrollment v2', () => {
     } finally {
       await rm(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('staging over a locked destination', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'imcodes-locked-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('displaces a running Windows image, then sweeps what earlier runs stranded', async () => {
+    // Windows keeps a running image locked and refuses a rename onto it, so a
+    // re-install has to take the name from the incumbent instead. The incumbent
+    // is still executing and cannot be deleted in the same run, so the sweep has
+    // to happen on the NEXT one -- otherwise every re-install strands another
+    // ~80MB copy in the protected directory forever.
+    const platform = process.platform;
+    Object.defineProperty(process, 'platform', { value: 'win32', configurable: true });
+    try {
+      const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+      const source = join(dir, 'source.bin');
+      const dest = join(dir, 'imcodes-node.exe');
+      await writeFile(source, Buffer.concat([Buffer.alloc(128, 0x42), blob]));
+      await writeFile(dest, Buffer.alloc(8, 0x01));
+      const stranded = `${dest}.replaced-11111111-1111-1111-1111-111111111111`;
+      await writeFile(stranded, Buffer.alloc(8, 0x02));
+
+      let lockedOnce = false;
+      const stagingFs = createEnrollmentStagingFs({
+        rename: async (from, to) => {
+          if (to === dest && !lockedOnce && from !== stranded) {
+            lockedOnce = true;
+            throw Object.assign(new Error('EPERM'), { code: 'EPERM' });
+          }
+          await rename(from, to);
+        },
+      });
+      const opened = await openVerifiedEnrollmentSource(source, stagingFs);
+      try {
+        const receipt = await opened.stageTrailerFreeExecutable(dest, 128);
+        expect(receipt.size).toBe(128);
+      } finally {
+        await opened.close();
+      }
+
+      // The locked-destination fallback actually ran, rather than the plain
+      // rename quietly succeeding and making the rest of this vacuous.
+      expect(lockedOnce).toBe(true);
+      // The copy an earlier run had to strand is swept.
+      expect(await readdir(dir)).not.toContain(basename(stranded));
+      // And the new bytes own the stable name.
+      expect((await readFile(dest)).length).toBe(128);
+      // Retaining the copy displaced by THIS run is Windows-only -- there the
+      // file is still the running image and cannot be deleted. This host has no
+      // such lock, so it is removed immediately and the state is not asserted.
+    } finally {
+      Object.defineProperty(process, 'platform', { value: platform, configurable: true });
+    }
+  });
+});
+
+describe('readEnrollmentBlob', () => {
+  let dir: string;
+  beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'imcodes-read-blob-')); });
+  afterEach(async () => { await rm(dir, { recursive: true, force: true }); });
+
+  it('reads the trailer before releasing the handle', async () => {
+    // The helper opened the source, returned the read promise WITHOUT awaiting
+    // it, and let `finally` close the handle underneath the in-flight read, so
+    // every call died with EBADF "file closed". Nothing exercised it until the
+    // installer started reading its own trailer to name the server, and then it
+    // crashed the install outright.
+    const blob = encodeEnrollmentBlob({ serverUrl: 'https://im.example', enrollToken: 'once' });
+    const source = join(dir, 'installer.bin');
+    await writeFile(source, Buffer.concat([Buffer.alloc(128, 0x42), blob]));
+
+    await expect(readEnrollmentBlob(source)).resolves.toMatchObject({
+      serverUrl: 'https://im.example',
+      enrollToken: 'once',
+    });
+  });
+
+  it('reports no trailer rather than throwing for an ordinary file', async () => {
+    const plain = join(dir, 'plain.bin');
+    await writeFile(plain, Buffer.alloc(64, 0x11));
+    await expect(readEnrollmentBlob(plain)).resolves.toBeNull();
   });
 });
 

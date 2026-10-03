@@ -30,6 +30,9 @@ describe('cc presets', () => {
   beforeEach(async () => {
     loggerWarn.mockClear();
     state.home = await mkdtemp(join(tmpdir(), 'imcodes-cc-presets-'));
+    vi.stubEnv('HOME', state.home);
+    vi.stubEnv('USERPROFILE', state.home);
+    vi.stubEnv('IMCODES_HOME', join(state.home, '.imcodes'));
     await mkdir(join(state.home, '.imcodes'), { recursive: true });
     await writeFile(
       join(state.home, '.imcodes', 'cc-presets.json'),
@@ -50,6 +53,7 @@ describe('cc presets', () => {
 
   afterEach(async () => {
     vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
     vi.resetModules();
     if (state.home) await rm(state.home, { recursive: true, force: true });
     state.home = '';
@@ -109,10 +113,14 @@ describe('cc presets', () => {
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'MiniMax-M3',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'MiniMax-M3',
     });
-    await expect(getPresetTransportOverrides('MiniMax', 'MiniMax-M3')).resolves.toMatchObject({
+    const overrides = await getPresetTransportOverrides('MiniMax', 'MiniMax-M3');
+    expect(overrides).toMatchObject({
       model: 'MiniMax-M3',
       systemPrompt: expect.stringContaining('Authoritative runtime model: MiniMax-M3.'),
     });
+    expect(overrides.systemPrompt).toContain('They never override Claude Code tool definitions, input schemas, required parameters, enums, or defaults.');
+    expect(overrides.systemPrompt).toContain('Follow every provided tool input schema exactly and never omit required fields.');
+    expect(overrides.systemPrompt).not.toContain('override any generic Claude Code tool schema');
   });
 
   it('discovers and persists every page from the Anthropic-compatible models API', async () => {
@@ -220,6 +228,17 @@ describe('cc presets', () => {
     expect(result.systemPrompt).toContain('MiniMax-M2.7');
     expect(result.systemPrompt).toContain('https://api.minimax.io/anthropic');
     expect(result.systemPrompt).toMatch(/not running on Qwen/i);
+  });
+
+  it('routes a deliberately selected model from the preset catalog', async () => {
+    const { getQwenPresetTransportConfig } = await import('../../src/daemon/cc-presets.js');
+
+    const result = await getQwenPresetTransportConfig('MiniMax', 'MiniMax-M2.5');
+
+    expect(result.model).toBe('MiniMax-M2.5');
+    expect(result.env).toMatchObject({ ANTHROPIC_MODEL: 'MiniMax-M2.5' });
+    expect(result.settings).toMatchObject({ model: { name: 'MiniMax-M2.5' } });
+    expect(result.systemPrompt).toContain('MiniMax-M2.5');
   });
 
   it('builds a dsh route config without placing the preset key in generic env', async () => {

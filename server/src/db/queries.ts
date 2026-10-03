@@ -8,6 +8,7 @@ import type {
 import { EXECUTION_CLONE_KIND } from '../../../shared/execution-clone.js';
 import { NODE_ROLE, type NodeRole } from '../../../shared/remote-exec.js';
 import { deleteTokenUsageFactsForServer } from './token-usage-queries.js';
+import { insertControlledServerWithNodeId } from '../services/controlled-node-identity.js';
 
 // ── Types ─────────────────────────────────────────────────────────────────
 
@@ -32,6 +33,7 @@ export interface DbPlatformIdentity {
 
 export interface DbServer {
   id: string;
+  node_id?: string | null;
   user_id: string;
   team_id: string | null;
   name: string;
@@ -44,6 +46,13 @@ export interface DbServer {
   created_at: number;
   /** Missing/null is a legacy full daemon; only the explicit controlled role is passive. */
   node_role?: NodeRole | null;
+  /**
+   * Set by the owner kill-switch. `SELECT *` has always returned this column,
+   * but it was absent from the type, so a caller could not check what it could
+   * not see — which is how daemon-token routes silently kept honouring revoked
+   * credentials.
+   */
+  revoked_at?: number | null;
 }
 
 export interface DbChannelBinding {
@@ -343,6 +352,21 @@ export async function createServer(
   nodeRole: NodeRole = NODE_ROLE.FULL,
 ): Promise<DbServer> {
   const now = Date.now();
+  if (nodeRole === NODE_ROLE.CONTROLLED) {
+    await insertControlledServerWithNodeId(db, {
+      serverId: id,
+      userId,
+      tokenHash,
+      displayName: name,
+      refName: null,
+      os: null,
+      arch: null,
+      hostServerId: null,
+      boundWithKeyId: keyId ?? null,
+      createdAt: now,
+    });
+    return { id, user_id: userId, team_id: null, name, token_hash: tokenHash, last_heartbeat_at: null, status: 'offline', daemon_version: null, bound_with_key_id: keyId ?? null, created_at: now };
+  }
   await db.execute(
     'INSERT INTO servers (id, user_id, name, token_hash, status, created_at, bound_with_key_id, node_role) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)',
     [id, userId, name, tokenHash, 'offline', now, keyId ?? null, nodeRole],
@@ -423,14 +447,20 @@ export async function updateServerHeartbeat(
   id: string,
   daemonVersion?: string | null,
   controlledCapabilities?: readonly string[],
+  runtimeArch?: string | null,
 ): Promise<void> {
+  // COALESCE, so an older node that does not report one keeps whatever the row
+  // already holds rather than having it erased.
   if (controlledCapabilities !== undefined) {
     await db.execute(
       `UPDATE servers
           SET last_heartbeat_at = $1, status = $2, daemon_version = COALESCE($3, daemon_version),
-              controlled_capabilities = $4::jsonb
+              controlled_capabilities = $4::jsonb, arch = COALESCE($6, arch)
         WHERE id = $5`,
-      [Date.now(), 'online', daemonVersion ?? null, JSON.stringify(controlledCapabilities), id],
+      [
+        Date.now(), 'online', daemonVersion ?? null,
+        JSON.stringify(controlledCapabilities), id, runtimeArch ?? null,
+      ],
     );
   } else if (daemonVersion) {
     await db.execute('UPDATE servers SET last_heartbeat_at = $1, status = $2, daemon_version = $3 WHERE id = $4', [Date.now(), 'online', daemonVersion, id]);
@@ -522,11 +552,15 @@ export async function getServersByUserId(db: Database, userId: string): Promise<
     [userId],
   );
 
+  // Through group membership, which lives in its own table because a machine
+  // can be in several groups. DISTINCT because matching more than one of them
+  // must not list the same machine twice.
   const teamRows = await db.query<DbServer>(
-    `SELECT s.* FROM servers s
-     JOIN team_members tm ON s.team_id = tm.team_id
+    `SELECT DISTINCT ON (s.id, s.created_at) s.* FROM servers s
+     JOIN machine_groups mg ON mg.server_id = s.id
+     JOIN team_members tm ON tm.team_id = mg.team_id
      WHERE tm.user_id = $1 AND s.user_id != $2
-     ORDER BY s.created_at DESC`,
+     ORDER BY s.created_at DESC, s.id`,
     [userId, userId],
   );
 
