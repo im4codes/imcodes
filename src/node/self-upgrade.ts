@@ -1554,8 +1554,23 @@ export function buildPosixControlledNodeUpgradeScript(input: {
     : '';
   const remoteDesktopWorkerRoot = join(dirname(input.destinationPath), 'remote-desktop-worker');
   const remoteDesktopWorkerCopy = input.stagedRemoteDesktopWorkerDir
-    ? `rm -rf ${shQuote(remoteDesktopWorkerRoot)}\nmkdir -p ${shQuote(remoteDesktopWorkerRoot)}\ncp -R ${shQuote(`${input.stagedRemoteDesktopWorkerDir}/.`)} ${shQuote(remoteDesktopWorkerRoot)}/ 2>/dev/null || true\n`
-      + `find ${shQuote(remoteDesktopWorkerRoot)} -type f -name '${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}' -exec chmod 755 {} \\; 2>/dev/null || true\n`
+    ? `worker_stage=${shQuote(`${remoteDesktopWorkerRoot}.new`)}\n`
+      + `worker_backup=${shQuote(`${remoteDesktopWorkerRoot}.previous`)}\n`
+      + `rm -rf -- "$worker_stage" "$worker_backup" || SKIP=1\n`
+      + `if [ "$SKIP" = "0" ]; then\n`
+      + `  mkdir -p -- "$worker_stage" || SKIP=1\n`
+      + `  if [ "$SKIP" = "0" ] && ! cp -R -- ${shQuote(`${input.stagedRemoteDesktopWorkerDir}/.`)} "$worker_stage/"; then SKIP=1; fi\n`
+      + `  find "$worker_stage" -type f -name '${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}' -exec chmod 755 {} \\; 2>/dev/null || SKIP=1\n`
+      + `  if [ "$SKIP" = "0" ] && [ ! -f "$worker_stage/${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}" ]; then SKIP=1; fi\n`
+      + `  if [ "$SKIP" = "0" ] && [ -e ${shQuote(remoteDesktopWorkerRoot)} ]; then mv -- ${shQuote(remoteDesktopWorkerRoot)} "$worker_backup" || SKIP=1; fi\n`
+      + `  if [ "$SKIP" = "0" ] && ! mv -- "$worker_stage" ${shQuote(remoteDesktopWorkerRoot)}; then SKIP=1; fi\n`
+      + `  if [ "$SKIP" != "0" ]; then\n`
+      + `    rm -rf -- "$worker_stage"\n`
+      + `    if [ -e "$worker_backup" ] && [ ! -e ${shQuote(remoteDesktopWorkerRoot)} ]; then mv -- "$worker_backup" ${shQuote(remoteDesktopWorkerRoot)} || true; fi\n`
+      + `  else\n`
+      + `    rm -rf -- "$worker_backup" || SKIP=1\n`
+      + `  fi\n`
+      + `fi\n`
     : '';
   // Publish the new executable through a temp file + rename(2), NEVER `cp -f`
   // straight onto the destination.

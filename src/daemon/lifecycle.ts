@@ -12,7 +12,7 @@ import { detectRepo } from '../repo/detector.js';
 import { repoCache, RepoCache } from '../repo/cache.js';
 import { ServerLink, setServerLinkDisconnectSecurityHandler, setServerLinkReconnectResyncHandler } from './server-link.js';
 import { DaemonRemoteDesktop } from './remote-desktop-daemon.js';
-import { closeDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
+import { closeDaemonRemoteDesktop, refreshDaemonRemoteDesktop, setDaemonRemoteDesktop } from './remote-desktop-registry.js';
 import { handleWebCommand, setRouterContext, refreshCodexQuotaMetadata, refreshClaudeSdkSubQuotaMetadata } from './command-handler.js';
 import { dispatchSessionMessageByName } from './session-dispatch.js';
 import { dispatchReadyAuditSweep } from './send-tool.js';
@@ -949,6 +949,7 @@ export async function startup(): Promise<DaemonContext> {
       send: (message) => link.send(message as never),
       onCapabilityChange: () => link.refreshDaemonCapabilities(),
     }));
+    void refreshDaemonRemoteDesktop();
     serverLink.onMessage((msg) => {
       const type = msg && typeof msg === 'object' && 'type' in msg ? (msg as { type?: unknown }).type : undefined;
       if (type === CAPABILITY_OPERATION_MSG.INSTALL

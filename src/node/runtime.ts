@@ -6,7 +6,7 @@ import { CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.j
 import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import { DAEMON_UPGRADE_BLOCK_REASON } from '../../shared/daemon-upgrade.js';
+import { DAEMON_UPGRADE_BLOCK_REASON, DAEMON_UPGRADE_TARGET_LATEST } from '../../shared/daemon-upgrade.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import {
   AuthenticatedWebSocketClient,
@@ -701,10 +701,18 @@ export function createControlledNodeRuntime(
     ];
   };
   refreshRemoteDesktopCapabilityState();
-  const missingRemoteDesktopWorkerCanRepair = (platform === 'win32' || platform === 'linux')
+  const remoteDesktopWorkerNeedsRepair = (): boolean => (platform === 'win32' || platform === 'linux')
     && arch === 'x64'
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
+  const remoteDesktopWorkerBusy = (): boolean => {
+    try {
+      if (!remoteDesktopWorker.available()) return false;
+      if (!remoteDesktopWorker.activeConnections) return true;
+      return remoteDesktopWorker.activeConnections().length > 0;
+    }
+    catch { return true; }
+  };
   // macOS advertises the same intent under its own name and installs by a
   // different mechanism: the components are published into a store with
   // rollback and a last-known-good selector, so nothing replaces the running
@@ -738,6 +746,7 @@ export function createControlledNodeRuntime(
   // macosRemoteDesktopEverAvailable now declared above, alongside
   // refreshRemoteDesktopCapabilityState, which reads it on its first call.
   let upgradeInFlight = false;
+  let pendingDaemonUpgradeTarget: string | undefined;
   let upgradeHandoffDeadlineAt: number | null = null;
   const armUpgradeHandoffWatchdog = (): void => {
     if (platform !== 'win32') return;
@@ -1062,7 +1071,7 @@ export function createControlledNodeRuntime(
     }
   };
   const repairMissingRemoteDesktopWorker = (force = false) => {
-    if (!missingRemoteDesktopWorkerCanRepair || upgradeInFlight) return false;
+    if (!remoteDesktopWorkerNeedsRepair() || upgradeInFlight || remoteDesktopWorkerBusy()) return false;
     const now = options.now?.() ?? Date.now();
     if (!force && (remoteDesktopWorkerRepairEligibleAt === null
       || now < remoteDesktopWorkerRepairEligibleAt)) return false;
@@ -1092,6 +1101,28 @@ export function createControlledNodeRuntime(
     }, (error) => {
       clearUpgradeGate();
       logger.warn({ err: error }, 'missing remote desktop worker repair failed; will retry');
+    });
+    return true;
+  };
+  const startDeferredDaemonUpgrade = (targetVersion: string): boolean => {
+    if (upgradeInFlight || remoteDesktopWorkerBusy()) return false;
+    upgradeInFlight = true;
+    pendingDaemonUpgradeTarget = undefined;
+    const startSelfUpgrade = options.startSelfUpgrade ?? startControlledNodeSelfUpgrade;
+    void startSelfUpgrade(credential, targetVersion).then((result) => {
+      if (result.ok) {
+        client.send({ type: DAEMON_MSG.UPGRADING, targetVersion: result.targetVersion, artifactSha256: result.artifactSha256 });
+        armUpgradeHandoffWatchdog();
+        return;
+      }
+      clearUpgradeGate();
+      client.send({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: result.reason ?? 'controlled_node_upgrade_failed' });
+    }, (error) => {
+      clearUpgradeGate();
+      client.send({
+        type: DAEMON_MSG.UPGRADE_BLOCKED,
+        reason: error instanceof Error ? error.message : 'controlled_node_upgrade_failed',
+      });
     });
     return true;
   };
@@ -1144,7 +1175,7 @@ export function createControlledNodeRuntime(
       ...(remoteDesktopAccessPaused
         ? [REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY]
         : []),
-      ...(missingRemoteDesktopWorkerCanRepair || linuxDesktopInstallable()
+      ...(remoteDesktopWorkerNeedsRepair() || linuxDesktopInstallable()
         ? [REMOTE_DESKTOP_INSTALLABLE_CAPABILITY]
         : []),
       ...(macosRemoteDesktopComponentsInstallable()
@@ -1334,6 +1365,9 @@ export function createControlledNodeRuntime(
             + REMOTE_DESKTOP_WORKER_REPAIR_AUTH_GRACE_MS;
         }
         repairMissingRemoteDesktopWorker();
+        if (pendingDaemonUpgradeTarget && !upgradeInFlight) {
+          startDeferredDaemonUpgrade(pendingDaemonUpgradeTarget);
+        }
         // macOS installs itself. The components are part of this release, the
         // node already knows it has none, and making a human click a button to
         // fetch them is asking them to do what the node can do unprompted. The
@@ -1398,24 +1432,19 @@ export function createControlledNodeRuntime(
           });
           return;
         }
-        upgradeInFlight = true;
-        const targetVersion = message.targetVersion;
-        const startSelfUpgrade = options.startSelfUpgrade ?? startControlledNodeSelfUpgrade;
-        void startSelfUpgrade(credential, targetVersion).then((result) => {
-          if (result.ok) {
-            client.send({ type: DAEMON_MSG.UPGRADING, targetVersion: result.targetVersion, artifactSha256: result.artifactSha256 });
-            armUpgradeHandoffWatchdog();
-            return;
-          }
-          clearUpgradeGate();
-          client.send({ type: DAEMON_MSG.UPGRADE_BLOCKED, reason: result.reason ?? 'controlled_node_upgrade_failed' });
-        }, (error) => {
-          clearUpgradeGate();
+        const targetVersion = typeof message.targetVersion === 'string'
+          ? message.targetVersion
+          : DAEMON_UPGRADE_TARGET_LATEST;
+        if (!startDeferredDaemonUpgrade(targetVersion)) {
+          pendingDaemonUpgradeTarget = targetVersion;
           client.send({
             type: DAEMON_MSG.UPGRADE_BLOCKED,
-            reason: error instanceof Error ? error.message : 'controlled_node_upgrade_failed',
+            reason: remoteDesktopWorkerBusy()
+              ? DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY
+              : DAEMON_UPGRADE_BLOCK_REASON.ALREADY_IN_PROGRESS,
+            targetVersion,
           });
-        });
+        }
         return;
       }
       if (message.type === DAEMON_COMMAND_TYPES.COMPUTER_USE) {
@@ -1579,6 +1608,9 @@ export function createControlledNodeRuntime(
                 client.send(reply);
               },
             });
+            if (pendingDaemonUpgradeTarget && !upgradeInFlight && !remoteDesktopWorkerBusy()) {
+              startDeferredDaemonUpgrade(pendingDaemonUpgradeTarget);
+            }
           },
         );
         return;

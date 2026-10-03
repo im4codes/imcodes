@@ -37,6 +37,7 @@ import {
   withArtifactDownloadRetries,
 } from '../../src/node/self-upgrade.js';
 import {
+  REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_FILENAME,
   REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX,
 } from '../../shared/remote-desktop-worker.js';
@@ -1684,6 +1685,51 @@ describe('controlled-node self-upgrade', () => {
       expect(serviceLog).toContain('stop');
       expect(serviceLog).toContain('start');
     }
+  });
+
+  it('keeps the previous POSIX remote-desktop worker when staged copy fails', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-copy-rollback-'));
+    dirs.push(root);
+    const stage = join(root, 'stage', 'remote-desktop-worker');
+    const destinationRoot = join(root, 'installed', 'remote-desktop-worker');
+    const destinationWorker = join(destinationRoot, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    const stagedArtifactPath = join(root, 'stage', 'imcodes-node');
+    const stagedManifestPath = `${stagedArtifactPath}.manifest.json`;
+    const destinationPath = join(root, 'installed', 'imcodes-node');
+    const destinationManifestPath = `${destinationPath}.manifest.json`;
+    const binDir = join(root, 'bin');
+    await mkdir(stage, { recursive: true });
+    await mkdir(destinationRoot, { recursive: true });
+    await mkdir(binDir, { recursive: true });
+    await writeFile(join(stage, REMOTE_DESKTOP_LINUX_WORKER_FILENAME), 'new-worker');
+    await writeFile(stagedArtifactPath, 'new-node', { mode: 0o755 });
+    await writeFile(stagedManifestPath, JSON.stringify({ build: { version: 'new' } }));
+    await writeFile(destinationWorker, 'old-worker', { mode: 0o755 });
+    await writeFile(join(binDir, 'systemctl'), '#!/bin/sh\nexit 0\n', { mode: 0o755 });
+    // Fail only for the remote-desktop worker copy; the main daemon copy still
+    // succeeds, proving the worker transaction itself preserves its old root.
+    await writeFile(join(binDir, 'cp'), [
+      '#!/bin/sh',
+      'for arg in "$@"; do case "$arg" in *remote-desktop-worker*) exit 1;; esac; done',
+      'exec /bin/cp "$@"',
+      '',
+    ].join('\n'), { mode: 0o755 });
+    const scriptPath = join(root, 'upgrade.sh');
+    await writeFile(scriptPath, buildPosixControlledNodeUpgradeScript({
+      platform: 'linux',
+      stagedArtifactPath,
+      stagedManifestPath,
+      destinationPath,
+      destinationManifestPath,
+      stagedRemoteDesktopWorkerDir: stage,
+    }), { mode: 0o755 });
+    await execFileAsync('/bin/sh', [scriptPath], {
+      timeout: 15_000,
+      env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ''}` },
+    });
+    expect(await readFile(destinationWorker, 'utf8')).toBe('old-worker');
+    await expect(lstat(`${destinationRoot}.new`)).rejects.toMatchObject({ code: 'ENOENT' });
+    await expect(lstat(`${destinationRoot}.previous`)).rejects.toMatchObject({ code: 'ENOENT' });
   });
 
   it.runIf(process.platform === 'linux')('executes POSIX cleanup and removes the owned staging directory after handoff', async () => {

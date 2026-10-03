@@ -289,6 +289,34 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
+  it('defers a daemon upgrade while a remote-desktop session is active', async () => {
+    const socket = new MockSocket();
+    let active = true;
+    const startSelfUpgrade = vi.fn(async () => ({
+      ok: true as const, targetVersion: '2026.9.9999', artifactSha256: 'd'.repeat(64),
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      activeConnections: vi.fn(() => active ? [{}] : []),
+      handle: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, { platform: 'win32', arch: 'x64', remoteDesktopWorker, startSelfUpgrade });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: DAEMON_COMMAND_TYPES.DAEMON_UPGRADE, targetVersion: '2026.9.9999' }));
+    await vi.waitFor(() => expect(socket.sent.map(JSON.parse)).toContainEqual(expect.objectContaining({
+      type: DAEMON_MSG.UPGRADE_BLOCKED, reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+    })));
+    expect(startSelfUpgrade).not.toHaveBeenCalled();
+    active = false;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(startSelfUpgrade).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
   it('tells the server which daemons share its computer: after authenticating, and again only when that changes', async () => {
     const socket = new MockSocket();
     let bound = ['daemon-a'];

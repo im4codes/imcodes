@@ -352,4 +352,42 @@ describe('DaemonRemoteDesktop', () => {
     expect(f.downloadWorker).toHaveBeenCalledTimes(1);
     expect(await f.remoteDesktop.handle({ type: 'session.send' })).toBe(false);
   });
+
+  it('refreshes an installed worker against the independent worker release', async () => {
+    const installed = { ...artifact, manifest: { workerVersion: '2026.8.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const latest = { ...artifact, manifest: { workerVersion: '2026.9.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    let resolveCalls = 0;
+    const f = fixture({
+      installed: true,
+      resolveArtifact: () => resolveCalls++ === 0 ? installed : latest,
+    });
+    await f.remoteDesktop.refresh();
+    expect(f.downloadWorker).toHaveBeenCalledOnce();
+    expect(f.downloadWorker.mock.calls[0]![0]).not.toHaveProperty('expectedVersion');
+    expect(f.remoteDesktop.available()).toBe(true);
+  });
+
+  it('does not replace an identical worker generation during a reconnect check', async () => {
+    const current = { ...artifact, manifest: { workerVersion: '2026.9.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const f = fixture({
+      installed: true,
+      resolveArtifact: () => current,
+    });
+    await f.remoteDesktop.refresh();
+    expect(f.downloadWorker).toHaveBeenCalledOnce();
+    expect(f.capabilityChanges).toHaveLength(0);
+  });
+
+  it('defers an automatic refresh while a remote-desktop connection is active', async () => {
+    let active = true;
+    const older = { ...artifact, manifest: { workerVersion: '0.1.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const host = { handle: vi.fn(async () => true), close: vi.fn(), activeConnections: () => active ? [{}] : [] };
+    const f = fixture({ installed: true, resolveArtifact: () => older, createHost: () => host });
+    await f.remoteDesktop.handle(prepareCommand());
+    await f.remoteDesktop.refresh();
+    expect(f.downloadWorker).not.toHaveBeenCalled();
+    active = false;
+    await f.remoteDesktop.handle({ type: REMOTE_DESKTOP_MSG.STOP, requestId, sessionId, capability });
+    await vi.waitFor(() => expect(f.downloadWorker).toHaveBeenCalledOnce());
+  });
 });

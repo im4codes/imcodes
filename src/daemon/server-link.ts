@@ -61,7 +61,7 @@ import {
 } from './latency-tracer.js';
 import { getDaemonBuildInfo } from './build-info.js';
 import { CLOCK_SYNC_FIELD } from '../../shared/clock-sync.js';
-import { daemonRemoteDesktopCapabilities } from './remote-desktop-registry.js';
+import { daemonRemoteDesktopCapabilities, refreshDaemonRemoteDesktop } from './remote-desktop-registry.js';
 import { incrementCounter } from '../util/metrics.js';
 import { CoreLaneSocket, coreLaneWorkerEnabled } from './core-lane-socket.js';
 import { CORE_LANE_STALL_RESTART_DEFAULT_MS } from '../../shared/core-lane-liveness.js';
@@ -1468,6 +1468,9 @@ export class ServerLink {
       helloEpoch: this.helloEpoch,
       sentAt,
     });
+    // A reconnect/hello is a safe boundary for a worker release check. The
+    // remote-desktop host itself defers while it has active connections.
+    void refreshDaemonRemoteDesktop().catch(() => {});
   }
 
   /**
