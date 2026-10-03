@@ -194,6 +194,27 @@ describe('ChatView render capability contract', () => {
     expect(cards.map((item) => item.taskPairNotification?.taskId)).toEqual(['tsk_first', 'tsk_second']);
   });
 
+  it('keeps incremental text for one notice in a single card', () => {
+    const first = {
+      ...ev('assistant.text'),
+      eventId: 'notice-same-first',
+      ts: 1,
+      payload: { text: '[IM.codes task tsk_same "Same task"]\nQUEUE status queued.' },
+    } as unknown as TimelineEvent;
+    const second = {
+      ...ev('assistant.text'),
+      eventId: 'notice-same-second',
+      ts: 2,
+      payload: { text: '[IM.codes task tsk_same "Same task"]\nQUEUE status queued.\nWhy: waiting for a worker.' },
+    } as unknown as TimelineEvent;
+
+    const items = __buildViewItemsForTests([first, second], true);
+    expect(items).toHaveLength(1);
+    expect(items[0].taskPairNotification?.taskId).toBe('tsk_same');
+    expect(items[0].text).toContain('waiting for a worker');
+    expect(items[0].eventIds).toEqual(['notice-same-first', 'notice-same-second']);
+  });
+
   it('converts strict protocol markers but leaves fenced examples and user prose untouched', () => {
     const marker = {
       ...ev('assistant.text'),
