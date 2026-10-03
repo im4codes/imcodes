@@ -1451,6 +1451,13 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
         : projection.executionState;
       if (!text && !executionState && !rawNotification) continue;
       const assistantAutomation = event.payload.automation === true;
+      // Each daemon task notice is a complete card boundary.  Do not let
+      // adjacent notices share one assistant block: the pending notification
+      // payload is singular, so otherwise the newer task would overwrite the
+      // older one and the first card would be silently lost.
+      if (rawNotification && pendingEventIds.length > 0) {
+        flushPending();
+      }
       if (pendingEventIds.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
         flushPending();
       }

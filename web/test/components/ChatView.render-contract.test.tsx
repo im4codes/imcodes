@@ -174,6 +174,26 @@ describe('ChatView render capability contract', () => {
     expect(items.filter((item) => item.type === 'event')).toHaveLength(1);
   });
 
+  it('keeps consecutive task notices as separate cards instead of dropping the first', () => {
+    const first = {
+      ...ev('assistant.text'),
+      eventId: 'notice-first',
+      ts: 1,
+      payload: { text: '[IM.codes task tsk_first "First task"]\nDISPATCH status working.' },
+    } as unknown as TimelineEvent;
+    const second = {
+      ...ev('assistant.text'),
+      eventId: 'notice-second',
+      ts: 2,
+      payload: { text: '[IM.codes task tsk_second "Second task"]\nDISPATCH status working.' },
+    } as unknown as TimelineEvent;
+
+    const items = __buildViewItemsForTests([first, second], true);
+    const cards = items.filter((item) => item.type === 'assistant-block');
+    expect(cards).toHaveLength(2);
+    expect(cards.map((item) => item.taskPairNotification?.taskId)).toEqual(['tsk_first', 'tsk_second']);
+  });
+
   it('converts strict protocol markers but leaves fenced examples and user prose untouched', () => {
     const marker = {
       ...ev('assistant.text'),
