@@ -2,7 +2,7 @@
  * @vitest-environment jsdom
  */
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { cleanup, render } from '@testing-library/preact';
+import { cleanup, fireEvent, render } from '@testing-library/preact';
 import { h } from 'preact';
 import type { TimelineEvent } from '../../src/ws-client.js';
 import {
@@ -126,6 +126,8 @@ describe('ChatView render capability contract', () => {
     expect(card?.getAttribute('data-task-id')).toBe('tsk_card_1234567890');
     expect(card?.classList.contains('task-pair-chip--rework')).toBe(true);
     expect(card?.textContent).toContain('A deliberately long task title');
+    expect(card?.querySelector('.task-pair-card-body')).toBeNull();
+    fireEvent.click(card?.querySelector('.task-pair-card-toggle')!);
     expect(card?.textContent).toContain('taskPair.card_executor');
     expect(card?.textContent).toContain('taskPair.card_auditor');
   });

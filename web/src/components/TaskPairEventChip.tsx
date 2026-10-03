@@ -1,4 +1,5 @@
 import { useTranslation } from 'react-i18next';
+import { useState } from 'preact/hooks';
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import {
   TASK_PAIR_STATUSES,
@@ -34,6 +35,7 @@ function workspaceText(t: (key: string, options?: Record<string, unknown>) => st
 /** Compact chat chip for one task-pair marker event (it replaces the hidden marker line). */
 export function TaskPairEventChip({ eventId, payload }: { eventId: string; payload: Record<string, unknown> }) {
   const { t } = useTranslation();
+  const [expanded, setExpanded] = useState(false);
   const event = payload as Partial<TaskPairEventPayload>;
   const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
   const writer = typeof event.writer === 'string' ? event.writer : '';
@@ -47,6 +49,7 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
     : '';
   const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
   const verdict = typeof event.verdictJudgement === 'string' ? event.verdictJudgement : '';
+  const payloadJson = JSON.stringify(payload, null, 2) ?? '{}';
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
@@ -65,37 +68,52 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
   };
   return (
     <section
-      class={`chat-event chat-system task-pair-chip task-pair-event-card${statusClass}${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
+      class={`chat-event chat-system task-pair-chip task-pair-event-card${expanded ? ' is-expanded' : ''}${statusClass}${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
       data-task-status={isStatus(event.toStatus) ? event.toStatus : undefined}
       data-event-id={eventId}
       data-task-id={taskId}
     >
       <header class="task-pair-card-head">
-        <div class="task-pair-card-heading">
-          <span class="task-pair-card-kicker">{t('taskPair.card_kicker')}</span>
-          <span class="task-pair-chip-task">
-            {title && <strong>{title}</strong>}
-            <small>{taskId}</small>
+        <button
+          type="button"
+          class="task-pair-card-toggle"
+          aria-expanded={expanded}
+          onClick={() => setExpanded((value) => !value)}
+        >
+          <span class="task-pair-card-heading">
+            <span class="task-pair-card-kicker">{t('taskPair.card_kicker')}</span>
+            <span class="task-pair-chip-task">
+              {title && <strong>{title}</strong>}
+              <small>{taskId}</small>
+            </span>
           </span>
-        </div>
-        <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
+          <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
+          <span class="task-pair-card-toggle-label">{expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}</span>
+          <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
+        </button>
       </header>
-      <div class="task-pair-card-body">
-        <span class="task-pair-chip-text">
-          {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
-            ? workspaceText(t, event)
-            : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
-        </span>
-        <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
-        {roleLabel(event.executor, event.executorLabel, 'executor')}
-        {roleLabel(event.auditor, event.auditorLabel, 'auditor')}
-      </div>
-      {(counts || verdict || held || event.unusual) && <footer class="task-pair-card-flags">
-        {counts && <span class="task-pair-chip-counts">{counts}</span>}
-        {verdict && <span class="task-pair-chip-verdict">{t('taskPair.card_verdict', { value: verdict })}</span>}
-        {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}
-        {event.unusual && <span class="task-pair-chip-unusual">{t('taskPair.unusual')}</span>}
-      </footer>}
+      {expanded && <>
+        <div class="task-pair-card-body">
+          <span class="task-pair-chip-text">
+            {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
+              ? workspaceText(t, event)
+              : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
+          </span>
+          <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
+          {roleLabel(event.executor, event.executorLabel, 'executor')}
+          {roleLabel(event.auditor, event.auditorLabel, 'auditor')}
+        </div>
+        {(counts || verdict || held || event.unusual) && <footer class="task-pair-card-flags">
+          {counts && <span class="task-pair-chip-counts">{counts}</span>}
+          {verdict && <span class="task-pair-chip-verdict">{t('taskPair.card_verdict', { value: verdict })}</span>}
+          {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}
+          {event.unusual && <span class="task-pair-chip-unusual">{t('taskPair.unusual')}</span>}
+        </footer>}
+        <div class="task-pair-card-payload">
+          <span class="task-pair-card-payload-label">{t('taskPair.card_payload')}</span>
+          <pre>{payloadJson}</pre>
+        </div>
+      </>}
     </section>
   );
 }

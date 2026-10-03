@@ -35,6 +35,14 @@ describe('TaskPairEventChip', () => {
       severityCounts: { P0: 1, P1: 0, P2: 2, P3: 0, P4: 0 }, verdictJudgement: 'consistent', unusual: false,
     }} />);
     const chip = container.querySelector('.task-pair-chip')!;
+    expect(chip.querySelector('.task-pair-card-body')).toBeNull();
+    const toggle = chip.querySelector('.task-pair-card-toggle')!;
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.textContent).toContain('taskPair.card_expand');
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(toggle.textContent).toContain('taskPair.card_collapse');
+    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).toContain('"taskId": "T42"');
     expect(chip.getAttribute('data-task-id')).toBe('T42');
     expect(chip.textContent).toContain('Fix loginT42');
     expect(chip.textContent).toContain('taskPair.chip:{"writer":"deck_sub_aud","verb":"taskPair.verb.rework"}');
@@ -44,6 +52,8 @@ describe('TaskPairEventChip', () => {
     expect(chip.textContent).toContain('taskPair.card_verdict:{"value":"consistent"}');
     expect(chip.textContent).not.toContain('"level":"P1"');
     expect(chip.textContent).not.toContain('taskPair.verdict_held');
+    fireEvent.click(toggle);
+    expect(chip.querySelector('.task-pair-card-body')).toBeNull();
   });
 
   it('labels a NEXT_ROUND event with its own verb and the resulting working status', () => {
@@ -51,6 +61,7 @@ describe('TaskPairEventChip', () => {
       taskId: 'T9', title: 'Staged', writer: 'deck_proj_brain', verb: 'NEXT_ROUND', toStatus: 'working', deliveryRound: 2, unusual: false,
     }} />);
     const chip = container.querySelector('.task-pair-chip')!;
+    fireEvent.click(chip.querySelector('.task-pair-card-toggle')!);
     expect(chip.textContent).toContain('taskPair.verb.next_round');
     expect(chip.textContent).toContain('taskPair.status.working');
   });
@@ -66,6 +77,7 @@ describe('TaskPairEventChip', () => {
     const task = container.querySelector('.task-pair-chip-task')!;
     expect(task.querySelector('strong')?.textContent).toBe('Readable task');
     expect(task.querySelector('small')?.textContent).toBe('T7');
+    fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
     fireEvent.click(screen.getByRole('button', { name: 'Cx6 (deck_sub_worker)' }));
     expect(navigate).toHaveBeenCalledWith('deck_sub_worker');
     window.removeEventListener('deck:navigate', listener);
@@ -76,6 +88,7 @@ describe('TaskPairEventChip', () => {
       taskId: 'T42', writer: 'daemon', verb: 'PASS', verdictJudgement: 'inconsistent', unusual: true,
     }} />);
     const chip = container.querySelector('.task-pair-chip')!;
+    fireEvent.click(chip.querySelector('.task-pair-card-toggle')!);
     expect(chip.classList.contains('task-pair-chip--held')).toBe(true);
     expect(chip.textContent).toContain('taskPair.verdict_held');
     expect(chip.textContent).toContain('taskPair.unusual');
@@ -91,6 +104,7 @@ describe('TaskPairEventChip workspace events', () => {
       taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_SAVED,
       outputPath: '/home/u/proj/reports/summary.md', toStatus: 'done', unusual: false,
     }} />);
+    fireEvent.click(saved.container.querySelector('.task-pair-card-toggle')!);
     expect(saved.container.textContent).toContain('taskPair.output_saved:{"path":"/home/u/proj/reports/summary.md"}');
     expect(saved.container.textContent).not.toContain('taskPair.chip');
     cleanup();
@@ -98,11 +112,13 @@ describe('TaskPairEventChip workspace events', () => {
       taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.OUTPUT_FAILED,
       outputError: 'outside_workspace', toStatus: 'done', unusual: true,
     }} />);
+    fireEvent.click(failed.container.querySelector('.task-pair-card-toggle')!);
     expect(failed.container.textContent).toContain('taskPair.output_failed:{"reason":"outside_workspace"}');
     cleanup();
     const kept = render(<TaskPairEventChip eventId="w3" payload={{
       taskId: 'T7', writer: 'daemon', verb: TASK_PAIR_WORKSPACE_EVENT_VERB, effect: TASK_PAIR_WORKSPACE_EFFECTS.KEPT, toStatus: 'cancelled', unusual: true,
     }} />);
+    fireEvent.click(kept.container.querySelector('.task-pair-card-toggle')!);
     expect(kept.container.textContent).toContain('taskPair.workspace_kept');
   });
 
@@ -982,6 +998,19 @@ describe('TaskPairEventChip status colours', () => {
     expect(css).toContain('.peer-audit-result-outcome--rework { border-color: var(--status-rework-border); color: var(--status-rework-text); }');
   });
 
+  it('uses the dark-tech theme for participant chips and every status badge', () => {
+    const chipRule = /\.task-pair-event-card \.task-pair-chip-session\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(chipRule).toContain('background: rgba(8, 20, 36, 0.86);');
+    expect(chipRule).toContain('border: 1px solid rgba(125, 211, 252, 0.3);');
+    expect(css).toContain('.task-pair-event-card .task-pair-chip-session:focus-visible');
+    expect(css).toContain('.task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong');
+    expect(css).toContain('text-overflow: ellipsis;');
+    for (const status of TASK_PAIR_STATUSES) {
+      const rule = new RegExp(`\\.task-pair-chip--${status} \\{([^}]*)\\}`).exec(css)?.[1] ?? '';
+      expect(rule, `${status} should define a themed background`).toContain('--task-pair-status-bg:');
+    }
+  });
+
   it('adds no status class to an event that changed no status', () => {
     const { container } = render(<TaskPairEventChip eventId="e-none" payload={{ taskId: '-', writer: 'w', verb: 'BOGUS' }} />);
     const chip = container.querySelector('.task-pair-chip')!;
@@ -993,6 +1022,7 @@ describe('TaskPairEventChip status colours', () => {
       taskId: 'x'.repeat(160), title: '   ', verb: 'BOGUS', toStatus: 'future_status', unusual: false,
     }} />);
     const chip = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(chip.querySelector('.task-pair-card-toggle')!);
     expect(chip.textContent).toContain('taskPair.card_unknown_status');
     expect(chip.textContent).toContain('taskPair.card_unassigned');
     expect(chip.querySelector('.task-pair-chip-status')?.className).toContain('status-unknown');

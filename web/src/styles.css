@@ -14530,15 +14530,15 @@ button.quick-agent-delegation-preset.active {
 /* One colour per pair status, from the shared verdict/status tones. */
 .task-pair-chip-status { color: var(--task-pair-status-text, inherit); border-color: var(--task-pair-status-border, var(--border-color, rgba(128, 128, 128, 0.35))); background: var(--task-pair-status-bg, transparent); font-weight: 600; }
 .task-pair-chip { border-left: 2px solid var(--task-pair-status-border, transparent); }
-.task-pair-chip--queued { --task-pair-status-text: var(--supervision-idle-text); }
+.task-pair-chip--queued { --task-pair-status-text: #cbd5e1; --task-pair-status-border: rgba(148, 163, 184, 0.48); --task-pair-status-bg: rgba(71, 85, 105, 0.24); }
 .task-pair-chip--working { --task-pair-status-text: var(--status-active-text); --task-pair-status-border: var(--status-active-border); --task-pair-status-bg: var(--status-active-bg); }
 .task-pair-chip--in_audit { --task-pair-status-text: var(--status-audit-text); --task-pair-status-border: var(--status-audit-border); --task-pair-status-bg: var(--status-audit-bg); }
 .task-pair-chip--awaiting_audit { --task-pair-status-text: var(--supervision-waiting-text); --task-pair-status-border: var(--supervision-waiting-border); --task-pair-status-bg: var(--supervision-waiting-bg); }
-.task-pair-chip--awaiting_brain_decision { --task-pair-status-text: #8a5b18; --task-pair-status-border: #c99845; --task-pair-status-bg: color-mix(in srgb, #e9b85f 16%, transparent); }
-.task-pair-chip--rework { --task-pair-status-text: var(--status-rework-text); --task-pair-status-border: var(--status-rework-border); }
-.task-pair-chip--passed { --task-pair-status-text: var(--status-pass-text); --task-pair-status-border: var(--status-pass-border); }
+.task-pair-chip--awaiting_brain_decision { --task-pair-status-text: #fde68a; --task-pair-status-border: #d6a84e; --task-pair-status-bg: rgba(120, 53, 15, 0.24); }
+.task-pair-chip--rework { --task-pair-status-text: var(--status-rework-text); --task-pair-status-border: var(--status-rework-border); --task-pair-status-bg: rgba(146, 64, 14, 0.2); }
+.task-pair-chip--passed { --task-pair-status-text: var(--status-pass-text); --task-pair-status-border: var(--status-pass-border); --task-pair-status-bg: rgba(6, 95, 70, 0.2); }
 .task-pair-chip--done { --task-pair-status-text: var(--status-done-text); --task-pair-status-border: var(--status-done-border); --task-pair-status-bg: var(--status-done-bg); }
-.task-pair-chip--cancelled { --task-pair-status-text: var(--status-cancelled-text); --task-pair-status-border: var(--status-cancelled-border); }
+.task-pair-chip--cancelled { --task-pair-status-text: var(--status-cancelled-text); --task-pair-status-border: var(--status-cancelled-border); --task-pair-status-bg: rgba(127, 29, 29, 0.22); }
 .task-pair-chip-unusual { opacity: 0.75; font-style: italic; }
 
 /* Full-width, left-aligned task-pair event card in the chat timeline.  The
@@ -14551,39 +14551,60 @@ button.quick-agent-delegation-preset.active {
   width: 100%;
   max-width: 100%;
   min-width: 0;
+  color: #dbeafe;
   flex-direction: column;
   align-items: stretch;
   gap: 8px;
   padding: 10px 12px;
-  border: 1px solid color-mix(in srgb, var(--task-pair-status-border, var(--border-color, #475569)) 48%, transparent);
+  border: 1px solid color-mix(in srgb, var(--task-pair-status-border, var(--chrome-line)) 78%, var(--chrome-line-soft));
   border-left-width: 3px;
   border-radius: 9px;
-  background: color-mix(in srgb, var(--task-pair-status-bg, var(--chrome-panel-2, #172033)) 72%, transparent);
-  box-shadow: 0 3px 12px rgba(2, 6, 23, 0.12);
+  background: radial-gradient(circle at 100% 0, color-mix(in srgb, var(--task-pair-status-text, var(--chrome-accent)) 12%, transparent), transparent 42%), linear-gradient(120deg, rgba(8, 20, 36, 0.98), color-mix(in srgb, var(--task-pair-status-bg, var(--chrome-panel-2)) 85%, #0b1220));
+  box-shadow: inset 0 1px 0 rgba(226, 232, 240, 0.08), 0 10px 26px rgba(2, 6, 23, 0.34), 0 0 18px color-mix(in srgb, var(--task-pair-status-text, var(--chrome-accent)) 7%, transparent);
   opacity: 1;
   overflow-wrap: anywhere;
 }
 .task-pair-card-head,
 .task-pair-card-body,
 .task-pair-card-flags { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
-.task-pair-card-head { justify-content: space-between; align-items: flex-start; }
+.task-pair-card-head { align-items: stretch; }
+.task-pair-card-toggle { display: flex; width: 100%; min-width: 0; align-items: center; gap: 10px; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.task-pair-card-toggle:hover .task-pair-card-heading strong { color: #ecfeff; }
+.task-pair-card-toggle:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 3px; border-radius: 5px; }
+.task-pair-card-toggle-label { margin-left: auto; color: #7dd3fc; font-size: 9px; font-weight: 700; letter-spacing: .04em; white-space: nowrap; }
 .task-pair-card-heading { display: flex; min-width: 0; flex: 1 1 240px; flex-direction: column; gap: 2px; }
-.task-pair-card-kicker { color: color-mix(in srgb, currentColor 62%, transparent); font-size: 9px; font-weight: 700; letter-spacing: .08em; line-height: 1.2; text-transform: uppercase; }
+.task-pair-card-kicker { color: var(--chrome-accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; line-height: 1.2; text-transform: uppercase; }
 .task-pair-event-card .task-pair-chip-task { display: flex; min-width: 0; flex-wrap: wrap; align-items: baseline; gap: 5px 8px; }
-.task-pair-event-card .task-pair-chip-task strong { min-width: 0; overflow-wrap: anywhere; }
-.task-pair-event-card .task-pair-chip-task small { color: color-mix(in srgb, currentColor 64%, transparent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; overflow-wrap: anywhere; }
-.task-pair-event-card .task-pair-chip-status { flex: 0 0 auto; }
-.task-pair-card-body { color: color-mix(in srgb, currentColor 82%, transparent); font-size: 11px; line-height: 1.35; }
-.task-pair-card-event-meta { display: inline-flex; min-width: 0; align-items: center; gap: 4px; color: color-mix(in srgb, currentColor 68%, transparent); }
+.task-pair-event-card .task-pair-chip-task strong { min-width: 0; color: #f0f9ff; font-size: 13px; overflow-wrap: anywhere; }
+.task-pair-event-card .task-pair-chip-task small { color: #94a3b8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; overflow-wrap: anywhere; }
+.task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong,
+.task-pair-event-card:not(.is-expanded) .task-pair-chip-task small { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-pair-event-card .task-pair-chip-status { flex: 0 0 auto; box-shadow: 0 0 12px color-mix(in srgb, var(--task-pair-status-text, var(--chrome-accent)) 12%, transparent); }
+.task-pair-card-chevron { flex: 0 0 auto; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(125, 211, 252, 0.24); border-radius: 5px; color: #7dd3fc; background: rgba(15, 23, 42, 0.72); font-size: 15px; line-height: 1; transition: transform .15s ease, background .15s ease; }
+.task-pair-card-chevron.is-expanded { transform: rotate(180deg); background: rgba(8, 145, 178, 0.2); }
+.task-pair-card-body { color: #cbd5e1; font-size: 11px; line-height: 1.45; }
+.task-pair-card-event-meta { display: inline-flex; min-width: 0; align-items: center; gap: 4px; color: #c4b5fd; }
 .task-pair-card-event-meta > span:first-child { font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
 .task-pair-card-role { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 4px; }
-.task-pair-card-role-label { color: color-mix(in srgb, currentColor 62%, transparent); font-size: 9px; text-transform: uppercase; }
+.task-pair-card-role-label { color: #64748b; font-size: 9px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
 .task-pair-card-role .task-pair-chip-session { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
-.task-pair-card-unassigned { color: color-mix(in srgb, currentColor 52%, transparent); font-style: italic; }
-.task-pair-card-flags { padding-top: 1px; border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+.task-pair-card-unassigned { color: #64748b; font-style: italic; }
+.task-pair-card-flags { padding-top: 7px; border-top: 1px solid rgba(148, 163, 184, 0.16); }
+.task-pair-card-payload { min-width: 0; margin-top: 2px; padding-top: 8px; border-top: 1px solid rgba(148, 163, 184, 0.16); }
+.task-pair-card-payload-label { color: #94a3b8; font-size: 9px; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; }
+.task-pair-card-payload pre { max-height: 220px; min-width: 0; margin: 5px 0 0; padding: 8px; overflow: auto; border: 1px solid rgba(125, 211, 252, 0.18); border-radius: 6px; color: #bfdbfe; background: rgba(2, 6, 23, 0.58); font: 10px/1.45 var(--imcodes-app-font-family); white-space: pre-wrap; overflow-wrap: anywhere; scrollbar-color: rgba(34, 211, 238, 0.3) transparent; }
+.task-pair-event-card .task-pair-chip-session { display: inline-flex; min-height: 23px; min-width: 0; max-width: 100%; align-items: center; padding: 3px 8px; border: 1px solid rgba(125, 211, 252, 0.3); border-radius: 6px; color: #7dd3fc; background: rgba(8, 20, 36, 0.86); -webkit-appearance: none; appearance: none; box-shadow: inset 0 1px 0 rgba(226, 232, 240, 0.06); font: 600 10px/1.2 var(--imcodes-app-font-family); text-align: left; cursor: pointer; transition: border-color .15s ease, background .15s ease, box-shadow .15s ease, color .15s ease; }
+.task-pair-event-card .task-pair-chip-session:hover { border-color: var(--chrome-accent); color: #cffafe; background: rgba(8, 145, 178, 0.2); box-shadow: 0 0 12px rgba(34, 211, 238, 0.16); }
+.task-pair-event-card .task-pair-chip-session:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 2px; }
+.task-pair-event-card .task-pair-chip-counts,
+.task-pair-event-card .task-pair-chip-verdict { color: #c4b5fd; background: rgba(30, 41, 59, 0.72); }
+.task-pair-event-card .task-pair-chip-held { color: #fde68a; border-color: rgba(251, 191, 36, 0.5); background: rgba(120, 53, 15, 0.24); }
+.task-pair-event-card .task-pair-chip-unusual { color: #fca5a5; border-color: rgba(248, 113, 113, 0.42); background: rgba(127, 29, 29, 0.2); opacity: 1; }
 @media (max-width: 640px) {
   .task-pair-event-card { padding: 9px 10px; }
-  .task-pair-card-head { align-items: stretch; flex-direction: column; }
+  .task-pair-card-toggle { align-items: flex-start; flex-wrap: wrap; gap: 7px; }
+  .task-pair-card-heading { flex-basis: calc(100% - 32px); }
+  .task-pair-card-toggle-label { margin-left: 0; }
   .task-pair-event-card .task-pair-chip-status { align-self: flex-start; }
   .task-pair-card-body { align-items: flex-start; flex-direction: column; gap: 5px; }
 }
