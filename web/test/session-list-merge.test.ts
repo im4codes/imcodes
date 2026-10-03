@@ -660,6 +660,37 @@ describe('mergeSessionListEntry — activity generation fence', () => {
     // runtime generation; the fence remains available for subsequent frames.
     expect(refreshed.state).toBe('idle');
   });
+
+  it('does not let opaque generation replace the fence before a later stale frame', () => {
+    const generation2 = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 2 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      pendingMessageEntries: [{ clientMessageId: 'new', text: 'new message' }],
+    }, makeExisting());
+    const legacy = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+      activityGeneration: 'legacy-turn-id',
+    }, generation2);
+    expect(legacy.activityGeneration).toEqual(generation2.activityGeneration);
+
+    const stale = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'queued',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 1 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [],
+    }, legacy);
+    expect(stale.activityGeneration).toEqual(generation2.activityGeneration);
+    expect(stale.state).toBe('idle');
+    expect(stale.transportPendingMessageEntries).toEqual([{ clientMessageId: 'new', text: 'new message' }]);
+  });
 });
 
 describe('mergeSessionListEntry — supervision heartbeat projection', () => {

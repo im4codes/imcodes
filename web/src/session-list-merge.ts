@@ -25,7 +25,9 @@ import type { SessionInfo } from './types.js';
 import { resolveRuntimeType } from './runtime-type.js';
 import { parseSupervisionHeartbeatSnapshot } from '@shared/supervision-heartbeat.js';
 import {
+  canReplaceActivityGeneration,
   isOlderActivityGeneration,
+  isOrderedActivityGeneration,
   type ActivityGenerationLike,
 } from '@shared/session-activity-types.js';
 import {
@@ -141,10 +143,18 @@ export function mergeSessionListEntry(
     existing
     && isOlderActivityGeneration(incoming.activityGeneration, existing.activityGeneration),
   );
+  const incomingGenerationIsOrdered = isOrderedActivityGeneration(incoming.activityGeneration);
+  const currentGenerationIsOrdered = isOrderedActivityGeneration(existing?.activityGeneration);
+  const canReplaceCurrentGeneration = incoming.activityGeneration !== undefined
+    && canReplaceActivityGeneration(incoming.activityGeneration, existing?.activityGeneration);
   const nextState = isOlderGeneration ? existing!.state : incoming.state as SessionInfo['state'];
-  const nextActivityGeneration = isOlderGeneration
+  const nextActivityGeneration = currentGenerationIsOrdered && !canReplaceCurrentGeneration
     ? existing!.activityGeneration
-    : incoming.activityGeneration ?? existing?.activityGeneration;
+    : incomingGenerationIsOrdered
+      ? incoming.activityGeneration
+      : incoming.activityGeneration === undefined
+        ? existing?.activityGeneration
+        : undefined;
   const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
   // Codex AND claude-code-sdk surface provider quota that the daemon may omit on
   // a given session_list pass (idle / 30-min throttle / a transient B failure);

@@ -249,6 +249,7 @@ export function normalizeActivityGeneration(value: ActivityGenerationLike): stri
   if (value == null) return null;
   if (typeof value === 'number') return Number.isFinite(value) ? `session:${value}` : null;
   if (typeof value === 'string') return value.trim() || null;
+  if (typeof value.scope !== 'string' || typeof value.sessionName !== 'string') return null;
   const sessionName = value.sessionName.trim();
   if (!sessionName || !Number.isFinite(value.generation)) return null;
   return `${value.scope}:${sessionName}:${value.generation}`;
@@ -416,6 +417,49 @@ export function sameActivityGeneration(a: ActivityGenerationLike, b: ActivityGen
   return left !== null && right !== null && left === right;
 }
 
+type OrderedActivityGeneration = { scope: string; sessionName?: string; generation: number };
+
+function parseOrderedActivityGeneration(value: ActivityGenerationLike): OrderedActivityGeneration | null {
+  if (typeof value === 'number') return Number.isFinite(value) ? { scope: 'session', generation: value } : null;
+  if (value && typeof value === 'object') {
+    return Number.isFinite(value.generation)
+      && typeof value.scope === 'string'
+      && typeof value.sessionName === 'string'
+      && value.sessionName.trim()
+      ? { scope: value.scope, sessionName: value.sessionName.trim(), generation: value.generation }
+      : null;
+  }
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim();
+  const full = /^(.*?):(.+):(-?\d+(?:\.\d+)?)$/.exec(normalized);
+  if (full) return { scope: full[1], sessionName: full[2], generation: Number(full[3]) };
+  const short = /^(.*?):(-?\d+(?:\.\d+)?)$/.exec(normalized);
+  return short ? { scope: short[1], generation: Number(short[2]) } : null;
+}
+
+/** Whether a frame carries a generation with an ordered numeric form. */
+export function isOrderedActivityGeneration(value: ActivityGenerationLike): boolean {
+  return parseOrderedActivityGeneration(value) !== null;
+}
+
+/**
+ * Returns whether an incoming ordered generation may replace the current
+ * ordered fence. Unknown/opaque values and cross-session generations cannot
+ * replace an existing fence.
+ */
+export function canReplaceActivityGeneration(
+  incoming: ActivityGenerationLike,
+  current: ActivityGenerationLike,
+): boolean {
+  const left = parseOrderedActivityGeneration(incoming);
+  if (!left) return false;
+  const right = parseOrderedActivityGeneration(current);
+  if (!right) return true;
+  if (left.scope !== right.scope) return false;
+  if (left.sessionName && right.sessionName && left.sessionName !== right.sessionName) return false;
+  return left.generation >= right.generation;
+}
+
 /**
  * Returns true only when both values carry an ordered generation for the same
  * session scope and the incoming frame is older.  Opaque/legacy strings remain
@@ -426,25 +470,8 @@ export function isOlderActivityGeneration(
   incoming: ActivityGenerationLike,
   current: ActivityGenerationLike,
 ): boolean {
-  const parse = (value: ActivityGenerationLike): { scope: string; sessionName?: string; generation: number } | null => {
-    if (typeof value === 'number') return Number.isFinite(value) ? { scope: 'session', generation: value } : null;
-    if (value && typeof value === 'object') {
-      return Number.isFinite(value.generation)
-        && typeof value.scope === 'string'
-        && typeof value.sessionName === 'string'
-        && value.sessionName.trim()
-        ? { scope: value.scope, sessionName: value.sessionName.trim(), generation: value.generation }
-        : null;
-    }
-    if (typeof value !== 'string') return null;
-    const normalized = value.trim();
-    const full = /^(.*?):(.+):(\d+)$/.exec(normalized);
-    if (full) return { scope: full[1], sessionName: full[2], generation: Number(full[3]) };
-    const short = /^(.*?):(\d+)$/.exec(normalized);
-    return short ? { scope: short[1], generation: Number(short[2]) } : null;
-  };
-  const left = parse(incoming);
-  const right = parse(current);
+  const left = parseOrderedActivityGeneration(incoming);
+  const right = parseOrderedActivityGeneration(current);
   if (!left || !right || left.scope !== right.scope) return false;
   if (left.sessionName && right.sessionName && left.sessionName !== right.sessionName) return false;
   return left.generation < right.generation;
