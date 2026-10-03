@@ -369,7 +369,7 @@ describe('remote desktop worker quick install', () => {
       `INSERT INTO servers
          (id, user_id, name, token_hash, status, last_heartbeat_at, created_at,
           node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities, node_id)
-       VALUES ($1,$2,'controlled',$3,$4,$4,$5,$6,true,'linux-ref','Linux box','linux','2026.8.4000-dev.1',$7,$8)`,
+       VALUES ($1,$2,'controlled',$3,$4,$5,$5,$6,true,'linux-ref','Linux box','linux','2026.8.4000-dev.1',$7,$8)`,
       [controlledId, userId, sha256(hex(16)), 'online', Date.now(), NODE_ROLE.CONTROLLED,
         JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY]),
         generateControlledNodeId()],
