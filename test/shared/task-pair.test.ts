@@ -100,6 +100,9 @@ describe('task-pair marker grammar', () => {
 
   it('publishes the checklist cadence in the contract rule', () => {
     expect(TASK_PAIR_CHECKLIST_RULE).toContain('as soon as that item is done');
+    expect(TASK_PAIR_CHECKLIST_RULE).toContain('MUST immediately emit CHECK');
+    expect(TASK_PAIR_CHECKLIST_RULE).toContain('never a substitute for real-time CHECK updates');
+    expect(TASK_PAIR_CHECKLIST_RULE).toContain('recorded with a reason');
     expect(TASK_PAIR_CHECKLIST_RULE).toContain('on REWORK the auditor unticks failed items');
     expect(buildTaskPairMarkerContract()).toContain('CHECK <taskId> box=implemented|audited');
     expect(buildTaskPairMarkerContract()).toContain('write STARTED once when you begin (never again on later turns');

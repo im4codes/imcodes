@@ -236,6 +236,18 @@ describe('pairs run without legacy supervision artifacts', () => {
     expect(pairs).toContain('write NEEDS_INPUT <taskId> note="..." and wait: that is never a P0 or REWORK');
   });
 
+  it('puts real-time checklist guidance in participant briefs and dispatch trailers', () => {
+    const state: TaskPairState = {
+      taskId: 'M-checklist', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working', flags: [], flagSides: {}, round: 0,
+      blocking: ['P0'], previousAuditors: [], capCounts: {}, capRound: 0, createdAt: 1, updatedAt: 1,
+      brief: '- [ ][ ] first\n- [ ][ ] second',
+    };
+    for (const text of [buildExecutorPairBrief(state), buildAuditorAssignmentMessage(state), buildDispatchTrailer(state)]) {
+      expect(text).toContain('MUST immediately emit CHECK');
+      expect(text).toContain('never a substitute for real-time CHECK updates');
+    }
+  });
+
   it('tells a no-auditor executor to self-validate, commit locally, and report straight to Brain before DONE, not just "write DONE"', () => {
     const withAuditor: TaskPairState = {
       taskId: 'M5', brain: BRAIN, executor: EXEC, auditor: AUD, status: 'working', flags: [], flagSides: {}, round: 0,

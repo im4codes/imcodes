@@ -935,6 +935,11 @@ export class TaskPairService {
   ): StoredTaskPair {
     const store = getTaskPairStore();
     let current = stored;
+    const reason = markerVerb === 'READY_FOR_AUDIT'
+      ? 'ready_for_audit_backstop'
+      : markerVerb === 'PASS'
+        ? 'pass_backstop'
+        : 'done_backstop';
     const boxes = markerVerb === 'PASS' ? ['implemented', 'audited'] as const : ['implemented'] as const;
     for (const box of boxes) {
       const items = parseTaskPairChecklist(current.state.brief ?? '')
@@ -948,6 +953,7 @@ export class TaskPairService {
       current = store.savePair(project, next, { liveness: current.liveness });
       const eventId = `${parentEventId}:checklist-auto:${box}`;
       const role = taskPairRoleOf(previous, 'daemon');
+      const notice = `Daemon checklist backstop (${reason}) filled ${box} items ${items.join(',')}; no participant CHECK was received for these items before ${markerVerb}.`;
       if (store.recordEvent({
         id: eventId,
         project,
@@ -955,7 +961,7 @@ export class TaskPairService {
         writer: 'daemon',
         role,
         verb: TASK_PAIR_CHECKLIST_AUTO_TICK_VERB,
-        attrs: { box, items: items.join(','), checked: 'true' },
+        attrs: { box, items: items.join(','), checked: 'true', reason, notice },
         effect: 'checklist_auto_tick',
         unusual: false,
         source: 'daemon',
@@ -971,6 +977,8 @@ export class TaskPairService {
           fromStatus: previous.status,
           toStatus: next.status,
           unusual: false,
+          checklistAutoTickReason: reason,
+          checklistAutoTickNotice: notice,
         });
       }
     }
@@ -2453,7 +2461,7 @@ export function emitTaskPairTimelineEvent(
 /** A daemon-authored pair event (not a marker), e.g. a data correction. */
 export function emitTaskPairDaemonEvent(
   pair: TaskPairState,
-  event: Pick<TaskPairEventPayload, 'verb' | 'effect' | 'source' | 'fromStatus' | 'toStatus' | 'unusual' | 'outputPath' | 'outputError'> & { eventId: string },
+  event: Pick<TaskPairEventPayload, 'verb' | 'effect' | 'source' | 'fromStatus' | 'toStatus' | 'unusual' | 'outputPath' | 'outputError' | 'checklistAutoTickReason' | 'checklistAutoTickNotice'> & { eventId: string },
 ): void {
   const { eventId, ...rest } = event;
   emitTaskPairTimelineEvent({ taskId: pair.taskId, writer: 'daemon', role: 'daemon', ...rest }, pair, eventId);

@@ -1591,7 +1591,11 @@ export async function startup(): Promise<DaemonContext> {
         const flushed = pendingPairRefresh.get(project);
         pendingPairRefresh.delete(project);
         const flushReason = flushed?.reason ?? reason;
-        supervisionConsole?.sessions.pairsChanged(project, taskIds, flushReason);
+        // Use the coalesced set, not only the first change that armed the
+        // timer.  Checklist ticks commonly save the same pair in a burst, but
+        // a marker burst can also touch several pairs; dropping the later IDs
+        // leaves their live checklist counts stale until a reconnect.
+        supervisionConsole?.sessions.pairsChanged(project, flushed?.taskIds ?? taskIds, flushReason);
         // Badges follow pair rows, reminders and session state, and the timeline
         // observer above already republishes on a session's running/idle change
         // and on user messages. A flush that only saw streamed activity has

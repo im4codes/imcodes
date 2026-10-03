@@ -14,6 +14,7 @@ import {
   TASK_PAIR_BRAIN_REPLY_RESOLUTION_RULE,
   TASK_PAIR_BRIEF_END_TAG,
   TASK_PAIR_CONTRACT_ID,
+  TASK_PAIR_CHECKLIST_RULE,
   TASK_PAIR_MARKER_TAG,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
@@ -569,6 +570,7 @@ export function buildExecutorPairBrief(pair: TaskPairState): string {
     header(pair),
     TASK_PAIR_TITLE_RULE,
     ...(pair.brief ? [pair.brief] : []),
+    TASK_PAIR_CHECKLIST_RULE,
     `You are the executor of this task pair, with ${auditor}. Write ${marker('STARTED', pair.taskId)} when you begin.`,
     blockingSummaryLine(pair),
     workplaceLine(pair),
@@ -782,6 +784,7 @@ export function buildDispatchTrailer(pair: TaskPairState): string {
     `[IM.codes task ${pair.taskId} · auditor: ${pair.auditor ?? 'none'}] Write ${marker('STARTED', pair.taskId)} when you begin and finish with ${readyMarker(pair)}; follow ${TASK_PAIR_CONTRACT_ID} and ${AUDIT_CONVERGENCE_CONTRACT_ID} (blocking=${pair.blocking.join(',')}). ${workplaceLine(pair)} ${TASK_PAIR_WORKSPACE_RULES} ${NO_LEGACY_ARTIFACTS}`,
     TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
     TASK_PAIR_BRAIN_REPORTING_RULE,
+    TASK_PAIR_CHECKLIST_RULE,
     ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? [TASK_PAIR_AUDITOR_PROPOSAL_RULE] : []),
   ].join('\n');
 }
@@ -795,6 +798,7 @@ export function buildAuditorAssignmentMessage(pair: TaskPairState): string {
     TASK_PAIR_CONVERGENCE_CHECKPOINT_RULE,
     TASK_PAIR_VALIDATION_REPORT_RULE,
     TASK_PAIR_NO_INTERMEDIATE_BRAIN_UPDATES_RULE,
+    TASK_PAIR_CHECKLIST_RULE,
     blockingSummaryLine(pair),
     NO_LEGACY_ARTIFACTS,
     TASK_PAIR_ASK_DONT_JUST_REPLY_RULE,

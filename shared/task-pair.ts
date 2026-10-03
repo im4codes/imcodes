@@ -39,7 +39,7 @@ export const TASK_PAIR_ENGINE_HOOK_PATH = '/task-pairs/engine' as const;
  * pairs Brain never carries a `supervision_*` contract.
  */
 export const TASK_PAIR_BRAIN_CONTRACT_ID = 'task_pair_brain_v1' as const;
-export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; a single-box "- [ ]" item has no audit box; number items 1..N in brief order. The executor ticks each implemented box as soon as that item is done and all delivered items before READY_FOR_AUDIT; the auditor ticks each audited box when verified and all verified items before PASS; on REWORK the auditor unticks failed items and names their numbers. Tick only work really done or verified. Use pair_task_get/update/check or the CHECK marker to update the whole brief.';
+export const TASK_PAIR_CHECKLIST_RULE = 'Pair brief checklist: keep requirements in Markdown lines "- [ ][ ] item"; a single-box "- [ ]" item has no audit box; number items 1..N in brief order. During work, the executor MUST immediately emit CHECK box=implemented for each item as soon as that item is done, and the auditor MUST immediately emit CHECK box=audited for each item as soon as that item is verified; do not defer normal progress checks until READY_FOR_AUDIT or PASS. The executor ticks all delivered implemented items before READY_FOR_AUDIT; the auditor ticks all verified audited items before PASS; on REWORK the auditor unticks failed items and names their numbers. Tick only work really done or verified. READY_FOR_AUDIT/PASS automatic ticks are a bounded daemon backstop for boxes still missing after the participant declared that terminal state, never a substitute for real-time CHECK updates, and are recorded with a reason. Use pair_task_get/update/check or the CHECK marker to update the whole brief.';
 export const TASK_PAIR_RESOURCE_CLAIM_RULE = 'Before using a shared machine, directory, port range, or named test stack, claim it with pair_resource_claim or `<!-- IMCODES_TASK CLAIM <taskId> resource=... mode=exclusive|shared ttl=... -->`; renew before the TTL expires. Claims are user-scoped, conflict-checked, persisted across daemon restarts, and released on DONE/CANCEL. Never touch an unclaimed shared resource.';
 export const TASK_PAIR_CHECK_VERB = 'CHECK' as const;
 /** Durable event verb emitted by the structured MCP dispatch surface. */
@@ -2234,6 +2234,10 @@ export interface TaskPairEventPayload {
   outputPath?: string;
   /** Why the deliverable could not be copied (OUTPUT_FAILED). */
   outputError?: string;
+  /** Human-readable reason attached to daemon checklist backstop events. */
+  checklistAutoTickReason?: string;
+  /** Observable notice for a daemon checklist backstop event. */
+  checklistAutoTickNotice?: string;
 }
 
 // ---------------------------------------------------------------------------

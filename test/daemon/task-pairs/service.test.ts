@@ -322,6 +322,19 @@ describe('task-pair marker ingestion', () => {
     expect(ticks[0]?.attrs).toMatchObject({ box: 'implemented', items: '2', checked: 'true' });
   });
 
+  it('records the terminal checklist backstop reason and notice without pretending a CHECK was received', async () => {
+    await say(BRAIN, '<!-- IMCODES_TASK QUEUE T-backstop-reason title="Checklist" auditor=' + AUD + ' -->\n- [ ][ ] first\n- [ ][ ] second\n<!-- IMCODES_TASK_END T-backstop-reason -->');
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-backstop-reason executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, '<!-- IMCODES_TASK READY_FOR_AUDIT T-backstop-reason path=/workspace -->');
+    const ticks = getTaskPairStore().listEvents(PROJECT, 'T-backstop-reason').filter((event) => event.verb === 'CHECKLIST_AUTO_TICK');
+    expect(ticks).toHaveLength(1);
+    expect(ticks[0]?.attrs).toMatchObject({
+      box: 'implemented', items: '1,2', checked: 'true', reason: 'ready_for_audit_backstop',
+    });
+    expect(ticks[0]?.attrs.notice).toContain('no participant CHECK was received');
+    expect(ticks[0]?.writer).toBe('daemon');
+  });
+
   it('auto-ticks implemented items when an auditor=none executor reports DONE', async () => {
     await say(BRAIN, '<!-- IMCODES_TASK QUEUE T-no-audit title="Checklist" auditor=none -->\n- [ ][ ] first\n<!-- IMCODES_TASK_END T-no-audit -->');
     await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-no-audit executor=${EXEC} auditor=none -->`);
