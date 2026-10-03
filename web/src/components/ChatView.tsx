@@ -131,6 +131,7 @@ import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
 import { TaskPairEventChip } from './TaskPairEventChip.js';
+import { parseTaskPairNotification } from '@shared/task-pair-notification.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -239,6 +240,8 @@ interface ViewItem {
    *  carries the structured delegation-claim projection. Passed through by
    *  reference so the memoized AssistantBlock keeps a stable prop identity. */
   delegationMetadata?: Record<string, unknown>;
+  /** Daemon-authored task creation/lifecycle notice projected as the same card. */
+  taskPairNotification?: Record<string, unknown>;
   /** All events in a collapsed tool group (first, middle..., last) */
   toolEvents?: TimelineEvent[];
   /** memory.context events linked to this event via relatedToEventId */
@@ -264,6 +267,7 @@ interface AssistantBlockProps {
   /** Completed assistant message metadata carrying the delegation-claim
    *  projection, when the runtime attached one. */
   delegationMetadata?: Record<string, unknown>;
+  taskPairNotification?: Record<string, unknown>;
   /** Daemon-announced per-assignment lifecycle status for the dispatch card. */
   liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
   /** Stable identifier for this merged block. Wired through to a
@@ -1338,6 +1342,16 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     return false;
   });
 
+  // A daemon notice can be persisted both as a structured task event and as
+  // the assistant text that announced it. The structured event is the
+  // authoritative card; suppress the duplicate text card below.
+  const structuredTaskIds = new Set(
+    renderable
+      .filter((event) => event.type === TASK_PAIR_TIMELINE_EVENT)
+      .map((event) => typeof event.payload.taskId === 'string' ? event.payload.taskId : '')
+      .filter(Boolean),
+  );
+
   // Main pass: merge assistant.text blocks + group consecutive tool.call runs
   const items: ViewItem[] = [];
   let pendingText: string[] = [];
@@ -1349,6 +1363,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   let pendingAssistantStreaming = false;
   let pendingExecutionState: SupervisionExecutionState | undefined;
   let pendingDelegationMetadata: Record<string, unknown> | undefined;
+  let pendingTaskPairNotification: Record<string, unknown> | undefined;
   let pendingTools: TimelineEvent[] = [];
   let deferredEvents: TimelineEvent[] = [];
 
@@ -1357,15 +1372,30 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
 
   const flushPending = () => {
     if (pendingEventIds.length > 0) {
+      const pendingTextValue = pendingText.join('\n');
+      const notification = pendingTaskPairNotification
+        ? { payload: pendingTaskPairNotification, taskId: pendingTaskPairNotification.taskId as string }
+        : parseTaskPairNotification(pendingTextValue);
+      if (notification && structuredTaskIds.has(notification.taskId)) {
+        pendingText = [];
+        pendingEventIds = [];
+        pendingAssistantAutomation = false;
+        pendingAssistantStreaming = false;
+        pendingExecutionState = undefined;
+        pendingDelegationMetadata = undefined;
+        pendingTaskPairNotification = undefined;
+        return;
+      }
       items.push({
         key: claimRunKey('assistant-block', pendingKey, pendingEventIds, usedRunKeys),
         type: 'assistant-block',
-        text: pendingText.join('\n'),
+        text: pendingTextValue,
         eventIds: [...pendingEventIds],
         assistantAutomation: pendingAssistantAutomation,
         assistantStreaming: pendingAssistantStreaming,
         ...(pendingExecutionState ? { executionState: pendingExecutionState } : {}),
         ...(pendingDelegationMetadata ? { delegationMetadata: pendingDelegationMetadata } : {}),
+        ...(notification ? { taskPairNotification: notification.payload } : {}),
         ts: pendingFirstTs,
         lastTs: pendingLastTs,
       });
@@ -1375,6 +1405,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       pendingAssistantStreaming = false;
       pendingExecutionState = undefined;
       pendingDelegationMetadata = undefined;
+      pendingTaskPairNotification = undefined;
     }
   };
 
@@ -1412,12 +1443,13 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // single live activity rail instead of many tiny rows.
       if (showToolCalls) flushTools();
       // Trim and collapse 3+ consecutive blank lines to 1 (CC output often has many trailing newlines)
+      const rawNotification = parseTaskPairNotification(event.payload.text);
       const projection = projectAssistantTextForDisplay(event.payload.text);
       const text = projection.text;
       const executionState = event.payload.streaming === true || event.payload.pending === true
         ? null
         : projection.executionState;
-      if (!text && !executionState) continue;
+      if (!text && !executionState && !rawNotification) continue;
       const assistantAutomation = event.payload.automation === true;
       if (pendingEventIds.length > 0 && pendingAssistantAutomation !== assistantAutomation) {
         flushPending();
@@ -1437,6 +1469,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       const delegationMetadata = readDelegationClaimMetadata(event.payload);
       if (delegationMetadata) pendingDelegationMetadata = delegationMetadata;
       if (executionState) pendingExecutionState = executionState;
+      if (rawNotification) pendingTaskPairNotification = rawNotification.payload;
       pendingLastTs = event.ts;
       if (text) pendingText.push(text);
       pendingEventIds.push(event.eventId);
@@ -4655,6 +4688,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   streaming={item.assistantStreaming === true}
                   executionState={item.executionState}
                   delegationMetadata={item.delegationMetadata}
+                  taskPairNotification={item.taskPairNotification}
                   liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
@@ -5457,6 +5491,7 @@ const AssistantBlock = memo(function AssistantBlock({
   ts,
   eventId,
   delegationMetadata,
+  taskPairNotification,
   liveAssignmentStatuses,
   onPathClick,
   onUrlClick,
@@ -5472,6 +5507,9 @@ const AssistantBlock = memo(function AssistantBlock({
       ? { className: 'needs-input', glyph: SUPERVISION_HEARTBEAT_GLYPH.NEEDS_INPUT, label: t('chat.execution_status.needs_input') }
       : null;
   const statusOnly = text.length === 0 && status !== null;
+  if (taskPairNotification) {
+    return <TaskPairEventChip eventId={eventId ?? 'task-pair-notice'} payload={taskPairNotification} timestamp={ts} />;
+  }
   return (
     <div
       class={`chat-event chat-assistant${automation ? ' chat-assistant-automation' : ''}${statusOnly ? ' chat-assistant-status-only' : ''}`}
@@ -5934,7 +5972,7 @@ const ChatEvent = memo(function ChatEvent({
       return null;
 
     case TASK_PAIR_TIMELINE_EVENT:
-      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} />;
+      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} timestamp={event.ts} />;
 
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');

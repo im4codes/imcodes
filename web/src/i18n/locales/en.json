@@ -4520,6 +4520,7 @@
     "brief_loading": "Loading brief…",
     "brief_unavailable": "Brief unavailable. Expand again to retry.",
     "brief_content": "Task content",
-    "brief_checklist": "Checklist"
+    "brief_checklist": "Checklist",
+    "card_time": "Time: {{value}}"
   }
 }

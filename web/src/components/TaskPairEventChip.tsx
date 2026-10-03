@@ -33,8 +33,8 @@ function workspaceText(t: (key: string, options?: Record<string, unknown>) => st
 }
 
 /** Compact chat chip for one task-pair marker event (it replaces the hidden marker line). */
-export function TaskPairEventChip({ eventId, payload }: { eventId: string; payload: Record<string, unknown> }) {
-  const { t } = useTranslation();
+export function TaskPairEventChip({ eventId, payload, timestamp }: { eventId: string; payload: Record<string, unknown>; timestamp?: number }) {
+  const { t, i18n } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const event = payload as Partial<TaskPairEventPayload>;
   const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
@@ -49,7 +49,16 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
     : '';
   const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
   const verdict = typeof event.verdictJudgement === 'string' ? event.verdictJudgement : '';
-  const payloadJson = JSON.stringify(payload, null, 2) ?? '{}';
+  const payloadForDetails = typeof timestamp === 'number' && Number.isFinite(timestamp)
+    ? { ...payload, _eventTimestamp: new Date(timestamp).toISOString() }
+    : payload;
+  const payloadJson = JSON.stringify(payloadForDetails, null, 2) ?? '{}';
+  const eventTime = typeof timestamp === 'number' && Number.isFinite(timestamp)
+    ? new Intl.DateTimeFormat(i18n?.language || undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp))
+    : '';
+  const noticeText = typeof (event as Record<string, unknown>).noticeText === 'string'
+    ? (event as Record<string, unknown>).noticeText as string
+    : '';
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
@@ -87,6 +96,7 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
             </span>
           </span>
           <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
+          {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{t('taskPair.card_time', { value: eventTime })}</time>}
           <span class="task-pair-card-toggle-label">{expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}</span>
           <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
         </button>
@@ -98,6 +108,7 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
               ? workspaceText(t, event)
               : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
           </span>
+          {noticeText && <pre class="task-pair-card-notice">{noticeText}</pre>}
           <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
           {roleLabel(event.executor, event.executorLabel, 'executor')}
           {roleLabel(event.auditor, event.auditorLabel, 'auditor')}

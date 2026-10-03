@@ -4520,6 +4520,7 @@
     "brief_loading": "正在載入簡報…",
     "brief_unavailable": "簡報無法使用。再次展開即可重試。",
     "brief_content": "任務內容",
-    "brief_checklist": "檢查清單"
+    "brief_checklist": "檢查清單",
+    "card_time": "時間：{{value}}"
   }
 }

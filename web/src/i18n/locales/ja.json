@@ -4519,6 +4519,7 @@
     "brief_loading": "ブリーフを読み込み中…",
     "brief_unavailable": "ブリーフを取得できません。もう一度開いて再試行してください。",
     "brief_content": "タスク内容",
-    "brief_checklist": "チェックリスト"
+    "brief_checklist": "チェックリスト",
+    "card_time": "時刻: {{value}}"
   }
 }

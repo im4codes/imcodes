@@ -98,6 +98,29 @@ describe('TaskPairEventChip', () => {
     expect(chip.textContent).toContain('taskPair.unusual');
     expect(chip.textContent).toContain('"writer":"taskPair.daemon"');
   });
+
+  it('shows a compact locale-aware event time while keeping the exact timestamp in details', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-time" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'T-time', title: 'Timed task', writer: 'daemon', verb: 'PASS', toStatus: 'passed', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    expect(card.querySelector('.task-pair-card-time')).toBeTruthy();
+    expect(card.querySelector('.task-pair-card-body')).toBeNull();
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('_eventTimestamp');
+    expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('2026-01-02T03:04:05.000Z');
+  });
+
+  it('renders a task notice reason only after expanding the same card', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-notice" payload={{
+      taskId: 'T-notice', title: 'Needs input', writer: 'daemon', verb: 'NEEDS_INPUT', toStatus: 'rework',
+      noticeText: 'Needs your decision: an executor is waiting. Why: verify the exact head.', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    expect(card.textContent).not.toContain('verify the exact head');
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('verify the exact head');
+  });
 });
 
 describe('TaskPairEventChip workspace events', () => {

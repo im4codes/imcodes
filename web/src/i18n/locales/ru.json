@@ -4519,6 +4519,7 @@
     "brief_loading": "Загрузка брифа…",
     "brief_unavailable": "Бриф недоступен. Раскройте снова, чтобы повторить.",
     "brief_content": "Содержание задачи",
-    "brief_checklist": "Чек-лист"
+    "brief_checklist": "Чек-лист",
+    "card_time": "Время: {{value}}"
   }
 }

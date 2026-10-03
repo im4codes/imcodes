@@ -4520,6 +4520,7 @@
     "brief_loading": "正在加载简报…",
     "brief_unavailable": "简报不可用。再次展开可重试。",
     "brief_content": "任务内容",
-    "brief_checklist": "检查清单"
+    "brief_checklist": "检查清单",
+    "card_time": "时间：{{value}}"
   }
 }

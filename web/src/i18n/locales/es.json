@@ -4520,6 +4520,7 @@
     "brief_loading": "Cargando el brief…",
     "brief_unavailable": "Brief no disponible. Expande de nuevo para reintentar.",
     "brief_content": "Contenido de la tarea",
-    "brief_checklist": "Lista de comprobación"
+    "brief_checklist": "Lista de comprobación",
+    "card_time": "Hora: {{value}}"
   }
 }

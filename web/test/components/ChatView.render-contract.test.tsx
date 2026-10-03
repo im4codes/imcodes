@@ -132,6 +132,73 @@ describe('ChatView render capability contract', () => {
     expect(card?.textContent).toContain('taskPair.card_auditor');
   });
 
+  it('projects a daemon task creation notice into one card and suppresses its raw text', () => {
+    const notice = '[IM.codes task tsk_notice "Create a card"]\nNeeds your decision: a participant is waiting on input. Executor deck_exec, auditor deck_aud, status rework, round 1.\nWhy: verify the exact head.';
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'notice-text',
+      payload: { text: notice },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: 'assistant-block',
+      taskPairNotification: expect.objectContaining({ taskId: 'tsk_notice', title: 'Create a card', toStatus: 'rework' }),
+    });
+    const { container } = render(<ChatView
+      events={[assistant]}
+      loading={false}
+      ws={{} as never}
+      workdir="/repo"
+      sessionId="session-a"
+    />);
+    expect(container.querySelectorAll('.task-pair-event-card')).toHaveLength(1);
+    expect(container.textContent).toContain('Create a card');
+    expect(container.textContent).not.toContain('[IM.codes task tsk_notice');
+  });
+
+  it('keeps one structured card when the same task notice is also persisted as assistant text', () => {
+    const taskId = 'tsk_duplicate';
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'duplicate-text',
+      payload: { text: `[IM.codes task ${taskId} "Duplicate"]\nPASS recorded for ${taskId}, status passed.` },
+    } as unknown as TimelineEvent;
+    const structured = {
+      ...ev('task_pair.event'),
+      eventId: 'duplicate-event',
+      payload: { taskId, title: 'Duplicate', writer: 'daemon', verb: 'PASS', toStatus: 'passed', unusual: false },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant, structured], true);
+    expect(items.filter((item) => item.type === 'assistant-block')).toHaveLength(0);
+    expect(items.filter((item) => item.type === 'event')).toHaveLength(1);
+  });
+
+  it('converts strict protocol markers but leaves fenced examples and user prose untouched', () => {
+    const marker = {
+      ...ev('assistant.text'),
+      eventId: 'dispatch-marker',
+      payload: { text: '<!-- IMCODES_TASK DISPATCH tsk_marker title="Dispatch card" -->' },
+    } as unknown as TimelineEvent;
+    const fenced = {
+      ...ev('assistant.text'),
+      eventId: 'fenced-marker',
+      payload: { text: '```\n[IM.codes task tsk_fake "Example"]\nstatus rework\n```' },
+    } as unknown as TimelineEvent;
+    const prose = {
+      ...ev('user.message'),
+      eventId: 'user-prose',
+      payload: { text: 'Please discuss [IM.codes task tsk_prose "not a task"] in this sentence.' },
+    } as unknown as TimelineEvent;
+    const markerItems = __buildViewItemsForTests([marker], true);
+    expect(markerItems[0]).toMatchObject({ taskPairNotification: expect.objectContaining({ taskId: 'tsk_marker', verb: 'DISPATCH' }) });
+    const fencedItems = __buildViewItemsForTests([fenced], true);
+    expect(fencedItems[0]).not.toHaveProperty('taskPairNotification');
+    expect(fencedItems[0]).toMatchObject({ type: 'assistant-block' });
+    const proseItems = __buildViewItemsForTests([prose], true);
+    expect(proseItems[0]).toMatchObject({ type: 'event', event: prose });
+  });
+
   it.each(ALL_CONTENT_TYPES.map((type) => [type]))(
     'classifies %s to match what the renderer actually draws',
     (type) => {
