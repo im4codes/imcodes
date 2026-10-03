@@ -31,7 +31,6 @@ import {
   parseImcodesVersion,
 } from '../../../shared/imcodes-version.js';
 import {
-  REMOTE_DESKTOP_CAPABILITY,
   REMOTE_DESKTOP_TERMINAL_REASON,
 } from '../../../shared/remote-desktop.js';
 import { randomUUID } from 'node:crypto';
@@ -647,7 +646,14 @@ machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c)
   const installable = capabilities.ok
     && (capabilities.value.includes(REMOTE_DESKTOP_INSTALLABLE_CAPABILITY)
       || capabilities.value.includes(REMOTE_DESKTOP_MACOS_INSTALLABLE_CAPABILITY));
-  if (!installable || capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)) {
+  // A controlled node may briefly advertise both capabilities while the
+  // server's durable snapshot catches up with a reconnect (notably Linux:
+  // the worker is present but the Xvfb desktop is not).  The install request
+  // is idempotent and the node-side handler decides whether provisioning or
+  // repair is still needed, so rejecting the mixed snapshot would strand the
+  // one action that can make the node usable.  Keep the capability gate, but
+  // do not turn a stale READY token into a permanent 409.
+  if (!installable) {
     return c.json({ error: 'remote_desktop_worker_not_installable' }, 409);
   }
   if (isImcodesVersionOutdated(owned.daemon_version, process.env.APP_VERSION)) {

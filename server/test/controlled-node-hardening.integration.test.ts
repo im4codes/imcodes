@@ -356,6 +356,44 @@ describe('remote desktop worker quick install', () => {
       else process.env.APP_VERSION = originalAppVersion;
     }
   });
+
+  it('still dispatches when a stale READY capability coexists with installable', async () => {
+    const originalAppVersion = process.env.APP_VERSION;
+    process.env.APP_VERSION = '2026.8.4000-dev.1';
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    const owner = await fullCredential(userId);
+    const controlledId = `ctl_${hex(8)}`;
+    await db.execute(
+      `INSERT INTO servers
+         (id, user_id, name, token_hash, status, last_heartbeat_at, created_at,
+          node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities, node_id)
+       VALUES ($1,$2,'controlled',$3,$4,$4,$5,true,'linux-ref','Linux box','linux','2026.8.4000-dev.1',$6,$7)`,
+      [controlledId, userId, sha256(hex(16)), 'online', Date.now(), NODE_ROLE.CONTROLLED,
+        JSON.stringify([REMOTE_DESKTOP_INSTALLABLE_CAPABILITY, REMOTE_DESKTOP_CAPABILITY]),
+        generateControlledNodeId()],
+    );
+    const bridge = WsBridge.get(controlledId);
+    const install = vi.spyOn(bridge, 'tryInstallControlledNodeRemoteDesktopWorker')
+      .mockReturnValue('sent');
+    try {
+      const response = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
+        method: 'POST',
+        headers: {
+          'X-Server-Id': owner.serverId,
+          authorization: `Bearer ${owner.token}`,
+        },
+      });
+      expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({ ok: true });
+      expect(install).toHaveBeenCalledWith(bridge.daemonConnectionGeneration());
+    } finally {
+      install.mockRestore();
+      if (originalAppVersion === undefined) delete process.env.APP_VERSION;
+      else process.env.APP_VERSION = originalAppVersion;
+    }
+  });
 });
 
 describe('owner-scoped machine listing (DB presence)', () => {
