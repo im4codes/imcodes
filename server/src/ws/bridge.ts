@@ -1151,6 +1151,7 @@ export interface WatchActiveMainSessionRow {
 
 type WatchActiveSubSessionRow = {
   name: string;
+  state?: string;
   parentSession?: string;
   agentType?: string;
   runtimeType?: string;
@@ -5801,12 +5802,45 @@ export class WsBridge {
       }
 
       // 10.2 — a CONTROLLED node's WS is a strict allowlist surface: it may ONLY
-      // deliver validated remote-desktop signaling, exec/file results, and heartbeats. Every other inbound frame is dropped
+      // deliver validated remote-desktop signaling, bounded session-readiness
+      // metadata, exec/file results, and heartbeats. Every other inbound frame is dropped
       // here BEFORE it can reach `relayToBrowsers` or the push dispatch below, so a
       // compromised controlled node cannot inject browser timeline messages or
       // trigger APNs/FCM. Client-declared role is irrelevant — `daemonNodeRole` is
       // DB-authoritative (set during auth).
       if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+        // Session readiness is a narrow, non-relayed control-plane surface.
+        // It establishes the authoritative idle/busy fence for upgrades while
+        // keeping controlled-node content and notifications fail-closed.
+        if (msg.type === 'session_list') {
+          if (!Array.isArray(msg.sessions)) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.replaceActiveMainSessions(msg.sessions);
+          return;
+        }
+        if (msg.type === 'session.idle') {
+          const sessionName = typeof msg.session === 'string' ? msg.session : null;
+          if (!sessionName) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.updateAuthoritativeSessionState(sessionName, 'idle');
+          return;
+        }
+        if (msg.type === TIMELINE_MESSAGES.EVENT) {
+          const event = msg.event as Record<string, unknown> | undefined;
+          const payload = event?.payload as Record<string, unknown> | undefined;
+          const sessionId = typeof event?.sessionId === 'string' ? event.sessionId : null;
+          const state = typeof payload?.state === 'string' ? payload.state : null;
+          if (!sessionId || event?.type !== 'session.state' || !state) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.updateAuthoritativeSessionState(sessionId, state);
+          return;
+        }
         if (msg.type === DAEMON_MSG.UPGRADE_BLOCKED) {
           const blocked = validateControlledNodeUpgradeBlockedMessage(msg);
           if (!blocked.ok) {
@@ -7406,6 +7440,26 @@ export class WsBridge {
     }
   }
 
+  private updateAuthoritativeSessionState(sessionName: string, state: string): void {
+    const main = this.activeMainSessions.get(sessionName);
+    if (main) this.activeMainSessions.set(sessionName, { ...main, state });
+    const sub = this.activeSubSessions.get(sessionName);
+    if (sub) this.activeSubSessions.set(sessionName, { ...sub, state });
+    if (state === 'idle' || state === 'stopped') this.activeDispatchIds.delete(sessionName);
+    this.scheduleControlledUpgradeFlushAtIdleBoundary();
+  }
+
+  private hasAuthoritativeBusySession(): boolean {
+    if (this.activeDispatchIds.size > 0) return true;
+    for (const session of this.activeMainSessions.values()) {
+      if (session.state !== 'idle' && session.state !== 'stopped') return true;
+    }
+    for (const session of this.activeSubSessions.values()) {
+      if (session.state !== undefined && session.state !== 'idle' && session.state !== 'stopped') return true;
+    }
+    return false;
+  }
+
   /**
    * A live authenticated socket is necessary but not sufficient for a safe
    * controlled-node upgrade: an active dispatch must reach its idle/terminal
@@ -8189,10 +8243,7 @@ export class WsBridge {
       }
       if (rawEvent.type === 'session.state') {
         const payload = rawEvent.payload as Record<string, unknown> | undefined;
-        if (payload?.state === 'idle') {
-          this.activeDispatchIds.delete(sessionId);
-          this.scheduleControlledUpgradeFlushAtIdleBoundary();
-        }
+        if (typeof payload?.state === 'string') this.updateAuthoritativeSessionState(sessionId, payload.state);
       }
       this.ingestRecentTextFromTimelineEvent(rawEvent);
       if (this.db) {
@@ -8280,8 +8331,7 @@ export class WsBridge {
       // behind PTY frames so the browser spinner clears in lockstep with
       // the push.
       if (type === 'session.idle') {
-        this.activeDispatchIds.delete(sessionName);
-        this.scheduleControlledUpgradeFlushAtIdleBoundary();
+        this.updateAuthoritativeSessionState(sessionName, 'idle');
       }
       this.sendJsonToSessionSubscribers(sessionName, JSON.stringify(msg));
       return;
@@ -8307,16 +8357,20 @@ export class WsBridge {
           : agentType
             ? getSessionRuntimeType(agentType)
             : undefined;
-        this.activeSubSessions.set(subSessionName, { name: subSessionName, label, parentSession, agentType, runtimeType });
+        this.activeSubSessions.set(subSessionName, {
+          name: subSessionName,
+          state: typeof msg.state === 'string' ? msg.state : undefined,
+          label,
+          parentSession,
+          agentType,
+          runtimeType,
+        });
         const subIdentityProjectKey = sessionIdentityProjectKey({
           contextNamespace: msg.contextNamespace as { projectId?: unknown } | null | undefined,
         });
         if (subIdentityProjectKey) this.subIdentityProjectKeys.set(subSessionName, subIdentityProjectKey);
         this.sessionRuntimeTypes.set(subSessionName, this.normalizeRuntimeType(runtimeType));
-        if (msg.state === 'idle') {
-          this.activeDispatchIds.delete(subSessionName);
-          this.scheduleControlledUpgradeFlushAtIdleBoundary();
-        }
+        if (typeof msg.state === 'string') this.updateAuthoritativeSessionState(subSessionName, msg.state);
       }
       void (async () => {
         const requestedType = typeof msg.sessionType === 'string' && msg.sessionType.trim()
@@ -10286,7 +10340,8 @@ export class WsBridge {
   private isDaemonReadyForUpgrade(): boolean {
     const syncReady = this.upgradeBlockedSyncRequiredGeneration !== this.daemonGeneration
       || this.upgradeBlockedSyncCompleteGeneration === this.daemonGeneration;
-    const controlledNodeIdle = this.daemonNodeRole !== NODE_ROLE.CONTROLLED || this.activeDispatchIds.size === 0;
+    const controlledNodeIdle = this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || (this.hasActiveMainSessionSnapshot && !this.hasAuthoritativeBusySession());
     return Boolean(
       this.daemonWs
       && this.authenticated

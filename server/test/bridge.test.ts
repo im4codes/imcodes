@@ -873,6 +873,16 @@ describe('WsBridge', () => {
       await flushAsync();
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'running' }] }));
+      await flushAsync();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'idle' }] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
       expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(1);
     });
 
@@ -897,8 +907,7 @@ describe('WsBridge', () => {
       expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(0);
 
       activeDispatchIds.delete('main');
-      (bridge as unknown as { scheduleControlledUpgradeFlushAtIdleBoundary: () => void })
-        .scheduleControlledUpgradeFlushAtIdleBoundary();
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'idle' }] }));
       await flushAsync();
       await vi.runOnlyPendingTimersAsync();
       await flushAsync();
@@ -914,7 +923,9 @@ describe('WsBridge', () => {
       bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.7.1233-dev.4', capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY] }));
       await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
       await flushAsync();
       expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(true);
       expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(false);
@@ -981,7 +992,9 @@ describe('WsBridge', () => {
       bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: [] }));
       await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
       await flushAsync();
       expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
       expect(ws.sentStrings.some((message) => message.includes('\"type\":\"machine.exec\"'))).toBe(true);
@@ -994,6 +1007,10 @@ describe('WsBridge', () => {
       const ws = new MockWs();
       bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN), {} as never);
       ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: [] }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
       await flushAsync();
       await vi.advanceTimersByTimeAsync(60_000);
       await flushAsync();
