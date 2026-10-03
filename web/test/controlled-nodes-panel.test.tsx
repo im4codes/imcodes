@@ -48,6 +48,18 @@ const setMachineExecEnabled = vi.fn(async () => {});
 const revokeMachine = vi.fn(async () => {});
 const renameMachine = vi.fn(async () => {});
 const installMachineRemoteDesktopWorker = vi.fn(async () => {});
+const getMachineUpgradeStatus = vi.fn(async () => ({
+  currentVersion: '2026.4.904-dev.876',
+  latestVersion: '2026.4.905-dev.877',
+  upgrade: {
+    upgradeId: 'upgrade-1', targetVersion: '2026.4.905-dev.877', source: 'manual' as const,
+    status: 'pending_offline' as const, createdAt: 1, updatedAt: 2, lastSentAt: null,
+  },
+}));
+const requestMachineUpgrade = vi.fn(async () => ({
+  ok: true, upgradeId: 'upgrade-2', targetVersion: '2026.4.905-dev.877', deliveryStatus: 'sent',
+  currentVersion: '2026.4.904-dev.876', latestVersion: '2026.4.905-dev.877',
+}));
 const listAvailableExecutables = vi.fn(async (): Promise<ControlledNodeAvailability> => ({
   available: ['win', 'mac', 'linux'],
   artifacts: [
@@ -64,6 +76,8 @@ vi.mock('../src/api/machines.js', async (importOriginal) => {
     revokeMachine: (...a: unknown[]) => revokeMachine(...a),
     renameMachine: (...a: unknown[]) => renameMachine(...a),
     installMachineRemoteDesktopWorker: (...a: unknown[]) => installMachineRemoteDesktopWorker(...a),
+    getMachineUpgradeStatus: (...a: unknown[]) => getMachineUpgradeStatus(...a),
+    requestMachineUpgrade: (...a: unknown[]) => requestMachineUpgrade(...a),
     listAvailableExecutables: () => listAvailableExecutables(),
   };
 });
@@ -184,6 +198,8 @@ beforeEach(() => {
   setMachineGroupMembership.mockClear();
   renameTeam.mockClear();
   deleteTeam.mockClear();
+  getMachineUpgradeStatus.mockClear();
+  requestMachineUpgrade.mockClear();
   createTeam.mockResolvedValue({ id: 'desk-new', name: 'My AI Desk', role: 'owner' as const });
 });
 
@@ -1866,5 +1882,30 @@ describe('ControlledNodesPanel group rename and delete', () => {
     expect(container.querySelector('[data-testid="controlled-nodes-team-chip-team-1"]')?.textContent).toContain('1');
     expect(container.querySelector('[data-testid="controlled-nodes-team-chip-team-2"]')?.textContent).toContain('1');
     expect(container.querySelector('[data-testid="controlled-nodes-machine-pick"]')).toBeNull();
+  });
+
+  it('opens the formal control surface, shows authoritative upgrade state, and de-duplicates retry', async () => {
+    machines = [owned({ serverId: 'control-node', displayName: 'Control Node', updateAvailable: true })];
+    let resolveRetry: ((value: unknown) => void) | undefined;
+    requestMachineUpgrade.mockImplementation(() => new Promise((resolve) => { resolveRetry = resolve; }));
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(getMachineUpgradeStatus).toHaveBeenCalledWith('control-node'));
+    fireEvent.click(container.querySelector('.controlled-nodes-control-toggle')!);
+    expect(container.querySelector('[data-testid="controlled-node-panel-control-node"]')?.textContent)
+      .toContain('controlled_nodes.upgrade_status_pending_offline');
+    const retry = container.querySelector('.controlled-nodes-upgrade-retry') as HTMLButtonElement;
+    fireEvent.click(retry);
+    fireEvent.click(retry);
+    expect(requestMachineUpgrade).toHaveBeenCalledTimes(1);
+    resolveRetry?.({ ok: true, deliveryStatus: 'sent', currentVersion: '2026.4.904-dev.876', latestVersion: '2026.4.905-dev.877' });
+  });
+
+  it('keeps viewer controls visible but disables upgrade and connection actions', async () => {
+    machines = [machine({ serverId: 'viewer-node', accessRole: 'viewer', online: true, updateAvailable: true })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(getMachineUpgradeStatus).toHaveBeenCalledWith('viewer-node'));
+    fireEvent.click(container.querySelector('.controlled-nodes-control-toggle')!);
+    expect((container.querySelector('.controlled-nodes-upgrade-retry') as HTMLButtonElement).disabled).toBe(true);
+    expect(container.querySelector('.controlled-nodes-control-panel')).not.toBeNull();
   });
 });

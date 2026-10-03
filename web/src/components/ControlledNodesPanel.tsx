@@ -196,6 +196,7 @@ export function ControlledNodesPanel({
   const [upgradeStatusByServerId, setUpgradeStatusByServerId] = useState<Record<string, Awaited<ReturnType<typeof getMachineUpgradeStatus>>>>({});
   const [upgradeResultByServerId, setUpgradeResultByServerId] = useState<Record<string, string | undefined>>({});
   const [upgradeBusyServerId, setUpgradeBusyServerId] = useState<string | null>(null);
+  const upgradeBusyRef = useRef<string | null>(null);
   const [connectionSummaries, setConnectionSummaries] = useState<readonly RemoteDesktopConnectionSummary[]>([]);
 
   useEffect(() => {
@@ -357,7 +358,8 @@ export function ControlledNodesPanel({
   }, [manualPresenceRefresh, refreshPresence]);
 
   const retryMachineUpgrade = useCallback(async (serverId: string) => {
-    if (upgradeBusyServerId === serverId) return;
+    if (upgradeBusyRef.current === serverId) return;
+    upgradeBusyRef.current = serverId;
     setUpgradeBusyServerId(serverId);
     try {
       const result = await requestMachineUpgrade(serverId);
@@ -374,9 +376,10 @@ export function ControlledNodesPanel({
     } catch (error) {
       setActionError(error instanceof Error ? error.message : t('controlled_nodes.upgrade_failed'));
     } finally {
+      upgradeBusyRef.current = null;
       setUpgradeBusyServerId(null);
     }
-  }, [refreshPresence, t, upgradeBusyServerId]);
+  }, [refreshPresence, t]);
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);

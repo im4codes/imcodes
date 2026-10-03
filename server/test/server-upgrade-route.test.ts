@@ -6,6 +6,7 @@ const mockGetServersByUserId = vi.fn();
 const mockGetFullServersByUserId = vi.fn();
 const mockSendToDaemon = vi.fn();
 const mockRequestDaemonUpgrade = vi.fn();
+const mockDaemonUpgradeStatus = vi.fn();
 const mockDeleteServer = vi.fn();
 const mockResolveServerRole = vi.fn();
 const mockGetServerById = vi.fn();
@@ -34,6 +35,7 @@ vi.mock('../src/ws/bridge.js', () => ({
     get: () => ({
       sendToDaemon: (...args: unknown[]) => mockSendToDaemon(...args),
       requestDaemonUpgrade: (...args: unknown[]) => mockRequestDaemonUpgrade(...args),
+      daemonUpgradeStatus: (...args: unknown[]) => mockDaemonUpgradeStatus(...args),
     }),
   },
 }));
@@ -77,6 +79,13 @@ describe('server routes', () => {
       upgradeId: 'upgrade-1',
       targetVersion: 'latest',
       deliveryStatus: 'sent',
+    });
+    mockDaemonUpgradeStatus.mockReturnValue({
+      currentVersion: '2026.4.904-dev.876',
+      upgrade: {
+        upgradeId: 'upgrade-1', targetVersion: '2026.4.905-dev.877', source: 'manual',
+        status: 'pending_offline', createdAt: 10, updatedAt: 20, lastSentAt: null,
+      },
     });
     mockDeleteServer.mockResolvedValue(true);
     mockResolveServerRole.mockResolvedValue('owner');
@@ -157,6 +166,28 @@ describe('server routes', () => {
       source: 'manual',
     });
     expect(mockSendToDaemon).not.toHaveBeenCalled();
+  });
+
+  it('returns authoritative upgrade status and latest version for an authorized operator', async () => {
+    process.env.APP_VERSION = '2026.4.905-dev.877';
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/upgrade');
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({
+      ok: true,
+      currentVersion: '2026.4.904-dev.876',
+      latestVersion: '2026.4.905-dev.877',
+      upgrade: expect.objectContaining({ status: 'pending_offline', upgradeId: 'upgrade-1' }),
+    });
+    expect(mockDaemonUpgradeStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not expose upgrade status to an unauthorized viewer', async () => {
+    mockResolveServerRole.mockResolvedValueOnce('none');
+    const app = await buildTestApp();
+    const res = await app.request('/api/server/srv-1/upgrade');
+    expect(res.status).toBe(404);
+    expect(mockDaemonUpgradeStatus).not.toHaveBeenCalled();
   });
 
   it('requests latest only when APP_VERSION is unavailable', async () => {
