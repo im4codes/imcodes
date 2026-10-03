@@ -721,23 +721,23 @@ export function ControlledNodesPanel({
           {connection ? (
             <>
               <span data-testid={`controlled-node-connection-${machine.serverId}`}>{connection.snapshot.state}</span>
-              <button type="button" disabled={!actionable} onClick={() => {
+              <button class="controlled-nodes-connection-toggle" type="button" disabled={!actionable} onClick={() => {
                 if (connection.snapshot.mode === 'view') remoteDesktopManager?.resume(machine.serverId);
                 else remoteDesktopManager?.pause(machine.serverId);
               }}>{connection.snapshot.mode === 'view' ? t('controlled_nodes.resume') : t('controlled_nodes.pause')}</button>
-              <button type="button" disabled={!actionable} onClick={() => remoteDesktopManager?.stop(machine.serverId, REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE)}>{t('controlled_nodes.disconnect')}</button>
+              <button class="controlled-nodes-disconnect" type="button" disabled={!actionable} onClick={() => remoteDesktopManager?.stop(machine.serverId, REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE)}>{t('controlled_nodes.disconnect')}</button>
             </>
           ) : <span class="controlled-nodes-muted">{t('controlled_nodes.not_connected')}</span>}
           {remoteDesktopManager && <button
             type="button"
-            class="controlled-nodes-stop-all"
+            class="controlled-nodes-stop-all controlled-nodes-danger-action"
             disabled={!actionable || connectionSummaries.length === 0}
             onClick={() => remoteDesktopManager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE)}
           >{t('controlled_nodes.stop_all')}</button>}
         </div>
         <div class="controlled-nodes-control-links">
-          <button type="button" onClick={() => onOpenRemoteDesktop?.(machine)} disabled={!canOpenRemoteDesktopMachine(machine)}>{t('remote_desktop.open')}</button>
-          {machineAccessRole(machine) === 'owner' && <button type="button" onClick={() => { setSharingMachineSection('account'); setSharingMachine(machine); }}>{t('share.menu.shareTab')}</button>}
+          <button class="controlled-nodes-control-open" type="button" onClick={() => onOpenRemoteDesktop?.(machine)} disabled={!canOpenRemoteDesktopMachine(machine)}>{t('remote_desktop.open')}</button>
+          {machineAccessRole(machine) === 'owner' && <button class="controlled-nodes-control-share" type="button" onClick={() => { setSharingMachineSection('account'); setSharingMachine(machine); }}>{t('share.menu.shareTab')}</button>}
         </div>
       </div>
     );

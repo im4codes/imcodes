@@ -1900,6 +1900,22 @@ describe('ControlledNodesPanel group rename and delete', () => {
     resolveRetry?.({ ok: true, deliveryStatus: 'sent', currentVersion: '2026.4.904-dev.876', latestVersion: '2026.4.905-dev.877' });
   });
 
+  it('keeps the controlled-node command deck dark, layered, and single-line for retry', () => {
+    const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'), 'utf8');
+    const panelStart = css.indexOf('.controlled-nodes-control-toggle,');
+    expect(panelStart).toBeGreaterThanOrEqual(0);
+    const panelSkin = css.slice(panelStart, css.indexOf('.controlled-nodes-upgrade-summary,', panelStart));
+    expect(panelSkin).not.toContain('var(--surface-2');
+    expect(panelSkin).not.toContain('#fff');
+    expect(css).toContain('.controlled-nodes-control-panel {');
+    expect(css).toContain('.controlled-nodes-control-panel button:focus-visible');
+    expect(css).toContain('.controlled-nodes-danger-action');
+    const retryStart = css.lastIndexOf('.controlled-nodes-upgrade-retry,');
+    const retryRule = css.slice(retryStart, css.indexOf('}', retryStart));
+    expect(retryRule).toContain('white-space: nowrap');
+    expect(retryRule).toContain('text-overflow: ellipsis');
+  });
+
   it('keeps viewer controls visible but disables upgrade and connection actions', async () => {
     machines = [machine({ serverId: 'viewer-node', accessRole: 'viewer', online: true, updateAvailable: true })];
     const { container } = render(<ControlledNodesPanel />);

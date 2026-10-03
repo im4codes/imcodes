@@ -3728,23 +3728,23 @@ html.native-ios-mac .chat-dl-btn {
 .controlled-nodes-control-toggle,
 .controlled-nodes-control-panel button {
   min-height: 30px;
-  border: 1px solid var(--border-color, #c9ced8);
-  border-radius: 6px;
-  background: var(--surface-2, #fff);
-  color: inherit;
+  border: 1px solid rgb(125 211 252 / 24%);
+  border-radius: 7px;
+  background: linear-gradient(180deg, rgb(25 52 76 / 94%), rgb(10 26 43 / 96%));
+  color: #cfeaff;
   padding: 4px 9px;
   cursor: pointer;
 }
 .controlled-nodes-control-toggle { margin-left: auto; }
-.controlled-nodes-control-toggle[aria-expanded="true"] { background: var(--surface-3, #eef2f8); }
+.controlled-nodes-control-toggle[aria-expanded="true"] { background: linear-gradient(180deg, rgb(8 91 117 / 42%), rgb(7 37 59 / 72%)); }
 .controlled-nodes-control-panel {
   display: grid;
   gap: 8px;
   margin-top: 8px;
   padding: 10px;
-  border: 1px solid var(--border-color, #c9ced8);
-  border-radius: 8px;
-  background: var(--surface-1, #fbfcfe);
+  border: 1px solid rgb(103 232 249 / 20%);
+  border-radius: 10px;
+  background: linear-gradient(135deg, rgb(12 36 55 / 88%), rgb(8 17 31 / 96%) 58%, rgb(31 20 61 / 78%));
 }
 .controlled-nodes-upgrade-summary,
 .controlled-nodes-connection-controls,
@@ -14887,3 +14887,233 @@ button.quick-agent-delegation-preset.active {
   background: #3b1d24; color: #fecaca; border: 1px solid #7f1d1d; box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
 }
 .chat-toast-close { background: none; border: none; color: inherit; cursor: pointer; font-size: 12px; padding: 0 2px; line-height: 1; }
+
+/* Controlled-node command deck -------------------------------------------------
+   Keep the management surface on the same dark glass language as the machine
+   cards.  This block intentionally lives after the legacy fallback rules above
+   so a browser's default button skin can never leak into the control deck. */
+.controlled-nodes-control-panel {
+  position: relative;
+  overflow: hidden;
+  gap: 10px;
+  margin-top: 9px;
+  padding: 12px;
+  border: 1px solid rgb(103 232 249 / 20%);
+  border-radius: 10px;
+  background:
+    linear-gradient(135deg, rgb(12 36 55 / 88%), rgb(8 17 31 / 96%) 58%, rgb(31 20 61 / 78%));
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 6%),
+    0 8px 24px rgb(0 0 0 / 24%),
+    0 0 22px rgb(34 211 238 / 6%);
+}
+.controlled-nodes-control-panel::before {
+  content: '';
+  position: absolute;
+  inset: 0 0 auto;
+  height: 1px;
+  background: linear-gradient(90deg, rgb(103 232 249 / 70%), rgb(167 139 250 / 45%), transparent 80%);
+  pointer-events: none;
+}
+.controlled-nodes-upgrade-summary,
+.controlled-nodes-connection-controls,
+.controlled-nodes-control-links {
+  position: relative;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  padding: 7px 8px;
+  border: 1px solid rgb(125 211 252 / 10%);
+  border-radius: 7px;
+  background: rgb(2 12 24 / 38%);
+}
+.controlled-nodes-upgrade-summary > span,
+.controlled-nodes-connection-controls > span,
+.controlled-nodes-control-links > span {
+  min-width: 0;
+  color: #b9cde0;
+  font-size: 10px;
+  line-height: 1.35;
+}
+.controlled-nodes-upgrade-summary strong,
+.controlled-nodes-control-label {
+  color: #e2f6ff;
+  font-weight: 750;
+  letter-spacing: .015em;
+}
+.controlled-nodes-control-panel button,
+.controlled-nodes-machine-actions button {
+  appearance: none;
+  -webkit-appearance: none;
+  box-sizing: border-box;
+  min-width: 0;
+  min-height: 31px;
+  padding: 6px 10px;
+  border: 1px solid rgb(125 211 252 / 24%);
+  border-radius: 7px;
+  background: linear-gradient(180deg, rgb(25 52 76 / 94%), rgb(10 26 43 / 96%));
+  color: #cfeaff;
+  font: 650 10.5px/1.2 var(--imcodes-app-font-family);
+  text-shadow: 0 1px 1px rgb(0 0 0 / 28%);
+  cursor: pointer;
+  transition: border-color .16s ease, background .16s ease, color .16s ease, box-shadow .16s ease, transform .16s ease;
+}
+.controlled-nodes-control-panel button:hover:not(:disabled),
+.controlled-nodes-machine-actions button:hover:not(:disabled) {
+  border-color: rgb(103 232 249 / 58%);
+  background: linear-gradient(180deg, rgb(31 70 96 / 96%), rgb(11 35 56 / 98%));
+  color: #ecfeff;
+  box-shadow: 0 0 14px rgb(34 211 238 / 13%), inset 0 1px 0 rgb(255 255 255 / 7%);
+  transform: translateY(-1px);
+}
+.controlled-nodes-control-panel button:focus-visible,
+.controlled-nodes-machine-actions button:focus-visible {
+  outline: 2px solid rgb(103 232 249 / 82%);
+  outline-offset: 2px;
+}
+.controlled-nodes-control-panel button:disabled,
+.controlled-nodes-machine-actions button:disabled {
+  border-color: rgb(100 116 139 / 18%);
+  background: rgb(15 23 42 / 46%);
+  color: #64748b;
+  cursor: not-allowed;
+  opacity: .62;
+  transform: none;
+  box-shadow: none;
+}
+.controlled-nodes-control-toggle {
+  margin-left: auto;
+  border-color: rgb(103 232 249 / 28%) !important;
+  border-radius: 999px !important;
+  padding-inline: 11px !important;
+  background: rgb(6 23 40 / 82%) !important;
+  color: #9edff2 !important;
+  font-size: 10px !important;
+  letter-spacing: .02em;
+  white-space: nowrap;
+}
+.controlled-nodes-control-toggle:hover:not(:disabled),
+.controlled-nodes-control-toggle[aria-expanded="true"] {
+  border-color: rgb(103 232 249 / 68%) !important;
+  background: linear-gradient(180deg, rgb(8 91 117 / 42%), rgb(7 37 59 / 72%)) !important;
+  color: #ecfeff !important;
+  box-shadow: 0 0 14px rgb(34 211 238 / 15%);
+}
+.controlled-nodes-upgrade-retry,
+.controlled-nodes-upgrade {
+  margin-left: auto;
+  border-color: rgb(245 179 74 / 48%) !important;
+  background: linear-gradient(180deg, rgb(91 60 18 / 88%), rgb(48 29 9 / 95%)) !important;
+  color: #ffe7b0 !important;
+}
+.controlled-nodes-upgrade-retry:hover:not(:disabled),
+.controlled-nodes-upgrade:hover:not(:disabled) {
+  border-color: rgb(255 207 112 / 82%) !important;
+  background: linear-gradient(180deg, rgb(121 78 21 / 92%), rgb(65 39 10 / 98%)) !important;
+  color: #fff5d6 !important;
+  box-shadow: 0 0 15px rgb(245 179 74 / 18%) !important;
+}
+.controlled-nodes-connection-toggle {
+  border-color: rgb(45 212 191 / 38%) !important;
+  color: #a7f3d0 !important;
+}
+.controlled-nodes-control-open {
+  border-color: rgb(103 232 249 / 48%) !important;
+  background: linear-gradient(180deg, rgb(9 79 104 / 92%), rgb(7 37 59 / 98%)) !important;
+  color: #bff7ff !important;
+  font-weight: 750 !important;
+}
+.controlled-nodes-control-share {
+  border-color: rgb(167 139 250 / 38%) !important;
+  background: linear-gradient(180deg, rgb(55 35 92 / 78%), rgb(29 20 55 / 94%)) !important;
+  color: #ddd6fe !important;
+}
+.controlled-nodes-disconnect,
+.controlled-nodes-danger-action,
+.controlled-nodes-revoke {
+  border-color: rgb(248 113 113 / 38%) !important;
+  background: linear-gradient(180deg, rgb(83 28 42 / 82%), rgb(45 16 28 / 96%)) !important;
+  color: #fda4af !important;
+}
+.controlled-nodes-disconnect:hover:not(:disabled),
+.controlled-nodes-danger-action:hover:not(:disabled),
+.controlled-nodes-revoke:hover:not(:disabled) {
+  border-color: rgb(251 113 133 / 72%) !important;
+  background: linear-gradient(180deg, rgb(116 35 53 / 88%), rgb(65 19 35 / 98%)) !important;
+  color: #ffe4e8 !important;
+  box-shadow: 0 0 14px rgb(244 63 94 / 16%) !important;
+}
+.controlled-nodes-upgrade-status.is-terminal_blocked,
+.controlled-nodes-upgrade-status.is-failed,
+.controlled-nodes-upgrade-error { color: #fda4af !important; }
+.controlled-nodes-upgrade-status.is-upgrading,
+.controlled-nodes-upgrade-status.is-deferred { color: #fcd34d !important; }
+.controlled-nodes-upgrade-status.is-sent,
+.controlled-nodes-upgrade-status.is-completed { color: #6ee7b7 !important; }
+
+/* The desktop action rail is a compact command deck, not a row of native
+   buttons. Keep long translations inside their grid cells. */
+.controlled-nodes-machine-actions button { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.controlled-nodes-machine-actions .controlled-nodes-remote-desktop {
+  border-color: rgb(103 232 249 / 54%) !important;
+  background: linear-gradient(180deg, rgb(16 83 111 / 96%), rgb(8 42 66 / 98%)) !important;
+  color: #d5fbff !important;
+  font-weight: 750;
+}
+.controlled-nodes-machine-actions .controlled-nodes-remote-desktop:hover:not(:disabled) {
+  border-color: rgb(165 243 252 / 88%) !important;
+  background: linear-gradient(180deg, rgb(22 111 139 / 98%), rgb(9 56 84 / 98%)) !important;
+  box-shadow: 0 0 17px rgb(34 211 238 / 22%) !important;
+}
+.controlled-nodes-rd-split > .controlled-nodes-rd-window {
+  border-color: rgb(103 232 249 / 40%) !important;
+  background: rgb(7 37 59 / 98%) !important;
+  color: #a5f3fc !important;
+}
+.controlled-nodes-machine-actions .controlled-nodes-install-worker {
+  border-color: rgb(245 179 74 / 55%) !important;
+  background: linear-gradient(180deg, rgb(83 55 15 / 94%), rgb(48 31 10 / 98%)) !important;
+  color: #ffe7b0 !important;
+}
+.controlled-nodes-mobile-menu-trigger {
+  border-color: rgb(103 232 249 / 34%) !important;
+  background: linear-gradient(180deg, rgb(20 48 70 / 96%), rgb(8 25 42 / 98%)) !important;
+  color: #cfeaff !important;
+}
+.controlled-nodes-mobile-menu-panel {
+  border-color: rgb(103 232 249 / 24%) !important;
+  background: linear-gradient(145deg, rgb(8 24 39 / 97%), rgb(8 14 27 / 99%)) !important;
+  box-shadow: inset 0 1px 0 rgb(255 255 255 / 5%), 0 10px 25px rgb(0 0 0 / 26%);
+}
+
+@media (max-width: 640px) {
+  .controlled-nodes-control-panel { padding: 10px; gap: 8px; }
+  .controlled-nodes-upgrade-summary,
+  .controlled-nodes-connection-controls,
+  .controlled-nodes-control-links { align-items: stretch; padding: 8px; }
+  .controlled-nodes-upgrade-summary > span,
+  .controlled-nodes-connection-controls > span { flex: 1 1 100%; }
+  .controlled-nodes-upgrade-summary button,
+  .controlled-nodes-connection-controls button,
+  .controlled-nodes-control-links button { flex: 1 1 auto; min-width: 0; }
+  .controlled-nodes-upgrade-retry { margin-left: 0; }
+  .controlled-nodes-machine-actions button { white-space: normal; overflow-wrap: anywhere; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .controlled-nodes-control-panel button,
+  .controlled-nodes-machine-actions button { transition: none; }
+}
+
+/* Upgrade retry is an atomic command: preserve its label on one horizontal
+   line even when the surrounding mobile flex row is narrow. Ellipsis keeps a
+   long translation inside the card instead of turning it into a letter stack. */
+.controlled-nodes-upgrade-retry,
+.controlled-nodes-upgrade {
+  flex: 0 1 auto !important;
+  min-width: 0 !important;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap !important;
+}
