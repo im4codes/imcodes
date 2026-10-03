@@ -429,7 +429,10 @@ export function isOlderActivityGeneration(
   const parse = (value: ActivityGenerationLike): { scope: string; sessionName?: string; generation: number } | null => {
     if (typeof value === 'number') return Number.isFinite(value) ? { scope: 'session', generation: value } : null;
     if (value && typeof value === 'object') {
-      return Number.isFinite(value.generation) && value.sessionName.trim()
+      return Number.isFinite(value.generation)
+        && typeof value.scope === 'string'
+        && typeof value.sessionName === 'string'
+        && value.sessionName.trim()
         ? { scope: value.scope, sessionName: value.sessionName.trim(), generation: value.generation }
         : null;
     }

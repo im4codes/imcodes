@@ -325,4 +325,15 @@ describe('session activity shared contract', () => {
     expect(isOlderActivityGeneration('session:deck_sub_other:1', 'session:deck_sub_child:2')).toBe(false);
     expect(isOlderActivityGeneration('provider-turn-a', 'provider-turn-b')).toBe(false);
   });
+
+  it('fails open for malformed generation objects from legacy or unknown frames', () => {
+    expect(() => isOlderActivityGeneration(
+      { scope: 'session', sessionName: null, generation: 1 } as never,
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 2 },
+    )).not.toThrow();
+    expect(isOlderActivityGeneration(
+      { scope: 'session', sessionName: null, generation: 1 } as never,
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 2 },
+    )).toBe(false);
+  });
 });
