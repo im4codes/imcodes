@@ -6,6 +6,7 @@ import {
   hasProviderActiveWork,
   isCodexLifecycleTerminalMetadata,
   isAuthoritativeCleanIdlePayload,
+  isOlderActivityGeneration,
   isWorkingSessionState,
   reduceTimelineActivity,
   toPrivacySafeLifecycleMetadata,
@@ -314,5 +315,14 @@ describe('session activity shared contract', () => {
       lastTerminalStatus: 'succeeded',
       lastTerminalReason: 'app_server_completed',
     });
+  });
+
+  it('orders participant frames by activity generation without crossing sessions', () => {
+    expect(isOlderActivityGeneration(
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 2 },
+      { scope: 'session', sessionName: 'deck_sub_child', generation: 3 },
+    )).toBe(true);
+    expect(isOlderActivityGeneration('session:deck_sub_other:1', 'session:deck_sub_child:2')).toBe(false);
+    expect(isOlderActivityGeneration('provider-turn-a', 'provider-turn-b')).toBe(false);
   });
 });

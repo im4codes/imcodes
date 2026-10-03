@@ -45,6 +45,8 @@ export interface SessionInfo {
   state: 'queued' | 'running' | 'idle' | 'stopped' | 'stopping' | 'error' | 'unknown';
   /** Local proof that a stale-turn acknowledgement observed the provider idle. */
   authoritativeIdleAt?: number;
+  /** Last runtime activity generation applied to state/queue frames. */
+  activityGeneration?: import('../../shared/session-activity-types.js').ActivityGenerationLike;
   error?: string | null;
   label?: string | null;
   userCreated?: boolean;
@@ -90,6 +92,8 @@ export interface SessionInfo {
   queueEpoch?: string;
   queueAuthorityId?: string;
   failedMessageEntries?: import('./transport-queue.js').TransportPendingMessageEntry[];
+  /** Local queue settlement tombstones prevent equal-version stale snapshots from resurrecting sends. */
+  transportPendingSettledMessageIds?: string[];
   /** Newest pending-queue version the UI has applied for this session.
    *  Used to drop stale out-of-order snapshots. See transport-queue.ts. */
   transportPendingMessageVersion?: number;

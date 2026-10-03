@@ -416,6 +416,37 @@ export function sameActivityGeneration(a: ActivityGenerationLike, b: ActivityGen
   return left !== null && right !== null && left === right;
 }
 
+/**
+ * Returns true only when both values carry an ordered generation for the same
+ * session scope and the incoming frame is older.  Opaque/legacy strings remain
+ * incomparable and therefore keep the historical safe behavior (accept the
+ * frame rather than guessing that it is stale).
+ */
+export function isOlderActivityGeneration(
+  incoming: ActivityGenerationLike,
+  current: ActivityGenerationLike,
+): boolean {
+  const parse = (value: ActivityGenerationLike): { scope: string; sessionName?: string; generation: number } | null => {
+    if (typeof value === 'number') return Number.isFinite(value) ? { scope: 'session', generation: value } : null;
+    if (value && typeof value === 'object') {
+      return Number.isFinite(value.generation) && value.sessionName.trim()
+        ? { scope: value.scope, sessionName: value.sessionName.trim(), generation: value.generation }
+        : null;
+    }
+    if (typeof value !== 'string') return null;
+    const normalized = value.trim();
+    const full = /^(.*?):(.+):(\d+)$/.exec(normalized);
+    if (full) return { scope: full[1], sessionName: full[2], generation: Number(full[3]) };
+    const short = /^(.*?):(\d+)$/.exec(normalized);
+    return short ? { scope: short[1], generation: Number(short[2]) } : null;
+  };
+  const left = parse(incoming);
+  const right = parse(current);
+  if (!left || !right || left.scope !== right.scope) return false;
+  if (left.sessionName && right.sessionName && left.sessionName !== right.sessionName) return false;
+  return left.generation < right.generation;
+}
+
 export type ProviderSnapshotEvaluation =
   | { state: 'none'; blocking: false; clear: false; reason: 'snapshot_unavailable' }
   | { state: 'active'; blocking: true; clear: false; reason: SessionActivityBusyReason }

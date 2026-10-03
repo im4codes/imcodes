@@ -1125,6 +1125,58 @@ describe('sub-session realtime state sync', () => {
     }));
     expect(captured[0]?.state).toBe('idle');
   });
+
+  it('does not let an older activity generation overwrite a newer terminal state', async () => {
+    const { ws, send } = createMockWs();
+    render(<Harness ws={ws} connected={true} />);
+    await waitFor(() => expect(ws.onMessage).toHaveBeenCalled());
+
+    act(() => send({
+      type: 'subsession.created',
+      id: 'generation-fence',
+      sessionName: 'deck_sub_generation-fence',
+      sessionType: 'codex-sdk',
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 2 },
+    }));
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'generation-idle',
+        sessionId: 'deck_sub_generation-fence',
+        type: 'session.state',
+        payload: {
+          state: 'idle',
+          activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 2 },
+        },
+      },
+    }));
+    expect(captured[0]?.state).toBe('idle');
+
+    // A delayed frame from the prior turn must not revive the spinner.
+    act(() => send({
+      type: 'timeline.event',
+      event: {
+        eventId: 'generation-stale-running',
+        sessionId: 'deck_sub_generation-fence',
+        type: 'session.state',
+        payload: {
+          state: 'running',
+          activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 1 },
+        },
+      },
+    }));
+    expect(captured[0]?.state).toBe('idle');
+
+    // A current frame still advances normally.
+    act(() => send({
+      type: 'subsession.sync',
+      id: 'generation-fence',
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_sub_generation-fence', generation: 3 },
+    }));
+    expect(captured[0]?.state).toBe('running');
+  });
 });
 
 describe('sub-session close behavior', () => {

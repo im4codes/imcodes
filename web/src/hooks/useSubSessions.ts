@@ -12,6 +12,7 @@ import {
 } from '../api.js';
 import type { WsClient } from '../ws-client.js';
 import { isRunningTimelineEvent } from '../timeline-running.js';
+import { isOlderActivityGeneration, type ActivityGenerationLike } from '@shared/session-activity-types.js';
 import { mergeTransportConfigPreservingSupervision } from '@shared/supervision-config.js';
 import {
   buildTransportQueueEventPatch,
@@ -42,9 +43,11 @@ export interface SubSession extends SubSessionData {
   queueEpoch?: string | null;
   queueAuthorityId?: string | null;
   failedMessageEntries?: import('../transport-queue.js').TransportPendingMessageEntry[] | null;
+  transportPendingSettledMessageIds?: string[] | null;
   /** Newest pending-queue version applied. Drops stale snapshots. */
   transportPendingMessageVersion?: number | null;
   supervisionHeartbeat?: SupervisionHeartbeatSnapshot | null;
+  activityGeneration?: ActivityGenerationLike;
 }
 
 /**
@@ -85,6 +88,7 @@ function mergeLoadedSubSession(s: SubSessionData, existing?: SubSession): SubSes
     queueEpoch: existing.queueEpoch ?? base.queueEpoch,
     queueAuthorityId: existing.queueAuthorityId ?? base.queueAuthorityId,
     failedMessageEntries: existing.failedMessageEntries ?? base.failedMessageEntries,
+    transportPendingSettledMessageIds: existing.transportPendingSettledMessageIds ?? base.transportPendingSettledMessageIds,
     transportPendingMessageVersion: existing.transportPendingMessageVersion ?? base.transportPendingMessageVersion,
     supervisionHeartbeat: existing.supervisionHeartbeat !== undefined
       ? existing.supervisionHeartbeat
@@ -253,11 +257,16 @@ export function useSubSessions(
           const idx = prev.findIndex((s) => s.sessionName === subSessionName);
           if (idx === -1) return prev;
           const existing = prev[idx];
+          const queueGeneration = 'activityGeneration' in queueEvent ? queueEvent.activityGeneration : undefined;
+          if (isOlderActivityGeneration(queueGeneration, existing.activityGeneration)) return prev;
           const transportPendingPatch = buildTransportQueueEventPatch(existing, queueEvent, subSessionName);
           if (Object.keys(transportPendingPatch).length === 0) return prev;
           const next = [...prev];
           next[idx] = {
             ...existing,
+            ...(queueGeneration !== undefined
+              ? { activityGeneration: queueGeneration as ActivityGenerationLike }
+              : {}),
             ...(queueEvent.type === TRANSPORT_QUEUE_DELIVERY_EVENT_TYPE
               && existing.state === 'queued'
               && (transportPendingPatch.transportPendingMessageEntries?.length ?? existing.transportPendingMessageEntries?.length ?? 0) === 0
@@ -301,6 +310,7 @@ export function useSubSessions(
             if (existingIdx !== -1) {
               const updated = [...prev];
               const existing = updated[existingIdx];
+              if (isOlderActivityGeneration(m.activityGeneration, existing.activityGeneration)) return prev;
               const preserveQuota = isCodexFamily(existing.type);
               const transportPendingPatch = buildTransportPendingSyncPatch(
                 existing,
@@ -308,6 +318,7 @@ export function useSubSessions(
                 existing.sessionName,
               );
               updated[existingIdx] = { ...updated[existingIdx],
+                ...(m.activityGeneration !== undefined && { activityGeneration: m.activityGeneration as ActivityGenerationLike }),
                 ...(m.state != null && { state: m.state as SubSession['state'] }),
                 ...(m.sessionInstanceId !== undefined && { sessionInstanceId: m.sessionInstanceId }),
                 ...(m.runtimeEpoch !== undefined && { runtimeEpoch: m.runtimeEpoch }),
@@ -365,6 +376,7 @@ export function useSubSessions(
               createdAt: now,
               updatedAt: now,
               state: (m.state || 'idle') as SubSession['state'],
+              ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
               qwenModel: m.qwenModel ?? null,
               requestedModel: m.requestedModel ?? null,
               activeModel: m.activeModel ?? m.modelDisplay ?? null,
@@ -406,9 +418,11 @@ export function useSubSessions(
         if (m.id) {
           setSubSessions((prev) => prev.map((s) => {
             if (s.id !== m.id) return s;
+            if (isOlderActivityGeneration(m.activityGeneration, s.activityGeneration)) return s;
             const preserveQuota = isCodexFamily(s.type);
             const transportPendingPatch = buildTransportPendingSyncPatch(s, m, s.sessionName);
             return { ...s,
+              ...(m.activityGeneration !== undefined ? { activityGeneration: m.activityGeneration as ActivityGenerationLike } : {}),
               ...(m.state ? { state: m.state as SubSession['state'] } : {}),
               ...(m.sessionInstanceId !== undefined ? { sessionInstanceId: m.sessionInstanceId } : {}),
               ...(m.runtimeEpoch !== undefined ? { runtimeEpoch: m.runtimeEpoch } : {}),
@@ -496,6 +510,10 @@ export function useSubSessions(
           setSubSessions((prev) => {
             const idx = prev.findIndex((s) => s.sessionName === subSessionName);
             if (idx === -1) return prev;
+            if (isOlderActivityGeneration(
+              (ev.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike,
+              prev[idx].activityGeneration,
+            )) return prev;
             const nextQueue = removeTransportPendingEntryForUserMessage(
               prev[idx].transportPendingMessageEntries,
               prev[idx].transportPendingMessages,
@@ -507,10 +525,22 @@ export function useSubSessions(
               subSessionName,
             );
             const advancedVersion = nextTransportQueueVersion(prev[idx].transportPendingMessageVersion ?? undefined, incomingVersion);
+            const settledId = typeof ev.payload.clientMessageId === 'string' ? ev.payload.clientMessageId.trim() : '';
+            const settledIds = settledId
+              ? [...new Set([...(prev[idx].transportPendingSettledMessageIds ?? []), settledId])].sort()
+              : prev[idx].transportPendingSettledMessageIds;
             if (!nextQueue.changed) {
-              if (advancedVersion === (prev[idx].transportPendingMessageVersion ?? undefined)) return prev;
+              if (advancedVersion === (prev[idx].transportPendingMessageVersion ?? undefined)
+                && settledIds === prev[idx].transportPendingSettledMessageIds) return prev;
               const nextSame = [...prev];
-              nextSame[idx] = { ...nextSame[idx], transportPendingMessageVersion: advancedVersion };
+              nextSame[idx] = {
+                ...nextSame[idx],
+                transportPendingMessageVersion: advancedVersion,
+                ...((ev.payload as Record<string, unknown>).activityGeneration !== undefined
+                  ? { activityGeneration: (ev.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                  : {}),
+                ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
+              };
               return nextSame;
             }
             const next = [...prev];
@@ -520,6 +550,10 @@ export function useSubSessions(
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
               transportPendingMessageVersion: advancedVersion,
+              ...((ev.payload as Record<string, unknown>).activityGeneration !== undefined
+                ? { activityGeneration: (ev.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                : {}),
+              ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
             };
             return next;
           });
@@ -549,12 +583,21 @@ export function useSubSessions(
         setSubSessions((prev) => {
           const idx = prev.findIndex((s) => s.sessionName === sessionName);
           if (idx === -1) return prev;
+          const statePayload = msg.type === 'timeline.event' && msg.event.payload && typeof msg.event.payload === 'object'
+            ? msg.event.payload as Record<string, unknown>
+            : undefined;
+          if (isOlderActivityGeneration(statePayload?.activityGeneration as ActivityGenerationLike, prev[idx].activityGeneration)) {
+            return prev;
+          }
           const transportPendingPatch = msg.type === 'timeline.event' && msg.event.type === 'session.state'
-            ? buildTransportPendingSyncPatch(prev[idx], msg.event.payload as Record<string, unknown>, sessionName)
+            ? buildTransportPendingSyncPatch(prev[idx], statePayload!, sessionName)
             : {};
           return replaceAtIfChanged(prev, idx, {
             ...prev[idx],
             state: state as SubSession['state'],
+            ...(statePayload?.activityGeneration !== undefined
+              ? { activityGeneration: statePayload.activityGeneration as ActivityGenerationLike }
+              : {}),
             ...transportPendingPatch,
           });
         });

@@ -146,6 +146,7 @@ export function mergeSessionListEntry(
       queueEpoch: existing?.queueEpoch,
       queueAuthorityId: existing?.queueAuthorityId,
       failedMessageEntries: existing?.failedMessageEntries,
+      transportPendingSettledMessageIds: existing?.transportPendingSettledMessageIds,
     }, incoming as unknown as Record<string, unknown>, incoming.name)
     : {};
   const hasPendingSyncPatch = Object.keys(pendingSyncPatch).length > 0;
@@ -223,6 +224,9 @@ export function mergeSessionListEntry(
     queueEpoch: hasPendingSyncPatch ? (pendingSyncPatch.queueEpoch ?? existing?.queueEpoch) : existing?.queueEpoch,
     queueAuthorityId: hasPendingSyncPatch ? (pendingSyncPatch.queueAuthorityId ?? existing?.queueAuthorityId) : existing?.queueAuthorityId,
     failedMessageEntries: hasPendingSyncPatch ? (pendingSyncPatch.failedMessageEntries ?? []) : (existing?.failedMessageEntries ?? []),
+    transportPendingSettledMessageIds: hasPendingSyncPatch
+      ? (pendingSyncPatch.transportPendingSettledMessageIds ?? existing?.transportPendingSettledMessageIds)
+      : existing?.transportPendingSettledMessageIds,
     transportPendingMessageVersion: nextPendingVersion,
     sharedState: incoming.sharedState ?? existing?.sharedState,
     executionTemplateEligible: incoming.executionTemplateEligible ?? existing?.executionTemplateEligible,

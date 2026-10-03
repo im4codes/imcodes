@@ -2412,6 +2412,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           queueEpoch: currentSession.queueEpoch,
           queueAuthorityId: currentSession.queueAuthorityId,
           failedMessageEntries: currentSession.failedMessageEntries,
+          transportPendingSettledMessageIds: currentSession.transportPendingSettledMessageIds,
         }, payload, snapshotSessionName);
         if (Object.keys(patch).length === 0) return false;
         const pendingEntries = (patch.transportPendingMessageEntries ?? []).map((entry) => ({

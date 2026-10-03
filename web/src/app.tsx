@@ -255,7 +255,7 @@ import {
 import { onWatchCommand } from './watch-bridge.js';
 import { watchProjectionStore } from './watch-projection.js';
 import { isIdleSessionStateTimelineEvent, noteLiveIdleSignal, isRunningTimelineEvent } from './timeline-running.js';
-import { isWorkingSessionState } from '@shared/session-activity-types.js';
+import { isOlderActivityGeneration, isWorkingSessionState, type ActivityGenerationLike } from '@shared/session-activity-types.js';
 import { isP2pDiscussionVisibleInSubSessionBar } from './p2p-discussion-scope.js';
 import {
   extractTransportPendingVersion,
@@ -4038,7 +4038,10 @@ export function App() {
         watchProjectionStore.handleTimelineEvent(event);
         if (isRunningTimelineEvent(event) && !event.sessionId.startsWith('deck_sub_')) {
           const current = sessionsRef.current.find((session) => session.name === event.sessionId);
-          if (current && current.state !== 'running') {
+          const incomingGeneration = event.payload?.activityGeneration as ActivityGenerationLike;
+          if (current
+            && !isOlderActivityGeneration(incomingGeneration, current.activityGeneration)
+            && current.state !== 'running') {
             setSessions((prev) => markSessionRunningIfNeeded(prev, event.sessionId));
           }
         }
@@ -4112,6 +4115,8 @@ export function App() {
           const incomingVersion = extractTransportPendingVersion(event.payload.pendingMessageVersion);
           setSessions((prev) => prev.map((s) => {
             if (s.name !== event.sessionId) return s;
+            const incomingGeneration = event.payload.activityGeneration as ActivityGenerationLike;
+            if (isOlderActivityGeneration(incomingGeneration, s.activityGeneration)) return s;
             const nextQueue = removeTransportPendingEntryForUserMessage(
               s.transportPendingMessageEntries,
               s.transportPendingMessages,
@@ -4123,10 +4128,21 @@ export function App() {
               event.sessionId,
             );
             const advancedVersion = nextTransportQueueVersion(s.transportPendingMessageVersion, incomingVersion);
+            const settledId = typeof event.payload.clientMessageId === 'string' ? event.payload.clientMessageId.trim() : '';
+            const settledIds = settledId
+              ? [...new Set([...(s.transportPendingSettledMessageIds ?? []), settledId])].sort()
+              : s.transportPendingSettledMessageIds;
             if (!nextQueue.changed) {
-              return advancedVersion === s.transportPendingMessageVersion
+              return advancedVersion === s.transportPendingMessageVersion && settledIds === s.transportPendingSettledMessageIds
                 ? s
-                : { ...s, transportPendingMessageVersion: advancedVersion };
+                : {
+                  ...s,
+                  transportPendingMessageVersion: advancedVersion,
+                  ...(event.payload.activityGeneration !== undefined
+                    ? { activityGeneration: incomingGeneration }
+                    : {}),
+                  ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
+                };
             }
             return {
               ...s,
@@ -4134,6 +4150,10 @@ export function App() {
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
               transportPendingMessageVersion: advancedVersion,
+              ...(event.payload.activityGeneration !== undefined
+                ? { activityGeneration: incomingGeneration }
+                : {}),
+              ...(settledIds ? { transportPendingSettledMessageIds: settledIds } : {}),
             };
           }));
         }
@@ -4145,6 +4165,8 @@ export function App() {
             // re-render the app and every mounted pane (updateSessionIfChanged
             // returns the same array, so setSessions bails out).
             setSessions((prev) => updateSessionIfChanged(prev, event.sessionId, (s) => {
+              const incomingGeneration = (event.payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike;
+              if (isOlderActivityGeneration(incomingGeneration, s.activityGeneration)) return s;
               const queuePatch = buildTransportPendingSyncPatch({
                 transportPendingMessages: s.transportPendingMessages,
                 transportPendingMessageEntries: s.transportPendingMessageEntries,
@@ -4152,9 +4174,13 @@ export function App() {
                 queueEpoch: s.queueEpoch,
                 queueAuthorityId: s.queueAuthorityId,
                 failedMessageEntries: s.failedMessageEntries,
+                transportPendingSettledMessageIds: s.transportPendingSettledMessageIds,
               }, event.payload as Record<string, unknown>, event.sessionId);
               return {
                 ...s,
+                ...(event.payload.activityGeneration !== undefined
+                  ? { activityGeneration: incomingGeneration }
+                  : {}),
                 state: liveState as SessionInfo['state'],
                 ...queuePatch,
               };
