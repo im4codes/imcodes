@@ -3973,10 +3973,31 @@ export function App() {
           transportPendingMessageVersion: sub.transportPendingMessageVersion,
           transportPendingMessageEntries: sub.transportPendingMessageEntries,
           failedMessageEntries: sub.failedMessageEntries,
+          transportPendingSettledMessageIds: sub.transportPendingSettledMessageIds,
+          activityGeneration: sub.activityGeneration,
         }));
+        // The daemon session-list is authoritative for discovery but may lag
+        // the browser's settled ledger during reconnect/restore.  Feed the
+        // watch projection the coalesced local row so its queue reducer keeps
+        // the same settled/generation fence as the main UI.
+        const watchSessions = msg.sessions.map((raw) => {
+          const incoming = raw as IncomingSessionListEntry;
+          const existing = sessionsRef.current.find((session) => session.name === incoming.name);
+          const merged = mergeSessionListEntry(incoming, existing);
+          return {
+            ...incoming,
+            activityGeneration: merged.activityGeneration,
+            queueEpoch: merged.queueEpoch,
+            queueAuthorityId: merged.queueAuthorityId,
+            transportPendingMessageVersion: merged.transportPendingMessageVersion,
+            transportPendingMessageEntries: merged.transportPendingMessageEntries,
+            failedMessageEntries: merged.failedMessageEntries,
+            transportPendingSettledMessageIds: merged.transportPendingSettledMessageIds,
+          };
+        });
         watchProjectionStore.updateFromSessionListWithSubs(
           { id: selectedServerId, name: watchServerName, baseUrl: auth.baseUrl },
-          msg.sessions,
+          watchSessions,
           watchSubInputs,
         );
         // Daemon is connected — mark this server as online now. Also cancel

@@ -25,6 +25,7 @@ import {
 } from '../../shared/transport-queue-wire.js';
 import {
   isAuthoritativeCleanIdlePayload,
+  isOlderActivityGeneration,
   normalizeActivityGeneration,
   type ActivityGenerationLike,
 } from '../../shared/session-activity-types.js';
@@ -114,6 +115,8 @@ export interface WatchSessionInput {
   pendingMessageEntries?: unknown;
   transportPendingMessageEntries?: unknown;
   failedMessageEntries?: unknown;
+  transportPendingSettledMessageIds?: string[] | null;
+  activityGeneration?: ActivityGenerationLike;
 }
 
 export interface WatchSubSessionInput {
@@ -130,6 +133,8 @@ export interface WatchSubSessionInput {
   pendingMessageEntries?: unknown;
   transportPendingMessageEntries?: unknown;
   failedMessageEntries?: unknown;
+  transportPendingSettledMessageIds?: string[] | null;
+  activityGeneration?: ActivityGenerationLike;
 }
 
 type WatchSessionLike = {
@@ -304,6 +309,13 @@ function toQueueProjectionEntries(value: unknown, status: QueueProjectionEntry['
       ...(typeof entry.commandId === 'string' && entry.commandId.trim() ? { commandId: entry.commandId.trim() } : {}),
     } satisfies QueueProjectionEntry];
   });
+}
+
+function readSettledMessageIds(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(value
+    .filter((id): id is string => typeof id === 'string' && id.trim().length > 0)
+    .map((id) => id.trim()))].sort();
 }
 
 function queueEventFromRecord(sessionName: string, value: Record<string, unknown>, source: string): QueueEvent | null {
@@ -862,6 +874,9 @@ export class WatchProjectionStore {
     for (const key of [...this.previewBySession.keys()]) {
       if (!nextSessions.has(key)) this.previewBySession.delete(key);
     }
+    for (const key of [...this.activityGenerationBySession.keys()]) {
+      if (!nextSessions.has(key)) this.activityGenerationBySession.delete(key);
+    }
     for (const key of [...this.baseStateBySession.keys()]) {
       if (!nextSessions.has(key)) this.baseStateBySession.delete(key);
     }
@@ -893,21 +908,70 @@ export class WatchProjectionStore {
   }
 
   private applyQueueEventFromRecord(sessionName: string, value: Record<string, unknown>, source: string): boolean {
+    const recordGeneration = normalizeActivityGeneration(value.activityGeneration as ActivityGenerationLike);
+    const currentGeneration = this.activityGenerationBySession.get(sessionName);
+    if (isOlderActivityGeneration(value.activityGeneration as ActivityGenerationLike, currentGeneration)) return false;
+    if (recordGeneration) this.activityGenerationBySession.set(sessionName, recordGeneration);
     const event = queueEventFromRecord(sessionName, value, source);
-    return event ? this.applyQueueEvent(event) : false;
+    if (!event) return false;
+    const previous = this.queueStateBySession.get(sessionName) ?? createTransportQueueReducerState(sessionName);
+    const next = this.reduceQueueEventWithGeneration(previous, event);
+    if (!next) return false;
+    const settledIds = readSettledMessageIds(value.transportPendingSettledMessageIds);
+    const withSettled = this.applyExternalSettledIds(
+      next,
+      'queueEpoch' in event ? event.queueEpoch : '',
+      settledIds,
+    );
+    this.queueStateBySession.set(sessionName, withSettled);
+    return this.updateRowQueueProjection(sessionName);
   }
 
   private applyQueueEvent(event: QueueEvent): boolean {
     const sessionName = event.sessionName;
     const previous = this.queueStateBySession.get(sessionName) ?? createTransportQueueReducerState(sessionName);
-    const next = reduceTransportQueueEvent(previous, event);
-    const accepted = next.degradedEvidence.length === previous.degradedEvidence.length;
-    if (!accepted) {
-      this.queueStateBySession.set(sessionName, next);
-      return false;
-    }
+    const next = this.reduceQueueEventWithGeneration(previous, event);
+    if (!next) return false;
     this.queueStateBySession.set(sessionName, next);
     return this.updateRowQueueProjection(sessionName);
+  }
+
+  private reduceQueueEventWithGeneration(
+    previous: TransportQueueReducerState,
+    event: QueueEvent,
+  ): TransportQueueReducerState | null {
+    const currentGeneration = this.activityGenerationBySession.get(event.sessionName);
+    const eventGeneration = 'activityGeneration' in event ? event.activityGeneration : undefined;
+    if (isOlderActivityGeneration(eventGeneration, currentGeneration)) return null;
+    const next = reduceTransportQueueEvent(previous, event);
+    if (next.degradedEvidence.length !== previous.degradedEvidence.length) return null;
+    const normalized = normalizeActivityGeneration(eventGeneration as ActivityGenerationLike);
+    if (normalized) this.activityGenerationBySession.set(event.sessionName, normalized);
+    return next;
+  }
+
+  private applyExternalSettledIds(
+    state: TransportQueueReducerState,
+    queueEpoch: string,
+    settledIds: string[],
+  ): TransportQueueReducerState {
+    if (!queueEpoch || settledIds.length === 0 || state.queueEpoch !== queueEpoch) return state;
+    const deliveredTombstones = { ...state.deliveredTombstones };
+    let changed = false;
+    for (const id of settledIds) {
+      const key = `${queueEpoch}:${id}`;
+      if (!deliveredTombstones[key]) {
+        deliveredTombstones[key] = true;
+        changed = true;
+      }
+    }
+    if (!changed) return state;
+    return {
+      ...state,
+      pendingMessageEntries: state.pendingMessageEntries.filter((entry) => !settledIds.includes(entry.clientMessageId)),
+      failedMessageEntries: state.failedMessageEntries.filter((entry) => !settledIds.includes(entry.clientMessageId)),
+      deliveredTombstones,
+    };
   }
 
   private hasOpenToolWork(sessionName: string): boolean {

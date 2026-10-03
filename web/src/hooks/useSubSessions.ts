@@ -476,6 +476,10 @@ export function useSubSessions(
             const idx = prev.findIndex((s) => s.sessionName === subSessionName);
             if (idx === -1) return prev;
             const existing = prev[idx];
+            if (isOlderActivityGeneration(
+              (payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike,
+              existing.activityGeneration,
+            )) return prev;
             if (existing.queueEpoch && queueEpoch && existing.queueEpoch !== queueEpoch) return prev;
             if (existing.queueAuthorityId && queueAuthorityId && existing.queueAuthorityId !== queueAuthorityId) return prev;
             const nextQueue = removeTransportPendingEntryForUserMessage(
@@ -485,10 +489,20 @@ export function useSubSessions(
               subSessionName,
             );
             const advancedVersion = nextTransportQueueVersion(existing.transportPendingMessageVersion ?? undefined, incomingVersion);
+            const settledIds = [...new Set([...(existing.transportPendingSettledMessageIds ?? []), clientMessageId])].sort();
             if (!nextQueue.changed) {
-              if (advancedVersion === (existing.transportPendingMessageVersion ?? undefined)) return prev;
+              if (advancedVersion === (existing.transportPendingMessageVersion ?? undefined)
+                && settledIds.length === (existing.transportPendingSettledMessageIds?.length ?? 0)
+                && settledIds.every((id, index) => id === existing.transportPendingSettledMessageIds?.[index])) return prev;
               const nextSame = [...prev];
-              nextSame[idx] = { ...existing, transportPendingMessageVersion: advancedVersion };
+              nextSame[idx] = {
+                ...existing,
+                transportPendingMessageVersion: advancedVersion,
+                transportPendingSettledMessageIds: settledIds,
+                ...((payload as Record<string, unknown>).activityGeneration !== undefined
+                  ? { activityGeneration: (payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                  : {}),
+              };
               return nextSame;
             }
             const next = [...prev];
@@ -498,6 +512,10 @@ export function useSubSessions(
               transportPendingMessages: nextQueue.messages,
               transportPendingMessageEntries: nextQueue.entries,
               transportPendingMessageVersion: advancedVersion,
+              transportPendingSettledMessageIds: settledIds,
+              ...((payload as Record<string, unknown>).activityGeneration !== undefined
+                ? { activityGeneration: (payload as Record<string, unknown>).activityGeneration as ActivityGenerationLike }
+                : {}),
             };
             return next;
           });
