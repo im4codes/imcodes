@@ -1403,7 +1403,11 @@ exec "${realGit}" "$@"
     expect(firstImplementationPrompt).toContain(`Change root: ${join(projectDir, 'openspec', 'changes', 'demo-change')}`);
     expect(firstImplementationPrompt).toContain('Before inspecting, editing, validating, or committing anything, work from the project root above.');
     expect(firstImplementationPrompt).toContain('Remaining tasks:');
-    expect(firstImplementationPrompt).toContain('Use all applicable testing tools and already-authorized test devices/environments');
+    expect(firstImplementationPrompt).toContain('Use all applicable testing tools and device environments in scope for this request');
+    expect(firstImplementationPrompt).toContain('explicitly supplied by the user in the current request');
+    expect(firstImplementationPrompt).toContain('do not ask for a second authorization');
+    expect(firstImplementationPrompt).toContain('When the user has not specified a target');
+    expect(firstImplementationPrompt).toContain('requires confirmation of the precise scope');
     expect(firstImplementationPrompt).toContain('focused unit, integration, end-to-end, and real-device checks');
     expect(firstImplementationPrompt).toContain('accepts completion only when the actual unchecked count is less than or equal to skippableTaskCount');
     expect(firstImplementationPrompt).toContain('MUST write the completed marker with the matching skippableTaskCount');
@@ -1538,7 +1542,8 @@ exec "${realGit}" "$@"
     );
     expect(reminderPrompt).toContain('Drive the implementation of @openspec/changes/demo-change aggressively.');
     expect(reminderPrompt).toContain('dispatch sub-agents with clear ownership');
-    expect(reminderPrompt).toContain('Use all applicable testing tools and already-authorized test devices/environments');
+    expect(reminderPrompt).toContain('Use all applicable testing tools and device environments in scope for this request');
+    expect(reminderPrompt).toContain('explicitly supplied by the user in the current request');
     expect(startP2pRunMock).not.toHaveBeenCalled();
 
     expect(await writeLatestImplementationMarker()).toBe(true);

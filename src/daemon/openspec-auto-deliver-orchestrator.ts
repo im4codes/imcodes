@@ -65,6 +65,7 @@ import {
   parseOpenSpecAutoDeliverAuthoritativeJsonPayload,
 } from '../../shared/openspec-auto-deliver-validators.js';
 import { formatOpenSpecAuditStandardTemplate, formatOpenSpecPromptTemplate } from '../../shared/openspec-prompt-templates.js';
+import { REAL_DEVICE_AUTHORIZATION_GUIDANCE } from '../../shared/transport-runtime-prompts.js';
 import {
   buildP2pExecutionMarker,
   isPostSummaryExecutionGateFailure,
@@ -99,7 +100,7 @@ import { execFileOffMain as execFileAsync } from '../util/exec-helper.js';
 const AUTO_DELIVER_IMPLEMENTATION_STAGE: ExecutionCloneParentStage = 'auto_deliver_implementation';
 
 const AUTO_DELIVER_IMPLEMENTATION_VALIDATION_INSTRUCTION =
-  'Run reasonable local validation for the touched code when available. Use all applicable testing tools and already-authorized test devices/environments available to you to test implementation completeness, including focused unit, integration, end-to-end, and real-device checks where relevant and safe. Do not expand authorization or access new devices without user approval. Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands, devices/environments, and outcomes, or explain why validation could not run.';
+  `Run reasonable local validation for the touched code when available. Use all applicable testing tools and device environments in scope for this request, including focused unit, integration, end-to-end, and real-device checks where relevant and safe. ${REAL_DEVICE_AUTHORIZATION_GUIDANCE} Treat the validation candidates below as project-specific hints only; choose the actual validation plan from the changed files and project tooling. Report exact commands, devices/environments, and outcomes, or explain why validation could not run.`;
 
 type AutoDeliverRunStatus = Extract<OpenSpecAutoDeliverStage,
   'proposed' | 'spec_audit_repair' | 'implementation_task_loop' | 'implementation_audit_repair' | 'commit_push' | 'passed' | 'needs_human' | 'failed' | 'stopped'>;

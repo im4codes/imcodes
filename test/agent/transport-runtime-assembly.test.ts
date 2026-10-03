@@ -983,13 +983,15 @@ describe('buildProviderContextPayload', () => {
       expect(systemText).toContain('[display name](/absolute/full/path)');
       expect(systemText).toContain(REAL_DEVICE_TESTING_SYSTEM_GUIDANCE);
       expect(systemText).toContain('perform it before audit');
-      // Discovery comes BEFORE asking. The guidance used to go straight from
-      // "use controlled nodes" to "ask the user", with no way to learn which
-      // machines were already authorized for this user and project -- so the
-      // verification machines configured for exactly this went unused.
+      expect(systemText).toContain('explicitly supplied by the user in the current request');
+      expect(systemText).toContain('do not ask for a second authorization');
+      expect(systemText).toContain('reading logs, checking status, running tests or builds');
+      expect(systemText).toContain('requires confirmation of the precise scope');
+      expect(systemText).toContain('Never bypass tool authority or resource claims');
+      // Discovery remains the fallback when the user did not name a target;
+      // an explicit target must not be forced through a second authorization gate.
       expect(systemText).toContain(`call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST}`);
-      expect(systemText.indexOf(VERIFICATION_MACHINE_MCP_TOOLS.LIST))
-        .toBeLessThan(systemText.indexOf('ask the user for that specific authorization'));
+      expect(systemText).toContain('When the user has not specified a target');
       // Both kinds the list can return, each with the tool that reaches it.
       expect(systemText).toContain(MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE);
       expect(systemText).toContain(ALIAS_MCP_TOOLS.RESOLVE);

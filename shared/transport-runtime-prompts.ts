@@ -44,22 +44,27 @@ import { VERIFICATION_MACHINE_MCP_TOOLS } from './verification-machine.js';
 import { FILE_OUTPUT_CONTRACT_ID, buildFileOutputContract } from './file-output-contract.js';
 
 /**
+ * Shared device-target authority rules. A target explicitly supplied in the
+ * current user request is already in scope for that request's safe work; it is
+ * not useful to make the user authorize the same target a second time.
+ */
+export const REAL_DEVICE_AUTHORIZATION_GUIDANCE = [
+  'A device, SSH target/command, canonical nodeId, alias, or endpoint explicitly supplied by the user in the current request is authorized for that request\'s non-destructive inspection or testing; do not ask for a second authorization or require verification_machine_list first.',
+  'Non-destructive work includes reading logs, checking status, running tests or builds, and temporary isolated validation.',
+  `Use the exact target with its tool's own schema, authority, resource-claim, reachability, and credential checks; for a controlled_node use ${MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE} with its nodeId, and for an ssh target resolve its alias with ${ALIAS_MCP_TOOLS.RESOLVE}.`,
+  `When the user has not specified a target, call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST} and, when availability matters, ${VERIFICATION_MACHINE_MCP_TOOLS.VERIFY} before selecting a machine.`,
+  'Deleting, overwriting, migrating ownership, restarting or stopping production, cleaning resources outside this task, or writing default-user data is destructive or irreversible and requires confirmation of the precise scope before execution.',
+  'Never bypass tool authority or resource claims, expose credentials, or fabricate device evidence; report commands, targets, and outcomes exactly.',
+].join(' ');
+
+/**
  * Prefer evidence from an authorized real machine over a purely textual audit.
  * This is provider-neutral and session-stable, so it belongs in the shared
  * system prompt rather than in one SDK adapter or a supervision-only preamble.
  */
 export const REAL_DEVICE_TESTING_SYSTEM_GUIDANCE = [
-  'REAL-DEVICE TESTING PRIORITY: when suitable authorized real-device testing is available, perform it before audit because it can expose actual code defects quickly.',
-  // How to FIND what is authorized. The guidance used to say "use controlled
-  // nodes when applicable" and "otherwise ask the user" -- with no way to learn
-  // which machines this user and project had already authorized. So a model
-  // that was supposed to verify on the machines configured for it asked the
-  // user instead, and the authorization the user had set up went unused.
-  `Before asking for a machine, call ${VERIFICATION_MACHINE_MCP_TOOLS.LIST} to see the verification machines already authorized for this user and project; use ${VERIFICATION_MACHINE_MCP_TOOLS.VERIFY} on one whose availability matters.`,
-  // Both kinds, not only controlled nodes: the list also carries SSH machines,
-  // which the old wording did not mention at all.
-  `For a controlled_node entry, run commands with ${MEMORY_MCP_TOOL_NAMES.EXEC_REMOTE} against its nodeId; for an ssh entry, resolve its alias with ${ALIAS_MCP_TOOLS.RESOLVE} and connect with that value.`,
-  'Only if no authorized machine fits the operating system or device the change needs, ask the user for that specific authorization.',
+  'REAL-DEVICE TESTING PRIORITY: when suitable real-device testing is available, perform it before audit because it can expose actual code defects quickly.',
+  REAL_DEVICE_AUTHORIZATION_GUIDANCE,
 ].join(' ');
 
 /**
