@@ -134,6 +134,7 @@ export const TIMELINE_CHAT_RENDERABLE_TYPES: readonly string[] = [
   'memory.context',
   'terminal.snapshot',
   TIMELINE_EVENT_FILE_CHANGE,
+  TASK_PAIR_TIMELINE_EVENT,
 ];
 
 /**

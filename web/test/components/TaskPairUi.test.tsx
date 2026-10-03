@@ -41,6 +41,7 @@ describe('TaskPairEventChip', () => {
     expect(chip.textContent).toContain('taskPair.status.rework');
     expect(chip.textContent).toContain('taskPair.severity:{"level":"P0","count":1}');
     expect(chip.textContent).toContain('taskPair.severity:{"level":"P2","count":2}');
+    expect(chip.textContent).toContain('taskPair.card_verdict:{"value":"consistent"}');
     expect(chip.textContent).not.toContain('"level":"P1"');
     expect(chip.textContent).not.toContain('taskPair.verdict_held');
   });
@@ -985,6 +986,17 @@ describe('TaskPairEventChip status colours', () => {
     const { container } = render(<TaskPairEventChip eventId="e-none" payload={{ taskId: '-', writer: 'w', verb: 'BOGUS' }} />);
     const chip = container.querySelector('.task-pair-chip')!;
     expect([...chip.classList].some((name) => /^task-pair-chip--(?!held|unusual)/.test(name))).toBe(false);
+  });
+
+  it('uses safe fallbacks for empty titles, unknown statuses and unassigned roles', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-fallback" payload={{
+      taskId: 'x'.repeat(160), title: '   ', verb: 'BOGUS', toStatus: 'future_status', unusual: false,
+    }} />);
+    const chip = container.querySelector('.task-pair-event-card')!;
+    expect(chip.textContent).toContain('taskPair.card_unknown_status');
+    expect(chip.textContent).toContain('taskPair.card_unassigned');
+    expect(chip.querySelector('.task-pair-chip-status')?.className).toContain('status-unknown');
+    expect(chip.getAttribute('data-task-id')).toHaveLength(160);
   });
 });
 

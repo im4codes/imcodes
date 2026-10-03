@@ -130,6 +130,7 @@ import {
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
+import { TaskPairEventChip } from './TaskPairEventChip.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -5933,7 +5934,7 @@ const ChatEvent = memo(function ChatEvent({
       return null;
 
     case TASK_PAIR_TIMELINE_EVENT:
-      return null;
+      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} />;
 
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');

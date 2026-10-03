@@ -38,7 +38,7 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
   const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
   const writer = typeof event.writer === 'string' ? event.writer : '';
   const verb = t(`taskPair.verb.${verbKey(event.verb)}`);
-  const status = isStatus(event.toStatus) ? t(`taskPair.status.${event.toStatus}`) : '';
+  const status = isStatus(event.toStatus) ? t(`taskPair.status.${event.toStatus}`) : t('taskPair.card_unknown_status');
   const counts = event.severityCounts
     ? AUDIT_SEVERITY_LEVELS
       .filter((level) => (event.severityCounts?.[level] ?? 0) > 0)
@@ -46,8 +46,10 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
       .join(' · ')
     : '';
   const held = event.verdictJudgement === 'inconsistent' || event.verdictJudgement === 'missing_severity';
+  const verdict = typeof event.verdictJudgement === 'string' ? event.verdictJudgement : '';
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
+  const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
   const title = typeof event.title === 'string' && event.title.trim() ? event.title : undefined;
   const sessionLabel = (id: unknown, label: unknown) => {
     if (typeof id !== 'string' || !id) return null;
@@ -57,28 +59,43 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
       window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
     }}>{text}</button>;
   };
+  const roleLabel = (id: unknown, label: unknown, role: 'executor' | 'auditor') => {
+    const session = sessionLabel(id, label);
+    return <span class="task-pair-card-role"><span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>{session ?? <span class="task-pair-card-unassigned">{t('taskPair.card_unassigned')}</span>}</span>;
+  };
   return (
-    <div
-      class={`chat-event chat-system task-pair-chip${statusClass}${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
+    <section
+      class={`chat-event chat-system task-pair-chip task-pair-event-card${statusClass}${event.unusual ? ' task-pair-chip--unusual' : ''}${held ? ' task-pair-chip--held' : ''}`}
       data-task-status={isStatus(event.toStatus) ? event.toStatus : undefined}
       data-event-id={eventId}
       data-task-id={taskId}
     >
-      <span class="task-pair-chip-task">
-        {title && <strong>{title}</strong>}
-        <small>{taskId}</small>
-      </span>
-      <span class="task-pair-chip-text">
-        {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
-          ? workspaceText(t, event)
-          : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
-      </span>
-      {sessionLabel(event.executor, event.executorLabel)}
-      {sessionLabel(event.auditor, event.auditorLabel)}
-      {status && <span class={`task-pair-chip-status status-${String(event.toStatus)}`}>{status}</span>}
-      {counts && <span class="task-pair-chip-counts">{counts}</span>}
-      {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}
-      {event.unusual && <span class="task-pair-chip-unusual">{t('taskPair.unusual')}</span>}
-    </div>
+      <header class="task-pair-card-head">
+        <div class="task-pair-card-heading">
+          <span class="task-pair-card-kicker">{t('taskPair.card_kicker')}</span>
+          <span class="task-pair-chip-task">
+            {title && <strong>{title}</strong>}
+            <small>{taskId}</small>
+          </span>
+        </div>
+        <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
+      </header>
+      <div class="task-pair-card-body">
+        <span class="task-pair-chip-text">
+          {event.verb === TASK_PAIR_WORKSPACE_EVENT_VERB
+            ? workspaceText(t, event)
+            : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
+        </span>
+        <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
+        {roleLabel(event.executor, event.executorLabel, 'executor')}
+        {roleLabel(event.auditor, event.auditorLabel, 'auditor')}
+      </div>
+      {(counts || verdict || held || event.unusual) && <footer class="task-pair-card-flags">
+        {counts && <span class="task-pair-chip-counts">{counts}</span>}
+        {verdict && <span class="task-pair-chip-verdict">{t('taskPair.card_verdict', { value: verdict })}</span>}
+        {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}
+        {event.unusual && <span class="task-pair-chip-unusual">{t('taskPair.unusual')}</span>}
+      </footer>}
+    </section>
   );
 }

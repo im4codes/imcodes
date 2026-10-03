@@ -103,6 +103,33 @@ function loadOlderOffered(container: HTMLElement): boolean {
 describe('ChatView render capability contract', () => {
   afterEach(() => cleanup());
 
+  it('renders task-pair events as a full-width left-aligned card with role links', () => {
+    const event = {
+      ...ev('task_pair.event'),
+      payload: {
+        taskId: 'tsk_card_1234567890',
+        title: 'A deliberately long task title that must wrap safely',
+        writer: 'deck_brain',
+        verb: 'REWORK',
+        toStatus: 'rework',
+        executor: 'deck_executor',
+        executorLabel: 'Executor',
+        auditor: 'deck_auditor',
+        auditorLabel: 'Auditor',
+        severityCounts: { P0: 1, P1: 0, P2: 2, P3: 0, P4: 0 },
+        verdictJudgement: 'consistent',
+      },
+    } as unknown as TimelineEvent;
+    const { container } = render(h(__ChatEventForTests as never, { event } as never));
+    const card = container.querySelector('.task-pair-event-card') as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(card?.getAttribute('data-task-id')).toBe('tsk_card_1234567890');
+    expect(card?.classList.contains('task-pair-chip--rework')).toBe(true);
+    expect(card?.textContent).toContain('A deliberately long task title');
+    expect(card?.textContent).toContain('taskPair.card_executor');
+    expect(card?.textContent).toContain('taskPair.card_auditor');
+  });
+
   it.each(ALL_CONTENT_TYPES.map((type) => [type]))(
     'classifies %s to match what the renderer actually draws',
     (type) => {

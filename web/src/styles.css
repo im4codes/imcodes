@@ -14519,6 +14519,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-chip-task { font-weight: 600; }
 .task-pair-chip-status,
 .task-pair-chip-counts,
+.task-pair-chip-verdict,
 .task-pair-chip-held,
 .task-pair-chip-unusual {
   border-radius: 8px;
@@ -14539,6 +14540,55 @@ button.quick-agent-delegation-preset.active {
 .task-pair-chip--done { --task-pair-status-text: var(--status-done-text); --task-pair-status-border: var(--status-done-border); --task-pair-status-bg: var(--status-done-bg); }
 .task-pair-chip--cancelled { --task-pair-status-text: var(--status-cancelled-text); --task-pair-status-border: var(--status-cancelled-border); }
 .task-pair-chip-unusual { opacity: 0.75; font-style: italic; }
+
+/* Full-width, left-aligned task-pair event card in the chat timeline.  The
+ * legacy chip classes above remain the shared status colour tokens used by the
+ * status panel and by existing consumers. */
+.task-pair-event-card {
+  align-self: flex-start;
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--task-pair-status-border, var(--border-color, #475569)) 48%, transparent);
+  border-left-width: 3px;
+  border-radius: 9px;
+  background: color-mix(in srgb, var(--task-pair-status-bg, var(--chrome-panel-2, #172033)) 72%, transparent);
+  box-shadow: 0 3px 12px rgba(2, 6, 23, 0.12);
+  opacity: 1;
+  overflow-wrap: anywhere;
+}
+.task-pair-card-head,
+.task-pair-card-body,
+.task-pair-card-flags { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
+.task-pair-card-head { justify-content: space-between; align-items: flex-start; }
+.task-pair-card-heading { display: flex; min-width: 0; flex: 1 1 240px; flex-direction: column; gap: 2px; }
+.task-pair-card-kicker { color: color-mix(in srgb, currentColor 62%, transparent); font-size: 9px; font-weight: 700; letter-spacing: .08em; line-height: 1.2; text-transform: uppercase; }
+.task-pair-event-card .task-pair-chip-task { display: flex; min-width: 0; flex-wrap: wrap; align-items: baseline; gap: 5px 8px; }
+.task-pair-event-card .task-pair-chip-task strong { min-width: 0; overflow-wrap: anywhere; }
+.task-pair-event-card .task-pair-chip-task small { color: color-mix(in srgb, currentColor 64%, transparent); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; overflow-wrap: anywhere; }
+.task-pair-event-card .task-pair-chip-status { flex: 0 0 auto; }
+.task-pair-card-body { color: color-mix(in srgb, currentColor 82%, transparent); font-size: 11px; line-height: 1.35; }
+.task-pair-card-event-meta { display: inline-flex; min-width: 0; align-items: center; gap: 4px; color: color-mix(in srgb, currentColor 68%, transparent); }
+.task-pair-card-event-meta > span:first-child { font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }
+.task-pair-card-role { display: inline-flex; min-width: 0; max-width: 100%; align-items: center; gap: 4px; }
+.task-pair-card-role-label { color: color-mix(in srgb, currentColor 62%, transparent); font-size: 9px; text-transform: uppercase; }
+.task-pair-card-role .task-pair-chip-session { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.task-pair-card-unassigned { color: color-mix(in srgb, currentColor 52%, transparent); font-style: italic; }
+.task-pair-card-flags { padding-top: 1px; border-top: 1px solid color-mix(in srgb, currentColor 12%, transparent); }
+@media (max-width: 640px) {
+  .task-pair-event-card { padding: 9px 10px; }
+  .task-pair-card-head { align-items: stretch; flex-direction: column; }
+  .task-pair-event-card .task-pair-chip-status { align-self: flex-start; }
+  .task-pair-card-body { align-items: flex-start; flex-direction: column; gap: 5px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .task-pair-event-card { transition: none; }
+}
 
 .supervision-task-console-pair {
   display: flex;
