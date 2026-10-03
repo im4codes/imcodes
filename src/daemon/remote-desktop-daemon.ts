@@ -243,7 +243,6 @@ export class DaemonRemoteDesktop {
     if (this.installing) return this.installing;
     const replacing = this.available();
     this.pendingAutoUpdate = false;
-    if (replacing) this.close();
     this.publish(REMOTE_DESKTOP_INSTALL_STATE.DOWNLOADING);
     this.installing = this.runInstall(replacing).finally(() => { this.installing = null; });
     return this.installing;
@@ -335,8 +334,18 @@ export class DaemonRemoteDesktop {
         return;
       }
     }
+    // A connection may have started while the release was downloading. Do
+    // not tear it down after the initial idle check; leave the staged bundle
+    // for the next idle edge instead.
+    if (replacing && this.workerBusy()) {
+      this.pendingAutoUpdate = true;
+      this.publish(REMOTE_DESKTOP_INSTALL_STATE.INSTALLED);
+      await cleanup();
+      return;
+    }
     try {
       if (stagingRoot) {
+        this.close();
         const stagedPlatform = join(stagingRoot, 'remote-desktop-worker', 'win32-x64');
         const finalPlatform = join(this.root, 'remote-desktop-worker', 'win32-x64');
         const backupPlatform = `${finalPlatform}.previous`;

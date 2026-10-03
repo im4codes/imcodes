@@ -385,22 +385,24 @@ describe('DaemonRemoteDesktop', () => {
     const installed = { ...artifact, manifest: { workerVersion: '2026.8.1' } } as VerifiedRemoteDesktopWorkerArtifact;
     const target = { ...artifact, manifest: { workerVersion: targetVersion } } as VerifiedRemoteDesktopWorkerArtifact;
     const launched: VerifiedRemoteDesktopWorkerArtifact[] = [];
+    const host = { handle: vi.fn(async () => true), close: vi.fn(), activeConnections: () => [] };
     let resolveCalls = 0;
     const f = fixture({
       installed: true,
       resolveArtifact: () => resolveCalls++ === 0 ? installed : target,
       createHost: (current) => {
         launched.push(current);
-        return { handle: vi.fn(async () => true), close: vi.fn() };
+        return host;
       },
     });
 
+    await f.remoteDesktop.handle(prepareCommand());
     await f.remoteDesktop.refresh();
 
     expect(f.downloadWorker).toHaveBeenCalledOnce();
     expect(f.remoteDesktop.available()).toBe(true);
     expect(f.capabilityChanges).toHaveLength(0);
-    await f.remoteDesktop.handle(prepareCommand());
+    expect(host.close).not.toHaveBeenCalled();
     expect(launched[0]?.manifest.workerVersion).toBe('2026.8.1');
     expect(f.sent.at(-1)).toMatchObject({
       state: REMOTE_DESKTOP_INSTALL_STATE.FAILED,
