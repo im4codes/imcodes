@@ -8957,7 +8957,7 @@ afterEach(() => {
   });
 
   it('sends the current attachment snapshot through the voice composer path', async () => {
-    uploadFileMock.mockResolvedValue({ attachment: { daemonPath: '/tmp/voice-proof.png' } });
+    uploadFileMock.mockResolvedValue({ attachment: { id: 'f670d9589bc3d1b2647a7cd4a98efdeb', daemonPath: '/tmp/voice-proof.png' } });
     const ws = makeWs();
     const onSend = vi.fn();
     render(
@@ -8990,7 +8990,10 @@ afterEach(() => {
       'voice-attachment-session',
       '#1:(/tmp/voice-proof.png) voice combo message',
       expect.objectContaining({
-        attachments: [expect.objectContaining({ daemonPath: '/tmp/voice-proof.png' })],
+        attachments: [expect.objectContaining({
+          id: 'f670d9589bc3d1b2647a7cd4a98efdeb',
+          daemonPath: '/tmp/voice-proof.png',
+        })],
       }),
     );
     expect(screen.queryByTestId('attachment-tag-1')).toBeNull();

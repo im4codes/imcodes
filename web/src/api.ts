@@ -398,6 +398,17 @@ async function rawFetch(path: string, opts: RequestInit = {}, baseUrl = _baseUrl
   return fetch(`${baseUrl}${path}`, { ...opts, headers, credentials: _apiKey ? 'omit' : 'include' });
 }
 
+/**
+ * Fetch an already-built API URL while retaining the normal cookie/Bearer,
+ * CSRF and identity headers.  Attachment URLs may use a configured origin
+ * (rather than the page origin), so passing the URL through rawFetch as a
+ * relative path would silently target the wrong host.
+ */
+async function rawFetchUrl(url: string, opts: RequestInit = {}): Promise<Response> {
+  const resolved = new URL(url, typeof window !== 'undefined' ? window.location.origin : 'http://localhost.invalid');
+  return rawFetch(`${resolved.pathname}${resolved.search}`, opts, resolved.origin);
+}
+
 export interface LocalWebPreviewCreateResponse {
   previewId: string;
   previewUrl?: string;
@@ -2304,7 +2315,8 @@ export async function createControlledNodeInstallCommand(
 }
 
 export async function previewAttachment(serverId: string, attachmentId: string, sessionName?: string): Promise<void> {
-  const res = await rawFetch(withSessionName(`/api/server/${encodeURIComponent(serverId)}/uploads/${encodeURIComponent(attachmentId)}/download`, sessionName));
+  const downloadUrl = await buildAttachmentDownloadUrl(serverId, attachmentId, sessionName);
+  const res = await rawFetchUrl(downloadUrl);
   if (!res.ok) {
     const body = await res.text().catch(() => '');
     throw new ApiError(res.status, body);

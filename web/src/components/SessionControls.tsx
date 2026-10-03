@@ -76,6 +76,7 @@ import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
 import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
+import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
@@ -4374,7 +4375,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     // bubble surfaces the same badges the confirmed message will.
     const attachmentSnapshot = !options?.programmaticDelegation && attachments.length > 0
       ? attachments.map((a) => ({
-          id: a.path,
+          // Keep the opaque upload handle in the timeline payload.  The
+          // daemonPath remains for provider/model file access, but must never
+          // be used as the browser download identifier (it exposes a host path
+          // and is rejected by the authenticated upload route).
+          id: attachmentDownloadId(a.id, a.path) ?? a.id ?? a.path,
           daemonPath: a.path,
           originalName: a.name,
       }))

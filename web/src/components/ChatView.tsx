@@ -58,6 +58,7 @@ import type {
 import type { FileChangeBatch, FileChangePatch } from '@shared/file-change.js';
 import { FS_READ_ERROR_CODES } from '@shared/fs-read-error-codes.js';
 import { isInsufficientCapacityError } from '../upload-error.js';
+import { attachmentDisplayName, attachmentDownloadId, isAbsoluteAttachmentPath } from '../attachment-refs.js';
 import { useNowTicker } from '../hooks/useNowTicker.js';
 import { formatToolDuration } from '../util/tool-duration.js';
 import {
@@ -5504,7 +5505,7 @@ function AttachmentDownloadButton({
   onHtmlPreview,
   sessionName,
 }: {
-  att: { id: string; originalName?: string; size?: number; daemonPath?: string };
+  att: { id?: string; originalName?: string; size?: number; daemonPath?: string };
   serverId: string;
   onPathClick?: (p: string) => void;
   onHtmlPreview?: (p: string) => void;
@@ -5512,7 +5513,8 @@ function AttachmentDownloadButton({
 }) {
   const { t } = useTranslation();
   const [error, setError] = useState<string | null>(null);
-  const label = att.originalName || att.id;
+  const downloadId = attachmentDownloadId(att.id, att.daemonPath);
+  const label = attachmentDisplayName(att.id, att.originalName, att.daemonPath);
   const sizeLabel = att.size ? ` (${(att.size / 1024).toFixed(0)}KB)` : '';
 
   const handleError = (err: unknown) => {
@@ -5531,15 +5533,21 @@ function AttachmentDownloadButton({
         class="chat-attachment-dl"
         onClick={() => {
           setError(null);
-          // If file has a daemon path, open in file browser floating panel
-          if (att.daemonPath && onPathClick) {
+          // Relative source references are still opened in the file browser.
+          // Uploaded attachments use their opaque download handle; never send
+          // a host absolute path to the browser or to the download route.
+          if (!downloadId && att.daemonPath && !isAbsoluteAttachmentPath(att.daemonPath) && onPathClick) {
             onPathClick(att.daemonPath);
+            return;
+          }
+          if (!downloadId) {
+            handleError(new Error('invalid_attachment_id'));
             return;
           }
           import('../api.js').then(({ previewAttachment }) => {
             const request = sessionName
-              ? previewAttachment(serverId, att.id, sessionName)
-              : previewAttachment(serverId, att.id);
+              ? previewAttachment(serverId, downloadId, sessionName)
+              : previewAttachment(serverId, downloadId);
             request.catch(handleError);
           });
         }}
@@ -5551,10 +5559,14 @@ function AttachmentDownloadButton({
         class="chat-attachment-dl-btn"
         onClick={() => {
           setError(null);
+          if (!downloadId) {
+            handleError(new Error('invalid_attachment_id'));
+            return;
+          }
           import('../api.js').then(({ downloadAttachment }) => {
             const request = sessionName
-              ? downloadAttachment(serverId, att.id, sessionName)
-              : downloadAttachment(serverId, att.id);
+              ? downloadAttachment(serverId, downloadId, sessionName)
+              : downloadAttachment(serverId, downloadId);
             request.catch(handleError);
           });
         }}
@@ -5563,7 +5575,7 @@ function AttachmentDownloadButton({
       >
         ⬇
       </button>
-      {att.daemonPath && onHtmlPreview && isHtmlPreviewPath(att.daemonPath) && (
+      {!downloadId && att.daemonPath && onHtmlPreview && isHtmlPreviewPath(att.daemonPath) && (
         <button
           type="button"
           class="chat-attachment-dl-btn chat-html-preview-btn"
@@ -5579,6 +5591,10 @@ function AttachmentDownloadButton({
       )}
     </span>
   );
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function supervisionUserPromptLabelKey(payload: Record<string, unknown>): string | null {
@@ -5767,11 +5783,19 @@ const ChatEvent = memo(function ChatEvent({
         );
       }
       let userText = parseTimelineDisplayText(rawUserText);
-      const attachments = event.payload.attachments as Array<{ id: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
+      const attachments = event.payload.attachments as Array<{ id?: string; originalName?: string; mime?: string; size?: number; daemonPath?: string }> | undefined;
       // Strip @path references from text when they're shown as attachment badges
       if (attachments && attachments.length > 0) {
         for (const att of attachments) {
-          if (att.daemonPath) userText = userText.split(`@${att.daemonPath}`).join('').trim();
+          if (att.daemonPath) {
+            const path = escapeRegExp(att.daemonPath);
+            // Attachment references are model-facing metadata.  Do not paint
+            // the daemon's absolute host path into the browser history.
+            userText = userText
+              .replace(new RegExp(`#\\d+:\\(${path}\\)`, 'g'), '')
+              .replace(new RegExp(`@${path}`, 'g'), '')
+              .trim();
+          }
         }
       }
       const isPending = !!event.payload.pending;

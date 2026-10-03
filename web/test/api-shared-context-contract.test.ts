@@ -437,6 +437,22 @@ describe('shared-context and file API contracts', () => {
     ]);
   });
 
+  it('previews through the configured API origin and never sends a daemon path', async () => {
+    const fetchMock = vi.mocked(fetch);
+    fetchMock.mockResolvedValueOnce(blobResponse('image-bytes', { 'Content-Type': 'image/png' }));
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, value: vi.fn(() => 'blob:image') });
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    const { configure, previewAttachment } = await import('../src/api.js');
+    configure('https://215.example/proxy');
+
+    await previewAttachment('srv-1', 'f670d9589bc3d1b2647a7cd4a98efdeb', 'deck_215');
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      'https://215.example/proxy/api/server/srv-1/uploads/f670d9589bc3d1b2647a7cd4a98efdeb/download?sessionName=deck_215',
+      expect.objectContaining({ credentials: 'include' }),
+    );
+  });
+
   it('downloads and previews attachments through desktop and native paths', async () => {
     vi.useFakeTimers();
     const fetchMock = vi.mocked(fetch);
