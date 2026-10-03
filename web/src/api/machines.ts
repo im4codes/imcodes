@@ -36,6 +36,7 @@ import {
 } from '@shared/machine-reference.js';
 import { isControlledNodeId } from '@shared/controlled-node-identity.js';
 import { CONTROLLED_NODE_UPGRADE_STATUS, type ControlledNodeUpgradeStatus } from '@shared/daemon-upgrade.js';
+import type { DaemonUpgradeStatusSnapshot, DaemonUpgradeLifecycleStatus } from '@shared/daemon-upgrade.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '@shared/remote-desktop.js';
 import { isMachineAccessRole, type MachineAccessRole } from '@shared/remote-exec.js';
 import {
@@ -97,6 +98,15 @@ export interface MachineListItem {
   upgradeStatus?: ControlledNodeUpgradeStatus;
   upgradeTargetVersion?: string;
   upgradeReason?: string;
+  latestVersion?: string;
+  upgrade?: {
+    upgradeId: string;
+    targetVersion: string;
+    status: DaemonUpgradeLifecycleStatus;
+    reason?: string;
+    updatedAt: number;
+    lastResult?: string;
+  };
   /** The node holds a sign-in secret for auto unlock. Never the secret itself. */
   autoUnlockConfigured?: boolean;
   /**
@@ -388,6 +398,20 @@ function extractMachineList(res: unknown): MachineListItem[] {
 export async function listControllableMachines(): Promise<MachineListItem[]> {
   const res = await apiFetch<unknown>(MACHINE_API_PATH);
   return extractMachineList(res);
+}
+
+export interface MachineUpgradeStatus {
+  currentVersion: string | null;
+  latestVersion: string | null;
+  upgrade?: DaemonUpgradeStatusSnapshot;
+}
+
+export async function getMachineUpgradeStatus(serverId: string): Promise<MachineUpgradeStatus> {
+  return apiFetch<MachineUpgradeStatus>(`${MACHINE_API_PATH.replace('/api/machines', '/api/server')}/${encodeURIComponent(serverId)}/upgrade`);
+}
+
+export async function requestMachineUpgrade(serverId: string): Promise<MachineUpgradeStatus & { upgradeId?: string; deliveryStatus?: string; reason?: string }> {
+  return apiFetch<MachineUpgradeStatus & { upgradeId?: string; deliveryStatus?: string; reason?: string }>(`${MACHINE_API_PATH.replace('/api/machines', '/api/server')}/${encodeURIComponent(serverId)}/upgrade`, { method: 'POST' });
 }
 
 /** Enable/disable remote exec for a controlled machine (owner-scoped). */

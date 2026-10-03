@@ -121,6 +121,26 @@ export const DAEMON_UPGRADE_DELIVERY_STATUS = {
   INVALID_TARGET: 'invalid_target',
 } as const;
 
+/** Server-authoritative lifecycle states exposed to the controlled-node UI. */
+export const DAEMON_UPGRADE_LIFECYCLE_STATUS = {
+  PENDING_OFFLINE: 'pending_offline',
+  PENDING_PUBLICATION: 'pending_publication',
+  SENT: 'sent',
+  TERMINAL_BLOCKED: 'terminal_blocked',
+  SUPERSEDED: 'superseded',
+} as const;
+export type DaemonUpgradeLifecycleStatus = typeof DAEMON_UPGRADE_LIFECYCLE_STATUS[keyof typeof DAEMON_UPGRADE_LIFECYCLE_STATUS];
+
+export interface DaemonUpgradeStatusSnapshot {
+  upgradeId: string;
+  targetVersion: string;
+  source: DaemonUpgradeSource;
+  status: DaemonUpgradeLifecycleStatus;
+  createdAt: number;
+  updatedAt: number;
+  lastSentAt: number | null;
+}
+
 export type DaemonUpgradeDeliveryStatus =
   (typeof DAEMON_UPGRADE_DELIVERY_STATUS)[keyof typeof DAEMON_UPGRADE_DELIVERY_STATUS];
 

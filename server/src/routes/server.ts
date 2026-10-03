@@ -408,6 +408,20 @@ serverRoutes.delete('/:id', requireAuth(), async (c) => {
 });
 
 // POST /api/server/:id/upgrade — tell daemon to upgrade itself and restart
+serverRoutes.get('/:id/upgrade', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('id') ?? '';
+  const role = await resolveServerRole(c.env.DB, serverId, userId);
+  if (!role || role === 'none') return c.json({ error: 'not_found' }, 404);
+  const status = WsBridge.get(serverId).daemonUpgradeStatus();
+  return c.json({
+    ok: true,
+    currentVersion: status.currentVersion,
+    latestVersion: process.env.APP_VERSION ?? null,
+    ...(status.upgrade ? { upgrade: status.upgrade } : {}),
+  });
+});
+
 serverRoutes.post('/:id/upgrade', requireAuth(), async (c) => {
   const userId = c.get('userId' as never) as string;
   const serverId = c.req.param('id') ?? '';

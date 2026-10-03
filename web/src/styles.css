@@ -3724,6 +3724,38 @@ html.native-ios-mac .chat-dl-btn {
   box-shadow: 0 8px 22px rgba(0, 0, 0, 0.22), 0 0 17px rgba(34, 211, 238, 0.06);
 }
 .controlled-nodes-machine-row.is-offline { filter: saturate(0.62); }
+
+.controlled-nodes-control-toggle,
+.controlled-nodes-control-panel button {
+  min-height: 30px;
+  border: 1px solid var(--border-color, #c9ced8);
+  border-radius: 6px;
+  background: var(--surface-2, #fff);
+  color: inherit;
+  padding: 4px 9px;
+  cursor: pointer;
+}
+.controlled-nodes-control-toggle { margin-left: auto; }
+.controlled-nodes-control-toggle[aria-expanded="true"] { background: var(--surface-3, #eef2f8); }
+.controlled-nodes-control-panel {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 10px;
+  border: 1px solid var(--border-color, #c9ced8);
+  border-radius: 8px;
+  background: var(--surface-1, #fbfcfe);
+}
+.controlled-nodes-upgrade-summary,
+.controlled-nodes-connection-controls,
+.controlled-nodes-control-links { display: flex; flex-wrap: wrap; align-items: center; gap: 7px; }
+.controlled-nodes-control-label { font-weight: 600; }
+.controlled-nodes-upgrade-status { font-size: .85em; font-weight: 600; }
+.controlled-nodes-upgrade-status.is-terminal_blocked,
+.controlled-nodes-upgrade-error { color: var(--danger-color, #b42318); }
+.controlled-nodes-upgrade-status.is-sent { color: var(--success-color, #087443); }
+.controlled-nodes-upgrade-retry { margin-left: auto; }
+.controlled-nodes-control-panel button:disabled { opacity: .52; cursor: not-allowed; }
 .controlled-nodes-machine-rail {
   position: absolute;
   top: 12px;

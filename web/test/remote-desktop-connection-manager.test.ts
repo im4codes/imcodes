@@ -39,6 +39,7 @@ class FakeConnectionClient {
   readonly startAttempts: number[] = [];
   readonly lifecycle: string[] = [];
   readonly input: string[] = [];
+  readonly modes: RemoteDesktopAccessMode[] = [];
   readonly stopOrigins: RemoteDesktopStopOrigin[] = [];
   private value = snapshot();
 
@@ -51,7 +52,7 @@ class FakeConnectionClient {
     this.hooks.onSnapshot(this.value);
   }
   daemonReconnected(): void { this.hooks.onDaemonReconnected?.(); }
-  setMode(_mode: RemoteDesktopAccessMode): void {}
+  setMode(mode: RemoteDesktopAccessMode): void { this.modes.push(mode); }
   selectDisplay(_displayId: string): boolean { return true; }
   setDisplayMode(_displayId: string, _width: number, _height: number): boolean { return true; }
   setDisplayScale(_displayId: string, _dpiScalePercent: number): boolean { return true; }
@@ -541,5 +542,20 @@ describe('RemoteDesktopConnectionManager', () => {
     expect(clients[0].stopOrigins).toEqual([REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE]);
     expect(manager.connection({ serverId: 'server-a' })).not.toBe(connection);
     expect(clients).toHaveLength(2);
+  });
+
+  it('publishes connection summaries and exposes idempotent pause/resume controls', () => {
+    const { manager, clients } = setupManager();
+    const updates: number[] = [];
+    const unsubscribe = manager.subscribe((connections) => updates.push(connections.length));
+    manager.connection({ serverId: 'server-a' });
+    expect(manager.listConnections()).toHaveLength(1);
+    manager.pause('server-a');
+    manager.resume('server-a');
+    expect(clients[0].modes).toEqual([REMOTE_DESKTOP_ACCESS_MODE.VIEW, REMOTE_DESKTOP_ACCESS_MODE.CONTROL]);
+    manager.stop('server-a', REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE);
+    expect(manager.listConnections()).toHaveLength(0);
+    expect(updates).toEqual([0, 1, 0]);
+    unsubscribe();
   });
 });

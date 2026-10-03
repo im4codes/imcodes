@@ -7,13 +7,14 @@ import {
   shouldSendDaemonUpgradeTargetVersion,
   type DaemonUpgradeSource,
   type DaemonUpgradeDeliveryStatus,
+  type DaemonUpgradeStatusSnapshot,
 } from '../../../shared/daemon-upgrade.js';
 import {
   daemonUpgradePublicationGate,
   type DaemonUpgradePublicationGate,
 } from './daemon-upgrade-publication-gate.js';
 
-type UpgradeLifecycleState =
+export type UpgradeLifecycleState =
   | 'pending_offline'
   | 'pending_publication'
   | 'sent'
@@ -66,7 +67,8 @@ export class DaemonUpgradeCoordinator {
 
   constructor(private readonly publicationGate: DaemonUpgradePublicationGate = daemonUpgradePublicationGate) {}
 
-  snapshot(): DaemonUpgradeLifecycleSnapshot | null {
+  /** Read-only state for authenticated status consumers; timers/callbacks never escape. */
+  snapshot(): DaemonUpgradeStatusSnapshot | null {
     const state = this.current;
     if (!state) return null;
     return {
@@ -74,6 +76,8 @@ export class DaemonUpgradeCoordinator {
       targetVersion: state.targetVersion,
       source: state.source,
       status: state.status,
+      createdAt: state.createdAt,
+      updatedAt: state.updatedAt,
       lastSentAt: state.lastSentAt,
     };
   }

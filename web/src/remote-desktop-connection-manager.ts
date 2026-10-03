@@ -24,6 +24,12 @@ export interface RemoteDesktopHostTarget {
 
 export type RemoteDesktopPresentationRef = object;
 export type RemoteDesktopSnapshotListener = (snapshot: RemoteDesktopSnapshot) => void;
+export interface RemoteDesktopConnectionSummary {
+  hostKey: string;
+  serverId: string;
+  snapshot: Readonly<RemoteDesktopSnapshot>;
+}
+export type RemoteDesktopManagerListener = (connections: readonly RemoteDesktopConnectionSummary[]) => void;
 
 interface RemoteDesktopConnectionClient {
   current(): Readonly<RemoteDesktopSnapshot>;
@@ -157,6 +163,7 @@ export class RemoteDesktopConnectionManager {
   /** Connections that failed while the page was hidden, retried once it is seen. */
   private readonly waitingForVisible = new Set<ManagedEntry>();
   private stopWatchingVisibility: (() => void) | null = null;
+  private readonly managerListeners = new Set<RemoteDesktopManagerListener>();
 
   constructor(dependencies: RemoteDesktopConnectionManagerDependencies = {}) {
     this.createClient = dependencies.createClient
@@ -176,6 +183,7 @@ export class RemoteDesktopConnectionManager {
 
     const entry = this.createEntry(hostKey, target.serverId);
     this.entries.set(hostKey, entry);
+    this.notifyManagerListeners();
     return entry.connection;
   }
 
@@ -203,6 +211,7 @@ export class RemoteDesktopConnectionManager {
     // RemoteDesktopClient.stop owns the exact release_all -> Stop ordering.
     entry.client.stop(origin);
     entry.presentations.clear();
+    this.notifyManagerListeners();
   }
 
   releaseInput(target: RemoteDesktopHostTarget | string): void {
@@ -215,6 +224,32 @@ export class RemoteDesktopConnectionManager {
 
   stopAll(origin: RemoteDesktopStopOrigin): void {
     for (const hostKey of [...this.entries.keys()]) this.stop(hostKey, origin);
+  }
+
+  listConnections(): readonly RemoteDesktopConnectionSummary[] {
+    return [...this.entries.values()].map((entry) => ({
+      hostKey: entry.hostKey,
+      serverId: entry.serverId,
+      snapshot: entry.snapshot,
+    }));
+  }
+
+  subscribe(listener: RemoteDesktopManagerListener): () => void {
+    this.managerListeners.add(listener);
+    listener(this.listConnections());
+    return () => this.managerListeners.delete(listener);
+  }
+
+  pause(target: RemoteDesktopHostTarget | string): void {
+    const hostKey = typeof target === 'string' ? target : remoteDesktopHostKey(target);
+    const entry = this.entries.get(hostKey);
+    if (entry && !entry.stopped) entry.connection.setMode('view');
+  }
+
+  resume(target: RemoteDesktopHostTarget | string): void {
+    const hostKey = typeof target === 'string' ? target : remoteDesktopHostKey(target);
+    const entry = this.entries.get(hostKey);
+    if (entry && !entry.stopped) entry.connection.setMode('control');
   }
 
   /**
@@ -486,6 +521,12 @@ export class RemoteDesktopConnectionManager {
   private publish(entry: ManagedEntry, snapshot: RemoteDesktopSnapshot): void {
     entry.snapshot = snapshot;
     for (const listener of entry.presentations.values()) listener(snapshot);
+    this.notifyManagerListeners();
+  }
+
+  private notifyManagerListeners(): void {
+    const snapshot = this.listConnections();
+    for (const listener of this.managerListeners) listener(snapshot);
   }
 
   private clearReconnectTimers(entry: ManagedEntry): void {

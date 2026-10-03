@@ -10299,6 +10299,13 @@ export class WsBridge {
     return result;
   }
 
+  daemonUpgradeStatus() {
+    return {
+      currentVersion: this.daemonVersion,
+      upgrade: this.daemonUpgradeCoordinator.snapshot(),
+    };
+  }
+
   private flushPendingDaemonUpgrade(ws: WebSocket): RequestDaemonUpgradeResult | null {
     const result = this.daemonUpgradeCoordinator.flushPending({
       skipPublicationGate: this.daemonNodeRole === NODE_ROLE.CONTROLLED,

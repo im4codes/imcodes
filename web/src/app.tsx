@@ -7569,6 +7569,7 @@ export function App() {
             projectKey={activeSessionInfo?.contextNamespace?.projectId || activeSessionInfo?.project}
             initialNodeId={aideskManagementNodeId ?? undefined}
             initialAction={aideskManagementAction}
+            remoteDesktopManager={remoteDesktopConnectionManager}
           />
         </FloatingPanel>
       )}

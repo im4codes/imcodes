@@ -19,6 +19,8 @@ import {
   setMachineAutoUnlock,
   setMachineExecEnabled,
   upgradeControlledMachine,
+  getMachineUpgradeStatus,
+  requestMachineUpgrade,
   type ControlledNodeArtifactMetadata,
   type ControlledNodeArtifactSelection,
   type ControlledNodeOs,
@@ -28,6 +30,7 @@ import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
 } from '@shared/remote-desktop-local-management.js';
+import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 import { CONTROLLED_NODE_OS_MAC } from '@shared/controlled-node-artifacts.js';
 import {
   canInstallRemoteDesktopWorker,
@@ -56,6 +59,7 @@ import {
 
 import { VerificationMachinesSection } from './VerificationMachinesSection.js';
 import { createRemoteDesktopAccessApi, type SavedRemoteDesktopDevice } from '../api/remote-desktop-access.js';
+import type { RemoteDesktopConnectionManager, RemoteDesktopConnectionSummary } from '../remote-desktop-connection-manager.js';
 
 /**
  * Auto unlock exists only where the remote-desktop worker does: it is that
@@ -128,6 +132,7 @@ export interface ControlledNodesPanelProps {
   initialAction?: typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION[
     keyof typeof REMOTE_DESKTOP_LOCAL_WEB_ACTION
   ];
+  remoteDesktopManager?: RemoteDesktopConnectionManager;
 }
 
 const CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH = 640;
@@ -139,6 +144,7 @@ export function ControlledNodesPanel({
   projectKey,
   initialNodeId,
   initialAction = REMOTE_DESKTOP_LOCAL_WEB_ACTION.MANAGE,
+  remoteDesktopManager,
 }: ControlledNodesPanelProps) {
   const { t, i18n } = useTranslation();
   const { machines, loaded, loading, error, refetch } = useMachines();
@@ -186,6 +192,37 @@ export function ControlledNodesPanel({
   const [mobileActions, setMobileActions] = useState(
     () => typeof window !== 'undefined' && window.innerWidth <= CONTROLLED_NODES_MOBILE_ACTIONS_MAX_WIDTH,
   );
+  const [expandedServerId, setExpandedServerId] = useState<string | null>(null);
+  const [upgradeStatusByServerId, setUpgradeStatusByServerId] = useState<Record<string, Awaited<ReturnType<typeof getMachineUpgradeStatus>>>>({});
+  const [upgradeResultByServerId, setUpgradeResultByServerId] = useState<Record<string, string | undefined>>({});
+  const [upgradeBusyServerId, setUpgradeBusyServerId] = useState<string | null>(null);
+  const [connectionSummaries, setConnectionSummaries] = useState<readonly RemoteDesktopConnectionSummary[]>([]);
+
+  useEffect(() => {
+    if (!remoteDesktopManager) return undefined;
+    return remoteDesktopManager.subscribe(setConnectionSummaries);
+  }, [remoteDesktopManager]);
+
+  useEffect(() => {
+    let active = true;
+    const requests = machines.map(async (machine) => {
+      try {
+        return [machine.serverId, await getMachineUpgradeStatus(machine.serverId)] as const;
+      } catch {
+        return null;
+      }
+    });
+    void Promise.all(requests).then((results) => {
+      if (!active) return;
+      setUpgradeStatusByServerId((current) => {
+        const next = { ...current };
+        for (const result of results) if (result) next[result[0]] = result[1];
+        return next;
+      });
+    });
+    return () => { active = false; }
+  }, [machines]);
+
 
   useEffect(() => {
     let active = true;
@@ -318,6 +355,28 @@ export function ControlledNodesPanel({
       setManualPresenceRefresh(false);
     }
   }, [manualPresenceRefresh, refreshPresence]);
+
+  const retryMachineUpgrade = useCallback(async (serverId: string) => {
+    if (upgradeBusyServerId === serverId) return;
+    setUpgradeBusyServerId(serverId);
+    try {
+      const result = await requestMachineUpgrade(serverId);
+      setUpgradeResultByServerId((current) => ({ ...current, [serverId]: result.reason ?? result.deliveryStatus }));
+      setUpgradeStatusByServerId((current) => ({
+        ...current,
+        [serverId]: {
+          currentVersion: result.currentVersion ?? null,
+          latestVersion: result.latestVersion ?? null,
+          ...(result.upgrade ? { upgrade: result.upgrade } : {}),
+        },
+      }));
+      await refreshPresence();
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : t('controlled_nodes.upgrade_failed'));
+    } finally {
+      setUpgradeBusyServerId(null);
+    }
+  }, [refreshPresence, t, upgradeBusyServerId]);
 
   const onDownload = async (target: ControlledNodeArtifactSelection) => {
     const key = artifactSelectionKey(target);
@@ -631,6 +690,55 @@ export function ControlledNodesPanel({
   const showEmptyCatalog = !availLoading && !availError && sortedTargets.length === 0;
   const onlineMachineCount = machines.filter((machine) => machine.online).length;
   const execEnabledMachineCount = machines.filter((machine) => machine.execEnabled).length;
+
+  const renderControlPanel = (machine: MachineListItem) => {
+    const upgrade = upgradeStatusByServerId[machine.serverId];
+    const connection = connectionSummaries.find((item) => item.serverId === machine.serverId);
+    const status = upgrade?.upgrade?.status;
+    const actionable = machineAccessRole(machine) !== 'viewer' && machine.online;
+    return (
+      <div class="controlled-nodes-control-panel" data-testid={`controlled-node-panel-${machine.serverId}`}>
+        <div class="controlled-nodes-upgrade-summary">
+          <span><strong>{t('controlled_nodes.current_version')}:</strong> {upgrade?.currentVersion ?? machine.daemonVersion ?? t('controlled_nodes.version_unknown')}</span>
+          <span><strong>{t('controlled_nodes.latest_version')}:</strong> {upgrade?.latestVersion ?? t('controlled_nodes.version_unknown')}</span>
+          {status && <span class={`controlled-nodes-upgrade-status is-${status}`} role="status">{t(`controlled_nodes.upgrade_status_${status}`, { defaultValue: status })}</span>}
+          {upgrade?.upgrade?.status === 'terminal_blocked' && <span class="controlled-nodes-upgrade-error" role="alert">{t('controlled_nodes.upgrade_failed_reason')}{upgradeResultByServerId[machine.serverId] ? ` (${upgradeResultByServerId[machine.serverId]})` : ''}</span>}
+          {(machine.updateAvailable || (upgrade?.latestVersion && upgrade.currentVersion && upgrade.latestVersion !== upgrade.currentVersion)) && (
+            <button
+              type="button"
+              class="controlled-nodes-upgrade-retry"
+              disabled={!actionable || upgradeBusyServerId === machine.serverId}
+              title={!actionable ? t('controlled_nodes.upgrade_permission_required') : undefined}
+              onClick={() => { void retryMachineUpgrade(machine.serverId); }}
+            >{upgradeBusyServerId === machine.serverId ? t('controlled_nodes.upgrade_retrying') : t('controlled_nodes.upgrade_retry')}</button>
+          )}
+        </div>
+        <div class="controlled-nodes-connection-controls">
+          <span class="controlled-nodes-control-label">{t('controlled_nodes.connection_status')}</span>
+          {connection ? (
+            <>
+              <span data-testid={`controlled-node-connection-${machine.serverId}`}>{connection.snapshot.state}</span>
+              <button type="button" disabled={!actionable} onClick={() => {
+                if (connection.snapshot.mode === 'view') remoteDesktopManager?.resume(machine.serverId);
+                else remoteDesktopManager?.pause(machine.serverId);
+              }}>{connection.snapshot.mode === 'view' ? t('controlled_nodes.resume') : t('controlled_nodes.pause')}</button>
+              <button type="button" disabled={!actionable} onClick={() => remoteDesktopManager?.stop(machine.serverId, REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE)}>{t('controlled_nodes.disconnect')}</button>
+            </>
+          ) : <span class="controlled-nodes-muted">{t('controlled_nodes.not_connected')}</span>}
+          {remoteDesktopManager && <button
+            type="button"
+            class="controlled-nodes-stop-all"
+            disabled={!actionable || connectionSummaries.length === 0}
+            onClick={() => remoteDesktopManager.stopAll(REMOTE_DESKTOP_STOP_ORIGIN.USER_CLOSE)}
+          >{t('controlled_nodes.stop_all')}</button>}
+        </div>
+        <div class="controlled-nodes-control-links">
+          <button type="button" onClick={() => onOpenRemoteDesktop?.(machine)} disabled={!canOpenRemoteDesktopMachine(machine)}>{t('remote_desktop.open')}</button>
+          {machineAccessRole(machine) === 'owner' && <button type="button" onClick={() => { setSharingMachineSection('account'); setSharingMachine(machine); }}>{t('share.menu.shareTab')}</button>}
+        </div>
+      </div>
+    );
+  };
 
   const renderInstallAction = (machine: MachineListItem, inMobileMenu: boolean) => (
     canInstallRemoteDesktopWorker(machine) && (
@@ -1004,6 +1112,13 @@ export function ControlledNodesPanel({
                   )}
                 </div>
                 <RemoteDesktopReadiness capabilities={m.capabilities} compact />
+                <button
+                  type="button"
+                  class="controlled-nodes-control-toggle"
+                  aria-expanded={expandedServerId === m.serverId}
+                  onClick={() => setExpandedServerId((current) => current === m.serverId ? null : m.serverId)}
+                >{expandedServerId === m.serverId ? t('controlled_nodes.hide_controls') : t('controlled_nodes.show_controls')}</button>
+                {expandedServerId === m.serverId && renderControlPanel(m)}
               </div>
               <div class={`controlled-nodes-machine-actions ${mobileActions ? `is-mobile is-${machineAccessRole(m)}` : `is-desktop is-${machineAccessRole(m)}`}`}>
                 {!mobileActions && renderInstallAction(m, false)}
