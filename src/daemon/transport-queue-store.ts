@@ -373,10 +373,33 @@ export class TransportQueueStore {
         recipient_runtime_epoch TEXT,
         PRIMARY KEY (session_name, client_message_id)
       );
+
+      -- Cron dispatches arrive over a reconnectable WS. Keep the logical
+      -- occurrence key outside process memory so a retry after daemon restart
+      -- cannot execute the same action twice.
+      CREATE TABLE IF NOT EXISTS cron_dispatch_ledger (
+        job_id TEXT NOT NULL,
+        execution_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (job_id, execution_id)
+      );
     `);
     this.migrateRecipientIdentityColumns();
     this.migrateSupervisionReferenceColumn();
     this.migrateDeliveryConversationColumn();
+  }
+
+  /** Atomically accept one server cron occurrence; retries are no-ops. */
+  claimCronDispatch(jobIdInput: string, executionIdInput: string, now = Date.now()): boolean {
+    const jobId = jobIdInput.trim();
+    const executionId = executionIdInput.trim();
+    if (!jobId || !executionId) return true;
+    const result = this.db.prepare(`
+      INSERT INTO cron_dispatch_ledger (job_id, execution_id, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT (job_id, execution_id) DO NOTHING
+    `).run(jobId, executionId, now);
+    return Number(result.changes ?? 0) === 1;
   }
 
   /**

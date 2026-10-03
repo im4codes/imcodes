@@ -67,6 +67,7 @@ import {
   type CronDispatchMessage,
 } from '../../shared/cron-types.js';
 import logger from '../../src/util/logger.js';
+import { resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -119,6 +120,7 @@ function selfManagedAction(
 describe('executeCronJob', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    resetTransportQueueStoreForTests();
     (sessionName as ReturnType<typeof vi.fn>).mockImplementation(
       (project: string, role: string) => `deck_${project}_${role}`,
     );
@@ -141,6 +143,23 @@ describe('executeCronJob', () => {
       expect.objectContaining({ userMessageMetadata: expect.objectContaining({ cronRun: expect.any(Object) }) }),
     );
     expect(sendKeys).not.toHaveBeenCalled();
+  });
+
+  it('does not send a command twice when the same execution is replayed after delivery', async () => {
+    (getSession as ReturnType<typeof vi.fn>).mockReturnValue(makeSession());
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+    const occurrence = makeMsg({ executionId: 'exec-replayed-command' });
+
+    await executeCronJob(occurrence, mockServerLink);
+    await executeCronJob(occurrence, mockServerLink);
+
+    expect(cronProcessSendMock).toHaveBeenCalledTimes(1);
+    expect(mockServerLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      type: CRON_MSG.COMMAND_RESULT,
+      executionId: 'exec-replayed-command',
+      status: 'dispatched',
+      detail: 'Cron execution already accepted; duplicate dispatch ignored',
+    }));
   });
 
   it('reports a process session send failure instead of leaving the cron execution unresolved', async () => {
@@ -841,6 +860,24 @@ describe('executeCronJob', () => {
         cronJobId: 'job-1',
       }),
     }));
+  });
+
+  it('does not create a second P2P task when the same execution is replayed', async () => {
+    (getSession as ReturnType<typeof vi.fn>).mockImplementation((name: string) => {
+      if (name === 'deck_myapp_brain') return makeSession();
+      if (name === 'deck_myapp_w1') return makeSession({ name: 'deck_myapp_w1' });
+      return null;
+    });
+    (detectStatusAsync as ReturnType<typeof vi.fn>).mockResolvedValue('idle');
+    const occurrence = makeMsg({
+      executionId: 'exec-replayed-p2p',
+      action: { type: 'p2p', topic: 'quick sync', mode: 'review', participants: ['w1'] },
+    });
+
+    await executeCronJob(occurrence, mockServerLink);
+    await executeCronJob(occurrence, mockServerLink);
+
+    expect(startP2pRun).toHaveBeenCalledTimes(1);
   });
 
   it('logs warning for unknown action type', async () => {

@@ -66,6 +66,22 @@ describe('TransportQueueStore', () => {
     }
   });
 
+  it('durably claims a cron occurrence once across concurrent stores and restart', () => {
+    const executionId = 'exec-restart-window-1';
+    expect(store.claimCronDispatch('job-restart-window', executionId, 1_000)).toBe(true);
+    expect(store.claimCronDispatch('job-restart-window', executionId, 2_000)).toBe(false);
+
+    const restarted = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+    try {
+      expect(restarted.claimCronDispatch('job-restart-window', executionId, 3_000)).toBe(false);
+      // The key includes the schedule id, so a different job's occurrence is
+      // not accidentally suppressed by a reused execution id.
+      expect(restarted.claimCronDispatch('another-job', executionId, 3_000)).toBe(true);
+    } finally {
+      restarted.close();
+    }
+  });
+
   it('drops an unrestorable queue once the bounded retry threshold is reached', () => {
     const sessionName = 'deck_queue_orphan_fixture';
     store.enqueue({ sessionName, clientMessageId: 'orphan-1', text: 'orphan' });

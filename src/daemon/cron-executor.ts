@@ -30,6 +30,7 @@ import { MCP_ERROR_REASONS } from '../../shared/memory-mcp-errors.js';
 import { authorizedDelegationCandidates } from './delegation-admission.js';
 import { Cron } from 'croner';
 import { normalizeCronSendActionForInterval } from '../../shared/cron-types.js';
+import { getTransportQueueStore } from './transport-queue-store.js';
 
 /** Default retry budget when daemon admission returns `daemon_busy`. */
 const CRON_DAEMON_BUSY_DEFAULT_ATTEMPTS = 3;
@@ -163,6 +164,22 @@ async function loadCronSendDispatcher(): Promise<CronSendDispatcher> {
 
 export async function executeCronJob(msg: CronDispatchMessage, serverLink: ServerLink): Promise<void> {
   const { jobId, executionId, jobName, projectName, targetRole, targetSessionName } = msg;
+  // The server outbox may resend after a crash between WS delivery and its
+  // `dispatched` acknowledgement.  Claim the logical occurrence in the
+  // daemon's durable SQLite ledger before resolving a target or invoking any
+  // action.  A duplicate gets a terminal receipt but never re-enters command,
+  // structured-send, or P2P side effects.
+  if (executionId && !getTransportQueueStore().claimCronDispatch(jobId, executionId)) {
+    logger.info({ jobId, executionId }, 'Cron: duplicate dispatch ignored');
+    sendCommandResult(serverLink, {
+      type: CRON_MSG.COMMAND_RESULT,
+      jobId,
+      executionId,
+      status: 'dispatched',
+      detail: 'Cron execution already accepted; duplicate dispatch ignored',
+    });
+    return;
+  }
   const action = msg.action.type === 'send'
     ? normalizeCronSendActionForInterval(msg.action, cronIntervalMs(msg.cronExpr, msg.timezone))
     : msg.action;

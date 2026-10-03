@@ -21,6 +21,12 @@ type PreparedCronAction =
   | { ok: true; action: CronAction }
   | { ok: false; reason: string };
 
+type ClaimedCronJob = DbCronJob & {
+  previous_run_at?: number | null;
+  /** Stable outbox id; present for transactional claims and recovery. */
+  execution_id?: string;
+};
+
 /** Parse, validate and durably register legacy self-managed actions before use. */
 async function prepareCronAction(env: Env, job: DbCronJob): Promise<PreparedCronAction> {
   let action: CronAction;
@@ -91,11 +97,68 @@ export async function dispatchJobNow(env: Env, job: DbCronJob): Promise<void> {
   logger.info({ jobId: job.id, jobName: job.name }, 'Cron job manually triggered');
 }
 
-export async function jobDispatchCron(env: Env): Promise<void> {
-  const now = Date.now();
+/**
+ * Claim due occurrences before doing any external work.
+ *
+ * The old dispatcher only advanced `last_run_at` in the claim statement and
+ * advanced `next_run_at` after sending to the daemon.  A process crash (or a
+ * pod restart) in that window left the same occurrence due, so the next tick
+ * sent it again.  Keep the lock, schedule advancement, and returned claim in
+ * one transaction; once it commits, a restart can only observe the following
+ * occurrence.  The send itself remains outside the transaction so a slow or
+ * disconnected daemon never holds a row lock.
+ */
+async function claimDueJobs(
+  env: Env,
+  now: number,
+): Promise<ClaimedCronJob[]> {
+  const selectDue = async (db: typeof env.DB): Promise<ClaimedCronJob[]> => (
+    db.query<DbCronJob & { previous_run_at?: number | null }>(
+      `SELECT *, last_run_at AS previous_run_at FROM cron_jobs
+       WHERE status = $2 AND next_run_at <= $1
+         AND (expires_at IS NULL OR expires_at >= $1)
+       ORDER BY next_run_at ASC
+       LIMIT 50
+       FOR UPDATE SKIP LOCKED`,
+      [now, CRON_STATUS.ACTIVE],
+    )
+  );
 
-  // Atomic select + lock — prevents double-dispatch from concurrent ticks
-  const dueJobs = await env.DB.query<DbCronJob & { previous_run_at?: number | null }>(
+  // Production Database always exposes transaction().  Keep the direct path
+  // for the small database-shaped test seams and older embedders; it still
+  // advances each occurrence before its external send (see the loop below).
+  const transaction = (env.DB as typeof env.DB & {
+    transaction?: <T>(fn: (tx: typeof env.DB) => Promise<T>) => Promise<T>;
+  }).transaction;
+  if (typeof transaction === 'function') {
+    return await transaction.call(env.DB, async (tx) => {
+      const jobs = await selectDue(tx);
+      const claimed: ClaimedCronJob[] = [];
+      for (const job of jobs) {
+        const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
+        const result = await tx.execute(
+          'UPDATE cron_jobs SET last_run_at = $1, next_run_at = $2 WHERE id = $3 AND status = $4 AND next_run_at <= $1',
+          [now, nextRun, job.id, CRON_STATUS.ACTIVE],
+        );
+        if (result.changes !== 1) continue;
+        const executionId = randomHex(12);
+        // cron_executions doubles as a small durable outbox.  The schedule
+        // claim and its dispatch intent commit together, so a restart can
+        // recover the intent even if it dies before the WS send.
+        await tx.execute(
+          'INSERT INTO cron_executions (id, job_id, status, detail, created_at) VALUES ($1, $2, $3, $4, $5)',
+          [executionId, job.id, 'pending_dispatch', JSON.stringify({ previousRunAt: job.last_run_at, nextRunAt: nextRun }), now],
+        );
+        claimed.push({ ...job, last_run_at: now, next_run_at: nextRun, execution_id: executionId });
+      }
+      return claimed;
+    }) as ClaimedCronJob[];
+  }
+
+  // Compatibility fallback: the query's row lock is released when the query
+  // returns, so advance each row immediately before it is sent.  Real
+  // deployments use the transactional path above.
+  const jobs = await env.DB.query<DbCronJob & { previous_run_at?: number | null }>(
     `WITH due AS (
        SELECT id, last_run_at AS previous_run_at FROM cron_jobs
        WHERE status = $2 AND next_run_at <= $1
@@ -109,6 +172,56 @@ export async function jobDispatchCron(env: Env): Promise<void> {
      RETURNING cron_jobs.*, due.previous_run_at`,
     [now, CRON_STATUS.ACTIVE],
   );
+  return jobs;
+}
+
+async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
+  // Older database-shaped test seams and embedders do not have the
+  // transaction/outbox contract; their CTE claim remains the compatibility
+  // path and has no recoverable intent rows.
+  if (typeof (env.DB as typeof env.DB & { transaction?: unknown }).transaction !== 'function') return [];
+  const transaction = (env.DB as typeof env.DB & {
+    transaction?: <T>(fn: (tx: typeof env.DB) => Promise<T>) => Promise<T>;
+  }).transaction!;
+  const now = Date.now();
+  return transaction(async (tx) => {
+    const rows = await tx.query<ClaimedCronJob & { execution_detail?: string | null }>(
+      `SELECT j.*, e.id AS execution_id, e.detail AS execution_detail
+         FROM cron_executions e
+         JOIN cron_jobs j ON j.id = e.job_id
+        WHERE e.status = 'pending_dispatch'
+           OR (e.status = 'dispatching' AND e.created_at <= $1)
+        ORDER BY e.created_at ASC
+        LIMIT 50
+        FOR UPDATE OF e SKIP LOCKED`,
+      [now - 60_000],
+    );
+    const claimed: ClaimedCronJob[] = [];
+    for (const row of rows.filter((candidate) => typeof candidate.execution_id === 'string' && candidate.execution_id.length > 0)) {
+      let detail: { previousRunAt?: number | null; nextRunAt?: number } = {};
+      try {
+        detail = row.execution_detail ? JSON.parse(row.execution_detail) as typeof detail : {};
+      } catch { /* malformed outbox detail is handled as the current job */ }
+      await tx.execute(
+        'UPDATE cron_executions SET status = $1, detail = $2 WHERE id = $3 AND status IN ($4, $5)',
+        ['dispatching', JSON.stringify({ ...detail, claimedAt: now }), row.execution_id, 'pending_dispatch', 'dispatching'],
+      );
+      claimed.push({
+        ...row,
+        ...(detail.previousRunAt !== undefined ? { previous_run_at: detail.previousRunAt } : {}),
+        ...(detail.nextRunAt !== undefined ? { next_run_at: detail.nextRunAt } : {}),
+      });
+    }
+    return claimed;
+  });
+}
+
+export async function jobDispatchCron(env: Env): Promise<void> {
+  const now = Date.now();
+  // Replay durable intents first.  They were claimed by a prior tick but may
+  // not have reached the daemon before a server restart.
+  const pendingJobs = await recoverPendingDispatches(env);
+  const dueJobs = [...pendingJobs, ...(await claimDueJobs(env, now))];
 
   // Periodic cleanup of old execution history (~1% of ticks)
   if (Math.random() < 0.01) {
@@ -122,6 +235,11 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       if (!prepared.ok) {
         logger.error({ jobId: job.id, reason: prepared.reason }, 'Cron job has invalid action/control state, marking as error');
         await env.DB.execute('UPDATE cron_jobs SET status = $1 WHERE id = $2', [CRON_STATUS.ERROR, job.id]);
+        if (job.execution_id) {
+          await env.DB.execute('UPDATE cron_executions SET status = $1, detail = $2 WHERE id = $3 AND status = $4', [
+            'error', prepared.reason, job.execution_id, 'dispatching',
+          ]);
+        }
         await logExecution(env, randomHex(12), job.id, 'error', prepared.reason);
         continue;
       }
@@ -131,21 +249,51 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       const bridge = WsBridge.get(job.server_id);
       if (!bridge.isDaemonConnected()) {
         logger.debug({ jobId: job.id }, 'Cron skipped: daemon offline');
-        const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
+        const nextRun = job.next_run_at ?? calculateNextRun(job.cron_expr, now, job.timezone);
         await env.DB.execute('UPDATE cron_jobs SET next_run_at = $1 WHERE id = $2', [nextRun, job.id]);
-        await logExecution(env, randomHex(12), job.id, 'skipped_offline');
+        if (job.execution_id) {
+          await env.DB.execute('UPDATE cron_executions SET status = $1 WHERE id = $2 AND status = $3', [
+            'pending_dispatch', job.execution_id, 'dispatching',
+          ]);
+        } else {
+          await logExecution(env, randomHex(12), job.id, 'skipped_offline');
+        }
         continue;
       }
 
-      // Dispatch to daemon
+      // Dispatch to daemon.  Transactional claims already advanced the
+      // schedule.  Database-shaped fallback callers claim only last_run_at,
+      // so advance next_run_at immediately before this external side effect.
+      if (!(env.DB as typeof env.DB & { transaction?: unknown }).transaction) {
+        const fallbackNextRun = calculateNextRun(job.cron_expr, now, job.timezone);
+        const fallbackExecutionId = randomHex(12);
+        // Compatibility databases without Database.transaction still get one
+        // PostgreSQL statement for schedule advancement + outbox insertion;
+        // there is no update→insert crash gap. Production always takes the
+        // stronger transaction path above.
+        await env.DB.execute(
+          `WITH claimed AS (
+             UPDATE cron_jobs SET next_run_at = $1
+              WHERE id = $2 AND last_run_at = $3
+              RETURNING id
+           )
+           INSERT INTO cron_executions (id, job_id, status, detail, created_at)
+           SELECT $4, id, $5, $6, $7 FROM claimed`,
+          [fallbackNextRun, job.id, now, fallbackExecutionId, 'pending_dispatch', JSON.stringify({ previousRunAt: job.previous_run_at ?? job.last_run_at, nextRunAt: fallbackNextRun }), now],
+        );
+        job.next_run_at = fallbackNextRun;
+        job.execution_id = fallbackExecutionId;
+      }
       if (!job.target_role) {
         logger.warn({ jobId: job.id }, 'Cron: target_role is NULL, defaulting to brain');
       }
-      const nextRun = calculateNextRun(job.cron_expr, now, job.timezone);
+      // Use the value written by the claim, rather than recalculating it after
+      // the claim, so the payload always describes the durable occurrence.
+      const nextRun = job.next_run_at ?? calculateNextRun(job.cron_expr, now, job.timezone);
       const msg: CronDispatchMessage = {
         type: CRON_MSG.DISPATCH,
         jobId: job.id,
-        executionId: randomHex(12),
+        executionId: job.execution_id ?? randomHex(12),
         jobName: job.name,
         serverId: job.server_id,
         projectName: job.project_name ?? '',
@@ -163,15 +311,22 @@ export async function jobDispatchCron(env: Env): Promise<void> {
       };
       bridge.sendToDaemon(JSON.stringify(msg));
 
-      // Advance schedule
-      await env.DB.execute('UPDATE cron_jobs SET next_run_at = $1 WHERE id = $2', [nextRun, job.id]);
+      // Transactional claims advanced the schedule before this send.  The
+      // fallback advanced it immediately above; do not leave a post-send
+      // write window in which a restart can redispatch the same occurrence.
 
       // Auto-expire if next run is past expiration
       if (job.expires_at && nextRun > job.expires_at) {
         await env.DB.execute('UPDATE cron_jobs SET status = $1 WHERE id = $2', [CRON_STATUS.EXPIRED, job.id]);
       }
 
-      await logExecution(env, msg.executionId!, job.id, 'dispatched');
+      if (job.execution_id) {
+        await env.DB.execute('UPDATE cron_executions SET status = $1, detail = $2 WHERE id = $3 AND status = $4', [
+          'dispatched', null, job.execution_id, 'dispatching',
+        ]);
+      } else {
+        await logExecution(env, msg.executionId!, job.id, 'dispatched');
+      }
 
       await logAudit(
         { userId: job.user_id, serverId: job.server_id, action: 'cron.job.dispatched', details: { jobId: job.id, jobName: job.name } },
