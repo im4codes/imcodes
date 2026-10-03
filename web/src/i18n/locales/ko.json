@@ -4402,6 +4402,7 @@
     "card_collapse": "세부 정보 숨기기",
     "card_payload": "이벤트 페이로드",
     "card_kicker": "작업 페어 이벤트",
+    "card_untitled": "제목 없는 작업",
     "card_event": "이벤트",
     "card_executor": "실행자",
     "card_auditor": "감사자",

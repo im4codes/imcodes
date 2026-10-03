@@ -4403,6 +4403,7 @@
     "card_collapse": "收起詳情",
     "card_payload": "事件資料",
     "card_kicker": "任務對事件",
+    "card_untitled": "未命名任務",
     "card_event": "事件",
     "card_executor": "執行者",
     "card_auditor": "稽核者",

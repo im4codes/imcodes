@@ -4402,6 +4402,7 @@
     "card_collapse": "Скрыть подробности",
     "card_payload": "Данные события",
     "card_kicker": "Событие пары задач",
+    "card_untitled": "Задача без названия",
     "card_event": "Событие",
     "card_executor": "Исполнитель",
     "card_auditor": "Аудитор",

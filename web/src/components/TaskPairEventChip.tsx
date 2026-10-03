@@ -53,7 +53,7 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
-  const title = typeof event.title === 'string' && event.title.trim() ? event.title : undefined;
+  const title = typeof event.title === 'string' && event.title.trim() ? event.title.trim() : t('taskPair.card_untitled');
   const sessionLabel = (id: unknown, label: unknown) => {
     if (typeof id !== 'string' || !id) return null;
     const text = typeof label === 'string' && label ? `${label} (${id})` : id;
@@ -83,8 +83,7 @@ export function TaskPairEventChip({ eventId, payload }: { eventId: string; paylo
           <span class="task-pair-card-heading">
             <span class="task-pair-card-kicker">{t('taskPair.card_kicker')}</span>
             <span class="task-pair-chip-task">
-              {title && <strong>{title}</strong>}
-              <small>{taskId}</small>
+              <strong>{title}</strong>
             </span>
           </span>
           <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>

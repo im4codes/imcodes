@@ -4403,6 +4403,7 @@
     "card_collapse": "Hide details",
     "card_payload": "Event payload",
     "card_kicker": "Task pair event",
+    "card_untitled": "Untitled task",
     "card_event": "Event",
     "card_executor": "Executor",
     "card_auditor": "Auditor",

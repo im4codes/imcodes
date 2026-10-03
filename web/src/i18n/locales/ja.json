@@ -4402,6 +4402,7 @@
     "card_collapse": "詳細を隠す",
     "card_payload": "イベントデータ",
     "card_kicker": "タスクペアイベント",
+    "card_untitled": "無題のタスク",
     "card_event": "イベント",
     "card_executor": "実行者",
     "card_auditor": "監査担当",

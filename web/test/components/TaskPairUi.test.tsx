@@ -36,6 +36,8 @@ describe('TaskPairEventChip', () => {
     }} />);
     const chip = container.querySelector('.task-pair-chip')!;
     expect(chip.querySelector('.task-pair-card-body')).toBeNull();
+    expect(chip.textContent).toContain('Fix login');
+    expect(chip.textContent).not.toContain('T42');
     const toggle = chip.querySelector('.task-pair-card-toggle')!;
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
     expect(toggle.textContent).toContain('taskPair.card_expand');
@@ -44,7 +46,7 @@ describe('TaskPairEventChip', () => {
     expect(toggle.textContent).toContain('taskPair.card_collapse');
     expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).toContain('"taskId": "T42"');
     expect(chip.getAttribute('data-task-id')).toBe('T42');
-    expect(chip.textContent).toContain('Fix loginT42');
+    expect(chip.textContent).toContain('Fix login');
     expect(chip.textContent).toContain('taskPair.chip:{"writer":"deck_sub_aud","verb":"taskPair.verb.rework"}');
     expect(chip.textContent).toContain('taskPair.status.rework');
     expect(chip.textContent).toContain('taskPair.severity:{"level":"P0","count":1}');
@@ -66,7 +68,7 @@ describe('TaskPairEventChip', () => {
     expect(chip.textContent).toContain('taskPair.status.working');
   });
 
-  it('renders title before the muted id and opens labelled sessions', () => {
+  it('renders the title without task id and opens labelled sessions', () => {
     const navigate = vi.fn();
     const listener = (event: Event) => navigate((event as CustomEvent).detail.session);
     window.addEventListener('deck:navigate', listener);
@@ -74,9 +76,11 @@ describe('TaskPairEventChip', () => {
       taskId: 'T7', title: 'Readable task', writer: 'brain', verb: 'DISPATCH',
       executor: 'deck_sub_worker', executorLabel: 'Cx6', unusual: false,
     }} />);
+    const chip = container.querySelector('.task-pair-chip')!;
     const task = container.querySelector('.task-pair-chip-task')!;
     expect(task.querySelector('strong')?.textContent).toBe('Readable task');
-    expect(task.querySelector('small')?.textContent).toBe('T7');
+    expect(task.querySelector('small')).toBeNull();
+    expect(chip.textContent).not.toContain('T7');
     fireEvent.click(container.querySelector('.task-pair-card-toggle')!);
     fireEvent.click(screen.getByRole('button', { name: 'Cx6 (deck_sub_worker)' }));
     expect(navigate).toHaveBeenCalledWith('deck_sub_worker');
@@ -129,6 +133,7 @@ describe('TaskPairEventChip workspace events', () => {
       for (const key of ['output_saved', 'output_failed', 'workspace_removed', 'workspace_kept']) {
         expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
       }
+      expect(taskPair.card_untitled, `${locale}.card_untitled`).toBeTruthy();
       expect(taskPair.output_saved).toContain('{{path}}');
       expect(taskPair.output_failed).toContain('{{reason}}');
     }
@@ -1022,11 +1027,14 @@ describe('TaskPairEventChip status colours', () => {
       taskId: 'x'.repeat(160), title: '   ', verb: 'BOGUS', toStatus: 'future_status', unusual: false,
     }} />);
     const chip = container.querySelector('.task-pair-event-card')!;
+    expect(chip.textContent).toContain('taskPair.card_untitled');
+    expect(chip.textContent).not.toContain('x'.repeat(160));
     fireEvent.click(chip.querySelector('.task-pair-card-toggle')!);
     expect(chip.textContent).toContain('taskPair.card_unknown_status');
     expect(chip.textContent).toContain('taskPair.card_unassigned');
     expect(chip.querySelector('.task-pair-chip-status')?.className).toContain('status-unknown');
     expect(chip.getAttribute('data-task-id')).toHaveLength(160);
+    expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).toContain('x'.repeat(160));
   });
 
   it('overrides the chat-system centering rule so every card body remains left aligned', () => {

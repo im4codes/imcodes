@@ -4403,6 +4403,7 @@
     "card_collapse": "Ocultar detalles",
     "card_payload": "Datos del evento",
     "card_kicker": "Evento de par de tareas",
+    "card_untitled": "Tarea sin título",
     "card_event": "Evento",
     "card_executor": "Ejecutor",
     "card_auditor": "Auditor",

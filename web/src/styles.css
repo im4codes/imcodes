@@ -14576,9 +14576,7 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-kicker { color: var(--chrome-accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; line-height: 1.2; text-transform: uppercase; }
 .task-pair-event-card .task-pair-chip-task { display: flex; min-width: 0; flex-wrap: wrap; align-items: baseline; gap: 5px 8px; }
 .task-pair-event-card .task-pair-chip-task strong { min-width: 0; color: #f0f9ff; font-size: 13px; overflow-wrap: anywhere; }
-.task-pair-event-card .task-pair-chip-task small { color: #94a3b8; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 10px; overflow-wrap: anywhere; }
-.task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong,
-.task-pair-event-card:not(.is-expanded) .task-pair-chip-task small { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong { max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .task-pair-event-card .task-pair-chip-status { flex: 0 0 auto; box-shadow: 0 0 12px color-mix(in srgb, var(--task-pair-status-text, var(--chrome-accent)) 12%, transparent); }
 .task-pair-card-chevron { flex: 0 0 auto; width: 22px; height: 22px; display: inline-flex; align-items: center; justify-content: center; border: 1px solid rgba(125, 211, 252, 0.24); border-radius: 5px; color: #7dd3fc; background: rgba(15, 23, 42, 0.72); font-size: 15px; line-height: 1; transition: transform .15s ease, background .15s ease; }
 .task-pair-card-chevron.is-expanded { transform: rotate(180deg); background: rgba(8, 145, 178, 0.2); }
