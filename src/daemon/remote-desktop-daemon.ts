@@ -25,6 +25,7 @@ import {
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_OS_WIN,
 } from '../../shared/controlled-node-artifacts.js';
+import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import {
   REMOTE_DESKTOP_LOGIN_SCREEN_ERROR,
   REMOTE_DESKTOP_LOGIN_SCREEN_MSG,
@@ -311,12 +312,28 @@ export class DaemonRemoteDesktop {
     // Worker releases are independent of the daemon release. A reconnect
     // check downloads the signed latest manifest, then skips the atomic swap
     // when the worker generation is already identical.
-    if (replacing
-      && this.artifact?.manifest.workerVersion
-      && artifact.manifest.workerVersion === this.artifact.manifest.workerVersion) {
-      this.publish(REMOTE_DESKTOP_INSTALL_STATE.INSTALLED);
-      await cleanup();
-      return;
+    if (replacing) {
+      const installedVersion = this.artifact?.manifest.workerVersion;
+      const targetVersion = artifact.manifest.workerVersion;
+      const releaseOrder = typeof installedVersion === 'string'
+        && typeof targetVersion === 'string'
+        ? compareImcodesVersions(installedVersion, targetVersion)
+        : null;
+      // A worker manifest is trusted for integrity, not for release ordering.
+      // Never replace a known-good worker when either side is unparseable or
+      // the downloaded bundle is not strictly newer. This keeps downgrade,
+      // malformed and missing-version releases fail-closed while preserving
+      // the old worker for service and a bounded, observable failure state.
+      if (releaseOrder === null || releaseOrder >= 0) {
+        this.publish(
+          releaseOrder === 0
+            ? REMOTE_DESKTOP_INSTALL_STATE.INSTALLED
+            : REMOTE_DESKTOP_INSTALL_STATE.FAILED,
+          releaseOrder === 0 ? undefined : REMOTE_DESKTOP_INSTALL_ERROR.VERIFICATION_FAILED,
+        );
+        await cleanup();
+        return;
+      }
     }
     try {
       if (stagingRoot) {

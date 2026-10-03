@@ -378,6 +378,36 @@ describe('DaemonRemoteDesktop', () => {
     expect(f.capabilityChanges).toHaveLength(0);
   });
 
+  it.each([
+    ['an older', '2026.7.1'],
+    ['an unknown', 'nightly'],
+  ])('keeps the installed worker when the release is %s', async (_label, targetVersion) => {
+    const installed = { ...artifact, manifest: { workerVersion: '2026.8.1' } } as VerifiedRemoteDesktopWorkerArtifact;
+    const target = { ...artifact, manifest: { workerVersion: targetVersion } } as VerifiedRemoteDesktopWorkerArtifact;
+    const launched: VerifiedRemoteDesktopWorkerArtifact[] = [];
+    let resolveCalls = 0;
+    const f = fixture({
+      installed: true,
+      resolveArtifact: () => resolveCalls++ === 0 ? installed : target,
+      createHost: (current) => {
+        launched.push(current);
+        return { handle: vi.fn(async () => true), close: vi.fn() };
+      },
+    });
+
+    await f.remoteDesktop.refresh();
+
+    expect(f.downloadWorker).toHaveBeenCalledOnce();
+    expect(f.remoteDesktop.available()).toBe(true);
+    expect(f.capabilityChanges).toHaveLength(0);
+    await f.remoteDesktop.handle(prepareCommand());
+    expect(launched[0]?.manifest.workerVersion).toBe('2026.8.1');
+    expect(f.sent.at(-1)).toMatchObject({
+      state: REMOTE_DESKTOP_INSTALL_STATE.FAILED,
+      error: REMOTE_DESKTOP_INSTALL_ERROR.VERIFICATION_FAILED,
+    });
+  });
+
   it('defers an automatic refresh while a remote-desktop connection is active', async () => {
     let active = true;
     const older = { ...artifact, manifest: { workerVersion: '0.1.1' } } as VerifiedRemoteDesktopWorkerArtifact;
