@@ -939,7 +939,8 @@ async function writeStoreToDisk(bestEffort: boolean, targetPath = dbPath(), forc
 /**
  * A consistent online snapshot of the database, at most once per interval, the
  * newest few kept. Replaces the five whole-file copies the JSON store rotated
- * on every flush. Never blocks the flush: the copy runs on its own.
+ * on every flush. Debounced writes do not wait for the copy; an explicit
+ * flushStore() drains it before returning so lifecycle teardown is deterministic.
  */
 function maybeStartSnapshot(handle: SessionDbHandle, targetPath: string): void {
   if (backupInFlight || committedPayloads.size === 0) return;
@@ -1158,7 +1159,13 @@ export function sessionStoreWriterConnectionForTests(): SessionDbHandle['db'] | 
 
 /** Test seam: resolves when a started snapshot has finished. */
 export async function waitForSessionStoreSnapshotForTests(): Promise<void> {
-  if (backupInFlight) await backupInFlight;
+  await waitForSessionStoreSnapshot();
+}
+
+async function waitForSessionStoreSnapshot(): Promise<void> {
+  // A snapshot cannot normally start another snapshot, but loop so a caller
+  // remains correct if that invariant changes while a backup is completing.
+  while (backupInFlight) await backupInFlight;
 }
 
 function enqueueWrite(bestEffort: boolean, targetPath = dbPath(), forceSweep = false): Promise<void> {
@@ -1413,4 +1420,8 @@ export async function flushStore(): Promise<void> {
   }
   await enqueueWrite(false, targetPath, true);
   await flushCompatExport(targetPath);
+  // flushStore() is the explicit lifecycle barrier used by shutdown and test
+  // teardown. Do not return while the snapshot started by the write is still
+  // touching the database or its temporary backup path.
+  await waitForSessionStoreSnapshot();
 }
