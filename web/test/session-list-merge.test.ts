@@ -614,6 +614,54 @@ describe('mergeSessionListEntry — structured transport queue sync', () => {
   });
 });
 
+describe('mergeSessionListEntry — activity generation fence', () => {
+  it('keeps newer state and queue when an older refresh arrives', () => {
+    const generation2 = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 2 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 2,
+      pendingMessageEntries: [{ clientMessageId: 'new', text: 'new message' }],
+    }, makeExisting({
+      state: 'idle',
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      transportPendingMessageVersion: 1,
+      transportPendingMessageEntries: [],
+      transportPendingMessages: [],
+    }));
+
+    const stale = mergeSessionListEntry({
+      ...BASE_INCOMING,
+      state: 'idle',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 1 },
+      queueEpoch: 'epoch-1',
+      queueAuthorityId: 'authority-1',
+      pendingMessageVersion: 1,
+      pendingMessageEntries: [],
+    }, generation2);
+
+    expect(stale.state).toBe('running');
+    expect(stale.activityGeneration).toEqual(generation2.activityGeneration);
+    expect(stale.transportPendingMessageEntries).toEqual([{ clientMessageId: 'new', text: 'new message' }]);
+    expect(stale.transportPendingMessageVersion).toBe(2);
+  });
+
+  it('preserves the generation fence when a refresh omits activityGeneration', () => {
+    const existing = makeExisting({
+      state: 'running',
+      activityGeneration: { scope: 'session', sessionName: 'deck_proj_brain', generation: 4 },
+    });
+    const refreshed = mergeSessionListEntry({ ...BASE_INCOMING, state: 'idle' }, existing);
+    expect(refreshed.activityGeneration).toEqual(existing.activityGeneration);
+    // An omitted generation cannot prove that the row supersedes the newer
+    // runtime generation; the fence remains available for subsequent frames.
+    expect(refreshed.state).toBe('idle');
+  });
+});
+
 describe('mergeSessionListEntry — supervision heartbeat projection', () => {
   it('accepts a valid schedule, preserves it across sparse rows, and applies explicit clear', () => {
     const armed = mergeSessionListEntry({

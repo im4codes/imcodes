@@ -25,6 +25,10 @@ import type { SessionInfo } from './types.js';
 import { resolveRuntimeType } from './runtime-type.js';
 import { parseSupervisionHeartbeatSnapshot } from '@shared/supervision-heartbeat.js';
 import {
+  isOlderActivityGeneration,
+  type ActivityGenerationLike,
+} from '@shared/session-activity-types.js';
+import {
   buildTransportPendingSyncPatch,
   hasTransportPendingSyncSnapshot,
 } from './transport-queue.js';
@@ -38,6 +42,7 @@ export interface IncomingSessionListEntry {
   name: string;
   sessionInstanceId?: string;
   runtimeEpoch?: string;
+  activityGeneration?: ActivityGenerationLike;
   project: string;
   role: string;
   agentType: string;
@@ -132,13 +137,21 @@ export function mergeSessionListEntry(
   incoming: IncomingSessionListEntry,
   existing: SessionInfo | undefined,
 ): SessionInfo {
+  const isOlderGeneration = Boolean(
+    existing
+    && isOlderActivityGeneration(incoming.activityGeneration, existing.activityGeneration),
+  );
+  const nextState = isOlderGeneration ? existing!.state : incoming.state as SessionInfo['state'];
+  const nextActivityGeneration = isOlderGeneration
+    ? existing!.activityGeneration
+    : incoming.activityGeneration ?? existing?.activityGeneration;
   const isCodexFamily = incoming.agentType === 'codex' || incoming.agentType === 'codex-sdk';
   // Codex AND claude-code-sdk surface provider quota that the daemon may omit on
   // a given session_list pass (idle / 30-min throttle / a transient B failure);
   // preserve the last known value so the footer doesn't flicker blank between
   // updates instead of dropping it to undefined.
   const preservesProviderQuota = isCodexFamily || incoming.agentType === 'claude-code-sdk';
-  const pendingSyncPatch = hasTransportPendingSyncSnapshot(incoming as unknown as Record<string, unknown>)
+  const pendingSyncPatch = !isOlderGeneration && hasTransportPendingSyncSnapshot(incoming as unknown as Record<string, unknown>)
     ? buildTransportPendingSyncPatch({
       transportPendingMessages: existing?.transportPendingMessages,
       transportPendingMessageEntries: existing?.transportPendingMessageEntries,
@@ -169,17 +182,20 @@ export function mergeSessionListEntry(
     agentType: incoming.agentType,
     providerId: incoming.providerId ?? existing?.providerId,
     agentVersion: incoming.agentVersion,
-    state: incoming.state as SessionInfo['state'],
+    state: nextState,
+    ...(nextActivityGeneration !== undefined ? { activityGeneration: nextActivityGeneration } : {}),
     // Keep the local idle proof across the authoritative session-list refresh
     // triggered by a stale-turn acknowledgement.  The daemon snapshot carries
     // the canonical state but not the browser observation timestamp; dropping
     // this marker here would immediately resurrect a stale timeline turn in
     // the composer after the refresh.
-    authoritativeIdleAt: incoming.state === 'idle'
+    authoritativeIdleAt: nextState === 'idle'
       ? existing?.authoritativeIdleAt
       : undefined,
-    error: incoming.state === 'error'
-      ? (incoming.error ?? existing?.error ?? null)
+    error: nextState === 'error'
+      ? (isOlderGeneration
+        ? (existing?.error ?? null)
+        : (incoming.error ?? existing?.error ?? null))
       : null,
     projectDir: incoming.projectDir ?? existing?.projectDir,
     runtimeType: resolveRuntimeType({
