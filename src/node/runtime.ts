@@ -321,7 +321,12 @@ export interface ControlledNodeRuntimeOptions {
    * and four signed binaries. The default implementation downloads this
    * release's component set and promotes it.
    */
-  installMacosRemoteDesktopComponents?: () => Promise<boolean>;
+  installMacosRemoteDesktopComponents?: () => Promise<boolean | {
+    installedVersion?: string;
+    targetVersion?: string;
+    artifactSha256?: string;
+    reason?: string;
+  }>;
   /** Test seam: the Server clock estimate used to translate deadlines. */
   serverClock?: ServerClockEstimator;
   /** Test seam: whether the store already holds a verified set for this release. */
@@ -1091,7 +1096,13 @@ export function createControlledNodeRuntime(
       }
     });
     try {
-      const installed = await install();
+      const installResult = await install();
+      const installed = typeof installResult === 'boolean' ? installResult : !installResult.reason;
+      if (typeof installResult !== 'boolean') {
+        installedTargetVersion = installResult.targetVersion ?? installResult.installedVersion ?? installedTargetVersion;
+        installedArtifactSha256 = installResult.artifactSha256 ?? installedArtifactSha256;
+        installFailureReason = installResult.reason ?? installFailureReason;
+      }
       if (installed) {
         logger.info('installed the macOS remote-desktop component set');
         macosRemoteDesktopInstalledForRelease = true;

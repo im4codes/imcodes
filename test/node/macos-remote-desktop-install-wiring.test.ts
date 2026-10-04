@@ -9,6 +9,7 @@ import {
   REMOTE_DESKTOP_PERMISSION_MSG,
 } from '../../shared/remote-desktop-install.js';
 import { CONTROLLED_NODE_CAPABILITIES } from '../../shared/controlled-node-capabilities.js';
+import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { createControlledNodeRuntime } from '../../src/node/runtime.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import type { AuthenticatedWebSocketLike } from '../../src/transport/authenticated-websocket.js';
@@ -114,6 +115,32 @@ describe('macOS remote-desktop install wiring', () => {
     socket.open();
     socket.emit('message', JSON.stringify({ type: REMOTE_DESKTOP_INSTALL_MSG.REQUEST }));
     await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+  });
+
+  it('projects structured installer results into refresh telemetry', async () => {
+    const socket = new MockSocket();
+    const install = vi.fn(async () => ({
+      installedVersion: '2026.10.5371-dev.5816',
+      targetVersion: '2026.10.5371-dev.5816',
+      artifactSha256: 'a'.repeat(64),
+    }));
+    createControlledNodeRuntime(CREDENTIAL, () => socket, {
+      platform: 'darwin',
+      arch: 'arm64',
+      installMacosRemoteDesktopComponents: install,
+    }).start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(install).toHaveBeenCalledOnce());
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw))
+        .filter((message) => message.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.at(-1)).toEqual(expect.objectContaining({
+        phase: 'succeeded',
+        targetVersion: '2026.10.5371-dev.5816',
+        artifactSha256: 'a'.repeat(64),
+      }));
+    });
   });
 
   it('refuses a request carrying caller-controlled fields', async () => {
