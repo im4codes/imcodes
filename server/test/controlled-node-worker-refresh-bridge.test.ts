@@ -71,6 +71,13 @@ describe('controlled worker refresh bridge contract', () => {
       expect.arrayContaining([status.attemptId, status.phase, status.artifactSha256, serverId, NODE_ROLE.CONTROLLED]),
     );
 
+    // A browser that connects after the daemon event must receive the cached
+    // snapshot immediately; otherwise a reconnecting UI stays stale until the
+    // next refresh attempt (which may be minutes away).
+    const lateBrowser = new MockWs();
+    bridge.handleBrowserConnection(lateBrowser as never, 'owner-1', db);
+    expect(lateBrowser.sent.map((raw) => JSON.parse(raw))).toContainEqual(status);
+
     // A replacement bridge/auth reads the durable row and exposes the same
     // status before any new daemon event arrives.
     const restored = WsBridge.get('controlled-refresh-bridge-2');
