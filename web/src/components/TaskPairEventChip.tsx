@@ -44,10 +44,17 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const isCancelledEvent = event.toStatus === 'cancelled';
   const cancelActor = typeof event.cancelActor === 'string' && event.cancelActor.trim()
     ? event.cancelActor.trim()
+<<<<<<< HEAD
     : event.cancelProvenanceTrusted ? writer : '';
   const cancelSource = typeof event.cancelSource === 'string' && event.cancelSource.trim()
     ? event.cancelSource.trim()
     : event.cancelProvenanceTrusted && typeof event.source === 'string' ? event.source : '';
+=======
+    : writer;
+  const cancelSource = typeof event.cancelSource === 'string' && event.cancelSource.trim()
+    ? event.cancelSource.trim()
+    : (typeof event.source === 'string' ? event.source : '');
+>>>>>>> 0803ccbc1 (feat(task-pairs): preserve cancellation provenance)
   const cancelReason = typeof event.cancelReason === 'string' && event.cancelReason.trim()
     ? event.cancelReason.trim()
     : t('taskPair.card_cancel_reason_unknown');
@@ -139,6 +146,11 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
           {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
           {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
+          {isCancelledEvent && <div class="task-pair-card-cancel-meta" data-cancel-provenance="true">
+            <span>{t('taskPair.card_cancel_actor', { value: cancelActor || t('taskPair.card_cancel_unknown') })}</span>
+            <span>{t('taskPair.card_cancel_source', { value: cancelSource ? t(`taskPair.cancel_source.${cancelSource}`, { defaultValue: cancelSource }) : t('taskPair.card_cancel_unknown') })}</span>
+            <span>{t('taskPair.card_cancel_reason', { value: cancelReason })}</span>
+          </div>}
         </div>
         {(counts || verdict || held || event.unusual) && <footer class="task-pair-card-flags">
           {counts && <span class="task-pair-chip-counts">{counts}</span>}

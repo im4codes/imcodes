@@ -1159,7 +1159,10 @@ describe('TaskPairEventChip status colours', () => {
     expect(card.textContent).toContain('taskPair.card_cancel_reason_unknown');
     expect(card.textContent).toContain('taskPair.card_cancel_actor:');
     expect(card.textContent).toContain('taskPair.card_cancel_source:');
+<<<<<<< HEAD
     expect(card.textContent).toContain('taskPair.card_cancel_unknown');
+=======
+>>>>>>> 0803ccbc1 (feat(task-pairs): preserve cancellation provenance)
   });
 
   it('shows explicit cancellation provenance and keeps other lifecycle events free of cancel details', () => {

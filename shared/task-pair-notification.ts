@@ -25,6 +25,7 @@ const AUDITOR_MODEL_RE = /\b(?:auditor(?:model|_model)|auditor\s+model)\s*(?::|=
 const EXECUTOR_THINKING_RE = /\b(?:executor(?:thinking|_thinking|effort)|executor\s+(?:thinking|effort))\s*(?::|=)?\s*([A-Za-z0-9_-]{1,40})/iu;
 const AUDITOR_THINKING_RE = /\b(?:auditor(?:thinking|_thinking|effort)|auditor\s+(?:thinking|effort))\s*(?::|=)?\s*([A-Za-z0-9_-]{1,40})/iu;
 const WHY_RE = /^Why:\s*(.+)$/imu;
+const CANCEL_REASON_RE = /\b(?:reason|cause|note)\s*(?::|=)\s*(?:"([^"]*)"|'([^']*)'|(.+?))(?=\s+\b(?:executor|auditor|status|round)\b|$)/imu;
 const QUEUE_DISPATCH_RE = /\bdispatched\s+from\s+the\s+queue\b/iu;
 const AUDIT_VERB_RE = /^\s*Audited\s+pair\s+(done|passed|pass|rework|ready(?:_for_audit)?|blocked|needs(?:_input|\s+your\s+decision)|cancel(?:led|ed)?)/iu;
 const AUDIT_SUMMARY_RE = /^\s*Audited\s+pair\b/iu;
@@ -75,7 +76,7 @@ function inferVerb(text: string, status: TaskPairStatus | undefined): TaskPairVe
   if (/\b(?:STARTED|WORKING)\b/iu.test(text)) return 'WORKING';
   if (/\b(?:BLOCKED|NEEDS_INPUT|NEEDS YOUR DECISION|AWAITING)\b/iu.test(text)) return 'NEEDS_INPUT';
   if (/\b(?:needs your decision|needs input|awaiting)\b/iu.test(text)) return 'NEEDS_INPUT';
-  if (/\b(?:cancelled|canceled)\b/iu.test(text)) return 'CANCEL';
+  if (/\b(?:CANCEL|cancelled|canceled)\b/iu.test(text)) return 'CANCEL';
   if (/\bDONE\b/iu.test(text)) return 'DONE';
   return 'DISPATCH';
 }
@@ -196,6 +197,12 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ?? knownStatus(marker?.attrs.status);
   const verb = marker?.knownVerb ?? inferVerb(body, status);
   const effectiveStatus = inferStatus(verb, status ?? (QUEUE_DISPATCH_RE.test(body) ? 'working' : undefined));
+  const cancellationReason = effectiveStatus === 'cancelled'
+    ? (body.match(WHY_RE)?.[1]?.trim() ?? (() => {
+      const match = body.match(CANCEL_REASON_RE);
+      return match?.[1]?.trim() ?? match?.[2]?.trim() ?? match?.[3]?.trim();
+    })())
+    : undefined;
   const payload: Record<string, unknown> = {
     taskId,
     ...(title ? { title } : {}),
@@ -214,6 +221,10 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ...((body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking) ? { auditorThinking: body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking } : {}),
     ...(body.match(WHY_RE)?.[1] ? { noticeReason: body.match(WHY_RE)![1].trim() } : {}),
     ...(effectiveStatus === 'cancelled' ? {
+<<<<<<< HEAD
+=======
+      cancelActor: 'daemon', cancelSource: 'daemon',
+>>>>>>> 0803ccbc1 (feat(task-pairs): preserve cancellation provenance)
       ...(cancellationReason ? { cancelReason: cancellationReason.slice(0, 500) } : {}),
     } : {}),
     noticeText: body,

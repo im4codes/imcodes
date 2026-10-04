@@ -186,6 +186,15 @@ function stableMarkerAttrs(attrs: Record<string, string>): string {
     .sort(([a], [b]) => a.localeCompare(b)));
 }
 
+/** Marker attributes that explain why a pair was cancelled, if supplied. */
+function cancellationReason(attrs: Record<string, string>): string | undefined {
+  for (const key of ['reason', 'note', 'cause', 'why']) {
+    const value = attrs[key]?.trim();
+    if (value) return value.slice(0, 500);
+  }
+  return undefined;
+}
+
 function isDuplicateVerdictMarker(
   store: ReturnType<typeof getTaskPairStore>,
   existing: StoredTaskPair | undefined,

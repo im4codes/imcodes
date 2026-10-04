@@ -29,6 +29,7 @@ describe('task-pair notification thinking metadata', () => {
       '[IM.codes task tsk_cancel "Handoff context"] status=cancelled CANCEL reason="user stopped after review" executor=deck_exec auditor=deck_aud',
     );
     expect(parsed?.payload).toMatchObject({
+<<<<<<< HEAD
       verb: 'CANCEL', toStatus: 'cancelled', cancelReason: 'user stopped after review', executor: 'deck_exec', auditor: 'deck_aud',
     });
     expect(parsed?.payload).not.toHaveProperty('cancelActor');
@@ -37,6 +38,13 @@ describe('task-pair notification thinking metadata', () => {
     expect(old?.payload).toMatchObject({ verb: 'CANCEL', toStatus: 'cancelled' });
     expect(old?.payload).not.toHaveProperty('cancelActor');
     expect(old?.payload).not.toHaveProperty('cancelSource');
+=======
+      verb: 'CANCEL', toStatus: 'cancelled', cancelActor: 'daemon', cancelSource: 'daemon',
+      cancelReason: 'user stopped after review', executor: 'deck_exec', auditor: 'deck_aud',
+    });
+    const old = parseTaskPairNotification('[IM.codes task tsk_old] CANCEL status=cancelled');
+    expect(old?.payload).toMatchObject({ verb: 'CANCEL', toStatus: 'cancelled', cancelActor: 'daemon', cancelSource: 'daemon' });
+>>>>>>> 0803ccbc1 (feat(task-pairs): preserve cancellation provenance)
     expect(old?.payload).not.toHaveProperty('cancelReason');
   });
 });

@@ -14599,6 +14599,8 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-role .task-pair-chip-session { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .task-pair-card-role-model { min-width: 0; max-width: 100%; color: #a5f3fc; font-size: 9px; overflow-wrap: anywhere; }
 .task-pair-card-role-thinking { min-width: 0; max-width: 100%; color: #c4b5fd; font-size: 9px; overflow-wrap: anywhere; }
+.task-pair-card-cancel-meta { display: flex; min-width: 0; flex: 1 1 100%; flex-wrap: wrap; gap: 4px 10px; color: #fca5a5; overflow-wrap: anywhere; }
+.task-pair-card-cancel-meta > span { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
 .task-pair-card-unassigned { color: #64748b; font-style: italic; }
 .task-pair-card-flags { padding-top: 7px; border-top: 1px solid rgba(148, 163, 184, 0.16); }
 .task-pair-card-payload { min-width: 0; margin-top: 2px; padding-top: 8px; border-top: 1px solid rgba(148, 163, 184, 0.16); }
