@@ -1469,8 +1469,14 @@ jobs:
           test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' imcodes-smoke:test)" = "${{ needs.release_version.outputs.app_version }}"
           docker run --rm --entrypoint test imcodes-smoke:test \
             -f /app/dist/server/src/db/migrations/099_controlled_node_worker_refresh_status.sql
+          # The persisted status columns and refresh bridge use the
+          # `controlled_worker_refresh_*` schema name (the migration filename
+          # retains the historical `controlled_node_worker` prefix).  Check
+          # the actual runtime symbol rather than the filename prefix; the
+          # previous `controlled_node_worker_refresh` needle made every
+          # otherwise-valid image fail this smoke gate before publication.
           docker run --rm --entrypoint sh imcodes-smoke:test -lc \
-            "grep -R -q 'controlled_node_worker_refresh' /app/dist/server/src"
+            "grep -R -q 'controlled_worker_refresh_' /app/dist/server/src"
           # Override entrypoint to run an import-only check inside the actual
           # production image. index.ts has an isMain guard so the import
           # resolves all static deps (including all routes/* modules) without
