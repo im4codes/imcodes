@@ -1199,7 +1199,9 @@ jobs:
         if: runner.os == 'Windows'
         run: npx tsx scripts/qualify-windows-self-upgrade.ts
       - name: Record exact source revision in the platform artifact
-        run: node -e "require('node:fs').writeFileSync('dist-node-exe/source-commit-${{ matrix.key }}.txt', process.env.GITHUB_SHA + '\\n')"
+        # A shell-escaped newline becomes a literal `\\n` under PowerShell;
+        # writing the bare SHA keeps the marker byte-identical on every runner.
+        run: node -e "require('node:fs').writeFileSync('dist-node-exe/source-commit-${{ matrix.key }}.txt', process.env.GITHUB_SHA)"
       - name: Upload controlled-node executable
         uses: actions/upload-artifact@v4
         with:
