@@ -1039,6 +1039,30 @@ describe('TaskPairEventChip status colours', () => {
     }
   });
 
+  it('clamps long task-card titles to two lines and reveals the full text when expanded', () => {
+    const longTitle = 'P0：时间线出站队列在正常负载下触发背压，并逐帧发送 secure://remote.example/'
+      + 'a'.repeat(96)
+      + ' 🔒 混合文本';
+    const view = render(<>
+      <TaskPairEventChip eventId="e-long-a" payload={{ taskId: 'long-a', title: longTitle, verb: 'PASS', toStatus: 'passed' }} />
+      <TaskPairEventChip eventId="e-long-b" payload={{ taskId: 'long-b', title: '第二张卡片也应独立折叠', verb: 'REWORK', toStatus: 'rework' }} />
+    </>);
+    const cards = view.container.querySelectorAll('.task-pair-event-card');
+    expect(cards).toHaveLength(2);
+    const firstTitle = cards[0]!.querySelector('.task-pair-chip-task strong')!;
+    expect(firstTitle.textContent).toBe(longTitle);
+    const rule = /\.task-pair-event-card:not\(\.is-expanded\) \.task-pair-chip-task strong\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(rule).toContain('display: -webkit-box;');
+    expect(rule).toContain('-webkit-line-clamp: 2;');
+    expect(rule).toContain('line-clamp: 2;');
+    expect(rule).toContain('white-space: normal;');
+    expect(rule).toContain('overflow-wrap: anywhere;');
+    fireEvent.click(cards[0]!.querySelector('.task-pair-card-toggle')!);
+    expect(cards[0]!.classList.contains('is-expanded')).toBe(true);
+    expect(firstTitle.textContent).toBe(longTitle);
+    expect(cards[1]!.classList.contains('is-expanded')).toBe(false);
+  });
+
   it('adds no status class to an event that changed no status', () => {
     const { container } = render(<TaskPairEventChip eventId="e-none" payload={{ taskId: '-', writer: 'w', verb: 'BOGUS' }} />);
     const chip = container.querySelector('.task-pair-chip')!;
