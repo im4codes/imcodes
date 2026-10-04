@@ -14545,6 +14545,7 @@ button.quick-agent-delegation-preset.active {
  * legacy chip classes above remain the shared status colour tokens used by the
  * status panel and by existing consumers. */
 .task-pair-event-card {
+  position: relative;
   align-self: flex-start;
   text-align: left;
   box-sizing: border-box;
@@ -14563,6 +14564,44 @@ button.quick-agent-delegation-preset.active {
   box-shadow: inset 0 1px 0 rgba(226, 232, 240, 0.08), 0 10px 26px rgba(2, 6, 23, 0.34), 0 0 18px color-mix(in srgb, var(--task-pair-status-text, var(--chrome-accent)) 7%, transparent);
   opacity: 1;
   overflow-wrap: anywhere;
+}
+.task-pair-card-hover-preview {
+  position: fixed;
+  z-index: 10020;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden auto;
+  box-sizing: border-box;
+  border: 1px solid rgba(34, 211, 238, 0.34);
+  border-radius: 10px;
+  background: linear-gradient(180deg, rgba(8, 47, 73, 0.96), rgba(2, 6, 23, 0.97));
+  box-shadow: 0 18px 44px rgba(2, 6, 23, 0.66), 0 0 0 1px rgba(8, 145, 178, 0.12), inset 0 1px 0 rgba(125, 211, 252, 0.12);
+  backdrop-filter: blur(14px) saturate(1.2);
+  -webkit-backdrop-filter: blur(14px) saturate(1.2);
+  color: #cbd5e1;
+  font-family: var(--imcodes-app-font-family);
+  font-size: 11px;
+  line-height: 1.45;
+  pointer-events: auto;
+  animation: task-pair-card-hover-preview-in .13s ease-out;
+}
+@keyframes task-pair-card-hover-preview-in {
+  from { opacity: 0; transform: translateY(3px) scale(.99); }
+  to { opacity: 1; transform: none; }
+}
+.task-pair-card-hover-preview-head { display: flex; min-width: 0; align-items: center; gap: 7px; padding: 9px 12px 7px; border-bottom: 1px solid rgba(34, 211, 238, 0.16); }
+.task-pair-card-hover-preview-head strong { min-width: 0; flex: 1 1 auto; color: #e0f2fe; overflow-wrap: anywhere; }
+.task-pair-card-hover-preview-head .task-pair-chip-status { flex: 0 0 auto; max-width: 42%; overflow-wrap: anywhere; }
+.task-pair-card-hover-preview-head time { flex: 0 0 auto; color: #94a3b8; font-size: 10px; white-space: nowrap; }
+.task-pair-card-hover-preview-body { display: flex; min-width: 0; flex-direction: column; gap: 6px; overflow: auto; padding: 9px 12px 11px; overflow-wrap: anywhere; }
+.task-pair-card-hover-preview-event { color: #c4b5fd; font-size: 10px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; }
+.task-pair-card-hover-role { display: flex; min-width: 0; flex-wrap: wrap; gap: 3px 8px; }
+.task-pair-card-hover-role-name { min-width: 0; color: #e2e8f0; overflow-wrap: anywhere; }
+.task-pair-card-hover-role-meta { min-width: 0; color: #a5f3fc; overflow-wrap: anywhere; }
+.task-pair-card-hover-preview-body p { margin: 0; color: #cbd5e1; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (prefers-reduced-motion: reduce) {
+  .task-pair-card-hover-preview { animation: none; }
 }
 .task-pair-card-head,
 .task-pair-card-body,

@@ -3,7 +3,7 @@
  */
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
+import { act, cleanup, createEvent, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 import { h } from 'preact';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
@@ -27,7 +27,86 @@ import {
 } from '../../../shared/task-pair.js';
 
 describe('TaskPairEventChip', () => {
-  afterEach(() => cleanup());
+  afterEach(() => { vi.useRealTimers(); cleanup(); });
+
+  function stubDesktopHover(matches: boolean) {
+    const previous = Object.getOwnPropertyDescriptor(window, 'matchMedia');
+    const impl = ((query: string) => ({
+      matches: query.includes('hover: hover') && query.includes('pointer: fine') ? matches : false,
+      media: query,
+      addEventListener: () => undefined,
+      removeEventListener: () => undefined,
+      addListener: () => undefined,
+      removeListener: () => undefined,
+      onchange: null,
+      dispatchEvent: () => false,
+    })) as unknown as typeof window.matchMedia;
+    Object.defineProperty(window, 'matchMedia', { configurable: true, value: impl });
+    return () => {
+      if (previous) Object.defineProperty(window, 'matchMedia', previous);
+      else delete (window as Window & { matchMedia?: typeof window.matchMedia }).matchMedia;
+    };
+  }
+
+  it('opens a delayed desktop hover preview with readable details and closes after leaving', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-hover" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} sessions={[
+      { name: 'exec-session', activeModel: 'provider/model-x', effort: 'high' },
+    ]} payload={{
+      taskId: 'hover-task', title: 'Inspect handoff context', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
+      executor: 'exec-session', executorLabel: 'Executor', noticeText: 'Readable human summary for the hover preview.',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.pointerEnter(card, { pointerType: 'mouse' });
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    act(() => vi.advanceTimersByTime(179));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    act(() => vi.advanceTimersByTime(1));
+    const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+    expect(preview.textContent).toContain('Inspect handoff context');
+    expect(preview.textContent).toContain('taskPair.status.passed');
+    expect(preview.textContent).toContain('provider/model-x');
+    expect(preview.textContent).toContain('taskPair.card_thinking:{"value":"high"}');
+    expect(preview.textContent).toContain('Readable human summary');
+    expect(preview.textContent).not.toContain('"taskId"');
+    fireEvent.pointerLeave(card, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(139));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeTruthy();
+    act(() => vi.advanceTimersByTime(1));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    restoreMatchMedia();
+    vi.useRealTimers();
+  });
+
+  it('does not open a hover preview for touch pointers, while click still expands details', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-touch" payload={{
+      taskId: 'touch-task', title: 'Touch task', writer: 'daemon', verb: 'DISPATCH', toStatus: 'queued',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    const touchEnter = createEvent.pointerEnter(card);
+    Object.defineProperty(touchEnter, 'pointerType', { value: 'touch' });
+    fireEvent(card, touchEnter);
+    act(() => vi.advanceTimersByTime(500));
+    expect(document.body.querySelector('.task-pair-card-hover-preview')).toBeNull();
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-body')).toBeTruthy();
+    restoreMatchMedia();
+    vi.useRealTimers();
+  });
+
+  it('keeps the click/keyboard expansion path explicitly accessible', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-focus" payload={{
+      taskId: 'focus-task', title: 'Keyboard task', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+    }} />);
+    const toggle = container.querySelector('.task-pair-card-toggle')!;
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_expand');
+    expect(toggle.getAttribute('title')).toBe('taskPair.card_expand');
+    fireEvent.click(toggle);
+    expect(container.querySelector('.task-pair-card-body')).toBeTruthy();
+  });
 
   it('shows the task, writer, verb, new status and non-zero severity counts', () => {
     const { container } = render(<TaskPairEventChip eventId="e1" payload={{
@@ -1081,6 +1160,9 @@ describe('TaskPairEventChip status colours', () => {
     expect(chipRule).toContain('background: rgba(8, 20, 36, 0.86);');
     expect(chipRule).toContain('border: 1px solid rgba(125, 211, 252, 0.3);');
     expect(css).toContain('.task-pair-event-card .task-pair-chip-session:focus-visible');
+    expect(css).toContain('.task-pair-card-hover-preview {');
+    expect(css).toContain('position: fixed;');
+    expect(css).toContain('overflow-wrap: anywhere;');
     expect(css).toContain('.task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong');
     expect(css).toContain('text-overflow: ellipsis;');
     for (const status of TASK_PAIR_STATUSES) {
