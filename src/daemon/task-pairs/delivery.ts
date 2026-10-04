@@ -51,6 +51,15 @@ const inFlightTaskPairMessages = new Set<string>();
 
 export function setTaskPairDeliveryDepsForTests(deps: TaskPairDeliveryDeps | undefined): void {
   testDeps = deps;
+  // A test transport is replaced between test cases.  Do not let a promise
+  // from the previous case keep the process-wide coalescing gate closed in the
+  // next one (the real transport owns its pending state independently).
+  inFlightTaskPairMessages.clear();
+}
+
+/** Clear only the in-process coalescing gate in a test. */
+export function resetTaskPairDeliveryInFlightForTests(): void {
+  inFlightTaskPairMessages.clear();
 }
 
 export async function sendTaskPairMessage(
@@ -58,9 +67,14 @@ export async function sendTaskPairMessage(
   taskId: string,
   reason: string,
   text: string,
+  dedupeScope?: string,
 ): Promise<TaskPairDeliveryResult> {
   const messageId = `${taskPairMessageIdPrefix(taskId, reason)}${randomUUID()}`;
-  const dedupeKey = `${target}\u0000${taskId}\u0000${reason}`;
+  // Most reasons are once-pending per pair.  A few state-machine notices are
+  // explicitly once per lifecycle scope (for example, one in-audit warning
+  // per round); callers provide that scope without changing the durable
+  // message-id prefix consumed by clients.
+  const dedupeKey = `${target}\u0000${taskId}\u0000${reason}\u0000${dedupeScope ?? ''}`;
   if (inFlightTaskPairMessages.has(dedupeKey)) return 'skipped_pending';
   noteTaskPairFocus(target, taskId);
   // Keep the last actionable pair instruction durable so participant recovery

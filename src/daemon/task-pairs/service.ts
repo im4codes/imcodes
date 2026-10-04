@@ -1579,7 +1579,7 @@ export class TaskPairService {
       if (intent.kind === 'policy_notice') {
         const key = `${intent.taskId}\u0000${intent.to}`;
         if (pair) {
-          await sendTaskPairMessage(intent.to, pair.taskId, 'policy-rejection', intent.text);
+          await sendTaskPairMessage(intent.to, pair.taskId, 'policy-rejection', intent.text, intent.dedupeScope);
         } else if (!this.#policyNoticeKeys.has(key)) {
           this.#policyNoticeKeys.add(key);
           if (this.#policyNoticeKeys.size > 500) this.#policyNoticeKeys.delete(this.#policyNoticeKeys.values().next().value!);

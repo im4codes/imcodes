@@ -1235,7 +1235,7 @@ export type TaskPairIntent =
    *  recorded, not applied -- only Brain DISPATCH/QUEUE reopens one. Tell
    *  them so, rather than leaving the marker silently inert. */
   | { kind: 'closed_pair_notice'; to: string }
-  | { kind: 'policy_notice'; to: string; taskId: string; text: string };
+  | { kind: 'policy_notice'; to: string; taskId: string; text: string; dedupeScope?: string };
 
 export interface TaskPairTransition {
   /** New or updated pair; undefined when the marker only created nothing (recorded). */
@@ -1843,6 +1843,7 @@ export function applyTaskPairMarker(
           effect: TASK_PAIR_IN_AUDIT_GUARDED_EFFECT, unusual: true,
           intents: [{
             kind: 'policy_notice', to: ctx.writer, taskId: marker.taskId,
+            dedupeScope: `round:${existing.round}`,
             text: `Your ${verb} for ${marker.taskId} was ignored: the pair is ${existing.status === 'in_audit' ? 'in audit' : 'awaiting audit'} and a status change would void the auditor's pending verdict. Answer questions with a plain reply (no marker); after new commits send a new READY_FOR_AUDIT with the new head.`,
           }],
         };

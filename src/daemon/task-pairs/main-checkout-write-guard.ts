@@ -29,7 +29,7 @@ import { TASK_PAIR_PARTICIPANT_STATUSES, type TaskPairState } from '../../../sha
 import { getSession, listSessions } from '../../store/session-store.js';
 import { isPairsEngineProject } from './engine.js';
 import { getTaskPairStore } from './store.js';
-import { sendTaskPairMessage } from './delivery.js';
+import { resetTaskPairDeliveryInFlightForTests, sendTaskPairMessage } from './delivery.js';
 import { buildMainCheckoutWriteBrainLine, buildMainCheckoutWriteParticipantNotice } from './messages.js';
 
 /** Environment switch to turn the guard off (any value but `off` keeps it on). */
@@ -130,11 +130,16 @@ export function reportPairMainCheckoutGitWrite(hit: PairMainCheckoutWrite, block
   if (lastNotice.size > MAX_TRACKED_NOTICES) {
     for (const [name, at] of lastNotice) if (at <= now - NOTICE_WINDOW_MS) lastNotice.delete(name);
   }
+  // The guard owns the five-minute window.  Include that window and the
+  // classified command in delivery coalescing too, so a different write (or
+  // the same write after expiry) cannot be hidden behind an earlier pending
+  // transport send, while duplicate calls in one window remain coalesced.
+  const deliveryScope = `${key}\u0000${Math.floor(now / NOTICE_WINDOW_MS)}`;
   const stored = getTaskPairStore().listActivePairs().find((candidate) => candidate.state.taskId === hit.taskId);
   const workspace = stored?.state.workspace?.status === 'active' ? stored.state.workspace.path : undefined;
   // A refused call already tells the participant through its tool result (mainCheckoutWriteRefusal).
-  if (!blocked) void sendTaskPairMessage(hit.session, hit.taskId, 'main-checkout-git-write', buildMainCheckoutWriteParticipantNotice(hit, blocked, workspace));
-  void sendTaskPairMessage(hit.brain, hit.taskId, 'brain-main-checkout-git-write', buildMainCheckoutWriteBrainLine(hit, blocked));
+  if (!blocked) void sendTaskPairMessage(hit.session, hit.taskId, 'main-checkout-git-write', buildMainCheckoutWriteParticipantNotice(hit, blocked, workspace), deliveryScope);
+  void sendTaskPairMessage(hit.brain, hit.taskId, 'brain-main-checkout-git-write', buildMainCheckoutWriteBrainLine(hit, blocked), deliveryScope);
 }
 
 /** Providers whose pre-tool hook refuses the call (see setToolExecutionGuard): the timeline report would only repeat it, wrongly as "already ran". */
@@ -158,4 +163,8 @@ export function inspectToolCallForPairMainCheckoutWrite(sessionId: string, paylo
 
 export function resetPairMainCheckoutWriteNoticesForTests(): void {
   lastNotice.clear();
+  // The guard's test reset also starts a fresh notification window.  Clear the
+  // transport's in-process pending gate so a prior async test send cannot hide
+  // the first notice in the new window.
+  resetTaskPairDeliveryInFlightForTests();
 }
