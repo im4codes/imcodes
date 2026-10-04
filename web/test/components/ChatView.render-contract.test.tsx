@@ -17,6 +17,7 @@ import {
   SUPERVISION_EXECUTION_STATUS_MARKERS,
   parseSupervisionExecutionStateDetailsFromText,
 } from '../../../shared/supervision-config.js';
+import { TASK_PAIR_AUTOMATION_KIND } from '../../../shared/task-pair.js';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (key: string) => key }),
@@ -297,6 +298,54 @@ describe('ChatView render capability contract', () => {
     expect(container.querySelectorAll('.task-pair-event-card')).toHaveLength(1);
     expect(container.textContent).toContain('Queue dispatch');
     expect(container.textContent).not.toContain('dispatched from the queue');
+  });
+
+  it('cards daemon user-message dispatched-from-queue notices and suppresses the raw bubble', () => {
+    const notice = '[IM.codes task tsk_queue_user "Queue user notice"] dispatched from the queue: executor deck_exec, auditor deck_aud.';
+    const userNotice = {
+      ...ev('user.message'),
+      eventId: 'queue-dispatch-user-message',
+      payload: { text: notice, automation: true, automationKind: TASK_PAIR_AUTOMATION_KIND },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([userNotice], true);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: 'assistant-block',
+      taskPairNotification: expect.objectContaining({
+        taskId: 'tsk_queue_user',
+        title: 'Queue user notice',
+        verb: 'DISPATCH',
+        toStatus: 'working',
+        executor: 'deck_exec',
+        auditor: 'deck_aud',
+      }),
+    });
+    const { container } = render(<ChatView events={[userNotice]} loading={false} ws={{} as never} workdir="/repo" sessionId="session-a" />);
+    expect(container.querySelectorAll('.task-pair-event-card')).toHaveLength(1);
+    expect(container.textContent).not.toContain('dispatched from the queue');
+  });
+
+  it('suppresses a duplicate daemon notice when the structured dispatch lifecycle is present', () => {
+    const structured = {
+      ...ev('task_pair.event'),
+      eventId: 'queue-dispatch-structured',
+      ts: 2,
+      payload: { taskId: 'tsk_queue_dupe', title: 'Queue duplicate', verb: 'DISPATCH', toStatus: 'working' },
+    } as unknown as TimelineEvent;
+    const userNotice = {
+      ...ev('user.message'),
+      eventId: 'queue-dispatch-duplicate',
+      ts: 1,
+      payload: {
+        text: '[IM.codes task tsk_queue_dupe "Queue duplicate"] dispatched from the queue: executor deck_exec, auditor deck_aud.',
+        automation: true,
+        automationKind: TASK_PAIR_AUTOMATION_KIND,
+      },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([userNotice, structured], true);
+    expect(items.filter((item) => item.type === 'event')).toHaveLength(1);
+    expect(items.filter((item) => item.type === 'assistant-block')).toHaveLength(0);
+    expect(items[0]).toMatchObject({ type: 'event', event: structured });
   });
 
   it('cards audited PASS summaries and keeps task metadata in the expandable payload', () => {

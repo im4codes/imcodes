@@ -128,7 +128,7 @@ import {
   readAgentDelegationSupervisionTaskProjection,
 } from '@shared/agent-delegation.js';
 import { parseTimelineDisplayText } from '../timeline-display-text.js';
-import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
+import { TASK_PAIR_AUTOMATION_KIND, TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
 import { TaskPairEventChip } from './TaskPairEventChip.js';
 import { parseTaskPairNotification, taskPairNotificationKey } from '@shared/task-pair-notification.js';
@@ -1550,6 +1550,29 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       // session.state hooks can fire between tool calls (e.g. CC notification hook).
       // Defer: render after the tool group closes.
       deferredEvents.push(event);
+    } else if (event.type === 'user.message'
+      && event.payload.automation === true
+      && event.payload.automationKind === TASK_PAIR_AUTOMATION_KIND) {
+      // Daemon task-pair notices are delivered as automation user.message
+      // rows (the dispatch path intentionally suppresses a provider echo).
+      // Treat only that trusted automation kind as a task notification; user
+      // prose or code examples must remain ordinary message events.
+      flushPending();
+      flushTools();
+      const notificationText = typeof event.payload.text === 'string' ? event.payload.text : undefined;
+      const notification = parseTaskPairNotification(notificationText);
+      if (notification && notificationText !== undefined && !structuredTaskLifecycleKeys.has(taskPairNotificationKey(notification.payload) ?? '')) {
+        items.push({
+          key: claimRunKey('assistant-block', event.eventId, [event.eventId], usedRunKeys),
+          type: 'assistant-block',
+          text: notificationText,
+          eventIds: [event.eventId],
+          assistantAutomation: true,
+          taskPairNotification: notification.payload,
+          ts: event.ts,
+          lastTs: event.ts,
+        });
+      }
     } else {
       flushPending();
       if (showToolCalls || event.type === 'user.message') flushTools();
