@@ -357,6 +357,7 @@ describe('SupervisionTaskConsole', () => {
               pair: {
                 status: 'rework', flags: ['verdict_inconsistent'], executor: 'deck_alpha_worker', auditor: 'deck_alpha_auditor',
                 round: 2, blocking: ['P0'], severityCounts: { P0: 1, P1: 0, P2: 3, P3: 0, P4: 0 }, lastVerdict: 'REWORK',
+                startedAt: NOW - 60_000, updatedAt: NOW,
               },
             },
           },
@@ -375,6 +376,7 @@ describe('SupervisionTaskConsole', () => {
     expect(details.textContent).toContain('taskPair.round');
     expect(details.textContent).toContain('taskPair.verb.rework');
     expect(details.textContent).toContain('taskPair.severity');
+    expect(document.querySelector('.supervision-task-console-task-duration')?.textContent).toContain('taskPair.panel_elapsed');
     expect(document.querySelector('.flag-verdict_inconsistent')?.textContent).toContain('taskPair.flag.verdict_inconsistent');
   });
 

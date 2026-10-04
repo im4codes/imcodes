@@ -100,6 +100,7 @@ html { position: fixed; }
 .supervision-task-console-task-title { min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .supervision-task-console-task-title strong { color: #e2e8f0; font-size: 12px; }
 .supervision-task-console-task-title small { overflow: hidden; color: #64748b; font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.supervision-task-console-task-duration { min-width: 0; color: #64748b; font-size: 9px; line-height: 1.2; white-space: nowrap; }
 .supervision-task-console-status { padding: 3px 6px; border: 1px solid var(--status-active-border); border-radius: 999px; color: var(--status-active-text); background: var(--status-active-bg); font-size: 9px; white-space: nowrap; }
 .supervision-task-console-status.status-rework, .supervision-task-console-status.status-blocked { color: #fbbf24; border-color: rgba(245,158,11,.3); background: rgba(245,158,11,.08); }
 .supervision-task-console-status.status-cancelled { color: var(--status-cancelled-text); border-color: var(--status-cancelled-border); }

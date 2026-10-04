@@ -29,6 +29,10 @@ export interface AutoFixTaskStatus {
   branch?: string;
   issueId?: string;
   startedAt: number;
+  /** Optional authoritative terminal timestamps from newer task payloads. */
+  finishedAt?: number;
+  endedAt?: number;
+  durationMs?: number;
   updatedAt: number;
   error?: string;
 }

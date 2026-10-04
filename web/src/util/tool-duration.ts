@@ -36,6 +36,46 @@ export interface ElapsedDurationUnits {
   separator?: string;
 }
 
+/** A lifecycle timestamp/duration payload accepted by task-card renderers. */
+export interface TaskDurationInput {
+  startedAt?: unknown;
+  finishedAt?: unknown;
+  endedAt?: unknown;
+  updatedAt?: unknown;
+  durationMs?: unknown;
+  now?: unknown;
+  terminal?: boolean;
+}
+
+function finiteNonNegative(value: unknown): number | undefined {
+  const number = typeof value === 'number' ? value : Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : undefined;
+}
+
+/**
+ * Resolve a lifecycle duration without ever exposing NaN, negative values, or
+ * a fabricated duration when an old payload has no start time.  Explicit
+ * server-provided duration wins; active rows use `now`, terminal rows use the
+ * first valid end timestamp.
+ */
+export function resolveTaskDurationMs(input: TaskDurationInput): number | undefined {
+  const explicit = finiteNonNegative(input.durationMs);
+  if (explicit !== undefined) return explicit;
+  const started = finiteNonNegative(input.startedAt);
+  if (started === undefined) return undefined;
+  const end = input.terminal
+    ? finiteNonNegative(input.finishedAt) ?? finiteNonNegative(input.endedAt) ?? finiteNonNegative(input.updatedAt)
+    : finiteNonNegative(input.now);
+  if (end === undefined) return undefined;
+  return Math.max(0, end - started);
+}
+
+/** Compact, deterministic task-card formatting; invalid input is omitted. */
+export function formatTaskDuration(input: TaskDurationInput, units: ElapsedDurationUnits): string | undefined {
+  const milliseconds = resolveTaskDurationMs(input);
+  return milliseconds === undefined ? undefined : formatElapsedDuration(milliseconds / 1000, units);
+}
+
 /**
  * Format a whole-second elapsed duration for compact status displays.
  * Leading zero units are omitted. Precision decreases as the duration grows:

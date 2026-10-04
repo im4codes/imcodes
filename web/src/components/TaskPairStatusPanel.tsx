@@ -5,7 +5,7 @@ import { createPortal } from 'preact/compat';
 import { useTranslation } from 'react-i18next';
 import type { TimelineEvent } from '../ws-client.js';
 import { TASK_PAIR_STATUS_PANEL_STORAGE_KEY, TASK_PAIR_TERMINAL_STATUSES, TASK_PAIR_TIMELINE_EVENT, TASK_PAIR_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
-import { formatElapsedDuration } from '../util/tool-duration.js';
+import { formatTaskDuration } from '../util/tool-duration.js';
 import { watchProjectionStore } from '../watch-projection.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
 
@@ -28,7 +28,7 @@ function status(value: unknown): value is TaskPairStatus {
 
 type TaskPairConsoleSnapshotDetail = { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[] };
 
-function finiteTimestamp(value: unknown, fallback: number): number {
+function finiteTimestamp(value: unknown, fallback?: number): number | undefined {
   const numeric = typeof value === 'number' ? value : Number(value);
   return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
 }
@@ -83,7 +83,7 @@ function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Reco
     const pair = (task.pair ?? {}) as Record<string, unknown>; const roles = byTask.get(String(task.taskId)) ?? [];
     const executor = roles.find((role) => role.role === 'implementer'); const auditor = roles.find((role) => role.role === 'auditor');
     const toStatus = pair.status ?? task.status;
-    const startedAt = finiteTimestamp(pair.startedAt ?? pair.createdAt ?? task.updatedAt, Date.now());
+    const startedAt = finiteTimestamp(pair.startedAt ?? pair.createdAt);
     const updatedAt = finiteTimestamp(pair.updatedAt ?? task.updatedAt, startedAt);
     const endedAt = TASK_PAIR_TERMINAL_STATUSES.includes(toStatus as TaskPairStatus)
       ? finiteTimestamp(pair.endedAt ?? task.updatedAt, updatedAt)
@@ -94,7 +94,7 @@ function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Reco
       title: task.title,
       brief: typeof task.brief === 'string' && task.brief.trim() ? task.brief : pair.brief,
       toStatus,
-      startedAt,
+      ...(startedAt !== undefined ? { startedAt } : {}),
       updatedAt,
       ...(endedAt !== undefined ? { endedAt } : {}),
       queuePosition: pair.queuePosition,
@@ -226,7 +226,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       reworkCounts.set(eventPayload.taskId, (reworkCounts.get(eventPayload.taskId) ?? 0) + 1);
     }
   }
-  if (snapshotRows) for (const payload of snapshotRows) if (typeof payload.taskId === 'string') latest.set(payload.taskId, { payload, startedAt: Number(payload.startedAt ?? Date.now()), updatedAt: Number(payload.updatedAt ?? Date.now()) });
+  if (snapshotRows) for (const payload of snapshotRows) if (typeof payload.taskId === 'string') latest.set(payload.taskId, { payload, startedAt: Number(payload.startedAt), updatedAt: Number(payload.updatedAt) });
   for (const event of events) {
     if (snapshotRows) break;
     if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
@@ -312,7 +312,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     {!collapsed && <div class="task-pair-status-rows" data-testid="task-pair-status-rows">
       {(() => { let sequence = 0; return groups.map((group) => {
         const heading = <h4>{group.key === 'awaiting_brain_decision' ? t('taskPair.status.awaiting_brain_decision') : t(`taskPair.panel_group_${group.key}`)} <small>({group.rows.length})</small></h4>;
-        const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const endedAt = terminal ? finiteTimestamp(payload.endedAt ?? payload.updatedAt, row.startedAt) : now; const elapsedSeconds = Math.max(0, Math.floor((endedAt - row.startedAt) / 1000)); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
+        const content = group.rows.map((row, index) => { const payload = row.payload; const sequenceNumber = ++sequence; const queued = group.key === 'queued'; const terminal = TASK_PAIR_TERMINAL_STATUSES.includes(payload.toStatus as TaskPairStatus); const duration = formatTaskDuration({ startedAt: row.startedAt, finishedAt: payload.finishedAt, endedAt: payload.endedAt, updatedAt: row.updatedAt, now, durationMs: payload.durationMs, terminal }, durationUnits); const title = typeof payload.title === 'string' && payload.title.trim() ? payload.title : t('taskPair.panel_untitled'); const taskStatus = String(payload.toStatus); const reworkCount = Math.max(1, reworkCounts.get(String(payload.taskId)) ?? 0); const auditRound = Number(payload.round ?? 0); const deliveryRound = Math.max(1, Number(payload.deliveryRound ?? 1)); return <div class={`task-pair-status-row task-pair-chip--${taskStatus}`} data-status={taskStatus} key={String(payload.taskId)}>
           <span class="task-pair-status-sequence" aria-label={`#${sequenceNumber}`}>{sequenceNumber}</span>
           <div class="task-pair-status-row-head">
             <span class={`task-pair-status-badge task-pair-chip--${taskStatus}`}>
@@ -325,7 +325,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           </div>
           <strong class="task-pair-status-row-title">{queued && <em>#{Number(payload.queuePosition ?? index + 1)} </em>}{title}</strong>
           <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
-          <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
+          {duration !== undefined && <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{Number.isFinite(row.startedAt) && <>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · </>}{queued ? t('taskPair.panel_queued', { duration }) : t('taskPair.panel_elapsed', { duration })}</small>}
           <div class="task-pair-status-row-roles">
             <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, payload.executorThinking, 'executor') ?? unassigned(payload.executorModel, payload.executorThinking)}</span>
             {payload.auditor === 'none'

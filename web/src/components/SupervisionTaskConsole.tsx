@@ -17,6 +17,8 @@ import { isSupervisionTaskLifecycleStatus } from '@shared/supervision-config.js'
 import { AUDIT_SEVERITY_LEVELS } from '@shared/audit-convergence.js';
 import type { WsClient } from '../ws-client.js';
 import { useSupervisionTaskConsole } from '../hooks/useSupervisionTaskConsole.js';
+import { useNowTicker } from '../hooks/useNowTicker.js';
+import { formatTaskDuration } from '../util/tool-duration.js';
 import {
   loadSupervisionTaskConsolePreferences,
   saveSupervisionTaskConsolePreferences,
@@ -33,7 +35,7 @@ import {
   type SupervisionTaskConsoleVisibilityInput,
 } from '../supervision-task-console-visibility.js';
 import { ExpandableTaskObjective } from './ExpandableTaskObjective.js';
-import { TASK_PAIR_OPEN_STATUSES, TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, type TaskPairStatus } from '@shared/task-pair.js';
+import { TASK_PAIR_OPEN_STATUSES, TASK_PAIR_STATUS_AWAITING_BRAIN_DECISION, TASK_PAIR_TERMINAL_STATUSES, type TaskPairStatus } from '@shared/task-pair.js';
 import { TaskPairBrief } from './TaskPairBrief.js';
 
 const DESKTOP_MIN_WIDTH = 720;
@@ -385,6 +387,7 @@ function TaskCard(props: {
   onToggle: () => void;
   onNavigateSession: (sessionName: string) => void;
   language: string;
+  now: number;
 }) {
   const { t } = useTranslation();
   const currentAssignments = supervisionConsoleAssignmentsForTask(props.task, props.assignments);
@@ -400,6 +403,22 @@ function TaskCard(props: {
     blocker: props.task.blocker,
     assignments: currentAssignments,
   });
+  const durationUnits = {
+    day: t('taskPair.panel_duration_day'),
+    hour: t('taskPair.panel_duration_hour'),
+    minute: t('taskPair.panel_duration_minute'),
+    second: t('taskPair.panel_duration_second'),
+    separator: t('taskPair.panel_duration_separator'),
+  };
+  const duration = props.task.pair
+    ? formatTaskDuration({
+      startedAt: props.task.pair.startedAt,
+      endedAt: props.task.pair.endedAt,
+      updatedAt: props.task.pair.updatedAt,
+      now: props.now,
+      terminal: TASK_PAIR_TERMINAL_STATUSES.includes(props.task.pair.status),
+    }, durationUnits)
+    : undefined;
   return (
     <article
       class={`supervision-task-console-task activity-${dominantState}`}
@@ -435,6 +454,7 @@ function TaskCard(props: {
           </span>
           <span aria-hidden="true" class="supervision-task-console-chevron">{props.expanded ? '⌃' : '⌄'}</span>
           </button>
+          {duration !== undefined && <small class="supervision-task-console-task-duration">{t('taskPair.panel_elapsed', { duration })}</small>}
         </div>
         <div class="supervision-task-console-role-tracks">
           {implementer && <SessionButton assignment={implementer} taskStatus={props.task.status} taskTab={taskTab} lane="implementer" onNavigateSession={props.onNavigateSession} />}
@@ -528,6 +548,8 @@ export function SupervisionTaskConsoleView(props: {
   const activeTaskCount = activeTasks.filter((task) => !task.unknownStatus).length;
   const pendingTaskCount = pendingTasks.filter((task) => !task.unknownStatus).length;
   const historyTaskCount = historyTasks.filter((task) => !task.unknownStatus).length;
+  const liveNow = useNowTicker(activeTasks.length > 0 || pendingTasks.length > 0);
+  const now = props.now ?? liveNow;
 
   useEffect(() => { if (props.mobile) closeRef.current?.focus(); }, [props.mobile]);
 
@@ -630,7 +652,7 @@ export function SupervisionTaskConsoleView(props: {
             key={task.taskId} task={task} assignments={assignmentsByTask.get(task.taskId) ?? []}
             events={props.state.eventsByTask[task.taskId] ?? []} expanded={expanded.has(task.taskId)}
             onToggle={() => setExpanded((previous) => { const next = new Set(previous); if (next.has(task.taskId)) next.delete(task.taskId); else next.add(task.taskId); return next; })}
-            onNavigateSession={props.onNavigateSession} language={language}
+            onNavigateSession={props.onNavigateSession} language={language} now={now}
           />)}
           {!visibleTasks.length && <div class="supervision-task-console-state">{t(activeTab === 'active'
             ? 'supervision_task_console.no_active'
