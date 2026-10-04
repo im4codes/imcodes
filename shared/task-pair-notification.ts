@@ -221,10 +221,7 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ...((body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking) ? { auditorThinking: body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking } : {}),
     ...(body.match(WHY_RE)?.[1] ? { noticeReason: body.match(WHY_RE)![1].trim() } : {}),
     ...(effectiveStatus === 'cancelled' ? {
-<<<<<<< HEAD
-=======
       cancelActor: 'daemon', cancelSource: 'daemon',
->>>>>>> 0803ccbc1 (feat(task-pairs): preserve cancellation provenance)
       ...(cancellationReason ? { cancelReason: cancellationReason.slice(0, 500) } : {}),
     } : {}),
     noticeText: body,

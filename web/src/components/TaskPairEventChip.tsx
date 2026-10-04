@@ -44,17 +44,10 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const isCancelledEvent = event.toStatus === 'cancelled';
   const cancelActor = typeof event.cancelActor === 'string' && event.cancelActor.trim()
     ? event.cancelActor.trim()
-<<<<<<< HEAD
     : event.cancelProvenanceTrusted ? writer : '';
   const cancelSource = typeof event.cancelSource === 'string' && event.cancelSource.trim()
     ? event.cancelSource.trim()
     : event.cancelProvenanceTrusted && typeof event.source === 'string' ? event.source : '';
-=======
-    : writer;
-  const cancelSource = typeof event.cancelSource === 'string' && event.cancelSource.trim()
-    ? event.cancelSource.trim()
-    : (typeof event.source === 'string' ? event.source : '');
->>>>>>> 0803ccbc1 (feat(task-pairs): preserve cancellation provenance)
   const cancelReason = typeof event.cancelReason === 'string' && event.cancelReason.trim()
     ? event.cancelReason.trim()
     : t('taskPair.card_cancel_reason_unknown');
