@@ -157,6 +157,21 @@ describe('ChatView render capability contract', () => {
     expect(container.textContent).not.toContain('[IM.codes task tsk_notice');
   });
 
+  it('透传 assistant notice 中的模型与 thinking 级别到任务卡 payload', () => {
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'notice-model-thinking',
+      payload: { text: '[IM.codes task tsk_model_notice "Model notice"]\nDISPATCH executor=deck_exec, auditor=deck_aud, executormodel=provider/executor, auditormodel=provider/auditor, executorthinking=high, auditorthinking=medium.' },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items[0].taskPairNotification).toMatchObject({
+      executorModel: 'provider/executor',
+      auditorModel: 'provider/auditor',
+      executorThinking: 'high',
+      auditorThinking: 'medium',
+    });
+  });
+
   it('keeps one structured card when the same task notice is also persisted as assistant text', () => {
     const taskId = 'tsk_duplicate';
     const assistant = {

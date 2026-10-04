@@ -181,7 +181,7 @@ interface Props {
   sessionState?: string;
   sessionId?: string | null;
   /** Session labels used by task-pair status rows when the event omits one. */
-  sessions?: readonly { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null }[];
+  sessions?: readonly { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   /** Receives a function that forces the chat list to scroll to the bottom. */
   onScrollBottomFn?: (fn: () => void) => void;
   /** When true, render as a non-interactive preview (no scroll button, no status bar) */
@@ -268,6 +268,8 @@ interface AssistantBlockProps {
    *  projection, when the runtime attached one. */
   delegationMetadata?: Record<string, unknown>;
   taskPairNotification?: Record<string, unknown>;
+  /** Session directory used to fill model names omitted by older task payloads. */
+  sessions?: readonly { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   /** Daemon-announced per-assignment lifecycle status for the dispatch card. */
   liveAssignmentStatuses?: ReadonlyMap<string, LiveAssignmentStatus>;
   /** Stable identifier for this merged block. Wired through to a
@@ -4754,6 +4756,7 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
                   executionState={item.executionState}
                   delegationMetadata={item.delegationMetadata}
                   taskPairNotification={item.taskPairNotification}
+                  sessions={sessions}
                   liveAssignmentStatuses={item.delegationMetadata ? liveAssignmentStatuses : undefined}
                   ts={item.lastTs ?? item.ts ?? 0}
                   onPathClick={pathClickHandler}
@@ -4773,16 +4776,17 @@ function ChatViewImpl({ events: eventsProp, loading, refreshing = false, history
             }
             const linkedEvents = item.linkedEvents ?? [];
             if (linkedEvents.length === 0) {
-              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
+              return <ChatEvent key={item.key} event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />;
             }
             return (
               <div key={item.key} class="chat-linked-event-group">
-                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
+                <ChatEvent event={item.event!} sessionName={sessionId ?? undefined} sessions={sessions} onPathClick={pathClickHandler} onUrlClick={urlClickHandler} onFileChangeOpen={fileChangeOpenHandler} onDownload={downloadHandler} onHtmlPreview={htmlPreviewHandler} onImagePreview={imagePreviewHandler} onOpenLocalWebPreview={onOpenLocalWebPreview} serverId={serverId} onResendFailed={onResendFailed} />
                 {linkedEvents.map((linkedEvent) => (
                   <ChatEvent
                     key={linkedEvent.eventId}
                     event={linkedEvent}
                     sessionName={sessionId ?? undefined}
+                    sessions={sessions}
                     onPathClick={pathClickHandler}
                     onUrlClick={urlClickHandler}
                     onFileChangeOpen={fileChangeOpenHandler}
@@ -5557,6 +5561,7 @@ const AssistantBlock = memo(function AssistantBlock({
   eventId,
   delegationMetadata,
   taskPairNotification,
+  sessions,
   liveAssignmentStatuses,
   onPathClick,
   onUrlClick,
@@ -5573,7 +5578,7 @@ const AssistantBlock = memo(function AssistantBlock({
       : null;
   const statusOnly = text.length === 0 && status !== null;
   if (taskPairNotification) {
-    return <TaskPairEventChip eventId={eventId ?? 'task-pair-notice'} payload={taskPairNotification} timestamp={ts} />;
+    return <TaskPairEventChip eventId={eventId ?? 'task-pair-notice'} payload={taskPairNotification} timestamp={ts} sessions={sessions} />;
   }
   return (
     <div
@@ -5828,6 +5833,7 @@ function PeerAuditRoundChip({
 const ChatEvent = memo(function ChatEvent({
   event,
   sessionName,
+  sessions,
   onPathClick,
   onUrlClick,
   onFileChangeOpen,
@@ -5841,6 +5847,7 @@ const ChatEvent = memo(function ChatEvent({
 }: {
   event: TimelineEvent;
   sessionName?: string;
+  sessions?: readonly { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null }[];
   onPathClick?: (p: string) => void;
   onUrlClick?: (url: string) => void;
   onFileChangeOpen?: (path: string, preferDiff?: boolean) => void;
@@ -6037,7 +6044,7 @@ const ChatEvent = memo(function ChatEvent({
       return null;
 
     case TASK_PAIR_TIMELINE_EVENT:
-      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} timestamp={event.ts} />;
+      return <TaskPairEventChip eventId={event.eventId} payload={event.payload} timestamp={event.ts} sessions={sessions} />;
 
     case AGENT_DELEGATION_REPLY_TIMELINE_EVENT: {
       const source = String(event.payload.sourceLabel ?? event.payload.sourceSessionName ?? '—');

@@ -87,6 +87,37 @@ describe('TaskPairEventChip', () => {
     window.removeEventListener('deck:navigate', listener);
   });
 
+  it('shows executor and auditor models in the expanded card, with session fallback', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-models" sessions={[
+      { name: 'deck_sub_exec', activeModel: 'provider/active-executor', effort: 'high' },
+      { name: 'deck_sub_aud', requestedModel: 'provider/requested-auditor', effort: 'medium' },
+    ]} payload={{
+      taskId: 'model-task', title: 'Model task', writer: 'daemon', verb: 'WORKING', toStatus: 'working',
+      executor: 'deck_sub_exec', executorLabel: 'Executor', auditor: 'deck_sub_aud', auditorLabel: 'Auditor', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    expect(card.textContent).not.toContain('provider/active-executor');
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/active-executor"}');
+    expect(card.textContent).toContain('taskPair.card_model:{"value":"provider/requested-auditor"}');
+    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"high"}');
+    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"medium"}');
+  });
+
+  it('prefers payload models and explicitly marks missing models', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-model-payload" payload={{
+      taskId: 'model-payload', title: 'Payload model', writer: 'daemon', verb: 'PASS', toStatus: 'passed',
+      executor: 'deck_exec', executorLabel: 'Executor', executorModel: 'provider/pinned', executorThinking: 'low', auditor: 'deck_aud', auditorLabel: 'Auditor', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.textContent).toContain('provider/pinned');
+    expect(card.textContent).toContain('taskPair.card_model:{"value":"taskPair.card_model_unknown"}');
+    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"low"}');
+    expect(card.textContent).toContain('taskPair.card_thinking:{"value":"taskPair.card_thinking_unknown"}');
+    expect(card.textContent).not.toContain('provider/active');
+  });
+
   it('marks a held verdict and an unusual event, and names the daemon', () => {
     const { container } = render(<TaskPairEventChip eventId="e2" payload={{
       taskId: 'T42', writer: 'daemon', verb: 'PASS', verdictJudgement: 'inconsistent', unusual: true,

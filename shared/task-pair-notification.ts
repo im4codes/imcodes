@@ -20,6 +20,10 @@ const STATUS_RE = /\bstatus\s*(?::|=)\s*([a-z_]+)|\bstatus\s+([a-z_]+)/iu;
 const ROUND_RE = /\bround\s*(?::|=)\s*(\d+)|\bround\s+(\d+)/iu;
 const EXECUTOR_RE = /\bexecutor\s*(?::|=)\s*([^,\s.]+)|\bexecutor\s+([^,\s.]+)/iu;
 const AUDITOR_RE = /\bauditor\s*(?::|=)\s*([^,\s.]+)|\bauditor\s+([^,\s.]+)/iu;
+const EXECUTOR_MODEL_RE = /\b(?:executor(?:model|_model)|executor\s+model)\s*(?::|=)?\s*([^,\s.]+)/iu;
+const AUDITOR_MODEL_RE = /\b(?:auditor(?:model|_model)|auditor\s+model)\s*(?::|=)?\s*([^,\s.]+)/iu;
+const EXECUTOR_THINKING_RE = /\b(?:executor(?:thinking|_thinking|effort)|executor\s+(?:thinking|effort))\s*(?::|=)?\s*([A-Za-z0-9_-]{1,40})/iu;
+const AUDITOR_THINKING_RE = /\b(?:auditor(?:thinking|_thinking|effort)|auditor\s+(?:thinking|effort))\s*(?::|=)?\s*([A-Za-z0-9_-]{1,40})/iu;
 const WHY_RE = /^Why:\s*(.+)$/imu;
 const QUEUE_DISPATCH_RE = /\bdispatched\s+from\s+the\s+queue\b/iu;
 const AUDIT_VERB_RE = /^\s*Audited\s+pair\s+(done|passed|pass|rework|ready(?:_for_audit)?|blocked|needs(?:_input|\s+your\s+decision)|cancel(?:led|ed)?)/iu;
@@ -204,6 +208,10 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ...((body.match(ROUND_RE)?.[1] ?? body.match(ROUND_RE)?.[2]) ? { round: Number(body.match(ROUND_RE)![1] ?? body.match(ROUND_RE)![2]) } : {}),
     ...((body.match(EXECUTOR_RE)?.[1] ?? body.match(EXECUTOR_RE)?.[2]) && (body.match(EXECUTOR_RE)![1] ?? body.match(EXECUTOR_RE)![2]) !== '-' ? { executor: body.match(EXECUTOR_RE)![1] ?? body.match(EXECUTOR_RE)![2] } : {}),
     ...((body.match(AUDITOR_RE)?.[1] ?? body.match(AUDITOR_RE)?.[2]) && (body.match(AUDITOR_RE)![1] ?? body.match(AUDITOR_RE)![2]) !== '-' ? { auditor: body.match(AUDITOR_RE)![1] ?? body.match(AUDITOR_RE)![2] } : {}),
+    ...((body.match(EXECUTOR_MODEL_RE)?.[1] ?? marker?.attrs.executormodel) ? { executorModel: body.match(EXECUTOR_MODEL_RE)?.[1] ?? marker?.attrs.executormodel } : {}),
+    ...((body.match(AUDITOR_MODEL_RE)?.[1] ?? marker?.attrs.auditormodel) ? { auditorModel: body.match(AUDITOR_MODEL_RE)?.[1] ?? marker?.attrs.auditormodel } : {}),
+    ...(body.match(EXECUTOR_THINKING_RE)?.[1] ? { executorThinking: body.match(EXECUTOR_THINKING_RE)![1] } : {}),
+    ...(body.match(AUDITOR_THINKING_RE)?.[1] ? { auditorThinking: body.match(AUDITOR_THINKING_RE)![1] } : {}),
     ...(body.match(WHY_RE)?.[1] ? { noticeReason: body.match(WHY_RE)![1].trim() } : {}),
     noticeText: body,
     rawText: text,

@@ -2439,11 +2439,13 @@ export function emitTaskPairTimelineEvent(
       if (record?.label) payload.executorLabel = record.label;
       const model = record?.activeModel?.trim() || record?.requestedModel?.trim();
       if (model) payload.executorModel = model;
+      if (record?.effort) payload.executorThinking = record.effort;
       if (record?.state) payload.executorState = record.state;
     } else {
       if (record?.label) payload.auditorLabel = record.label;
       const model = record?.activeModel?.trim() || record?.requestedModel?.trim();
       if (model) payload.auditorModel = model;
+      if (record?.effort) payload.auditorThinking = record.effort;
       if (record?.state) payload.auditorState = record.state;
     }
   }

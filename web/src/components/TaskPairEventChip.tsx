@@ -10,6 +10,8 @@ import {
   type TaskPairStatus,
 } from '@shared/task-pair.js';
 
+type SessionModelEntry = { name: string; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
+
 function isStatus(value: unknown): value is TaskPairStatus {
   return typeof value === 'string' && (TASK_PAIR_STATUSES as readonly string[]).includes(value);
 }
@@ -33,7 +35,7 @@ function workspaceText(t: (key: string, options?: Record<string, unknown>) => st
 }
 
 /** Compact chat chip for one task-pair marker event (it replaces the hidden marker line). */
-export function TaskPairEventChip({ eventId, payload, timestamp }: { eventId: string; payload: Record<string, unknown>; timestamp?: number }) {
+export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { eventId: string; payload: Record<string, unknown>; timestamp?: number; sessions?: readonly SessionModelEntry[] }) {
   const { t, i18n } = useTranslation();
   const [expanded, setExpanded] = useState(false);
   const event = payload as Partial<TaskPairEventPayload>;
@@ -71,9 +73,23 @@ export function TaskPairEventChip({ eventId, payload, timestamp }: { eventId: st
       window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }));
     }}>{text}</button>;
   };
-  const roleLabel = (id: unknown, label: unknown, role: 'executor' | 'auditor') => {
+  const resolveModel = (id: unknown, payloadModel: unknown): string | undefined => {
+    if (typeof payloadModel === 'string' && payloadModel.trim()) return payloadModel.trim();
+    if (typeof id !== 'string' || !id) return undefined;
+    const session = sessions?.find((entry) => entry.name === id);
+    return session?.activeModel?.trim() || session?.requestedModel?.trim() || undefined;
+  };
+  const resolveThinking = (id: unknown, payloadThinking: unknown): string | undefined => {
+    if (typeof payloadThinking === 'string' && payloadThinking.trim()) return payloadThinking.trim();
+    if (typeof id !== 'string' || !id) return undefined;
+    const session = sessions?.find((entry) => entry.name === id);
+    return session?.effort?.trim() || undefined;
+  };
+  const roleLabel = (id: unknown, label: unknown, modelValue: unknown, thinkingValue: unknown, role: 'executor' | 'auditor') => {
     const session = sessionLabel(id, label);
-    return <span class="task-pair-card-role"><span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>{session ?? <span class="task-pair-card-unassigned">{t('taskPair.card_unassigned')}</span>}</span>;
+    const model = resolveModel(id, modelValue);
+    const thinking = resolveThinking(id, thinkingValue);
+    return <span class="task-pair-card-role"><span class="task-pair-card-role-label">{t(`taskPair.card_${role}`)}</span>{session ?? <span class="task-pair-card-unassigned">{t('taskPair.card_unassigned')}</span>}{session && <span class="task-pair-card-role-model">{t('taskPair.card_model', { value: model ?? t('taskPair.card_model_unknown') })}</span>}{session && <span class="task-pair-card-role-thinking">{t('taskPair.card_thinking', { value: thinking ?? t('taskPair.card_thinking_unknown') })}</span>}</span>;
   };
   return (
     <section
@@ -110,8 +126,8 @@ export function TaskPairEventChip({ eventId, payload, timestamp }: { eventId: st
           </span>
           {noticeText && <pre class="task-pair-card-notice">{noticeText}</pre>}
           <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
-          {roleLabel(event.executor, event.executorLabel, 'executor')}
-          {roleLabel(event.auditor, event.auditorLabel, 'auditor')}
+          {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
+          {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}
         </div>
         {(counts || verdict || held || event.unusual) && <footer class="task-pair-card-flags">
           {counts && <span class="task-pair-chip-counts">{counts}</span>}

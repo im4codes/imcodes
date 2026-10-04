@@ -2214,10 +2214,14 @@ export interface TaskPairEventPayload {
   executor?: string;
   executorLabel?: string;
   executorModel?: string;
+  /** Current provider thinking/effort level for the executor session. */
+  executorThinking?: string;
   executorState?: string;
   auditor?: string;
   auditorLabel?: string;
   auditorModel?: string;
+  /** Current provider thinking/effort level for the auditor session. */
+  auditorThinking?: string;
   auditorState?: string;
   queuePosition?: number;
   urgent?: boolean;
