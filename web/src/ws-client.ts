@@ -21,6 +21,7 @@ import type { MemoryShortRefHealth } from '@shared/memory-short-ref-health.js';
 import { P2P_CAPABILITY_FRESHNESS_TTL_MS } from '@shared/p2p-workflow-constants.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
 import { DAEMON_COMMAND_TYPES } from '@shared/daemon-command-types.js';
+import type { ControlledNodeWorkerRefreshStatusMessage } from '@shared/controlled-node-worker-refresh.js';
 import { PEER_AUDIT_MESSAGES } from '@shared/peer-audit.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
 import { FS_GENERIC_ERROR_CODES } from '@shared/fs-error-codes.js';
@@ -166,6 +167,7 @@ export type SessionEventReason =
 export type ServerMessage =
   | ResourceChangedMessage
   | DirectFileTransferServerMessage
+  | ControlledNodeWorkerRefreshStatusMessage
   | { type: 'terminal.diff'; diff: TerminalDiff }
   | { type: 'terminal.history'; sessionName: string; content: string }
   | { type: typeof TERMINAL_CONTROL.STREAM_RESET; session: string; reason: string }

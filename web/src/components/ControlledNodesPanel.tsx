@@ -206,9 +206,10 @@ export function ControlledNodesPanel({
       if (!detail || typeof detail.serverId !== 'string' || typeof detail.attemptId !== 'string'
         || typeof detail.phase !== 'string' || typeof detail.recordedAt !== 'number') return;
       if (!['started', 'deferred', 'succeeded', 'failed'].includes(detail.phase)) return;
+      const serverId = detail.serverId;
       setWorkerRefreshByServerId((previous) => ({
         ...previous,
-        [detail.serverId]: {
+        [serverId]: {
           attemptId: detail.attemptId,
           phase: detail.phase as NonNullable<MachineListItem['workerRefresh']>['phase'],
           ...(typeof detail.installedVersion === 'string' ? { installedVersion: detail.installedVersion } : {}),
