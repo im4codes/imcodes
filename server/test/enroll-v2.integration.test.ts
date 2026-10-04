@@ -2690,8 +2690,12 @@ describe('GET /api/enroll/v2/node-artifact (controlled-node self-upgrade)', () =
     await db.execute('UPDATE servers SET revoked_at = NULL WHERE id = $1', [serverId]);
     await writeMacosRemoteDesktopRelease('arm64', '2026.7.1234-dev.6');
     const mixedVersion = await app.request(requestPath('arm64'), { headers });
-    expect(mixedVersion.status).toBe(503);
-    expect(await mixedVersion.json()).toEqual({ error: 'macos_release_version_mismatch' });
+    expect(mixedVersion.status).toBe(200);
+    expect(mixedVersion.headers.get(CONTROLLED_NODE_ARTIFACT_HEADERS.VERSION))
+      .toBe('2026.7.1234-dev.6');
+    // Consume the body so the pinned component handles are released in the
+    // same way a real stale daemon download releases them.
+    expect((await mixedVersion.arrayBuffer()).byteLength).toBeGreaterThan(0);
   });
 
   it('fails closed for missing, extra, duplicate-name, or hash-mismatched macOS component sets', async () => {

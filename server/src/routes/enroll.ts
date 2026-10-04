@@ -1565,13 +1565,11 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
     if (requestedProtocol !== String(REMOTE_DESKTOP_PROTOCOL_VERSION)) {
       return c.json({ error: 'remote_desktop_protocol_unsupported' }, 409);
     }
-    // Verify the release carrier before pinning any component handles. Apart
-    // from preserving the main-release/version binding, this ordering avoids
-    // leaking a complete-set handle if catalog verification ever throws.
-    const nodeRelease = await artifactCatalog.ensureVerified(dir, 'mac', 'universal');
-    if (!nodeRelease.ok) {
-      return c.json({ error: 'macos_release_version_mismatch' }, 503);
-    }
+    // The macOS worker is an independently published sidecar. Do not require
+    // the controlled-node executable in this directory to carry the same
+    // version: a stale daemon must still converge on a newer signed worker
+    // without taking a daemon upgrade first. The component-set manifest is
+    // validated and pinned by openMacosRemoteDesktopComponentSet below.
     const openedSet = await openMacosRemoteDesktopComponentSet(
       dir,
       requestedMacosComponentArch!,
@@ -1582,10 +1580,6 @@ enrollRoutes.get('/v2/node-artifact', async (c) => {
         os,
         arch: requestedMacosComponentArch,
       }, 503);
-    }
-    if (nodeRelease.descriptor.version !== openedSet.manifest.workerVersion) {
-      await openedSet.close();
-      return c.json({ error: 'macos_release_version_mismatch' }, 503);
     }
     c.header('Content-Length', String(openedSet.sizeBytes));
     c.header('Content-Type', 'application/octet-stream');

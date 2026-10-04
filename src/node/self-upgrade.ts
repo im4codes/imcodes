@@ -846,7 +846,7 @@ export async function downloadControlledNodeMacosRemoteDesktopComponentSet(input
   fetchImpl: typeof fetch;
   expectedVersion?: string;
   onProgress?: (phase: ControlledNodeArtifactDownloadPhase) => Promise<void>;
-}): Promise<{ componentDirectory: string; manifestPath: string } | undefined> {
+}): Promise<{ componentDirectory: string; manifestPath: string; artifactSha256: string } | undefined> {
   if (input.target.os !== CONTROLLED_NODE_OS_MAC) return undefined;
   const arch = input.target.arch;
   if (arch !== 'arm64' && arch !== 'x64') return undefined;
@@ -941,7 +941,7 @@ export async function downloadControlledNodeMacosRemoteDesktopComponentSet(input
     }
     const manifestPath = join(componentDirectory, REMOTE_DESKTOP_MACOS_MANIFEST_FILENAME);
     await writeFile(manifestPath, manifestBytes, { mode: 0o644 });
-    return { componentDirectory, manifestPath };
+    return { componentDirectory, manifestPath, artifactSha256: download.sha256 };
   } finally {
     await handle.close().catch(() => {});
     // The archive and the downloader's sidecar are not part of the set the

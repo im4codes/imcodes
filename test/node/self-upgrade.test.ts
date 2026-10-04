@@ -214,7 +214,9 @@ describe('controlled-node self-upgrade', () => {
       root,
       downloadLinuxWorker: downloaded('2026.10.5371-dev.5816', 'new-worker') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
     });
-    expect(newer).toEqual({ updated: true, targetVersion: '2026.10.5371-dev.5816' });
+    expect(newer).toMatchObject({ updated: true, targetVersion: '2026.10.5371-dev.5816' });
+    expect(newer.installedVersion).toBe('2026.10.5371-dev.5816');
+    expect(newer.artifactSha256).toMatch(/^[a-f0-9]{64}$/);
     expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
 
     const current = await refreshControlledNodeRemoteDesktopWorker({
@@ -224,7 +226,7 @@ describe('controlled-node self-upgrade', () => {
       root,
       downloadLinuxWorker: downloaded('2026.10.5371-dev.5816', 'same-worker') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
     });
-    expect(current).toEqual({ updated: false, targetVersion: '2026.10.5371-dev.5816', reason: 'worker_current' });
+    expect(current).toMatchObject({ updated: false, targetVersion: '2026.10.5371-dev.5816', reason: 'worker_current' });
     expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
 
     const older = await refreshControlledNodeRemoteDesktopWorker({
@@ -234,7 +236,7 @@ describe('controlled-node self-upgrade', () => {
       root,
       downloadLinuxWorker: downloaded('2026.9.5113-dev.5644', 'old-target') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
     });
-    expect(older).toEqual({ updated: false, targetVersion: '2026.9.5113-dev.5644', reason: 'worker_downgrade_rejected' });
+    expect(older).toMatchObject({ updated: false, targetVersion: '2026.9.5113-dev.5644', reason: 'worker_downgrade_rejected' });
     expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
 
     const unknown = await refreshControlledNodeRemoteDesktopWorker({
@@ -244,7 +246,7 @@ describe('controlled-node self-upgrade', () => {
       root,
       downloadLinuxWorker: downloaded('opaque-worker-build', 'unknown-target') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
     });
-    expect(unknown).toEqual({ updated: false, targetVersion: 'opaque-worker-build', reason: 'worker_version_unparseable' });
+    expect(unknown).toMatchObject({ updated: false, targetVersion: 'opaque-worker-build', reason: 'worker_version_unparseable' });
     expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
 
     const fenced = await refreshControlledNodeRemoteDesktopWorker({
@@ -255,7 +257,7 @@ describe('controlled-node self-upgrade', () => {
       canCommit: () => false,
       downloadLinuxWorker: downloaded('2026.11.1-dev.1', 'fenced-worker') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
     });
-    expect(fenced).toEqual({ updated: false, targetVersion: '2026.11.1-dev.1', reason: 'worker_busy' });
+    expect(fenced).toMatchObject({ updated: false, targetVersion: '2026.11.1-dev.1', reason: 'worker_busy' });
     expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
   });
 
@@ -310,7 +312,7 @@ describe('controlled-node self-upgrade', () => {
     await renameReady;
     expect(commitFence.acquire()).toBeNull();
     releaseRename();
-    expect(await refreshPromise).toEqual({ updated: true, targetVersion: '2026.10.5371-dev.5816' });
+    expect(await refreshPromise).toMatchObject({ updated: true, targetVersion: '2026.10.5371-dev.5816' });
     expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
   });
 

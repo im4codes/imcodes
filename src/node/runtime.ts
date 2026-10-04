@@ -1,6 +1,6 @@
 import WebSocket from 'ws';
 import { randomUUID } from 'node:crypto';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.js';
@@ -9,6 +9,7 @@ import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import { CONTROLLED_NODE_WORKER_REFRESH_PHASE } from '../../shared/controlled-node-worker-refresh.js';
 import { DAEMON_UPGRADE_BLOCK_REASON, DAEMON_UPGRADE_TARGET_LATEST } from '../../shared/daemon-upgrade.js';
+import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import {
   AuthenticatedWebSocketClient,
@@ -1005,6 +1006,23 @@ export function createControlledNodeRuntime(
     if (!force && now < macosRemoteDesktopInstallNextAttemptAt) return false;
     macosRemoteDesktopInstallNextAttemptAt = now + MACOS_REMOTE_DESKTOP_INSTALL_RETRY_MS;
     macosRemoteDesktopInstallInFlight = true;
+    const refreshAttemptId = randomUUID();
+    const emitMacRefreshStatus = (
+      phase: typeof CONTROLLED_NODE_WORKER_REFRESH_PHASE[keyof typeof CONTROLLED_NODE_WORKER_REFRESH_PHASE],
+      fields: Record<string, string> = {},
+    ): void => {
+      client.send({
+        type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+        attemptId: refreshAttemptId,
+        phase,
+        recordedAt: Date.now(),
+        ...fields,
+      });
+    };
+    emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.STARTED);
+    let installedTargetVersion: string | undefined;
+    let installFailureReason: string | undefined;
+    let installedArtifactSha256: string | undefined;
     const install = options.installMacosRemoteDesktopComponents ?? (async () => {
       const staging = await mkdtemp(join(tmpdir(), 'imcodes-macos-rd-install-'));
       try {
@@ -1013,30 +1031,56 @@ export function createControlledNodeRuntime(
           target: { os: CONTROLLED_NODE_OS_MAC, arch: componentArch },
           dir: staging,
           fetchImpl: fetch,
-          expectedVersion: DAEMON_VERSION,
         });
         if (!downloaded) {
           // The server has no signed macOS component set for THIS daemon
-          // version (403/404/503). On a matched release this never happens; on
-          // a node whose version has drifted from the server image's bundled
-          // set it happens every retry. It used to return silently, so a Mac
-          // that could never install its worker -- and therefore never raised
-          // the permission prompt -- left no trace at all. Say so, throttled by
-          // the install retry window above.
+          // release (403/404/503). A worker release is allowed to advance
+          // independently of the daemon carrier, so an older node can still
+          // converge on the current signed component set. It used to pin this
+          // request to DAEMON_VERSION, which made every stale Mac retry a
+          // release that the server no longer published.
           logger.warn(
-            { expectedVersion: DAEMON_VERSION, arch: componentArch },
-            'macOS remote-desktop component set unavailable for this daemon version; '
-            + 'the server has no matching signed set, so the worker cannot install '
+            { daemonVersion: DAEMON_VERSION, arch: componentArch },
+            'macOS remote-desktop component set unavailable from the hosted release '
             + '(auto-install will retry)',
           );
           return false;
         }
-        await promoteMacosRemoteDesktopArtifact({
+        const manifest = await readFile(downloaded.manifestPath, 'utf8');
+        const targetVersion = (() => {
+          try {
+            const parsed = JSON.parse(manifest) as { workerVersion?: unknown };
+            return typeof parsed.workerVersion === 'string' ? parsed.workerVersion : undefined;
+          } catch {
+            return undefined;
+          }
+        })();
+        if (!targetVersion) {
+          installFailureReason = 'worker_version_missing';
+          logger.warn({ arch: componentArch }, 'macOS remote-desktop component set has no worker version');
+          return false;
+        }
+        installedTargetVersion = targetVersion;
+        const current = await selectMacosRemoteDesktopArtifact(storeRoot, 'current', {
+          runtime: { platform, arch: componentArch },
+        }).catch(() => null);
+        if (current?.manifest.workerVersion) {
+          const order = compareImcodesVersions(current.manifest.workerVersion, targetVersion);
+          if (order === null) {
+            installFailureReason = 'worker_version_unparseable';
+            return false;
+          }
+          if (order >= 0) {
+            installFailureReason = order === 0 ? 'worker_current' : 'worker_downgrade_rejected';
+            return false;
+          }
+        }
+        const promoted = await promoteMacosRemoteDesktopArtifact({
           artifactDirectory: downloaded.componentDirectory,
           manifestPath: downloaded.manifestPath,
           storeRoot,
-          expectedWorkerVersion: DAEMON_VERSION,
         });
+        installedArtifactSha256 = promoted.setSha256 || downloaded.artifactSha256;
         return true;
       } finally {
         await rm(staging, { recursive: true, force: true }).catch(() => {});
@@ -1069,10 +1113,21 @@ export function createControlledNodeRuntime(
         // Re-read rather than assume: starting does not imply readiness, and
         // screen recording may not be granted yet.
         republishCapabilitiesIfChanged();
+        emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, {
+          targetVersion: installedTargetVersion ?? DAEMON_VERSION,
+          ...(installedArtifactSha256 ? { artifactSha256: installedArtifactSha256 } : {}),
+        });
+      } else {
+        emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+          reason: installFailureReason ?? 'worker_not_available',
+        });
       }
       return installed;
     } catch (error) {
       logger.warn({ err: error }, 'macOS remote-desktop component install failed');
+      emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+        reason: error instanceof Error ? error.message : 'worker_refresh_failed',
+      });
       return false;
     } finally {
       macosRemoteDesktopInstallInFlight = false;
@@ -1162,6 +1217,7 @@ export function createControlledNodeRuntime(
     remoteDesktopWorkerRefreshNextAttemptAt = now + REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS;
     remoteDesktopWorkerRefreshInFlight = true;
     emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.STARTED);
+    let refreshActivationFailureReason: string | undefined;
     const refresh = options.refreshRemoteDesktopWorker
       ?? ((context: ControlledNodeRemoteDesktopWorkerRefreshContext) => refreshControlledNodeRemoteDesktopWorker({
         credential,
@@ -1177,6 +1233,7 @@ export function createControlledNodeRuntime(
             : (remoteDesktopWorker.close(), true);
           if (!reloaded) {
             logger.warn({ targetVersion }, 'remote-desktop worker refresh was not loadable');
+            refreshActivationFailureReason = 'worker_reload_failed';
             return;
           }
           try {
@@ -1196,6 +1253,13 @@ export function createControlledNodeRuntime(
         emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, result);
         return;
       }
+      if (refreshActivationFailureReason) {
+        emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+          ...result,
+          reason: refreshActivationFailureReason,
+        });
+        return;
+      }
       // Custom test/integration refreshers may perform the swap themselves.
       // Keep activation behind the same fence unless they explicitly report
       // that activation already happened under it.
@@ -1203,6 +1267,10 @@ export function createControlledNodeRuntime(
         const release = remoteDesktopCommitFence.acquire();
         if (!release) {
           logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh activation was busy');
+          emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+            ...result,
+            reason: 'worker_reload_busy',
+          });
           return;
         }
         try {
@@ -1211,6 +1279,10 @@ export function createControlledNodeRuntime(
             : (remoteDesktopWorker.close(), true);
           if (!reloaded) {
             logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh was not loadable');
+            emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+              ...result,
+              reason: 'worker_reload_failed',
+            });
             return;
           }
           try {

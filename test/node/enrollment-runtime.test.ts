@@ -423,8 +423,14 @@ describe('controlled node enrollment and runtime', () => {
 
     const execCommand = process.platform === 'win32' ? "[Console]::Write('ok')" : 'printf ok';
     socket.emit('message', JSON.stringify({ type: DAEMON_COMMAND_TYPES.MACHINE_EXEC, correlationId: 'exec-1', idempotencyKey: 'exec-1', command: execCommand }));
-    await vi.waitFor(() => expect(socket.sent.length).toBeGreaterThanOrEqual(4), { timeout: 5_000 });
-    const execFrames = socket.sent.slice(2).map((value) => JSON.parse(value) as Record<string, unknown>);
+    await vi.waitFor(() => {
+      const frames = socket.sent.map((value) => JSON.parse(value) as Record<string, unknown>);
+      expect(frames.some((frame) => frame.type === DAEMON_MSG.MACHINE_EXEC_RESULT
+        && frame.correlationId === 'exec-1')).toBe(true);
+    }, { timeout: 5_000 });
+    const execFrames = socket.sent
+      .map((value) => JSON.parse(value) as Record<string, unknown>)
+      .filter((frame) => frame.type === DAEMON_MSG.MACHINE_EXEC_CHUNK || frame.type === DAEMON_MSG.MACHINE_EXEC_RESULT);
     expect(execFrames).toContainEqual(expect.objectContaining({
       type: DAEMON_MSG.MACHINE_EXEC_CHUNK,
       correlationId: 'exec-1',

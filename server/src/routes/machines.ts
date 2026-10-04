@@ -62,6 +62,10 @@ import {
   DAEMON_UPGRADE_SOURCE,
   type ControlledNodeUpgradeStatus,
 } from '../../../shared/daemon-upgrade.js';
+import {
+  CONTROLLED_NODE_WORKER_REFRESH_PHASE,
+  type ControlledNodeWorkerRefreshPhase,
+} from '../../../shared/controlled-node-worker-refresh.js';
 
 /** A node only has to reach its own disk, so this stays short. */
 const AUTO_UNLOCK_TIMEOUT_MS = 15_000;
@@ -145,13 +149,20 @@ export async function listControlledMachines(
     const bridge = WsBridge.find(r.id);
     const liveUpgrade = bridge?.getControlledNodeUpgradeStatus();
     const liveWorkerRefresh = bridge?.getControlledNodeWorkerRefreshStatus();
+    const persistedWorkerRefreshPhase = r.controlled_worker_refresh_phase;
+    const workerRefreshPhase = persistedWorkerRefreshPhase
+      && Object.values(CONTROLLED_NODE_WORKER_REFRESH_PHASE).includes(
+        persistedWorkerRefreshPhase as ControlledNodeWorkerRefreshPhase,
+      )
+      ? persistedWorkerRefreshPhase
+      : null;
     const workerRefresh = liveWorkerRefresh ?? (r.controlled_worker_refresh_attempt_id
-      && r.controlled_worker_refresh_phase
+      && workerRefreshPhase
       && typeof r.controlled_worker_refresh_recorded_at === 'number'
       ? {
         type: 'controlled_node.worker_refresh_status' as const,
         attemptId: r.controlled_worker_refresh_attempt_id,
-        phase: r.controlled_worker_refresh_phase,
+        phase: workerRefreshPhase,
         ...(r.controlled_worker_refresh_installed_version ? { installedVersion: r.controlled_worker_refresh_installed_version } : {}),
         ...(r.controlled_worker_refresh_target_version ? { targetVersion: r.controlled_worker_refresh_target_version } : {}),
         ...(r.controlled_worker_refresh_artifact_sha256 ? { artifactSha256: r.controlled_worker_refresh_artifact_sha256 } : {}),
