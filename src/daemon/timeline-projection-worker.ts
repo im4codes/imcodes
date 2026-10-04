@@ -470,9 +470,23 @@ async function handleRecordAppendedEvent(event: TimelineEvent): Promise<boolean>
   return true;
 }
 
-function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql: string; params: unknown[] } {
+function buildRangeSql(
+  base: string,
+  afterTs?: number,
+  afterSeq?: number,
+  epoch?: number,
+  beforeTs?: number,
+): { sql: string; params: unknown[] } {
   const clauses = [base];
   const params: unknown[] = [];
+  if (epoch !== undefined) {
+    clauses.push('AND epoch = ?');
+    params.push(epoch);
+  }
+  if (afterSeq !== undefined) {
+    clauses.push('AND seq > ?');
+    params.push(afterSeq);
+  }
   if (afterTs !== undefined) {
     clauses.push('AND ts > ?');
     params.push(afterTs);
@@ -484,12 +498,14 @@ function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql
   return { sql: clauses.join(' '), params };
 }
 
-async function handleQueryHistory(sessionId: string, afterTs?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
+async function handleQueryHistory(sessionId: string, afterTs?: number, afterSeq?: number, epoch?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
   if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 10_000));
   const { sql, params } = buildRangeSql(
     'SELECT * FROM timeline_projection_events WHERE session_id = ?',
     afterTs,
+    afterSeq,
+    epoch,
     beforeTs,
   );
   const rows = ensureDb().prepare(`${sql} ORDER BY ts DESC, append_ordinal DESC LIMIT ?`).all(...([sessionId, ...params, boundedLimit] as any[])) as Array<Record<string, unknown>>;
@@ -527,7 +543,7 @@ async function handleQueryCompletedTextTail(sessionId: string, limit = 50): Prom
   return { source: 'sqlite', events: rows.reverse().map(rowToEvent) };
 }
 
-async function handleQueryByTypes(sessionId: string, types: TimelineEventType[], afterTs?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
+async function handleQueryByTypes(sessionId: string, types: TimelineEventType[], afterTs?: number, afterSeq?: number, epoch?: number, beforeTs?: number, limit = 500): Promise<{ source: 'sqlite'; events: TimelineEvent[] }> {
   if (!prepareSqliteRead(sessionId)) return { source: 'sqlite', events: [] };
   if (types.length === 0) return { source: 'sqlite', events: [] };
   const boundedLimit = Math.max(1, Math.min(limit, 10_000));
@@ -535,6 +551,8 @@ async function handleQueryByTypes(sessionId: string, types: TimelineEventType[],
   const { sql, params } = buildRangeSql(
     `SELECT * FROM timeline_projection_events WHERE session_id = ? AND type IN (${placeholders})`,
     afterTs,
+    afterSeq,
+    epoch,
     beforeTs,
   );
   const rows = ensureDb().prepare(`${sql} ORDER BY ts DESC, append_ordinal DESC LIMIT ?`)
@@ -601,13 +619,13 @@ async function handleRequest(message: WorkerRequest): Promise<unknown> {
     case 'recordAppendedEvent':
       return handleRecordAppendedEvent(message.payload.event);
     case 'queryHistory':
-      return handleQueryHistory(message.payload.sessionId, message.payload.afterTs, message.payload.beforeTs, message.payload.limit);
+      return handleQueryHistory(message.payload.sessionId, message.payload.afterTs, message.payload.afterSeq, message.payload.epoch, message.payload.beforeTs, message.payload.limit);
     case 'queryLatest':
       return handleQueryLatest(message.payload.sessionId);
     case 'queryCompletedTextTail':
       return handleQueryCompletedTextTail(message.payload.sessionId, message.payload.limit);
     case 'queryByTypes':
-      return handleQueryByTypes(message.payload.sessionId, message.payload.types, message.payload.afterTs, message.payload.beforeTs, message.payload.limit);
+      return handleQueryByTypes(message.payload.sessionId, message.payload.types, message.payload.afterTs, message.payload.afterSeq, message.payload.epoch, message.payload.beforeTs, message.payload.limit);
     case 'rebuildSession': {
       const existing = rebuildPromises.get(message.payload.sessionId);
       if (existing) return existing;

@@ -165,4 +165,47 @@ describe('command-handler timeline.history_request SQLite parity', () => {
       actualPayloadBytes: expect.any(Number),
     }));
   });
+
+  it('honors a same-epoch seq cursor instead of replaying the full tail', async () => {
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_proj_brain',
+      requestId: 'req-cursor',
+      limit: 50,
+      cursor: { epoch: 5, afterSeq: 42, direction: 'newer' },
+    }, serverLink as never);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({
+      limit: 51,
+      afterTs: undefined,
+      beforeTs: undefined,
+      afterSeq: 42,
+      epoch: 5,
+    });
+    expect(readByTypesPreferredMock.mock.calls[1][2]).toEqual({
+      limit: 100,
+      afterTs: 99,
+      beforeTs: undefined,
+      afterSeq: 42,
+      epoch: 5,
+    });
+  });
+
+  it('fails safe to the bounded newest window for a cursor from an older daemon epoch', async () => {
+    handleWebCommand({
+      type: 'timeline.history_request',
+      sessionName: 'deck_proj_brain',
+      requestId: 'req-old-epoch',
+      limit: 50,
+      cursor: { epoch: 4, afterSeq: 42, direction: 'newer' },
+    }, serverLink as never);
+    await flushAsync();
+
+    expect(readByTypesPreferredMock.mock.calls[0][2]).toEqual({
+      limit: 51,
+      afterTs: undefined,
+      beforeTs: undefined,
+    });
+  });
 });

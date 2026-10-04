@@ -330,11 +330,13 @@ class TimelineStore {
 
   async readPreferred(
     sessionName: string,
-    opts?: { afterTs?: number; beforeTs?: number; limit?: number },
+    opts?: { afterTs?: number; afterSeq?: number; epoch?: number; beforeTs?: number; limit?: number },
   ): Promise<TimelineEvent[]> {
     const events = await timelineProjection.queryHistory({
       sessionId: sessionName,
       afterTs: opts?.afterTs,
+      afterSeq: opts?.afterSeq,
+      epoch: opts?.epoch,
       beforeTs: opts?.beforeTs,
       limit: opts?.limit,
     });
@@ -353,6 +355,8 @@ class TimelineStore {
         sessionId: sessionName,
         types,
         afterTs: opts?.afterTs,
+        afterSeq: opts?.afterSeq,
+        epoch: opts?.epoch,
         beforeTs: opts?.beforeTs,
         limit: opts?.limit,
       });

@@ -199,6 +199,21 @@ describe('timeline history worker', () => {
     ]);
   });
 
+  it('filters a same-epoch cursor by seq when timestamps are identical', async () => {
+    const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {
+      insertSession(db, 'deck_hist');
+      insertEvent(db, 1, makeEvent('deck_hist', 1, 'user.message', { text: 'already shown' }, 100));
+      insertEvent(db, 2, makeEvent('deck_hist', 2, 'user.message', { text: 'cursor boundary' }, 100));
+      insertEvent(db, 3, makeEvent('deck_hist', 3, 'assistant.text', { text: 'new event', streaming: false }, 100));
+    });
+
+    const result = await handleTimelineHistoryWorkerRequest(request({ epoch: 1, afterSeq: 2 }));
+
+    expect(result.kind).toBe('success');
+    if (result.kind !== 'success') throw new Error(result.reason);
+    expect(result.events.map((event) => event.payload.text)).toEqual(['new event']);
+  });
+
   it('does not send multi-MB raw detail candidates back to the main thread', async () => {
     const huge = 'x'.repeat(2 * 1024 * 1024);
     const { handleTimelineHistoryWorkerRequest } = await loadWorker((db) => {

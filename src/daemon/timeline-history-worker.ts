@@ -115,9 +115,23 @@ function compareTimelineEventsForReplay(a: TimelineEvent, b: TimelineEvent): num
   return a.ts - b.ts || a.seq - b.seq || a.eventId.localeCompare(b.eventId);
 }
 
-function buildRangeSql(base: string, afterTs?: number, beforeTs?: number): { sql: string; params: unknown[] } {
+function buildRangeSql(
+  base: string,
+  afterTs?: number,
+  afterSeq?: number,
+  epoch?: number,
+  beforeTs?: number,
+): { sql: string; params: unknown[] } {
   const clauses = [base];
   const params: unknown[] = [];
+  if (epoch !== undefined) {
+    clauses.push('AND epoch = ?');
+    params.push(epoch);
+  }
+  if (afterSeq !== undefined) {
+    clauses.push('AND seq > ?');
+    params.push(afterSeq);
+  }
   if (afterTs !== undefined) {
     clauses.push('AND ts > ?');
     params.push(afterTs);
@@ -134,6 +148,8 @@ function queryByTypes(
   types: readonly string[],
   limit: number,
   afterTs?: number,
+  afterSeq?: number,
+  epoch?: number,
   beforeTs?: number,
 ): TimelineEvent[] {
   if (types.length === 0) return [];
@@ -142,6 +158,8 @@ function queryByTypes(
   const { sql, params } = buildRangeSql(
     `SELECT * FROM timeline_projection_events WHERE session_id = ? AND type IN (${placeholders})`,
     afterTs,
+    afterSeq,
+    epoch,
     beforeTs,
   );
   const rows = ensureDb().prepare(`${sql} ORDER BY ts DESC, append_ordinal DESC LIMIT ?`)
@@ -192,6 +210,8 @@ export async function handleTimelineHistoryWorkerRequest(
       message.contentTypes,
       limit + 1,
       message.afterTs,
+      message.afterSeq,
+      message.epoch,
       message.beforeTs,
     );
     let stateEvents: TimelineEvent[] = [];
@@ -203,6 +223,8 @@ export async function handleTimelineHistoryWorkerRequest(
         message.stateTypes,
         Math.max(limit * 2, 100),
         stateAfterTs,
+        message.afterSeq,
+        message.epoch,
         message.beforeTs,
       );
     }

@@ -6817,6 +6817,9 @@ interface TimelineHistoryRequestParams {
   requestId?: string;
   limit: number;
   afterTs?: number;
+  /** Same-daemon cursor boundary. Only paired with epoch matching the live daemon. */
+  afterSeq?: number;
+  epoch?: number;
   beforeTs?: number;
   maxResponseBytes: number;
   /** `text`: only user.message/assistant.text rows (no tool/state rows) — see TIMELINE_HISTORY_CONTENT_FILTERS. */
@@ -6903,6 +6906,8 @@ function timelineHistoryInflightKey(params: TimelineHistoryRequestParams): strin
     sessionName: params.sessionName,
     limit: params.limit,
     afterTs: params.afterTs ?? null,
+    afterSeq: params.afterSeq ?? null,
+    epoch: params.epoch ?? null,
     beforeTs: params.beforeTs ?? null,
     maxResponseBytes: params.maxResponseBytes,
     contentFilter: params.contentFilter ?? null,
@@ -6956,7 +6961,9 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
   // Query content by type instead of over-reading and filtering in JS. SQLite
   // has (session_id, type, ts) indexes; using them keeps the common path near
   // O(requested rows) instead of decoding thousands of unrelated state events.
-  // Do NOT filter by epoch — history should include events across daemon restarts.
+  // Unscoped history spans daemon epochs. A same-epoch "newer" cursor is the
+  // one exception: it is safe to apply the sequence fence supplied by the
+  // client, while stale-epoch cursors fall back to the bounded history window.
   const tRead0 = Date.now();
   const historyTypes = timelineHistoryTypesForFilter(params.contentFilter);
   let substantive: TimelineEvent[];
@@ -6965,7 +6972,13 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
     substantive = await timelineStore.readByTypesPreferred(
       params.sessionName,
       historyTypes.contentTypes,
-      { limit: params.limit + 1, afterTs: params.afterTs, beforeTs: params.beforeTs },
+      {
+        limit: params.limit + 1,
+        afterTs: params.afterTs,
+        beforeTs: params.beforeTs,
+        ...(params.afterSeq !== undefined ? { afterSeq: params.afterSeq } : {}),
+        ...(params.epoch !== undefined ? { epoch: params.epoch } : {}),
+      },
     );
   } catch (err) {
     if (err instanceof TimelinePreferredReadError) {
@@ -6980,7 +6993,13 @@ async function buildTimelineHistoryOnMain(params: TimelineHistoryRequestParams):
       stateEvents = await timelineStore.readByTypesPreferred(
         params.sessionName,
         historyTypes.stateTypes,
-        { limit: Math.max(params.limit * 2, 100), afterTs: stateAfterTs, beforeTs: params.beforeTs },
+        {
+          limit: Math.max(params.limit * 2, 100),
+          afterTs: stateAfterTs,
+          beforeTs: params.beforeTs,
+          ...(params.afterSeq !== undefined ? { afterSeq: params.afterSeq } : {}),
+          ...(params.epoch !== undefined ? { epoch: params.epoch } : {}),
+        },
       );
     } catch (err) {
       if (err instanceof TimelinePreferredReadError) {
@@ -7082,6 +7101,8 @@ async function buildTimelineHistoryWithWorker(params: TimelineHistoryRequestPara
     sessionName: params.sessionName,
     limit: params.limit,
     afterTs: params.afterTs,
+    afterSeq: params.afterSeq,
+    epoch: params.epoch,
     beforeTs: params.beforeTs,
     maxResponseBytes: params.maxResponseBytes,
     ...timelineHistoryTypesForFilter(params.contentFilter),
@@ -7123,6 +7144,16 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   const cursor = cmd.cursor && typeof cmd.cursor === 'object' && !Array.isArray(cmd.cursor)
     ? cmd.cursor as Record<string, unknown>
     : undefined;
+  const requestedEpoch = optionalFiniteNumber(cursor?.epoch);
+  const sameEpochCursor = cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER
+    && requestedEpoch !== undefined && requestedEpoch === timelineEmitter.epoch
+    ? optionalFiniteNumber(cursor?.afterSeq)
+    : undefined;
+  // A cursor from an older daemon generation cannot safely be applied by seq:
+  // seq counters restart with the daemon epoch. In that case deliberately fall
+  // back to the bounded newest window so the client can reconcile by eventId.
+  const afterSeq = sameEpochCursor;
+  const epoch = sameEpochCursor === undefined ? undefined : requestedEpoch;
   const afterTs = optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
   const beforeTs = optionalFiniteNumber(cmd.beforeTs) ?? optionalFiniteNumber(cursor?.beforeTs);
   // On a congested uplink one full-budget reply (up to 1 MiB) occupies the
@@ -7158,7 +7189,7 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
 
   const contentFilter = isTimelineHistoryContentFilter(cmd.contentFilter) ? cmd.contentFilter : undefined;
   const params: TimelineHistoryRequestParams = {
-    sessionName, requestId, limit, afterTs, beforeTs, maxResponseBytes,
+    sessionName, requestId, limit, afterTs, afterSeq, epoch, beforeTs, maxResponseBytes,
     ...(contentFilter ? { contentFilter } : {}),
   };
   const tStart = Date.now();
