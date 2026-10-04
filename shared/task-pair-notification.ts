@@ -7,6 +7,8 @@ import {
   TASK_PAIR_VERBS,
   type TaskPairStatus,
   type TaskPairVerb,
+  type TaskPairAuditDetails,
+  type TaskPairAuditFinding,
 } from './task-pair.js';
 
 /**
@@ -97,6 +99,119 @@ function inferStatus(verb: TaskPairVerb, status: TaskPairStatus | undefined): Ta
     case 'CANCEL': return 'cancelled';
     default: return undefined;
   }
+}
+
+const DETAIL_FIELD_RE = /^\s*(?:[-*]\s*)?(?:invariant|violat(?:es|ed)|违反不变量|不变量|location|位置|file|function|evidence|证据|repro(?:duction)?|复现|proposal|suggest(?:ed)? solution|建议(?:方案)?|trade[- ]?offs?|权衡|validation|验证|next step|下一步|reason|原因)\s*[:：]\s*(.*)$/iu;
+const FINDING_RE = /^\s*(?:[-*]\s*)?(?:finding\s*)?\[(P[0-4])\]\s*(.*)$/iu;
+const FINDING_WORD_RE = /^\s*(?:[-*]\s*)?(?:finding|发现)\s*[:：]?\s*(.*)$/iu;
+const SUMMARY_RE = /^\s*(?:summary|audit summary|摘要|审计摘要)\s*[:：]\s*(.*)$/iu;
+
+function cleanDetailText(value: unknown, max = 2000): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const text = value.replace(/\s+/gu, ' ').trim();
+  return text ? text.slice(0, max) : undefined;
+}
+
+function setFindingField(finding: TaskPairAuditFinding, label: string, value: string): void {
+  const key = label.toLowerCase().replace(/[：:]/gu, '').trim();
+  const field = key.includes('invariant') || key.includes('violat') || key.includes('不变量') ? 'invariant'
+    : key.includes('location') || key === 'file' || key === 'function' || key.includes('位置') ? 'location'
+      : key.includes('evidence') || key.includes('repro') || key.includes('证据') || key.includes('复现') ? 'evidence'
+        : key.includes('proposal') || key.includes('solution') || key.includes('建议') ? 'proposal'
+          : key.includes('trade') || key.includes('权衡') ? 'tradeoffs' : undefined;
+  if (!field) return;
+  const normalized = cleanDetailText(value);
+  if (!normalized) return;
+  finding[field] = finding[field] ? `${finding[field]} ${normalized}`.slice(0, 2000) : normalized;
+}
+
+/** Parse the explicitly labelled portions of an auditor notice. Unlabelled
+ * prose is retained as noticeText but is never guessed to be a finding. */
+export function parseTaskPairAuditDetails(text: unknown): TaskPairAuditDetails | undefined {
+  if (typeof text !== 'string' || !text.trim()) return undefined;
+  const lines = text.replace(/\r\n?/gu, '\n').split('\n');
+  const findings: TaskPairAuditFinding[] = [];
+  let current: TaskPairAuditFinding | undefined;
+  let currentField: keyof TaskPairAuditFinding | undefined;
+  let summary: string | undefined;
+  const validation: string[] = [];
+  const nextSteps: string[] = [];
+  const reasons: string[] = [];
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const findingMatch = line.match(FINDING_RE);
+    const findingWord = line.match(FINDING_WORD_RE);
+    if (findingMatch || findingWord) {
+      current = { ...(findingMatch?.[1] ? { severity: findingMatch[1].toUpperCase() } : {}) };
+      const initial = cleanDetailText(findingMatch?.[2] ?? findingWord?.[1]);
+      if (initial) current.summary = initial;
+      findings.push(current);
+      currentField = 'summary';
+      continue;
+    }
+    const summaryMatch = line.match(SUMMARY_RE);
+    if (summaryMatch) {
+      summary = cleanDetailText(summaryMatch[1]);
+      currentField = undefined;
+      continue;
+    }
+    const labelled = line.match(DETAIL_FIELD_RE);
+    if (labelled) {
+      const label = line.slice(0, line.indexOf(labelled[1] ?? '')).trim();
+      const value = labelled[1] ?? '';
+      if (current && /invariant|violat|不变量/iu.test(label)) { setFindingField(current, 'invariant', value); currentField = 'invariant'; continue; }
+      if (current && /location|位置|file|function/iu.test(label)) { setFindingField(current, 'location', value); currentField = 'location'; continue; }
+      if (current && /evidence|repro|证据|复现/iu.test(label)) { setFindingField(current, 'evidence', value); currentField = 'evidence'; continue; }
+      if (current && /proposal|solution|建议/iu.test(label)) { setFindingField(current, 'proposal', value); currentField = 'proposal'; continue; }
+      if (current && /trade|权衡/iu.test(label)) { setFindingField(current, 'tradeoffs', value); currentField = 'tradeoffs'; continue; }
+      if (/validation|验证|tests?|suite/iu.test(label)) validation.push(value);
+      else if (/next step|下一步/iu.test(label)) nextSteps.push(value);
+      else if (/reason|原因/iu.test(label)) reasons.push(value);
+      continue;
+    }
+    if (current && currentField && currentField !== 'severity') {
+      const continuation = cleanDetailText(line);
+      if (continuation && currentField !== 'summary') current[currentField] = `${current[currentField] ?? ''} ${continuation}`.trim().slice(0, 2000);
+    }
+  }
+  const result: TaskPairAuditDetails = {
+    ...(findings.length ? { findings: findings.slice(0, 20) } : {}),
+    ...(summary ? { summary } : {}),
+    ...(validation.length ? { validation: cleanDetailText(validation.join(' '), 3000) } : {}),
+    ...(reasons.length ? { reason: cleanDetailText(reasons.join(' '), 2000) } : {}),
+    ...(nextSteps.length ? { nextStep: cleanDetailText(nextSteps.join(' '), 2000) } : {}),
+  };
+  return Object.keys(result).length ? result : undefined;
+}
+
+/** Accept structured fields from newer projections and legacy aliases. */
+export function normalizeTaskPairAuditDetails(input: unknown): TaskPairAuditDetails | undefined {
+  if (!input || typeof input !== 'object') return undefined;
+  const record = input as Record<string, unknown>;
+  const source = record.auditDetails && typeof record.auditDetails === 'object'
+    ? record.auditDetails as Record<string, unknown> : record;
+  const rawFindings = source.findings ?? source.auditFindings;
+  const findings = Array.isArray(rawFindings) ? rawFindings.slice(0, 20).flatMap((item): TaskPairAuditFinding[] => {
+    if (typeof item === 'string') return [{ summary: cleanDetailText(item) }];
+    if (!item || typeof item !== 'object') return [];
+    const value = item as Record<string, unknown>;
+    const finding: TaskPairAuditFinding = {};
+    for (const field of ['severity', 'summary', 'invariant', 'location', 'evidence', 'proposal', 'tradeoffs'] as const) {
+      const text = cleanDetailText(value[field]);
+      if (text) finding[field] = text;
+    }
+    return Object.keys(finding).length ? [finding] : [];
+  }) : [];
+  const details: TaskPairAuditDetails = {
+    ...(findings.length ? { findings } : {}),
+    ...(['summary', 'validation', 'reason', 'nextStep'].reduce((out, field) => {
+      const value = cleanDetailText(source[field] ?? record[`${field}Summary`]);
+      if (value) (out as Record<string, string>)[field] = value;
+      return out;
+    }, {} as Partial<TaskPairAuditDetails>)),
+  };
+  return Object.keys(details).length ? details : undefined;
 }
 
 export interface ParsedTaskPairNotification {
@@ -203,6 +318,7 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
       return match?.[1]?.trim() ?? match?.[2]?.trim() ?? match?.[3]?.trim();
     })())
     : undefined;
+  const auditDetails = parseTaskPairAuditDetails(body);
   const payload: Record<string, unknown> = {
     taskId,
     ...(title ? { title } : {}),
@@ -220,6 +336,7 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ...((body.match(EXECUTOR_THINKING_RE)?.[1] ?? marker?.attrs.executorthinking) ? { executorThinking: body.match(EXECUTOR_THINKING_RE)?.[1] ?? marker?.attrs.executorthinking } : {}),
     ...((body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking) ? { auditorThinking: body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking } : {}),
     ...(body.match(WHY_RE)?.[1] ? { noticeReason: body.match(WHY_RE)![1].trim() } : {}),
+    ...(auditDetails ? { auditDetails } : {}),
     ...(effectiveStatus === 'cancelled' ? {
       cancelActor: 'daemon', cancelSource: 'daemon',
       ...(cancellationReason ? { cancelReason: cancellationReason.slice(0, 500) } : {}),

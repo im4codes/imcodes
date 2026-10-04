@@ -56,6 +56,7 @@ import {
   type TaskPairTransition,
 } from '../../../shared/task-pair.js';
 import { parseTaskPairChecklist, updateTaskPairChecklist } from '../../../shared/task-pair-checklist.js';
+import { parseTaskPairAuditDetails } from '../../../shared/task-pair-notification.js';
 import { flushTaskPairStoreLiveness, getTaskPairStore, livenessChangedBeyondActivityTimestamps, type StoredTaskPair, type TaskPairLiveness } from './store.js';
 import { brainUiLocale, isPairsEngineProject, projectBrainSession, projectOfSession } from './engine.js';
 import { inspectToolCallForPairMainCheckoutWrite } from './main-checkout-write-guard.js';
@@ -1536,6 +1537,8 @@ export class TaskPairService {
     transition: TaskPairTransition,
     pair: TaskPairState | undefined,
   ): void {
+    const noticeText = input.turnText ? stripTaskPairMarkersForDisplay(input.turnText).trim().slice(0, 4000) : '';
+    const auditDetails = noticeText ? parseTaskPairAuditDetails(noticeText) : undefined;
     emitTaskPairTimelineEvent({
       taskId,
       verb: input.marker.knownVerb ?? input.marker.verb,
@@ -1554,6 +1557,8 @@ export class TaskPairService {
       unusual: transition.unusual,
       ...(transition.resourceConflict ? { resourceConflict: transition.resourceConflict } : {}),
       ...(transition.verdict ? { severityCounts: transition.verdict.counts, verdictJudgement: transition.verdict.judgement } : {}),
+      ...(noticeText ? { noticeText } : {}),
+      ...(auditDetails ? { auditDetails } : {}),
     }, pair, input.eventId);
   }
 

@@ -235,6 +235,32 @@ describe('TaskPairEventChip', () => {
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('verify the exact head');
   });
+
+  it('renders structured findings and safe fallback details in the expanded card', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-findings" payload={{
+      taskId: 'T-findings', title: 'Audit details', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+      severityCounts: { P0: 1, P1: 0, P2: 0, P3: 0, P4: 0 },
+      auditDetails: { findings: [{ severity: 'P0', invariant: 'owner identity is preserved', location: 'src/daemon/foo.ts:42', evidence: 'reproduced on 211', proposal: 'persist server lifetime', tradeoffs: 'keep foreign-owner rejection' }], validation: 'focused test fails on base and passes on head' },
+      noticeText: 'Original auditor notice',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const details = card.querySelector('.task-pair-card-audit-details')!;
+    expect(details.textContent).toContain('P0');
+    expect(details.textContent).toContain('src/daemon/foo.ts:42');
+    expect(details.textContent).toContain('reproduced on 211');
+    expect(details.textContent).toContain('persist server lifetime');
+    expect(details.textContent).toContain('focused test fails on base');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('Original auditor notice');
+  });
+
+  it('does not invent findings when an old payload only has counts', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-old" payload={{ taskId: 'T-old', writer: 'daemon', verb: 'PASS', toStatus: 'passed', severityCounts: { P0: 0, P1: 0, P2: 0, P3: 0, P4: 0 } }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-detail-line')?.textContent).toContain('taskPair.card_no_blocking');
+    expect(card.querySelectorAll('.task-pair-card-finding')).toHaveLength(0);
+  });
 });
 
 describe('TaskPairEventChip workspace events', () => {

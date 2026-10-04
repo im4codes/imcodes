@@ -2256,6 +2256,30 @@ export interface TaskPairEventPayload {
   checklistAutoTickReason?: string;
   /** Observable notice for a daemon checklist backstop event. */
   checklistAutoTickNotice?: string;
+  /** Original human-readable daemon/auditor notice, when one was available. */
+  noticeText?: string;
+  /** Structured, display-safe audit context extracted from the notice. */
+  auditDetails?: TaskPairAuditDetails;
+}
+
+/** A finding shown in an expanded task-pair card. All fields are optional so
+ * old notices and partial auditor reports remain valid without invented text. */
+export interface TaskPairAuditFinding {
+  severity?: string;
+  summary?: string;
+  invariant?: string;
+  location?: string;
+  evidence?: string;
+  proposal?: string;
+  tradeoffs?: string;
+}
+
+export interface TaskPairAuditDetails {
+  findings?: TaskPairAuditFinding[];
+  summary?: string;
+  validation?: string;
+  reason?: string;
+  nextStep?: string;
 }
 
 // ---------------------------------------------------------------------------

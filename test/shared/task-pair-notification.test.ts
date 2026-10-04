@@ -1,7 +1,30 @@
 import { describe, expect, it } from 'vitest';
-import { parseTaskPairNotification } from '../../shared/task-pair-notification.js';
+import { normalizeTaskPairAuditDetails, parseTaskPairAuditDetails, parseTaskPairNotification } from '../../shared/task-pair-notification.js';
 
 describe('task-pair notification thinking metadata', () => {
+  it('extracts labelled auditor findings without reducing them to severity counts', () => {
+    const parsed = parseTaskPairNotification(
+      '[IM.codes task tsk_findings "Audit details"]\n'
+        + 'Audited pair REWORK status=rework verdict=consistent p0=1\n'
+        + '[P0] stale ownership is accepted after restart\n'
+        + 'Invariant: an old owner must not be treated as live\n'
+        + 'Location: src/daemon/session-resource-registry.ts:532\n'
+        + 'Evidence: restart reproduced session_resource_owner_conflict on 211\n'
+        + 'Proposal: include the tmux server lifetime in the handle\n'
+        + 'Trade-offs: preserve rejection of a truly live foreign pane\n'
+        + 'Validation: focused causal test fails on base and passes on head',
+    );
+    expect(parsed?.payload.auditDetails).toMatchObject({
+      findings: [{ severity: 'P0', summary: 'stale ownership is accepted after restart', invariant: 'an old owner must not be treated as live', location: 'src/daemon/session-resource-registry.ts:532', evidence: expect.stringContaining('211'), proposal: expect.stringContaining('server lifetime'), tradeoffs: expect.stringContaining('foreign pane') }],
+      validation: expect.stringContaining('fails on base'),
+    });
+  });
+
+  it('normalizes structured and legacy aliases, while leaving missing details absent', () => {
+    expect(normalizeTaskPairAuditDetails({ auditFindings: [{ severity: 'P1', evidence: 'repro' }], validationSummary: '2 tests passed' })).toEqual({ findings: [{ severity: 'P1', evidence: 'repro' }], validation: '2 tests passed' });
+    expect(parseTaskPairAuditDetails('Audited pair PASS status=passed p0=0')).toBeUndefined();
+  });
+
   it('keeps thinking levels from marker attributes when the assistant body has no prose fields', () => {
     const parsed = parseTaskPairNotification(
       '[IM.codes task tsk_attrs "Thinking attrs"]\n'

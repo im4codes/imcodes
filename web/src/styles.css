@@ -14631,6 +14631,14 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-chevron { flex: 0 0 auto; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 0; color: #7dd3fc; background: transparent; font-size: 15px; line-height: 1; transition: transform .15s ease, color .15s ease; }
 .task-pair-card-chevron.is-expanded { transform: rotate(180deg); color: #cffafe; }
 .task-pair-card-body { color: #cbd5e1; font-size: 11px; line-height: 1.45; }
+.task-pair-card-audit-details { display: flex; min-width: 0; max-width: 100%; flex: 1 1 100%; flex-direction: column; gap: 6px; margin: 6px 0 2px; padding: 8px; border: 1px solid rgba(125, 211, 252, 0.18); border-radius: 7px; background: rgba(8, 20, 36, 0.48); overflow-wrap: anywhere; }
+.task-pair-card-audit-details h4 { margin: 0; color: #bae6fd; font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }
+.task-pair-card-finding { min-width: 0; padding: 6px 7px; border-left: 2px solid rgba(248, 113, 113, 0.55); background: rgba(2, 6, 23, 0.32); }
+.task-pair-card-finding p, .task-pair-card-detail-line { min-width: 0; margin: 3px 0 0; overflow-wrap: anywhere; }
+.task-pair-card-finding-head { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 5px; color: #f8fafc; }
+.task-pair-card-finding-severity { padding: 1px 5px; border-radius: 4px; color: #fecaca; background: rgba(127, 29, 29, 0.5); font-size: 9px; font-weight: 800; }
+.task-pair-card-finding-summary { color: #e2e8f0; }
+.task-pair-card-details-unavailable { margin: 0; color: #94a3b8; font-style: italic; }
 .task-pair-card-notice { flex: 1 1 100%; max-height: 180px; min-width: 0; margin: 2px 0 0; padding: 7px 8px; overflow: auto; border-left: 2px solid rgba(125, 211, 252, 0.28); color: #cbd5e1; background: rgba(2, 6, 23, 0.28); font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; }
 .task-pair-card-event-meta { display: inline-flex; min-width: 0; align-items: center; gap: 4px; color: #c4b5fd; }
 .task-pair-card-event-meta > span:first-child { font-size: 9px; letter-spacing: .04em; text-transform: uppercase; }

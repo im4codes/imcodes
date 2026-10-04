@@ -153,6 +153,25 @@ describe('task-pair marker ingestion', () => {
     expect(pair('T-thinking-queued')).toMatchObject({ executorThinking: 'high', auditorThinking: 'medium' });
   });
 
+  it('projects labelled auditor findings into the live timeline payload for replay', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.payload && typeof event.payload === 'object') seen.push(event.payload as Record<string, unknown>);
+    });
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-audit-details executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, `<!-- IMCODES_TASK READY_FOR_AUDIT T-audit-details -->`);
+    await say(AUD, 'Audited pair REWORK status=rework verdict=consistent p0=1\n'
+      + '[P0] stale owner\n'
+      + 'Invariant: owner identity is preserved\n'
+      + 'Location: src/daemon/foo.ts:42\n'
+      + 'Evidence: reproduced on 211\n'
+      + 'Proposal: persist server lifetime\n'
+      + '<!-- IMCODES_TASK REWORK T-audit-details blocking=P0 p0=1 -->');
+    off();
+    const rework = seen.reverse().find((payload) => payload.taskId === 'T-audit-details' && payload.verb === 'REWORK');
+    expect(rework?.auditDetails).toMatchObject({ findings: [{ severity: 'P0', location: 'src/daemon/foo.ts:42', evidence: expect.stringContaining('211'), proposal: expect.stringContaining('server lifetime') }] });
+  });
+
   it('returns one delivery receipt per participant and does not auto-send before the structured caller awaits it', async () => {
     const transition = service.implicitDispatch({
       project: PROJECT,

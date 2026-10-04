@@ -4540,6 +4540,19 @@
     "brief_unavailable": "Brief no disponible. Expande de nuevo para reintentar.",
     "brief_content": "Contenido de la tarea",
     "brief_checklist": "Lista de comprobación",
-    "card_time": "Hora: {{value}}"
+    "card_time": "Hora: {{value}}",
+    "card_audit_details": "Audit details",
+    "card_finding": "Finding {{index}}",
+    "card_invariant": "Violates invariant",
+    "card_location": "Location",
+    "card_evidence": "Evidence / reproduction",
+    "card_proposal": "Suggested fix",
+    "card_tradeoffs": "Trade-offs",
+    "card_summary": "Summary",
+    "card_validation": "Validation",
+    "card_reason": "Reason",
+    "card_next_step": "Next step",
+    "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
+    "card_no_blocking": "No blocking findings."
   }
 }

@@ -4539,6 +4539,19 @@
     "brief_unavailable": "브리프를 불러올 수 없습니다. 다시 펼쳐서 재시도하세요.",
     "brief_content": "작업 내용",
     "brief_checklist": "체크리스트",
-    "card_time": "시간: {{value}}"
+    "card_time": "시간: {{value}}",
+    "card_audit_details": "Audit details",
+    "card_finding": "Finding {{index}}",
+    "card_invariant": "Violates invariant",
+    "card_location": "Location",
+    "card_evidence": "Evidence / reproduction",
+    "card_proposal": "Suggested fix",
+    "card_tradeoffs": "Trade-offs",
+    "card_summary": "Summary",
+    "card_validation": "Validation",
+    "card_reason": "Reason",
+    "card_next_step": "Next step",
+    "card_details_unavailable": "Detailed information was not provided; see the original notice below.",
+    "card_no_blocking": "No blocking findings."
   }
 }
