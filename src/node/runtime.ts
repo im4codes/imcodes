@@ -999,7 +999,11 @@ export function createControlledNodeRuntime(
       } finally {
         macosRemoteDesktopInstallInFlight = false;
       }
-      if (installedForThisRelease) return false;
+      // A custom installer is already version-aware in its owning host and
+      // keeps the historical no-download behaviour. The production installer
+      // must still check the hosted sidecar release independently: the daemon
+      // version can remain old while the worker has a newer signed target.
+      if (installedForThisRelease && options.installMacosRemoteDesktopComponents) return false;
     } else {
       return false;
     }
