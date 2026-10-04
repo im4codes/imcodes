@@ -27,6 +27,8 @@ import {
   refreshControlledNodeRemoteDesktopWorker,
   startControlledNodeUpgradeScavenger,
   startControlledNodeSelfUpgrade,
+  type ControlledNodeRemoteDesktopWorkerCommitFence,
+  type ControlledNodeRemoteDesktopWorkerRefreshContext,
   type ControlledNodeRemoteDesktopWorkerRefreshResult,
 } from './self-upgrade.js';
 import { promoteMacosRemoteDesktopArtifact, selectMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
@@ -363,7 +365,9 @@ export interface ControlledNodeRuntimeOptions {
    */
   repairMissingRemoteDesktopWorker?: (targetVersion: string) => ReturnType<typeof startControlledNodeSelfUpgrade>;
   /** Refresh an already-installed worker independently of daemon upgrades. */
-  refreshRemoteDesktopWorker?: () => Promise<ControlledNodeRemoteDesktopWorkerRefreshResult>;
+  refreshRemoteDesktopWorker?: (
+    context: ControlledNodeRemoteDesktopWorkerRefreshContext,
+  ) => Promise<ControlledNodeRemoteDesktopWorkerRefreshResult>;
   /** Test seam for a Linux box with no graphical session (see linux-desktop-environment.ts). */
   linuxDesktop?: {
     displayAvailable(): boolean;
@@ -711,13 +715,29 @@ export function createControlledNodeRuntime(
     && arch === 'x64'
     && remoteDesktopFeatureEnabled
     && !remoteDesktopWorkerAvailable;
-  const remoteDesktopWorkerBusy = (): boolean => {
+  // PREPARE admission and sidecar replacement share one synchronous fence.
+  // A PREPARE that has entered the handler before refresh starts is counted
+  // before its first await, so refresh cannot pass its final commit check
+  // while that session is still being admitted. A PREPARE arriving after the
+  // final fence is claimed is rejected until the new worker is active.
+  let remoteDesktopPrepareInFlight = 0;
+  let remoteDesktopWorkerCommitFenceHeld = false;
+  const remoteDesktopWorkerHasActiveConnections = (): boolean => {
     try {
       if (!remoteDesktopWorker.available()) return false;
       if (!remoteDesktopWorker.activeConnections) return true;
       return remoteDesktopWorker.activeConnections().length > 0;
     }
     catch { return true; }
+  };
+  const remoteDesktopWorkerBusy = (): boolean => remoteDesktopPrepareInFlight > 0
+    || remoteDesktopWorkerHasActiveConnections();
+  const remoteDesktopCommitFence: ControlledNodeRemoteDesktopWorkerCommitFence = {
+    acquire: () => {
+      if (remoteDesktopWorkerCommitFenceHeld || upgradeInFlight || remoteDesktopWorkerBusy()) return null;
+      remoteDesktopWorkerCommitFenceHeld = true;
+      return () => { remoteDesktopWorkerCommitFenceHeld = false; };
+    },
   };
   // macOS advertises the same intent under its own name and installs by a
   // different mechanism: the components are published into a store with
@@ -1123,28 +1143,64 @@ export function createControlledNodeRuntime(
     remoteDesktopWorkerRefreshNextAttemptAt = now + REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS;
     remoteDesktopWorkerRefreshInFlight = true;
     const refresh = options.refreshRemoteDesktopWorker
-      ?? (() => refreshControlledNodeRemoteDesktopWorker({
+      ?? ((context: ControlledNodeRemoteDesktopWorkerRefreshContext) => refreshControlledNodeRemoteDesktopWorker({
         credential,
         platform,
         arch,
-        canCommit: () => !upgradeInFlight && !remoteDesktopWorkerBusy(),
+        canCommit: () => !upgradeInFlight
+          && remoteDesktopPrepareInFlight === 0
+          && !remoteDesktopWorkerHasActiveConnections(),
+        commitFence: context.commitFence,
+        afterCommit: async (targetVersion) => {
+          const reloaded = remoteDesktopWorker.reloadFromDisk
+            ? remoteDesktopWorker.reloadFromDisk()
+            : (remoteDesktopWorker.close(), true);
+          if (!reloaded) {
+            logger.warn({ targetVersion }, 'remote-desktop worker refresh was not loadable');
+            return;
+          }
+          try {
+            await remoteDesktopWorkerStartup?.();
+          } catch (error) {
+            logger.warn({ err: error }, 'refreshed remote-desktop worker did not start');
+          }
+          refreshRemoteDesktopCapabilityState();
+          republishCapabilitiesIfChanged();
+        },
       }));
-    void refresh().then(async (result) => {
+    const refreshContext: ControlledNodeRemoteDesktopWorkerRefreshContext = {
+      commitFence: remoteDesktopCommitFence,
+    };
+    void refresh(refreshContext).then(async (result) => {
       if (!result.updated) return;
-      const reloaded = remoteDesktopWorker.reloadFromDisk
-        ? remoteDesktopWorker.reloadFromDisk()
-        : (remoteDesktopWorker.close(), true);
-      if (!reloaded) {
-        logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh was not loadable');
-        return;
+      // Custom test/integration refreshers may perform the swap themselves.
+      // Keep activation behind the same fence unless they explicitly report
+      // that activation already happened under it.
+      if (!result.activated) {
+        const release = remoteDesktopCommitFence.acquire();
+        if (!release) {
+          logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh activation was busy');
+          return;
+        }
+        try {
+          const reloaded = remoteDesktopWorker.reloadFromDisk
+            ? remoteDesktopWorker.reloadFromDisk()
+            : (remoteDesktopWorker.close(), true);
+          if (!reloaded) {
+            logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh was not loadable');
+            return;
+          }
+          try {
+            await remoteDesktopWorkerStartup?.();
+          } catch (error) {
+            logger.warn({ err: error }, 'refreshed remote-desktop worker did not start');
+          }
+          refreshRemoteDesktopCapabilityState();
+          republishCapabilitiesIfChanged();
+        } finally {
+          release();
+        }
       }
-      try {
-        await remoteDesktopWorkerStartup?.();
-      } catch (error) {
-        logger.warn({ err: error }, 'refreshed remote-desktop worker did not start');
-      }
-      refreshRemoteDesktopCapabilityState();
-      republishCapabilitiesIfChanged();
       logger.info({ targetVersion: result.targetVersion }, 'refreshed remote-desktop worker independently of daemon version');
     }).catch((error) => {
       logger.warn({ err: error }, 'remote-desktop worker refresh attempt failed');
@@ -1622,9 +1678,38 @@ export function createControlledNodeRuntime(
           return;
         }
         const command: Record<string, unknown> = message;
+        const rejectFencedRemoteDesktopCommand = (): boolean => {
+          if (!remoteDesktopWorkerCommitFenceHeld
+            || (command.type !== REMOTE_DESKTOP_MSG.PREPARE && command.type !== REMOTE_DESKTOP_MSG.LEASE)) return false;
+          const fenced = validateRemoteDesktopDaemonCommand(command);
+          if (fenced.ok) {
+            client.send({
+              type: REMOTE_DESKTOP_MSG.TERMINAL,
+              requestId: fenced.value.requestId,
+              sessionId: fenced.value.sessionId,
+              capability: fenced.value.capability,
+              reason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE,
+            });
+          }
+          return true;
+        };
+        if (rejectFencedRemoteDesktopCommand()) return;
         await inRemoteDesktopSessionOrder(
           typeof command.sessionId === 'string' ? command.sessionId : undefined,
           async () => {
+            const isPrepare = command.type === REMOTE_DESKTOP_MSG.PREPARE;
+            // The command may have been queued behind another command for the
+            // same session after the outer check. Recheck at admission so a
+            // newly acquired commit fence cannot be bypassed by ordering.
+            if (rejectFencedRemoteDesktopCommand()) return;
+            if (isPrepare) {
+              // Claim admission synchronously before any startup await. A
+              // refresh that is already downloading must see this counter and
+              // defer its final commit instead of replacing this session's
+              // worker underneath it.
+              remoteDesktopPrepareInFlight += 1;
+            }
+            try {
             // A macOS worker that idled itself down after nobody used it (see
             // macosRemoteDesktopEverAvailable above) is no longer kept warm by the
             // heartbeat poller on purpose. A real PREPARE is real demand arriving
@@ -1661,6 +1746,9 @@ export function createControlledNodeRuntime(
             });
             if (pendingDaemonUpgradeTarget && !upgradeInFlight && !remoteDesktopWorkerBusy()) {
               startDeferredDaemonUpgrade(pendingDaemonUpgradeTarget);
+            }
+            } finally {
+              if (isPrepare) remoteDesktopPrepareInFlight -= 1;
             }
           },
         );

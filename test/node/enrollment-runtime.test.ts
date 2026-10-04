@@ -1117,6 +1117,83 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
+  it('defers PREPARE admitted during the worker refresh commit fence', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    let releaseRefresh!: () => void;
+    const refreshStarted = vi.fn();
+    const refreshRemoteDesktopWorker = vi.fn((context: { commitFence: { acquire: () => (() => void) | null } }) => new Promise<{ updated: boolean }>((resolve) => {
+      const release = context.commitFence.acquire();
+      expect(release).not.toBeNull();
+      refreshStarted();
+      releaseRefresh = () => {
+        release?.();
+        resolve({ updated: true });
+      };
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      activeConnections: vi.fn(() => []),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => true),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      refreshRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshStarted).toHaveBeenCalledOnce());
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_fenced_1234',
+      sessionId: 'session_fenced_1234',
+      capability: 'a'.repeat(43),
+      leaseExpiresAt: 20_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      expiresAt: 60_000,
+      iceServers: [],
+    }));
+    await Promise.resolve();
+    expect(remoteDesktopWorker.handle).not.toHaveBeenCalled();
+    expect(socket.sent.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({
+      type: REMOTE_DESKTOP_MSG.TERMINAL,
+      reason: REMOTE_DESKTOP_TERMINAL_REASON.CAPABILITY_UNAVAILABLE,
+    }));
+
+    releaseRefresh();
+    await vi.waitFor(() => expect(remoteDesktopWorker.reloadFromDisk).toHaveBeenCalledOnce());
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_after_refresh_1234',
+      sessionId: 'session_after_refresh_1234',
+      capability: 'a'.repeat(43),
+      leaseExpiresAt: 20_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.CONTROL,
+      inputEpoch: 1,
+      expiresAt: 60_000,
+      iceServers: [],
+    }));
+    await vi.waitFor(() => expect(remoteDesktopWorker.handle).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
   it('sends a resolvable v3 remote-desktop profile from a real LinuxRemoteDesktopWorkerHost once its sidecar exists', async () => {
     // Regression coverage for a production bug: a real worker binary
     // present on disk, running, with the fix above landed, still produced
