@@ -105,6 +105,7 @@ export interface SupervisionProducerOptions {
   resolveSessionPresentation?: (sessionName: string, durableObservedAt: number) => {
     label?: string;
     model?: string;
+    thinking?: string;
     state: SupervisionConsoleSessionState;
     source: SupervisionConsoleSessionStateSource;
     observedAt: number;
@@ -796,6 +797,13 @@ export class SupervisionConsoleProducer {
       ownerSessionLabel: presentation?.label,
       ownerAgentType: row.agent_type ? String(row.agent_type) : undefined,
       observedModel: row.observed_model ? String(row.observed_model) : undefined,
+      observedThinking: presentation?.thinking ?? (() => {
+        try {
+          const payload = JSON.parse(String(row.payload_json ?? '{}')) as Record<string, unknown>;
+          const value = payload.thinking ?? payload.effort;
+          return typeof value === 'string' && value.trim() ? value.trim() : undefined;
+        } catch { return undefined; }
+      })(),
       observedProvider: row.observed_provider ? String(row.observed_provider)
         : (row.provider_family ? String(row.provider_family) : undefined),
       sessionState: presentation?.state ?? 'unknown',

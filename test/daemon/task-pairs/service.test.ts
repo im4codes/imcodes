@@ -27,11 +27,12 @@ const AUD2 = 'deck_sub_pairsaud2';
 const PROC = 'deck_pairsproj_w1';
 const OTHER_PROJECT_SESSION = 'deck_otherproj_brain';
 
-function session(name: string, role: SessionRecord['role'], agentType = 'claude-code-sdk', projectName = PROJECT): SessionRecord {
+function session(name: string, role: SessionRecord['role'], agentType = 'claude-code-sdk', projectName = PROJECT, effort?: SessionRecord['effort']): SessionRecord {
   return {
     name, projectName, role, agentType, projectDir: `/tmp/${projectName}`, state: 'idle',
     sessionInstanceId: `instance_${name}`, runtimeEpoch: `epoch_${name}`,
     restarts: 0, restartTimestamps: [], createdAt: 1, updatedAt: 1,
+    effort,
   } as SessionRecord;
 }
 
@@ -130,6 +131,26 @@ describe('task-pair marker ingestion', () => {
     // pair first (this is that event), then the daemon's own queue-drain
     // starts it (a second, separately-recorded event) once a slot is free.
     expect(seen[0]?.payload).toMatchObject({ taskId: 'T1', verb: 'DISPATCH', toStatus: 'queued', role: 'brain', source: 'marker' });
+  });
+
+  it('snapshots configured session thinking into the durable pair state and timeline payload', async () => {
+    upsertSession({ ...session(EXEC, 'w2', 'claude-code-sdk', PROJECT, 'high'), activeModel: 'provider/executor' });
+    upsertSession({ ...session(AUD, 'w3', 'codex-sdk', PROJECT, 'medium'), requestedModel: 'provider/auditor' });
+    const seen: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.payload && typeof event.payload === 'object') seen.push(event.payload as Record<string, unknown>);
+    });
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-thinking executor=${EXEC} auditor=${AUD} -->`);
+    off();
+    expect(pair('T-thinking')).toMatchObject({ executorThinking: 'high', auditorThinking: 'medium' });
+    expect(seen.find((payload) => payload.taskId === 'T-thinking')).toMatchObject({
+      executorModel: 'provider/executor',
+      auditorModel: 'provider/auditor',
+      executorThinking: 'high',
+      auditorThinking: 'medium',
+    });
+    await say(BRAIN, `<!-- IMCODES_TASK QUEUE T-thinking-queued executor=${EXEC} auditor=${AUD} -->`);
+    expect(pair('T-thinking-queued')).toMatchObject({ executorThinking: 'high', auditorThinking: 'medium' });
   });
 
   it('returns one delivery receipt per participant and does not auto-send before the structured caller awaits it', async () => {

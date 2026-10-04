@@ -996,7 +996,11 @@ export interface TaskPairState {
    * an explicit session nor an explicit model.
    */
   executorModel?: string;
+  /** Snapshot of the executor's configured provider thinking/effort level. */
+  executorThinking?: string;
   auditorModel?: string;
+  /** Snapshot of the auditor's configured provider thinking/effort level. */
+  auditorThinking?: string;
   brief?: string;
   /**
    * Where the audit material is: the executor's worktree at the HEAD it named
@@ -1451,6 +1455,7 @@ function resetCaps(pair: TaskPairState): void {
 function setRolesFromAttrs(pair: TaskPairState, attrs: Record<string, string>, intents: TaskPairIntent[]): void {
   if (attrs.executor) pair.executor = attrs.executor;
   if (attrs.executormodel) pair.executorModel = attrs.executormodel;
+  if (attrs.executorthinking) pair.executorThinking = attrs.executorthinking;
   if (attrs.auditor) {
     if (pair.auditor && pair.auditor !== attrs.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR) {
       pair.previousAuditors.push(pair.auditor);
@@ -1459,6 +1464,7 @@ function setRolesFromAttrs(pair: TaskPairState, attrs: Record<string, string>, i
     removeFlag(pair, 'needs_auditor');
   }
   if (attrs.auditormodel) pair.auditorModel = attrs.auditormodel;
+  if (attrs.auditorthinking) pair.auditorThinking = attrs.auditorthinking;
   if (attrs.title) pair.title = attrs.title;
   if (attrs.pool) pair.executorPool = attrs.pool;
   applyWorkspaceAttr(pair, attrs);
@@ -2098,8 +2104,10 @@ function dismissIntegration(existing: TaskPairState, now: number): TaskPairTrans
 function setRolesFromAttrsQueued(pair: TaskPairState, attrs: Record<string, string>): void {
   if (attrs.executor) pair.executor = attrs.executor;
   if (attrs.executormodel) pair.executorModel = attrs.executormodel;
+  if (attrs.executorthinking) pair.executorThinking = attrs.executorthinking;
   if (attrs.auditor) pair.auditor = attrs.auditor;
   if (attrs.auditormodel) pair.auditorModel = attrs.auditormodel;
+  if (attrs.auditorthinking) pair.auditorThinking = attrs.auditorthinking;
   if (attrs.title) pair.title = attrs.title;
   if (attrs.pool) pair.executorPool = attrs.pool;
   if (attrs.urgent !== undefined) pair.urgent = isTrue(attrs.urgent);

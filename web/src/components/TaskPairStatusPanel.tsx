@@ -103,14 +103,16 @@ function normalizeSnapshot(detail: TaskPairConsoleSnapshotDetail): readonly Reco
       executorLabel: executor?.ownerSessionLabel ?? pair.executorLabel,
       auditorLabel: auditor?.ownerSessionLabel ?? pair.auditorLabel,
       executorModel: executor?.observedModel ?? pair.executorModel,
+      executorThinking: executor?.observedThinking ?? pair.executorThinking,
       auditorModel: auditor?.observedModel ?? pair.auditorModel,
+      auditorThinking: auditor?.observedThinking ?? pair.auditorThinking,
       executorState: executor?.sessionState ?? pair.executorState,
       auditorState: auditor?.sessionState ?? pair.auditorState,
     };
   });
 }
 
-type SessionLabelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null };
+type SessionLabelEntry = { name: string; label?: string | null; activeModel?: string | null; requestedModel?: string | null; effort?: string | null };
 
 function hasPairActivity(events: readonly TimelineEvent[]): boolean {
   if (events.some((event) => event.type === TASK_PAIR_TIMELINE_EVENT)) return true;
@@ -143,6 +145,16 @@ function resolveSessionModel(
   if (session?.activeModel?.trim() || session?.requestedModel?.trim()) return session.activeModel?.trim() || session.requestedModel?.trim() || undefined;
   const projected = projectionSessions.find((entry) => entry.sessionName === id);
   return projected?.activeModel?.trim() || projected?.requestedModel?.trim() || undefined;
+}
+
+function resolveSessionThinking(
+  id: string,
+  payloadThinking: unknown,
+  sessions: readonly SessionLabelEntry[] | undefined,
+): string | undefined {
+  if (typeof payloadThinking === 'string' && payloadThinking.trim()) return payloadThinking.trim();
+  const session = sessions?.find((entry) => entry.name === id);
+  return session?.effort?.trim() || undefined;
 }
 
 export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId }: { events: readonly TimelineEvent[]; sessions?: readonly SessionLabelEntry[]; serverId?: string | null; scopeSessionId?: string | null }) {
@@ -256,15 +268,19 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
     toggle();
   };
   const projectionSessions = watchProjectionStore.getSnapshot().sessions;
-  const session = (id: unknown, label: unknown, model: unknown, role: 'executor' | 'auditor') => {
+  const session = (id: unknown, label: unknown, model: unknown, thinking: unknown, role: 'executor' | 'auditor') => {
     // 'none' is a real, deliberate value (auditor=none): there is no session
     // to open, so it must not render as a dangling clickable placeholder.
     if (typeof id !== 'string' || !id || id === 'none') return null;
     const text = resolveSessionLabel(id, label, sessions, projectionSessions) || t(`taskPair.panel_${role}`);
     const resolvedModel = resolveSessionModel(id, model, sessions, projectionSessions);
-    return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>{resolvedModel ? `${text}${t('taskPair.panel_model_separator')}${resolvedModel}` : text}</button>;
+    const resolvedThinking = resolveSessionThinking(id, thinking, sessions);
+    return <button type="button" class="task-pair-status-session" data-session-name={id} onClick={() => window.dispatchEvent(new CustomEvent('deck:navigate', { detail: { session: id } }))}>
+      <span class="task-pair-status-session-main"><span class="task-pair-status-session-label">{text}</span>{resolvedModel && <span class="task-pair-status-session-model">{t('taskPair.panel_model_separator')}{resolvedModel}</span>}{resolvedModel && <span aria-hidden="true" style={{ display: 'none' }}>{text}{t('taskPair.panel_model_separator')}{resolvedModel}</span>}</span>
+      <span class="task-pair-status-session-thinking">{t('taskPair.card_thinking', { value: resolvedThinking ?? t('taskPair.card_thinking_unknown') })}</span>
+    </button>;
   };
-  const unassigned = (model: unknown) => <small>{t('taskPair.panel_unassigned')}{typeof model === 'string' && model.trim() ? `${t('taskPair.panel_model_separator')}${model.trim()}` : ''}</small>;
+  const unassigned = (model: unknown, thinking: unknown) => <small>{t('taskPair.panel_unassigned')}{typeof model === 'string' && model.trim() ? `${t('taskPair.panel_model_separator')}${model.trim()}` : ''}{t('taskPair.card_thinking', { value: typeof thinking === 'string' && thinking.trim() ? thinking.trim() : t('taskPair.card_thinking_unknown') })}</small>;
   const durationUnits = {
     hour: t('taskPair.panel_duration_hour'),
     day: t('taskPair.panel_duration_day'),
@@ -311,10 +327,10 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
           <TaskPairBrief brief={typeof payload.brief === 'string' ? payload.brief : undefined} briefRevision={typeof payload.briefRevision === 'string' ? payload.briefRevision : undefined} checklist={payload.checklist as { total: number; implemented: number; audited: number } | undefined} taskId={String(payload.taskId)} defaultOpen={String(payload.taskId) === String(scopedDefaultTaskId)} />
           <small class="task-pair-status-row-meta"><span class="task-pair-status-row-meta-icon" aria-hidden="true">⏱</span>{t('taskPair.panel_started', { time: new Date(row.startedAt).toLocaleTimeString() })} · {queued ? t('taskPair.panel_queued', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) }) : t('taskPair.panel_elapsed', { duration: formatElapsedDuration(elapsedSeconds, durationUnits) })}</small>
           <div class="task-pair-status-row-roles">
-            <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, 'executor') ?? unassigned(payload.executorModel)}</span>
+            <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.executorState === 'running' ? 'is-running' : ''}`} />{session(payload.executor, payload.executorLabel, payload.executorModel, payload.executorThinking, 'executor') ?? unassigned(payload.executorModel, payload.executorThinking)}</span>
             {payload.auditor === 'none'
               ? <span class="task-pair-role-chip task-pair-role-chip--muted">{t('taskPair.panel_no_audit')}</span>
-              : <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, 'auditor') ?? unassigned(payload.auditorModel)}</span>}
+              : <span class="task-pair-role-chip"><span class={`task-pair-status-dot ${payload.auditorState === 'running' ? 'is-running' : ''}`} />{session(payload.auditor, payload.auditorLabel, payload.auditorModel, payload.auditorThinking, 'auditor') ?? unassigned(payload.auditorModel, payload.auditorThinking)}</span>}
           </div>
         </div>; });
         return group.key === 'recent'

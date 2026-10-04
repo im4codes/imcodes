@@ -1539,6 +1539,7 @@ export async function startup(): Promise<DaemonContext> {
           return {
             label: record.label,
             model: record.activeModel?.trim() || record.requestedModel?.trim(),
+            thinking: record.effort,
             state: 'needs_input',
             source: 'supervision',
             observedAt: record.updatedAt,
@@ -1559,6 +1560,7 @@ export async function startup(): Promise<DaemonContext> {
         return {
           label: record.label,
           model: record.activeModel?.trim() || record.requestedModel?.trim(),
+          thinking: record.effort,
           state: working || observed === 'running' || observed === 'queued'
             ? 'running'
             : observed === 'idle'

@@ -661,6 +661,28 @@ export class TaskPairService {
   }
 
   applyMarker(input: ApplyMarkerInput): TaskPairTransition {
+    // Persist the configured thinking level on the pair at the point a role
+    // is named.  This is the durable fallback for queue/replay paths where a
+    // later session-list refresh may no longer contain the participant.
+    // Explicit marker attributes win; live session config is authoritative
+    // when the marker omitted the optional field.
+    const executor = input.marker.attrs.executor;
+    const auditor = input.marker.attrs.auditor;
+    const executorThinking = executor && executor !== TASK_PAIR_NO_AUDITOR ? getSession(executor)?.effort?.trim() : undefined;
+    const auditorThinking = auditor && auditor !== TASK_PAIR_NO_AUDITOR ? getSession(auditor)?.effort?.trim() : undefined;
+    if ((executorThinking && !input.marker.attrs.executorthinking) || (auditorThinking && !input.marker.attrs.auditorthinking)) {
+      input = {
+        ...input,
+        marker: {
+          ...input.marker,
+          attrs: {
+            ...input.marker.attrs,
+            ...(executorThinking && !input.marker.attrs.executorthinking ? { executorthinking: executorThinking } : {}),
+            ...(auditorThinking && !input.marker.attrs.auditorthinking ? { auditorthinking: auditorThinking } : {}),
+          },
+        },
+      };
+    }
     const store = getTaskPairStore();
     const now = input.now ?? Date.now();
     if (store.hasEvent(input.eventId)) return { effect: 'replayed', unusual: false, intents: [] };
@@ -2429,7 +2451,9 @@ export function emitTaskPairTimelineEvent(
       ...(pair.executorPool ? { executorPool: pair.executorPool } : {}),
       ...(pair.auditorPool ? { auditorPool: pair.auditorPool } : {}),
       ...(pair.executorModel ? { executorModel: pair.executorModel } : {}),
+      ...(pair.executorThinking ? { executorThinking: pair.executorThinking } : {}),
       ...(pair.auditor === TASK_PAIR_NO_AUDITOR ? { auditorModel: TASK_PAIR_NO_AUDITOR } : pair.auditorModel ? { auditorModel: pair.auditorModel } : {}),
+      ...(pair.auditorThinking ? { auditorThinking: pair.auditorThinking } : {}),
     } : {}),
   };
   for (const [role, session] of [['executor', pair?.executor], ['auditor', pair?.auditor]] as const) {

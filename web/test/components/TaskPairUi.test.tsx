@@ -796,6 +796,21 @@ describe('TaskPairStatusPanel', () => {
     window.removeEventListener('deck:navigate', listener);
   });
 
+  it('shows thinking levels for status-panel sessions and uses an explicit unknown fallback', () => {
+    render(<TaskPairStatusPanel sessions={[
+      { name: 'deck_sub_exec', label: 'Executor', activeModel: 'provider/executor', effort: 'high' },
+      { name: 'deck_sub_aud', label: 'Auditor', requestedModel: 'provider/auditor' },
+    ]} events={[{
+      eventId: 'thinking-panel', type: 'task_pair.event', ts: Date.now(),
+      payload: {
+        taskId: 'thinking-panel-task', title: 'Thinking panel', toStatus: 'working',
+        executor: 'deck_sub_exec', auditor: 'deck_sub_aud',
+      },
+    }] as never} />);
+    expect(screen.getByText('taskPair.card_thinking:{"value":"high"}')).toBeTruthy();
+    expect(screen.getByText('taskPair.card_thinking:{"value":"taskPair.card_thinking_unknown"}')).toBeTruthy();
+  });
+
   it('uses localized neutral role fallbacks when labels are missing', () => {
     render(<TaskPairStatusPanel events={[{ eventId: 'fallback', type: 'task_pair.event', ts: Date.now(), payload: { taskId: 'fallback-task', title: 'Fallback', toStatus: 'working', executor: 'deck_sub_exec' } }] as never} />);
     expect(screen.getByText('taskPair.panel_executor')).toBeTruthy();

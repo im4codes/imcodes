@@ -27,6 +27,7 @@ import type { StoredTaskPair } from './task-pairs/store.js';
 export interface PairPresentation {
   label?: string;
   model?: string;
+  thinking?: string;
   state: SupervisionConsoleSessionState;
   source: SupervisionConsoleSessionStateSource;
   observedAt: number;
@@ -98,8 +99,8 @@ export function buildPairConsoleRow(
       queueOrder: stored.queueOrder,
       ...(options.queuePosition !== undefined ? { queuePosition: options.queuePosition } : {}),
       ...(pair.urgent ? { urgent: true } : {}),
-      ...(pair.executor ? (() => { const p = resolve?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorModel: p?.model ?? pair.executorModel, executorState: p?.state }; })() : pair.executorModel ? { executorModel: pair.executorModel } : {}),
-      ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = resolve?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorModel: p?.model ?? pair.auditorModel, auditorState: p?.state }; })() : pair.auditor === TASK_PAIR_NO_AUDITOR ? { auditorModel: TASK_PAIR_NO_AUDITOR } : pair.auditorModel ? { auditorModel: pair.auditorModel } : {}),
+      ...(pair.executor ? (() => { const p = resolve?.(pair.executor!, pair.updatedAt); return { executorLabel: p?.label, executorModel: p?.model ?? pair.executorModel, executorThinking: p?.thinking ?? pair.executorThinking, executorState: p?.state }; })() : pair.executorModel || pair.executorThinking ? { executorModel: pair.executorModel, executorThinking: pair.executorThinking } : {}),
+      ...(pair.auditor && pair.auditor !== TASK_PAIR_NO_AUDITOR ? (() => { const p = resolve?.(pair.auditor!, pair.updatedAt); return { auditorLabel: p?.label, auditorModel: p?.model ?? pair.auditorModel, auditorThinking: p?.thinking ?? pair.auditorThinking, auditorState: p?.state }; })() : pair.auditor === TASK_PAIR_NO_AUDITOR ? { auditorModel: TASK_PAIR_NO_AUDITOR } : pair.auditorModel || pair.auditorThinking ? { auditorModel: pair.auditorModel, auditorThinking: pair.auditorThinking } : {}),
       ...(pair.lastVerdict ? { severityCounts: { ...pair.lastVerdict.counts }, lastVerdict: pair.lastVerdict.verb } : {}),
       ...(pair.flags.includes('waiting_for_capacity') ? { waitingReason: pair.capacityWaitReason ?? null } : {}),
       ...(pair.brief
@@ -128,6 +129,7 @@ export function buildPairConsoleRow(
       ownerSessionName: session,
       ownerSessionLabel: presentation?.label,
       observedModel: presentation?.model,
+      observedThinking: presentation?.thinking,
       sessionState: presentation?.state ?? 'unknown',
       sessionStateSource: presentation?.source ?? 'registry',
       sessionStateObservedAt: presentation?.observedAt ?? progressAt,

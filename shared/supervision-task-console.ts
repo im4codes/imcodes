@@ -480,8 +480,10 @@ export interface SupervisionConsolePairInfo {
   queuePosition?: number;
   executorLabel?: string;
   executorModel?: string;
+  executorThinking?: string;
   auditorLabel?: string;
   auditorModel?: string;
+  auditorThinking?: string;
   executorState?: SupervisionConsoleSessionState;
   auditorState?: SupervisionConsoleSessionState;
   /**
@@ -566,6 +568,8 @@ export interface SupervisionTaskConsoleAssignmentRow {
   ownerAgentType?: string;
   /** Daemon-OBSERVED, not self-reported. */
   observedModel?: string;
+  /** Daemon-observed provider thinking/effort level. */
+  observedThinking?: string;
   observedProvider?: string;
   /** Current daemon-authoritative state of the canonical owner session. */
   /** Server-derived answer to "is the owner runtime actually alive?".
@@ -768,7 +772,7 @@ export const SUPERVISION_CONSOLE_TRANSITION_FIELDS: readonly string[] = Object.f
  * an earlier one and no intermediate value carries meaning.
  */
 export const SUPERVISION_CONSOLE_COALESCEABLE_FIELDS: readonly string[] = Object.freeze([
-  'progress', 'updatedAt', 'nextAction', 'currentAction', 'observedModel',
+  'progress', 'updatedAt', 'nextAction', 'currentAction', 'observedModel', 'observedThinking',
   'observedProvider', 'poolId', 'poolKind', 'title', 'heartbeatAt',
 ]);
 
