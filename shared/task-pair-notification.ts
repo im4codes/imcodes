@@ -22,6 +22,7 @@ const EXECUTOR_RE = /\bexecutor\s*(?::|=)\s*([^,\s.]+)|\bexecutor\s+([^,\s.]+)/i
 const AUDITOR_RE = /\bauditor\s*(?::|=)\s*([^,\s.]+)|\bauditor\s+([^,\s.]+)/iu;
 const WHY_RE = /^Why:\s*(.+)$/imu;
 const QUEUE_DISPATCH_RE = /\bdispatched\s+from\s+the\s+queue\b/iu;
+const AUDIT_VERB_RE = /^\s*Audited\s+pair\s+(done|passed|pass|rework|ready(?:_for_audit)?|blocked|needs(?:_input|\s+your\s+decision)|cancel(?:led|ed)?)/iu;
 const AUDIT_SUMMARY_RE = /^\s*Audited\s+pair\b/iu;
 const AUDIT_LIFECYCLE_RE = /\b(?:done|pass(?:ed)?|rework|ready(?:_for_audit)?|blocked|needs(?:_input|\s+your\s+decision)|cancel(?:led|ed)?)\b/iu;
 const AUDIT_FIELD_RE = /\b(?:executor|auditor|verdict|status|worktree|p[0-4]\s*=)\b/iu;
@@ -42,16 +43,36 @@ function knownStatus(value: string | undefined): TaskPairStatus | undefined {
 }
 
 function inferVerb(text: string, status: TaskPairStatus | undefined): TaskPairVerb {
+  // A daemon PASS notice for a completed pair contains both lifecycle words
+  // ("Audited pair done") and the auditor's verdict ("PASS"). The lifecycle
+  // stage is authoritative; otherwise DONE would be downgraded to PASS.
+  const auditVerb = text.match(AUDIT_VERB_RE)?.[1]?.toLowerCase();
+  if (auditVerb === 'done') return 'DONE';
+  if (auditVerb === 'passed' || auditVerb === 'pass') return 'PASS';
+  if (auditVerb === 'rework') return 'REWORK';
+  if (auditVerb?.startsWith('ready')) return 'READY_FOR_AUDIT';
+  if (auditVerb === 'blocked' || auditVerb?.startsWith('needs')) return 'NEEDS_INPUT';
+  if (auditVerb?.startsWith('cancel')) return 'CANCEL';
+
+  // A structured status is also stronger than incidental words in the
+  // explanatory body (for example `DONE status done ... verdict PASS`).
+  if (status === 'done') return 'DONE';
+  if (status === 'passed') return 'PASS';
+  if (status === 'rework') return 'REWORK';
+  if (status === 'in_audit') return 'READY_FOR_AUDIT';
+  if (status === 'cancelled') return 'CANCEL';
+  if (status === 'queued') return 'QUEUE';
+
   if (QUEUE_DISPATCH_RE.test(text)) return 'DISPATCH';
   if (/\bPASS(?:ED)?\b/iu.test(text)) return 'PASS';
-  if (/\bREWORK\b/iu.test(text) || status === 'rework') return 'REWORK';
-  if (/\b(?:queued|queue)\b/iu.test(text) || status === 'queued') return 'QUEUE';
+  if (/\bREWORK\b/iu.test(text)) return 'REWORK';
+  if (/\b(?:queued|queue)\b/iu.test(text)) return 'QUEUE';
   if (/\bREADY(?:_FOR_AUDIT)?\b/iu.test(text)) return 'READY_FOR_AUDIT';
   if (/\b(?:STARTED|WORKING)\b/iu.test(text)) return 'WORKING';
   if (/\b(?:BLOCKED|NEEDS_INPUT|NEEDS YOUR DECISION|AWAITING)\b/iu.test(text)) return 'NEEDS_INPUT';
   if (/\b(?:needs your decision|needs input|awaiting)\b/iu.test(text)) return 'NEEDS_INPUT';
-  if (/\b(?:cancelled|canceled)\b/iu.test(text) || status === 'cancelled') return 'CANCEL';
-  if (/\bDONE\b/iu.test(text) || status === 'done') return 'DONE';
+  if (/\b(?:cancelled|canceled)\b/iu.test(text)) return 'CANCEL';
+  if (/\bDONE\b/iu.test(text)) return 'DONE';
   return 'DISPATCH';
 }
 

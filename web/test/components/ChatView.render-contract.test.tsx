@@ -218,8 +218,8 @@ describe('ChatView render capability contract', () => {
     expect(items[0].taskPairNotification).toMatchObject({
       taskId: 'tsk_audited_done',
       title: 'Two-line collapse',
-      verb: 'PASS',
-      toStatus: 'passed',
+      verb: 'DONE',
+      toStatus: 'done',
       executor: 'deck_exec',
       auditor: 'deck_aud',
     });
@@ -249,8 +249,23 @@ describe('ChatView render capability contract', () => {
     expect(items[0].taskPairNotification).toMatchObject({
       taskId: 'tsk_headerless',
       title: 'Headerless audit',
-      verb: 'PASS',
-      toStatus: 'passed',
+      verb: 'DONE',
+      toStatus: 'done',
+    });
+  });
+
+  it('keeps a completed audited-pair summary as DONE when its verdict is PASS', () => {
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'audited-done-pass-verdict',
+      payload: { text: '[IM.codes task tsk_done_pass "Completed pair"]\nAudited pair done: executor deck_exec.\nAuditor deck_aud verdict: PASS (p0=0 p1=0).\nWorktree: /repo/task.' },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items).toHaveLength(1);
+    expect(items[0].taskPairNotification).toMatchObject({
+      taskId: 'tsk_done_pass',
+      verb: 'DONE',
+      toStatus: 'done',
     });
   });
 
