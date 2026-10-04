@@ -40,11 +40,13 @@ describe('TaskPairEventChip', () => {
     expect(chip.textContent).not.toContain('T42');
     const toggle = chip.querySelector('.task-pair-card-toggle')!;
     expect(toggle.getAttribute('aria-expanded')).toBe('false');
-    expect(toggle.textContent).toContain('taskPair.card_expand');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_expand');
+    expect(toggle.querySelector('.task-pair-card-toggle-label')).toBeNull();
     fireEvent.click(toggle);
     expect(toggle.getAttribute('aria-expanded')).toBe('true');
-    expect(toggle.textContent).toContain('taskPair.card_collapse');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_collapse');
     expect(chip.querySelector('.task-pair-card-payload pre')?.textContent).toContain('"taskId": "T42"');
+    expect((chip.querySelector('.task-pair-card-payload') as HTMLDetailsElement).open).toBe(false);
     expect(chip.getAttribute('data-task-id')).toBe('T42');
     expect(chip.textContent).toContain('Fix login');
     expect(chip.textContent).toContain('taskPair.chip:{"writer":"deck_sub_aud","verb":"taskPair.verb.rework"}');
@@ -136,6 +138,8 @@ describe('TaskPairEventChip', () => {
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
     expect(card.querySelector('.task-pair-card-time')).toBeTruthy();
+    expect(card.querySelector('.task-pair-card-time')?.textContent).not.toContain('taskPair.card_time');
+    expect(card.querySelector('.task-pair-card-toggle')?.textContent).not.toContain('taskPair.card_expand');
     expect(card.querySelector('.task-pair-card-body')).toBeNull();
     fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
     expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('_eventTimestamp');
@@ -1120,6 +1124,21 @@ describe('TaskPairEventChip status colours', () => {
     expect(rule).toContain('text-align: left;');
     expect(rule).toContain('width: 100%;');
     expect(rule).toContain('max-width: 100%;');
+  });
+
+  it('keeps cancelled as data status and never treats the chevron as a cancel action', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-cancelled" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'cancelled-task', title: 'Cancelled task', writer: 'daemon', verb: 'CANCEL', toStatus: 'cancelled', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    const toggle = card.querySelector('.task-pair-card-toggle')!;
+    expect(card.getAttribute('data-task-status')).toBe('cancelled');
+    expect(card.querySelector('.task-pair-chip-status')?.textContent).toContain('taskPair.status.cancelled');
+    expect(card.querySelector('.task-pair-card-time')?.textContent).not.toContain('taskPair.card_time');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_expand');
+    fireEvent.click(toggle);
+    expect(card.getAttribute('data-task-status')).toBe('cancelled');
+    expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_collapse');
   });
 });
 

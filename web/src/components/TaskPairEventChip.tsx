@@ -102,6 +102,8 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         <button
           type="button"
           class="task-pair-card-toggle"
+          aria-label={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
+          title={expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}
           aria-expanded={expanded}
           onClick={() => setExpanded((value) => !value)}
         >
@@ -112,8 +114,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
             </span>
           </span>
           <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
-          {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{t('taskPair.card_time', { value: eventTime })}</time>}
-          <span class="task-pair-card-toggle-label">{expanded ? t('taskPair.card_collapse') : t('taskPair.card_expand')}</span>
+          {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
           <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
         </button>
       </header>
@@ -135,10 +136,10 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
           {held && <span class="task-pair-chip-held">{t('taskPair.verdict_held')}</span>}
           {event.unusual && <span class="task-pair-chip-unusual">{t('taskPair.unusual')}</span>}
         </footer>}
-        <div class="task-pair-card-payload">
-          <span class="task-pair-card-payload-label">{t('taskPair.card_payload')}</span>
+        <details class="task-pair-card-payload">
+          <summary class="task-pair-card-payload-label">{t('taskPair.card_payload')}</summary>
           <pre>{payloadJson}</pre>
-        </div>
+        </details>
       </>}
     </section>
   );
