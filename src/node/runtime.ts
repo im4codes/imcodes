@@ -1129,11 +1129,13 @@ export function createControlledNodeRuntime(
         // screen recording may not be granted yet.
         republishCapabilitiesIfChanged();
         emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, {
+          installedVersion: installedTargetVersion ?? DAEMON_VERSION,
           targetVersion: installedTargetVersion ?? DAEMON_VERSION,
           ...(installedArtifactSha256 ? { artifactSha256: installedArtifactSha256 } : {}),
         });
       } else {
         emitMacRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+          ...(installedTargetVersion ? { targetVersion: installedTargetVersion } : {}),
           reason: installFailureReason ?? 'worker_not_available',
         });
       }
