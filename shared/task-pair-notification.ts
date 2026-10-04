@@ -213,6 +213,9 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     ...((body.match(EXECUTOR_THINKING_RE)?.[1] ?? marker?.attrs.executorthinking) ? { executorThinking: body.match(EXECUTOR_THINKING_RE)?.[1] ?? marker?.attrs.executorthinking } : {}),
     ...((body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking) ? { auditorThinking: body.match(AUDITOR_THINKING_RE)?.[1] ?? marker?.attrs.auditorthinking } : {}),
     ...(body.match(WHY_RE)?.[1] ? { noticeReason: body.match(WHY_RE)![1].trim() } : {}),
+    ...(effectiveStatus === 'cancelled' ? {
+      ...(cancellationReason ? { cancelReason: cancellationReason.slice(0, 500) } : {}),
+    } : {}),
     noticeText: body,
     rawText: text,
     unusual: false,

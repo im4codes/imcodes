@@ -41,6 +41,16 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const event = payload as Partial<TaskPairEventPayload>;
   const taskId = typeof event.taskId === 'string' ? event.taskId : '—';
   const writer = typeof event.writer === 'string' ? event.writer : '';
+  const isCancelledEvent = event.toStatus === 'cancelled';
+  const cancelActor = typeof event.cancelActor === 'string' && event.cancelActor.trim()
+    ? event.cancelActor.trim()
+    : event.cancelProvenanceTrusted ? writer : '';
+  const cancelSource = typeof event.cancelSource === 'string' && event.cancelSource.trim()
+    ? event.cancelSource.trim()
+    : event.cancelProvenanceTrusted && typeof event.source === 'string' ? event.source : '';
+  const cancelReason = typeof event.cancelReason === 'string' && event.cancelReason.trim()
+    ? event.cancelReason.trim()
+    : t('taskPair.card_cancel_reason_unknown');
   const verb = t(`taskPair.verb.${verbKey(event.verb)}`);
   const status = isStatus(event.toStatus) ? t(`taskPair.status.${event.toStatus}`) : t('taskPair.card_unknown_status');
   const counts = event.severityCounts

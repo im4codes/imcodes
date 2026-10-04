@@ -1533,6 +1533,12 @@ export class TaskPairService {
       effect: transition.effect,
       ...(transition.fromStatus ? { fromStatus: transition.fromStatus } : {}),
       ...(transition.toStatus ?? pair?.status ? { toStatus: transition.toStatus ?? pair?.status } : {}),
+      ...(transition.toStatus === 'cancelled' ? {
+        cancelActor: input.writer,
+        cancelSource: input.source,
+        ...(cancellationReason(input.marker.attrs) ? { cancelReason: cancellationReason(input.marker.attrs) } : {}),
+        cancelProvenanceTrusted: true,
+      } : {}),
       unusual: transition.unusual,
       ...(transition.resourceConflict ? { resourceConflict: transition.resourceConflict } : {}),
       ...(transition.verdict ? { severityCounts: transition.verdict.counts, verdictJudgement: transition.verdict.judgement } : {}),

@@ -854,6 +854,46 @@ describe('task-pair marker ingestion', () => {
     expect(sent[0]?.text).toContain('only Brain can reopen it');
   });
 
+  it('records cancellation actor, source, reason, and timestamp at the sole status-transition producer', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.payload.taskId === 'cancel-provenance') events.push(event.payload);
+    });
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH cancel-provenance executor=${EXEC} auditor=${AUD} -->`);
+    await say(BRAIN, '<!-- IMCODES_TASK CANCEL cancel-provenance reason="User requested cancellation after handoff" -->');
+    off();
+    const cancel = events.find((event) => event.toStatus === 'cancelled');
+    expect(cancel).toMatchObject({
+      verb: 'CANCEL', writer: BRAIN, role: 'brain', source: 'marker',
+      cancelActor: BRAIN, cancelSource: 'marker', cancelReason: 'User requested cancellation after handoff', cancelProvenanceTrusted: true,
+      fromStatus: 'working', toStatus: 'cancelled',
+    });
+    const stored = getTaskPairStore().listEvents(PROJECT, 'cancel-provenance').find((event) => event.verb === 'CANCEL');
+    expect(stored).toMatchObject({ writer: BRAIN, source: 'marker', attrs: { reason: 'User requested cancellation after handoff' }, toStatus: 'cancelled' });
+    expect(stored?.at).toEqual(expect.any(Number));
+    expect(pair('cancel-provenance')?.status).toBe('cancelled');
+  });
+
+  it('distinguishes a legacy/tool cancellation source and does not synthesize missing reasons', async () => {
+    const events: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.payload.taskId === 'cancel-legacy') events.push(event.payload);
+    });
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH cancel-legacy executor=${EXEC} auditor=${AUD} -->`);
+    const result = service.applyMarker({
+      project: PROJECT, writer: BRAIN,
+      marker: { verb: 'CANCEL', knownVerb: 'CANCEL', taskId: 'cancel-legacy', attrs: {} },
+      source: 'legacy_tool', eventId: 'cancel-legacy-tool', now: 123456,
+    });
+    off();
+    expect(result.toStatus).toBe('cancelled');
+    expect(events.find((event) => event.toStatus === 'cancelled')).toMatchObject({
+      writer: BRAIN, source: 'legacy_tool', cancelActor: BRAIN, cancelSource: 'legacy_tool', cancelProvenanceTrusted: true, toStatus: 'cancelled',
+    });
+    expect(events.find((event) => event.toStatus === 'cancelled')).not.toHaveProperty('cancelReason');
+    expect(getTaskPairStore().listEvents(PROJECT, 'cancel-legacy').find((event) => event.verb === 'CANCEL')?.at).toBe(123456);
+  });
+
   it('delivers the stored brief to the executor on a Brain DISPATCH naming roles for an already-queued pair, not just the title (tsk_cd_upgrade_starvation)', async () => {
     await say(BRAIN, `<!-- IMCODES_TASK QUEUE T12 title="Upgrade starvation fix" -->\nAdd a bounded max-wait, then an orderly drain.\n<!-- IMCODES_TASK_END T12 -->`);
     await flush();

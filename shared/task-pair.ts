@@ -2215,6 +2215,12 @@ export interface TaskPairEventPayload {
   effect: string;
   fromStatus?: TaskPairStatus;
   toStatus?: TaskPairStatus;
+  /** Provenance attached when this event transitions a pair to cancelled. */
+  cancelActor?: string;
+  cancelSource?: TaskPairEventSource;
+  cancelReason?: string;
+  /** True only for a daemon-projected event whose writer/source are trusted cancellation provenance. */
+  cancelProvenanceTrusted?: boolean;
   unusual: boolean;
   /** Existing claim that blocked a CLAIM marker, including holder and expiry. */
   resourceConflict?: TaskPairResourceClaim;

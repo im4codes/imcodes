@@ -1154,6 +1154,48 @@ describe('TaskPairEventChip status colours', () => {
     fireEvent.click(toggle);
     expect(card.getAttribute('data-task-status')).toBe('cancelled');
     expect(toggle.getAttribute('aria-label')).toBe('taskPair.card_collapse');
+    expect(card.querySelector('[data-cancel-provenance="true"]')).toBeTruthy();
+    expect(card.textContent).toContain('taskPair.card_cancel_reason:');
+    expect(card.textContent).toContain('taskPair.card_cancel_reason_unknown');
+    expect(card.textContent).toContain('taskPair.card_cancel_actor:');
+    expect(card.textContent).toContain('taskPair.card_cancel_source:');
+    expect(card.textContent).toContain('taskPair.card_cancel_unknown');
+  });
+
+  it('shows explicit cancellation provenance and keeps other lifecycle events free of cancel details', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-cancel-detail" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'cancel-detail', title: 'Handoff verification', writer: 'deck_pairsproj_brain', role: 'brain',
+      verb: 'CANCEL', source: 'marker', cancelActor: 'deck_pairsproj_brain', cancelSource: 'marker',
+      cancelReason: 'User requested cancellation', toStatus: 'cancelled', unusual: false,
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const provenance = card.querySelector('[data-cancel-provenance="true"]')!;
+    expect(provenance.textContent).toContain('deck_pairsproj_brain');
+    expect(provenance.textContent).toContain('User requested cancellation');
+    expect(provenance.textContent).toContain('taskPair.cancel_source.marker');
+    expect(card.querySelector('.task-pair-card-payload pre')?.textContent).toContain('2026-01-02T03:04:05.000Z');
+    cleanup();
+    const { container: passContainer } = render(<TaskPairEventChip eventId="e-pass-no-cancel" payload={{
+      taskId: 'passed', writer: 'auditor', verb: 'PASS', toStatus: 'passed', unusual: false,
+    }} />);
+    const pass = passContainer.querySelector('.task-pair-event-card')!;
+    fireEvent.click(pass.querySelector('.task-pair-card-toggle')!);
+    expect(pass.querySelector('[data-cancel-provenance="true"]')).toBeNull();
+    expect(pass.getAttribute('data-task-status')).toBe('passed');
+  });
+
+  it('keeps all cancellation provenance labels present in every supported locale', () => {
+    const WEB = process.cwd().endsWith('/web') ? process.cwd() : join(process.cwd(), 'web');
+    const sourceKeys = ['marker', 'implicit_dispatch', 'legacy_tool', 'legacy_import', 'heartbeat', 'queue', 'mcp', 'daemon'];
+    for (const locale of ['en', 'zh-CN', 'zh-TW', 'es', 'ru', 'ja', 'ko']) {
+      const taskPair = (JSON.parse(readFileSync(join(WEB, 'src/i18n/locales', `${locale}.json`), 'utf8')) as { taskPair: Record<string, any> }).taskPair;
+      for (const key of ['card_cancel_actor', 'card_cancel_source', 'card_cancel_reason', 'card_cancel_reason_unknown', 'card_cancel_unknown']) {
+        expect(taskPair[key], `${locale}.${key}`).toBeTruthy();
+      }
+      expect(taskPair.card_cancel_reason).toContain('{{value}}');
+      for (const source of sourceKeys) expect(taskPair.cancel_source?.[source], `${locale}.cancel_source.${source}`).toBeTruthy();
+    }
   });
 });
 
