@@ -121,13 +121,23 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   previewRef.current = preview;
   const pendingRawChunksRef = useRef<Uint8Array[]>([]);
   const pendingRawBytesRef = useRef(0);
-  // xterm's parser is asynchronous.  Serialise completed frame writes so a
-  // timer flush cannot enter term.write while the previous frame is still
-  // being parsed (which can interleave bytes during high-volume PTY output).
-  const rawWriteQueueRef = useRef<Uint8Array[]>([]);
-  const rawWriteInFlightRef = useRef(false);
+  // xterm's parser is asynchronous. Serialise *all* writes (raw PTY bytes and
+  // diff frames) so a timer flush cannot enter term.write while the previous
+  // frame is still being parsed. A bounded queue is essential here: when the
+  // parser/render loop is slower than a busy PTY, an unbounded queue displays
+  // old bytes seconds after the live screen has changed. We recover by asking
+  // the daemon for a fresh full-frame snapshot instead of dropping an
+  // arbitrary middle of an ANSI stream.
+  type TerminalWrite = { data: Uint8Array | string; bytes: number; fullFrame?: boolean; raw?: boolean };
+  const terminalWriteQueueRef = useRef<TerminalWrite[]>([]);
+  const terminalWriteQueuedBytesRef = useRef(0);
+  const terminalWriteInFlightRef = useRef(false);
+  const rawResyncPendingRef = useRef(false);
   const rawFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRawWriteAtRef = useRef(0);
+  const rawSubscriptionGenerationRef = useRef(0);
+  const diffSubscriptionGenerationRef = useRef(0);
+  const controlSubscriptionGenerationRef = useRef(0);
 
   // Touch scroll tracking: suppress auto-scroll for 1s after user releases touch
   const lastTouchEndRef = useRef<number>(0);
@@ -177,30 +187,63 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     clearRawFlushTimer();
     pendingRawChunksRef.current = [];
     pendingRawBytesRef.current = 0;
-    rawWriteQueueRef.current = [];
+    terminalWriteQueueRef.current = [];
+    terminalWriteQueuedBytesRef.current = 0;
+    rawResyncPendingRef.current = false;
   }, [clearRawFlushTimer]);
 
-  const drainRawWriteQueue = useCallback(() => {
-    if (rawWriteInFlightRef.current) return;
+  const drainTerminalWriteQueue = useCallback(() => {
+    if (terminalWriteInFlightRef.current) return;
     const term = termRef.current;
-    const data = rawWriteQueueRef.current.shift();
-    if (!term || !data) return;
-    rawWriteInFlightRef.current = true;
-    lastRawWriteAtRef.current = Date.now();
-    term.write(data, () => {
+    const item = terminalWriteQueueRef.current.shift();
+    if (!term || !item) return;
+    terminalWriteQueuedBytesRef.current = Math.max(0, terminalWriteQueuedBytesRef.current - item.bytes);
+    terminalWriteInFlightRef.current = true;
+    if (item.raw) lastRawWriteAtRef.current = Date.now();
+    term.write(item.data, () => {
       // Snap to bottom after each PTY write. CC redraws its UI from cursor-home
       // (\x1b[H) which makes xterm follow the cursor to the top; snapping here
       // ensures the viewport stays at the bottom showing the latest output.
       term.scrollToBottom();
-      rawWriteInFlightRef.current = false;
-      drainRawWriteQueue();
+      terminalWriteInFlightRef.current = false;
+      drainTerminalWriteQueue();
     });
   }, []);
 
-  const writeRawToTerminal = useCallback((data: Uint8Array) => {
-    rawWriteQueueRef.current.push(data);
-    drainRawWriteQueue();
-  }, [drainRawWriteQueue]);
+  const writeTerminal = useCallback((data: Uint8Array | string, fullFrame = false, raw = false) => {
+    if (!activeRef.current || !termRef.current) return;
+    if (!fullFrame && rawResyncPendingRef.current) return;
+    const bytes = typeof data === 'string' ? data.length : data.byteLength;
+    const maxBytes = previewRef.current ? PREVIEW_RAW_MAX_BYTES : RAW_MAX_BYTES;
+    if (!fullFrame && terminalWriteQueuedBytesRef.current + bytes > maxBytes) {
+      // A partial ANSI stream cannot be safely truncated. Drop only the
+      // queued (not in-flight) bytes and resynchronise from a full snapshot.
+      terminalWriteQueueRef.current = [];
+      terminalWriteQueuedBytesRef.current = 0;
+      if (!rawResyncPendingRef.current) {
+        rawResyncPendingRef.current = true;
+        try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* reconnect will retry */ }
+      }
+      return;
+    }
+    if (fullFrame) {
+      // A full frame supersedes every queued partial/raw frame. It is the
+      // authoritative recovery point after an overflow or stream reset.
+      clearRawFlushTimer();
+      pendingRawChunksRef.current = [];
+      pendingRawBytesRef.current = 0;
+      terminalWriteQueueRef.current = [];
+      terminalWriteQueuedBytesRef.current = 0;
+      rawResyncPendingRef.current = false;
+      // The authoritative frame replaces the bytes that triggered recovery;
+      // preview diff suppression must not hide the first live partial frame
+      // after this point.
+      lastRawWriteAtRef.current = 0;
+    }
+    terminalWriteQueueRef.current.push({ data, bytes, fullFrame, raw });
+    terminalWriteQueuedBytesRef.current += bytes;
+    drainTerminalWriteQueue();
+  }, [clearRawFlushTimer, drainTerminalWriteQueue, sessionName]);
 
   const flushPendingRaw = useCallback(() => {
     clearRawFlushTimer();
@@ -209,10 +252,11 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     if (chunks.length === 0 || totalBytes === 0) return;
     pendingRawChunksRef.current = [];
     pendingRawBytesRef.current = 0;
-    writeRawToTerminal(concatChunks(chunks, totalBytes));
-  }, [clearRawFlushTimer, writeRawToTerminal]);
+    writeTerminal(concatChunks(chunks, totalBytes), false, true);
+  }, [clearRawFlushTimer, writeTerminal]);
 
   const enqueueRawWrite = useCallback((data: Uint8Array) => {
+    if (!activeRef.current || rawResyncPendingRef.current) return;
     pendingRawChunksRef.current.push(data);
     pendingRawBytesRef.current += data.byteLength;
     const maxBytes = previewRef.current ? PREVIEW_RAW_MAX_BYTES : RAW_MAX_BYTES;
@@ -223,7 +267,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     if (!rawFlushTimerRef.current) {
       rawFlushTimerRef.current = setTimeout(flushPendingRaw, previewRef.current ? PREVIEW_RAW_FLUSH_MS : RAW_FLUSH_MS);
     }
-  }, [flushPendingRaw, writeRawToTerminal]);
+  }, [flushPendingRaw]);
 
   useEffect(() => {
     const term = new Terminal({
@@ -495,9 +539,15 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   // allowing multiple TerminalViews for the same session (e.g. preview card + window).
   useEffect(() => {
     if (!ws || !active) return;
-    const unsub = ws.onTerminalRaw(sessionName, enqueueRawWrite);
+    const generation = ++rawSubscriptionGenerationRef.current;
+    const guardedRawWrite = (data: Uint8Array) => {
+      if (!activeRef.current || generation !== rawSubscriptionGenerationRef.current) return;
+      enqueueRawWrite(data);
+    };
+    const unsub = ws.onTerminalRaw(sessionName, guardedRawWrite);
     return () => {
       unsub();
+      if (rawSubscriptionGenerationRef.current === generation) rawSubscriptionGenerationRef.current++;
       discardPendingRaw();
     };
   }, [active, discardPendingRaw, enqueueRawWrite, ws, sessionName]);
@@ -505,7 +555,9 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   // Handle terminal.stream_reset — reset xterm state so stale ANSI doesn't corrupt (Task 5.4)
   useEffect(() => {
     if (!ws || !active) return;
+    const generation = ++controlSubscriptionGenerationRef.current;
     const unsub = ws.onMessage((msg) => {
+      if (generation !== controlSubscriptionGenerationRef.current || !activeRef.current) return;
       if (msg.type === TERMINAL_CONTROL.RECOVERY_EXHAUSTED && msg.session === sessionName) {
         setRecoveryError(true);
         return;
@@ -516,7 +568,10 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         linesRef.current = [];
       }
     });
-    return unsub;
+    return () => {
+      unsub();
+      if (controlSubscriptionGenerationRef.current === generation) controlSubscriptionGenerationRef.current++;
+    };
   }, [active, discardPendingRaw, ws, sessionName]);
 
   const applyDiff = useCallback((diff: TerminalDiff) => {
@@ -525,6 +580,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     if (!term) return;
     if (
       previewRef.current
+      && !diff.fullFrame
       && lastRawWriteAtRef.current > 0
       && Date.now() - lastRawWriteAtRef.current < PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS
     ) {
@@ -559,10 +615,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         if (i < linesRef.current.length - 1) buf += '\r\n';
       }
       buf += '\x1b[J';
-      term.write(buf, () => {
-        autoFollowRef.current = true;
-        term.scrollToBottom();
-      });
+      writeTerminal(buf, true);
     } else if (diff.lines.length > 0) {
       // Partial update: only write changed lines using cursor addressing
       let buf = '';
@@ -576,7 +629,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         // CSI row;col H — 1-based row addressing
         buf += `\x1b[${lineIdx + 1};1H${content}\x1b[K`;
       }
-      term.write(buf);
+      writeTerminal(buf);
     }
 
     // Always scroll to bottom on new content (fullFrame handles its own scroll internally).
@@ -589,7 +642,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     // an unbounded backlog for the whole lock and the browser executes every
     // one of them inside the first frame after unlock.
     if (!diff.fullFrame) scheduleScrollToBottom();
-  }, [scheduleScrollToBottom]);
+  }, [scheduleScrollToBottom, writeTerminal]);
 
   const applyHistory = useCallback((content: string) => {
     if (!activeRef.current) return;
@@ -599,11 +652,19 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     // We use the normal buffer — history goes above current viewport.
     const historyLines = content.split('\n');
     const batch = historyLines.map((l) => l + '\r\n').join('');
-    term.write(batch);
-  }, []);
+    writeTerminal(batch);
+  }, [writeTerminal]);
 
   useEffect(() => {
-    onDiff?.(applyDiff);
+    const generation = ++diffSubscriptionGenerationRef.current;
+    const guardedApplyDiff = (diff: TerminalDiff) => {
+      if (generation !== diffSubscriptionGenerationRef.current || !activeRef.current) return;
+      applyDiff(diff);
+    };
+    onDiff?.(guardedApplyDiff);
+    return () => {
+      if (diffSubscriptionGenerationRef.current === generation) diffSubscriptionGenerationRef.current++;
+    };
   }, [applyDiff, onDiff]);
 
   useEffect(() => {
