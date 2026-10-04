@@ -281,9 +281,11 @@ import {
   isServerOnline,
   pickAutoEntryServer,
   pickMostRecentMainSession,
+  resolveServerSessionSnapshot,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
+import { readServerSession, writeServerSession } from './server-tab-state.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
 import { resumeDirectFileTransfers } from './direct-file-transfer.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
@@ -1705,9 +1707,31 @@ export function App() {
       if (mapped.length > 0) {
         setSessionsLoaded(true);
       }
-      // Auto-select first session if none was previously saved
-      if (navigableMapped.length > 0 && !localStorage.getItem('rcc_session')) {
-        setActiveSession(navigableMapped[0].name);
+      // Restore the last tab for this server, never the global session value
+      // left by another server.  A stale/missing snapshot safely falls back
+      // to the first navigable tab.
+      if (navigableMapped.length > 0) {
+        const preferred = resolveServerSessionSnapshot(
+          selectedServerId,
+          initialHashStateRef.current.sessionName ?? readServerSession(selectedServerId),
+          navigableMapped.map((session) => ({
+            serverId: selectedServerId,
+            sessionName: session.name,
+          })),
+          readServerSession(selectedServerId),
+        ) ?? navigableMapped[0].name;
+        setActiveSession(preferred);
+        // Replace a deleted/disabled snapshot with the safe fallback so the
+        // next server switch/reload cannot keep retrying the stale tab.
+        writeServerSession(selectedServerId, preferred);
+        if (preferred !== initialHashStateRef.current.sessionName) {
+          initialHashStateRef.current = {
+            ...initialHashStateRef.current,
+            serverId: selectedServerId,
+            sessionName: preferred,
+          };
+          writeHashState(selectedServerId, preferred);
+        }
       }
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { clearTimeout(timer); ctrl.abort(); };
@@ -2836,6 +2860,19 @@ export function App() {
     }
   }, [setOpenSubIds]);
 
+  // Keep a server-scoped snapshot whenever the user changes the main mobile
+  // tab.  The one-render guard prevents a server switch from briefly writing
+  // the previous server's active tab before its route/session restore lands.
+  const sessionSnapshotServerRef = useRef<string | null>(selectedServerId);
+  useEffect(() => {
+    if (sessionSnapshotServerRef.current !== selectedServerId) {
+      sessionSnapshotServerRef.current = selectedServerId;
+      return;
+    }
+    if (!selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
+    writeServerSession(selectedServerId, activeSession);
+  }, [activeSession, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
+
   const claimExplicitSessionNavigation = useCallback((name: string) => {
     sharedOpenGenerationRef.current += 1;
     externalRouteGenerationRef.current += 1;
@@ -2887,14 +2924,20 @@ export function App() {
   }, [claimExplicitSessionNavigation, openSubSessionWindow, setActiveSession]);
 
   useEffect(() => {
-    if (!activeSession) return;
+    // Do not let a persisted/hash-selected tab survive once the current
+    // server's authoritative session list has loaded and says it is gone.
+    // This covers server switching, refresh/back-forward, and permission or
+    // role changes that remove a previously navigable tab.
+    if (!activeSession || !sessionsLoaded) return;
     if (navigableMainSessions.some((session) => session.name === activeSession)) return;
     const hiddenActive = sessions.find((session) => session.name === activeSession);
-    if (!hiddenActive || isNavigableMainSession(hiddenActive)) return;
-    const replacement = navigableMainSessions.find((session) => session.project === hiddenActive.project)
+    if (hiddenActive && isNavigableMainSession(hiddenActive)) return;
+    const replacement = (hiddenActive
+      ? navigableMainSessions.find((session) => session.project === hiddenActive.project)
+      : undefined)
       ?? navigableMainSessions[0];
-    if (replacement) setActiveSession(replacement.name);
-  }, [activeSession, navigableMainSessions, sessions, setActiveSession]);
+    setActiveSession(replacement?.name ?? null);
+  }, [activeSession, navigableMainSessions, sessions, sessionsLoaded, setActiveSession]);
 
   useEffect(() => {
     if (!auth || selectedServerId || !serversLoaded || servers.length === 0 || manualDashboard) return;
@@ -2924,7 +2967,9 @@ export function App() {
 
       const recent = pickMostRecentMainSession(rows.filter((row) => typeof row.previewUpdatedAt === 'number'));
       const fallback = pickAutoEntryServer(servers, savedServerId);
-      const savedFallbackSession = fallback ? localStorage.getItem(`rcc_session_${fallback.serverId}`) : null;
+      const savedFallbackSession = fallback
+        ? resolveServerSessionSnapshot(fallback.serverId, readServerSession(fallback.serverId), rows)
+        : null;
       const firstMain = pickMostRecentMainSession(rows);
       const selection = recent
         ?? (fallback && savedFallbackSession ? { ...fallback, sessionName: savedFallbackSession } : null)
@@ -2939,13 +2984,21 @@ export function App() {
       setSelectedServerId(selection.serverId);
       setSelectedServerName(server?.name ?? null);
       if (selection.sessionName) {
-        localStorage.setItem(`rcc_session_${selection.serverId}`, selection.sessionName);
+        writeServerSession(selection.serverId, selection.sessionName);
         setActiveSession(selection.sessionName);
       } else {
-        const savedSession = localStorage.getItem(`rcc_session_${selection.serverId}`);
+        const savedSession = resolveServerSessionSnapshot(
+          selection.serverId,
+          readServerSession(selection.serverId),
+          rows,
+        );
         setActiveSession(savedSession);
       }
-      writeHashState(selection.serverId, selection.sessionName ?? localStorage.getItem(`rcc_session_${selection.serverId}`));
+      writeHashState(selection.serverId, selection.sessionName ?? resolveServerSessionSnapshot(
+        selection.serverId,
+        readServerSession(selection.serverId),
+        rows,
+      ));
     };
 
     void choose().finally(() => {
@@ -5267,31 +5320,31 @@ export function App() {
     clearSharedTabRestoreMarker();
     setShowSharedReturnGuide(false);
     // Save current active session for the server we're leaving
-    const prevServer = localStorage.getItem('rcc_server');
-    const currentSession = localStorage.getItem('rcc_session');
+    // Prefer live route refs over the cross-tab legacy fallback.  The latter
+    // may still point at a different server while a hash/back-forward route is
+    // converging.
+    const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
+    const currentSession = activeSessionRef.current ?? localStorage.getItem('rcc_session');
     if (prevServer && currentSession) {
-      localStorage.setItem(`rcc_session_${prevServer}`, currentSession);
+      writeServerSession(prevServer, currentSession);
     } else if (prevServer) {
-      localStorage.removeItem(`rcc_session_${prevServer}`);
+      writeServerSession(prevServer, null);
     }
 
     localStorage.setItem('rcc_server', serverId);
     if (serverName) localStorage.setItem('rcc_server_name', serverName);
 
-    // Restore previously selected session for this server
-    const savedSession = localStorage.getItem(`rcc_session_${serverId}`);
-    if (savedSession) {
-      safeLocalStorageSetItem('rcc_session', savedSession);
-    } else {
-      localStorage.removeItem('rcc_session');
-    }
+    // The destination server's session list is not loaded yet. Keep the
+    // scoped snapshot in storage, but do not put an unvalidated candidate in
+    // the hash; the destination hydrate will resolve it against navigable
+    // sessions before selecting it.
 
     // This click, not the route that happened to mount the document, is now
     // authoritative. Converge the canonical state before the hash-sync effect
     // can publish the old shared selection while reload is being scheduled.
     // Retiring the startup refs also prevents a delayed restore/open result
     // from treating the original shared URL as a still-live intent.
-    const nextRoute = { serverId, sessionName: savedSession, sharedEntryId: null };
+    const nextRoute = { serverId, sessionName: null, sharedEntryId: null };
     initialHashStateRef.current = nextRoute;
     initialSharedTabRestoreRef.current = null;
     sharedHashRestoreStartedRef.current = true;
@@ -5299,11 +5352,11 @@ export function App() {
     selectedServerIdRef.current = serverId;
     setSelectedServerId(serverId);
     setSelectedServerName(serverName ?? null);
-    setActiveSession(savedSession);
+    setActiveSession(null);
 
     // Write the hash BEFORE reload so the new page picks up the right server+session
     // from the URL rather than from (now shared) localStorage.
-    writeHashState(serverId, savedSession ?? null);
+    writeHashState(serverId, null);
 
     // Full page reload — guarantees all components, WS connections, and pinned
     // panels start fresh with the new server. Avoids stale WS/state bugs.
@@ -5423,9 +5476,17 @@ export function App() {
         setManualDashboard(false);
         localStorage.setItem('rcc_server', ownedServer.id);
         if (ownedServer.name) localStorage.setItem('rcc_server_name', ownedServer.name);
+        initialHashStateRef.current = {
+          serverId: ownedServer.id,
+          sessionName: route.sessionName,
+          sharedEntryId: null,
+        };
         setSelectedServerId(ownedServer.id);
         setSelectedServerName(ownedServer.name ?? null);
-        setActiveSession(route.sessionName ?? localStorage.getItem(`rcc_session_${ownedServer.id}`));
+        const routeSessionIsLoaded = route.sessionName
+          ? sessions.some((session) => session.name === route.sessionName && isNavigableMainSession(session))
+          : false;
+        setActiveSession(routeSessionIsLoaded ? route.sessionName : null);
         externalRouteInFlightKeyRef.current = null;
         return;
       }
@@ -5475,6 +5536,7 @@ export function App() {
     selectedSharedEntryId,
     servers,
     serversLoaded,
+    sessions,
     setActiveSession,
     sharedEntries,
   ]);

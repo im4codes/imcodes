@@ -17,6 +17,7 @@ import {
   TEAM_DISCUSSION_LAYOUT,
   TEAM_DISCUSSION_LAYOUT_STORAGE_KEY,
 } from '../src/team-discussion-layout-preference.js';
+import { serverSessionStorageKey } from '../src/server-tab-state.js';
 
 const {
   apiFetchMock,
@@ -2045,6 +2046,40 @@ describe('App shell', () => {
     expect(screen.getByText('featureAnnouncements.messagePins')).toBeTruthy();
     fireEvent.click(screen.getByText('featureAnnouncements.dismiss'));
     await waitFor(() => expect(screen.queryByTestId('feature-announcement')).toBeNull());
+  }, 20_000);
+
+  it('falls back to the first navigable tab when a saved server tab was removed', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_removed_brain');
+    localStorage.setItem('rcc_session', 'deck_removed_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            sessionList().sessions[0],
+            {
+              ...sessionList().sessions[0],
+              name: 'deck_disabled_w1',
+              role: 'worker',
+              state: 'stopped',
+            },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const { App } = await importApp();
+    render(<App />);
+
+    expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
+    expect(screen.queryByTestId('session-pane-deck_removed_brain')).toBeNull();
+    expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_brain');
+    expect(window.location.hash).toContain('/srv-1/deck_alpha_brain');
   }, 20_000);
 
   it('defaults the vertical rail right, persists both dock sides, and keeps each as a root flex child', async () => {

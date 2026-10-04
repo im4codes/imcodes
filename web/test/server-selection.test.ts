@@ -8,6 +8,7 @@ import {
   isServerOnline,
   pickAutoEntryServer,
   pickMostRecentMainSession,
+  resolveServerSessionSnapshot,
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from '../src/server-selection.js';
@@ -126,6 +127,30 @@ describe('pickAutoEntryServer', () => {
       { id: 'srv-off', name: 'Offline', status: 'offline', lastHeartbeatAt: Date.now(), createdAt: 100 },
       { id: 'srv-on', name: 'Online', status: 'online', lastHeartbeatAt: Date.now(), createdAt: 1 },
     ], null)).toEqual({ serverId: 'srv-on', sessionName: null });
+  });
+});
+
+describe('resolveServerSessionSnapshot', () => {
+  it('falls back when the saved tab was deleted or is no longer navigable', () => {
+    const sessions = [
+      { serverId: 'srv-a', sessionName: 'deck_deleted_brain', isSubSession: true, previewUpdatedAt: 100 },
+      { serverId: 'srv-a', sessionName: 'deck_project_w1', previewUpdatedAt: 90 },
+      { serverId: 'srv-a', sessionName: 'deck_project_brain', previewUpdatedAt: 10 },
+      { serverId: 'srv-b', sessionName: 'deck_other_brain', previewUpdatedAt: 999 },
+    ];
+
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_deleted_brain', sessions)).toBe('deck_project_brain');
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_missing_brain', sessions)).toBe('deck_project_brain');
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_other_brain', sessions)).toBe('deck_project_brain');
+  });
+
+  it('restores a valid snapshot only for its own server', () => {
+    const sessions = [
+      { serverId: 'srv-a', sessionName: 'deck_shared_brain', previewUpdatedAt: 10 },
+      { serverId: 'srv-b', sessionName: 'deck_shared_brain', previewUpdatedAt: 20 },
+    ];
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_shared_brain', sessions)).toBe('deck_shared_brain');
+    expect(resolveServerSessionSnapshot('srv-a', 'deck_missing_brain', sessions)).toBe('deck_shared_brain');
   });
 });
 
