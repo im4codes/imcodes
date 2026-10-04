@@ -1462,8 +1462,11 @@ jobs:
       - name: Container startup smoke test
         run: |
           set -euo pipefail
-          test "$(docker inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' imcodes-smoke:test)" = "${{ github.sha }}"
-          test "$(docker inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' imcodes-smoke:test)" = "${{ needs.release_version.outputs.app_version }}"
+          # Keep the Go-template quotes literal. Backslash-escaping them here
+          # makes Docker's template parser see a backslash token and fail
+          # before any image provenance or migration checks run.
+          test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' imcodes-smoke:test)" = "${{ github.sha }}"
+          test "$(docker inspect --format '{{index .Config.Labels "org.opencontainers.image.version"}}' imcodes-smoke:test)" = "${{ needs.release_version.outputs.app_version }}"
           docker run --rm --entrypoint test imcodes-smoke:test \
             -f /app/dist/server/src/db/migrations/099_controlled_node_worker_refresh_status.sql
           docker run --rm --entrypoint sh imcodes-smoke:test -lc \
