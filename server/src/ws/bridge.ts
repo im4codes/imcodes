@@ -6470,6 +6470,13 @@ export class WsBridge {
         safeSend(ws, JSON.stringify({ type: TRANSPORT_MSG.SESSIONS_RESPONSE, providerId, sessions }));
       }
     }
+    // Worker refresh status is durable per controlled node. Replay the latest
+    // validated snapshot to browsers that connect after the daemon emitted it,
+    // just like the cached capability snapshot below; otherwise a reconnecting
+    // UI would regress to the stale worker version until the next refresh.
+    if (this.controlledNodeWorkerRefreshStatus) {
+      safeSend(ws, JSON.stringify(this.controlledNodeWorkerRefreshStatus));
+    }
     /*
      * R3 v2 PR-σ — Replay the cached `daemon.hello` to newly-connected
      * browsers. Previously the daemon only sent hello on (a) WS
