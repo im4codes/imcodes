@@ -1033,6 +1033,90 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
+  it('refreshes an installed worker independently when the daemon version is unchanged', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const refreshRemoteDesktopWorker = vi.fn(async () => ({
+      updated: true,
+      targetVersion: '2026.10.5371-dev.5816',
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      activeConnections: vi.fn(() => []),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      refreshRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(refreshRemoteDesktopWorker).not.toHaveBeenCalled();
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    expect(remoteDesktopWorker.reloadFromDisk).toHaveBeenCalledOnce();
+
+    // Repeated heartbeats do not download the same release again within the
+    // bounded refresh window, even though the daemon version never changed.
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
+  it('defers an installed-worker refresh while a remote-desktop session is active', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    let active = true;
+    const refreshRemoteDesktopWorker = vi.fn(async () => ({ updated: true }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      activeConnections: vi.fn(() => active ? [{}] : []),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      refreshRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(refreshRemoteDesktopWorker).not.toHaveBeenCalled();
+    active = false;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
   it('sends a resolvable v3 remote-desktop profile from a real LinuxRemoteDesktopWorkerHost once its sidecar exists', async () => {
     // Regression coverage for a production bug: a real worker binary
     // present on disk, running, with the fix above landed, still produced

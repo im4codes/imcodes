@@ -314,7 +314,7 @@ export interface RemoteDesktopWorkerHostOptions {
  * credential, database role, media, and input never do.
  */
 export class RemoteDesktopWorkerHost {
-  private readonly artifact: VerifiedRemoteDesktopWorkerArtifact | null;
+  private artifact: VerifiedRemoteDesktopWorkerArtifact | null;
   private readonly platform: NodeJS.Platform;
   private readonly trustedSignerSha256: string;
   private readonly nonce = randomBytes(32).toString('base64url');
@@ -452,6 +452,16 @@ export class RemoteDesktopWorkerHost {
   available(): boolean {
     return this.platform === 'win32' && this.artifact !== null
       && SHA256_RE.test(this.trustedSignerSha256);
+  }
+
+  /** Re-read the atomically replaced sidecar without changing daemon version. */
+  reloadFromDisk(): boolean {
+    if (!this.artifact) return false;
+    const next = verifyRemoteDesktopWorkerArtifact(this.artifact.executablePath, this.trustedSignerSha256);
+    if (!next) return false;
+    this.close();
+    this.artifact = next;
+    return true;
   }
 
   /** The shipped Windows host remains on the byte-compatible v2 profile. */

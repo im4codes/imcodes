@@ -24,8 +24,10 @@ import {
 } from './startup-diagnostics.js';
 import {
   downloadControlledNodeMacosRemoteDesktopComponentSet,
+  refreshControlledNodeRemoteDesktopWorker,
   startControlledNodeUpgradeScavenger,
   startControlledNodeSelfUpgrade,
+  type ControlledNodeRemoteDesktopWorkerRefreshResult,
 } from './self-upgrade.js';
 import { promoteMacosRemoteDesktopArtifact, selectMacosRemoteDesktopArtifact } from './macos-remote-desktop-artifact.js';
 import { defaultMacosRemoteDesktopArtifactStoreRoot } from './macos-remote-desktop-production.js';
@@ -183,6 +185,8 @@ export function isControlledNodeAuthAck(message: Record<string, unknown>): boole
 
 export interface ControlledNodeRemoteDesktopWorker {
   available(): boolean;
+  /** Reload a newly published sidecar after an atomic on-disk swap. */
+  reloadFromDisk?(): boolean;
   sessionCapabilities?(): readonly string[];
   adapterCapabilities?(): readonly RemoteDesktopAdapterCapability[];
   sendConsentFrame?(frame: Record<string, unknown>): Promise<boolean> | boolean;
@@ -358,6 +362,8 @@ export interface ControlledNodeRuntimeOptions {
    * worker beside it even when its main version already matches the Server.
    */
   repairMissingRemoteDesktopWorker?: (targetVersion: string) => ReturnType<typeof startControlledNodeSelfUpgrade>;
+  /** Refresh an already-installed worker independently of daemon upgrades. */
+  refreshRemoteDesktopWorker?: () => Promise<ControlledNodeRemoteDesktopWorkerRefreshResult>;
   /** Test seam for a Linux box with no graphical session (see linux-desktop-environment.ts). */
   linuxDesktop?: {
     displayAvailable(): boolean;
@@ -850,6 +856,8 @@ export function createControlledNodeRuntime(
 
   let remoteDesktopWorkerRepairEligibleAt: number | null = null;
   let remoteDesktopWorkerRepairNextAttemptAt = 0;
+  let remoteDesktopWorkerRefreshNextAttemptAt = 0;
+  let remoteDesktopWorkerRefreshInFlight = false;
   let authenticationPersisted = false;
   let authenticationPersistenceInFlight = false;
   let legacyUpgradeRescueCleanupStarted = false;
@@ -1101,6 +1109,47 @@ export function createControlledNodeRuntime(
     }, (error) => {
       clearUpgradeGate();
       logger.warn({ err: error }, 'missing remote desktop worker repair failed; will retry');
+    });
+    return true;
+  };
+  const refreshRemoteDesktopWorkerIfDue = (force = false): boolean => {
+    if (platform !== 'win32' && platform !== 'linux') return false;
+    if (arch !== 'x64' || !remoteDesktopFeatureEnabled || !remoteDesktopWorkerAvailable) return false;
+    if (remoteDesktopWorkerRefreshInFlight || upgradeInFlight || remoteDesktopWorkerBusy()) return false;
+    const now = options.now?.() ?? Date.now();
+    if (!force && (remoteDesktopWorkerRepairEligibleAt === null
+      || now < remoteDesktopWorkerRepairEligibleAt
+      || now < remoteDesktopWorkerRefreshNextAttemptAt)) return false;
+    remoteDesktopWorkerRefreshNextAttemptAt = now + REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS;
+    remoteDesktopWorkerRefreshInFlight = true;
+    const refresh = options.refreshRemoteDesktopWorker
+      ?? (() => refreshControlledNodeRemoteDesktopWorker({
+        credential,
+        platform,
+        arch,
+        canCommit: () => !upgradeInFlight && !remoteDesktopWorkerBusy(),
+      }));
+    void refresh().then(async (result) => {
+      if (!result.updated) return;
+      const reloaded = remoteDesktopWorker.reloadFromDisk
+        ? remoteDesktopWorker.reloadFromDisk()
+        : (remoteDesktopWorker.close(), true);
+      if (!reloaded) {
+        logger.warn({ targetVersion: result.targetVersion }, 'remote-desktop worker refresh was not loadable');
+        return;
+      }
+      try {
+        await remoteDesktopWorkerStartup?.();
+      } catch (error) {
+        logger.warn({ err: error }, 'refreshed remote-desktop worker did not start');
+      }
+      refreshRemoteDesktopCapabilityState();
+      republishCapabilitiesIfChanged();
+      logger.info({ targetVersion: result.targetVersion }, 'refreshed remote-desktop worker independently of daemon version');
+    }).catch((error) => {
+      logger.warn({ err: error }, 'remote-desktop worker refresh attempt failed');
+    }).finally(() => {
+      remoteDesktopWorkerRefreshInFlight = false;
     });
     return true;
   };
@@ -1365,6 +1414,7 @@ export function createControlledNodeRuntime(
             + REMOTE_DESKTOP_WORKER_REPAIR_AUTH_GRACE_MS;
         }
         repairMissingRemoteDesktopWorker();
+        refreshRemoteDesktopWorkerIfDue();
         if (pendingDaemonUpgradeTarget && !upgradeInFlight) {
           startDeferredDaemonUpgrade(pendingDaemonUpgradeTarget);
         }
@@ -1492,6 +1542,7 @@ export function createControlledNodeRuntime(
           return;
         }
         repairMissingRemoteDesktopWorker(true);
+        refreshRemoteDesktopWorkerIfDue(true);
         return;
       }
       if (message.type === REMOTE_DESKTOP_PRIVACY_MSG.BEGIN

@@ -147,6 +147,12 @@ export class LinuxRemoteDesktopWorkerHost implements ControlledNodeRemoteDesktop
     return existsSync(this.workerPath);
   }
 
+  /** Restart the sidecar after the refresh coordinator atomically swaps it. */
+  reloadFromDisk(): boolean {
+    this.close();
+    return this.available();
+  }
+
   /**
    * The v3 profile, once the worker binary is present -- NOT the bare
    * legacy REMOTE_DESKTOP_CAPABILITY token. resolveRemoteDesktopSessionProfile

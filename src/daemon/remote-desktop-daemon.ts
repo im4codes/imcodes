@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
 import { existsSync, readFileSync } from 'node:fs';
 import { mkdtemp, mkdir, rename, rm } from 'node:fs/promises';
 import { join } from 'node:path';
-import { promisify } from 'node:util';
 import {
   REMOTE_DESKTOP_CAPABILITY,
   isRemoteDesktopMessageType,
@@ -48,12 +46,14 @@ import {
 } from '../node/remote-desktop-worker-host.js';
 import { launchWindowsWorkerInCurrentSession } from '../node/windows-user-session.js';
 import type { RemoteDesktopCommandTarget } from '../node/remote-desktop-dispatch.js';
-import { downloadControlledNodeRemoteDesktopWorker } from '../node/self-upgrade.js';
+import {
+  downloadControlledNodeRemoteDesktopWorker,
+  extractWindowsRemoteDesktopVirtualDisplay,
+} from '../node/self-upgrade.js';
 import { loadDaemonCredential, type DaemonCredential } from './machine-mcp-deps.js';
 import logger from '../util/logger.js';
 import { imcodesStateDir } from '../util/imcodes-state-dir.js';
 
-const execFileAsync = promisify(execFile);
 const SHA256_RE = /^[a-f0-9]{64}$/;
 
 /**
@@ -282,7 +282,7 @@ export class DaemonRemoteDesktop {
       // no such script, so it does the same step here. The extracted files are
       // then hash- and signer-verified by the shared artifact verifier below,
       // and again by Authenticode at launch.
-      await (this.deps.extractVirtualDisplay ?? extractVirtualDisplayArchive)(
+      await (this.deps.extractVirtualDisplay ?? extractWindowsRemoteDesktopVirtualDisplay)(
         join(downloaded.workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME),
         join(downloaded.workerDir, 'virtual-display'),
       );
@@ -584,22 +584,3 @@ function installedWorkerSigner(executablePath: string): string {
  * Expand the signed virtual-display archive. PowerShell is the only unzip this
  * project can rely on, and this path is Windows-only by construction.
  */
-async function extractVirtualDisplayArchive(
-  archivePath: string,
-  destination: string,
-): Promise<void> {
-  await execFileAsync(
-    join(process.env.WINDIR ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
-    [
-      '-NoProfile',
-      '-NonInteractive',
-      '-ExecutionPolicy', 'Bypass',
-      '-Command',
-      'Expand-Archive -LiteralPath $env:IMCODES_RD_ARCHIVE -DestinationPath $env:IMCODES_RD_DEST -Force',
-    ],
-    {
-      windowsHide: true,
-      env: { ...process.env, IMCODES_RD_ARCHIVE: archivePath, IMCODES_RD_DEST: destination },
-    },
-  );
-}
