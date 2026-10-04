@@ -132,7 +132,9 @@ function buildRangeSql(
     clauses.push('AND seq > ?');
     params.push(afterSeq);
   }
-  if (afterTs !== undefined) {
+  // A validated same-epoch sequence cursor is authoritative. Combining it
+  // with a timestamp using AND would drop events sharing the boundary ts.
+  if (afterTs !== undefined && (afterSeq === undefined || epoch === undefined)) {
     clauses.push('AND ts > ?');
     params.push(afterTs);
   }

@@ -207,7 +207,7 @@ describe('timeline history worker', () => {
       insertEvent(db, 3, makeEvent('deck_hist', 3, 'assistant.text', { text: 'new event', streaming: false }, 100));
     });
 
-    const result = await handleTimelineHistoryWorkerRequest(request({ epoch: 1, afterSeq: 2 }));
+    const result = await handleTimelineHistoryWorkerRequest(request({ epoch: 1, afterSeq: 2, afterTs: 100 }));
 
     expect(result.kind).toBe('success');
     if (result.kind !== 'success') throw new Error(result.reason);

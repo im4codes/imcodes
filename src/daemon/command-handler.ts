@@ -7145,8 +7145,10 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
     ? cmd.cursor as Record<string, unknown>
     : undefined;
   const requestedEpoch = optionalFiniteNumber(cursor?.epoch);
-  const sameEpochCursor = cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER
-    && requestedEpoch !== undefined && requestedEpoch === timelineEmitter.epoch
+  const hasNewerEpochCursor = cursor?.direction === TIMELINE_CURSOR_DIRECTIONS.NEWER
+    && requestedEpoch !== undefined;
+  const sameEpochCursor = hasNewerEpochCursor
+    && requestedEpoch === timelineEmitter.epoch
     ? optionalFiniteNumber(cursor?.afterSeq)
     : undefined;
   // A cursor from an older daemon generation cannot safely be applied by seq:
@@ -7154,7 +7156,13 @@ async function handleTimelineHistory(cmd: Record<string, unknown>, serverLink: S
   // back to the bounded newest window so the client can reconcile by eventId.
   const afterSeq = sameEpochCursor;
   const epoch = sameEpochCursor === undefined ? undefined : requestedEpoch;
-  const afterTs = optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
+  // A newer cursor carrying an epoch is authoritative. Same-epoch seq fences
+  // must include events sharing the boundary timestamp; stale-epoch cursors
+  // deliberately ignore their old timestamp and use the bounded newest
+  // fallback. Timestamp-only legacy requests retain their old semantics.
+  const afterTs = hasNewerEpochCursor
+    ? undefined
+    : optionalFiniteNumber(cmd.afterTs) ?? optionalFiniteNumber(cursor?.afterTs);
   const beforeTs = optionalFiniteNumber(cmd.beforeTs) ?? optionalFiniteNumber(cursor?.beforeTs);
   // On a congested uplink one full-budget reply (up to 1 MiB) occupies the
   // socket for minutes and every heartbeat/ack/session.state queues behind

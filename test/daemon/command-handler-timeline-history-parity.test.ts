@@ -172,6 +172,7 @@ describe('command-handler timeline.history_request SQLite parity', () => {
       sessionName: 'deck_proj_brain',
       requestId: 'req-cursor',
       limit: 50,
+      afterTs: 100,
       cursor: { epoch: 5, afterSeq: 42, direction: 'newer' },
     }, serverLink as never);
     await flushAsync();
@@ -198,7 +199,8 @@ describe('command-handler timeline.history_request SQLite parity', () => {
       sessionName: 'deck_proj_brain',
       requestId: 'req-old-epoch',
       limit: 50,
-      cursor: { epoch: 4, afterSeq: 42, direction: 'newer' },
+      afterTs: 999_999,
+      cursor: { epoch: 4, afterSeq: 42, afterTs: 999_999, direction: 'newer' },
     }, serverLink as never);
     await flushAsync();
 
