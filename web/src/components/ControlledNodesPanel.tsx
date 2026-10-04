@@ -207,16 +207,18 @@ export function ControlledNodesPanel({
         || typeof detail.phase !== 'string' || typeof detail.recordedAt !== 'number') return;
       if (!['started', 'deferred', 'succeeded', 'failed'].includes(detail.phase)) return;
       const serverId = detail.serverId;
+      const attemptId = detail.attemptId;
+      const recordedAt = detail.recordedAt;
       setWorkerRefreshByServerId((previous) => ({
         ...previous,
         [serverId]: {
-          attemptId: detail.attemptId,
+          attemptId,
           phase: detail.phase as NonNullable<MachineListItem['workerRefresh']>['phase'],
           ...(typeof detail.installedVersion === 'string' ? { installedVersion: detail.installedVersion } : {}),
           ...(typeof detail.targetVersion === 'string' ? { targetVersion: detail.targetVersion } : {}),
           ...(typeof detail.artifactSha256 === 'string' ? { artifactSha256: detail.artifactSha256 } : {}),
           ...(typeof detail.reason === 'string' ? { reason: detail.reason } : {}),
-          recordedAt: detail.recordedAt,
+          recordedAt,
         },
       }));
     };
