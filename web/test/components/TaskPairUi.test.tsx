@@ -261,6 +261,30 @@ describe('TaskPairEventChip', () => {
     expect(card.querySelector('.task-pair-card-detail-line')?.textContent).toContain('taskPair.card_no_blocking');
     expect(card.querySelectorAll('.task-pair-card-finding')).toHaveLength(0);
   });
+
+  it('masks POSIX and Windows private home paths in expanded summaries and hover previews', () => {
+    const restoreMatchMedia = stubDesktopHover(true);
+    vi.useFakeTimers();
+    const { container } = render(<TaskPairEventChip eventId="e-private-paths" payload={{
+      taskId: 'T-private-paths', title: 'Private paths', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
+      auditDetails: { findings: [{ severity: 'P0', evidence: 'see /Users/alice/secret and C:\\Users\\alice\\secret' }] },
+      noticeText: 'see /Users/alice/secret and /home/alice/private and C:\\Users\\alice\\private',
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.pointerEnter(card, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(180));
+    const preview = document.body.querySelector('.task-pair-card-hover-preview')!;
+    expect(preview.textContent).toContain('<user-home>');
+    expect(preview.textContent).not.toContain('alice');
+    fireEvent.pointerLeave(card, { pointerType: 'mouse' });
+    act(() => vi.advanceTimersByTime(140));
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    const details = card.querySelector('.task-pair-card-audit-details')!;
+    expect(details.textContent).toContain('<user-home>');
+    expect(details.textContent).not.toContain('alice');
+    restoreMatchMedia();
+    vi.useRealTimers();
+  });
 });
 
 describe('TaskPairEventChip workspace events', () => {

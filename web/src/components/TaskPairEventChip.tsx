@@ -30,7 +30,8 @@ function safeDetailText(value: unknown): string {
   if (typeof value !== 'string') return '';
   return value
     .replace(/((?:api[_ -]?key|token|password|secret)\s*[:=]\s*)\S+/gi, '$1•••')
-    .replace(/(?:\/Users\/|\/home\/|C:\\\\Users\\\\)[^\s/\\]+/gu, '<user-home>');
+    .replace(/\/(?:Users|home)\/[^/\s]+/gu, '/<user-home>')
+    .replace(/[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+/gu, '<user-home>');
 }
 
 /** Text of a daemon workspace event: where a kept deliverable went, or what happened to the workspace. */
@@ -97,9 +98,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const noBlockingFindings = (event.toStatus === 'passed' || event.toStatus === 'done')
     && findings.length === 0
     && (event.severityCounts ? (event.severityCounts.P0 ?? 0) === 0 && (event.severityCounts.P1 ?? 0) === 0 : true);
-  const previewNoticeText = noticeText
-    .replace(/((?:api[_ -]?key|token|password|secret)\s*[:=]\s*)\S+/gi, '$1•••')
-    .slice(0, 320);
+  const previewNoticeText = safeDetailText(noticeText).slice(0, 320);
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
   const statusBadgeClass = isStatus(event.toStatus) ? event.toStatus : 'unknown';
