@@ -76,4 +76,66 @@ describe('macOS worker refresh runtime', () => {
     expect(promoteMacSet).toHaveBeenCalledOnce();
     runtime.stop();
   });
+
+  it('reports the current-worker rejection without promoting an equal sidecar', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-mac-worker-refresh-current-'));
+    tempDirs.push(root);
+    const manifestPath = join(root, 'manifest.json');
+    await writeFile(manifestPath, JSON.stringify({ workerVersion: '2026.9.5113-dev.5644' }));
+    downloadMacSet.mockResolvedValue({
+      componentDirectory: join(root, 'components'),
+      manifestPath,
+      artifactSha256: 'c'.repeat(64),
+    });
+    selectMacSet.mockResolvedValue({ manifest: { workerVersion: '2026.9.5113-dev.5644' } });
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'mac-refresh-current', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'darwin', arch: 'arm64',
+      remoteDesktopWorker: { available: vi.fn(() => true), sessionCapabilities: vi.fn(() => [REMOTE_DESKTOP_CAPABILITY]), close: vi.fn() },
+      macosRemoteDesktopComponentsInstalled: async () => true,
+      now: () => 10_000,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.at(-1)).toEqual(expect.objectContaining({ phase: 'failed', targetVersion: '2026.9.5113-dev.5644', reason: 'worker_current' }));
+    });
+    expect(promoteMacSet).not.toHaveBeenCalled();
+    runtime.stop();
+  });
+
+  it('rejects a downgrade and preserves the installed sidecar', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-mac-worker-refresh-downgrade-'));
+    tempDirs.push(root);
+    const manifestPath = join(root, 'manifest.json');
+    await writeFile(manifestPath, JSON.stringify({ workerVersion: '2026.9.5113-dev.5644' }));
+    downloadMacSet.mockResolvedValue({
+      componentDirectory: join(root, 'components'),
+      manifestPath,
+      artifactSha256: 'd'.repeat(64),
+    });
+    selectMacSet.mockResolvedValue({ manifest: { workerVersion: '2026.10.5371-dev.5816' } });
+    const socket = new MockSocket();
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'mac-refresh-downgrade', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'darwin', arch: 'arm64',
+      remoteDesktopWorker: { available: vi.fn(() => true), sessionCapabilities: vi.fn(() => [REMOTE_DESKTOP_CAPABILITY]), close: vi.fn() },
+      macosRemoteDesktopComponentsInstalled: async () => true,
+      now: () => 10_000,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((frame) => frame.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.at(-1)).toEqual(expect.objectContaining({ phase: 'failed', targetVersion: '2026.9.5113-dev.5644', reason: 'worker_downgrade_rejected' }));
+    });
+    expect(promoteMacSet).not.toHaveBeenCalled();
+    runtime.stop();
+  });
 });
