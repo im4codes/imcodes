@@ -85,7 +85,14 @@ export async function sendTaskPairMessage(
   if (testDeps?.send) {
     inFlightTaskPairMessages.add(dedupeKey);
     try {
-      await testDeps.send(target, text, messageId);
+      // Test transports record delivery synchronously in every caller.  Drop
+      // the in-flight marker immediately after invoking the fake so one test
+      // cannot leak a pending key into the next test's fresh dependency
+      // instance.  The real transport path below retains the await-backed
+      // gate, which is the production concurrency protection.
+      const send = testDeps.send(target, text, messageId);
+      inFlightTaskPairMessages.delete(dedupeKey);
+      await send;
       return 'sent';
     } finally {
       inFlightTaskPairMessages.delete(dedupeKey);
