@@ -2258,6 +2258,8 @@ export interface TaskPairEventPayload {
   checklistAutoTickNotice?: string;
   /** Original human-readable daemon/auditor notice, when one was available. */
   noticeText?: string;
+  /** The latest participant wait note, projected for NEEDS_INPUT/BLOCKED cards. */
+  blockedNote?: string;
   /** Structured, display-safe audit context extracted from the notice. */
   auditDetails?: TaskPairAuditDetails;
 }

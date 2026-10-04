@@ -22,7 +22,22 @@ describe('task-pair notification thinking metadata', () => {
 
   it('normalizes structured and legacy aliases, while leaving missing details absent', () => {
     expect(normalizeTaskPairAuditDetails({ auditFindings: [{ severity: 'P1', evidence: 'repro' }], validationSummary: '2 tests passed' })).toEqual({ findings: [{ severity: 'P1', evidence: 'repro' }], validation: '2 tests passed' });
+    expect(normalizeTaskPairAuditDetails({ auditDetails: { validationSummary: 'replayed validation' }, blockedNote: 'waiting for the exact head' })).toEqual({ validation: 'replayed validation', reason: 'waiting for the exact head' });
     expect(parseTaskPairAuditDetails('Audited pair PASS status=passed p0=0')).toBeUndefined();
+  });
+
+  it('accepts common violation, file/function, why, and markdown-bold labels', () => {
+    expect(parseTaskPairAuditDetails(
+      '[P1] stale audit projection\n'
+      + '**Violation of invariant:** replay must retain the latest finding\n'
+      + 'File/function: web/src/components/TaskPairEventChip.tsx:100\n'
+      + 'Evidence / reproduction: reload history\n'
+      + 'Suggested solution: keep the structured projection\n'
+      + 'Why: the old payload only carried counts',
+    )).toMatchObject({
+      findings: [{ invariant: 'replay must retain the latest finding', location: 'web/src/components/TaskPairEventChip.tsx:100', evidence: 'reload history', proposal: 'keep the structured projection' }],
+      reason: 'the old payload only carried counts',
+    });
   });
 
   it('keeps thinking levels from marker attributes when the assistant body has no prose fields', () => {

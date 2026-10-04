@@ -262,13 +262,26 @@ describe('TaskPairEventChip', () => {
     expect(card.querySelectorAll('.task-pair-card-finding')).toHaveLength(0);
   });
 
+  it('shows a blocked note for NEEDS_INPUT and respects configured blocking levels', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-blocked" payload={{
+      taskId: 'T-blocked', title: 'Waiting for input', writer: 'daemon', verb: 'NEEDS_INPUT', toStatus: 'awaiting_brain_decision',
+      blockedNote: 'Provide the exact audit head or choose a replacement machine.', blocking: ['P2'],
+      severityCounts: { P0: 0, P1: 0, P2: 1, P3: 0, P4: 0 },
+    }} />);
+    const card = container.querySelector('.task-pair-event-card')!;
+    fireEvent.click(card.querySelector('.task-pair-card-toggle')!);
+    expect(card.querySelector('.task-pair-card-audit-details')?.textContent).toContain('Provide the exact audit head');
+    expect(card.querySelector('.task-pair-card-detail-line')?.textContent).toContain('taskPair.card_reason');
+  });
+
   it('masks POSIX and Windows private home paths in expanded summaries and hover previews', () => {
     const restoreMatchMedia = stubDesktopHover(true);
     vi.useFakeTimers();
     const { container } = render(<TaskPairEventChip eventId="e-private-paths" payload={{
       taskId: 'T-private-paths', title: 'Private paths', writer: 'daemon', verb: 'REWORK', toStatus: 'rework',
       auditDetails: { findings: [{ severity: 'P0', evidence: 'see /Users/alice/secret and C:\\Users\\alice\\secret' }] },
-      noticeText: 'see /Users/alice/secret and /home/alice/private and C:\\Users\\alice\\private',
+      noticeText: 'see /Users/alice/secret and /home/alice/private and C:\\Users\\alice\\private token=super-secret',
+      authorization: 'Bearer super-secret',
     }} />);
     const card = container.querySelector('.task-pair-event-card')!;
     fireEvent.pointerEnter(card, { pointerType: 'mouse' });
@@ -282,6 +295,12 @@ describe('TaskPairEventChip', () => {
     const details = card.querySelector('.task-pair-card-audit-details')!;
     expect(details.textContent).toContain('<user-home>');
     expect(details.textContent).not.toContain('alice');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).toContain('<user-home>');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).not.toContain('alice');
+    expect(card.querySelector('.task-pair-card-notice')?.textContent).not.toContain('super-secret');
+    const payload = card.querySelector('.task-pair-card-payload pre')?.textContent ?? '';
+    expect(payload).not.toContain('super-secret');
+    expect(payload).toContain('•••');
     restoreMatchMedia();
     vi.useRealTimers();
   });

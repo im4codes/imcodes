@@ -172,6 +172,18 @@ describe('task-pair marker ingestion', () => {
     expect(rework?.auditDetails).toMatchObject({ findings: [{ severity: 'P0', location: 'src/daemon/foo.ts:42', evidence: expect.stringContaining('211'), proposal: expect.stringContaining('server lifetime') }] });
   });
 
+  it('projects participant wait notes so replayed NEEDS_INPUT cards retain the reason', async () => {
+    const seen: Array<Record<string, unknown>> = [];
+    const off = timelineEmitter.on((event) => {
+      if (event.type === TASK_PAIR_TIMELINE_EVENT && event.payload && typeof event.payload === 'object') seen.push(event.payload as Record<string, unknown>);
+    });
+    await say(BRAIN, `<!-- IMCODES_TASK DISPATCH T-wait-note executor=${EXEC} auditor=${AUD} -->`);
+    await say(EXEC, `<!-- IMCODES_TASK NEEDS_INPUT T-wait-note note="Provide the exact audit head" -->`);
+    off();
+    const wait = seen.reverse().find((payload) => payload.taskId === 'T-wait-note' && payload.verb === 'NEEDS_INPUT');
+    expect(wait).toMatchObject({ blockedNote: 'Provide the exact audit head' });
+  });
+
   it('returns one delivery receipt per participant and does not auto-send before the structured caller awaits it', async () => {
     const transition = service.implicitDispatch({
       project: PROJECT,

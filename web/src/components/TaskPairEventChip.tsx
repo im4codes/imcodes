@@ -26,12 +26,29 @@ function verbKey(verb: unknown): string {
   return typeof verb === 'string' && (TASK_PAIR_VERBS as readonly string[]).includes(verb) ? verb.toLowerCase() : 'other';
 }
 
+const SENSITIVE_KEY_RE = /(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password|secret|authorization|cookie|credential)/iu;
+
+/** Redact credentials and private home-directory components before audit text
+ * reaches the browser. Notices and payloads are daemon-authored but can carry
+ * command output, paths, or credentials from a real workspace. */
 function safeDetailText(value: unknown): string {
   if (typeof value !== 'string') return '';
   return value
-    .replace(/((?:api[_ -]?key|token|password|secret)\s*[:=]\s*)\S+/gi, '$1•••')
+    .replace(/((?:["']?(?:api[_ -]?key|access[_ -]?token|refresh[_ -]?token|token|password|secret|authorization|cookie|credential)["']?\s*[:=]\s*))(?:["']?)[^\s,;}"']+/giu, '$1•••')
+    .replace(/((?:authorization)\s+bearer\s+)[^\s,;}]+/giu, '$1•••')
     .replace(/\/(?:Users|home)\/[^/\s]+/gu, '/<user-home>')
     .replace(/[A-Za-z]:[\\/]+Users[\\/]+[^\\/\s]+/gu, '<user-home>');
+}
+
+function safePayloadValue(value: unknown, key?: string): unknown {
+  if (key && SENSITIVE_KEY_RE.test(key)) return '•••';
+  if (typeof value === 'string') return safeDetailText(value);
+  if (Array.isArray(value)) return value.map((entry) => safePayloadValue(entry));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .map(([entryKey, entryValue]) => [entryKey, safePayloadValue(entryValue, entryKey)]));
+  }
+  return value;
 }
 
 /** Text of a daemon workspace event: where a kept deliverable went, or what happened to the workspace. */
@@ -85,19 +102,29 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
   const payloadForDetails = typeof timestamp === 'number' && Number.isFinite(timestamp)
     ? { ...payload, _eventTimestamp: new Date(timestamp).toISOString() }
     : payload;
-  const payloadJson = JSON.stringify(payloadForDetails, null, 2) ?? '{}';
+  const payloadJson = JSON.stringify(safePayloadValue(payloadForDetails), null, 2) ?? '{}';
   const eventTime = typeof timestamp === 'number' && Number.isFinite(timestamp)
     ? new Intl.DateTimeFormat(i18n?.language || undefined, { hour: '2-digit', minute: '2-digit' }).format(new Date(timestamp))
     : '';
   const noticeText = typeof (event as Record<string, unknown>).noticeText === 'string'
     ? (event as Record<string, unknown>).noticeText as string
     : '';
-  const auditDetails = normalizeTaskPairAuditDetails(event) ?? parseTaskPairAuditDetails(noticeText);
+  const parsedAuditDetails = normalizeTaskPairAuditDetails(event) ?? parseTaskPairAuditDetails(noticeText);
+  const blockedNote = typeof event.blockedNote === 'string' ? event.blockedNote.trim() : '';
+  const auditDetails = parsedAuditDetails || blockedNote
+    ? {
+      ...(parsedAuditDetails ?? {}),
+      ...(!parsedAuditDetails?.reason && blockedNote ? { reason: blockedNote } : {}),
+    }
+    : undefined;
   const findings = auditDetails?.findings ?? [];
   const hasAuditDetails = Boolean(auditDetails && Object.values(auditDetails).some((value) => Array.isArray(value) ? value.length > 0 : Boolean(value)));
+  const blockingLevels = Array.isArray(event.blocking) && event.blocking.length > 0
+    ? event.blocking
+    : ['P0', 'P1'] as const;
   const noBlockingFindings = (event.toStatus === 'passed' || event.toStatus === 'done')
     && findings.length === 0
-    && (event.severityCounts ? (event.severityCounts.P0 ?? 0) === 0 && (event.severityCounts.P1 ?? 0) === 0 : true);
+    && (event.severityCounts ? blockingLevels.every((level) => (event.severityCounts?.[level] ?? 0) === 0) : true);
   const previewNoticeText = safeDetailText(noticeText).slice(0, 320);
   // One colour per status (styles.css `.task-pair-chip--<status>`).
   const statusClass = isStatus(event.toStatus) ? ` task-pair-chip--${event.toStatus}` : '';
@@ -295,7 +322,7 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
               : t('taskPair.chip', { writer: writer === 'daemon' ? t('taskPair.daemon') : writer, verb })}
           </span>
           {renderAuditDetails()}
-          {noticeText && <pre class="task-pair-card-notice">{noticeText}</pre>}
+          {noticeText && <pre class="task-pair-card-notice">{safeDetailText(noticeText)}</pre>}
           <span class="task-pair-card-event-meta"><span>{t('taskPair.card_event')}</span>{verb}</span>
           {roleLabel(event.executor, event.executorLabel, event.executorModel, event.executorThinking, 'executor')}
           {roleLabel(event.auditor, event.auditorLabel, event.auditorModel, event.auditorThinking, 'auditor')}

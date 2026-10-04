@@ -1558,6 +1558,7 @@ export class TaskPairService {
       ...(transition.resourceConflict ? { resourceConflict: transition.resourceConflict } : {}),
       ...(transition.verdict ? { severityCounts: transition.verdict.counts, verdictJudgement: transition.verdict.judgement } : {}),
       ...(noticeText ? { noticeText } : {}),
+      ...(pair?.blockedNote ? { blockedNote: pair.blockedNote } : {}),
       ...(auditDetails ? { auditDetails } : {}),
     }, pair, input.eventId);
   }

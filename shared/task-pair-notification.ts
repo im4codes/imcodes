@@ -101,8 +101,8 @@ function inferStatus(verb: TaskPairVerb, status: TaskPairStatus | undefined): Ta
   }
 }
 
-const DETAIL_FIELD_RE = /^\s*(?:[-*]\s*)?(?:invariant|violat(?:es|ed)|违反不变量|不变量|location|位置|file|function|evidence|证据|repro(?:duction)?|复现|proposal|suggest(?:ed)? solution|建议(?:方案)?|trade[- ]?offs?|权衡|validation|验证|next step|下一步|reason|原因)\s*[:：]\s*(.*)$/iu;
-const FINDING_RE = /^\s*(?:[-*]\s*)?(?:finding\s*)?\[(P[0-4])\]\s*(.*)$/iu;
+const DETAIL_FIELD_RE = /^\s*(?:[-*]\s*)?(?:\*\*|__)?(?<label>invariant|violat(?:es|ed|ion)|violation\s+of\s+invariant|invariant\s+violated|违反不变量|不变量|location|位置|file(?:\s*\/\s*function)?|function|evidence(?:\s*\/\s*repro(?:duction)?)?|证据|repro(?:duction)?|复现|proposal|recommendation|auditor\s+proposal|suggest(?:ed)? solution|suggested fix|fix|建议(?:方案)?|trade[- ]?offs?|权衡|validation(?:\s+summary)?|验证(?:摘要)?|tests?|suite|next step|next steps|下一步|reason|why|原因)(?:\*\*|__)?\s*[:：]\s*(?:\*\*|__)?(?<value>.*)$/iu;
+const FINDING_RE = /^\s*(?:[-*]\s*)?(?:finding\s*)?\[\s*(P[0-4])\s*\]\s*(.*)$/iu;
 const FINDING_WORD_RE = /^\s*(?:[-*]\s*)?(?:finding|发现)\s*[:：]?\s*(.*)$/iu;
 const SUMMARY_RE = /^\s*(?:summary|audit summary|摘要|审计摘要)\s*[:：]\s*(.*)$/iu;
 
@@ -117,7 +117,7 @@ function setFindingField(finding: TaskPairAuditFinding, label: string, value: st
   const field = key.includes('invariant') || key.includes('violat') || key.includes('不变量') ? 'invariant'
     : key.includes('location') || key === 'file' || key === 'function' || key.includes('位置') ? 'location'
       : key.includes('evidence') || key.includes('repro') || key.includes('证据') || key.includes('复现') ? 'evidence'
-        : key.includes('proposal') || key.includes('solution') || key.includes('建议') ? 'proposal'
+          : key.includes('proposal') || key.includes('recommend') || key.includes('solution') || key === 'fix' || key.includes('建议') ? 'proposal'
           : key.includes('trade') || key.includes('权衡') ? 'tradeoffs' : undefined;
   if (!field) return;
   const normalized = cleanDetailText(value);
@@ -158,8 +158,8 @@ export function parseTaskPairAuditDetails(text: unknown): TaskPairAuditDetails |
     }
     const labelled = line.match(DETAIL_FIELD_RE);
     if (labelled) {
-      const label = line.slice(0, line.indexOf(labelled[1] ?? '')).trim();
-      const value = labelled[1] ?? '';
+      const label = labelled.groups?.label ?? '';
+      const value = labelled.groups?.value ?? '';
       if (current && /invariant|violat|不变量/iu.test(label)) { setFindingField(current, 'invariant', value); currentField = 'invariant'; continue; }
       if (current && /location|位置|file|function/iu.test(label)) { setFindingField(current, 'location', value); currentField = 'location'; continue; }
       if (current && /evidence|repro|证据|复现/iu.test(label)) { setFindingField(current, 'evidence', value); currentField = 'evidence'; continue; }
@@ -167,7 +167,7 @@ export function parseTaskPairAuditDetails(text: unknown): TaskPairAuditDetails |
       if (current && /trade|权衡/iu.test(label)) { setFindingField(current, 'tradeoffs', value); currentField = 'tradeoffs'; continue; }
       if (/validation|验证|tests?|suite/iu.test(label)) validation.push(value);
       else if (/next step|下一步/iu.test(label)) nextSteps.push(value);
-      else if (/reason|原因/iu.test(label)) reasons.push(value);
+      else if (/reason|why|原因/iu.test(label)) reasons.push(value);
       continue;
     }
     if (current && currentField && currentField !== 'severity') {
@@ -206,7 +206,12 @@ export function normalizeTaskPairAuditDetails(input: unknown): TaskPairAuditDeta
   const details: TaskPairAuditDetails = {
     ...(findings.length ? { findings } : {}),
     ...(['summary', 'validation', 'reason', 'nextStep'].reduce((out, field) => {
-      const value = cleanDetailText(source[field] ?? record[`${field}Summary`]);
+      const value = cleanDetailText(
+        source[field]
+          ?? source[`${field}Summary`]
+          ?? record[`${field}Summary`]
+          ?? (field === 'reason' ? record.blockedNote ?? record.noticeReason : undefined),
+      );
       if (value) (out as Record<string, string>)[field] = value;
       return out;
     }, {} as Partial<TaskPairAuditDetails>)),
