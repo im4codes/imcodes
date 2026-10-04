@@ -196,8 +196,32 @@ export function ControlledNodesPanel({
   const [upgradeStatusByServerId, setUpgradeStatusByServerId] = useState<Record<string, Awaited<ReturnType<typeof getMachineUpgradeStatus>>>>({});
   const [upgradeResultByServerId, setUpgradeResultByServerId] = useState<Record<string, string | undefined>>({});
   const [upgradeBusyServerId, setUpgradeBusyServerId] = useState<string | null>(null);
+  const [workerRefreshByServerId, setWorkerRefreshByServerId] = useState<Record<string, NonNullable<MachineListItem['workerRefresh']>>>({});
   const upgradeBusyRef = useRef<string | null>(null);
   const [connectionSummaries, setConnectionSummaries] = useState<readonly RemoteDesktopConnectionSummary[]>([]);
+
+  useEffect(() => {
+    const onWorkerRefresh = (event: Event): void => {
+      const detail = (event as CustomEvent<Record<string, unknown>>).detail;
+      if (!detail || typeof detail.serverId !== 'string' || typeof detail.attemptId !== 'string'
+        || typeof detail.phase !== 'string' || typeof detail.recordedAt !== 'number') return;
+      if (!['started', 'deferred', 'succeeded', 'failed'].includes(detail.phase)) return;
+      setWorkerRefreshByServerId((previous) => ({
+        ...previous,
+        [detail.serverId]: {
+          attemptId: detail.attemptId,
+          phase: detail.phase as NonNullable<MachineListItem['workerRefresh']>['phase'],
+          ...(typeof detail.installedVersion === 'string' ? { installedVersion: detail.installedVersion } : {}),
+          ...(typeof detail.targetVersion === 'string' ? { targetVersion: detail.targetVersion } : {}),
+          ...(typeof detail.artifactSha256 === 'string' ? { artifactSha256: detail.artifactSha256 } : {}),
+          ...(typeof detail.reason === 'string' ? { reason: detail.reason } : {}),
+          recordedAt: detail.recordedAt,
+        },
+      }));
+    };
+    window.addEventListener('controlled-node-worker-refresh-status', onWorkerRefresh);
+    return () => window.removeEventListener('controlled-node-worker-refresh-status', onWorkerRefresh);
+  }, []);
 
   useEffect(() => {
     if (!remoteDesktopManager) return undefined;
@@ -696,6 +720,7 @@ export function ControlledNodesPanel({
 
   const renderControlPanel = (machine: MachineListItem) => {
     const upgrade = upgradeStatusByServerId[machine.serverId];
+    const workerRefresh = workerRefreshByServerId[machine.serverId] ?? machine.workerRefresh;
     const connection = connectionSummaries.find((item) => item.serverId === machine.serverId);
     const status = upgrade?.upgrade?.status;
     const actionable = machineAccessRole(machine) !== 'viewer' && machine.online;
@@ -705,6 +730,17 @@ export function ControlledNodesPanel({
           <span><strong>{t('controlled_nodes.current_version')}:</strong> {upgrade?.currentVersion ?? machine.daemonVersion ?? t('controlled_nodes.version_unknown')}</span>
           <span><strong>{t('controlled_nodes.latest_version')}:</strong> {upgrade?.latestVersion ?? t('controlled_nodes.version_unknown')}</span>
           {status && <span class={`controlled-nodes-upgrade-status is-${status}`} role="status">{t(`controlled_nodes.upgrade_status_${status}`, { defaultValue: status })}</span>}
+          {workerRefresh && <span
+            class={`controlled-nodes-worker-refresh-status is-${workerRefresh.phase}`}
+            data-testid={`controlled-node-worker-refresh-${machine.serverId}`}
+            role={workerRefresh.phase === 'failed' ? 'alert' : 'status'}
+          >
+            {t(`controlled_nodes.worker_refresh_${workerRefresh.phase}`, { defaultValue: `Worker refresh: ${workerRefresh.phase}` })}
+            {workerRefresh.installedVersion ? ` (${workerRefresh.installedVersion})` : ''}
+            {workerRefresh.targetVersion ? ` → ${workerRefresh.targetVersion}` : ''}
+            {workerRefresh.artifactSha256 ? ` #${workerRefresh.artifactSha256.slice(0, 12)}` : ''}
+            {workerRefresh.reason ? `: ${workerRefresh.reason}` : ''}
+          </span>}
           {upgrade?.upgrade?.status === 'terminal_blocked' && <span class="controlled-nodes-upgrade-error" role="alert">{t('controlled_nodes.upgrade_failed_reason')}{upgradeResultByServerId[machine.serverId] ? ` (${upgradeResultByServerId[machine.serverId]})` : ''}</span>}
           {(machine.updateAvailable || (upgrade?.latestVersion && upgrade.currentVersion && upgrade.latestVersion !== upgrade.currentVersion)) && (
             <button

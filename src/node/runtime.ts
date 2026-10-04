@@ -1,4 +1,5 @@
 import WebSocket from 'ws';
+import { randomUUID } from 'node:crypto';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -6,6 +7,7 @@ import { CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.j
 import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CONTROLLED_NODE_WORKER_REFRESH_PHASE } from '../../shared/controlled-node-worker-refresh.js';
 import { DAEMON_UPGRADE_BLOCK_REASON, DAEMON_UPGRADE_TARGET_LATEST } from '../../shared/daemon-upgrade.js';
 import { DAEMON_VERSION } from '../util/version.js';
 import {
@@ -1135,13 +1137,31 @@ export function createControlledNodeRuntime(
   const refreshRemoteDesktopWorkerIfDue = (force = false): boolean => {
     if (platform !== 'win32' && platform !== 'linux') return false;
     if (arch !== 'x64' || !remoteDesktopFeatureEnabled || !remoteDesktopWorkerAvailable) return false;
-    if (remoteDesktopWorkerRefreshInFlight || upgradeInFlight || remoteDesktopWorkerBusy()) return false;
+    if (remoteDesktopWorkerRefreshInFlight || upgradeInFlight) return false;
     const now = options.now?.() ?? Date.now();
     if (!force && (remoteDesktopWorkerRepairEligibleAt === null
       || now < remoteDesktopWorkerRepairEligibleAt
       || now < remoteDesktopWorkerRefreshNextAttemptAt)) return false;
+    const attemptId = randomUUID();
+    const emitRefreshStatus = (phase: typeof CONTROLLED_NODE_WORKER_REFRESH_PHASE[keyof typeof CONTROLLED_NODE_WORKER_REFRESH_PHASE], result: Partial<ControlledNodeRemoteDesktopWorkerRefreshResult> = {}): void => {
+      client.send({
+        type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+        attemptId,
+        phase,
+        recordedAt: Date.now(),
+        ...(result.installedVersion ? { installedVersion: result.installedVersion } : {}),
+        ...(result.targetVersion ? { targetVersion: result.targetVersion } : { targetVersion: DAEMON_VERSION }),
+        ...(result.artifactSha256 ? { artifactSha256: result.artifactSha256 } : {}),
+        ...(result.reason ? { reason: result.reason.slice(0, 256) } : {}),
+      });
+    };
+    if (remoteDesktopWorkerBusy()) {
+      emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.DEFERRED, { reason: 'worker_busy' });
+      return false;
+    }
     remoteDesktopWorkerRefreshNextAttemptAt = now + REMOTE_DESKTOP_WORKER_REPAIR_RETRY_MS;
     remoteDesktopWorkerRefreshInFlight = true;
+    emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.STARTED);
     const refresh = options.refreshRemoteDesktopWorker
       ?? ((context: ControlledNodeRemoteDesktopWorkerRefreshContext) => refreshControlledNodeRemoteDesktopWorker({
         credential,
@@ -1172,7 +1192,10 @@ export function createControlledNodeRuntime(
       commitFence: remoteDesktopCommitFence,
     };
     void refresh(refreshContext).then(async (result) => {
-      if (!result.updated) return;
+      if (!result.updated) {
+        emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, result);
+        return;
+      }
       // Custom test/integration refreshers may perform the swap themselves.
       // Keep activation behind the same fence unless they explicitly report
       // that activation already happened under it.
@@ -1202,8 +1225,13 @@ export function createControlledNodeRuntime(
         }
       }
       logger.info({ targetVersion: result.targetVersion }, 'refreshed remote-desktop worker independently of daemon version');
+      emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED, result);
     }).catch((error) => {
       logger.warn({ err: error }, 'remote-desktop worker refresh attempt failed');
+      emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
+        targetVersion: DAEMON_VERSION,
+        reason: error instanceof Error ? error.message : 'worker_refresh_failed',
+      });
     }).finally(() => {
       remoteDesktopWorkerRefreshInFlight = false;
     });

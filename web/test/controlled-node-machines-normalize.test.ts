@@ -164,6 +164,28 @@ describe('controlled-node access-role normalization', () => {
     });
   });
 
+  it('surfaces bounded worker-refresh status instead of stale worker metadata', async () => {
+    apiFetch.mockResolvedValueOnce({
+      machines: withNodeIds([{
+        serverId: 'worker-refresh', refName: 'worker-refresh', online: true, execEnabled: true,
+        workerRefresh: {
+          attemptId: 'attempt-1234', phase: 'failed', installedVersion: '2026.9.1-dev.1',
+          targetVersion: '2026.10.1-dev.2', artifactSha256: VALID_SHA256,
+          reason: 'worker_verification_failed', recordedAt: 123456,
+        },
+      }]),
+    });
+    expect((await listControllableMachines())[0]?.workerRefresh).toEqual(expect.objectContaining({
+      attemptId: 'attempt-1234',
+      phase: 'failed',
+      installedVersion: '2026.9.1-dev.1',
+      targetVersion: '2026.10.1-dev.2',
+      artifactSha256: VALID_SHA256,
+      reason: 'worker_verification_failed',
+      recordedAt: 123456,
+    }));
+  });
+
   it('keeps only an exact, known remote-desktop capability list', async () => {
     apiFetch.mockResolvedValueOnce({
       machines: withNodeIds([

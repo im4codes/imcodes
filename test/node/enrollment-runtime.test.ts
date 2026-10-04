@@ -1071,6 +1071,11 @@ describe('controlled node enrollment and runtime', () => {
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
     expect(remoteDesktopWorker.reloadFromDisk).toHaveBeenCalledOnce();
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((message) => message.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.map((message) => message.phase)).toEqual(['started', 'succeeded']);
+      expect(statuses[1]).toEqual(expect.objectContaining({ targetVersion: '2026.10.5371-dev.5816' }));
+    });
 
     // Repeated heartbeats do not download the same release again within the
     // bounded refresh window, even though the daemon version never changed.
@@ -1114,6 +1119,7 @@ describe('controlled node enrollment and runtime', () => {
     active = false;
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    expect(socket.sent.map((raw) => JSON.parse(raw)).some((message) => message.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS && message.phase === 'deferred')).toBe(true);
     runtime.stop();
   });
 

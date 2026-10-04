@@ -367,6 +367,10 @@ import {
   type DaemonUpgradeBlockedAckDisposition,
 } from '../../../shared/daemon-upgrade.js';
 import {
+  validateControlledNodeWorkerRefreshStatusMessage,
+  type ControlledNodeWorkerRefreshStatusMessage,
+} from '../../../shared/controlled-node-worker-refresh.js';
+import {
   P2P_WORKFLOW_MSG,
   isP2pWorkflowRequestId,
   parseP2pWorkflowMessageType,
@@ -2127,6 +2131,8 @@ export class WsBridge {
   private controlledNodeUpgradeReason: string | null = null;
   private controlledNodeUpgradeTargetVersion: string | null = null;
   private controlledNodeUpgradePersistence: Promise<void> = Promise.resolve();
+  private controlledNodeWorkerRefreshStatus: ControlledNodeWorkerRefreshStatusMessage | null = null;
+  private controlledNodeWorkerRefreshPersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
   private queue: string[] = [];
@@ -2580,6 +2586,46 @@ export class WsBridge {
       ...(this.controlledNodeUpgradeTargetVersion ? { targetVersion: this.controlledNodeUpgradeTargetVersion } : {}),
       ...(this.controlledNodeUpgradeReason ? { reason: this.controlledNodeUpgradeReason } : {}),
     };
+  }
+
+  getControlledNodeWorkerRefreshStatus(): ControlledNodeWorkerRefreshStatusMessage | null {
+    return this.controlledNodeWorkerRefreshStatus;
+  }
+
+  private setControlledNodeWorkerRefreshStatus(status: ControlledNodeWorkerRefreshStatusMessage): void {
+    this.controlledNodeWorkerRefreshStatus = status;
+    const db = this.db;
+    if (!db) {
+      this.broadcastToBrowsers(JSON.stringify(status));
+      return;
+    }
+    this.controlledNodeWorkerRefreshPersistence = this.controlledNodeWorkerRefreshPersistence
+      .catch(() => {})
+      .then(() => db.execute(
+        `UPDATE servers
+            SET controlled_worker_refresh_attempt_id = $1,
+                controlled_worker_refresh_phase = $2,
+                controlled_worker_refresh_installed_version = $3,
+                controlled_worker_refresh_target_version = $4,
+                controlled_worker_refresh_artifact_sha256 = $5,
+                controlled_worker_refresh_reason = $6,
+                controlled_worker_refresh_recorded_at = $7
+          WHERE id = $8 AND node_role = $9 AND revoked_at IS NULL`,
+        [
+          status.attemptId,
+          status.phase,
+          status.installedVersion ?? null,
+          status.targetVersion ?? null,
+          status.artifactSha256 ?? null,
+          status.reason ?? null,
+          status.recordedAt,
+          this.serverId,
+          NODE_ROLE.CONTROLLED,
+        ],
+      ))
+      .then(() => undefined)
+      .catch((error) => logger.warn({ error, serverId: this.serverId }, 'Controlled worker refresh status persistence failed'));
+    this.broadcastToBrowsers(JSON.stringify(status));
   }
 
   private setControlledNodeUpgradeState(
@@ -5455,6 +5501,13 @@ export class WsBridge {
           controlled_upgrade_status?: string | null;
           controlled_upgrade_target_version?: string | null;
           controlled_upgrade_reason?: string | null;
+          controlled_worker_refresh_attempt_id?: string | null;
+          controlled_worker_refresh_phase?: string | null;
+          controlled_worker_refresh_installed_version?: string | null;
+          controlled_worker_refresh_target_version?: string | null;
+          controlled_worker_refresh_artifact_sha256?: string | null;
+          controlled_worker_refresh_reason?: string | null;
+          controlled_worker_refresh_recorded_at?: number | null;
         } | null = null;
         try {
           server = await db.queryOne<{
@@ -5464,7 +5517,12 @@ export class WsBridge {
             revoked_at?: number | null;
             os?: string | null;
           }>(
-            'SELECT token_hash, user_id, node_role, revoked_at, os FROM servers WHERE id = $1',
+            `SELECT token_hash, user_id, node_role, revoked_at, os,
+                    controlled_worker_refresh_attempt_id, controlled_worker_refresh_phase,
+                    controlled_worker_refresh_installed_version, controlled_worker_refresh_target_version,
+                    controlled_worker_refresh_artifact_sha256, controlled_worker_refresh_reason,
+                    controlled_worker_refresh_recorded_at
+               FROM servers WHERE id = $1`,
             [this.serverId],
           );
         } catch (err) {
@@ -5543,6 +5601,20 @@ export class WsBridge {
             : null;
           this.controlledNodeUpgradeReason = typeof server.controlled_upgrade_reason === 'string'
             ? server.controlled_upgrade_reason
+            : null;
+          this.controlledNodeWorkerRefreshStatus = server.controlled_worker_refresh_attempt_id
+            && server.controlled_worker_refresh_phase
+            && typeof server.controlled_worker_refresh_recorded_at === 'number'
+            ? {
+              type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+              attemptId: server.controlled_worker_refresh_attempt_id,
+              phase: server.controlled_worker_refresh_phase as ControlledNodeWorkerRefreshStatusMessage['phase'],
+              ...(server.controlled_worker_refresh_installed_version ? { installedVersion: server.controlled_worker_refresh_installed_version } : {}),
+              ...(server.controlled_worker_refresh_target_version ? { targetVersion: server.controlled_worker_refresh_target_version } : {}),
+              ...(server.controlled_worker_refresh_artifact_sha256 ? { artifactSha256: server.controlled_worker_refresh_artifact_sha256 } : {}),
+              ...(server.controlled_worker_refresh_reason ? { reason: server.controlled_worker_refresh_reason } : {}),
+              recordedAt: server.controlled_worker_refresh_recorded_at,
+            }
             : null;
         }
         this.resetLegacyUpgradeRescueForGeneration(connectionGeneration);
@@ -5864,6 +5936,15 @@ export class WsBridge {
             targetVersion,
             null,
           );
+          return;
+        }
+        if (msg.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS) {
+          const status = validateControlledNodeWorkerRefreshStatusMessage(msg);
+          if (!status.ok) {
+            WsBridge.controlledInboundDropped++;
+            return;
+          }
+          this.setControlledNodeWorkerRefreshStatus(status.value);
           return;
         }
         if (msg.type === DAEMON_MSG.MACHINE_EXEC_CHUNK) {

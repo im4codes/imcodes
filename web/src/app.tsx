@@ -3894,6 +3894,13 @@ export function App() {
     }
 
     const unsub = ws.onMessage((msg) => {
+      if (msg.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS
+        && selectedServerId
+        && typeof window !== 'undefined') {
+        window.dispatchEvent(new CustomEvent('controlled-node-worker-refresh-status', {
+          detail: { serverId: selectedServerId, ...msg },
+        }));
+      }
       if (msg.type === 'session.event') {
         if (msg.session) {
           watchProjectionStore.updateSessionState(msg.session, msg.state);

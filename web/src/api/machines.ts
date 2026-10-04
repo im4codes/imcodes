@@ -107,6 +107,15 @@ export interface MachineListItem {
     updatedAt: number;
     lastResult?: string;
   };
+  workerRefresh?: {
+    attemptId: string;
+    phase: 'started' | 'deferred' | 'succeeded' | 'failed';
+    installedVersion?: string;
+    targetVersion?: string;
+    artifactSha256?: string;
+    reason?: string;
+    recordedAt: number;
+  };
   /** The node holds a sign-in secret for auto unlock. Never the secret itself. */
   autoUnlockConfigured?: boolean;
   /**
@@ -360,6 +369,23 @@ function normalizeMachine(raw: unknown): MachineListItem | null {
       : {}),
     ...(typeof raw.upgradeReason === 'string' && raw.upgradeReason
       ? { upgradeReason: raw.upgradeReason }
+      : {}),
+    ...(isRecord(raw.workerRefresh)
+      && typeof raw.workerRefresh.attemptId === 'string'
+      && typeof raw.workerRefresh.phase === 'string'
+      && ['started', 'deferred', 'succeeded', 'failed'].includes(raw.workerRefresh.phase)
+      && typeof raw.workerRefresh.recordedAt === 'number'
+      ? {
+        workerRefresh: {
+          attemptId: raw.workerRefresh.attemptId,
+          phase: raw.workerRefresh.phase as 'started' | 'deferred' | 'succeeded' | 'failed',
+          ...(typeof raw.workerRefresh.installedVersion === 'string' ? { installedVersion: raw.workerRefresh.installedVersion } : {}),
+          ...(typeof raw.workerRefresh.targetVersion === 'string' ? { targetVersion: raw.workerRefresh.targetVersion } : {}),
+          ...(typeof raw.workerRefresh.artifactSha256 === 'string' ? { artifactSha256: raw.workerRefresh.artifactSha256 } : {}),
+          ...(typeof raw.workerRefresh.reason === 'string' ? { reason: raw.workerRefresh.reason } : {}),
+          recordedAt: raw.workerRefresh.recordedAt,
+        },
+      }
       : {}),
     ...(raw.autoUnlockConfigured === true ? { autoUnlockConfigured: true } : {}),
     ...(typeof raw.hostServerId === 'string' && raw.hostServerId

@@ -152,7 +152,9 @@ export interface ControlledNodeSelfUpgradeResult {
 
 export interface ControlledNodeRemoteDesktopWorkerRefreshResult {
   updated: boolean;
+  installedVersion?: string;
   targetVersion?: string;
+  artifactSha256?: string;
   reason?: string;
   /** True when the refresh helper also reloaded/started the worker under its commit fence. */
   activated?: boolean;
@@ -1818,7 +1820,7 @@ export async function refreshControlledNodeRemoteDesktopWorker(
         dir: stagingRoot,
         fetchImpl: input.fetchImpl ?? fetch,
       });
-    if (!downloaded) return { updated: false, reason: 'worker_not_available' };
+    if (!downloaded) return { updated: false, installedVersion, reason: 'worker_not_available' };
     const targetManifest = JSON.parse(await readFile(downloaded.manifestPath, 'utf8')) as Record<string, unknown>;
     const targetVersion = platform === 'win32'
       ? validateRemoteDesktopWorkerManifest(targetManifest)?.workerVersion
@@ -1826,15 +1828,15 @@ export async function refreshControlledNodeRemoteDesktopWorker(
     if (!targetVersion || !installedVersion) return { updated: false, reason: 'worker_version_missing' };
     const releaseOrder = compareImcodesVersions(installedVersion, targetVersion);
     if (releaseOrder === null) {
-      return { updated: false, targetVersion, reason: 'worker_version_unparseable' };
+      return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: 'worker_version_unparseable' };
     }
     if (releaseOrder >= 0) {
-      return { updated: false, targetVersion, reason: releaseOrder === 0 ? 'worker_current' : 'worker_downgrade_rejected' };
+      return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: releaseOrder === 0 ? 'worker_current' : 'worker_downgrade_rejected' };
     }
     if (platform === 'win32') {
       const target = validateRemoteDesktopWorkerManifest(targetManifest);
       if (!target || !installedSigner || target.authenticodeSignerSha256 !== installedSigner) {
-        return { updated: false, targetVersion, reason: 'worker_signer_mismatch' };
+        return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: 'worker_signer_mismatch' };
       }
       await (input.extractVirtualDisplay ?? extractWindowsRemoteDesktopVirtualDisplay)(
         join(downloaded.workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME),
@@ -1843,18 +1845,18 @@ export async function refreshControlledNodeRemoteDesktopWorker(
       if (!verifyRemoteDesktopWorkerArtifact(
         join(downloaded.workerDir, REMOTE_DESKTOP_WORKER_FILENAME),
         installedSigner,
-      )) return { updated: false, targetVersion, reason: 'worker_verification_failed' };
+      )) return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: 'worker_verification_failed' };
     }
     // Acquire synchronously before the final admission check. Once held,
     // runtime PREPARE handlers wait, so no session can appear between the
     // check and the first atomic rename.
     const releaseCommit = input.commitFence?.acquire() ?? null;
     if (input.commitFence && !releaseCommit) {
-      return { updated: false, targetVersion, reason: 'worker_busy' };
+      return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: 'worker_busy' };
     }
     try {
       if (input.canCommit && !(await input.canCommit())) {
-        return { updated: false, targetVersion, reason: 'worker_busy' };
+        return { updated: false, installedVersion, targetVersion, artifactSha256: downloaded.sha256, reason: 'worker_busy' };
       }
       const backupRoot = `${finalRoot}.previous`;
       await rm(backupRoot, { recursive: true, force: true });
@@ -1870,7 +1872,9 @@ export async function refreshControlledNodeRemoteDesktopWorker(
       await rm(backupRoot, { recursive: true, force: true });
       return {
         updated: true,
+        installedVersion: targetVersion,
         targetVersion,
+        artifactSha256: downloaded.sha256,
         ...(input.afterCommit ? { activated: true } : {}),
       };
     } finally {
@@ -1878,7 +1882,7 @@ export async function refreshControlledNodeRemoteDesktopWorker(
     }
   } catch (error) {
     logger.warn({ err: error }, 'controlled-node remote-desktop worker refresh failed');
-    return { updated: false, reason: 'worker_refresh_failed' };
+    return { updated: false, installedVersion, reason: 'worker_refresh_failed' };
   } finally {
     await cleanup();
   }

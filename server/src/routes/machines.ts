@@ -87,6 +87,13 @@ interface ControlledRow {
   controlled_upgrade_status: string | null;
   controlled_upgrade_target_version: string | null;
   controlled_upgrade_reason: string | null;
+  controlled_worker_refresh_attempt_id: string | null;
+  controlled_worker_refresh_phase: string | null;
+  controlled_worker_refresh_installed_version: string | null;
+  controlled_worker_refresh_target_version: string | null;
+  controlled_worker_refresh_artifact_sha256: string | null;
+  controlled_worker_refresh_reason: string | null;
+  controlled_worker_refresh_recorded_at: number | null;
   host_server_id: string | null;
   remote_desktop_host_id: string | null;
   access_role: MachineAccessRole;
@@ -137,6 +144,21 @@ export async function listControlledMachines(
       : null;
     const bridge = WsBridge.find(r.id);
     const liveUpgrade = bridge?.getControlledNodeUpgradeStatus();
+    const liveWorkerRefresh = bridge?.getControlledNodeWorkerRefreshStatus();
+    const workerRefresh = liveWorkerRefresh ?? (r.controlled_worker_refresh_attempt_id
+      && r.controlled_worker_refresh_phase
+      && typeof r.controlled_worker_refresh_recorded_at === 'number'
+      ? {
+        type: 'controlled_node.worker_refresh_status' as const,
+        attemptId: r.controlled_worker_refresh_attempt_id,
+        phase: r.controlled_worker_refresh_phase,
+        ...(r.controlled_worker_refresh_installed_version ? { installedVersion: r.controlled_worker_refresh_installed_version } : {}),
+        ...(r.controlled_worker_refresh_target_version ? { targetVersion: r.controlled_worker_refresh_target_version } : {}),
+        ...(r.controlled_worker_refresh_artifact_sha256 ? { artifactSha256: r.controlled_worker_refresh_artifact_sha256 } : {}),
+        ...(r.controlled_worker_refresh_reason ? { reason: r.controlled_worker_refresh_reason } : {}),
+        recordedAt: r.controlled_worker_refresh_recorded_at,
+      }
+      : undefined);
     const persistedUpgradeStatus = Object.values(CONTROLLED_NODE_UPGRADE_STATUS)
       .includes(r.controlled_upgrade_status as ControlledNodeUpgradeStatus)
       ? r.controlled_upgrade_status as ControlledNodeUpgradeStatus
@@ -191,6 +213,7 @@ export async function listControlledMachines(
         ...(upgrade.targetVersion ? { upgradeTargetVersion: upgrade.targetVersion } : {}),
         ...(upgrade.reason ? { upgradeReason: upgrade.reason } : {}),
       } : {}),
+      ...(workerRefresh ? { workerRefresh } : {}),
       // Presence of a stored sign-in secret, never the secret itself.
       ...(r.auto_unlock_configured === true ? { autoUnlockConfigured: true } : {}),
       // Same machine as that daemon: the browser keeps one remote-control entry
