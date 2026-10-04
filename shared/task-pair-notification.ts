@@ -79,6 +79,7 @@ function inferVerb(text: string, status: TaskPairStatus | undefined): TaskPairVe
 function inferStatus(verb: TaskPairVerb, status: TaskPairStatus | undefined): TaskPairStatus | undefined {
   if (status) return status;
   switch (verb) {
+    case 'DISPATCH': return 'working';
     case 'PASS': return 'passed';
     case 'REWORK': return 'rework';
     case 'QUEUE': return 'queued';
@@ -98,6 +99,54 @@ export interface ParsedTaskPairNotification {
   title?: string;
   payload: Record<string, unknown>;
   rawText: string;
+}
+
+/**
+ * Stable UI correlation key for one task lifecycle.  Event ids differ between
+ * structured timeline delivery, assistant text, and replay; task id plus the
+ * resulting lifecycle status is the shared identity across those sources.
+ * Missing ids deliberately return undefined so unrelated notices are never
+ * merged merely because their titles happen to match.
+ */
+export function taskPairNotificationKey(payload: Record<string, unknown>): string | undefined {
+  const taskId = typeof payload.taskId === 'string' ? payload.taskId.trim() : '';
+  if (!taskId) return undefined;
+  const rawStatus = typeof payload.toStatus === 'string' ? payload.toStatus.trim().toLowerCase() : '';
+  const rawVerb = typeof payload.verb === 'string' ? payload.verb.trim().toUpperCase() : '';
+  // Structured events normally carry toStatus while assistant notices often
+  // only carry a verb. Normalize both forms to the same lifecycle identity so
+  // cross-source delivery (for example DISPATCH + working) collapses safely.
+  const statusByVerb: Record<string, string> = {
+    DISPATCH: 'working',
+    QUEUE: 'queued',
+    STARTED: 'working',
+    WORKING: 'working',
+    READY_FOR_AUDIT: 'in_audit',
+    PASS: 'passed',
+    REWORK: 'rework',
+    DONE: 'done',
+    BLOCKED: 'awaiting_brain_decision',
+    NEEDS_INPUT: 'awaiting_brain_decision',
+    CANCEL: 'cancelled',
+  };
+  const statusAliases: Record<string, string> = {
+    started: 'working',
+    working: 'working',
+    queued: 'queued',
+    in_audit: 'in_audit',
+    awaiting_audit: 'awaiting_audit',
+    awaiting_brain_decision: 'awaiting_brain_decision',
+    passed: 'passed',
+    pass: 'passed',
+    rework: 'rework',
+    done: 'done',
+    cancelled: 'cancelled',
+    canceled: 'cancelled',
+  };
+  const lifecycle = statusAliases[rawStatus]
+    ?? statusByVerb[rawVerb]
+    ?? (rawStatus || rawVerb.toLowerCase() || 'unknown');
+  return `${taskId}\u0000${lifecycle}`;
 }
 
 /** Parse one daemon-authored task notice into the payload consumed by the card. */

@@ -131,7 +131,7 @@ import { parseTimelineDisplayText } from '../timeline-display-text.js';
 import { TASK_PAIR_TIMELINE_EVENT } from '@shared/task-pair.js';
 import { TaskPairStatusPanelHost } from './TaskPairStatusPanel.js';
 import { TaskPairEventChip } from './TaskPairEventChip.js';
-import { parseTaskPairNotification } from '@shared/task-pair-notification.js';
+import { parseTaskPairNotification, taskPairNotificationKey } from '@shared/task-pair-notification.js';
 import {
   MESSAGE_PIN_LIMITS,
   isMessagePinEventType,
@@ -1172,6 +1172,60 @@ export function __buildViewItemsForTests(events: TimelineEvent[], showToolCalls:
   return buildViewItems(events, showToolCalls);
 }
 
+function deduplicateTaskPairTimelineEvents(events: TimelineEvent[]): TimelineEvent[] {
+  const latest = new Map<string, TimelineEvent>();
+  for (const event of events) {
+    if (event.type !== TASK_PAIR_TIMELINE_EVENT) continue;
+    const key = taskPairNotificationKey(event.payload);
+    if (!key) continue;
+    const previous = latest.get(key);
+    const eventTs = Number.isFinite(event.ts) ? event.ts : Number.NEGATIVE_INFINITY;
+    const previousTs = previous && Number.isFinite(previous.ts) ? previous.ts : Number.NEGATIVE_INFINITY;
+    if (!previous || eventTs >= previousTs) latest.set(key, event);
+  }
+  const emitted = new Set<string>();
+  return events.filter((event) => {
+    if (event.type !== TASK_PAIR_TIMELINE_EVENT) return true;
+    const key = taskPairNotificationKey(event.payload);
+    if (!key) return true;
+    if (latest.get(key) !== event || emitted.has(key)) return false;
+    emitted.add(key);
+    return true;
+  });
+}
+
+function deduplicateTaskPairViewItems(items: ViewItem[]): ViewItem[] {
+  const result: ViewItem[] = [];
+  const byLifecycle = new Map<string, number>();
+  for (const item of items) {
+    if (item.type !== 'assistant-block' || !item.taskPairNotification) {
+      result.push(item);
+      continue;
+    }
+    const key = taskPairNotificationKey(item.taskPairNotification);
+    if (!key) {
+      result.push(item);
+      continue;
+    }
+    const existingIndex = byLifecycle.get(key);
+    if (existingIndex === undefined) {
+      byLifecycle.set(key, result.length);
+      result.push(item);
+      continue;
+    }
+    const existing = result[existingIndex];
+    const currentTs = Number.isFinite(item.lastTs ?? item.ts) ? (item.lastTs ?? item.ts)! : Number.NEGATIVE_INFINITY;
+    const existingTs = Number.isFinite(existing.lastTs ?? existing.ts) ? (existing.lastTs ?? existing.ts)! : Number.NEGATIVE_INFINITY;
+    const mergedEventIds = [...new Set([...(existing.eventIds ?? []), ...(item.eventIds ?? [])])];
+    if (currentTs >= existingTs) {
+      result[existingIndex] = { ...item, key: existing.key, eventIds: mergedEventIds };
+    } else {
+      result[existingIndex] = { ...existing, eventIds: mergedEventIds };
+    }
+  }
+  return result;
+}
+
 function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewItem[] {
   // Simple view still needs tool call/result events to build its compact live
   // activity rail. Other developer details remain fully filtered.
@@ -1330,7 +1384,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       .filter((event) => event.type === 'user.message')
       .map((event) => event.eventId),
   );
-  const renderable = consolidated.filter((event) => {
+  const renderable = deduplicateTaskPairTimelineEvents(consolidated.filter((event) => {
     if (event.type !== 'memory.context') return true;
     const relatedToEventId = typeof event.payload.relatedToEventId === 'string'
       ? event.payload.relatedToEventId
@@ -1340,15 +1394,15 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
     group.push(event);
     linkedMemoryEvents.set(relatedToEventId, group);
     return false;
-  });
+  }));
 
   // A daemon notice can be persisted both as a structured task event and as
   // the assistant text that announced it. The structured event is the
   // authoritative card; suppress the duplicate text card below.
-  const structuredTaskIds = new Set(
+  const structuredTaskLifecycleKeys = new Set(
     renderable
       .filter((event) => event.type === TASK_PAIR_TIMELINE_EVENT)
-      .map((event) => typeof event.payload.taskId === 'string' ? event.payload.taskId : '')
+      .map((event) => taskPairNotificationKey(event.payload) ?? '')
       .filter(Boolean),
   );
 
@@ -1376,7 +1430,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
       const notification = pendingTaskPairNotification
         ? { payload: pendingTaskPairNotification, taskId: pendingTaskPairNotification.taskId as string }
         : parseTaskPairNotification(pendingTextValue);
-      if (notification && structuredTaskIds.has(notification.taskId)) {
+      if (notification && structuredTaskLifecycleKeys.has(taskPairNotificationKey(notification.payload) ?? '')) {
         pendingText = [];
         pendingEventIds = [];
         pendingAssistantAutomation = false;
@@ -1513,7 +1567,7 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
   flushPending();
   flushTools();
 
-  return stabilizeViewItems(foldSupervisionStatusRuns(items));
+  return stabilizeViewItems(foldSupervisionStatusRuns(deduplicateTaskPairViewItems(items)));
 }
 
 type SupervisionStatusCandidate = {

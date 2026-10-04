@@ -174,6 +174,84 @@ describe('ChatView render capability contract', () => {
     expect(items.filter((item) => item.type === 'event')).toHaveLength(1);
   });
 
+  it('deduplicates replayed structured events by task lifecycle and keeps the latest payload', () => {
+    const first = {
+      ...ev('task_pair.event'),
+      eventId: 'structured-replay-old',
+      ts: 10,
+      payload: { taskId: 'tsk_replay', title: 'Old title', verb: 'PASS', toStatus: 'passed' },
+    } as unknown as TimelineEvent;
+    const latest = {
+      ...ev('task_pair.event'),
+      eventId: 'structured-replay-latest',
+      ts: 20,
+      payload: { taskId: 'tsk_replay', title: 'Latest title', verb: 'PASS', toStatus: 'passed', auditor: 'deck_aud' },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([first, latest], true);
+    const cards = items.filter((item) => item.type === 'event');
+    expect(cards).toHaveLength(1);
+    expect(cards[0].event?.eventId).toBe('structured-replay-latest');
+    expect(cards[0].event?.payload.title).toBe('Latest title');
+  });
+
+  it('preserves separate lifecycle records while suppressing assistant duplicates', () => {
+    const dispatch = {
+      ...ev('assistant.text'),
+      eventId: 'assistant-dispatch-first',
+      ts: 10,
+      payload: { text: '[IM.codes task tsk_lifecycle "Lifecycle"]\nDISPATCH status working.' },
+    } as unknown as TimelineEvent;
+    const separator = {
+      ...ev('user.message'),
+      eventId: 'separator',
+      ts: 15,
+      payload: { text: 'acknowledged' },
+    } as unknown as TimelineEvent;
+    const dispatchReplay = {
+      ...ev('assistant.text'),
+      eventId: 'assistant-dispatch-replay',
+      ts: 20,
+      payload: { text: '[IM.codes task tsk_lifecycle "Lifecycle"]\nDISPATCH status working. executor deck_exec.' },
+    } as unknown as TimelineEvent;
+    const pass = {
+      ...ev('assistant.text'),
+      eventId: 'assistant-pass',
+      ts: 30,
+      payload: { text: '[IM.codes task tsk_lifecycle "Lifecycle"]\nPASS status passed.' },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([dispatch, separator, dispatchReplay, pass], true);
+    const cards = items.filter((item) => item.type === 'assistant-block');
+    expect(cards).toHaveLength(2);
+    expect(cards.map((item) => item.taskPairNotification?.toStatus)).toEqual(['working', 'passed']);
+    expect(cards[0].text).toContain('executor deck_exec');
+  });
+
+  it('correlates verb-only assistant DISPATCH with structured working lifecycle', () => {
+    const structured = {
+      ...ev('task_pair.event'),
+      eventId: 'structured-dispatch-working',
+      ts: 20,
+      payload: { taskId: 'tsk_cross_source', title: 'Cross source', verb: 'DISPATCH', toStatus: 'working' },
+    } as unknown as TimelineEvent;
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'assistant-dispatch-working',
+      ts: 10,
+      payload: { text: '[IM.codes task tsk_cross_source "Cross source"]\nDISPATCH executor=deck_exec.' },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant, structured], true);
+    expect(items.filter((item) => item.type === 'event')).toHaveLength(1);
+    expect(items.filter((item) => item.type === 'assistant-block')).toHaveLength(0);
+    expect(items[0]).toMatchObject({ type: 'event', event: { eventId: 'structured-dispatch-working' } });
+  });
+
+  it('does not merge structured records that have no task id', () => {
+    const first = { ...ev('task_pair.event'), eventId: 'missing-id-1', payload: { title: 'Unknown one', toStatus: 'working' } } as unknown as TimelineEvent;
+    const second = { ...ev('task_pair.event'), eventId: 'missing-id-2', payload: { title: 'Unknown two', toStatus: 'working' } } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([first, second], true);
+    expect(items.filter((item) => item.type === 'event')).toHaveLength(2);
+  });
+
   it('cards inline dispatched-from-queue notices and suppresses the raw protocol text', () => {
     const notice = '[IM.codes task tsk_queue_dispatch "Queue dispatch"] dispatched from the queue: executor=deck_exec, auditor=deck_aud, status=working.';
     const assistant = {
