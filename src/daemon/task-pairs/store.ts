@@ -108,6 +108,11 @@ export interface TaskPairLiveness {
   integrationReminderLastAt?: number;
   /** The head was found integrated (ancestor or patch-equivalent) at this time: nothing more to remind or check. */
   integrationIntegratedAt?: number;
+  /** Bounded retry state for a workspace-kept/unreadable notice. */
+  workspaceKeptReminderKey?: string;
+  workspaceKeptReminderCount?: number;
+  workspaceKeptReminderLastAt?: number;
+  workspaceKeptReminderDeliveredAt?: number;
 }
 
 export interface StoredTaskPair {
@@ -754,6 +759,10 @@ function rowToPair(row: Record<string, unknown>): StoredTaskPair {
     ...(Number.isFinite(Number(raw.integrationReminderCount)) ? { integrationReminderCount: Number(raw.integrationReminderCount) } : {}),
     ...(Number.isFinite(Number(raw.integrationReminderLastAt)) ? { integrationReminderLastAt: Number(raw.integrationReminderLastAt) } : {}),
     ...(Number.isFinite(Number(raw.integrationIntegratedAt)) ? { integrationIntegratedAt: Number(raw.integrationIntegratedAt) } : {}),
+    ...(typeof raw.workspaceKeptReminderKey === 'string' ? { workspaceKeptReminderKey: raw.workspaceKeptReminderKey } : {}),
+    ...(Number.isFinite(Number(raw.workspaceKeptReminderCount)) ? { workspaceKeptReminderCount: Number(raw.workspaceKeptReminderCount) } : {}),
+    ...(Number.isFinite(Number(raw.workspaceKeptReminderLastAt)) ? { workspaceKeptReminderLastAt: Number(raw.workspaceKeptReminderLastAt) } : {}),
+    ...(Number.isFinite(Number(raw.workspaceKeptReminderDeliveredAt)) ? { workspaceKeptReminderDeliveredAt: Number(raw.workspaceKeptReminderDeliveredAt) } : {}),
   };
   return {
     project: String(row.project),

@@ -131,6 +131,41 @@ function resolveQueuedTaskPairNudgeAdmission(
 }
 
 /**
+ * The integration-drift reminder is an aggregate (`__integration__`) rather
+ * than a real pair id, so the ordinary nudge admission cannot retire it when
+ * every line has since been integrated or dismissed.  Keep replay/live
+ * delivery conservative: only drop the queued digest when every task id in
+ * its durable list is known and none still needs a reminder.  Unknown rows
+ * remain authorized so a transient store failure never loses a live notice.
+ */
+function resolveQueuedIntegrationDigestAdmission(
+  sessionName: string,
+  entry: { clientMessageId?: string; commandId?: string; text: string },
+): QueueSupervisionAdmission {
+  const id = entry.clientMessageId ?? entry.commandId ?? '';
+  if (!id.startsWith('task-pair-nudge:__integration__:integration-drift:')) return 'authorized';
+  const taskIds = [...entry.text.matchAll(/^\s*-\s+([^:]+):\s+head\s+/gmu)].map((match) => match[1]!.trim()).filter(Boolean);
+  if (taskIds.length === 0) return 'authorized';
+  const project = getSession(sessionName)?.projectName;
+  if (!project) return 'authorized';
+  try {
+    const pairs = taskIds.map((taskId) => getTaskPairStore().getPair(project, taskId));
+    if (pairs.some((pair) => !pair)) return 'authorized';
+    const live = pairs.some((pair) => {
+      const state = pair!.state;
+      if (state.status !== 'done' || state.integrationDismissedAt !== undefined) return false;
+      return pair!.liveness.integrationIntegratedAt === undefined;
+    });
+    if (live) return 'authorized';
+    logger.info({ sessionName, taskIds }, 'dropping a queued integration reminder: all listed pairs are integrated or dismissed');
+    return 'stale';
+  } catch (error) {
+    logger.warn({ error, sessionName }, 'queued integration reminder lookup failed; admitting it');
+    return 'authorized';
+  }
+}
+
+/**
  * One admission for a queued transport entry, shared by the restart resend
  * drain and the runtime's own pending drain. The supervision heartbeat check
  * applies to every entry; a queued delegation reply must additionally still
@@ -143,6 +178,8 @@ export function resolveTransportQueueEntryAdmission(sessionName: string, entry: 
   supervisionReference?: Parameters<typeof resolveQueuedSupervisionHeartbeatDelivery>[0]['supervisionReference'];
   delegationReply?: { delegationId: string };
 }): QueueSupervisionAdmission {
+  const integrationDigest = resolveQueuedIntegrationDigestAdmission(sessionName, entry);
+  if (integrationDigest !== 'authorized') return integrationDigest;
   const taskPairNudge = resolveQueuedTaskPairNudgeAdmission(sessionName, entry);
   if (taskPairNudge !== 'authorized') return taskPairNudge;
   const supervision = resolveQueuedSupervisionHeartbeatDelivery({

@@ -43,6 +43,12 @@ export interface TaskPairDeliveryDeps {
 
 let testDeps: TaskPairDeliveryDeps | undefined;
 
+// A heartbeat/replay can reach the same reminder from two scheduler paths in
+// one turn.  The transport queue is the durable authority, but it is only
+// populated after dispatch starts; this small in-process gate closes that
+// race without changing the queue's restart semantics.
+const inFlightTaskPairMessages = new Set<string>();
+
 export function setTaskPairDeliveryDepsForTests(deps: TaskPairDeliveryDeps | undefined): void {
   testDeps = deps;
 }
@@ -54,6 +60,8 @@ export async function sendTaskPairMessage(
   text: string,
 ): Promise<TaskPairDeliveryResult> {
   const messageId = `${taskPairMessageIdPrefix(taskId, reason)}${randomUUID()}`;
+  const dedupeKey = `${target}\u0000${taskId}\u0000${reason}`;
+  if (inFlightTaskPairMessages.has(dedupeKey)) return 'skipped_pending';
   noteTaskPairFocus(target, taskId);
   // Keep the last actionable pair instruction durable so participant recovery
   // can resume the exact turn after a provider/process restart.  Aggregate
@@ -75,21 +83,31 @@ export async function sendTaskPairMessage(
     }
   }
   if (testDeps?.send) {
-    await testDeps.send(target, text, messageId);
-    return 'sent';
+    inFlightTaskPairMessages.add(dedupeKey);
+    try {
+      await testDeps.send(target, text, messageId);
+      return 'sent';
+    } finally {
+      inFlightTaskPairMessages.delete(dedupeKey);
+    }
   }
   const record = getSession(target);
   if (!record) return 'no_session';
+  // Check before emitting the timeline projection.  Previously a replay of a
+  // queued message returned skipped_pending only after appending a fresh
+  // automation row, which made the old reminder card reappear on every
+  // reconnect even though no duplicate transport send occurred.
   if (hasPendingTaskPairMessage(target, taskId, reason)) return 'skipped_pending';
-  timelineEmitter.emit(target, 'user.message', {
-    text,
-    clientMessageId: messageId,
-    allowDuplicate: true,
-    automation: true,
-    automationKind: TASK_PAIR_AUTOMATION_KIND,
-    memoryExcluded: true,
-  }, { source: 'daemon', confidence: 'high', eventId: messageId });
+  inFlightTaskPairMessages.add(dedupeKey);
   try {
+    timelineEmitter.emit(target, 'user.message', {
+      text,
+      clientMessageId: messageId,
+      allowDuplicate: true,
+      automation: true,
+      automationKind: TASK_PAIR_AUTOMATION_KIND,
+      memoryExcluded: true,
+    }, { source: 'daemon', confidence: 'high', eventId: messageId });
     const result = await dispatchSessionMessage(record, text, {
       dispatchId: createSendDispatchId(),
       // Our own id prefix is what makes the pending-queue dedupe possible.
@@ -103,5 +121,7 @@ export async function sendTaskPairMessage(
   } catch (error) {
     logger.warn({ err: error, target, taskId, reason }, 'task-pair: message delivery failed');
     return 'failed';
+  } finally {
+    inFlightTaskPairMessages.delete(dedupeKey);
   }
 }

@@ -175,6 +175,9 @@ function mentionsTaskId(text: string, taskId: string): boolean {
 }
 
 const TASK_PAIR_MARKER_DEDUP_WINDOW_MS = 15_000;
+/** Workspace-kept notices are one-shot; failed/unreadable delivery gets a small durable retry budget. */
+const TASK_PAIR_WORKSPACE_KEPT_REMINDER_MAX_ATTEMPTS = 3;
+const TASK_PAIR_WORKSPACE_KEPT_REMINDER_RETRY_MS = 15 * 60_000;
 /** How long a new worktree waits for a low-disk reclaim before it is created anyway. */
 const DISK_PREFLIGHT_WAIT_MS = 90_000;
 /** Heartbeat free-space check cadence: statfs is cheap, the reclaim it may start is not. */
@@ -2011,6 +2014,37 @@ export class TaskPairService {
   #lastSweepAt = 0;
 
   /**
+   * Deliver a retained-workspace notice once, with bounded retry when the
+   * Brain was offline/unreadable.  The key is the retention event itself, so
+   * a restart cannot re-arm a successful notice and a later pair/retention
+   * event cannot inherit an old suppression watermark.
+   */
+  async #notifyWorkspaceKept(project: string, pair: TaskPairState, now: number, reason: string): Promise<void> {
+    const workspace = pair.workspace;
+    if (!workspace) return;
+    const store = getTaskPairStore();
+    const current = store.getPair(project, pair.taskId);
+    if (!current) return;
+    const key = `${workspace.path}\u0000${workspace.endedAt ?? pair.updatedAt}\u0000${reason}`;
+    const previous = current.liveness;
+    const same = previous.workspaceKeptReminderKey === key;
+    if (same && previous.workspaceKeptReminderDeliveredAt !== undefined) return;
+    const count = same ? (previous.workspaceKeptReminderCount ?? 0) : 0;
+    if (count >= TASK_PAIR_WORKSPACE_KEPT_REMINDER_MAX_ATTEMPTS) return;
+    if (same && previous.workspaceKeptReminderLastAt !== undefined
+      && now - previous.workspaceKeptReminderLastAt < TASK_PAIR_WORKSPACE_KEPT_REMINDER_RETRY_MS) return;
+    const result = await sendTaskPairMessage(pair.brain, pair.taskId, 'brain-workspace-kept', buildWorkspaceKeptLine(pair, reason));
+    const delivered = result === 'sent' || result === 'queued' || result === 'skipped_pending';
+    store.saveLiveness(project, pair.taskId, {
+      ...previous,
+      workspaceKeptReminderKey: key,
+      workspaceKeptReminderCount: count + 1,
+      workspaceKeptReminderLastAt: now,
+      ...(delivered ? { workspaceKeptReminderDeliveredAt: now } : { workspaceKeptReminderDeliveredAt: undefined }),
+    });
+  }
+
+  /**
    * Remove the workspaces of pairs that ended at least the retention period
    * ago. A worktree that still holds unsaved work is kept (Brain is told once)
    * and retried on later sweeps. Runs at most hourly unless forced.
@@ -2059,8 +2093,8 @@ export class TaskPairService {
           // The worktree GC backstop removes it too once the work is saved.
           const { getSupervisionTaskRegistry } = await import('../supervision-state-store.js');
           getSupervisionTaskRegistry().requestWorktreeGc(stored.project);
-          await sendTaskPairMessage(next.brain, pair.taskId, 'brain-workspace-kept', buildWorkspaceKeptLine(next, released.reason));
         }
+        if (released.action === 'kept') await this.#notifyWorkspaceKept(stored.project, next, now, released.reason);
       } catch (error) {
         logger.warn({ err: error, taskId: pair.taskId }, 'task-pair: workspace sweep failed');
       }

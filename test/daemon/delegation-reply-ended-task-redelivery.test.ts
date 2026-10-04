@@ -323,4 +323,33 @@ describe('task-bound delegation replies across a daemon restart', () => {
     // conservative/authorized.
     expect(resolveTransportQueueEntryAdmission(brain.sessionName, queued('__integration__'))).toBe('authorized');
   });
+
+  it('drops a queued aggregate integration reminder after every listed pair is integrated or dismissed', () => {
+    mocks.sessions.set(brain.sessionName, { name: brain.sessionName, projectName: PROJECT });
+    pairs.savePair(PROJECT, pairState('tsk_integrated', 'done'), {
+      liveness: {
+        silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: 0, progressAuditorAt: 0, lastTickAt: 0, notified: [],
+        integrationIntegratedAt: 123,
+      },
+    });
+    pairs.savePair(PROJECT, { ...pairState('tsk_dismissed', 'done'), integrationDismissedAt: 123 });
+    const queued = {
+      commandId: 'task-pair-nudge:__integration__:integration-drift:message-1',
+      text: '- tsk_integrated: head abc123 (1 commit not in dev), worktree /tmp/a, finished 1h ago\n- tsk_dismissed: head def456 (1 commit not in dev), worktree /tmp/b, finished 1h ago',
+    };
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, queued)).toBe('stale');
+
+    // A still-unintegrated row keeps the aggregate authorized; a transiently
+    // missing row is also admitted conservatively rather than losing a live
+    // reminder during a store/restart race.
+    pairs.savePair(PROJECT, pairState('tsk_live_integration', 'done'));
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, {
+      ...queued,
+      text: '- tsk_live_integration: head ghi789 (1 commit not in dev), worktree /tmp/c, finished 1h ago',
+    })).toBe('authorized');
+    expect(resolveTransportQueueEntryAdmission(brain.sessionName, {
+      ...queued,
+      text: '- tsk_missing_integration: head jkl012 (1 commit not in dev), worktree /tmp/d, finished 1h ago',
+    })).toBe('authorized');
+  });
 });
