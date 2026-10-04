@@ -1,8 +1,9 @@
-import { execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync, spawn } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
 import { appendFile, chmod, lstat, mkdir, mkdtemp, open, opendir, readFile, rename, rm, stat, statfs, writeFile } from 'node:fs/promises';
 import { tmpdir, uptime } from 'node:os';
 import { basename, dirname, join, resolve, win32 as pathWin32 } from 'node:path';
+import { promisify } from 'node:util';
 import {
   CONTROLLED_NODE_ARCH_X64,
   CONTROLLED_NODE_ARTIFACT_ARCH_UNIVERSAL,
@@ -18,6 +19,7 @@ import {
 } from '../../shared/controlled-node-artifacts.js';
 import { DAEMON_UPGRADE_TARGET_LATEST, normalizeDaemonUpgradeTargetVersion } from '../../shared/daemon-upgrade.js';
 import { isTransientRequestFailure } from '../../shared/request-failure.js';
+import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import {
   CONTROLLED_NODE_WINDOWS_RELEASE_TRUST_PREFLIGHT_FAILURE,
   CONTROLLED_NODE_WINDOWS_RELEASE_MANIFEST_PREFLIGHT_FAILURE,
@@ -63,6 +65,7 @@ import {
 import { defaultCredentialPath, defaultStagedExecutablePath, type ControlledNodeCredential } from './enrollment.js';
 import { loadInstallJournal, INSTALL_JOURNAL_VERSION } from './install-journal.js';
 import { WINDOWS_COMPILED_RELEASE_SIGNER_SHA256 } from './windows-artifact-trust.js';
+import { verifyRemoteDesktopWorkerArtifact } from './remote-desktop-worker-host.js';
 import logger from '../util/logger.js';
 
 export const CONTROLLED_NODE_UPGRADE_DIR_PREFIX = 'imcodes-node-upgrade-';
@@ -77,6 +80,7 @@ const CONTROLLED_NODE_UPGRADE_MAX_LSTAT = 128;
 const CONTROLLED_NODE_UPGRADE_MAX_MARKER_READ = 64;
 const CONTROLLED_NODE_UPGRADE_MAX_DELETE = 32;
 const CONTROLLED_NODE_ARTIFACT_IO_BUFFER_BYTES = 64 * 1024;
+const execFileAsync = promisify(execFile);
 
 /**
  * Rollback runs outside the node process, so the old generation reports the
@@ -144,6 +148,42 @@ export interface ControlledNodeSelfUpgradeResult {
   targetVersion: string;
   artifactSha256?: string;
   scriptPath?: string;
+}
+
+export interface ControlledNodeRemoteDesktopWorkerRefreshResult {
+  updated: boolean;
+  targetVersion?: string;
+  reason?: string;
+  /** True when the refresh helper also reloaded/started the worker under its commit fence. */
+  activated?: boolean;
+}
+
+export interface ControlledNodeRemoteDesktopWorkerCommitFence {
+  /** Must be synchronous: once acquired, no new worker session may be admitted. */
+  acquire: () => (() => void) | null;
+}
+
+export interface ControlledNodeRemoteDesktopWorkerRefreshContext {
+  commitFence: ControlledNodeRemoteDesktopWorkerCommitFence;
+}
+
+export interface ControlledNodeRemoteDesktopWorkerRefreshDeps {
+  credential: ArtifactDownloadCredential;
+  platform?: NodeJS.Platform;
+  arch?: NodeJS.Architecture;
+  root?: string;
+  fetchImpl?: typeof fetch;
+  downloadWindowsWorker?: typeof downloadControlledNodeRemoteDesktopWorker;
+  downloadLinuxWorker?: typeof downloadControlledNodeLinuxRemoteDesktopWorker;
+  extractVirtualDisplay?: (archivePath: string, destination: string) => Promise<void>;
+  /** Test seam for pausing the first atomic rename and exercising the fence. */
+  rename?: typeof rename;
+  /** Final safety fence immediately before the on-disk worker swap. */
+  canCommit?: () => boolean | Promise<boolean>;
+  /** Short-lived runtime fence held through swap and worker activation. */
+  commitFence?: ControlledNodeRemoteDesktopWorkerCommitFence;
+  /** Reload/start the new worker while the commit fence remains held. */
+  afterCommit?: (targetVersion: string) => Promise<void> | void;
 }
 
 async function defaultFreeBytes(path: string): Promise<number | null> {
@@ -1693,6 +1733,154 @@ export function scheduleWindowsControlledNodeUpgrade(
       try { onCleanupFailure?.(cleanupError); } catch { /* diagnostics never replace /Run authority */ }
     }
     throw error;
+  }
+}
+
+export async function extractWindowsRemoteDesktopVirtualDisplay(
+  archivePath: string,
+  destination: string,
+): Promise<void> {
+  await execFileAsync(
+    join(process.env.WINDIR ?? 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe'),
+    [
+      '-NoProfile',
+      '-NonInteractive',
+      '-ExecutionPolicy', 'Bypass',
+      '-Command',
+      'Expand-Archive -LiteralPath $env:IMCODES_RD_ARCHIVE -DestinationPath $env:IMCODES_RD_DEST -Force',
+    ],
+    {
+      windowsHide: true,
+      env: { ...process.env, IMCODES_RD_ARCHIVE: archivePath, IMCODES_RD_DEST: destination },
+    },
+  );
+}
+
+/**
+ * Refresh only the independently released remote-desktop worker sidecar.
+ * Unlike startControlledNodeSelfUpgrade this never downloads or replaces the
+ * controlled-node executable, so a daemon whose own version is unchanged can
+ * still receive a newer worker at an authenticated idle/reconnect boundary.
+ */
+export async function refreshControlledNodeRemoteDesktopWorker(
+  input: ControlledNodeRemoteDesktopWorkerRefreshDeps,
+): Promise<ControlledNodeRemoteDesktopWorkerRefreshResult> {
+  const platform = input.platform ?? process.platform;
+  const arch = input.arch ?? process.arch;
+  if (arch !== 'x64' || (platform !== 'win32' && platform !== 'linux')) {
+    return { updated: false, reason: 'unsupported_platform' };
+  }
+  const root = input.root ?? dirname(process.execPath);
+  const finalRoot = join(root, 'remote-desktop-worker');
+  const finalPlatformRoot = join(finalRoot, platform === 'win32' ? 'win32-x64' : 'linux-x64');
+  const manifestPath = join(
+    finalPlatformRoot,
+    platform === 'win32'
+      ? `${REMOTE_DESKTOP_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`
+      : `${REMOTE_DESKTOP_LINUX_WORKER_FILENAME}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`,
+  );
+  let installedVersion: string | undefined;
+  let installedSigner: string | undefined;
+  try {
+    const raw = JSON.parse(await readFile(manifestPath, 'utf8')) as Record<string, unknown>;
+    if (platform === 'win32') {
+      const manifest = validateRemoteDesktopWorkerManifest(raw);
+      if (!manifest) return { updated: false, reason: 'installed_manifest_invalid' };
+      installedVersion = manifest.workerVersion;
+      installedSigner = manifest.authenticodeSignerSha256;
+    } else {
+      const manifest = validateRemoteDesktopLinuxWorkerManifest(raw);
+      if (!manifest) return { updated: false, reason: 'installed_manifest_invalid' };
+      installedVersion = manifest.build.version;
+    }
+  } catch {
+    return { updated: false, reason: 'installed_manifest_missing' };
+  }
+
+  const stagingRoot = await mkdtemp(join(root, '.remote-desktop-worker-refresh-'));
+  const cleanup = async (): Promise<void> => {
+    await rm(stagingRoot, { recursive: true, force: true }).catch(() => {});
+  };
+  try {
+    const target = platform === 'win32'
+      ? { os: CONTROLLED_NODE_OS_WIN, arch: CONTROLLED_NODE_ARCH_X64 }
+      : { os: CONTROLLED_NODE_OS_LINUX, arch: CONTROLLED_NODE_ARCH_X64 };
+    const downloaded = platform === 'win32'
+      ? await (input.downloadWindowsWorker ?? downloadControlledNodeRemoteDesktopWorker)({
+        credential: input.credential,
+        target,
+        dir: stagingRoot,
+        fetchImpl: input.fetchImpl ?? fetch,
+      })
+      : await (input.downloadLinuxWorker ?? downloadControlledNodeLinuxRemoteDesktopWorker)({
+        credential: input.credential,
+        target,
+        dir: stagingRoot,
+        fetchImpl: input.fetchImpl ?? fetch,
+      });
+    if (!downloaded) return { updated: false, reason: 'worker_not_available' };
+    const targetManifest = JSON.parse(await readFile(downloaded.manifestPath, 'utf8')) as Record<string, unknown>;
+    const targetVersion = platform === 'win32'
+      ? validateRemoteDesktopWorkerManifest(targetManifest)?.workerVersion
+      : validateRemoteDesktopLinuxWorkerManifest(targetManifest)?.build.version;
+    if (!targetVersion || !installedVersion) return { updated: false, reason: 'worker_version_missing' };
+    const releaseOrder = compareImcodesVersions(installedVersion, targetVersion);
+    if (releaseOrder === null) {
+      return { updated: false, targetVersion, reason: 'worker_version_unparseable' };
+    }
+    if (releaseOrder >= 0) {
+      return { updated: false, targetVersion, reason: releaseOrder === 0 ? 'worker_current' : 'worker_downgrade_rejected' };
+    }
+    if (platform === 'win32') {
+      const target = validateRemoteDesktopWorkerManifest(targetManifest);
+      if (!target || !installedSigner || target.authenticodeSignerSha256 !== installedSigner) {
+        return { updated: false, targetVersion, reason: 'worker_signer_mismatch' };
+      }
+      await (input.extractVirtualDisplay ?? extractWindowsRemoteDesktopVirtualDisplay)(
+        join(downloaded.workerDir, REMOTE_DESKTOP_VIRTUAL_DISPLAY_ARCHIVE_FILENAME),
+        join(downloaded.workerDir, 'virtual-display'),
+      );
+      if (!verifyRemoteDesktopWorkerArtifact(
+        join(downloaded.workerDir, REMOTE_DESKTOP_WORKER_FILENAME),
+        installedSigner,
+      )) return { updated: false, targetVersion, reason: 'worker_verification_failed' };
+    }
+    // Acquire synchronously before the final admission check. Once held,
+    // runtime PREPARE handlers wait, so no session can appear between the
+    // check and the first atomic rename.
+    const releaseCommit = input.commitFence?.acquire() ?? null;
+    if (input.commitFence && !releaseCommit) {
+      return { updated: false, targetVersion, reason: 'worker_busy' };
+    }
+    try {
+      if (input.canCommit && !(await input.canCommit())) {
+        return { updated: false, targetVersion, reason: 'worker_busy' };
+      }
+      const backupRoot = `${finalRoot}.previous`;
+      await rm(backupRoot, { recursive: true, force: true });
+      const renameImpl = input.rename ?? rename;
+      await renameImpl(finalRoot, backupRoot);
+      try {
+        await renameImpl(join(stagingRoot, 'remote-desktop-worker'), finalRoot);
+      } catch (error) {
+        await renameImpl(backupRoot, finalRoot).catch(() => {});
+        throw error;
+      }
+      if (input.afterCommit) await input.afterCommit(targetVersion);
+      await rm(backupRoot, { recursive: true, force: true });
+      return {
+        updated: true,
+        targetVersion,
+        ...(input.afterCommit ? { activated: true } : {}),
+      };
+    } finally {
+      releaseCommit?.();
+    }
+  } catch (error) {
+    logger.warn({ err: error }, 'controlled-node remote-desktop worker refresh failed');
+    return { updated: false, reason: 'worker_refresh_failed' };
+  } finally {
+    await cleanup();
   }
 }
 

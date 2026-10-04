@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, utimes, writeFile } from 'node:fs/promises';
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, rename as fsRename, rm, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createHash } from 'node:crypto';
@@ -28,7 +28,9 @@ import {
   controlledNodeArtifactTarget,
   controlledNodeArtifactUpgradeUrl,
   downloadControlledNodeExecutable,
+  downloadControlledNodeLinuxRemoteDesktopWorker,
   downloadControlledNodeRemoteDesktopWorker,
+  refreshControlledNodeRemoteDesktopWorker,
   scheduleLinuxControlledNodeUpgrade,
   scheduleWindowsControlledNodeUpgrade,
   scavengeStaleControlledNodeUpgradeDirs,
@@ -170,6 +172,148 @@ async function createOwnedUpgradeDir(input: {
 }
 
 describe('controlled-node self-upgrade', () => {
+  it('refreshes an independently published Linux worker and rejects same, older, and unknown targets', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-refresh-test-'));
+    dirs.push(root);
+    const workerRoot = join(root, 'remote-desktop-worker', 'linux-x64');
+    await mkdir(workerRoot, { recursive: true });
+    const workerFile = join(workerRoot, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    const writeRelease = async (dir: string, version: string, contents: string) => {
+      const executable = join(dir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+      const bytes = Buffer.from(contents);
+      await writeFile(executable, bytes, { mode: 0o755 });
+      await writeFile(`${executable}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, JSON.stringify({
+        schemaVersion: 1,
+        artifact: {
+          fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME,
+          os: 'linux',
+          arch: 'x64',
+          size: bytes.byteLength,
+          sha256: createHash('sha256').update(bytes).digest('hex'),
+        },
+        build: { source: 'ci', version },
+      }));
+      return {
+        workerDir: dir,
+        artifactPath: executable,
+        manifestPath: `${executable}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`,
+        sha256: createHash('sha256').update(bytes).digest('hex'),
+      };
+    };
+    await writeRelease(workerRoot, '2026.9.5113-dev.5644', 'old-worker');
+    const downloaded = (version: string, contents: string) => async ({ dir }: { dir: string }) => {
+      const targetDir = join(dir, 'remote-desktop-worker', 'linux-x64');
+      await mkdir(targetDir, { recursive: true });
+      return writeRelease(targetDir, version, contents);
+    };
+
+    const newer = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      downloadLinuxWorker: downloaded('2026.10.5371-dev.5816', 'new-worker') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
+    });
+    expect(newer).toEqual({ updated: true, targetVersion: '2026.10.5371-dev.5816' });
+    expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
+
+    const current = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      downloadLinuxWorker: downloaded('2026.10.5371-dev.5816', 'same-worker') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
+    });
+    expect(current).toEqual({ updated: false, targetVersion: '2026.10.5371-dev.5816', reason: 'worker_current' });
+    expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
+
+    const older = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      downloadLinuxWorker: downloaded('2026.9.5113-dev.5644', 'old-target') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
+    });
+    expect(older).toEqual({ updated: false, targetVersion: '2026.9.5113-dev.5644', reason: 'worker_downgrade_rejected' });
+    expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
+
+    const unknown = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      downloadLinuxWorker: downloaded('opaque-worker-build', 'unknown-target') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
+    });
+    expect(unknown).toEqual({ updated: false, targetVersion: 'opaque-worker-build', reason: 'worker_version_unparseable' });
+    expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
+
+    const fenced = await refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      canCommit: () => false,
+      downloadLinuxWorker: downloaded('2026.11.1-dev.1', 'fenced-worker') as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
+    });
+    expect(fenced).toEqual({ updated: false, targetVersion: '2026.11.1-dev.1', reason: 'worker_busy' });
+    expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
+  });
+
+  it('holds the commit fence across a paused atomic rename', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'imcodes-worker-fence-test-'));
+    dirs.push(root);
+    const workerRoot = join(root, 'remote-desktop-worker', 'linux-x64');
+    await mkdir(workerRoot, { recursive: true });
+    const workerFile = join(workerRoot, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+    const writeRelease = async (dir: string, version: string, contents: string) => {
+      const executable = join(dir, REMOTE_DESKTOP_LINUX_WORKER_FILENAME);
+      const bytes = Buffer.from(contents);
+      await writeFile(executable, bytes, { mode: 0o755 });
+      await writeFile(`${executable}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, JSON.stringify({
+        schemaVersion: 1,
+        artifact: { fileName: REMOTE_DESKTOP_LINUX_WORKER_FILENAME, os: 'linux', arch: 'x64', size: bytes.byteLength, sha256: createHash('sha256').update(bytes).digest('hex') },
+        build: { source: 'ci', version },
+      }));
+      return { workerDir: dir, artifactPath: executable, manifestPath: `${executable}${REMOTE_DESKTOP_WORKER_MANIFEST_SUFFIX}`, sha256: createHash('sha256').update(bytes).digest('hex') };
+    };
+    await writeRelease(workerRoot, '2026.9.5113-dev.5644', 'old-worker');
+    const downloaded = async ({ dir }: { dir: string }) => {
+      const targetDir = join(dir, 'remote-desktop-worker', 'linux-x64');
+      await mkdir(targetDir, { recursive: true });
+      return writeRelease(targetDir, '2026.10.5371-dev.5816', 'new-worker');
+    };
+    let releaseRename!: () => void;
+    let firstRenameReady!: () => void;
+    const renameReady = new Promise<void>((resolve) => { firstRenameReady = resolve; });
+    const renameContinue = new Promise<void>((resolve) => { releaseRename = resolve; });
+    let held = false;
+    const commitFence = {
+      acquire: vi.fn(() => {
+        if (held) return null;
+        held = true;
+        return () => { held = false; };
+      }),
+    };
+    const refreshPromise = refreshControlledNodeRemoteDesktopWorker({
+      credential,
+      platform: 'linux',
+      arch: 'x64',
+      root,
+      downloadLinuxWorker: downloaded as typeof downloadControlledNodeLinuxRemoteDesktopWorker,
+      commitFence,
+      rename: async (...args) => {
+        firstRenameReady();
+        await renameContinue;
+        return fsRename(...args);
+      },
+    });
+    await renameReady;
+    expect(commitFence.acquire()).toBeNull();
+    releaseRename();
+    expect(await refreshPromise).toEqual({ updated: true, targetVersion: '2026.10.5371-dev.5816' });
+    expect(await readFile(workerFile, 'utf8')).toBe('new-worker');
+  });
+
   it('keeps the production controlled-node bundle independent of the native addon that requires quiesce', async () => {
     const { stdout } = await execFileAsync(process.execPath, ['scripts/check-node-exe-deps.mjs'], {
       cwd: process.cwd(),
