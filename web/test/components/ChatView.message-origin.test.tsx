@@ -89,6 +89,10 @@ describe('ChatView user.message alignment by origin', () => {
       expect(originOf(container, 'typed on the web')).toBe(CHAT_MESSAGE_ORIGINS.USER);
       expect(originOf(container, 'spoken on the phone')).toBe(CHAT_MESSAGE_ORIGINS.USER);
       expect(originOf(container, '收到，本次复审已结束。')).toBe(CHAT_MESSAGE_ORIGINS.AGENT);
+      // Trusted task-pair automation also carries ordinary prose (for
+      // example, a nudge) that is not a lifecycle notification. It must stay
+      // visible rather than being dropped by the notification branch.
+      expect(originOf(container, 'pair nudge')).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
       expect(originOf(container, 'nightly report')).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
       expect(originOf(container, 'p2p round prompt')).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);
       expect(originOf(container, 'openspec apply prompt')).toBe(CHAT_MESSAGE_ORIGINS.SYSTEM);

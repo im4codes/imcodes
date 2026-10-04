@@ -1572,6 +1572,20 @@ function buildViewItems(events: TimelineEvent[], showToolCalls: boolean): ViewIt
           ts: event.ts,
           lastTs: event.ts,
         });
+      } else if (!notification) {
+        // Not every trusted task-pair automation row is a lifecycle notice.
+        // Keep ordinary automation prose visible instead of silently dropping
+        // it when it does not match the task-notification grammar.
+        if (!isNeverRenderedTimelineEventType(event.type)) {
+          items.push({
+            key: event.eventId,
+            type: 'event',
+            event,
+            ...(linkedMemoryEvents.has(event.eventId)
+              ? { linkedEvents: linkedMemoryEvents.get(event.eventId) }
+              : {}),
+          });
+        }
       }
     } else {
       flushPending();
