@@ -119,13 +119,15 @@ export function TaskPairEventChip({ eventId, payload, timestamp, sessions }: { e
         >
           <span class="task-pair-card-heading">
             <span class="task-pair-card-kicker">{t('taskPair.card_kicker')}</span>
-            <span class="task-pair-chip-task">
-              <strong>{title}</strong>
-            </span>
           </span>
-          <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
-          {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
-          <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
+          <span class="task-pair-card-meta">
+            <span class={`task-pair-chip-status status-${statusBadgeClass}`}>{status}</span>
+            {eventTime && <time class="task-pair-card-time" dateTime={new Date(timestamp!).toISOString()}>{eventTime}</time>}
+            <span class={`task-pair-card-chevron${expanded ? ' is-expanded' : ''}`} aria-hidden="true">⌄</span>
+          </span>
+          <span class="task-pair-chip-task">
+            <strong>{title}</strong>
+          </span>
         </button>
       </header>
       {expanded && <>

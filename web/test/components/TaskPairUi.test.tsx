@@ -1113,6 +1113,31 @@ describe('TaskPairEventChip status colours', () => {
     expect(cards[1]!.classList.contains('is-expanded')).toBe(false);
   });
 
+  it('keeps event metadata ahead of the title so flex wrapping moves the title as one unit', () => {
+    const { container } = render(<TaskPairEventChip eventId="e-layout" timestamp={Date.UTC(2026, 0, 2, 3, 4, 5)} payload={{
+      taskId: 'layout-task', title: 'A long title that may move to the second row', writer: 'daemon',
+      verb: 'PASS', toStatus: 'passed', unusual: false,
+    }} />);
+    const toggle = container.querySelector('.task-pair-card-toggle')!;
+    const children = [...toggle.children] as HTMLElement[];
+    expect(children.map((child) => child.className)).toEqual([
+      'task-pair-card-heading', 'task-pair-card-meta', 'task-pair-chip-task',
+    ]);
+    expect(children[0]!.querySelector('.task-pair-card-kicker')).toBeTruthy();
+    expect(children[1]!.querySelector('.task-pair-chip-status')).toBeTruthy();
+    expect(children[1]!.querySelector('.task-pair-card-time')).toBeTruthy();
+    expect(children[1]!.querySelector('.task-pair-card-chevron')).toBeTruthy();
+    expect(children[2]!.querySelector('strong')?.textContent).toContain('A long title');
+    const toggleRule = /\.task-pair-card-toggle\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const titleRule = /\.task-pair-event-card \.task-pair-chip-task\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    const metaRule = /\.task-pair-card-meta\s*\{([^}]*)\}/.exec(css)?.[1] ?? '';
+    expect(toggleRule).toContain('flex-wrap: wrap;');
+    expect(titleRule).toContain('order: 3;');
+    expect(titleRule).toContain('min-width: min(100%, 12rem);');
+    expect(metaRule).toContain('order: 2;');
+    expect(metaRule).toContain('margin-left: auto;');
+  });
+
   it('adds no status class to an event that changed no status', () => {
     const { container } = render(<TaskPairEventChip eventId="e-none" payload={{ taskId: '-', writer: 'w', verb: 'BOGUS' }} />);
     const chip = container.querySelector('.task-pair-chip')!;

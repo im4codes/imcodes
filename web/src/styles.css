@@ -14568,12 +14568,12 @@ button.quick-agent-delegation-preset.active {
 .task-pair-card-body,
 .task-pair-card-flags { display: flex; min-width: 0; flex-wrap: wrap; align-items: center; gap: 6px 10px; }
 .task-pair-card-head { align-items: stretch; }
-.task-pair-card-toggle { display: flex; width: 100%; min-width: 0; align-items: center; gap: 10px; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
+.task-pair-card-toggle { display: flex; width: 100%; min-width: 0; flex-wrap: wrap; align-items: center; gap: 10px; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: left; cursor: pointer; }
 .task-pair-card-toggle:hover .task-pair-card-heading strong { color: #ecfeff; }
 .task-pair-card-toggle:focus-visible { outline: 2px solid var(--chrome-accent); outline-offset: 3px; border-radius: 5px; }
-.task-pair-card-heading { display: flex; min-width: 0; flex: 1 1 auto; align-items: baseline; gap: 5px 8px; }
+.task-pair-card-heading { display: contents; }
 .task-pair-card-kicker { color: var(--chrome-accent); font-size: 9px; font-weight: 800; letter-spacing: .12em; line-height: 1.2; text-transform: uppercase; }
-.task-pair-event-card .task-pair-chip-task { display: flex; min-width: 0; flex-wrap: wrap; align-items: baseline; gap: 5px 8px; }
+.task-pair-event-card .task-pair-chip-task { display: flex; min-width: min(100%, 12rem); max-width: 100%; flex: 1 1 15rem; align-items: baseline; gap: 5px 8px; order: 3; }
 .task-pair-event-card .task-pair-chip-task strong { min-width: 0; color: #f0f9ff; font-size: 13px; overflow-wrap: anywhere; }
 .task-pair-event-card:not(.is-expanded) .task-pair-chip-task strong {
   display: -webkit-box;
@@ -14586,7 +14586,8 @@ button.quick-agent-delegation-preset.active {
   -webkit-line-clamp: 2;
   line-clamp: 2;
 }
-.task-pair-event-card .task-pair-chip-status { flex: 0 0 auto; box-shadow: 0 0 12px color-mix(in srgb, var(--task-pair-status-text, var(--chrome-accent)) 12%, transparent); }
+.task-pair-card-meta { display: inline-flex; min-width: 0; max-width: 100%; flex: 0 1 auto; align-items: center; gap: 6px; margin-left: auto; order: 2; }
+.task-pair-event-card .task-pair-chip-status { flex: 0 1 auto; max-width: 100%; overflow-wrap: anywhere; box-shadow: 0 0 12px color-mix(in srgb, var(--task-pair-status-text, var(--chrome-accent)) 12%, transparent); }
 .task-pair-card-time { flex: 0 0 auto; color: #94a3b8; font-size: 10px; white-space: nowrap; }
 .task-pair-card-chevron { flex: 0 0 auto; width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center; border: 0; border-radius: 0; color: #7dd3fc; background: transparent; font-size: 15px; line-height: 1; transition: transform .15s ease, color .15s ease; }
 .task-pair-card-chevron.is-expanded { transform: rotate(180deg); color: #cffafe; }
