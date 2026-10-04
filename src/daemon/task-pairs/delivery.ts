@@ -23,15 +23,20 @@ import logger from '../../util/logger.js';
 
 export type TaskPairDeliveryResult = 'sent' | 'queued' | 'skipped_pending' | 'no_session' | 'failed';
 
-export function taskPairMessageIdPrefix(taskId: string, reason: string): string {
-  return `${TASK_PAIR_NUDGE_ID_PREFIX}${taskId}:${reason}:`;
+export function taskPairMessageIdPrefix(taskId: string, reason: string, dedupeScope?: string): string {
+  const prefix = `${TASK_PAIR_NUDGE_ID_PREFIX}${taskId}:${reason}:`;
+  // Lifecycle-scoped notices must remain distinct in the durable queue as
+  // well as in the in-process gate.  URI-encoding keeps arbitrary scope text
+  // from introducing another prefix separator.  Callers without a scope keep
+  // the historical prefix for replay and admission compatibility.
+  return dedupeScope === undefined ? prefix : `${prefix}scope:${encodeURIComponent(dedupeScope)}:`;
 }
 
 /** True while a message for this pair and reason still waits in the session's queue. */
-export function hasPendingTaskPairMessage(sessionName: string, taskId: string, reason?: string): boolean {
+export function hasPendingTaskPairMessage(sessionName: string, taskId: string, reason?: string, dedupeScope?: string): boolean {
   const runtime = getTransportRuntime(sessionName);
   if (!runtime) return false;
-  const prefix = reason ? taskPairMessageIdPrefix(taskId, reason) : `${TASK_PAIR_NUDGE_ID_PREFIX}${taskId}:`;
+  const prefix = reason ? taskPairMessageIdPrefix(taskId, reason, dedupeScope) : `${TASK_PAIR_NUDGE_ID_PREFIX}${taskId}:`;
   return runtime.pendingEntries.some((entry) => entry.clientMessageId.startsWith(prefix));
 }
 
@@ -51,6 +56,15 @@ const inFlightTaskPairMessages = new Set<string>();
 
 export function setTaskPairDeliveryDepsForTests(deps: TaskPairDeliveryDeps | undefined): void {
   testDeps = deps;
+  // A test transport is replaced between test cases.  Do not let a promise
+  // from the previous case keep the process-wide coalescing gate closed in the
+  // next one (the real transport owns its pending state independently).
+  inFlightTaskPairMessages.clear();
+}
+
+/** Clear only the in-process coalescing gate in a test. */
+export function resetTaskPairDeliveryInFlightForTests(): void {
+  inFlightTaskPairMessages.clear();
 }
 
 export async function sendTaskPairMessage(
@@ -58,9 +72,14 @@ export async function sendTaskPairMessage(
   taskId: string,
   reason: string,
   text: string,
+  dedupeScope?: string,
 ): Promise<TaskPairDeliveryResult> {
-  const messageId = `${taskPairMessageIdPrefix(taskId, reason)}${randomUUID()}`;
-  const dedupeKey = `${target}\u0000${taskId}\u0000${reason}`;
+  const messageId = `${taskPairMessageIdPrefix(taskId, reason, dedupeScope)}${randomUUID()}`;
+  // Most reasons are once-pending per pair.  A few state-machine notices are
+  // explicitly once per lifecycle scope (for example, one in-audit warning
+  // per round); callers provide that scope without changing the durable
+  // message-id prefix consumed by clients.
+  const dedupeKey = `${target}\u0000${taskId}\u0000${reason}\u0000${dedupeScope ?? ''}`;
   if (inFlightTaskPairMessages.has(dedupeKey)) return 'skipped_pending';
   noteTaskPairFocus(target, taskId);
   // Keep the last actionable pair instruction durable so participant recovery
@@ -104,7 +123,7 @@ export async function sendTaskPairMessage(
   // queued message returned skipped_pending only after appending a fresh
   // automation row, which made the old reminder card reappear on every
   // reconnect even though no duplicate transport send occurred.
-  if (hasPendingTaskPairMessage(target, taskId, reason)) return 'skipped_pending';
+  if (hasPendingTaskPairMessage(target, taskId, reason, dedupeScope)) return 'skipped_pending';
   inFlightTaskPairMessages.add(dedupeKey);
   try {
     timelineEmitter.emit(target, 'user.message', {

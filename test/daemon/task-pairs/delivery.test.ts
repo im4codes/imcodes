@@ -12,7 +12,7 @@ vi.mock('../../../src/agent/session-manager.js', () => ({ getTransportRuntime: m
 vi.mock('../../../src/daemon/session-dispatch.js', () => ({ dispatchSessionMessage: mocks.dispatchSessionMessage }));
 vi.mock('../../../src/daemon/timeline-emitter.js', () => ({ timelineEmitter: { emit: mocks.emit } }));
 
-import { sendTaskPairMessage, setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
+import { sendTaskPairMessage, setTaskPairDeliveryDepsForTests, taskPairMessageIdPrefix } from '../../../src/daemon/task-pairs/delivery.js';
 
 describe('task-pair reminder delivery dedupe', () => {
   afterEach(() => {
@@ -45,6 +45,26 @@ describe('task-pair reminder delivery dedupe', () => {
     expect(mocks.emit).toHaveBeenCalledTimes(1);
     release('queued');
     await expect(first).resolves.toBe('queued');
+    expect(mocks.dispatchSessionMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps durable pending notices isolated by lifecycle scope across replay', async () => {
+    const taskId = 'pair-round-scope';
+    const oldRoundId = `${taskPairMessageIdPrefix(taskId, 'policy-rejection', 'round:1')}old-round`;
+    mocks.getTransportRuntime.mockReturnValue({ pendingEntries: [{ clientMessageId: oldRoundId }] });
+    mocks.dispatchSessionMessage.mockReturnValue('queued');
+
+    await expect(sendTaskPairMessage('deck_delivery_brain', taskId, 'policy-rejection', 'new round', 'round:2'))
+      .resolves.toBe('queued');
+    expect(mocks.dispatchSessionMessage).toHaveBeenCalledTimes(1);
+    const newRoundId = mocks.emit.mock.calls[0]?.[2]?.clientMessageId as string;
+    expect(newRoundId).toMatch(new RegExp(`^${taskPairMessageIdPrefix(taskId, 'policy-rejection', 'round:2')}`));
+
+    // A restart/replay snapshot containing the new round must suppress only
+    // that same scope; the older round was intentionally not a match.
+    mocks.getTransportRuntime.mockReturnValue({ pendingEntries: [{ clientMessageId: newRoundId }] });
+    await expect(sendTaskPairMessage('deck_delivery_brain', taskId, 'policy-rejection', 'replay', 'round:2'))
+      .resolves.toBe('skipped_pending');
     expect(mocks.dispatchSessionMessage).toHaveBeenCalledTimes(1);
   });
 });
