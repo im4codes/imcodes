@@ -34,6 +34,7 @@ describe('loadConfig()', () => {
     expect(config).toBeDefined();
     // Default config should have some known keys
     expect(typeof config).toBe('object');
+    expect(config.daemon.autoUpgrade).toBe(true);
   });
 
   it('expands ${ENV_VAR} in config values', async () => {

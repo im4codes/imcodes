@@ -23,7 +23,8 @@ export interface Config {
     reconnectBase: number;
     reconnectMax: number;
     /** When false, the daemon refuses server-driven auto-upgrades (manual
-     *  upgrades and explicitly confirmed server upgrades still work). */
+     *  upgrades and explicitly confirmed server upgrades still work). The
+     *  shipped default is true; installations can opt out explicitly. */
     autoUpgrade: boolean;
   };
   agents: {

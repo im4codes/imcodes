@@ -1198,6 +1198,8 @@ jobs:
       - name: Qualify signed Windows self-upgrade and rollback
         if: runner.os == 'Windows'
         run: npx tsx scripts/qualify-windows-self-upgrade.ts
+      - name: Record exact source revision in the platform artifact
+        run: node -e "require('node:fs').writeFileSync('dist-node-exe/source-commit-${{ matrix.key }}.txt', process.env.GITHUB_SHA + '\\n')"
       - name: Upload controlled-node executable
         uses: actions/upload-artifact@v4
         with:
@@ -1205,6 +1207,7 @@ jobs:
           path: |
             dist-node-exe/${{ matrix.artifact }}
             dist-node-exe/${{ matrix.artifact }}.manifest.json
+            dist-node-exe/source-commit-${{ matrix.key }}.txt
             dist-node-exe/computer-use-helper/**
             dist-node-exe/*.dmg
             dist-node-exe/remote-desktop-worker/**
@@ -1284,6 +1287,50 @@ jobs:
         run: >-
           node scripts/node-exe-artifacts.mjs verify-set server/controlled-node-artifacts
           imcodes-node-linux imcodes-node-macos imcodes-node.exe
+
+      - name: Verify native artifacts came from this exact source revision
+        env:
+          RELEASE_COMMIT: ${{ github.sha }}
+          RELEASE_VERSION: ${{ needs.release_version.outputs.app_version }}
+        run: |
+          set -euo pipefail
+          for platform in linux macos windows; do
+            marker="server/controlled-node-artifacts/source-commit-${platform}.txt"
+            [ -f "$marker" ] || { echo "::error::missing $marker" >&2; exit 1; }
+            actual="$(tr -d '\r\n' < "$marker")"
+            [ "$actual" = "$RELEASE_COMMIT" ] || {
+              echo "::error::${platform} artifact was built from ${actual}, expected ${RELEASE_COMMIT}" >&2
+              exit 1
+            }
+          done
+          node - <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const crypto = require('node:crypto');
+          const root = 'server/controlled-node-artifacts';
+          const files = [];
+          function visit(dir) {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+              const full = path.join(dir, entry.name);
+              if (entry.isDirectory()) visit(full);
+              else if (entry.name.endsWith('.manifest.json')) {
+                files.push({
+                  path: path.relative(root, full).replaceAll(path.sep, '/'),
+                  sha256: crypto.createHash('sha256').update(fs.readFileSync(full)).digest('hex'),
+                });
+              }
+            }
+          }
+          visit(root);
+          files.sort((a, b) => a.path.localeCompare(b.path));
+          if (files.length < 5) throw new Error(`expected all platform manifests, found ${files.length}`);
+          fs.writeFileSync(path.join(root, 'release-provenance.json'), `${JSON.stringify({
+            schemaVersion: 1,
+            sourceCommit: process.env.RELEASE_COMMIT,
+            appVersion: process.env.RELEASE_VERSION,
+            manifestFiles: files,
+          }, null, 2)}\n`);
+          NODE
 
       # EVERY target the image is supposed to serve, not just the default one.
       # This verifier defaults to the Windows target when none is named, so a
@@ -1403,6 +1450,7 @@ jobs:
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
+            SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
@@ -1412,6 +1460,12 @@ jobs:
       - name: Container startup smoke test
         run: |
           set -euo pipefail
+          test "$(docker inspect --format '{{index .Config.Labels \"org.opencontainers.image.revision\"}}' imcodes-smoke:test)" = "${{ github.sha }}"
+          test "$(docker inspect --format '{{index .Config.Labels \"org.opencontainers.image.version\"}}' imcodes-smoke:test)" = "${{ needs.release_version.outputs.app_version }}"
+          docker run --rm --entrypoint test imcodes-smoke:test \
+            -f /app/dist/server/src/db/migrations/099_controlled_node_worker_refresh_status.sql
+          docker run --rm --entrypoint sh imcodes-smoke:test -lc \
+            "grep -R -q 'controlled_node_worker_refresh' /app/dist/server/src"
           # Override entrypoint to run an import-only check inside the actual
           # production image. index.ts has an isMain guard so the import
           # resolves all static deps (including all routes/* modules) without
@@ -1422,6 +1476,8 @@ jobs:
           docker run --rm --entrypoint node imcodes-smoke:test \
             scripts/node-exe-artifacts.mjs verify-set /app/controlled-node-executables \
             imcodes-node-linux imcodes-node-macos imcodes-node.exe
+          docker run --rm --entrypoint node imcodes-smoke:test -e \
+            "const fs=require('node:fs'); const p=JSON.parse(fs.readFileSync('/app/controlled-node-executables/release-provenance.json','utf8')); if(p.sourceCommit!=='${{ github.sha }}'||p.appVersion!=='${{ needs.release_version.outputs.app_version }}') throw new Error('release provenance mismatch'); console.log('release provenance verified:',p.sourceCommit,p.appVersion)"
           # Every target, named. This verifier defaults to the WINDOWS target
           # when none is given, so this final gate -- the last check before the
           # image ships -- passed on an image containing no macOS component set
@@ -1455,6 +1511,7 @@ jobs:
             BUILD_TIME=${{ steps.ts.outputs.value }}
             OTA_VERSION=${{ steps.ota.outputs.version }}
             APP_VERSION=${{ needs.release_version.outputs.app_version }}
+            SOURCE_COMMIT=${{ github.sha }}
             IMCODES_EMBEDDING_PRELOAD_SOFT_FAIL=1
           cache-from: type=gha
           cache-to: type=gha,mode=max
