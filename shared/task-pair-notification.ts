@@ -15,12 +15,18 @@ import {
  * grammar deliberately strict: the header must be the first non-empty line,
  * so prose and fenced examples never become task cards.
  */
-const HEADER_RE = /^\s*\[IM\.codes task\s+([A-Za-z0-9._:-]{1,96})(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]\s*(?:\r?\n|$)/u;
-const STATUS_RE = /\bstatus\s+([a-z_]+)/iu;
-const ROUND_RE = /\bround\s+(\d+)/iu;
-const EXECUTOR_RE = /\bexecutor\s+([^,\s.]+)/iu;
-const AUDITOR_RE = /\bauditor\s+([^,\s.]+)/iu;
+const HEADER_RE = /^\s*\[IM\.codes task\s+([A-Za-z0-9._:-]{1,96})(?:\s+"((?:[^"\\]|\\.)*)")?\s*\]\s*/u;
+const STATUS_RE = /\bstatus\s*(?::|=)\s*([a-z_]+)|\bstatus\s+([a-z_]+)/iu;
+const ROUND_RE = /\bround\s*(?::|=)\s*(\d+)|\bround\s+(\d+)/iu;
+const EXECUTOR_RE = /\bexecutor\s*(?::|=)\s*([^,\s.]+)|\bexecutor\s+([^,\s.]+)/iu;
+const AUDITOR_RE = /\bauditor\s*(?::|=)\s*([^,\s.]+)|\bauditor\s+([^,\s.]+)/iu;
 const WHY_RE = /^Why:\s*(.+)$/imu;
+const QUEUE_DISPATCH_RE = /\bdispatched\s+from\s+the\s+queue\b/iu;
+const AUDIT_SUMMARY_RE = /^\s*Audited\s+pair\b/iu;
+const AUDIT_LIFECYCLE_RE = /\b(?:done|pass(?:ed)?|rework|ready(?:_for_audit)?|blocked|needs(?:_input|\s+your\s+decision)|cancel(?:led|ed)?)\b/iu;
+const AUDIT_FIELD_RE = /\b(?:executor|auditor|verdict|status|worktree|p[0-4]\s*=)\b/iu;
+const TASK_ID_RE = /\b(tsk_[A-Za-z0-9._:-]{1,96})\b/iu;
+const QUOTED_TITLE_RE = /\btsk_[A-Za-z0-9._:-]{1,96}\s+"((?:[^"\\]|\\.)*)"/iu;
 
 function unescapeQuotedTitle(value: string | undefined): string | undefined {
   if (!value) return undefined;
@@ -36,9 +42,13 @@ function knownStatus(value: string | undefined): TaskPairStatus | undefined {
 }
 
 function inferVerb(text: string, status: TaskPairStatus | undefined): TaskPairVerb {
-  if (/\bPASSED?\b/iu.test(text)) return 'PASS';
+  if (QUEUE_DISPATCH_RE.test(text)) return 'DISPATCH';
+  if (/\bPASS(?:ED)?\b/iu.test(text)) return 'PASS';
   if (/\bREWORK\b/iu.test(text) || status === 'rework') return 'REWORK';
   if (/\b(?:queued|queue)\b/iu.test(text) || status === 'queued') return 'QUEUE';
+  if (/\bREADY(?:_FOR_AUDIT)?\b/iu.test(text)) return 'READY_FOR_AUDIT';
+  if (/\b(?:STARTED|WORKING)\b/iu.test(text)) return 'WORKING';
+  if (/\b(?:BLOCKED|NEEDS_INPUT|NEEDS YOUR DECISION|AWAITING)\b/iu.test(text)) return 'NEEDS_INPUT';
   if (/\b(?:needs your decision|needs input|awaiting)\b/iu.test(text)) return 'NEEDS_INPUT';
   if (/\b(?:cancelled|canceled)\b/iu.test(text) || status === 'cancelled') return 'CANCEL';
   if (/\bDONE\b/iu.test(text) || status === 'done') return 'DONE';
@@ -51,6 +61,11 @@ function inferStatus(verb: TaskPairVerb, status: TaskPairStatus | undefined): Ta
     case 'PASS': return 'passed';
     case 'REWORK': return 'rework';
     case 'QUEUE': return 'queued';
+    case 'READY_FOR_AUDIT': return 'in_audit';
+    case 'STARTED':
+    case 'WORKING': return 'working';
+    case 'BLOCKED':
+    case 'NEEDS_INPUT': return 'awaiting_brain_decision';
     case 'DONE': return 'done';
     case 'CANCEL': return 'cancelled';
     default: return undefined;
@@ -70,30 +85,43 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
   // Fenced examples and inline mentions are intentionally rejected.  The
   // header must occupy the first non-empty line and the body must be non-empty.
   const match = text.match(HEADER_RE);
-  const markerScan = match ? undefined : scanTaskPairMarkers(text);
+  const auditSummary = !match
+    && AUDIT_SUMMARY_RE.test(text)
+    && TASK_ID_RE.test(text)
+    && AUDIT_LIFECYCLE_RE.test(text)
+    && AUDIT_FIELD_RE.test(text);
+  const markerScan = match || auditSummary ? undefined : scanTaskPairMarkers(text);
   const marker = markerScan?.markers.find((candidate) => candidate.knownVerb === 'DISPATCH'
     || candidate.knownVerb === 'QUEUE'
     || candidate.knownVerb === 'PASS'
     || candidate.knownVerb === 'REWORK'
+    || candidate.knownVerb === 'READY_FOR_AUDIT'
+    || candidate.knownVerb === 'STARTED'
+    || candidate.knownVerb === 'WORKING'
+    || candidate.knownVerb === 'BLOCKED'
     || candidate.knownVerb === 'NEEDS_INPUT'
     || candidate.knownVerb === 'DONE'
     || candidate.knownVerb === 'CANCEL');
-  if (!match && !marker) return undefined;
+  if (!match && !auditSummary && !marker) return undefined;
   const body = match
     ? text.slice(match[0].length).trim()
     : text.trim();
   if (!body || body.startsWith('```')) return undefined;
-  if (!marker && !/(?:\bstatus\b|\b(?:executor|auditor)\b|\bround\b|\b(?:PASS|PASSED|REWORK|QUEUED|QUEUE|NEEDS_INPUT|NEEDS YOUR DECISION|CANCEL(?:LED|ED)?|DONE)\b|^Why:)/imu.test(body)) {
+  if (!marker && !/(?:\bstatus\b|\b(?:executor|auditor)\b|\bround\b|\b(?:Audited\s+pair|PASS(?:ED)?|REWORK|QUEUED|QUEUE|READY(?:_FOR_AUDIT)?|STARTED|WORKING|BLOCKED|NEEDS_INPUT|NEEDS YOUR DECISION|CANCEL(?:LED|ED)?|DONE)\b|^Why:)/imu.test(body)) {
     return undefined;
   }
-  const taskId = match?.[1] ?? marker!.taskId;
+  const bareTaskId = auditSummary ? body.match(TASK_ID_RE)?.[1] : undefined;
+  const taskId = match?.[1] ?? marker?.taskId ?? bareTaskId;
+  if (!taskId) return undefined;
+  const summaryTitle = auditSummary ? body.match(QUOTED_TITLE_RE)?.[1] : undefined;
   const title = unescapeQuotedTitle(match?.[2])
+    ?? unescapeQuotedTitle(summaryTitle)
     ?? unescapeQuotedTitle(marker?.attrs.title)
     ?? deriveSupervisionTaskTitleFromBrief(marker?.brief);
-  const status = knownStatus(body.match(STATUS_RE)?.[1])
+  const status = knownStatus(body.match(STATUS_RE)?.[1] ?? body.match(STATUS_RE)?.[2])
     ?? knownStatus(marker?.attrs.status);
   const verb = marker?.knownVerb ?? inferVerb(body, status);
-  const effectiveStatus = inferStatus(verb, status);
+  const effectiveStatus = inferStatus(verb, status ?? (QUEUE_DISPATCH_RE.test(body) ? 'working' : undefined));
   const payload: Record<string, unknown> = {
     taskId,
     ...(title ? { title } : {}),
@@ -103,9 +131,9 @@ export function parseTaskPairNotification(text: unknown): ParsedTaskPairNotifica
     effect: 'recorded',
     verb,
     ...(effectiveStatus ? { toStatus: effectiveStatus } : {}),
-    ...(body.match(ROUND_RE)?.[1] ? { round: Number(body.match(ROUND_RE)![1]) } : {}),
-    ...(body.match(EXECUTOR_RE)?.[1] && body.match(EXECUTOR_RE)![1] !== '-' ? { executor: body.match(EXECUTOR_RE)![1] } : {}),
-    ...(body.match(AUDITOR_RE)?.[1] && body.match(AUDITOR_RE)![1] !== '-' ? { auditor: body.match(AUDITOR_RE)![1] } : {}),
+    ...((body.match(ROUND_RE)?.[1] ?? body.match(ROUND_RE)?.[2]) ? { round: Number(body.match(ROUND_RE)![1] ?? body.match(ROUND_RE)![2]) } : {}),
+    ...((body.match(EXECUTOR_RE)?.[1] ?? body.match(EXECUTOR_RE)?.[2]) && (body.match(EXECUTOR_RE)![1] ?? body.match(EXECUTOR_RE)![2]) !== '-' ? { executor: body.match(EXECUTOR_RE)![1] ?? body.match(EXECUTOR_RE)![2] } : {}),
+    ...((body.match(AUDITOR_RE)?.[1] ?? body.match(AUDITOR_RE)?.[2]) && (body.match(AUDITOR_RE)![1] ?? body.match(AUDITOR_RE)![2]) !== '-' ? { auditor: body.match(AUDITOR_RE)![1] ?? body.match(AUDITOR_RE)![2] } : {}),
     ...(body.match(WHY_RE)?.[1] ? { noticeReason: body.match(WHY_RE)![1].trim() } : {}),
     noticeText: body,
     rawText: text,

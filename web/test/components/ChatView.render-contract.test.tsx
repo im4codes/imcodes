@@ -174,6 +174,111 @@ describe('ChatView render capability contract', () => {
     expect(items.filter((item) => item.type === 'event')).toHaveLength(1);
   });
 
+  it('cards inline dispatched-from-queue notices and suppresses the raw protocol text', () => {
+    const notice = '[IM.codes task tsk_queue_dispatch "Queue dispatch"] dispatched from the queue: executor=deck_exec, auditor=deck_aud, status=working.';
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'queue-dispatch-text',
+      payload: { text: notice },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      type: 'assistant-block',
+      taskPairNotification: expect.objectContaining({
+        taskId: 'tsk_queue_dispatch',
+        title: 'Queue dispatch',
+        verb: 'DISPATCH',
+        toStatus: 'working',
+        executor: 'deck_exec',
+        auditor: 'deck_aud',
+      }),
+    });
+    const { container } = render(<ChatView
+      events={[assistant]}
+      loading={false}
+      ws={{} as never}
+      workdir="/repo"
+      sessionId="session-a"
+    />);
+    expect(container.querySelectorAll('.task-pair-event-card')).toHaveLength(1);
+    expect(container.textContent).toContain('Queue dispatch');
+    expect(container.textContent).not.toContain('dispatched from the queue');
+  });
+
+  it('cards audited PASS summaries and keeps task metadata in the expandable payload', () => {
+    const notice = '[IM.codes task tsk_audited_done "Two-line collapse"]\nAudited pair done: executor deck_exec. Auditor deck_aud verdict: PASS (p0=0 p1=0).\nWorktree: /repo/task.';
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'audited-pass-text',
+      payload: { text: notice },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items).toHaveLength(1);
+    expect(items[0].taskPairNotification).toMatchObject({
+      taskId: 'tsk_audited_done',
+      title: 'Two-line collapse',
+      verb: 'PASS',
+      toStatus: 'passed',
+      executor: 'deck_exec',
+      auditor: 'deck_aud',
+    });
+    const { container } = render(<ChatView
+      events={[assistant]}
+      loading={false}
+      ws={{} as never}
+      workdir="/repo"
+      sessionId="session-a"
+    />);
+    const card = container.querySelector('.task-pair-event-card') as HTMLElement | null;
+    expect(card).not.toBeNull();
+    expect(container.textContent).not.toContain('[IM.codes task tsk_audited_done');
+    fireEvent.click(card?.querySelector('.task-pair-card-toggle')!);
+    expect(card?.textContent).toContain('Audited pair done');
+    expect(card?.querySelector('.task-pair-card-payload')?.textContent).toContain('tsk_audited_done');
+  });
+
+  it('cards a strict headerless audited summary when lifecycle and audit fields are present', () => {
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'headerless-audited-pass',
+      payload: { text: 'Audited pair done: tsk_headerless "Headerless audit"; executor deck_exec; auditor deck_aud; verdict PASS.' },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items).toHaveLength(1);
+    expect(items[0].taskPairNotification).toMatchObject({
+      taskId: 'tsk_headerless',
+      title: 'Headerless audit',
+      verb: 'PASS',
+      toStatus: 'passed',
+    });
+  });
+
+  it.each([
+    ['READY_FOR_AUDIT', 'in_audit'],
+    ['DONE', 'done'],
+    ['REWORK', 'rework'],
+  ])('cards %s audit lifecycle summaries', (verb, status) => {
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: `audit-${verb.toLowerCase()}`,
+      payload: { text: `[IM.codes task tsk_audit_${verb.toLowerCase()} "Audit ${verb}"]\n${verb} status ${status}. executor deck_exec, auditor deck_aud.` },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items).toHaveLength(1);
+    expect(items[0].taskPairNotification).toMatchObject({ verb, toStatus: status });
+  });
+
+  it('does not reinterpret an ordinary sentence mentioning an audit summary', () => {
+    const assistant = {
+      ...ev('assistant.text'),
+      eventId: 'audit-prose',
+      payload: { text: 'Audited pair tsk_demo is a historical note, not a lifecycle status.' },
+    } as unknown as TimelineEvent;
+    const items = __buildViewItemsForTests([assistant], true);
+    expect(items[0]).not.toHaveProperty('taskPairNotification');
+  });
+
   it('keeps consecutive task notices as separate cards instead of dropping the first', () => {
     const first = {
       ...ev('assistant.text'),
