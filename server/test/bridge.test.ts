@@ -48,6 +48,8 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CONTROLLED_NODE_WORKER_REFRESH_PHASE } from '../../shared/controlled-node-worker-refresh.js';
+import { listControlledMachines } from '../src/routes/machines.js';
 import {
   DIRECT_FILE_TRANSFER_DIRECTION,
   DIRECT_FILE_TRANSFER_MSG,
@@ -861,6 +863,132 @@ describe('WsBridge', () => {
       await flushAsync();
 
       expect(ws.sentStrings.some((msg) => msg.includes('"type":"daemon.upgrade"') && msg.includes('2026.4.905-dev.877'))).toBe(false);
+    });
+
+    it('persists, broadcasts, restores, and projects controlled worker refresh status', async () => {
+      const persisted: Record<string, unknown> = {};
+      const writes: Array<{ sql: string; params: unknown[] }> = [];
+      const db = {
+        queryOne: async () => ({
+          token_hash: 'valid-hash',
+          node_role: 'controlled',
+          revoked_at: null,
+          os: CONTROLLED_NODE_OS_LINUX,
+          ...persisted,
+        }),
+        query: async () => [],
+        execute: async (sql: string, params: unknown[] = []) => {
+          writes.push({ sql, params });
+          if (sql.includes('controlled_worker_refresh_attempt_id')) {
+            [
+              'controlled_worker_refresh_attempt_id',
+              'controlled_worker_refresh_phase',
+              'controlled_worker_refresh_installed_version',
+              'controlled_worker_refresh_target_version',
+              'controlled_worker_refresh_artifact_sha256',
+              'controlled_worker_refresh_reason',
+              'controlled_worker_refresh_recorded_at',
+            ].forEach((key, index) => { persisted[key] = params[index]; });
+          }
+          return { changes: 1 };
+        },
+        exec: async () => {},
+        transaction: async <T>(fn: (tx: import('../src/db/client.js').Database) => Promise<T>) => fn(db as unknown as import('../src/db/client.js').Database),
+        close: () => {},
+      } as unknown as import('../src/db/client.js').Database;
+      const bridge = WsBridge.get(serverId);
+      const daemon = new MockWs();
+      const browser = new MockWs();
+      bridge.handleBrowserConnection(browser as never, 'test-user', db);
+      bridge.handleDaemonConnection(daemon as never, db, {} as never);
+      daemon.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.9.1', capabilities: [],
+      }));
+      await flushAsync();
+
+      const started = {
+        type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+        attemptId: 'attempt-refresh-1',
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.STARTED,
+        targetVersion: '2026.10.1',
+        recordedAt: 1_700_000_000_000,
+      };
+      daemon.emit('message', JSON.stringify(started));
+      await flushBridgeDataPlane();
+      const succeeded = {
+        ...started,
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        installedVersion: '2026.10.1',
+        artifactSha256: 'a'.repeat(64),
+        recordedAt: started.recordedAt + 1,
+      };
+      daemon.emit('message', JSON.stringify(succeeded));
+      await flushBridgeDataPlane();
+
+      expect(writes.filter(({ sql }) => sql.includes('controlled_worker_refresh_attempt_id'))).toHaveLength(2);
+      expect(browser.sentStrings.map((raw) => JSON.parse(raw)).filter((msg) => msg.type === started.type)).toEqual([
+        expect.objectContaining({ phase: 'started', attemptId: started.attemptId }),
+        expect.objectContaining({ phase: 'succeeded', installedVersion: '2026.10.1', artifactSha256: 'a'.repeat(64) }),
+      ]);
+
+      const beforeInvalid = writes.length;
+      daemon.emit('message', JSON.stringify({ ...succeeded, unexpected: true }));
+      await flushAsync();
+      expect(writes).toHaveLength(beforeInvalid);
+
+      WsBridge.getAll().clear();
+      const restoredBridge = WsBridge.get(serverId);
+      const restoredDaemon = new MockWs();
+      restoredBridge.handleDaemonConnection(restoredDaemon as never, db, {} as never);
+      restoredDaemon.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '2026.9.1', capabilities: [],
+      }));
+      await flushAsync();
+      expect(restoredBridge.getControlledNodeWorkerRefreshStatus()).toEqual(expect.objectContaining({
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        installedVersion: '2026.10.1',
+      }));
+      const reconnectedBrowser = new MockWs();
+      restoredBridge.handleBrowserConnection(reconnectedBrowser as never, 'test-user', db);
+      expect(reconnectedBrowser.sentStrings.map((raw) => JSON.parse(raw))).toContainEqual(expect.objectContaining({
+        type: DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS,
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        artifactSha256: 'a'.repeat(64),
+      }));
+
+      const listDb = {
+        query: async () => [{
+          id: serverId,
+          node_id: '1234567890',
+          user_id: 'test-user',
+          ref_name: 'worker',
+          display_name: 'worker',
+          status: 'online',
+          last_heartbeat_at: Date.now(),
+          exec_enabled: true,
+          os: CONTROLLED_NODE_OS_LINUX,
+          daemon_version: '2026.9.1',
+          auto_unlock_configured: false,
+          revoked_at: null,
+          access_role: 'owner',
+          access_expires_at: null,
+          controlled_capabilities: [],
+          controlled_upgrade_status: null,
+          controlled_upgrade_target_version: null,
+          controlled_upgrade_reason: null,
+          ...persisted,
+          node_role: 'controlled',
+          host_server_id: null,
+          remote_desktop_host_id: null,
+          team_ids: [],
+          team_names: [],
+        }],
+      } as unknown as import('../src/db/client.js').Database;
+      const listed = await listControlledMachines(listDb, 'test-user', Date.now());
+      expect(listed.machines[0]?.workerRefresh).toEqual(expect.objectContaining({
+        phase: CONTROLLED_NODE_WORKER_REFRESH_PHASE.SUCCEEDED,
+        installedVersion: '2026.10.1',
+      }));
     });
 
     it('auto-upgrades a controlled node once at the authenticated idle boundary', async () => {
