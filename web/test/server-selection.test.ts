@@ -1,4 +1,7 @@
-import { describe, expect, it } from 'vitest';
+/**
+ * @vitest-environment jsdom
+ */
+import { describe, expect, it, beforeEach } from 'vitest';
 
 import {
   getDaemonBadgeState,
@@ -12,6 +15,7 @@ import {
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from '../src/server-selection.js';
+import { readServerSession, serverSessionStorageKey, writeServerSession } from '../src/server-tab-state.js';
 
 describe('getSelectedServerName', () => {
   it('uses the persisted fallback before the server list is loaded', () => {
@@ -35,6 +39,31 @@ describe('getSelectedServerName', () => {
       [{ id: 'srv-1', name: 'Server One' }],
       'Server One',
     )).toBeNull();
+  });
+});
+
+describe('server-scoped tab snapshots', () => {
+  beforeEach(() => localStorage.clear());
+  it('keeps each server tab independent, including same-named sessions', () => {
+    localStorage.clear();
+    writeServerSession('server-a', 'deck_shared_brain');
+    writeServerSession('server-b', 'deck_shared_brain');
+    expect(serverSessionStorageKey('server-a')).not.toBe(serverSessionStorageKey('server-b'));
+    expect(readServerSession('server-a')).toBe('deck_shared_brain');
+    expect(readServerSession('server-b')).toBe('deck_shared_brain');
+    writeServerSession('server-a', 'deck_other_brain');
+    expect(readServerSession('server-a')).toBe('deck_other_brain');
+    expect(readServerSession('server-b')).toBe('deck_shared_brain');
+  });
+
+  it('drops invalid or removed snapshots instead of restoring them', () => {
+    localStorage.clear();
+    writeServerSession('server-a', '');
+    expect(readServerSession('server-a')).toBeNull();
+    localStorage.setItem(serverSessionStorageKey('server-a'), 'x'.repeat(1025));
+    expect(readServerSession('server-a')).toBeNull();
+    writeServerSession('server-a', null);
+    expect(localStorage.getItem(serverSessionStorageKey('server-a'))).toBeNull();
   });
 });
 

@@ -12,6 +12,8 @@
  * remains a last-resort fallback for a new tab with no explicit route.
  */
 
+import { readServerSession } from '../server-tab-state.js';
+
 export interface HashState {
   serverId: string | null;
   sessionName: string | null;
@@ -117,9 +119,10 @@ export function resolveInitialRouteState(): HashState {
   const fromTab = readTabRouteState();
   if (fromTab.serverId) return fromTab;
 
+  const serverId = localStorage.getItem('rcc_server');
   return {
-    serverId: localStorage.getItem('rcc_server'),
-    sessionName: localStorage.getItem('rcc_session'),
+    serverId,
+    sessionName: serverId ? (readServerSession(serverId) ?? localStorage.getItem('rcc_session')) : localStorage.getItem('rcc_session'),
     sharedEntryId: null,
   };
 }

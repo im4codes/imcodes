@@ -9,6 +9,7 @@ import {
   resolveInitialSessionName,
   writeHashState,
 } from '../src/hooks/useHashState.js';
+import { serverSessionStorageKey } from '../src/server-tab-state.js';
 
 describe('tab-local hash state', () => {
   beforeEach(() => {
@@ -71,6 +72,17 @@ describe('tab-local hash state', () => {
     localStorage.setItem('rcc_server', 'srv-other');
     localStorage.setItem('rcc_session', 'deck_other_brain');
 
+    expect(resolveInitialRouteState()).toEqual({
+      serverId: 'srv-current',
+      sessionName: 'deck_current_brain',
+      sharedEntryId: null,
+    });
+  });
+
+  it('prefers the selected server\'s tab snapshot over another server\'s legacy fallback', () => {
+    localStorage.setItem('rcc_server', 'srv-current');
+    localStorage.setItem(serverSessionStorageKey('srv-current'), 'deck_current_brain');
+    localStorage.setItem('rcc_session', 'deck_other_brain');
     expect(resolveInitialRouteState()).toEqual({
       serverId: 'srv-current',
       sessionName: 'deck_current_brain',
