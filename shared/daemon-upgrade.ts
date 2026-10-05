@@ -3,6 +3,18 @@ import { compareImcodesVersions, getReleaseChannel } from './imcodes-version.js'
 
 export const DAEMON_UPGRADE_TARGET_LATEST = 'latest';
 
+/**
+ * Deployment-level opt-out for server-driven automatic upgrades. The image
+ * must not set this value itself; an operator can still provide it explicitly
+ * while manual and replayed upgrades remain available.
+ */
+export function isDaemonAutoUpgradeDisabledByEnv(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  return env.IMCODES_DISABLE_AUTO_UPGRADE === '1'
+    || env.IMCODES_DISABLE_AUTO_UPGRADE === 'true';
+}
+
 /** Origin of a daemon upgrade command. Auto is retained only for legacy
  * controlled-node recovery; full daemons never receive it on reconnect. */
 export const DAEMON_UPGRADE_SOURCE = {

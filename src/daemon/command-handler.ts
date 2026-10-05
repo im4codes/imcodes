@@ -228,6 +228,7 @@ import {
   DAEMON_UPGRADE_BLOCK_REASON,
   DAEMON_UPGRADE_SOURCE,
   DAEMON_UPGRADE_TARGET_LATEST,
+  isDaemonAutoUpgradeDisabledByEnv,
   normalizeDaemonUpgradeTargetVersion,
   resolveDaemonUpgradeSource,
   type DaemonUpgradeSource,
@@ -8408,11 +8409,10 @@ async function handleDaemonUpgrade(
 ): Promise<void> {
   const UPGRADE_MEMORY_FREEZE_TTL_MS = 15 * 60 * 1000;
 
-  // ── Opt-out: server-driven automatic upgrades are disabled by default. ────
+  // ── Opt-out: an operator can disable server-driven automatic upgrades. ────
   // Explicitly confirmed manual upgrades and replay of an existing manual
   // lifecycle remain allowed; only legacy source:auto is gated here.
-  const envDisabled = process.env.IMCODES_DISABLE_AUTO_UPGRADE === '1'
-    || process.env.IMCODES_DISABLE_AUTO_UPGRADE === 'true';
+  const envDisabled = isDaemonAutoUpgradeDisabledByEnv();
   // Read the already-cached config synchronously — no await before the
   // active-turn / cooldown checks below (an extra async hop would delay them
   // past their awaiters). Null (config not yet loaded) is treated as enabled.

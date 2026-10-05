@@ -626,10 +626,13 @@ describe('WsBridge', () => {
 
   describe('daemon auth', () => {
     const originalAppVersion = process.env.APP_VERSION;
+    const originalAutoUpgradeDisable = process.env.IMCODES_DISABLE_AUTO_UPGRADE;
 
     afterEach(() => {
       if (originalAppVersion == null) delete process.env.APP_VERSION;
       else process.env.APP_VERSION = originalAppVersion;
+      if (originalAutoUpgradeDisable == null) delete process.env.IMCODES_DISABLE_AUTO_UPGRADE;
+      else process.env.IMCODES_DISABLE_AUTO_UPGRADE = originalAutoUpgradeDisable;
       vi.useRealTimers();
     });
 
@@ -1012,6 +1015,25 @@ describe('WsBridge', () => {
       await vi.runOnlyPendingTimersAsync();
       await flushAsync();
       expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(1);
+    });
+
+    it('does not auto-upgrade a controlled node when the explicit deployment opt-out is set', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      await flushAsync();
+      ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'idle' }] }));
+      await flushAsync();
+      await vi.runOnlyPendingTimersAsync();
+      await flushAsync();
+      expect(ws.sentStrings.some((message) => message.includes('\"type\":\"daemon.upgrade\"'))).toBe(false);
     });
 
     it('defers a controlled-node upgrade while a dispatch is active and flushes once at idle', async () => {

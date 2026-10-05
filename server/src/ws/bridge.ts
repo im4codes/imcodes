@@ -361,6 +361,7 @@ import {
   DAEMON_UPGRADE_SOURCE,
   CONTROLLED_NODE_UPGRADE_STATUS,
   isDaemonUpgradeAvailable,
+  isDaemonAutoUpgradeDisabledByEnv,
   isRetryableDaemonUpgradeBlockReason,
   validateControlledNodeUpgradeBlockedMessage,
   type ControlledNodeUpgradeStatus,
@@ -10280,6 +10281,9 @@ export class WsBridge {
    * this path and retain the explicit operator-confirmation policy. */
   private maybeAutoUpgradeControlledNode(): RequestDaemonUpgradeResult | null {
     if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED || !this.authenticated) return null;
+    // An operator may explicitly hold the server-driven trigger closed while
+    // retaining manual upgrades. The published image does not set this value.
+    if (isDaemonAutoUpgradeDisabledByEnv()) return null;
     const targetVersion = process.env.APP_VERSION;
     if (!targetVersion || targetVersion === '0.0.0' || !this.daemonVersion) return null;
     this.controlledNodeUpgradeTargetVersion = targetVersion;

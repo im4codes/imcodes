@@ -2,9 +2,20 @@ import { describe, expect, it } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   DAEMON_UPGRADE_BLOCK_REASON,
+  isDaemonAutoUpgradeDisabledByEnv,
   normalizeDaemonUpgradeTargetVersion,
   validateControlledNodeUpgradeBlockedMessage,
 } from '../../shared/daemon-upgrade.js';
+
+describe('deployment auto-upgrade gate', () => {
+  it('only disables automatic upgrades for explicit opt-out values', () => {
+    expect(isDaemonAutoUpgradeDisabledByEnv({ IMCODES_DISABLE_AUTO_UPGRADE: '1' })).toBe(true);
+    expect(isDaemonAutoUpgradeDisabledByEnv({ IMCODES_DISABLE_AUTO_UPGRADE: 'true' })).toBe(true);
+    expect(isDaemonAutoUpgradeDisabledByEnv({ IMCODES_DISABLE_AUTO_UPGRADE: '0' })).toBe(false);
+    expect(isDaemonAutoUpgradeDisabledByEnv({ IMCODES_DISABLE_AUTO_UPGRADE: 'false' })).toBe(false);
+    expect(isDaemonAutoUpgradeDisabledByEnv({})).toBe(false);
+  });
+});
 
 describe('daemon upgrade target validation', () => {
   it('accepts latest, semver, and dev calver targets', () => {

@@ -131,6 +131,9 @@ ARG APP_VERSION=0.0.0
 ARG SOURCE_COMMIT=unknown
 ENV NODE_ENV=production
 ENV APP_VERSION=${APP_VERSION}
+# Do not bake IMCODES_DISABLE_AUTO_UPGRADE into the published image. Deployers
+# may set this environment variable explicitly as an emergency opt-out; the
+# normal production image must allow the daemon's auto-upgrade gate to run.
 ENV WEB_DIST_PATH=/app/web/dist
 ENV LANDING_DIST_PATH=/app/landing
 ENV UPDATES_DIST_PATH=/app/updates
