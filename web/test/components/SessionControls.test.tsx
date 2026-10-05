@@ -8,6 +8,7 @@ import { SESSION_SEND_DELIVERY_MODES } from '../../../shared/session-send-delive
 import { selectQueueDeliveryMode } from '../fixtures/delivery-mode.js';
 import { useRef, useState } from 'preact/hooks';
 import { FILE_TRANSFER_LIMITS } from '../../../shared/transport/file-transfer.js';
+import { DIRECT_FILE_TRANSFER_ERROR } from '../../../shared/direct-file-transfer.js';
 import { HERMES_AGENT_PROVIDER_ID } from '../../../shared/hermes-agent.js';
 
 const DEFAULT_INNER_WIDTH = 1280;
@@ -373,6 +374,7 @@ import {
   OPENSPEC_LIST_REQUEST_TIMEOUT_MS,
   SessionControls,
 } from '../../src/components/SessionControls.js';
+import { DirectFileTransferFailure } from '../../src/direct-file-transfer.js';
 import { __resetPrefCacheForTests } from '../../src/hooks/usePref.js';
 import type { SessionInfo } from '../../src/types.js';
 import { INLINE_PASTE_TEXT_CHAR_LIMIT } from '../../src/composer-inline-limit.js';
@@ -9427,6 +9429,63 @@ afterEach(() => {
     expect(input.textContent).toBe('keep this text');
     expect(screen.getAllByText('upload_failed').length).toBeGreaterThan(0);
     expect(gatherSendCalls(ws)).toHaveLength(0);
+  });
+
+  it('maps DirectFileTransferFailure insufficient_capacity to the capacity UI error (not upload_failed)', async () => {
+    // Causal: daemon/direct ENOSPC now surfaces as DirectFileTransferFailure.code=
+    // insufficient_capacity. Composer must show the dedicated capacity string so
+    // disk-full is not disguised as a generic upload_failed.
+    directFileTransferMocks.useUploadFileWithDirectFallbackMock = true;
+    directFileTransferMocks.uploadFileWithDirectFallback.mockRejectedValueOnce(
+      new DirectFileTransferFailure(DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY, false),
+    );
+    const ws = makeWs();
+    render(
+      <SessionControls
+        ws={ws as any}
+        activeSession={makeSession({ name: 'capacity-direct-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        files: [new File(['x'], 'full-disk.bin', { type: 'application/octet-stream' })],
+        getData: () => '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('insufficient_capacity').length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText('upload_failed')).toBeNull();
+    expect(directFileTransferMocks.uploadFileWithDirectFallback).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps legacy ENOSPC / API 507 body text to the capacity UI error', async () => {
+    // Old clients and HTTP relay still deliver ENOSPC as plain Error message text.
+    uploadFileMock.mockRejectedValueOnce(new Error('API 507: insufficient_capacity'));
+    render(
+      <SessionControls
+        ws={makeWs() as any}
+        activeSession={makeSession({ name: 'capacity-legacy-session' })}
+        quickData={makeQuickData() as any}
+        serverId="srv-1"
+      />,
+    );
+
+    fireEvent.paste(screen.getByRole('textbox'), {
+      clipboardData: {
+        files: [new File(['x'], 'legacy-enospc.txt', { type: 'text/plain' })],
+        getData: () => '',
+      },
+    });
+
+    await waitFor(() => {
+      expect(screen.getAllByText('insufficient_capacity').length).toBeGreaterThan(0);
+    });
+    expect(screen.queryByText('upload_failed')).toBeNull();
   });
 
   it('deletes the daemon upload when the existing attachment x is clicked without confirmation', async () => {
