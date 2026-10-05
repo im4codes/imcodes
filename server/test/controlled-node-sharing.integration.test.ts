@@ -654,6 +654,7 @@ describe('controlled-node shared action admission', () => {
       'POST /:serverId/exec-enabled',
       'POST /:serverId/remote-desktop-permissions',
       'POST /:serverId/remote-desktop-worker',
+      'POST /:serverId/remote-desktop-worker/refresh',
       'POST /:serverId/revoke',
       'POST /:serverId/upgrade',
     ]);
