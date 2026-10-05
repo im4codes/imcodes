@@ -2247,6 +2247,113 @@ describe('daemon direct file transfer v2 lease broker', () => {
     await direct.shutdownDirectFileTransfers();
   });
 
+  it('returns a prior commit instead of stale_daemon_generation after a generation recycle', async () => {
+    // Field race: generation N commits the upload, generation N+1 then receives
+    // a PREPARE for the same clientUploadId against a lease it no longer holds.
+    // Refusing with stale_daemon_generation made the browser retry and write a
+    // second upload directory for a file already on disk.
+    const { direct, sent, sender } = await readyLease();
+    const existing = {
+      id: 'stored-id', source: 'upload', serverId: '', daemonPath: storedPath,
+      originalName: 'source.bin', size: 5, createdAt: new Date().toISOString(), downloadable: true,
+    };
+    lookupAttachmentByClientUploadId.mockReturnValue(existing);
+    sent.length = 0;
+
+    await direct.handleDirectFileTransferCommand(uploadPrepare({
+      ...binding({
+        requestId: 'request-stale-commit-0001',
+        attemptId: 'attempt-stale-commit-0001',
+        leaseId: 'lease-that-was-evicted',
+        daemonGeneration: 2,
+      }),
+      clientUploadId: operationId,
+      channelLabel: 'imcodes-file-upload-stale-commit',
+    }), sender);
+
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+      attachment: existing,
+    }));
+    expect(sent.filter((message) => (
+      message.type === DIRECT_FILE_TRANSFER_MSG.ERROR
+      && message.error === DIRECT_FILE_TRANSFER_ERROR.STALE_DAEMON_GENERATION
+    ))).toEqual([]);
+    expect(finalizeDirectUploadedFile).not.toHaveBeenCalled();
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('fails upload start with insufficient_capacity when free disk cannot hold the file', async () => {
+    // Preflight used to throw write_failed, which retried / HTTP-fell-back onto
+    // the same full volume and looked like a generic upload_failed in the UI.
+    const { direct, sent, sender } = await readyLease();
+    const authority = uploadPrepare({
+      ...binding({
+        requestId: 'request-capacity-0001',
+        attemptId: 'attempt-capacity-0001',
+        operationId: 'operation-capacity-0001',
+      }),
+      clientUploadId: 'operation-capacity-0001',
+      // Far above any realistic free space after DISK_RESERVE_BYTES.
+      size: Number.MAX_SAFE_INTEGER,
+      channelLabel: 'imcodes-file-upload-capacity',
+    });
+    await direct.handleDirectFileTransferCommand(authority, sender);
+    const channel = new FakeDataChannel(authority.channelLabel as string);
+    FakePeerConnection.latest!.emitDataChannel(channel);
+    channel.emit(JSON.stringify({
+      type: DIRECT_FILE_TRANSFER_DATA_MSG.START,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...binding({
+        requestId: 'request-capacity-0001',
+        attemptId: 'attempt-capacity-0001',
+        operationId: 'operation-capacity-0001',
+      }),
+      authority: authority.authority,
+    }));
+
+    await vi.waitFor(() => expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.FAILED,
+      error: DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY,
+    })));
+    expect(sent).toContainEqual(expect.objectContaining({
+      type: DIRECT_FILE_TRANSFER_MSG.ERROR,
+      error: DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY,
+      retryable: false,
+    }));
+    expect(directLogger.info).toHaveBeenCalledWith(
+      expect.objectContaining({
+        event: 'direct_file_v2.attempt_failed',
+        error: DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY,
+        retryable: false,
+      }),
+      'Direct file transfer v2 metric',
+    );
+    await direct.shutdownDirectFileTransfers();
+  });
+
+  it('maps ENOSPC mid-write errors to terminal insufficient_capacity', async () => {
+    // ESM forbids spying node:fs/promises.open; exercise the shared mapper the
+    // write-chain catch uses so ENOSPC cannot be disguised as retryable write_failed.
+    const { direct } = await readyLease();
+    const enospc = Object.assign(new Error('ENOSPC: no space left on device, write'), { code: 'ENOSPC' });
+    expect(direct.__mapUploadWriteFailureForTests(enospc)).toEqual({
+      error: DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY,
+      retryable: false,
+    });
+    expect(direct.__mapUploadWriteFailureForTests(new Error(DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY))).toEqual({
+      error: DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY,
+      retryable: false,
+    });
+    expect(direct.__mapUploadWriteFailureForTests(new Error('EIO: i/o error'))).toEqual({
+      error: DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
+      retryable: true,
+    });
+    await direct.shutdownDirectFileTransfers();
+  });
+
   it('refuses an operation whose authority has already expired', async () => {
     const { direct, sent, sender } = await readyLease();
     sent.length = 0;

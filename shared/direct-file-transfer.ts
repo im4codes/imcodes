@@ -1,5 +1,9 @@
 import type { AttachmentRef } from './transport/file-transfer.js';
-import { FILE_TRANSFER_PATH_MAX_BYTES, validateAttachmentRef } from './transport/file-transfer.js';
+import {
+  FILE_TRANSFER_PATH_MAX_BYTES,
+  FILE_TRANSFER_UPLOAD_ERROR_CODE,
+  validateAttachmentRef,
+} from './transport/file-transfer.js';
 
 /**
  * Full daemons auto-upgrade, so this is a clean v2 protocol.  Do not add v1
@@ -118,6 +122,12 @@ export const DIRECT_FILE_TRANSFER_ERROR = {
   SIZE_MISMATCH: 'size_mismatch',
   CHECKSUM_MISMATCH: 'checksum_mismatch',
   WRITE_FAILED: 'write_failed',
+  /**
+   * The daemon cannot accept the upload because free disk is below the reserve
+   * for this size (or a write failed with ENOSPC). Same wire token as the HTTP
+   * upload path so the UI can localize one capacity message.
+   */
+  INSUFFICIENT_CAPACITY: FILE_TRANSFER_UPLOAD_ERROR_CODE.INSUFFICIENT_CAPACITY,
   CANCELED: 'canceled',
   INTERNAL_ERROR: 'internal_error',
   /** The daemon host was busy/unavailable while committing transfer metadata. */
@@ -177,6 +187,12 @@ export function classifyDirectFileTransferFailure(
 ): DirectFileTransferFailureDisposition {
   if (error === DIRECT_FILE_TRANSFER_ERROR.CAPABILITY_UNAVAILABLE) {
     return DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.HTTP_FALLBACK;
+  }
+  // Disk pressure is local to the daemon volume. Retrying the same direct path
+  // (or falling back to HTTP onto the same disk) only burns attempts and can
+  // create orphan partials; surface a terminal, localized capacity error.
+  if (error === DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY) {
+    return DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL;
   }
   if (!DIRECT_FILE_TRANSFER_RETRYABLE_TRANSPORT_ERRORS.has(error)) {
     return DIRECT_FILE_TRANSFER_FAILURE_DISPOSITION.TERMINAL;

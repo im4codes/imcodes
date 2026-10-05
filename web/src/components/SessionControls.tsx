@@ -78,6 +78,7 @@ import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
 import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
+import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
 import { DirectFileTransferFailure, FILE_UPLOAD_TRANSPORT_MODE, isFileUploadCanceled, prewarmDirectFileLease, uploadFileWithDirectFallback, type FileUploadTransportMode } from '../direct-file-transfer.js';
 import { patchSessionSupervision } from '../api.js';
 import { isImeComposingKeyEvent } from '../ime-keyboard.js';
@@ -5075,7 +5076,11 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         let errorMessage: string;
         if (err instanceof DirectFileTransferFailure && err.code === 'relay_size_limit') {
           errorMessage = t('upload.direct_required_large', { max: MAX_UPLOAD_SIZE_MB });
-        } else if (isInsufficientCapacityError(body)) {
+        } else if (
+          (err instanceof DirectFileTransferFailure
+            && err.code === DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY)
+          || isInsufficientCapacityError(body)
+        ) {
           errorMessage = t('upload.insufficient_capacity');
         } else if (body.includes('daemon_offline')) {
           errorMessage = t('upload.daemon_offline');

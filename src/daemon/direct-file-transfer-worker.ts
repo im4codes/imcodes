@@ -1330,10 +1330,80 @@ async function failTransfer(
   await closeTransferResources(transfer, discardPartial);
 }
 
+/** True when a write/preflight failure is disk-full (ENOSPC) rather than a generic I/O fault. */
+function isInsufficientCapacityFailure(error: unknown): boolean {
+  if (error instanceof Error && error.message === DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY) return true;
+  if ((error as { code?: unknown } | null)?.code === 'ENOSPC') return true;
+  const msg = (error instanceof Error ? error.message : String(error ?? '')).toLowerCase();
+  return msg.includes('enospc') || msg.includes('no space left');
+}
+
+/**
+ * Map a local upload write/preflight failure to the wire error the browser
+ * classifies. Capacity is terminal and must not be disguised as write_failed
+ * (which retries / HTTP-falls-back onto the same full disk).
+ */
+function mapUploadWriteFailure(error: unknown): { error: DirectFileTransferError; retryable: boolean } {
+  if (isHostCallTimeout(error)) {
+    return { error: DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT, retryable: true };
+  }
+  if (isInsufficientCapacityFailure(error)) {
+    return { error: DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY, retryable: false };
+  }
+  return { error: DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, retryable: true };
+}
+
+/** Test-only: exercise ENOSPC / capacity mapping without spying ESM fs bindings. */
+export function __mapUploadWriteFailureForTests(error: unknown): {
+  error: DirectFileTransferError;
+  retryable: boolean;
+} {
+  return mapUploadWriteFailure(error);
+}
+
 async function ensureDiskCapacity(size: number, targetPath: string): Promise<void> {
   const stats = await statfs(path.dirname(targetPath));
   const free = Number(stats.bavail) * Number(stats.bsize);
-  if (!Number.isFinite(free) || free - DIRECT_FILE_TRANSFER_LIMITS.DISK_RESERVE_BYTES < size) throw new Error(DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED);
+  if (!Number.isFinite(free) || free - DIRECT_FILE_TRANSFER_LIMITS.DISK_RESERVE_BYTES < size) {
+    throw new Error(DIRECT_FILE_TRANSFER_ERROR.INSUFFICIENT_CAPACITY);
+  }
+}
+
+/**
+ * When a PREPARE arrives against a lease/generation the worker no longer holds,
+ * still return a prior successful commit for the same client upload id instead
+ * of refusing with stale_daemon_generation (which made the browser retry and
+ * write a second directory for a file already on disk).
+ */
+async function replyCommittedUploadIfPresent(
+  authority: DirectFileTransferPrepare,
+  sender: WorkerControlSender,
+): Promise<boolean> {
+  if (authority.direction !== DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) return false;
+  const existing = await lookupAttachmentByClientUploadId(authority.clientUploadId);
+  if (!existing) return false;
+  putLedger(
+    authority,
+    DIRECT_FILE_TRANSFER_OPERATION_STATE.COMMITTED,
+    DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+    existing,
+  );
+  directFileMetric('direct_success', {
+    direction: authority.direction,
+    attempt: authority.attempt,
+    bytes: typeof existing.size === 'number' ? existing.size : 0,
+    route: 'direct',
+  });
+  try {
+    sender.send({
+      type: DIRECT_FILE_TRANSFER_MSG.TERMINAL,
+      protocolVersion: DIRECT_FILE_TRANSFER_PROTOCOL_VERSION,
+      ...attemptBinding(authority),
+      state: DIRECT_FILE_TRANSFER_TERMINAL_STATE.COMMITTED,
+      attachment: existing,
+    });
+  } catch { /* control socket already gone; the browser will time out as before */ }
+  return true;
 }
 
 function makeDataBinding(authority: DirectFileTransferPrepare): DirectFileTransferAttemptBinding {
@@ -1928,7 +1998,8 @@ function enqueueUploadChunk(transfer: ActiveDirectTransfer, bytes: Uint8Array): 
     reportUploadCommit(transfer);
   }).catch((error) => {
     transfer.pendingBytes = Math.max(0, transfer.pendingBytes - copy.byteLength);
-    void failTransfer(transfer, DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED, true, errorDetail(error));
+    const mapped = mapUploadWriteFailure(error);
+    void failTransfer(transfer, mapped.error, mapped.retryable, errorDetail(error));
   });
 }
 
@@ -2121,12 +2192,10 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
       } else if (transfer.authority.direction === DIRECT_FILE_TRANSFER_DIRECTION.UPLOAD) {
         if (!transfer.startPromise) {
           transfer.startPromise = startUpload(transfer, parsed.value.resumeOffset ?? 0);
-          void transfer.startPromise.catch((error) => void failTransfer(
-            transfer,
-            isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
-            true,
-            errorDetail(error),
-          ));
+          void transfer.startPromise.catch((error) => {
+            const mapped = mapUploadWriteFailure(error);
+            void failTransfer(transfer, mapped.error, mapped.retryable, errorDetail(error));
+          });
         }
       } else {
         void startDownload(transfer, parsed.value.resumeOffset ?? 0)
@@ -2148,12 +2217,8 @@ function attachChannel(transfer: ActiveDirectTransfer, channel: DataChannel, ear
       if (!transfer.finishPromise) {
         transfer.finishPromise = finishUpload(transfer, parsed.value.totalBytes, parsed.value.sha256);
         void transfer.finishPromise.catch((error) => {
-          void failTransfer(
-            transfer,
-            isHostCallTimeout(error) ? DIRECT_FILE_TRANSFER_ERROR.HOST_CALL_TIMEOUT : DIRECT_FILE_TRANSFER_ERROR.WRITE_FAILED,
-            true,
-            errorDetail(error),
-          );
+          const mapped = mapUploadWriteFailure(error);
+          void failTransfer(transfer, mapped.error, mapped.retryable, errorDetail(error));
         });
       }
       return;
@@ -2375,6 +2440,11 @@ async function prepareOperation(authority: DirectFileTransferPrepare, sender: Wo
   const lease = leases.get(leaseKey(authority.leaseId, authority.leaseGeneration));
   if (!lease || lease.binding.serverId !== authority.serverId || lease.binding.browserTabId !== authority.browserTabId
     || lease.binding.daemonGeneration !== authority.daemonGeneration) {
+    // A prior attempt may already have committed under a different generation
+    // (worker recycle / daemon restart). Returning that commit avoids a false
+    // stale_daemon_generation failure that would retry into a duplicate upload
+    // directory for the same clientUploadId.
+    if (await replyCommittedUploadIfPresent(authority, sender)) return;
     // The daemon evicts an idle lease on its own timer without telling the
     // server, so the server can still hand out authority against one that is
     // gone here. Retryable: re-initialising the lease is exactly the recovery.
