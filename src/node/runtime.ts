@@ -733,11 +733,31 @@ export function createControlledNodeRuntime(
   // while that session is still being admitted. A PREPARE arriving after the
   // final fence is claimed is rejected until the new worker is active.
   let remoteDesktopPrepareInFlight = 0;
+  // Compatibility fallback for legacy worker adapters that do not expose
+  // activeConnections(). Legacy worker adapters do not expose a connection
+  // list, so keep a small
+  // lease-indexed fence for sessions admitted through those adapters so a
+  // refresh cannot replace a worker while a route is live, but also so a lost
+  // STOP/CANCEL edge cannot starve every later refresh forever.  LEASE extends
+  // the deadline; expiry is the protocol's authoritative teardown boundary.
+  const legacyRemoteDesktopSessions = new Map<string, number>();
+  const pruneLegacyRemoteDesktopSessions = (now: number): void => {
+    for (const [sessionId, leaseExpiresAt] of legacyRemoteDesktopSessions) {
+      if (leaseExpiresAt < now) legacyRemoteDesktopSessions.delete(sessionId);
+    }
+  };
   let remoteDesktopWorkerCommitFenceHeld = false;
   const remoteDesktopWorkerHasActiveConnections = (): boolean => {
     try {
       if (!remoteDesktopWorker.available()) return false;
-      if (!remoteDesktopWorker.activeConnections) return true;
+      // Older worker adapters predate activeConnections(). Their absence must
+      // not turn every reconnect into a permanently busy refresh. Production
+      // hosts expose the method; legacy adapters are fenced by the synchronous
+      // PREPARE counter below and continue with an observable refresh result.
+      if (!remoteDesktopWorker.activeConnections) {
+        pruneLegacyRemoteDesktopSessions(options.now?.() ?? Date.now());
+        return legacyRemoteDesktopSessions.size > 0;
+      }
       return remoteDesktopWorker.activeConnections().length > 0;
     }
     catch { return true; }
@@ -1548,6 +1568,7 @@ export function createControlledNodeRuntime(
     },
     onClose: () => {
       worker.abortAll();
+      legacyRemoteDesktopSessions.clear();
       // Remote desktop authority is connection-generation-bound. Unlike the
       // warm Computer Use helper, every peer must die on Server-link loss.
       if (remoteDesktopWorker.onDaemonDisconnected) {
@@ -1843,6 +1864,21 @@ export function createControlledNodeRuntime(
               // defer its final commit instead of replacing this session's
               // worker underneath it.
               remoteDesktopPrepareInFlight += 1;
+              if (typeof command.sessionId === 'string' && !remoteDesktopWorker.activeConnections) {
+                const leaseExpiresAt = typeof command.leaseExpiresAt === 'number'
+                  ? command.leaseExpiresAt
+                  : 0;
+                if (leaseExpiresAt > (options.now?.() ?? Date.now())) {
+                  legacyRemoteDesktopSessions.set(command.sessionId, leaseExpiresAt);
+                }
+              }
+            } else if (command.type === REMOTE_DESKTOP_MSG.LEASE
+              && typeof command.sessionId === 'string'
+              && !remoteDesktopWorker.activeConnections
+              && typeof command.leaseExpiresAt === 'number') {
+              // A legacy worker has no connection list to consult, so mirror
+              // each lease edge and let the expiry prune a stale route.
+              legacyRemoteDesktopSessions.set(command.sessionId, command.leaseExpiresAt);
             }
             try {
             // A macOS worker that idled itself down after nobody used it (see
@@ -1872,6 +1908,10 @@ export function createControlledNodeRuntime(
               enabled: remoteDesktopEnabled && !remoteDesktopAccessPaused,
               target: remoteDesktopWorker,
               send: (reply) => {
+                if (reply.type === REMOTE_DESKTOP_MSG.TERMINAL
+                  && typeof command.sessionId === 'string') {
+                  legacyRemoteDesktopSessions.delete(command.sessionId);
+                }
                 logger.info({
                   type: (reply as { type?: unknown }).type,
                   reason: (reply as { reason?: unknown }).reason,
@@ -1884,6 +1924,10 @@ export function createControlledNodeRuntime(
             }
             } finally {
               if (isPrepare) remoteDesktopPrepareInFlight -= 1;
+              if ((command.type === REMOTE_DESKTOP_MSG.STOP || command.type === REMOTE_DESKTOP_MSG.CANCEL)
+                && typeof command.sessionId === 'string') {
+                legacyRemoteDesktopSessions.delete(command.sessionId);
+              }
             }
           },
         );

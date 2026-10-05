@@ -1207,6 +1207,141 @@ describe('controlled node enrollment and runtime', () => {
     runtime.stop();
   });
 
+  it('does not permanently defer refresh for a legacy worker without activeConnections', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const refreshRemoteDesktopWorker = vi.fn(async () => ({ updated: true }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      refreshRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
+  it('keeps a legacy worker session fenced until its stop edge', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const refreshRemoteDesktopWorker = vi.fn(async () => ({ updated: true }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => true),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      refreshRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_legacy_12345678',
+      sessionId: 'session_legacy_12345678',
+      capability: 'l'.repeat(43),
+      expiresAt: 60_000,
+      leaseExpiresAt: 20_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    }));
+    await vi.waitFor(() => expect(remoteDesktopWorker.handle).toHaveBeenCalledOnce());
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await Promise.resolve();
+    expect(refreshRemoteDesktopWorker).not.toHaveBeenCalled();
+
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.STOP,
+      requestId: 'request_legacy_12345678',
+      sessionId: 'session_legacy_12345678',
+      capability: 'l'.repeat(43),
+    }));
+    await vi.waitFor(() => expect(remoteDesktopWorker.handle).toHaveBeenCalledTimes(2));
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
+  it('releases a stale legacy worker fence when the lease expires', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const refreshRemoteDesktopWorker = vi.fn(async () => ({ updated: true }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      reloadFromDisk: vi.fn(() => true),
+      // Deliberately omit activeConnections: this is the legacy adapter path.
+      handle: vi.fn(async () => true),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example',
+      serverId: 'controlled-1',
+      token: 'secret',
+      nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux',
+      arch: 'x64',
+      remoteDesktopWorker,
+      refreshRemoteDesktopWorker,
+      now: () => now,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    socket.emit('message', JSON.stringify({
+      type: REMOTE_DESKTOP_MSG.PREPARE,
+      requestId: 'request_legacy_expiry_12345678',
+      sessionId: 'session_legacy_expiry_12345678',
+      capability: 'l'.repeat(43),
+      expiresAt: 60_000,
+      leaseExpiresAt: 20_000,
+      daemonGeneration: 7,
+      mode: REMOTE_DESKTOP_ACCESS_MODE.VIEW,
+      inputEpoch: 0,
+      iceServers: [],
+    }));
+    await vi.waitFor(() => expect(remoteDesktopWorker.handle).toHaveBeenCalledOnce());
+
+    // No STOP/CANCEL arrives. Once the protocol lease is over, refresh must
+    // recover instead of waiting forever on the legacy adapter's fence.
+    now = 21_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    runtime.stop();
+  });
+
   it('defers PREPARE admitted during the worker refresh commit fence', async () => {
     const socket = new MockSocket();
     let now = 10_000;
