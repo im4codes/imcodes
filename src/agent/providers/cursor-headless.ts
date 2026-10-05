@@ -59,6 +59,12 @@ const CURSOR_BIN = 'cursor-agent';
 const CONNECT_PROBE_TIMEOUT_MS = 15_000;
 const CANCEL_ESCALATION_MS = 2_000;
 const MIN_CURSOR_VERSION = { major: 1, minor: 0, patch: 0 };
+// `cursor-agent --list-models` exposes ids made of these characters.  The
+// stream's `system.init.model` is not guaranteed to be an id: recent Cursor
+// builds report a human label such as "Claude Sonnet 5 300K Medium No
+// Thinking" there.  Passing that label back to `--model` makes the next turn
+// fail with "Cannot use this model".
+const CURSOR_MODEL_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export interface CursorHeadlessRuntimeHooks {
   loadChildProcess(): Promise<typeof import('node:child_process')>;
@@ -93,6 +99,12 @@ interface CursorSessionState {
 
 function isTruthyString(value: unknown): value is string {
   return typeof value === 'string' && value.trim().length > 0;
+}
+
+function normalizeCursorModelId(value: unknown): string | undefined {
+  if (!isTruthyString(value)) return undefined;
+  const model = value.trim();
+  return CURSOR_MODEL_ID_RE.test(model) ? model : undefined;
 }
 
 function extractString(record: Record<string, unknown>, ...keys: string[]): string | undefined {
@@ -307,7 +319,8 @@ export class CursorHeadlessProvider implements TransportProvider {
     const existingEntry = this.findSessionByRouteId(routeId);
     if (existingEntry && !config.fresh) {
       const [sessionId, state] = existingEntry;
-      if (isTruthyString(config.agentId)) state.model = config.agentId;
+      const requestedModel = normalizeCursorModelId(config.agentId);
+      if (requestedModel) state.model = requestedModel;
       this.emitSessionInfo(sessionId, {
         resumeId: state.resumeId,
         ...(state.model ? { model: state.model } : {}),
@@ -320,7 +333,7 @@ export class CursorHeadlessProvider implements TransportProvider {
     }
 
     const cwd = normalizeTransportCwd(config.cwd) ?? normalizeTransportCwd(process.cwd())!;
-    const model = isTruthyString(config.agentId) ? config.agentId : this.resolveDefaultModel();
+    const model = normalizeCursorModelId(config.agentId) ?? this.resolveDefaultModel();
     const resumeId =
       isTruthyString(config.resumeId)
         ? config.resumeId
@@ -416,10 +429,15 @@ export class CursorHeadlessProvider implements TransportProvider {
   setSessionAgentId(sessionId: string, agentId: string): void {
     const state = this.getSessionState(sessionId);
     if (!state) return;
-    state.model = agentId;
+    const model = normalizeCursorModelId(agentId);
+    // Model switching is a void provider contract.  Refuse an invalid value
+    // here rather than poisoning the live session so that the next send can
+    // never pass a display label (or other malformed value) to Cursor.
+    if (!model) return;
+    state.model = model;
     this.emitSessionInfo(this.findSessionIdForState(state) ?? sessionId, {
       resumeId: state.resumeId,
-      model: agentId,
+      model,
     });
   }
 
@@ -542,9 +560,10 @@ export class CursorHeadlessProvider implements TransportProvider {
         if (event.sessionId) {
           state.resumeId = event.sessionId;
         }
-        if (event.model) {
-          state.model = event.model;
-        }
+        // Cursor's init event is telemetry and can carry a human-readable
+        // display label. Never promote it to the launch id: an omitted model
+        // intentionally means "use Cursor's current default", while a model
+        // selected at session creation/model-switch time remains canonical.
         emitSessionInfoUpdate({
           resumeId: state.resumeId,
           ...(state.model ? { model: state.model } : {}),
@@ -750,7 +769,7 @@ export class CursorHeadlessProvider implements TransportProvider {
   }
 
   private resolveDefaultModel(): string | undefined {
-    return isTruthyString(this.config?.agentId) ? this.config!.agentId : undefined;
+    return normalizeCursorModelId(this.config?.agentId);
   }
 
   private parseCursorVersion(output: string): { major: number; minor: number; patch: number; raw: string } | null {
