@@ -23,4 +23,22 @@ describe('core-lane durable inbound inbox', () => {
     restarted.acknowledge('i1');
     expect(new CoreLaneInboundInbox(file).pending()).toEqual([]);
   });
+
+  it('acks an old replay without dropping a newer handoff', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'core-lane-inbox-mixed-'));
+    const file = join(dir, 'inbound.jsonl');
+    const first = new CoreLaneInboundInbox(file);
+    const oldEntry = { id: 'old', commandId: 'old-command', session: 'deck-a', payload: 'old', ts: 1 };
+    const newEntry = { id: 'new', commandId: 'new-command', session: 'deck-a', payload: 'new', ts: 2 };
+    first.append(oldEntry);
+    first.append(newEntry);
+
+    // A concurrent recovery may finish the old command first.  Its durable
+    // ack must leave the newer command available for the replacement worker.
+    first.acknowledge(oldEntry.id);
+    const replayed: string[] = [];
+    replayCoreLaneInbound(new CoreLaneInboundInbox(file).pending(), (entry) => replayed.push(entry.id));
+    expect(replayed).toEqual(['new']);
+    expect(new CoreLaneInboundInbox(file).pending()).toEqual([newEntry]);
+  });
 });

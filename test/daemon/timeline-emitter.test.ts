@@ -117,6 +117,24 @@ describe('TimelineEmitter — seq counter', () => {
     expect(events[1]?.payload.text).toBe('retry');
   });
 
+  it('keeps a replayed commandId as one user event across a fresh timestamp/epoch', () => {
+    const first = emitter.emit(
+      'session-a',
+      'user.message',
+      { text: 'old task', commandId: 'cmd-replayed', allowDuplicate: true },
+      { eventId: 'transport-user:cmd-replayed', ts: 10 },
+    );
+    const replay = emitter.emit(
+      'session-a',
+      'user.message',
+      { text: 'old task', commandId: 'cmd-replayed', allowDuplicate: true },
+      { eventId: 'transport-user:cmd-replayed', ts: 20 },
+    );
+
+    expect(replay?.eventId).toBe(first?.eventId);
+    expect(emitter.replay('session-a', 0).events.filter((event) => event.type === 'user.message')).toHaveLength(1);
+  });
+
   it('still suppresses duplicate user messages without allowDuplicate', () => {
     emitter.emit('session-a', 'user.message', { text: 'retry' }, { ts: 10 });
     emitter.emit('session-a', 'user.message', { text: 'retry' }, { ts: 20 });

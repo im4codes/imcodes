@@ -41,6 +41,12 @@ export class CoreLaneSocket {
   private respawnTimer?: ReturnType<typeof setTimeout>;
   private respawnAttempt = 0;
   private workerFailureHandled = false;
+  /**
+   * Commit requests must survive a worker generation change.  The worker
+   * owns the durable inbox, so a commit posted just as that worker exits can
+   * otherwise be lost; the next worker then replays the same old command.
+   */
+  private readonly pendingInboundCommits = new Set<string>();
 
   constructor(private readonly url: string, options: CoreLaneSocketOptions = {}) {
     this.options = options;
@@ -64,7 +70,7 @@ export class CoreLaneSocket {
     this.workerFailureHandled = false;
     this.readyState = 0;
     worker.on('message', (message: {
-      event: Kind | 'drained' | 'reconnecting' | 'liveness_timeout';
+      event: Kind | 'drained' | 'reconnecting' | 'liveness_timeout' | 'inbound_committed';
       data?: unknown;
       binary?: boolean;
       message?: string;
@@ -82,6 +88,10 @@ export class CoreLaneSocket {
       if (message.event === 'close') this.readyState = CoreLaneSocket.CLOSED;
       if (message.event === 'drained') {
         this.bufferedAmount = Math.max(0, this.bufferedAmount - Number(message.bytes ?? 0));
+        return;
+      }
+      if (message.event === 'inbound_committed') {
+        if (typeof message.inboundId === 'string') this.pendingInboundCommits.delete(message.inboundId);
         return;
       }
       const event = Object.assign(new Event(message.event), {
@@ -113,6 +123,13 @@ export class CoreLaneSocket {
       if (worker !== this.worker || this.stopping || code === 0) return;
       this.handleWorkerFailure(worker, 1011, `worker_exit:${code}`);
     });
+
+    // A commit can have been sent to the previous worker immediately before it
+    // crashed. Re-send every unconfirmed commit to this generation; the inbox
+    // acknowledge operation is idempotent, so a late duplicate is harmless.
+    for (const inboundId of this.pendingInboundCommits) {
+      worker.postMessage({ type: 'inbound_commit', inboundId });
+    }
   }
 
   private handleWorkerFailure(worker: Worker, code: number, reason: string): void {
@@ -182,6 +199,7 @@ export class CoreLaneSocket {
 
   commitInbound(inboundId: string): void {
     if (!inboundId || this.stopping) return;
+    this.pendingInboundCommits.add(inboundId);
     this.worker.postMessage({ type: 'inbound_commit', inboundId });
   }
 

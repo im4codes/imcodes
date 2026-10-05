@@ -237,7 +237,11 @@ port.on('message', (command: { type: string; payload?: string | Uint8Array; code
       const entry = id ? inboundInbox.pending().find((item) => item.id === id) : undefined;
       inboundInbox.acknowledge(id);
       inboundHandoffBytes = Math.max(0, inboundHandoffBytes - (entry ? Buffer.byteLength(entry.payload) : 0));
-      } else if (command.type === 'sessions') {
+      // Let the parent forget this commit only after this worker has applied
+      // the durable ack.  If the worker exits before this frame, the parent
+      // re-sends the still-pending commit to the replacement generation.
+      if (id) emit({ event: 'inbound_committed', inboundId: id });
+    } else if (command.type === 'sessions') {
       if (Array.isArray(command.sessions)) {
         authorizedSessions = new Set(command.sessions.filter((name): name is string => typeof name === 'string' && name.length > 0));
         authorizedSessionsReady = true;

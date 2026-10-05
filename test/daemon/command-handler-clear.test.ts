@@ -128,7 +128,7 @@ describe('process session /clear handling', () => {
       'deck_proj_brain',
       'user.message',
       { text: '/clear', allowDuplicate: true, commandId: 'cmd-clear-process' },
-      undefined,
+      { source: 'daemon', confidence: 'high', eventId: 'transport-user:cmd-clear-process' },
     );
     expect(emitMock).toHaveBeenCalledWith('deck_proj_brain', 'assistant.text', {
       text: 'Started a fresh conversation',

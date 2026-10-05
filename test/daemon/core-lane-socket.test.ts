@@ -9,7 +9,7 @@ const { FakeWorker, workers } = vi.hoisted(() => {
       this.listeners.set(name, [...(this.listeners.get(name) ?? []), listener]);
       return this;
     }
-    emit(name: string, value: { event: string; bytes?: number }): void {
+    emit(name: string, value: { event: string; bytes?: number; inboundId?: string }): void {
       for (const listener of this.listeners.get(name) ?? []) listener(value);
     }
     terminate(): Promise<void> { return Promise.resolve(); }
@@ -86,5 +86,30 @@ describe('CoreLaneSocket', () => {
     expect(() => socket.send('n'.repeat(2 * 1024))).toThrow(/normal queue is full/);
     expect(() => socket.send('p'.repeat(1024), 'priority')).not.toThrow();
     socket.terminate();
+  });
+
+  it('replays an unconfirmed inbound commit to a replacement worker', () => {
+    vi.useFakeTimers();
+    const socket = new CoreLaneSocket('ws://test');
+    workers[0].emit('message', { event: 'open' });
+
+    socket.commitInbound('inbound-1');
+    expect(workers[0].messages).toContainEqual({ type: 'inbound_commit', inboundId: 'inbound-1' });
+
+    workers[0].emit('error', { event: 'error' });
+    vi.advanceTimersByTime(250);
+    expect(workers).toHaveLength(2);
+    expect(workers[1].messages).toContainEqual({ type: 'inbound_commit', inboundId: 'inbound-1' });
+
+    // Once the replacement confirms the durable ack, a later worker restart
+    // must not resend it, while a new inbound commit remains independent.
+    workers[1].emit('message', { event: 'inbound_committed', inboundId: 'inbound-1' });
+    workers[1].emit('error', { event: 'error' });
+    vi.advanceTimersByTime(500);
+    expect(workers).toHaveLength(3);
+    expect(workers[2].messages).not.toContainEqual({ type: 'inbound_commit', inboundId: 'inbound-1' });
+
+    socket.terminate();
+    vi.useRealTimers();
   });
 });

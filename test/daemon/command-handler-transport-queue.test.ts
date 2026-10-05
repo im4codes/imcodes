@@ -1661,7 +1661,7 @@ describe('handleWebCommand transport queue behavior', () => {
       'deck_transport_brain',
       'user.message',
       { text: '/clear', allowDuplicate: true, commandId: 'cmd-clear-cc' },
-      undefined,
+      { source: 'daemon', confidence: 'high', eventId: 'transport-user:cmd-clear-cc' },
     );
     expect(emitMock).toHaveBeenCalledWith('deck_transport_brain', 'assistant.text', {
       text: 'Started a fresh conversation',

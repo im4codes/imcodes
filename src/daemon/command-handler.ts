@@ -4099,7 +4099,16 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
       sessionName,
       'user.message',
       payload,
-      eventId ? { source: 'daemon', confidence: 'high', eventId } : undefined,
+      {
+        source: 'daemon',
+        confidence: 'high',
+        // commandId is the durable identity of a server-delivered send.  Use
+        // it as the timeline key even when a daemon restart replays the
+        // durable inbound handoff with a fresh epoch/timestamp; otherwise the
+        // same historical task message becomes a new UI event on every
+        // recovery. Explicit IDs remain available for queue/system callers.
+        eventId: eventId ?? `transport-user:${effectiveId}`,
+      },
     );
     persistTransportUserMessage(sessionName, payloadText, payload);
   };
