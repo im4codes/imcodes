@@ -26,6 +26,7 @@ const MACHINE_ACTION_PATHS = [
   '/:serverId/exec-enabled',
   '/:serverId/remote-desktop-permissions',
   '/:serverId/remote-desktop-worker',
+  '/:serverId/remote-desktop-worker/refresh',
   '/:serverId/revoke',
   '/:serverId/upgrade',
 ] as const;

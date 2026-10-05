@@ -54,11 +54,14 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
   CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
-  REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY,
 ] as const;
 
 export type ControlledNodeCapability = typeof CONTROLLED_NODE_CAPABILITIES[number]
-  | typeof REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY;
+  | typeof REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY
+  // This is emitted only while local access is paused, so it is not part of
+  // the always-advertised capability envelope. It remains a known token for
+  // ingress validation without spending one of the 32 bounded slots.
+  | typeof REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY;
 // Remote-desktop adapters advertise consent, signed shell, capture privacy,
 // input, lock-screen, branding and local disclosure independently. Keep the
 // envelope bounded while leaving room for that explicit feature matrix and
@@ -70,7 +73,8 @@ const CONTROLLED_NODE_CAPABILITY_ADVERTISEMENT_PATTERN = /^[a-z0-9][a-z0-9._-]*$
 export function isControlledNodeCapability(value: unknown): value is ControlledNodeCapability {
   return typeof value === 'string'
     && ((CONTROLLED_NODE_CAPABILITIES as readonly string[]).includes(value)
-      || value === REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY);
+      || value === REMOTE_DESKTOP_UNSUPPORTED_PROFILE_CAPABILITY
+      || value === REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY);
 }
 
 export type ControlledNodeCapabilitiesValidation =

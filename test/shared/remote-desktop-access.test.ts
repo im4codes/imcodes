@@ -78,6 +78,7 @@ import {
   type RemoteDesktopPrivacyAck,
   type RemoteDesktopPrivacyEpoch,
 } from '../../shared/remote-desktop-access.js';
+import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 
 const ID = 'a'.repeat(24);
 const HOST = `host-${'b'.repeat(20)}`;
@@ -516,6 +517,13 @@ describe('consent messages', () => {
     // A full advertisement must still validate, or a compliant node would be
     // rejected at authentication the moment every adapter is present.
     expect(validateControlledNodeCapabilities([...CONTROLLED_NODE_CAPABILITIES]).ok).toBe(true);
+  });
+
+  it('recognizes the transient paused capability without spending an advertisement slot', () => {
+    const paused = REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY;
+    expect(CONTROLLED_NODE_CAPABILITIES as readonly string[]).not.toContain(paused);
+    expect(validateControlledNodeCapabilities([paused])).toEqual({ ok: true, value: [paused] });
+    expect(CONTROLLED_NODE_CAPABILITIES.length).toBeLessThanOrEqual(CONTROLLED_NODE_CAPABILITY_MAX_ITEMS);
   });
 });
 
