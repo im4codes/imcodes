@@ -1,6 +1,8 @@
 export const TIMELINE_SNAPSHOT_STORAGE_PREFIX = 'rcc_timeline_snapshot:';
 export const FILE_BROWSER_SNAPSHOT_KEY_PREFIX = 'rcc_fb_snapshot_v1';
 export const TERMINAL_FRAME_STORAGE_PREFIX = 'deck_frame_';
+/** Keep a single composer draft bounded so one paste cannot consume the tab's entire session store. */
+export const COMPOSER_DRAFT_MAX_CHARS = 64 * 1024;
 
 function isQuotaExceededError(error: unknown): boolean {
   if (!(error instanceof DOMException)) return false;
@@ -95,4 +97,89 @@ export function safeLocalStorageRemoveItem(key: string): boolean {
   } catch {
     return false;
   }
+}
+
+function getSessionStorage(): Storage | null {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) return window.sessionStorage;
+  } catch { /* fall through to the global shim/implementation */ }
+  try { return globalThis.sessionStorage ?? null; } catch { return null; }
+}
+
+// Keep a bounded in-memory copy when a browser refuses all sessionStorage
+// writes. This survives composer unmount/remount during a tab switch without
+// evicting any other session's persisted draft.
+const sessionDraftFallback = new Map<string, string>();
+// A fallback value is authoritative only while the corresponding storage
+// write is known to be unavailable.  Once storage is readable and has no key,
+// do not resurrect a stale value from an earlier component instance.
+const sessionDraftFallbackPending = new Set<string>();
+const sessionDraftFallbackStorage = new Map<string, Storage | null>();
+
+/** Session-storage counterpart used by transient composer state. */
+export function safeSessionStorageGetItem(key: string): string | null {
+  const storage = getSessionStorage();
+  if (storage) {
+    try {
+      const persisted = storage.getItem(key);
+      if (persisted !== null) return persisted;
+      if (!sessionDraftFallbackPending.has(key)) return null;
+      if (sessionDraftFallbackStorage.get(key) !== storage) return null;
+    } catch { /* use the in-memory copy below */ }
+  }
+  return sessionDraftFallback.get(key) ?? null;
+}
+
+/**
+ * Persist a draft without allowing a large paste or a full tab store to take
+ * down a tab during a React unmount.  Only the current draft key may be
+ * removed on retry; other sessions' drafts are never evicted.
+ */
+export function safeSessionStorageSetItem(
+  key: string,
+  value: string,
+  maxLength = COMPOSER_DRAFT_MAX_CHARS,
+): boolean {
+  const bounded = value.length > maxLength ? value.slice(0, maxLength) : value;
+  // Keep the latest bounded value before touching storage, so quota/security
+  // failures leave a recoverable draft for a same-page remount.
+  sessionDraftFallback.set(key, bounded);
+  sessionDraftFallbackPending.add(key);
+  const storage = getSessionStorage();
+  sessionDraftFallbackStorage.set(key, storage);
+  if (!storage) return false;
+  try {
+    // Bound before the first write as well as on quota retry. A successful
+    // write must never allow one paste to consume the entire session store.
+    storage.setItem(key, bounded);
+    sessionDraftFallbackPending.delete(key);
+    return true;
+  } catch (error) {
+    if (!isQuotaExceededError(error)) return false;
+  }
+  try {
+    storage.setItem(key, bounded);
+    sessionDraftFallbackPending.delete(key);
+    return true;
+  } catch (error) {
+    if (!isQuotaExceededError(error)) return false;
+  }
+  // Replacing a very large value can itself exceed a strict implementation's
+  // temporary quota. Removing only this key makes the compact retry possible
+  // without deleting another session's data.
+  try { storage.removeItem(key); } catch { return false; }
+  try {
+    storage.setItem(key, bounded);
+    sessionDraftFallbackPending.delete(key);
+    return true;
+  } catch { return false; }
+}
+
+export function safeSessionStorageRemoveItem(key: string): boolean {
+  sessionDraftFallback.delete(key);
+  sessionDraftFallbackPending.delete(key);
+  sessionDraftFallbackStorage.delete(key);
+  const storage = getSessionStorage();
+  if (!storage) return false;
+  try { storage.removeItem(key); return true; } catch { return false; }
 }

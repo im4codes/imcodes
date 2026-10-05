@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   FILE_BROWSER_SNAPSHOT_KEY_PREFIX,
   TIMELINE_SNAPSHOT_STORAGE_PREFIX,
+  safeSessionStorageGetItem,
+  safeSessionStorageSetItem,
   safeLocalStorageSetItem,
 } from '../src/local-storage-quota.js';
 
@@ -147,5 +149,58 @@ describe('safeLocalStorageSetItem', () => {
 
     expect(() => safeLocalStorageSetItem('rcc_open_subs_deck_main', '["sub-1"]')).not.toThrow();
     expect(safeLocalStorageSetItem('rcc_open_subs_deck_main', '["sub-1"]')).toBe(false);
+  });
+});
+
+describe('safeSessionStorageSetItem', () => {
+  let originalSessionStorage: Storage;
+
+  beforeEach(() => { originalSessionStorage = window.sessionStorage; });
+  afterEach(() => {
+    Object.defineProperty(window, 'sessionStorage', { value: originalSessionStorage, configurable: true });
+    originalSessionStorage.clear();
+  });
+
+  it('bounds an oversized draft after a quota failure without touching peer sessions', () => {
+    const storage = new FakeStorage();
+    storage.maxTotalLength = 80;
+    storage.setItem('rcc_draft_session:peer', 'peer draft');
+    Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
+
+    expect(safeSessionStorageSetItem('rcc_draft_session:current', 'x'.repeat(200), 32)).toBe(true);
+    expect(storage.getItem('rcc_draft_session:current')).toBe('x'.repeat(32));
+    expect(storage.getItem('rcc_draft_session:peer')).toBe('peer draft');
+  });
+
+  it('bounds an oversized draft even when the initial write has ample quota', () => {
+    const storage = new FakeStorage();
+    Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
+
+    expect(safeSessionStorageSetItem('rcc_draft_session:current', 'x'.repeat(200), 32)).toBe(true);
+    expect(storage.getItem('rcc_draft_session:current')).toBe('x'.repeat(32));
+  });
+
+  it('returns false without throwing when session storage remains full', () => {
+    const storage = new FakeStorage();
+    storage.maxTotalLength = 0;
+    Object.defineProperty(window, 'sessionStorage', { value: storage, configurable: true });
+
+    expect(() => safeSessionStorageSetItem('rcc_draft_session:current', 'draft')).not.toThrow();
+    expect(safeSessionStorageSetItem('rcc_draft_session:current', 'draft')).toBe(false);
+    // The persisted write fails, but the current page retains a recoverable
+    // bounded copy instead of dropping the draft during a tab switch.
+    expect(safeSessionStorageGetItem('rcc_draft_session:current')).toBe('draft');
+    expect(storage.getItem('rcc_draft_session:peer')).toBeNull();
+  });
+
+  it('does not resurrect a fallback after readable storage has no draft key', () => {
+    const full = new FakeStorage();
+    full.maxTotalLength = 0;
+    Object.defineProperty(window, 'sessionStorage', { value: full, configurable: true });
+    expect(safeSessionStorageSetItem('rcc_draft_session:stale', 'draft')).toBe(false);
+
+    const fresh = new FakeStorage();
+    Object.defineProperty(window, 'sessionStorage', { value: fresh, configurable: true });
+    expect(safeSessionStorageGetItem('rcc_draft_session:stale')).toBeNull();
   });
 });
