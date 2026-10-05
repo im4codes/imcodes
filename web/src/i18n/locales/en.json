@@ -3577,6 +3577,7 @@
     "version_current": "Up to date with the Server release",
     "version_outdated": "Older than the Server release — an upgrade is pending",
     "version_unknown": "Version unknown",
+    "worker_version": "Worker version",
     "auto_unlock_set": "Auto unlock…",
     "auto_unlock_clear": "Remove auto unlock",
     "auto_unlock_placeholder": "Windows sign-in password",

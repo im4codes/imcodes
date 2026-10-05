@@ -3576,6 +3576,7 @@
     "version_current": "Соответствует версии сервера",
     "version_outdated": "Старее версии сервера — обновление ожидается",
     "version_unknown": "Версия неизвестна",
+    "worker_version": "Версия worker",
     "auto_unlock_set": "Авторазблокировка…",
     "auto_unlock_clear": "Убрать авторазблокировку",
     "auto_unlock_placeholder": "Пароль входа Windows",

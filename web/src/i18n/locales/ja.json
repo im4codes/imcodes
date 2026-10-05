@@ -3576,6 +3576,7 @@
     "version_current": "サーバーのリリースと同じバージョンです",
     "version_outdated": "サーバーのリリースより古く、アップグレード待ちです",
     "version_unknown": "バージョン不明",
+    "worker_version": "Worker バージョン",
     "auto_unlock_set": "自動ロック解除…",
     "auto_unlock_clear": "自動ロック解除を削除",
     "auto_unlock_placeholder": "Windows サインイン パスワード",

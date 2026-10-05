@@ -1080,6 +1080,7 @@ describe('controlled node enrollment and runtime', () => {
     await vi.waitFor(() => {
       const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((message) => message.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
       expect(statuses.map((message) => message.phase)).toEqual(['started', 'succeeded']);
+      expect(statuses[0]).not.toHaveProperty('targetVersion');
       expect(statuses[1]).toEqual(expect.objectContaining({ targetVersion: '2026.10.5371-dev.5816' }));
     });
 
@@ -1088,6 +1089,44 @@ describe('controlled node enrollment and runtime', () => {
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await Promise.resolve();
     expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
+  it('does not report the daemon version as a worker target when refresh fails without one', async () => {
+    const socket = new MockSocket();
+    let now = 10_000;
+    const refreshRemoteDesktopWorker = vi.fn(async () => ({
+      updated: false,
+      installedVersion: '2026.9.5113-dev.5644',
+      reason: 'worker_current',
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      activeConnections: vi.fn(() => []),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'linux', arch: 'x64', remoteDesktopWorker, refreshRemoteDesktopWorker, now: () => now,
+    });
+    runtime.start();
+    socket.open();
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    now += 10_000;
+    socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((message) => message.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses).toContainEqual(expect.objectContaining({
+        phase: 'failed', installedVersion: '2026.9.5113-dev.5644', reason: 'worker_current',
+      }));
+      expect(statuses.find((message) => message.phase === 'failed')).not.toHaveProperty('targetVersion');
+    });
     runtime.stop();
   });
 

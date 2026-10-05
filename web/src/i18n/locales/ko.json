@@ -3576,6 +3576,7 @@
     "version_current": "서버 릴리스와 동일한 버전입니다",
     "version_outdated": "서버 릴리스보다 낮은 버전으로, 업그레이드가 대기 중입니다",
     "version_unknown": "버전 알 수 없음",
+    "worker_version": "Worker 버전",
     "auto_unlock_set": "자동 잠금 해제…",
     "auto_unlock_clear": "자동 잠금 해제 삭제",
     "auto_unlock_placeholder": "Windows 로그인 암호",

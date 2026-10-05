@@ -1900,6 +1900,31 @@ describe('ControlledNodesPanel group rename and delete', () => {
     resolveRetry?.({ ok: true, deliveryStatus: 'sent', currentVersion: '2026.4.904-dev.876', latestVersion: '2026.4.905-dev.877' });
   });
 
+  it('distinguishes the daemon release from the worker version actually installed', async () => {
+    getMachineUpgradeStatus.mockResolvedValueOnce({
+      currentVersion: '2026.10.5425-dev.5872',
+      latestVersion: '2026.10.5425-dev.5872',
+      upgrade: null,
+    });
+    machines = [machine({
+      serverId: 'version-node',
+      daemonVersion: '2026.10.5425-dev.5872',
+      workerRefresh: {
+        attemptId: 'attempt-1', phase: 'failed',
+        installedVersion: '2026.9.5113-dev.5644', reason: 'worker_current', recordedAt: 1,
+      },
+    })];
+    const { container } = render(<ControlledNodesPanel />);
+    await waitFor(() => expect(getMachineUpgradeStatus).toHaveBeenCalledWith('version-node'));
+    fireEvent.click(container.querySelector('.controlled-nodes-control-toggle')!);
+    const panel = container.querySelector('[data-testid="controlled-node-panel-version-node"]')!;
+    expect(panel.textContent).toContain('server.daemon_current_version');
+    expect(panel.textContent).toContain('2026.10.5425-dev.5872');
+    expect(panel.textContent).toContain('controlled_nodes.worker_version');
+    expect(container.querySelector('[data-testid="controlled-node-worker-version-version-node"]')?.textContent)
+      .toContain('2026.9.5113-dev.5644');
+  });
+
   it('keeps the controlled-node command deck dark, layered, and single-line for retry', () => {
     const css = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../src/styles.css'), 'utf8');
     const panelStart = css.indexOf('.controlled-nodes-control-toggle,');

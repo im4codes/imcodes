@@ -730,8 +730,9 @@ export function ControlledNodesPanel({
     return (
       <div class="controlled-nodes-control-panel" data-testid={`controlled-node-panel-${machine.serverId}`}>
         <div class="controlled-nodes-upgrade-summary">
-          <span><strong>{t('controlled_nodes.current_version')}:</strong> {upgrade?.currentVersion ?? machine.daemonVersion ?? t('controlled_nodes.version_unknown')}</span>
-          <span><strong>{t('controlled_nodes.latest_version')}:</strong> {upgrade?.latestVersion ?? t('controlled_nodes.version_unknown')}</span>
+          <span><strong>{t('server.daemon_current_version')}:</strong> {upgrade?.currentVersion ?? machine.daemonVersion ?? t('controlled_nodes.version_unknown')}</span>
+          <span><strong>{t('server.daemon_latest_version')}:</strong> {upgrade?.latestVersion ?? t('controlled_nodes.version_unknown')}</span>
+          <span data-testid={`controlled-node-worker-version-${machine.serverId}`}><strong>{t('controlled_nodes.worker_version')}:</strong> {workerRefresh?.installedVersion ?? t('controlled_nodes.version_unknown')}</span>
           {status && <span class={`controlled-nodes-upgrade-status is-${status}`} role="status">{t(`controlled_nodes.upgrade_status_${status}`, { defaultValue: status })}</span>}
           {workerRefresh && <span
             class={`controlled-nodes-worker-refresh-status is-${workerRefresh.phase}`}

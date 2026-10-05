@@ -1222,7 +1222,11 @@ export function createControlledNodeRuntime(
         phase,
         recordedAt: Date.now(),
         ...(result.installedVersion ? { installedVersion: result.installedVersion } : {}),
-        ...(result.targetVersion ? { targetVersion: result.targetVersion } : { targetVersion: DAEMON_VERSION }),
+        // The remote-desktop worker is released independently from the
+        // daemon. Never substitute the daemon release for an unknown worker
+        // target: doing so makes the UI report a version that was never
+        // downloaded or installed.
+        ...(result.targetVersion ? { targetVersion: result.targetVersion } : {}),
         ...(result.artifactSha256 ? { artifactSha256: result.artifactSha256 } : {}),
         ...(result.reason ? { reason: result.reason.slice(0, 256) } : {}),
       });
@@ -1318,7 +1322,6 @@ export function createControlledNodeRuntime(
     }).catch((error) => {
       logger.warn({ err: error }, 'remote-desktop worker refresh attempt failed');
       emitRefreshStatus(CONTROLLED_NODE_WORKER_REFRESH_PHASE.FAILED, {
-        targetVersion: DAEMON_VERSION,
         reason: error instanceof Error ? error.message : 'worker_refresh_failed',
       });
     }).finally(() => {

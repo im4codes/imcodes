@@ -3577,6 +3577,7 @@
     "version_current": "與伺服器發布版本一致",
     "version_outdated": "低於伺服器發布版本，升級尚未完成",
     "version_unknown": "版本未知",
+    "worker_version": "Worker 版本",
     "auto_unlock_set": "自動解鎖…",
     "auto_unlock_clear": "移除自動解鎖",
     "auto_unlock_placeholder": "Windows 登入密碼",
