@@ -48,7 +48,11 @@ import { TIMELINE_PAYLOAD_BUDGET_BYTES } from '../../shared/timeline-payload-bud
 import { OPENSPEC_AUTO_DELIVER_MSG } from '../../shared/openspec-auto-deliver-constants.js';
 import { EXECUTION_CLONE_KIND } from '../../shared/execution-clone.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import { CONTROLLED_NODE_WORKER_REFRESH_PHASE } from '../../shared/controlled-node-worker-refresh.js';
+import {
+  CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
+  CONTROLLED_NODE_WORKER_REFRESH_MSG,
+  CONTROLLED_NODE_WORKER_REFRESH_PHASE,
+} from '../../shared/controlled-node-worker-refresh.js';
 import { listControlledMachines } from '../src/routes/machines.js';
 import {
   DIRECT_FILE_TRANSFER_DIRECTION,
@@ -715,6 +719,33 @@ describe('WsBridge', () => {
         type: REMOTE_DESKTOP_NODE_CONTEXT_MSG.UNAVAILABLE,
         daemonGeneration: bridge.daemonConnectionGeneration(),
       });
+    });
+
+    it('sends an exact generation-bound independent worker refresh request', async () => {
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      bridge.handleDaemonConnection(
+        ws as never,
+        makeDb('valid-hash', 'controlled', CONTROLLED_NODE_OS_WIN),
+        {} as never,
+      );
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', capabilities: [
+          REMOTE_DESKTOP_CAPABILITY,
+          CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
+        ],
+      }));
+      await flushAsync();
+
+      expect(bridge.tryRefreshControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration(),
+      )).toBe('sent');
+      expect(ws.sentStrings.map((value) => JSON.parse(value))).toContainEqual({
+        type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST,
+      });
+      expect(bridge.tryRefreshControlledNodeRemoteDesktopWorker(
+        bridge.daemonConnectionGeneration() - 1,
+      )).toBe('generation_changed');
     });
 
     it('publishes the canonical host context and actively clears it when the mapping disappears', async () => {

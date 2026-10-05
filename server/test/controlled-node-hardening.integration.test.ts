@@ -20,6 +20,7 @@ import { MACHINE_REASONS } from '../../shared/machine-reference.js';
 import { REMOTE_DESKTOP_CAPABILITY } from '../../shared/remote-desktop.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_ERROR } from '../../shared/controlled-node-auto-unlock.js';
 import { REMOTE_DESKTOP_INSTALLABLE_CAPABILITY } from '../../shared/remote-desktop-install.js';
+import { CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY } from '../../shared/controlled-node-worker-refresh.js';
 import { signJwt } from '../src/security/crypto.js';
 import { generateControlledNodeId } from '../src/services/controlled-node-identity.js';
 import { listMachines as decodeMachineList } from '../../src/daemon/machine-exec-client.js';
@@ -332,7 +333,7 @@ describe('remote desktop worker quick install', () => {
 
       await db.execute(
         'UPDATE servers SET controlled_capabilities = $2 WHERE id = $1',
-        [controlledId, JSON.stringify([])],
+        [controlledId, JSON.stringify([REMOTE_DESKTOP_CAPABILITY])],
       );
       const unsupported = await app.request(`/api/machines/${controlledId}/remote-desktop-worker`, {
         method: 'POST', headers,
@@ -392,6 +393,73 @@ describe('remote desktop worker quick install', () => {
       install.mockRestore();
       if (originalAppVersion === undefined) delete process.env.APP_VERSION;
       else process.env.APP_VERSION = originalAppVersion;
+    }
+  });
+
+  it('dispatches an independent worker refresh only to an owned online capable node', async () => {
+    const app = buildApp();
+    const userId = `u_${hex(4)}`;
+    const otherUserId = `u_${hex(4)}`;
+    await createUser(db, userId);
+    await createUser(db, otherUserId);
+    const owner = await fullCredential(userId);
+    const other = await fullCredential(otherUserId);
+    const controlledId = `ctl_${hex(8)}`;
+    const heartbeat = Date.now();
+    await db.execute(
+      `INSERT INTO servers
+         (id, user_id, name, token_hash, status, last_heartbeat_at, created_at,
+          node_role, exec_enabled, ref_name, display_name, os, daemon_version, controlled_capabilities, node_id)
+       VALUES ($1,$2,'controlled',$3,'online',$4,$4,$5,true,'win-ref','Win box','win','2026.10.5427-dev.5876',$6,$7)`,
+      [controlledId, userId, sha256(hex(16)), heartbeat, NODE_ROLE.CONTROLLED,
+        JSON.stringify([REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY]), generateControlledNodeId()],
+    );
+    const bridge = WsBridge.get(controlledId);
+    const refresh = vi.spyOn(bridge, 'tryRefreshControlledNodeRemoteDesktopWorker')
+      .mockReturnValue('sent');
+    try {
+      const headers = {
+        'X-Server-Id': owner.serverId,
+        authorization: `Bearer ${owner.token}`,
+      };
+      const response = await app.request(`/api/machines/${controlledId}/remote-desktop-worker/refresh`, {
+        method: 'POST', headers,
+      });
+      expect(response.status).toBe(202);
+      expect(await response.json()).toEqual({ ok: true });
+      expect(refresh).toHaveBeenCalledWith(bridge.daemonConnectionGeneration());
+
+      const denied = await app.request(`/api/machines/${controlledId}/remote-desktop-worker/refresh`, {
+        method: 'POST',
+        headers: {
+          'X-Server-Id': other.serverId,
+          authorization: `Bearer ${other.token}`,
+        },
+      });
+      expect(denied.status).toBe(404);
+
+      await db.execute(
+        'UPDATE servers SET controlled_capabilities = $2 WHERE id = $1',
+        [controlledId, JSON.stringify([])],
+      );
+      const unsupported = await app.request(`/api/machines/${controlledId}/remote-desktop-worker/refresh`, {
+        method: 'POST', headers,
+      });
+      expect(unsupported.status).toBe(409);
+      expect(await unsupported.json()).toEqual({ error: 'remote_desktop_worker_refresh_unsupported' });
+
+      await db.execute(
+        'UPDATE servers SET controlled_capabilities = $2, status = $3 WHERE id = $1',
+        [controlledId, JSON.stringify([REMOTE_DESKTOP_CAPABILITY, CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY]), 'offline'],
+      );
+      const offline = await app.request(`/api/machines/${controlledId}/remote-desktop-worker/refresh`, {
+        method: 'POST', headers,
+      });
+      expect(offline.status).toBe(503);
+      expect(await offline.json()).toEqual({ error: 'node_offline' });
+      expect(refresh).toHaveBeenCalledTimes(1);
+    } finally {
+      refresh.mockRestore();
     }
   });
 });

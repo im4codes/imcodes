@@ -7,7 +7,11 @@ import { CONTROLLED_NODE_OS_MAC } from '../../shared/controlled-node-artifacts.j
 import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
-import { CONTROLLED_NODE_WORKER_REFRESH_PHASE } from '../../shared/controlled-node-worker-refresh.js';
+import {
+  CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
+  CONTROLLED_NODE_WORKER_REFRESH_MSG,
+  CONTROLLED_NODE_WORKER_REFRESH_PHASE,
+} from '../../shared/controlled-node-worker-refresh.js';
 import { DAEMON_UPGRADE_BLOCK_REASON, DAEMON_UPGRADE_TARGET_LATEST } from '../../shared/daemon-upgrade.js';
 import { compareImcodesVersions } from '../../shared/imcodes-version.js';
 import { DAEMON_VERSION } from '../util/version.js';
@@ -1392,6 +1396,9 @@ export function createControlledNodeRuntime(
       ...(remoteDesktopEnabled && !remoteDesktopAccessPaused
         ? [
           ...workerSessionCapabilities,
+          ...(arch === 'x64' && (platform === 'win32' || platform === 'linux')
+            ? [CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY]
+            : []),
           ...(remoteDesktopAutoUnlockAvailable ? [CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY] : []),
           // Workers shipped with this node accept PREPARE's relay ceiling.
           REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
@@ -1718,6 +1725,14 @@ export function createControlledNodeRuntime(
           return;
         }
         repairMissingRemoteDesktopWorker(true);
+        refreshRemoteDesktopWorkerIfDue(true);
+        return;
+      }
+      if (message.type === CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST) {
+        // This command has no target or artifact fields: the runtime resolves
+        // the independently published release and keeps all signature/hash,
+        // version, busy-session, and atomic-commit fences local.
+        if (Object.keys(message).length !== 1) return;
         refreshRemoteDesktopWorkerIfDue(true);
         return;
       }

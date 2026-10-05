@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
+import { CONTROLLED_NODE_WORKER_REFRESH_MSG } from '../../shared/controlled-node-worker-refresh.js';
 import { CONTROLLED_NODE_LOCAL_DAEMONS_RESCAN_MS } from '../../shared/controlled-node-host-link.js';
 import { NODE_ROLE } from '../../shared/remote-exec.js';
 import {
@@ -1089,6 +1090,44 @@ describe('controlled node enrollment and runtime', () => {
     socket.emit('message', JSON.stringify({ type: 'heartbeat_ack' }));
     await Promise.resolve();
     expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce();
+    runtime.stop();
+  });
+
+  it('runs one authorized manual worker refresh and ignores duplicate/inexact requests', async () => {
+    const socket = new MockSocket();
+    let resolveRefresh!: (result: { updated: boolean; targetVersion: string }) => void;
+    const refreshRemoteDesktopWorker = vi.fn(() => new Promise<{ updated: boolean; targetVersion: string }>((resolve) => {
+      resolveRefresh = resolve;
+    }));
+    const remoteDesktopWorker = {
+      available: vi.fn(() => true),
+      activeConnections: vi.fn(() => []),
+      reloadFromDisk: vi.fn(() => true),
+      handle: vi.fn(async () => false),
+      applyAutoUnlockSecret: vi.fn(async () => false),
+      autoUnlockConfigured: vi.fn(async () => false),
+      close: vi.fn(),
+    };
+    const runtime = createControlledNodeRuntime({
+      serverUrl: 'https://im.example', serverId: 'controlled-1', token: 'secret', nodeRole: NODE_ROLE.CONTROLLED,
+    }, () => socket, {
+      platform: 'win32', arch: 'x64', remoteDesktopWorker, refreshRemoteDesktopWorker,
+    });
+    runtime.start();
+    socket.open();
+
+    socket.emit('message', JSON.stringify({ type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST }));
+    await vi.waitFor(() => expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce());
+    socket.emit('message', JSON.stringify({ type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST }));
+    socket.emit('message', JSON.stringify({ type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST, targetVersion: 'untrusted' }));
+    await Promise.resolve();
+    expect(refreshRemoteDesktopWorker).toHaveBeenCalledOnce();
+
+    resolveRefresh({ updated: true, targetVersion: '2026.10.5427-dev.5876' });
+    await vi.waitFor(() => {
+      const statuses = socket.sent.map((raw) => JSON.parse(raw)).filter((message) => message.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS);
+      expect(statuses.map((message) => message.phase)).toEqual(['started', 'succeeded']);
+    });
     runtime.stop();
   });
 

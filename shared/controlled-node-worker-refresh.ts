@@ -1,5 +1,13 @@
 import { DAEMON_MSG } from './daemon-events.js';
 
+/** Capability advertised by runtimes that understand the operator refresh command. */
+export const CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY = 'remote.desktop.worker.refresh.v1' as const;
+
+/** Server → controlled-node: request one independent worker refresh attempt. */
+export const CONTROLLED_NODE_WORKER_REFRESH_MSG = {
+  REQUEST: 'controlled_node.worker_refresh_request',
+} as const;
+
 export const CONTROLLED_NODE_WORKER_REFRESH_PHASE = {
   STARTED: 'started',
   DEFERRED: 'deferred',

@@ -32,7 +32,9 @@ import {
 } from '../../../shared/imcodes-version.js';
 import {
   REMOTE_DESKTOP_TERMINAL_REASON,
+  REMOTE_DESKTOP_CAPABILITY,
 } from '../../../shared/remote-desktop.js';
+import { CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY } from '../../../shared/controlled-node-worker-refresh.js';
 import { randomUUID } from 'node:crypto';
 import { DAEMON_COMMAND_TYPES } from '../../../shared/daemon-command-types.js';
 import {
@@ -709,6 +711,45 @@ machinesRoutes.post('/:serverId/remote-desktop-worker', requireAuth(), async (c)
     userId,
     action: 'machine.remote_desktop_worker_install',
     ip,
+    details: { serverId },
+  }, c.env.DB).catch(() => {});
+  return c.json({ ok: true }, 202);
+});
+
+// POST /api/machines/:serverId/remote-desktop-worker/refresh — explicitly
+// request one independent worker refresh on a controlled node. This is not a
+// daemon upgrade and is deliberately separate from the first-install/repair
+// endpoint above.
+machinesRoutes.post('/:serverId/remote-desktop-worker/refresh', requireAuth(), async (c) => {
+  const userId = c.get('userId' as never) as string;
+  const serverId = c.req.param('serverId');
+  if (!serverId) return c.json({ error: 'invalid_body' }, 400);
+  const owned = await resolveControlledMachineManagementAccess(c.env.DB, userId, serverId, Date.now());
+  if (!owned) return c.json({ error: 'not_found' }, 404);
+  const capabilities = validateControlledNodeCapabilities(owned.controlled_capabilities);
+  if (!capabilities.ok
+    || !capabilities.value.includes(REMOTE_DESKTOP_CAPABILITY)
+    || !capabilities.value.includes(CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY)) {
+    return c.json({ error: 'remote_desktop_worker_refresh_unsupported' }, 409);
+  }
+  const now = Date.now();
+  if (owned.status !== 'online'
+    || typeof owned.last_heartbeat_at !== 'number'
+    || now - owned.last_heartbeat_at >= MACHINE_PRESENCE_STALENESS_MS) {
+    return c.json({ error: 'node_offline' }, 503);
+  }
+  const bridge = WsBridge.get(serverId);
+  const generation = bridge.daemonConnectionGeneration();
+  const delivery = bridge.tryRefreshControlledNodeRemoteDesktopWorker(generation);
+  if (delivery !== 'sent') {
+    return c.json({
+      error: delivery === 'generation_changed' ? 'node_connection_changed' : 'node_offline',
+    }, delivery === 'generation_changed' ? 409 : 503);
+  }
+  logAudit({
+    userId,
+    action: 'machine.remote_desktop_worker_refresh',
+    ip: (c.get('clientIp' as never) as string) ?? 'unknown',
     details: { serverId },
   }, c.env.DB).catch(() => {});
   return c.json({ ok: true }, 202);

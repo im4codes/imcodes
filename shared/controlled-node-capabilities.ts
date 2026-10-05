@@ -25,6 +25,7 @@ import {
 } from './remote-desktop-platform.js';
 import { CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY } from './controlled-node-service.js';
 import { CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY } from './controlled-node-auto-unlock.js';
+import { CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY } from './controlled-node-worker-refresh.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from './remote-desktop-local-management.js';
 
 export const CONTROLLED_NODE_CAPABILITIES = [
@@ -52,6 +53,7 @@ export const CONTROLLED_NODE_CAPABILITIES = [
   REMOTE_DESKTOP_RELAY_CAP_CAPABILITY,
   CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY,
   CONTROLLED_NODE_AUTO_UNLOCK_CAPABILITY,
+  CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
   REMOTE_DESKTOP_LOCAL_MANAGEMENT.PAUSED_CAPABILITY,
 ] as const;
 

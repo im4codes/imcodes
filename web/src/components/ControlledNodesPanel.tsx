@@ -12,6 +12,7 @@ import {
   artifactSelectionKey,
   buildControlledNodeDownloadTargets,
   installMachineRemoteDesktopWorker,
+  refreshMachineRemoteDesktopWorker,
   requestMachineRemoteDesktopPermissions,
   listAvailableExecutables,
   renameMachine,
@@ -30,7 +31,7 @@ import {
   REMOTE_DESKTOP_LOCAL_MANAGEMENT,
   REMOTE_DESKTOP_LOCAL_WEB_ACTION,
 } from '@shared/remote-desktop-local-management.js';
-import { REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
+import { REMOTE_DESKTOP_CAPABILITY, REMOTE_DESKTOP_STOP_ORIGIN } from '@shared/remote-desktop.js';
 import { CONTROLLED_NODE_OS_MAC } from '@shared/controlled-node-artifacts.js';
 import {
   canInstallRemoteDesktopWorker,
@@ -594,6 +595,19 @@ export function ControlledNodesPanel({
     setBusyServerId(null);
   };
 
+  const onRefreshRemoteDesktopWorker = async (serverId: string) => {
+    setActionError(null);
+    setBusyServerId(serverId);
+    try {
+      await refreshMachineRemoteDesktopWorker(serverId);
+      await refreshPresence();
+    } catch {
+      setActionError(t('remote_desktop.worker_refresh_failed'));
+    } finally {
+      setBusyServerId(null);
+    }
+  };
+
   const onRetryUpgrade = async (serverId: string) => {
     setActionError(null);
     setBusyServerId(serverId);
@@ -733,6 +747,18 @@ export function ControlledNodesPanel({
           <span><strong>{t('server.daemon_current_version')}:</strong> {upgrade?.currentVersion ?? machine.daemonVersion ?? t('controlled_nodes.version_unknown')}</span>
           <span><strong>{t('server.daemon_latest_version')}:</strong> {upgrade?.latestVersion ?? t('controlled_nodes.version_unknown')}</span>
           <span data-testid={`controlled-node-worker-version-${machine.serverId}`}><strong>{t('controlled_nodes.worker_version')}:</strong> {workerRefresh?.installedVersion ?? t('controlled_nodes.version_unknown')}</span>
+          {actionable && machine.capabilities?.includes(REMOTE_DESKTOP_CAPABILITY) && (
+            <button
+              type="button"
+              class="controlled-nodes-worker-refresh"
+              disabled={busyServerId === machine.serverId}
+              onClick={() => { void onRefreshRemoteDesktopWorker(machine.serverId); }}
+            >
+              {busyServerId === machine.serverId
+                ? t('remote_desktop.worker_refreshing')
+                : t('remote_desktop.refresh_worker')}
+            </button>
+          )}
           {status && <span class={`controlled-nodes-upgrade-status is-${status}`} role="status">{t(`controlled_nodes.upgrade_status_${status}`, { defaultValue: status })}</span>}
           {workerRefresh && <span
             class={`controlled-nodes-worker-refresh-status is-${workerRefresh.phase}`}

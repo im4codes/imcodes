@@ -463,6 +463,13 @@ export async function installMachineRemoteDesktopWorker(serverId: string): Promi
   });
 }
 
+/** Ask an online controlled node to refresh its independently released worker. */
+export async function refreshMachineRemoteDesktopWorker(serverId: string): Promise<void> {
+  await apiFetch(`${MACHINE_API_PATH}/${encodeURIComponent(serverId)}/remote-desktop-worker/refresh`, {
+    method: 'POST',
+  });
+}
+
 /**
  * Ask an online controlled node to raise its own permission dialog.
  *

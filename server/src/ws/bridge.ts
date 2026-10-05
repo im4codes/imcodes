@@ -132,6 +132,9 @@ import {
   type RemoteDesktopTerminalReason,
 } from '../../../shared/remote-desktop.js';
 import {
+  CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY,
+} from '../../../shared/controlled-node-worker-refresh.js';
+import {
   REMOTE_DESKTOP_ACTOR_SOURCE,
   REMOTE_DESKTOP_CAPTURE_PRIVACY_CAPABILITY,
   REMOTE_DESKTOP_CONSENT_CANCEL_REASON,
@@ -368,6 +371,7 @@ import {
   type DaemonUpgradeBlockedAckDisposition,
 } from '../../../shared/daemon-upgrade.js';
 import {
+  CONTROLLED_NODE_WORKER_REFRESH_MSG,
   validateControlledNodeWorkerRefreshStatusMessage,
   type ControlledNodeWorkerRefreshStatusMessage,
 } from '../../../shared/controlled-node-worker-refresh.js';
@@ -10932,6 +10936,22 @@ export class WsBridge {
       return 'sent';
     } catch (err) {
       logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop worker repair');
+      return 'send_failed';
+    }
+  }
+
+  /** Request one independent worker refresh on an online controlled node. */
+  tryRefreshControlledNodeRemoteDesktopWorker(expectedGeneration: number): 'sent' | 'offline' | 'generation_changed' | 'send_failed' {
+    if (!this.daemonWs || !this.authenticated || this.daemonWs.readyState !== WebSocket.OPEN) return 'offline';
+    if (this.daemonGeneration !== expectedGeneration) return 'generation_changed';
+    if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED
+      || !this.hasDaemonCapability(REMOTE_DESKTOP_CAPABILITY)
+      || !this.hasDaemonCapability(CONTROLLED_NODE_WORKER_REFRESH_CAPABILITY)) return 'offline';
+    try {
+      this.daemonWs.send(JSON.stringify({ type: CONTROLLED_NODE_WORKER_REFRESH_MSG.REQUEST }));
+      return 'sent';
+    } catch (err) {
+      logger.error({ serverId: this.serverId, err }, 'Failed to request remote desktop worker refresh');
       return 'send_failed';
     }
   }
