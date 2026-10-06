@@ -14,13 +14,22 @@
  * logged once). All git goes through the off-main exec helper; the patch-equivalence logic is the worktree GC's own
  * (`listTaskPairCommitsNotInIntegration`), so a cherry-pick into dev (a different SHA, the same patch) counts as integrated.
  *
+ * "Merged" means present on ANY branch of the repository, not only on one fixed integration branch (the owner's rule: once it is in the
+ * repository, stop reminding; it need not be main or dev). Cost per check, however many branches exist: one branch listing (cached per
+ * repository), one `for-each-ref --contains` (every branch at once), one `git worktree list`, then the patch-equivalence tests
+ * (cherry-picks) on at most TASK_PAIR_INTEGRATION_MAX_EXTRA_BRANCHES further branches (each about three git calls, all bounded by the
+ * same timeouts and buffers). The pair's own branch and the branches of other pair worktrees never count as "merged".
+ *
  * Skipped by design: non-git and `dir` workspaces and daemon-made local repos (no integration ref exists), a project without any
  * integration ref, a fetch or git failure (no reminder is claimed when git cannot tell).
  */
-import { existsSync } from 'node:fs';
-import { isAbsolute, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { existsSync, realpathSync } from 'node:fs';
+import { isAbsolute, relative, resolve, sep } from 'node:path';
 import {
   TASK_PAIR_EVIDENCE_COMMIT_PREFIX,
+  TASK_PAIR_INTEGRATION_MAX_BRANCH_REFS,
+  TASK_PAIR_INTEGRATION_MAX_EXTRA_BRANCHES,
   TASK_PAIR_INTEGRATION_REF_ENV,
   TASK_PAIR_OVERLAP_IGNORED_BASENAMES,
   TASK_PAIR_OVERLAP_MAX_LISTED_FILES,
@@ -36,7 +45,14 @@ import {
 } from '../../../shared/task-pair.js';
 import { execFileOffMain } from '../../util/exec-helper.js';
 import logger from '../../util/logger.js';
-import { listTaskPairCommitsNotInIntegration } from '../supervision-worktree-gc.js';
+import {
+  defaultWorktreesRoot,
+  listTaskPairBranchRefs,
+  listTaskPairBranchesContaining,
+  listTaskPairCommitsNotInIntegration,
+  shortTaskPairBranchName,
+  type TaskPairBranchRef,
+} from '../supervision-worktree-gc.js';
 import { sendTaskPairMessage, type TaskPairDeliveryResult } from './delivery.js';
 import { isPairsEngineProject } from './engine.js';
 import { getTaskPairStore, type StoredTaskPair, type TaskPairLiveness } from './store.js';
@@ -75,8 +91,11 @@ export interface PairIntegration {
   ref?: string;
   /** integrated: why (`ancestor`, `patch_equivalent`, `evidence_only`); unknown: why git could not tell. */
   reason?: string;
-  /** unintegrated: commits still missing (evidence commits excluded). */
+  /** unintegrated: commits still missing (evidence commits excluded), in the branch that is closest to having them. */
   missing?: number;
+  /** unintegrated: the branches the commits were looked for in (short names, the integration ref first), and how many branches the repository has. */
+  checked?: string[];
+  branchCount?: number;
 }
 
 export interface StaleBase extends StaleBaseReport {
@@ -145,6 +164,7 @@ export function resetIntegrationDriftCachesForTests(): void {
   results.clear();
   ranges.clear();
   staleResults.clear();
+  snapshots.clear();
 }
 
 /**
@@ -298,28 +318,170 @@ async function subjectsOf(repoPath: string, hashes: readonly string[]): Promise<
 // ---- (1) is a finished head integrated? ---------------------------------------------------------------------------------------
 
 /**
- * Has `head` (a pair's final commit) reached the integration ref? Integrated when it is an ancestor, or every commit of the
- * pair (after `base`) is patch-equivalent to one in the ref (Brain cherry-picks), ignoring `evidence:` commits, which are never
- * integrated. Cached per head and integration tip: an integrated head is never re-checked, an unintegrated one only after the ref
+ * Is `head` (a pair's final commit) in the repository? Integrated when it is an ancestor of the integration ref or of ANY other local or
+ * remote branch (the pair's own branch excluded), or every commit of the pair (after `base`) is patch-equivalent to one in the
+ * integration ref or in one of a few other branches (Brain cherry-picks), ignoring `evidence:` commits, which are never integrated.
+ * Cached per head, integration tip and branch set: an integrated head is never re-checked, an unintegrated one only after a branch
  * moved, and an unknown answer is remembered for thirty minutes so a broken repository costs no git per heartbeat.
  */
-export async function inspectPairIntegration(repoPath: string, head: string, base: string | undefined): Promise<PairIntegration> {
+export async function inspectPairIntegration(repoPath: string, head: string, base: string | undefined, options: { taskId?: string } = {}): Promise<PairIntegration> {
   const ref = await resolveIntegrationRef(repoPath);
-  if (!ref) return { state: 'unknown', reason: 'no_integration_ref' };
+  // A configured ref that does not exist is a configuration error: nothing is claimed.
+  if (!ref && process.env[TASK_PAIR_INTEGRATION_REF_ENV]?.trim()) return { state: 'unknown', reason: 'no_integration_ref' };
   const repoKey = await repoKeyOf(repoPath);
   const permanentKey = `${repoKey}\u0000${head}\u0000integrated`;
   const permanent = results.get(permanentKey);
   if (permanent) return permanent.value;
-  await refreshIntegrationRef(repoPath, ref);
-  const measure = await measuringRef(repoPath, ref);
-  const tip = await tipOf(repoPath, measure);
-  if (!tip) return { state: 'unknown', ref, reason: 'no_integration_tip' };
-  const key = `${repoKey}\u0000${head}\u0000${tip}`;
+  let measure: string | undefined;
+  let tip: string | undefined;
+  if (ref) {
+    await refreshIntegrationRef(repoPath, ref);
+    measure = await measuringRef(repoPath, ref);
+    tip = await tipOf(repoPath, measure);
+    if (!tip) return { state: 'unknown', ref, reason: 'no_integration_tip' };
+  }
+  const snapshot = await branchSnapshotOf(repoPath);
+  if (!snapshot) {
+    // Git cannot list the branches, so "on no branch" cannot be told: nothing is claimed, and the answer is remembered like any unknown.
+    const unlisted = `${repoKey}\u0000${head}\u0000unlisted`;
+    const known = results.get(unlisted);
+    if (known && now() - known.at < UNKNOWN_CACHE_MS) return known.value;
+    const value: PairIntegration = { state: 'unknown', ...(ref ? { ref } : {}), reason: 'branch_listing_failed' };
+    remember(results, unlisted, { value, at: now() });
+    return value;
+  }
+  if (!ref && snapshot.refs.length === 0) return { state: 'unknown', reason: 'no_integration_ref' };
+  const key = `${repoKey}\u0000${head}\u0000${tip ?? '-'}\u0000${snapshot.digest}`;
   const cached = results.get(key);
   if (cached && (cached.value.state !== 'unknown' || now() - cached.at < UNKNOWN_CACHE_MS)) return cached.value;
-  const value = await computeIntegration(repoPath, head, base, ref, measure, tip);
+  const value = await computeIntegration(repoPath, head, base, { ref, measure, tip, snapshot, taskId: options.taskId });
   remember(results, value.state === 'integrated' ? permanentKey : key, { value, at: now() });
   return value;
+}
+
+// ---- the branches of a repository ----------------------------------------------------------------------------------------------
+
+interface BranchSnapshot { refs: TaskPairBranchRef[]; digest: string }
+const snapshots = new Map<string, { value: BranchSnapshot | undefined; at: number }>();
+
+const gitRunner = (cwd: string, args: readonly string[]): Promise<GitOutcome> => git(cwd, args, GIT_TIMEOUT_MS, { maxBuffer: RANGE_MAX_BUFFER });
+
+/** Every local and remote branch with its tip (the GC's own listing), cached 30 s per repository; the digest changes when any branch moves. */
+async function branchSnapshotOf(repoPath: string): Promise<BranchSnapshot | undefined> {
+  const key = await repoKeyOf(repoPath);
+  const cached = snapshots.get(key);
+  if (cached && now() - cached.at < TIP_CACHE_MS) return cached.value;
+  const refs = await listTaskPairBranchRefs(repoPath, { limit: TASK_PAIR_INTEGRATION_MAX_BRANCH_REFS, run: gitRunner });
+  const value = refs ? { refs, digest: createHash('sha1').update(refs.map((entry) => `${entry.ref}\u0000${entry.tip}`).sort().join('\n')).digest('hex') } : undefined;
+  remember(snapshots, key, { value, at: now() });
+  return value;
+}
+
+interface WorktreeEntry { path: string; branch?: string }
+
+/** `git worktree list --porcelain`: the main checkout first, then every linked worktree, with the branch each has checked out. */
+async function listWorktrees(repoPath: string): Promise<WorktreeEntry[] | undefined> {
+  const out = await git(repoPath, ['worktree', 'list', '--porcelain']);
+  if (!out.ok) return undefined;
+  const entries: WorktreeEntry[] = [];
+  for (const block of out.stdout.split(/\r?\n\r?\n/u)) {
+    let path: string | undefined;
+    let branch: string | undefined;
+    for (const line of block.split(/\r?\n/u)) {
+      if (line.startsWith('worktree ')) path = line.slice('worktree '.length).trim();
+      else if (line.startsWith('branch ')) branch = line.slice('branch '.length).trim();
+    }
+    if (path) entries.push({ path, ...(branch ? { branch } : {}) });
+  }
+  return entries;
+}
+
+function samePath(a: string, b: string): boolean {
+  const real = (path: string): string => { try { return realpathSync(path); } catch { return resolve(path); } };
+  return real(a) === real(b);
+}
+
+function isInsidePath(parent: string, child: string): boolean {
+  const rel = relative(resolve(parent), resolve(child));
+  return rel !== '' && !rel.startsWith('..') && !isAbsolute(rel) && rel.split(sep)[0] !== '..';
+}
+
+const escapeRegExp = (value: string): string => value.replace(/[.*+?^${}()|[\]\\]/gu, '\\$&');
+
+/**
+ * Which branches are the pair's own work and so say nothing about "merged": the branch checked out in the pair's worktree, the branches of
+ * every other pair worktree the daemon made, any branch named after the task id, and the remote copies of those. (Every pair branch
+ * contains its own head; counting it would call every pair merged.)
+ */
+function ownedBranchMatcher(worktrees: readonly WorktreeEntry[] | undefined, repoPath: string, taskId: string | undefined): (ref: string) => boolean {
+  const owned = new Set<string>();
+  const pairRoot = defaultWorktreesRoot();
+  for (const entry of worktrees ?? []) {
+    if (!entry.branch) continue;
+    if (samePath(entry.path, repoPath) || isInsidePath(pairRoot, entry.path)) owned.add(shortTaskPairBranchName(entry.branch));
+  }
+  const named = taskId ? new RegExp(`(^|[^a-z0-9])${escapeRegExp(taskId.toLowerCase())}($|[^a-z0-9])`, 'u') : undefined;
+  return (ref) => {
+    const short = shortTaskPairBranchName(ref);
+    if (owned.has(short)) return true;
+    // refs/remotes/<remote>/<branch>: the same name without the remote
+    if (ref.startsWith('refs/remotes/') && owned.has(short.slice(short.indexOf('/') + 1))) return true;
+    return named?.test(ref.toLowerCase()) === true;
+  };
+}
+
+interface IntegrationInputs {
+  ref: string | undefined;
+  measure: string | undefined;
+  tip: string | undefined;
+  snapshot: BranchSnapshot;
+  taskId: string | undefined;
+}
+
+async function computeIntegration(repoPath: string, head: string, base: string | undefined, inputs: IntegrationInputs): Promise<PairIntegration> {
+  const { ref, measure, tip, snapshot } = inputs;
+  // 1. an ancestor of the integration ref: the common case, one git call
+  if (ref && measure) {
+    const ancestor = await git(repoPath, ['merge-base', '--is-ancestor', head, measure]);
+    if (ancestor.ok) return { state: 'integrated', ref, reason: 'ancestor' };
+    if (ancestor.exitCode !== 1) return { state: 'unknown', ref, reason: 'git_failed' };
+  }
+  // 2. an ancestor of ANY other branch, local or remote (one git call for all of them), the pair's own branches left out
+  const worktrees = await listWorktrees(repoPath);
+  const isOwned = ownedBranchMatcher(worktrees, repoPath, inputs.taskId);
+  const containing = await listTaskPairBranchesContaining(repoPath, head, { run: gitRunner });
+  if (containing === undefined) return { state: 'unknown', ...(ref ? { ref } : {}), reason: 'git_failed' };
+  const found = containing.find((name) => !isOwned(name));
+  if (found) return { state: 'integrated', ref: shortTaskPairBranchName(found), reason: 'ancestor_any_branch' };
+  // 3. patch-equivalent (a cherry-pick) in the integration ref, then in a few other branches
+  const checked: string[] = [];
+  let missing: number | undefined;
+  let unknownReason: string | undefined;
+  const tests: Array<{ name: string; ref: string; tip: string }> = [];
+  if (ref && measure && tip) tests.push({ name: ref, ref: measure, tip });
+  // Which further branches get the (costlier) patch-equivalence test: the main checkout's own branch, the usual integration names, then the newest.
+  const seen = new Set(tests.map((entry) => entry.tip));
+  const byName = new Map(snapshot.refs.map((entry) => [shortTaskPairBranchName(entry.ref), entry] as const));
+  const preferred: Array<TaskPairBranchRef | undefined> = [];
+  const mainBranch = worktrees?.[0]?.branch;
+  if (mainBranch) preferred.push(snapshot.refs.find((entry) => entry.ref === mainBranch));
+  for (const name of INTEGRATION_CANDIDATE_REFS) preferred.push(byName.get(name));
+  for (const entry of [...preferred, ...snapshot.refs]) {
+    if (!entry || tests.length >= TASK_PAIR_INTEGRATION_MAX_EXTRA_BRANCHES + (ref ? 1 : 0) || seen.has(entry.tip) || isOwned(entry.ref)) continue;
+    seen.add(entry.tip);
+    tests.push({ name: shortTaskPairBranchName(entry.ref), ref: entry.ref, tip: entry.tip });
+  }
+  for (const test of tests) {
+    const outcome = await equivalentIn(repoPath, head, base, test.name, test.ref, test.tip);
+    if (outcome.state === 'integrated') return outcome;
+    checked.push(test.name);
+    if (outcome.state === 'unknown') unknownReason ??= outcome.reason;
+    else if (outcome.missing !== undefined) missing = missing === undefined ? outcome.missing : Math.min(missing, outcome.missing);
+  }
+  // A branch git could not read: claim nothing (a missing reminder beats a false one).
+  if (unknownReason !== undefined) return { state: 'unknown', ...(ref ? { ref } : {}), reason: unknownReason };
+  if (missing === undefined) return { state: 'unknown', ...(ref ? { ref } : {}), reason: 'no_branch_to_compare' };
+  return { state: 'unintegrated', ref: ref ?? checked[0], missing, checked, branchCount: snapshot.refs.length };
 }
 
 /**
@@ -348,10 +510,8 @@ async function rangeIndex(repoPath: string, from: string, measure: string, tip: 
   return value;
 }
 
-async function computeIntegration(repoPath: string, head: string, base: string | undefined, ref: string, measure: string, tip: string): Promise<PairIntegration> {
-  const ancestor = await git(repoPath, ['merge-base', '--is-ancestor', head, measure]);
-  if (ancestor.ok) return { state: 'integrated', ref, reason: 'ancestor' };
-  if (ancestor.exitCode !== 1) return { state: 'unknown', ref, reason: 'git_failed' };
+/** Is every non-evidence commit of the pair (after `base`) in `measure` (a branch whose tip is `tip`), as the same patch, a cherry-pick -x, or the same subject? */
+async function equivalentIn(repoPath: string, head: string, base: string | undefined, ref: string, measure: string, tip: string): Promise<PairIntegration> {
   const branchPoint = (await git(repoPath, ['merge-base', head, measure])).stdout.trim();
   const from = base ?? (branchPoint || undefined);
   if (!from) return { state: 'unknown', ref, reason: 'no_base' };
@@ -650,7 +810,7 @@ async function runPass(at: number): Promise<IntegrationDriftPassResult> {
   const unintegrated = new Map<string, Array<{ candidate: Candidate; integration: PairIntegration }>>();
   for (const candidate of due) {
     result.checked += 1;
-    const integration = await inspectPairIntegration(candidate.repoPath, candidate.head, candidate.base);
+    const integration = await inspectPairIntegration(candidate.repoPath, candidate.head, candidate.base, { taskId: candidate.stored.state.taskId });
     if (integration.state === 'integrated') {
       result.integrated += 1;
       saveState(candidate, { integrationIntegratedAt: at });
@@ -669,6 +829,8 @@ async function runPass(at: number): Promise<IntegrationDriftPassResult> {
       ageMs: at - candidate.endedAt,
       ref: integration.ref ?? '',
       missing: integration.missing ?? 0,
+      checked: integration.checked ?? [],
+      branchCount: integration.branchCount ?? 0,
     })));
     const delivered = await send(brain, TASK_PAIR_INTEGRATION_DIGEST_ID, TASK_PAIR_INTEGRATION_DIGEST_REASON, text);
     if (delivered !== 'sent' && delivered !== 'queued') continue;

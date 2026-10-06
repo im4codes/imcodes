@@ -283,7 +283,8 @@ interface GcJournal {
   external?: boolean;
 }
 
-function defaultWorktreesRoot(): string {
+/** Where the daemon puts every pair worktree (`~/.imcodes/worktrees`). */
+export function defaultWorktreesRoot(): string {
   return resolve(imcodesStateDir(), 'worktrees');
 }
 
@@ -585,12 +586,64 @@ export async function listTaskPairCommitsNotInIntegration(
   return hashes.filter((hash) => unique.has(hash));
 }
 
+/** Runs one git command in `cwd`; the worktree GC's own `runGit` by default, a caller's off-main/injected runner otherwise. */
+export type TaskPairGitRunner = (cwd: string, args: readonly string[]) => Promise<{ ok: boolean; stdout: string }>;
+
+export interface TaskPairBranchRef {
+  /** Full ref name (`refs/heads/dev`, `refs/remotes/origin/dev`). */
+  ref: string;
+  /** The commit the branch points at. */
+  tip: string;
+}
+
+/** `refs/heads/dev` -> `dev`, `refs/remotes/origin/dev` -> `origin/dev`. */
+export function shortTaskPairBranchName(ref: string): string {
+  return ref.replace(/^refs\/(?:heads|remotes)\//u, '');
+}
+
+/**
+ * Every local and remote branch (newest commit first, at most `limit`; a remote's symbolic `HEAD` is left out, it only repeats another
+ * branch). The one enumeration shared by the worktree GC and the integration reminder, so both read the same set of "branches".
+ * `undefined` when git cannot tell.
+ */
+export async function listTaskPairBranchRefs(
+  repoPath: string,
+  options: { limit?: number; run?: TaskPairGitRunner } = {},
+): Promise<TaskPairBranchRef[] | undefined> {
+  const run = options.run ?? runGit;
+  const out = await run(repoPath, ['for-each-ref', '--sort=-committerdate', `--count=${options.limit ?? 2_000}`, '--format=%(objectname) %(refname)', 'refs/heads', 'refs/remotes']);
+  if (!out.ok) return undefined;
+  const refs: TaskPairBranchRef[] = [];
+  for (const line of out.stdout.split(/\r?\n/u)) {
+    const match = /^([0-9a-f]{40,64}) (\S+)$/u.exec(line.trim());
+    if (!match || /^refs\/remotes\/[^/]+\/HEAD$/u.test(match[2]!)) continue;
+    refs.push({ ref: match[2]!, tip: match[1]! });
+  }
+  return refs;
+}
+
+/**
+ * The branches (local and remote) that contain `head` as an ancestor, in ONE git call however many branches the repository has.
+ * `undefined` when git cannot tell.
+ */
+export async function listTaskPairBranchesContaining(
+  repoPath: string,
+  head: string,
+  options: { run?: TaskPairGitRunner } = {},
+): Promise<string[] | undefined> {
+  const run = options.run ?? runGit;
+  const out = await run(repoPath, ['for-each-ref', '--contains', head, '--format=%(refname)', 'refs/heads', 'refs/remotes']);
+  if (!out.ok) return undefined;
+  return out.stdout.split(/\r?\n/u).map((ref) => ref.trim()).filter((ref) => ref && !/^refs\/remotes\/[^/]+\/HEAD$/u.test(ref));
+}
+
 /**
  * The executor commits after `baseRevision` that are not represented by any
  * local or remote branch. A cherry-picked equivalent is considered
  * integrated. Worktrees are shared with the project repository, so checking
  * every branch is the safe rule: a pair may be merged to a release or feature
  * branch instead of the project's preferred integration branch.
+ * A head already reachable from a branch is answered by one git call (no per-branch cherry).
  */
 export async function listTaskPairCommitsNotInAnyBranch(
   repoPath: string,
@@ -603,11 +656,10 @@ export async function listTaskPairCommitsNotInAnyBranch(
   const hashes = commits.stdout.trim().split(/\s+/u).filter(Boolean);
   if (hashes.length === 0) return [];
 
-  const refs = await runGit(repoPath, [
-    'for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/remotes',
-  ]);
-  if (!refs.ok) return undefined;
-  const branchRefs = refs.stdout.split(/\r?\n/u).map((ref) => ref.trim()).filter(Boolean);
+  if ((await listTaskPairBranchesContaining(repoPath, head))?.length) return [];
+  const listed = await listTaskPairBranchRefs(repoPath);
+  if (!listed) return undefined;
+  const branchRefs = listed.map((entry) => entry.ref);
   if (branchRefs.length === 0) return hashes;
 
   let best = hashes;

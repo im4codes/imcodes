@@ -16,6 +16,7 @@ import {
   TASK_PAIR_CONTRACT_ID,
   TASK_PAIR_CHECKLIST_RULE,
   TASK_PAIR_MARKER_TAG,
+  TASK_PAIR_INTEGRATION_LISTED_BRANCHES,
   TASK_PAIR_NO_AUDITOR,
   TASK_PAIR_PROJECT_PRECEDENCE_CLAUSE,
   TASK_PAIR_TITLE_RULE,
@@ -861,20 +862,34 @@ export interface IntegrationDriftLine {
   head: string;
   worktree: string;
   ageMs: number;
+  /** The integration ref the check started from (may be empty when the repository has none). */
   ref: string;
   missing: number;
+  /** Short names of the branches the commits were looked for in, the integration ref first. */
+  checked?: readonly string[];
+  /** How many local and remote branches the repository has (0 = not known). */
+  branchCount?: number;
+}
+
+function describeCheckedBranches(line: IntegrationDriftLine): string {
+  const names = line.checked?.length ? line.checked : (line.ref ? [line.ref] : []);
+  const listed = names.slice(0, TASK_PAIR_INTEGRATION_LISTED_BRANCHES);
+  const total = Math.max(line.branchCount ?? 0, names.length);
+  const more = total - listed.length;
+  if (listed.length === 0) return `${total} branch${total === 1 ? '' : 'es'}`;
+  return `${listed.join(', ')}${more > 0 ? ` and ${more} more branch${more === 1 ? '' : 'es'} by ancestry` : ''}`;
 }
 
 /**
- * The unintegrated-DONE reminder: ONE message per Brain, ONE line per finished pair whose final head is not in the integration
- * branch (taskId, head, worktree, age). Brain merges every PASSed pair (owner rule); dismiss one it will not merge.
+ * The unintegrated-DONE reminder: ONE message per Brain, ONE line per finished pair whose commits are on no branch of the repository
+ * (taskId, head, worktree, age, the branches that were checked). "Merged" means present on any local or remote branch, whichever
+ * branch the project integrates on. Brain merges every PASSed pair (owner rule); dismiss one it will not merge.
  */
 export function buildIntegrationDriftDigest(lines: readonly IntegrationDriftLine[]): string {
-  const ref = lines[0]?.ref || 'the integration branch';
-  const body = lines.map((line) => `- ${line.taskId}: head ${line.head.slice(0, 12)} (${line.missing} commit${line.missing === 1 ? '' : 's'} not in ${line.ref || ref}), worktree ${line.worktree}, finished ${formatDriftAge(line.ageMs)} ago`).join('\n');
+  const body = lines.map((line) => `- ${line.taskId}: head ${line.head.slice(0, 12)} (${line.missing} commit${line.missing === 1 ? '' : 's'} not found on any branch of this repository; checked ${describeCheckedBranches(line)}), worktree ${line.worktree}, finished ${formatDriftAge(line.ageMs)} ago`).join('\n');
   const example = lines[0]?.taskId ?? '<taskId>';
-  return `Finished pair${lines.length === 1 ? '' : 's'} not yet merged into ${ref} (cherry-picked equivalents count as merged):\n${body}\n`
-    + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head, then push dev). A pair you will not merge: ${marker('DONE', example, 'integration=dismiss')} (or CANCEL ${example}) stops these reminders.`;
+  return `Finished pair${lines.length === 1 ? '' : 's'} not yet merged into this repository (cherry-picked equivalents on any branch count as merged):\n${body}\n`
+    + `Merge ${lines.length === 1 ? 'it' : 'them'} (cherry-pick the PASSed head onto the branch you integrate on, then push that branch). A pair you will not merge: ${marker('DONE', example, 'integration=dismiss')} (or CANCEL ${example}) stops these reminders.`;
 }
 
 const STALE_STAGE_LABEL = { ready: 'READY_FOR_AUDIT', pass: 'PASS' } as const;

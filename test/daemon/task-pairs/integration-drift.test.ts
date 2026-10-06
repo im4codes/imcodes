@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { SessionRecord } from '../../../src/store/session-store.js';
 import { removeSession, upsertSession } from '../../../src/store/session-store.js';
 import { TaskPairStore, getTaskPairStore, setTaskPairStoreForTests } from '../../../src/daemon/task-pairs/store.js';
-import { listTaskPairCommitsNotInIntegration } from '../../../src/daemon/supervision-worktree-gc.js';
+import { listTaskPairBranchRefs, listTaskPairCommitsNotInAnyBranch, listTaskPairCommitsNotInIntegration } from '../../../src/daemon/supervision-worktree-gc.js';
 import { setTaskPairDeliveryDepsForTests } from '../../../src/daemon/task-pairs/delivery.js';
 import { TaskPairService } from '../../../src/daemon/task-pairs/service.js';
 import {
@@ -278,7 +278,7 @@ describe('integration drift', () => {
       donePair('mc2', wt, extra, base);
       const result = await passAt(30);
       expect(result.reminded).toBe(1);
-      expect(digests()[0]!.text).toContain('1 commit not in');
+      expect(digests()[0]!.text).toContain('1 commit not found on any branch of this repository');
       expect(head).not.toBe(extra);
     });
 
@@ -594,6 +594,165 @@ describe('integration drift', () => {
       // Not one extra git call per heartbeat beyond the bounded probes of the first pass.
       expect(gitCalls.length).toBeLessThanOrEqual(callsAfterFirst * 3);
       expect(digests()).toHaveLength(0);
+    });
+  });
+
+  describe('merged anywhere in the repository (not only the integration branch)', () => {
+    const remind = async () => (await passAt(30)).reminded;
+    const setUp = (name: string, subject = `feat: ${name}`) => {
+      const { base } = setUpRepos();
+      const wt = addWorktree(name, base);
+      const head = commit(wt, `${name}.txt`, `${name}\n`, subject);
+      donePair(name, wt, head, base);
+      return { base, wt, head };
+    };
+
+    it('a head that only a branch outside the candidate list (feat/zjq) has is merged: no reminder (this is the 158 jdzs case)', async () => {
+      const { head } = setUp('a1');
+      run(main, 'branch', 'feat/zjq', head);
+      const result = await passAt(30);
+      expect(result.integrated).toBe(1);
+      expect(digests()).toHaveLength(0);
+      expect(live('a1').integrationIntegratedAt).toBeDefined();
+    });
+
+    it('the branch the main checkout is on counts, whatever its name (ff merge, then a cherry-pick whose patch-id differs)', async () => {
+      const { base, head } = setUp('a2');
+      run(main, 'checkout', '-q', '-b', 'work/current');
+      run(main, 'merge', '-q', '--ff-only', head);
+      expect((await passAt(30)).integrated).toBe(1);
+      // a second pair, cherry-picked onto the checked-out branch with a reworded subject and a changed context
+      const wt = addWorktree('a2b', base);
+      const second = commit(wt, 'a2b.txt', 'a2b\n', 'feat: a2b original subject');
+      donePair('a2b', wt, second, base);
+      run(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'cherry-pick', '-x', second);
+      expect((await passAt(31)).integrated).toBe(1);
+      expect(digests()).toHaveLength(0);
+    });
+
+    it('a branch that exists only on the remote (origin/release/1, never checked out locally) counts', async () => {
+      const { head } = setUp('a3');
+      run(main, 'push', '-q', 'origin', `${head}:refs/heads/release/1`);
+      run(main, 'fetch', '-q', 'origin');
+      expect(run(main, 'branch', '-a', '--list', 'origin/release/1')).toContain('origin/release/1');
+      expect((await passAt(30)).integrated).toBe(1);
+      expect(digests()).toHaveLength(0);
+    });
+
+    it('a cherry-pick (same patch, new SHA; also the -x and same-subject forms) into a non-candidate branch counts', async () => {
+      const { base, head } = setUp('a4');
+      run(main, 'checkout', '-q', '-b', 'feat/zjq', 'origin/dev');
+      commit(main, 'zjq-only.txt', 'z\n', 'chore: only on feat/zjq');
+      run(main, '-c', 'user.name=t', '-c', 'user.email=t@t', 'cherry-pick', head);
+      run(main, 'checkout', '-q', 'dev');
+      expect(run(main, 'rev-parse', 'feat/zjq')).not.toBe(head);
+      expect(run(main, 'branch', '--contains', head, '--list', 'feat/zjq')).toBe('');
+      expect((await passAt(30)).integrated).toBe(1);
+      expect(base).toBeTruthy();
+      expect(digests()).toHaveLength(0);
+    });
+
+    it('a head that is on no branch at all is still reminded, naming what was checked and not hard-coding dev; the pair\'s own branch and a backup branch named after the task do not count', async () => {
+      const { head } = setUp('a5');
+      run(main, 'branch', 'backup/a5-copy', head);
+      for (let i = 0; i < 8; i += 1) run(main, 'branch', `other/${i}`, 'origin/dev');
+      expect(await remind()).toBe(1);
+      const text = digests()[0]!.text;
+      expect(text).toContain('not found on any branch of this repository');
+      expect(text).toContain('origin/dev');
+      expect(text).not.toContain('push dev');
+      expect(text).not.toContain('not yet merged into origin/dev');
+      expect(text).toContain(`${TASK_PAIR_INTEGRATION_ATTR}=${TASK_PAIR_INTEGRATION_DISMISS_VALUE}`);
+    });
+
+    it('a pair that only has evidence: commits left is merged (and stays so with other branches around)', async () => {
+      const { base } = setUpRepos();
+      const wt = addWorktree('a6', base);
+      const work = commit(wt, 'w.txt', 'w\n', 'feat: a6 work');
+      const head = commit(wt, 'e.md', 'numbers\n', 'evidence: a6 measurements');
+      run(main, 'branch', 'feat/zjq', work);
+      donePair('a6', wt, head, base);
+      expect((await passAt(30)).integrated).toBe(1);
+      expect(digests()).toHaveLength(0);
+    });
+
+    it('a repository with no remote and no dev/main/master: merged into whichever branch the owner works on is merged, otherwise reminded', async () => {
+      const solo = join(root, 'solo2');
+      mkdirSync(solo);
+      run(solo, 'init', '-q', '-b', 'trunk');
+      const base = commit(solo, 'a.txt', 'a\n', 'base');
+      const wt = join(root, 'wt-solo2');
+      run(solo, 'worktree', 'add', '-q', '-b', 'pair/solo2', wt, base);
+      const head = commit(wt, 'f.txt', 'f\n', 'feat: solo2');
+      donePair('s2', wt, head, base);
+      expect((await passAt(30)).reminded).toBe(1);
+      expect(gitCalls.some((call) => isFetch(call))).toBe(false);
+      run(solo, 'merge', '-q', '--ff-only', head);
+      expect((await passAt(60)).integrated).toBe(1);
+    });
+
+    it('a shallow clone that lacks the base, or git that cannot list the branches, answers unknown: no reminder, no crash', async () => {
+      const { base } = setUpRepos();
+      const shallow = join(root, 'shallow');
+      run(root, 'clone', '-q', '--depth', '1', `file://${origin}`, shallow);
+      const wt = join(root, 'wt-shallow');
+      run(shallow, 'worktree', 'add', '-q', '-b', 'pair/shallow', wt, 'HEAD');
+      const head = commit(wt, 's.txt', 's\n', 'feat: shallow');
+      donePair('sh1', wt, head, 'f'.repeat(40));
+      expect((await passAt(30)).reminded).toBe(0);
+      // and when for-each-ref itself fails for the (otherwise fine) repository
+      const wt2 = addWorktree('a7b', base);
+      donePair('sh2', wt2, commit(wt2, 'b.txt', 'b\n', 'feat: b'), base);
+      setIntegrationDriftDepsForTests({
+        now: () => clock,
+        send: async (target, taskId, reason, text) => { sent.push({ target, taskId, reason, text }); return 'sent'; },
+        git: async (cwd, args, timeoutMs) => {
+          if (args[0] === 'for-each-ref') return { ok: false, stdout: '', exitCode: 128 };
+          try { return { ok: true, stdout: execFileSync('git', ['-C', cwd, ...args], { encoding: 'utf8', timeout: timeoutMs, stdio: ['ignore', 'pipe', 'pipe'] }) }; } catch (error) { return { ok: false, stdout: '', exitCode: (error as { status?: number }).status }; }
+        },
+      });
+      const result = await passAt(45);
+      expect(result.reminded).toBe(0);
+      expect(digests()).toHaveLength(0);
+    });
+
+    it('branch names with spaces-free special characters (#, @, unicode, nested slashes) are read and matched', async () => {
+      const { head } = setUp('a8');
+      run(main, 'branch', 'feat/ünï#cödé@1/x', head);
+      expect((await passAt(30)).integrated).toBe(1);
+      const refs = await listTaskPairBranchRefs(main);
+      expect(refs?.some((entry) => entry.ref === 'refs/heads/feat/ünï#cödé@1/x')).toBe(true);
+    });
+
+    it('a repository with 200 branches costs a bounded number of git calls for one check (and none per heartbeat after it)', async () => {
+      const { base, head } = setUp('a9');
+      const stream: string[] = [];
+      for (let i = 0; i < 200; i += 1) {
+        stream.push(`commit refs/heads/bulk/${i}`, `committer t <t@t> ${1_700_000_000 + i} +0000`, `data ${`b${i}`.length}`, `b${i}`, `from ${base}`, '');
+      }
+      execFileSync('git', ['fast-import', '--quiet'], { cwd: main, input: `${stream.join('\n')}\n` });
+      expect(run(main, 'for-each-ref', 'refs/heads/bulk').split('\n')).toHaveLength(200);
+      gitCalls.length = 0;
+      const started = Date.now();
+      expect((await passAt(30)).reminded).toBe(1);
+      const elapsed = Date.now() - started;
+      expect(gitCalls.length).toBeLessThanOrEqual(40);
+      expect(elapsed).toBeLessThan(15_000);
+      const callsFirst = gitCalls.length;
+      await passAt(31);
+      expect(gitCalls.length).toBe(callsFirst); // not due again: no git at all
+      expect(head).toBeTruthy();
+    });
+
+    it('the worktree GC answers the same question: a head on a branch is "not missing" from one git call, no per-branch cherry', async () => {
+      const { base, wt, head } = setUp('b1');
+      run(main, 'branch', 'feat/zjq', head);
+      expect(await listTaskPairCommitsNotInAnyBranch(wt, base, { head })).toEqual([]);
+      const other = commit(wt, 'b1b.txt', 'x\n', 'feat: never merged b1b');
+      // the pair's own branch pair/b1 still holds it for the GC (nothing is lost), which is exactly what the reminder must NOT count
+      expect(await listTaskPairCommitsNotInAnyBranch(wt, base, { head: other })).toEqual([]);
+      donePair('b1', wt, other, base);
+      expect(await remind()).toBe(1);
     });
   });
 
