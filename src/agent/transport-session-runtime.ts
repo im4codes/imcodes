@@ -2166,14 +2166,6 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._activeDispatchCancelled = false;
       this._activeDispatchStaleRecoveryStarted = false;
     }
-    if (this.reconcileOrphanedOpenTools(`idle-drain:${reason}`, false) > 0
-      && this._pendingMessages.length === 0
-      && this.isInProgressStatus(this._status)
-      && !this.hasActiveTurnWork()) {
-      // Nothing is queued and nothing is running: leave "working" behind.
-      this.setStatus('idle');
-      return false;
-    }
     const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount > 0) {
       logger.warn(
@@ -2208,50 +2200,41 @@ export class TransportSessionRuntime implements SessionRuntime {
   }
 
   /**
-   * True while this runtime itself owns a dispatch or retry that has not
-   * settled. Unlike {@link hasLocalActiveTurnWork} it ignores open tool-call
-   * entries: those are exactly what can outlive their turn.
+   * True while a turn this runtime dispatched has not settled. Tool calls are
+   * owned by such a turn; see {@link recordToolActivity}.
+   */
+  private hasLocalTurnInFlight(): boolean {
+    return Boolean(this._sending || this._activeTurn) || this._activeDispatchEntries.length > 0;
+  }
+
+  /**
+   * True while this runtime owns a dispatch OR a retry of one that has not
+   * settled. Messages queued behind it are drained by its settle path.
    */
   private hasLocalDispatchInFlight(): boolean {
-    return Boolean(this._sending || this._activeTurn)
-      || this._activeDispatchEntries.length > 0
+    return this.hasLocalTurnInFlight()
       || this._recoverableRetryTimer !== null
       || this._capacityRetryTimer !== null;
   }
 
-  /** The provider's own snapshot is current and reports no work of any kind. */
-  private providerReportsNoActiveWork(): boolean {
-    const snapshot = this.getProviderActiveWorkSnapshot();
-    if (!snapshot || (snapshot.status ?? 'current') !== 'current') return false;
-    return snapshot.activeWorkCount === 0
-      && snapshot.activeToolCount === 0
-      && snapshot.busyReasons.length === 0;
-  }
-
   /**
-   * Reconcile tool-call entries that outlived their turn.
-   *
-   * A tool event that lands after its turn was settled (a stop, a late
-   * provider callback) is never followed by a terminal event, so it kept
-   * `open_tool_call` blocking forever: every queued message then sat behind
-   * work no provider was doing. This only acts when nothing local is in flight
-   * -- a real running turn always has a local dispatch -- and, unless the
-   * caller already holds the provider's own "no active turn" answer, only when
-   * the provider's snapshot independently reports no work. Anything else is
-   * left untouched.
+   * A tool-start that arrived with no turn to own it. It is not tracked, but
+   * the timeline already shows it as running (the relay forwards provider
+   * events independently), so end it there as well -- unless the provider
+   * itself reports live work, i.e. a provider-initiated turn that will send its
+   * own end event (its snapshot also keeps the queue blocked meanwhile).
    */
-  private reconcileOrphanedOpenTools(reason: string, providerAlreadyReportedIdle: boolean): number {
-    if (this._openTools.size === 0 || this.hasLocalDispatchInFlight()) return 0;
-    if (!providerAlreadyReportedIdle && !this.providerReportsNoActiveWork()) return 0;
-    const openToolCount = this._openTools.size;
-    const closed = this.closeOpenTools('stale', 'provider_stale');
-    if (closed > 0) {
-      logger.warn(
-        { sessionKey: this.sessionKey, reason, openToolCount, closed, pendingCount: this._pendingMessages.length },
-        'transport runtime closed tool-call entries orphaned by a settled turn so queued messages are not pinned behind them',
-      );
-    }
-    return closed;
+  private rejectLateToolOpen(tool: Pick<ToolCallEvent, 'id' | 'name'>, generation: number): void {
+    incrementCounter('transport.tool_event.late_after_settle', { provider: this.provider.id });
+    logger.debug(
+      { sessionKey: this.sessionKey, toolId: tool.id, tool: tool.name, generation },
+      'transport runtime ignored a tool start that arrived after its turn was settled',
+    );
+    const snapshot = this.getProviderActiveWorkSnapshot();
+    const providerHasLiveWork = !!snapshot
+      && (snapshot.activeWorkCount > 0 || snapshot.activeToolCount > 0 || snapshot.busyReasons.length > 0);
+    if (providerHasLiveWork) return;
+    this.emitSyntheticToolTerminal(tool.id, { generation, name: tool.name }, 'stale', 'provider_stale');
   }
 
   private hasLocalActiveTurnWork(): boolean {
@@ -2494,6 +2477,17 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     const generation = this._activityGeneration;
     if (tool.status === 'running') {
+      // A tool call belongs to the turn that ran it. With no turn in flight
+      // there is nothing to own it: this is a late event from a turn that was
+      // already settled (a stop, a timeout, a late provider callback). Opening
+      // an entry for it would be unclosable -- the provider has no turn left to
+      // send the end event -- and `open_tool_call` would pin the session-level
+      // queue forever, while the next dispatch (whose generation rollover is
+      // what would clear it) could never start. So it is never opened.
+      if (!this.hasLocalTurnInFlight()) {
+        this.rejectLateToolOpen(tool, generation);
+        return;
+      }
       this._openTools.set(tool.id, { generation, name: tool.name, status: 'running' });
       return;
     }
@@ -2856,6 +2850,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         reason: 'sync_dispatch_prologue_failure',
       });
       this._activeDispatchEntries = [];
+      this.closeOpenTools('errored', 'provider_error');
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
@@ -3236,15 +3231,14 @@ export class TransportSessionRuntime implements SessionRuntime {
     if (admission !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
       restoreReservation();
       if (admission === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED) return { status: 'unsupported' };
-      // The provider says there is no turn to append to. This runtime still
-      // believed one was active, so its activity state was stale -- and the
-      // session-level queue is not tied to that turn. For the external
-      // (user-initiated) entry point: reconcile the stale state against the
-      // provider's answer, then send the queue as a fresh turn instead of
-      // failing and leaving the rows stuck. The internal scheduled flush does
-      // not opt in and keeps its "stale means defer to the idle drain" behavior.
+      // The provider says there is no turn to append to. The session-level
+      // queue is not tied to any one turn: for the external (user-initiated)
+      // entry point, send it as a fresh turn instead of failing. Tool-call
+      // entries cannot outlive their turn (see recordToolActivity), so if this
+      // runtime holds no dispatch of its own the drain is not blocked. The
+      // internal scheduled flush does not opt in and keeps its "stale means
+      // defer to the idle drain" behavior.
       if (options.allowDispatchAsNewTurn) {
-        this.reconcileOrphanedOpenTools('provider-stale-append', true);
         if (this._drainPending()) return { status: 'dispatched_as_new_turn' };
         // Still blocked: this runtime owns a dispatch that has not settled. Its
         // terminal callback drains the untouched FIFO, so report a hand-off to
@@ -3851,6 +3845,7 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn?.reject(failure);
     this._activeTurn = null;
+    this.closeOpenTools('errored', 'provider_error');
     this.clearStalePendingCancelFallbackTimer();
     const activeEntries = this._activeDispatchEntries;
     this.settleActiveDispatchHandoffs(activeEntries, {
@@ -3985,6 +3980,8 @@ export class TransportSessionRuntime implements SessionRuntime {
     this.rollbackActiveSummarySyncReservation(this._activeDispatchId ?? undefined);
     this._activeTurn.resolve();
     this._activeTurn = null;
+    // The lost turn's tool calls end with it; the replayed turn starts clean.
+    this.closeOpenTools('abandoned', 'generation_rollover');
     this.clearStalePendingCancelFallbackTimer();
     this._activeDispatchEntries = [];
     this._activeDispatchProviderStarted = false;
@@ -4743,6 +4740,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._sending = false;
           this._activeTurn.reject(providerError);
           this._activeTurn = null;
+          this.closeOpenTools('errored', 'provider_error');
           this.clearStalePendingCancelFallbackTimer();
           this._activeDispatchProviderStarted = false;
           this._activeDispatchProviderAccepted = false;
@@ -4764,6 +4762,7 @@ export class TransportSessionRuntime implements SessionRuntime {
             reason: `accepted_provider_error:${providerError.code}`,
           });
           this._activeDispatchEntries = [];
+          this.closeOpenTools('errored', 'provider_error');
           this.setStatus('error');
           return;
         }
@@ -4783,6 +4782,7 @@ export class TransportSessionRuntime implements SessionRuntime {
           this._sending = false;
           this._activeTurn.reject(providerError);
           this._activeTurn = null;
+          this.closeOpenTools('errored', 'provider_error');
           this.clearStalePendingCancelFallbackTimer();
           this._activeDispatchProviderStarted = false;
           this._activeDispatchProviderAccepted = false;
@@ -4797,6 +4797,7 @@ export class TransportSessionRuntime implements SessionRuntime {
         this._sending = false;
         this._activeTurn.reject(providerError);
         this._activeTurn = null;
+        this.closeOpenTools('errored', 'provider_error');
         this.clearStalePendingCancelFallbackTimer();
         this._activeDispatchProviderStarted = false;
         this._activeDispatchCancelled = false;
@@ -5228,6 +5229,7 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._sending = false;
       this._activeTurn = null;
       this._activeDispatchEntries = [];
+      this.closeOpenTools('errored', 'provider_error');
       this.clearStalePendingCancelFallbackTimer();
       this._activeDispatchProviderStarted = false;
       this._activeDispatchCancelled = false;
