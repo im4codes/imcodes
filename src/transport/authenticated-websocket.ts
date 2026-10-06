@@ -55,6 +55,12 @@ export class AuthenticatedWebSocketClient {
   private watchdogTimer: ReturnType<typeof setInterval> | null = null;
   private stopped = true;
   private backoffMs: number;
+  /** True once the server has sent a frame on the CURRENT socket, i.e. accepted
+   *  the auth frame. Backoff only resets then, never on a bare `open`: a server
+   *  that opens the socket and immediately closes it (4001/4002/4003) would
+   *  otherwise be retried at the base delay forever and trip its own
+   *  per-daemon connect limit. */
+  private serverAnswered = false;
   private lastInboundAt = 0;
   private lastWatchdogTickAt = 0;
   private lastWatchdogWallAt = 0;
@@ -122,6 +128,7 @@ export class AuthenticatedWebSocketClient {
       return;
     }
     this.socket = socket;
+    this.serverAnswered = false;
     const connectTimeoutMs = this.options.connectTimeoutMs ?? 20_000;
     this.connectTimer = setTimeout(() => this.failSocket(socket, 'connect_timeout'), connectTimeoutMs);
     this.connectTimer.unref?.();
@@ -130,7 +137,6 @@ export class AuthenticatedWebSocketClient {
       if (this.socket !== socket || this.stopped) return;
       if (this.connectTimer) clearTimeout(this.connectTimer);
       this.connectTimer = null;
-      this.backoffMs = this.options.initialBackoffMs ?? 500;
       const monotonicNow = this.monotonicNow();
       this.lastInboundAt = monotonicNow;
       this.lastWatchdogTickAt = monotonicNow;
@@ -143,6 +149,10 @@ export class AuthenticatedWebSocketClient {
     socket.on('message', (data: unknown) => {
       if (this.socket !== socket || this.stopped) return;
       this.lastInboundAt = this.monotonicNow();
+      if (!this.serverAnswered) {
+        this.serverAnswered = true;
+        this.backoffMs = this.options.initialBackoffMs ?? 500;
+      }
       void Promise.resolve(this.options.onMessage(data)).catch(() => {});
     });
     socket.on('error', () => this.failSocket(socket, 'socket_error'));
