@@ -125,6 +125,17 @@ describe('supervision task console reducer', () => {
     expect(empty.tasks).toEqual({});
   });
 
+  it('records stored-but-untracked pairs of an engine-off project, and ignores nonsense values', () => {
+    const reduce = (inertPairs: unknown) => supervisionTaskConsoleReducer(subscribingState(), {
+      type: 'snapshot_received',
+      payload: snapshot({ tasks: [], assignments: [], pools: [], inertPairs } as Partial<SupervisionTaskConsoleSnapshot>),
+    });
+    expect(reduce(3).inertPairs).toBe(3);
+    // An older daemon never sends the field; garbage is treated as absent.
+    expect(reduce(undefined).inertPairs).toBe(0);
+    for (const bad of [0, -1, 1.5, '4', null]) expect(reduce(bad).inertPairs).toBe(0);
+  });
+
   it('turns a transport disconnect into a terminal visible error state', () => {
     const disconnected = supervisionTaskConsoleReducer(subscribingState(), {
       type: 'transport_disconnected',

@@ -10,17 +10,17 @@ describe('supervision task console visibility', () => {
     })).toBe(true);
   });
 
-  it.each(['participant', 'viewer'] as const)('allows a %s viewing a shared main session', (sharedAccessRole) => {
+  it.each([
+    ['main', 'participant'], ['main', 'viewer'], ['server', 'participant'], ['server', 'viewer'],
+  ] as const)('allows a %s share %s (the share covers the Brain)', (shareTargetKind, sharedAccessRole) => {
     expect(canViewSupervisionTaskConsole({
       session: { role: 'brain' },
-      shareTargetKind: 'main',
+      shareTargetKind,
       sharedAccessRole,
     })).toBe(true);
   });
 
   it.each([
-    ['participant in a server share', 'server', 'participant'],
-    ['viewer in a server share', 'server', 'viewer'],
     ['participant in a sub-session share', 'subsession', 'participant'],
     ['viewer in a sub-session share', 'subsession', 'viewer'],
   ] as const)('rejects a %s', (_label, shareTargetKind, sharedAccessRole) => {
@@ -28,6 +28,14 @@ describe('supervision task console visibility', () => {
       session: { role: 'brain' },
       shareTargetKind,
       sharedAccessRole,
+    })).toBe(false);
+  });
+
+  it('fails closed when a whole-server share has no authoritative access role', () => {
+    expect(canViewSupervisionTaskConsole({
+      session: { role: 'brain' },
+      shareTargetKind: 'server',
+      sharedAccessRole: null,
     })).toBe(false);
   });
 

@@ -312,8 +312,12 @@ type DaemonMessagePolicy = {
    * sessions the receiving socket may have no share for at all.
    */
   scopesServerTargetInRedact?: true;
-  /** Task-console authority is visible only through an exact MAIN tab share. */
-  mainShareOnly?: true;
+  /**
+   * Task-console authority is visible only through the exact MAIN tab share of
+   * the coordinator or a whole-server share (which covers it); a sub-session
+   * share never receives it.
+   */
+  mainOrServerShareOnly?: true;
 };
 
 export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessagePolicy>([
@@ -341,12 +345,12 @@ export const SHARE_SCOPED_DAEMON_MESSAGE_POLICY = new Map<string, DaemonMessageP
   ['timeline.event', {
     target: timelineEventTarget,
   }],
-  [SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.DELTA, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
-  [SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE, { target: supervisionTaskConsoleTarget, mainShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.RESYNC_REQUIRED, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
+  [SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE, { target: supervisionTaskConsoleTarget, mainOrServerShareOnly: true }],
   [TRANSPORT_MSG.CHAT_HISTORY, {
     target: sessionIdFieldTarget,
     redact: redactTransportHistory,
@@ -526,7 +530,10 @@ export function evaluateShareCommand(input: {
       : { allowed: false, reason: SHARE_REASONS.DIRECT_SURFACE_DENIED };
   }
   if (policy.kind === 'allow-main-covered-read') {
-    if (serverParticipant && sessionName) return { allowed: true };
+    // A whole-server share (viewer or participant) covers every session, the
+    // project Brain included, so reading its task console discloses nothing
+    // beyond what the share already grants. Tab shares need the exact main tab.
+    if (input.state.target.kind === 'server' && sessionName) return { allowed: true };
     return input.state.target.kind === 'main'
       && !!sessionName
       && input.state.target.sessionName === sessionName
@@ -821,7 +828,7 @@ export function filterShareDaemonMessage(
   if (!policy) return null;
   const target = policy.target(msg);
   if (!target) return null;
-  if (policy.mainShareOnly && state.target.kind !== 'main') return null;
+  if (policy.mainOrServerShareOnly && state.target.kind !== 'main' && state.target.kind !== 'server') return null;
   if (target.serverId && target.serverId !== state.target.serverId) return null;
   if (target.kind === 'server') {
     // A server-scoped target names no session, so per-session coverage cannot

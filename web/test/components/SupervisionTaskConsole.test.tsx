@@ -233,11 +233,15 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
   });
 
-  it('hides the toggle for unresolved, server-shared, and sub-session-shared scopes', () => {
+  it('hides the toggle for unresolved and sub-session-shared scopes, shows it for a whole-server share that covers the Brain', () => {
     const view = render(<SupervisionTaskConsoleToggle visibility={{ session: null, shareTargetKind: 'main', sharedAccessRole: 'viewer' }} open={false} onToggle={() => {}} />);
     expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
 
-    view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: 'server', sharedAccessRole: 'participant' }} open={false} onToggle={() => {}} />);
+    for (const sharedAccessRole of ['participant', 'viewer'] as const) {
+      view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: 'server', sharedAccessRole }} open={false} onToggle={() => {}} />);
+      expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).not.toBeNull();
+    }
+    view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: 'server', sharedAccessRole: null }} open={false} onToggle={() => {}} />);
     expect(screen.queryByRole('button', { name: 'supervision_task_console.toggle' })).toBeNull();
 
     view.rerender(<SupervisionTaskConsoleToggle visibility={{ session: { role: 'brain' }, shareTargetKind: 'subsession', sharedAccessRole: 'viewer' }} open={false} onToggle={() => {}} />);
@@ -1203,6 +1207,10 @@ describe('SupervisionTaskConsole', () => {
     expect(screen.getByText('supervision_task_console.loading')).toBeTruthy();
     view.rerender(<SupervisionTaskConsoleView state={state({ tasks: {}, assignments: {} })} mobile={false} now={NOW} onClose={() => {}} onNavigateSession={() => {}} />);
     expect(screen.getByText('supervision_task_console.empty')).toBeTruthy();
+    // Engine off but pairs on disk: explain it instead of a misleading "no tasks".
+    view.rerender(<SupervisionTaskConsoleView state={state({ tasks: {}, assignments: {}, inertPairs: 4 })} mobile={false} now={NOW} onClose={() => {}} onNavigateSession={() => {}} />);
+    expect(screen.getByText('supervision_task_console.inert_pairs')).toBeTruthy();
+    expect(screen.queryByText('supervision_task_console.empty')).toBeNull();
     view.rerender(<SupervisionTaskConsoleView state={state({ phase: SUPERVISION_TASK_CONSOLE_PHASE.ERROR })} mobile={false} now={NOW} onClose={() => {}} onNavigateSession={() => {}} />);
     expect(screen.getByRole('alert').textContent).toContain('supervision_task_console.error');
     view.rerender(<SupervisionTaskConsoleView state={state({ phase: SUPERVISION_TASK_CONSOLE_PHASE.RESYNCING, resyncReason: 'version_gap' })} mobile={false} now={NOW} onClose={() => {}} onNavigateSession={() => {}} />);

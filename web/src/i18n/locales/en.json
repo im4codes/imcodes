@@ -3859,6 +3859,7 @@
     "recovering": "Projection gap detected. Requesting a full resync…",
     "error": "The live task stream is unavailable.",
     "empty": "No supervised tasks yet.",
+    "inert_pairs": "Automatic supervision is off for this project, so its {{count}} stored task pair(s) are not tracked or listed here. Turn supervision on in the Brain session settings to see them.",
     "unsupported": "Unsupported task status. Resynchronizing safely.",
     "unknown_status": "Unknown status",
     "group": {

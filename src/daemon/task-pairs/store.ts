@@ -407,9 +407,22 @@ export class TaskPairStore {
     return rows.map((row) => this.#hydrate(row));
   }
 
-  /** Every pair of a project, newest first (for the console). */
+  /**
+   * The console window of a project, newest first: EVERY open pair plus the
+   * `limit` most recently finished ones. A plain `LIMIT` by recency let a
+   * long-quiet working pair fall out of the window behind a long history of
+   * finished pairs, so the console silently omitted live work.
+   */
+  #windowQuery(columns: string): string {
+    const terminal = TASK_PAIR_TERMINAL_STATUSES.map((status) => `'${status}'`).join(',');
+    return `SELECT ${columns} FROM task_pairs WHERE project = ? AND (status NOT IN (${terminal}) OR task_id IN (`
+      + `SELECT task_id FROM task_pairs WHERE project = ? AND status IN (${terminal}) ORDER BY updated_at DESC LIMIT ?)) `
+      + 'ORDER BY updated_at DESC';
+  }
+
+  /** Every open pair of a project plus its most recent finished ones, newest first (for the console). */
   listPairs(project: string, limit = 200): StoredTaskPair[] {
-    const rows = this.#db.prepare('SELECT * FROM task_pairs WHERE project = ? ORDER BY updated_at DESC LIMIT ?').all(project, limit) as Array<Record<string, unknown>>;
+    const rows = this.#db.prepare(this.#windowQuery('*')).all(project, project, limit) as Array<Record<string, unknown>>;
     return rows.map((row) => this.#hydrate(row));
   }
 
@@ -418,8 +431,14 @@ export class TaskPairStore {
    * parsing any pair JSON (the console delta path only needs set membership).
    */
   listPairWindowIds(project: string, limit = 200): string[] {
-    const rows = this.#db.prepare('SELECT task_id FROM task_pairs WHERE project = ? ORDER BY updated_at DESC LIMIT ?').all(project, limit) as Array<{ task_id: string }>;
+    const rows = this.#db.prepare(this.#windowQuery('task_id')).all(project, project, limit) as Array<{ task_id: string }>;
     return rows.map((row) => String(row.task_id));
+  }
+
+  /** How many pairs the store holds for a project, any status (one indexed count, no JSON parsing). */
+  countPairs(project: string): number {
+    const row = this.#db.prepare('SELECT COUNT(*) AS n FROM task_pairs WHERE project = ?').get(project) as { n?: number } | undefined;
+    return Number(row?.n ?? 0);
   }
 
   /** Queued pairs of a project (few); the console recomputes their queue positions. */

@@ -10,8 +10,9 @@ export interface SupervisionTaskConsoleVisibilityInput {
 /**
  * Viewing the task console never promotes a session to Brain. The original
  * Brain can always view it, while viewers and participants of a shared main
- * session may also inspect its read-only projection. Server-wide and
- * sub-session shares stay excluded; mutation permissions remain independent.
+ * session or of a whole-server share (which covers the Brain) may also inspect
+ * its read-only projection. Sub-session shares stay excluded; mutation
+ * permissions remain independent.
  */
 export function canViewSupervisionTaskConsole(
   input: SupervisionTaskConsoleVisibilityInput,
@@ -20,5 +21,5 @@ export function canViewSupervisionTaskConsole(
   if (input.shareTargetKind === null) return true;
   const hasSharedReadAccess = input.sharedAccessRole === 'viewer'
     || input.sharedAccessRole === 'participant';
-  return input.shareTargetKind === 'main' && hasSharedReadAccess;
+  return (input.shareTargetKind === 'main' || input.shareTargetKind === 'server') && hasSharedReadAccess;
 }

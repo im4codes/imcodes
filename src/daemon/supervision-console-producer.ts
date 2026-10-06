@@ -1155,6 +1155,11 @@ export class SupervisionConsoleProducer {
       pools: pairRows ? this.readPoolsIncremental(scope.projectName) : this.readPools(scope.projectName),
       ...(pairRevision !== undefined ? { pairRevision } : {}),
     };
+    // No pair rows means the pairs engine is off for this project (the legacy
+    // engine is retired). Pairs may still sit on disk: say so rather than
+    // present a silent empty list.
+    const inertPairs = pairRows ? 0 : getTaskPairStore().countPairs(scope.projectName);
+    if (inertPairs > 0) snapshot.inertPairs = inertPairs;
     if (pairRows && pairDelta) this.#pairSnapshotEntries.set(snapshot, pairRows.entries);
     return snapshot;
   }

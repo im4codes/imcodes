@@ -67,6 +67,8 @@ export interface SupervisionTaskConsoleReducerState {
    * applying one replaced a cancelled pair row with a `delegated` legacy row.)
    */
   pairProjection: boolean;
+  /** Stored pairs of an engine-off project that the daemon does not track (0 when none). */
+  inertPairs: number;
   tasks: Readonly<Record<string, SupervisionTaskConsoleTaskRow>>;
   assignments: Readonly<Record<string, SupervisionTaskConsoleAssignmentRow>>;
   eventsByTask: Readonly<Record<string, readonly SupervisionTaskConsoleEventEvidence[]>>;
@@ -222,6 +224,7 @@ export function createSupervisionTaskConsoleState(
     projectionEpoch: cursor.projectionEpoch,
     pairRevision: null,
     pairProjection: false,
+    inertPairs: 0,
     tasks: {},
     assignments: {},
     eventsByTask: {},
@@ -272,6 +275,7 @@ function applySnapshot(
     projectionEpoch: snapshot.projectionEpoch,
     pairRevision: typeof snapshot.pairRevision === 'number' ? snapshot.pairRevision : null,
     pairProjection: typeof snapshot.pairRevision === 'number' || snapshot.tasks.some((task) => Boolean(task.pair)),
+    inertPairs: Number.isInteger(snapshot.inertPairs) && (snapshot.inertPairs ?? 0) > 0 ? snapshot.inertPairs! : 0,
     tasks,
     assignments,
     eventsByTask: {},

@@ -3859,6 +3859,7 @@
     "recovering": "Se detectó una brecha. Solicitando resincronización completa…",
     "error": "El flujo de tareas en vivo no está disponible.",
     "empty": "Aún no hay tareas supervisadas.",
+    "inert_pairs": "La supervisión automática está desactivada en este proyecto, por lo que sus {{count}} pares de tareas guardados no se rastrean ni se listan aquí. Activa la supervisión en los ajustes de la sesión Brain para verlos.",
     "unsupported": "Estado no compatible. Resincronizando de forma segura.",
     "unknown_status": "Estado desconocido",
     "group": {

@@ -643,7 +643,9 @@ export function SupervisionTaskConsoleView(props: {
         {bodyState === 'recovery' && <div class="supervision-task-console-state is-recovery" role="status">{t('supervision_task_console.recovering')}</div>}
         {bodyState === 'unsupported' && <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.unsupported')}</div>}
         {bodyState === 'error' && <div class="supervision-task-console-state is-error" role="alert">{t('supervision_task_console.error')}</div>}
-        {bodyState === 'empty' && <div class="supervision-task-console-state">{t('supervision_task_console.empty')}</div>}
+        {bodyState === 'empty' && (props.state.inertPairs > 0
+          ? <div class="supervision-task-console-state is-inert" role="status">{t('supervision_task_console.inert_pairs', { count: props.state.inertPairs })}</div>
+          : <div class="supervision-task-console-state">{t('supervision_task_console.empty')}</div>)}
         {bodyState === 'ready' && <section
           id={`task-console-panel-${activeTab}`} role="tabpanel" aria-labelledby={`task-console-tab-${activeTab}`}
           class="supervision-task-console-grid" data-tab={activeTab} tabIndex={0}

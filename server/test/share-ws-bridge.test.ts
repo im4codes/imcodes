@@ -865,7 +865,7 @@ describe('WsBridge share-scoped sockets', () => {
     });
   });
 
-  it('bridges task-console reads only for shared MAIN viewers and participants', async () => {
+  it('bridges task-console reads to shared MAIN and whole-server viewers/participants, never to sub-session or other-tab shares', async () => {
     const bridge = WsBridge.get(serverId);
     const mainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
     bridge.setShareCoverageResolverForTests(async ({ target }) => coverage(target, 'viewer', now));
@@ -895,12 +895,28 @@ describe('WsBridge share-scoped sockets', () => {
       target: serverTarget,
       snapshot: coverage(serverTarget, 'viewer', now),
     });
+    // The owner's real-world case: a whole-server PARTICIPANT (owner-equivalent
+    // operator) who could previously subscribe but never got a frame back.
+    const serverParticipant = new MockWs();
+    bridge.handleShareBrowserConnection(serverParticipant as never, 'server-participant-user', db, {
+      ticketId: 'task-console-server-participant',
+      target: serverTarget,
+      snapshot: { ...coverage(serverTarget, 'participant', now), serverParticipantAuthority: true },
+    });
     const subTarget: ShareTarget = { kind: 'subsession', serverId, subSessionId: 'child' };
     const subShare = new MockWs();
     bridge.handleShareBrowserConnection(subShare as never, 'sub-share-user', db, {
       ticketId: 'task-console-sub',
       target: subTarget,
       snapshot: coverage(subTarget, 'participant', now),
+    });
+    // A MAIN share of ANOTHER project's Brain must not read this project's pairs.
+    const otherMainTarget: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_other_brain' };
+    const otherMain = new MockWs();
+    bridge.handleShareBrowserConnection(otherMain as never, 'other-main-user', db, {
+      ticketId: 'task-console-other-main',
+      target: otherMainTarget,
+      snapshot: coverage(otherMainTarget, 'participant', now),
     });
 
     const subscribe = {
@@ -913,33 +929,45 @@ describe('WsBridge share-scoped sockets', () => {
     viewer.emit('message', JSON.stringify(subscribe));
     participant.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'participant-subscription' }));
     serverShare.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'server-subscription' }));
+    serverParticipant.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'server-participant-subscription' }));
     subShare.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'subsession-subscription' }));
+    otherMain.emit('message', JSON.stringify({ ...subscribe, subscriptionId: 'other-main-subscription' }));
     await flushAsync();
 
     expect(daemon.sentJson.filter((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE))
       .toEqual(expect.arrayContaining([
         expect.objectContaining({ subscriptionId: 'task-console-subscription' }),
         expect.objectContaining({ subscriptionId: 'participant-subscription' }),
+        expect.objectContaining({ subscriptionId: 'server-subscription' }),
+        expect.objectContaining({ subscriptionId: 'server-participant-subscription' }),
       ]));
     expect(daemon.sentJson.some((msg) => (
-      msg.subscriptionId === 'server-subscription' || msg.subscriptionId === 'subsession-subscription'
+      msg.subscriptionId === 'subsession-subscription' || msg.subscriptionId === 'other-main-subscription'
     ))).toBe(false);
 
-    daemon.emit('message', JSON.stringify({
-      type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
-      subscriptionId: 'task-console-subscription',
-      scope: subscribe.scope,
-      projectionVersion: 0,
-      tasks: [],
-      assignments: [],
-      pools: [],
-    }));
+    const frames = [
+      { type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT, tasks: [], assignments: [], pools: [] },
+      { type: SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA, upserts: [], removals: [] },
+      { type: SUPERVISION_TASK_CONSOLE_MSG.UNAVAILABLE, reason: 'unauthorized' },
+    ];
+    for (const frame of frames) {
+      daemon.emit('message', JSON.stringify({
+        ...frame,
+        subscriptionId: 'task-console-subscription',
+        scope: subscribe.scope,
+        projectionVersion: 0,
+      }));
+    }
     await flushAsync();
 
-    expect(viewer.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(true);
-    expect(participant.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(true);
-    expect(serverShare.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(false);
-    expect(subShare.sentJson.some((msg) => msg.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT)).toBe(false);
+    for (const type of frames.map((frame) => frame.type)) {
+      for (const receiver of [viewer, participant, serverShare, serverParticipant]) {
+        expect(receiver.sentJson.some((msg) => msg.type === type)).toBe(true);
+      }
+      for (const blocked of [subShare, otherMain]) {
+        expect(blocked.sentJson.some((msg) => msg.type === type)).toBe(false);
+      }
+    }
   });
 
   it('persists and broadcasts share discussion comments without daemon relay', async () => {

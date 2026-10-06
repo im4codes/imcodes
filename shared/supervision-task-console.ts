@@ -632,6 +632,12 @@ export interface SupervisionTaskConsoleSnapshot extends SupervisionTaskConsoleCu
    * rows are at. The next PAIR_DELTA must carry exactly `pairRevision + 1`.
    */
   pairRevision?: number;
+  /**
+   * Engine-off project whose task-pair store still holds this many pairs: they
+   * are neither tracked nor listed, so the console says so instead of a silent
+   * empty list. Absent (never 0) when there are none or the engine is on.
+   */
+  inertPairs?: number;
 }
 
 /** One pair's summary row plus its participant rows (a full replacement of that pair). */
