@@ -528,6 +528,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
     <div
       data-testid={`session-pane-${session.name}`}
       data-active-dispatch-id={session.sharedState?.activeDispatchId ?? ''}
+      data-session-state={session.state ?? ''}
       data-supervision-mode={session.supervisionMode ?? ''}
       data-share-target-kind={session.sharedState?.targetKind ?? ''}
       data-can-share={String(Boolean(onShareSession))}
@@ -2919,6 +2920,57 @@ describe('App shell', () => {
     });
 
     expect(ws.requestSessionList).toHaveBeenCalledTimes(1);
+  }, 20_000);
+
+  it('releases a main session stuck "working" when the daemon answers an append with the stale-turn error (older daemon), and leaves an accepted ack alone', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+
+    const { App } = await importApp();
+    render(<App />);
+
+    const ws = await getActiveWsClient();
+    await act(async () => {
+      ws.emit({
+        type: 'session_list',
+        sessions: [{
+          name: 'deck_alpha_brain',
+          project: 'Alpha',
+          role: 'brain',
+          agentType: 'codex-sdk',
+          state: 'running',
+          runtimeType: 'transport',
+        }],
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-session-state')).toBe('running');
+    });
+
+    // The new daemon hands a deferred append to the session queue and acks it
+    // as accepted: that must not flip anything.
+    await act(async () => {
+      ws.emit({ type: 'command.ack', commandId: 'append-1', status: 'accepted', session: 'deck_alpha_brain' });
+    });
+    expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-session-state')).toBe('running');
+
+    // An older daemon still answers with the stale-turn error. The browser must
+    // not stay "working" with queued rows behind a turn that is gone.
+    ws.requestSessionList.mockClear();
+    await act(async () => {
+      ws.emit({
+        type: 'command.ack',
+        commandId: 'append-2',
+        status: 'error',
+        error: 'The active turn already finished',
+        session: 'deck_alpha_brain',
+      });
+    });
+    await waitFor(() => {
+      expect(screen.getByTestId('session-pane-deck_alpha_brain').getAttribute('data-session-state')).toBe('idle');
+    });
+    expect(ws.requestSessionList).toHaveBeenCalled();
   }, 20_000);
 
   it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {

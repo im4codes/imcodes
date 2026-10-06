@@ -5803,13 +5803,16 @@ async function handleAppendQueuedTransportMessages(cmd: Record<string, unknown>,
     const result = await runtime.appendPendingMessagesToActiveTurn(
       clientMessageIds, commandId, undefined, { allowDispatchAsNewTurn: true },
     );
-    if (result.status === 'dispatched_as_new_turn') {
-      // No turn was active by the time the runtime looked; the pending queue
-      // was dispatched as a fresh turn instead of appended in-place. This is
-      // success from the caller's point of view — the queued messages are on
-      // their way — so ack normally and broadcast the now-accurate state
-      // (the drain already flipped `sending`/`pendingCount`) instead of the
-      // stale "already finished" error this closure used to return.
+    if (result.status === 'dispatched_as_new_turn' || result.status === 'deferred') {
+      // No turn was active by the time the runtime looked (or the provider
+      // reported the turn gone); the pending queue was dispatched as a fresh
+      // turn instead of appended in-place. `deferred` is the same hand-off
+      // when the runtime still owns a dispatch that has not settled: the rows
+      // stay queued and drain the moment it settles. This is success from the
+      // caller's point of view — the queued messages are on their way — so ack
+      // normally and broadcast the now-accurate state (the drain already
+      // flipped `sending`/`pendingCount`) instead of the stale "already
+      // finished" error this closure used to return.
       const queuePayload = buildTransportQueueSnapshotPayload(sessionName, 'command_handler');
       timelineEmitter.emit(sessionName, 'session.state', {
         state: runtime.pendingCount > 0 ? 'queued' : (runtime.sending ? 'running' : 'idle'),

@@ -5565,6 +5565,43 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
   });
 
+  it('acks an append as accepted (no "already finished" error) when the runtime hands the rows to the session queue because a dispatch is still unsettled', async () => {
+    // The provider said the append target is gone but the runtime still owns a
+    // dispatch it must not duplicate. The rows stay queued and drain when that
+    // dispatch settles, so this is a successful hand-off, never the old
+    // "The active turn already finished" rejection that left the user stuck.
+    const appendPendingMessagesToActiveTurn = vi.fn().mockResolvedValue({ status: 'deferred' });
+    getTransportRuntimeMock.mockReturnValue({
+      appendPendingMessagesToActiveTurn,
+      rehydratePendingFromStore: vi.fn(),
+      pendingEntries: [{ clientMessageId: 'append-deferred', text: 'wait for the dispatch to settle' }],
+      pendingCount: 1,
+      sending: true,
+    });
+
+    handleWebCommand({
+      type: TRANSPORT_QUEUE_COMMANDS.APPEND_MESSAGES,
+      sessionName: 'deck_transport_brain',
+      clientMessageIds: ['append-deferred'],
+      commandId: 'cmd-append-deferred',
+    }, serverLink as any);
+    await flushAsync();
+
+    expect(appendPendingMessagesToActiveTurn).toHaveBeenCalledWith(
+      ['append-deferred'], 'cmd-append-deferred', undefined, { allowDispatchAsNewTurn: true },
+    );
+    expect(emitMock).toHaveBeenCalledWith(
+      'deck_transport_brain',
+      'session.state',
+      expect.objectContaining({ state: 'queued' }),
+      expect.any(Object),
+    );
+    expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+      commandId: 'cmd-append-deferred', status: 'accepted',
+    }));
+    expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({ status: 'error' }));
+  });
+
   it('carries the whole recipient-gated queue authority on the not-found ack itself', async () => {
     // The snapshot used to travel ONLY on a best-effort timeline session.state.
     // command.ack is the reliable, replayable frame, so a browser that loses the

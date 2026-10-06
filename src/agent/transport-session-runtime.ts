@@ -227,6 +227,13 @@ export type AppendQueuedMessagesResult =
   // error and leave the queue stuck, the pending queue was dispatched as a
   // fresh turn instead.
   | { status: 'dispatched_as_new_turn' }
+  // The provider reported the in-turn append target gone, but this runtime
+  // still owns a dispatch that has not settled (for example it is waiting for
+  // provider admission), so a second turn must not be started now. The rows
+  // stay in the FIFO untouched and drain through the normal settle path as soon
+  // as that dispatch ends -- this is a successful hand-off to the session-level
+  // queue, not a failure.
+  | { status: 'deferred' }
   | { status: 'stale' | 'rejected' | 'retry' | 'unsupported' | 'not_found' | 'attachments_unsupported' | 'control_unsupported' };
 
 type SdkTurnLostRecoveryAttemptStatus =
@@ -2159,6 +2166,14 @@ export class TransportSessionRuntime implements SessionRuntime {
       this._activeDispatchCancelled = false;
       this._activeDispatchStaleRecoveryStarted = false;
     }
+    if (this.reconcileOrphanedOpenTools(`idle-drain:${reason}`, false) > 0
+      && this._pendingMessages.length === 0
+      && this.isInProgressStatus(this._status)
+      && !this.hasActiveTurnWork()) {
+      // Nothing is queued and nothing is running: leave "working" behind.
+      this.setStatus('idle');
+      return false;
+    }
     const activity = this.getActivitySnapshot();
     if (activity.blockingWorkCount > 0) {
       logger.warn(
@@ -2190,6 +2205,53 @@ export class TransportSessionRuntime implements SessionRuntime {
 
   private hasActiveTurnWork(): boolean {
     return this.getActivitySnapshot().blockingWorkCount > 0;
+  }
+
+  /**
+   * True while this runtime itself owns a dispatch or retry that has not
+   * settled. Unlike {@link hasLocalActiveTurnWork} it ignores open tool-call
+   * entries: those are exactly what can outlive their turn.
+   */
+  private hasLocalDispatchInFlight(): boolean {
+    return Boolean(this._sending || this._activeTurn)
+      || this._activeDispatchEntries.length > 0
+      || this._recoverableRetryTimer !== null
+      || this._capacityRetryTimer !== null;
+  }
+
+  /** The provider's own snapshot is current and reports no work of any kind. */
+  private providerReportsNoActiveWork(): boolean {
+    const snapshot = this.getProviderActiveWorkSnapshot();
+    if (!snapshot || (snapshot.status ?? 'current') !== 'current') return false;
+    return snapshot.activeWorkCount === 0
+      && snapshot.activeToolCount === 0
+      && snapshot.busyReasons.length === 0;
+  }
+
+  /**
+   * Reconcile tool-call entries that outlived their turn.
+   *
+   * A tool event that lands after its turn was settled (a stop, a late
+   * provider callback) is never followed by a terminal event, so it kept
+   * `open_tool_call` blocking forever: every queued message then sat behind
+   * work no provider was doing. This only acts when nothing local is in flight
+   * -- a real running turn always has a local dispatch -- and, unless the
+   * caller already holds the provider's own "no active turn" answer, only when
+   * the provider's snapshot independently reports no work. Anything else is
+   * left untouched.
+   */
+  private reconcileOrphanedOpenTools(reason: string, providerAlreadyReportedIdle: boolean): number {
+    if (this._openTools.size === 0 || this.hasLocalDispatchInFlight()) return 0;
+    if (!providerAlreadyReportedIdle && !this.providerReportsNoActiveWork()) return 0;
+    const openToolCount = this._openTools.size;
+    const closed = this.closeOpenTools('stale', 'provider_stale');
+    if (closed > 0) {
+      logger.warn(
+        { sessionKey: this.sessionKey, reason, openToolCount, closed, pendingCount: this._pendingMessages.length },
+        'transport runtime closed tool-call entries orphaned by a settled turn so queued messages are not pinned behind them',
+      );
+    }
+    return closed;
   }
 
   private hasLocalActiveTurnWork(): boolean {
@@ -3173,9 +3235,23 @@ export class TransportSessionRuntime implements SessionRuntime {
     }
     if (admission !== AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED) {
       restoreReservation();
-      return {
-        status: admission === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED ? 'unsupported' : 'stale',
-      };
+      if (admission === AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED) return { status: 'unsupported' };
+      // The provider says there is no turn to append to. This runtime still
+      // believed one was active, so its activity state was stale -- and the
+      // session-level queue is not tied to that turn. For the external
+      // (user-initiated) entry point: reconcile the stale state against the
+      // provider's answer, then send the queue as a fresh turn instead of
+      // failing and leaving the rows stuck. The internal scheduled flush does
+      // not opt in and keeps its "stale means defer to the idle drain" behavior.
+      if (options.allowDispatchAsNewTurn) {
+        this.reconcileOrphanedOpenTools('provider-stale-append', true);
+        if (this._drainPending()) return { status: 'dispatched_as_new_turn' };
+        // Still blocked: this runtime owns a dispatch that has not settled. Its
+        // terminal callback drains the untouched FIFO, so report a hand-off to
+        // the queue rather than an error.
+        if (this.hasLocalDispatchInFlight()) return { status: 'deferred' };
+      }
+      return { status: 'stale' };
     }
 
     // Provider acceptance is irreversible, but queue finalization/history

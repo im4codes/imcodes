@@ -793,6 +793,172 @@ describe('TransportSessionRuntime', () => {
     expect(mock.provider.send).toHaveBeenCalledTimes(2);
   });
 
+  describe('a user append never dies on a provider-stale / orphaned-activity race (158 jdzs: "The active turn already finished")', () => {
+    // The exact 158 shape: the turn settled, then a late tool event arrived with
+    // no turn to close it, so `open_tool_call` blocks forever while the provider
+    // (correctly) says there is no active turn to append to.
+    async function settleTurnThenOrphanATool(): Promise<void> {
+      runtime.send('first turn', 'turn-1');
+      await waitForProviderSendCount(mock.provider, 1);
+      mock.fireComplete('sess-1');
+      await flushDispatch();
+      mock.fireTool('sess-1', { id: 'late-tool', name: 'Bash', status: 'running' });
+      expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+    }
+
+    function sentTexts(): string[] {
+      return (mock.provider.send as ReturnType<typeof vi.fn>).mock.calls
+        .map((call) => (call[1] as { userMessage?: string }).userMessage ?? '');
+    }
+
+    beforeEach(() => {
+      mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
+      mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.STALE);
+    });
+
+    it('reconciles the orphaned tool and sends the queued messages as a new turn, exactly once and in FIFO order', async () => {
+      await settleTurnThenOrphanATool();
+      expect(runtime.send('first queued', 'q-1')).toBe('queued');
+      expect(runtime.send('second queued', 'q-2')).toBe('queued');
+      expect(runtime.send('third queued', 'q-3')).toBe('queued');
+
+      const result = await runtime.appendPendingMessagesToActiveTurn(
+        ['q-2'], 'append-orphan', undefined, { allowDispatchAsNewTurn: true },
+      );
+      await flushDispatch();
+
+      expect(result.status).toBe('dispatched_as_new_turn');
+      expect(runtime.pendingCount).toBe(0);
+      expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
+      // Every queued message reached the provider exactly once, in FIFO order.
+      const delivered = sentTexts().slice(1).join('\n\n');
+      expect(delivered.match(/first queued/g)).toHaveLength(1);
+      expect(delivered.match(/second queued/g)).toHaveLength(1);
+      expect(delivered.match(/third queued/g)).toHaveLength(1);
+      expect(delivered.indexOf('first queued')).toBeLessThan(delivered.indexOf('second queued'));
+      expect(delivered.indexOf('second queued')).toBeLessThan(delivered.indexOf('third queued'));
+      expect(mock.provider.cancel).not.toHaveBeenCalled();
+    });
+
+    it('does not start a second turn while this runtime still owns an unsettled dispatch (pre-admission window)', async () => {
+      runtime.send('foreground work', 'foreground-inflight');
+      await waitForProviderSendCount(mock.provider, 1);
+      expect(runtime.send('queued behind work', 'q-inflight')).toBe('queued');
+
+      const result = await runtime.appendPendingMessagesToActiveTurn(
+        ['q-inflight'], 'append-inflight', undefined, { allowDispatchAsNewTurn: true },
+      );
+
+      // Not an error and not a duplicate turn: the row stays queued untouched
+      // and drains when the in-flight dispatch settles.
+      expect(result).toEqual({ status: 'deferred' });
+      expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      expect(runtime.pendingEntries).toEqual([{ clientMessageId: 'q-inflight', text: 'queued behind work' }]);
+      mock.fireComplete('sess-1');
+      await waitForProviderSendCount(mock.provider, 2);
+      expect(sentTexts()[1]).toContain('queued behind work');
+      expect(runtime.pendingCount).toBe(0);
+    });
+
+    it('keeps the internal scheduled-flush contract: without the opt-in a stale provider still defers, nothing is force-dispatched', async () => {
+      await settleTurnThenOrphanATool();
+      expect(runtime.send('internal flush row', 'q-internal')).toBe('queued');
+
+      const result = await runtime.appendPendingMessagesToActiveTurn(['q-internal'], 'append-internal');
+
+      expect(result).toEqual({ status: 'stale' });
+      expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      expect(runtime.pendingEntries).toEqual([{ clientMessageId: 'q-internal', text: 'internal flush row' }]);
+    });
+
+    it('still reports unsupported (and keeps the queue) when the provider cannot append, even with the opt-in', async () => {
+      mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.UNSUPPORTED);
+      await settleTurnThenOrphanATool();
+      expect(runtime.send('stays queued', 'q-unsupported')).toBe('queued');
+
+      const result = await runtime.appendPendingMessagesToActiveTurn(
+        ['q-unsupported'], 'append-unsupported', undefined, { allowDispatchAsNewTurn: true },
+      );
+
+      expect(result).toEqual({ status: 'unsupported' });
+      expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      expect(runtime.pendingEntries).toEqual([{ clientMessageId: 'q-unsupported', text: 'stays queued' }]);
+    });
+
+    it('does not dispatch attachment or control rows as a new turn on this path', async () => {
+      await settleTurnThenOrphanATool();
+      expect(runtime.send('has attachment', 'q-attach', [
+        { id: 'att-1', daemonPath: '/tmp/a.png', mime: 'image/png' } as never,
+      ])).toBe('queued');
+
+      const result = await runtime.appendPendingMessagesToActiveTurn(
+        ['q-attach'], 'append-attach', undefined, { allowDispatchAsNewTurn: true },
+      );
+
+      // Attachments are rejected before the provider is ever asked, exactly as before.
+      expect(result.status).toBe('attachments_unsupported');
+      expect(mock.provider.notifyActiveDelegation).not.toHaveBeenCalled();
+      expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      expect(runtime.pendingEntries).toHaveLength(1);
+    });
+
+    describe('periodic idle drain (plain sends and internal rows stuck behind the same orphan)', () => {
+      const IDLE_SNAPSHOT = {
+        status: 'current', activeWorkCount: 0, activeToolCount: 0, busyReasons: [] as string[], updatedAt: 0,
+      };
+
+      it('drains the queue once the provider independently reports no work', async () => {
+        await settleTurnThenOrphanATool();
+        mock.provider.getActiveWorkSnapshot = vi.fn(() => ({ ...IDLE_SNAPSHOT, updatedAt: Date.now() })) as never;
+        expect(runtime.send('plain user send', 'q-plain')).toBe('queued');
+
+        expect(runtime.drainPendingIfIdle('transport-queue-diagnostics')).toBe(true);
+        await flushDispatch();
+
+        expect(sentTexts().at(-1)).toContain('plain user send');
+        expect(runtime.pendingCount).toBe(0);
+      });
+
+      it('clears a stuck "working" status when nothing is queued', async () => {
+        await settleTurnThenOrphanATool();
+        mock.provider.getActiveWorkSnapshot = vi.fn(() => ({ ...IDLE_SNAPSHOT, updatedAt: Date.now() })) as never;
+        runtime.drainPendingIfIdle('transport-queue-diagnostics');
+        expect(runtime.getDiagnosticSnapshot().busyReasons).not.toContain('open_tool_call');
+        expect(runtime.getStatus()).toBe('idle');
+      });
+
+      it('leaves the tool open when the provider has no snapshot (cannot prove it is orphaned)', async () => {
+        await settleTurnThenOrphanATool();
+        expect(runtime.send('must wait', 'q-nosnapshot')).toBe('queued');
+        expect(runtime.drainPendingIfIdle('transport-queue-diagnostics')).toBe(false);
+        expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+        expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      });
+
+      it('leaves the tool open when the provider still reports work (a provider-initiated turn)', async () => {
+        await settleTurnThenOrphanATool();
+        mock.provider.getActiveWorkSnapshot = vi.fn(() => ({
+          status: 'current', activeWorkCount: 1, activeToolCount: 1, busyReasons: ['provider_tool_item'], updatedAt: Date.now(),
+        })) as never;
+        expect(runtime.send('must wait', 'q-busy')).toBe('queued');
+        expect(runtime.drainPendingIfIdle('transport-queue-diagnostics')).toBe(false);
+        expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      });
+
+      it('never closes a tool that belongs to a turn this runtime dispatched', async () => {
+        mock.provider.getActiveWorkSnapshot = vi.fn(() => ({ ...IDLE_SNAPSHOT, updatedAt: Date.now() })) as never;
+        runtime.send('running turn', 'turn-live');
+        await waitForProviderSendCount(mock.provider, 1);
+        mock.fireTool('sess-1', { id: 'live-tool', name: 'Bash', status: 'running' });
+        expect(runtime.send('queued behind live', 'q-live')).toBe('queued');
+
+        expect(runtime.drainPendingIfIdle('transport-queue-diagnostics')).toBe(false);
+        expect(runtime.getDiagnosticSnapshot().busyReasons).toContain('open_tool_call');
+        expect(mock.provider.send).toHaveBeenCalledTimes(1);
+      });
+    });
+  });
+
   it('keeps a retry supervision row durable without blocking a trailing ordinary message, repeated ticks, or recovery', async () => {
     mock.provider.capabilities.activeDelegationNotification = AGENT_DELEGATION_ACTIVE_NOTIFICATION_MODES.NATIVE;
     mock.provider.notifyActiveDelegation = vi.fn().mockResolvedValue(AGENT_DELEGATION_NOTIFICATION_RESULTS.DELIVERED);
