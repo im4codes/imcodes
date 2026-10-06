@@ -319,6 +319,73 @@ describe('Terminal streaming integration', () => {
     expect(daemonWs.sent.filter((s) => s.includes('cmd-once'))).toHaveLength(1);
   });
 
+  // ── Replay lock ──────────────────────────────────────────────────────────
+  // A daemon reconnect must never hand the daemon a command it already accepted.
+  async function reconnectDaemon(bridge: WsBridge, serverId: string): Promise<MockWs> {
+    const next = new MockWs();
+    bridge.handleDaemonConnection(next as never, makeDb(), {} as never);
+    next.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'valid-token' }));
+    await flush();
+    return next;
+  }
+
+  it('an acked session.send is not delivered again when the daemon reconnects', async () => {
+    const { serverId, bridge, daemonWs, browserWs } = await setupStreamingBridge();
+    browserWs.emit('message', JSON.stringify({ type: 'session.send', session: 'deck_x_brain', text: '/model a', commandId: 'cmd-acked' }));
+    await flush();
+    expect(daemonWs.sent.filter((s) => s.includes('cmd-acked'))).toHaveLength(1);
+
+    daemonWs.emit('message', JSON.stringify({ type: 'command.ack', commandId: 'cmd-acked', session: 'deck_x_brain', status: 'accepted' }));
+    await flush();
+
+    daemonWs.close();
+    await flush();
+    const next = await reconnectDaemon(bridge, serverId);
+
+    expect(next.sent.filter((s) => s.includes('cmd-acked'))).toHaveLength(0);
+  });
+
+  it('a session.send whose ack was lost is retried at most once per reconnect and carries the bridge-retry marker', async () => {
+    const { serverId, bridge, daemonWs, browserWs } = await setupStreamingBridge();
+    browserWs.emit('message', JSON.stringify({ type: 'session.send', session: 'deck_x_brain', text: 'hi', commandId: 'cmd-unacked' }));
+    await flush();
+
+    daemonWs.close();
+    await flush();
+    const next = await reconnectDaemon(bridge, serverId);
+
+    const resent = next.sent.filter((s) => s.includes('cmd-unacked'));
+    expect(resent).toHaveLength(1);
+    // The daemon relies on this marker to re-ack instead of erroring/duplicating.
+    expect(JSON.parse(resent[0]!)).toMatchObject({ commandId: 'cmd-unacked', __bridgeRetry: true });
+  });
+
+  it('commands flushed on one reconnect are not flushed again on the next', async () => {
+    const serverId = `flushonce-${Math.random().toString(36).slice(2)}`;
+    const bridge = WsBridge.get(serverId);
+    const browserWs = new MockWs();
+    bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb());
+    browserWs.emit('message', JSON.stringify({ type: 'get_sessions', marker: 'queued-once' }));
+
+    const first = await reconnectDaemon(bridge, serverId);
+    expect(first.sent.filter((s) => s.includes('queued-once'))).toHaveLength(1);
+
+    first.close();
+    await flush();
+    const second = await reconnectDaemon(bridge, serverId);
+    expect(second.sent.filter((s) => s.includes('queued-once'))).toHaveLength(0);
+  });
+
+  it('a browser double-sending the same commandId reaches the daemon once', async () => {
+    const { daemonWs, browserWs } = await setupStreamingBridge();
+    const frame = JSON.stringify({ type: 'session.send', session: 'deck_x_brain', text: 'once', commandId: 'cmd-double' });
+    browserWs.emit('message', frame);
+    browserWs.emit('message', frame);
+    await flush();
+
+    expect(daemonWs.sent.filter((s) => s.includes('cmd-double'))).toHaveLength(1);
+  });
+
   it('daemon reconnect broadcasts daemon.reconnected to browsers', async () => {
     const { serverId, daemonWs, browserWs } = await setupStreamingBridge();
 

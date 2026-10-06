@@ -374,6 +374,7 @@ import {
   handleWebCommand,
   listSessionModelsNow,
   switchSessionModelNow,
+  resetSessionCommandDedupForTests,
   switchSessionThinkingNow,
   restartSessionNow,
   __invalidateTransportListModelsCacheForTests,
@@ -393,6 +394,8 @@ import {
 import {
   getTransportQueueStore,
   resetTransportQueueStoreForTests,
+  SESSION_COMMAND_LEDGER_TTL_MS,
+  TransportQueueStore,
 } from '../../src/daemon/transport-queue-store.js';
 
 const flushAsync = () => new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -3839,12 +3842,178 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(transportSend).toHaveBeenCalledTimes(1);
 
     // A restart empties every in-process map but keeps the sqlite ledger.
-    const { resetSessionCommandDedupForTests } = await import('../../src/daemon/command-handler.js');
     resetSessionCommandDedupForTests();
     handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'once', commandId: 'cmd-replay-restart' }, serverLink as any);
     await flushAsync();
 
     expect(transportSend).toHaveBeenCalledTimes(1);
+  });
+
+  // ── Replay lock ──────────────────────────────────────────────────────────
+  // A reconnect (server 502, pod hand-off, browser reload) can hand the daemon a
+  // command it accepted long ago. Executing it again re-runs a stale `/model`,
+  // re-sends old text, etc. These pin the durable ledger contract.
+  describe('replayed session.send commands', () => {
+    const replayAfterMs = 150 * 60 * 1000; // observed: replay 2.5h after the original
+    let nowSpy: ReturnType<typeof vi.spyOn> | null = null;
+    let claimSpy: ReturnType<typeof vi.spyOn> | null = null;
+    let realNow = 0;
+
+    beforeEach(() => {
+      realNow = Date.now();
+      nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    });
+
+    afterEach(() => {
+      nowSpy?.mockRestore();
+      nowSpy = null;
+      claimSpy?.mockRestore();
+      claimSpy = null;
+    });
+
+    const sendModel = (commandId: string, model: string) => handleWebCommand({
+      type: 'session.send',
+      session: 'deck_transport_brain',
+      text: `/model ${model}`,
+      commandId,
+    }, serverLink as any);
+
+    it('does not re-run a stale /model switch when the same command is replayed hours later', async () => {
+      const setAgentId = vi.fn();
+      getSessionMock.mockReturnValue({
+        name: 'deck_transport_brain',
+        projectName: 'transport',
+        role: 'brain',
+        agentType: 'copilot-sdk',
+        runtimeType: 'transport',
+        state: 'running',
+        requestedModel: 'gpt-5.4',
+      });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'provider-route-1', setAgentId });
+
+      sendModel('cmd-model-replay-1', 'gpt-5.4-mini');
+      await flushAsync();
+      expect(setAgentId).toHaveBeenCalledTimes(1);
+
+      // The user later switched to another model.
+      sendModel('cmd-model-replay-2', 'gpt-5.4');
+      await flushAsync();
+      expect(setAgentId).toHaveBeenLastCalledWith('gpt-5.4');
+      expect(setAgentId).toHaveBeenCalledTimes(2);
+
+      // Reconnect replays the FIRST command: it must not switch the model back.
+      nowSpy!.mockReturnValue(realNow + replayAfterMs);
+      sendModel('cmd-model-replay-1', 'gpt-5.4-mini');
+      await flushAsync();
+
+      expect(setAgentId).toHaveBeenCalledTimes(2);
+      expect(setAgentId).not.toHaveBeenLastCalledWith('gpt-5.4-mini');
+    });
+
+    it('replays arriving in a burst after a reconnect are each executed at most once', async () => {
+      const transportSend = vi.fn(() => 'sent');
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send: transportSend, pendingCount: 0 });
+      const ids = ['cmd-burst-a', 'cmd-burst-b', 'cmd-burst-c'];
+
+      for (const id of ids) {
+        handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: `text ${id}`, commandId: id }, serverLink as any);
+        await flushAsync();
+      }
+      expect(transportSend).toHaveBeenCalledTimes(3);
+
+      nowSpy!.mockReturnValue(realNow + replayAfterMs);
+      // Replay the whole history twice, in order, like a reconnect storm.
+      for (let round = 0; round < 2; round += 1) {
+        for (const id of ids) {
+          handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: `text ${id}`, commandId: id }, serverLink as any);
+          await flushAsync();
+        }
+      }
+      expect(transportSend).toHaveBeenCalledTimes(3);
+    });
+
+    it('a bridge retry of an already-owned commandId beyond the memory window is re-acked, not re-executed or errored', async () => {
+      const transportSend = vi.fn(() => 'sent');
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send: transportSend, pendingCount: 0 });
+
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'ack lost', commandId: 'cmd-late-bridge-retry' }, serverLink as any);
+      await flushAsync();
+      expect(transportSend).toHaveBeenCalledTimes(1);
+      serverLink.send.mockClear();
+
+      nowSpy!.mockReturnValue(realNow + replayAfterMs);
+      handleWebCommand({
+        type: 'session.send',
+        session: 'deck_transport_brain',
+        text: 'ack lost',
+        commandId: 'cmd-late-bridge-retry',
+        __bridgeRetry: true,
+      } as any, serverLink as any);
+      await flushAsync();
+
+      expect(transportSend).toHaveBeenCalledTimes(1);
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'command.ack',
+        commandId: 'cmd-late-bridge-retry',
+        status: 'accepted',
+      }));
+      expect(serverLink.send).not.toHaveBeenCalledWith(expect.objectContaining({
+        commandId: 'cmd-late-bridge-retry',
+        status: 'error',
+      }));
+    });
+
+    it('the same commandId on a different session is an independent command', async () => {
+      const transportSend = vi.fn(() => 'sent');
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send: transportSend, pendingCount: 0 });
+      getSessionMock.mockImplementation((name: string) => ({
+        name,
+        projectName: 'transport',
+        role: 'brain',
+        agentType: 'claude-code-sdk',
+        runtimeType: 'transport',
+        state: 'running',
+      }));
+
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'one', commandId: 'cmd-shared-id' }, serverLink as any);
+      await flushAsync();
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_other', text: 'two', commandId: 'cmd-shared-id' }, serverLink as any);
+      await flushAsync();
+
+      expect(transportSend).toHaveBeenCalledTimes(2);
+    });
+
+    it('fails open when the durable ledger is unavailable: live sends are never blocked', async () => {
+      const transportSend = vi.fn(() => 'sent');
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send: transportSend, pendingCount: 0 });
+      claimSpy = vi.spyOn(TransportQueueStore.prototype, 'claimSessionCommand').mockImplementation(() => {
+        throw new Error('database is locked');
+      });
+
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'still delivered', commandId: 'cmd-ledger-down' }, serverLink as any);
+      await flushAsync();
+
+      expect(transportSend).toHaveBeenCalledTimes(1);
+      expect(serverLink.send).toHaveBeenCalledWith(expect.objectContaining({
+        type: 'command.ack',
+        commandId: 'cmd-ledger-down',
+        status: 'accepted',
+      }));
+    });
+
+    it('a command past the ledger retention is accepted again (the ledger is bounded, not permanent)', async () => {
+      const transportSend = vi.fn(() => 'sent');
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send: transportSend, pendingCount: 0 });
+
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'old', commandId: 'cmd-retention' }, serverLink as any);
+      await flushAsync();
+      nowSpy!.mockReturnValue(realNow + SESSION_COMMAND_LEDGER_TTL_MS + 60_000);
+      resetSessionCommandDedupForTests();
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'old', commandId: 'cmd-retention' }, serverLink as any);
+      await flushAsync();
+
+      expect(transportSend).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('passes the raw user message to transport runtime assembly without client-side context shaping', async () => {

@@ -102,6 +102,36 @@ describe('TransportQueueStore', () => {
     }
   });
 
+  it('only one of two processes sharing the database wins a session command claim', () => {
+    // The daemon and a helper process (MCP/CLI) open the same sqlite file.
+    const other = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+    try {
+      const results = [
+        store.claimSessionCommand('deck_race', 'cmd-race', 5_000),
+        other.claimSessionCommand('deck_race', 'cmd-race', 5_000),
+        store.claimSessionCommand('deck_race', 'cmd-race', 5_001),
+        other.claimSessionCommand('deck_race', 'cmd-race', 5_001),
+      ];
+      expect(results.filter(Boolean)).toHaveLength(1);
+      expect(results[0]).toBe(true);
+    } finally {
+      other.close();
+    }
+  });
+
+  it('keeps a session command claimed exactly until the retention boundary, and pruning never evicts a live claim', () => {
+    expect(store.claimSessionCommand('deck_ttl', 'cmd-edge', 10_000)).toBe(true);
+    // Still inside retention at the boundary.
+    expect(store.claimSessionCommand('deck_ttl', 'cmd-edge', 10_000 + SESSION_COMMAND_LEDGER_TTL_MS)).toBe(false);
+    // A fresh claim made later survives a prune triggered by an unrelated claim.
+    const later = 10_000 + SESSION_COMMAND_LEDGER_TTL_MS - 1_000;
+    expect(store.claimSessionCommand('deck_ttl', 'cmd-fresh', later)).toBe(true);
+    expect(store.claimSessionCommand('deck_ttl', 'cmd-other', later + 11 * 60 * 1000)).toBe(true);
+    expect(store.claimSessionCommand('deck_ttl', 'cmd-fresh', later + 11 * 60 * 1000 + 1)).toBe(false);
+    // Past retention the original is accepted again.
+    expect(store.claimSessionCommand('deck_ttl', 'cmd-edge', 10_001 + SESSION_COMMAND_LEDGER_TTL_MS + 1)).toBe(true);
+  });
+
   it('drops an unrestorable queue once the bounded retry threshold is reached', () => {
     const sessionName = 'deck_queue_orphan_fixture';
     store.enqueue({ sessionName, clientMessageId: 'orphan-1', text: 'orphan' });
