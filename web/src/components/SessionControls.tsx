@@ -76,7 +76,7 @@ import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
 import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
-import { safeSessionStorageGetItem, safeSessionStorageSetItem } from '../local-storage-quota.js';
+import { safeSessionStorageGetItem, safeSessionStorageRemoveItem, safeSessionStorageSetItem } from '../local-storage-quota.js';
 import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
@@ -1846,7 +1846,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
   const [hydratedAttachmentDraftKey, setHydratedAttachmentDraftKey] = useState<string | null>(null);
   useEffect(() => {
     if (!draftKey || !divRef.current) return;
-    const saved = sessionStorage.getItem(draftKey);
+    const saved = safeSessionStorageGetItem(draftKey);
     if (saved) {
       setComposerElementText(divRef.current, saved);
       setHasText(!!saved.trim());
@@ -1856,7 +1856,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     }
     return () => {
       const text = divRef.current ? readComposerElementText(divRef.current) : '';
-      if (draftKey) sessionStorage.setItem(draftKey, text);
+      if (draftKey) safeSessionStorageSetItem(draftKey, text);
     };
   }, [draftKey, publishComposerText]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -1867,7 +1867,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       attachmentDraftRef.current = [];
       return;
     }
-    const saved = parseStoredComposerAttachments(sessionStorage.getItem(attachmentDraftKey));
+    const saved = parseStoredComposerAttachments(safeSessionStorageGetItem(attachmentDraftKey));
     setAttachments(saved);
     attachmentDraftRef.current = saved;
     setHydratedAttachmentDraftKey(attachmentDraftKey);
@@ -1878,8 +1878,9 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
     closeQuickSuggestions();
     if (!attachmentDraftKey || hydratedAttachmentDraftKey !== attachmentDraftKey) return;
     try {
-      if (attachments.length > 0) sessionStorage.setItem(attachmentDraftKey, JSON.stringify(attachments));
-      else sessionStorage.removeItem(attachmentDraftKey);
+      // Unbounded: the default draft cap would truncate this JSON.
+      if (attachments.length > 0) safeSessionStorageSetItem(attachmentDraftKey, JSON.stringify(attachments), Number.MAX_SAFE_INTEGER);
+      else safeSessionStorageRemoveItem(attachmentDraftKey);
     } catch {
       /* ignore */
     }
@@ -4301,8 +4302,8 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
       setQuickSuggestionQuery('');
       histIdxRef.current = -1;
       draftRef.current = '';
-      if (draftKey) sessionStorage.removeItem(draftKey);
-      if (attachmentDraftKey) sessionStorage.removeItem(attachmentDraftKey);
+      if (draftKey) safeSessionStorageRemoveItem(draftKey);
+      if (attachmentDraftKey) safeSessionStorageRemoveItem(attachmentDraftKey);
     };
     if (effectiveRuntimeType === 'transport' && !isP2pSend && !isDelegationSend && payload.text.trim() === '/stop') {
       showStopFeedback();
@@ -4928,7 +4929,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
         if (histIdxRef.current === -1) {
           // Save current draft before navigating
           draftRef.current = divRef.current ? readComposerElementText(divRef.current) : '';
-          if (draftKey) sessionStorage.setItem(draftKey, draftRef.current);
+          if (draftKey) safeSessionStorageSetItem(draftKey, draftRef.current);
         }
         const next = Math.min(histIdxRef.current + 1, history.length - 1);
         if (next !== histIdxRef.current || histIdxRef.current === -1) {

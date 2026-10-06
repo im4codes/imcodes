@@ -11158,4 +11158,23 @@ afterEach(() => {
     expect(appendButtons.length > 0).toBe(expected);
   });
 
+  it('does not crash when sessionStorage is full while the draft is saved on unmount', () => {
+    const quota = () => {
+      throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+    };
+    const view = render(<SessionControls ws={makeWs() as any} activeSession={makeSession({ name: 'quota-session' })} quickData={makeQuickData() as any} />);
+    const input = screen.getByRole('textbox');
+    input.textContent = 'a draft that must survive a full store';
+    fireEvent.input(input);
+    const spy = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(quota);
+    try {
+      // The draft is saved from an effect cleanup; a raw setItem there threw
+      // "Failed to execute 'setItem' on 'Storage' ... exceeded the quota" and
+      // took the whole component down (the error boundary's "retry" card).
+      expect(() => view.unmount()).not.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
 });
