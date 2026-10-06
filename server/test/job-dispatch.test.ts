@@ -312,4 +312,19 @@ describe('jobDispatchCron', () => {
     const sent = JSON.parse(mockSendToDaemon.mock.calls[0][0]);
     expect(sent.jobId).toBe('good');
   });
+  it('calls the production Database.transaction with its own receiver when recovering pending dispatches', async () => {
+    // Production's Database.transaction reads this.pool; a detached call threw
+    // "Cannot read properties of undefined (reading 'pool')" every minute.
+    class ReceiverBoundDb {
+      pool = {};
+      query = vi.fn(async () => []);
+      execute = vi.fn(async () => ({ changes: 0 }));
+      transaction<T>(fn: (tx: ReceiverBoundDb) => Promise<T>): Promise<T> {
+        if (!this.pool) return fn(this);
+        return fn(this);
+      }
+    }
+    const db = new ReceiverBoundDb();
+    await expect(jobDispatchCron({ DB: db } as any)).resolves.toBeUndefined();
+  });
 });

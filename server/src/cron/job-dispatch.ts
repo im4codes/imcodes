@@ -184,7 +184,7 @@ async function recoverPendingDispatches(env: Env): Promise<ClaimedCronJob[]> {
     transaction?: <T>(fn: (tx: typeof env.DB) => Promise<T>) => Promise<T>;
   }).transaction!;
   const now = Date.now();
-  return transaction(async (tx) => {
+  return transaction.call(env.DB, async (tx) => {
     const rows = await tx.query<ClaimedCronJob & { execution_detail?: string | null }>(
       `SELECT j.*, e.id AS execution_id, e.detail AS execution_detail
          FROM cron_executions e
