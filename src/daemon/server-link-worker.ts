@@ -133,13 +133,17 @@ function connect(): void {
   const current = new WebSocket(config.url);
   socket = current;
   let openedForAttempt = false;
+  // Back-off resets only once the server has answered on this socket (proof
+  // that auth was accepted), never on bare `open` — otherwise a server that
+  // closes right after open (auth_failed 4001) is retried at the base delay
+  // forever.
+  let serverAnsweredOnAttempt = false;
   const connectTimeout = setTimeout(() => {
     if (!openedForAttempt && socket === current) current.terminate();
   }, CONNECT_TIMEOUT_MS);
   current.on('open', () => {
     openedForAttempt = true;
     clearTimeout(connectTimeout);
-    reconnectAttempt = 0;
     opened = true;
     pendingHeartbeats = [];
     lastInboundAt = Date.now();
@@ -159,6 +163,10 @@ function connect(): void {
   });
   current.on('message', (data: WebSocket.RawData, binary: boolean) => {
     lastInboundAt = Date.now();
+    if (!serverAnsweredOnAttempt) {
+      serverAnsweredOnAttempt = true;
+      reconnectAttempt = 0;
+    }
     if (!binary) {
       const text = data.toString();
       try {

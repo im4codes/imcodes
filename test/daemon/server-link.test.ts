@@ -916,7 +916,9 @@ describe('ServerLink', () => {
     expect(openHandler).toBeDefined();
     expect(closeHandler).toBeDefined();
 
-    const INITIAL = 500; // matches INITIAL_BACKOFF_MS
+    // A fresh link starts at INITIAL_BACKOFF_MS; read it instead of duplicating the literal.
+    const INITIAL = link.__backoffMsForTests();
+    expect(INITIAL).toBeGreaterThan(0);
 
     // Cycle 1: open (no message) → close (auth_failed) → timer fires → backoff doubles.
     openHandler!();
@@ -958,7 +960,9 @@ describe('ServerLink', () => {
     expect(messageHandler).toBeDefined();
     expect(closeHandler).toBeDefined();
 
-    const INITIAL = 500;
+    // A fresh link starts at INITIAL_BACKOFF_MS; read it instead of duplicating the literal.
+    const INITIAL = link.__backoffMsForTests();
+    expect(INITIAL).toBeGreaterThan(0);
 
     // Simulate: connect, server sends a message (auth confirmed), then network drops.
     openHandler!();
