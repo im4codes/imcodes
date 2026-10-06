@@ -368,6 +368,7 @@ import {
   CONTROLLED_NODE_UPGRADE_STATUS,
   CONTROLLED_NODE_UPGRADE_WAIT_REASON,
   controlledNodeUpgradeRetryDelayMs,
+  controlledNodeUpgradeStaggerMs,
   isDaemonUpgradeAvailable,
   isDaemonAutoUpgradeDisabledByEnv,
   isRetryableDaemonUpgradeBlockReason,
@@ -5860,7 +5861,7 @@ export class WsBridge {
         // reconnecting daemon, and its handler was waiting on authPromise. A
         // next-turn flush lets that persisted terminal blocker run first,
         // regardless of how long replayInflightToDaemon() made auth take.
-        setImmediate(() => {
+        const runPostAuthUpgrade = () => {
           if (
             this.daemonWs !== ws
             || this.daemonGeneration !== connectionGeneration
@@ -5870,7 +5871,14 @@ export class WsBridge {
             this.maybeAutoUpgradeControlledNode();
           }
           this.flushPendingDaemonUpgrade(ws);
-        });
+        };
+        if (this.daemonNodeRole === NODE_ROLE.CONTROLLED) {
+          // Per-node stagger: see CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS.
+          const timer = setTimeout(runPostAuthUpgrade, controlledNodeUpgradeStaggerMs(this.serverId));
+          (timer as { unref?: () => void }).unref?.();
+        } else {
+          setImmediate(runPostAuthUpgrade);
+        }
         return;
       }
 

@@ -2,8 +2,10 @@ import { describe, expect, it } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
   CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS,
+  CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS,
   DAEMON_UPGRADE_BLOCK_REASON,
   controlledNodeUpgradeRetryDelayMs,
+  controlledNodeUpgradeStaggerMs,
   isDaemonAutoUpgradeDisabledByEnv,
   normalizeDaemonUpgradeTargetVersion,
   validateControlledNodeUpgradeBlockedMessage,
@@ -123,5 +125,21 @@ describe('controlled-node upgrade retry schedule', () => {
       const delay = controlledNodeUpgradeRetryDelayMs(attempts);
       expect(delay).toBeGreaterThanOrEqual(CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS[0]);
     }
+  });
+});
+
+describe('controlled-node upgrade stagger', () => {
+  it('is stable per node, bounded, and spreads a fleet instead of firing it together', () => {
+    const ids = Array.from({ length: 64 }, (_, i) => `node-${i.toString(16).padStart(32, '0')}`);
+    const delays = ids.map(controlledNodeUpgradeStaggerMs);
+    expect(delays).toEqual(ids.map(controlledNodeUpgradeStaggerMs));
+    for (const delay of delays) {
+      expect(Number.isInteger(delay)).toBe(true);
+      expect(delay).toBeGreaterThanOrEqual(0);
+      expect(delay).toBeLessThan(CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS);
+    }
+    // A fleet must not all land on one instant (the thundering herd this prevents).
+    expect(new Set(delays).size).toBeGreaterThan(ids.length / 2);
+    expect(controlledNodeUpgradeStaggerMs('')).toBe(0);
   });
 });

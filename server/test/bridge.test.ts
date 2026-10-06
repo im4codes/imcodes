@@ -62,6 +62,7 @@ import {
   DIRECT_FILE_TRANSFER_REQUIRED_CAPABILITIES,
 } from '../../shared/direct-file-transfer.js';
 import {
+  CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS,
   DAEMON_UPGRADE_BLOCKED_ACK_DISPOSITION,
   DAEMON_UPGRADE_BLOCKED_SYNC_PROTOCOL,
   DAEMON_UPGRADE_BLOCK_REASON,
@@ -1034,6 +1035,7 @@ describe('WsBridge', () => {
       }));
     });
 
+    const STAGGER_MS = CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS;
     const upgradeFrames = (ws: MockWs) => ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'));
     const authControlled = async (
       ws: MockWs,
@@ -1056,7 +1058,7 @@ describe('WsBridge', () => {
       process.env.APP_VERSION = '2026.7.1234-dev.5';
       const ws = new MockWs();
       await authControlled(ws);
-      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       await flushAsync();
       expect(upgradeFrames(ws)).toHaveLength(1);
       expect(WsBridge.get(serverId).getControlledNodeUpgradeStatus()).toMatchObject({ status: 'upgrading' });
@@ -1075,7 +1077,7 @@ describe('WsBridge', () => {
       // Queued behind auth: it is applied before the post-auth upgrade check runs.
       ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'running' }] }));
       await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       await flushAsync();
       expect(upgradeFrames(ws)).toHaveLength(0);
       expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({
@@ -1098,7 +1100,7 @@ describe('WsBridge', () => {
         target: '2026.7.1000-dev.1',
         reason: 'install_failed',
       }));
-      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       await flushAsync();
       expect(upgradeFrames(ws)).toHaveLength(1);
     });
@@ -1112,7 +1114,7 @@ describe('WsBridge', () => {
         target: process.env.APP_VERSION,
         reason: 'download_failed',
       }));
-      await vi.advanceTimersByTimeAsync(5000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       await flushAsync();
       expect(upgradeFrames(ws)).toHaveLength(1);
     });
@@ -1123,7 +1125,7 @@ describe('WsBridge', () => {
       const bridge = WsBridge.get(serverId);
       const ws = new MockWs();
       await authControlled(ws);
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       expect(upgradeFrames(ws)).toHaveLength(1);
 
       // An arbitrary node reason used to change nothing: the lifecycle stayed
@@ -1148,21 +1150,21 @@ describe('WsBridge', () => {
       process.env.APP_VERSION = '2026.7.1234-dev.5';
       const first = new MockWs();
       await authControlled(first);
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       expect(upgradeFrames(first)).toHaveLength(1);
 
       // Reconnect inside the backoff: the install may still be running.
       await vi.advanceTimersByTimeAsync(60_000);
       const second = new MockWs();
       await authControlled(second);
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       expect(upgradeFrames(second)).toHaveLength(0);
 
       // Reconnect after the backoff, still old: the install did not complete.
       await vi.advanceTimersByTimeAsync(10 * 60_000);
       const third = new MockWs();
       await authControlled(third);
-      await vi.advanceTimersByTimeAsync(1000);
+      await vi.advanceTimersByTimeAsync(STAGGER_MS);
       expect(upgradeFrames(third)).toHaveLength(1);
     });
 

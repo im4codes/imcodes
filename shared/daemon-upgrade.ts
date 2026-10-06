@@ -95,6 +95,20 @@ export function controlledNodeUpgradeRetryDelayMs(attempts: number): number {
   return CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS[index]!;
 }
 
+/**
+ * A server restart reconnects every controlled node within seconds, and each
+ * one would start pulling a ~200 MB artifact at once. Spread the automatic
+ * post-auth trigger over this window, deterministically per node so a given
+ * node's delay is stable and testable.
+ */
+export const CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS = 15_000;
+
+export function controlledNodeUpgradeStaggerMs(serverId: string): number {
+  let hash = 0;
+  for (let i = 0; i < serverId.length; i += 1) hash = (Math.imul(hash, 31) + serverId.charCodeAt(i)) >>> 0;
+  return hash % CONTROLLED_NODE_UPGRADE_STAGGER_MAX_MS;
+}
+
 export const CONTROLLED_NODE_UPGRADE_STATUS = {
   CURRENT: 'current',
   AVAILABLE: 'available',
