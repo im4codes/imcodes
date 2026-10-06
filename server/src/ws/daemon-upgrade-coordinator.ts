@@ -280,6 +280,37 @@ export class DaemonUpgradeCoordinator {
   }
 
   /**
+   * End a terminal block so the same target can be offered again. Used only by
+   * the bounded retry schedule; auto/replay requests are otherwise refused for
+   * a blocked target so a failing install cannot become a restart loop.
+   */
+  releaseTerminalBlock(targetVersion: unknown, now = Date.now()): boolean {
+    let normalized: string;
+    try {
+      normalized = normalizeDaemonUpgradeTargetVersion(targetVersion);
+    } catch {
+      return false;
+    }
+    if (this.current?.targetVersion !== normalized || this.current.status !== 'terminal_blocked') return false;
+    this.supersedeCurrent(now);
+    return true;
+  }
+
+  /** Read-only: the lifecycle for `targetVersion` is `sent` (delivered, completion unknown). */
+  sentLifecycleFor(targetVersion: unknown): { lastSentAt: number | null } | null {
+    let normalized: string;
+    try {
+      normalized = normalizeDaemonUpgradeTargetVersion(targetVersion);
+    } catch {
+      return null;
+    }
+    const state = this.current;
+    return state && state.targetVersion === normalized && state.status === 'sent'
+      ? { lastSentAt: state.lastSentAt }
+      : null;
+  }
+
+  /**
    * A terminal failure belongs to the upgrade command that produced it.
    * If a newer manual lifecycle for the same target has a different id, the
    * old persisted failure was explicitly superseded and must not re-block it.

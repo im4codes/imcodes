@@ -223,6 +223,7 @@ function makeDb(
   nodeRole: 'full' | 'controlled' = 'full',
   os: ControlledNodeOs | null = nodeRole === 'controlled' ? CONTROLLED_NODE_OS_LINUX : null,
   ownerUserId?: string,
+  controlledUpgrade?: { status: string; target: string | null; reason?: string | null },
 ) {
   const db = {
     queryOne: async () => ({
@@ -231,6 +232,13 @@ function makeDb(
       revoked_at: null,
       os,
       ...(ownerUserId ? { user_id: ownerUserId } : {}),
+      ...(controlledUpgrade
+        ? {
+          controlled_upgrade_status: controlledUpgrade.status,
+          controlled_upgrade_target_version: controlledUpgrade.target,
+          controlled_upgrade_reason: controlledUpgrade.reason ?? null,
+        }
+        : {}),
     }),
     query: async () => [],
     execute: async () => ({ changes: 1 }),
@@ -1026,27 +1034,136 @@ describe('WsBridge', () => {
       }));
     });
 
-    it('auto-upgrades a controlled node once at the authenticated idle boundary', async () => {
+    const upgradeFrames = (ws: MockWs) => ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'));
+    const authControlled = async (
+      ws: MockWs,
+      daemonVersion = '0.1.2',
+      db = makeDb('valid-hash', 'controlled'),
+    ) => {
+      WsBridge.get(serverId).handleDaemonConnection(ws as never, db, {} as never);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion,
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      await flushAsync();
+    };
+
+    it('upgrades a controlled node at auth even though it never publishes a session snapshot', async () => {
+      // Regression (tsk_043b784d11): imcodes-node has no sessions and never sends
+      // `session_list`, but the idle gate demanded one, so every controlled node
+      // stayed `deferred` with no reason, forever.
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const ws = new MockWs();
+      await authControlled(ws);
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      expect(WsBridge.get(serverId).getControlledNodeUpgradeStatus()).toMatchObject({ status: 'upgrading' });
+    });
+
+    it('holds a controlled-node upgrade while the node reports a busy session, says why, and sends at idle', async () => {
       vi.useFakeTimers();
       process.env.APP_VERSION = '2026.7.1234-dev.5';
       const bridge = WsBridge.get(serverId);
       const ws = new MockWs();
       bridge.handleDaemonConnection(ws as never, makeDb('valid-hash', 'controlled'), {} as never);
-      ws.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2', capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY] }));
-      await flushAsync();
-      await vi.advanceTimersByTimeAsync(5000);
-      await flushAsync();
-      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      ws.emit('message', JSON.stringify({
+        type: 'auth', serverId, token: 'my-token', daemonVersion: '0.1.2',
+        capabilities: [CONTROLLED_NODE_SAFE_SELF_UPGRADE_CAPABILITY],
+      }));
+      // Queued behind auth: it is applied before the post-auth upgrade check runs.
       ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'running' }] }));
       await flushAsync();
       await vi.advanceTimersByTimeAsync(5000);
       await flushAsync();
-      expect(ws.sentStrings.filter((msg) => msg.includes('"type":"daemon.upgrade"'))).toHaveLength(0);
+      expect(upgradeFrames(ws)).toHaveLength(0);
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({
+        status: 'deferred',
+        reason: DAEMON_UPGRADE_BLOCK_REASON.SESSION_BUSY,
+      });
       ws.emit('message', JSON.stringify({ type: 'session_list', sessions: [{ name: 'main', state: 'idle' }] }));
       await flushAsync();
       await vi.runOnlyPendingTimersAsync();
       await flushAsync();
-      expect(ws.sentStrings.filter((msg) => msg.includes('\"type\":\"daemon.upgrade\"'))).toHaveLength(1);
+      expect(upgradeFrames(ws)).toHaveLength(1);
+    });
+
+    it('does not let a persisted failure for an older target block a newer target', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const ws = new MockWs();
+      await authControlled(ws, '0.1.2', makeDb('valid-hash', 'controlled', undefined, undefined, {
+        status: 'failed',
+        target: '2026.7.1000-dev.1',
+        reason: 'install_failed',
+      }));
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+    });
+
+    it('retries a persisted failure for the same target once a fresh server process sees it', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const ws = new MockWs();
+      await authControlled(ws, '0.1.2', makeDb('valid-hash', 'controlled', undefined, undefined, {
+        status: 'failed',
+        target: process.env.APP_VERSION,
+        reason: 'download_failed',
+      }));
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+    });
+
+    it('records any node-reported failure reason and retries the same target after a backoff', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const bridge = WsBridge.get(serverId);
+      const ws = new MockWs();
+      await authControlled(ws);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(upgradeFrames(ws)).toHaveLength(1);
+
+      // An arbitrary node reason used to change nothing: the lifecycle stayed
+      // `sent`, so every later request answered `already_in_progress`.
+      ws.emit('message', JSON.stringify({
+        type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'artifact_download_failed', targetVersion: process.env.APP_VERSION,
+      }));
+      await flushAsync();
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({ status: 'failed', reason: 'artifact_download_failed' });
+
+      await vi.advanceTimersByTimeAsync(9 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(1);
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      await flushAsync();
+      expect(upgradeFrames(ws)).toHaveLength(2);
+      expect(bridge.getControlledNodeUpgradeStatus()).toMatchObject({ status: 'upgrading' });
+    });
+
+    it('offers the target again when a node that was sent an upgrade reconnects still on the old version', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const first = new MockWs();
+      await authControlled(first);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(upgradeFrames(first)).toHaveLength(1);
+
+      // Reconnect inside the backoff: the install may still be running.
+      await vi.advanceTimersByTimeAsync(60_000);
+      const second = new MockWs();
+      await authControlled(second);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(upgradeFrames(second)).toHaveLength(0);
+
+      // Reconnect after the backoff, still old: the install did not complete.
+      await vi.advanceTimersByTimeAsync(10 * 60_000);
+      const third = new MockWs();
+      await authControlled(third);
+      await vi.advanceTimersByTimeAsync(1000);
+      expect(upgradeFrames(third)).toHaveLength(1);
     });
 
     it('does not auto-upgrade a controlled node when the explicit deployment opt-out is set', async () => {

@@ -308,4 +308,47 @@ describe('DaemonUpgradeCoordinator npm publication gate', () => {
 
     expect(sent).toHaveLength(1);
   });
+
+  it('releases a terminal block so the same target can be offered again, and only that target', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    const sent: Record<string, unknown>[] = [];
+    const input = (now: number) => ({
+      targetVersion: '2026.7.3192-dev.3593',
+      source: 'auto' as const,
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: (message: Record<string, unknown>) => sent.push(message),
+      now,
+    });
+    coordinator.blockTargetAfterTerminalFailure('2026.7.3192-dev.3593', 0);
+    expect(coordinator.request(input(1)).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.BACKOFF);
+
+    expect(coordinator.releaseTerminalBlock('2026.7.9999-dev.1', 2)).toBe(false);
+    expect(coordinator.releaseTerminalBlock('not a version', 2)).toBe(false);
+    expect(coordinator.releaseTerminalBlock('2026.7.3192-dev.3593', 2)).toBe(true);
+    expect(coordinator.request(input(3)).deliveryStatus).toBe(DAEMON_UPGRADE_DELIVERY_STATUS.SENT);
+    expect(sent).toHaveLength(1);
+    // Nothing left to release once the target is in flight.
+    expect(coordinator.releaseTerminalBlock('2026.7.3192-dev.3593', 4)).toBe(false);
+  });
+
+  it('reports a delivered lifecycle for its exact target only', () => {
+    const coordinator = new DaemonUpgradeCoordinator();
+    expect(coordinator.sentLifecycleFor('2026.7.3192-dev.3593')).toBeNull();
+    coordinator.request({
+      targetVersion: '2026.7.3192-dev.3593',
+      source: 'auto',
+      skipPublicationGate: true,
+      isDaemonReady: () => true,
+      isStillCurrent: () => true,
+      send: () => {},
+      now: 42,
+    });
+    expect(coordinator.sentLifecycleFor('2026.7.3192-dev.3593')).toEqual({ lastSentAt: 42 });
+    expect(coordinator.sentLifecycleFor('2026.7.3193-dev.3594')).toBeNull();
+    expect(coordinator.sentLifecycleFor(undefined)).toBeNull();
+    coordinator.prepareRetryAfterDaemonRestart(50);
+    expect(coordinator.sentLifecycleFor('2026.7.3192-dev.3593')).toBeNull();
+  });
 });

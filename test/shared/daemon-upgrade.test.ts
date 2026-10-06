@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { DAEMON_MSG } from '../../shared/daemon-events.js';
 import {
+  CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS,
   DAEMON_UPGRADE_BLOCK_REASON,
+  controlledNodeUpgradeRetryDelayMs,
   isDaemonAutoUpgradeDisabledByEnv,
   normalizeDaemonUpgradeTargetVersion,
   validateControlledNodeUpgradeBlockedMessage,
@@ -104,5 +106,22 @@ describe('resolveDaemonUpgradeSource', () => {
     expect(resolveDaemonUpgradeSource('bogus')).toBe(DAEMON_UPGRADE_SOURCE.AUTO);
     expect(resolveDaemonUpgradeSource(DAEMON_UPGRADE_SOURCE.MANUAL)).toBe(DAEMON_UPGRADE_SOURCE.MANUAL);
     expect(resolveDaemonUpgradeSource(DAEMON_UPGRADE_SOURCE.REPLAY)).toBe(DAEMON_UPGRADE_SOURCE.REPLAY);
+  });
+});
+
+describe('controlled-node upgrade retry schedule', () => {
+  it('backs off with each attempt and repeats the last delay instead of giving up', () => {
+    const delays = [1, 2, 3, 4, 5, 50].map(controlledNodeUpgradeRetryDelayMs);
+    expect(delays.slice(0, 4)).toEqual([...CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS]);
+    expect(delays[4]).toBe(CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS.at(-1));
+    expect(delays[5]).toBe(CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS.at(-1));
+    expect([...delays].sort((a, b) => a - b)).toEqual(delays);
+  });
+
+  it('never returns an immediate or negative delay, whatever the attempt count', () => {
+    for (const attempts of [0, -3, 0.5, Number.NaN]) {
+      const delay = controlledNodeUpgradeRetryDelayMs(attempts);
+      expect(delay).toBeGreaterThanOrEqual(CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS[0]);
+    }
   });
 });

@@ -63,6 +63,38 @@ export const DAEMON_UPGRADE_BLOCK_REASON = {
   TOOLCHAIN_UNAVAILABLE: 'toolchain_unavailable',
 } as const;
 
+/**
+ * Why the server is holding a controlled node's upgrade back. These are
+ * surfaced as `controlled_upgrade_reason` and in the server log, so an operator
+ * can tell "waiting for an idle edge" from "never going to be sent".
+ * `SESSION_BUSY` deliberately reuses {@link DAEMON_UPGRADE_BLOCK_REASON}.
+ */
+export const CONTROLLED_NODE_UPGRADE_WAIT_REASON = {
+  DAEMON_NOT_READY: 'daemon_not_ready',
+  BLOCKED_SYNC_PENDING: 'blocked_sync_pending',
+  LEGACY_RESCUE_PENDING: 'legacy_rescue_pending',
+} as const;
+
+/**
+ * Retry schedule for a controlled-node upgrade that failed or never completed.
+ * A failure blocks only the exact target that failed, and only for this long;
+ * the last delay repeats so a node that keeps failing is retried a few times a
+ * day rather than every reconnect (restart loop) or never (silently stuck).
+ */
+export const CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS = [
+  10 * 60_000,
+  30 * 60_000,
+  2 * 60 * 60_000,
+  6 * 60 * 60_000,
+] as const;
+
+/** `attempts` is the number of upgrade attempts already made for one target. */
+export function controlledNodeUpgradeRetryDelayMs(attempts: number): number {
+  const made = Number.isFinite(attempts) ? Math.trunc(attempts) : 1;
+  const index = Math.min(Math.max(made - 1, 0), CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS.length - 1);
+  return CONTROLLED_NODE_UPGRADE_RETRY_DELAYS_MS[index]!;
+}
+
 export const CONTROLLED_NODE_UPGRADE_STATUS = {
   CURRENT: 'current',
   AVAILABLE: 'available',
