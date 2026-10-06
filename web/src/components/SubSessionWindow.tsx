@@ -78,7 +78,7 @@ interface Props {
   /** Report the trailing pending ask.question (or null) for dialog re-surface. */
   onPendingQuestion?: (sessionName: string, q: TrailingAskQuestion | null) => void;
   idleFlashToken?: number;
-  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
+  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   onMinimize: () => void;
   onClose: () => void;

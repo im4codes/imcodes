@@ -3348,6 +3348,107 @@ describe('WsBridge', () => {
     });
   });
 
+  // ── Slow-socket recovery: the resync must be asked for when it CAN be delivered ──
+  //
+  // tsk_f2a967730b. A paused queue drops everything, including the snapshot the
+  // browser requests in reaction to the (single) reset sent when the drop began.
+  // Nothing was ever sent again, so the browser - which discards every byte until
+  // a snapshot arrives - sat on its last picture after the socket had drained.
+
+  describe('backpressure recovery: the browser is told again once frames flow', () => {
+    const resetsOf = (ws: MockWs, session: string) => ws.sentStrings
+      .map((s) => { try { return JSON.parse(s) as Record<string, unknown>; } catch { return null; } })
+      .filter((m): m is Record<string, unknown> => m?.type === 'terminal.stream_reset' && m.session === session);
+
+    async function congest(session: string) {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      browserWs.stallSend = true;
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+      // Fill the 4 MB budget with frames the peer never acknowledges, then drop.
+      for (let i = 0; i < 6; i++) {
+        daemonWs.emit('message', packFrame(session, Buffer.alloc(1024 * 1024, 0x61)), true);
+        await flushAsync();
+      }
+      return { daemonWs, browserWs };
+    }
+
+    it('sends a second stream_reset (backpressure_resume) when the socket drains after drops', async () => {
+      const { browserWs } = await congest('sessResume');
+      expect(resetsOf(browserWs, 'sessResume').map((m) => m.reason)).toEqual(['backpressure']);
+
+      browserWs.drainStalledSends();
+      await flushAsync();
+      expect(resetsOf(browserWs, 'sessResume').map((m) => m.reason)).toEqual(['backpressure', 'backpressure_resume']);
+    });
+
+    it('does not repeat the resume notice for later drains, and sends none when nothing was dropped', async () => {
+      const { daemonWs, browserWs } = await congest('sessResumeOnce');
+      browserWs.drainStalledSends();
+      await flushAsync();
+      const afterFirst = resetsOf(browserWs, 'sessResumeOnce').length;
+      // Healthy traffic and further drains: no more resets.
+      browserWs.stallSend = true;
+      daemonWs.emit('message', packFrame('sessResumeOnce', Buffer.alloc(1024, 0x62)), true);
+      await flushAsync();
+      browserWs.drainStalledSends();
+      await flushAsync();
+      expect(resetsOf(browserWs, 'sessResumeOnce')).toHaveLength(afterFirst);
+
+      // A socket that never congested never gets one.
+      const { bridge, daemonWs: daemon2 } = await setupAuth();
+      const calm = new MockWs();
+      bridge.handleBrowserConnection(calm as never, 'test-user', makeDb('valid-hash'));
+      calm.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessCalm' }));
+      await flushAsync();
+      for (let i = 0; i < 10; i++) daemon2.emit('message', packFrame('sessCalm', Buffer.alloc(512, 0x63)), true);
+      await flushAsync();
+      expect(resetsOf(calm, 'sessCalm')).toHaveLength(0);
+    });
+
+    it('also notifies when the grace valve forgives a socket that never drained', async () => {
+      vi.useFakeTimers();
+      try {
+        const { bridge, daemonWs } = await setupAuth();
+        const browserWs = new MockWs();
+        browserWs.stallSend = true;
+        bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+        browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessGrace' }));
+        await vi.advanceTimersByTimeAsync(50);
+        browserWs.sent.length = 0;
+        for (let i = 0; i < 6; i++) {
+          daemonWs.emit('message', packFrame('sessGrace', Buffer.alloc(1024 * 1024, 0x61)), true);
+          await vi.advanceTimersByTimeAsync(1);
+        }
+        expect(resetsOf(browserWs, 'sessGrace').map((m) => m.reason)).toEqual(['backpressure']);
+
+        await vi.advanceTimersByTimeAsync(2_500);
+        daemonWs.emit('message', packFrame('sessGrace', Buffer.alloc(1024, 0x63)), true);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(resetsOf(browserWs, 'sessGrace').map((m) => m.reason)).toEqual(['backpressure', 'backpressure_resume']);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('an oversize single frame with nothing in flight needs no resume (nothing is paused)', async () => {
+      const { bridge, daemonWs } = await setupAuth();
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({ type: 'terminal.subscribe', session: 'sessOversize' }));
+      await flushAsync();
+      browserWs.sent.length = 0;
+      daemonWs.emit('message', packFrame('sessOversize', Buffer.alloc(4 * 1024 * 1024 + 100, 0x44)), true);
+      await flushAsync();
+      daemonWs.emit('message', packFrame('sessOversize', Buffer.alloc(64, 0x45)), true);
+      await flushAsync();
+      expect(resetsOf(browserWs, 'sessOversize').map((m) => m.reason)).toEqual(['backpressure']);
+    });
+  });
+
   // ── Daemon reconnect subscription replay ──────────────────────────────────
 
   describe('daemon reconnect subscription replay', () => {

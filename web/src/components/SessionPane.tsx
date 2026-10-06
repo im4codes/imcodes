@@ -96,7 +96,7 @@ export interface SessionPaneProps {
   /** Called with the chat input element ref so app.tsx can route keystrokes to it. */
   onInputRef?: (el: HTMLDivElement | null) => void;
   /** Called with the terminal diff applier for this session. */
-  onDiff?: (apply: (diff: TerminalDiff) => void) => void;
+  onDiff?: (apply: (diff: TerminalDiff) => void) => void | (() => void);
   /** Called with the terminal history applier for this session. */
   onHistory?: (apply: (content: string) => void) => void;
 

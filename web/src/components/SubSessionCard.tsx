@@ -85,7 +85,7 @@ interface Props {
   onOpen: () => void;
   onClose?: () => void;
   onRestart?: () => void;
-  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
+  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   cardW?: number;
   cardH?: number;

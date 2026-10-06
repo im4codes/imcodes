@@ -6,9 +6,10 @@ import { FitAddon } from '@xterm/addon-fit';
 import 'xterm/css/xterm.css';
 import type { WsClient } from '../ws-client.js';
 import type { TerminalDiff } from '../types.js';
-import { TERMINAL_MAX_ROWS } from '@shared/terminal-limits.js';
+import type { TerminalDiffRegistration } from '../terminal-diff-registry.js';
 import { IOS_MAC_TERMINAL_FONT_SIZE, shouldUseIosMacTextScale } from '../native-platform.js';
 import { TERMINAL_CONTROL } from '@shared/terminal-protocol.js';
+import { applyDiffToRows, fullFrameWriteFromDiff, isRenderableLineIndex, resolveDiffRows } from '../terminal-frame.js';
 
 interface Props {
   sessionName: string;
@@ -18,7 +19,8 @@ interface Props {
   active?: boolean;
   /** Optimize for embedded preview cards: coalesce raw writes and reduce idle work. */
   preview?: boolean;
-  onDiff?: (applyDiff: (diff: TerminalDiff) => void) => void;
+  /** Registers this view's frame handler; the returned function unregisters it. */
+  onDiff?: TerminalDiffRegistration;
   onHistory?: (applyHistory: (content: string) => void) => void;
   /** Receives a function that focuses the xterm terminal — call it to restore keyboard to xterm. */
   onFocusFn?: (fn: () => void) => void;
@@ -37,39 +39,20 @@ const PREVIEW_RAW_MAX_BYTES = 16 * 1024;
 const RAW_FLUSH_MS = 16;
 const RAW_MAX_BYTES = 64 * 1024;
 const PREVIEW_DIFF_SUPPRESS_AFTER_RAW_MS = 1000;
-
 /**
- * Resolves the row bounds for one diff frame.
- *
- * `declaredRows` is what the frame actually claims, or `null` when it claims
- * nothing usable; `rows` is the bound to test line indices against. They differ
- * on purpose: a frame with no usable `rows` must still paint its lines, because
- * the original code sized the buffer with `lines.slice(0, diff.rows)` and
- * `slice(0, undefined)` keeps everything. Collapsing an absent `rows` to 0 made
- * every line fail the bounds test and blanked the buffer, so incremental frames
- * stopped rendering and output only appeared when the next full frame redrew
- * the whole screen at once.
+ * While a resync is pending the view discards every byte (a partial ANSI stream
+ * cannot be truncated), so it is only as live as the snapshot it is waiting for.
+ * That snapshot can be lost: the request raced a closing socket, the daemon was
+ * mid-capture, the server dropped the frame for a slow socket. The first retry
+ * comes quickly; later ones back off so a daemon that is genuinely gone is not
+ * hammered. There is no give-up: a view stuck on an old picture is the failure.
  */
-export function resolveDiffRows(rawRows: unknown): { declaredRows: number | null; rows: number } {
-  const declaredRows = Number.isFinite(rawRows)
-    ? Math.max(0, Math.min(Math.floor(rawRows as number), TERMINAL_MAX_ROWS))
-    : null;
-  return { declaredRows, rows: declaredRows ?? TERMINAL_MAX_ROWS };
-}
+const RESYNC_RETRY_FIRST_MS = 1_500;
+const RESYNC_RETRY_MAX_MS = 10_000;
+/** Returning to a tab that was hidden at least this long verifies the screen against the pane. */
+const VISIBILITY_RESYNC_MIN_HIDDEN_MS = 3_000;
 
-/**
- * The single rule for "is this a row this frame may describe".
- *
- * Both the line-array path and the ANSI cursor-addressing path must agree; when
- * they did not, a frame with rows=1 and lines=[[1000, …]] dropped the line from
- * the array but still emitted `\x1b[1001;1H` to the terminal.
- */
-export function isRenderableLineIndex(lineIdx: unknown, rows: number): lineIdx is number {
-  return Number.isInteger(lineIdx)
-    && (lineIdx as number) >= 0
-    && (lineIdx as number) < rows
-    && (lineIdx as number) < TERMINAL_MAX_ROWS;
-}
+export { resolveDiffRows, isRenderableLineIndex };
 
 function requestFrame(callback: FrameRequestCallback): number | ReturnType<typeof setTimeout> {
   const raf = globalThis.requestAnimationFrame;
@@ -133,6 +116,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   const terminalWriteQueuedBytesRef = useRef(0);
   const terminalWriteInFlightRef = useRef(false);
   const rawResyncPendingRef = useRef(false);
+  const resyncWatchdogRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const resyncAttemptRef = useRef(0);
   const rawFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastRawWriteAtRef = useRef(0);
   const rawSubscriptionGenerationRef = useRef(0);
@@ -183,6 +168,38 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     }
   }, []);
 
+  const clearResyncWatchdog = useCallback(() => {
+    if (resyncWatchdogRef.current) {
+      clearTimeout(resyncWatchdogRef.current);
+      resyncWatchdogRef.current = null;
+    }
+    resyncAttemptRef.current = 0;
+  }, []);
+
+  /**
+   * Stop trusting the incoming stream until a full frame arrives, and keep
+   * asking for one until it does. `requestNow` is false when the request was
+   * already sent by the caller (or by the reset handler in the socket client).
+   */
+  const beginResync = useCallback((requestNow: boolean) => {
+    rawResyncPendingRef.current = true;
+    if (requestNow) {
+      try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* the watchdog asks again */ }
+    }
+    if (resyncWatchdogRef.current) return;
+    const arm = (): void => {
+      const delay = Math.min(RESYNC_RETRY_FIRST_MS * 2 ** resyncAttemptRef.current, RESYNC_RETRY_MAX_MS);
+      resyncWatchdogRef.current = setTimeout(() => {
+        resyncWatchdogRef.current = null;
+        if (!rawResyncPendingRef.current || !activeRef.current) return;
+        resyncAttemptRef.current += 1;
+        try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* try again next round */ }
+        arm();
+      }, delay);
+    };
+    arm();
+  }, [sessionName]);
+
   const discardPendingRaw = useCallback(() => {
     clearRawFlushTimer();
     pendingRawChunksRef.current = [];
@@ -190,7 +207,8 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     terminalWriteQueueRef.current = [];
     terminalWriteQueuedBytesRef.current = 0;
     rawResyncPendingRef.current = false;
-  }, [clearRawFlushTimer]);
+    clearResyncWatchdog();
+  }, [clearRawFlushTimer, clearResyncWatchdog]);
 
   const drainTerminalWriteQueue = useCallback(() => {
     if (terminalWriteInFlightRef.current) return;
@@ -215,15 +233,17 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     if (!fullFrame && rawResyncPendingRef.current) return;
     const bytes = typeof data === 'string' ? data.length : data.byteLength;
     const maxBytes = previewRef.current ? PREVIEW_RAW_MAX_BYTES : RAW_MAX_BYTES;
-    if (!fullFrame && terminalWriteQueuedBytesRef.current + bytes > maxBytes) {
+    // Backlog = what is queued behind the parser plus the write it is chewing
+    // on. An idle writer has no backlog, so one large chunk (a big `cat`, a
+    // screen redraw) is accepted instead of being mistaken for congestion and
+    // answered by throwing the bytes away and resyncing.
+    const hasBacklog = terminalWriteQueuedBytesRef.current > 0 || terminalWriteInFlightRef.current;
+    if (!fullFrame && hasBacklog && terminalWriteQueuedBytesRef.current + bytes > maxBytes) {
       // A partial ANSI stream cannot be safely truncated. Drop only the
       // queued (not in-flight) bytes and resynchronise from a full snapshot.
       terminalWriteQueueRef.current = [];
       terminalWriteQueuedBytesRef.current = 0;
-      if (!rawResyncPendingRef.current) {
-        rawResyncPendingRef.current = true;
-        try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* reconnect will retry */ }
-      }
+      if (!rawResyncPendingRef.current) beginResync(true);
       return;
     }
     if (fullFrame) {
@@ -235,6 +255,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       terminalWriteQueueRef.current = [];
       terminalWriteQueuedBytesRef.current = 0;
       rawResyncPendingRef.current = false;
+      clearResyncWatchdog();
       // The authoritative frame replaces the bytes that triggered recovery;
       // preview diff suppression must not hide the first live partial frame
       // after this point.
@@ -243,7 +264,7 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
     terminalWriteQueueRef.current.push({ data, bytes, fullFrame, raw });
     terminalWriteQueuedBytesRef.current += bytes;
     drainTerminalWriteQueue();
-  }, [clearRawFlushTimer, drainTerminalWriteQueue, sessionName]);
+  }, [beginResync, clearRawFlushTimer, clearResyncWatchdog, drainTerminalWriteQueue]);
 
   const flushPendingRaw = useCallback(() => {
     clearRawFlushTimer();
@@ -477,8 +498,20 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
 
     // Re-fit when window regains focus or tab becomes visible.
     const onWindowFocus = () => { doFitAndSnap(); };
+    let hiddenAt: number | null = null;
     const onVisibilityChange = () => {
-      if (activeRef.current && document.visibilityState === 'visible') { doFitAndSnap(); }
+      if (document.visibilityState === 'hidden') { hiddenAt = Date.now(); return; }
+      const hiddenFor = hiddenAt === null ? 0 : Date.now() - hiddenAt;
+      hiddenAt = null;
+      if (!activeRef.current || document.visibilityState !== 'visible') return;
+      doFitAndSnap();
+      // A hidden tab is throttled hard (timers, rendering, sometimes the socket
+      // itself). Whatever it missed or dropped there, the screen it comes back
+      // to must be verified against the pane rather than trusted. Governed by
+      // the socket client's per-session request spacing.
+      if (hiddenFor >= VISIBILITY_RESYNC_MIN_HIDDEN_MS) {
+        try { wsRef.current?.sendSnapshotRequest(sessionName); } catch { /* the next trigger recovers */ }
+      }
     };
     window.addEventListener('focus', onWindowFocus);
     document.addEventListener('visibilitychange', onVisibilityChange);
@@ -525,11 +558,19 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
   useEffect(() => {
     if (!connected || !active) return;
     const el = containerRef.current;
-    if (!el || el.clientWidth === 0 || el.clientHeight === 0) return; // hidden (chat mode)
+    const hidden = !el || el.clientWidth === 0 || el.clientHeight === 0; // hidden (chat mode)
     const term = termRef.current;
     const ws = wsRef.current;
     if (term && ws) {
-      ws.sendResize(sessionName, term.cols, term.rows);
+      // Dimensions only when visible: a hidden container reports 0x0 and the
+      // parent pins its own fallback size meanwhile.
+      if (!hidden) ws.sendResize(sessionName, term.cols, term.rows);
+      // The snapshot is requested either way. A view that is (re)mounted while
+      // hidden used to skip it, and nothing else repaints it: a re-mount inside
+      // the socket client's unsubscribe debounce reuses the live daemon
+      // subscription, so no bootstrap snapshot is sent, and a later layout that
+      // leaves the size unchanged produces no resize either - it stayed blank
+      // or stale until the next byte happened to redraw it.
       try { ws.sendSnapshotRequest(sessionName); } catch { /* ignore */ }
     }
   }, [active, connected, sessionName]);
@@ -566,13 +607,18 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
         discardPendingRaw();
         termRef.current?.reset();
         linesRef.current = [];
+        // The picture can no longer be trusted. Painting the raw bytes that keep
+        // arriving mid-stream onto the blank screen just produces a half-drawn
+        // one, so wait for the snapshot the socket client is already requesting
+        // (and keep asking if it never comes).
+        beginResync(false);
       }
     });
     return () => {
       unsub();
       if (controlSubscriptionGenerationRef.current === generation) controlSubscriptionGenerationRef.current++;
     };
-  }, [active, discardPendingRaw, ws, sessionName]);
+  }, [active, beginResync, discardPendingRaw, ws, sessionName]);
 
   const applyDiff = useCallback((diff: TerminalDiff) => {
     if (!activeRef.current) return;
@@ -587,35 +633,15 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       return;
     }
 
-    // `rows` and every `lineIdx` arrive over the wire. Clamp before growing the
-    // array: the loops below are synchronous, so a single bad value would lock
-    // the main thread hard enough that the tab cannot even process a reload.
-    //
-    // See resolveDiffRows: an absent `rows` bounds allocation but must not be
-    // read as "zero rows", or incremental frames stop painting entirely.
-    const { declaredRows, rows } = resolveDiffRows(diff.rows);
-    const lines = linesRef.current;
-    for (const [lineIdx, content] of diff.lines) {
-      if (!isRenderableLineIndex(lineIdx, rows)) continue;
-      while (lines.length <= lineIdx) lines.push('');
-      lines[lineIdx] = content;
-    }
-    if (declaredRows !== null) {
-      while (lines.length < declaredRows) lines.push('');
-      linesRef.current = lines.slice(0, declaredRows);
-    } else {
-      linesRef.current = lines;
-    }
+    // `rows` and every `lineIdx` arrive over the wire and are bounded before any
+    // array grows (see applyDiffToRows / resolveDiffRows in terminal-frame.ts).
+    const { rows } = resolveDiffRows(diff.rows);
+    linesRef.current = applyDiffToRows(linesRef.current, diff);
 
     if (diff.fullFrame) {
-      // Full frame: rewrite entire screen from cursor home
-      let buf = '\x1b[H';
-      for (let i = 0; i < linesRef.current.length; i++) {
-        buf += (linesRef.current[i] ?? '') + '\x1b[K';
-        if (i < linesRef.current.length - 1) buf += '\r\n';
-      }
-      buf += '\x1b[J';
-      writeTerminal(buf, true);
+      // Full frame: repaint the whole screen AND restore what the raw bytes that
+      // follow assume (cursor cell, alternate screen) - see terminal-frame.ts.
+      writeTerminal(fullFrameWriteFromDiff(diff, linesRef.current), true);
     } else if (diff.lines.length > 0) {
       // Partial update: only write changed lines using cursor addressing
       let buf = '';
@@ -661,9 +687,10 @@ export function TerminalView({ sessionName, ws, connected, active = true, previe
       if (generation !== diffSubscriptionGenerationRef.current || !activeRef.current) return;
       applyDiff(diff);
     };
-    onDiff?.(guardedApplyDiff);
+    const unregister = onDiff?.(guardedApplyDiff);
     return () => {
       if (diffSubscriptionGenerationRef.current === generation) diffSubscriptionGenerationRef.current++;
+      if (typeof unregister === 'function') unregister();
     };
   }, [applyDiff, onDiff]);
 

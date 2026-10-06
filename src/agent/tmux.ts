@@ -256,14 +256,14 @@ async function tmuxRun(...args: string[]): Promise<string> {
   }
 }
 
-async function tmuxRunSpawn(args: string[]): Promise<string> {
+async function tmuxRunSpawn(args: string[], trim = true): Promise<string> {
   let lastError: unknown;
   const attempts = 3;
   for (let attempt = 0; attempt < attempts; attempt++) {
     await ensureTmuxServer();
     try {
       const { stdout } = await (isCoalescableTmuxRead(args) ? execFileRead : execFile)('tmux', args);
-      return stdout.trim();
+      return trim ? stdout.trim() : stdout;
     } catch (error) {
       if (!isRecoverableTmuxServerError(error)) throw error;
       lastError = error;
@@ -332,6 +332,74 @@ export async function capturePaneVisible(session: string): Promise<string> {
   // snapshot inserts a space at every visual wrap and the next stream frame
   // starts from a different logical line than xterm's buffer.
   return tmuxRun('capture-pane', '-e', '-J', '-p', '-t', session);
+}
+
+/**
+ * Everything a browser needs to repaint a pane so that the NEXT raw bytes land
+ * where tmux's own screen would put them.
+ *
+ * The visible text alone is not enough, and treating it as enough was a root
+ * cause of the "numbers stop updating / stuck on an old page" reports: after a
+ * snapshot the browser's cursor sat at the end of the frame instead of where the
+ * application left it, so every cursor-relative update (`\r` + a counter, an
+ * echoed keystroke, a status-line redraw) was painted on the wrong row; and a
+ * pane showing its ALTERNATE screen (vim, less, htop) was painted into the
+ * normal buffer, so leaving the application never restored the shell screen.
+ */
+export interface PaneScreenSnapshot {
+  /** Visible rows with ANSI colours, joined wrapped rows (see capturePaneVisible). */
+  visible: string;
+  /** 0-based cursor cell of the visible screen. Absent when the backend cannot say. */
+  cursor?: { x: number; y: number; visible: boolean };
+  /** The pane is currently showing its alternate screen. */
+  altScreen?: boolean;
+  /** The screen the application will return to when it leaves the alternate screen. */
+  normal?: string;
+}
+
+let paneScreenSnapshotSeq = 0;
+
+/**
+ * Capture the visible pane AND its cursor / alternate-screen state in ONE tmux
+ * invocation. tmux executes a `;`-chained command list in a single pass without
+ * reading pane output in between, so the text, the cursor and the saved normal
+ * screen describe the same instant - separate calls can straddle an update.
+ *
+ * Output is NOT trimmed: `capture-pane` rows are positional, and trimming the
+ * result also removed leading blank rows, shifting every row of a screen whose
+ * first rows were empty up by that many.
+ *
+ * The per-call marker also keeps this read out of the identical-read coalescing
+ * above: a snapshot requested NOW must be taken now, not borrowed from a read
+ * that started before the request.
+ */
+export async function capturePaneScreen(session: string): Promise<PaneScreenSnapshot> {
+  if (BACKEND !== 'tmux') return { visible: await capturePaneVisible(session) };
+  const marker = `@@IMCODES-SCREEN-${process.pid}-${++paneScreenSnapshotSeq}@@`;
+  const out = await tmuxRunSpawn([
+    'capture-pane', '-e', '-J', '-p', '-t', session,
+    ';', 'display-message', '-p', '-t', session, `${marker}#{cursor_x},#{cursor_y},#{cursor_flag},#{alternate_on}`,
+    ';', 'capture-pane', '-a', '-q', '-e', '-J', '-p', '-t', session,
+  ], false);
+  const markerAt = out.indexOf(marker);
+  if (markerAt < 0) return { visible: out };
+  const visible = out.slice(0, markerAt);
+  const afterMarker = out.slice(markerAt + marker.length);
+  const newline = afterMarker.indexOf('\n');
+  const metaLine = newline < 0 ? afterMarker : afterMarker.slice(0, newline);
+  const normal = newline < 0 ? '' : afterMarker.slice(newline + 1);
+  const [x, y, cursorFlag, alternateOn] = metaLine.trim().split(',');
+  const cursorX = Number(x);
+  const cursorY = Number(y);
+  const altScreen = alternateOn === '1';
+  return {
+    visible,
+    ...(Number.isInteger(cursorX) && Number.isInteger(cursorY) && cursorX >= 0 && cursorY >= 0
+      ? { cursor: { x: cursorX, y: cursorY, visible: cursorFlag !== '0' } }
+      : {}),
+    altScreen,
+    ...(altScreen ? { normal } : {}),
+  };
 }
 
 /**

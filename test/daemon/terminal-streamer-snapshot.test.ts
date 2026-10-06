@@ -966,13 +966,22 @@ describe('TerminalStreamer — snapshot coalescing (subscription storm)', () => 
 
     // The capture finally resolves with the pre-raw screen.
     releaseCapture('stale0\nstale1\nstale2\nstale3');
-    await flush();
+    await vi.advanceTimersByTimeAsync(1);
 
     const stale = frames.filter((d) => d.snapshotRequested && d.fullFrame);
     expect(
       stale.length,
       'a capture older than already-forwarded raw must not be published as a full frame',
     ).toBe(0);
+
+    // ...but the request is still OWED. It is answered by a capture taken after
+    // that raw, never left unanswered (the requester discards every byte until
+    // it gets one and would otherwise sit on its old picture for good).
+    mockCapture.mockResolvedValue('fresh0\nfresh1\nfresh2\nfresh3');
+    await flush();
+    const answered = frames.filter((d) => d.snapshotRequested && d.fullFrame);
+    expect(answered).toHaveLength(1);
+    expect(answered[0].lines.map(([, line]) => line)).toEqual(['fresh0', 'fresh1', 'fresh2', 'fresh3']);
   });
 
   it('keeps a session recoverable after a raw_buffer_overflow reset', async () => {

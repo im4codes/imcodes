@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'preact/hooks';
 import type { TerminalDiff } from '../types.js';
+import type { TerminalDiffRegistration } from '../terminal-diff-registry.js';
 import type { WsClient } from '../ws-client.js';
 
 const MAX_PREVIEW_CHARS = 32 * 1024;
@@ -24,7 +25,7 @@ interface Props {
   sessionName: string;
   ws: WsClient | null;
   connected: boolean;
-  onDiff: (apply: (diff: TerminalDiff) => void) => void;
+  onDiff: TerminalDiffRegistration;
   onHistory: (apply: (content: string) => void) => void;
   onScrollBottomFn?: (fn: () => void) => void;
 }
@@ -80,7 +81,8 @@ export function TerminalTextPreview({ sessionName, ws, connected, onDiff, onHist
 
   useEffect(() => {
     onHistory(applyHistory);
-    onDiff(applyDiff);
+    const unregister = onDiff(applyDiff);
+    return () => { if (typeof unregister === 'function') unregister(); };
   }, [applyDiff, applyHistory, onDiff, onHistory]);
 
   useEffect(() => {

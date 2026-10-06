@@ -187,7 +187,7 @@ interface Props {
   onStopDiscussion?: (id: string) => void;
   ws: WsClient | null;
   connected: boolean;
-  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void;
+  onDiff: (sessionName: string, apply: (d: TerminalDiff) => void) => void | (() => void);
   onHistory: (sessionName: string, apply: (c: string) => void) => void;
   serverId?: string;
   /** Main-session identity used to isolate the temporary quick-collapse stash. */

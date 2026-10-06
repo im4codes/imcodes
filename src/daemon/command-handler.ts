@@ -6157,6 +6157,9 @@ async function handleResize(cmd: Record<string, unknown>): Promise<void> {
     // causing tmux output to wrap at a wider width and misalign with xterm's display.
     await resizeSession(sessionName, Math.max(cols - 1, 40), Math.max(rows, 10));
     terminalStreamer.invalidateSize(sessionName);
+    // tmux reflowed its grid and the browser reflowed its own; a shell at its
+    // prompt redraws nothing, so nothing else would reconcile them.
+    terminalStreamer.scheduleResizeSnapshot(sessionName);
   } catch (err) {
     logger.error({ sessionName, cols, rows, err }, 'session.resize failed');
   }
@@ -6242,6 +6245,13 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
   const subscriber: StreamSubscriber = {
     sessionName: session,
     send: (diff) => {
+      // Raw bytes batched for up to RAW_BATCH_FLUSH_MS leave on the binary
+      // channel; the snapshot leaves immediately on the JSON one. Without this
+      // flush those OLDER bytes overtook nothing but were delivered AFTER the
+      // snapshot that already reflects them, i.e. applied twice (duplicated
+      // text, a counter rewound, the cursor moved) - the browser's queue is
+      // cleared by a full frame only for bytes it has already received.
+      flushRawBatch();
       try { serverLink.send({ type: 'terminal_update', diff }); } catch { /* ignore */ }
     },
     sendRaw: (data: Buffer) => {
@@ -6254,6 +6264,9 @@ function handleSubscribe(cmd: Record<string, unknown>, serverLink: ServerLink): 
       }
     },
     sendControl: (msg) => {
+      // Same ordering rule as `send`: a reset must not be overtaken by bytes
+      // that were forwarded before it.
+      flushRawBatch();
       try { serverLink.send(msg); } catch { /* ignore */ }
     },
     onBootstrapStalled: (reason) => {

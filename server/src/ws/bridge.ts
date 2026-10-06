@@ -28,6 +28,7 @@ import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-a
 import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { TERMINAL_CONTROL, TERMINAL_STREAM_RESET_REASON } from '../../../shared/terminal-protocol.js';
 import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
 import {
   CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME,
@@ -709,6 +710,9 @@ class TerminalForwardQueue {
   private epoch = 0;
   /** One stream_reset per overflow episode, not one per dropped frame. */
   private overflowNotified = false;
+  /** Frames were withheld during a pause (or forgiven by the grace valve) and
+   *  the browser has not yet been told that the socket is writable again. */
+  private droppedSinceResume = false;
 
   /** In-flight bytes this queue has handed to `ws.send` and not yet seen
    *  acknowledged. Exposed so overflow handling can decide when the socket is
@@ -727,8 +731,9 @@ class TerminalForwardQueue {
    *          out. The caller decides whether that is the FIRST drop of this
    *          episode (worth a stream_reset) by checking `takeOverflowNotice()`.
    */
-  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void): 'sent' | 'dropped' {
+  send(ws: WebSocket, data: string | Buffer, onOverflow: () => void, onResume?: () => void): 'sent' | 'dropped' {
     const size = typeof data === 'string' ? Buffer.byteLength(data, 'utf8') : data.byteLength;
+    let resumeAfterSend = false;
 
     const now = Date.now();
     if (this.paused || this.bufferedBytes + size > QUEUE_MAX_BYTES) {
@@ -751,6 +756,9 @@ class TerminalForwardQueue {
         this.paused = true;
         this.pausedSince = now;
       }
+      // From here every drop is a gap the browser can only close with a
+      // snapshot that the socket must be able to carry.
+      this.droppedSinceResume = true;
       // Escape valve. If the socket never acknowledges (a wedged connection, or
       // a peer whose main thread has stopped reading), staying paused forever
       // would freeze the terminal — the exact "终端卡住不更新, 刷新才恢复"
@@ -767,6 +775,10 @@ class TerminalForwardQueue {
         this.paused = false;
         this.overflowNotified = false;
         this.pausedSince = 0;
+        // Frames were dropped for the whole pause and the snapshot the browser
+        // asked for at its start could not be delivered either.
+        resumeAfterSend = this.droppedSinceResume;
+        this.droppedSinceResume = false;
       } else {
         onOverflow();
         return 'dropped';
@@ -793,8 +805,16 @@ class TerminalForwardQueue {
       if (sameEpoch && this.paused && this.bufferedBytes <= QUEUE_LOW_WATER_BYTES) {
         this.paused = false;
         this.overflowNotified = false;
+        // The socket carries frames again. The frames dropped meanwhile, and the
+        // snapshot requested when the drop began, never reached the browser:
+        // tell it to resync now that a snapshot can get through.
+        if (this.droppedSinceResume) {
+          this.droppedSinceResume = false;
+          onResume?.();
+        }
       }
     });
+    if (resumeAfterSend) onResume?.();
     return 'sent';
   }
 
@@ -9072,7 +9092,7 @@ export class WsBridge {
       if (!sessions.has(sessionName)) continue;
       if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
-      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
+      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws), () => this.handleQueueResume(sessionName, ws));
     }
   }
 
@@ -9429,7 +9449,7 @@ export class WsBridge {
       // while the terminal is visible; that must not suppress raw PTY bytes.
       if (!this.canShareSocketReceiveSession(ws, sessionName, data)) continue;
       const queue = this.getOrCreateQueue(sessionName, ws);
-      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws));
+      queue.send(ws, data, () => this.handleQueueOverflow(sessionName, ws), () => this.handleQueueResume(sessionName, ws));
     }
   }
 
@@ -9452,6 +9472,22 @@ export class WsBridge {
     return !!this.filterShareOutgoingJson(ws, msg, data);
   }
 
+  /**
+   * The slow browser socket is writable again after dropped frames: send it one
+   * more `terminal.stream_reset` so it asks for a snapshot NOW. The reset sent
+   * when the drop began made it ask while the socket was still full, so that
+   * snapshot (a `terminal.diff` through the same queue) was dropped like
+   * everything else, and the browser - discarding every byte until a snapshot
+   * arrives - stayed on its stale picture with no further signal ever sent.
+   */
+  private handleQueueResume(sessionName: string, ws: WebSocket): void {
+    safeSend(ws, JSON.stringify({
+      type: TERMINAL_CONTROL.STREAM_RESET,
+      session: sessionName,
+      reason: TERMINAL_STREAM_RESET_REASON.BACKPRESSURE_RESUME,
+    }));
+  }
+
   private handleQueueOverflow(sessionName: string, ws: WebSocket): void {
     // One reset per overflow EPISODE, not per dropped frame. Every reset makes
     // the client ask for a fresh full-frame snapshot, which is exactly the work
@@ -9461,9 +9497,9 @@ export class WsBridge {
     if (queue && !queue.takeOverflowNotice()) return;
 
     const resetMsg = JSON.stringify({
-      type: 'terminal.stream_reset',
+      type: TERMINAL_CONTROL.STREAM_RESET,
       session: sessionName,
-      reason: 'backpressure',
+      reason: TERMINAL_STREAM_RESET_REASON.BACKPRESSURE,
     });
 
     const sent = safeSend(ws, resetMsg, (err) => {

@@ -242,6 +242,7 @@ import { initPushNotifications, resetPushBadge } from './push-notifications.js';
 import { ServerSetupPage } from './pages/ServerSetupPage.js';
 import { NativeAuthBridge } from './pages/NativeAuthBridge.js';
 import type { SessionInfo, TerminalDiff } from './types.js';
+import { TerminalDiffRegistry } from './terminal-diff-registry.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import {
   buildTerminalResubscribePlan,
@@ -3563,7 +3564,7 @@ export function App() {
     setP2pSessionNames(names);
   }, [activeRootSession, p2pConfigPref.value]);
 
-  const diffApplyersRef = useRef<Map<string, (diff: TerminalDiff) => void>>(new Map());
+  const diffApplyersRef = useRef(new TerminalDiffRegistry());
   const historyApplyersRef = useRef<Map<string, (content: string) => void>>(new Map());
   // Per-session input refs (chat input element in SessionPane) — used by global keyboard handler
   const inputRefsMap = useRef<Map<string, HTMLDivElement>>(new Map());
@@ -4140,8 +4141,7 @@ export function App() {
         }
       }
       if (msg.type === 'terminal.diff') {
-        const apply = diffApplyersRef.current.get(msg.diff.sessionName);
-        apply?.(msg.diff);
+        diffApplyersRef.current.dispatch(msg.diff.sessionName, msg.diff);
         // Scan terminal lines for model keywords (catches Codex footer, fallback for all agents)
         const sessionName = msg.diff.sessionName;
         const stripped = msg.diff.lines.map(([, l]: [unknown, string]) => l.replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')).join(' ').toLowerCase();
@@ -5785,9 +5785,9 @@ export function App() {
     wsRef.current?.sendSessionCommand('restart', { project, ...(fresh ? { fresh: true } : {}) });
   }, []);
 
-  const registerDiffApplyer = useCallback((sessionName: string, apply: (d: TerminalDiff) => void) => {
-    diffApplyersRef.current.set(sessionName, apply);
-  }, []);
+  const registerDiffApplyer = useCallback((sessionName: string, apply: (d: TerminalDiff) => void): (() => void) => (
+    diffApplyersRef.current.register(sessionName, apply)
+  ), []);
 
   const registerHistoryApplyer = useCallback((sessionName: string, apply: (content: string) => void) => {
     historyApplyersRef.current.set(sessionName, apply);
