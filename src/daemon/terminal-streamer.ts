@@ -110,14 +110,22 @@ const SNAPSHOT_FRESHNESS_MS = 250;
  * A snapshot request is OWED until a snapshot has been published that is not
  * older than any raw byte already forwarded. When a capture raced live output
  * it is not published (a browser that already applied the newer bytes would be
- * rewound), but the request stays owed and is retried on this schedule; after
- * the clean attempts a snapshot is published anyway - the requester has been
- * discarding every byte since its gap, so waiting for a quiet moment on a
- * never-quiet stream (`yes`, a log tail) would freeze it indefinitely - and a
- * trailing "settle" snapshot then corrects whatever that forced frame missed
- * as soon as the output pauses.
+ * rewound), but the request stays owed and is retried at this spacing.
+ *
+ * Whether to keep waiting for a CLEAN capture is decided by how long the
+ * request has been owed, never by how many attempts were made: under a flood
+ * the tmux server is saturated and one `capture-pane` can itself take seconds,
+ * so "give up after N attempts" meant N x (capture time) - seven seconds on a
+ * CI runner, while the requester discards every byte and sits frozen. Once a
+ * request has been owed for SNAPSHOT_FORCE_AFTER_MS the next capture that
+ * completes is published even if output raced it (the requester has been
+ * discarding every byte since its gap, and a never-quiet stream - `yes`, a log
+ * tail - never offers a quiet moment), and a trailing "settle" snapshot then
+ * corrects whatever that forced frame missed as soon as the output pauses.
  */
 const SNAPSHOT_RETRY_DELAYS_MS = [30, 60, 120, 240, 400] as const;
+/** How long a request may wait for a clean capture before a raced one is published anyway. */
+const SNAPSHOT_FORCE_AFTER_MS = 1_000;
 /** Output must be silent this long before the settle snapshot is taken. */
 const SNAPSHOT_SETTLE_QUIET_MS = 200;
 const SNAPSHOT_SETTLE_POLL_MS = 100;
@@ -264,7 +272,7 @@ export class TerminalStreamer {
    *  only while no raw byte has been forwarded since. */
   private snapshotFreshStartedAt = new Map<string, number>();
   /** Requests not yet answered by a published snapshot (see SNAPSHOT_RETRY_DELAYS_MS). */
-  private snapshotOwed = new Map<string, { attempts: number }>();
+  private snapshotOwed = new Map<string, { attempts: number; since: number }>();
   private snapshotRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private snapshotSettleTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private resizeSnapshotTimers = new Map<string, ReturnType<typeof setTimeout>>();
@@ -715,7 +723,7 @@ export class TerminalStreamer {
     // one" and "discarded because output raced it" used to each answer the
     // request with silence, and the requester - which discards every byte from
     // its gap until a snapshot arrives - stayed on its last picture for good.
-    if (!this.snapshotOwed.has(sessionName)) this.snapshotOwed.set(sessionName, { attempts: 0 });
+    if (!this.snapshotOwed.has(sessionName)) this.snapshotOwed.set(sessionName, { attempts: 0, since: Date.now() });
 
     const requestedAt = Date.now();
     // Already capturing. That capture answers this request only if it began no
@@ -763,7 +771,11 @@ export class TerminalStreamer {
         const screen = await captureScreen(sessionName);
         const diff = buildSnapshotDiff(sessionName, size, screen, this.nextFrameSeq(sessionName), true);
         raced = (this.lastStreamRawAt.get(sessionName) ?? 0) >= startedAt;
-        if (!raced || force) {
+        // Judged at COMPLETION: a capture that began inside the deadline and ran
+        // past it is exactly the slow-tmux case, and must not be thrown away.
+        const owedSince = this.snapshotOwed.get(sessionName)?.since;
+        const overdue = owedSince !== undefined && Date.now() - owedSince >= SNAPSHOT_FORCE_AFTER_MS;
+        if (!raced || force || overdue) {
           for (const [sub] of this.subscribers.get(sessionName) ?? []) {
             try { sub.send(diff); } catch { /* ignore */ }
           }
@@ -839,13 +851,12 @@ export class TerminalStreamer {
     if (!owed) return;
     const attempt = owed.attempts;
     owed.attempts += 1;
-    const force = attempt >= SNAPSHOT_RETRY_DELAYS_MS.length;
     const delay = SNAPSHOT_RETRY_DELAYS_MS[Math.min(attempt, SNAPSHOT_RETRY_DELAYS_MS.length - 1)];
     const timer = setTimeout(() => {
       this.snapshotRetryTimers.delete(sessionName);
       if ((this.subscribers.get(sessionName)?.size ?? 0) === 0) { this.snapshotOwed.delete(sessionName); return; }
       if (this.snapshotInFlight.has(sessionName)) { this.scheduleSnapshotRetry(sessionName); return; }
-      this.runSnapshot(sessionName, force);
+      this.runSnapshot(sessionName, Date.now() - owed.since >= SNAPSHOT_FORCE_AFTER_MS);
     }, delay);
     timer.unref?.();
     this.snapshotRetryTimers.set(sessionName, timer);

@@ -138,6 +138,35 @@ describe('TerminalStreamer — an owed snapshot is never answered with silence',
     expect(requested().at(-1)!.lines[0]![1]).toBe('final0');
   });
 
+  it('a saturated tmux (every capture slow, every capture raced) is answered within the deadline + one capture, not N captures', async () => {
+    // Production shape on a busy CI runner: under a `yes` flood one capture-pane
+    // takes ~1.4 s, and output arrives during each of them. The give-up rule used
+    // to count ATTEMPTS (five clean ones, then force), i.e. five slow captures
+    // plus the forced one: ~7 s with the requester frozen the whole time.
+    let calls = 0;
+    mockScreen.mockImplementation(() => new Promise((resolve) => {
+      calls += 1;
+      setTimeout(() => { emitRaw('flood'); resolve(screenOf(`capture${calls}-`)); }, 1_400);
+    }));
+    streamer.requestSnapshot(SESSION);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(requested(), 'published as soon as the first overdue capture completes').toHaveLength(1);
+    expect(calls).toBe(1);
+  });
+
+  it('with moderately slow captures the deadline, not the attempt count, ends the retries', async () => {
+    let calls = 0;
+    mockScreen.mockImplementation(() => new Promise((resolve) => {
+      calls += 1;
+      setTimeout(() => { emitRaw('flood'); resolve(screenOf(`capture${calls}-`)); }, 400);
+    }));
+    streamer.requestSnapshot(SESSION);
+    await vi.advanceTimersByTimeAsync(990);
+    expect(requested(), 'before the deadline a raced capture is still withheld').toHaveLength(0);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(requested()).toHaveLength(1);
+  });
+
   it('stops retrying when nobody is subscribed any more', async () => {
     let release: (value: ReturnType<typeof screenOf>) => void = () => {};
     mockScreen.mockReturnValueOnce(new Promise((resolve) => { release = resolve; }));
