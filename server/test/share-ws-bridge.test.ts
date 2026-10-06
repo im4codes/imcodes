@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events';
+import { ASK_ANSWER_COMMAND } from '../../shared/ask-answer.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   WsBridge,
@@ -1203,6 +1204,35 @@ describe('WsBridge share-scoped sockets', () => {
       expect.objectContaining({ type: 'command.failed', commandId: 'cmd-viewer', reason: SHARE_REASONS.ROLE_DENIED }),
     ]));
     expect(daemon.sentJson.some((msg) => msg.type === 'unknown.command' || msg.type === 'session.resize' || msg.type === 'session.send')).toBe(false);
+  });
+
+  it('keeps ask.answer owner-only (not widened to participants) and reports the refusal so the answer is not lost', async () => {
+    const bridge = WsBridge.get(serverId);
+    const target: ShareTarget = { kind: 'main', serverId, sessionName: 'deck_proj_brain' };
+    bridge.setShareCoverageResolverForTests(async () => coverage(target, 'participant', now));
+    const daemon = new MockWs();
+    bridge.handleDaemonConnection(daemon as never, makeDb(), { JWT_SIGNING_KEY: 'share-ws-test-signing-key' } as never);
+    daemon.emit('message', JSON.stringify({ type: 'auth', serverId, token: 't' }));
+    await flushAsync();
+    daemon.sent.length = 0;
+
+    const shared = new MockWs();
+    bridge.handleShareBrowserConnection(shared as never, 'shared-user', makeDb(), {
+      ticketId: 'share-ticket-ask',
+      target,
+      snapshot: coverage(target, 'participant', now),
+    });
+
+    shared.emit('message', JSON.stringify({
+      type: ASK_ANSWER_COMMAND, sessionName: 'deck_proj_brain', answer: 'A', commandId: 'ans-share', toolUseId: 'toolu_1',
+    }));
+    await flushAsync();
+
+    // The browser is told (the answer text stays with the user), and nothing reached the daemon.
+    expect(shared.sentJson).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: 'command.ack', commandId: 'ans-share', status: 'error', error: SHARE_REASONS.DIRECT_SURFACE_DENIED }),
+    ]));
+    expect(daemon.sentJson.some((msg) => msg.type === ASK_ANSWER_COMMAND)).toBe(false);
   });
 
   it('allows a participant to start a covered sub-session and OpenSpec run while denying viewers', async () => {

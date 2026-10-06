@@ -242,7 +242,15 @@
     "answerPlaceholder": "回答を入力",
     "dismiss": "閉じる",
     "answer": "回答",
-    "interrupt": "この回答で割り込む"
+    "interrupt": "この回答で割り込む",
+    "answerNotSent": "接続が切れているため回答を送信できませんでした。ダイアログに残してあるので、再接続後にもう一度お試しください。",
+    "answerTooLarge": "回答が大きすぎて送信できません。",
+    "answerFailed": {
+      "failed": "回答をモデルに届けられませんでした。入力したテキストは下に残してあります。",
+      "unconfirmed": "回答の配信を確認できませんでした。再送する前にタイムラインを確認してください。入力したテキストは下に残してあります。",
+      "already_answered": "この質問はすでに別のデバイスから回答されています。",
+      "sendAsMessage": "メッセージとして送信"
+    }
   },
   "chat": {
     "daemon_notice": {

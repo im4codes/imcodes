@@ -65,6 +65,7 @@ import type {
   MemorySkillAdminRecord,
 } from '@shared/memory-management.js';
 import type { MemoryProjectResolveResponsePayload } from '@shared/memory-project-options.js';
+import { ASK_ANSWER_ACK_CAPABILITY_V1, ASK_ANSWER_COMMAND } from '@shared/ask-answer.js';
 import {
   MSG_COMMAND_ACK,
   MSG_COMMAND_FAILED,
@@ -496,11 +497,17 @@ export function chunkSubSessionRebuildBatches<T>(items: readonly T[]): T[][] {
   return batches;
 }
 
+const OUTBOUND_MESSAGE_TOO_LARGE = 'Message too large';
+
 function maxOutboundMessageBytes(msg: object): number {
   return (msg as { type?: unknown }).type === 'fs.write'
     ? FS_WRITE_OUTBOUND_WS_MAX_BYTES
     : DEFAULT_OUTBOUND_WS_MESSAGE_MAX_BYTES;
 }
+
+export type AskAnswerSendResult =
+  | { ok: true; commandId?: string }
+  | { ok: false; reason: 'not_connected' | 'too_large' };
 
 export class WsClient {
   private ws: WebSocket | null = null;
@@ -741,7 +748,7 @@ export class WsClient {
     }
     const json = JSON.stringify(msg);
     if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
-      throw new Error('Message too large');
+      throw new Error(OUTBOUND_MESSAGE_TOO_LARGE);
     }
     return json;
   }
@@ -807,7 +814,7 @@ export class WsClient {
     }
     const json = JSON.stringify(msg);
     if (utf8ByteLength(json) > maxOutboundMessageBytes(msg)) {
-      throw new Error('Message too large');
+      throw new Error(OUTBOUND_MESSAGE_TOO_LARGE);
     }
     this.ws.send(json);
   }
@@ -1462,8 +1469,34 @@ export class WsClient {
     this.send({ type: 'subsession.set_model', sessionName, model, cwd });
   }
 
-  askAnswer(sessionName: string, answer: string): void {
-    this.send({ type: 'ask.answer', sessionName, answer });
+  /**
+   * Answer an AskUserQuestion card. Unlike the fire-and-forget `send()`, this
+   * reports whether the frame actually left the browser: the user's choice must
+   * never be dropped silently while the card is dismissed as if it was sent.
+   * Uses the OS-level socket state (like /stop) so a focus/visibility probe that
+   * momentarily flips `_connected` cannot swallow the tap.
+   *
+   * With a daemon that advertises ASK_ANSWER_ACK_CAPABILITY_V1 the frame carries a
+   * `commandId`, and the returned id is what the daemon's `command.ack` /
+   * the bridge's `command.failed` will name. Older daemons get the legacy frame
+   * and no id (no confirmation will ever come).
+   */
+  askAnswer(sessionName: string, answer: string, opts: { toolUseId?: string } = {}): AskAnswerSendResult {
+    const acked = this.daemonCapabilitySnapshot?.capabilities.includes(ASK_ANSWER_ACK_CAPABILITY_V1) === true;
+    const commandId = acked ? crypto.randomUUID() : undefined;
+    try {
+      this.sendUrgent({
+        type: ASK_ANSWER_COMMAND,
+        sessionName,
+        answer,
+        ...(opts.toolUseId ? { toolUseId: opts.toolUseId } : {}),
+        ...(commandId ? { commandId } : {}),
+      });
+    } catch (err) {
+      const tooLarge = err instanceof Error && err.message === OUTBOUND_MESSAGE_TOO_LARGE;
+      return { ok: false, reason: tooLarge ? 'too_large' : 'not_connected' };
+    }
+    return { ok: true, ...(commandId ? { commandId } : {}) };
   }
 
   // ── Discussion commands ────────────────────────────────────────────────────

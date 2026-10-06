@@ -9,6 +9,7 @@ import {
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
+import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '../../shared/ask-answer.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 import { TIMELINE_HISTORY_CANCEL_CAPABILITY, TIMELINE_PROTOCOL_CAPABILITY, TIMELINE_PROTOCOL_REVISION } from '../../shared/timeline-protocol.js';
 import {
@@ -204,6 +205,7 @@ describe('ServerLink P2P workflow hello', () => {
       TIMELINE_HISTORY_CANCEL_CAPABILITY,
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+      ASK_ANSWER_ACK_CAPABILITY_V1,
     ]);
 
     link.updateP2pWorkflowCapabilities([
@@ -227,6 +229,7 @@ describe('ServerLink P2P workflow hello', () => {
       TIMELINE_HISTORY_CANCEL_CAPABILITY,
       FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
       FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+      ASK_ANSWER_ACK_CAPABILITY_V1,
     ]));
   });
 
@@ -294,6 +297,7 @@ describe('ServerLink P2P workflow hello', () => {
         TIMELINE_HISTORY_CANCEL_CAPABILITY,
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
         FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+        ASK_ANSWER_ACK_CAPABILITY_V1,
       ],
       timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
       timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,
@@ -371,6 +375,7 @@ describe('ServerLink P2P workflow hello', () => {
         TIMELINE_HISTORY_CANCEL_CAPABILITY,
         FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
         FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+        ASK_ANSWER_ACK_CAPABILITY_V1,
       ]),
       timelineProtocolCapability: TIMELINE_PROTOCOL_CAPABILITY,
       timelineProtocolRevision: TIMELINE_PROTOCOL_REVISION,

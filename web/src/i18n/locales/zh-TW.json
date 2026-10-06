@@ -242,7 +242,15 @@
     "answerPlaceholder": "輸入你的回答",
     "dismiss": "關閉",
     "answer": "回答",
-    "interrupt": "用此回答打斷"
+    "interrupt": "用此回答打斷",
+    "answerNotSent": "連線已中斷，回答沒有送出，仍保留在對話框中，連線恢復後請重試。",
+    "answerTooLarge": "回答內容太大，無法傳送。",
+    "answerFailed": {
+      "failed": "你的回答沒有送達模型，文字已保留在下方。",
+      "unconfirmed": "未能確認你的回答已送達。重送前請先查看時間線，文字已保留在下方。",
+      "already_answered": "這個問題已在另一台裝置上回答過。",
+      "sendAsMessage": "作為訊息傳送"
+    }
   },
   "chat": {
     "daemon_notice": {

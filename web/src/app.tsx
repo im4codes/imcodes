@@ -114,6 +114,9 @@ import type { SessionSettingsOpenIntent } from './session-settings-open-intent.j
 import { StartDiscussionDialog, type DiscussionPrefs, type SubSessionOption } from './components/StartDiscussionDialog.js';
 import { AskQuestionDialog, type PendingQuestion } from './components/AskQuestionDialog.js';
 import { shouldDismissPendingQuestion } from './ask-question-dismiss.js';
+import { AskAnswerTracker, type AskAnswerFailure } from './ask-answer-tracker.js';
+import { AskAnswerFailedDialog } from './components/AskAnswerFailedDialog.js';
+import { ASK_ANSWER_ACK_WAIT_MS } from '@shared/ask-answer.js';
 import type { TrailingAskQuestion } from './find-pending-question.js';
 import { ServerContextMenu, DeleteServerDialog } from './components/ServerContextMenu.js';
 import { RepoPage, type RepoPageTabKey } from './pages/RepoPage.js';
@@ -2437,6 +2440,14 @@ export function App() {
   // Questions the user already answered/dismissed this session — so re-hydrating
   // from history (below) never re-pops a question they've dealt with.
   const dismissedQuestionsRef = useRef<Set<string>>(new Set());
+  // Answers sent to the daemon but not yet confirmed, and the one (if any) that
+  // turned out refused/lost — shown with the user's text so it is never silent.
+  const [askAnswerFailure, setAskAnswerFailure] = useState<AskAnswerFailure | null>(null);
+  const askAnswerTrackerRef = useRef<AskAnswerTracker | null>(null);
+  if (!askAnswerTrackerRef.current) {
+    askAnswerTrackerRef.current = new AskAnswerTracker(ASK_ANSWER_ACK_WAIT_MS, setAskAnswerFailure);
+  }
+  useEffect(() => () => askAnswerTrackerRef.current?.dispose(), []);
   const [discussions, setDiscussions] = useState<Array<{
     id: string;
     topic: string;
@@ -3941,6 +3952,16 @@ export function App() {
     }
 
     const unsub = ws.onMessage((msg) => {
+      askAnswerTrackerRef.current?.handle(msg);
+      if (msg.type === 'timeline.event' && msg.event.type === 'user.message') {
+        // The echo of an answer names the question it settled: close this
+        // device's copy of the card (answered from another tab/device).
+        const answeredId = msg.event.payload.askToolUseId;
+        if (typeof answeredId === 'string' && answeredId) {
+          dismissedQuestionsRef.current.add(answeredId);
+          setPendingQuestion((pq) => (pq?.toolUseId === answeredId ? null : pq));
+        }
+      }
       if (msg.type === DAEMON_MSG.CONTROLLED_NODE_WORKER_REFRESH_STATUS
         && selectedServerId
         && typeof window !== 'undefined') {
@@ -8006,14 +8027,49 @@ export function App() {
         <AskQuestionDialog
           pending={pendingQuestion}
           onSubmit={(answer) => {
+            const sent = wsRef.current?.askAnswer(
+              pendingQuestion.sessionName,
+              answer,
+              { toolUseId: pendingQuestion.toolUseId },
+            );
+            if (sent && !sent.ok) {
+              // Nothing left the browser: keep the card (and the user's
+              // selections) open instead of dismissing it as if answered.
+              const toastId = Date.now() + Math.random();
+              setToasts((prev) => [...prev, {
+                id: toastId,
+                kind: 'notification',
+                title: trans(sent.reason === 'too_large' ? 'askQuestion.answerTooLarge' : 'askQuestion.answerNotSent'),
+              }]);
+              setTimeout(() => setToasts((prev) => prev.filter((x) => x.id !== toastId)), 8000);
+              return;
+            }
+            if (sent?.commandId) {
+              askAnswerTrackerRef.current?.track({
+                commandId: sent.commandId,
+                sessionName: pendingQuestion.sessionName,
+                toolUseId: pendingQuestion.toolUseId,
+                answer,
+              });
+            }
             dismissedQuestionsRef.current.add(pendingQuestion.toolUseId);
-            wsRef.current?.askAnswer(pendingQuestion.sessionName, answer);
             setPendingQuestion(null);
           }}
           onDismiss={() => {
             dismissedQuestionsRef.current.add(pendingQuestion.toolUseId);
             setPendingQuestion(null);
           }}
+        />
+      )}
+
+      {askAnswerFailure && (
+        <AskAnswerFailedDialog
+          failure={askAnswerFailure}
+          onSendAsMessage={(answer) => {
+            wsRef.current?.sendSessionMessage(askAnswerFailure.sessionName, answer);
+            setAskAnswerFailure(null);
+          }}
+          onDismiss={() => setAskAnswerFailure(null)}
         />
       )}
 

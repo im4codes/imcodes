@@ -1,4 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { ASK_ANSWER_COMMAND } from '../../shared/ask-answer.js';
 import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import { EventEmitter } from 'node:events';
@@ -3898,6 +3899,41 @@ describe('WsBridge', () => {
       browserWs.emit('message', JSON.stringify({ type: 'ask.answer', sessionName: 's', answer: 'yes' }));
       await flushAsync();
       expect(daemonWs.sentStrings.some((s) => s.includes('ask.answer'))).toBe(true);
+    });
+
+    it('tracks an ask.answer that carries a commandId until the daemon acks it', async () => {
+      const { daemonWs, browserWs } = await setupBridge();
+      const bridge = WsBridge.get(serverId);
+      browserWs.emit('message', JSON.stringify({
+        type: ASK_ANSWER_COMMAND, sessionName: 's', answer: 'yes', commandId: 'ans-1', toolUseId: 'toolu_1',
+      }));
+      await flushAsync();
+      expect(daemonWs.sentStrings.some((s) => s.includes(ASK_ANSWER_COMMAND) && s.includes('ans-1'))).toBe(true);
+      expect(bridge._getInflightCountForTest()).toBe(1);
+
+      daemonWs.emit('message', JSON.stringify({
+        type: 'command.ack', commandId: 'ans-1', status: 'accepted', session: 's', delivery: 'in_place',
+      }));
+      await flushAsync();
+      expect(bridge._getInflightCountForTest()).toBe(0);
+      const acks = browserWs.sent
+        .map((raw) => { try { return JSON.parse(raw as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((msg) => msg?.type === 'command.ack' && msg.commandId === 'ans-1');
+      expect(acks).toEqual([expect.objectContaining({ status: 'accepted', delivery: 'in_place' })]);
+    });
+
+    it('tells the browser at once when an ask.answer cannot reach an offline daemon', async () => {
+      const bridge = WsBridge.get(serverId);
+      const browserWs = new MockWs();
+      bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb('valid-hash'));
+      browserWs.emit('message', JSON.stringify({
+        type: ASK_ANSWER_COMMAND, sessionName: 's', answer: 'yes', commandId: 'ans-offline',
+      }));
+      await flushAsync();
+      const failed = browserWs.sent
+        .map((raw) => { try { return JSON.parse(raw as string) as Record<string, unknown>; } catch { return null; } })
+        .filter((msg) => msg?.type === 'command.failed' && msg.commandId === 'ans-offline');
+      expect(failed).toEqual([expect.objectContaining({ reason: 'daemon_offline' })]);
     });
   });
 

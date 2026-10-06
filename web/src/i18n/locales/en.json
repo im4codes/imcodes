@@ -242,7 +242,15 @@
     "answerPlaceholder": "Your answer",
     "dismiss": "Dismiss",
     "answer": "Answer",
-    "interrupt": "Interrupt with this"
+    "interrupt": "Interrupt with this",
+    "answerNotSent": "Your answer was not sent because the connection is down. It is still in the dialog — try again once reconnected.",
+    "answerTooLarge": "Your answer is too large to send.",
+    "answerFailed": {
+      "failed": "Your answer could not be delivered to the model. Your text is kept below.",
+      "unconfirmed": "Delivery of your answer was not confirmed. Check the timeline before resending. Your text is kept below.",
+      "already_answered": "This question was already answered from another device.",
+      "sendAsMessage": "Send as message"
+    }
   },
   "chat": {
     "daemon_notice": {

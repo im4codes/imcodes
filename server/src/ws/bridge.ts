@@ -293,6 +293,7 @@ import {
   COMMAND_ACK_ORIGIN_TTL_MS,
   type AckFailureReason,
 } from '../../../shared/ack-protocol.js';
+import { ASK_ANSWER_COMMAND } from '../../../shared/ask-answer.js';
 import {
   PREVIEW_BINARY_FRAME,
   PREVIEW_ERROR,
@@ -7010,12 +7011,16 @@ export class WsBridge {
       // (or timeout / disconnect) can correlate back to the right browser.
       if ((msg.type === 'session.send'
         || msg.type === DAEMON_COMMAND_TYPES.SESSION_CANCEL
-        || msg.type === 'session.undo_queued_message')
+        || msg.type === 'session.undo_queued_message'
+        || msg.type === ASK_ANSWER_COMMAND)
         && typeof msg.commandId === 'string') {
         const sessionName = typeof msg.sessionName === 'string'
           ? msg.sessionName
           : (typeof msg.session === 'string' ? msg.session : '');
         if (sessionName) {
+          // An answer can come from a page that never subscribed to the session
+          // (the question card is app-level): route its ack back to this socket.
+          if (msg.type === ASK_ANSWER_COMMAND) this.commandAckOrigins.record(msg.commandId, ws);
           this.handleOutboundSessionSend(ws, msg.commandId, sessionName, raw);
           return;
         }

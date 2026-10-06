@@ -29,6 +29,7 @@ import {
 } from '../../shared/p2p-workflow-constants.js';
 import { P2P_WORKFLOW_MSG } from '../../shared/p2p-workflow-messages.js';
 import { SESSION_GROUP_CLONE_CAPABILITY_V1 } from '../../shared/session-group-clone.js';
+import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '../../shared/ask-answer.js';
 import { EXECUTION_CLONE_CAPABILITY_V1 } from '../../shared/execution-clone.js';
 import { GIT_REMOTE_CLONE_CAPABILITY_V1 } from '../../shared/git-remote-url.js';
 import {
@@ -324,6 +325,7 @@ const DAEMON_STATIC_CAPABILITIES = [
   TIMELINE_HISTORY_CANCEL_CAPABILITY,
   FILE_TRANSFER_UPLOAD_FETCH_CAPABILITY,
   FILE_TRANSFER_DOWNLOAD_STREAM_CAPABILITY,
+  ASK_ANSWER_ACK_CAPABILITY_V1,
 ] as const;
 
 export function directFileTransferDaemonCapabilities(available: boolean): readonly string[] {

@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID } from '../../shared/ack-protocol.js';
+import { ASK_ANSWER_ACK_ERRORS, ASK_ANSWER_COMMAND, ASK_ANSWER_DELIVERY } from '../../shared/ask-answer.js';
 import { DAEMON_USER_NOTICE_CODE } from '../../shared/daemon-user-notices.js';
 import { TRANSPORT_SESSION_AGENT_TYPES } from '../../shared/agent-types.js';
 import { DAEMON_COMMAND_TYPES } from '../../shared/daemon-command-types.js';
@@ -375,6 +376,7 @@ import {
   listSessionModelsNow,
   switchSessionModelNow,
   resetSessionCommandDedupForTests,
+  resetAskAnswerLedgerForTests,
   switchSessionThinkingNow,
   restartSessionNow,
   __invalidateTransportListModelsCacheForTests,
@@ -1136,6 +1138,200 @@ describe('handleWebCommand transport queue behavior', () => {
 
     expect(send).toHaveBeenCalledTimes(1);
     expect(cancel).not.toHaveBeenCalled();
+  });
+
+  describe('ask.answer acknowledgement contract', () => {
+    const ackCalls = (commandId: string) => serverLink.send.mock.calls
+      .map((call) => call[0] as Record<string, unknown>)
+      .filter((msg) => msg.type === 'command.ack' && msg.commandId === commandId);
+    const userMessageEmits = () => emitMock.mock.calls.filter((call) => call[1] === 'user.message');
+
+    beforeEach(() => {
+      resetAskAnswerLedgerForTests();
+      resetSessionCommandDedupForTests();
+    });
+
+    it('resolves a paused question in place, records the answer in the timeline and acks the delivery', async () => {
+      const answerPendingQuestion = vi.fn(() => true);
+      getProviderMock.mockReturnValue({ id: 'mock-provider', answerPendingQuestion });
+
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND,
+        sessionName: 'deck_transport_brain',
+        answer: 'Option A',
+        commandId: 'ans-1',
+        toolUseId: 'toolu_1',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(answerPendingQuestion).toHaveBeenCalledWith('deck_transport_brain', 'Option A');
+      // Timeline: exactly one user.message, naming the question it settled.
+      expect(userMessageEmits()).toHaveLength(1);
+      expect(userMessageEmits()[0]?.[2]).toMatchObject({
+        text: 'Option A',
+        askToolUseId: 'toolu_1',
+        askAnswerCommandId: 'ans-1',
+      });
+      expect(ackCalls('ans-1')).toEqual([expect.objectContaining({
+        status: 'accepted',
+        delivery: ASK_ANSWER_DELIVERY.IN_PLACE,
+        session: 'deck_transport_brain',
+      })]);
+    });
+
+    it('delivers an answer to a question that already timed out as a new turn, once', async () => {
+      const send = vi.fn(() => 'sent');
+      getProviderMock.mockReturnValue({ id: 'mock-provider', answerPendingQuestion: vi.fn(() => false) });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send, cancel: vi.fn(async () => {}) });
+
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'Late pick', commandId: 'ans-late', toolUseId: 'toolu_late',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(send).toHaveBeenCalledTimes(1);
+      expect(userMessageEmits()).toHaveLength(1);
+      expect(ackCalls('ans-late')).toEqual([expect.objectContaining({ status: 'accepted', delivery: ASK_ANSWER_DELIVERY.SENT })]);
+    });
+
+    it('acks a queued front-of-queue answer as queued (the drain writes its timeline row)', async () => {
+      const send = vi.fn(() => 'queued');
+      const cancel = vi.fn(async () => {});
+      getProviderMock.mockReturnValue({ id: 'mock-provider' });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send, cancel });
+
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'B', commandId: 'ans-q', toolUseId: 'toolu_q',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(cancel).toHaveBeenCalledTimes(1);
+      expect(userMessageEmits()).toHaveLength(0);
+      expect(ackCalls('ans-q')).toEqual([expect.objectContaining({ status: 'accepted', delivery: ASK_ANSWER_DELIVERY.QUEUED })]);
+    });
+
+    it('re-emits the SAME ack for a bridge redispatch instead of delivering the answer twice', async () => {
+      const answerPendingQuestion = vi.fn(() => true);
+      getProviderMock.mockReturnValue({ id: 'mock-provider', answerPendingQuestion });
+      const cmd = {
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'Option A', commandId: 'ans-dup', toolUseId: 'toolu_dup',
+      };
+
+      handleWebCommand(cmd as any, serverLink as any);
+      await flushAsync();
+      handleWebCommand({ ...cmd, __bridgeRetry: true } as any, serverLink as any);
+      await flushAsync();
+
+      expect(answerPendingQuestion).toHaveBeenCalledTimes(1);
+      expect(userMessageEmits()).toHaveLength(1);
+      const acks = ackCalls('ans-dup');
+      expect(acks).toHaveLength(2);
+      expect(acks.every((ack) => ack.status === 'accepted' && ack.delivery === ASK_ANSWER_DELIVERY.IN_PLACE)).toBe(true);
+    });
+
+    it('refuses a second device answering the same question and never steers the model twice', async () => {
+      const answerPendingQuestion = vi.fn(() => true);
+      getProviderMock.mockReturnValue({ id: 'mock-provider', answerPendingQuestion });
+
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'Phone pick', commandId: 'ans-phone', toolUseId: 'toolu_same',
+      }, serverLink as any);
+      await flushAsync();
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'Desktop pick', commandId: 'ans-desktop', toolUseId: 'toolu_same',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(answerPendingQuestion).toHaveBeenCalledTimes(1);
+      expect(userMessageEmits()).toHaveLength(1);
+      expect(ackCalls('ans-desktop')).toEqual([expect.objectContaining({
+        status: 'error',
+        error: ASK_ANSWER_ACK_ERRORS.ALREADY_ANSWERED,
+      })]);
+    });
+
+    it('turns a delivery exception into an error ack (no silent loss) and lets the same question be answered again', async () => {
+      const send = vi.fn(() => { throw new Error('transport message authority rejected before dispatch'); });
+      getProviderMock.mockReturnValue({ id: 'mock-provider' });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send, cancel: vi.fn(async () => {}) });
+
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'X', commandId: 'ans-fail', toolUseId: 'toolu_retry',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(userMessageEmits()).toHaveLength(0);
+      expect(ackCalls('ans-fail')).toEqual([expect.objectContaining({
+        status: 'error',
+        error: ASK_ANSWER_ACK_ERRORS.DELIVERY_FAILED,
+      })]);
+
+      // The failed attempt must not burn the question: a retry can still land.
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send: vi.fn(() => 'sent'), cancel: vi.fn(async () => {}) });
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'X', commandId: 'ans-retry', toolUseId: 'toolu_retry',
+      }, serverLink as any);
+      await flushAsync();
+      expect(ackCalls('ans-retry')).toEqual([expect.objectContaining({ status: 'accepted' })]);
+    });
+
+    it('acks a vanished session as an error instead of typing into a missing terminal', async () => {
+      getSessionMock.mockReturnValue(undefined);
+
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_gone_brain', answer: 'Y', commandId: 'ans-gone',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(ackCalls('ans-gone')).toEqual([expect.objectContaining({
+        status: 'error',
+        error: ASK_ANSWER_ACK_ERRORS.DELIVERY_FAILED,
+      })]);
+    });
+
+    it('acks an empty answer as an error', async () => {
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: '   ', commandId: 'ans-empty',
+      }, serverLink as any);
+      await flushAsync();
+      expect(ackCalls('ans-empty')).toEqual([expect.objectContaining({
+        status: 'error',
+        error: ASK_ANSWER_ACK_ERRORS.EMPTY_ANSWER,
+      })]);
+    });
+
+    it('keeps the legacy fire-and-forget behaviour (no ack) for a browser that sends no commandId', async () => {
+      const answerPendingQuestion = vi.fn(() => true);
+      getProviderMock.mockReturnValue({ id: 'mock-provider', answerPendingQuestion });
+
+      handleWebCommand({
+        type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'Option A',
+      }, serverLink as any);
+      await flushAsync();
+
+      expect(answerPendingQuestion).toHaveBeenCalledTimes(1);
+      expect(userMessageEmits()).toHaveLength(1);
+      expect(userMessageEmits()[0]?.[2]).not.toHaveProperty('askToolUseId');
+      expect(serverLink.send.mock.calls.filter((call) => (call[0] as { type?: string }).type === 'command.ack')).toHaveLength(0);
+    });
+
+    it('does not leave an unhandled rejection when a legacy answer cannot be delivered', async () => {
+      const send = vi.fn(() => { throw new Error('boom'); });
+      getProviderMock.mockReturnValue({ id: 'mock-provider' });
+      getTransportRuntimeMock.mockReturnValue({ providerSessionId: 'route-transport', send, cancel: vi.fn(async () => {}) });
+      const unhandled = vi.fn();
+      process.on('unhandledRejection', unhandled);
+      try {
+        handleWebCommand({
+          type: ASK_ANSWER_COMMAND, sessionName: 'deck_transport_brain', answer: 'Z',
+        }, serverLink as any);
+        await flushAsync();
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      } finally {
+        process.off('unhandledRejection', unhandled);
+      }
+      expect(unhandled).not.toHaveBeenCalled();
+    });
   });
 
   it('undo_queued_message deletes a SQLite-only queued orphan when the runtime in-memory queue is empty', async () => {

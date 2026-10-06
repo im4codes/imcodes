@@ -83,6 +83,7 @@ const {
     discussionList: ReturnType<typeof vi.fn>;
     discussionStop: ReturnType<typeof vi.fn>;
     askAnswer: ReturnType<typeof vi.fn>;
+    sendSessionMessage: ReturnType<typeof vi.fn>;
     repoDetect: ReturnType<typeof vi.fn>;
     resumeConnection: ReturnType<typeof vi.fn>;
     reconnectNow: ReturnType<typeof vi.fn>;
@@ -212,6 +213,7 @@ vi.mock('../src/ws-client.js', () => ({
     discussionList = vi.fn();
     discussionStop = vi.fn();
     askAnswer = vi.fn();
+    sendSessionMessage = vi.fn();
     repoDetect = vi.fn();
     resumeConnection = vi.fn();
     reconnectNow = vi.fn();
@@ -4172,9 +4174,108 @@ describe('App shell', () => {
     });
 
     fireEvent.click(screen.getByText('ask-submit'));
-    expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer');
+    expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer', { toolUseId: 'auto-run-1:needs-human:2' });
     expect(screen.queryByText('ask-question-dialog')).toBeNull();
   }, 20_000);
+
+  describe('AskUserQuestion answer delivery', () => {
+    const askEvent = (toolUseId: string) => ({
+      type: 'timeline.event',
+      event: {
+        id: `evt-${toolUseId}`,
+        ts: Date.now(),
+        sessionId: 'deck_alpha_brain',
+        type: 'ask.question',
+        payload: { toolUseId, waitMs: 60_000, questions: [{ question: 'Pick one', options: [{ label: 'A' }, { label: 'B' }] }] },
+      },
+    });
+
+    async function openQuestion(toolUseId: string) {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', 'srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_brain');
+      const { App } = await importApp();
+      render(<App />);
+      expect(await screen.findByText('session-tabs')).toBeTruthy();
+      const ws = await getActiveWsClient();
+      await act(async () => { ws.emit(askEvent(toolUseId)); });
+      expect(await screen.findByText('ask-question-dialog')).toBeTruthy();
+      return ws;
+    }
+
+    it('keeps the card open when the answer could not leave the browser', async () => {
+      const ws = await openQuestion('toolu_offline');
+      ws.askAnswer.mockReturnValue({ ok: false, reason: 'not_connected' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+
+      expect(ws.askAnswer).toHaveBeenCalledWith('deck_alpha_brain', 'answer', { toolUseId: 'toolu_offline' });
+      // Not dismissed: the user can retry once the connection is back.
+      expect(screen.queryByText('ask-question-dialog')).toBeTruthy();
+      expect(await screen.findByText('askQuestion.answerNotSent')).toBeTruthy();
+    }, 20_000);
+
+    it('shows the preserved answer and offers to resend it when the daemon refuses it', async () => {
+      const ws = await openQuestion('toolu_refused');
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-refused' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+
+      await act(async () => {
+        ws.emit({ type: 'command.ack', commandId: 'ans-refused', status: 'error', error: 'ask_answer_delivery_failed', session: 'deck_alpha_brain' });
+      });
+      const failed = await screen.findByTestId('ask-answer-failed');
+      expect(failed.textContent).toContain('answer');
+      expect(failed.textContent).toContain('askQuestion.answerFailed.failed');
+
+      fireEvent.click(screen.getByText('askQuestion.answerFailed.sendAsMessage'));
+      expect(ws.sendSessionMessage).toHaveBeenCalledWith('deck_alpha_brain', 'answer');
+      expect(screen.queryByTestId('ask-answer-failed')).toBeNull();
+    }, 20_000);
+
+    it('does not offer a resend when another device already answered the question', async () => {
+      const ws = await openQuestion('toolu_second');
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-second' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+      await act(async () => {
+        ws.emit({ type: 'command.ack', commandId: 'ans-second', status: 'error', error: 'ask_answer_already_answered', session: 'deck_alpha_brain' });
+      });
+      expect(await screen.findByText('askQuestion.answerFailed.already_answered')).toBeTruthy();
+      expect(screen.queryByText('askQuestion.answerFailed.sendAsMessage')).toBeNull();
+    }, 20_000);
+
+    it('stays quiet when the daemon confirms the answer', async () => {
+      const ws = await openQuestion('toolu_ok');
+      ws.askAnswer.mockReturnValue({ ok: true, commandId: 'ans-ok' });
+
+      fireEvent.click(screen.getByText('ask-submit'));
+      await act(async () => {
+        ws.emit({ type: 'command.ack', commandId: 'ans-ok', status: 'accepted', session: 'deck_alpha_brain', delivery: 'in_place' });
+      });
+      expect(screen.queryByTestId('ask-answer-failed')).toBeNull();
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+    }, 20_000);
+
+    it("closes this device's card when the answer's timeline echo names the question (answered elsewhere)", async () => {
+      const ws = await openQuestion('toolu_elsewhere');
+
+      await act(async () => {
+        ws.emit({
+          type: 'timeline.event',
+          event: {
+            id: 'evt-echo',
+            ts: Date.now(),
+            sessionId: 'deck_alpha_brain',
+            type: 'user.message',
+            payload: { text: 'B', askToolUseId: 'toolu_elsewhere', askAnswerCommandId: 'ans-other-device' },
+          },
+        });
+      });
+      expect(screen.queryByText('ask-question-dialog')).toBeNull();
+    }, 20_000);
+  });
 
   it('quick-collapses and restores all sub-session windows without unmounting their chat state', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));

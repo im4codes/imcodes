@@ -87,6 +87,13 @@ import { maybeCloneGitRemoteToDirectory } from './git-remote-clone.js';
 import { getDefaultAckOutbox } from './ack-outbox.js';
 import { COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID, MSG_COMMAND_ACK } from '../../shared/ack-protocol.js';
 import {
+  ASK_ANSWER_ACK_ERRORS,
+  ASK_ANSWER_COMMAND,
+  ASK_ANSWER_DELIVERY,
+  type AskAnswerDelivery,
+} from '../../shared/ask-answer.js';
+import { AskAnswerLedger, type AskAnswerOutcome } from './ask-answer-ledger.js';
+import {
   AGENT_DELEGATION_ERROR_CODES,
   AGENT_DELEGATION_REPLY_TIMELINE_EVENT,
   AGENT_DELEGATION_TARGET_FIELD,
@@ -2075,7 +2082,7 @@ function dispatchWebCommand(cmd: Record<string, unknown>, serverLink: ServerLink
       }
       break;
     }
-    case 'ask.answer':
+    case ASK_ANSWER_COMMAND:
       void handleAskAnswer(cmd, serverLink);
       break;
     case 'discussion.start':
@@ -7604,13 +7611,92 @@ async function handleSubSessionReadResponse(cmd: Record<string, unknown>, server
   } catch { /* not connected */ }
 }
 
+const askAnswerLedger = new AskAnswerLedger();
+
+/** Test seam: forget the in-process ask.answer bookkeeping, as a daemon restart does. */
+export function resetAskAnswerLedgerForTests(): void {
+  askAnswerLedger.clear();
+}
+
+/**
+ * `ask.answer` entrypoint. Never throws and never fails silently: an answer
+ * the daemon cannot deliver is acked as an error (when the browser sent a
+ * `commandId`) and logged, so the browser can keep the user's text and offer
+ * to send it as an ordinary message instead of showing a fake success.
+ */
 async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerLink): Promise<void> {
-  const sessionName = cmd.sessionName as string | undefined;
-  const answer = cmd.answer as string | undefined;
+  const sessionName = typeof cmd.sessionName === 'string' ? cmd.sessionName : undefined;
+  const answer = typeof cmd.answer === 'string' ? cmd.answer : undefined;
+  const commandId = typeof cmd.commandId === 'string' && cmd.commandId.trim() ? cmd.commandId.trim() : undefined;
+  const toolUseId = typeof cmd.toolUseId === 'string' && cmd.toolUseId.trim() ? cmd.toolUseId.trim() : undefined;
+  const ackSession = sessionName ?? '';
+
+  const settle = (outcome: AskAnswerOutcome): void => {
+    if (!commandId) return;
+    askAnswerLedger.settle(commandId, ackSession, toolUseId, outcome);
+    emitCommandAckReliable(serverLink, {
+      commandId,
+      sessionName: ackSession,
+      status: outcome.status,
+      ...(outcome.error ? { error: outcome.error } : {}),
+      ...(outcome.extras ?? {}),
+    });
+  };
+  const fail = (error: string): void => settle({ status: 'error', error });
+
   if (!sessionName || answer === undefined) {
-    logger.warn('ask.answer: missing sessionName or answer');
+    logger.warn({ commandId }, 'ask.answer: missing sessionName or answer');
+    if (commandId) emitCommandAckReliable(serverLink, { commandId, sessionName: ackSession, status: 'error', error: ASK_ANSWER_ACK_ERRORS.EMPTY_ANSWER });
     return;
   }
+
+  if (commandId) {
+    const begun = askAnswerLedger.begin(commandId);
+    if (begun.state === 'pending') return; // bridge redispatch of a command still being delivered: its ack is coming
+    if (begun.state === 'done') {
+      // The bridge only redispatches when it never saw our ack: replay the SAME
+      // outcome instead of delivering the answer a second time.
+      settle(begun.outcome);
+      return;
+    }
+    if (isAcceptedSessionCommand(sessionName, commandId)) {
+      // Seen by an earlier daemon process (durable ledger) with an unknown
+      // outcome: refuse rather than risk delivering the answer twice.
+      emitCommandAckReliable(serverLink, { commandId, sessionName, status: 'error', error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID });
+      return;
+    }
+    if (toolUseId && !askAnswerLedger.claimQuestion(sessionName, toolUseId, commandId)) {
+      fail(ASK_ANSWER_ACK_ERRORS.ALREADY_ANSWERED);
+      return;
+    }
+  }
+
+  try {
+    const delivery = await deliverAskAnswer(sessionName, answer, toolUseId, commandId, serverLink);
+    if (delivery === 'empty') {
+      fail(ASK_ANSWER_ACK_ERRORS.EMPTY_ANSWER);
+      return;
+    }
+    settle({ status: 'accepted', extras: { delivery } });
+  } catch (err) {
+    logger.warn({ err, sessionName, commandId }, 'ask.answer: delivery failed');
+    fail(ASK_ANSWER_ACK_ERRORS.DELIVERY_FAILED);
+  }
+}
+
+async function deliverAskAnswer(
+  sessionName: string,
+  answer: string,
+  toolUseId: string | undefined,
+  commandId: string | undefined,
+  serverLink: ServerLink,
+): Promise<AskAnswerDelivery | 'empty'> {
+  // The answer's timeline echo carries the question it answers, so every other
+  // open tab/device can close its copy of the card.
+  const echoExtra: Record<string, unknown> = {
+    ...(toolUseId ? { askToolUseId: toolUseId } : {}),
+    ...(commandId ? { askAnswerCommandId: commandId } : {}),
+  };
   // Transport (SDK) sessions have no TUI to type into. Deliver the chosen answer
   // as an ordinary message via handleSend (which is transport-aware): the
   // provider restarts the turn with it, resolving the AskUserQuestion by having
@@ -7620,7 +7706,7 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
   const isTransportSession = record?.runtimeType === 'transport'
     || (typeof record?.agentType === 'string' && isTransportAgent(record.agentType));
   if (isTransportSession) {
-    if (!answer.trim()) return;
+    if (!answer.trim()) return 'empty';
     // If the model is PAUSED on this question (canUseTool wait window), resolve
     // it in place so the model continues in the SAME turn with the user's
     // choice. Otherwise (timed out / already self-continued) deliver the answer
@@ -7633,67 +7719,69 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
       // user send, so handleSend's echo never fires. Emit the chosen answer as a
       // user.message ourselves so the chat visibly records what the user picked
       // (confirming the answer was received) and persists it across a refresh.
-      emitTransportUserMessageEvent(sessionName, answer);
-    } else {
-      const runtime = getTransportRuntime(sessionName);
-      if (runtime?.providerSessionId) {
-        // If the provider cannot resolve the question in place, this answer is
-        // still semantically tied to the currently visible dialog. Do not append
-        // it behind unrelated pending user messages: put it at the front of the
-        // transport queue so it is the next provider-visible turn. This fixes
-        // the askquestion failure mode where a queued backlog caused the chosen
-        // option to arrive too late and the dialog reported "no answer".
-        const result = runtime.send(answer, undefined, undefined, undefined, { queuePlacement: 'front' });
-        if (result === 'sent') {
-          emitTransportUserMessageEvent(sessionName, answer);
-        } else {
-          // DEADLOCK BREAK. `queuePlacement: 'front'` only wins against other
-          // QUEUED messages — it still waits for the active turn to settle. But
-          // the active turn is usually the very turn that is paused ON this
-          // question, so it can only settle once the answer arrives: the answer
-          // waits for the turn, the turn waits for the answer, and the user sees
-          // "answered, nothing happened". Providers without
-          // `answerPendingQuestion` (everything except claude-code-sdk today)
-          // hit this on every dialog.
-          //
-          // A dialog answer is a control response, not an ordinary queued send
-          // (see CLAUDE.md: approval/feedback responses must use the priority
-          // path and must not be blocked by the ordinary send queue). `cancel()`
-          // is exactly that priority path: it cuts in line, settles the active
-          // turn LOCALLY without waiting on the provider, keeps queued messages
-          // intact, and then drains — so our front entry becomes the next turn
-          // immediately. This is the "force-interrupt that re-steers the model"
-          // the branch above always intended.
-          //
-          // The drain emits the visible `user.message` for the queued entry, so
-          // do NOT emit it here as well or the answer renders twice.
-          timelineEmitter.emit(
-            sessionName,
-            'session.state',
-            buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_ask_answer'),
-            { source: 'daemon', confidence: 'high' },
-          );
-          try {
-            await runtime.cancel();
-          } catch (err) {
-            logger.warn(
-              { err, sessionName },
-              'ask.answer: force-interrupt of the paused turn failed; answer stays queued at the front',
-            );
-          }
-        }
-      } else {
-        // Timed out / already self-continued and no live runtime snapshot is
-        // available: fall back to the ordinary transport-aware send path.
-        await handleSend({ sessionName, text: answer }, serverLink);
-      }
+      emitTransportUserMessageEvent(sessionName, answer, echoExtra);
+      return ASK_ANSWER_DELIVERY.IN_PLACE;
     }
-    return;
+    const runtime = getTransportRuntime(sessionName);
+    if (runtime?.providerSessionId) {
+      // If the provider cannot resolve the question in place, this answer is
+      // still semantically tied to the currently visible dialog. Do not append
+      // it behind unrelated pending user messages: put it at the front of the
+      // transport queue so it is the next provider-visible turn. This fixes
+      // the askquestion failure mode where a queued backlog caused the chosen
+      // option to arrive too late and the dialog reported "no answer".
+      const result = runtime.send(answer, undefined, undefined, undefined, { queuePlacement: 'front' });
+      if (result === 'sent') {
+        emitTransportUserMessageEvent(sessionName, answer, echoExtra);
+        return ASK_ANSWER_DELIVERY.SENT;
+      }
+      // DEADLOCK BREAK. `queuePlacement: 'front'` only wins against other
+      // QUEUED messages — it still waits for the active turn to settle. But
+      // the active turn is usually the very turn that is paused ON this
+      // question, so it can only settle once the answer arrives: the answer
+      // waits for the turn, the turn waits for the answer, and the user sees
+      // "answered, nothing happened". Providers without
+      // `answerPendingQuestion` (everything except claude-code-sdk today)
+      // hit this on every dialog.
+      //
+      // A dialog answer is a control response, not an ordinary queued send
+      // (see CLAUDE.md: approval/feedback responses must use the priority
+      // path and must not be blocked by the ordinary send queue). `cancel()`
+      // is exactly that priority path: it cuts in line, settles the active
+      // turn LOCALLY without waiting on the provider, keeps queued messages
+      // intact, and then drains — so our front entry becomes the next turn
+      // immediately. This is the "force-interrupt that re-steers the model"
+      // the branch above always intended.
+      //
+      // The drain emits the visible `user.message` for the queued entry, so
+      // do NOT emit it here as well or the answer renders twice.
+      timelineEmitter.emit(
+        sessionName,
+        'session.state',
+        buildTransportQueueSessionStatePayload(sessionName, 'queued', 'command_handler_ask_answer'),
+        { source: 'daemon', confidence: 'high' },
+      );
+      try {
+        await runtime.cancel();
+      } catch (err) {
+        logger.warn(
+          { err, sessionName },
+          'ask.answer: force-interrupt of the paused turn failed; answer stays queued at the front',
+        );
+      }
+      return ASK_ANSWER_DELIVERY.QUEUED;
+    }
+    // Timed out / already self-continued and no live runtime snapshot is
+    // available: fall back to the ordinary transport-aware send path.
+    await handleSend({ sessionName, text: answer }, serverLink);
+    return ASK_ANSWER_DELIVERY.SENT;
   }
+  if (!record) throw new Error(`ask.answer: session not found: ${sessionName}`);
   // Process/TUI path: ESC to dismiss the dialog, then send the answer text + Enter.
   await sendKey(sessionName, 'Escape');
   await new Promise<void>((r) => setTimeout(r, 150));
   await sendKeys(sessionName, answer);
+  return ASK_ANSWER_DELIVERY.TERMINAL;
 }
 
 // ── P2P discussion file listing ────────────────────────────────────────────

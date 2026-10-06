@@ -3,6 +3,7 @@ import { WsClient } from '../src/ws-client.js';
 import { DAEMON_MSG } from '@shared/daemon-events.js';
 import { P2P_WORKFLOW_MSG, isP2pWorkflowRequestId } from '@shared/p2p-workflow-messages.js';
 import { TRANSPORT_MSG } from '@shared/transport-events.js';
+import { ASK_ANSWER_ACK_CAPABILITY_V1 } from '@shared/ask-answer.js';
 import { REPO_MSG } from '@shared/repo-types.js';
 import { TIMELINE_MESSAGES, TIMELINE_PROTOCOL_CAPABILITY } from '@shared/timeline-protocol.js';
 import { FS_TRANSPORT_MSG } from '@shared/fs-transport-messages.js';
@@ -2175,6 +2176,65 @@ describe('WsClient', () => {
       // Socket is gone; even urgent send must throw so the caller falls
       // back to HTTP rather than silently dropping.
       expect(() => client.sendUrgent({ type: 'session.send', text: '/stop' })).toThrow('WebSocket not connected');
+    });
+
+    describe('askAnswer', () => {
+      const hello = (capabilities: string[]) => ({ data: JSON.stringify({
+        type: 'daemon.hello',
+        daemonId: 'daemon-ask',
+        capabilities,
+        helloEpoch: 1,
+        sentAt: Date.now(),
+      }) });
+
+      it('reports a socket that is not open instead of silently dropping the answer', async () => {
+        const client = await connectClient();
+        lastWs!.emit('close', { code: 1006, reason: 'lost' });
+        expect(client.askAnswer('deck_brain', 'A', { toolUseId: 'toolu_1' })).toEqual({ ok: false, reason: 'not_connected' });
+      });
+
+      it('still delivers during the probe window where the gated send() would drop it', async () => {
+        const client = await connectClient();
+        lastWs!.send.mockClear();
+        (client as unknown as { _connected: boolean })._connected = false;
+        const result = client.askAnswer('deck_brain', 'A');
+        expect(result).toEqual({ ok: true });
+        expect(JSON.parse(String(lastWs!.send.mock.calls[0]![0]))).toEqual({
+          type: 'ask.answer', sessionName: 'deck_brain', answer: 'A',
+        });
+        client.disconnect();
+      });
+
+      it('reports an over-size answer', async () => {
+        const client = await connectClient();
+        lastWs!.send.mockClear();
+        expect(client.askAnswer('deck_brain', 'x'.repeat(5 * 1024 * 1024))).toEqual({ ok: false, reason: 'too_large' });
+        expect(lastWs!.send).not.toHaveBeenCalled();
+        client.disconnect();
+      });
+
+      it('adds a commandId + toolUseId only when the daemon advertises answer acks', async () => {
+        const client = await connectClient();
+        lastWs!.emit('message', hello([ASK_ANSWER_ACK_CAPABILITY_V1]));
+        lastWs!.send.mockClear();
+        const result = client.askAnswer('deck_brain', 'A', { toolUseId: 'toolu_1' });
+        expect(result.ok).toBe(true);
+        const frame = JSON.parse(String(lastWs!.send.mock.calls[0]![0])) as Record<string, unknown>;
+        expect(frame).toMatchObject({ type: 'ask.answer', sessionName: 'deck_brain', answer: 'A', toolUseId: 'toolu_1' });
+        expect(typeof frame.commandId).toBe('string');
+        expect(result).toEqual({ ok: true, commandId: frame.commandId });
+        client.disconnect();
+      });
+
+      it('sends the legacy frame (no commandId) to a daemon without the capability', async () => {
+        const client = await connectClient();
+        lastWs!.emit('message', hello([]));
+        lastWs!.send.mockClear();
+        const result = client.askAnswer('deck_brain', 'A', { toolUseId: 'toolu_1' });
+        expect(result).toEqual({ ok: true });
+        expect(JSON.parse(String(lastWs!.send.mock.calls[0]![0]))).not.toHaveProperty('commandId');
+        client.disconnect();
+      });
     });
 
     it('sendSessionCommandUrgent maps cancel to session.cancel without /stop text', async () => {

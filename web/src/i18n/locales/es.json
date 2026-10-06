@@ -242,7 +242,15 @@
     "answerPlaceholder": "Tu respuesta",
     "dismiss": "Cerrar",
     "answer": "Responder",
-    "interrupt": "Interrumpir con esto"
+    "interrupt": "Interrumpir con esto",
+    "answerNotSent": "Tu respuesta no se envió porque no hay conexión. Sigue en el cuadro de diálogo: inténtalo de nuevo al reconectar.",
+    "answerTooLarge": "Tu respuesta es demasiado grande para enviarse.",
+    "answerFailed": {
+      "failed": "No se pudo entregar tu respuesta al modelo. Tu texto se conserva abajo.",
+      "unconfirmed": "No se confirmó la entrega de tu respuesta. Revisa la línea de tiempo antes de reenviar. Tu texto se conserva abajo.",
+      "already_answered": "Esta pregunta ya se respondió desde otro dispositivo.",
+      "sendAsMessage": "Enviar como mensaje"
+    }
   },
   "chat": {
     "daemon_notice": {
