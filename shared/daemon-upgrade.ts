@@ -73,6 +73,13 @@ export const CONTROLLED_NODE_UPGRADE_WAIT_REASON = {
   DAEMON_NOT_READY: 'daemon_not_ready',
   BLOCKED_SYNC_PENDING: 'blocked_sync_pending',
   LEGACY_RESCUE_PENDING: 'legacy_rescue_pending',
+  /** The operator set IMCODES_DISABLE_AUTO_UPGRADE on this deployment. */
+  DISABLED_BY_ENV: 'auto_upgrade_disabled_by_env',
+  /** The server has no usable APP_VERSION to converge nodes to. */
+  SERVER_VERSION_UNKNOWN: 'server_version_unknown',
+  DAEMON_VERSION_UNKNOWN: 'daemon_version_unknown',
+  /** A failed attempt for this exact target is waiting out its backoff. */
+  RETRY_BACKOFF: 'retry_backoff',
 } as const;
 
 /**

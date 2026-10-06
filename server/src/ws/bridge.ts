@@ -10418,9 +10418,19 @@ export class WsBridge {
     if (this.daemonNodeRole !== NODE_ROLE.CONTROLLED || !this.authenticated) return null;
     // An operator may explicitly hold the server-driven trigger closed while
     // retaining manual upgrades. The published image does not set this value.
-    if (isDaemonAutoUpgradeDisabledByEnv()) return null;
+    if (isDaemonAutoUpgradeDisabledByEnv()) {
+      this.logControlledNodeUpgradeWait(process.env.APP_VERSION ?? null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DISABLED_BY_ENV);
+      return null;
+    }
     const targetVersion = process.env.APP_VERSION;
-    if (!targetVersion || targetVersion === '0.0.0' || !this.daemonVersion) return null;
+    if (!targetVersion || targetVersion === '0.0.0') {
+      this.logControlledNodeUpgradeWait(null, CONTROLLED_NODE_UPGRADE_WAIT_REASON.SERVER_VERSION_UNKNOWN);
+      return null;
+    }
+    if (!this.daemonVersion) {
+      this.logControlledNodeUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.DAEMON_VERSION_UNKNOWN);
+      return null;
+    }
     this.controlledNodeUpgradeTargetVersion = targetVersion;
     if (!isDaemonUpgradeAvailable(this.daemonVersion, targetVersion)) {
       this.setControlledNodeUpgradeState(CONTROLLED_NODE_UPGRADE_STATUS.CURRENT, null, null);
@@ -10443,6 +10453,7 @@ export class WsBridge {
       // due immediately, so a node can never be stranded by an old failure.
       if (retryRemainingMs > 0) {
         this.scheduleControlledNodeUpgradeRetry(retryRemainingMs);
+        this.logControlledNodeUpgradeWait(targetVersion, CONTROLLED_NODE_UPGRADE_WAIT_REASON.RETRY_BACKOFF);
         return null;
       }
       this.daemonUpgradeCoordinator.releaseTerminalBlock(targetVersion, now);
@@ -10476,13 +10487,16 @@ export class WsBridge {
         reason,
       );
       this.logControlledNodeUpgradeWait(targetVersion, reason);
+    } else {
+      // already_in_progress / suppressed / anything else: still say why nothing was sent.
+      this.logControlledNodeUpgradeWait(targetVersion, result.reason ?? result.deliveryStatus);
     }
     return result;
   }
 
   /** Log a held-back upgrade once per distinct reason, never per flush. */
-  private logControlledNodeUpgradeWait(targetVersion: string, reason: string | null): void {
-    const key = `${targetVersion}:${reason ?? 'unknown'}`;
+  private logControlledNodeUpgradeWait(targetVersion: string | null, reason: string | null): void {
+    const key = `${targetVersion ?? 'none'}:${reason ?? 'unknown'}`;
     if (this.lastLoggedControlledUpgradeWait === key) return;
     this.lastLoggedControlledUpgradeWait = key;
     logger.info({

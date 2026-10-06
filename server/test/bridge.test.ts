@@ -3,6 +3,7 @@ import { ASK_ANSWER_COMMAND } from '../../shared/ask-answer.js';
 import { AGENT_SKILLS_MESSAGE_PREFIX, AGENT_SKILLS_MSG } from '../../shared/agent-skills.js';
 import { AGENT_MCP_MESSAGE_PREFIX, AGENT_MCP_MSG } from '../../shared/agent-mcp.js';
 import { EventEmitter } from 'node:events';
+import logger from '../src/util/logger.js';
 import { performance } from 'node:perf_hooks';
 import { readFileSync } from 'node:fs';
 import {
@@ -1166,6 +1167,62 @@ describe('WsBridge', () => {
       await authControlled(third);
       await vi.advanceTimersByTimeAsync(STAGGER_MS);
       expect(upgradeFrames(third)).toHaveLength(1);
+    });
+
+    it('says why a controlled node is not upgraded on every early-return path', async () => {
+      vi.useFakeTimers();
+      const heldBack = () => infoSpy.mock.calls
+        .filter(([, message]) => message === 'controlled node upgrade is being held back')
+        .map(([fields]) => (fields as { reason?: string }).reason);
+      const infoSpy = vi.spyOn(logger, 'info');
+      try {
+        // (1) explicit operator opt-out
+        process.env.APP_VERSION = '2026.7.1234-dev.5';
+        process.env.IMCODES_DISABLE_AUTO_UPGRADE = '1';
+        const optedOut = new MockWs();
+        await authControlled(optedOut);
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        expect(upgradeFrames(optedOut)).toHaveLength(0);
+        expect(heldBack()).toContain('auto_upgrade_disabled_by_env');
+        delete process.env.IMCODES_DISABLE_AUTO_UPGRADE;
+
+        // (2) the server has no usable target version
+        process.env.APP_VERSION = '0.0.0';
+        const noTarget = new MockWs();
+        await authControlled(noTarget);
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        expect(upgradeFrames(noTarget)).toHaveLength(0);
+        expect(heldBack()).toContain('server_version_unknown');
+      } finally {
+        infoSpy.mockRestore();
+      }
+    });
+
+    it('says why a failed target is not retried yet', async () => {
+      vi.useFakeTimers();
+      process.env.APP_VERSION = '2026.7.1234-dev.5';
+      const infoSpy = vi.spyOn(logger, 'info');
+      try {
+        const ws = new MockWs();
+        await authControlled(ws);
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        ws.emit('message', JSON.stringify({
+          type: DAEMON_MSG.UPGRADE_BLOCKED, reason: 'artifact_download_failed', targetVersion: process.env.APP_VERSION,
+        }));
+        await flushAsync();
+        // Reconnect inside the backoff, with the failure persisted as production would have it:
+        // the node is not offered the target again yet, and the log says why.
+        const again = new MockWs();
+        await authControlled(again, '0.1.2', makeDb('valid-hash', 'controlled', undefined, undefined, {
+          status: 'failed', target: process.env.APP_VERSION, reason: 'artifact_download_failed',
+        }));
+        await vi.advanceTimersByTimeAsync(STAGGER_MS);
+        expect(upgradeFrames(again)).toHaveLength(0);
+        expect(infoSpy.mock.calls.some(([fields, message]) => message === 'controlled node upgrade is being held back'
+          && (fields as { reason?: string }).reason === 'retry_backoff')).toBe(true);
+      } finally {
+        infoSpy.mockRestore();
+      }
     });
 
     it('does not auto-upgrade a controlled node when the explicit deployment opt-out is set', async () => {
