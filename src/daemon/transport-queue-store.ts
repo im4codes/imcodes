@@ -36,6 +36,9 @@ function defaultDbPath(): string {
 }
 export const MAX_QUEUE_HANDOFF_ATTEMPTS = 3;
 const QUEUE_CANCELLATION_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+/** How long an accepted session.send commandId is remembered across restarts. */
+export const SESSION_COMMAND_LEDGER_TTL_MS = 24 * 60 * 60 * 1000;
+const SESSION_COMMAND_LEDGER_PRUNE_INTERVAL_MS = 10 * 60 * 1000;
 
 /** Number of durable sweeps allowed before an ownerless queue is terminally dropped. */
 export const MAX_ORPHAN_QUEUE_RESTORE_ATTEMPTS = 3;
@@ -276,6 +279,7 @@ export class TransportQueueStore {
   private readonly db: DatabaseSyncInstance;
   private readonly ownsDb: boolean;
   private closed = false;
+  private lastSessionCommandPruneAt = 0;
 
   constructor(options: TransportQueueStoreOptions = {}) {
     if (options.database) {
@@ -383,6 +387,19 @@ export class TransportQueueStore {
         created_at INTEGER NOT NULL,
         PRIMARY KEY (job_id, execution_id)
       );
+
+      -- session.send commandIds the daemon has already accepted. The in-memory
+      -- dedup forgets after minutes / on restart, while the server and browser
+      -- can legitimately re-deliver an old command after a reconnect; without
+      -- this a replayed command (e.g. "/model X") executes a second time.
+      CREATE TABLE IF NOT EXISTS session_command_ledger (
+        session_name TEXT NOT NULL,
+        command_id TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        PRIMARY KEY (session_name, command_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_command_ledger_created_at
+        ON session_command_ledger (created_at);
     `);
     this.migrateRecipientIdentityColumns();
     this.migrateSupervisionReferenceColumn();
@@ -400,6 +417,30 @@ export class TransportQueueStore {
       ON CONFLICT (job_id, execution_id) DO NOTHING
     `).run(jobId, executionId, now);
     return Number(result.changes ?? 0) === 1;
+  }
+
+  /**
+   * Atomically record that this daemon accepted `commandId` for `sessionName`.
+   * Returns false when it was already accepted inside the retention window, i.e.
+   * the caller is looking at a replay and must not execute it again. Expired
+   * rows are pruned lazily and never block a fresh claim.
+   */
+  claimSessionCommand(sessionNameInput: string, commandIdInput: string, now = Date.now()): boolean {
+    const sessionName = sessionNameInput.trim();
+    const commandId = commandIdInput.trim();
+    if (!sessionName || !commandId) return true;
+    const cutoff = now - SESSION_COMMAND_LEDGER_TTL_MS;
+    if (now - this.lastSessionCommandPruneAt >= SESSION_COMMAND_LEDGER_PRUNE_INTERVAL_MS) {
+      this.lastSessionCommandPruneAt = now;
+      this.db.prepare('DELETE FROM session_command_ledger WHERE created_at < ?').run(cutoff);
+    }
+    const claimed = this.db.prepare(`
+      INSERT INTO session_command_ledger (session_name, command_id, created_at)
+      VALUES (?, ?, ?)
+      ON CONFLICT (session_name, command_id) DO UPDATE SET created_at = excluded.created_at
+        WHERE session_command_ledger.created_at < ?
+    `).run(sessionName, commandId, now, cutoff);
+    return Number(claimed.changes ?? 0) === 1;
   }
 
   /**

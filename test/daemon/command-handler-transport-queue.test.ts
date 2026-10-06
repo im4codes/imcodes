@@ -3794,6 +3794,59 @@ describe('handleWebCommand transport queue behavior', () => {
     expect(userMessages).toHaveLength(1);
   });
 
+  it('refuses a replayed commandId after the in-memory window, without executing it again', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+    const realNow = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    try {
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'once', commandId: 'cmd-replay-late' }, serverLink as any);
+      await flushAsync();
+      expect(transportSend).toHaveBeenCalledTimes(1);
+
+      // 2.5h later (the observed reconnect replay): far beyond the 5-minute
+      // in-memory dedup, still inside the durable ledger retention.
+      nowSpy.mockReturnValue(realNow + 150 * 60 * 1000);
+      handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'once', commandId: 'cmd-replay-late' }, serverLink as any);
+      await flushAsync();
+
+      expect(transportSend).toHaveBeenCalledTimes(1);
+      expect(serverLink.send).toHaveBeenCalledWith({
+        type: 'command.ack',
+        commandId: 'cmd-replay-late',
+        status: 'error',
+        session: 'deck_transport_brain',
+        error: COMMAND_ACK_ERROR_DUPLICATE_COMMAND_ID,
+      });
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('still refuses a replayed commandId after the in-memory dedup is gone (daemon restart)', async () => {
+    const transportSend = vi.fn(() => 'sent');
+    getTransportRuntimeMock.mockReturnValue({
+      providerSessionId: 'route-transport',
+      send: transportSend,
+      pendingCount: 0,
+    });
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'once', commandId: 'cmd-replay-restart' }, serverLink as any);
+    await flushAsync();
+    expect(transportSend).toHaveBeenCalledTimes(1);
+
+    // A restart empties every in-process map but keeps the sqlite ledger.
+    const { resetSessionCommandDedupForTests } = await import('../../src/daemon/command-handler.js');
+    resetSessionCommandDedupForTests();
+    handleWebCommand({ type: 'session.send', session: 'deck_transport_brain', text: 'once', commandId: 'cmd-replay-restart' }, serverLink as any);
+    await flushAsync();
+
+    expect(transportSend).toHaveBeenCalledTimes(1);
+  });
+
   it('passes the raw user message to transport runtime assembly without client-side context shaping', async () => {
     const transportSend = vi.fn(() => 'sent');
     getTransportRuntimeMock.mockReturnValue({

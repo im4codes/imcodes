@@ -9,6 +9,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   getTransportQueueStore,
   resetTransportQueueStoreForTests,
+  SESSION_COMMAND_LEDGER_TTL_MS,
   shouldQuarantineUnrestorableQueueSession,
   TransportQueueStore,
 } from '../../src/daemon/transport-queue-store.js';
@@ -77,6 +78,25 @@ describe('TransportQueueStore', () => {
       // The key includes the schedule id, so a different job's occurrence is
       // not accidentally suppressed by a reused execution id.
       expect(restarted.claimCronDispatch('another-job', executionId, 3_000)).toBe(true);
+    } finally {
+      restarted.close();
+    }
+  });
+
+  it('durably claims a session.send commandId once, across restart, until retention expires', () => {
+    expect(store.claimSessionCommand('deck_a', 'cmd-1', 1_000)).toBe(true);
+    expect(store.claimSessionCommand('deck_a', 'cmd-1', 2_000)).toBe(false);
+    // Scoped per session, and a blank id is never blocked.
+    expect(store.claimSessionCommand('deck_b', 'cmd-1', 2_000)).toBe(true);
+    expect(store.claimSessionCommand('deck_a', '', 2_000)).toBe(true);
+
+    const restarted = new TransportQueueStore({ dbPath: join(dir, 'queue.sqlite') });
+    try {
+      expect(restarted.claimSessionCommand('deck_a', 'cmd-1', 3_000)).toBe(false);
+      // Past the retention window the id is accepted again and re-armed.
+      const later = 3_000 + SESSION_COMMAND_LEDGER_TTL_MS + 1;
+      expect(restarted.claimSessionCommand('deck_a', 'cmd-1', later)).toBe(true);
+      expect(restarted.claimSessionCommand('deck_a', 'cmd-1', later + 1)).toBe(false);
     } finally {
       restarted.close();
     }

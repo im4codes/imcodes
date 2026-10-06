@@ -1752,6 +1752,34 @@ function getDedup(sessionName: string): CommandDedup {
   return dedup;
 }
 
+/** Test seam: forget the in-process dedup window, as a daemon restart does. */
+export function resetSessionCommandDedupForTests(): void {
+  sessionDedups.clear();
+}
+
+/**
+ * True when this daemon already accepted `commandId` for `sessionName`: either
+ * inside the in-memory window or, beyond it (or across a restart), in the
+ * durable ledger. The server/browser may re-deliver a command long after the
+ * memory window; it must be refused rather than executed a second time. A
+ * ledger fault fails open so a storage problem never blocks live sends.
+ */
+export function isAcceptedSessionCommand(
+  sessionName: string,
+  commandId: string,
+  dedup: Pick<CommandDedup, 'has' | 'add'> = getDedup(sessionName),
+): boolean {
+  if (dedup.has(commandId)) return true;
+  try {
+    if (getTransportQueueStore().claimSessionCommand(sessionName, commandId)) return false;
+  } catch (err) {
+    logger.warn({ err, sessionName, commandId }, 'session.send: command ledger unavailable — accepting without durable dedup');
+    return false;
+  }
+  dedup.add(commandId);
+  return true;
+}
+
 function expandTilde(p: string): string {
   if (p === '~') return homedir();
   if (p.startsWith('~/') || p.startsWith('~\\')) return homedir() + p.slice(1);
@@ -4045,7 +4073,7 @@ async function handleSend(cmd: Record<string, unknown>, serverLink: ServerLink):
   // Dedup: reject duplicate commandIds explicitly so the browser/server does
   // not wait for an ack timeout after the daemon has already seen this send.
   const dedup = getDedup(sessionName);
-  if (dedup.has(effectiveId)) {
+  if (isAcceptedSessionCommand(sessionName, effectiveId, dedup)) {
     if ((cmd as any).__bridgeRetry === true) {
       if (replayDelegationTerminalAckIfPresent(serverLink, sessionName, effectiveId)) return;
       // The bridge only retries session.send when it never saw our ack — so the
