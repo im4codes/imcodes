@@ -134,15 +134,15 @@ describe('a busy supervised_audit project with a long finished history', () => {
       .toEqual(['auditor', 'implementer']);
   });
 
-  it('keeps open pairs in the window when the finished history exceeds it', () => {
+  it('keeps open pairs in the (capped) window when the finished history exceeds it', () => {
     save(BUSY, 'old-open', 'working', 1);
     for (let i = 0; i < 260; i += 1) save(BUSY, `d${i}`, 'done', 1_000 + i);
 
     registry.handleFrame(subscribe(BUSY));
     const ids = sent.at(-1).tasks.map((task: any) => task.taskId);
     expect(ids).toContain('old-open');
-    // open pair + the 200 newest finished ones, newest first.
-    expect(ids).toHaveLength(201);
+    // Capped at 200 rows: the open pair first, then the newest finished ones.
+    expect(ids).toHaveLength(200);
     expect(ids).toContain('d259');
     expect(ids).not.toContain('d0');
     expect(store.listPairWindowIds(BUSY.project)).toEqual(store.listPairs(BUSY.project).map((stored) => stored.state.taskId));

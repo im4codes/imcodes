@@ -408,19 +408,19 @@ export class TaskPairStore {
   }
 
   /**
-   * The console window of a project, newest first: EVERY open pair plus the
-   * `limit` most recently finished ones. A plain `LIMIT` by recency let a
-   * long-quiet working pair fall out of the window behind a long history of
-   * finished pairs, so the console silently omitted live work.
+   * The console window of a project: at most `limit` pairs, open pairs first
+   * and then the most recently finished ones, returned newest first. A plain
+   * recency `LIMIT` let a long-quiet working pair fall out of the window behind
+   * a long history of finished pairs, so the console silently omitted live work.
    */
   #windowQuery(columns: string): string {
     const terminal = TASK_PAIR_TERMINAL_STATUSES.map((status) => `'${status}'`).join(',');
-    return `SELECT ${columns} FROM task_pairs WHERE project = ? AND (status NOT IN (${terminal}) OR task_id IN (`
-      + `SELECT task_id FROM task_pairs WHERE project = ? AND status IN (${terminal}) ORDER BY updated_at DESC LIMIT ?)) `
+    return `SELECT ${columns} FROM task_pairs WHERE project = ? AND task_id IN (`
+      + `SELECT task_id FROM task_pairs WHERE project = ? ORDER BY (status IN (${terminal})) ASC, updated_at DESC LIMIT ?) `
       + 'ORDER BY updated_at DESC';
   }
 
-  /** Every open pair of a project plus its most recent finished ones, newest first (for the console). */
+  /** The console window of a project (see {@link #windowQuery}), newest first. */
   listPairs(project: string, limit = 200): StoredTaskPair[] {
     const rows = this.#db.prepare(this.#windowQuery('*')).all(project, project, limit) as Array<Record<string, unknown>>;
     return rows.map((row) => this.#hydrate(row));
