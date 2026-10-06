@@ -2859,6 +2859,9 @@ export function createMemoryMcpToolHandlers(caller: McpRuntimeCaller, deps: Memo
       if (!caller.sessionName || projectBrainSession(context.project) !== caller.sessionName) {
         return error(MCP_ERROR_REASONS.SCOPE_FORBIDDEN, 'pair_create requires the authoritative project Brain');
       }
+      if (!isPairsEngineProject(context.project)) {
+        return error(MCP_ERROR_REASONS.CONTROL_PLANE_UNAVAILABLE, `pairs engine is off for project '${context.project}' — enable it in supervision settings (set supervision mode to supervised in the Brain session) before calling pair_create`);
+      }
       const args = pickAllowedMcpArgs(input, ['taskId', 'title', 'brief', 'executor', 'auditor', 'executorModel', 'auditorModel', 'executionPool', 'idempotencyKey']);
       const executor = stringArg(args, 'executor');
       const brief = stringArg(args, 'brief');
