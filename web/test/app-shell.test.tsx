@@ -451,6 +451,9 @@ vi.mock('../src/components/ServerIconBar.js', () => ({
       <button onClick={onHome}>server-home</button>
       <button onClick={onToggleSidebar}>server-toggle-sidebar</button>
       <button onClick={() => onSelectServer?.(servers?.[0]?.id, servers?.[0]?.name)}>server-select</button>
+      {servers?.map((server: any) => (
+        <button key={server.id} onClick={() => onSelectServer?.(server.id, server.name)}>server-select-{server.id}</button>
+      ))}
       <button onClick={() => onServerContextMenu?.(servers?.[0], 11, 22)}>server-menu</button>
     </div>
   ),
@@ -508,6 +511,7 @@ vi.mock('../src/components/SessionTabs.js', () => ({
 }));
 vi.mock('../src/components/SessionPane.js', () => ({
   SessionPane: ({
+    isActive,
     session,
     onAfterAction,
     onChatScrollFn,
@@ -529,6 +533,7 @@ vi.mock('../src/components/SessionPane.js', () => ({
   }: any) => (
     <div
       data-testid={`session-pane-${session.name}`}
+      data-is-active={String(Boolean(isActive))}
       data-active-dispatch-id={session.sharedState?.activeDispatchId ?? ''}
       data-session-state={session.state ?? ''}
       data-supervision-mode={session.supervisionMode ?? ''}
@@ -2083,7 +2088,9 @@ describe('App shell', () => {
 
     expect(await screen.findByTestId('session-pane-deck_alpha_brain')).toBeTruthy();
     expect(screen.queryByTestId('session-pane-deck_removed_brain')).toBeNull();
-    expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_brain');
+    // The fallback is shown but NOT recorded as the user's last tab: the memory
+    // of what they really had open stays, so it is restored if that tab returns.
+    expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_removed_brain');
     expect(window.location.hash).toContain('/srv-1/deck_alpha_brain');
   }, 20_000);
 
@@ -2974,6 +2981,310 @@ describe('App shell', () => {
     });
     expect(ws.requestSessionList).toHaveBeenCalled();
   }, 20_000);
+
+  describe('the last opened tab of each server is restored (per-server memory)', () => {
+    const SERVERS = ['srv-1', 'srv-2'] as const;
+    const SESSIONS: Record<string, string[]> = {
+      'srv-1': ['deck_alpha_brain', 'deck_alpha_notes', 'deck_alpha_review'],
+      'srv-2': ['deck_gamma_brain', 'deck_gamma_ops'],
+    };
+
+    function listFor(serverId: string) {
+      return SESSIONS[serverId].map((name) => ({
+        name,
+        project_name: name.replace(/^deck_/, '').split('_')[0],
+        role: 'brain',
+        agent_type: 'codex-sdk',
+        agent_version: '5.0',
+        state: 'running',
+        project_dir: `/work/${name}`,
+        runtime_type: 'process',
+        label: name,
+        description: 'tab',
+      }));
+    }
+
+    function installApi(overrides: { sessions?: (serverId: string) => Promise<unknown> | undefined } = {}) {
+      apiFetchMock.mockImplementation(async (path: string, init?: { signal?: AbortSignal }) => {
+        // A real page reload destroys the old document and aborts its requests;
+        // honoring the signal keeps an unmounted instance from acting late.
+        const settle = async <T,>(value: T | Promise<T>): Promise<T> => {
+          const result = await value;
+          if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError');
+          return result;
+        };
+        if (path === '/api/auth/user/me') return { id: 'user-1' };
+        if (path === '/api/server') {
+          return {
+            ...serverList(),
+            servers: SERVERS.map((id) => ({
+              id, name: `Server ${id}`, status: 'online', lastHeartbeatAt: Date.now(), createdAt: Date.now(), daemonVersion: '2026.5.11',
+            })),
+          };
+        }
+        const match = /^\/api\/server\/([^/]+)\/sessions$/.exec(path);
+        if (match) {
+          const custom = overrides.sessions?.(match[1]!);
+          if (custom) return settle(custom);
+          return settle({ sessions: listFor(match[1]!) });
+        }
+        if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+        return {};
+      });
+    }
+
+    function seedLogin(serverId: string) {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      localStorage.setItem('rcc_server', serverId);
+    }
+
+    /** A full page reload keeps the URL hash and both storages, and nothing else. */
+    async function reloadApp(App: () => any) {
+      cleanup();
+      wsInstances.length = 0;
+      return render(<App />);
+    }
+
+    /** The one main session the app currently has selected. */
+    const activePaneName = (): string | null => {
+      const active = Array.from(document.querySelectorAll('[data-testid^="session-pane-"][data-is-active="true"]'));
+      expect(active.length).toBeLessThanOrEqual(1);
+      return active[0]?.getAttribute('data-testid')?.replace('session-pane-', '') ?? null;
+    };
+    const expectActive = async (name: string) => {
+      await waitFor(() => expect(activePaneName()).toBe(name));
+    };
+
+    it('switching to another server and back returns to the last opened tab, each server remembering its own', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+
+      // Away to srv-2 (the app reloads into it) and open ITS second tab.
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await reloadApp(App);
+      await expectActive('deck_gamma_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_gamma_ops'));
+      await expectActive('deck_gamma_ops');
+
+      // Back to srv-1: its last tab, not its first / Brain.
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await reloadApp(App);
+      await expectActive('deck_alpha_notes');
+
+      // And srv-2 still remembers its own.
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await reloadApp(App);
+      await expectActive('deck_gamma_ops');
+    }, 30_000);
+
+    it('a plain reload with no hash returns to the last tab of the remembered server', async () => {
+      seedLogin('srv-1');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_brain');
+      fireEvent.click(screen.getByText('tabs-select-deck_alpha_review'));
+      await expectActive('deck_alpha_review');
+
+      history.replaceState(null, '', window.location.pathname);
+      sessionStorage.clear(); // a brand-new browser tab / returning from the background
+      await reloadApp(App);
+
+      await expectActive('deck_alpha_review');
+    }, 30_000);
+
+    it('restores the last tab even when the REST list fails and only the websocket session_list arrives', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_review');
+      installApi({ sessions: () => Promise.reject(new Error('rest unavailable')) });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      const ws = wsInstances[0];
+      await act(async () => {
+        ws.emit({
+          type: 'session_list',
+          sessions: listFor('srv-1').map((s) => ({
+            name: s.name, project: s.project_name, role: 'brain', agentType: 'codex-sdk', state: 'running', runtimeType: 'process',
+          })),
+        });
+      });
+
+      await expectActive('deck_alpha_review');
+    }, 30_000);
+
+    const wsSessionList = (serverId: string) => ({
+      type: 'session_list',
+      sessions: listFor(serverId).map((row) => ({
+        name: row.name, project: row.project_name, role: 'brain', agentType: 'codex-sdk', state: 'running', runtimeType: 'process',
+      })),
+    });
+
+    it('a server-only hash (what a server switch writes) with a failed REST list still restores the tab from the websocket list', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_review');
+      history.replaceState(null, '', '#/srv-1');
+      installApi({ sessions: () => Promise.reject(new Error('rest unavailable')) });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      expect(activePaneName()).toBeNull();
+
+      await act(async () => { wsInstances[0].emit(wsSessionList('srv-1')); });
+
+      await expectActive('deck_alpha_review');
+      // Restoring is not a new choice: the memory is untouched and still correct.
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_review');
+    }, 30_000);
+
+    it('booting into a server before its tab is resolved never erases the remembered tab', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_notes');
+      history.replaceState(null, '', '#/srv-1');
+      let releaseRest!: () => void;
+      const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+      installApi({ sessions: async () => { await restGate; return { sessions: listFor('srv-1') }; } });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      await new Promise((resolve) => setTimeout(resolve, 30));
+
+      // Nothing is selected yet; the memory must survive this window.
+      expect(activePaneName()).toBeNull();
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_notes');
+
+      await act(async () => { releaseRest(); await Promise.resolve(); });
+      await expectActive('deck_alpha_notes');
+    }, 30_000);
+
+    it('leaving a server with nothing selected keeps what was remembered for it', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_notes');
+      history.replaceState(null, '', '#/srv-1');
+      installApi({ sessions: () => new Promise(() => { /* never resolves: still loading */ }) });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      // The daemon reports no tab at all (e.g. it is still starting): nothing to select.
+      await act(async () => { wsInstances[0].emit({ type: 'session_list', sessions: [] }); });
+      expect(activePaneName()).toBeNull();
+
+      fireEvent.click(await screen.findByText('server-select-srv-2'));
+
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_notes');
+    }, 30_000);
+
+    it('a fallback tab is shown but never recorded as the last tab; the remembered one returns when it exists again', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_gone');
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_alpha_brain'); // explicit fallback, no error
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_gone');
+
+      // The tab comes back (e.g. the session was recreated): it is restored.
+      SESSIONS['srv-1'] = ['deck_alpha_brain', 'deck_alpha_gone', 'deck_alpha_review'];
+      try {
+        // Later, in a fresh browser tab (no hash / tab route): the memory decides.
+        history.replaceState(null, '', window.location.pathname);
+        sessionStorage.clear();
+        await reloadApp(App);
+        await expectActive('deck_alpha_gone');
+      } finally {
+        SESSIONS['srv-1'] = ['deck_alpha_brain', 'deck_alpha_notes', 'deck_alpha_review'];
+      }
+    }, 30_000);
+
+    it('migrates an older build\'s single global tab: it becomes the server\'s memory and survives a server switch', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem('rcc_session', 'deck_alpha_review'); // all an older build ever stored
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_alpha_review');
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_review');
+
+      fireEvent.click(screen.getByText('server-select-srv-2'));
+      await reloadApp(App);
+      await expectActive('deck_gamma_brain');
+      fireEvent.click(screen.getByText('server-select-srv-1'));
+      await reloadApp(App);
+      await expectActive('deck_alpha_review');
+    }, 30_000);
+
+    it('a global tab left by ANOTHER server is ignored when the server being entered does not have it', async () => {
+      seedLogin('srv-2');
+      localStorage.setItem('rcc_session', 'deck_alpha_review'); // belongs to srv-1
+      installApi();
+      const { App } = await importApp();
+      render(<App />);
+      await expectActive('deck_gamma_brain');
+      expect(localStorage.getItem(serverSessionStorageKey('srv-2'))).toBeNull(); // the fallback is not remembered
+    }, 30_000);
+
+    it('entering with no server selected returns to the last server and tab instead of the most recently active one', async () => {
+      localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+      // No rcc_server (e.g. after a re-login): the remembered-tab index knows where the user was.
+      localStorage.setItem(serverSessionStorageKey('srv-2'), 'deck_gamma_ops');
+      localStorage.setItem('rcc_session_index_v1', JSON.stringify(['srv-2', 'srv-1']));
+      installApi();
+      const baseApi = apiFetchMock.getMockImplementation()!;
+      apiFetchMock.mockImplementation(async (path: string, init?: { signal?: AbortSignal }) => {
+        if (path.startsWith('/api/watch/sessions')) {
+          const serverId = new URL(path, 'http://x').searchParams.get('serverId');
+          // srv-1 has the freshest activity; srv-2's remembered tab is older.
+          return serverId === 'srv-1'
+            ? { sessions: [{ serverId, sessionName: 'deck_alpha_review', previewUpdatedAt: Date.now() }] }
+            : { sessions: [{ serverId, sessionName: 'deck_gamma_ops', previewUpdatedAt: Date.now() - 86_400_000 }, { serverId, sessionName: 'deck_gamma_brain', previewUpdatedAt: Date.now() - 90_000_000 }] };
+        }
+        return baseApi(path, init);
+      });
+      const { App } = await importApp();
+      render(<App />);
+
+      await expectActive('deck_gamma_ops');
+      expect(localStorage.getItem('rcc_server')).toBe('srv-2');
+    }, 30_000);
+
+    it('a tab the user clicked before the late restore finished is not overridden by it', async () => {
+      seedLogin('srv-1');
+      localStorage.setItem(serverSessionStorageKey('srv-1'), 'deck_alpha_review');
+      let releaseRest!: () => void;
+      const restGate = new Promise<void>((resolve) => { releaseRest = resolve; });
+      installApi({
+        sessions: async () => { await restGate; return { sessions: listFor('srv-1') }; },
+      });
+      const { App } = await importApp();
+      render(<App />);
+      await waitFor(() => expect(wsInstances.length).toBe(1));
+      const ws = wsInstances[0];
+      await act(async () => {
+        ws.emit({
+          type: 'session_list',
+          sessions: listFor('srv-1').map((s) => ({
+            name: s.name, project: s.project_name, role: 'brain', agentType: 'codex-sdk', state: 'running', runtimeType: 'process',
+          })),
+        });
+      });
+
+      // The tabs are visible; the user picks one before the REST restore lands.
+      fireEvent.click(await screen.findByText('tabs-select-deck_alpha_notes'));
+      await expectActive('deck_alpha_notes');
+      await act(async () => { releaseRest(); await Promise.resolve(); });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+
+      expect(activePaneName()).toBe('deck_alpha_notes');
+      expect(localStorage.getItem(serverSessionStorageKey('srv-1'))).toBe('deck_alpha_notes');
+    }, 30_000);
+  });
 
   it('subscribes sdk sub-sessions to transport live events even when runtimeType is missing', async () => {
     localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));

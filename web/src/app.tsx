@@ -289,7 +289,7 @@ import {
   shouldResetSelectedServer,
   shouldShowInitialConnectingGate,
 } from './server-selection.js';
-import { readServerSession, writeServerSession } from './server-tab-state.js';
+import { readLastRememberedServerId, readServerSession, writeServerSession } from './server-tab-state.js';
 import { installNativeAppResumeRefresh } from './app-resume-refresh.js';
 import { resumeDirectFileTransfers } from './direct-file-transfer.js';
 import { isImeComposingKeyEvent } from './ime-keyboard.js';
@@ -1742,31 +1742,10 @@ export function App() {
         setSessionsLoaded(true);
       }
       // Restore the last tab for this server, never the global session value
-      // left by another server.  A stale/missing snapshot safely falls back
-      // to the first navigable tab.
-      if (navigableMapped.length > 0) {
-        const preferred = resolveServerSessionSnapshot(
-          selectedServerId,
-          initialHashStateRef.current.sessionName ?? readServerSession(selectedServerId),
-          navigableMapped.map((session) => ({
-            serverId: selectedServerId,
-            sessionName: session.name,
-          })),
-          readServerSession(selectedServerId),
-        ) ?? navigableMapped[0].name;
-        setActiveSession(preferred);
-        // Replace a deleted/disabled snapshot with the safe fallback so the
-        // next server switch/reload cannot keep retrying the stale tab.
-        writeServerSession(selectedServerId, preferred);
-        if (preferred !== initialHashStateRef.current.sessionName) {
-          initialHashStateRef.current = {
-            ...initialHashStateRef.current,
-            serverId: selectedServerId,
-            sessionName: preferred,
-          };
-          writeHashState(selectedServerId, preferred);
-        }
-      }
+      // left by another server. A stale/missing snapshot safely falls back
+      // to the first navigable tab -- without being recorded as the user's
+      // choice, so the memory of what they really had open is kept.
+      restoreLastTabRef.current(selectedServerId, navigableMapped.map((session) => session.name));
     }).catch(() => { clearTimeout(timer); /* WS fallback */ });
     return () => { clearTimeout(timer); ctrl.abort(); };
   }, [auth, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
@@ -2887,10 +2866,28 @@ export function App() {
     }
   }, [previewFileRequest, selectedServerId, ensureDesktopWindow, removeDesktopWindow]);
 
+  // The tab the user last chose on purpose, and whether they have chosen one at
+  // all since this document loaded. Only an explicit choice is remembered per
+  // server, and a late automatic restore never overrides one.
+  const rememberIntentRef = useRef<string | null>(null);
+  // The server the user last chose a tab on in this document. Scoped to the
+  // server so a choice made elsewhere (a shared session, the previous server)
+  // never blocks restoring the tab of the server being entered.
+  const explicitSelectionServerRef = useRef<string | null>(null);
+
+  /**
+   * `remember: false` marks an AUTOMATIC selection (restoring the saved tab,
+   * replacing a tab that no longer exists, auto-entering a server). Those are
+   * never recorded as "the user's last tab", so a fallback cannot replace the
+   * memory of what the user really had open.
+   */
   const setActiveSession = useCallback((
     name: string | null,
-    opts?: { keepSubWindows?: boolean; scrollToBottom?: boolean },
+    opts?: { keepSubWindows?: boolean; scrollToBottom?: boolean; remember?: boolean },
   ) => {
+    const deliberate = Boolean(name) && opts?.remember !== false;
+    rememberIntentRef.current = deliberate ? name : null;
+    if (deliberate) explicitSelectionServerRef.current = selectedServerId;
     // Update this before setOpenSubIds: state setters below run in the same
     // turn, before the hash-sync effect can publish the new tab-local scope.
     openSubPersistenceSessionRef.current = name;
@@ -2918,9 +2915,12 @@ export function App() {
     }
   }, [selectedServerId, setOpenSubIds]);
 
-  // Keep a server-scoped snapshot whenever the user changes the main mobile
-  // tab.  The one-render guard prevents a server switch from briefly writing
-  // the previous server's active tab before its route/session restore lands.
+  // Keep a server-scoped snapshot of the tab the user deliberately opened.
+  // It is written ONLY for an explicit choice (rememberIntentRef): an
+  // unresolved selection (null, e.g. a boot from a server-only hash) must not
+  // erase it before the restore reads it, and an automatic fallback must not
+  // replace it. The one-render guard prevents a server switch from briefly
+  // writing the previous server's active tab before its route/session restore.
   const sessionSnapshotServerRef = useRef<string | null>(selectedServerId);
   useEffect(() => {
     if (sessionSnapshotServerRef.current !== selectedServerId) {
@@ -2928,8 +2928,42 @@ export function App() {
       return;
     }
     if (!selectedServerId || selectedShareTarget || sharedHashRestorePending) return;
+    if (!activeSession || rememberIntentRef.current !== activeSession) return;
     writeServerSession(selectedServerId, activeSession);
   }, [activeSession, selectedServerId, selectedShareTarget, sharedHashRestorePending]);
+
+  /**
+   * Restore the tab the user last had open on `serverId` once its session list
+   * is known (shared by the REST and websocket list paths). An explicit hash
+   * session wins, then the per-server memory; a missing/disabled tab falls back
+   * to the server's most recent/first main session without being remembered.
+   * Does nothing once the user has picked a tab on this server this load, so a
+   * late list can never override a click.
+   */
+  const restoreLastTabRef = useRef<(serverId: string, navigableNames: readonly string[]) => string | null>(() => null);
+  restoreLastTabRef.current = (serverId, navigableNames) => {
+    if (explicitSelectionServerRef.current === serverId || navigableNames.length === 0) return null;
+    const remembered = readServerSession(serverId);
+    const preferred = resolveServerSessionSnapshot(
+      serverId,
+      initialHashStateRef.current.sessionName ?? remembered,
+      navigableNames.map((sessionName) => ({ serverId, sessionName })),
+      remembered,
+    ) ?? navigableNames[0]!;
+    setActiveSession(preferred, { remember: false });
+    // Migration: a tab that came from the hash or from an older build's single
+    // global value (not from a fallback) is where the user really was, so it
+    // becomes this server's memory when none exists yet. Otherwise a user who
+    // upgrades and never clicks a tab would lose it on the next server switch.
+    if (!remembered && preferred === initialHashStateRef.current.sessionName) {
+      writeServerSession(serverId, preferred);
+    }
+    if (preferred !== initialHashStateRef.current.sessionName) {
+      initialHashStateRef.current = { ...initialHashStateRef.current, serverId, sessionName: preferred };
+      writeHashState(serverId, preferred);
+    }
+    return preferred;
+  };
 
   const claimExplicitSessionNavigation = useCallback((name: string) => {
     sharedOpenGenerationRef.current += 1;
@@ -2994,7 +3028,8 @@ export function App() {
       ? navigableMainSessions.find((session) => session.project === hiddenActive.project)
       : undefined)
       ?? navigableMainSessions[0];
-    setActiveSession(replacement?.name ?? null);
+    // Automatic: the replacement is a fallback, not something the user chose.
+    setActiveSession(replacement?.name ?? null, { remember: false });
   }, [activeSession, navigableMainSessions, sessions, sessionsLoaded, setActiveSession]);
 
   useEffect(() => {
@@ -3024,12 +3059,20 @@ export function App() {
       if (cancelled || runId !== autoEntryRunRef.current || selectedServerIdRef.current) return;
 
       const recent = pickMostRecentMainSession(rows.filter((row) => typeof row.previewUpdatedAt === 'number'));
-      const fallback = pickAutoEntryServer(servers, savedServerId);
+      // Entering with no server selected (first load after a login, the
+      // dashboard) returns to where the user last was: the saved server, else
+      // the server whose tab was remembered most recently. Only then does
+      // recent activity decide.
+      const fallback = pickAutoEntryServer(servers, savedServerId ?? readLastRememberedServerId());
+      const rememberedTab = fallback ? readServerSession(fallback.serverId) : null;
+      const rememberedStillThere = fallback && rememberedTab
+        && resolveServerSessionSnapshot(fallback.serverId, rememberedTab, rows) === rememberedTab;
       const savedFallbackSession = fallback
         ? resolveServerSessionSnapshot(fallback.serverId, readServerSession(fallback.serverId), rows)
         : null;
       const firstMain = pickMostRecentMainSession(rows);
-      const selection = recent
+      const selection = (rememberedStillThere && fallback ? { ...fallback, sessionName: rememberedTab } : null)
+        ?? recent
         ?? (fallback && savedFallbackSession ? { ...fallback, sessionName: savedFallbackSession } : null)
         ?? firstMain
         ?? fallback;
@@ -3041,22 +3084,11 @@ export function App() {
       else localStorage.removeItem('rcc_server_name');
       setSelectedServerId(selection.serverId);
       setSelectedServerName(server?.name ?? null);
-      if (selection.sessionName) {
-        writeServerSession(selection.serverId, selection.sessionName);
-        setActiveSession(selection.sessionName);
-      } else {
-        const savedSession = resolveServerSessionSnapshot(
-          selection.serverId,
-          readServerSession(selection.serverId),
-          rows,
-        );
-        setActiveSession(savedSession);
-      }
-      writeHashState(selection.serverId, selection.sessionName ?? resolveServerSessionSnapshot(
-        selection.serverId,
-        readServerSession(selection.serverId),
-        rows,
-      ));
+      // Automatic entry: whatever it lands on is a fallback, never recorded as
+      // the user's own last tab (that memory is only written by a real choice).
+      const entered = selection.sessionName ?? savedFallbackSession;
+      setActiveSession(entered, { remember: false });
+      writeHashState(selection.serverId, entered);
     };
 
     void choose().finally(() => {
@@ -3374,7 +3406,9 @@ export function App() {
       } else {
         localStorage.removeItem('rcc_session');
       }
-      setActiveSession(activeFromTarget, { keepSubWindows: true });
+      // A shared target is not a choice of the owner's own tab on any of their
+      // servers: never remember it, and never let it block a later restore.
+      setActiveSession(activeFromTarget, { keepSubWindows: true, remember: false });
       if (openedTarget.kind === 'subsession') {
         setOpenSubIds((prev) => new Set([...prev, openedTarget.subSessionId]));
       }
@@ -4158,7 +4192,11 @@ export function App() {
           const replacement = hiddenActive
             ? navigableNewSessions.find((s) => s.project === hiddenActive.project)
             : null;
-          setActiveSession(replacement?.name ?? null);
+          setActiveSession(replacement?.name ?? null, { remember: false });
+        } else if (!activeSessionRef.current && !selectedShareTarget && !sharedHashRestorePending) {
+          // Nothing selected yet (the REST list is slow or failed): restore the
+          // remembered tab from this list instead of leaving the user on none.
+          restoreLastTabRef.current(selectedServerId, navigableNewSessions.map((s) => s.name));
         }
       }
       if (msg.type === 'terminal.diff') {
@@ -5397,12 +5435,13 @@ export function App() {
     // Prefer live route refs over the cross-tab legacy fallback.  The latter
     // may still point at a different server while a hash/back-forward route is
     // converging.
+    // Only a tab the user deliberately opened is remembered; leaving a server
+    // with nothing selected (or with an automatic fallback showing) must keep
+    // what was remembered before, never erase or replace it.
     const prevServer = selectedServerIdRef.current ?? localStorage.getItem('rcc_server');
-    const currentSession = activeSessionRef.current ?? localStorage.getItem('rcc_session');
-    if (prevServer && currentSession) {
+    const currentSession = activeSessionRef.current;
+    if (prevServer && currentSession && rememberIntentRef.current === currentSession) {
       writeServerSession(prevServer, currentSession);
-    } else if (prevServer) {
-      writeServerSession(prevServer, null);
     }
 
     localStorage.setItem('rcc_server', serverId);
