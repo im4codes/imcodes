@@ -64,6 +64,7 @@ import {
   resourceOwnerEnv,
 } from '../daemon/session-resource-service.js';
 import { emitSessionInlineError } from '../daemon/session-error.js';
+import { isNonDaemonProcess } from '../daemon/process-role.js';
 import { startWatching, startWatchingFile, stopWatching, isWatching, findJsonlPathBySessionId, reserveSessionFile, reassignSessionFile } from '../daemon/jsonl-watcher.js';
 import { startWatching as startCodexWatching, startWatchingSpecificFile as startCodexWatchingFile, startWatchingById as startCodexWatchingById, stopWatching as stopCodexWatching, isWatching as isCodexWatching, findRolloutPathByUuid } from '../daemon/codex-watcher.js';
 import { startWatching as startGeminiWatching, startWatchingLatest as startGeminiWatchingLatest, stopWatching as stopGeminiWatching, isWatching as isGeminiWatching } from '../daemon/gemini-watcher.js';
@@ -2701,6 +2702,13 @@ export async function restoreTransportSessions(
     interSessionDelayMs?: number;
   } = {},
 ): Promise<void> {
+  // Only the daemon owns transport runtimes. A helper process (MCP server, CLI)
+  // that restored them would open its own provider connection and drain the
+  // daemon's durable resend queue, racing the real owner.
+  if (isNonDaemonProcess()) {
+    logger.warn({ providerId, sessionName: options.sessionName }, 'restoreTransportSessions refused: this process is not the daemon');
+    return;
+  }
   const all = storeSessions();
   const qwenRuntime = providerId === 'qwen' ? await getQwenRuntimeConfig().catch(() => null) : null;
   const remoteSessionsByDirectory = new Map<string, Promise<RemoteSessionInfo[]>>();
@@ -3882,6 +3890,8 @@ export async function ensureTransportRuntimeAvailable(
 ): Promise<TransportSessionRuntime | undefined> {
   const existing = getTransportRuntime(sessionName);
   if (existing?.providerSessionId) return existing;
+  // Recovery launches/restores a runtime and drains its queue: daemon-only work.
+  if (isNonDaemonProcess()) return undefined;
 
   // A restore that already proved permanently unbound for this exact record
   // state is not retried until its backoff window ends or the record/provider

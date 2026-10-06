@@ -98,6 +98,7 @@ import { PROJECT_ROOT } from './util/project-root.js';
 import { asReleaseChannel, getReleaseChannel } from '../shared/imcodes-version.js';
 import { INSTALLER_CONFIG_BASENAME, normalizeRegistryBase } from '../shared/installer-contract.js';
 import { daemonProcessAppearsRunning, isRecordedProcessIdentityCurrent, readInstanceLockMetadata } from './daemon/instance-lock.js';
+import { markNonDaemonProcess } from './daemon/process-role.js';
 import { resolveImcodesHome } from './util/windows-daemon-lock.js';
 import { resolvePosixDaemonServicePaths } from './util/posix-daemon-service.js';
 import { imcodesStateDir } from './util/imcodes-state-dir.js';
@@ -1360,6 +1361,8 @@ function isMainModule(): boolean {
 }
 
 export function runCli(argv: string[] = process.argv): void {
+  // Every CLI command is a helper process; the daemon marks itself in startup().
+  markNonDaemonProcess();
 program.parseAsync(argv).catch((err: unknown) => {
   const exitCode = typeof err === 'object' && err && 'exitCode' in err
     ? Number((err as { exitCode?: unknown }).exitCode)

@@ -494,6 +494,13 @@ import type { QueueSnapshot } from '../../../shared/transport-queue-types.js';
 
 const AUTH_TIMEOUT_MS = 5000;
 const MAX_QUEUE_SIZE = 100;
+/**
+ * A command buffered while the daemon was unreachable is only meaningful for a
+ * short outage. Replaying it after a long one re-executes an intent the user
+ * has long since moved past (a stale `/model`, edit, delete...), so it is
+ * dropped instead of delivered on the next authentication.
+ */
+const DAEMON_QUEUE_REPLAY_MAX_AGE_MS = 10 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const DAEMON_UPGRADE_BLOCKED_FAILURE_DEDUP_MAX = 1_000;
 const LEGACY_UPGRADE_RESCUE_RETRY_BASE_MS = 60_000;
@@ -2140,7 +2147,7 @@ export class WsBridge {
   private controlledNodeWorkerRefreshPersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
   private mobileSockets = new Set<WebSocket>();
-  private queue: string[] = [];
+  private queue: Array<{ message: string; queuedAt: number }> = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
   /**
    * Audit fix (78-server reconnect-storm investigation, 2026-05-11) —
@@ -5734,9 +5741,20 @@ export class WsBridge {
         }
 
         // Replay queued messages, skipping terminal.subscribe/unsubscribe — refs replay below is authoritative
-        for (const queued of this.queue) {
+        const replayNow = Date.now();
+        let staleDropped = 0;
+        for (const { message: queued, queuedAt } of this.queue) {
           try {
-            const parsed = JSON.parse(queued) as { type?: string };
+            if (replayNow - queuedAt > DAEMON_QUEUE_REPLAY_MAX_AGE_MS) {
+              staleDropped += 1;
+              continue;
+            }
+            const parsed = JSON.parse(queued) as { type?: string; commandId?: unknown };
+            // A session.send still tracked as inflight is replayed (once, with the
+            // bridge-retry marker) by replayInflightToDaemon below; sending the raw
+            // copy here as well delivered the same command twice.
+            if (parsed.type === 'session.send' && typeof parsed.commandId === 'string'
+              && this.inflightCommands.has(parsed.commandId)) continue;
             if (parsed.type === 'terminal.subscribe' || parsed.type === 'terminal.unsubscribe') continue;
             // MACHINE_EXEC is never replayed — a one-shot SYSTEM command must not
             // execute on a fresh generation after the relay gave up (10.6).
@@ -5757,6 +5775,9 @@ export class WsBridge {
           } catch { /* ignore */ }
         }
         this.queue = [];
+        if (staleDropped > 0) {
+          logger.warn({ serverId: this.serverId, staleDropped }, 'Dropped stale queued daemon commands instead of replaying them');
+        }
 
         this.broadcastToBrowsers(JSON.stringify({ type: DAEMON_MSG.RECONNECTED }));
 
@@ -11308,7 +11329,7 @@ export class WsBridge {
       }
     } else {
       if (this.queue.length < MAX_QUEUE_SIZE) {
-        this.queue.push(message);
+        this.queue.push({ message, queuedAt: Date.now() });
       }
     }
   }

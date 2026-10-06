@@ -25,6 +25,7 @@ const isMain = Boolean(entry) && (() => {
 })();
 
 if (isMain && isMemoryMcp) {
+  (await import('./daemon/process-role.js')).markNonDaemonProcess();
   const { IMCODES_MEMORY_MCP_BACKEND_ENV } = await import('./daemon/mcp-stdio-lifecycle.js');
   if (process.env[IMCODES_MEMORY_MCP_BACKEND_ENV] === '1') {
     const { runMemoryMcpServer } = await import('./daemon/memory-mcp-server.js');

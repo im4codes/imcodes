@@ -6,6 +6,7 @@ import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isSessionWorking } from './session-working.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
+import { markDaemonProcess } from './process-role.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
 import { sessionExists, isPaneAlive, BACKEND, killSession, createTmuxHealthProbe, type TmuxHealthProbe } from '../agent/tmux.js';
 import { detectRepo } from '../repo/detector.js';
@@ -615,6 +616,7 @@ export async function startup(): Promise<DaemonContext> {
   // can schedule a migration/probe write, and a non-owner must never be able
   // to persist its transient (possibly empty) in-memory view.
   configureSessionStoreWriteAuthority(lockServer.identity, lockServer.metadataPath);
+  markDaemonProcess();
   cgroupValidationProbes = startDaemonCgroupValidationProbes();
   installDaemonRuntimeDiagnosticsProvider();
   // Captures an initial heap snapshot into the runtime status; subsequent

@@ -238,6 +238,7 @@ import {
 } from '../../src/agent/session-manager.js';
 import { newSession } from '../../src/agent/tmux.js';
 import { releaseSessionChildResources } from '../../src/daemon/session-resource-service.js';
+import { markNonDaemonProcess, markDaemonProcess, resetProcessRoleForTests } from '../../src/daemon/process-role.js';
 import { PROVIDER_ERROR_CODES, type ProviderError } from '../../src/agent/transport-provider.js';
 import { clearAllResend, enqueueResend, getResendCount, getResendEntries } from '../../src/daemon/transport-resend-queue.js';
 import { getTransportQueueStore, resetTransportQueueStoreForTests } from '../../src/daemon/transport-queue-store.js';
@@ -586,6 +587,41 @@ describe('sdk transport session restore', () => {
     expect(mocks.store.get('deck_sdk_cc_brain')?.effort).toBe('high');
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespace).toEqual({ scope: 'personal', projectId: 'sdk-cc-restore' });
     expect(mocks.store.get('deck_sdk_cc_brain')?.contextNamespaceDiagnostics).toEqual(['namespace:explicit']);
+  });
+
+  it('a non-daemon process (MCP/CLI) never restores or binds the daemon\'s transport runtimes', async () => {
+    const now = Date.now();
+    mocks.store.set('deck_sdk_nondaemon_brain', {
+      name: 'deck_sdk_nondaemon_brain',
+      projectName: 'sdknondaemon',
+      role: 'brain',
+      agentType: 'claude-code-sdk',
+      projectDir: '/tmp/deck_sdk_nondaemon_brain',
+      state: 'idle',
+      restarts: 0,
+      restartTimestamps: [],
+      createdAt: now,
+      updatedAt: now,
+      runtimeType: 'transport',
+      providerId: 'claude-code-sdk',
+      providerSessionId: 'route-nondaemon',
+      ccSessionId: 'cc-nondaemon',
+    });
+    await connectProvider('claude-code-sdk', {});
+
+    markNonDaemonProcess();
+    try {
+      await expect(ensureTransportRuntimeAvailable('deck_sdk_nondaemon_brain')).resolves.toBeUndefined();
+      await restoreTransportSessions('claude-code-sdk');
+      expect(getTransportRuntime('deck_sdk_nondaemon_brain')).toBeUndefined();
+
+      // The daemon itself (startup marks it) restores normally.
+      markDaemonProcess();
+      const runtime = await ensureTransportRuntimeAvailable('deck_sdk_nondaemon_brain');
+      expect(runtime?.providerSessionId).toBe('route-nondaemon');
+    } finally {
+      resetProcessRoleForTests();
+    }
   });
 
   it('restores only the requested persisted transport session on demand', async () => {

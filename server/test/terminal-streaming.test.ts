@@ -263,6 +263,62 @@ describe('Terminal streaming integration', () => {
     expect(daemonWs.sent.some((s) => s.includes('get_sessions'))).toBe(true);
   });
 
+  it('daemon reconnect does not replay commands buffered longer than the replay window', async () => {
+    const serverId = `stale-${Math.random().toString(36).slice(2)}`;
+    const bridge = WsBridge.get(serverId);
+    const browserWs = new MockWs();
+    bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb());
+
+    const realNow = Date.now();
+    const nowSpy = vi.spyOn(Date, 'now').mockReturnValue(realNow);
+    try {
+      browserWs.emit('message', JSON.stringify({ type: 'get_sessions' }));
+      // Daemon stays unreachable for 11 minutes, then a fresh command arrives.
+      nowSpy.mockReturnValue(realNow + 11 * 60 * 1000);
+      browserWs.emit('message', JSON.stringify({ type: 'get_sessions', marker: 'fresh' }));
+
+      const daemonWs = new MockWs();
+      bridge.handleDaemonConnection(daemonWs as never, makeDb(), {} as never);
+      daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'valid-token' }));
+      await flush();
+
+      const replayed = daemonWs.sent.filter((s) => s.includes('get_sessions'));
+      expect(replayed).toHaveLength(1);
+      expect(replayed[0]).toContain('fresh');
+    } finally {
+      nowSpy.mockRestore();
+    }
+  });
+
+  it('daemon reconnect sends an inflight session.send once, not again from the raw queue', async () => {
+    const serverId = `dupsend-${Math.random().toString(36).slice(2)}`;
+    const bridge = WsBridge.get(serverId);
+    const browserWs = new MockWs();
+    bridge.handleBrowserConnection(browserWs as never, 'test-user', makeDb());
+
+    // The browser sent session.send while the daemon was down: it is tracked as
+    // an inflight command AND a raw copy sits in the generic queue.
+    const raw = JSON.stringify({ type: 'session.send', session: 'deck_x_brain', text: 'hello', commandId: 'cmd-once' });
+    (bridge as unknown as { inflightCommands: Map<string, unknown> }).inflightCommands.set('cmd-once', {
+      commandId: 'cmd-once',
+      sessionName: 'deck_x_brain',
+      browser: browserWs,
+      rawPayload: raw,
+      state: 'buffered',
+      sentAt: Date.now(),
+      dispatchAttempts: 0,
+      timeoutTimer: null,
+    });
+    (bridge as unknown as { queue: Array<{ message: string; queuedAt: number }> }).queue.push({ message: raw, queuedAt: Date.now() });
+
+    const daemonWs = new MockWs();
+    bridge.handleDaemonConnection(daemonWs as never, makeDb(), {} as never);
+    daemonWs.emit('message', JSON.stringify({ type: 'auth', serverId, token: 'valid-token' }));
+    await flush();
+
+    expect(daemonWs.sent.filter((s) => s.includes('cmd-once'))).toHaveLength(1);
+  });
+
   it('daemon reconnect broadcasts daemon.reconnected to browsers', async () => {
     const { serverId, daemonWs, browserWs } = await setupStreamingBridge();
 
