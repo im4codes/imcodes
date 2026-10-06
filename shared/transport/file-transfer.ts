@@ -97,6 +97,14 @@ export const FILE_TRANSFER_LIMITS = {
    *  for genuinely large files where avoiding base64-over-WS bloat matters.
    *  1 MiB raw ≈ 1.37 MiB base64. */
   DOWNLOAD_INLINE_MAX_BYTES: 1024 * 1024,
+  /** Daemon→server relay HTTP calls that fail before any byte is sent (connect
+   *  timeout, DNS failure, TLS dropped before the handshake) are retried this
+   *  many times in total, with exponential backoff between BASE and MAX. Sized
+   *  to ride out a multi-second gateway/proxy hiccup while staying well inside
+   *  STAGED_UPLOAD_TTL_MS. */
+  RELAY_PRE_CONNECT_MAX_ATTEMPTS: 5,
+  RELAY_PRE_CONNECT_BASE_DELAY_MS: 500,
+  RELAY_PRE_CONNECT_MAX_DELAY_MS: 4_000,
   /** Temporary uploaded files are cleaned after this duration (ms). 24 hours. */
   TEMP_TTL_MS: 24 * 60 * 60 * 1000,
   /** Project-file download handles expire after this duration (ms). 4 hours. */

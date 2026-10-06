@@ -494,6 +494,90 @@ describe('machine file client', () => {
     expect(close).toHaveBeenCalledOnce();
   });
 
+  describe('relay fetch rides out connect-phase network failures', () => {
+    const FAST_RETRY = { baseDelayMs: 1, maxDelayMs: 1 };
+
+    function connectTimeout(): TypeError {
+      return Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(
+          new Error('Connect Timeout Error (attempted address: relay.example:443, timeout: 10000ms)'),
+          { name: 'ConnectTimeoutError', code: 'UND_ERR_CONNECT_TIMEOUT' },
+        ),
+      });
+    }
+
+    async function setup(name: string) {
+      const dir = await mkdtemp(join(tmpdir(), `imcodes-machine-fetch-${name}-`));
+      dirs.push(dir);
+      startMachineDirectFetchReceiverMock.mockResolvedValueOnce({
+        candidates: [{ host: '172.16.253.211', port: 45125 }],
+        completion: new Promise(() => {}),
+        close: vi.fn(),
+      });
+      return { dir, destinationPath: join(dir, `${name}.txt`) };
+    }
+
+    function routes(failures: { handle?: number; download?: number }) {
+      let handleLeft = failures.handle ?? 0;
+      let downloadLeft = failures.download ?? 0;
+      const calls = { handle: 0, download: 0 };
+      const fetchImpl = vi.fn(async (url: string | URL | Request) => {
+        const pathname = new URL(String(url)).pathname;
+        if (pathname.endsWith('/machine-direct-fetch')) {
+          return new Response(JSON.stringify({ error: 'connect_failed' }), { status: 409 });
+        }
+        if (pathname.endsWith('/machine-file-handle')) {
+          calls.handle += 1;
+          if (handleLeft > 0) { handleLeft -= 1; throw connectTimeout(); }
+          return new Response(JSON.stringify({
+            ok: true,
+            attachment: attachment('c'.repeat(32), '/tmp/source.txt'),
+            sourceIdentity: sourceIdentity(),
+          }), { status: 200 });
+        }
+        calls.download += 1;
+        if (downloadLeft > 0) { downloadLeft -= 1; throw connectTimeout(); }
+        return new Response('hello', { status: 200, headers: { 'content-length': '5' } });
+      });
+      return { fetchImpl, calls };
+    }
+
+    it('retries the file-handle request after connect timeouts instead of failing the fetch', async () => {
+      const { destinationPath } = await setup('handle-flaky');
+      const { fetchImpl, calls } = routes({ handle: 3 });
+      await expect(fetchFileFromMachine({
+        serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token', targetServerId: 'controlled-1',
+        sourcePath: '/tmp/source.txt', destinationPath, fetchImpl: fetchImpl as typeof fetch,
+        timeoutPolicy: { preConnectRetry: FAST_RETRY },
+      })).resolves.toMatchObject({ size: 5, transport: 'relay', destinationPath });
+      await expect(readFile(destinationPath, 'utf8')).resolves.toBe('hello');
+      expect(calls).toEqual({ handle: 4, download: 1 });
+    });
+
+    it('retries the relay download request after connect timeouts', async () => {
+      const { destinationPath } = await setup('download-flaky');
+      const { fetchImpl, calls } = routes({ download: 2 });
+      await expect(fetchFileFromMachine({
+        serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token', targetServerId: 'controlled-1',
+        sourcePath: '/tmp/source.txt', destinationPath, fetchImpl: fetchImpl as typeof fetch,
+        timeoutPolicy: { preConnectRetry: FAST_RETRY },
+      })).resolves.toMatchObject({ size: 5, transport: 'relay', destinationPath });
+      await expect(readFile(destinationPath, 'utf8')).resolves.toBe('hello');
+      expect(calls).toEqual({ handle: 1, download: 3 });
+    });
+
+    it('gives up with a transport error after the bounded number of attempts on a dead network', async () => {
+      const { destinationPath } = await setup('handle-dead');
+      const { fetchImpl, calls } = routes({ handle: 99 });
+      await expect(fetchFileFromMachine({
+        serverUrl: 'https://relay.example', sourceServerId: 'full-1', sourceToken: 'token', targetServerId: 'controlled-1',
+        sourcePath: '/tmp/source.txt', destinationPath, fetchImpl: fetchImpl as typeof fetch,
+        timeoutPolicy: { preConnectRetry: { ...FAST_RETRY, maxAttempts: 4 } },
+      })).rejects.toMatchObject({ kind: 'transport', message: expect.stringContaining('relay file handle transport failed') });
+      expect(calls).toEqual({ handle: 4, download: 0 });
+    });
+  });
+
   it('continues HTTP fallback from the prefix committed by reverse direct', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'imcodes-machine-fetch-resume-fallback-'));
     dirs.push(dir);

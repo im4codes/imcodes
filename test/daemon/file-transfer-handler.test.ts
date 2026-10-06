@@ -6,7 +6,10 @@ import path from 'node:path';
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { FILE_TRANSFER_LIMITS, FILE_TRANSFER_MSG, FILE_TRANSFER_RELAY_HEADER } from '../../shared/transport/file-transfer.js';
 
-async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize?: number }) {
+async function loadFileTransferHandler(
+  fakeHome: string,
+  options?: { maxFileSize?: number; limits?: Partial<Record<keyof typeof FILE_TRANSFER_LIMITS, number>> },
+) {
   vi.stubEnv('HOME', fakeHome);
   vi.stubEnv('USERPROFILE', fakeHome);
   vi.stubEnv('IMCODES_HOME', path.join(fakeHome, '.imcodes'));
@@ -15,14 +18,15 @@ async function loadFileTransferHandler(fakeHome: string, options?: { maxFileSize
     const actual = await importOriginal<typeof import('node:os')>();
     return { ...actual, homedir: () => fakeHome };
   });
-  if (options?.maxFileSize !== undefined) {
+  if (options?.maxFileSize !== undefined || options?.limits) {
     vi.doMock('../../shared/transport/file-transfer.js', async (importOriginal) => {
       const actual = await importOriginal<typeof import('../../shared/transport/file-transfer.js')>();
       return {
         ...actual,
         FILE_TRANSFER_LIMITS: {
           ...actual.FILE_TRANSFER_LIMITS,
-          MAX_FILE_SIZE: options.maxFileSize,
+          ...options.limits,
+          ...(options.maxFileSize !== undefined ? { MAX_FILE_SIZE: options.maxFileSize } : {}),
         },
       };
     });
@@ -462,6 +466,65 @@ describe('file-transfer local handle hardening', () => {
 
     expect(failed.sent).toEqual([expect.objectContaining({ type: 'file.download_error', downloadId: 'download-past-end' })]);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  describe('relay upload fetch rides out connect-phase network failures', () => {
+    function connectTimeout(): TypeError {
+      return Object.assign(new TypeError('fetch failed'), {
+        cause: Object.assign(
+          new Error('Connect Timeout Error (attempted address: relay.example:443, timeout: 10000ms)'),
+          { name: 'ConnectTimeoutError', code: 'UND_ERR_CONNECT_TIMEOUT' },
+        ),
+      });
+    }
+
+    async function runUploadFetch(
+      fetchMock: ReturnType<typeof vi.fn>,
+      uploadId: string,
+    ): Promise<ReturnType<typeof createServerLinkMock>> {
+      // Real timers with the spaced pre-connect backoff shrunk to 1ms: no fake
+      // clock to desynchronise from the handler's real file I/O.
+      const transfer = await loadFileTransferHandler(fakeHome, {
+        limits: { RELAY_PRE_CONNECT_BASE_DELAY_MS: 1, RELAY_PRE_CONNECT_MAX_DELAY_MS: 1 },
+      });
+      vi.stubGlobal('fetch', fetchMock);
+      const done = createServerLinkMock();
+      await transfer.handleFileUploadFetch({
+        type: 'file.upload_fetch', uploadId, clientUploadId: `client-${uploadId}`,
+        filename: `${uploadId}.bin`, originalName: `${uploadId}.bin`, size: 5,
+        downloadUrl: 'https://relay.example/upload-staged/x?token=secret',
+      }, done.serverLink as never);
+      return done;
+    }
+
+    it('succeeds after more consecutive connect timeouts than the old three-attempt loop allowed', async () => {
+      const fetchMock = vi.fn()
+        .mockRejectedValueOnce(connectTimeout())
+        .mockRejectedValueOnce(connectTimeout())
+        .mockRejectedValueOnce(connectTimeout())
+        .mockRejectedValueOnce(connectTimeout())
+        .mockImplementation(async () => new Response('hello', { status: 200, headers: { 'content-length': '5' } }));
+      const done = await runUploadFetch(fetchMock, 'relay-flaky');
+      expect(fetchMock).toHaveBeenCalledTimes(5);
+      expect(done.sent.some((m) => (m as { type?: string }).type === 'file.upload_done')).toBe(true);
+      expect(done.sent.some((m) => (m as { type?: string }).type === 'file.upload_error')).toBe(false);
+    });
+
+    it('reports one terminal error after exactly RELAY_PRE_CONNECT_MAX_ATTEMPTS fetches on a dead network', async () => {
+      const fetchMock = vi.fn().mockImplementation(async () => { throw connectTimeout(); });
+      const done = await runUploadFetch(fetchMock, 'relay-dead');
+      expect(fetchMock).toHaveBeenCalledTimes(FILE_TRANSFER_LIMITS.RELAY_PRE_CONNECT_MAX_ATTEMPTS);
+      const errors = done.sent.filter((m) => (m as { type?: string }).type === 'file.upload_error');
+      expect(errors).toHaveLength(1);
+      expect(done.sent.some((m) => (m as { type?: string }).type === 'file.upload_done')).toBe(false);
+    });
+
+    it('keeps the original three-attempt policy for HTTP failures (no pre-connect retry)', async () => {
+      const fetchMock = vi.fn().mockImplementation(async () => new Response('', { status: 503 }));
+      const done = await runUploadFetch(fetchMock, 'relay-503');
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+      expect(done.sent.filter((m) => (m as { type?: string }).type === 'file.upload_error')).toHaveLength(1);
+    });
   });
 
   it('rejects legacy uploads over the active single-frame cap', async () => {

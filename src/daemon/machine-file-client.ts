@@ -15,6 +15,7 @@ import {
   type AttachmentRef,
   type FileTransferSourceIdentity,
 } from '../../shared/transport/file-transfer.js';
+import { withPreConnectRetry, type PreConnectRetryOptions } from '../util/pre-connect-retry.js';
 import { isFilePreviewPathAllowed } from './file-preview-path-policy.js';
 import { MachineControlPlaneError } from './machine-exec-client.js';
 import {
@@ -55,6 +56,8 @@ export interface MachineFileTransferTimeoutPolicy {
   directStallMs: number;
   relayAttemptMs: number;
   relayTotalMs?: number;
+  /** Backoff override for connect-phase retries of the single-shot relay calls (test seam). */
+  preConnectRetry?: PreConnectRetryOptions;
 }
 
 const DEFAULT_TIMEOUT_POLICY: MachineFileTransferTimeoutPolicy = {
@@ -537,13 +540,19 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
   let handleResponse: Response;
   let handleSignal: AbortSignal;
   try {
-    handleSignal = boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS);
-    handleResponse = await doFetch(`${base}/api/server/${encodeURIComponent(options.targetServerId)}/machine-file-handle`, {
-      method: 'POST',
-      headers: { ...headers, 'content-type': 'application/json' },
-      body: JSON.stringify({ path: options.sourcePath }),
-      signal: handleSignal,
-    });
+    // Nothing is sent when the connect phase fails, so a flaky link is retried
+    // here instead of failing the whole fetch. Each try gets its own signal so
+    // its timeout is independent.
+    ({ response: handleResponse, signal: handleSignal } = await withPreConnectRetry(async () => {
+      const signal = boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS);
+      const response = await doFetch(`${base}/api/server/${encodeURIComponent(options.targetServerId)}/machine-file-handle`, {
+        method: 'POST',
+        headers: { ...headers, 'content-type': 'application/json' },
+        body: JSON.stringify({ path: options.sourcePath }),
+        signal,
+      });
+      return { response, signal };
+    }, timeouts.preConnectRetry));
   } catch (error) {
     throw new MachineControlPlaneError('transport', `${directFailure}; relay file handle transport failed: ${transferErrorDetail(error)}`);
   }
@@ -584,7 +593,7 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
       resumeOffset = 0;
     }
     await bindMachineFetchResumeIdentity(prepared.temp, sourceIdentity);
-    const response = await doFetch(
+    const response = await withPreConnectRetry(() => doFetch(
       `${base}/api/server/${encodeURIComponent(options.targetServerId)}/uploads/${encodeURIComponent(attachment.id)}/download`,
       {
         headers: {
@@ -593,7 +602,7 @@ export async function fetchFileFromMachine(options: FetchFileFromMachineOptions)
         },
         signal: boundedTransferSignal(options.signal, FILE_TRANSFER_LIMITS.DOWNLOAD_TIMEOUT_MS),
       },
-    );
+    ), timeouts.preConnectRetry);
     if (!response.ok || !response.body) {
       throw new MachineControlPlaneError('http_status', `file download rejected: http_${response.status}`);
     }

@@ -60,6 +60,7 @@ import { DIRECT_FILE_TRANSFER_COMMIT_INTENT_SUFFIX } from '../../shared/direct-f
 import { FS_GENERIC_ERROR_CODES } from '../../shared/fs-error-codes.js';
 import { MACHINE_DIRECT_RESUME_FILE_PREFIX } from '../../shared/machine-direct-file-transfer.js';
 import { sanitizeUploadFilename } from '../../shared/upload-filename.js';
+import { isPreConnectNetworkError, withPreConnectRetry } from '../util/pre-connect-retry.js';
 import { resolveCanonical, validateCanonicalRealPath } from './file-preview-path-policy.js';
 import type { ValidatedRealPath } from './file-preview-path-policy.js';
 export type { ValidatedRealPath } from './file-preview-path-policy.js';
@@ -617,10 +618,14 @@ async function fetchRelayUpload(
         await unlink(resolved).catch(() => {});
         loaded = 0;
       }
-      const response = await fetch(downloadUrl, {
-        ...(loaded > 0 ? { headers: { Range: formatFileTransferRangeRequest(loaded) } } : {}),
+      // Connect-phase failures (timeout, DNS, TLS dropped before handshake)
+      // sent nothing, so they are retried with spaced backoff here instead of
+      // burning one of the three outer attempts that follow sub-second delays.
+      const resumeFrom = loaded;
+      const response = await withPreConnectRetry(() => fetch(downloadUrl, {
+        ...(resumeFrom > 0 ? { headers: { Range: formatFileTransferRangeRequest(resumeFrom) } } : {}),
         signal: AbortSignal.timeout(FILE_TRANSFER_LIMITS.UPLOAD_TIMEOUT_MS),
-      });
+      }));
       if (response.status === 416 && loaded === expectedSize) return loaded;
       if (!response.ok) {
         throw new Error(`relay_fetch_${response.status}`);
@@ -674,6 +679,9 @@ async function fetchRelayUpload(
       return fileStat.size;
     } catch (err) {
       lastErr = err;
+      // withPreConnectRetry already spent its spaced budget on this class;
+      // repeating it here would only multiply the wait on a dead network.
+      if (isPreConnectNetworkError(err)) break;
       if (attempt < 3) {
         await new Promise((resolve) => setTimeout(resolve, attempt * 250));
       }
