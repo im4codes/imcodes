@@ -737,6 +737,16 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachmentR
 // Keep the persisted-draft append primitive for single-completion callers and
 // compatibility with older composer integrations.  Batched uploads call it
 // first, then immediately rewrite the draft in selection order below.
+// Best-effort: the transfer has already committed on the daemon, so a storage
+// quota/security error must never turn a finished upload into "failed" (the
+// guarded helpers keep an in-memory copy when storage refuses).
+function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachmentRecord): ComposerAttachmentRecord[] {
+  const current = parseStoredComposerAttachments(safeSessionStorageGetItem(storageKey));
+  const next = renumberAttachments([...current, attachment]);
+  safeSessionStorageSetItem(storageKey, JSON.stringify(next), Number.MAX_SAFE_INTEGER);
+  return next;
+}
+
 type ComposerUploadSnapshot = {
   uploads: ComposerUploadItem[];
   error: string | null;
@@ -5036,10 +5046,7 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           .filter((entry): entry is ComposerAttachmentRecord => !!entry);
         const completedPaths = new Set(orderedCompleted.map((entry) => entry.path));
         if (uploadAttachmentDraftKey) {
-          // The transfer has already committed on the daemon. Persisting the
-          // composer draft is best-effort: a quota/security error from
-          // sessionStorage must never turn a finished upload into "failed"
-          // (the guarded helpers keep an in-memory copy when storage refuses).
+          appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
           const stored = parseStoredComposerAttachments(safeSessionStorageGetItem(uploadAttachmentDraftKey));
           const next = renumberAttachments([
             ...stored.filter((entry) => !completedPaths.has(entry.path)),
