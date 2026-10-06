@@ -897,4 +897,78 @@ describe('ServerLink', () => {
       setServerLinkReconnectResyncHandler(null);
     }
   });
+
+  it('auth_failed loop: backoff doubles on each close when no server message is received', () => {
+    // Regression for the win-201 bug: the daemon was retrying auth_failed at
+    // ~500 ms indefinitely because backoffMs was reset on socket open, before
+    // the server sent auth_failed (code 4001) and closed. With the fix, the
+    // backoff only resets when the server has actually sent a message (auth ok).
+    //
+    // scheduleReconnect() fires the timer and doubles backoffMs INSIDE the callback.
+    // So we advance fake timers after each close to observe the doubled value.
+    vi.useFakeTimers();
+    link.connect();
+
+    const calls = mockWsInstance.addEventListener.mock.calls;
+    const openHandler = calls.find(([type]) => type === 'open')?.[1] as (() => void) | undefined;
+    const closeHandler = calls.find(([type]) => type === 'close')?.[1] as
+      ((e: { code: number; reason: string }) => void) | undefined;
+    expect(openHandler).toBeDefined();
+    expect(closeHandler).toBeDefined();
+
+    const INITIAL = 500; // matches INITIAL_BACKOFF_MS
+
+    // Cycle 1: open (no message) → close (auth_failed) → timer fires → backoff doubles.
+    openHandler!();
+    expect(link.__backoffMsForTests()).toBe(INITIAL); // not yet confirmed
+
+    closeHandler!({ code: 4001, reason: 'auth_failed' });
+    vi.advanceTimersByTime(2_000); // fire the reconnect timer; doubling happens inside it
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 2); // backed off
+
+    // Cycle 2: open again (still no server message) → close → timer → doubled again.
+    // The handlers registered on the new connect() call share the same mock object;
+    // the most-recently-added handlers are the live ones.
+    const allCalls = mockWsInstance.addEventListener.mock.calls;
+    const openHandler2 = [...allCalls].reverse().find(([type]) => type === 'open')?.[1] as (() => void) | undefined;
+    const closeHandler2 = [...allCalls].reverse().find(([type]) => type === 'close')?.[1] as
+      ((e: { code: number; reason: string }) => void) | undefined;
+
+    openHandler2?.();
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 2); // NOT reset — no message received
+
+    closeHandler2?.({ code: 4001, reason: 'auth_failed' });
+    vi.advanceTimersByTime(10_000);
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 4); // doubled again — exponential back-off
+  });
+
+  it('normal reconnect: backoff resets to initial after server sends the first message', () => {
+    // Complement: when the server accepts auth and sends a message, the next
+    // reconnect (e.g. after a network drop) starts fresh at INITIAL_BACKOFF_MS.
+    vi.useFakeTimers();
+    link.connect();
+
+    const calls = mockWsInstance.addEventListener.mock.calls;
+    const openHandler = calls.find(([type]) => type === 'open')?.[1] as (() => void) | undefined;
+    const messageHandler = calls.find(([type]) => type === 'message')?.[1] as
+      ((e: { data: string }) => void) | undefined;
+    const closeHandler = calls.find(([type]) => type === 'close')?.[1] as
+      ((e: { code: number; reason: string }) => void) | undefined;
+    expect(openHandler).toBeDefined();
+    expect(messageHandler).toBeDefined();
+    expect(closeHandler).toBeDefined();
+
+    const INITIAL = 500;
+
+    // Simulate: connect, server sends a message (auth confirmed), then network drops.
+    openHandler!();
+    messageHandler!({ data: JSON.stringify({ type: 'heartbeat_ack', ts: 1 }) });
+    expect(link.__backoffMsForTests()).toBe(INITIAL); // reset on first message
+
+    // After the drop, scheduleReconnect() uses INITIAL (fast reconnect — good).
+    // The timer callback doubles it so the next attempt is INITIAL*2 if it also fails.
+    closeHandler!({ code: 1001, reason: 'going away' });
+    vi.advanceTimersByTime(2_000);
+    expect(link.__backoffMsForTests()).toBe(INITIAL * 2); // doubled for next attempt
+  });
 });

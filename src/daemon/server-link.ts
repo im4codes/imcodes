@@ -526,6 +526,12 @@ export class ServerLink {
   /** A6 connect-timeout watchdog. Cleared on open/close/error. */
   private connectTimeoutTimer?: ReturnType<typeof setTimeout>;
   private backoffMs = INITIAL_BACKOFF_MS;
+  /** True once the server has sent at least one message on the current socket,
+   *  proving auth was accepted. Reset on every new connect() call.
+   *  Backoff is only reset to INITIAL when this flips to true — so a
+   *  permanent auth_failed loop (server closes immediately, never sends) keeps
+   *  the exponential back-off instead of retrying at 500 ms forever. */
+  private serverAuthConfirmedOnCurrentSocket = false;
   private stopping = false;
   private reconnecting = false;
   /** True once this link has completed at least one successful open. Gates the
@@ -618,6 +624,7 @@ export class ServerLink {
     this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.WS_CONNECT_ATTEMPT, {});
     this.recordRuntimeLinkStatus({ state: 'connecting', workerUrl: this.workerUrl, serverId: this.serverId });
     this.reconnecting = false;
+    this.serverAuthConfirmedOnCurrentSocket = false;
     // Production uses the worker-owned control socket so a synchronous main
     // thread task cannot pause auth, heartbeat, reconnect, or priority sends.
     // Vitest keeps the injectable in-process socket for deterministic protocol
@@ -682,7 +689,6 @@ export class ServerLink {
       // record it as sent right here, without ever logging the frame itself
       // (it carries `token`).
       this.diagnostics.record(STARTUP_DIAGNOSTIC_EVENT.AUTH_SENT, {});
-      this.backoffMs = INITIAL_BACKOFF_MS;
       this.dataPlaneSocketBackpressured = false;
       this.dataPlaneOverloadReconnectRequested = false;
       this.resetLinkCongestion();
@@ -812,6 +818,13 @@ export class ServerLink {
     eventSocket.addEventListener('message', (event: MessageEvent) => {
       if (this.ws !== ws) return; // stale socket
       this.lastPong = Date.now();
+      // First message from the server proves auth was accepted. Reset backoff
+      // here (not on socket open) so a permanent auth_failed loop — where the
+      // server closes immediately and never sends — keeps exponential back-off.
+      if (!this.serverAuthConfirmedOnCurrentSocket) {
+        this.serverAuthConfirmedOnCurrentSocket = true;
+        this.backoffMs = INITIAL_BACKOFF_MS;
+      }
       if (typeof event.data !== 'string') {
         void (async () => {
           const buffer = await toWebSocketBinaryBuffer(event.data);
@@ -1813,6 +1826,9 @@ export class ServerLink {
       this.backoffMs = Math.min(this.backoffMs * 2, MAX_BACKOFF_MS);
     }, delayMs);
   }
+
+  /** Exposed for tests only — do NOT call in production paths. */
+  __backoffMsForTests(): number { return this.backoffMs; }
 
   private recordRuntimeLinkStatus(
     update: Parameters<typeof recordDaemonServerLinkStatus>[0],
