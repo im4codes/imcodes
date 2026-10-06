@@ -7,6 +7,7 @@ import {
   timingSafeEqual,
 } from 'node:crypto';
 import { mkdir, open, lstat, readFile, realpath, rename, stat, unlink, writeFile, type FileHandle } from 'node:fs/promises';
+import type { Stats } from 'node:fs';
 import { networkInterfaces } from 'node:os';
 import { createServer, connect, isIP, type Server, type Socket } from 'node:net';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -320,7 +321,7 @@ export async function bindMachineFetchResumeIdentity(
 }
 
 function machineDirectSourceIdentityMatches(
-  actual: Awaited<ReturnType<FileHandle['stat']>>,
+  actual: Stats,
   expected: MachineDirectSourceIdentity,
 ): boolean {
   return actual.isFile()
