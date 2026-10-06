@@ -7650,6 +7650,7 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
     return;
   }
 
+  logger.info({ sessionName, commandId, toolUseId, answerChars: answer.length }, 'ask.answer received');
   if (commandId) {
     const begun = askAnswerLedger.begin(commandId);
     if (begun.state === 'pending') return; // bridge redispatch of a command still being delivered: its ack is coming
@@ -7677,6 +7678,9 @@ async function handleAskAnswer(cmd: Record<string, unknown>, serverLink: ServerL
       fail(ASK_ANSWER_ACK_ERRORS.EMPTY_ANSWER);
       return;
     }
+    // Info-level on purpose: this is the only trace that an answer reached the
+    // daemon and how it was delivered (the command itself is not otherwise logged).
+    logger.info({ sessionName, commandId, toolUseId, delivery }, 'ask.answer delivered');
     settle({ status: 'accepted', extras: { delivery } });
   } catch (err) {
     logger.warn({ err, sessionName, commandId }, 'ask.answer: delivery failed');

@@ -442,6 +442,58 @@ describe('ClaudeCodeSdkProvider', () => {
     expect(sessionInfo.some((info) => info.model === 'claude-sonnet-4-6')).toBe(true);
   });
 
+  describe('AskUserQuestion pause (canUseTool) and in-place answer', () => {
+    async function startSession(sessionName: string | undefined) {
+      sdkMock.setNextMessages([
+        { type: 'system', subtype: 'init', session_id: 'session-1', model: 'claude-sonnet-4-6' },
+      ]);
+      const provider = new ClaudeCodeSdkProvider();
+      await provider.connect({ binaryPath: 'claude' });
+      await provider.createSession({ sessionKey: 'route-ask', cwd: '/tmp/project', resumeId: 'session-1', ...(sessionName ? { sessionName } : {}) });
+      await provider.send('route-ask', 'hello');
+      await flush();
+      const canUseTool = sdkMock.runs[0]!.options.canUseTool as (name: string, input: Record<string, unknown>, opts: { signal?: AbortSignal }) => Promise<Record<string, unknown>>;
+      return { provider, canUseTool };
+    }
+    const questionInput = { questions: [{ question: 'Pick', options: [{ label: 'A' }, { label: 'B' }] }] };
+
+    it('pauses the model on AskUserQuestion until the daemon answers by sessionName, then continues the SAME turn with the answer', async () => {
+      const { provider, canUseTool } = await startSession('deck_proj_brain');
+      let settled: Record<string, unknown> | null = null;
+      const pending = canUseTool('AskUserQuestion', questionInput, {}).then((result) => { settled = result; return result; });
+      await flush();
+      expect(settled).toBeNull(); // paused: the model has not been released
+
+      // handleAskAnswer answers by the daemon-facing sessionName, not the route id.
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'Option B')).toBe(true);
+      await expect(pending).resolves.toEqual({ behavior: 'deny', message: 'Option B', interrupt: false });
+      // Nothing is pending any more: a second answer is not swallowed as if it were the first.
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'Option A')).toBe(false);
+    });
+
+    it('lets every other tool through untouched', async () => {
+      const { canUseTool } = await startSession('deck_proj_brain');
+      await expect(canUseTool('Read', { file_path: 'a.ts' }, {})).resolves.toEqual({ behavior: 'allow', updatedInput: { file_path: 'a.ts' } });
+    });
+
+    it('releases the model with its own choice when the question is aborted (stop), so nothing hangs', async () => {
+      const { provider, canUseTool } = await startSession('deck_proj_brain');
+      const abort = new AbortController();
+      const pending = canUseTool('AskUserQuestion', questionInput, { signal: abort.signal });
+      abort.abort();
+      await expect(pending).resolves.toEqual({ behavior: 'allow', updatedInput: questionInput });
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'late')).toBe(false);
+    });
+
+    it('is keyed by the route id when no sessionName was given (documents why createSession must always pass it)', async () => {
+      const { provider, canUseTool } = await startSession(undefined);
+      void canUseTool('AskUserQuestion', questionInput, {});
+      await flush();
+      expect(provider.answerPendingQuestion('deck_proj_brain', 'x')).toBe(false);
+      expect(provider.answerPendingQuestion('route-ask', 'x')).toBe(true);
+    });
+  });
+
   it('does not carry finished subagent rows into the next turn', async () => {
     // `subagentTasks` was append-only and survives session re-create, so rows
     // from a finished turn stayed forever. The 15-minute stale sweep and cancel
