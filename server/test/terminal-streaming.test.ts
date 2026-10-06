@@ -309,7 +309,7 @@ describe('Terminal streaming integration', () => {
       dispatchAttempts: 0,
       timeoutTimer: null,
     });
-    (bridge as unknown as { queue: Array<{ message: string; queuedAt: number }> }).queue.push({ message: raw, queuedAt: Date.now() });
+    bridge.sendToDaemon(raw); // daemon not authenticated yet -> lands in the generic queue
 
     const daemonWs = new MockWs();
     bridge.handleDaemonConnection(daemonWs as never, makeDb(), {} as never);
