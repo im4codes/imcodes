@@ -3,7 +3,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { h } from 'preact';
-import { cleanup, fireEvent, render, waitFor } from '@testing-library/preact';
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/preact';
 
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
@@ -37,7 +37,9 @@ const sessionControlsSpy = vi.fn((props: any) => (
     data-quota={props.activeSession?.quotaLabel ?? ''}
     data-state={props.activeSession?.state ?? ''}
     data-queued={(props.activeSession?.transportPendingMessages ?? []).join('|')}
-  />
+  >
+    <div data-testid="session-composer" role="textbox" />
+  </div>
 ));
 const usageFooterSpy = vi.fn((props: any) => (
   <div
@@ -2021,7 +2023,7 @@ describe('SDK window startup budget', () => {
     sendSnapshotRequest: vi.fn(), sendResize: vi.fn(), getDaemonCapabilitySnapshot: vi.fn(() => null),
     onDaemonCapabilitySnapshot: vi.fn(() => () => undefined),
   } as any;
-  it('mounts 19 realistic SDK windows with only the focused controls tree', () => {
+  it('mounts visible SDK composers while deferring controls for hidden windows', () => {
     const windows = Array.from({ length: 19 }, (_, index) => makeSubSession({
       id: `sdk-${index}`, sessionName: `deck_sub_sdk-${index}`, type: index % 2 ? 'claude-code-sdk' : 'codex-sdk',
       runtimeType: 'transport', providerId: index % 2 ? 'claude-code-sdk' : 'codex-sdk', providerSessionId: `provider-${index}`,
@@ -2038,7 +2040,10 @@ describe('SDK window startup budget', () => {
     expect(Math.max(...rendersBySession.values())).toBeLessThanOrEqual(2);
     expect(timelineCalls.filter(([, , , options]) => options.subscriptionMode === 'full').length).toBeGreaterThanOrEqual(9);
     expect(timelineCalls.filter(([, , , options]) => options.subscriptionMode === 'summary').length).toBeGreaterThanOrEqual(10);
-    expect(sessionControlsSpy.mock.calls.length - beforeControls).toBeLessThanOrEqual(2);
+    const controlCalls = sessionControlsSpy.mock.calls.slice(beforeControls);
+    expect(controlCalls.length).toBeGreaterThanOrEqual(9);
+    expect(controlCalls.some(([props]) => props.activeSession?.name === 'deck_sub_sdk-9')).toBe(false);
+    expect(controlCalls.some(([props]) => props.activeSession?.name === 'deck_sub_sdk-18')).toBe(false);
   });
   it('does not throw for incomplete transport metadata', () => {
     expect(() => render(<SubSessionWindow sub={makeSubSession({ id: 'sdk-missing', sessionName: 'deck_sub_sdk-missing', type: 'codex-sdk', runtimeType: null, providerId: null, providerSessionId: null, state: 'unknown' })} ws={ws} connected active visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />)).not.toThrow();
@@ -2049,5 +2054,30 @@ describe('SDK window startup budget', () => {
     expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: false, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true });
     view.rerender(<SubSessionWindow sub={sub} ws={ws} connected active visible onDiff={vi.fn()} onHistory={vi.fn()} onMinimize={vi.fn()} onClose={vi.fn()} onRestart={vi.fn()} onRename={vi.fn()} zIndex={5000} onFocus={vi.fn()} serverId="srv-1" />);
     expect(useTimelineSpy.mock.calls.at(-1)?.[3]).toMatchObject({ isActiveSession: true, isVisible: true, subscriptionMode: 'full', bootstrapWhenVisible: true });
+  });
+
+  it('keeps the composer visible for an on-screen inactive desktop window', () => {
+    render(<SubSessionWindow
+      sub={makeSubSession({ id: 'inactive-composer', sessionName: 'deck_sub_inactive-composer', type: 'codex-sdk', runtimeType: 'transport' })}
+      ws={ws}
+      connected={true}
+      active={false}
+      visible={true}
+      onDiff={vi.fn()}
+      onHistory={vi.fn()}
+      onMinimize={vi.fn()}
+      onClose={vi.fn()}
+      onRestart={vi.fn()}
+      onRename={vi.fn()}
+      zIndex={5000}
+      onFocus={vi.fn()}
+      serverId="srv-1"
+    />);
+
+    expect(screen.getByTestId('session-composer')).toBeTruthy();
+    expect(sessionControlsSpy.mock.calls.at(-1)?.[0]).toMatchObject({
+      keyboardActive: false,
+      activeSession: { name: 'deck_sub_inactive-composer' },
+    });
   });
 });

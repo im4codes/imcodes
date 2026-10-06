@@ -1116,13 +1116,16 @@ export function SubSessionWindow({
         />
       )}
 
-      {/* Full SessionControls — with sub-session action overrides. Inactive
-          windows keep a cheap footer shell; mounting SessionControls for every
-          restored window starts independent status/open-spec/rebuild work and
-          defeats the per-session timeline store. The window's capture handler
-          focuses it before a click reaches this shell, so it upgrades on the
-          next render without losing the user's first interaction. */}
-      {active ? <SessionControls
+      {/* Full SessionControls — with sub-session action overrides. Keep the
+          composer mounted for every visible desktop window, not just the
+          frontmost one: an unfocused sub-session is still an independent
+          conversation and its input must remain visible for draft review and
+          direct interaction. `keyboardActive` gates only global keyboard
+          handling (for example Escape cancellation), while the existing
+          connected/shared-state guards keep genuinely read-only sessions
+          disabled. Hidden windows (an inactive main-session tab) retain their
+          timeline state but defer this expensive control tree until shown. */}
+      {visible ? <SessionControls
         ws={ws}
         connected={connected}
         activeSession={controlsSessionInfo}
@@ -1181,7 +1184,7 @@ export function SubSessionWindow({
         onPendingPrefillApplied={onPendingPrefillApplied}
         onVersionSensitiveAction={onVersionSensitiveAction}
         onComposerTextChange={setComposerText}
-      /> : visible ? <div class="subsession-controls-deferred" aria-hidden="true" /> : null}
+      /> : null}
       </div>
 
       {/* Keep resize hit surfaces in a final sibling layer.  The composer,
