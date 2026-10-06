@@ -692,7 +692,7 @@ vi.mock('../src/components/SubSessionBar.js', () => ({
   ),
 }));
 vi.mock('../src/components/SubSessionWindow.js', () => ({
-  SubSessionWindow: ({ sub, ws, active, visible, zIndex, onFocus, onViewRepo, onShareSession, onSettings, sharedState }: any) => {
+  SubSessionWindow: ({ sub, ws, active, visible, zIndex, maximized, onToggleMaximized, onFocus, onViewRepo, onShareSession, onSettings, sharedState }: any) => {
     const incomingViewer = !!sharedState
       && sharedState.outgoing !== true
       && sharedState.effectiveRole !== 'participant';
@@ -701,12 +701,14 @@ vi.mock('../src/components/SubSessionWindow.js', () => ({
       data-testid={`sub-session-window-${sub?.id}`}
       data-active={String(active)}
       data-visible={String(visible)}
+      data-maximized={String(Boolean(maximized))}
       data-shared-outgoing={String(sharedState?.outgoing === true)}
       data-share-role={sharedState?.effectiveRole ?? ''}
       style={{ zIndex }}
       onMouseDown={onFocus}
     >
       sub-session-window
+      <button onClick={onToggleMaximized}>sub-window-toggle-max-{sub?.id}</button>
       <button onClick={onViewRepo}>sub-window-repo-{sub?.id}</button>
       <button onClick={() => onSettings?.({ surface: 'session' })}>sub-window-settings-{sub?.id}</button>
       <input aria-label={`sub-window-composer-${sub?.id}`} disabled={incomingViewer} />
@@ -3126,6 +3128,75 @@ describe('App shell', () => {
     });
     expect(ws.p2pListDiscussions).toHaveBeenCalledWith({ sessionName: 'deck_alpha_brain' });
     expect(ws.p2pStatus).toHaveBeenCalledWith({ sessionName: 'deck_alpha_brain' });
+  }, 20_000);
+
+  it('keeps a sub-session fullscreen state scoped to its main tab when switching tabs', async () => {
+    localStorage.setItem('rcc_auth', JSON.stringify({ userId: 'user-1', baseUrl: 'http://localhost' }));
+    localStorage.setItem('rcc_server', 'srv-1');
+    localStorage.setItem('rcc_session', 'deck_alpha_brain');
+    apiFetchMock.mockImplementation(async (path: string) => {
+      if (path === '/api/auth/user/me') return { id: 'user-1' };
+      if (path === '/api/server') return serverList();
+      if (path === '/api/server/srv-1/sessions') {
+        return {
+          sessions: [
+            ...sessionList().sessions,
+            { ...sessionList().sessions[0], name: 'deck_beta_brain', project_name: 'Beta', label: 'Beta Brain' },
+          ],
+        };
+      }
+      if (path.startsWith('/api/watch/sessions')) return { sessions: [] };
+      return {};
+    });
+
+    const alphaSub = {
+      id: 'sub-alpha-fullscreen',
+      sessionName: 'deck_sub_alpha_fullscreen',
+      parentSession: 'deck_alpha_brain',
+      label: 'Alpha child',
+      description: '',
+      cwd: '/work/alpha',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    const betaSub = {
+      id: 'sub-beta-fullscreen',
+      sessionName: 'deck_sub_beta_fullscreen',
+      parentSession: 'deck_beta_brain',
+      label: 'Beta child',
+      description: '',
+      cwd: '/work/beta',
+      type: 'codex-sdk',
+      runtimeType: 'transport',
+      state: 'idle',
+      serverId: 'srv-1',
+    };
+    useSubSessionsState.subSessions = [alphaSub, betaSub];
+    useSubSessionsState.visibleSubSessions = [alphaSub];
+
+    const { App } = await importApp();
+    render(<App />);
+    await waitFor(() => expect(wsInstances.length).toBe(1));
+
+    fireEvent.click(await screen.findByText('subbar-open-sub-alpha-fullscreen'));
+    const alphaWindow = await screen.findByTestId('sub-session-window-sub-alpha-fullscreen');
+    fireEvent.click(screen.getByText('sub-window-toggle-max-sub-alpha-fullscreen'));
+    await waitFor(() => expect(alphaWindow.getAttribute('data-maximized')).toBe('true'));
+    expect(localStorage.getItem('rcc_maximized_subs_srv-1_deck_alpha_brain')).toBe(JSON.stringify(['sub-alpha-fullscreen']));
+
+    localStorage.setItem('rcc_open_subs_deck_beta_brain', JSON.stringify(['sub-beta-fullscreen']));
+    localStorage.setItem('rcc_maximized_subs_srv-1_deck_beta_brain', '{malformed');
+    useSubSessionsState.visibleSubSessions = [betaSub];
+    fireEvent.click(screen.getByText('tabs-select-deck_beta_brain'));
+    await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-beta-fullscreen')).toBeTruthy());
+    expect(screen.getByTestId('sub-session-window-sub-beta-fullscreen').getAttribute('data-maximized')).toBe('false');
+
+    useSubSessionsState.visibleSubSessions = [alphaSub];
+    fireEvent.click(screen.getByText('tabs-select-deck_alpha_brain'));
+    await waitFor(() => expect(screen.getByTestId('sub-session-window-sub-alpha-fullscreen').getAttribute('data-maximized')).toBe('true'));
+    expect(screen.getByTestId('sub-session-window-sub-beta-fullscreen').getAttribute('data-maximized')).toBe('false');
   }, 20_000);
 
   it('nudges browser WebSocket recovery when daemon heartbeat is fresh but the tab is disconnected', async () => {

@@ -398,6 +398,34 @@ const DAEMON_ONLINE_WS_RECOVERY_INTERVAL_MS = 5_000;
 // after this so it doesn't stick forever. Reconnect/online clears it sooner.
 const DAEMON_UPGRADING_MAX_MS = 5 * 60 * 1_000;
 const OPENSPEC_AUTO_RUNBAR_COMPACT_STORAGE_KEY = 'rcc_openspec_auto_runbar_compact';
+const MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS = 128;
+
+/**
+ * Desktop sub-session maximize state belongs to the owning main-session tab,
+ * not to the currently mounted App tree.  Keep the key server-scoped too:
+ * session names are daemon-local and can legitimately repeat on two servers.
+ * The bounded parser is deliberately fail-closed for malformed/legacy values.
+ */
+function maximizedSubSessionStorageKey(serverId: string | null, sessionName: string): string {
+  return `rcc_maximized_subs_${serverId ?? 'default'}_${sessionName}`;
+}
+
+function loadPersistedMaximizedSubSessionIds(serverId: string | null, sessionName: string | null): Set<string> {
+  if (!sessionName) return new Set();
+  try {
+    const raw = localStorage.getItem(maximizedSubSessionStorageKey(serverId, sessionName));
+    if (!raw) return new Set();
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return new Set();
+    return new Set(
+      parsed
+        .filter((id): id is string => typeof id === 'string' && id.length > 0)
+        .slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS),
+    );
+  } catch {
+    return new Set();
+  }
+}
 
 function readOpenSpecAutoRunbarCompactPreference(): boolean {
   try {
@@ -954,7 +982,9 @@ export function App() {
   }, [sidebarCollapsed]);
   const [showDesktopFileBrowser, setShowDesktopFileBrowser] = useState(false);
   const [desktopFileBrowserMaximized, setDesktopFileBrowserMaximized] = useState(false);
-  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => new Set());
+  const [maximizedSubIds, setMaximizedSubIds] = useState<Set<string>>(() => (
+    loadPersistedMaximizedSubSessionIds(selectedServerId, initialHashStateRef.current.sessionName)
+  ));
   const [subSessionBarCollapsed, setSubSessionBarCollapsed] = useState(() => {
     try {
       const raw = localStorage.getItem(SUBSESSION_BAR_COLLAPSED_STORAGE_KEY);
@@ -1980,6 +2010,7 @@ export function App() {
   // Reading `localStorage.rcc_session` here made a reload in tab B restore tab
   // A's window state (or no windows at all).
   const openSubPersistenceSessionRef = useRef(initialHashStateRef.current.sessionName);
+  const openSubPersistenceServerRef = useRef(selectedServerId);
   const [openSubIds, setOpenSubIdsRaw] = useState<Set<string>>(() => {
     try {
       const initial = openSubPersistenceSessionRef.current;
@@ -2012,6 +2043,20 @@ export function App() {
     if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
     else safeLocalStorageRemoveItem(storageKey);
   }, []);
+  const persistMaximizedSubIds = useCallback((next: Set<string>) => {
+    const mainSession = openSubPersistenceSessionRef.current;
+    if (!mainSession) return;
+    const ids = Array.from(next).slice(0, MAX_PERSISTED_MAXIMIZED_SUBSESSION_IDS);
+    const storageKey = maximizedSubSessionStorageKey(openSubPersistenceServerRef.current, mainSession);
+    if (ids.length > 0) safeLocalStorageSetItem(storageKey, JSON.stringify(ids));
+    else safeLocalStorageRemoveItem(storageKey);
+  }, []);
+  useEffect(() => {
+    // State changes from maximize/restore and session switches share one
+    // bounded, session-scoped persistence path.  Reading the refs avoids a
+    // transient render writing the previous tab's state under the new key.
+    persistMaximizedSubIds(maximizedSubIds);
+  }, [maximizedSubIds, persistMaximizedSubIds]);
   const setOpenSubIds = useCallback((
     updater: Set<string> | ((prev: Set<string>) => Set<string>),
     options?: { retainPrevious?: boolean },
@@ -2837,11 +2882,12 @@ export function App() {
     // Update this before setOpenSubIds: state setters below run in the same
     // turn, before the hash-sync effect can publish the new tab-local scope.
     openSubPersistenceSessionRef.current = name;
+    openSubPersistenceServerRef.current = selectedServerId;
     if (name) safeLocalStorageSetItem('rcc_session', name);
     else safeLocalStorageRemoveItem('rcc_session');
     setActiveSessionState(name);
     if (!opts?.keepSubWindows) {
-      setMaximizedSubIds(new Set());
+      setMaximizedSubIds(loadPersistedMaximizedSubSessionIds(selectedServerId, name));
       setDesktopFileBrowserMaximized(false);
       // Restore saved open sub-sessions for the target main session
       if (name) {
@@ -2858,7 +2904,7 @@ export function App() {
     if (name && opts?.scrollToBottom !== false) {
       requestAnimationFrame(() => chatScrollFnsRef.current.get(name)?.());
     }
-  }, [setOpenSubIds]);
+  }, [selectedServerId, setOpenSubIds]);
 
   // Keep a server-scoped snapshot whenever the user changes the main mobile
   // tab.  The one-render guard prevents a server switch from briefly writing
