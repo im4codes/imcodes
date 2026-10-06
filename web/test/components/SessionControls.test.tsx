@@ -9401,6 +9401,76 @@ afterEach(() => {
     });
   });
 
+  describe('a committed upload is never reported as failed by post-transfer bookkeeping', () => {
+    function renderForUpload(name: string) {
+      directFileTransferMocks.useUploadFileWithDirectFallbackMock = true;
+      const ws = makeWs();
+      render(
+        <SessionControls
+          ws={ws as any}
+          activeSession={makeSession({ name })}
+          quickData={makeQuickData() as any}
+          serverId="srv-1"
+        />,
+      );
+      const input = screen.getByRole('textbox') as HTMLDivElement;
+      input.textContent = 'keep this text';
+      fireEvent.input(input);
+      return { ws, input };
+    }
+
+    it('still attaches the file when sessionStorage refuses the attachment draft write', async () => {
+      directFileTransferMocks.uploadFileWithDirectFallback.mockResolvedValue({
+        attachment: { id: 'attachment-quota', serverId: 'srv-1', daemonPath: '/tmp/quota-proof.txt' },
+      });
+      const realSetItem = Storage.prototype.setItem;
+      // Only the attachment draft key fails, like a full/restricted store;
+      // unrelated writes (text draft) keep working.
+      const setItem = vi.spyOn(Storage.prototype, 'setItem').mockImplementation(function (this: Storage, key: string, value: string) {
+        if (key.startsWith('rcc_draft_attachments_')) {
+          throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+        }
+        return realSetItem.call(this, key, value);
+      });
+      try {
+        const { ws, input } = renderForUpload('storage-quota-session');
+        fireEvent.paste(input, {
+          clipboardData: { files: [new File(['x'], 'quota-proof.txt', { type: 'text/plain' })], getData: () => '' },
+        });
+        await waitFor(() => expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1'));
+        expect(screen.queryByText('upload_failed')).toBeNull();
+        expect(screen.queryByTestId('composer-upload-row')).toBeNull();
+        expect(input.textContent).toBe('keep this text');
+        fireEvent.click(screen.getByRole('button', { name: /send/i }));
+        expectSendPayload(ws, {
+          sessionName: 'storage-quota-session',
+          text: '#1:(/tmp/quota-proof.txt) keep this text',
+        });
+      } finally {
+        setItem.mockRestore();
+      }
+    });
+
+    it('still attaches an image when the preview object URL cannot be created', async () => {
+      directFileTransferMocks.uploadFileWithDirectFallback.mockResolvedValue({
+        attachment: { id: 'attachment-preview', serverId: 'srv-1', daemonPath: '/tmp/preview-proof.png' },
+      });
+      const original = URL.createObjectURL;
+      URL.createObjectURL = vi.fn(() => { throw new Error('createObjectURL unavailable'); }) as typeof URL.createObjectURL;
+      try {
+        const { input } = renderForUpload('preview-failure-session');
+        fireEvent.paste(input, {
+          clipboardData: { files: [new File(['x'], 'preview-proof.png', { type: 'image/png' })], getData: () => '' },
+        });
+        await waitFor(() => expect(screen.getByTestId('attachment-tag-1').textContent).toBe('#1'));
+        expect(screen.queryByText('upload_failed')).toBeNull();
+        expect(screen.queryByTestId('composer-upload-row')).toBeNull();
+      } finally {
+        URL.createObjectURL = original;
+      }
+    });
+  });
+
   it('does not send text-only when a completed transfer has no daemon path', async () => {
     // A malformed completion must fail closed just like a transport failure.
     // This covers recovery/fallback adapters returning an incomplete

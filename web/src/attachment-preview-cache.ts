@@ -24,7 +24,11 @@ export function rememberAttachmentPreview(path: string, file: Blob & { name?: st
   const looksLikeImage = (file.type ?? '').startsWith('image/') || isPreviewableImageName(file.name ?? '');
   if (!looksLikeImage || typeof URL.createObjectURL !== 'function') return;
   forgetAttachmentPreview(path);
-  previews.set(path, URL.createObjectURL(file));
+  // Cosmetic: a webview that refuses an object URL must not fail the upload
+  // this preview belongs to (the transfer has already committed).
+  let url: string;
+  try { url = URL.createObjectURL(file); } catch { return; }
+  previews.set(path, url);
   while (previews.size > MAX_CACHED_PREVIEWS) {
     const oldest = previews.keys().next().value;
     if (oldest === undefined) break;

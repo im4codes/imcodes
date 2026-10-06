@@ -76,6 +76,7 @@ import { parseP2pSavedConfig, serializeP2pSavedConfig } from '../preferences/p2p
 import { sendSessionViaHttp, cancelSessionViaHttp, deleteAttachment } from '../api.js';
 import { ComposerAttachmentBadge } from './ComposerAttachmentBadge.js';
 import { forgetAttachmentPreview, rememberAttachmentPreview } from '../attachment-preview-cache.js';
+import { safeSessionStorageGetItem, safeSessionStorageSetItem } from '../local-storage-quota.js';
 import { attachmentDownloadId } from '../attachment-refs.js';
 import { formatTransferBytes, formatTransferDuration } from '../util/transfer-format.js';
 import { DIRECT_FILE_TRANSFER_ERROR } from '@shared/direct-file-transfer.js';
@@ -736,13 +737,6 @@ function parseStoredComposerAttachments(raw: string | null): ComposerAttachmentR
 // Keep the persisted-draft append primitive for single-completion callers and
 // compatibility with older composer integrations.  Batched uploads call it
 // first, then immediately rewrite the draft in selection order below.
-function appendStoredComposerAttachment(storageKey: string, attachment: ComposerAttachmentRecord): ComposerAttachmentRecord[] {
-  const current = parseStoredComposerAttachments(window.sessionStorage.getItem(storageKey));
-  const next = renumberAttachments([...current, attachment]);
-  window.sessionStorage.setItem(storageKey, JSON.stringify(next));
-  return next;
-}
-
 type ComposerUploadSnapshot = {
   uploads: ComposerUploadItem[];
   error: string | null;
@@ -5042,13 +5036,17 @@ export function SessionControls({ ws, activeSession, connected: connectedProp, i
           .filter((entry): entry is ComposerAttachmentRecord => !!entry);
         const completedPaths = new Set(orderedCompleted.map((entry) => entry.path));
         if (uploadAttachmentDraftKey) {
-          appendStoredComposerAttachment(uploadAttachmentDraftKey, attachment);
-          const stored = parseStoredComposerAttachments(window.sessionStorage.getItem(uploadAttachmentDraftKey));
+          // The transfer has already committed on the daemon. Persisting the
+          // composer draft is best-effort: a quota/security error from
+          // sessionStorage must never turn a finished upload into "failed"
+          // (the guarded helpers keep an in-memory copy when storage refuses).
+          const stored = parseStoredComposerAttachments(safeSessionStorageGetItem(uploadAttachmentDraftKey));
           const next = renumberAttachments([
             ...stored.filter((entry) => !completedPaths.has(entry.path)),
             ...orderedCompleted,
           ]);
-          window.sessionStorage.setItem(uploadAttachmentDraftKey, JSON.stringify(next));
+          // Unbounded: the default draft cap would truncate this JSON.
+          safeSessionStorageSetItem(uploadAttachmentDraftKey, JSON.stringify(next), Number.MAX_SAFE_INTEGER);
           if (mountedRef.current && attachmentDraftKeyRef.current === uploadAttachmentDraftKey) {
             setAttachments(next);
           }

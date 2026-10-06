@@ -1888,6 +1888,13 @@ async function uploadFileRequest(options: {
     const armStallTimer = () => {
       clearStallTimer();
       stallTimer = setTimeout(() => {
+        // `file.upload_done` is only written after the daemon committed the
+        // file, so a stream that stalls while closing is a success, not a
+        // failure to retry.
+        if (settleFromCommittedPayload()) {
+          xhr.abort();
+          return;
+        }
         // status 0 matches xhr.onerror's shape below, which the resumable
         // upload loop in uploadFile() already retries from the last
         // daemon-committed offset.
@@ -1920,7 +1927,11 @@ async function uploadFileRequest(options: {
           const loaded = typeof msg.loaded === 'number' ? msg.loaded : 0;
           const total = typeof msg.total === 'number' && msg.total > 0 ? msg.total : options.wholeFile.size;
           const daemonPct = total > 0 ? Math.min(1, loaded / total) : 0;
-          options.emitProgress(browserUploadWeight + daemonPct * daemonDownloadWeight);
+          // 100 is reserved for `file.upload_done`: the daemon reports its pull
+          // as complete BEFORE it commits the file, so 100% here would show a
+          // finished upload that can still fail (the direct path reserves it
+          // the same way).
+          options.emitProgress(Math.min(99, browserUploadWeight + daemonPct * daemonDownloadWeight));
           continue;
         }
         if (msg.type === 'file.upload_done' && msg.attachment) {
@@ -1939,6 +1950,21 @@ async function uploadFileRequest(options: {
       }
     };
 
+    // The server emits `file.upload_done` only after the daemon reported the
+    // attachment committed. Once that line has been read the upload IS
+    // complete: a connection that then errors, stalls or is aborted before the
+    // response finishes (a gateway cutting the stream's tail) must not discard
+    // it and report a finished transfer as failed. Flushes whatever is still
+    // buffered first so a final line without a trailing newline counts too.
+    const settleFromCommittedPayload = (): boolean => {
+      consumeProgressLines(true);
+      if (!finalPayload) return false;
+      cleanupAbortListener();
+      clearStallTimer();
+      resolve(finalPayload);
+      return true;
+    };
+
     xhr.onprogress = () => {
       armStallTimer();
       consumeProgressLines(false);
@@ -1950,12 +1976,13 @@ async function uploadFileRequest(options: {
       if (xhr.status >= 200 && xhr.status < 300) {
         try {
           consumeProgressLines(true);
-          if (streamError) {
-            reject(streamError);
-            return;
-          }
+          // A committed upload outranks any error line: it cannot be undone.
           if (finalPayload) {
             resolve(finalPayload);
+            return;
+          }
+          if (streamError) {
+            reject(streamError);
             return;
           }
           const parsed = JSON.parse(xhr.responseText) as UploadFileRequestResult;
@@ -1978,11 +2005,15 @@ async function uploadFileRequest(options: {
     };
 
     xhr.onerror = () => {
+      if (settleFromCommittedPayload()) return;
       cleanupAbortListener();
       clearStallTimer();
       reject(new ApiError(0, 'Network error'));
     };
     xhr.onabort = () => {
+      // A user cancel stays a cancel; only a non-user abort (the stall timer
+      // above, already settled) may be superseded by committed evidence.
+      if (!options.signal?.aborted && settleFromCommittedPayload()) return;
       cleanupAbortListener();
       clearStallTimer();
       reject(abortError());
