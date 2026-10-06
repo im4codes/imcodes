@@ -2338,4 +2338,58 @@ describe('SessionSettingsDialog supervision', () => {
     });
     expect(patchSessionMock).not.toHaveBeenCalled();
   });
+
+  it('syncs model list and resets model when provider is switched', async () => {
+    const ws = makeIdentityAckWs();
+    render(
+      <SessionSettingsDialog
+        serverId="srv-1"
+        sessionName="deck_proj_brain"
+        label="Brain"
+        description=""
+        cwd="/proj"
+        type="codex-sdk"
+        activeModel={CODEX_MODEL_IDS[0]}
+        requestedModel={CODEX_MODEL_IDS[0]}
+        transportConfig={null}
+        surface="session"
+        ws={ws as any}
+        onClose={vi.fn()}
+        onSaved={vi.fn()}
+      />,
+    );
+
+    // Initial state: model list contains Codex models, no Claude models
+    const modelSelect = screen.getByLabelText('label') as HTMLSelectElement;
+    const initialOptions = [...modelSelect.options].map((o) => o.value);
+    expect(initialOptions.some((id) => CODEX_MODEL_IDS.includes(id as typeof CODEX_MODEL_IDS[number]))).toBe(true);
+    expect(initialOptions.some((id) => CLAUDE_CODE_MODEL_IDS.includes(id as typeof CLAUDE_CODE_MODEL_IDS[number]))).toBe(false);
+
+    // Switch provider to claude-code-sdk
+    const typeSelect = screen.getByTestId('session-agent-type') as HTMLSelectElement;
+    expect(typeSelect.value).toBe('codex-sdk');
+    changeSelect(typeSelect, 'claude-code-sdk');
+
+    // Model list must now contain Claude models
+    await waitFor(() => {
+      const options = [...modelSelect.options].map((o) => o.value);
+      expect(options.some((id) => CLAUDE_CODE_MODEL_IDS.includes(id as typeof CLAUDE_CODE_MODEL_IDS[number]))).toBe(true);
+    });
+
+    // Selected model must have been reset to a Claude default (not a stale Codex model)
+    await waitFor(() => {
+      expect(CLAUDE_CODE_MODEL_IDS.includes(modelSelect.value as typeof CLAUDE_CODE_MODEL_IDS[number])).toBe(true);
+    });
+
+    // Apply must dispatch the /model command using the new Claude model (not a Codex model)
+    const applyButton = await screen.findByRole('button', { name: 'apply' });
+    expect((applyButton as HTMLButtonElement).disabled).toBe(false);
+    fireEvent.click(applyButton);
+    await waitFor(() =>
+      expect(ws.sendSessionMessage).toHaveBeenCalledWith(
+        'deck_proj_brain',
+        `/model ${CLAUDE_CODE_MODEL_IDS[0]}`,
+      ),
+    );
+  });
 });

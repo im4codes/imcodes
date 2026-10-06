@@ -836,6 +836,7 @@ export function SessionSettingsDialog({
   const [pendingSessionModel, setPendingSessionModel] = useState<string | null>(null);
   const [supervision, setSupervision] = useState<SupervisionDraft>(initialSupervision);
   const ccPresetListRequestIdRef = useRef<string | null>(null);
+  const agentTypeMountedRef = useRef(false);
   const [supervisorDefaults, setSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const [initialSupervisorDefaults, setInitialSupervisorDefaults] = useState<SupervisionRuntimeDraft>(() => normalizeSupervisorDefaultConfig(null));
   const supervisorDefaultsDirtyRef = useRef(false);
@@ -865,6 +866,25 @@ export function SessionSettingsDialog({
     setModelApplyError('');
     setPendingSessionModel(null);
   }, [sessionName, subSessionId, type]);
+
+  // When the user switches provider (agentType), reset sessionModel to the new
+  // provider's static default. Skips on initial mount and on session-switch
+  // resets (where agentType is set back to equal type).
+  useEffect(() => {
+    if (!agentTypeMountedRef.current) {
+      agentTypeMountedRef.current = true;
+      return;
+    }
+    if (agentType === type) return;
+    const newDefault = agentType === 'claude-code' || agentType === 'claude-code-sdk'
+      ? (CLAUDE_CODE_MODEL_IDS[0] ?? '')
+      : agentType === 'codex' || agentType === 'codex-sdk'
+        ? (CODEX_MODEL_IDS[0] ?? '')
+        : agentType === 'qwen'
+          ? (getKnownQwenModelOptions()[0]?.id ?? '')
+          : '';
+    setSessionModel(newDefault);
+  }, [agentType, type]);
 
   useEffect(() => {
     const activeEffectiveModel = activeModel?.trim() || modelDisplay?.trim() || '';
@@ -906,26 +926,26 @@ export function SessionSettingsDialog({
 
   const sessionDynamicModels = useTransportModels(
     ws ?? null,
-    surface !== 'supervision' && supportsDynamicTransportModels(type) ? type : null,
+    surface !== 'supervision' && supportsDynamicTransportModels(agentType) ? agentType : null,
     undefined,
     sessionName,
   );
   const sessionModelOptions = useMemo(() => {
-    const staticOptions = type === 'claude-code' || type === 'claude-code-sdk'
+    const staticOptions = agentType === 'claude-code' || agentType === 'claude-code-sdk'
       ? [...CLAUDE_CODE_MODEL_IDS]
-      : type === 'codex' || type === 'codex-sdk'
+      : agentType === 'codex' || agentType === 'codex-sdk'
         ? [...CODEX_MODEL_IDS]
-        : type === 'qwen'
+        : agentType === 'qwen'
           ? getKnownQwenModelOptions().map((entry) => entry.id)
           : [];
     return mergeModelSuggestions(
       [sessionModel, initialSessionModel, sessionDynamicModels.defaultModel, ...staticOptions].filter((value): value is string => !!value),
       sessionDynamicModels.models.map((entry) => entry.id),
     );
-  }, [initialSessionModel, sessionDynamicModels.defaultModel, sessionDynamicModels.models, sessionModel, type]);
-  const sessionModelSwitchSupported = type === 'claude-code'
-    || type === 'codex'
-    || supportsDynamicTransportModels(type);
+  }, [agentType, initialSessionModel, sessionDynamicModels.defaultModel, sessionDynamicModels.models, sessionModel]);
+  const sessionModelSwitchSupported = agentType === 'claude-code'
+    || agentType === 'codex'
+    || supportsDynamicTransportModels(agentType);
   const sessionModelDirty = sessionModel.trim() !== appliedSessionModel;
 
   const handleApplySessionModel = async (): Promise<void> => {
@@ -946,7 +966,7 @@ export function SessionSettingsDialog({
         setSubSessionModel: (targetSessionName, modelId, cwd) => ws.subSessionSetModel(targetSessionName, modelId, cwd),
       }, {
         sessionName,
-        agentType: type,
+        agentType: agentType,
         model: nextModel,
         cwd: initCwd,
         subSession: !!subSessionId,
@@ -1986,7 +2006,9 @@ export function SessionSettingsDialog({
             <div class="session-settings-label">{t('session.type')}</div>
             <select
               class="input"
+              data-testid="session-agent-type"
               value={agentType}
+              onInput={(e) => setAgentType((e.target as HTMLSelectElement).value as SessionAgentType)}
               onChange={(e) => setAgentType((e.target as HTMLSelectElement).value as SessionAgentType)}
               style={{ width: '100%' }}
               disabled={saving}
