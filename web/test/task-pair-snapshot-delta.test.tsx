@@ -51,6 +51,7 @@ import {
   taskPairBriefStatus,
 } from '../src/task-pair-brief-store.js';
 import { clearAllSupervisionTaskConsoleCaches } from '../src/supervision-task-console-cache.js';
+import { createPairConsoleDaemon, type PairConsoleDaemon } from './helpers/pair-console-daemon.js';
 
 const PROJECT = 'alpha';
 const BRAIN = 'deck_alpha_brain';
@@ -75,59 +76,9 @@ function save(store: TaskPairStore, taskId: string, over: Record<string, unknown
   } as never, { liveness: { silenceExecutor: 0, silenceAuditor: 0, progressExecutorAt: 1_000, progressAuditorAt: 1_000 } as never });
 }
 
-interface Daemon {
-  registry: SupervisionConsoleSessionRegistry;
-  producer: SupervisionConsoleProducer;
-  /** Frames the daemon pushed, in order (already JSON round-tripped, as on the wire). */
-  frames: any[];
-  bytes: () => number;
-  connect(): { socket: SupervisionTaskConsoleSocket };
-}
+type Daemon = PairConsoleDaemon;
 
-function newDaemon(): Daemon {
-  const db = new DatabaseSync(':memory:');
-  db.exec(`
-    CREATE TABLE supervision_tasks (task_id TEXT PRIMARY KEY, top_level_task_id TEXT NOT NULL,
-      classification TEXT NOT NULL, status TEXT NOT NULL, current_revision TEXT, commit_sha TEXT,
-      push_remote_ref TEXT, blocker TEXT, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL,
-      updated_at INTEGER NOT NULL);
-    CREATE TABLE supervision_task_assignments (assignment_id TEXT PRIMARY KEY, task_id TEXT NOT NULL,
-      role TEXT NOT NULL, status TEXT NOT NULL, session_name TEXT NOT NULL, session_instance_id TEXT NOT NULL,
-      runtime_epoch TEXT NOT NULL, agent_type TEXT NOT NULL, provider_family TEXT NOT NULL,
-      lease_id TEXT NOT NULL, generation INTEGER NOT NULL, audit_attempt_id TEXT, audit_revision TEXT,
-      verdict TEXT, blocker TEXT, payload_json TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
-    CREATE TABLE supervision_task_events (id INTEGER PRIMARY KEY AUTOINCREMENT, task_id TEXT NOT NULL,
-      assignment_id TEXT, event_type TEXT NOT NULL, status TEXT NOT NULL, payload_json TEXT, created_at INTEGER NOT NULL);
-  `);
-  migrateSupervisionStore(db as unknown as SupervisionMigrationDb);
-  const handlers = new Set<(message: unknown) => void>();
-  const frames: any[] = [];
-  let total = 0;
-  let registry!: SupervisionConsoleSessionRegistry;
-  const producer = new SupervisionConsoleProducer(db as unknown as SupervisionMigrationDb, {
-    projectionEpoch: EPOCH, now: () => 5_000, snapshotCacheTtlMs: 0,
-    broadcast: (frame) => registry.broadcast(frame),
-  });
-  registry = new SupervisionConsoleSessionRegistry({
-    producer, authorize: () => true, now: () => 5_000,
-    send: (frame) => {
-      const wire = JSON.stringify(frame);
-      total += wire.length;
-      const parsed = JSON.parse(wire);
-      frames.push(parsed);
-      for (const handler of handlers) handler(parsed);
-    },
-  });
-  return {
-    registry, producer, frames, bytes: () => total,
-    connect: () => ({
-      socket: {
-        send: (message: object) => { registry.handleFrame(JSON.parse(JSON.stringify(message))); },
-        onMessage: (handler) => { handlers.add(handler); return () => { handlers.delete(handler); }; },
-      },
-    }),
-  };
-}
+const newDaemon = (): Daemon => createPairConsoleDaemon({ epoch: EPOCH });
 
 /** A connected viewer: the real controller subscribed through the real registry. */
 function viewer(daemon: Daemon): SupervisionTaskConsoleController {
@@ -211,9 +162,10 @@ describe('delta-merged view == full snapshot view (counter-example)', () => {
     save(store, 'p0', { status: 'rework', round: 1 });
     daemon.registry.pairsChanged(PROJECT, ['p2', 'p0'], 'task_pair_changed');
 
-    // The controller republishes the merged list to the panel like a snapshot.
-    const published = (window as any).__imcodesTaskPairSnapshot;
-    expect(published.type).toBe(SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT);
+    // The snapshot bridge publishes the controller state to the panel (the
+    // controller itself no longer writes to the window).
+    expect((window as any).__imcodesTaskPairSnapshot).toBeUndefined();
+    (window as any).__imcodesTaskPairSnapshot = taskConsoleStateToPairSnapshot(delta.getState());
     const fromDelta = render(<TaskPairStatusPanel events={[]} serverId="delta" />);
     const deltaHtml = fromDelta.container.innerHTML;
     fromDelta.unmount();
@@ -221,6 +173,7 @@ describe('delta-merged view == full snapshot view (counter-example)', () => {
     delete (window as any).__imcodesTaskPairSnapshot;
     const reference = newDaemon();
     const fresh = viewer(reference);
+    (window as any).__imcodesTaskPairSnapshot = taskConsoleStateToPairSnapshot(fresh.getState());
     const fromSnapshot = render(<TaskPairStatusPanel events={[]} serverId="fresh" />);
     expect(deltaHtml.length).toBeGreaterThan(0);
     expect(fromSnapshot.container.innerHTML).toBe(deltaHtml);
@@ -355,21 +308,24 @@ describe('controller wiring', () => {
     controller.stop();
   });
 
-  it('a pair delta reaches the compact panel as the whole merged list, in snapshot order', () => {
+  it('a pair delta leaves the controller state as the whole merged list, in snapshot order, for the compact panel', () => {
     const store = newStore();
     setTaskPairStoreForTests(store);
     for (const id of ['a', 'b', 'c']) save(store, id);
     const daemon = newDaemon();
     const controller = viewer(daemon);
+    // The controller never writes to the window: the snapshot bridge is the
+    // single publisher, so no second (stale or foreign) frame can reach the panel.
     const events: any[] = [];
     const listener = (event: Event) => events.push((event as CustomEvent).detail);
     window.addEventListener('supervision:task-pairs', listener);
     save(store, 'a', { round: 1 });
     daemon.registry.pairsChanged(PROJECT, ['a'], 'task_pair_changed');
     window.removeEventListener('supervision:task-pairs', listener);
-    expect(events).toHaveLength(1);
-    expect(events[0].tasks.map((task: any) => task.taskId)).toEqual(['a', 'c', 'b']);
-    expect(events[0].tasks[0].pair.round).toBe(1);
+    expect(events).toEqual([]);
+    const published = taskConsoleStateToPairSnapshot(controller.getState());
+    expect(published.tasks.map((task: any) => task.taskId)).toEqual(['a', 'c', 'b']);
+    expect((published.tasks[0] as any).pair.round).toBe(1);
     controller.stop();
   });
 

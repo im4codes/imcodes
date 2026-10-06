@@ -192,8 +192,19 @@ export class SupervisionConsoleProducer {
     snapshot: Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>;
   }>();
   readonly #snapshotBuildInFlight = new Map<string, Promise<Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'>>>();
-  /** Per scope: the pair rows + revision a PAIR_DELTA_V1 viewer was last sent. */
+  /**
+   * Per scope AND subscription: the pair rows + revision one PAIR_DELTA_V1
+   * viewer was last sent. Several viewers of a scope (a second tab, the phone,
+   * the compact panel next to the full console) each hold their own, so one
+   * viewer subscribing or leaving never invalidates another's delta base.
+   */
   readonly #pairViews = new Map<string, PairScopeView>();
+  /**
+   * Pair rows a PAIR_DELTA_V1 snapshot was built from, keyed by the snapshot
+   * object itself so they never travel on the wire. Seeds one view per
+   * subscription that receives that snapshot.
+   */
+  readonly #pairSnapshotEntries = new WeakMap<object, SupervisionTaskConsolePairUpsert[]>();
   /**
    * Assignment rows memoized for one synchronous projection pass. A replay of
    * N durable events used to re-project every assignment (and each owner's
@@ -269,6 +280,7 @@ export class SupervisionConsoleProducer {
       this.#snapshotBuildInFlight.set(key, work);
     }
     const snapshot = await work;
+    if (pairDelta) this.#seedPairView(scope, subscriptionId, snapshot);
     return { ...snapshot, subscriptionId };
   }
 
@@ -980,9 +992,32 @@ export class SupervisionConsoleProducer {
     return isPairsEngineProject(scope.projectName);
   }
 
-  /** The viewer of this scope went away or must be re-seeded by its next snapshot. */
-  dropPairView(scope: SupervisionTaskConsoleScope): void {
-    this.#pairViews.delete(this.#snapshotKey(scope));
+  #pairViewKey(scope: SupervisionTaskConsoleScope, subscriptionId: string): string {
+    return JSON.stringify([scope.projectName, scope.coordinatorSessionName, subscriptionId]);
+  }
+
+  #seedPairView(scope: SupervisionTaskConsoleScope, subscriptionId: string, snapshot: object): void {
+    const entries = this.#pairSnapshotEntries.get(snapshot);
+    if (!entries) return;
+    // Revisions restart at 0 with each snapshot: deltas are only ever
+    // meaningful against the snapshot of the subscription they belong to.
+    const view: PairScopeView = { revision: 0, rows: new Map() };
+    // Fresh wrappers per viewer: each view memoizes its own row JSON.
+    for (const entry of entries) view.rows.set(entry.task.taskId, { upsert: entry });
+    this.#pairViews.set(this.#pairViewKey(scope, subscriptionId), view);
+  }
+
+  /**
+   * One viewer went away or must be re-seeded by its next snapshot. Without a
+   * subscription id every viewer of the scope is dropped.
+   */
+  dropPairView(scope: SupervisionTaskConsoleScope, subscriptionId?: string): void {
+    if (subscriptionId !== undefined) {
+      this.#pairViews.delete(this.#pairViewKey(scope, subscriptionId));
+      return;
+    }
+    const prefix = JSON.stringify([scope.projectName, scope.coordinatorSessionName]).slice(0, -1);
+    for (const key of this.#pairViews.keys()) if (key.startsWith(`${prefix},`)) this.#pairViews.delete(key);
   }
 
   /**
@@ -996,7 +1031,7 @@ export class SupervisionConsoleProducer {
    */
   buildPairDelta(scope: SupervisionTaskConsoleScope, subscriptionId: string, dirtyTaskIds: Iterable<string>): SupervisionTaskConsolePairDelta | undefined {
     return withEventLoopWatchdogPhase('supervision-console.pair-delta', () => {
-      const view = this.#pairViews.get(this.#snapshotKey(scope));
+      const view = this.#pairViews.get(this.#pairViewKey(scope, subscriptionId));
       if (!view) return undefined;
       const store = getTaskPairStore();
       const windowIds = store.listPairWindowIds(scope.projectName);
@@ -1049,7 +1084,11 @@ export class SupervisionConsoleProducer {
     return withEventLoopWatchdogPhase('supervision-console.build-snapshot', () => traceSync(
       'supervision-console.build-snapshot',
       { projectName: scope.projectName },
-      () => ({ ...this.#buildSnapshotCached(scope, options.pairDelta === true), subscriptionId }),
+      () => {
+        const base = this.#buildSnapshotCached(scope, options.pairDelta === true);
+        if (options.pairDelta === true) this.#seedPairView(scope, subscriptionId, base);
+        return { ...base, subscriptionId };
+      },
     ));
   }
 
@@ -1094,20 +1133,11 @@ export class SupervisionConsoleProducer {
     const pairRows = isPairsEngineProject(scope.projectName)
       ? this.readPairRows(scope.projectName, { inlineBrief: !pairDelta })
       : undefined;
-    let pairRevision: number | undefined;
-    if (pairRows && pairDelta) {
-      const viewKey = this.#snapshotKey(scope);
-      // Revisions restart at 0 with each snapshot: deltas are only ever
-      // meaningful against the snapshot of the subscription they belong to.
-      const view: PairScopeView = { revision: 0, rows: new Map() };
-      for (const entry of pairRows.entries) view.rows.set(entry.task.taskId, { upsert: entry });
-      this.#pairViews.set(viewKey, view);
-      pairRevision = view.revision;
-    }
+    const pairRevision: number | undefined = pairRows && pairDelta ? 0 : undefined;
     const tasks = pairRows?.tasks ?? [...this.#visibleTaskIds(scope.projectName)]
       .map((taskId) => this.readTaskRow(taskId, scope.projectName))
       .filter((row): row is SupervisionTaskConsoleTaskRow => !!row);
-    return {
+    const snapshot: Omit<SupervisionTaskConsoleSnapshot, 'subscriptionId'> = {
       type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
       scope,
       schemaVersion: SUPERVISION_TASK_CONSOLE_SCHEMA_VERSION,
@@ -1125,6 +1155,8 @@ export class SupervisionConsoleProducer {
       pools: pairRows ? this.readPoolsIncremental(scope.projectName) : this.readPools(scope.projectName),
       ...(pairRevision !== undefined ? { pairRevision } : {}),
     };
+    if (pairRows && pairDelta) this.#pairSnapshotEntries.set(snapshot, pairRows.entries);
+    return snapshot;
   }
 
   /**

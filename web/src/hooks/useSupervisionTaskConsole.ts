@@ -1,10 +1,7 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import type { SupervisionTaskConsoleScope } from '@shared/supervision-task-console.js';
 import type { WsClient } from '../ws-client.js';
-import {
-  SupervisionTaskConsoleController,
-  type SupervisionTaskConsoleSocket,
-} from '../supervision-task-console-controller.js';
+import type { SupervisionTaskConsoleSocket } from '../supervision-task-console-controller.js';
 import {
   createSupervisionTaskConsoleState,
   type SupervisionTaskConsoleReducerState,
@@ -13,6 +10,11 @@ import {
   readSupervisionTaskConsoleCache,
   type SupervisionTaskConsoleAuthority,
 } from '../supervision-task-console-cache.js';
+import {
+  leaseSupervisionTaskConsoleController,
+  peekSharedSupervisionTaskConsoleController,
+  type SupervisionTaskConsoleLease,
+} from '../supervision-task-console-shared.js';
 
 export function createSupervisionTaskConsoleSocket(ws: WsClient): SupervisionTaskConsoleSocket {
   return {
@@ -35,40 +37,42 @@ export function useSupervisionTaskConsole(input: {
     projectName: input.scope.projectName,
     coordinatorSessionName: input.scope.coordinatorSessionName,
   }), [scopeKey]);
-  const controller = useMemo(() => {
-    if (!input.ws) return null;
-    return new SupervisionTaskConsoleController(
+  const initialState = () => (
+    (input.ws ? peekSharedSupervisionTaskConsoleController(input.ws, authority)?.getState() : undefined)
+      ?? readSupervisionTaskConsoleCache(authority)
+      ?? createSupervisionTaskConsoleState(input.scope)
+  );
+  const [state, setState] = useState<SupervisionTaskConsoleReducerState>(initialState);
+  const [lease, setLease] = useState<SupervisionTaskConsoleLease | null>(null);
+
+  // One controller (hence one daemon subscription) per page and scope, shared
+  // with every other view of the scope; see supervision-task-console-shared.ts.
+  useEffect(() => {
+    if (!input.ws) {
+      setLease(null);
+      setState(readSupervisionTaskConsoleCache(authority) ?? createSupervisionTaskConsoleState(input.scope));
+      return undefined;
+    }
+    const acquired = leaseSupervisionTaskConsoleController(
+      input.ws,
       createSupervisionTaskConsoleSocket(input.ws),
       input.scope,
       authority,
     );
-  }, [input.ws, scopeKey]);
-  const [state, setState] = useState<SupervisionTaskConsoleReducerState>(() => (
-    controller?.getState()
-      ?? readSupervisionTaskConsoleCache(authority)
-      ?? createSupervisionTaskConsoleState(input.scope)
-  ));
-
-  useEffect(() => {
-    if (!controller) {
-      setState(readSupervisionTaskConsoleCache(authority) ?? createSupervisionTaskConsoleState(input.scope));
-      return undefined;
-    }
-    const unsubscribe = controller.subscribe(setState);
-    controller.start();
-    controller.setConnected(input.connected);
+    const unsubscribe = acquired.controller.subscribe(setState);
+    setLease(acquired);
     return () => {
       unsubscribe();
-      controller.stop();
+      acquired.release();
     };
-  }, [controller, scopeKey]);
+  }, [input.ws, scopeKey]);
 
   useEffect(() => {
-    controller?.setConnected(input.connected);
-  }, [controller, input.connected]);
+    lease?.setConnected(input.connected);
+  }, [lease, input.connected]);
 
   return {
     state,
-    retry: () => { controller?.retry(); },
+    retry: () => { lease?.controller.retry(); },
   };
 }

@@ -145,11 +145,21 @@ export interface SupervisionTaskConsoleCursor {
 export type SupervisionTaskConsoleCursorState =
   SupervisionTaskConsoleCursor & { scope: SupervisionTaskConsoleScope };
 
+/** Longest `clientId` the daemon honours; a longer or non-string one is treated as absent. */
+export const SUPERVISION_TASK_CONSOLE_CLIENT_ID_MAX_LENGTH = 128;
+
 export interface SupervisionTaskConsoleSubscribe extends SupervisionTaskConsoleCursor {
   type: typeof SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE;
   scope: SupervisionTaskConsoleScope;
   /** Client-minted per subscribe attempt; echoed on every projection. */
   subscriptionId: string;
+  /**
+   * Stable for one browser page (all its controllers, every re-subscribe).
+   * The daemon keeps one subscription per `clientId` and scope, so another tab,
+   * device or panel viewing the same scope keeps its own instead of being
+   * superseded. Absent (older browsers): one shared slot per scope, as before.
+   */
+  clientId?: string;
   /** null demands a full snapshot; a number resumes catch-up after that event. */
   afterEventId: number | null;
   reason: SupervisionConsoleResyncReason;

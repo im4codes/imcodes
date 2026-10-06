@@ -28,6 +28,7 @@ import { issueSharedMachineAuthorityForSession } from '../share/shared-machine-a
 import { SHARED_MACHINE_AUTHORITY_FIELD } from '../../../shared/shared-machine-authority.js';
 import { resolveServerRole } from '../security/authorization.js';
 import { DAEMON_MSG } from '../../../shared/daemon-events.js';
+import { SUPERVISION_TASK_CONSOLE_MSG } from '../../../shared/supervision-task-console.js';
 import {
   CONTROLLED_NODE_HOST_AUTO_LINK_OUTCOME,
   validateControlledNodeLocalDaemonsMessage,
@@ -2146,6 +2147,16 @@ export class WsBridge {
   private controlledNodeWorkerRefreshStatus: ControlledNodeWorkerRefreshStatusMessage | null = null;
   private controlledNodeWorkerRefreshPersistence: Promise<void> = Promise.resolve();
   private browserSockets = new Set<WebSocket>();
+  /**
+   * Task-console subscriptions each browser socket opened, so a socket that
+   * goes away without saying so (tab closed, phone asleep, network drop) can
+   * be unsubscribed on the daemon's behalf. The daemon holds one subscription
+   * per viewer and sends every delta once per subscription; without this a
+   * dead viewer's subscription (and its pair view) lived as long as the
+   * daemon connection did. Keyed by viewer (`clientId`, else the subscription
+   * id) + scope; a viewer's newer subscribe replaces its older entry.
+   */
+  private consoleSubscriptions = new Map<WebSocket, Map<string, { subscriptionId: string; projectName: string; coordinatorSessionName: string }>>();
   private mobileSockets = new Set<WebSocket>();
   private queue: Array<{ message: string; queuedAt: number }> = [];
   private authTimer: ReturnType<typeof setTimeout> | null = null;
@@ -7049,6 +7060,9 @@ export class WsBridge {
         this.commandAckOrigins.record(msg.commandId, ws);
         this.startAckHousekeepingIfNeeded();
       }
+      if (msg.type === SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE || msg.type === SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE) {
+        this.trackBrowserConsoleSubscription(ws, msg);
+      }
       this.sendToDaemon(raw);
     });
 
@@ -9621,7 +9635,45 @@ export class WsBridge {
     return this.transportSubscriptionRevisions.get(ws)?.get(sessionId) === revision;
   }
 
+  private trackBrowserConsoleSubscription(ws: WebSocket, msg: Record<string, unknown>): void {
+    const subscriptionId = msg.subscriptionId;
+    const scope = msg.scope as { projectName?: unknown; coordinatorSessionName?: unknown } | undefined;
+    if (typeof subscriptionId !== 'string' || !subscriptionId
+      || typeof scope?.projectName !== 'string' || typeof scope.coordinatorSessionName !== 'string') return;
+    let entries = this.consoleSubscriptions.get(ws);
+    if (msg.type === SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE) {
+      if (!entries) return;
+      for (const [key, entry] of entries) if (entry.subscriptionId === subscriptionId) entries.delete(key);
+      if (entries.size === 0) this.consoleSubscriptions.delete(ws);
+      return;
+    }
+    if (!entries) { entries = new Map(); this.consoleSubscriptions.set(ws, entries); }
+    const viewer = typeof msg.clientId === 'string' && msg.clientId ? msg.clientId : subscriptionId;
+    const key = JSON.stringify([viewer, scope.projectName, scope.coordinatorSessionName]);
+    entries.delete(key);
+    entries.set(key, { subscriptionId, projectName: scope.projectName, coordinatorSessionName: scope.coordinatorSessionName });
+    // A socket cannot legitimately hold many; bound what a hostile one can make us keep.
+    while (entries.size > 32) entries.delete(entries.keys().next().value as string);
+  }
+
+  /** The socket is gone: release the daemon-side subscriptions it opened (no-op for ones already replaced). */
+  private releaseBrowserConsoleSubscriptions(ws: WebSocket): void {
+    const entries = this.consoleSubscriptions.get(ws);
+    this.consoleSubscriptions.delete(ws);
+    if (!entries) return;
+    for (const entry of entries.values()) {
+      try {
+        this.sendToDaemon(JSON.stringify({
+          type: SUPERVISION_TASK_CONSOLE_MSG.UNSUBSCRIBE,
+          subscriptionId: entry.subscriptionId,
+          scope: { projectName: entry.projectName, coordinatorSessionName: entry.coordinatorSessionName },
+        }));
+      } catch { /* the daemon link is down: its subscriptions died with it */ }
+    }
+  }
+
   private cleanupBrowserSocket(ws: WebSocket): void {
+    this.releaseBrowserConsoleSubscriptions(ws);
     this.browserSockets.delete(ws);
     this.mobileSockets.delete(ws);
     this.browserUserIds.delete(ws);

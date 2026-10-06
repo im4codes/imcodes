@@ -5,6 +5,8 @@ import { setTransportToolExecutionEvaluator } from './transport-relay.js';
 import { taskPairAutomation } from './task-pairs/scheduler.js';
 import { getTaskPairStore } from './task-pairs/store.js';
 import { isSessionWorking } from './session-working.js';
+import { createSupervisionSessionPresentationResolver } from './supervision-session-presentation.js';
+import { createSupervisionPairRefreshScheduler } from './supervision-pair-refresh.js';
 import { loadStore, flushStore, listSessions, getSession, upsertSession, removeSession, markSessionStoreAuthoritative, configureSessionStoreWriteAuthority, type SessionRecord } from '../store/session-store.js';
 import { markDaemonProcess } from './process-role.js';
 import { restoreFromStore, setSessionEventCallback, setSessionPersistCallback, setTransportSessionRestoredCallback, restartSession, respawnSession, initOnStartup, rebuildProviderRoutes, getTransportRuntime, unregisterProviderRoute, resyncTransportSessionStatesAfterLinkRestore, ensureTransportRuntimeForPendingResend } from '../agent/session-manager.js';
@@ -1513,16 +1515,16 @@ export async function startup(): Promise<DaemonContext> {
   // take the daemon down, so it is logged and the rest of startup continues.
   try {
     if (!serverLink) throw new Error('no server link');
-    // Live session state read at most once per session per second. A console
-    // snapshot/replay projects every assignment, and each read builds that
-    // session's full transport-queue snapshot; hundreds of assignments share
-    // far fewer sessions, and re-reading per row pegged the main thread (215).
-    const liveStateCache = new Map<string, {
-      at: number;
-      observed: ReturnType<typeof resolveAuthoritativeSessionListState>;
-      working: boolean;
-    }>();
-    const SUPERVISION_LIVE_STATE_CACHE_MS = 1_000;
+    // Live participant presentation, memoized per session for bulk passes; the
+    // timeline hook below invalidates a session's entry on every event that can
+    // change it (see supervision-session-presentation.ts).
+    const supervisionPresentation = createSupervisionSessionPresentationResolver({
+      getSession,
+      isWaitingForUserInput: (sessionName) => supervisionAutomation.isWaitingForUserInput(sessionName),
+      observeListState: resolveAuthoritativeSessionListState,
+      isSessionWorking,
+      resolveMissing: resolveMissingSupervisionSessionPresentation,
+    });
     supervisionConsole = createProductionSupervisionConsoleBinding({
       serverLink,
       registry: getSupervisionTaskRegistry(),
@@ -1532,50 +1534,7 @@ export async function startup(): Promise<DaemonContext> {
       deferSnapshots: true,
       // Only the coordinator that owns a project scope may subscribe to it.
       authorize: (scope) => isAuthorizedSupervisionConsoleScope(scope, listSessions()),
-      resolveSessionPresentation: (sessionName, durableObservedAt) => {
-        const record = getSession(sessionName);
-        if (!record) {
-          return resolveMissingSupervisionSessionPresentation(durableObservedAt);
-        }
-        if (supervisionAutomation.isWaitingForUserInput(sessionName)) {
-          return {
-            label: record.label,
-            model: record.activeModel?.trim() || record.requestedModel?.trim(),
-            thinking: record.effort,
-            state: 'needs_input',
-            source: 'supervision',
-            observedAt: record.updatedAt,
-          };
-        }
-        const now = Date.now();
-        let live = liveStateCache.get(sessionName);
-        if (!live || now - live.at >= SUPERVISION_LIVE_STATE_CACHE_MS) {
-          live = {
-            at: now,
-            observed: resolveAuthoritativeSessionListState(record),
-            working: isSessionWorking(sessionName),
-          };
-          if (liveStateCache.size >= 4_096) liveStateCache.clear();
-          liveStateCache.set(sessionName, live);
-        }
-        const { observed, working } = live;
-        return {
-          label: record.label,
-          model: record.activeModel?.trim() || record.requestedModel?.trim(),
-          thinking: record.effort,
-          state: working || observed === 'running' || observed === 'queued'
-            ? 'running'
-            : observed === 'idle'
-              ? 'idle'
-              : observed === 'error' || observed === 'stopped'
-                ? 'offline'
-                : 'unknown',
-          source: observed === 'running' || observed === 'queued' || observed === 'idle'
-            ? 'runtime'
-            : 'registry',
-          observedAt: record.updatedAt,
-        };
-      },
+      resolveSessionPresentation: (sessionName, durableObservedAt) => supervisionPresentation.resolve(sessionName, durableObservedAt),
       onError: (error) => logger.warn({ error }, 'supervision console projection unavailable'),
     });
     logger.info({ epoch: supervisionConsole.projectionEpoch }, 'supervision console bound');
@@ -1583,34 +1542,21 @@ export async function startup(): Promise<DaemonContext> {
     // per project so a burst of markers costs one refresh. The console gets a
     // one-pair delta for the pairs that changed; a legacy console viewer still
     // re-subscribes for a full snapshot.
-    const pendingPairRefresh = new Map<string, { timer: NodeJS.Timeout; taskIds: Set<string>; reason: 'task_pair_changed' | 'session_activity_changed' }>();
-    const schedulePairRefresh = (project: string, taskId: string, reason: 'task_pair_changed' | 'session_activity_changed') => {
-      const pending = pendingPairRefresh.get(project);
-      if (pending) {
-        pending.taskIds.add(taskId);
-        if (reason === 'task_pair_changed') pending.reason = reason;
-        return;
-      }
-      const taskIds = new Set([taskId]);
-      const timer = setTimeout(() => {
-        const flushed = pendingPairRefresh.get(project);
-        pendingPairRefresh.delete(project);
-        const flushReason = flushed?.reason ?? reason;
-        // Use the coalesced set, not only the first change that armed the
-        // timer.  Checklist ticks commonly save the same pair in a burst, but
-        // a marker burst can also touch several pairs; dropping the later IDs
-        // leaves their live checklist counts stale until a reconnect.
-        supervisionConsole?.sessions.pairsChanged(project, flushed?.taskIds ?? taskIds, flushReason);
-        // Badges follow pair rows, reminders and session state, and the timeline
-        // observer above already republishes on a session's running/idle change
-        // and on user messages. A flush that only saw streamed activity has
-        // nothing new for them, and this ran a full pass every 250 ms per
-        // project for as long as any session streamed.
-        if (flushReason === 'task_pair_changed') taskPairAutomation.publishBadges();
-      }, 250);
-      timer.unref?.();
-      pendingPairRefresh.set(project, { timer, taskIds, reason });
-    };
+    const pairRefresh = createSupervisionPairRefreshScheduler({
+      participantsOf: (project, taskId) => {
+        const state = getTaskPairStore().getPair(project, taskId)?.state;
+        return [state?.executor, state?.auditor].filter((name): name is string => Boolean(name));
+      },
+      invalidatePresentation: (sessionName) => supervisionPresentation.invalidate(sessionName),
+      pairsChanged: (project, taskIds, reason) => supervisionConsole?.sessions.pairsChanged(project, taskIds, reason),
+      // Badges follow pair rows, reminders and session state, and the timeline
+      // observer above already republishes on a session's running/idle change
+      // and on user messages. A flush that only saw streamed activity has
+      // nothing new for them, and this ran a full pass every 250 ms per
+      // project for as long as any session streamed.
+      publishBadges: () => taskPairAutomation.publishBadges(),
+    });
+    const schedulePairRefresh = pairRefresh.schedule;
     getTaskPairStore().onPairSaved((project, taskId) => schedulePairRefresh(project, taskId, 'task_pair_changed'));
     // State/tool events change live executorState/auditorState in the status
     // payload even when no pair row was saved. Resolve by participant so main

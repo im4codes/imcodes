@@ -165,6 +165,12 @@ export function createProductionSupervisionConsoleBinding(
     };
     const pollExternalWriters = () => {
       if (pollRunning || binding.sessions.activeSubscriptionCount === 0) return;
+      // The engine behind a scope (pairs vs legacy registry) is decided by
+      // settings that live outside the supervision database, so data_version
+      // below never notices a flip. Cheap (in-memory session list + one settings
+      // read per viewed project), and it keeps an open viewer from sitting on
+      // the other engine's rows until some unrelated pair is saved.
+      try { binding.sessions.reconcileProjectEngines(); } catch (error) { deps.onError?.(error); }
       if (busyWaitTicks > 0) { busyWaitTicks -= 1; return; }
       pollRunning = true;
       try {

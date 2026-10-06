@@ -827,7 +827,7 @@ describe('TaskPairStatusPanel', () => {
     }
   });
 
-  it('applies a live authoritative DONE upsert over the prior row without waiting for chat history', async () => {
+  it('applies a live authoritative DONE snapshot over the prior row without waiting for chat history', async () => {
     render(<TaskPairStatusPanel events={[]} />);
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
       tasks: [{ taskId: 'live-done', title: 'Live finish', updatedAt: 10_000, pair: { status: 'rework', createdAt: 1_000, startedAt: 2_000, updatedAt: 10_000 } }],
@@ -835,40 +835,13 @@ describe('TaskPairStatusPanel', () => {
     } }));
     await waitFor(() => expect(document.querySelector('[data-status="rework"]')).toBeTruthy());
     window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
-      op: 'task_upsert',
-      task: { taskId: 'live-done', title: 'Live finish', updatedAt: 12_000, pair: { status: 'done', createdAt: 1_000, startedAt: 2_000, updatedAt: 12_000 } },
+      tasks: [{ taskId: 'live-done', title: 'Live finish', updatedAt: 12_000, pair: { status: 'done', createdAt: 1_000, startedAt: 2_000, updatedAt: 12_000 } }],
+      assignments: [],
     } }));
     await waitFor(() => {
       expect(document.querySelector('[data-status="done"]')).toBeTruthy();
       expect(document.querySelector('[data-status="rework"]')).toBeNull();
     });
-  });
-
-  it('ignores an out-of-order non-terminal upsert after a terminal row', async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(20_000);
-    try {
-      render(<TaskPairStatusPanel events={[]} />);
-      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
-        tasks: [{ taskId: 'ordered-upsert', title: 'Ordered upsert', updatedAt: 100, pair: { status: 'done', createdAt: 10, startedAt: 20, updatedAt: 100 } }],
-        assignments: [],
-      } }));
-      await waitFor(() => expect(document.querySelector('[data-status="done"]')).toBeTruthy());
-      const meta = document.querySelector('[data-status="done"] .task-pair-status-row-meta')!;
-      const before = meta.textContent;
-      window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: {
-        op: 'task_upsert',
-        task: { taskId: 'ordered-upsert', title: 'Ordered upsert', updatedAt: 90, pair: { status: 'rework', createdAt: 10, startedAt: 20, updatedAt: 90 } },
-      } }));
-      await waitFor(() => {
-        expect(document.querySelector('[data-status="done"]')).toBeTruthy();
-        expect(document.querySelector('[data-status="rework"]')).toBeNull();
-      });
-      vi.advanceTimersByTime(30_000);
-      await waitFor(() => expect(meta.textContent).toBe(before));
-    } finally {
-      vi.useRealTimers();
-    }
   });
 
   it('ignores an out-of-order non-terminal full snapshot after a terminal row', async () => {

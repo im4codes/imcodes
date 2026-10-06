@@ -53,6 +53,13 @@ export const SUPERVISION_TASK_CONSOLE_RESYNC_MAX_DELAY_MS = 60_000;
 export const SUPERVISION_TASK_CONSOLE_RESYNC_WINDOW_MS = 5 * 60_000;
 export const SUPERVISION_TASK_CONSOLE_MAX_AUTOMATIC_RESYNCS = 6;
 export const SUPERVISION_TASK_CONSOLE_RESYNC_LIMIT_ERROR = 'resync_limit';
+/**
+ * An unanswered subscribe (lost on a flapping link, daemon not yet listening)
+ * is retried on the same budget instead of dead-ending in a stale state that
+ * needs a human click. The first retry waits a full base delay so the visible
+ * stale/error state is not replaced by an instant re-subscribe.
+ */
+export const SUPERVISION_TASK_CONSOLE_TIMEOUT_RETRY_DELAY_MS = SUPERVISION_TASK_CONSOLE_RESYNC_BASE_DELAY_MS;
 
 function sameScope(left: SupervisionTaskConsoleScope, right: SupervisionTaskConsoleScope): boolean {
   return left.projectName === right.projectName
@@ -66,6 +73,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 function newSubscriptionId(): string {
   return globalThis.crypto?.randomUUID?.()
     ?? `task-console-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+}
+
+let pageClientId: string | null = null;
+/**
+ * Identifies this browser page to the daemon (SUBSCRIBE `clientId`): stable for
+ * the page's lifetime and shared by all its controllers, so the daemon replaces
+ * only this page's own previous subscription and leaves other tabs/devices'
+ * alone. A fresh id per page load; nothing persists.
+ */
+export function supervisionTaskConsolePageClientId(): string {
+  pageClientId ??= newSubscriptionId();
+  return pageClientId;
 }
 
 function isResyncReason(value: unknown): value is SupervisionConsoleResyncReason {
@@ -214,7 +233,7 @@ export class SupervisionTaskConsoleController {
     this.resyncTimer = null;
   }
 
-  private scheduleAutomaticResync(reason: SupervisionConsoleResyncReason): void {
+  private scheduleAutomaticResync(reason: SupervisionConsoleResyncReason, minDelayMs = 0): void {
     // One pending resync covers every further request until it fires.
     if (this.resyncTimer) return;
     if (this.automaticResyncExhausted) {
@@ -232,12 +251,12 @@ export class SupervisionTaskConsoleController {
       this.apply({ type: 'transport_error', error: SUPERVISION_TASK_CONSOLE_RESYNC_LIMIT_ERROR });
       return;
     }
-    const delayMs = attempt === 0
+    const delayMs = Math.max(minDelayMs, attempt === 0
       ? 0
       : Math.min(
         SUPERVISION_TASK_CONSOLE_RESYNC_BASE_DELAY_MS * 2 ** (attempt - 1),
         SUPERVISION_TASK_CONSOLE_RESYNC_MAX_DELAY_MS,
-      );
+      ));
     this.automaticResyncs.push(now + delayMs);
     if (delayMs === 0) {
       this.requestSubscription(reason, true);
@@ -258,6 +277,7 @@ export class SupervisionTaskConsoleController {
         || !this.state.syncing
         || this.state.subscriptionId !== subscriptionId) return;
       this.apply({ type: 'transport_error', error: 'subscription_timeout' });
+      this.scheduleAutomaticResync('initial', SUPERVISION_TASK_CONSOLE_TIMEOUT_RETRY_DELAY_MS);
     }, SUPERVISION_TASK_CONSOLE_SUBSCRIBE_TIMEOUT_MS);
   }
 
@@ -316,6 +336,7 @@ export class SupervisionTaskConsoleController {
       ...cursor,
       type: SUPERVISION_TASK_CONSOLE_MSG.SUBSCRIBE,
       subscriptionId,
+      clientId: supervisionTaskConsolePageClientId(),
       afterEventId: fullSnapshot ? null : current.lastDurableEventId,
       reason,
       features: [SUPERVISION_TASK_CONSOLE_FEATURES.PAIR_DELTA_V1],
@@ -377,29 +398,11 @@ export class SupervisionTaskConsoleController {
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT) {
       if (message.subscriptionId === this.state.subscriptionId) this.clearSubscribeTimeout();
-      if (typeof window !== 'undefined') { (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = message; window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: message })); }
       this.apply({ type: 'snapshot_received', payload: message, receivedAt: Date.now() });
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.PAIR_DELTA) {
-      const before = this.state;
       this.apply({ type: 'pair_delta_received', payload: message, receivedAt: Date.now() });
-      // Feed the compact panel exactly what a full snapshot would have: the
-      // whole merged list, in snapshot order, so its grouping/ordering (which
-      // depends on row order) is identical to the pre-delta behaviour.
-      if (typeof window !== 'undefined' && this.state.pairRevision !== before.pairRevision) {
-        const detail = {
-          type: SUPERVISION_TASK_CONSOLE_MSG.SNAPSHOT,
-          scope: this.state.scope,
-          subscriptionId: this.state.subscriptionId,
-          generatedAt: this.state.lastSyncedAt,
-          tasks: Object.values(this.state.tasks),
-          assignments: Object.values(this.state.assignments),
-          pools: this.state.pools,
-        };
-        (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = detail;
-        window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail }));
-      }
       return;
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.BRIEF_RESPONSE) {
@@ -412,7 +415,6 @@ export class SupervisionTaskConsoleController {
     }
     if (message.type === SUPERVISION_TASK_CONSOLE_MSG.DELTA) {
       if (message.subscriptionId === this.state.subscriptionId) this.clearSubscribeTimeout();
-      if (typeof window !== 'undefined') window.dispatchEvent(new CustomEvent('supervision:task-pairs', { detail: message }));
       this.apply({ type: 'delta_received', payload: message, receivedAt: Date.now() });
     }
   }

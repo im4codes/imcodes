@@ -59,6 +59,14 @@ export interface SupervisionTaskConsoleReducerState {
    * daemon sent the legacy shape (it then repairs pair changes by resync).
    */
   pairRevision: number | null;
+  /**
+   * The rows are the pair store's (a `pairs`-engine project), not the legacy
+   * registry's. Legacy DELTA frames then describe rows this projection does not
+   * hold: they may move the cursor but must never touch a row. (The legacy
+   * registry keeps the tasks pairs were imported from under the SAME ids, so
+   * applying one replaced a cancelled pair row with a `delegated` legacy row.)
+   */
+  pairProjection: boolean;
   tasks: Readonly<Record<string, SupervisionTaskConsoleTaskRow>>;
   assignments: Readonly<Record<string, SupervisionTaskConsoleAssignmentRow>>;
   eventsByTask: Readonly<Record<string, readonly SupervisionTaskConsoleEventEvidence[]>>;
@@ -213,6 +221,7 @@ export function createSupervisionTaskConsoleState(
     lastDurableEventId: cursor.lastDurableEventId,
     projectionEpoch: cursor.projectionEpoch,
     pairRevision: null,
+    pairProjection: false,
     tasks: {},
     assignments: {},
     eventsByTask: {},
@@ -262,6 +271,7 @@ function applySnapshot(
     lastDurableEventId: snapshot.lastDurableEventId,
     projectionEpoch: snapshot.projectionEpoch,
     pairRevision: typeof snapshot.pairRevision === 'number' ? snapshot.pairRevision : null,
+    pairProjection: typeof snapshot.pairRevision === 'number' || snapshot.tasks.some((task) => Boolean(task.pair)),
     tasks,
     assignments,
     eventsByTask: {},
@@ -296,6 +306,17 @@ function applyDelta(
   }
   if (delta.eventId !== delta.lastDurableEventId || delta.eventId === state.lastDurableEventId) {
     return requestResync(state, 'cursor_unknown');
+  }
+  if (state.pairProjection) {
+    // Legacy-registry event on a pairs project: keep the cursor dense so the
+    // next frame is still "in order", leave every row alone.
+    return {
+      ...state,
+      projectionVersion: delta.projectionVersion,
+      lastDurableEventId: delta.lastDurableEventId,
+      projectionEpoch: delta.projectionEpoch,
+      error: null,
+    };
   }
 
   const tasks: Record<string, SupervisionTaskConsoleTaskRow> = { ...state.tasks };

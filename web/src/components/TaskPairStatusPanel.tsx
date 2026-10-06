@@ -33,15 +33,6 @@ function finiteTimestamp(value: unknown, fallback?: number): number | undefined 
   return Number.isFinite(numeric) && numeric >= 0 ? numeric : fallback;
 }
 
-function mergeDefined(
-  previous: Record<string, unknown> | undefined,
-  incoming: Record<string, unknown>,
-): Record<string, unknown> {
-  const merged = { ...(previous ?? {}) };
-  for (const [key, value] of Object.entries(incoming)) if (value !== undefined) merged[key] = value;
-  return merged;
-}
-
 function snapshotTimestamp(row: Record<string, unknown>): number {
   const value = Number(row.updatedAt);
   return Number.isFinite(value) && value >= 0 ? value : 0;
@@ -52,9 +43,12 @@ function isTerminalRow(row: Record<string, unknown> | undefined): boolean {
 }
 
 /**
- * Pair snapshots/upserts can cross on the socket.  Once a terminal row has
- * been observed, an older (or even newer but non-terminal) participant update
- * must not resurrect it or restart its elapsed timer.
+ * Pair snapshots can cross.  Once a terminal row has been observed, an older
+ * (or even newer but non-terminal) update must not resurrect it or restart its
+ * elapsed timer.  An accepted incoming row REPLACES the previous one: it is the
+ * daemon's whole row, so a field it no longer carries (a cleared
+ * `waitingReason`, a `queuePosition` after the pair left the queue, a
+ * participant state) must disappear - merging kept the old value forever.
  */
 function mergeSnapshotRow(
   previous: Record<string, unknown> | undefined,
@@ -63,7 +57,7 @@ function mergeSnapshotRow(
   if (!previous) return incoming;
   if (isTerminalRow(previous) && !isTerminalRow(incoming)) return previous;
   if (snapshotTimestamp(incoming) < snapshotTimestamp(previous)) return previous;
-  return mergeDefined(previous, incoming);
+  return incoming;
 }
 
 function mergeSnapshotRows(
@@ -193,7 +187,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
   });
   useEffect(() => {
     const onSnapshot = (event: Event) => {
-      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean; op?: string; task?: Record<string, unknown>; removedId?: string } | undefined;
+      const detail = (event as CustomEvent).detail as { tasks?: readonly Record<string, unknown>[]; assignments?: readonly Record<string, unknown>[]; scopeReset?: boolean } | undefined;
       if (!detail) return;
       if (detail.scopeReset) {
         (window as Window & { __imcodesTaskPairSnapshot?: unknown }).__imcodesTaskPairSnapshot = undefined;
@@ -203,16 +197,7 @@ export function TaskPairStatusPanel({ events, sessions, serverId, scopeSessionId
       if (Array.isArray(detail.tasks)) {
         const normalized = normalizeSnapshot(detail);
         if (normalized) setSnapshotRows((current) => mergeSnapshotRows(current, normalized));
-      } else if (detail.op === 'task_upsert' && detail.task) {
-        setSnapshotRows((current) => {
-          if (!current) return current;
-          const normalized = normalizeSnapshot({ tasks: [detail.task!], assignments: detail.assignments });
-          const incoming = normalized?.[0];
-          if (!incoming) return current;
-          const previous = current.find((row) => row.taskId === incoming.taskId);
-          return [...current.filter((row) => row.taskId !== incoming.taskId), mergeSnapshotRow(previous, incoming)];
-        });
-      } else if (detail.op === 'task_remove' && detail.removedId) setSnapshotRows((current) => current?.filter((row) => row.taskId !== detail.removedId) ?? current);
+      }
     };
     window.addEventListener('supervision:task-pairs', onSnapshot);
     return () => window.removeEventListener('supervision:task-pairs', onSnapshot);
