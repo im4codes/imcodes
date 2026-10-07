@@ -11,6 +11,7 @@
 #include <cmath>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 
@@ -630,6 +631,21 @@ class ScreenCaptureKitAdapter::Impl {
         limits(capture_limits),
         delivery(std::make_shared<DeliveryState>()) {
     delivery->max_pending_frames = limits.max_pending_frames;
+    retarget_queue = dispatch_queue_create(
+        "to.aidesk.remote-desktop.capture-retarget", DISPATCH_QUEUE_SERIAL);
+  }
+
+  ~Impl() {
+    // A queued retarget holds `this`: make it a no-op, then let it finish.
+    {
+      std::lock_guard lock(request_mutex);
+      running = false;
+      ++run_generation;
+    }
+    if (retarget_queue != nullptr) {
+      dispatch_sync(retarget_queue, ^{
+      });
+    }
   }
 
   [[nodiscard]] common::ReadinessState ProbeReadiness() {
@@ -759,6 +775,7 @@ class ScreenCaptureKitAdapter::Impl {
 
   bool Start(const common::DisplayTopology& display,
              common::CapturedFrameSink sink) {
+    std::lock_guard stream_lock(stream_mutex);
     if (!sink || !display.IsValid() ||
         display.generation != worker_generation) {
       std::lock_guard lock(delivery->mutex);
@@ -789,7 +806,7 @@ class ScreenCaptureKitAdapter::Impl {
           "capture start rejected stale display topology metadata"};
       return false;
     }
-    Stop();
+    StopLocked();
     {
       std::lock_guard lock(delivery->mutex);
       delivery->accepting = true;
@@ -843,10 +860,153 @@ class ScreenCaptureKitAdapter::Impl {
       stream.reset();
       return false;
     }
+    {
+      // The stream was created at the display's native size; a later
+      // SetOutputSize() may switch it to a smaller one.
+      std::lock_guard lock(request_mutex);
+      running = true;
+      native_size = display.encoded_pixels;
+      native_display_id = found->second.native_display_id;
+      cursor_supported = found->second.cursor_supported;
+      requested_size = display.encoded_pixels;
+      current_size = display.encoded_pixels;
+    }
+    output_size.store(0, std::memory_order_release);
     return true;
   }
 
   void Stop() noexcept {
+    std::lock_guard stream_lock(stream_mutex);
+    StopLocked();
+  }
+
+  // --- Output-size capture -------------------------------------------------
+  //
+  // Only a backend that reports SupportsOutputSize() (CGDisplayStream) takes
+  // part. The switch is make-before-break: a stream at the new size is started
+  // and must deliver a frame before the old one is stopped, so the picture
+  // never stops, and a failed switch keeps the old stream running.
+
+  [[nodiscard]] bool SupportsOutputSize() const noexcept {
+    return backend != nullptr && backend->SupportsOutputSize();
+  }
+
+  [[nodiscard]] static std::uint64_t PackSize(common::PixelSize size) noexcept {
+    return (static_cast<std::uint64_t>(size.width) << 32) | size.height;
+  }
+
+  bool SetOutputSize(common::PixelSize size) {
+    if (!SupportsOutputSize() || !size.IsValid()) return false;
+    std::uint64_t generation = 0;
+    {
+      std::lock_guard lock(request_mutex);
+      if (!running) return false;
+      // Never upscale: the native size is the ceiling in both dimensions.
+      size.width = std::min(size.width, native_size.width);
+      size.height = std::min(size.height, native_size.height);
+      if (size.width == requested_size.width &&
+          size.height == requested_size.height) {
+        return true;
+      }
+      requested_size = size;
+      generation = run_generation;
+    }
+    dispatch_async(retarget_queue, ^{
+      Retarget(generation);
+    });
+    return true;
+  }
+
+  [[nodiscard]] std::optional<common::PixelSize> OutputSize() const noexcept {
+    const std::uint64_t packed = output_size.load(std::memory_order_acquire);
+    if (packed == 0) return std::nullopt;
+    return common::PixelSize{static_cast<std::uint32_t>(packed >> 32),
+                             static_cast<std::uint32_t>(packed & 0xffffffffU)};
+  }
+
+  void Retarget(std::uint64_t generation) {
+    std::lock_guard stream_lock(stream_mutex);
+    common::PixelSize target;
+    common::PixelSize current;
+    common::PixelSize native;
+    std::uint32_t display_id = 0;
+    bool show_cursor = false;
+    {
+      std::lock_guard lock(request_mutex);
+      if (!running || generation != run_generation) return;
+      target = requested_size;
+      current = current_size;
+      native = native_size;
+      display_id = native_display_id;
+      show_cursor = cursor_supported;
+    }
+    if (!stream) return;
+    if (target.width == current.width && target.height == current.height) return;
+
+    const auto shared_delivery = delivery;
+    CaptureError create_error;
+    std::unique_ptr<ScreenCaptureKitBackendStream> fresh = backend->CreateStream(
+        ScreenCaptureKitStreamConfiguration{
+            .native_display_id = display_id,
+            .encoded_pixels = target,
+            .display_lookup_timeout_ms = limits.enumeration_timeout_ms,
+            .frame_rate = limits.frame_rate,
+            .max_pending_frames = limits.max_pending_frames,
+            .show_cursor = show_cursor,
+        },
+        [shared_delivery](common::CapturedFrame frame) {
+          shared_delivery->Deliver(std::move(frame));
+        },
+        [shared_delivery](CaptureError error) {
+          shared_delivery->Fail(std::move(error));
+        },
+        &create_error);
+    std::string error;
+    const std::uint32_t start_ms =
+        std::min(limits.stream_start_timeout_ms, kRetargetStreamTimeoutMs);
+    const std::uint32_t frame_ms =
+        std::min(limits.first_frame_timeout_ms, kRetargetStreamTimeoutMs);
+    if (!fresh || !fresh->Start(start_ms, &error) ||
+        !fresh->WaitForFirstFrame(frame_ms, &error)) {
+      if (fresh) fresh->Stop(limits.stream_stop_timeout_ms);
+      // Keep the running stream, and let a later request try again.
+      std::lock_guard lock(request_mutex);
+      requested_size = current_size;
+      return;
+    }
+    std::unique_ptr<ScreenCaptureKitBackendStream> previous = std::move(stream);
+    stream = std::move(fresh);
+    {
+      std::lock_guard lock(request_mutex);
+      current_size = target;
+    }
+    const bool is_native =
+        target.width == native.width && target.height == native.height;
+    output_size.store(is_native ? 0 : PackSize(target),
+                      std::memory_order_release);
+    previous->Stop(limits.stream_stop_timeout_ms);
+  }
+
+  const common::WorkerGeneration worker_generation;
+  std::unique_ptr<ScreenCaptureKitBackend> backend;
+  const ScreenCaptureKitLimits limits;
+  std::shared_ptr<DeliveryState> delivery;
+  common::TopologyRevision topology_revision = 1;
+  std::unordered_map<std::string, ScreenCaptureKitBackendDisplay> displays;
+  // Guards `stream` (Start/Stop/Retarget); never held by a frame callback.
+  std::mutex stream_mutex;
+  std::unique_ptr<ScreenCaptureKitBackendStream> stream;
+
+ private:
+  static constexpr std::uint32_t kRetargetStreamTimeoutMs = 1'500;
+
+  void StopLocked() noexcept {
+    {
+      std::lock_guard lock(request_mutex);
+      running = false;
+      ++run_generation;
+    }
+    output_size.store(0, std::memory_order_release);
     {
       std::lock_guard lock(delivery->mutex);
       delivery->accepting = false;
@@ -858,13 +1018,21 @@ class ScreenCaptureKitAdapter::Impl {
     }
   }
 
-  const common::WorkerGeneration worker_generation;
-  std::unique_ptr<ScreenCaptureKitBackend> backend;
-  const ScreenCaptureKitLimits limits;
-  std::shared_ptr<DeliveryState> delivery;
-  common::TopologyRevision topology_revision = 1;
-  std::unordered_map<std::string, ScreenCaptureKitBackendDisplay> displays;
-  std::unique_ptr<ScreenCaptureKitBackendStream> stream;
+  // State of the running capture, for output-size switching. Small and
+  // separate from `stream_mutex` so the per-frame size check never waits on a
+  // stream restart.
+  std::mutex request_mutex;
+  bool running = false;
+  std::uint64_t run_generation = 0;
+  common::PixelSize native_size;
+  common::PixelSize requested_size;
+  common::PixelSize current_size;
+  std::uint32_t native_display_id = 0;
+  bool cursor_supported = false;
+  // (width << 32) | height of the stream's output when it is not the native
+  // size; 0 = native. Read per frame without locking.
+  std::atomic<std::uint64_t> output_size{0};
+  dispatch_queue_t retarget_queue = nullptr;
 };
 
 std::unique_ptr<ScreenCaptureKitBackend> CreateAppleScreenCaptureKitBackend() {
@@ -921,6 +1089,19 @@ bool ScreenCaptureKitAdapter::Start(const common::DisplayTopology& display,
 }
 
 void ScreenCaptureKitAdapter::Stop() noexcept { impl_->Stop(); }
+
+bool ScreenCaptureKitAdapter::SupportsOutputSize() const noexcept {
+  return impl_->SupportsOutputSize();
+}
+
+bool ScreenCaptureKitAdapter::SetOutputSize(common::PixelSize size) {
+  return impl_->SetOutputSize(size);
+}
+
+std::optional<common::PixelSize> ScreenCaptureKitAdapter::OutputSize()
+    const noexcept {
+  return impl_->OutputSize();
+}
 
 bool ScreenCaptureKitAdapter::CursorCaptureSupported(
     std::string_view display_id) const noexcept {

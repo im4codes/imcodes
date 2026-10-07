@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <utility>
 
 #include "cg_event_input_adapter.h"
@@ -1181,9 +1182,20 @@ class MacosRemoteDesktopSession::Impl final
     // behind the lock screen, a mode switch before topology catches up -- and
     // ending a live session over one such frame took every locked-Mac session
     // down within milliseconds of connecting.
+    //
+    // A capture that scales in the compositor delivers frames at the size it
+    // was last asked for (SetOutputSize) instead of the display's native size,
+    // so that is the size to expect; for every other capture OutputSize() is
+    // empty and the rule is unchanged.
+    const std::optional<common::PixelSize> capture_size =
+        dependencies_.adapters.capture.OutputSize();
+    const common::PixelSize expected_size =
+        capture_size.has_value()
+            ? *capture_size
+            : (display != nullptr ? display->encoded_pixels : common::PixelSize{});
     if (display == nullptr || !frame.IsValid() ||
-        frame.encoded_pixels.width != display->encoded_pixels.width ||
-        frame.encoded_pixels.height != display->encoded_pixels.height) {
+        frame.encoded_pixels.width != expected_size.width ||
+        frame.encoded_pixels.height != expected_size.height) {
       if (!reported_frame_mismatch_) {
         reported_frame_mismatch_ = true;
         std::fprintf(stderr,
@@ -1609,7 +1621,7 @@ class OwnedProductionAdapters final {
         .negotiate_offer = negotiate_offer_,
         .apply_quality =
             [this](const common::QualitySelection& selection) {
-              return encoder_.ReconfigureFromQualitySelection(
+              const bool applied = encoder_.ReconfigureFromQualitySelection(
                   imcodes::rd::QualitySelection{
                       selection.preset_id.c_str(),
                       static_cast<int>(selection.encoded_pixels.width),
@@ -1617,11 +1629,25 @@ class OwnedProductionAdapters final {
                       static_cast<int>(selection.frame_rate),
                       selection.bitrate_bps,
                   });
+              RetargetCaptureToEncoder();
+              return applied;
             },
     };
   }
 
  private:
+  // Asks a capture that can scale in the compositor (CGDisplayStream) to
+  // deliver frames at the size the encoder is now configured for, so the worker
+  // no longer copies and resamples a native-size frame on the CPU for every
+  // frame it sends. A no-op for ScreenCaptureKit, whose adapter reports no
+  // output-size support. Never blocks: the adapter switches in the background.
+  void RetargetCaptureToEncoder() {
+    if (!capture_.SupportsOutputSize()) return;
+    if (const auto configuration = encoder_.Configuration()) {
+      (void)capture_.SetOutputSize(configuration->encoded_pixels);
+    }
+  }
+
   ScreenCaptureKitAdapter capture_;
   MacosVirtualDisplayAdapter virtual_display_;
   VideoToolboxH264Encoder encoder_;

@@ -102,6 +102,14 @@ class ScreenCaptureKitBackendStream {
 class ScreenCaptureKitBackend {
  public:
   virtual ~ScreenCaptureKitBackend() = default;
+  // True when streams this backend creates deliver frames at the size named in
+  // ScreenCaptureKitStreamConfiguration::encoded_pixels (the capture API scales
+  // in the compositor/GPU), so the output size can be chosen per stream.
+  // False (the default) means the stream always delivers the display's native
+  // size and encoded_pixels only names it.
+  [[nodiscard]] virtual bool SupportsOutputSize() const noexcept {
+    return false;
+  }
   [[nodiscard]] virtual common::ReadinessState ProbeReadiness() noexcept = 0;
   virtual bool EnumerateDisplays(
       std::uint32_t timeout_ms,
@@ -154,6 +162,14 @@ class ScreenCaptureKitAdapter final : public common::CaptureAdapter,
   bool Start(const common::DisplayTopology& display,
              common::CapturedFrameSink sink) override;
   void Stop() noexcept override;
+
+  // Output-size capture (see common::CaptureAdapter). Only a backend that
+  // reports SupportsOutputSize() takes part; ScreenCaptureKit does not, so on
+  // every path that uses it these are the no-ops of the base class.
+  [[nodiscard]] bool SupportsOutputSize() const noexcept override;
+  bool SetOutputSize(common::PixelSize size) override;
+  [[nodiscard]] std::optional<common::PixelSize> OutputSize()
+      const noexcept override;
 
   [[nodiscard]] bool CursorCaptureSupported(
       std::string_view display_id) const noexcept;

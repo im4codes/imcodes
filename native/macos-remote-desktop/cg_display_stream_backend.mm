@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -26,17 +27,17 @@ namespace common = imcodes::remote_desktop::common;
 /** Owns one IOSurface-backed frame for as long as the frame is alive. */
 class SurfaceStorage final : public common::FrameStorage {
  public:
-  SurfaceStorage(std::vector<std::byte> bytes) : bytes_(std::move(bytes)) {}
+  SurfaceStorage(std::unique_ptr<std::byte[]> bytes, std::size_t size)
+      : bytes_(std::move(bytes)), size_(size) {}
 
   [[nodiscard]] const std::byte* data() const noexcept override {
-    return bytes_.data();
+    return bytes_.get();
   }
-  [[nodiscard]] std::size_t size() const noexcept override {
-    return bytes_.size();
-  }
+  [[nodiscard]] std::size_t size() const noexcept override { return size_; }
 
  private:
-  std::vector<std::byte> bytes_;
+  std::unique_ptr<std::byte[]> bytes_;
+  std::size_t size_;
 };
 
 [[nodiscard]] std::int64_t NowMicroseconds() {
@@ -65,14 +66,19 @@ class SurfaceStorage final : public common::FrameStorage {
   const auto* base = static_cast<const std::byte*>(IOSurfaceGetBaseAddress(surface));
   bool copied = false;
   if (base != nullptr && width > 0 && height > 0 && row_bytes > 0) {
-    std::vector<std::byte> bytes(row_bytes * height);
-    std::memcpy(bytes.data(), base, bytes.size());
+    // Uninitialised on purpose: every byte is overwritten by the copy below,
+    // and zero-filling a native 5K frame first (~52 MB) cost a measurable part
+    // of the frame budget on the capture thread.
+    const std::size_t byte_count = row_bytes * height;
+    // `new std::byte[n]` default-initialises: no zero fill.
+    std::unique_ptr<std::byte[]> bytes(new std::byte[byte_count]);
+    std::memcpy(bytes.get(), base, byte_count);
     out->encoded_pixels = common::PixelSize{static_cast<std::uint32_t>(width),
                                             static_cast<std::uint32_t>(height)};
     out->pixel_format = common::PixelFormat::kBgra8888;
     out->row_bytes = static_cast<std::uint32_t>(row_bytes);
     out->capture_time_us = NowMicroseconds();
-    out->storage = std::make_shared<SurfaceStorage>(std::move(bytes));
+    out->storage = std::make_shared<SurfaceStorage>(std::move(bytes), byte_count);
     copied = true;
   }
   (void)IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, nullptr);
@@ -304,6 +310,12 @@ class CgDisplayStreamHandle final : public ScreenCaptureKitBackendStream {
 
 class CgDisplayStreamBackend final : public ScreenCaptureKitBackend {
  public:
+  // CGDisplayStreamCreate takes the output width and height, and WindowServer
+  // scales to it on the GPU: a stream can deliver frames already the size the
+  // encoder will use, instead of a native-size frame the worker would have to
+  // copy and resample on the CPU.
+  bool SupportsOutputSize() const noexcept override { return true; }
+
   common::ReadinessState ProbeReadiness() noexcept override {
     // Preflight, never request: a backend that triggered a TCC prompt at the
     // login window would prompt where nobody can answer it.

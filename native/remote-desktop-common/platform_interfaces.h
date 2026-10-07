@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -34,6 +35,32 @@ class CaptureAdapter {
   virtual bool Start(const DisplayTopology& display,
                      CapturedFrameSink sink) = 0;
   virtual void Stop() noexcept = 0;
+
+  // Capture at the output size instead of the display's native size.
+  //
+  // A capture API that can scale in the compositor/GPU hands over frames that
+  // are already the size the encoder will use, so the worker does not copy and
+  // resample a native-size frame on the CPU for every frame it sends. That
+  // matters on a 5K display: a native BGRA frame is ~52 MB.
+  //
+  // The defaults say "not supported": the capture then always delivers the
+  // display's native size, exactly as before, and nothing below applies.
+  [[nodiscard]] virtual bool SupportsOutputSize() const noexcept {
+    return false;
+  }
+  // Asks the capture to deliver frames of `size` from now on. Never blocks on
+  // the capture API: the switch happens in the background, and OutputSize()
+  // changes when frames of the new size are actually flowing. Returns false
+  // when the capture cannot do it (unsupported, or not running).
+  virtual bool SetOutputSize(PixelSize size) {
+    (void)size;
+    return false;
+  }
+  // The size frames are delivered at right now; empty = the display's native
+  // size. Cheap and lock-free: it is read on the per-frame path.
+  [[nodiscard]] virtual std::optional<PixelSize> OutputSize() const noexcept {
+    return std::nullopt;
+  }
 };
 
 struct EncoderConfiguration {
