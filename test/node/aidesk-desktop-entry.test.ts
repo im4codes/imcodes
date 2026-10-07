@@ -1,5 +1,7 @@
+import { AIDESK_HICOLOR_ICONS_BASE64, AIDESK_ICON_SOURCE_SHA256 } from '../../shared/aidesk-icon-generated.js';
+import { logoSha256 } from '../../scripts/aidesk-icon.mjs';
 import { LOCAL_PANEL_LINUX_WM_CLASS } from '../../shared/local-panel-window.js';
-import { mkdtemp, mkdir, readFile, readlink, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -9,6 +11,7 @@ import {
   buildWindowsAideskShortcutRemovalCommand,
   ensureWindowsAideskShortcut,
   ensureLinuxAideskDesktopEntry,
+  writeLinuxAideskIcons,
   ensureMacosAideskApplicationEntry,
   isMacosAideskAgentRunning,
   resolveAideskLocalUiExecutable,
@@ -35,9 +38,9 @@ async function root(): Promise<string> {
 
 describe('aiDesk desktop entries', () => {
   it('the Linux desktop entry carries the panel window\'s WM_CLASS as StartupWMClass, so the shell shows its name and icon for the browser window', () => {
-    const entry = buildLinuxAideskDesktopEntry('/opt/imcodes/imcodes-node', '/opt/imcodes/icon.png');
+    const entry = buildLinuxAideskDesktopEntry('/opt/imcodes/imcodes-node');
     expect(entry).toContain(`StartupWMClass=${LOCAL_PANEL_LINUX_WM_CLASS}\n`);
-    expect(entry).toContain('Icon="/opt/imcodes/icon.png"');
+    expect(entry).toContain('Icon=aidesk\n');
   });
 
   it('resolves the packaged native UI beside the controlled-node executable on each desktop OS', () => {
@@ -101,7 +104,6 @@ describe('aiDesk desktop entries', () => {
       uid: process.getuid?.() ?? 501,
       gid: process.getgid?.() ?? 20,
       executablePath: '/opt/ai Desk/$agent',
-      iconPath: '/opt/ai Desk/icon.png',
       runUpdateDatabase: async (directory: string) => { calls.push(directory); },
     };
     await expect(ensureLinuxAideskDesktopEntry(input)).resolves.toBe('created');
@@ -111,7 +113,41 @@ describe('aiDesk desktop entries', () => {
     expect(content).toContain('Exec="/opt/ai Desk/\\$agent" --open-local-panel');
     await expect(ensureLinuxAideskDesktopEntry(input)).resolves.toBe('unchanged');
     expect(calls).toHaveLength(1);
+    // the themed icon the entry names is written (from the bundle, no file next to the executable) as the desktop user's own files
+    for (const [size, base64] of Object.entries(AIDESK_HICOLOR_ICONS_BASE64)) {
+      const icon = join(home, '.local', 'share', 'icons', 'hicolor', `${size}x${size}`, 'apps', 'aidesk.png');
+      expect((await readFile(icon)).equals(Buffer.from(base64, 'base64'))).toBe(true);
+      expect((await stat(icon)).mode & 0o777).toBe(0o644);
+    }
     await expect(removeLinuxAideskDesktopEntry(home)).resolves.toBe(true);
+    for (const size of Object.keys(AIDESK_HICOLOR_ICONS_BASE64)) {
+      await expect(stat(join(home, '.local', 'share', 'icons', 'hicolor', `${size}x${size}`, 'apps', 'aidesk.png'))).rejects.toThrow();
+    }
+  });
+
+  it('never removes or overwrites-away a different aidesk.png of the user on removal, and repairs a damaged one of ours', async () => {
+    if (process.platform === 'win32') return;
+    const home = await root();
+    const ids = { uid: process.getuid?.() ?? 501, gid: process.getgid?.() ?? 20 };
+    await ensureLinuxAideskDesktopEntry({ home, ...ids, executablePath: '/x' });
+    const size = Object.keys(AIDESK_HICOLOR_ICONS_BASE64)[0]!;
+    const icon = join(home, '.local', 'share', 'icons', 'hicolor', `${size}x${size}`, 'apps', 'aidesk.png');
+    await writeFile(icon, 'the user\'s own picture');
+    await removeLinuxAideskDesktopEntry(home);
+    expect(await readFile(icon, 'utf8')).toBe('the user\'s own picture');
+    await expect(writeLinuxAideskIcons(home, ids.uid, ids.gid)).resolves.toBe(true); // a changed file is rewritten with ours
+    expect((await readFile(icon)).equals(Buffer.from(AIDESK_HICOLOR_ICONS_BASE64[Number(size)]!, 'base64'))).toBe(true);
+    await expect(writeLinuxAideskIcons(home, ids.uid, ids.gid)).resolves.toBe(false); // nothing to do the second time
+  });
+
+  it('the embedded icons are the official logo\'s: hash recorded, PNG signature, small enough to ship inside the bundle', () => {
+    expect(AIDESK_ICON_SOURCE_SHA256).toBe(logoSha256());
+    const total = Object.values(AIDESK_HICOLOR_ICONS_BASE64).reduce((sum, base64) => sum + base64.length, 0);
+    expect(total).toBeLessThan(60_000);
+    for (const base64 of Object.values(AIDESK_HICOLOR_ICONS_BASE64)) {
+      expect(Buffer.from(base64, 'base64').subarray(0, 8).toString('hex')).toBe('89504e470d0a1a0a');
+    }
+    expect(Object.keys(AIDESK_HICOLOR_ICONS_BASE64).map(Number)).toEqual(expect.arrayContaining([48, 256]));
   });
 
   it('preserves an unmanaged Linux entry and rejects control characters in paths', async () => {
@@ -121,10 +157,10 @@ describe('aiDesk desktop entries', () => {
     await mkdir(directory, { recursive: true });
     const path = join(directory, AIDESK_LINUX_DESKTOP_FILE_NAME);
     await writeFile(path, '[Desktop Entry]\nName=mine\n');
-    const input = { home, uid: process.getuid?.() ?? 501, gid: process.getgid?.() ?? 20, executablePath: '/x', iconPath: '/i' };
+    const input = { home, uid: process.getuid?.() ?? 501, gid: process.getgid?.() ?? 20, executablePath: '/x' };
     await expect(ensureLinuxAideskDesktopEntry(input)).resolves.toBe('preserved');
     await expect(removeLinuxAideskDesktopEntry(home)).resolves.toBe(false);
-    expect(() => buildLinuxAideskDesktopEntry('/bad\npath', '/icon')).toThrow();
+    expect(() => buildLinuxAideskDesktopEntry('/bad\npath')).toThrow();
   });
 
   it('encodes Windows paths as data and repairs only an owned shortcut', () => {

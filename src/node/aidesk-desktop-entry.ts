@@ -23,8 +23,8 @@ import {
   AIDESK_MACOS_APP_NAME,
   AIDESK_PRODUCT_NAME,
   AIDESK_WINDOWS_SHORTCUT_FILE_NAME,
-  AIDESK_ICON_FILE_NAME,
 } from '../../shared/aidesk-product.js';
+import { AIDESK_HICOLOR_ICONS_BASE64 } from '../../shared/aidesk-icon-generated.js';
 import { LOCAL_PANEL_LINUX_WM_CLASS } from '../../shared/local-panel-window.js';
 import { REMOTE_DESKTOP_LOCAL_MANAGEMENT } from '../../shared/remote-desktop-local-management.js';
 import { pickLinuxDesktopUserProfile } from './linux-desktop-environment.js';
@@ -67,8 +67,11 @@ function desktopExecQuote(value: string): string {
   return `"${value.replaceAll('\\', '\\\\').replaceAll('"', '\\"').replaceAll('`', '\\`').replaceAll('$', '\\$')}"`;
 }
 
-export function buildLinuxAideskDesktopEntry(executablePath: string, iconPath: string): string {
-  return `[Desktop Entry]\nType=Application\nVersion=1.0\nName=${AIDESK_PRODUCT_NAME}\nComment=${AIDESK_PRODUCT_NAME}\nExec=${desktopExecQuote(executablePath)} --open-local-panel\nIcon=${desktopExecQuote(iconPath)}\nTerminal=false\nCategories=Network;RemoteAccess;\nStartupNotify=true\nStartupWMClass=${LOCAL_PANEL_LINUX_WM_CLASS}\n${MANAGED_MARKER}\n`;
+/** The themed icon name of the desktop entry: the PNGs are written to the user's hicolor theme under this name (see writeLinuxAideskIcons). */
+export const LINUX_AIDESK_ICON_NAME = 'aidesk';
+
+export function buildLinuxAideskDesktopEntry(executablePath: string): string {
+  return `[Desktop Entry]\nType=Application\nVersion=1.0\nName=${AIDESK_PRODUCT_NAME}\nComment=${AIDESK_PRODUCT_NAME}\nExec=${desktopExecQuote(executablePath)} --open-local-panel\nIcon=${LINUX_AIDESK_ICON_NAME}\nTerminal=false\nCategories=Network;RemoteAccess;\nStartupNotify=true\nStartupWMClass=${LOCAL_PANEL_LINUX_WM_CLASS}\n${MANAGED_MARKER}\n`;
 }
 
 function windowsEncodedCommand(script: string): string {
@@ -297,19 +300,52 @@ export async function removeMacosAideskApplicationEntry(input: {
   return true;
 }
 
+/** The icon file name inside `<home>/.local/share/icons/hicolor/<n>x<n>/apps/`. */
+const LINUX_ICON_FILE = `${LINUX_AIDESK_ICON_NAME}.png`;
+
+/**
+ * Writes the logo PNGs that travel inside the node bundle to the desktop user's own hicolor theme (owned by that user, mode 0644), so the
+ * desktop entry's themed `Icon=aidesk` resolves with nothing shipped next to the executable. Returns whether anything changed.
+ */
+export async function writeLinuxAideskIcons(
+  home: string,
+  uid: number,
+  gid: number,
+  icons: Readonly<Record<number, string>> = AIDESK_HICOLOR_ICONS_BASE64,
+): Promise<boolean> {
+  let changed = false;
+  for (const [sizeText, base64] of Object.entries(icons)) {
+    const size = Number(sizeText);
+    if (!Number.isInteger(size) || size <= 0) continue;
+    const bytes = Buffer.from(base64, 'base64');
+    const directory = await ensureOwnedDirectoryChain(home, ['.local', 'share', 'icons', 'hicolor', `${size}x${size}`, 'apps'], uid, gid);
+    const path = join(directory, LINUX_ICON_FILE);
+    const current = await readFile(path).catch(() => null);
+    if (current !== null && current.equals(bytes)) continue;
+    const temp = join(directory, `.${LINUX_ICON_FILE}.${process.pid}.tmp`);
+    await writeFile(temp, bytes, { mode: 0o644, flag: 'wx' });
+    await chown(temp, uid, gid);
+    await chmod(temp, 0o644);
+    await rename(temp, path);
+    changed = true;
+  }
+  return changed;
+}
+
 export async function ensureLinuxAideskDesktopEntry(input: {
   home: string;
   uid: number;
   gid: number;
   executablePath: string;
-  iconPath: string;
   runUpdateDatabase?: (directory: string) => Promise<void>;
 }): Promise<AideskDesktopEntryResult> {
+  // The icon is best effort: a desktop entry without its icon is still a working entry.
+  await writeLinuxAideskIcons(input.home, input.uid, input.gid).catch(() => false);
   const directory = await ensureOwnedDirectoryChain(
     input.home, ['.local', 'share', 'applications'], input.uid, input.gid,
   );
   const path = join(directory, AIDESK_LINUX_DESKTOP_FILE_NAME);
-  const wanted = buildLinuxAideskDesktopEntry(input.executablePath, input.iconPath);
+  const wanted = buildLinuxAideskDesktopEntry(input.executablePath);
   const current = await readFile(path, 'utf8').catch(() => null);
   if (current !== null && !current.includes(MANAGED_MARKER)) return 'preserved';
   if (current === wanted) return 'unchanged';
@@ -327,6 +363,12 @@ export async function removeLinuxAideskDesktopEntry(home: string): Promise<boole
   const current = await readFile(path, 'utf8').catch(() => null);
   if (!current?.includes(MANAGED_MARKER)) return false;
   await rm(path);
+  // Only the icon files this node wrote (byte-identical): a user's own aidesk.png is left alone.
+  for (const [sizeText, base64] of Object.entries(AIDESK_HICOLOR_ICONS_BASE64)) {
+    const icon = join(home, '.local', 'share', 'icons', 'hicolor', `${sizeText}x${sizeText}`, 'apps', LINUX_ICON_FILE);
+    const bytes = await readFile(icon).catch(() => null);
+    if (bytes !== null && bytes.equals(Buffer.from(base64, 'base64'))) await rm(icon).catch(() => undefined);
+  }
   return true;
 }
 
@@ -382,12 +424,10 @@ export async function ensureAideskDesktopEntry(
     const passwd = readFileSync('/etc/passwd', 'utf8');
     const user = pickLinuxDesktopUserProfile(passwd);
     if (!user) return 'unavailable';
-    const iconPath = resolve(dirname(process.execPath), AIDESK_ICON_FILE_NAME);
     const nativeUi = resolveAideskLocalUiExecutable(platform);
     return ensureLinuxAideskDesktopEntry({
       ...user,
       executablePath: existsSync(nativeUi) ? nativeUi : process.execPath,
-      iconPath,
       runUpdateDatabase: runUpdateDesktopDatabase,
     });
   }

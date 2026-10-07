@@ -11,5 +11,3 @@ export const AIDESK_WINDOWS_SHORTCUT_FILE_NAME = AIDESK_PRODUCT.windowsShortcutF
 export const AIDESK_LOCAL_UI_EXECUTABLE_NAME = AIDESK_PRODUCT.localUiExecutableName;
 /** Info.plist key (boolean) the aiDesk app carries when it shows the local management panel in its own window; the node reads it before asking. */
 export const AIDESK_PANEL_HOST_PLIST_KEY = AIDESK_PRODUCT.panelHostPlistKey;
-/** The application icon file (a 512 px PNG of the official IM.codes logo) shipped next to the node executable; the Linux desktop entry's Icon. */
-export const AIDESK_ICON_FILE_NAME = AIDESK_PRODUCT.iconFileName;

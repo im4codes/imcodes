@@ -5,6 +5,5 @@
   "linuxDesktopFileName": "aidesk.desktop",
   "windowsShortcutFileName": "aiDesk.to by IM.codes.lnk",
   "localUiExecutableName": "aidesk-local-ui",
-  "panelHostPlistKey": "AiDeskHostsPanelWindow",
-  "iconFileName": "aidesk-icon.png"
+  "panelHostPlistKey": "AiDeskHostsPanelWindow"
 }

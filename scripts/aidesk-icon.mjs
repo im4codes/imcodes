@@ -8,6 +8,7 @@
  *   node scripts/aidesk-icon.mjs iconset DIR            (then: iconutil -c icns DIR -o AppIcon.icns)
  *   node scripts/aidesk-icon.mjs hicolor DIR            (DIR/<n>x<n>/apps/aidesk.png)
  *   node scripts/aidesk-icon.mjs favicon-ts [OUT.ts]    (shared/aidesk-favicon-generated.ts, committed; the test binds it to the source hash)
+ *   node scripts/aidesk-icon.mjs icon-ts [OUT.ts]       (shared/aidesk-icon-generated.ts: the Linux hicolor PNGs, embedded in the node bundle)
  *
  * The logo is black, so on a dark Dock or taskbar its edge would vanish: the artwork is shaped as a rounded tile with a hairline light
  * border, and at 64 px and below it is cropped to the wordmark so "IM.codes" stays legible.
@@ -32,6 +33,9 @@ export const AIDESK_ICONSET_ENTRIES = Object.freeze([
   ['icon_512x512', 512], ['icon_512x512@2x', 1024],
 ]);
 export const AIDESK_FAVICON_SIZE = 64;
+export const AIDESK_ICON_TS = join(root, 'shared', 'aidesk-icon-generated.ts');
+/** The hicolor sizes the node writes for the Linux desktop entry (the shell scales between them): small enough to embed in the bundle. */
+export const AIDESK_EMBEDDED_ICON_SIZES = Object.freeze([48, 256]);
 
 /** The wordmark's bounding box inside the 1024 px artwork, padded: what small sizes are cropped to. */
 const WORDMARK_CROP = Object.freeze({ left: 188, top: 120, width: 704, height: 704 });
@@ -129,12 +133,34 @@ export const AIDESK_FAVICON_SOURCE_SHA256 = '${logoSha256()}';
 `;
 }
 
+/** The text of shared/aidesk-icon-generated.ts: the Linux desktop icon PNGs (base64), bound to the logo they were made from. */
+export async function iconModule() {
+  const entries = [];
+  for (const size of AIDESK_EMBEDDED_ICON_SIZES) entries.push(`  ${size}: '${(await renderAideskIcon(size)).toString('base64')}',`);
+  return `// GENERATED FILE -- DO NOT EDIT BY HAND.
+//
+// Produced by \`node scripts/aidesk-icon.mjs icon-ts\` from the official IM.codes logo (the iOS app icon). The Linux desktop entry's icon
+// travels inside the node bundle (nothing to ship or roll back separately): the node writes these PNGs to the desktop user's hicolor
+// icon directories. Re-run after the logo changes; test/node/aidesk-desktop-entry.test.ts fails if the recorded hash and the logo disagree.
+//
+// source: web/ios/App/App/Assets.xcassets/AppIcon.appiconset/AppIcon-512@2x.png
+// sha256: ${logoSha256()}
+
+/** Pixel size -> PNG (base64). */
+export const AIDESK_HICOLOR_ICONS_BASE64: Readonly<Record<number, string>> = Object.freeze({
+${entries.join('\n')}
+});
+export const AIDESK_ICON_SOURCE_SHA256 = '${logoSha256()}';
+`;
+}
+
 if (process.argv[1] && process.argv[1].endsWith('aidesk-icon.mjs')) {
   const [mode, target] = process.argv.slice(2);
-  const need = () => { if (!target) { process.stderr.write('usage: aidesk-icon.mjs ico OUT.ico | iconset DIR | hicolor DIR | favicon-ts [OUT.ts]\n'); process.exit(2); } return resolve(target); };
+  const need = () => { if (!target) { process.stderr.write('usage: aidesk-icon.mjs ico OUT.ico | iconset DIR | hicolor DIR | favicon-ts [OUT.ts] | icon-ts [OUT.ts]\n'); process.exit(2); } return resolve(target); };
   if (mode === 'ico') { const out = need(); mkdirSync(dirname(out), { recursive: true }); writeFileSync(out, await buildIco()); }
   else if (mode === 'iconset') await writeIconset(need());
   else if (mode === 'hicolor') await writeHicolor(need());
+  else if (mode === 'icon-ts') writeFileSync(target ? resolve(target) : AIDESK_ICON_TS, await iconModule());
   else if (mode === 'favicon-ts') writeFileSync(target ? resolve(target) : AIDESK_FAVICON_TS, await faviconModule());
-  else { process.stderr.write('usage: aidesk-icon.mjs ico OUT.ico | iconset DIR | hicolor DIR | favicon-ts [OUT.ts]\n'); process.exit(2); }
+  else { process.stderr.write('usage: aidesk-icon.mjs ico OUT.ico | iconset DIR | hicolor DIR | favicon-ts [OUT.ts] | icon-ts [OUT.ts]\n'); process.exit(2); }
 }
